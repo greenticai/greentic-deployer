@@ -1834,14 +1834,15 @@ dependencies = [
 
 [[package]]
 name = "greentic-interfaces-host"
-version = "0.4.78"
+version = "0.4.93"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5985daae9d28c0ef9fb967e169cd286af734eae910c4b41cb3228bf509f55f2"
+checksum = "76201b1600ea779c4b661973656d57a6e5f8d47112eb74f53b45e371cca96da3"
 dependencies = [
  "greentic-interfaces",
  "greentic-types",
  "serde",
  "serde_json",
+ "wasmtime 41.0.0",
 ]
 
 [[package]]
