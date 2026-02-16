@@ -42,7 +42,7 @@ toml = "0.9"
 sha2 = "0.10"
 base64 = "0.22"
 ipnet = "2"
-jsonschema = "0.17"
+jsonschema = "0.42"
 rpassword = "7"
 wasmtime = { version = "40", features = ["component-model"] }
 indexmap = "2"
