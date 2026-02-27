@@ -5,8 +5,8 @@ edition = "2024"
 description = "Greentic pack deployer generating multi-cloud IaC + manifests"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/greentic-ai/greentic-deployer"
-homepage = "https://github.com/greentic-ai/greentic-deployer"
+repository = "https://github.com/greenticai/greentic-deployer"
+homepage = "https://github.com/greenticai/greentic-deployer"
 documentation = "https://docs.greentic.ai/deployer"
 keywords = ["greentic", "deployer", "terraform", "opentofu"]
 categories = ["command-line-utilities", "development-tools"]
@@ -60,3 +60,4 @@ path = "src/bin/gen_placeholder_pack.rs"
 [[bin]]
 name = "greentic-deployer-packgen"
 path = "src/bin/greentic-deployer-packgen.rs"
+
