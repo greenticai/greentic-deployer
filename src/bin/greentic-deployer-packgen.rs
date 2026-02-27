@@ -55,7 +55,7 @@ struct GenerateArgs {
     /// Validator pack reference used by greentic-pack doctor.
     #[arg(
         long,
-        default_value = "oci://ghcr.io/greentic-ai/validators/deployer:latest"
+        default_value = "oci://ghcr.io/greenticai/validators/deployer:latest"
     )]
     validator_pack: String,
 }
@@ -377,7 +377,7 @@ mod tests {
             verbose: false,
             dry_run: true,
             strict: false,
-            validator_pack: "oci://ghcr.io/greentic-ai/validators/deployer:latest".into(),
+            validator_pack: "oci://ghcr.io/greenticai/validators/deployer:latest".into(),
         }
     }
 
@@ -396,3 +396,4 @@ mod tests {
         assert!(late.last().unwrap().formatted().contains("--validate"));
     }
 }
+

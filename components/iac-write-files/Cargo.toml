@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Greentic write-files component for emitting IaC placeholders."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/greentic-ai/greentic-deployer"
+repository = "https://github.com/greenticai/greentic-deployer"
 
 [lib]
 crate-type = ["cdylib"]
@@ -13,4 +13,5 @@ crate-type = ["cdylib"]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 wasmtime = { version = "40", features = ["wasi-preview1"] }
+
 
