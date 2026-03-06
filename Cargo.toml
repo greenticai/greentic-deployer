@@ -44,7 +44,7 @@ base64 = "0.22"
 ipnet = "2"
 jsonschema = "0.17"
 rpassword = "7"
-wasmtime = { version = "40", features = ["component-model"] }
+wasmtime = { version = "41", features = ["component-model"] }
 indexmap = "2"
 walkdir = "2"
 zip = "7"
