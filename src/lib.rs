@@ -4,25 +4,31 @@
 use greentic_interfaces_host as _greentic_interfaces_host;
 
 pub mod apply;
-pub mod bootstrap;
 pub mod config;
+pub mod contract;
 pub mod deployment;
 pub mod error;
-pub mod iac;
 pub mod pack_introspect;
 pub mod path_safety;
-pub mod placeholder;
 pub mod plan;
-pub mod platform;
-pub mod provider_onboarding;
-pub mod providers;
-pub mod secrets;
 pub mod telemetry;
 
-pub use config::{Action, CliArgs, Command, DeployerConfig, OutputFormat, Provider};
+pub use apply::{
+    ApplyPayload, CapabilityPayload, DestroyPayload, ExecutionReport, GeneratePayload,
+    OperationPayload, OperationResult, OutputValidation, PlanPayload, RollbackPayload,
+    StatusPayload,
+};
+pub use config::{DeployerConfig, DeployerRequest, OutputFormat, Provider};
+pub use contract::{
+    CapabilitySpecV1, ContractAsset, DeployerCapability, DeployerContractV1, PlannerSpecV1,
+    ResolvedCapabilityContract, ResolvedDeployerContract, ResolvedPlannerContract,
+};
+pub use deployment::{
+    ApplyExecutionOutcome, DestroyExecutionOutcome, ExecutionOutcome, ExecutionOutcomePayload,
+    StatusExecutionOutcome,
+};
 pub use error::DeployerError;
 pub use plan::{
     ChannelContext, ComponentRole, DeploymentProfile, InferenceNotes, InfraPlan, MessagingContext,
     PlanContext, PlannedComponent, Target, TelemetryContext,
 };
-pub use providers::{GeneratedFile, ProviderArtifacts, ProviderBackend};

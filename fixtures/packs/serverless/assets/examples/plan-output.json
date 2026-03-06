@@ -1,0 +1,17 @@
+{
+  "kind": "plan",
+  "capability": "plan",
+  "provider": "generic",
+  "strategy": "serverless-container",
+  "startup_contract": "Container starts, fetches bundle by OCI/object source, verifies digest, then exposes /healthz and /readyz.",
+  "environment_variables": [
+    "REDIS_URL",
+    "GREENTIC_BUNDLE_SOURCE",
+    "GREENTIC_STARTUP_FETCH_TIMEOUT_SECONDS",
+    "GREENTIC_WARM_FAILURE_BEHAVIOR"
+  ],
+  "required_secrets": [
+    "REDIS_URL"
+  ]
+}
+

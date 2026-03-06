@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "required": [
+    "application_name",
+    "snap_channel",
+    "bundle_source",
+    "bundle_digest",
+    "admin_listener",
+    "redis_relation_name",
+    "ingress_relation_name",
+    "observability_relation_name"
+  ],
+  "properties": {
+    "application_name": { "type": "string", "minLength": 1 },
+    "snap_channel": { "type": "string", "minLength": 1 },
+    "bundle_source": { "type": "string", "minLength": 1 },
+    "bundle_digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "admin_listener": { "type": "string", "minLength": 1 },
+    "redis_relation_name": { "type": "string", "minLength": 1 },
+    "ingress_relation_name": { "type": "string", "minLength": 1 },
+    "observability_relation_name": { "type": "string", "minLength": 1 },
+    "secrets_relation_name": { "type": "string" }
+  }
+}
+

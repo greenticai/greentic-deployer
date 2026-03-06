@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "required": ["kind", "deployment_id", "state", "snap_revision"],
+  "properties": {
+    "kind": { "const": "apply" },
+    "deployment_id": { "type": "string" },
+    "state": { "type": "string" },
+    "snap_revision": { "type": "integer", "minimum": 1 }
+  }
+}
+

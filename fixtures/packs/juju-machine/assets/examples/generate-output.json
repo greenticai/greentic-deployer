@@ -1,0 +1,8 @@
+{
+  "kind": "generate",
+  "capability": "generate",
+  "provider": "generic",
+  "strategy": "juju-machine",
+  "charm_root": "charm"
+}
+

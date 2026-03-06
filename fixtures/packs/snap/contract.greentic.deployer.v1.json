@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "planner": {
+    "flow_id": "plan_snap",
+    "input_schema_ref": "assets/schemas/generate-input.schema.json",
+    "output_schema_ref": "assets/schemas/generate-output.schema.json"
+  },
+  "capabilities": [
+    {
+      "capability": "generate",
+      "flow_id": "generate_snap",
+      "input_schema_ref": "assets/schemas/generate-input.schema.json",
+      "output_schema_ref": "assets/schemas/generate-output.schema.json",
+      "example_refs": [
+        "assets/examples/fetch-request.json",
+        "assets/examples/fetch-output.json",
+        "assets/examples/embedded-request.json",
+        "assets/examples/embedded-output.json"
+      ]
+    },
+    {
+      "capability": "plan",
+      "flow_id": "plan_snap",
+      "input_schema_ref": "assets/schemas/generate-input.schema.json",
+      "output_schema_ref": "assets/schemas/plan-output.schema.json"
+    },
+    {
+      "capability": "apply",
+      "flow_id": "apply_snap",
+      "execution_output_schema_ref": "assets/schemas/apply-execution-output.schema.json"
+    }
+  ]
+}
+

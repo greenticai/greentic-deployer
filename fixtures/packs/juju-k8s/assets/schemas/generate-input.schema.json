@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "required": [
+    "application_name",
+    "workload_image_digest",
+    "bundle_source",
+    "bundle_digest",
+    "redis_relation_name",
+    "ingress_relation_name",
+    "observability_relation_name"
+  ],
+  "properties": {
+    "application_name": { "type": "string", "minLength": 1 },
+    "workload_image_digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "bundle_source": { "type": "string", "minLength": 1 },
+    "bundle_digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "redis_relation_name": { "type": "string", "minLength": 1 },
+    "ingress_relation_name": { "type": "string", "minLength": 1 },
+    "observability_relation_name": { "type": "string", "minLength": 1 },
+    "admin_listener": { "type": "string", "pattern": "^(127\\.0\\.0\\.1|localhost|\\[::1\\])" }
+  }
+}
+

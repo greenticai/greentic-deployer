@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "required": [
+    "kind",
+    "capability",
+    "provider",
+    "strategy",
+    "mode",
+    "refresh_guidance"
+  ],
+  "properties": {
+    "kind": { "const": "plan" },
+    "capability": { "const": "plan" },
+    "provider": { "const": "local" },
+    "strategy": { "const": "snap" },
+    "mode": {
+      "type": "string",
+      "enum": ["fetch", "embedded"]
+    },
+    "refresh_guidance": { "type": "string", "minLength": 1 }
+  }
+}
+

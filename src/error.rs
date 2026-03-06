@@ -13,6 +13,9 @@ pub enum DeployerError {
     #[error("pack parsing error: {0}")]
     Pack(String),
 
+    #[error("deployer contract error: {0}")]
+    Contract(String),
+
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
 
@@ -45,20 +48,13 @@ pub enum DeployerError {
     OfflineDisallowed(String),
 
     #[error(
-        "IaC tool '{tool}' missing on PATH (binary '{binary}'). Install it or choose --iac-tool / GREENTIC_IAC_TOOL."
+        "deployment packs not wired yet for capability={capability}, provider={provider}, strategy={strategy}"
     )]
-    IaCToolMissing { tool: String, binary: &'static str },
-
-    #[error("IaC tool '{tool}' command '{step}' failed (exit {status:?}): {stderr}")]
-    IaCTool {
-        tool: String,
-        step: String,
-        status: Option<i32>,
-        stderr: String,
+    DeploymentPackUnsupported {
+        capability: String,
+        provider: String,
+        strategy: String,
     },
-
-    #[error("deployment packs not wired yet for provider={provider}, strategy={strategy}")]
-    DeploymentPackUnsupported { provider: String, strategy: String },
 
     #[error("unexpected error: {0}")]
     Other(String),

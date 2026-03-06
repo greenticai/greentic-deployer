@@ -1,0 +1,446 @@
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
+
+use greentic_types::pack_manifest::{ExtensionInline, ExtensionRef, PackManifest};
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+
+use crate::error::{DeployerError, Result};
+use crate::pack_introspect::read_entry_from_gtpack;
+
+pub const EXT_DEPLOYER_V1: &str = "greentic.deployer.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeployerCapability {
+    Generate,
+    Plan,
+    Apply,
+    Destroy,
+    Status,
+    Rollback,
+}
+
+impl DeployerCapability {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Generate => "generate",
+            Self::Plan => "plan",
+            Self::Apply => "apply",
+            Self::Destroy => "destroy",
+            Self::Status => "status",
+            Self::Rollback => "rollback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeployerContractV1 {
+    pub schema_version: u32,
+    pub planner: PlannerSpecV1,
+    pub capabilities: Vec<CapabilitySpecV1>,
+}
+
+impl DeployerContractV1 {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != 1 {
+            return Err(DeployerError::Contract(format!(
+                "unsupported {} schema_version {}",
+                EXT_DEPLOYER_V1, self.schema_version
+            )));
+        }
+        self.planner.validate()?;
+
+        let mut seen = BTreeSet::new();
+        for capability in &self.capabilities {
+            capability.validate()?;
+            if !seen.insert(capability.capability) {
+                return Err(DeployerError::Contract(format!(
+                    "duplicate capability `{}` in {}",
+                    capability.capability.as_str(),
+                    EXT_DEPLOYER_V1
+                )));
+            }
+        }
+
+        if !seen.contains(&DeployerCapability::Plan) {
+            return Err(DeployerError::Contract(format!(
+                "{} must declare the `plan` capability",
+                EXT_DEPLOYER_V1
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub fn capability(&self, capability: DeployerCapability) -> Option<&CapabilitySpecV1> {
+        self.capabilities
+            .iter()
+            .find(|entry| entry.capability == capability)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannerSpecV1 {
+    pub flow_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qa_spec_ref: Option<String>,
+}
+
+impl PlannerSpecV1 {
+    fn validate(&self) -> Result<()> {
+        if self.flow_id.trim().is_empty() {
+            return Err(DeployerError::Contract(format!(
+                "{} planner.flow_id must not be empty",
+                EXT_DEPLOYER_V1
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilitySpecV1 {
+    pub capability: DeployerCapability,
+    pub flow_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_output_schema_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qa_spec_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub example_refs: Vec<String>,
+}
+
+impl CapabilitySpecV1 {
+    fn validate(&self) -> Result<()> {
+        if self.flow_id.trim().is_empty() {
+            return Err(DeployerError::Contract(format!(
+                "{} capability `{}` has empty flow_id",
+                EXT_DEPLOYER_V1,
+                self.capability.as_str()
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContractAsset {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    pub size_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedCapabilityContract {
+    pub capability: DeployerCapability,
+    pub flow_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<ContractAsset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<ContractAsset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_output_schema: Option<ContractAsset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qa_spec: Option<ContractAsset>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<ContractAsset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedPlannerContract {
+    pub flow_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<ContractAsset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<ContractAsset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qa_spec: Option<ContractAsset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedDeployerContract {
+    pub schema_version: u32,
+    pub planner: ResolvedPlannerContract,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<ResolvedCapabilityContract>,
+}
+
+pub fn get_deployer_contract_v1(manifest: &PackManifest) -> Result<Option<DeployerContractV1>> {
+    let extension = manifest
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get(EXT_DEPLOYER_V1));
+    let inline = match extension.and_then(|entry| entry.inline.as_ref()) {
+        Some(ExtensionInline::Other(value)) => value,
+        Some(_) => {
+            return Err(DeployerError::Contract(format!(
+                "{} inline payload has unexpected type",
+                EXT_DEPLOYER_V1
+            )));
+        }
+        None => return Ok(None),
+    };
+
+    let payload: DeployerContractV1 = serde_json::from_value(inline.clone()).map_err(|err| {
+        DeployerError::Contract(format!("{} deserialize failed: {}", EXT_DEPLOYER_V1, err))
+    })?;
+    payload.validate()?;
+    Ok(Some(payload))
+}
+
+pub fn set_deployer_contract_v1(
+    manifest: &mut PackManifest,
+    contract: DeployerContractV1,
+) -> Result<()> {
+    contract.validate()?;
+    let inline = serde_json::to_value(&contract).map_err(|err| {
+        DeployerError::Contract(format!("{} serialize failed: {}", EXT_DEPLOYER_V1, err))
+    })?;
+    let extensions = manifest.extensions.get_or_insert_with(Default::default);
+    extensions.insert(
+        EXT_DEPLOYER_V1.to_string(),
+        ExtensionRef {
+            kind: EXT_DEPLOYER_V1.to_string(),
+            version: "1.0.0".to_string(),
+            digest: None,
+            location: None,
+            inline: Some(ExtensionInline::Other(inline)),
+        },
+    );
+    Ok(())
+}
+
+pub fn read_pack_asset(pack_path: &Path, asset_ref: &str) -> Result<Vec<u8>> {
+    let relative = Path::new(asset_ref);
+    if relative.is_absolute() || asset_ref.contains("..") {
+        return Err(DeployerError::Contract(format!(
+            "pack asset ref must stay pack-relative: {}",
+            asset_ref
+        )));
+    }
+
+    if pack_path.is_dir() {
+        return fs::read(pack_path.join(relative)).map_err(DeployerError::Io);
+    }
+
+    read_entry_from_gtpack(pack_path, relative)
+}
+
+pub fn resolve_deployer_contract_assets(
+    manifest: &PackManifest,
+    pack_path: &Path,
+) -> Result<Option<ResolvedDeployerContract>> {
+    let Some(contract) = get_deployer_contract_v1(manifest)? else {
+        return Ok(None);
+    };
+
+    let planner = ResolvedPlannerContract {
+        flow_id: contract.planner.flow_id.clone(),
+        input_schema: load_optional_asset(pack_path, contract.planner.input_schema_ref.as_deref())?,
+        output_schema: load_optional_asset(
+            pack_path,
+            contract.planner.output_schema_ref.as_deref(),
+        )?,
+        qa_spec: load_optional_asset(pack_path, contract.planner.qa_spec_ref.as_deref())?,
+    };
+
+    let mut capabilities = Vec::new();
+    for capability in &contract.capabilities {
+        capabilities.push(ResolvedCapabilityContract {
+            capability: capability.capability,
+            flow_id: capability.flow_id.clone(),
+            input_schema: load_optional_asset(pack_path, capability.input_schema_ref.as_deref())?,
+            output_schema: load_optional_asset(pack_path, capability.output_schema_ref.as_deref())?,
+            execution_output_schema: load_optional_asset(
+                pack_path,
+                capability.execution_output_schema_ref.as_deref(),
+            )?,
+            qa_spec: load_optional_asset(pack_path, capability.qa_spec_ref.as_deref())?,
+            examples: capability
+                .example_refs
+                .iter()
+                .map(|path| load_contract_asset(pack_path, path))
+                .collect::<Result<Vec<_>>>()?,
+        });
+    }
+
+    Ok(Some(ResolvedDeployerContract {
+        schema_version: contract.schema_version,
+        planner,
+        capabilities,
+    }))
+}
+
+fn load_optional_asset(pack_path: &Path, asset_ref: Option<&str>) -> Result<Option<ContractAsset>> {
+    asset_ref
+        .map(|asset_ref| load_contract_asset(pack_path, asset_ref))
+        .transpose()
+}
+
+fn load_contract_asset(pack_path: &Path, asset_ref: &str) -> Result<ContractAsset> {
+    let bytes = read_pack_asset(pack_path, asset_ref)?;
+    let text = String::from_utf8(bytes.clone()).ok();
+    let json = text
+        .as_ref()
+        .and_then(|text| serde_json::from_str::<JsonValue>(text).ok());
+    Ok(ContractAsset {
+        path: asset_ref.to_string(),
+        json,
+        text,
+        size_bytes: bytes.len(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use greentic_types::PackId;
+    use greentic_types::pack_manifest::{PackKind, PackManifest};
+    use semver::Version;
+    use std::io::Write;
+    use std::str::FromStr;
+    use tar::Builder;
+
+    fn sample_manifest() -> PackManifest {
+        PackManifest {
+            schema_version: "pack-v1".to_string(),
+            pack_id: PackId::from_str("dev.greentic.sample").unwrap(),
+            name: None,
+            version: Version::new(0, 1, 0),
+            kind: PackKind::Application,
+            publisher: "greentic".to_string(),
+            secret_requirements: Vec::new(),
+            components: Vec::new(),
+            flows: Vec::new(),
+            dependencies: Vec::new(),
+            capabilities: Vec::new(),
+            signatures: Default::default(),
+            bootstrap: None,
+            extensions: None,
+        }
+    }
+
+    fn sample_contract() -> DeployerContractV1 {
+        DeployerContractV1 {
+            schema_version: 1,
+            planner: PlannerSpecV1 {
+                flow_id: "plan_flow".into(),
+                input_schema_ref: Some("assets/schemas/deployer-plan-input.schema.json".into()),
+                output_schema_ref: Some("assets/schemas/deployer-plan-output.schema.json".into()),
+                qa_spec_ref: Some("assets/qaspecs/plan.json".into()),
+            },
+            capabilities: vec![
+                CapabilitySpecV1 {
+                    capability: DeployerCapability::Plan,
+                    flow_id: "plan_flow".into(),
+                    input_schema_ref: Some("assets/schemas/deployer-plan-input.schema.json".into()),
+                    output_schema_ref: Some(
+                        "assets/schemas/deployer-plan-output.schema.json".into(),
+                    ),
+                    execution_output_schema_ref: None,
+                    qa_spec_ref: None,
+                    example_refs: vec!["assets/examples/plan.json".into()],
+                },
+                CapabilitySpecV1 {
+                    capability: DeployerCapability::Apply,
+                    flow_id: "apply_flow".into(),
+                    input_schema_ref: None,
+                    output_schema_ref: None,
+                    execution_output_schema_ref: Some(
+                        "assets/schemas/apply-execution-output.schema.json".into(),
+                    ),
+                    qa_spec_ref: None,
+                    example_refs: Vec::new(),
+                },
+                CapabilitySpecV1 {
+                    capability: DeployerCapability::Destroy,
+                    flow_id: "destroy_flow".into(),
+                    input_schema_ref: None,
+                    output_schema_ref: None,
+                    execution_output_schema_ref: Some(
+                        "assets/schemas/destroy-execution-output.schema.json".into(),
+                    ),
+                    qa_spec_ref: None,
+                    example_refs: Vec::new(),
+                },
+                CapabilitySpecV1 {
+                    capability: DeployerCapability::Status,
+                    flow_id: "status_flow".into(),
+                    input_schema_ref: None,
+                    output_schema_ref: None,
+                    execution_output_schema_ref: Some(
+                        "assets/schemas/status-execution-output.schema.json".into(),
+                    ),
+                    qa_spec_ref: None,
+                    example_refs: Vec::new(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn round_trips_contract_through_manifest_extension() {
+        let mut manifest = sample_manifest();
+        let contract = sample_contract();
+        set_deployer_contract_v1(&mut manifest, contract.clone()).unwrap();
+        let decoded = get_deployer_contract_v1(&manifest).unwrap().unwrap();
+        assert_eq!(decoded, contract);
+    }
+
+    #[test]
+    fn rejects_duplicate_capabilities() {
+        let mut contract = sample_contract();
+        contract.capabilities.push(CapabilitySpecV1 {
+            capability: DeployerCapability::Plan,
+            flow_id: "other_plan".into(),
+            input_schema_ref: None,
+            output_schema_ref: None,
+            execution_output_schema_ref: None,
+            qa_spec_ref: None,
+            example_refs: Vec::new(),
+        });
+        let err = contract.validate().unwrap_err();
+        assert!(format!("{err}").contains("duplicate capability"));
+    }
+
+    #[test]
+    fn loads_pack_asset_from_dir_and_gtpack() {
+        let base = std::env::current_dir().unwrap().join("target/tmp-tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(&base).unwrap();
+        let relative = "assets/schemas/deployer-plan-input.schema.json";
+        let bytes = br#"{"type":"object"}"#;
+        let asset_path = dir.path().join(relative);
+        std::fs::create_dir_all(asset_path.parent().unwrap()).unwrap();
+        std::fs::write(&asset_path, bytes).unwrap();
+        assert_eq!(read_pack_asset(dir.path(), relative).unwrap(), bytes);
+
+        let tar_path = dir.path().join("sample.gtpack");
+        let mut builder = Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, relative, &bytes[..])
+            .expect("append asset");
+        let tar_bytes = builder.into_inner().unwrap();
+        let mut file = std::fs::File::create(&tar_path).unwrap();
+        file.write_all(&tar_bytes).unwrap();
+
+        assert_eq!(read_pack_asset(&tar_path, relative).unwrap(), bytes);
+    }
+}

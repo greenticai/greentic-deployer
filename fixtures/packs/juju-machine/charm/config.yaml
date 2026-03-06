@@ -1,0 +1,10 @@
+options:
+  bundle-source:
+    type: string
+  bundle-digest:
+    type: string
+  admin-listener:
+    type: string
+  otlp-endpoint:
+    type: string
+

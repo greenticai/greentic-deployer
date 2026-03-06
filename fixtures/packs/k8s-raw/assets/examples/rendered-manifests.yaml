@@ -1,0 +1,222 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: greentic-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: greentic-operator
+  namespace: greentic-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: greentic-operator
+  namespace: greentic-system
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: greentic-operator
+  namespace: greentic-system
+subjects:
+  - kind: ServiceAccount
+    name: greentic-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: greentic-operator
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: greentic-operator-config
+  namespace: greentic-system
+data:
+  GREENTIC_BUNDLE_SOURCE: oci://registry.greentic.ai/bundles/operator:stable
+  GREENTIC_ADMIN_LISTEN: 0.0.0.0:8081
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector.observability.svc.cluster.local:4317
+  GREENTIC_SAFE_MODE: "false"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: greentic-operator
+  namespace: greentic-system
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: greentic-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: greentic-operator
+    spec:
+      serviceAccountName: greentic-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: ghcr.io/greentic-ai/operator-distroless:0.1.0-distroless
+          ports:
+            - containerPort: 8080
+          env:
+            - name: REDIS_URL
+              value: redis://redis.greentic-system.svc.cluster.local:6379/0
+            - name: GREENTIC_BUNDLE_SOURCE
+              valueFrom:
+                configMapKeyRef:
+                  name: greentic-operator-config
+                  key: GREENTIC_BUNDLE_SOURCE
+            - name: GREENTIC_ADMIN_LISTEN
+              valueFrom:
+                configMapKeyRef:
+                  name: greentic-operator-config
+                  key: GREENTIC_ADMIN_LISTEN
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: greentic-operator-config
+                  key: OTEL_EXPORTER_OTLP_ENDPOINT
+            - name: GREENTIC_SAFE_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: greentic-operator-config
+                  key: GREENTIC_SAFE_MODE
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /var/cache/greentic
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+          startupProbe:
+            httpGet:
+              path: /status
+              port: 8080
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: greentic-operator
+  namespace: greentic-system
+spec:
+  selector:
+    app.kubernetes.io/name: greentic-operator
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: greentic-operator
+  namespace: greentic-system
+spec:
+  rules:
+    - host: operator.greentic.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: greentic-operator
+                port:
+                  number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: greentic-operator
+  namespace: greentic-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: greentic-operator
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: greentic-system
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - protocol: TCP
+          port: 4317
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: greentic-operator
+  namespace: greentic-system
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: greentic-operator
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: greentic-operator
+  namespace: greentic-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: greentic-operator
+

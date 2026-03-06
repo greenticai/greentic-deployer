@@ -1,0 +1,14 @@
+{
+  "namespace": "greentic-system",
+  "image": "ghcr.io/greentic-ai/operator-distroless:0.1.0-distroless",
+  "service_name": "greentic-operator",
+  "ingress_host": "operator.greentic.example.com",
+  "redis_url": "redis://redis.greentic-system.svc.cluster.local:6379/0",
+  "bundle_source": "oci://registry.greentic.ai/bundles/operator:stable",
+  "admin_listener": "0.0.0.0:8081",
+  "otlp_endpoint": "http://otel-collector.observability.svc.cluster.local:4317",
+  "upgrade_mode": "rolling",
+  "startup_pull_enabled": true,
+  "allow_unrestricted_egress": false
+}
+

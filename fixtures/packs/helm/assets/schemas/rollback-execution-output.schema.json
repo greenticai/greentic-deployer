@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "required": ["kind", "release_name", "target_revision", "command"],
+  "properties": {
+    "kind": { "const": "rollback" },
+    "release_name": { "type": "string" },
+    "target_revision": { "type": "integer", "minimum": 1 },
+    "command": {
+      "type": "string",
+      "pattern": "helm rollback"
+    }
+  }
+}
+

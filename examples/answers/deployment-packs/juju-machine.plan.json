@@ -1,0 +1,12 @@
+{
+  "wizard": "greentic-pack wizard",
+  "pack_fixture": "fixtures/packs/juju-machine",
+  "capability": "plan",
+  "answers": {
+    "provider": "generic",
+    "strategy": "juju-machine",
+    "example_request": "assets/examples/generate-request.json",
+    "expected_output": "assets/examples/plan-output.json"
+  }
+}
+

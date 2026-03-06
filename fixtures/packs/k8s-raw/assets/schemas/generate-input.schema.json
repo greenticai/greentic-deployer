@@ -1,0 +1,31 @@
+{
+  "type": "object",
+  "required": [
+    "namespace",
+    "image",
+    "service_name",
+    "ingress_host",
+    "redis_url",
+    "bundle_source",
+    "admin_listener",
+    "otlp_endpoint",
+    "upgrade_mode"
+  ],
+  "properties": {
+    "namespace": { "type": "string", "minLength": 1 },
+    "image": { "type": "string", "pattern": "distroless" },
+    "service_name": { "type": "string", "minLength": 1 },
+    "ingress_host": { "type": "string", "minLength": 1 },
+    "redis_url": { "type": "string", "minLength": 1 },
+    "bundle_source": { "type": "string", "minLength": 1 },
+    "admin_listener": { "type": "string", "minLength": 1 },
+    "otlp_endpoint": { "type": "string", "minLength": 1 },
+    "upgrade_mode": {
+      "type": "string",
+      "enum": ["rolling", "blue_green", "canary_external"]
+    },
+    "startup_pull_enabled": { "type": "boolean" },
+    "allow_unrestricted_egress": { "type": "boolean" }
+  }
+}
+

@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "greentic-operator.fullname" . }}-config
+data:
+  bundleSource: {{ .Values.bundle.source | quote }}
+  adminListener: {{ .Values.adminApi.listener | quote }}
+  adminPublic: {{ .Values.adminApi.public | quote }}
+

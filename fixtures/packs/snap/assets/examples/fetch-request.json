@@ -1,0 +1,10 @@
+{
+  "mode": "fetch",
+  "snap_name": "greentic-operator",
+  "redis_url": "redis://127.0.0.1:6379/0",
+  "admin_listener": "127.0.0.1:8081",
+  "cache_size_hint_mb": 512,
+  "userspace_reader": true,
+  "bundle_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+}
+

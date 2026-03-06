@@ -1,0 +1,17 @@
+{
+  "kind": "plan",
+  "capability": "plan",
+  "provider": "k8s",
+  "strategy": "juju-k8s",
+  "deploy_command": "juju deploy ./charm greentic-operator-k8s --resource operator-image=ghcr.io/greentic-ai/operator@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "integrate_commands": [
+    "juju integrate greentic-operator-k8s redis",
+    "juju integrate greentic-operator-k8s ingress",
+    "juju integrate greentic-operator-k8s observability"
+  ],
+  "config_set_command": "juju config greentic-operator-k8s admin-listener=127.0.0.1:8081",
+  "upgrade_command": "juju refresh greentic-operator-k8s --path ./charm",
+  "refresh_bundle_command": "juju config greentic-operator-k8s bundle-digest=sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "remove_command": "juju remove-application greentic-operator-k8s"
+}
+

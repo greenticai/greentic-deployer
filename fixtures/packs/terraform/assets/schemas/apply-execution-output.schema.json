@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "required": ["kind", "deployment_id", "state", "endpoints"],
+  "properties": {
+    "kind": { "const": "apply" },
+    "deployment_id": { "type": "string" },
+    "state": { "type": "string" },
+    "endpoints": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}
+

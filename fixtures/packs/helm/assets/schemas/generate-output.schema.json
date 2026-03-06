@@ -1,0 +1,30 @@
+{
+  "type": "object",
+  "required": [
+    "kind",
+    "capability",
+    "provider",
+    "strategy",
+    "chart_root",
+    "helm_upgrade_command",
+    "rollback_command_template",
+    "values_diff_guidance"
+  ],
+  "properties": {
+    "kind": { "const": "generate" },
+    "capability": { "const": "generate" },
+    "provider": { "const": "k8s" },
+    "strategy": { "const": "helm" },
+    "chart_root": { "const": "chart" },
+    "helm_upgrade_command": {
+      "type": "string",
+      "pattern": "helm upgrade --install"
+    },
+    "rollback_command_template": {
+      "type": "string",
+      "pattern": "helm rollback"
+    },
+    "values_diff_guidance": { "type": "string", "minLength": 1 }
+  }
+}
+

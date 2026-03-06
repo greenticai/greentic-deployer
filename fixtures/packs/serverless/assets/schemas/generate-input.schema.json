@@ -1,0 +1,52 @@
+{
+  "type": "object",
+  "required": [
+    "runtime_family",
+    "image",
+    "redis_url",
+    "bundle_source",
+    "startup_fetch_timeout_seconds",
+    "warm_failure_behavior",
+    "retry_policy",
+    "mount_mode",
+    "admin_api_exposure"
+  ],
+  "properties": {
+    "runtime_family": {
+      "type": "string",
+      "enum": ["cloud_run", "lambda_container", "container_apps", "generic"]
+    },
+    "image": { "type": "string", "minLength": 1 },
+    "redis_url": { "type": "string", "minLength": 1 },
+    "bundle_source": { "type": "string", "minLength": 1 },
+    "startup_fetch_timeout_seconds": { "type": "integer", "minimum": 1 },
+    "warm_failure_behavior": {
+      "type": "string",
+      "enum": ["fail_closed", "degraded"]
+    },
+    "retry_policy": {
+      "type": "object",
+      "required": ["max_attempts", "backoff_seconds"],
+      "properties": {
+        "max_attempts": { "type": "integer", "minimum": 1 },
+        "backoff_seconds": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "mount_mode": {
+      "type": "string",
+      "enum": ["tmp_only", "mount_required"]
+    },
+    "admin_api_exposure": {
+      "type": "string",
+      "enum": ["private_only", "disabled"]
+    }
+  },
+  "allOf": [
+    {
+      "properties": {
+        "mount_mode": { "const": "tmp_only" }
+      }
+    }
+  ]
+}
+

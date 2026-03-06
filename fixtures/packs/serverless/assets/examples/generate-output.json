@@ -1,0 +1,15 @@
+{
+  "kind": "generate",
+  "capability": "generate",
+  "provider": "generic",
+  "strategy": "serverless-container",
+  "descriptor_path": "assets/examples/deployment-descriptor.json",
+  "required_secrets": [
+    "REDIS_URL"
+  ],
+  "health_endpoints": [
+    "/healthz",
+    "/readyz"
+  ]
+}
+

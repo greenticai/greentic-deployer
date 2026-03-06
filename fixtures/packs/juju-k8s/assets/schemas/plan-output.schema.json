@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "required": [
+    "kind",
+    "capability",
+    "provider",
+    "strategy",
+    "deploy_command",
+    "integrate_commands",
+    "config_set_command",
+    "upgrade_command",
+    "refresh_bundle_command",
+    "remove_command"
+  ],
+  "properties": {
+    "kind": { "const": "plan" },
+    "capability": { "const": "plan" },
+    "provider": { "const": "k8s" },
+    "strategy": { "const": "juju-k8s" },
+    "deploy_command": { "type": "string", "pattern": "juju deploy" },
+    "integrate_commands": { "type": "array", "items": { "type": "string" }, "minItems": 2 },
+    "config_set_command": { "type": "string", "pattern": "juju config" },
+    "upgrade_command": { "type": "string", "pattern": "juju refresh" },
+    "refresh_bundle_command": { "type": "string", "pattern": "juju config" },
+    "remove_command": { "type": "string", "pattern": "juju remove-application" }
+  }
+}
+

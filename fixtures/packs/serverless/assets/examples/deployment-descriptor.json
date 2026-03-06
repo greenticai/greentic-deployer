@@ -1,0 +1,16 @@
+{
+  "containerCommand": ["/bin/operator"],
+  "containerArgs": ["--serverless"],
+  "environment": {
+    "REDIS_URL": "${REDIS_URL}",
+    "GREENTIC_BUNDLE_SOURCE": "oci://registry.greentic.ai/bundles/operator",
+    "GREENTIC_STARTUP_FETCH_TIMEOUT_SECONDS": "45",
+    "GREENTIC_WARM_FAILURE_BEHAVIOR": "degraded",
+    "GREENTIC_ADMIN_API_EXPOSURE": "private_only"
+  },
+  "filesystem": {
+    "writable": ["/tmp"],
+    "durable": []
+  }
+}
+

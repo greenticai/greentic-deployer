@@ -1,0 +1,46 @@
+{
+  "type": "object",
+  "required": [
+    "mode",
+    "snap_name",
+    "redis_url",
+    "admin_listener",
+    "cache_size_hint_mb",
+    "userspace_reader"
+  ],
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["fetch", "embedded"]
+    },
+    "snap_name": { "type": "string", "minLength": 1 },
+    "redis_url": { "type": "string", "minLength": 1 },
+    "admin_listener": { "type": "string", "pattern": "^(127\\.0\\.0\\.1|localhost|\\[::1\\])" },
+    "cache_size_hint_mb": { "type": "integer", "minimum": 128 },
+    "userspace_reader": { "type": "boolean", "const": true },
+    "bundle_digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "embedded_bundle_path": { "type": "string", "minLength": 1 }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "mode": { "const": "fetch" } }
+      },
+      "then": {
+        "required": ["bundle_digest"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "mode": { "const": "embedded" } }
+      },
+      "then": {
+        "required": ["embedded_bundle_path"]
+      }
+    }
+  ]
+}
+

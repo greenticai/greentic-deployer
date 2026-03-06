@@ -1,0 +1,11 @@
+{
+  "application_name": "greentic-operator-k8s",
+  "workload_image_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "bundle_source": "oci://registry.greentic.ai/bundles/operator",
+  "bundle_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "redis_relation_name": "redis",
+  "ingress_relation_name": "ingress",
+  "observability_relation_name": "observability",
+  "admin_listener": "127.0.0.1:8081"
+}
+

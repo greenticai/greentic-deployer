@@ -1,0 +1,11 @@
+{
+  "kind": "generate",
+  "capability": "generate",
+  "provider": "k8s",
+  "strategy": "helm",
+  "chart_root": "chart",
+  "helm_upgrade_command": "helm upgrade --install greentic-operator chart --namespace greentic-system --create-namespace -f values.yaml",
+  "rollback_command_template": "helm rollback greentic-operator <REVISION> --namespace greentic-system",
+  "values_diff_guidance": "Compare rendered values.yaml against the previous release values before applying."
+}
+

@@ -1,0 +1,12 @@
+{
+  "wizard": "greentic-pack wizard",
+  "pack_fixture": "fixtures/packs/helm",
+  "capability": "generate",
+  "answers": {
+    "provider": "k8s",
+    "strategy": "helm",
+    "example_request": "assets/examples/generate-request.json",
+    "expected_output": "assets/examples/generate-output.json"
+  }
+}
+

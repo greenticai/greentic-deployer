@@ -5,12 +5,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::config::DeployerConfig;
+use crate::contract::{DeployerCapability, get_deployer_contract_v1};
 use crate::error::{DeployerError, Result};
 use crate::pack_introspect::{read_manifest_from_directory, read_manifest_from_gtpack};
 use crate::plan::PlanContext;
 use async_trait::async_trait;
 use greentic_types::pack_manifest::PackManifest;
 use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 
 /// Logical deployment target keyed by provider + strategy.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -22,6 +24,7 @@ pub struct DeploymentTarget {
 /// Dispatch details describing which deployment pack/flow to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeploymentDispatch {
+    pub capability: DeployerCapability,
     pub pack_id: String,
     pub flow_id: String,
 }
@@ -36,7 +39,8 @@ pub struct DeploymentPackSelection {
     pub candidates: Vec<String>,
 }
 
-/// Built-in placeholder defaults. Real packs should replace these entries later.
+/// Built-in provider/strategy defaults. Override them with `DEPLOY_TARGET_*` env vars as
+/// deployment packs become available in your environment.
 pub fn default_dispatch_table() -> HashMap<DeploymentTarget, DeploymentDispatch> {
     let mut map = HashMap::new();
     map.insert(
@@ -45,7 +49,8 @@ pub fn default_dispatch_table() -> HashMap<DeploymentTarget, DeploymentDispatch>
             strategy: "iac-only".into(),
         },
         DeploymentDispatch {
-            pack_id: "greentic.demo.deploy.aws".into(),
+            capability: DeployerCapability::Apply,
+            pack_id: "greentic.deploy.aws".into(),
             flow_id: "deploy_aws_iac".into(),
         },
     );
@@ -55,7 +60,8 @@ pub fn default_dispatch_table() -> HashMap<DeploymentTarget, DeploymentDispatch>
             strategy: "iac-only".into(),
         },
         DeploymentDispatch {
-            pack_id: "greentic.demo.deploy.local".into(),
+            capability: DeployerCapability::Apply,
+            pack_id: "greentic.deploy.local".into(),
             flow_id: "deploy_local_iac".into(),
         },
     );
@@ -65,7 +71,8 @@ pub fn default_dispatch_table() -> HashMap<DeploymentTarget, DeploymentDispatch>
             strategy: "iac-only".into(),
         },
         DeploymentDispatch {
-            pack_id: "greentic.demo.deploy.azure".into(),
+            capability: DeployerCapability::Apply,
+            pack_id: "greentic.deploy.azure".into(),
             flow_id: "deploy_azure_iac".into(),
         },
     );
@@ -75,7 +82,8 @@ pub fn default_dispatch_table() -> HashMap<DeploymentTarget, DeploymentDispatch>
             strategy: "iac-only".into(),
         },
         DeploymentDispatch {
-            pack_id: "greentic.demo.deploy.gcp".into(),
+            capability: DeployerCapability::Apply,
+            pack_id: "greentic.deploy.gcp".into(),
             flow_id: "deploy_gcp_iac".into(),
         },
     );
@@ -85,7 +93,8 @@ pub fn default_dispatch_table() -> HashMap<DeploymentTarget, DeploymentDispatch>
             strategy: "iac-only".into(),
         },
         DeploymentDispatch {
-            pack_id: "greentic.demo.deploy.k8s".into(),
+            capability: DeployerCapability::Apply,
+            pack_id: "greentic.deploy.k8s".into(),
             flow_id: "deploy_k8s_iac".into(),
         },
     );
@@ -95,7 +104,8 @@ pub fn default_dispatch_table() -> HashMap<DeploymentTarget, DeploymentDispatch>
             strategy: "iac-only".into(),
         },
         DeploymentDispatch {
-            pack_id: "greentic.demo.deploy.generic".into(),
+            capability: DeployerCapability::Apply,
+            pack_id: "greentic.deploy.generic".into(),
             flow_id: "deploy_generic_iac".into(),
         },
     );
@@ -111,15 +121,58 @@ pub fn resolve_deployment_pack(
     config: &DeployerConfig,
     target: &DeploymentTarget,
 ) -> Result<DeploymentPackSelection> {
-    let dispatch = resolve_dispatch(target)?;
-    let discovery = find_pack_for_dispatch(config, target, &dispatch)?;
+    resolve_deployment_pack_for_capability(config, target, config.capability)
+}
+
+pub fn resolve_deployment_pack_for_capability(
+    config: &DeployerConfig,
+    target: &DeploymentTarget,
+    capability: DeployerCapability,
+) -> Result<DeploymentPackSelection> {
+    let default_dispatch = resolve_dispatch(target)?;
+    let mut discovery = find_pack_for_dispatch(config, target, &default_dispatch)?;
+    let dispatch = resolve_contract_dispatch(&discovery.manifest, capability, &default_dispatch)?;
     ensure_flow_available(&dispatch, &discovery.manifest)?;
+    discovery.candidates.push(format!(
+        "capability={} flow={}",
+        dispatch.capability.as_str(),
+        dispatch.flow_id
+    ));
     Ok(DeploymentPackSelection {
         dispatch,
         pack_path: discovery.pack_path,
         manifest: discovery.manifest,
         origin: discovery.origin,
         candidates: discovery.candidates,
+    })
+}
+
+fn resolve_contract_dispatch(
+    manifest: &PackManifest,
+    capability: DeployerCapability,
+    fallback: &DeploymentDispatch,
+) -> Result<DeploymentDispatch> {
+    let Some(contract) = get_deployer_contract_v1(manifest)? else {
+        return Ok(DeploymentDispatch {
+            capability,
+            pack_id: fallback.pack_id.clone(),
+            flow_id: fallback.flow_id.clone(),
+        });
+    };
+
+    let Some(spec) = contract.capability(capability) else {
+        return Err(DeployerError::Contract(format!(
+            "deployment pack {} does not declare `{}` capability in {}",
+            manifest.pack_id,
+            capability.as_str(),
+            crate::contract::EXT_DEPLOYER_V1
+        )));
+    };
+
+    Ok(DeploymentDispatch {
+        capability,
+        pack_id: manifest.pack_id.to_string(),
+        flow_id: spec.flow_id.clone(),
     })
 }
 
@@ -170,7 +223,11 @@ where
     let pack = get_env(&pack_key);
     let flow = get_env(&flow_key);
     match (pack, flow) {
-        (Some(pack_id), Some(flow_id)) => Ok(Some(DeploymentDispatch { pack_id, flow_id })),
+        (Some(pack_id), Some(flow_id)) => Ok(Some(DeploymentDispatch {
+            capability: DeployerCapability::Apply,
+            pack_id,
+            flow_id,
+        })),
         (None, None) => Ok(None),
         (Some(_), None) | (None, Some(_)) => Err(DeployerError::Config(format!(
             "Incomplete deployment mapping overrides. Both {pack_key} and {flow_key} must be set."
@@ -367,27 +424,28 @@ fn sanitize_key(input: &str) -> String {
         .collect()
 }
 
-/// Placeholder hook for future deployment-pack execution via greentic-runner.
+/// Executes the resolved deployment pack via a registered executor.
 ///
-/// Returns `Ok(true)` when the plan was executed via a deployment pack,
-/// `Ok(false)` when the legacy provider shim should be used, and `Err` on fatal failures.
+/// Returns `Ok(true)` when an executor was registered and ran, `Ok(false)` when no executor is
+/// available yet, and `Err` on fatal failures.
 pub async fn execute_deployment_pack(
     config: &DeployerConfig,
     plan: &PlanContext,
     dispatch: &DeploymentDispatch,
-) -> Result<bool> {
+) -> Result<Option<ExecutionOutcome>> {
     if let Some(executor) = deployment_executor() {
-        executor.execute(config, plan, dispatch).await?;
-        return Ok(true);
+        let outcome = executor.execute(config, plan, dispatch).await?;
+        return Ok(Some(outcome));
     }
     tracing::info!(
+        capability = %dispatch.capability.as_str(),
         provider = %plan.deployment.provider,
         strategy = %plan.deployment.strategy,
         pack_id = %dispatch.pack_id,
         flow_id = %dispatch.flow_id,
-        "deployment executor not registered; falling back to legacy shim"
+        "deployment executor not registered"
     );
-    Ok(false)
+    Ok(None)
 }
 
 #[async_trait]
@@ -397,7 +455,45 @@ pub trait DeploymentExecutor: Send + Sync {
         config: &DeployerConfig,
         plan: &PlanContext,
         dispatch: &DeploymentDispatch,
-    ) -> Result<()>;
+    ) -> Result<ExecutionOutcome>;
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecutionOutcome {
+    pub status: Option<String>,
+    pub message: Option<String>,
+    pub output_files: Vec<String>,
+    pub payload: Option<ExecutionOutcomePayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecutionOutcomePayload {
+    Apply(ApplyExecutionOutcome),
+    Destroy(DestroyExecutionOutcome),
+    Status(StatusExecutionOutcome),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyExecutionOutcome {
+    pub deployment_id: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestroyExecutionOutcome {
+    pub deployment_id: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusExecutionOutcome {
+    pub deployment_id: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub health_checks: Vec<String>,
 }
 
 static EXECUTOR: Lazy<RwLock<Option<Arc<dyn DeploymentExecutor>>>> =
@@ -424,8 +520,11 @@ fn deployment_executor() -> Option<Arc<dyn DeploymentExecutor>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Action, DeployerConfig, Provider};
-    use crate::iac::IaCTool;
+    use crate::config::{DeployerConfig, Provider};
+    use crate::contract::{
+        CapabilitySpecV1, DeployerCapability, DeployerContractV1, PlannerSpecV1,
+        set_deployer_contract_v1,
+    };
     use crate::pack_introspect;
     use greentic_types::cbor::encode_pack_manifest;
     use greentic_types::component::{ComponentCapabilities, ComponentManifest, ComponentProfiles};
@@ -443,8 +542,9 @@ mod tests {
             strategy: "iac-only".into(),
         };
         let dispatch = resolve_dispatch(&target).expect("default mapping");
-        assert_eq!(dispatch.pack_id, "greentic.demo.deploy.generic");
+        assert_eq!(dispatch.pack_id, "greentic.deploy.generic");
         assert_eq!(dispatch.flow_id, "deploy_generic_iac");
+        assert_eq!(dispatch.capability, DeployerCapability::Apply);
     }
 
     #[test]
@@ -507,9 +607,18 @@ mod tests {
             _config: &DeployerConfig,
             _plan: &PlanContext,
             _dispatch: &DeploymentDispatch,
-        ) -> Result<()> {
+        ) -> Result<ExecutionOutcome> {
             self.hits.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(ExecutionOutcome {
+                status: Some("applied".into()),
+                message: Some("runner completed".into()),
+                output_files: vec!["result.json".into()],
+                payload: Some(ExecutionOutcomePayload::Apply(ApplyExecutionOutcome {
+                    deployment_id: "dep-123".into(),
+                    state: "ready".into(),
+                    endpoints: vec!["https://deploy.example.test".into()],
+                })),
+            })
         }
     }
 
@@ -520,7 +629,7 @@ mod tests {
         set_deployment_executor(Arc::new(TestExecutor { hits: hits.clone() }));
         let pack_path = write_test_pack();
         let config = DeployerConfig {
-            action: Action::Plan,
+            capability: DeployerCapability::Plan,
             provider: Provider::Aws,
             strategy: "iac-only".into(),
             tenant: "acme".into(),
@@ -532,10 +641,8 @@ mod tests {
             pack_ref: None,
             distributor_url: None,
             distributor_token: None,
-            yes: true,
             preview: false,
             dry_run: false,
-            iac_tool: IaCTool::Terraform,
             output: crate::config::OutputFormat::Text,
             greentic: greentic_config::ConfigResolver::new()
                 .load()
@@ -543,20 +650,29 @@ mod tests {
                 .config,
             provenance: greentic_config::ProvenanceMap::new(),
             config_warnings: Vec::new(),
-            explain_config: false,
-            explain_config_json: false,
-            allow_remote_in_offline: false,
         };
         let plan = pack_introspect::build_plan(&config).expect("plan builds");
         let dispatch = DeploymentDispatch {
+            capability: DeployerCapability::Apply,
             pack_id: "test.pack".into(),
             flow_id: "deploy_flow".into(),
         };
         let ran = execute_deployment_pack(&config, &plan, &dispatch)
             .await
             .expect("executor runs");
-        assert!(ran);
+        let outcome = ran.expect("outcome");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.status.as_deref(), Some("applied"));
+        assert_eq!(outcome.message.as_deref(), Some("runner completed"));
+        assert_eq!(outcome.output_files, vec!["result.json".to_string()]);
+        match outcome.payload.expect("payload") {
+            ExecutionOutcomePayload::Apply(payload) => {
+                assert_eq!(payload.deployment_id, "dep-123");
+                assert_eq!(payload.state, "ready");
+                assert_eq!(payload.endpoints, vec!["https://deploy.example.test"]);
+            }
+            other => panic!("unexpected outcome payload: {:?}", other),
+        }
         clear_deployment_executor();
     }
 
@@ -568,6 +684,7 @@ mod tests {
         let manifest = PackManifest {
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::try_from("dev.greentic.sample").unwrap(),
+            name: None,
             version: Version::new(0, 1, 0),
             kind: PackKind::Application,
             publisher: "greentic".to_string(),
@@ -595,5 +712,130 @@ mod tests {
         let bytes = encode_pack_manifest(&manifest).expect("encode manifest");
         std::fs::write(dir.path().join("manifest.cbor"), bytes).expect("write manifest");
         dir.into_path()
+    }
+
+    #[test]
+    fn contract_owned_capability_flow_overrides_default_flow() {
+        let manifest = PackManifest {
+            schema_version: "pack-v1".to_string(),
+            pack_id: PackId::try_from("greentic.deploy.aws").unwrap(),
+            name: None,
+            version: Version::new(0, 1, 0),
+            kind: PackKind::Provider,
+            publisher: "greentic".to_string(),
+            secret_requirements: Vec::new(),
+            components: vec![],
+            flows: vec![],
+            dependencies: Vec::new(),
+            capabilities: Vec::new(),
+            signatures: Default::default(),
+            bootstrap: None,
+            extensions: None,
+        };
+        let mut manifest = manifest;
+        set_deployer_contract_v1(
+            &mut manifest,
+            DeployerContractV1 {
+                schema_version: 1,
+                planner: PlannerSpecV1 {
+                    flow_id: "plan_pack".into(),
+                    input_schema_ref: None,
+                    output_schema_ref: None,
+                    qa_spec_ref: None,
+                },
+                capabilities: vec![
+                    CapabilitySpecV1 {
+                        capability: DeployerCapability::Plan,
+                        flow_id: "plan_pack".into(),
+                        input_schema_ref: None,
+                        output_schema_ref: None,
+                        execution_output_schema_ref: None,
+                        qa_spec_ref: None,
+                        example_refs: Vec::new(),
+                    },
+                    CapabilitySpecV1 {
+                        capability: DeployerCapability::Apply,
+                        flow_id: "apply_pack".into(),
+                        input_schema_ref: None,
+                        output_schema_ref: None,
+                        execution_output_schema_ref: None,
+                        qa_spec_ref: None,
+                        example_refs: Vec::new(),
+                    },
+                    CapabilitySpecV1 {
+                        capability: DeployerCapability::Destroy,
+                        flow_id: "destroy_pack".into(),
+                        input_schema_ref: None,
+                        output_schema_ref: None,
+                        execution_output_schema_ref: None,
+                        qa_spec_ref: None,
+                        example_refs: Vec::new(),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let fallback = DeploymentDispatch {
+            capability: DeployerCapability::Apply,
+            pack_id: "greentic.deploy.aws".into(),
+            flow_id: "deploy_aws_iac".into(),
+        };
+        let resolved =
+            resolve_contract_dispatch(&manifest, DeployerCapability::Destroy, &fallback).unwrap();
+        assert_eq!(resolved.pack_id, "greentic.deploy.aws");
+        assert_eq!(resolved.flow_id, "destroy_pack");
+        assert_eq!(resolved.capability, DeployerCapability::Destroy);
+    }
+
+    #[test]
+    fn missing_contract_capability_errors() {
+        let mut manifest = PackManifest {
+            schema_version: "pack-v1".to_string(),
+            pack_id: PackId::try_from("greentic.deploy.aws").unwrap(),
+            name: None,
+            version: Version::new(0, 1, 0),
+            kind: PackKind::Provider,
+            publisher: "greentic".to_string(),
+            secret_requirements: Vec::new(),
+            components: vec![],
+            flows: vec![],
+            dependencies: Vec::new(),
+            capabilities: Vec::new(),
+            signatures: Default::default(),
+            bootstrap: None,
+            extensions: None,
+        };
+        set_deployer_contract_v1(
+            &mut manifest,
+            DeployerContractV1 {
+                schema_version: 1,
+                planner: PlannerSpecV1 {
+                    flow_id: "plan_pack".into(),
+                    input_schema_ref: None,
+                    output_schema_ref: None,
+                    qa_spec_ref: None,
+                },
+                capabilities: vec![CapabilitySpecV1 {
+                    capability: DeployerCapability::Plan,
+                    flow_id: "plan_pack".into(),
+                    input_schema_ref: None,
+                    output_schema_ref: None,
+                    execution_output_schema_ref: None,
+                    qa_spec_ref: None,
+                    example_refs: Vec::new(),
+                }],
+            },
+        )
+        .unwrap();
+
+        let fallback = DeploymentDispatch {
+            capability: DeployerCapability::Apply,
+            pack_id: "greentic.deploy.aws".into(),
+            flow_id: "deploy_aws_iac".into(),
+        };
+        let err = resolve_contract_dispatch(&manifest, DeployerCapability::Rollback, &fallback)
+            .unwrap_err();
+        assert!(format!("{err}").contains("does not declare `rollback` capability"));
     }
 }

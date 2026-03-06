@@ -6,8 +6,8 @@ use std::str::FromStr;
 
 use greentic_deployer::pack_introspect::build_plan;
 use greentic_deployer::{
-    config::{Action, DeployerConfig, OutputFormat, Provider},
-    iac::IaCTool,
+    config::{DeployerConfig, OutputFormat, Provider},
+    contract::DeployerCapability,
 };
 use greentic_types::SemverReq;
 use greentic_types::cbor::encode_pack_manifest;
@@ -113,6 +113,7 @@ fn sample_manifest() -> PackManifest {
     PackManifest {
         schema_version: "pack-v1".to_string(),
         pack_id: PackId::from_str("dev.greentic.sample").unwrap(),
+        name: None,
         version: Version::new(0, 1, 0),
         kind: PackKind::Application,
         publisher: "greentic".to_string(),
@@ -171,7 +172,7 @@ fn write_directory_pack(manifest: &PackManifest, root: &Path) {
 
 fn default_config(pack_path: PathBuf) -> DeployerConfig {
     DeployerConfig {
-        action: Action::Plan,
+        capability: DeployerCapability::Plan,
         provider: Provider::Aws,
         strategy: "iac-only".into(),
         tenant: "acme".into(),
@@ -183,10 +184,8 @@ fn default_config(pack_path: PathBuf) -> DeployerConfig {
         pack_ref: None,
         distributor_url: None,
         distributor_token: None,
-        yes: true,
         preview: false,
         dry_run: false,
-        iac_tool: IaCTool::Terraform,
         output: OutputFormat::Text,
         greentic: greentic_config::ConfigResolver::new()
             .load()
@@ -194,9 +193,6 @@ fn default_config(pack_path: PathBuf) -> DeployerConfig {
             .config,
         provenance: greentic_config::ProvenanceMap::new(),
         config_warnings: Vec::new(),
-        explain_config: false,
-        explain_config_json: false,
-        allow_remote_in_offline: false,
     }
 }
 

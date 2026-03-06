@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "required": ["kind", "capability", "provider", "strategy", "charm_root"],
+  "properties": {
+    "kind": { "const": "generate" },
+    "capability": { "const": "generate" },
+    "provider": { "const": "generic" },
+    "strategy": { "const": "juju-machine" },
+    "charm_root": { "const": "charm" }
+  }
+}
+

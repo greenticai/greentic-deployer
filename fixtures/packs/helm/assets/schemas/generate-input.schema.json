@@ -1,0 +1,34 @@
+{
+  "type": "object",
+  "required": [
+    "release_name",
+    "namespace",
+    "chart_version",
+    "image_repository",
+    "image_digest",
+    "service_name",
+    "ingress_host",
+    "redis_url",
+    "bundle_source",
+    "bundle_mode",
+    "admin_listener"
+  ],
+  "properties": {
+    "release_name": { "type": "string", "minLength": 1 },
+    "namespace": { "type": "string", "minLength": 1 },
+    "chart_version": { "type": "string", "minLength": 1 },
+    "image_repository": { "type": "string", "minLength": 1 },
+    "image_digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "service_name": { "type": "string", "minLength": 1 },
+    "ingress_host": { "type": "string", "minLength": 1 },
+    "redis_url": { "type": "string", "minLength": 1 },
+    "bundle_source": { "type": "string", "minLength": 1 },
+    "bundle_mode": {
+      "type": "string",
+      "enum": ["oci", "object_store", "prefetched_volume"]
+    },
+    "admin_listener": { "type": "string", "minLength": 1 },
+    "public_admin_api": { "type": "boolean" }
+  }
+}
+

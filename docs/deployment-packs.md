@@ -1,78 +1,75 @@
 # Deployment Packs
 
-Deployment packs extend Greentic deployments without changing `greentic-deployer`’s code. They are regular Greentic packs with:
+Deployment packs extend `greentic-deployer` without changing the deployer itself. They are normal Greentic packs with:
 
-- `kind: "deployment"`.
-- One or more `type: events` flows acting as deployment pipelines.
-- Nodes built from deployment components (`supports: ["events"]`, `world: "greentic:deploy-plan@1.0.0"`).
-- Host IaC permissions (`host.iac.write_templates = true` and optionally `host.iac.execute_plans`).
+- `kind: "deployment"`
+- one or more `type: events` deployment flows
+- components that support `greentic:deploy-plan@1.0.0`
+- host permissions for the assets they need to emit
 
-## Provider / strategy mapping
+## Runtime contract
 
-`greentic-deployer` maps `(--provider, --strategy)` to `(deployment_pack_id, deploy_flow_id)`. Examples:
+`greentic-deployer` does four things:
 
-| Provider | Strategy   | Deployment pack          | Flow ID               |
-|----------|------------|--------------------------|-----------------------|
-| `aws`    | `serverless` | `greentic.deploy.aws`     | `deploy_aws_serverless` |
-| `generic`| `iac`      | `greentic.deploy.generic` | `deploy_generic_iac`  |
+1. loads the application pack
+2. builds a provider-agnostic `DeploymentPlan`
+3. resolves `(provider, strategy)` to `(deployment_pack_id, flow_id)`
+4. persists runtime metadata and hands execution to a registered deployment executor
 
-The mapping can be extended without recompiling the deployer—new targets just publish new deployment packs.
+The deployer itself no longer contains provider-specific execution backends. Actual deployment execution belongs to the registered executor, which will typically invoke `greentic-runner`.
+The deployment pack owns planner inputs, planner behavior, and the dispatch metadata the operator uses to invoke each supported capability.
 
-## Runtime integration
+`greentic.deployer.v1` currently supports:
 
-1. Load the **application pack** (kind `application`/`mixed`).
-2. Build a provider-agnostic `DeploymentPlan`.
-3. Resolve the deployment pack for `(provider,strategy)` and load it via `greentic-pack`.
-4. Execute the deployment flow with `greentic-runner`, providing:
-   - `ExecutionCtx.deployment_plan = Some(plan)` so components call `get-deployment-plan()`.
-   - A filesystem preopen (e.g. host `deploy/<provider>/<tenant>/<env>/` mounted at guest `/iac`).
+- planner input/output schemas
+- per-capability input/output schemas
+- per-capability execution-result schemas
+- QA spec refs
+- example asset refs
+- per-capability flow dispatch
 
-Deployment packs then generate IaC/templates, secrets manifests, and any other provider-specific assets entirely in Wasm, keeping `greentic-deployer` and the shared types provider-agnostic.
+## Provider and strategy mapping
 
-## Roles, profiles, and targets
+Targets are keyed by:
 
-`greentic-deployer` now carries a lightweight planning model per component:
+- `provider`
+- `strategy`
 
-- **Role:** `event_provider`, `event_bridge`, `messaging_adapter`, `worker`, or `other`.
-- **Deployment profile:** `long_lived_service`, `http_endpoint`, `queue_consumer`, `scheduled_source`, `one_shot_job` (extensible).
-- **Target:** `local`, `aws`, `azure`, `gcp`, `k8s`.
+That pair resolves to:
 
-Profiles come from pack metadata when present (e.g. `greentic.deployment.profiles[component_id]`). When missing, the deployer infers profiles from worlds + tags (`http-endpoint`, `scheduled`, `queue-consumer`, `long-lived`, `one-shot`) and falls back conservatively with a warning (defaulting to `long_lived_service`).
+- `pack_id`
+- `flow_id`
 
-Each profile maps to target-specific infra primitives, still without knowing any provider brands:
+You can override mappings with environment variables:
 
-- `http_endpoint`: local gateway/handler, API Gateway+Lambda, Function App (HTTP), Cloud Run (HTTP), Ingress+Service+Deployment.
-- `long_lived_service`: runner-managed process, ECS/EKS service, Container Apps/App Service, Cloud Run (always-on), Deployment+Service.
-- `queue_consumer`: local queue worker, SQS+Lambda, Service Bus trigger, Pub/Sub subscriber, Deployment-based consumer.
-- `scheduled_source`: local scheduler, EventBridge+Lambda, Timer Function, Cloud Scheduler+Run/Function, CronJob.
-- `one_shot_job`: runner one-shot, Lambda, Container Apps job/Function, Cloud Run job, Job.
+- `DEPLOY_TARGET_<PROVIDER>_<STRATEGY>_PACK_ID`
+- `DEPLOY_TARGET_<PROVIDER>_<STRATEGY>_FLOW_ID`
+- `DEPLOY_TARGET_<PROVIDER>_PACK_ID`
+- `DEPLOY_TARGET_<PROVIDER>_FLOW_ID`
 
-Local/K8s note: the legacy Rust backends only cover AWS/Azure/GCP. For `local` and `k8s` targets you need a deployment pack plus a registered executor (or extend the provider/strategy mapping to point at your pack) so the deployer can delegate IaC generation.
+## Executor handoff
 
-CLI plans now surface these mappings (and inference warnings) and can be rendered as text, JSON, or YAML via `--output text|json|yaml`.
+When the deployer resolves a deployment pack it writes:
 
-## Authoring flows
+- `deploy/<provider>/<tenant>/<environment>/._deployer_invocation.json`
+- `deploy/<provider>/<tenant>/<environment>/._runner_cmd.txt`
+- `.greentic/state/runtime/<tenant>/<environment>/plan.json`
+- `.greentic/state/runtime/<tenant>/<environment>/invoke.json`
 
-For the YGTC flow authoring format and schema notes, see `docs/flow-authoring.md`.
+These files are the stable handoff point for external runners and control planes.
 
-## Loading packs
+At runtime the library returns:
 
-- Local files/directories: `--pack <path>` continues to work.
-- Registry/distributor: use `--pack-id`, `--pack-version`, and `--pack-digest` plus `--distributor-url` (and optionally `--distributor-token`) to resolve packs from a distributor. Programmatic callers can also register a distributor source via `set_distributor_source`.
-- The default HTTP source posts to `/distributor-api/pack` with `pack_id` and `version` and retries on transient errors.
+- typed operator payloads for `generate`, `plan`, `apply`, `destroy`, `status`, and `rollback`
+- `output_validation` for pre-execution payloads validated against pack-owned output schemas
+- `execution` reports for executed operations
+- `outcome_validation` for executor-returned payloads validated against pack-owned execution schemas
 
-### Notes for distributors
+## Authoring notes
 
-- The HTTP fetcher is intentionally minimal. If your distributor API differs, register a custom `DistributorSource` via `set_distributor_source` before calling `build_plan`.
-- `reqwest` is used in blocking mode by default; swap in an async source if needed.
-
-# Placeholder pack pipeline
-
-`greentic-deployer` now exposes a deterministic pipeline backed by `greentic-deployer-packgen`:
-
-1. `ci/gen_packs.sh` runs `greentic-deployer-packgen generate --provider <name>` for every placeholder provider (`aws`, `azure`, `gcp`, `k8s`, `local`, `generic`). Packgen orchestrates the canonical CLIs (`greentic-pack new/add-extension/build/doctor`, `greentic-flow new/doctor`, optionally `greentic-component` tooling) so every pack is scaffolded, validated, and emitted as `dist/greentic.demo.deploy.<provider>.gtpack`.
-2. `ci/smoke_deployer.sh` exercises every placeholder pack with `plan` + `apply --dry-run`, then inspects `.greentic/state/deploy/<provider>/<tenant>/<environment>` for `._deployer_invocation.json` and `._runner_cmd.txt` to surface the resolved `(pack_id, flow_id)` and runner command.
-3. `ci/local_check.sh` bundles fmt/clippy/tests/doc checks, installs the greentic CLIs via `cargo binstall`, runs `ci/gen_packs.sh`, and re-runs `greentic-pack doctor` plus the smoke harness so the ABI and diagnostics stay locked to real packs.
-4. `.github/workflows/ci.yml` drives the same steps through the `local-check`, `build`, `doctor`, and `smoke` jobs so the `publish` job for tags only runs after every pack has been generated, doctored, and smoke-tested.
-
-Keeping this pipeline green ensures every placeholder pack shipped via GHCR is CLI-built, doctored, and validated by the smoke harness with deterministic logs.
+- keep deployment logic inside the deployment pack, not in the deployer binary
+- keep planner and dispatch ownership inside the deployment pack, not in the deployer binary
+- keep execution result schemas inside the deployment pack, not in the deployer binary
+- consume the normalized deployment plan rather than application-pack internals directly
+- emit provider-specific assets through host capabilities exposed by the executor environment
+- treat the deployer as the planner and dispatcher, not the infrastructure engine

@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "required": ["kind", "deployment_id", "state", "health_checks"],
+  "properties": {
+    "kind": { "const": "status" },
+    "deployment_id": { "type": "string" },
+    "state": { "type": "string" },
+    "health_checks": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}
+

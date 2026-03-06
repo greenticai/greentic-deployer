@@ -1,0 +1,38 @@
+{
+  "wizard_id": "greentic-pack.wizard.run",
+  "schema_id": "greentic-pack.wizard.answers",
+  "schema_version": "1.0.0",
+  "locale": "en-GB",
+  "answers": {
+    "dry_run": true,
+    "extension_catalog_ref": "file://docs/extensions_capability_packs.catalog.v1.json",
+    "extension_edit_answers": {
+      "component_ref": "deployer",
+      "contract_id": "greentic.deployer.v1",
+      "entry_label": "deployer",
+      "supported_ops": "generate,plan,status"
+    },
+    "extension_operation": "create_extension_pack",
+    "extension_template_id": "deployer-basic",
+    "extension_template_qa_answers": {
+      "display_name": "Juju K8s Deployer",
+      "pack_id": "greentic.deploy.juju-k8s"
+    },
+    "extension_type_id": "deployer",
+    "mode": "interactive-dry-run",
+    "pack_dir": "__PACK_DIR__",
+    "run_build": true,
+    "run_delegate_component": false,
+    "run_delegate_flow": false,
+    "run_doctor": true,
+    "selected_actions": [
+      "main.create_extension_pack",
+      "create_extension_pack.start",
+      "pipeline.update_validate",
+      "pipeline.sign_prompt.skip",
+      "main.exit"
+    ],
+    "sign": false
+  },
+  "locks": {}
+}

@@ -1,0 +1,30 @@
+name: greentic-operator
+base: core24
+version: "0.1.0"
+summary: Greentic operator snap (embedded mode)
+description: |
+  Embedded-mode snap that carries the bundle in the snap payload.
+confinement: strict
+grade: stable
+
+apps:
+  operator:
+    command: bin/operator
+    daemon: simple
+    plugs: [network, network-bind]
+    environment:
+      REDIS_URL: redis://127.0.0.1:6379/0
+      GREENTIC_ADMIN_LISTEN: 127.0.0.1:8081
+      GREENTIC_BUNDLE_MODE: embedded
+      GREENTIC_BUNDLE_PATH: $SNAP/bundles/operator.bundle
+      GREENTIC_BUNDLE_READER: userspace-squashfs
+      GREENTIC_LOG_PATH: $SNAP_COMMON/logs
+      GREENTIC_CACHE_PATH: $SNAP_COMMON/cache
+      GREENTIC_STATE_PATH: $SNAP_COMMON/state
+      GREENTIC_CACHE_SIZE_HINT_MB: "512"
+
+parts:
+  operator:
+    plugin: dump
+    source: .
+

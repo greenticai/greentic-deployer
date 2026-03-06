@@ -1,0 +1,32 @@
+{
+  "type": "object",
+  "required": [
+    "environment",
+    "kubernetes_namespace",
+    "operator_image_digest",
+    "redis_secret_name",
+    "dns_name",
+    "bundle_source",
+    "bundle_digest",
+    "otlp_endpoint",
+    "remote_state_backend"
+  ],
+  "properties": {
+    "environment": { "type": "string", "minLength": 1 },
+    "kubernetes_namespace": { "type": "string", "minLength": 1 },
+    "operator_image_digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "redis_secret_name": { "type": "string", "minLength": 1 },
+    "dns_name": { "type": "string", "minLength": 1 },
+    "bundle_source": { "type": "string", "minLength": 1 },
+    "bundle_digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "otlp_endpoint": { "type": "string", "minLength": 1 },
+    "remote_state_backend": { "type": "string", "minLength": 1 }
+  }
+}
+

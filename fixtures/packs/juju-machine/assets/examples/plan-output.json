@@ -1,0 +1,17 @@
+{
+  "kind": "plan",
+  "capability": "plan",
+  "provider": "generic",
+  "strategy": "juju-machine",
+  "deploy_command": "juju deploy ./charm greentic-operator",
+  "integrate_commands": [
+    "juju integrate greentic-operator redis",
+    "juju integrate greentic-operator ingress",
+    "juju integrate greentic-operator observability"
+  ],
+  "config_set_command": "juju config greentic-operator admin-listener=127.0.0.1:8081",
+  "upgrade_command": "juju refresh greentic-operator --path ./charm",
+  "refresh_bundle_command": "juju config greentic-operator bundle-digest=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "remove_command": "juju remove-application greentic-operator"
+}
+

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "replays": [
+    "examples/answers/deployment-packs/k8s-raw.generate.json",
+    "examples/answers/deployment-packs/helm.generate.json",
+    "examples/answers/deployment-packs/terraform.plan.json",
+    "examples/answers/deployment-packs/snap.fetch.json",
+    "examples/answers/deployment-packs/snap.embedded.json",
+    "examples/answers/deployment-packs/juju-machine.plan.json",
+    "examples/answers/deployment-packs/juju-k8s.plan.json",
+    "examples/answers/deployment-packs/serverless.generate.json"
+  ]
+}
+

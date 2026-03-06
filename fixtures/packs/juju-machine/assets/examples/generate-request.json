@@ -1,0 +1,11 @@
+{
+  "application_name": "greentic-operator",
+  "snap_channel": "latest/stable",
+  "bundle_source": "oci://registry.greentic.ai/bundles/operator",
+  "bundle_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "admin_listener": "127.0.0.1:8081",
+  "redis_relation_name": "redis",
+  "ingress_relation_name": "ingress",
+  "observability_relation_name": "observability"
+}
+

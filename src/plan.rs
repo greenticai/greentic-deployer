@@ -147,7 +147,7 @@ pub struct PlanContext {
 }
 
 impl PlanContext {
-    /// Returns a compact summary string for CLI output.
+    /// Returns a compact summary string for callers that want a human-readable overview.
     pub fn summary(&self) -> String {
         format!(
             "Plan for {} @ {} (target {}): {} runners, {} channels, {} components",
@@ -219,7 +219,7 @@ pub fn build_telemetry_context(plan: &DeploymentPlan, config: &DeployerConfig) -
     }
 }
 
-/// Builds channel ingress hints based on the plan data and CLI config.
+/// Builds channel ingress hints based on the plan data and resolved deployer config.
 pub fn build_channel_context(
     plan: &DeploymentPlan,
     config: &DeployerConfig,

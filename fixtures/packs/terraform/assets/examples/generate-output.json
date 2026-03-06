@@ -1,0 +1,15 @@
+{
+  "kind": "generate",
+  "capability": "generate",
+  "provider": "generic",
+  "strategy": "terraform",
+  "terraform_root": "terraform",
+  "generated_files": [
+    "main.tf",
+    "variables.tf",
+    "outputs.tf",
+    "providers.tf",
+    "staging.tfvars.example"
+  ]
+}
+

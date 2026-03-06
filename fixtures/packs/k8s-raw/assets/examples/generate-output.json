@@ -1,0 +1,9 @@
+{
+  "kind": "generate",
+  "capability": "generate",
+  "provider": "k8s",
+  "strategy": "raw-manifests",
+  "rendered_manifest_path": "assets/examples/rendered-manifests.yaml",
+  "supported_upgrade_modes": ["rolling", "blue_green", "canary_external"]
+}
+

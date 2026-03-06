@@ -1,0 +1,9 @@
+{
+  "kind": "apply",
+  "deployment_id": "greentic-staging",
+  "state": "applied",
+  "endpoints": [
+    "https://operator.greentic.example.com"
+  ]
+}
+

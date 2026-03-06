@@ -179,7 +179,7 @@ fn resolve_distributor_source(config: &DeployerConfig) -> Result<Arc<dyn Distrib
             err
         } else {
             DeployerError::Config(format!(
-                "no distributor source registered; either register one programmatically or set --distributor-url ({err})"
+                "no distributor source registered; either register one programmatically or set distributor_url ({err})"
             ))
         }
     })
@@ -194,9 +194,10 @@ pub fn set_distributor_source(source: Arc<dyn DistributorSource>) {
 }
 
 fn build_http_distributor_source(config: &DeployerConfig) -> Result<Arc<dyn DistributorSource>> {
-    let base_url = config.distributor_url.as_deref().ok_or_else(|| {
-        DeployerError::Config("set --distributor-url when using --pack-id".into())
-    })?;
+    let base_url = config
+        .distributor_url
+        .as_deref()
+        .ok_or_else(|| DeployerError::Config("set distributor_url when using pack_id".into()))?;
 
     if matches!(
         config.greentic.environment.connection,
@@ -877,8 +878,8 @@ fn map_profile_to_infra(target: &Target, profile: &DeploymentProfile) -> InfraPl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Action, DeployerConfig, OutputFormat, Provider};
-    use crate::iac::IaCTool;
+    use crate::config::{DeployerConfig, OutputFormat, Provider};
+    use crate::contract::DeployerCapability;
     use greentic_types::cbor::encode_pack_manifest;
     use greentic_types::component::{ComponentCapabilities, ComponentProfiles, HostCapabilities};
     use greentic_types::flow::{
@@ -983,6 +984,7 @@ mod tests {
         PackManifest {
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::from_str("dev.greentic.sample").unwrap(),
+            name: None,
             version: Version::new(0, 1, 0),
             kind: PackKind::Application,
             publisher: "greentic".to_string(),
@@ -1200,7 +1202,7 @@ mod tests {
 
     fn registry_config() -> DeployerConfig {
         DeployerConfig {
-            action: Action::Plan,
+            capability: DeployerCapability::Plan,
             provider: Provider::Aws,
             strategy: "iac-only".into(),
             tenant: "acme".into(),
@@ -1216,10 +1218,8 @@ mod tests {
             )),
             distributor_url: None,
             distributor_token: None,
-            yes: true,
             preview: false,
             dry_run: false,
-            iac_tool: IaCTool::Terraform,
             output: OutputFormat::Text,
             greentic: greentic_config::ConfigResolver::new()
                 .load()
@@ -1227,15 +1227,12 @@ mod tests {
                 .config,
             provenance: greentic_config::ProvenanceMap::new(),
             config_warnings: Vec::new(),
-            explain_config: false,
-            explain_config_json: false,
-            allow_remote_in_offline: false,
         }
     }
 
     fn default_config(pack_path: PathBuf) -> DeployerConfig {
         DeployerConfig {
-            action: Action::Plan,
+            capability: DeployerCapability::Plan,
             provider: Provider::Aws,
             strategy: "iac-only".into(),
             tenant: "acme".into(),
@@ -1247,10 +1244,8 @@ mod tests {
             pack_ref: None,
             distributor_url: None,
             distributor_token: None,
-            yes: true,
             preview: false,
             dry_run: false,
-            iac_tool: IaCTool::Terraform,
             output: OutputFormat::Text,
             greentic: greentic_config::ConfigResolver::new()
                 .load()
@@ -1258,9 +1253,6 @@ mod tests {
                 .config,
             provenance: greentic_config::ProvenanceMap::new(),
             config_warnings: Vec::new(),
-            explain_config: false,
-            explain_config_json: false,
-            allow_remote_in_offline: false,
         }
     }
 }

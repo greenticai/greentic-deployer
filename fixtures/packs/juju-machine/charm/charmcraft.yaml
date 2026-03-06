@@ -1,0 +1,5 @@
+type: charm
+bases:
+  - build-on: [ubuntu@24.04]
+    run-on: [ubuntu@24.04]
+

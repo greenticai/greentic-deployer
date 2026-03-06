@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "required": [
+    "kind",
+    "capability",
+    "provider",
+    "strategy",
+    "mode",
+    "snapcraft_path"
+  ],
+  "properties": {
+    "kind": { "const": "generate" },
+    "capability": { "const": "generate" },
+    "provider": { "const": "local" },
+    "strategy": { "const": "snap" },
+    "mode": {
+      "type": "string",
+      "enum": ["fetch", "embedded"]
+    },
+    "snapcraft_path": { "type": "string", "pattern": "^snap/(fetch|embedded)/snapcraft\\.yaml$" }
+  }
+}
+

@@ -1,0 +1,9 @@
+{
+  "kind": "generate",
+  "capability": "generate",
+  "provider": "local",
+  "strategy": "snap",
+  "mode": "embedded",
+  "snapcraft_path": "snap/embedded/snapcraft.yaml"
+}
+

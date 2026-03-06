@@ -1,0 +1,11 @@
+name: greentic-operator-k8s
+summary: Greentic operator Kubernetes charm
+description: Kubernetes charm that manages the operator workload.
+requires:
+  redis:
+    interface: redis
+  ingress:
+    interface: ingress
+  observability:
+    interface: tracing
+

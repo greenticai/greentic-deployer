@@ -1,0 +1,27 @@
+{
+  "type": "object",
+  "required": [
+    "kind",
+    "capability",
+    "provider",
+    "strategy",
+    "rendered_manifest_path",
+    "supported_upgrade_modes"
+  ],
+  "properties": {
+    "kind": { "const": "generate" },
+    "capability": { "const": "generate" },
+    "provider": { "const": "k8s" },
+    "strategy": { "const": "raw-manifests" },
+    "rendered_manifest_path": {
+      "const": "assets/examples/rendered-manifests.yaml"
+    },
+    "supported_upgrade_modes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "contains": { "const": "rolling" },
+      "minItems": 3
+    }
+  }
+}
+

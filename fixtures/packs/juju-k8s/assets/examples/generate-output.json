@@ -1,0 +1,8 @@
+{
+  "kind": "generate",
+  "capability": "generate",
+  "provider": "k8s",
+  "strategy": "juju-k8s",
+  "charm_root": "charm"
+}
+

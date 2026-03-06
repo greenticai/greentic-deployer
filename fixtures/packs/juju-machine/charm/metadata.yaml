@@ -1,0 +1,14 @@
+name: greentic-operator
+summary: Greentic operator machine charm
+description: Machine charm that manages the operator snap.
+requires:
+  redis:
+    interface: redis
+  ingress:
+    interface: ingress
+  observability:
+    interface: tracing
+  secrets:
+    interface: secrets
+    optional: true
+

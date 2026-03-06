@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "planner": {
+    "flow_id": "plan_k8s_raw",
+    "input_schema_ref": "assets/schemas/generate-input.schema.json",
+    "output_schema_ref": "assets/schemas/generate-output.schema.json"
+  },
+  "capabilities": [
+    {
+      "capability": "generate",
+      "flow_id": "generate_k8s_raw",
+      "input_schema_ref": "assets/schemas/generate-input.schema.json",
+      "output_schema_ref": "assets/schemas/generate-output.schema.json",
+      "example_refs": [
+        "assets/examples/generate-request.json",
+        "assets/examples/generate-output.json"
+      ]
+    },
+    {
+      "capability": "plan",
+      "flow_id": "plan_k8s_raw",
+      "input_schema_ref": "assets/schemas/generate-input.schema.json",
+      "output_schema_ref": "assets/schemas/generate-output.schema.json"
+    },
+    {
+      "capability": "apply",
+      "flow_id": "apply_k8s_raw",
+      "execution_output_schema_ref": "assets/schemas/apply-execution-output.schema.json",
+      "example_refs": [
+        "assets/examples/apply-execution-output.json"
+      ]
+    },
+    {
+      "capability": "destroy",
+      "flow_id": "destroy_k8s_raw",
+      "execution_output_schema_ref": "assets/schemas/destroy-execution-output.schema.json"
+    },
+    {
+      "capability": "status",
+      "flow_id": "status_k8s_raw",
+      "execution_output_schema_ref": "assets/schemas/status-execution-output.schema.json"
+    },
+    {
+      "capability": "rollback",
+      "flow_id": "rollback_k8s_raw"
+    }
+  ]
+}
+

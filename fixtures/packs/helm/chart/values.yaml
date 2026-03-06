@@ -1,0 +1,47 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/greentic-ai/operator-distroless
+  digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: greentic-operator
+
+rbac:
+  create: true
+
+service:
+  name: greentic-operator
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: nginx
+  host: operator.greentic.example.com
+  path: /
+
+adminApi:
+  listener: 127.0.0.1:8081
+  public: false
+
+redis:
+  externalUrl: redis://redis.greentic-system.svc.cluster.local:6379/0
+
+bundle:
+  source: oci://registry.greentic.ai/bundles/operator:stable
+  mode: oci
+
+otel:
+  endpoint: http://otel-collector.observability.svc.cluster.local:4317
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+
+networkPolicy:
+  enabled: true
+

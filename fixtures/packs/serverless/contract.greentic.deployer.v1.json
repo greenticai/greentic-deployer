@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "planner": {
+    "flow_id": "plan_serverless",
+    "input_schema_ref": "assets/schemas/generate-input.schema.json",
+    "output_schema_ref": "assets/schemas/plan-output.schema.json"
+  },
+  "capabilities": [
+    {
+      "capability": "generate",
+      "flow_id": "generate_serverless",
+      "input_schema_ref": "assets/schemas/generate-input.schema.json",
+      "output_schema_ref": "assets/schemas/generate-output.schema.json",
+      "example_refs": [
+        "assets/examples/generate-request.json",
+        "assets/examples/generate-output.json"
+      ]
+    },
+    {
+      "capability": "plan",
+      "flow_id": "plan_serverless",
+      "input_schema_ref": "assets/schemas/generate-input.schema.json",
+      "output_schema_ref": "assets/schemas/plan-output.schema.json",
+      "example_refs": [
+        "assets/examples/plan-output.json"
+      ]
+    },
+    {
+      "capability": "apply",
+      "flow_id": "apply_serverless",
+      "execution_output_schema_ref": "assets/schemas/apply-execution-output.schema.json"
+    }
+  ]
+}
+

@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "required": ["kind", "capability", "provider", "strategy", "charm_root"],
+  "properties": {
+    "kind": { "const": "generate" },
+    "capability": { "const": "generate" },
+    "provider": { "const": "k8s" },
+    "strategy": { "const": "juju-k8s" },
+    "charm_root": { "const": "charm" }
+  }
+}
+

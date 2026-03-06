@@ -1,0 +1,11 @@
+{
+  "wizard": "greentic-pack wizard",
+  "pack_fixture": "fixtures/packs/snap",
+  "capability": "generate",
+  "answers": {
+    "mode": "fetch",
+    "example_request": "assets/examples/fetch-request.json",
+    "expected_output": "assets/examples/fetch-output.json"
+  }
+}
+

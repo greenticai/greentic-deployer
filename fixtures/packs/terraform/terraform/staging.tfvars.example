@@ -1,0 +1,9 @@
+kubernetes_namespace = "greentic-system"
+operator_image_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+redis_secret_name = "greentic-redis"
+dns_name = "operator.greentic.example.com"
+bundle_source = "oci://registry.greentic.ai/bundles/operator"
+bundle_digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+otlp_endpoint = "http://otel-collector.internal:4317"
+remote_state_backend = "s3"
+

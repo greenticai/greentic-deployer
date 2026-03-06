@@ -1,0 +1,15 @@
+{
+  "release_name": "greentic-operator",
+  "namespace": "greentic-system",
+  "chart_version": "0.1.0",
+  "image_repository": "ghcr.io/greentic-ai/operator-distroless",
+  "image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "service_name": "greentic-operator",
+  "ingress_host": "operator.greentic.example.com",
+  "redis_url": "redis://redis.greentic-system.svc.cluster.local:6379/0",
+  "bundle_source": "oci://registry.greentic.ai/bundles/operator:stable",
+  "bundle_mode": "oci",
+  "admin_listener": "127.0.0.1:8081",
+  "public_admin_api": false
+}
+

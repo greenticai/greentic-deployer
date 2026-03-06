@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "planner": {
+    "flow_id": "plan_juju_k8s",
+    "input_schema_ref": "assets/schemas/generate-input.schema.json",
+    "output_schema_ref": "assets/schemas/plan-output.schema.json"
+  },
+  "capabilities": [
+    {
+      "capability": "generate",
+      "flow_id": "generate_juju_k8s",
+      "input_schema_ref": "assets/schemas/generate-input.schema.json",
+      "output_schema_ref": "assets/schemas/generate-output.schema.json",
+      "example_refs": [
+        "assets/examples/generate-request.json",
+        "assets/examples/generate-output.json"
+      ]
+    },
+    {
+      "capability": "plan",
+      "flow_id": "plan_juju_k8s",
+      "input_schema_ref": "assets/schemas/generate-input.schema.json",
+      "output_schema_ref": "assets/schemas/plan-output.schema.json",
+      "example_refs": ["assets/examples/plan-output.json"]
+    },
+    {
+      "capability": "status",
+      "flow_id": "status_juju_k8s",
+      "execution_output_schema_ref": "assets/schemas/status-execution-output.schema.json"
+    }
+  ]
+}
+
