@@ -1073,7 +1073,6 @@ dependencies = [
  "greentic-config",
  "greentic-config-types",
  "greentic-distributor-client",
- "greentic-interfaces-host",
  "greentic-telemetry",
  "greentic-types",
  "indexmap 2.13.0",
@@ -1145,19 +1144,6 @@ dependencies = [
  "wit-bindgen 0.53.1",
  "wit-bindgen-core 0.53.1",
  "wit-bindgen-rust 0.53.1",
-]
-
-[[package]]
-name = "greentic-interfaces-host"
-version = "0.4.107"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48ac4236167bb349b8bcbfcd0d5088d9e2a0975d407d0845c05597a6e9f96a1b"
-dependencies = [
- "greentic-interfaces",
- "greentic-types",
- "serde",
- "serde_json",
- "wasmtime",
 ]
 
 [[package]]

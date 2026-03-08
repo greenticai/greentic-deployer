@@ -1,8 +1,5 @@
 #![forbid(unsafe_code)]
 
-#[allow(unused_imports)]
-use greentic_interfaces_host as _greentic_interfaces_host;
-
 pub mod apply;
 pub mod config;
 pub mod contract;

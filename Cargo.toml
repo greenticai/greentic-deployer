@@ -17,7 +17,6 @@ anyhow = "1"
 async-trait = "0.1"
 greentic-telemetry = { version = "0.4", features = ["otlp"] }
 greentic-types = { version = "0.4" }
-greentic-interfaces-host = { version = "0.4" }
 greentic-distributor-client = { version = "0.4" }
 greentic-config = "0.4"
 greentic-config-types = "0.4"
