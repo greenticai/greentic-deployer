@@ -42,15 +42,21 @@ fn main() -> Result<()> {
             .and_then(|name| name.to_str())
             .context("fixture name missing")?;
         let output_path = output_root.join(format!("{fixture_name}.gtpack"));
-        build_fixture_gtpack(&fixture_dir, &output_path)?;
+        let manifest = build_fixture_gtpack(&fixture_dir, &output_path)?;
         validate_fixture_gtpack(&fixture_dir, &output_path)?;
         println!("built and validated {}", output_path.display());
+        println!(
+            "PACK\t{}\t{}\t{}",
+            manifest.pack_id,
+            manifest.version,
+            output_path.display()
+        );
     }
 
     Ok(())
 }
 
-fn build_fixture_gtpack(fixture_dir: &Path, output_path: &Path) -> Result<()> {
+fn build_fixture_gtpack(fixture_dir: &Path, output_path: &Path) -> Result<PackManifest> {
     let contract = load_contract(fixture_dir)?;
     let manifest = build_manifest(fixture_dir, &contract)?;
     let encoded =
@@ -64,7 +70,7 @@ fn build_fixture_gtpack(fixture_dir: &Path, output_path: &Path) -> Result<()> {
     append_fixture_tree(&mut builder, fixture_dir, fixture_dir)?;
     builder.finish().context("finish gtpack archive")?;
 
-    Ok(())
+    Ok(manifest)
 }
 
 fn validate_fixture_gtpack(fixture_dir: &Path, gtpack_path: &Path) -> Result<()> {
