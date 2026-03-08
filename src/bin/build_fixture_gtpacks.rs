@@ -122,12 +122,14 @@ fn build_manifest(fixture_dir: &Path, contract: &DeployerContractV1) -> Result<P
         .and_then(|name| name.to_str())
         .context("fixture name missing")?;
     let pack_id = fixture_name.replace('-', ".");
+    let package_version =
+        Version::parse(env!("CARGO_PKG_VERSION")).context("parse package version")?;
     let mut manifest = PackManifest {
         schema_version: "pack-v1".to_string(),
         pack_id: PackId::from_str(&format!("greentic.fixture.{pack_id}"))
             .context("build pack id")?,
         name: Some(format!("Fixture {}", fixture_name)),
-        version: Version::new(0, 1, 0),
+        version: package_version,
         kind: PackKind::Application,
         publisher: "greentic".to_string(),
         secret_requirements: Vec::new(),
