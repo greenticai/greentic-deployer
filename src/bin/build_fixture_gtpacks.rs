@@ -121,13 +121,11 @@ fn build_manifest(fixture_dir: &Path, contract: &DeployerContractV1) -> Result<P
         .file_name()
         .and_then(|name| name.to_str())
         .context("fixture name missing")?;
-    let pack_id = fixture_name.replace('-', ".");
     let package_version =
         Version::parse(env!("CARGO_PKG_VERSION")).context("parse package version")?;
     let mut manifest = PackManifest {
         schema_version: "pack-v1".to_string(),
-        pack_id: PackId::from_str(&format!("greentic.fixture.{pack_id}"))
-            .context("build pack id")?,
+        pack_id: fixture_pack_id(fixture_name)?,
         name: Some(format!("Fixture {}", fixture_name)),
         version: package_version,
         kind: PackKind::Application,
@@ -143,6 +141,11 @@ fn build_manifest(fixture_dir: &Path, contract: &DeployerContractV1) -> Result<P
     };
     set_deployer_contract_v1(&mut manifest, contract.clone()).context("embed deployer contract")?;
     Ok(manifest)
+}
+
+fn fixture_pack_id(fixture_name: &str) -> Result<PackId> {
+    let pack_id = fixture_name.replace('-', ".");
+    PackId::from_str(&format!("greentic.fixture.{pack_id}.gtpack")).context("build pack id")
 }
 
 fn contract_flow_entries(contract: &DeployerContractV1) -> Result<Vec<PackFlowEntry>> {
@@ -206,4 +209,25 @@ fn append_bytes(builder: &mut Builder<File>, path: &Path, bytes: &[u8]) -> Resul
         .append_data(&mut header, path, bytes)
         .with_context(|| format!("append {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixture_pack_id;
+
+    #[test]
+    fn fixture_pack_ids_keep_gtpack_suffix() {
+        assert_eq!(
+            fixture_pack_id("helm").unwrap().to_string(),
+            "greentic.fixture.helm.gtpack"
+        );
+        assert_eq!(
+            fixture_pack_id("k8s-raw").unwrap().to_string(),
+            "greentic.fixture.k8s.raw.gtpack"
+        );
+        assert_eq!(
+            fixture_pack_id("juju-machine").unwrap().to_string(),
+            "greentic.fixture.juju.machine.gtpack"
+        );
+    }
 }
