@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use greentic_types::pack_manifest::{ExtensionInline, ExtensionRef, PackManifest};
@@ -239,6 +240,112 @@ pub fn read_pack_asset(pack_path: &Path, asset_ref: &str) -> Result<Vec<u8>> {
     read_entry_from_gtpack(pack_path, relative)
 }
 
+pub fn copy_pack_subtree(
+    pack_path: &Path,
+    subtree_ref: &str,
+    destination_root: &Path,
+) -> Result<Vec<String>> {
+    let subtree = Path::new(subtree_ref);
+    if subtree.is_absolute() || subtree_ref.contains("..") {
+        return Err(DeployerError::Contract(format!(
+            "pack subtree ref must stay pack-relative: {}",
+            subtree_ref
+        )));
+    }
+
+    if pack_path.is_dir() {
+        return copy_pack_subtree_from_dir(pack_path, subtree, destination_root);
+    }
+
+    copy_pack_subtree_from_gtpack(pack_path, subtree, destination_root)
+}
+
+fn copy_pack_subtree_from_dir(
+    pack_root: &Path,
+    subtree: &Path,
+    destination_root: &Path,
+) -> Result<Vec<String>> {
+    let source_root = pack_root.join(subtree);
+    if !source_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut copied = Vec::new();
+    copy_dir_recursive(&source_root, &source_root, destination_root, &mut copied)?;
+    copied.sort();
+    Ok(copied)
+}
+
+fn copy_dir_recursive(
+    current: &Path,
+    source_root: &Path,
+    destination_root: &Path,
+    copied: &mut Vec<String>,
+) -> Result<()> {
+    for entry in fs::read_dir(current).map_err(DeployerError::Io)? {
+        let entry = entry.map_err(DeployerError::Io)?;
+        let path = entry.path();
+        if path.is_dir() {
+            copy_dir_recursive(&path, source_root, destination_root, copied)?;
+            continue;
+        }
+
+        let relative = path.strip_prefix(source_root).map_err(|err| {
+            DeployerError::Contract(format!(
+                "failed to relativize {} under {}: {}",
+                path.display(),
+                source_root.display(),
+                err
+            ))
+        })?;
+        let destination = destination_root.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(DeployerError::Io)?;
+        }
+        fs::copy(&path, &destination).map_err(DeployerError::Io)?;
+        copied.push(relative.display().to_string());
+    }
+    Ok(())
+}
+
+fn copy_pack_subtree_from_gtpack(
+    pack_path: &Path,
+    subtree: &Path,
+    destination_root: &Path,
+) -> Result<Vec<String>> {
+    let file = fs::File::open(pack_path).map_err(DeployerError::Io)?;
+    let mut archive = tar::Archive::new(file);
+    let mut copied = Vec::new();
+
+    for entry in archive.entries().map_err(DeployerError::Io)? {
+        let mut entry = entry.map_err(DeployerError::Io)?;
+        let entry_path = entry.path().map_err(DeployerError::Io)?.into_owned();
+        if !entry_path.starts_with(subtree) || entry.header().entry_type().is_dir() {
+            continue;
+        }
+
+        let relative = entry_path.strip_prefix(subtree).map_err(|err| {
+            DeployerError::Contract(format!(
+                "failed to relativize {} under {}: {}",
+                entry_path.display(),
+                subtree.display(),
+                err
+            ))
+        })?;
+        let destination = destination_root.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(DeployerError::Io)?;
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).map_err(DeployerError::Io)?;
+        fs::write(&destination, bytes).map_err(DeployerError::Io)?;
+        copied.push(relative.display().to_string());
+    }
+
+    copied.sort();
+    Ok(copied)
+}
+
 pub fn resolve_deployer_contract_assets(
     manifest: &PackManifest,
     pack_path: &Path,
@@ -442,5 +549,69 @@ mod tests {
         file.write_all(&tar_bytes).unwrap();
 
         assert_eq!(read_pack_asset(&tar_path, relative).unwrap(), bytes);
+    }
+
+    #[test]
+    fn copies_pack_subtree_from_dir_and_gtpack() {
+        let base = std::env::current_dir().unwrap().join("target/tmp-tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(&base).unwrap();
+
+        let source_root = dir.path().join("terraform");
+        std::fs::create_dir_all(source_root.join("modules/operator")).unwrap();
+        std::fs::write(source_root.join("main.tf"), "module \"root\" {}").unwrap();
+        std::fs::write(
+            source_root.join("modules/operator/main.tf"),
+            "module \"operator\" {}",
+        )
+        .unwrap();
+
+        let copied =
+            copy_pack_subtree(dir.path(), "terraform", &dir.path().join("out-dir")).unwrap();
+        assert_eq!(
+            copied,
+            vec![
+                "main.tf".to_string(),
+                "modules/operator/main.tf".to_string()
+            ]
+        );
+        assert!(dir.path().join("out-dir/main.tf").exists());
+        assert!(dir.path().join("out-dir/modules/operator/main.tf").exists());
+
+        let tar_path = dir.path().join("sample.gtpack");
+        let mut builder = Builder::new(Vec::new());
+        append_tar_file(&mut builder, "terraform/main.tf", br#"module "root" {}"#);
+        append_tar_file(
+            &mut builder,
+            "terraform/modules/operator/main.tf",
+            br#"module "operator" {}"#,
+        );
+        let tar_bytes = builder.into_inner().unwrap();
+        let mut file = std::fs::File::create(&tar_path).unwrap();
+        file.write_all(&tar_bytes).unwrap();
+
+        let copied =
+            copy_pack_subtree(&tar_path, "terraform", &dir.path().join("out-gtpack")).unwrap();
+        assert_eq!(
+            copied,
+            vec![
+                "main.tf".to_string(),
+                "modules/operator/main.tf".to_string()
+            ]
+        );
+        assert!(dir.path().join("out-gtpack/main.tf").exists());
+        assert!(
+            dir.path()
+                .join("out-gtpack/modules/operator/main.tf")
+                .exists()
+        );
+    }
+
+    fn append_tar_file(builder: &mut Builder<Vec<u8>>, path: &str, bytes: &[u8]) {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, path, bytes).unwrap();
     }
 }

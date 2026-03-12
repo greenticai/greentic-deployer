@@ -1,0 +1,10 @@
+{
+  "kind": "status",
+  "deployment_id": "deploy/generic/acme/staging",
+  "state": "handoff_ready",
+  "health_checks": [
+    "terraform_runtime_json:deploy/generic/acme/staging/terraform-runtime.json",
+    "terraform_root:present",
+    "script:terraform-status.sh:present"
+  ]
+}

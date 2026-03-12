@@ -129,7 +129,13 @@ pub fn resolve_deployment_pack_for_capability(
     target: &DeploymentTarget,
     capability: DeployerCapability,
 ) -> Result<DeploymentPackSelection> {
-    let default_dispatch = resolve_dispatch(target)?;
+    let default_dispatch = if let Some(dispatch) = explicit_dispatch_override(config, capability)? {
+        dispatch
+    } else if let Some(dispatch) = dispatch_from_provider_pack(config, capability)? {
+        dispatch
+    } else {
+        resolve_dispatch(target)?
+    };
     let mut discovery = find_pack_for_dispatch(config, target, &default_dispatch)?;
     let dispatch = resolve_contract_dispatch(&discovery.manifest, capability, &default_dispatch)?;
     ensure_flow_available(&dispatch, &discovery.manifest)?;
@@ -145,6 +151,72 @@ pub fn resolve_deployment_pack_for_capability(
         origin: discovery.origin,
         candidates: discovery.candidates,
     })
+}
+
+fn explicit_dispatch_override(
+    config: &DeployerConfig,
+    capability: DeployerCapability,
+) -> Result<Option<DeploymentDispatch>> {
+    match (
+        config.deploy_pack_id_override.as_ref(),
+        config.deploy_flow_id_override.as_ref(),
+    ) {
+        (Some(pack_id), Some(flow_id)) => Ok(Some(DeploymentDispatch {
+            capability,
+            pack_id: pack_id.clone(),
+            flow_id: flow_id.clone(),
+        })),
+        (None, None) => Ok(None),
+        _ => Err(DeployerError::Config(
+            "deploy_pack_id_override and deploy_flow_id_override must be set together".to_string(),
+        )),
+    }
+}
+
+fn dispatch_from_provider_pack(
+    config: &DeployerConfig,
+    capability: DeployerCapability,
+) -> Result<Option<DeploymentDispatch>> {
+    let Some(path) = config.provider_pack.as_ref() else {
+        return Ok(None);
+    };
+    let manifest = load_manifest(path)?;
+    let pack_id = manifest.pack_id.to_string();
+
+    if let Some(contract) = get_deployer_contract_v1(&manifest)? {
+        let flow_id = match capability {
+            DeployerCapability::Plan => contract.planner.flow_id,
+            _ => contract
+                .capability(capability)
+                .map(|spec| spec.flow_id.clone())
+                .or_else(|| manifest.flows.first().map(|flow| flow.id.to_string()))
+                .ok_or_else(|| {
+                    DeployerError::Config(format!(
+                        "deployment pack {} does not declare `{}` and has no fallback flows",
+                        pack_id,
+                        capability.as_str()
+                    ))
+                })?,
+        };
+        return Ok(Some(DeploymentDispatch {
+            capability,
+            pack_id,
+            flow_id,
+        }));
+    }
+
+    let Some(first_flow) = manifest.flows.first() else {
+        return Err(DeployerError::Config(format!(
+            "deployment pack {} has no contract and no flows",
+            pack_id
+        )));
+    };
+
+    Ok(Some(DeploymentDispatch {
+        capability,
+        pack_id,
+        flow_id: first_flow.id.to_string(),
+    }))
 }
 
 fn resolve_contract_dispatch(
@@ -255,19 +327,16 @@ fn find_pack_for_dispatch(
     if let Some(ref override_path) = config.provider_pack {
         let manifest = load_manifest(override_path)?;
         let actual = manifest.pack_id.to_string();
-        if actual != dispatch.pack_id {
-            return Err(DeployerError::Config(format!(
-                "explicit deployment pack {} contains pack_id {} (expected {})",
-                override_path.display(),
-                actual,
-                dispatch.pack_id
-            )));
-        }
         return Ok(PackDiscovery {
             pack_path: override_path.clone(),
             manifest,
             origin: format!("override -> {}", override_path.display()),
-            candidates: vec![format!("{} (override {})", actual, override_path.display())],
+            candidates: vec![format!(
+                "{} (override {}, requested {})",
+                actual,
+                override_path.display(),
+                dispatch.pack_id
+            )],
         });
     }
 
@@ -643,6 +712,7 @@ mod tests {
             distributor_token: None,
             preview: false,
             dry_run: false,
+            execute_local: false,
             output: crate::config::OutputFormat::Text,
             greentic: greentic_config::ConfigResolver::new()
                 .load()
@@ -650,6 +720,8 @@ mod tests {
                 .config,
             provenance: greentic_config::ProvenanceMap::new(),
             config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
         };
         let plan = pack_introspect::build_plan(&config).expect("plan builds");
         let dispatch = DeploymentDispatch {

@@ -45,9 +45,9 @@ fn main() -> Result<()> {
         let manifest = build_fixture_gtpack(&fixture_dir, &output_path)?;
         validate_fixture_gtpack(&fixture_dir, &output_path)?;
         println!("built and validated {}", output_path.display());
-        let relative_output_path = output_path
-            .strip_prefix(&root)
-            .with_context(|| format!("compute relative output path for {}", output_path.display()))?;
+        let relative_output_path = output_path.strip_prefix(&root).with_context(|| {
+            format!("compute relative output path for {}", output_path.display())
+        })?;
         println!(
             "PACK\t{}\t{}\t{}",
             manifest.pack_id,

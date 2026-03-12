@@ -1,15 +1,22 @@
+//! Legacy/provider-oriented multi-target deployment orchestration.
+//!
+//! This module still contains the older generic deployment-pack execution path
+//! used for non-single-vm targets. The stable OSS single-VM path lives in
+//! `crate::single_vm`.
+
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use tracing::{info, info_span};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::config::{DeployerConfig, OutputFormat};
 use crate::contract::{
-    DeployerCapability, ResolvedCapabilityContract, ResolvedDeployerContract,
-    resolve_deployer_contract_assets,
+    DeployerCapability, ResolvedCapabilityContract, ResolvedDeployerContract, copy_pack_subtree,
+    read_pack_asset, resolve_deployer_contract_assets,
 };
 use crate::deployment::{
     DeploymentPackSelection, DeploymentTarget, ExecutionOutcome, ExecutionOutcomePayload,
@@ -168,6 +175,161 @@ pub struct OperationResult {
     pub execution: Option<ExecutionReport>,
 }
 
+pub fn render_operation_result(value: &OperationResult, format: OutputFormat) -> Result<String> {
+    match format {
+        OutputFormat::Text => Ok(render_operation_result_text(value)),
+        OutputFormat::Json => {
+            serde_json::to_string_pretty(value).map_err(|err| DeployerError::Other(err.to_string()))
+        }
+        OutputFormat::Yaml => {
+            serde_yaml::to_string(value).map_err(|err| DeployerError::Other(err.to_string()))
+        }
+    }
+}
+
+fn render_operation_result_text(value: &OperationResult) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "capability={} executed={} preview={}\n",
+        value.capability, value.executed, value.preview
+    ));
+    out.push_str(&format!("pack_id={}\n", value.pack_id));
+    out.push_str(&format!("flow_id={}\n", value.flow_id));
+    out.push_str(&format!("pack_path={}\n", value.pack_path));
+    out.push_str(&format!("output_dir={}\n", value.output_dir));
+    out.push_str(&format!("plan_path={}\n", value.plan_path));
+    out.push_str(&format!("invoke_path={}\n", value.invoke_path));
+
+    if let Some(payload) = value.payload.as_ref() {
+        render_operation_payload_text(payload, &mut out);
+    }
+    if let Some(validation) = value.output_validation.as_ref() {
+        render_output_validation_text("output_validation", validation, &mut out);
+    }
+    if let Some(execution) = value.execution.as_ref() {
+        render_execution_report_text(execution, &mut out);
+    }
+    append_terraform_runtime_text(value, &mut out);
+
+    out
+}
+
+fn render_operation_payload_text(payload: &OperationPayload, out: &mut String) {
+    match payload {
+        OperationPayload::Plan(payload) => {
+            out.push_str("payload_kind=plan\n");
+            out.push_str(&format!("target={}\n", payload.plan.target.as_str()));
+            out.push_str(&format!("components={}\n", payload.plan.components.len()));
+        }
+        OperationPayload::Generate(payload) => {
+            out.push_str("payload_kind=generate\n");
+            out.push_str(&format!("provider={}\n", payload.provider));
+            out.push_str(&format!("strategy={}\n", payload.strategy));
+            if let Some(path) = payload.input_schema_path.as_ref() {
+                out.push_str(&format!("input_schema={path}\n"));
+            }
+            if let Some(path) = payload.output_schema_path.as_ref() {
+                out.push_str(&format!("output_schema={path}\n"));
+            }
+            if let Some(path) = payload.qa_spec_path.as_ref() {
+                out.push_str(&format!("qa_spec={path}\n"));
+            }
+            if !payload.example_paths.is_empty() {
+                out.push_str(&format!("examples={}\n", payload.example_paths.join(", ")));
+            }
+        }
+        OperationPayload::Apply(payload) => {
+            out.push_str("payload_kind=apply\n");
+            out.push_str(&format!("provider={}\n", payload.provider));
+            out.push_str(&format!("strategy={}\n", payload.strategy));
+            out.push_str(&format!("runner_cmd={}\n", payload.runner_cmd.join(" ")));
+        }
+        OperationPayload::Destroy(payload) => {
+            out.push_str("payload_kind=destroy\n");
+            out.push_str(&format!("provider={}\n", payload.provider));
+            out.push_str(&format!("strategy={}\n", payload.strategy));
+            out.push_str(&format!("runner_cmd={}\n", payload.runner_cmd.join(" ")));
+        }
+        OperationPayload::Status(payload) => {
+            out.push_str("payload_kind=status\n");
+            out.push_str(&format!("provider={}\n", payload.provider));
+            out.push_str(&format!("strategy={}\n", payload.strategy));
+        }
+        OperationPayload::Rollback(payload) => {
+            out.push_str("payload_kind=rollback\n");
+            out.push_str(&format!("provider={}\n", payload.provider));
+            out.push_str(&format!("strategy={}\n", payload.strategy));
+            out.push_str(&format!(
+                "target_capability={}\n",
+                payload.target_capability
+            ));
+        }
+    }
+}
+
+fn render_output_validation_text(label: &str, validation: &OutputValidation, out: &mut String) {
+    out.push_str(&format!("{label}.schema={}\n", validation.schema_path));
+    out.push_str(&format!("{label}.valid={}\n", validation.valid));
+    if !validation.errors.is_empty() {
+        out.push_str(&format!(
+            "{label}.errors={}\n",
+            validation.errors.join(" | ")
+        ));
+    }
+}
+
+fn render_execution_report_text(execution: &ExecutionReport, out: &mut String) {
+    out.push_str("execution.present=true\n");
+    out.push_str(&format!("execution.output_dir={}\n", execution.output_dir));
+    out.push_str(&format!(
+        "execution.handoff_path={}\n",
+        execution.handoff_path
+    ));
+    out.push_str(&format!(
+        "execution.runner_command_path={}\n",
+        execution.runner_command_path
+    ));
+    if let Some(status) = execution.status.as_ref() {
+        out.push_str(&format!("execution.status={status}\n"));
+    }
+    if let Some(message) = execution.message.as_ref() {
+        out.push_str(&format!("execution.message={message}\n"));
+    }
+    if !execution.output_files.is_empty() {
+        out.push_str(&format!(
+            "execution.output_files={}\n",
+            execution.output_files.join(", ")
+        ));
+    }
+    if let Some(validation) = execution.outcome_validation.as_ref() {
+        render_output_validation_text("execution.validation", validation, out);
+    }
+}
+
+fn append_terraform_runtime_text(value: &OperationResult, out: &mut String) {
+    let runtime_path = Path::new(&value.output_dir).join("terraform-runtime.json");
+    let Ok(bytes) = fs::read(&runtime_path) else {
+        return;
+    };
+    let Ok(metadata) = serde_json::from_slice::<TerraformRuntimeMetadata>(&bytes) else {
+        return;
+    };
+
+    out.push_str("terraform_runtime.present=true\n");
+    out.push_str(&format!(
+        "terraform_runtime.root={}\n",
+        metadata.terraform_root
+    ));
+    out.push_str(&format!(
+        "terraform_runtime.copied_files={}\n",
+        metadata.copied_files.join(", ")
+    ));
+    out.push_str(&format!(
+        "terraform_runtime.status_command={}\n",
+        metadata.status_command
+    ));
+}
+
 pub async fn run(config: DeployerConfig) -> Result<OperationResult> {
     telemetry::init(&config)?;
     let plan = {
@@ -255,6 +417,25 @@ pub async fn run_with_plan(config: DeployerConfig, plan: PlanContext) -> Result<
 
     if let Some(execution_outcome) = execute_deployment_pack(&config, &plan, dispatch).await? {
         info!("deployment plan executed via deployment pack");
+        return Ok(build_operation_result(
+            &config,
+            &selection,
+            &runtime_artifacts,
+            OperationResultData {
+                contract,
+                capability_contract,
+                payload: executed_payload,
+                output_validation: executed_output_validation,
+                execution_outcome: Some(execution_outcome),
+                executed: true,
+            },
+        ));
+    }
+
+    if let Some(execution_outcome) =
+        synthesize_local_execution_outcome(&config, &runtime_artifacts)?
+    {
+        info!("deployment status synthesized from local runtime artifacts");
         return Ok(build_operation_result(
             &config,
             &selection,
@@ -437,6 +618,506 @@ pub async fn run_with_plan(config: DeployerConfig, plan: PlanContext) -> Result<
             })
         }
     }
+}
+
+fn synthesize_local_execution_outcome(
+    config: &DeployerConfig,
+    runtime_artifacts: &RuntimeArtifacts,
+) -> Result<Option<ExecutionOutcome>> {
+    if config.execute_local && uses_terraform_handoff(config) {
+        match config.capability {
+            DeployerCapability::Apply => {
+                return execute_local_terraform_operation(runtime_artifacts, "apply");
+            }
+            DeployerCapability::Destroy => {
+                return execute_local_terraform_operation(runtime_artifacts, "destroy");
+            }
+            _ => {}
+        }
+    }
+    if config.execute_local && uses_operator_handoff(config) {
+        match config.capability {
+            DeployerCapability::Apply => {
+                return execute_local_scripted_operation(
+                    runtime_artifacts,
+                    "operator-apply.sh",
+                    "operator-apply",
+                    "applied",
+                    ScriptedPayloadKind::Apply,
+                    "operator apply executed locally",
+                );
+            }
+            DeployerCapability::Destroy => {
+                return execute_local_scripted_operation(
+                    runtime_artifacts,
+                    "operator-delete.sh",
+                    "operator-destroy",
+                    "destroyed",
+                    ScriptedPayloadKind::Destroy,
+                    "operator destroy executed locally",
+                );
+            }
+            _ => {}
+        }
+    }
+    if config.execute_local && uses_serverless_handoff(config) {
+        match config.capability {
+            DeployerCapability::Apply => {
+                return execute_local_scripted_operation(
+                    runtime_artifacts,
+                    "serverless-deploy.sh",
+                    "serverless-apply",
+                    "applied",
+                    ScriptedPayloadKind::Apply,
+                    "serverless apply executed locally",
+                );
+            }
+            DeployerCapability::Destroy => {
+                return execute_local_scripted_operation(
+                    runtime_artifacts,
+                    "serverless-destroy.sh",
+                    "serverless-destroy",
+                    "destroyed",
+                    ScriptedPayloadKind::Destroy,
+                    "serverless destroy executed locally",
+                );
+            }
+            _ => {}
+        }
+    }
+    if config.execute_local && uses_snap_handoff(config) {
+        match config.capability {
+            DeployerCapability::Apply => {
+                return execute_local_scripted_operation(
+                    runtime_artifacts,
+                    "snap-install.sh",
+                    "snap-apply",
+                    "applied",
+                    ScriptedPayloadKind::Apply,
+                    "snap apply executed locally",
+                );
+            }
+            DeployerCapability::Destroy => {
+                return execute_local_scripted_operation(
+                    runtime_artifacts,
+                    "snap-remove.sh",
+                    "snap-destroy",
+                    "destroyed",
+                    ScriptedPayloadKind::Destroy,
+                    "snap destroy executed locally",
+                );
+            }
+            _ => {}
+        }
+    }
+    if config.execute_local && uses_juju_machine_handoff(config) {
+        match config.capability {
+            DeployerCapability::Apply => {
+                return execute_local_scripted_operation(
+                    runtime_artifacts,
+                    "juju-machine-deploy.sh",
+                    "juju-machine-apply",
+                    "applied",
+                    ScriptedPayloadKind::Apply,
+                    "juju-machine apply executed locally",
+                );
+            }
+            DeployerCapability::Destroy => {
+                return execute_local_scripted_operation(
+                    runtime_artifacts,
+                    "juju-machine-remove.sh",
+                    "juju-machine-destroy",
+                    "destroyed",
+                    ScriptedPayloadKind::Destroy,
+                    "juju-machine destroy executed locally",
+                );
+            }
+            _ => {}
+        }
+    }
+    if config.execute_local && uses_juju_k8s_handoff(config) {
+        match config.capability {
+            DeployerCapability::Apply => {
+                return execute_local_scripted_operation(
+                    runtime_artifacts,
+                    "juju-k8s-deploy.sh",
+                    "juju-k8s-apply",
+                    "applied",
+                    ScriptedPayloadKind::Apply,
+                    "juju-k8s apply executed locally",
+                );
+            }
+            DeployerCapability::Destroy => {
+                return execute_local_scripted_operation(
+                    runtime_artifacts,
+                    "juju-k8s-remove.sh",
+                    "juju-k8s-destroy",
+                    "destroyed",
+                    ScriptedPayloadKind::Destroy,
+                    "juju-k8s destroy executed locally",
+                );
+            }
+            _ => {}
+        }
+    }
+    if config.capability == DeployerCapability::Status && uses_terraform_handoff(config) {
+        return synthesize_local_terraform_status(runtime_artifacts);
+    }
+    if config.capability == DeployerCapability::Status && uses_operator_handoff(config) {
+        return synthesize_scripted_handoff_status(
+            runtime_artifacts,
+            "operator-handoff.txt",
+            vec![
+                ("operator_manifest", "operator/rendered-manifests.yaml"),
+                ("operator_apply_script", "operator-apply.sh"),
+                ("operator_delete_script", "operator-delete.sh"),
+                ("operator_status_script", "operator-status.sh"),
+            ],
+            "operator status synthesized from local handoff artifacts",
+        );
+    }
+    if config.capability == DeployerCapability::Status && uses_serverless_handoff(config) {
+        return synthesize_scripted_handoff_status(
+            runtime_artifacts,
+            "serverless-handoff.txt",
+            vec![
+                (
+                    "serverless_descriptor",
+                    "serverless/deployment-descriptor.json",
+                ),
+                ("serverless_deploy_script", "serverless-deploy.sh"),
+                ("serverless_destroy_script", "serverless-destroy.sh"),
+                ("serverless_status_script", "serverless-status.sh"),
+            ],
+            "serverless status synthesized from local handoff artifacts",
+        );
+    }
+    if config.capability == DeployerCapability::Status && uses_snap_handoff(config) {
+        return synthesize_scripted_handoff_status(
+            runtime_artifacts,
+            "snap-handoff.txt",
+            vec![
+                ("snap_fetch", "snap/fetch/snapcraft.yaml"),
+                ("snap_embedded", "snap/embedded/snapcraft.yaml"),
+                ("snap_install", "snap-install.sh"),
+                ("snap_remove", "snap-remove.sh"),
+                ("snap_status", "snap-status.sh"),
+            ],
+            "snap status synthesized from local handoff artifacts",
+        );
+    }
+    if config.capability == DeployerCapability::Status && uses_juju_machine_handoff(config) {
+        return synthesize_scripted_handoff_status(
+            runtime_artifacts,
+            "juju-machine-handoff.txt",
+            vec![
+                ("juju_machine_charm", "juju-machine-charm/charmcraft.yaml"),
+                ("juju_machine_deploy", "juju-machine-deploy.sh"),
+                ("juju_machine_remove", "juju-machine-remove.sh"),
+                ("juju_machine_status", "juju-machine-status.sh"),
+            ],
+            "juju-machine status synthesized from local handoff artifacts",
+        );
+    }
+    if config.capability == DeployerCapability::Status && uses_juju_k8s_handoff(config) {
+        return synthesize_scripted_handoff_status(
+            runtime_artifacts,
+            "juju-k8s-handoff.txt",
+            vec![
+                ("juju_k8s_charm", "juju-k8s-charm/charmcraft.yaml"),
+                ("juju_k8s_deploy", "juju-k8s-deploy.sh"),
+                ("juju_k8s_remove", "juju-k8s-remove.sh"),
+                ("juju_k8s_status", "juju-k8s-status.sh"),
+            ],
+            "juju-k8s status synthesized from local handoff artifacts",
+        );
+    }
+    Ok(None)
+}
+
+fn uses_terraform_handoff(config: &DeployerConfig) -> bool {
+    (config.provider == crate::config::Provider::Generic && config.strategy == "terraform")
+        || (matches!(
+            config.provider,
+            crate::config::Provider::Aws
+                | crate::config::Provider::Azure
+                | crate::config::Provider::Gcp
+        ) && config.strategy == "iac-only")
+}
+
+fn uses_operator_handoff(config: &DeployerConfig) -> bool {
+    config.provider == crate::config::Provider::K8s && config.strategy == "operator"
+}
+
+fn uses_serverless_handoff(config: &DeployerConfig) -> bool {
+    config.provider == crate::config::Provider::Generic && config.strategy == "serverless-container"
+}
+
+fn uses_snap_handoff(config: &DeployerConfig) -> bool {
+    config.provider == crate::config::Provider::Local && config.strategy == "snap"
+}
+
+fn uses_juju_machine_handoff(config: &DeployerConfig) -> bool {
+    config.provider == crate::config::Provider::Local && config.strategy == "juju-machine"
+}
+
+fn uses_juju_k8s_handoff(config: &DeployerConfig) -> bool {
+    config.provider == crate::config::Provider::K8s && config.strategy == "juju-k8s"
+}
+
+enum ScriptedPayloadKind {
+    Apply,
+    Destroy,
+}
+
+fn execute_local_terraform_operation(
+    runtime_artifacts: &RuntimeArtifacts,
+    operation: &str,
+) -> Result<Option<ExecutionOutcome>> {
+    let script_name = match operation {
+        "apply" => "terraform-apply.sh",
+        "destroy" => "terraform-destroy.sh",
+        other => {
+            return Err(DeployerError::Config(format!(
+                "unsupported terraform local operation {other}"
+            )));
+        }
+    };
+    let script_path = runtime_artifacts.deploy_dir.join(script_name);
+    if !script_path.exists() {
+        return Ok(None);
+    }
+
+    let output = Command::new(&script_path)
+        .current_dir(&runtime_artifacts.deploy_dir)
+        .output()
+        .map_err(DeployerError::Io)?;
+
+    let stdout_log = format!("terraform-{operation}.stdout.log");
+    let stderr_log = format!("terraform-{operation}.stderr.log");
+    fs::write(
+        runtime_artifacts.deploy_dir.join(&stdout_log),
+        &output.stdout,
+    )?;
+    fs::write(
+        runtime_artifacts.deploy_dir.join(&stderr_log),
+        &output.stderr,
+    )?;
+
+    if !output.status.success() {
+        let code = output
+            .status
+            .code()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "signal".to_string());
+        return Err(DeployerError::Other(format!(
+            "terraform {operation} failed with exit {code}; see {stdout_log} and {stderr_log}"
+        )));
+    }
+
+    let state = if operation == "apply" {
+        "applied"
+    } else {
+        "destroyed"
+    };
+    let payload = if operation == "apply" {
+        ExecutionOutcomePayload::Apply(crate::deployment::ApplyExecutionOutcome {
+            deployment_id: runtime_artifacts.handoff.output_dir.clone(),
+            state: state.to_string(),
+            endpoints: Vec::new(),
+        })
+    } else {
+        ExecutionOutcomePayload::Destroy(crate::deployment::DestroyExecutionOutcome {
+            deployment_id: runtime_artifacts.handoff.output_dir.clone(),
+            state: state.to_string(),
+        })
+    };
+
+    Ok(Some(ExecutionOutcome {
+        status: Some(state.to_string()),
+        message: Some(format!(
+            "terraform {operation} executed locally via {}",
+            script_path.display()
+        )),
+        output_files: vec![stdout_log, stderr_log],
+        payload: Some(payload),
+    }))
+}
+
+fn execute_local_scripted_operation(
+    runtime_artifacts: &RuntimeArtifacts,
+    script_name: &str,
+    log_prefix: &str,
+    state: &str,
+    payload_kind: ScriptedPayloadKind,
+    message: &str,
+) -> Result<Option<ExecutionOutcome>> {
+    let script_path = runtime_artifacts.deploy_dir.join(script_name);
+    if !script_path.exists() {
+        return Ok(None);
+    }
+
+    let output = Command::new(&script_path)
+        .current_dir(&runtime_artifacts.deploy_dir)
+        .output()
+        .map_err(DeployerError::Io)?;
+
+    let stdout_log = format!("{log_prefix}.stdout.log");
+    let stderr_log = format!("{log_prefix}.stderr.log");
+    fs::write(
+        runtime_artifacts.deploy_dir.join(&stdout_log),
+        &output.stdout,
+    )?;
+    fs::write(
+        runtime_artifacts.deploy_dir.join(&stderr_log),
+        &output.stderr,
+    )?;
+
+    if !output.status.success() {
+        let code = output
+            .status
+            .code()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "signal".to_string());
+        return Err(DeployerError::Other(format!(
+            "{script_name} failed with exit {code}; see {stdout_log} and {stderr_log}"
+        )));
+    }
+
+    let payload = match payload_kind {
+        ScriptedPayloadKind::Apply => {
+            ExecutionOutcomePayload::Apply(crate::deployment::ApplyExecutionOutcome {
+                deployment_id: runtime_artifacts.handoff.output_dir.clone(),
+                state: state.to_string(),
+                endpoints: Vec::new(),
+            })
+        }
+        ScriptedPayloadKind::Destroy => {
+            ExecutionOutcomePayload::Destroy(crate::deployment::DestroyExecutionOutcome {
+                deployment_id: runtime_artifacts.handoff.output_dir.clone(),
+                state: state.to_string(),
+            })
+        }
+    };
+
+    Ok(Some(ExecutionOutcome {
+        status: Some(state.to_string()),
+        message: Some(format!("{message} via {}", script_path.display())),
+        output_files: vec![stdout_log, stderr_log],
+        payload: Some(payload),
+    }))
+}
+
+fn synthesize_local_terraform_status(
+    runtime_artifacts: &RuntimeArtifacts,
+) -> Result<Option<ExecutionOutcome>> {
+    let runtime_path = runtime_artifacts.deploy_dir.join("terraform-runtime.json");
+    let bytes = match fs::read(&runtime_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(DeployerError::Io(err)),
+    };
+    let metadata: TerraformRuntimeMetadata =
+        serde_json::from_slice(&bytes).map_err(|err| DeployerError::Other(err.to_string()))?;
+
+    let terraform_root = PathBuf::from(&metadata.terraform_root);
+    let mut health_checks = Vec::new();
+    health_checks.push(format!("terraform_runtime_json:{}", runtime_path.display()));
+    health_checks.push(format!(
+        "terraform_root:{}",
+        if terraform_root.exists() {
+            "present"
+        } else {
+            "missing"
+        }
+    ));
+    for script in &metadata.scripts {
+        let present = runtime_artifacts.deploy_dir.join(script).exists();
+        health_checks.push(format!(
+            "script:{}:{}",
+            script,
+            if present { "present" } else { "missing" }
+        ));
+    }
+
+    let ready = terraform_root.exists()
+        && metadata
+            .scripts
+            .iter()
+            .all(|script| runtime_artifacts.deploy_dir.join(script).exists());
+    let state = if ready {
+        "handoff_ready"
+    } else {
+        "handoff_incomplete"
+    };
+
+    Ok(Some(ExecutionOutcome {
+        status: Some(state.to_string()),
+        message: Some("terraform status synthesized from local handoff artifacts".into()),
+        output_files: vec![
+            "terraform-runtime.json".into(),
+            "terraform-handoff.txt".into(),
+            "terraform-init.sh".into(),
+            "terraform-plan.sh".into(),
+            "terraform-apply.sh".into(),
+            "terraform-destroy.sh".into(),
+            "terraform-status.sh".into(),
+        ],
+        payload: Some(ExecutionOutcomePayload::Status(
+            crate::deployment::StatusExecutionOutcome {
+                deployment_id: runtime_artifacts.handoff.output_dir.clone(),
+                state: state.to_string(),
+                health_checks,
+            },
+        )),
+    }))
+}
+
+fn synthesize_scripted_handoff_status(
+    runtime_artifacts: &RuntimeArtifacts,
+    handoff_note: &str,
+    checks: Vec<(&str, &str)>,
+    message: &str,
+) -> Result<Option<ExecutionOutcome>> {
+    let note_path = runtime_artifacts.deploy_dir.join(handoff_note);
+    if !note_path.exists() {
+        return Ok(None);
+    }
+
+    let mut health_checks = Vec::new();
+    let mut ready = true;
+    let mut output_files = vec![handoff_note.to_string()];
+    for (name, relative_path) in checks {
+        let path = runtime_artifacts.deploy_dir.join(relative_path);
+        let present = path.exists();
+        ready &= present;
+        health_checks.push(format!(
+            "{}:{}",
+            name,
+            if present { "present" } else { "missing" }
+        ));
+        if path.is_file() {
+            output_files.push(relative_path.to_string());
+        }
+    }
+    let state = if ready {
+        "handoff_ready"
+    } else {
+        "handoff_incomplete"
+    };
+
+    Ok(Some(ExecutionOutcome {
+        status: Some(state.to_string()),
+        message: Some(message.to_string()),
+        output_files,
+        payload: Some(ExecutionOutcomePayload::Status(
+            crate::deployment::StatusExecutionOutcome {
+                deployment_id: runtime_artifacts.handoff.output_dir.clone(),
+                state: state.to_string(),
+                health_checks,
+            },
+        )),
+    }))
 }
 
 fn operation_payload(
@@ -753,6 +1434,7 @@ fn persist_runtime_artifacts(
     let invoke_file = fs::File::create(&invoke_path)?;
     serde_json::to_writer_pretty(invoke_file, &invocation)?;
 
+    materialize_adapter_handoff_assets(config, selection, deploy_dir)?;
     let handoff = write_runner_diagnostics(config, deploy_dir, selection, &plan_path)?;
 
     Ok(RuntimeArtifacts {
@@ -763,6 +1445,477 @@ fn persist_runtime_artifacts(
         handoff_path: handoff.handoff_path,
         runner_command_path: handoff.runner_command_path,
     })
+}
+
+fn materialize_adapter_handoff_assets(
+    config: &DeployerConfig,
+    selection: &DeploymentPackSelection,
+    deploy_dir: &Path,
+) -> Result<()> {
+    if uses_terraform_handoff(config) {
+        materialize_terraform_handoff_assets(config, selection, deploy_dir)?;
+    } else if config.provider == crate::config::Provider::K8s && config.strategy == "raw-manifests"
+    {
+        materialize_k8s_raw_handoff_assets(config, selection, deploy_dir)?;
+    } else if config.provider == crate::config::Provider::K8s && config.strategy == "operator" {
+        materialize_operator_handoff_assets(config, selection, deploy_dir)?;
+    } else if config.provider == crate::config::Provider::K8s && config.strategy == "helm" {
+        materialize_helm_handoff_assets(config, selection, deploy_dir)?;
+    } else if config.provider == crate::config::Provider::Generic
+        && config.strategy == "serverless-container"
+    {
+        materialize_serverless_handoff_assets(config, selection, deploy_dir)?;
+    } else if uses_snap_handoff(config) {
+        materialize_snap_handoff_assets(config, selection, deploy_dir)?;
+    } else if uses_juju_machine_handoff(config) {
+        materialize_juju_machine_handoff_assets(config, selection, deploy_dir)?;
+    } else if uses_juju_k8s_handoff(config) {
+        materialize_juju_k8s_handoff_assets(config, selection, deploy_dir)?;
+    }
+    Ok(())
+}
+
+fn materialize_terraform_handoff_assets(
+    config: &DeployerConfig,
+    selection: &DeploymentPackSelection,
+    deploy_dir: &Path,
+) -> Result<()> {
+    let terraform_root = deploy_dir.join("terraform");
+    let copied = copy_pack_subtree(&selection.pack_path, "terraform", &terraform_root)?;
+    if copied.is_empty() {
+        return Ok(());
+    }
+    let local_terraform = terraform_root.join("terraform");
+    if local_terraform.exists() {
+        set_executable_if_unix(&local_terraform)?;
+    }
+
+    let tfvars_example = format!("{}.tfvars.example", config.environment);
+    let init_script = "terraform-init.sh";
+    let plan_script = "terraform-plan.sh";
+    let apply_script = "terraform-apply.sh";
+    let destroy_script = "terraform-destroy.sh";
+    let status_script = "terraform-status.sh";
+    write_executable_script(
+        &deploy_dir.join(init_script),
+        terraform_script_prelude("\"$TERRAFORM_BIN\" init \"$@\""),
+    )?;
+    write_executable_script(
+        &deploy_dir.join(plan_script),
+        terraform_plan_like_script("plan", &tfvars_example),
+    )?;
+    write_executable_script(
+        &deploy_dir.join(apply_script),
+        terraform_plan_like_script("apply", &tfvars_example),
+    )?;
+    write_executable_script(
+        &deploy_dir.join(destroy_script),
+        terraform_plan_like_script("destroy", &tfvars_example),
+    )?;
+    write_executable_script(
+        &deploy_dir.join(status_script),
+        terraform_script_prelude("\"$TERRAFORM_BIN\" show -json \"$@\""),
+    )?;
+
+    let metadata = TerraformRuntimeMetadata {
+        terraform_root: terraform_root.display().to_string(),
+        copied_files: copied.clone(),
+        scripts: vec![
+            init_script.to_string(),
+            plan_script.to_string(),
+            apply_script.to_string(),
+            destroy_script.to_string(),
+            status_script.to_string(),
+        ],
+        init_command: format!("./{init_script}"),
+        plan_command: format!("./{plan_script}"),
+        apply_command: format!("./{apply_script}"),
+        destroy_command: format!("./{destroy_script}"),
+        status_command: format!("./{status_script}"),
+    };
+    fs::write(
+        deploy_dir.join("terraform-runtime.json"),
+        serde_json::to_vec_pretty(&metadata)
+            .map_err(|err| DeployerError::Other(err.to_string()))?,
+    )?;
+
+    let mut note = String::new();
+    note.push_str("Terraform handoff assets were materialized from the deployment pack.\n");
+    note.push_str(&format!("terraform_root={}\n", terraform_root.display()));
+    note.push_str(&format!(
+        "suggested_tfvars_example={}\n",
+        terraform_root.join(&tfvars_example).display()
+    ));
+    note.push_str(
+        "scripts=terraform-init.sh, terraform-plan.sh, terraform-apply.sh, terraform-destroy.sh, terraform-status.sh\n",
+    );
+    note.push_str(&format!("status_command={}\n", metadata.status_command));
+    note.push_str("copied_files:\n");
+    for path in copied {
+        note.push_str(&format!("- {path}\n"));
+    }
+    fs::write(deploy_dir.join("terraform-handoff.txt"), note)?;
+    Ok(())
+}
+
+fn materialize_k8s_raw_handoff_assets(
+    _config: &DeployerConfig,
+    selection: &DeploymentPackSelection,
+    deploy_dir: &Path,
+) -> Result<()> {
+    let manifests = read_pack_asset(
+        &selection.pack_path,
+        "assets/examples/rendered-manifests.yaml",
+    )?;
+    let k8s_root = deploy_dir.join("k8s");
+    fs::create_dir_all(&k8s_root)?;
+    fs::write(k8s_root.join("rendered-manifests.yaml"), manifests)?;
+    write_executable_script(
+        &deploy_dir.join("kubectl-apply.sh"),
+        kubectl_script("apply -f \"$K8S_ROOT/rendered-manifests.yaml\" \"$@\""),
+    )?;
+    write_executable_script(
+        &deploy_dir.join("kubectl-delete.sh"),
+        kubectl_script("delete -f \"$K8S_ROOT/rendered-manifests.yaml\" \"$@\""),
+    )?;
+    write_executable_script(
+        &deploy_dir.join("kubectl-status.sh"),
+        kubectl_script("get -f \"$K8S_ROOT/rendered-manifests.yaml\" \"$@\""),
+    )?;
+
+    let mut note = String::new();
+    note.push_str("K8s raw handoff assets were materialized from the deployment pack.\n");
+    note.push_str(&format!(
+        "manifest_path={}\n",
+        k8s_root.join("rendered-manifests.yaml").display()
+    ));
+    note.push_str("scripts=kubectl-apply.sh, kubectl-delete.sh, kubectl-status.sh\n");
+    fs::write(deploy_dir.join("k8s-handoff.txt"), note)?;
+    Ok(())
+}
+
+fn materialize_helm_handoff_assets(
+    config: &DeployerConfig,
+    selection: &DeploymentPackSelection,
+    deploy_dir: &Path,
+) -> Result<()> {
+    let chart_root = deploy_dir.join("helm-chart");
+    let copied = copy_pack_subtree(&selection.pack_path, "chart", &chart_root)?;
+    if copied.is_empty() {
+        return Ok(());
+    }
+
+    let release_name = format!("greentic-{}", config.tenant);
+    write_executable_script(
+        &deploy_dir.join("helm-upgrade.sh"),
+        helm_script(&format!(
+            "upgrade --install {release_name} \"$CHART_ROOT\" \"$@\""
+        )),
+    )?;
+    write_executable_script(
+        &deploy_dir.join("helm-rollback.sh"),
+        helm_script(&format!("rollback {release_name} \"$@\"")),
+    )?;
+    write_executable_script(
+        &deploy_dir.join("helm-status.sh"),
+        helm_script(&format!("status {release_name} \"$@\"")),
+    )?;
+
+    let mut note = String::new();
+    note.push_str("Helm handoff assets were materialized from the deployment pack.\n");
+    note.push_str(&format!("chart_root={}\n", chart_root.display()));
+    note.push_str(&format!("release_name={release_name}\n"));
+    note.push_str("scripts=helm-upgrade.sh, helm-rollback.sh, helm-status.sh\n");
+    note.push_str("copied_files:\n");
+    for path in copied {
+        note.push_str(&format!("- {path}\n"));
+    }
+    fs::write(deploy_dir.join("helm-handoff.txt"), note)?;
+    Ok(())
+}
+
+fn materialize_operator_handoff_assets(
+    _config: &DeployerConfig,
+    selection: &DeploymentPackSelection,
+    deploy_dir: &Path,
+) -> Result<()> {
+    let manifests = read_pack_asset(
+        &selection.pack_path,
+        "assets/examples/rendered-manifests.yaml",
+    )?;
+    let operator_root = deploy_dir.join("operator");
+    fs::create_dir_all(&operator_root)?;
+    fs::write(operator_root.join("rendered-manifests.yaml"), manifests)?;
+    write_executable_script(
+        &deploy_dir.join("operator-apply.sh"),
+        kubectl_root_script(
+            "OPERATOR_ROOT",
+            "apply -f \"$OPERATOR_ROOT/rendered-manifests.yaml\" \"$@\"",
+        ),
+    )?;
+    write_executable_script(
+        &deploy_dir.join("operator-delete.sh"),
+        kubectl_root_script(
+            "OPERATOR_ROOT",
+            "delete -f \"$OPERATOR_ROOT/rendered-manifests.yaml\" \"$@\"",
+        ),
+    )?;
+    write_executable_script(
+        &deploy_dir.join("operator-status.sh"),
+        kubectl_root_script(
+            "OPERATOR_ROOT",
+            "get -f \"$OPERATOR_ROOT/rendered-manifests.yaml\" \"$@\"",
+        ),
+    )?;
+
+    let mut note = String::new();
+    note.push_str("Operator handoff assets were materialized from the deployment pack.\n");
+    note.push_str(&format!(
+        "manifest_path={}\n",
+        operator_root.join("rendered-manifests.yaml").display()
+    ));
+    note.push_str("scripts=operator-apply.sh, operator-delete.sh, operator-status.sh\n");
+    note.push_str("admin_api=localhost_only_https_mtls\n");
+    fs::write(deploy_dir.join("operator-handoff.txt"), note)?;
+    Ok(())
+}
+
+fn materialize_serverless_handoff_assets(
+    _config: &DeployerConfig,
+    selection: &DeploymentPackSelection,
+    deploy_dir: &Path,
+) -> Result<()> {
+    let descriptor = read_pack_asset(
+        &selection.pack_path,
+        "assets/examples/deployment-descriptor.json",
+    )?;
+    let serverless_root = deploy_dir.join("serverless");
+    fs::create_dir_all(&serverless_root)?;
+    fs::write(
+        serverless_root.join("deployment-descriptor.json"),
+        descriptor,
+    )?;
+    write_executable_script(
+        &deploy_dir.join("serverless-deploy.sh"),
+        generic_root_script(
+            "SERVERLESS_ROOT",
+            "echo \"serverless deploy descriptor: $SERVERLESS_ROOT/deployment-descriptor.json\"",
+        ),
+    )?;
+    write_executable_script(
+        &deploy_dir.join("serverless-status.sh"),
+        generic_root_script(
+            "SERVERLESS_ROOT",
+            "echo \"serverless status descriptor: $SERVERLESS_ROOT/deployment-descriptor.json\"",
+        ),
+    )?;
+    write_executable_script(
+        &deploy_dir.join("serverless-destroy.sh"),
+        generic_root_script(
+            "SERVERLESS_ROOT",
+            "echo \"serverless destroy descriptor: $SERVERLESS_ROOT/deployment-descriptor.json\"",
+        ),
+    )?;
+
+    let mut note = String::new();
+    note.push_str("Serverless handoff assets were materialized from the deployment pack.\n");
+    note.push_str(&format!(
+        "descriptor_path={}\n",
+        serverless_root.join("deployment-descriptor.json").display()
+    ));
+    note.push_str("scripts=serverless-deploy.sh, serverless-destroy.sh, serverless-status.sh\n");
+    note.push_str("filesystem_hint=tmp_only\n");
+    fs::write(deploy_dir.join("serverless-handoff.txt"), note)?;
+    Ok(())
+}
+
+fn materialize_snap_handoff_assets(
+    _config: &DeployerConfig,
+    selection: &DeploymentPackSelection,
+    deploy_dir: &Path,
+) -> Result<()> {
+    let snap_root = deploy_dir.join("snap");
+    let copied = copy_pack_subtree(&selection.pack_path, "snap", &snap_root)?;
+    if copied.is_empty() {
+        return Ok(());
+    }
+    write_executable_script(
+        &deploy_dir.join("snap-install.sh"),
+        generic_root_script(
+            "SNAP_ROOT",
+            "echo \"snap install scaffold from $SNAP_ROOT/fetch/snapcraft.yaml\"",
+        ),
+    )?;
+    write_executable_script(
+        &deploy_dir.join("snap-remove.sh"),
+        generic_root_script(
+            "SNAP_ROOT",
+            "echo \"snap remove scaffold from $SNAP_ROOT/embedded/snapcraft.yaml\"",
+        ),
+    )?;
+    write_executable_script(
+        &deploy_dir.join("snap-status.sh"),
+        generic_root_script(
+            "SNAP_ROOT",
+            "echo \"snap status scaffold from $SNAP_ROOT/fetch/snapcraft.yaml\"",
+        ),
+    )?;
+
+    let mut note = String::new();
+    note.push_str("Snap handoff assets were materialized from the deployment pack.\n");
+    note.push_str(&format!("snap_root={}\n", snap_root.display()));
+    note.push_str("scripts=snap-install.sh, snap-remove.sh, snap-status.sh\n");
+    note.push_str("copied_files:\n");
+    for path in copied {
+        note.push_str(&format!("- {path}\n"));
+    }
+    fs::write(deploy_dir.join("snap-handoff.txt"), note)?;
+    Ok(())
+}
+
+fn materialize_juju_machine_handoff_assets(
+    _config: &DeployerConfig,
+    selection: &DeploymentPackSelection,
+    deploy_dir: &Path,
+) -> Result<()> {
+    let charm_root = deploy_dir.join("juju-machine-charm");
+    let copied = copy_pack_subtree(&selection.pack_path, "charm", &charm_root)?;
+    if copied.is_empty() {
+        return Ok(());
+    }
+    write_executable_script(
+        &deploy_dir.join("juju-machine-deploy.sh"),
+        juju_script(
+            "juju-machine-charm",
+            "deploy \"$CHARM_ROOT\" greentic-operator \"$@\"",
+        ),
+    )?;
+    write_executable_script(
+        &deploy_dir.join("juju-machine-remove.sh"),
+        juju_script(
+            "juju-machine-charm",
+            "remove-application greentic-operator \"$@\"",
+        ),
+    )?;
+    write_executable_script(
+        &deploy_dir.join("juju-machine-status.sh"),
+        juju_script("juju-machine-charm", "status greentic-operator \"$@\""),
+    )?;
+
+    let mut note = String::new();
+    note.push_str("Juju machine handoff assets were materialized from the deployment pack.\n");
+    note.push_str(&format!("charm_root={}\n", charm_root.display()));
+    note.push_str(
+        "scripts=juju-machine-deploy.sh, juju-machine-remove.sh, juju-machine-status.sh\n",
+    );
+    note.push_str("copied_files:\n");
+    for path in copied {
+        note.push_str(&format!("- {path}\n"));
+    }
+    fs::write(deploy_dir.join("juju-machine-handoff.txt"), note)?;
+    Ok(())
+}
+
+fn materialize_juju_k8s_handoff_assets(
+    _config: &DeployerConfig,
+    selection: &DeploymentPackSelection,
+    deploy_dir: &Path,
+) -> Result<()> {
+    let charm_root = deploy_dir.join("juju-k8s-charm");
+    let copied = copy_pack_subtree(&selection.pack_path, "charm", &charm_root)?;
+    if copied.is_empty() {
+        return Ok(());
+    }
+    write_executable_script(
+        &deploy_dir.join("juju-k8s-deploy.sh"),
+        juju_script(
+            "juju-k8s-charm",
+            "deploy \"$CHARM_ROOT\" greentic-operator-k8s \"$@\"",
+        ),
+    )?;
+    write_executable_script(
+        &deploy_dir.join("juju-k8s-remove.sh"),
+        juju_script(
+            "juju-k8s-charm",
+            "remove-application greentic-operator-k8s \"$@\"",
+        ),
+    )?;
+    write_executable_script(
+        &deploy_dir.join("juju-k8s-status.sh"),
+        juju_script("juju-k8s-charm", "status greentic-operator-k8s \"$@\""),
+    )?;
+
+    let mut note = String::new();
+    note.push_str("Juju k8s handoff assets were materialized from the deployment pack.\n");
+    note.push_str(&format!("charm_root={}\n", charm_root.display()));
+    note.push_str("scripts=juju-k8s-deploy.sh, juju-k8s-remove.sh, juju-k8s-status.sh\n");
+    note.push_str("copied_files:\n");
+    for path in copied {
+        note.push_str(&format!("- {path}\n"));
+    }
+    fs::write(deploy_dir.join("juju-k8s-handoff.txt"), note)?;
+    Ok(())
+}
+
+fn terraform_script_prelude(command: &str) -> String {
+    format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\n{command}\n"
+    )
+}
+
+fn terraform_plan_like_script(operation: &str, tfvars_example: &str) -> String {
+    format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\nVAR_FILE=\"\"\nif [ -f \"{tfvars_example}\" ]; then\n  VAR_FILE=\"{tfvars_example}\"\nfi\nif [ -n \"$VAR_FILE\" ]; then\n  \"$TERRAFORM_BIN\" {operation} -var-file=\"$VAR_FILE\" \"$@\"\nelse\n  \"$TERRAFORM_BIN\" {operation} \"$@\"\nfi\n"
+    )
+}
+
+fn kubectl_script(command: &str) -> String {
+    format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nK8S_ROOT=\"${{SCRIPT_DIR}}/k8s\"\n{command}\n"
+    )
+}
+
+fn kubectl_root_script(root_var: &str, command: &str) -> String {
+    format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n{root_var}=\"${{SCRIPT_DIR}}/{}\"\nkubectl {command}\n",
+        root_var.to_ascii_lowercase().trim_end_matches("_root")
+    )
+}
+
+fn helm_script(command: &str) -> String {
+    format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nCHART_ROOT=\"${{SCRIPT_DIR}}/helm-chart\"\nhelm {command}\n"
+    )
+}
+
+fn juju_script(charm_dir: &str, command: &str) -> String {
+    format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nCHARM_ROOT=\"${{SCRIPT_DIR}}/{charm_dir}\"\njuju {command}\n"
+    )
+}
+
+fn generic_root_script(root_var: &str, command: &str) -> String {
+    format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n{root_var}=\"${{SCRIPT_DIR}}/{}\"\n{command}\n",
+        root_var.to_ascii_lowercase().trim_end_matches("_root")
+    )
+}
+
+fn write_executable_script(path: &Path, contents: String) -> Result<()> {
+    fs::write(path, contents)?;
+    set_executable_if_unix(path)?;
+    Ok(())
+}
+
+fn set_executable_if_unix(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)?;
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -794,6 +1947,18 @@ struct WrittenDiagnostics {
     invocation: DeployerInvocation,
     handoff_path: PathBuf,
     runner_command_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TerraformRuntimeMetadata {
+    terraform_root: String,
+    copied_files: Vec<String>,
+    scripts: Vec<String>,
+    init_command: String,
+    plan_command: String,
+    apply_command: String,
+    destroy_command: String,
+    status_command: String,
 }
 
 fn write_runner_diagnostics(
@@ -1041,6 +2206,7 @@ mod tests {
             distributor_token: None,
             preview: false,
             dry_run: false,
+            execute_local: false,
             output: crate::config::OutputFormat::Json,
             greentic: greentic_config::ConfigResolver::new()
                 .load()
@@ -1048,6 +2214,8 @@ mod tests {
                 .config,
             provenance: greentic_config::ProvenanceMap::new(),
             config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
         }
     }
 
@@ -1216,6 +2384,15 @@ mod tests {
             );
             append_tar_entry(
                 &mut builder,
+                "assets/examples/rendered-manifests.yaml",
+                br#"apiVersion: v1
+kind: Namespace
+metadata:
+  name: greentic
+"#,
+            );
+            append_tar_entry(
+                &mut builder,
                 "assets/schemas/apply-execution-output.schema.json",
                 br#"{"type":"object","required":["kind","deployment_id","state","endpoints"],"properties":{"kind":{"const":"apply"},"deployment_id":{"type":"string"},"state":{"type":"string"},"endpoints":{"type":"array","items":{"type":"string"}}}}"#,
             );
@@ -1238,6 +2415,47 @@ mod tests {
                 &mut builder,
                 "assets/schemas/rollback-output.schema.json",
                 br#"{"type":"object","required":["kind","capability","provider","strategy","pack_id","flow_id","target_capability"],"properties":{"kind":{"const":"rollback"},"capability":{"const":"rollback"},"provider":{"type":"string"},"strategy":{"type":"string"},"pack_id":{"type":"string"},"flow_id":{"type":"string"},"target_capability":{"const":"apply"}}}"#,
+            );
+            append_tar_entry(&mut builder, "terraform/main.tf", br#"module "root" {}"#);
+            append_tar_entry(
+                &mut builder,
+                "terraform/staging.tfvars.example",
+                br#"dns_name = "acme.example.test""#,
+            );
+            append_tar_entry(
+                &mut builder,
+                "terraform/modules/operator/main.tf",
+                br#"module "operator" {}"#,
+            );
+            append_tar_entry(
+                &mut builder,
+                "terraform/terraform",
+                br#"#!/usr/bin/env bash
+set -euo pipefail
+echo "$@" > terraform-invocation.args
+"#,
+            );
+            append_tar_entry(
+                &mut builder,
+                "chart/Chart.yaml",
+                br#"apiVersion: v2
+name: greentic
+version: 0.1.0
+"#,
+            );
+            append_tar_entry(
+                &mut builder,
+                "chart/values.yaml",
+                br#"image:
+  repository: ghcr.io/greenticai/greentic-runtime
+"#,
+            );
+            append_tar_entry(
+                &mut builder,
+                "chart/templates/deployment.yaml",
+                br#"apiVersion: apps/v1
+kind: Deployment
+"#,
             );
         }
         let bytes = builder.into_inner().expect("tar bytes");
@@ -1564,6 +2782,469 @@ mod tests {
             other => panic!("unexpected payload: {:?}", other),
         }
         assert!(result.output_validation.as_ref().expect("validation").valid);
+    }
+
+    #[tokio::test]
+    async fn terraform_status_synthesizes_local_execution_outcome() {
+        let _guard = TEST_LOCK.lock().await;
+        clear_deployment_executor();
+        let base = std::env::current_dir()
+            .expect("cwd")
+            .join("target/tmp-tests");
+        std::fs::create_dir_all(&base).expect("create tmp base");
+        let dir = tempfile::tempdir_in(base).expect("temp dir");
+        let pack_path = write_test_pack(true);
+
+        let mut greentic = greentic_config::ConfigResolver::new()
+            .load()
+            .expect("load default config")
+            .config;
+        greentic.paths.state_dir = dir.path().join(".greentic-state");
+
+        let result = run(DeployerConfig {
+            capability: DeployerCapability::Status,
+            provider: Provider::Generic,
+            strategy: "terraform".into(),
+            tenant: "acme".into(),
+            environment: "staging".into(),
+            pack_path: pack_path.clone(),
+            providers_dir: PathBuf::from("providers/deployer"),
+            packs_dir: PathBuf::from("packs"),
+            provider_pack: Some(pack_path),
+            pack_ref: None,
+            distributor_url: None,
+            distributor_token: None,
+            preview: false,
+            dry_run: false,
+            execute_local: false,
+            output: crate::config::OutputFormat::Text,
+            greentic,
+            provenance: greentic_config::ProvenanceMap::new(),
+            config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
+        })
+        .await
+        .expect("terraform status runs");
+
+        assert!(result.executed);
+        assert_eq!(result.capability, "status");
+        let execution = result.execution.expect("execution report");
+        assert_eq!(execution.status.as_deref(), Some("handoff_ready"));
+        match execution.outcome_payload.expect("outcome payload") {
+            ExecutionOutcomePayload::Status(payload) => {
+                assert_eq!(payload.state, "handoff_ready");
+                assert!(
+                    payload
+                        .health_checks
+                        .iter()
+                        .any(|entry| entry == "terraform_root:present")
+                );
+                assert!(
+                    payload
+                        .health_checks
+                        .iter()
+                        .any(|entry| entry == "script:terraform-status.sh:present")
+                );
+            }
+            other => panic!("unexpected outcome payload: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn terraform_apply_execute_runs_local_script_via_fake_terraform() {
+        let _guard = TEST_LOCK.lock().await;
+        clear_deployment_executor();
+        let base = std::env::current_dir()
+            .expect("cwd")
+            .join("target/tmp-tests");
+        std::fs::create_dir_all(&base).expect("create tmp base");
+        let dir = tempfile::tempdir_in(&base).expect("temp dir");
+        let pack_path = write_test_pack(true);
+        let mut greentic = greentic_config::ConfigResolver::new()
+            .load()
+            .expect("load default config")
+            .config;
+        greentic.paths.state_dir = dir.path().join(".greentic-state");
+
+        let result = run(DeployerConfig {
+            capability: DeployerCapability::Apply,
+            provider: Provider::Generic,
+            strategy: "terraform".into(),
+            tenant: "acme".into(),
+            environment: "staging".into(),
+            pack_path: pack_path.clone(),
+            providers_dir: PathBuf::from("providers/deployer"),
+            packs_dir: PathBuf::from("packs"),
+            provider_pack: Some(pack_path),
+            pack_ref: None,
+            distributor_url: None,
+            distributor_token: None,
+            preview: false,
+            dry_run: false,
+            execute_local: true,
+            output: crate::config::OutputFormat::Text,
+            greentic,
+            provenance: greentic_config::ProvenanceMap::new(),
+            config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
+        })
+        .await
+        .expect("terraform apply runs");
+        assert!(result.executed);
+        let execution = result.execution.expect("execution report");
+        assert_eq!(execution.status.as_deref(), Some("applied"));
+        assert!(
+            execution
+                .output_files
+                .iter()
+                .any(|entry| entry == "terraform-apply.stdout.log")
+        );
+        let applied_args = std::fs::read_to_string(
+            Path::new(&result.output_dir)
+                .join("terraform")
+                .join("terraform-invocation.args"),
+        )
+        .expect("read fake terraform args");
+        assert!(applied_args.contains("apply"));
+        assert!(applied_args.contains("-var-file=staging.tfvars.example"));
+    }
+
+    #[test]
+    fn persist_runtime_artifacts_materializes_terraform_handoff_assets() {
+        let base = std::env::current_dir()
+            .expect("cwd")
+            .join("target/tmp-tests");
+        std::fs::create_dir_all(&base).expect("create tmp base");
+        let dir = tempfile::tempdir_in(base).expect("temp dir");
+        let pack_path = write_test_pack(true);
+
+        let mut greentic = greentic_config::ConfigResolver::new()
+            .load()
+            .expect("load default config")
+            .config;
+        greentic.paths.state_dir = dir.path().join(".greentic-state");
+
+        let config = DeployerConfig {
+            capability: DeployerCapability::Plan,
+            provider: Provider::Generic,
+            strategy: "terraform".into(),
+            tenant: "acme".into(),
+            environment: "staging".into(),
+            pack_path: pack_path.clone(),
+            providers_dir: PathBuf::from("providers/deployer"),
+            packs_dir: PathBuf::from("packs"),
+            provider_pack: Some(pack_path.clone()),
+            pack_ref: None,
+            distributor_url: None,
+            distributor_token: None,
+            preview: false,
+            dry_run: false,
+            execute_local: false,
+            output: crate::config::OutputFormat::Json,
+            greentic,
+            provenance: greentic_config::ProvenanceMap::new(),
+            config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
+        };
+        let plan = pack_introspect::build_plan(&config).expect("build plan");
+        let deploy_dir = dir.path().join("output");
+        std::fs::create_dir_all(&deploy_dir).expect("create output dir");
+        let selection = DeploymentPackSelection {
+            dispatch: crate::deployment::DeploymentDispatch {
+                capability: DeployerCapability::Plan,
+                pack_id: "greentic.deploy.terraform".into(),
+                flow_id: "plan_terraform".into(),
+            },
+            pack_path,
+            manifest: PackManifest {
+                schema_version: "pack-v1".to_string(),
+                pack_id: PackId::from_str("greentic.deploy.terraform").unwrap(),
+                name: None,
+                version: Version::new(0, 1, 0),
+                kind: PackKind::Application,
+                publisher: "greentic".to_string(),
+                secret_requirements: Vec::new(),
+                components: Vec::new(),
+                flows: Vec::new(),
+                dependencies: Vec::new(),
+                capabilities: Vec::new(),
+                signatures: Default::default(),
+                bootstrap: None,
+                extensions: None,
+            },
+            origin: "test".into(),
+            candidates: Vec::new(),
+        };
+
+        let artifacts = persist_runtime_artifacts(&config, &plan, &selection, &deploy_dir)
+            .expect("persist runtime artifacts");
+
+        assert!(artifacts.deploy_dir.join("terraform/main.tf").exists());
+        assert!(
+            artifacts
+                .deploy_dir
+                .join("terraform/modules/operator/main.tf")
+                .exists()
+        );
+        assert!(artifacts.deploy_dir.join("terraform-init.sh").exists());
+        assert!(artifacts.deploy_dir.join("terraform-plan.sh").exists());
+        assert!(artifacts.deploy_dir.join("terraform-apply.sh").exists());
+        assert!(artifacts.deploy_dir.join("terraform-destroy.sh").exists());
+        assert!(artifacts.deploy_dir.join("terraform-status.sh").exists());
+        let metadata: TerraformRuntimeMetadata = serde_json::from_slice(
+            &std::fs::read(artifacts.deploy_dir.join("terraform-runtime.json"))
+                .expect("read terraform runtime metadata"),
+        )
+        .expect("parse terraform runtime metadata");
+        assert_eq!(
+            metadata.scripts,
+            vec![
+                "terraform-init.sh".to_string(),
+                "terraform-plan.sh".to_string(),
+                "terraform-apply.sh".to_string(),
+                "terraform-destroy.sh".to_string(),
+                "terraform-status.sh".to_string()
+            ]
+        );
+        assert_eq!(metadata.status_command, "./terraform-status.sh");
+        let note = std::fs::read_to_string(artifacts.deploy_dir.join("terraform-handoff.txt"))
+            .expect("read terraform handoff note");
+        assert!(note.contains("terraform_root="));
+        assert!(note.contains("copied_files:"));
+        assert!(note.contains("modules/operator/main.tf"));
+        assert!(note.contains("status_command=./terraform-status.sh"));
+    }
+
+    #[test]
+    fn render_operation_result_text_includes_terraform_runtime_summary() {
+        let base = std::env::current_dir()
+            .expect("cwd")
+            .join("target/tmp-tests");
+        std::fs::create_dir_all(&base).expect("create tmp base");
+        let dir = tempfile::tempdir_in(base).expect("temp dir");
+        let output_dir = dir.path().join("deploy");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+        std::fs::write(
+            output_dir.join("terraform-runtime.json"),
+            serde_json::to_vec_pretty(&TerraformRuntimeMetadata {
+                terraform_root: output_dir.join("terraform").display().to_string(),
+                copied_files: vec!["main.tf".into(), "modules/operator/main.tf".into()],
+                scripts: vec!["terraform-status.sh".into()],
+                init_command: "./terraform-init.sh".into(),
+                plan_command: "./terraform-plan.sh".into(),
+                apply_command: "./terraform-apply.sh".into(),
+                destroy_command: "./terraform-destroy.sh".into(),
+                status_command: "./terraform-status.sh".into(),
+            })
+            .expect("encode terraform runtime metadata"),
+        )
+        .expect("write runtime metadata");
+
+        let rendered = render_operation_result_text(&OperationResult {
+            capability: "status".into(),
+            executed: false,
+            preview: false,
+            output_dir: output_dir.display().to_string(),
+            plan_path: "/tmp/plan.json".into(),
+            invoke_path: "/tmp/invoke.json".into(),
+            pack_id: "greentic.deploy.terraform".into(),
+            flow_id: "status_terraform".into(),
+            pack_path: "/tmp/provider.gtpack".into(),
+            contract: None,
+            capability_contract: None,
+            payload: Some(OperationPayload::Status(Box::new(StatusPayload {
+                capability: "status".into(),
+                provider: "generic".into(),
+                strategy: "terraform".into(),
+                pack_id: "greentic.deploy.terraform".into(),
+                flow_id: "status_terraform".into(),
+                rendered_output: None,
+            }))),
+            output_validation: None,
+            execution: None,
+        });
+
+        assert!(rendered.contains("terraform_runtime.present=true"));
+        assert!(
+            rendered.contains("terraform_runtime.copied_files=main.tf, modules/operator/main.tf")
+        );
+        assert!(rendered.contains("terraform_runtime.status_command=./terraform-status.sh"));
+    }
+
+    #[test]
+    fn persist_runtime_artifacts_materializes_k8s_raw_handoff_assets() {
+        let base = std::env::current_dir()
+            .expect("cwd")
+            .join("target/tmp-tests");
+        std::fs::create_dir_all(&base).expect("create tmp base");
+        let dir = tempfile::tempdir_in(base).expect("temp dir");
+        let pack_path = write_test_pack(true);
+
+        let mut greentic = greentic_config::ConfigResolver::new()
+            .load()
+            .expect("load default config")
+            .config;
+        greentic.paths.state_dir = dir.path().join(".greentic-state");
+
+        let config = DeployerConfig {
+            capability: DeployerCapability::Plan,
+            provider: Provider::K8s,
+            strategy: "raw-manifests".into(),
+            tenant: "acme".into(),
+            environment: "staging".into(),
+            pack_path: pack_path.clone(),
+            providers_dir: PathBuf::from("providers/deployer"),
+            packs_dir: PathBuf::from("packs"),
+            provider_pack: Some(pack_path.clone()),
+            pack_ref: None,
+            distributor_url: None,
+            distributor_token: None,
+            preview: false,
+            dry_run: false,
+            execute_local: false,
+            output: crate::config::OutputFormat::Json,
+            greentic,
+            provenance: greentic_config::ProvenanceMap::new(),
+            config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
+        };
+        let plan = pack_introspect::build_plan(&config).expect("build plan");
+        let deploy_dir = dir.path().join("output");
+        std::fs::create_dir_all(&deploy_dir).expect("create output dir");
+        let selection = DeploymentPackSelection {
+            dispatch: crate::deployment::DeploymentDispatch {
+                capability: DeployerCapability::Plan,
+                pack_id: "greentic.deploy.k8s".into(),
+                flow_id: "plan_k8s_raw".into(),
+            },
+            pack_path,
+            manifest: PackManifest {
+                schema_version: "pack-v1".to_string(),
+                pack_id: PackId::from_str("greentic.deploy.k8s").unwrap(),
+                name: None,
+                version: Version::new(0, 1, 0),
+                kind: PackKind::Application,
+                publisher: "greentic".to_string(),
+                secret_requirements: Vec::new(),
+                components: Vec::new(),
+                flows: Vec::new(),
+                dependencies: Vec::new(),
+                capabilities: Vec::new(),
+                signatures: Default::default(),
+                bootstrap: None,
+                extensions: None,
+            },
+            origin: "test".into(),
+            candidates: Vec::new(),
+        };
+
+        let artifacts = persist_runtime_artifacts(&config, &plan, &selection, &deploy_dir)
+            .expect("persist runtime artifacts");
+
+        assert!(
+            artifacts
+                .deploy_dir
+                .join("k8s/rendered-manifests.yaml")
+                .exists()
+        );
+        assert!(artifacts.deploy_dir.join("kubectl-apply.sh").exists());
+        assert!(artifacts.deploy_dir.join("kubectl-delete.sh").exists());
+        assert!(artifacts.deploy_dir.join("kubectl-status.sh").exists());
+        let note = std::fs::read_to_string(artifacts.deploy_dir.join("k8s-handoff.txt"))
+            .expect("read k8s handoff note");
+        assert!(note.contains("manifest_path="));
+        assert!(note.contains("kubectl-apply.sh"));
+    }
+
+    #[test]
+    fn persist_runtime_artifacts_materializes_helm_handoff_assets() {
+        let base = std::env::current_dir()
+            .expect("cwd")
+            .join("target/tmp-tests");
+        std::fs::create_dir_all(&base).expect("create tmp base");
+        let dir = tempfile::tempdir_in(base).expect("temp dir");
+        let pack_path = write_test_pack(true);
+
+        let mut greentic = greentic_config::ConfigResolver::new()
+            .load()
+            .expect("load default config")
+            .config;
+        greentic.paths.state_dir = dir.path().join(".greentic-state");
+
+        let config = DeployerConfig {
+            capability: DeployerCapability::Plan,
+            provider: Provider::K8s,
+            strategy: "helm".into(),
+            tenant: "acme".into(),
+            environment: "staging".into(),
+            pack_path: pack_path.clone(),
+            providers_dir: PathBuf::from("providers/deployer"),
+            packs_dir: PathBuf::from("packs"),
+            provider_pack: Some(pack_path.clone()),
+            pack_ref: None,
+            distributor_url: None,
+            distributor_token: None,
+            preview: false,
+            dry_run: false,
+            execute_local: false,
+            output: crate::config::OutputFormat::Json,
+            greentic,
+            provenance: greentic_config::ProvenanceMap::new(),
+            config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
+        };
+        let plan = pack_introspect::build_plan(&config).expect("build plan");
+        let deploy_dir = dir.path().join("output");
+        std::fs::create_dir_all(&deploy_dir).expect("create output dir");
+        let selection = DeploymentPackSelection {
+            dispatch: crate::deployment::DeploymentDispatch {
+                capability: DeployerCapability::Plan,
+                pack_id: "greentic.deploy.helm".into(),
+                flow_id: "plan_helm".into(),
+            },
+            pack_path,
+            manifest: PackManifest {
+                schema_version: "pack-v1".to_string(),
+                pack_id: PackId::from_str("greentic.deploy.helm").unwrap(),
+                name: None,
+                version: Version::new(0, 1, 0),
+                kind: PackKind::Application,
+                publisher: "greentic".to_string(),
+                secret_requirements: Vec::new(),
+                components: Vec::new(),
+                flows: Vec::new(),
+                dependencies: Vec::new(),
+                capabilities: Vec::new(),
+                signatures: Default::default(),
+                bootstrap: None,
+                extensions: None,
+            },
+            origin: "test".into(),
+            candidates: Vec::new(),
+        };
+
+        let artifacts = persist_runtime_artifacts(&config, &plan, &selection, &deploy_dir)
+            .expect("persist runtime artifacts");
+
+        assert!(artifacts.deploy_dir.join("helm-chart/Chart.yaml").exists());
+        assert!(
+            artifacts
+                .deploy_dir
+                .join("helm-chart/templates/deployment.yaml")
+                .exists()
+        );
+        assert!(artifacts.deploy_dir.join("helm-upgrade.sh").exists());
+        assert!(artifacts.deploy_dir.join("helm-rollback.sh").exists());
+        assert!(artifacts.deploy_dir.join("helm-status.sh").exists());
+        let note = std::fs::read_to_string(artifacts.deploy_dir.join("helm-handoff.txt"))
+            .expect("read helm handoff note");
+        assert!(note.contains("chart_root="));
+        assert!(note.contains("release_name=greentic-acme"));
     }
 
     #[tokio::test]

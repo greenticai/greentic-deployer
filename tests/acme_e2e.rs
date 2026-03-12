@@ -186,6 +186,7 @@ fn default_config(pack_path: PathBuf) -> DeployerConfig {
         distributor_token: None,
         preview: false,
         dry_run: false,
+        execute_local: false,
         output: OutputFormat::Text,
         greentic: greentic_config::ConfigResolver::new()
             .load()
@@ -193,6 +194,8 @@ fn default_config(pack_path: PathBuf) -> DeployerConfig {
             .config,
         provenance: greentic_config::ProvenanceMap::new(),
         config_warnings: Vec::new(),
+        deploy_pack_id_override: None,
+        deploy_flow_id_override: None,
     }
 }
 

@@ -29,7 +29,14 @@
       "capability": "apply",
       "flow_id": "apply_serverless",
       "execution_output_schema_ref": "assets/schemas/apply-execution-output.schema.json"
+    },
+    {
+      "capability": "destroy",
+      "flow_id": "destroy_serverless"
+    },
+    {
+      "capability": "status",
+      "flow_id": "status_serverless"
     }
   ]
 }
-

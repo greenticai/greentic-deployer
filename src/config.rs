@@ -8,6 +8,7 @@ use greentic_types::pack::PackRef;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
+use crate::adapter::{AdapterFamily, MultiTargetKind, UnifiedTargetSelection};
 use crate::contract::DeployerCapability;
 use crate::error::{DeployerError, Result};
 
@@ -32,6 +33,15 @@ impl Provider {
             Provider::K8s => "k8s",
             Provider::Generic => "generic",
         }
+    }
+
+    /// The provider-oriented flow must stay outside the dedicated single-vm adapter path.
+    pub fn adapter_family(&self) -> AdapterFamily {
+        AdapterFamily::MultiTarget
+    }
+
+    pub fn unified_target(&self) -> UnifiedTargetSelection {
+        UnifiedTargetSelection::MultiTarget(MultiTargetKind::from(*self))
     }
 }
 
@@ -63,9 +73,12 @@ pub struct DeployerRequest {
     pub distributor_token: Option<String>,
     pub preview: bool,
     pub dry_run: bool,
+    pub execute_local: bool,
     pub output: OutputFormat,
     pub config_path: Option<PathBuf>,
     pub allow_remote_in_offline: bool,
+    pub deploy_pack_id_override: Option<String>,
+    pub deploy_flow_id_override: Option<String>,
 }
 
 impl DeployerRequest {
@@ -92,9 +105,12 @@ impl DeployerRequest {
             distributor_token: None,
             preview: false,
             dry_run: false,
+            execute_local: false,
             output: OutputFormat::Text,
             config_path: None,
             allow_remote_in_offline: false,
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
         }
     }
 }
@@ -116,10 +132,13 @@ pub struct DeployerConfig {
     pub distributor_token: Option<String>,
     pub preview: bool,
     pub dry_run: bool,
+    pub execute_local: bool,
     pub output: OutputFormat,
     pub greentic: GreenticConfig,
     pub provenance: ProvenanceMap,
     pub config_warnings: Vec<String>,
+    pub deploy_pack_id_override: Option<String>,
+    pub deploy_flow_id_override: Option<String>,
 }
 
 impl DeployerConfig {
@@ -160,6 +179,13 @@ impl DeployerConfig {
             request.allow_remote_in_offline,
         )?;
 
+        if request.deploy_pack_id_override.is_some() ^ request.deploy_flow_id_override.is_some() {
+            return Err(DeployerError::Config(
+                "deploy_pack_id_override and deploy_flow_id_override must be set together"
+                    .to_string(),
+            ));
+        }
+
         Ok(Self {
             capability: request.capability,
             provider: request.provider,
@@ -175,10 +201,13 @@ impl DeployerConfig {
             distributor_token: request.distributor_token,
             preview: request.preview,
             dry_run: request.dry_run,
+            execute_local: request.execute_local,
             output: request.output,
             greentic,
             provenance: resolved.provenance,
             config_warnings: resolved.warnings,
+            deploy_pack_id_override: request.deploy_pack_id_override,
+            deploy_flow_id_override: request.deploy_flow_id_override,
         })
     }
 
@@ -283,6 +312,24 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[test]
+    fn provider_targets_stay_on_multi_target_adapter_family() {
+        for provider in [
+            Provider::Local,
+            Provider::Aws,
+            Provider::Azure,
+            Provider::Gcp,
+            Provider::K8s,
+            Provider::Generic,
+        ] {
+            assert_eq!(provider.adapter_family(), AdapterFamily::MultiTarget);
+            assert!(matches!(
+                provider.unified_target(),
+                UnifiedTargetSelection::MultiTarget(_)
+            ));
+        }
+    }
 
     fn base_request() -> DeployerRequest {
         DeployerRequest::new(

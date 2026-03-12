@@ -24,10 +24,17 @@
       "example_refs": ["assets/examples/plan-output.json"]
     },
     {
+      "capability": "apply",
+      "flow_id": "apply_juju_machine"
+    },
+    {
+      "capability": "destroy",
+      "flow_id": "destroy_juju_machine"
+    },
+    {
       "capability": "status",
       "flow_id": "status_juju_machine",
       "execution_output_schema_ref": "assets/schemas/status-execution-output.schema.json"
     }
   ]
 }
-

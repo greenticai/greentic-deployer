@@ -77,6 +77,18 @@ fn terraform_examples_validate_against_pack_schemas() {
         &root.join("assets/examples/apply-execution-output.json"),
     );
     validate_with_schema(
+        &root.join("assets/schemas/destroy-execution-output.schema.json"),
+        &root.join("assets/examples/destroy-execution-output.json"),
+    );
+    validate_with_schema(
+        &root.join("assets/schemas/status-output.schema.json"),
+        &root.join("assets/examples/status-output.json"),
+    );
+    validate_with_schema(
+        &root.join("assets/schemas/status-execution-output.schema.json"),
+        &root.join("assets/examples/status-execution-output.json"),
+    );
+    validate_with_schema(
         &root.join("assets/schemas/rollback-execution-output.schema.json"),
         &root.join("assets/examples/rollback-execution-output.json"),
     );
@@ -155,6 +167,37 @@ fn terraform_plan_output_declares_commands_and_variables() {
         .collect::<Vec<_>>();
     assert!(vars.contains(&"operator_image_digest"));
     assert!(vars.contains(&"bundle_digest"));
+}
+
+#[test]
+fn terraform_status_and_destroy_examples_capture_lifecycle_expectations() {
+    let status = load_json(&fixture_root().join("assets/examples/status-output.json"));
+    assert_eq!(status["kind"].as_str(), Some("status"));
+    assert_eq!(status["flow_id"].as_str(), Some("status_terraform"));
+
+    let status_execution =
+        load_json(&fixture_root().join("assets/examples/status-execution-output.json"));
+    assert_eq!(status_execution["kind"].as_str(), Some("status"));
+    assert_eq!(status_execution["state"].as_str(), Some("handoff_ready"));
+    assert!(
+        status_execution["health_checks"]
+            .as_array()
+            .expect("health checks")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .any(|value| value == "terraform_root:present")
+    );
+
+    let destroy = load_json(&fixture_root().join("assets/examples/destroy-execution-output.json"));
+    assert_eq!(destroy["kind"].as_str(), Some("destroy"));
+    assert_eq!(destroy["state"].as_str(), Some("destroyed"));
+    assert!(
+        destroy["destroyed_resources"]
+            .as_array()
+            .expect("destroyed resources")
+            .len()
+            >= 2
+    );
 }
 
 #[test]

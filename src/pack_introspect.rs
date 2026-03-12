@@ -1220,6 +1220,7 @@ mod tests {
             distributor_token: None,
             preview: false,
             dry_run: false,
+            execute_local: false,
             output: OutputFormat::Text,
             greentic: greentic_config::ConfigResolver::new()
                 .load()
@@ -1227,6 +1228,8 @@ mod tests {
                 .config,
             provenance: greentic_config::ProvenanceMap::new(),
             config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
         }
     }
 
@@ -1246,6 +1249,7 @@ mod tests {
             distributor_token: None,
             preview: false,
             dry_run: false,
+            execute_local: false,
             output: OutputFormat::Text,
             greentic: greentic_config::ConfigResolver::new()
                 .load()
@@ -1253,6 +1257,8 @@ mod tests {
                 .config,
             provenance: greentic_config::ProvenanceMap::new(),
             config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
         }
     }
 }

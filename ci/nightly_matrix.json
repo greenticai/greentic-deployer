@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "owner": "Dmytro",
+  "description": "Nightly deployment verification matrix for greentic-deployer.",
+  "targets": [
+    {
+      "tier": 1,
+      "adapter": "single-vm",
+      "mode": "execute",
+      "environment": "dedicated-linux-vm",
+      "steps": ["plan", "apply", "status", "destroy"]
+    },
+    {
+      "tier": 1,
+      "adapter": "terraform",
+      "mode": "execute",
+      "environment": "terraform-runner",
+      "steps": ["generate", "plan", "apply", "status", "destroy"]
+    },
+    {
+      "tier": 1,
+      "adapter": "aws",
+      "mode": "execute",
+      "environment": "aws-sandbox",
+      "steps": ["generate", "plan", "apply", "status", "destroy"]
+    },
+    {
+      "tier": 1,
+      "adapter": "gcp",
+      "mode": "execute",
+      "environment": "gcp-sandbox",
+      "steps": ["generate", "plan", "apply", "status", "destroy"]
+    },
+    {
+      "tier": 1,
+      "adapter": "azure",
+      "mode": "execute",
+      "environment": "azure-sandbox",
+      "steps": ["generate", "plan", "apply", "status", "destroy"]
+    },
+    {
+      "tier": 2,
+      "adapter": "k8s-raw",
+      "mode": "handoff",
+      "environment": "k8s-sandbox",
+      "steps": ["generate", "plan", "status"]
+    },
+    {
+      "tier": 2,
+      "adapter": "helm",
+      "mode": "handoff",
+      "environment": "k8s-sandbox",
+      "steps": ["generate", "plan", "status"]
+    },
+    {
+      "tier": 2,
+      "adapter": "operator",
+      "mode": "execute",
+      "environment": "k8s-sandbox",
+      "steps": ["generate", "apply", "status", "destroy"]
+    },
+    {
+      "tier": 3,
+      "adapter": "serverless",
+      "mode": "execute",
+      "environment": "serverless-sandbox",
+      "steps": ["generate", "apply", "status", "destroy"]
+    },
+    {
+      "tier": 3,
+      "adapter": "snap",
+      "mode": "execute",
+      "environment": "snap-vm",
+      "steps": ["generate", "apply", "status", "destroy"]
+    },
+    {
+      "tier": 3,
+      "adapter": "juju-machine",
+      "mode": "handoff",
+      "environment": "juju-machine-controller",
+      "steps": ["generate", "plan", "status"]
+    },
+    {
+      "tier": 3,
+      "adapter": "juju-k8s",
+      "mode": "handoff",
+      "environment": "juju-k8s-controller",
+      "steps": ["generate", "plan", "status"]
+    }
+  ]
+}

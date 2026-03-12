@@ -28,7 +28,14 @@
       "capability": "apply",
       "flow_id": "apply_snap",
       "execution_output_schema_ref": "assets/schemas/apply-execution-output.schema.json"
+    },
+    {
+      "capability": "destroy",
+      "flow_id": "destroy_snap"
+    },
+    {
+      "capability": "status",
+      "flow_id": "status_snap"
     }
   ]
 }
-
