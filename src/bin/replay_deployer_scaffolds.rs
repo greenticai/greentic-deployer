@@ -15,6 +15,19 @@ struct ScaffoldIndex {
 
 fn main() -> Result<()> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let required_tools = ["greentic-pack", "greentic-flow"];
+    let missing_tools = required_tools
+        .into_iter()
+        .filter(|tool| !command_available(tool))
+        .collect::<Vec<_>>();
+    if !missing_tools.is_empty() {
+        eprintln!(
+            "skipping replay_deployer_scaffolds: missing external tool(s): {}",
+            missing_tools.join(", ")
+        );
+        return Ok(());
+    }
+
     let output_root = root.join("target/replayed-pack-scaffolds");
     recreate_dir(&output_root)?;
 
@@ -69,6 +82,14 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn command_available(program: &str) -> bool {
+    match Command::new(program).arg("--help").output() {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
 }
 
 fn recreate_dir(path: &Path) -> Result<()> {

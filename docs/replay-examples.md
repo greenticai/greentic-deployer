@@ -36,6 +36,8 @@ When the wizard tooling is available locally:
 cargo run --bin replay_deployer_scaffolds
 ```
 
+If `greentic-pack` or `greentic-flow` are not available in `PATH`, the replay binary exits successfully after printing a skip message. This is expected for CI jobs that only check out `greentic-deployer`.
+
 2. inspect the generated sources under `target/replayed-pack-scaffolds/*`
 3. update the provider-specific fixture assets under `fixtures/packs/*` as needed
 4. update the capability/example replay docs under `examples/answers/deployment-packs/*` if fixture examples change
