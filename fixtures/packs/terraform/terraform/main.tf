@@ -2,7 +2,7 @@ module "operator" {
   source = "./modules/operator"
 
   kubernetes_namespace = var.kubernetes_namespace
-  operator_image      = "ghcr.io/greentic-ai/operator@${var.operator_image_digest}"
+  operator_image       = "public.ecr.aws/nginx/nginx:stable-alpine"
   bundle_source       = var.bundle_source
   bundle_digest       = var.bundle_digest
   otlp_endpoint       = var.otlp_endpoint
@@ -26,4 +26,3 @@ module "redis" {
 
   redis_secret_name = var.redis_secret_name
 }
-

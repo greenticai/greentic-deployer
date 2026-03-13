@@ -313,6 +313,23 @@ fn copy_pack_subtree_from_gtpack(
     subtree: &Path,
     destination_root: &Path,
 ) -> Result<Vec<String>> {
+    match copy_pack_subtree_from_tar_gtpack(pack_path, subtree, destination_root) {
+        Ok(copied) => Ok(copied),
+        Err(DeployerError::Io(err)) if err.kind() == std::io::ErrorKind::InvalidData => {
+            copy_pack_subtree_from_zip_gtpack(pack_path, subtree, destination_root)
+        }
+        Err(DeployerError::Io(err)) if err.kind() == std::io::ErrorKind::Other => {
+            copy_pack_subtree_from_zip_gtpack(pack_path, subtree, destination_root)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn copy_pack_subtree_from_tar_gtpack(
+    pack_path: &Path,
+    subtree: &Path,
+    destination_root: &Path,
+) -> Result<Vec<String>> {
     let file = fs::File::open(pack_path).map_err(DeployerError::Io)?;
     let mut archive = tar::Archive::new(file);
     let mut copied = Vec::new();
@@ -328,6 +345,56 @@ fn copy_pack_subtree_from_gtpack(
             DeployerError::Contract(format!(
                 "failed to relativize {} under {}: {}",
                 entry_path.display(),
+                subtree.display(),
+                err
+            ))
+        })?;
+        let destination = destination_root.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(DeployerError::Io)?;
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).map_err(DeployerError::Io)?;
+        fs::write(&destination, bytes).map_err(DeployerError::Io)?;
+        copied.push(relative.display().to_string());
+    }
+
+    copied.sort();
+    Ok(copied)
+}
+
+fn copy_pack_subtree_from_zip_gtpack(
+    pack_path: &Path,
+    subtree: &Path,
+    destination_root: &Path,
+) -> Result<Vec<String>> {
+    let file = fs::File::open(pack_path).map_err(DeployerError::Io)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|err| {
+        DeployerError::Contract(format!(
+            "failed to open zip pack {}: {err}",
+            pack_path.display()
+        ))
+    })?;
+    let mut copied = Vec::new();
+
+    for idx in 0..archive.len() {
+        let mut entry = archive.by_index(idx).map_err(|err| {
+            DeployerError::Contract(format!(
+                "failed to read zip entry {idx} in {}: {err}",
+                pack_path.display()
+            ))
+        })?;
+        let Some(entry_name) = entry.enclosed_name().map(|path| path.to_path_buf()) else {
+            continue;
+        };
+        if !entry_name.starts_with(subtree) || entry.is_dir() {
+            continue;
+        }
+
+        let relative = entry_name.strip_prefix(subtree).map_err(|err| {
+            DeployerError::Contract(format!(
+                "failed to relativize {} under {}: {}",
+                entry_name.display(),
                 subtree.display(),
                 err
             ))

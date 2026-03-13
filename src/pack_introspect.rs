@@ -20,6 +20,7 @@ use greentic_types::secrets::{SecretRequirement, SecretScope};
 use semver::Version;
 use serde_json::{Value as JsonValue, json};
 use tar::Archive;
+use zip::result::ZipError;
 
 use crate::config::DeployerConfig;
 use crate::error::{DeployerError, Result};
@@ -111,7 +112,7 @@ impl PackSource {
 
     fn read_manifest(&mut self) -> Result<PackManifest> {
         match self {
-            PackSource::GtpackPath(path) => read_manifest_from_tar(path),
+            PackSource::GtpackPath(path) => read_manifest_from_gtpack(path),
             PackSource::Dir(path) => read_manifest_from_directory(path),
             PackSource::Registry {
                 source, reference, ..
@@ -145,13 +146,55 @@ fn read_manifest_from_tar(path: &Path) -> Result<PackManifest> {
     load_pack_manifest_from_bytes(&bytes)
 }
 
+fn read_manifest_from_zip(path: &Path) -> Result<PackManifest> {
+    let file = File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|err| {
+        DeployerError::Pack(format!("failed to open zip pack {}: {err}", path.display()))
+    })?;
+    let mut entry = archive.by_name("manifest.cbor").map_err(|err| match err {
+        ZipError::FileNotFound => DeployerError::Pack(format!(
+            "manifest.cbor missing in pack archive {}",
+            path.display()
+        )),
+        other => DeployerError::Pack(format!(
+            "failed to read manifest.cbor in {}: {other}",
+            path.display()
+        )),
+    })?;
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes)?;
+    load_pack_manifest_from_bytes(&bytes)
+}
+
 /// Read a manifest directly from a `.gtpack` archive on disk.
 pub fn read_manifest_from_gtpack(path: &Path) -> Result<PackManifest> {
-    read_manifest_from_tar(path)
+    match read_manifest_from_tar(path) {
+        Ok(manifest) => Ok(manifest),
+        Err(DeployerError::Io(err)) if err.kind() == std::io::ErrorKind::InvalidData => {
+            read_manifest_from_zip(path)
+        }
+        Err(DeployerError::Io(err)) if err.kind() == std::io::ErrorKind::Other => {
+            read_manifest_from_zip(path)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Read an arbitrary entry from a `.gtpack` archive.
 pub fn read_entry_from_gtpack(path: &Path, entry_path: &Path) -> Result<Vec<u8>> {
+    match read_entry_from_tar_gtpack(path, entry_path) {
+        Ok(bytes) => Ok(bytes),
+        Err(DeployerError::Io(err)) if err.kind() == std::io::ErrorKind::InvalidData => {
+            read_entry_from_zip_gtpack(path, entry_path)
+        }
+        Err(DeployerError::Io(err)) if err.kind() == std::io::ErrorKind::Other => {
+            read_entry_from_zip_gtpack(path, entry_path)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn read_entry_from_tar_gtpack(path: &Path, entry_path: &Path) -> Result<Vec<u8>> {
     let file = File::open(path)?;
     let mut archive = Archive::new(file);
     for entry in archive.entries()? {
@@ -167,6 +210,30 @@ pub fn read_entry_from_gtpack(path: &Path, entry_path: &Path) -> Result<Vec<u8>>
         entry_path.display(),
         path.display()
     )))
+}
+
+fn read_entry_from_zip_gtpack(path: &Path, entry_path: &Path) -> Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|err| {
+        DeployerError::Pack(format!("failed to open zip pack {}: {err}", path.display()))
+    })?;
+    let mut entry = archive
+        .by_name(&entry_path.to_string_lossy())
+        .map_err(|err| match err {
+            ZipError::FileNotFound => DeployerError::Pack(format!(
+                "entry {} not found in {}",
+                entry_path.display(),
+                path.display()
+            )),
+            other => DeployerError::Pack(format!(
+                "failed to read entry {} in {}: {other}",
+                entry_path.display(),
+                path.display()
+            )),
+        })?;
+    let mut buf = Vec::new();
+    entry.read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 fn resolve_distributor_source(config: &DeployerConfig) -> Result<Arc<dyn DistributorSource>> {

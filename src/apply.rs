@@ -920,11 +920,19 @@ fn execute_local_terraform_operation(
     } else {
         "destroyed"
     };
+    if operation == "apply" {
+        let _ = capture_terraform_outputs(runtime_artifacts);
+    }
+    let endpoints = if operation == "apply" {
+        collect_runtime_endpoints(runtime_artifacts)
+    } else {
+        Vec::new()
+    };
     let payload = if operation == "apply" {
         ExecutionOutcomePayload::Apply(crate::deployment::ApplyExecutionOutcome {
             deployment_id: runtime_artifacts.handoff.output_dir.clone(),
             state: state.to_string(),
-            endpoints: Vec::new(),
+            endpoints,
         })
     } else {
         ExecutionOutcomePayload::Destroy(crate::deployment::DestroyExecutionOutcome {
@@ -984,12 +992,17 @@ fn execute_local_scripted_operation(
         )));
     }
 
+    let endpoints = if matches!(payload_kind, ScriptedPayloadKind::Apply) {
+        collect_runtime_endpoints(runtime_artifacts)
+    } else {
+        Vec::new()
+    };
     let payload = match payload_kind {
         ScriptedPayloadKind::Apply => {
             ExecutionOutcomePayload::Apply(crate::deployment::ApplyExecutionOutcome {
                 deployment_id: runtime_artifacts.handoff.output_dir.clone(),
                 state: state.to_string(),
-                endpoints: Vec::new(),
+                endpoints,
             })
         }
         ScriptedPayloadKind::Destroy => {
@@ -1071,6 +1084,119 @@ fn synthesize_local_terraform_status(
             },
         )),
     }))
+}
+
+fn collect_runtime_endpoints(runtime_artifacts: &RuntimeArtifacts) -> Vec<String> {
+    let outputs_path = runtime_artifacts.deploy_dir.join("terraform-outputs.json");
+    if let Ok(contents) = fs::read_to_string(&outputs_path) {
+        let endpoints = parse_terraform_output_endpoints(&contents);
+        if !endpoints.is_empty() {
+            return endpoints;
+        }
+    }
+
+    let terraform_root = runtime_artifacts.deploy_dir.join("terraform");
+    let Some(tfvars_path) = select_tfvars_example_path(&terraform_root) else {
+        return Vec::new();
+    };
+    let Ok(contents) = fs::read_to_string(tfvars_path) else {
+        return Vec::new();
+    };
+
+    parse_dns_name_endpoint(&contents).into_iter().collect()
+}
+
+fn capture_terraform_outputs(runtime_artifacts: &RuntimeArtifacts) -> Result<()> {
+    let terraform_root = runtime_artifacts.deploy_dir.join("terraform");
+    if !terraform_root.exists() {
+        return Ok(());
+    }
+
+    let terraform_bin = if terraform_root.join("terraform").exists() {
+        terraform_root.join("terraform")
+    } else {
+        PathBuf::from("terraform")
+    };
+    let output = Command::new(terraform_bin)
+        .current_dir(&terraform_root)
+        .arg("output")
+        .arg("-json")
+        .output()
+        .map_err(DeployerError::Io)?;
+
+    if !output.status.success() {
+        return Ok(());
+    }
+
+    fs::write(
+        runtime_artifacts.deploy_dir.join("terraform-outputs.json"),
+        output.stdout,
+    )
+    .map_err(DeployerError::Io)
+}
+
+fn select_tfvars_example_path(terraform_root: &Path) -> Option<PathBuf> {
+    let mut candidates = fs::read_dir(terraform_root)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|value| value.path()))
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.ends_with(".tfvars.example"))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+fn parse_dns_name_endpoint(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+            continue;
+        }
+        let (key, value) = trimmed.split_once('=')?;
+        if key.trim() != "dns_name" {
+            continue;
+        }
+        let dns_name = value
+            .split('#')
+            .next()
+            .and_then(|segment| segment.split("//").next())
+            .map(str::trim)
+            .map(|segment| segment.trim_matches('"'))
+            .filter(|segment| !segment.is_empty())?;
+        return Some(format!("https://{dns_name}"));
+    }
+    None
+}
+
+fn parse_terraform_output_endpoints(contents: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(contents) else {
+        return Vec::new();
+    };
+    let Some(map) = value.as_object() else {
+        return Vec::new();
+    };
+
+    let mut endpoints = Vec::new();
+    for (key, value) in map {
+        let lower = key.to_ascii_lowercase();
+        if !lower.contains("endpoint") && !lower.contains("url") && !lower.contains("dns") {
+            continue;
+        }
+        let Some(output_value) = value.get("value") else {
+            continue;
+        };
+        if let Some(url) = output_value.as_str() {
+            endpoints.push(url.to_string());
+        }
+    }
+    endpoints.sort();
+    endpoints.dedup();
+    endpoints
 }
 
 fn synthesize_scripted_handoff_status(
@@ -1489,6 +1615,7 @@ fn materialize_terraform_handoff_assets(
     if local_terraform.exists() {
         set_executable_if_unix(&local_terraform)?;
     }
+    configure_terraform_backend(config, &terraform_root, deploy_dir)?;
 
     let tfvars_example = format!("{}.tfvars.example", config.environment);
     let init_script = "terraform-init.sh";
@@ -1859,14 +1986,66 @@ fn materialize_juju_k8s_handoff_assets(
 
 fn terraform_script_prelude(command: &str) -> String {
     format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\n{command}\n"
+        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\nBACKEND_ARGS=()\nif [ -f \"${{SCRIPT_DIR}}/backend.hcl\" ]; then\n  BACKEND_ARGS=(-backend-config=\"${{SCRIPT_DIR}}/backend.hcl\")\nfi\n{command}\n"
     )
 }
 
 fn terraform_plan_like_script(operation: &str, tfvars_example: &str) -> String {
+    let extra_args = match operation {
+        "apply" | "destroy" => " -auto-approve -input=false",
+        _ => " -input=false",
+    };
     format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\nVAR_FILE=\"\"\nif [ -f \"{tfvars_example}\" ]; then\n  VAR_FILE=\"{tfvars_example}\"\nfi\nif [ -n \"$VAR_FILE\" ]; then\n  \"$TERRAFORM_BIN\" {operation} -var-file=\"$VAR_FILE\" \"$@\"\nelse\n  \"$TERRAFORM_BIN\" {operation} \"$@\"\nfi\n"
+        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\nBACKEND_ARGS=()\nif [ -f \"${{SCRIPT_DIR}}/backend.hcl\" ]; then\n  BACKEND_ARGS=(-backend-config=\"${{SCRIPT_DIR}}/backend.hcl\")\nfi\n\"$TERRAFORM_BIN\" init -input=false \"${{BACKEND_ARGS[@]}}\"\nVAR_FILE=\"\"\nif [ -f \"{tfvars_example}\" ]; then\n  VAR_FILE=\"{tfvars_example}\"\nelse\n  for candidate in *.tfvars.example; do\n    if [ -f \"$candidate\" ]; then\n      VAR_FILE=\"$candidate\"\n      break\n    fi\n  done\nfi\nif [ -n \"$VAR_FILE\" ]; then\n  \"$TERRAFORM_BIN\" {operation}{extra_args} -var-file=\"$VAR_FILE\" \"$@\"\nelse\n  \"$TERRAFORM_BIN\" {operation}{extra_args} \"$@\"\nfi\n"
     )
+}
+
+fn configure_terraform_backend(
+    config: &DeployerConfig,
+    terraform_root: &Path,
+    deploy_dir: &Path,
+) -> Result<()> {
+    let providers_path = terraform_root.join("providers.tf");
+    if !providers_path.exists() {
+        return Ok(());
+    }
+
+    let contents = fs::read_to_string(&providers_path)?;
+    if !contents.contains("backend \"s3\" {}") {
+        return Ok(());
+    }
+
+    if let Some(bucket) = std::env::var("GREENTIC_TERRAFORM_BACKEND_BUCKET")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let region = std::env::var("GREENTIC_TERRAFORM_BACKEND_REGION")
+            .ok()
+            .or_else(|| std::env::var("AWS_REGION").ok())
+            .unwrap_or_else(|| "us-east-1".to_string());
+        let key = std::env::var("GREENTIC_TERRAFORM_BACKEND_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "greentic/{}/{}/{}/terraform.tfstate",
+                    config.provider.as_str(),
+                    config.tenant,
+                    config.environment
+                )
+            });
+        let backend_hcl =
+            format!("bucket = \"{bucket}\"\nkey = \"{key}\"\nregion = \"{region}\"\n");
+        fs::write(deploy_dir.join("backend.hcl"), backend_hcl)?;
+        return Ok(());
+    }
+
+    let rewritten = contents.replace(
+        "backend \"s3\" {}",
+        "backend \"local\" {\n    path = \"terraform.tfstate\"\n  }",
+    );
+    fs::write(providers_path, rewritten)?;
+    Ok(())
 }
 
 fn kubectl_script(command: &str) -> String {
@@ -2432,7 +2611,12 @@ metadata:
                 "terraform/terraform",
                 br#"#!/usr/bin/env bash
 set -euo pipefail
-echo "$@" > terraform-invocation.args
+printf '%s\n' "$*" >> terraform-invocation.args
+if [ "${1:-}" = "output" ] && [ "${2:-}" = "-json" ]; then
+cat <<'EOF'
+{"operator_endpoint":{"value":"http://terraform-output.example.test"}}
+EOF
+fi
 "#,
             );
             append_tar_entry(
@@ -2895,6 +3079,15 @@ kind: Deployment
         assert!(result.executed);
         let execution = result.execution.expect("execution report");
         assert_eq!(execution.status.as_deref(), Some("applied"));
+        match execution.outcome_payload.expect("outcome payload") {
+            ExecutionOutcomePayload::Apply(payload) => {
+                assert_eq!(
+                    payload.endpoints,
+                    vec!["http://terraform-output.example.test"]
+                );
+            }
+            other => panic!("unexpected outcome payload: {:?}", other),
+        }
         assert!(
             execution
                 .output_files
@@ -2907,8 +3100,19 @@ kind: Deployment
                 .join("terraform-invocation.args"),
         )
         .expect("read fake terraform args");
-        assert!(applied_args.contains("apply"));
+        assert!(applied_args.contains("apply -auto-approve -input=false"));
         assert!(applied_args.contains("-var-file=staging.tfvars.example"));
+        assert!(applied_args.contains("output -json"));
+    }
+
+    #[test]
+    fn parse_dns_name_endpoint_extracts_https_endpoint() {
+        let endpoint = parse_dns_name_endpoint(
+            r#"
+            dns_name = "acme.example.test"
+            "#,
+        );
+        assert_eq!(endpoint.as_deref(), Some("https://acme.example.test"));
     }
 
     #[test]
