@@ -15,7 +15,7 @@ categories = ["development-tools"]
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 greentic-telemetry = { version = "0.4", features = ["otlp"] }
 greentic-types = { version = "0.4" }
 greentic-distributor-client = { version = "0.4" }
