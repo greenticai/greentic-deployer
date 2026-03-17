@@ -215,11 +215,27 @@ impl DeployerConfig {
         self.greentic.paths.state_dir.join("deploy")
     }
 
+    pub fn runtime_base(&self) -> PathBuf {
+        self.greentic.paths.state_dir.join("runtime")
+    }
+
+    pub fn output_scope_key(&self) -> String {
+        scope_key_for_path(&self.pack_path)
+    }
+
     pub fn provider_output_dir(&self) -> PathBuf {
         self.deploy_base()
             .join(self.provider.as_str())
             .join(&self.tenant)
             .join(&self.environment)
+            .join(self.output_scope_key())
+    }
+
+    pub fn runtime_output_dir(&self) -> PathBuf {
+        self.runtime_base()
+            .join(&self.tenant)
+            .join(&self.environment)
+            .join(self.output_scope_key())
     }
 
     pub fn telemetry_config(&self) -> &TelemetryConfig {
@@ -229,6 +245,26 @@ impl DeployerConfig {
     pub fn paths(&self) -> &PathsConfig {
         &self.greentic.paths
     }
+}
+
+fn scope_key_for_path(path: &std::path::Path) -> String {
+    let canonical = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string();
+    let mut scoped = String::with_capacity(canonical.len());
+    for ch in canonical.chars() {
+        if ch.is_ascii_alphanumeric() {
+            scoped.push(ch.to_ascii_lowercase());
+        } else {
+            scoped.push('-');
+        }
+    }
+    while scoped.contains("--") {
+        scoped = scoped.replace("--", "-");
+    }
+    scoped.trim_matches('-').to_string()
 }
 
 fn load_explicit_config(path: Option<&PathBuf>) -> Result<Option<ConfigLayer>> {
@@ -432,6 +468,34 @@ kind = "none"
         assert!(
             format!("{err}").contains("Offline"),
             "expected offline validation error, got {err}"
+        );
+    }
+
+    #[test]
+    fn provider_output_dir_is_scoped_by_pack_path() {
+        let dir = tempdir().unwrap();
+        let first_pack = dir.path().join("bundle-a").join("packs").join("app.gtpack");
+        let second_pack = dir.path().join("bundle-b").join("packs").join("app.gtpack");
+        fs::create_dir_all(first_pack.parent().unwrap()).expect("create first pack dir");
+        fs::create_dir_all(second_pack.parent().unwrap()).expect("create second pack dir");
+        fs::write(&first_pack, "").expect("write first pack");
+        fs::write(&second_pack, "").expect("write second pack");
+
+        let mut first_request = base_request();
+        first_request.pack_path = first_pack;
+        let first_config = DeployerConfig::resolve(first_request).expect("first config");
+
+        let mut second_request = base_request();
+        second_request.pack_path = second_pack;
+        let second_config = DeployerConfig::resolve(second_request).expect("second config");
+
+        assert_ne!(
+            first_config.provider_output_dir(),
+            second_config.provider_output_dir()
+        );
+        assert_ne!(
+            first_config.runtime_output_dir(),
+            second_config.runtime_output_dir()
         );
     }
 }

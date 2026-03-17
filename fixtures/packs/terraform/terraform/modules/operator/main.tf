@@ -4,6 +4,13 @@ data "aws_availability_zones" "available" {
 
 locals {
   name_prefix = "greentic-${substr(md5(var.bundle_digest), 0, 8)}"
+  app_port    = 8080
+  admin_bind  = "127.0.0.1:8081"
+  bundle_mount = "/mnt/greentic/bundles/current"
+  state_dir    = "/var/lib/greentic/state"
+  cache_dir    = "/var/cache/greentic"
+  log_dir      = "/var/log/greentic"
+  temp_dir     = "/tmp/greentic"
   common_tags = {
     ManagedBy = "greentic-demo"
     Bundle    = var.bundle_digest
@@ -89,8 +96,8 @@ resource "aws_security_group" "service" {
   vpc_id      = aws_vpc.this.id
 
   ingress {
-    from_port       = 80
-    to_port         = 80
+    from_port       = local.app_port
+    to_port         = local.app_port
     protocol        = "tcp"
     security_groups = [aws_security_group.alb.id]
   }
@@ -116,15 +123,19 @@ resource "aws_lb" "this" {
 }
 
 resource "aws_lb_target_group" "this" {
-  name        = "${local.name_prefix}-tg"
-  port        = 80
+  name_prefix = "gtg-"
+  port        = local.app_port
   protocol    = "HTTP"
   target_type = "ip"
   vpc_id      = aws_vpc.this.id
 
+  lifecycle {
+    create_before_destroy = true
+  }
+
   health_check {
     enabled             = true
-    path                = "/"
+    path                = "/readyz"
     matcher             = "200-399"
     healthy_threshold   = 2
     unhealthy_threshold = 5
@@ -198,8 +209,8 @@ resource "aws_ecs_task_definition" "this" {
       essential = true
       portMappings = [
         {
-          containerPort = 80
-          hostPort      = 80
+          containerPort = local.app_port
+          hostPort      = local.app_port
           protocol      = "tcp"
         }
       ]
@@ -213,8 +224,48 @@ resource "aws_ecs_task_definition" "this" {
           value = var.bundle_digest
         },
         {
-          name  = "GREENTIC_OTLP_ENDPOINT"
+          name  = "GREENTIC_BUNDLE_FORMAT"
+          value = "squashfs"
+        },
+        {
+          name  = "GREENTIC_BUNDLE_MOUNT"
+          value = local.bundle_mount
+        },
+        {
+          name  = "GREENTIC_STATE_DIR"
+          value = local.state_dir
+        },
+        {
+          name  = "GREENTIC_CACHE_DIR"
+          value = local.cache_dir
+        },
+        {
+          name  = "GREENTIC_LOG_DIR"
+          value = local.log_dir
+        },
+        {
+          name  = "GREENTIC_TEMP_DIR"
+          value = local.temp_dir
+        },
+        {
+          name  = "GREENTIC_ADMIN_LISTEN"
+          value = local.admin_bind
+        },
+        {
+          name  = "OTEL_EXPORTER_OTLP_ENDPOINT"
           value = var.otlp_endpoint
+        },
+        {
+          name  = "GREENTIC_HEALTH_READINESS_PATH"
+          value = "/readyz"
+        },
+        {
+          name  = "GREENTIC_HEALTH_LIVENESS_PATH"
+          value = "/healthz"
+        },
+        {
+          name  = "GREENTIC_HEALTH_STARTUP_TIMEOUT_SECONDS"
+          value = "120"
         }
       ]
       logConfiguration = {
@@ -249,7 +300,7 @@ resource "aws_ecs_service" "this" {
   load_balancer {
     target_group_arn = aws_lb_target_group.this.arn
     container_name   = "app"
-    container_port   = 80
+    container_port   = local.app_port
   }
 
   depends_on = [aws_lb_listener.http]

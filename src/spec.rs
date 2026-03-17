@@ -250,14 +250,14 @@ spec:
     source: file:///opt/greentic/bundles/acme.squashfs
     format: squashfs
   runtime:
-    image: ghcr.io/greenticai/greentic-runtime:0.1.0
+    image: "ghcr.io/greentic-ai/operator-distroless:0.1.0-distroless"
     arch: x86_64
     admin:
       bind: 127.0.0.1:8433
       mtls:
         caFile: /etc/greentic/admin/ca.crt
-        certFile: /etc/greentic/admin/client.crt
-        keyFile: /etc/greentic/admin/client.key
+        certFile: /etc/greentic/admin/server.crt
+        keyFile: /etc/greentic/admin/server.key
   storage:
     stateDir: /var/lib/greentic/state
     cacheDir: /var/lib/greentic/cache
@@ -298,14 +298,14 @@ spec:
       "format": "squashfs"
     },
     "runtime": {
-      "image": "ghcr.io/greenticai/greentic-runtime:0.1.0",
+      "image": "ghcr.io/greentic-ai/operator-distroless:0.1.0-distroless",
       "arch": "x86_64",
       "admin": {
         "bind": "127.0.0.1:8433",
         "mtls": {
           "caFile": "/etc/greentic/admin/ca.crt",
-          "certFile": "/etc/greentic/admin/client.crt",
-          "keyFile": "/etc/greentic/admin/client.key"
+          "certFile": "/etc/greentic/admin/server.crt",
+          "keyFile": "/etc/greentic/admin/server.key"
         }
       }
     },
@@ -352,14 +352,14 @@ spec:
                     format: BundleFormat::Squashfs,
                 },
                 runtime: RuntimeSpec {
-                    image: "ghcr.io/greenticai/greentic-runtime:0.1.0".to_string(),
+                    image: "ghcr.io/greentic-ai/operator-distroless:0.1.0-distroless".to_string(),
                     arch: LinuxArch::X86_64,
                     admin: AdminEndpointSpec {
                         bind: "0.0.0.0:8433".to_string(),
                         mtls: MtlsSpec {
                             ca_file: "/etc/greentic/admin/ca.crt".into(),
-                            cert_file: "/etc/greentic/admin/client.crt".into(),
-                            key_file: "/etc/greentic/admin/client.key".into(),
+                            cert_file: "/etc/greentic/admin/server.crt".into(),
+                            key_file: "/etc/greentic/admin/server.key".into(),
                         },
                     },
                 },
@@ -403,14 +403,14 @@ spec:
     source: file:///opt/greentic/bundles/acme.squashfs
     format: squashfs
   runtime:
-    image: ghcr.io/greenticai/greentic-runtime:0.1.0
+    image: "ghcr.io/greentic-ai/operator-distroless:0.1.0-distroless"
     arch: x86_64
     admin:
       bind: 127.0.0.1:8433
       mtls:
         caFile: /etc/greentic/admin/ca.crt
-        certFile: /etc/greentic/admin/client.crt
-        keyFile: /etc/greentic/admin/client.key
+        certFile: /etc/greentic/admin/server.crt
+        keyFile: /etc/greentic/admin/server.key
   storage:
     stateDir: /var/lib/greentic/state
     cacheDir: /var/lib/greentic/cache

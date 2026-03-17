@@ -1531,13 +1531,7 @@ fn persist_runtime_artifacts(
     selection: &DeploymentPackSelection,
     deploy_dir: &Path,
 ) -> Result<RuntimeArtifacts> {
-    let runtime_dir = config
-        .greentic
-        .paths
-        .state_dir
-        .join("runtime")
-        .join(&config.tenant)
-        .join(&config.environment);
+    let runtime_dir = config.runtime_output_dir();
     fs::create_dir_all(&runtime_dir)?;
 
     let plan_path = runtime_dir.join("plan.json");
@@ -2631,7 +2625,7 @@ version: 0.1.0
                 &mut builder,
                 "chart/values.yaml",
                 br#"image:
-  repository: ghcr.io/greenticai/greentic-runtime
+  repository: ghcr.io/greentic-ai/operator-distroless
 "#,
             );
             append_tar_entry(

@@ -706,6 +706,8 @@ fn render_single_vm_status_report_text(report: &SingleVmStatusReport) -> String 
 }
 
 pub fn render_systemd_unit(plan: &SingleVmPlan, env_file_path: &std::path::Path) -> String {
+    let bundle_mounts = render_bundle_source_mounts(&plan.bundle.source);
+    let admin_mounts = render_admin_cert_mounts(&plan.admin);
     format!(
         "[Unit]
 Description=Greentic runtime for deployment {deployment_name}
@@ -720,12 +722,15 @@ EnvironmentFile={env_file}
 ExecStart=/usr/bin/docker run --rm \\
   --name {service_name} \\
   --read-only \\
+  --env-file {env_file} \\
   -p 127.0.0.1:8433:8433 \\
   -v {bundle_mount}:{bundle_mount}:ro \\
   -v {state_dir}:{state_dir} \\
   -v {cache_dir}:{cache_dir} \\
   -v {log_dir}:{log_dir} \\
   -v {temp_dir}:{temp_dir} \\
+{bundle_mounts}\
+{admin_mounts}\
   {image}
 ExecStop=/usr/bin/docker stop {service_name}
 Restart=always
@@ -744,6 +749,8 @@ WantedBy=multi-user.target
         cache_dir = plan.storage.cache_dir.display(),
         log_dir = plan.storage.log_dir.display(),
         temp_dir = plan.storage.temp_dir.display(),
+        bundle_mounts = bundle_mounts,
+        admin_mounts = admin_mounts,
         image = plan.runtime.image,
     )
 }
@@ -758,6 +765,7 @@ GREENTIC_CACHE_DIR={cache_dir}
 GREENTIC_LOG_DIR={log_dir}
 GREENTIC_TEMP_DIR={temp_dir}
 GREENTIC_ADMIN_BIND={admin_bind}
+GREENTIC_ADMIN_LISTEN={admin_bind}
 GREENTIC_ADMIN_CA_FILE={ca_file}
 GREENTIC_ADMIN_CERT_FILE={cert_file}
 GREENTIC_ADMIN_KEY_FILE={key_file}
@@ -782,6 +790,34 @@ GREENTIC_HEALTH_STARTUP_TIMEOUT_SECONDS={startup_timeout_seconds}
         liveness_path = plan.health.liveness_path,
         startup_timeout_seconds = plan.health.startup_timeout_seconds,
     )
+}
+
+fn render_bundle_source_mounts(source: &str) -> String {
+    local_bundle_source_path(source)
+        .map(|path| format!("  -v {}:{}:ro \\\n", path.display(), path.display()))
+        .unwrap_or_default()
+}
+
+fn render_admin_cert_mounts(admin: &SingleVmAdminPlan) -> String {
+    let mut mounts = String::new();
+    for path in [&admin.ca_file, &admin.cert_file, &admin.key_file] {
+        mounts.push_str(&format!(
+            "  -v {}:{}:ro \\\n",
+            path.display(),
+            path.display()
+        ));
+    }
+    mounts
+}
+
+fn local_bundle_source_path(source: &str) -> Option<PathBuf> {
+    source
+        .strip_prefix("file://")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let path = PathBuf::from(source);
+            path.is_absolute().then_some(path)
+        })
 }
 
 fn sanitize_service_name(name: &str) -> String {
@@ -900,14 +936,14 @@ spec:
     source: file:///opt/greentic/bundles/acme.squashfs
     format: squashfs
   runtime:
-    image: ghcr.io/greenticai/greentic-runtime:0.1.0
+    image: ghcr.io/greentic-ai/operator-distroless:0.1.0-distroless
     arch: x86_64
     admin:
       bind: 127.0.0.1:8433
       mtls:
         caFile: /etc/greentic/admin/ca.crt
-        certFile: /etc/greentic/admin/client.crt
-        keyFile: /etc/greentic/admin/client.key
+        certFile: /etc/greentic/admin/server.crt
+        keyFile: /etc/greentic/admin/server.key
   storage:
     stateDir: /var/lib/greentic/state
     cacheDir: /var/lib/greentic/cache
@@ -975,8 +1011,29 @@ spec:
         let plan = build_single_vm_plan(&sample_spec()).expect("plan");
         let rendered = render_env_file(&plan);
         assert!(rendered.contains("GREENTIC_ADMIN_BIND=127.0.0.1:8433"));
+        assert!(rendered.contains("GREENTIC_ADMIN_LISTEN=127.0.0.1:8433"));
         assert!(rendered.contains("GREENTIC_STATE_DIR=/var/lib/greentic/state"));
         assert!(rendered.contains("GREENTIC_BUNDLE_FORMAT=squashfs"));
+    }
+
+    #[test]
+    fn render_systemd_unit_uses_env_file_and_mounts_local_inputs() {
+        let plan = build_single_vm_plan(&sample_spec()).expect("plan");
+        let rendered = render_systemd_unit(&plan, Path::new("/etc/greentic/acme.env"));
+        assert!(rendered.contains("EnvironmentFile=/etc/greentic/acme.env"));
+        assert!(rendered.contains("--env-file /etc/greentic/acme.env"));
+        assert!(rendered.contains(
+            "-v /opt/greentic/bundles/acme.squashfs:/opt/greentic/bundles/acme.squashfs:ro"
+        ));
+        assert!(rendered.contains("-v /etc/greentic/admin/ca.crt:/etc/greentic/admin/ca.crt:ro"));
+        assert!(
+            rendered
+                .contains("-v /etc/greentic/admin/server.crt:/etc/greentic/admin/server.crt:ro")
+        );
+        assert!(
+            rendered
+                .contains("-v /etc/greentic/admin/server.key:/etc/greentic/admin/server.key:ro")
+        );
     }
 
     #[test]

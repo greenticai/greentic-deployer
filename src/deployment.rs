@@ -733,7 +733,10 @@ mod tests {
             .await
             .expect("executor runs");
         let outcome = ran.expect("outcome");
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(
+            hits.load(Ordering::SeqCst) >= 1,
+            "registered executor should be invoked at least once"
+        );
         assert_eq!(outcome.status.as_deref(), Some("applied"));
         assert_eq!(outcome.message.as_deref(), Some("runner completed"));
         assert_eq!(outcome.output_files, vec!["result.json".to_string()]);

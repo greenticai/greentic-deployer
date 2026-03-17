@@ -2,7 +2,7 @@ module "operator" {
   source = "./modules/operator"
 
   kubernetes_namespace = var.kubernetes_namespace
-  operator_image       = "public.ecr.aws/nginx/nginx:stable-alpine"
+  operator_image       = "ghcr.io/greenticai/greentic-runtime@${var.operator_image_digest}"
   bundle_source       = var.bundle_source
   bundle_digest       = var.bundle_digest
   otlp_endpoint       = var.otlp_endpoint

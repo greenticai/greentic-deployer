@@ -23,7 +23,7 @@ spec:
     source: file://{bundle}
     format: squashfs
   runtime:
-    image: ghcr.io/greenticai/greentic-runtime:0.1.0
+    image: ghcr.io/greentic-ai/operator-distroless:0.1.0-distroless
     arch: x86_64
     admin:
       bind: 127.0.0.1:8433
@@ -49,8 +49,8 @@ spec:
 "#,
             bundle = root.join("bundle.squashfs").display(),
             ca = root.join("admin").join("ca.crt").display(),
-            cert = root.join("admin").join("client.crt").display(),
-            key = root.join("admin").join("client.key").display(),
+            cert = root.join("admin").join("server.crt").display(),
+            key = root.join("admin").join("server.key").display(),
             state = root.join("state").display(),
             cache = root.join("cache").display(),
             log = root.join("log").display(),
@@ -194,14 +194,14 @@ spec:
     source: file:///opt/greentic/bundles/acme.squashfs
     format: squashfs
   runtime:
-    image: ghcr.io/greenticai/greentic-runtime:0.1.0
+    image: ghcr.io/greentic-ai/operator-distroless:0.1.0-distroless
     arch: aarch64
     admin:
       bind: 127.0.0.1:8433
       mtls:
         caFile: /etc/greentic/admin/ca.crt
-        certFile: /etc/greentic/admin/client.crt
-        keyFile: /etc/greentic/admin/client.key
+        certFile: /etc/greentic/admin/server.crt
+        keyFile: /etc/greentic/admin/server.key
   storage:
     stateDir: /var/lib/greentic/state
     cacheDir: /var/lib/greentic/cache

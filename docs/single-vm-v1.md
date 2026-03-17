@@ -138,14 +138,14 @@ spec:
     source: file:///opt/greentic/bundles/acme.squashfs
     format: squashfs
   runtime:
-    image: ghcr.io/greenticai/greentic-runtime:0.1.0
+    image: ghcr.io/greentic-ai/operator-distroless:0.1.0-distroless
     arch: x86_64
     admin:
       bind: 127.0.0.1:8433
       mtls:
         caFile: /etc/greentic/admin/ca.crt
-        certFile: /etc/greentic/admin/client.crt
-        keyFile: /etc/greentic/admin/client.key
+        certFile: /etc/greentic/admin/server.crt
+        keyFile: /etc/greentic/admin/server.key
   storage:
     stateDir: /var/lib/greentic/state
     cacheDir: /var/lib/greentic/cache
