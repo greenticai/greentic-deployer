@@ -14,6 +14,65 @@ on:
   workflow_dispatch:
 
 jobs:
+  binary-release-assets:
+    name: Build binary release assets
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            archive_ext: tar.gz
+            asset_suffix: linux-arm64
+            binary_name: greentic-deployer
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            archive_ext: zip
+            asset_suffix: windows-arm64
+            binary_name: greentic-deployer.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.91.1
+          targets: ${{ matrix.target }}
+      - name: Install Linux ARM cross toolchain
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package Linux ARM asset
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        env:
+          ASSET_BASENAME: greentic-deployer-${{ github.ref_name }}-${{ matrix.asset_suffix }}
+        run: |
+          set -euo pipefail
+          mkdir "$ASSET_BASENAME"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "$ASSET_BASENAME/"
+          tar -czf "${ASSET_BASENAME}.tar.gz" "$ASSET_BASENAME"
+      - name: Package Windows ARM asset
+        if: matrix.archive_ext == 'zip'
+        shell: bash
+        env:
+          ASSET_BASENAME: greentic-deployer-${{ github.ref_name }}-${{ matrix.asset_suffix }}
+        run: |
+          set -euo pipefail
+          mkdir "$ASSET_BASENAME"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "$ASSET_BASENAME/"
+          powershell -NoLogo -NoProfile -Command "Compress-Archive -Path '$env:ASSET_BASENAME' -DestinationPath '$env:ASSET_BASENAME.zip'"
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: greentic-deployer-${{ github.ref_name }}-${{ matrix.asset_suffix }}.${{ matrix.archive_ext }}
+
   crate-publish:
     runs-on: ubuntu-latest
     permissions:

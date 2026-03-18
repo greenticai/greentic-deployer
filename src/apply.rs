@@ -1617,10 +1617,7 @@ fn materialize_terraform_handoff_assets(
     let apply_script = "terraform-apply.sh";
     let destroy_script = "terraform-destroy.sh";
     let status_script = "terraform-status.sh";
-    write_executable_script(
-        &deploy_dir.join(init_script),
-        terraform_script_prelude("\"$TERRAFORM_BIN\" init \"$@\""),
-    )?;
+    write_executable_script(&deploy_dir.join(init_script), terraform_init_script())?;
     write_executable_script(
         &deploy_dir.join(plan_script),
         terraform_plan_like_script("plan", &tfvars_example),
@@ -1980,8 +1977,13 @@ fn materialize_juju_k8s_handoff_assets(
 
 fn terraform_script_prelude(command: &str) -> String {
     format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\nBACKEND_ARGS=()\nif [ -f \"${{SCRIPT_DIR}}/backend.hcl\" ]; then\n  BACKEND_ARGS=(-backend-config=\"${{SCRIPT_DIR}}/backend.hcl\")\nfi\n{command}\n"
+        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\n{command}\n"
     )
+}
+
+fn terraform_init_script() -> String {
+    "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${SCRIPT_DIR}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\nif [ -f \"${SCRIPT_DIR}/backend.hcl\" ]; then\n  \"$TERRAFORM_BIN\" init -backend-config=\"${SCRIPT_DIR}/backend.hcl\" \"$@\"\nelse\n  \"$TERRAFORM_BIN\" init \"$@\"\nfi\n"
+        .to_string()
 }
 
 fn terraform_plan_like_script(operation: &str, tfvars_example: &str) -> String {
@@ -1990,7 +1992,7 @@ fn terraform_plan_like_script(operation: &str, tfvars_example: &str) -> String {
         _ => " -input=false",
     };
     format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\nBACKEND_ARGS=()\nif [ -f \"${{SCRIPT_DIR}}/backend.hcl\" ]; then\n  BACKEND_ARGS=(-backend-config=\"${{SCRIPT_DIR}}/backend.hcl\")\nfi\n\"$TERRAFORM_BIN\" init -input=false \"${{BACKEND_ARGS[@]}}\"\nVAR_FILE=\"\"\nif [ -f \"{tfvars_example}\" ]; then\n  VAR_FILE=\"{tfvars_example}\"\nelse\n  for candidate in *.tfvars.example; do\n    if [ -f \"$candidate\" ]; then\n      VAR_FILE=\"$candidate\"\n      break\n    fi\n  done\nfi\nif [ -n \"$VAR_FILE\" ]; then\n  \"$TERRAFORM_BIN\" {operation}{extra_args} -var-file=\"$VAR_FILE\" \"$@\"\nelse\n  \"$TERRAFORM_BIN\" {operation}{extra_args} \"$@\"\nfi\n"
+        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\nif [ -f \"${{SCRIPT_DIR}}/backend.hcl\" ]; then\n  \"$TERRAFORM_BIN\" init -input=false -backend-config=\"${{SCRIPT_DIR}}/backend.hcl\"\nelse\n  \"$TERRAFORM_BIN\" init -input=false\nfi\nVAR_FILE=\"\"\nif [ -f \"{tfvars_example}\" ]; then\n  VAR_FILE=\"{tfvars_example}\"\nelse\n  for candidate in *.tfvars.example; do\n    if [ -f \"$candidate\" ]; then\n      VAR_FILE=\"$candidate\"\n      break\n    fi\n  done\nfi\nif [ -n \"$VAR_FILE\" ]; then\n  \"$TERRAFORM_BIN\" {operation}{extra_args} -var-file=\"$VAR_FILE\" \"$@\"\nelse\n  \"$TERRAFORM_BIN\" {operation}{extra_args} \"$@\"\nfi\n"
     )
 }
 

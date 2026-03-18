@@ -137,6 +137,11 @@ Current single-VM execution model:
 - readonly bundle mount
 - separate writable state/cache/log/temp directories
 
+Tagged GitHub releases also publish CLI binaries for:
+
+- Linux `arm64`
+- Windows `arm64`
+
 Persisted single-VM state is written to:
 
 - `<stateDir>/single-vm-state.json`
