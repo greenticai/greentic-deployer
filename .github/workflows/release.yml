@@ -75,14 +75,13 @@ jobs:
           tar -czf "${ASSET_BASENAME}.tar.gz" "$ASSET_BASENAME"
       - name: Package Windows ARM asset
         if: matrix.archive_ext == 'zip'
-        shell: bash
+        shell: pwsh
         env:
           ASSET_BASENAME: greentic-deployer-${{ github.ref_name }}-${{ matrix.asset_suffix }}
         run: |
-          set -euo pipefail
-          mkdir "$ASSET_BASENAME"
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "$ASSET_BASENAME/"
-          powershell -NoLogo -NoProfile -Command "Compress-Archive -Path '$env:ASSET_BASENAME' -DestinationPath '$env:ASSET_BASENAME.zip'"
+          New-Item -ItemType Directory -Path $env:ASSET_BASENAME | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "$env:ASSET_BASENAME/"
+          Compress-Archive -Path $env:ASSET_BASENAME -DestinationPath "$env:ASSET_BASENAME.zip"
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
