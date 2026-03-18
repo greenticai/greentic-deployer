@@ -40,12 +40,12 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
+            target: x86_64-unknown-linux-gnu
             archive_ext: tar.gz
             asset_suffix: linux-amd64
             binary_name: greentic-deployer
           - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
+            target: aarch64-unknown-linux-gnu
             archive_ext: tar.gz
             asset_suffix: linux-arm64
             binary_name: greentic-deployer
