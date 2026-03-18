@@ -1157,9 +1157,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-distributor-client"
-version = "0.4.37"
+version = "0.4.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f0bf35af065744f5bb5940b2f9fd036278385750e70410b67900d423464e01c"
+checksum = "4352579b21809eef9f170440488532ad846614e62bc1e3d9e5f7ded23fd42d08"
 dependencies = [
  "anyhow",
  "async-trait",
