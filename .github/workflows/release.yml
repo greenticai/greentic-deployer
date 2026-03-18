@@ -40,30 +40,45 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive_ext: tar.gz
+            asset_suffix: linux-amd64
+            binary_name: greentic-deployer
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             archive_ext: tar.gz
             asset_suffix: linux-arm64
             binary_name: greentic-deployer
           - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+            asset_suffix: windows-amd64
+            binary_name: greentic-deployer.exe
+          - os: windows-11-arm
             target: aarch64-pc-windows-msvc
             archive_ext: zip
             asset_suffix: windows-arm64
             binary_name: greentic-deployer.exe
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+            asset_suffix: macos-amd64
+            binary_name: greentic-deployer
+          - os: macos-15
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+            asset_suffix: macos-arm64
+            binary_name: greentic-deployer
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: 1.91.1
           targets: ${{ matrix.target }}
-      - name: Install Linux ARM cross toolchain
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        uses: taiki-e/setup-cross-toolchain-action@v1
-        with:
-          target: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
-      - name: Package Linux ARM asset
+      - name: Package Unix asset
         if: matrix.archive_ext == 'tar.gz'
         shell: bash
         env:
@@ -87,6 +102,34 @@ jobs:
         with:
           name: greentic-deployer-${{ github.ref_name }}-${{ matrix.asset_suffix }}
           path: greentic-deployer-${{ github.ref_name }}-${{ matrix.asset_suffix }}.${{ matrix.archive_ext }}
+
+  publish-master-release:
+    name: Publish rolling master release
+    runs-on: ubuntu-latest
+    needs: binary-release-assets
+    permissions:
+      contents: write
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: greentic-deployer-*
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: master-latest
+          target_commitish: ${{ github.sha }}
+          name: Master Latest
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
 
   crate-publish:
     runs-on: ubuntu-latest
