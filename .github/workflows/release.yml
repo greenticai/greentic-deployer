@@ -82,6 +82,7 @@ jobs:
             exit 1
           fi
           echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: 1.91.1
@@ -93,7 +94,7 @@ jobs:
         if: matrix.archive_ext == 'tar.gz'
         shell: bash
         env:
-          ASSET_BASENAME: greentic-deployer-${{ steps.version.outputs.value }}-${{ matrix.asset_suffix }}
+          ASSET_BASENAME: greentic-deployer-${{ matrix.target }}-${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
           mkdir "$ASSET_BASENAME"
@@ -103,7 +104,7 @@ jobs:
         if: matrix.archive_ext == 'zip'
         shell: pwsh
         env:
-          ASSET_BASENAME: greentic-deployer-${{ steps.version.outputs.value }}-${{ matrix.asset_suffix }}
+          ASSET_BASENAME: greentic-deployer-${{ matrix.target }}-${{ steps.version.outputs.tag }}
         run: |
           New-Item -ItemType Directory -Path $env:ASSET_BASENAME | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "$env:ASSET_BASENAME/"
@@ -111,8 +112,8 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: greentic-deployer-${{ steps.version.outputs.value }}-${{ matrix.asset_suffix }}
-          path: greentic-deployer-${{ steps.version.outputs.value }}-${{ matrix.asset_suffix }}.${{ matrix.archive_ext }}
+          name: greentic-deployer-${{ matrix.target }}-${{ steps.version.outputs.tag }}
+          path: greentic-deployer-${{ matrix.target }}-${{ steps.version.outputs.tag }}.${{ matrix.archive_ext }}
 
   publish-version-release:
     name: Publish version release
@@ -136,9 +137,10 @@ jobs:
             exit 1
           fi
           echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with:
-          pattern: greentic-deployer-${{ steps.version.outputs.value }}-*
+          pattern: greentic-deployer-*-${{ steps.version.outputs.tag }}
           path: dist
           merge-multiple: true
       - name: Publish GitHub release assets
