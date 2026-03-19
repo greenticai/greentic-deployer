@@ -1684,9 +1684,7 @@ fn materialize_terraform_handoff_assets(
             terraform_root.join(tfvars).display()
         ));
     }
-    note.push_str(
-        "terraform_env_override_prefix=GREENTIC_DEPLOY_TERRAFORM_VAR_\n",
-    );
+    note.push_str("terraform_env_override_prefix=GREENTIC_DEPLOY_TERRAFORM_VAR_\n");
     note.push_str(
         "scripts=terraform-init.sh, terraform-plan.sh, terraform-apply.sh, terraform-destroy.sh, terraform-status.sh\n",
     );

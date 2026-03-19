@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1143,9 +1143,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-distributor-client"
-version = "0.4.39"
+version = "0.4.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4352579b21809eef9f170440488532ad846614e62bc1e3d9e5f7ded23fd42d08"
+checksum = "ac0be356e62f355975b475d298fe2d2534f6b932efddc9333f95ca0f857473cb"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2175,9 +2175,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-otlp"
-version = "0.31.0"
+version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a2366db2dca4d2ad033cad11e6ee42844fd727007af5ad04a1730f4cb8163bf"
+checksum = "1f69cd6acbb9af919df949cd1ec9e5e7fdc2ef15d234b6b795aaa525cc02f71f"
 dependencies = [
  "http",
  "opentelemetry",
@@ -4882,18 +4882,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.42"
+version = "0.8.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2578b716f8a7a858b7f02d5bd870c14bf4ddbbcf3a4c05414ba6503640505e3"
+checksum = "efbb2a062be311f2ba113ce66f697a4dc589f85e78a4aea276200804cea0ed87"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.42"
+version = "0.8.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e6cc098ea4d3bd6246687de65af3f920c430e236bee1e3bf2e441463f08a02f"
+checksum = "0e8bc7269b54418e7aeeef514aa68f8690b8c0489a06b0136e5f57c4c5ccab89"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4963,9 +4963,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "8.2.0"
+version = "8.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b680f2a0cd479b4cff6e1233c483fdead418106eae419dc60200ae9850f6d004"
+checksum = "4a243cfad17427fc077f529da5a95abe4e94fd2bfdb601611870a6557cc67657"
 dependencies = [
  "crc32fast",
  "flate2",
