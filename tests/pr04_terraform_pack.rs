@@ -217,7 +217,7 @@ fn terraform_runtime_module_uses_distroless_command_and_admin_secrets() {
     let module_tf = fs::read_to_string(fixture_root().join("terraform/modules/operator/main.tf"))
         .expect("read module");
 
-    assert!(main_tf.contains("ghcr.io/greentic-ai/operator-distroless@"));
+    assert!(main_tf.contains("ghcr.io/greenticai/gtc-distroless@"));
     assert!(module_tf.contains("\"start\""));
     assert!(module_tf.contains("\"--bundle\""));
     assert!(module_tf.contains("GREENTIC_ADMIN_CA_PEM"));
