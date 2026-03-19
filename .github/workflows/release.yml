@@ -209,7 +209,7 @@ jobs:
         id: build-gtpacks
         run: |
           set -euo pipefail
-          cargo run --bin build_fixture_gtpacks | tee /tmp/build_fixture_gtpacks.log
+          cargo run --features internal-tools --bin build_fixture_gtpacks | tee /tmp/build_fixture_gtpacks.log
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:

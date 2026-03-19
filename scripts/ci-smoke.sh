@@ -8,4 +8,4 @@ echo "==> replay-backed deployment-pack smoke tests"
 cargo test --test pr08_replay_examples
 
 echo "==> replay deployer scaffolds"
-cargo run --bin replay_deployer_scaffolds
+cargo run --features internal-tools --bin replay_deployer_scaffolds

@@ -11,10 +11,10 @@ echo "==> cargo clippy"
 cargo clippy --all-targets --all-features -- -D warnings
 
 echo "==> replay deployer scaffolds"
-cargo run --bin replay_deployer_scaffolds
+cargo run --features internal-tools --bin replay_deployer_scaffolds
 
 echo "==> build and validate fixture gtpacks"
-cargo run --bin build_fixture_gtpacks
+cargo run --features internal-tools --bin build_fixture_gtpacks
 
 echo "==> cargo test"
 cargo test --all

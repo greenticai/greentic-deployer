@@ -12,6 +12,24 @@ documentation = "https://docs.greentic.ai/deployer"
 keywords = ["greentic", "deployer", "deployment-pack", "runner"]
 categories = ["development-tools"]
 
+[features]
+default = []
+internal-tools = []
+
+[[bin]]
+name = "greentic-deployer"
+path = "src/main.rs"
+
+[[bin]]
+name = "build_fixture_gtpacks"
+path = "src/bin/build_fixture_gtpacks.rs"
+required-features = ["internal-tools"]
+
+[[bin]]
+name = "replay_deployer_scaffolds"
+path = "src/bin/replay_deployer_scaffolds.rs"
+required-features = ["internal-tools"]
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
