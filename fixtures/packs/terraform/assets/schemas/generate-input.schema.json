@@ -4,11 +4,8 @@
     "environment",
     "kubernetes_namespace",
     "operator_image_digest",
-    "redis_secret_name",
-    "dns_name",
     "bundle_source",
     "bundle_digest",
-    "otlp_endpoint",
     "remote_state_backend"
   ],
   "properties": {
@@ -18,15 +15,14 @@
       "type": "string",
       "pattern": "^sha256:[a-f0-9]{64}$"
     },
-    "redis_secret_name": { "type": "string", "minLength": 1 },
-    "dns_name": { "type": "string", "minLength": 1 },
+    "dns_name": { "type": "string" },
     "bundle_source": { "type": "string", "minLength": 1 },
     "bundle_digest": {
       "type": "string",
       "pattern": "^sha256:[a-f0-9]{64}$"
     },
-    "otlp_endpoint": { "type": "string", "minLength": 1 },
+    "admin_allowed_clients": { "type": "string" },
+    "public_base_url": { "type": "string", "minLength": 1 },
     "remote_state_backend": { "type": "string", "minLength": 1 }
   }
 }
-

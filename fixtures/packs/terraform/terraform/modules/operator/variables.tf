@@ -14,6 +14,10 @@ variable "bundle_source" {
   type = string
 }
 
-variable "otlp_endpoint" {
+variable "admin_allowed_clients" {
+  type = string
+}
+
+variable "public_base_url" {
   type = string
 }

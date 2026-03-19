@@ -2,13 +2,15 @@ module "operator" {
   source = "./modules/operator"
 
   kubernetes_namespace = var.kubernetes_namespace
-  operator_image       = "ghcr.io/greenticai/greentic-runtime@${var.operator_image_digest}"
-  bundle_source       = var.bundle_source
-  bundle_digest       = var.bundle_digest
-  otlp_endpoint       = var.otlp_endpoint
+  operator_image = "ghcr.io/greentic-ai/operator-distroless@${var.operator_image_digest}"
+  bundle_source  = var.bundle_source
+  bundle_digest  = var.bundle_digest
+  admin_allowed_clients = var.admin_allowed_clients
+  public_base_url = var.public_base_url
 }
 
 module "dns" {
+  count  = var.dns_name != "" ? 1 : 0
   source = "./modules/dns"
 
   dns_name = var.dns_name
@@ -19,10 +21,4 @@ module "registry" {
 
   bundle_source = var.bundle_source
   bundle_digest = var.bundle_digest
-}
-
-module "redis" {
-  source = "./modules/redis"
-
-  redis_secret_name = var.redis_secret_name
 }

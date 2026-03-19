@@ -122,8 +122,9 @@ pub fn write_fake_terraform_bin(dir: &Path) -> PathBuf {
 #[allow(dead_code)]
 pub fn write_fake_command_bin(dir: &Path, command_name: &str) -> PathBuf {
     let path = dir.join(command_name);
+    let temp_path = dir.join(format!(".{command_name}.tmp"));
     fs::write(
-        &path,
+        &temp_path,
         format!(
             "#!/usr/bin/env bash\nset -euo pipefail\necho \"fake {} $*\"\n",
             command_name
@@ -133,9 +134,10 @@ pub fn write_fake_command_bin(dir: &Path, command_name: &str) -> PathBuf {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&path).expect("metadata").permissions();
+        let mut perms = fs::metadata(&temp_path).expect("metadata").permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).expect("set permissions");
+        fs::set_permissions(&temp_path, perms).expect("set permissions");
     }
+    fs::rename(&temp_path, &path).expect("rename fake command into place");
     path
 }

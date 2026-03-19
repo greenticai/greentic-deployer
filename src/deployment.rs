@@ -722,6 +722,8 @@ mod tests {
             config_warnings: Vec::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
+            bundle_source: None,
+            bundle_digest: None,
         };
         let plan = pack_introspect::build_plan(&config).expect("plan builds");
         let dispatch = DeploymentDispatch {

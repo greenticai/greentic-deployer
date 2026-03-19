@@ -196,6 +196,8 @@ fn default_config(pack_path: PathBuf) -> DeployerConfig {
         config_warnings: Vec::new(),
         deploy_pack_id_override: None,
         deploy_flow_id_override: None,
+        bundle_source: None,
+        bundle_digest: None,
     }
 }
 

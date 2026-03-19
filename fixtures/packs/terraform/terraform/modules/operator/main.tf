@@ -5,16 +5,65 @@ data "aws_availability_zones" "available" {
 locals {
   name_prefix = "greentic-${substr(md5(var.bundle_digest), 0, 8)}"
   app_port    = 8080
-  admin_bind  = "127.0.0.1:8081"
-  bundle_mount = "/mnt/greentic/bundles/current"
-  state_dir    = "/var/lib/greentic/state"
-  cache_dir    = "/var/cache/greentic"
-  log_dir      = "/var/log/greentic"
-  temp_dir     = "/tmp/greentic"
+  admin_port  = 8433
+  admin_bind  = "127.0.0.1:${local.admin_port}"
+  admin_secret_prefix = "greentic/admin/${local.name_prefix}"
   common_tags = {
     ManagedBy = "greentic-demo"
     Bundle    = var.bundle_digest
   }
+}
+
+resource "tls_private_key" "admin_ca" {
+  algorithm = "RSA"
+  rsa_bits  = 2048
+}
+
+resource "tls_self_signed_cert" "admin_ca" {
+  private_key_pem = tls_private_key.admin_ca.private_key_pem
+
+  subject {
+    common_name  = "${local.name_prefix}-admin-ca"
+    organization = "Greentic"
+  }
+
+  is_ca_certificate     = true
+  validity_period_hours = 24 * 365
+  allowed_uses = [
+    "cert_signing",
+    "crl_signing",
+    "digital_signature",
+    "key_encipherment",
+  ]
+}
+
+resource "tls_private_key" "admin_server" {
+  algorithm = "RSA"
+  rsa_bits  = 2048
+}
+
+resource "tls_cert_request" "admin_server" {
+  private_key_pem = tls_private_key.admin_server.private_key_pem
+
+  subject {
+    common_name  = "localhost"
+    organization = "Greentic"
+  }
+
+  dns_names    = ["localhost"]
+  ip_addresses = ["127.0.0.1"]
+}
+
+resource "tls_locally_signed_cert" "admin_server" {
+  cert_request_pem      = tls_cert_request.admin_server.cert_request_pem
+  ca_private_key_pem    = tls_private_key.admin_ca.private_key_pem
+  ca_cert_pem           = tls_self_signed_cert.admin_ca.cert_pem
+  validity_period_hours = 24 * 365
+  allowed_uses = [
+    "digital_signature",
+    "key_encipherment",
+    "server_auth",
+  ]
 }
 
 resource "aws_vpc" "this" {
@@ -194,6 +243,61 @@ resource "aws_iam_role_policy_attachment" "task_execution" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+resource "aws_secretsmanager_secret" "admin_ca" {
+  name = "${local.admin_secret_prefix}/ca"
+
+  tags = local.common_tags
+}
+
+resource "aws_secretsmanager_secret_version" "admin_ca" {
+  secret_id     = aws_secretsmanager_secret.admin_ca.id
+  secret_string = tls_self_signed_cert.admin_ca.cert_pem
+}
+
+resource "aws_secretsmanager_secret" "admin_server_cert" {
+  name = "${local.admin_secret_prefix}/server-cert"
+
+  tags = local.common_tags
+}
+
+resource "aws_secretsmanager_secret_version" "admin_server_cert" {
+  secret_id     = aws_secretsmanager_secret.admin_server_cert.id
+  secret_string = tls_locally_signed_cert.admin_server.cert_pem
+}
+
+resource "aws_secretsmanager_secret" "admin_server_key" {
+  name = "${local.admin_secret_prefix}/server-key"
+
+  tags = local.common_tags
+}
+
+resource "aws_secretsmanager_secret_version" "admin_server_key" {
+  secret_id     = aws_secretsmanager_secret.admin_server_key.id
+  secret_string = tls_private_key.admin_server.private_key_pem
+}
+
+resource "aws_iam_role_policy" "task_execution_admin_secrets" {
+  name = "${local.name_prefix}-task-exec-admin-secrets"
+  role = aws_iam_role.task_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = [
+          aws_secretsmanager_secret.admin_ca.arn,
+          aws_secretsmanager_secret.admin_server_cert.arn,
+          aws_secretsmanager_secret.admin_server_key.arn
+        ]
+      }
+    ]
+  })
+}
+
 resource "aws_ecs_task_definition" "this" {
   family                   = "${local.name_prefix}-task"
   requires_compatibilities = ["FARGATE"]
@@ -207,6 +311,18 @@ resource "aws_ecs_task_definition" "this" {
       name      = "app"
       image     = var.operator_image
       essential = true
+      command = [
+        "start",
+        "--bundle",
+        var.bundle_source,
+        "--cloudflared",
+        "off",
+        "--ngrok",
+        "off",
+        "--admin",
+        "--admin-port",
+        tostring(local.admin_port)
+      ]
       portMappings = [
         {
           containerPort = local.app_port
@@ -214,58 +330,58 @@ resource "aws_ecs_task_definition" "this" {
           protocol      = "tcp"
         }
       ]
-      environment = [
+      environment = concat(
+        [
+          {
+            name  = "GREENTIC_BUNDLE_SOURCE"
+            value = var.bundle_source
+          },
+          {
+            name  = "GREENTIC_BUNDLE_DIGEST"
+            value = var.bundle_digest
+          },
+          {
+            name  = "GREENTIC_ADMIN_LISTEN"
+            value = local.admin_bind
+          },
+          {
+            name  = "GREENTIC_HEALTH_READINESS_PATH"
+            value = "/readyz"
+          },
+          {
+            name  = "GREENTIC_HEALTH_LIVENESS_PATH"
+            value = "/healthz"
+          },
+          {
+            name  = "GREENTIC_HEALTH_STARTUP_TIMEOUT_SECONDS"
+            value = "120"
+          }
+        ],
+        var.public_base_url != "" ? [
+          {
+            name  = "PUBLIC_BASE_URL"
+            value = var.public_base_url
+          }
+        ] : [],
+        var.admin_allowed_clients != "" ? [
+          {
+            name  = "GREENTIC_ADMIN_ALLOWED_CLIENTS"
+            value = var.admin_allowed_clients
+          }
+        ] : []
+      )
+      secrets = [
         {
-          name  = "GREENTIC_BUNDLE_SOURCE"
-          value = var.bundle_source
+          name      = "GREENTIC_ADMIN_CA_PEM"
+          valueFrom = aws_secretsmanager_secret.admin_ca.arn
         },
         {
-          name  = "GREENTIC_BUNDLE_DIGEST"
-          value = var.bundle_digest
+          name      = "GREENTIC_ADMIN_SERVER_CERT_PEM"
+          valueFrom = aws_secretsmanager_secret.admin_server_cert.arn
         },
         {
-          name  = "GREENTIC_BUNDLE_FORMAT"
-          value = "squashfs"
-        },
-        {
-          name  = "GREENTIC_BUNDLE_MOUNT"
-          value = local.bundle_mount
-        },
-        {
-          name  = "GREENTIC_STATE_DIR"
-          value = local.state_dir
-        },
-        {
-          name  = "GREENTIC_CACHE_DIR"
-          value = local.cache_dir
-        },
-        {
-          name  = "GREENTIC_LOG_DIR"
-          value = local.log_dir
-        },
-        {
-          name  = "GREENTIC_TEMP_DIR"
-          value = local.temp_dir
-        },
-        {
-          name  = "GREENTIC_ADMIN_LISTEN"
-          value = local.admin_bind
-        },
-        {
-          name  = "OTEL_EXPORTER_OTLP_ENDPOINT"
-          value = var.otlp_endpoint
-        },
-        {
-          name  = "GREENTIC_HEALTH_READINESS_PATH"
-          value = "/readyz"
-        },
-        {
-          name  = "GREENTIC_HEALTH_LIVENESS_PATH"
-          value = "/healthz"
-        },
-        {
-          name  = "GREENTIC_HEALTH_STARTUP_TIMEOUT_SECONDS"
-          value = "120"
+          name      = "GREENTIC_ADMIN_SERVER_KEY_PEM"
+          valueFrom = aws_secretsmanager_secret.admin_server_key.arn
         }
       ]
       logConfiguration = {

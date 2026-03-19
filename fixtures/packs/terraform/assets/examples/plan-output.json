@@ -7,9 +7,9 @@
   "terraform_plan_command": "terraform plan -var-file=staging.tfvars.example",
   "expected_variables": [
     "operator_image_digest",
+    "bundle_source",
     "bundle_digest",
     "dns_name",
-    "redis_secret_name"
+    "remote_state_backend"
   ]
 }
-

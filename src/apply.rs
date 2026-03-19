@@ -1096,7 +1096,7 @@ fn collect_runtime_endpoints(runtime_artifacts: &RuntimeArtifacts) -> Vec<String
     }
 
     let terraform_root = runtime_artifacts.deploy_dir.join("terraform");
-    let Some(tfvars_path) = select_tfvars_example_path(&terraform_root) else {
+    let Some(tfvars_path) = select_tfvars_path(&terraform_root) else {
         return Vec::new();
     };
     let Ok(contents) = fs::read_to_string(tfvars_path) else {
@@ -1135,7 +1135,7 @@ fn capture_terraform_outputs(runtime_artifacts: &RuntimeArtifacts) -> Result<()>
     .map_err(DeployerError::Io)
 }
 
-fn select_tfvars_example_path(terraform_root: &Path) -> Option<PathBuf> {
+fn select_tfvars_path(terraform_root: &Path) -> Option<PathBuf> {
     let mut candidates = fs::read_dir(terraform_root)
         .ok()?
         .filter_map(|entry| entry.ok().map(|value| value.path()))
@@ -1144,11 +1144,23 @@ fn select_tfvars_example_path(terraform_root: &Path) -> Option<PathBuf> {
                 && path
                     .file_name()
                     .and_then(|value| value.to_str())
-                    .is_some_and(|value| value.ends_with(".tfvars.example"))
+                    .is_some_and(|value| {
+                        value.ends_with(".tfvars") || value.ends_with(".tfvars.example")
+                    })
         })
         .collect::<Vec<_>>();
     candidates.sort();
-    candidates.into_iter().next()
+    candidates
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| {
+                    value.ends_with(".tfvars") && !value.ends_with(".tfvars.example")
+                })
+        })
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
 }
 
 fn parse_dns_name_endpoint(contents: &str) -> Option<String> {
@@ -1612,6 +1624,7 @@ fn materialize_terraform_handoff_assets(
     configure_terraform_backend(config, &terraform_root, deploy_dir)?;
 
     let tfvars_example = format!("{}.tfvars.example", config.environment);
+    let generated_tfvars = materialize_generated_tfvars(config, &terraform_root, &tfvars_example)?;
     let init_script = "terraform-init.sh";
     let plan_script = "terraform-plan.sh";
     let apply_script = "terraform-apply.sh";
@@ -1620,15 +1633,15 @@ fn materialize_terraform_handoff_assets(
     write_executable_script(&deploy_dir.join(init_script), terraform_init_script())?;
     write_executable_script(
         &deploy_dir.join(plan_script),
-        terraform_plan_like_script("plan", &tfvars_example),
+        terraform_plan_like_script("plan", generated_tfvars.as_deref(), &tfvars_example),
     )?;
     write_executable_script(
         &deploy_dir.join(apply_script),
-        terraform_plan_like_script("apply", &tfvars_example),
+        terraform_plan_like_script("apply", generated_tfvars.as_deref(), &tfvars_example),
     )?;
     write_executable_script(
         &deploy_dir.join(destroy_script),
-        terraform_plan_like_script("destroy", &tfvars_example),
+        terraform_plan_like_script("destroy", generated_tfvars.as_deref(), &tfvars_example),
     )?;
     write_executable_script(
         &deploy_dir.join(status_script),
@@ -1645,6 +1658,7 @@ fn materialize_terraform_handoff_assets(
             destroy_script.to_string(),
             status_script.to_string(),
         ],
+        generated_tfvars: generated_tfvars.clone(),
         init_command: format!("./{init_script}"),
         plan_command: format!("./{plan_script}"),
         apply_command: format!("./{apply_script}"),
@@ -1664,6 +1678,15 @@ fn materialize_terraform_handoff_assets(
         "suggested_tfvars_example={}\n",
         terraform_root.join(&tfvars_example).display()
     ));
+    if let Some(tfvars) = generated_tfvars.as_ref() {
+        note.push_str(&format!(
+            "generated_tfvars={}\n",
+            terraform_root.join(tfvars).display()
+        ));
+    }
+    note.push_str(
+        "terraform_env_override_prefix=GREENTIC_DEPLOY_TERRAFORM_VAR_\n",
+    );
     note.push_str(
         "scripts=terraform-init.sh, terraform-plan.sh, terraform-apply.sh, terraform-destroy.sh, terraform-status.sh\n",
     );
@@ -1674,6 +1697,84 @@ fn materialize_terraform_handoff_assets(
     }
     fs::write(deploy_dir.join("terraform-handoff.txt"), note)?;
     Ok(())
+}
+
+fn materialize_generated_tfvars(
+    config: &DeployerConfig,
+    terraform_root: &Path,
+    tfvars_example: &str,
+) -> Result<Option<String>> {
+    if config.bundle_source.is_none()
+        && config.bundle_digest.is_none()
+        && terraform_env_overrides().is_empty()
+    {
+        return Ok(None);
+    }
+
+    let example_path = terraform_root.join(tfvars_example);
+    let output_name = format!("{}.tfvars", config.environment);
+    let output_path = terraform_root.join(&output_name);
+
+    let mut contents = if example_path.exists() {
+        fs::read_to_string(&example_path)?
+    } else {
+        String::new()
+    };
+
+    if let Some(bundle_source) = config.bundle_source.as_ref() {
+        replace_tfvars_assignment(&mut contents, "bundle_source", bundle_source);
+    }
+    if let Some(bundle_digest) = config.bundle_digest.as_ref() {
+        replace_tfvars_assignment(&mut contents, "bundle_digest", bundle_digest);
+    }
+    for (key, value) in terraform_env_overrides() {
+        replace_tfvars_assignment(&mut contents, &key, &value);
+    }
+
+    fs::write(output_path, contents)?;
+    Ok(Some(output_name))
+}
+
+fn terraform_env_overrides() -> Vec<(String, String)> {
+    const PREFIX: &str = "GREENTIC_DEPLOY_TERRAFORM_VAR_";
+    let mut overrides = std::env::vars()
+        .filter_map(|(key, value)| {
+            let suffix = key.strip_prefix(PREFIX)?;
+            let normalized = suffix.trim();
+            if normalized.is_empty() {
+                return None;
+            }
+            Some((normalized.to_ascii_lowercase(), value))
+        })
+        .map(|(key, value)| (key.replace("__", "-").replace('_', "."), value))
+        .map(|(key, value)| (key.replace('.', "_"), value))
+        .collect::<Vec<_>>();
+    overrides.sort_by(|a, b| a.0.cmp(&b.0));
+    overrides
+}
+
+fn replace_tfvars_assignment(contents: &mut String, key: &str, value: &str) {
+    let replacement = format!(
+        "{key} = {}",
+        serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
+    );
+
+    let mut rewritten = Vec::new();
+    let mut replaced = false;
+    for line in contents.lines() {
+        let trimmed = line.trim_start();
+        if !replaced && trimmed.starts_with(&format!("{key} =")) {
+            rewritten.push(replacement.clone());
+            replaced = true;
+        } else {
+            rewritten.push(line.to_string());
+        }
+    }
+    if !replaced {
+        rewritten.push(replacement);
+    }
+    *contents = rewritten.join("\n");
+    contents.push('\n');
 }
 
 fn materialize_k8s_raw_handoff_assets(
@@ -1986,13 +2087,26 @@ fn terraform_init_script() -> String {
         .to_string()
 }
 
-fn terraform_plan_like_script(operation: &str, tfvars_example: &str) -> String {
+fn terraform_plan_like_script(
+    operation: &str,
+    generated_tfvars: Option<&str>,
+    tfvars_example: &str,
+) -> String {
     let extra_args = match operation {
         "apply" | "destroy" => " -auto-approve -input=false",
         _ => " -input=false",
     };
+    let tfvars_lookup = if let Some(generated_tfvars) = generated_tfvars {
+        format!(
+            "if [ -f \"{generated_tfvars}\" ]; then\n  VAR_FILE=\"{generated_tfvars}\"\nelif [ -f \"{tfvars_example}\" ]; then\n  VAR_FILE=\"{tfvars_example}\"\nelse\n  for candidate in *.tfvars *.tfvars.example; do\n    if [ -f \"$candidate\" ]; then\n      VAR_FILE=\"$candidate\"\n      break\n    fi\n  done\nfi"
+        )
+    } else {
+        format!(
+            "if [ -f \"{tfvars_example}\" ]; then\n  VAR_FILE=\"{tfvars_example}\"\nelse\n  for candidate in *.tfvars *.tfvars.example; do\n    if [ -f \"$candidate\" ]; then\n      VAR_FILE=\"$candidate\"\n      break\n    fi\n  done\nfi"
+        )
+    };
     format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\nif [ -f \"${{SCRIPT_DIR}}/backend.hcl\" ]; then\n  \"$TERRAFORM_BIN\" init -input=false -backend-config=\"${{SCRIPT_DIR}}/backend.hcl\"\nelse\n  \"$TERRAFORM_BIN\" init -input=false\nfi\nVAR_FILE=\"\"\nif [ -f \"{tfvars_example}\" ]; then\n  VAR_FILE=\"{tfvars_example}\"\nelse\n  for candidate in *.tfvars.example; do\n    if [ -f \"$candidate\" ]; then\n      VAR_FILE=\"$candidate\"\n      break\n    fi\n  done\nfi\nif [ -n \"$VAR_FILE\" ]; then\n  \"$TERRAFORM_BIN\" {operation}{extra_args} -var-file=\"$VAR_FILE\" \"$@\"\nelse\n  \"$TERRAFORM_BIN\" {operation}{extra_args} \"$@\"\nfi\n"
+        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\nBACKEND_ARGS=()\nif [ -f \"${{SCRIPT_DIR}}/backend.hcl\" ]; then\n  BACKEND_ARGS=(-backend-config=\"${{SCRIPT_DIR}}/backend.hcl\")\nfi\n\"$TERRAFORM_BIN\" init -input=false \"${{BACKEND_ARGS[@]}}\"\nVAR_FILE=\"\"\n{tfvars_lookup}\nif [ -n \"$VAR_FILE\" ]; then\n  \"$TERRAFORM_BIN\" {operation}{extra_args} -var-file=\"$VAR_FILE\" \"$@\"\nelse\n  \"$TERRAFORM_BIN\" {operation}{extra_args} \"$@\"\nfi\n"
     )
 }
 
@@ -2129,6 +2243,8 @@ struct TerraformRuntimeMetadata {
     terraform_root: String,
     copied_files: Vec<String>,
     scripts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generated_tfvars: Option<String>,
     init_command: String,
     plan_command: String,
     apply_command: String,
@@ -2391,6 +2507,8 @@ mod tests {
             config_warnings: Vec::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
+            bundle_source: None,
+            bundle_digest: None,
         }
     }
 
@@ -3003,6 +3121,8 @@ kind: Deployment
             config_warnings: Vec::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
+            bundle_source: None,
+            bundle_digest: None,
         })
         .await
         .expect("terraform status runs");
@@ -3069,6 +3189,10 @@ kind: Deployment
             config_warnings: Vec::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
+            bundle_source: Some("file:///tmp/apply-test.gtbundle".into()),
+            bundle_digest: Some(
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            ),
         })
         .await
         .expect("terraform apply runs");
@@ -3097,7 +3221,7 @@ kind: Deployment
         )
         .expect("read fake terraform args");
         assert!(applied_args.contains("apply -auto-approve -input=false"));
-        assert!(applied_args.contains("-var-file=staging.tfvars.example"));
+        assert!(applied_args.contains("-var-file=staging.tfvars"));
         assert!(applied_args.contains("output -json"));
     }
 
@@ -3148,6 +3272,10 @@ kind: Deployment
             config_warnings: Vec::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
+            bundle_source: Some("file:///tmp/demo.gtbundle".into()),
+            bundle_digest: Some(
+                "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
+            ),
         };
         let plan = pack_introspect::build_plan(&config).expect("build plan");
         let deploy_dir = dir.path().join("output");
@@ -3209,10 +3337,12 @@ kind: Deployment
                 "terraform-status.sh".to_string()
             ]
         );
+        assert_eq!(metadata.generated_tfvars.as_deref(), Some("staging.tfvars"));
         assert_eq!(metadata.status_command, "./terraform-status.sh");
         let note = std::fs::read_to_string(artifacts.deploy_dir.join("terraform-handoff.txt"))
             .expect("read terraform handoff note");
         assert!(note.contains("terraform_root="));
+        assert!(note.contains("generated_tfvars="));
         assert!(note.contains("copied_files:"));
         assert!(note.contains("modules/operator/main.tf"));
         assert!(note.contains("status_command=./terraform-status.sh"));
@@ -3233,6 +3363,7 @@ kind: Deployment
                 terraform_root: output_dir.join("terraform").display().to_string(),
                 copied_files: vec!["main.tf".into(), "modules/operator/main.tf".into()],
                 scripts: vec!["terraform-status.sh".into()],
+                generated_tfvars: None,
                 init_command: "./terraform-init.sh".into(),
                 plan_command: "./terraform-plan.sh".into(),
                 apply_command: "./terraform-apply.sh".into(),
@@ -3311,6 +3442,8 @@ kind: Deployment
             config_warnings: Vec::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
+            bundle_source: None,
+            bundle_digest: None,
         };
         let plan = pack_introspect::build_plan(&config).expect("build plan");
         let deploy_dir = dir.path().join("output");
@@ -3397,6 +3530,8 @@ kind: Deployment
             config_warnings: Vec::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
+            bundle_source: None,
+            bundle_digest: None,
         };
         let plan = pack_introspect::build_plan(&config).expect("build plan");
         let deploy_dir = dir.path().join("output");

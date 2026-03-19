@@ -6,12 +6,9 @@ variable "operator_image_digest" {
   type = string
 }
 
-variable "redis_secret_name" {
-  type = string
-}
-
 variable "dns_name" {
-  type = string
+  type    = string
+  default = ""
 }
 
 variable "bundle_source" {
@@ -22,11 +19,16 @@ variable "bundle_digest" {
   type = string
 }
 
-variable "otlp_endpoint" {
-  type = string
+variable "admin_allowed_clients" {
+  type    = string
+  default = ""
+}
+
+variable "public_base_url" {
+  type    = string
+  default = ""
 }
 
 variable "remote_state_backend" {
   type = string
 }
-

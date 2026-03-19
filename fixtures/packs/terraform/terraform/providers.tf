@@ -5,4 +5,4 @@ terraform {
 
 provider "kubernetes" {}
 provider "aws" {}
-
+provider "tls" {}

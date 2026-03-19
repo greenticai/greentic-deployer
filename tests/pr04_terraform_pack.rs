@@ -167,6 +167,8 @@ fn terraform_plan_output_declares_commands_and_variables() {
         .collect::<Vec<_>>();
     assert!(vars.contains(&"operator_image_digest"));
     assert!(vars.contains(&"bundle_digest"));
+    assert!(vars.contains(&"dns_name"));
+    assert!(vars.contains(&"remote_state_backend"));
 }
 
 #[test]
@@ -207,4 +209,20 @@ fn terraform_providers_and_remote_state_are_templated() {
     assert!(providers.contains("backend \"s3\" {}"));
     assert!(providers.contains("provider \"kubernetes\" {}"));
     assert!(providers.contains("provider \"aws\" {}"));
+}
+
+#[test]
+fn terraform_runtime_module_uses_distroless_command_and_admin_secrets() {
+    let main_tf = fs::read_to_string(fixture_root().join("terraform/main.tf")).expect("read main");
+    let module_tf = fs::read_to_string(fixture_root().join("terraform/modules/operator/main.tf"))
+        .expect("read module");
+
+    assert!(main_tf.contains("ghcr.io/greentic-ai/operator-distroless@"));
+    assert!(module_tf.contains("\"start\""));
+    assert!(module_tf.contains("\"--bundle\""));
+    assert!(module_tf.contains("GREENTIC_ADMIN_CA_PEM"));
+    assert!(module_tf.contains("GREENTIC_ADMIN_SERVER_CERT_PEM"));
+    assert!(module_tf.contains("GREENTIC_ADMIN_SERVER_KEY_PEM"));
+    assert!(module_tf.contains("GREENTIC_ADMIN_ALLOWED_CLIENTS"));
+    assert!(module_tf.contains("PUBLIC_BASE_URL"));
 }

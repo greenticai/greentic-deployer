@@ -434,6 +434,10 @@ struct AwsArgs {
     #[arg(long)]
     pack: std::path::PathBuf,
     #[arg(long)]
+    bundle_source: Option<String>,
+    #[arg(long)]
+    bundle_digest: Option<String>,
+    #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
     #[arg(long)]
     deploy_pack_id: Option<String>,
@@ -873,6 +877,8 @@ fn run_multi_target(command: MultiTargetCommand) -> Result<()> {
         allow_remote_in_offline: args.allow_remote_in_offline,
         deploy_pack_id_override: args.deploy_pack_id,
         deploy_flow_id_override: args.deploy_flow_id,
+        bundle_source: None,
+        bundle_digest: None,
     })
 }
 
@@ -1013,6 +1019,8 @@ fn run_aws(command: AwsCommand) -> Result<()> {
         capability,
         tenant: args.tenant,
         pack_path: args.pack,
+        bundle_source: args.bundle_source,
+        bundle_digest: args.bundle_digest,
         provider_pack: args.provider_pack,
         deploy_pack_id_override: args.deploy_pack_id,
         deploy_flow_id_override: args.deploy_flow_id,

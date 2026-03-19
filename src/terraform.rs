@@ -85,6 +85,8 @@ impl TerraformRequest {
             allow_remote_in_offline: self.allow_remote_in_offline,
             deploy_pack_id_override: self.deploy_pack_id_override,
             deploy_flow_id_override: self.deploy_flow_id_override,
+            bundle_source: None,
+            bundle_digest: None,
         }
     }
 }
@@ -173,6 +175,8 @@ mod tests {
             config_warnings: Vec::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
+            bundle_source: None,
+            bundle_digest: None,
         };
 
         let err = ensure_terraform_config(&config).expect_err("non-terraform config rejected");

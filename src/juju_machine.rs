@@ -84,6 +84,8 @@ impl JujuMachineRequest {
             allow_remote_in_offline: self.allow_remote_in_offline,
             deploy_pack_id_override: self.deploy_pack_id_override,
             deploy_flow_id_override: self.deploy_flow_id_override,
+            bundle_source: None,
+            bundle_digest: None,
         }
     }
 }
