@@ -58,6 +58,7 @@ pub fn build_provider_gtpack(fixture_name: &str, output_path: &Path, pack_id: &s
     builder.finish().expect("finish archive");
 }
 
+#[allow(dead_code)]
 pub fn build_operator_provider_gtpack(output_path: &Path) {
     let fixture_dir = fixture_root("k8s-raw");
     let contract_path = fixture_dir.join("contract.greentic.deployer.v1.json");
