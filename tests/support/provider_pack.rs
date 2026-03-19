@@ -24,6 +24,7 @@ fn fixture_root(name: &str) -> PathBuf {
         .join(name)
 }
 
+#[allow(dead_code)]
 pub fn build_provider_gtpack(fixture_name: &str, output_path: &Path, pack_id: &str) {
     let fixture_dir = fixture_root(fixture_name);
     let contract_path = fixture_dir.join("contract.greentic.deployer.v1.json");
@@ -54,6 +55,84 @@ pub fn build_provider_gtpack(fixture_name: &str, output_path: &Path, pack_id: &s
     let mut builder = Builder::new(file);
     append_bytes(&mut builder, Path::new("manifest.cbor"), &encoded);
     append_fixture_tree(&mut builder, &fixture_dir, &fixture_dir);
+    builder.finish().expect("finish archive");
+}
+
+pub fn build_operator_provider_gtpack(output_path: &Path) {
+    let fixture_dir = fixture_root("k8s-raw");
+    let contract_path = fixture_dir.join("contract.greentic.deployer.v1.json");
+    let contract: DeployerContractV1 =
+        serde_json::from_slice(&fs::read(&contract_path).expect("read contract"))
+            .expect("parse contract");
+
+    let mut manifest = PackManifest {
+        schema_version: "pack-v1".to_string(),
+        pack_id: PackId::from_str("greentic.deploy.operator").expect("pack id"),
+        name: Some("Fixture operator provider pack".to_string()),
+        version: Version::new(0, 4, 17),
+        kind: PackKind::Application,
+        publisher: "greentic".to_string(),
+        secret_requirements: Vec::new(),
+        components: Vec::new(),
+        flows: contract_flow_entries(&contract),
+        dependencies: Vec::new(),
+        capabilities: Vec::new(),
+        signatures: Default::default(),
+        bootstrap: None,
+        extensions: None,
+    };
+    set_deployer_contract_v1(&mut manifest, contract).expect("embed contract");
+    let encoded = greentic_types::cbor::encode_pack_manifest(&manifest).expect("encode manifest");
+
+    let file = File::create(output_path).expect("create output archive");
+    let mut builder = Builder::new(file);
+    append_bytes(&mut builder, Path::new("manifest.cbor"), &encoded);
+    append_fixture_tree(&mut builder, &fixture_dir, &fixture_dir);
+
+    append_bytes(
+        &mut builder,
+        Path::new("assets/examples/generate-output.json"),
+        br#"{
+  "kind": "generate",
+  "capability": "generate",
+  "provider": "k8s",
+  "strategy": "operator",
+  "rendered_manifest_path": "assets/examples/rendered-manifests.yaml",
+  "supported_upgrade_modes": ["rolling", "blue_green", "canary_external"]
+}
+"#,
+    );
+    append_bytes(
+        &mut builder,
+        Path::new("assets/schemas/generate-output.schema.json"),
+        br#"{
+  "type": "object",
+  "required": [
+    "kind",
+    "capability",
+    "provider",
+    "strategy",
+    "rendered_manifest_path",
+    "supported_upgrade_modes"
+  ],
+  "properties": {
+    "kind": { "const": "generate" },
+    "capability": { "const": "generate" },
+    "provider": { "const": "k8s" },
+    "strategy": { "const": "operator" },
+    "rendered_manifest_path": {
+      "const": "assets/examples/rendered-manifests.yaml"
+    },
+    "supported_upgrade_modes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "contains": { "const": "rolling" },
+      "minItems": 3
+    }
+  }
+}
+"#,
+    );
     builder.finish().expect("finish archive");
 }
 

@@ -3,13 +3,13 @@ use std::process::Command;
 #[path = "support/provider_pack.rs"]
 mod provider_pack;
 
-use provider_pack::{build_provider_gtpack, example_pack_path, write_fake_command_bin};
+use provider_pack::{build_operator_provider_gtpack, example_pack_path, write_fake_command_bin};
 
 #[test]
 fn operator_generate_cli_renders_json_output() {
     let dir = tempfile::tempdir().expect("tempdir");
     let provider_pack = dir.path().join("provider.gtpack");
-    build_provider_gtpack("k8s-raw", &provider_pack, "greentic.deploy.operator");
+    build_operator_provider_gtpack(&provider_pack);
     let pack = example_pack_path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_greentic-deployer"))
@@ -28,7 +28,12 @@ fn operator_generate_cli_renders_json_output() {
         .output()
         .expect("run greentic-deployer");
 
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("\"capability\": \"generate\""));
     assert!(stdout.contains("\"provider\": \"k8s\""));
@@ -39,7 +44,7 @@ fn operator_generate_cli_renders_json_output() {
 fn operator_status_cli_renders_json_output() {
     let dir = tempfile::tempdir().expect("tempdir");
     let provider_pack = dir.path().join("provider.gtpack");
-    build_provider_gtpack("k8s-raw", &provider_pack, "greentic.deploy.operator");
+    build_operator_provider_gtpack(&provider_pack);
     let pack = example_pack_path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_greentic-deployer"))
@@ -58,7 +63,12 @@ fn operator_status_cli_renders_json_output() {
         .output()
         .expect("run greentic-deployer");
 
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("\"capability\": \"status\""));
     assert!(stdout.contains("\"provider\": \"k8s\""));
@@ -70,7 +80,7 @@ fn operator_status_cli_renders_json_output() {
 fn operator_apply_execute_cli_runs_local_kubectl_scaffold() {
     let dir = tempfile::tempdir().expect("tempdir");
     let provider_pack = dir.path().join("provider.gtpack");
-    build_provider_gtpack("k8s-raw", &provider_pack, "greentic.deploy.operator");
+    build_operator_provider_gtpack(&provider_pack);
     let fake_bin_dir = dir.path().join("bin");
     std::fs::create_dir_all(&fake_bin_dir).expect("create fake bin dir");
     write_fake_command_bin(&fake_bin_dir, "kubectl");
