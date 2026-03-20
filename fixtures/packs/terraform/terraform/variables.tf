@@ -1,7 +1,3 @@
-variable "kubernetes_namespace" {
-  type = string
-}
-
 variable "operator_image_digest" {
   type = string
 }

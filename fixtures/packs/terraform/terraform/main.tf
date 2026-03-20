@@ -1,7 +1,6 @@
 module "operator" {
   source = "./modules/operator"
 
-  kubernetes_namespace = var.kubernetes_namespace
   operator_image = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
   bundle_source  = var.bundle_source
   bundle_digest  = var.bundle_digest

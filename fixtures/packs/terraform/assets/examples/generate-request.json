@@ -1,6 +1,5 @@
 {
   "environment": "staging",
-  "kubernetes_namespace": "greentic-system",
   "operator_image_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "dns_name": "",
   "bundle_source": "oci://registry.greentic.ai/bundles/operator",
