@@ -1625,7 +1625,7 @@ fn materialize_terraform_handoff_assets(
     }
     configure_terraform_backend(config, &terraform_root, deploy_dir)?;
 
-    let tfvars_example = format!("{}.tfvars.example", config.environment);
+    let tfvars_example = resolve_tfvars_example_name(&terraform_root, &config.environment)?;
     let generated_tfvars = materialize_generated_tfvars(config, &terraform_root, &tfvars_example)?;
     let init_script = "terraform-init.sh";
     let plan_script = "terraform-plan.sh";
@@ -1733,6 +1733,29 @@ fn materialize_generated_tfvars(
 
     fs::write(output_path, contents)?;
     Ok(Some(output_name))
+}
+
+fn resolve_tfvars_example_name(terraform_root: &Path, environment: &str) -> Result<String> {
+    let preferred = format!("{environment}.tfvars.example");
+    if terraform_root.join(&preferred).exists() {
+        return Ok(preferred);
+    }
+
+    let mut candidates = fs::read_dir(terraform_root)?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            if !file_type.is_file() {
+                return None;
+            }
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            name.ends_with(".tfvars.example").then(|| name.to_string())
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+
+    Ok(candidates.into_iter().next().unwrap_or(preferred))
 }
 
 fn terraform_env_overrides() -> Vec<(String, String)> {
@@ -3351,6 +3374,101 @@ kind: Deployment
         assert!(note.contains("copied_files:"));
         assert!(note.contains("modules/operator/main.tf"));
         assert!(note.contains("status_command=./terraform-status.sh"));
+    }
+
+    #[test]
+    fn persist_runtime_artifacts_falls_back_to_available_tfvars_example() {
+        let base = std::env::current_dir()
+            .expect("cwd")
+            .join("target/tmp-tests");
+        std::fs::create_dir_all(&base).expect("create tmp base");
+        let dir = tempfile::tempdir_in(base).expect("temp dir");
+        let pack_path = write_test_pack(true);
+
+        let mut greentic = greentic_config::ConfigResolver::new()
+            .load()
+            .expect("load default config")
+            .config;
+        greentic.paths.state_dir = dir.path().join(".greentic-state");
+
+        let config = DeployerConfig {
+            capability: DeployerCapability::Plan,
+            provider: Provider::Generic,
+            strategy: "terraform".into(),
+            tenant: "acme".into(),
+            environment: "dev".into(),
+            pack_path: pack_path.clone(),
+            providers_dir: PathBuf::from("providers/deployer"),
+            packs_dir: PathBuf::from("packs"),
+            provider_pack: Some(pack_path.clone()),
+            pack_ref: None,
+            distributor_url: None,
+            distributor_token: None,
+            preview: false,
+            dry_run: false,
+            execute_local: false,
+            output: crate::config::OutputFormat::Json,
+            greentic,
+            provenance: greentic_config::ProvenanceMap::new(),
+            config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
+            bundle_source: Some("file:///tmp/demo.gtbundle".into()),
+            bundle_digest: Some(
+                "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
+            ),
+        };
+        let plan = pack_introspect::build_plan(&config).expect("build plan");
+        let deploy_dir = dir.path().join("output");
+        std::fs::create_dir_all(&deploy_dir).expect("create output dir");
+        let selection = DeploymentPackSelection {
+            dispatch: crate::deployment::DeploymentDispatch {
+                capability: DeployerCapability::Plan,
+                pack_id: "greentic.deploy.terraform".into(),
+                flow_id: "plan_terraform".into(),
+            },
+            pack_path,
+            manifest: PackManifest {
+                schema_version: "pack-v1".to_string(),
+                pack_id: PackId::from_str("greentic.deploy.terraform").unwrap(),
+                name: None,
+                version: Version::new(0, 1, 0),
+                kind: PackKind::Application,
+                publisher: "greentic".to_string(),
+                secret_requirements: Vec::new(),
+                components: Vec::new(),
+                flows: Vec::new(),
+                dependencies: Vec::new(),
+                capabilities: Vec::new(),
+                signatures: Default::default(),
+                bootstrap: None,
+                extensions: None,
+            },
+            origin: "test".into(),
+            candidates: Vec::new(),
+        };
+
+        let artifacts = persist_runtime_artifacts(&config, &plan, &selection, &deploy_dir)
+            .expect("persist runtime artifacts");
+        let metadata: TerraformRuntimeMetadata = serde_json::from_slice(
+            &std::fs::read(artifacts.deploy_dir.join("terraform-runtime.json"))
+                .expect("read terraform runtime metadata"),
+        )
+        .expect("parse terraform runtime metadata");
+        assert_eq!(metadata.generated_tfvars.as_deref(), Some("dev.tfvars"));
+
+        let generated = std::fs::read_to_string(artifacts.deploy_dir.join("terraform/dev.tfvars"))
+            .expect("read generated tfvars");
+        assert!(generated.contains("bundle_source = \"file:///tmp/demo.gtbundle\""));
+        assert!(generated.contains(
+            "bundle_digest = \"sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd\""
+        ));
+
+        let destroy_script =
+            std::fs::read_to_string(artifacts.deploy_dir.join("terraform-destroy.sh"))
+                .expect("read destroy script");
+        assert!(destroy_script.contains("VAR_FILE=\"dev.tfvars\""));
+        assert!(destroy_script.contains("elif [ -f \"staging.tfvars.example\" ]; then"));
     }
 
     #[test]
