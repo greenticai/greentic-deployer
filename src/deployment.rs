@@ -555,6 +555,8 @@ pub struct ApplyExecutionOutcome {
 pub struct DestroyExecutionOutcome {
     pub deployment_id: String,
     pub state: String,
+    #[serde(default)]
+    pub destroyed_resources: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

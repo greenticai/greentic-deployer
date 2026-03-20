@@ -938,6 +938,7 @@ fn execute_local_terraform_operation(
         ExecutionOutcomePayload::Destroy(crate::deployment::DestroyExecutionOutcome {
             deployment_id: runtime_artifacts.handoff.output_dir.clone(),
             state: state.to_string(),
+            destroyed_resources: Vec::new(),
         })
     };
 
@@ -1009,6 +1010,7 @@ fn execute_local_scripted_operation(
             ExecutionOutcomePayload::Destroy(crate::deployment::DestroyExecutionOutcome {
                 deployment_id: runtime_artifacts.handoff.output_dir.clone(),
                 state: state.to_string(),
+                destroyed_resources: Vec::new(),
             })
         }
     };
@@ -2942,11 +2944,15 @@ kind: Deployment
                 path: "assets/schemas/destroy-execution-output.schema.json".into(),
                 json: Some(serde_json::json!({
                     "type": "object",
-                    "required": ["kind", "deployment_id", "state"],
+                    "required": ["kind", "deployment_id", "state", "destroyed_resources"],
                     "properties": {
                         "kind": { "const": "destroy" },
                         "deployment_id": { "type": "string" },
-                        "state": { "type": "string" }
+                        "state": { "type": "string" },
+                        "destroyed_resources": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
                     }
                 })),
                 text: None,
@@ -2967,6 +2973,7 @@ kind: Deployment
                     crate::deployment::DestroyExecutionOutcome {
                         deployment_id: "dep-42".into(),
                         state: "deleted".into(),
+                        destroyed_resources: Vec::new(),
                     },
                 )),
             }),
