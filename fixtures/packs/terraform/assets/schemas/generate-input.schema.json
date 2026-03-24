@@ -1,6 +1,7 @@
 {
   "type": "object",
   "required": [
+    "cloud",
     "environment",
     "operator_image_digest",
     "bundle_source",
@@ -8,6 +9,10 @@
     "remote_state_backend"
   ],
   "properties": {
+    "cloud": {
+      "type": "string",
+      "enum": ["aws", "azure", "gcp"]
+    },
     "environment": { "type": "string", "minLength": 1 },
     "operator_image_digest": {
       "type": "string",
@@ -19,7 +24,14 @@
       "type": "string",
       "pattern": "^sha256:[a-f0-9]{64}$"
     },
+    "repo_registry_base": { "type": "string" },
+    "store_registry_base": { "type": "string" },
+    "azure_key_vault_uri": { "type": "string", "minLength": 1 },
+    "azure_key_vault_id": { "type": "string", "minLength": 1 },
+    "azure_location": { "type": "string", "minLength": 1 },
     "admin_allowed_clients": { "type": "string" },
+    "gcp_project_id": { "type": "string", "minLength": 1 },
+    "gcp_region": { "type": "string", "minLength": 1 },
     "public_base_url": { "type": "string", "minLength": 1 },
     "remote_state_backend": { "type": "string", "minLength": 1 }
   }

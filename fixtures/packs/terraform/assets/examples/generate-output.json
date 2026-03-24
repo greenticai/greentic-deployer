@@ -4,12 +4,28 @@
   "provider": "generic",
   "strategy": "terraform",
   "terraform_root": "terraform",
+  "supported_clouds": [
+    "aws",
+    "azure",
+    "gcp"
+  ],
+  "cloud_modules": {
+    "aws": "modules/operator",
+    "azure": "modules/operator-azure",
+    "gcp": "modules/operator-gcp"
+  },
   "generated_files": [
     "main.tf",
     "variables.tf",
     "outputs.tf",
     "providers.tf",
-    "staging.tfvars.example"
+    "staging.tfvars.example",
+    "modules/operator/main.tf",
+    "modules/operator-azure/main.tf",
+    "modules/operator-azure/variables.tf",
+    "modules/operator-azure/outputs.tf",
+    "modules/operator-gcp/main.tf",
+    "modules/operator-gcp/variables.tf",
+    "modules/operator-gcp/outputs.tf"
   ]
 }
-

@@ -13,6 +13,8 @@
       "output_schema_ref": "assets/schemas/generate-output.schema.json",
       "example_refs": [
         "assets/examples/generate-request.json",
+        "assets/examples/generate-request.azure.json",
+        "assets/examples/generate-request.gcp.json",
         "assets/examples/generate-output.json"
       ]
     },

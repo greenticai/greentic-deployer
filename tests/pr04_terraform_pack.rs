@@ -207,8 +207,10 @@ fn terraform_providers_and_remote_state_are_templated() {
     let providers =
         fs::read_to_string(fixture_root().join("terraform/providers.tf")).expect("read providers");
     assert!(providers.contains("backend \"s3\" {}"));
-    assert!(providers.contains("provider \"kubernetes\" {}"));
-    assert!(providers.contains("provider \"aws\" {}"));
+    assert!(!providers.contains("provider \"kubernetes\" {}"));
+    assert!(!providers.contains("provider \"aws\" {}"));
+    assert!(providers.contains("provider \"google\""));
+    assert!(providers.contains("provider \"azurerm\""));
 }
 
 #[test]

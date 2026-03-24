@@ -341,8 +341,28 @@ resource "aws_ecs_task_definition" "this" {
             value = var.bundle_digest
           },
           {
+            name  = "GREENTIC_REPO_REGISTRY_BASE"
+            value = var.repo_registry_base
+          },
+          {
+            name  = "GREENTIC_STORE_REGISTRY_BASE"
+            value = var.store_registry_base
+          },
+          {
             name  = "GREENTIC_ADMIN_LISTEN"
             value = local.admin_bind
+          },
+          {
+            name  = "GREENTIC_ADMIN_CA_SECRET_REF"
+            value = aws_secretsmanager_secret.admin_ca.arn
+          },
+          {
+            name  = "GREENTIC_ADMIN_SERVER_CERT_SECRET_REF"
+            value = aws_secretsmanager_secret.admin_server_cert.arn
+          },
+          {
+            name  = "GREENTIC_ADMIN_SERVER_KEY_SECRET_REF"
+            value = aws_secretsmanager_secret.admin_server_key.arn
           },
           {
             name  = "GREENTIC_HEALTH_READINESS_PATH"

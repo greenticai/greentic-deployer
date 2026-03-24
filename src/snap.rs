@@ -86,6 +86,8 @@ impl SnapRequest {
             deploy_flow_id_override: self.deploy_flow_id_override,
             bundle_source: None,
             bundle_digest: None,
+            repo_registry_base: None,
+            store_registry_base: None,
         }
     }
 }

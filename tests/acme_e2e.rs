@@ -198,6 +198,8 @@ fn default_config(pack_path: PathBuf) -> DeployerConfig {
         deploy_flow_id_override: None,
         bundle_source: None,
         bundle_digest: None,
+        repo_registry_base: None,
+        store_registry_base: None,
     }
 }
 

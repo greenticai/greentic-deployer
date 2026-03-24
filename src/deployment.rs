@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -547,8 +547,14 @@ pub enum ExecutionOutcomePayload {
 pub struct ApplyExecutionOutcome {
     pub deployment_id: String,
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub endpoints: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub output_refs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -563,8 +569,18 @@ pub struct DestroyExecutionOutcome {
 pub struct StatusExecutionOutcome {
     pub deployment_id: String,
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub health_checks: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub output_refs: BTreeMap<String, String>,
 }
 
 static EXECUTOR: Lazy<RwLock<Option<Arc<dyn DeploymentExecutor>>>> =
@@ -687,7 +703,13 @@ mod tests {
                 payload: Some(ExecutionOutcomePayload::Apply(ApplyExecutionOutcome {
                     deployment_id: "dep-123".into(),
                     state: "ready".into(),
+                    provider: Some("aws".into()),
+                    strategy: Some("iac-only".into()),
                     endpoints: vec!["https://deploy.example.test".into()],
+                    output_refs: BTreeMap::from([(
+                        "operator_endpoint".into(),
+                        "https://deploy.example.test".into(),
+                    )]),
                 })),
             })
         }
@@ -726,6 +748,8 @@ mod tests {
             deploy_flow_id_override: None,
             bundle_source: None,
             bundle_digest: None,
+            repo_registry_base: None,
+            store_registry_base: None,
         };
         let plan = pack_introspect::build_plan(&config).expect("plan builds");
         let dispatch = DeploymentDispatch {
@@ -748,7 +772,16 @@ mod tests {
             ExecutionOutcomePayload::Apply(payload) => {
                 assert_eq!(payload.deployment_id, "dep-123");
                 assert_eq!(payload.state, "ready");
+                assert_eq!(payload.provider.as_deref(), Some("aws"));
+                assert_eq!(payload.strategy.as_deref(), Some("iac-only"));
                 assert_eq!(payload.endpoints, vec!["https://deploy.example.test"]);
+                assert_eq!(
+                    payload
+                        .output_refs
+                        .get("operator_endpoint")
+                        .map(String::as_str),
+                    Some("https://deploy.example.test")
+                );
             }
             other => panic!("unexpected outcome payload: {:?}", other),
         }
