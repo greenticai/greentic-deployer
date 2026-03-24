@@ -4,3 +4,6 @@
 /dist
 providers/*/dist
 .greentic
+
+# OS
+.DS_Store
