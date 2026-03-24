@@ -5,10 +5,15 @@
     "kind": { "const": "apply" },
     "deployment_id": { "type": "string" },
     "state": { "type": "string" },
+    "provider": { "type": "string" },
+    "strategy": { "type": "string" },
     "endpoints": {
       "type": "array",
       "items": { "type": "string" }
+    },
+    "output_refs": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
     }
   }
 }
-

@@ -1,5 +1,5 @@
 {
-  "cloud": "aws",
+  "cloud": "azure",
   "environment": "staging",
   "operator_image_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "dns_name": "",
@@ -7,7 +7,10 @@
   "bundle_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
   "repo_registry_base": "",
   "store_registry_base": "",
+  "azure_key_vault_uri": "https://greentic-staging.vault.azure.net/",
+  "azure_key_vault_id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/greentic-staging/providers/Microsoft.KeyVault/vaults/greentic-staging",
+  "azure_location": "eastus",
   "admin_allowed_clients": "local-admin,ops-admin",
   "public_base_url": "https://operator.greentic.example.com",
-  "remote_state_backend": "s3"
+  "remote_state_backend": "azurerm"
 }

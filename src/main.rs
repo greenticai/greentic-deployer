@@ -285,7 +285,11 @@ struct MultiTargetArgs {
     strategy: String,
     #[arg(long)]
     tenant: String,
-    #[arg(long)]
+    #[arg(
+        long = "bundle-pack",
+        visible_alias = "pack",
+        help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
+    )]
     pack: std::path::PathBuf,
     #[arg(long)]
     environment: Option<String>,
@@ -321,7 +325,11 @@ struct MultiTargetArgs {
 struct TerraformArgs {
     #[arg(long)]
     tenant: String,
-    #[arg(long)]
+    #[arg(
+        long = "bundle-pack",
+        visible_alias = "pack",
+        help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
+    )]
     pack: std::path::PathBuf,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
@@ -359,7 +367,11 @@ struct TerraformArgs {
 struct K8sRawArgs {
     #[arg(long)]
     tenant: String,
-    #[arg(long)]
+    #[arg(
+        long = "bundle-pack",
+        visible_alias = "pack",
+        help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
+    )]
     pack: std::path::PathBuf,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
@@ -395,7 +407,11 @@ struct K8sRawArgs {
 struct HelmArgs {
     #[arg(long)]
     tenant: String,
-    #[arg(long)]
+    #[arg(
+        long = "bundle-pack",
+        visible_alias = "pack",
+        help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
+    )]
     pack: std::path::PathBuf,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
@@ -431,12 +447,20 @@ struct HelmArgs {
 struct AwsArgs {
     #[arg(long)]
     tenant: String,
-    #[arg(long)]
+    #[arg(
+        long = "bundle-pack",
+        visible_alias = "pack",
+        help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
+    )]
     pack: std::path::PathBuf,
     #[arg(long)]
     bundle_source: Option<String>,
     #[arg(long)]
     bundle_digest: Option<String>,
+    #[arg(long)]
+    repo_registry_base: Option<String>,
+    #[arg(long)]
+    store_registry_base: Option<String>,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
     #[arg(long)]
@@ -473,8 +497,20 @@ struct AwsArgs {
 struct AzureArgs {
     #[arg(long)]
     tenant: String,
-    #[arg(long)]
+    #[arg(
+        long = "bundle-pack",
+        visible_alias = "pack",
+        help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
+    )]
     pack: std::path::PathBuf,
+    #[arg(long)]
+    bundle_source: Option<String>,
+    #[arg(long)]
+    bundle_digest: Option<String>,
+    #[arg(long)]
+    repo_registry_base: Option<String>,
+    #[arg(long)]
+    store_registry_base: Option<String>,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
     #[arg(long)]
@@ -511,8 +547,20 @@ struct AzureArgs {
 struct GcpArgs {
     #[arg(long)]
     tenant: String,
-    #[arg(long)]
+    #[arg(
+        long = "bundle-pack",
+        visible_alias = "pack",
+        help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
+    )]
     pack: std::path::PathBuf,
+    #[arg(long)]
+    bundle_source: Option<String>,
+    #[arg(long)]
+    bundle_digest: Option<String>,
+    #[arg(long)]
+    repo_registry_base: Option<String>,
+    #[arg(long)]
+    store_registry_base: Option<String>,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
     #[arg(long)]
@@ -549,7 +597,11 @@ struct GcpArgs {
 struct JujuK8sArgs {
     #[arg(long)]
     tenant: String,
-    #[arg(long)]
+    #[arg(
+        long = "bundle-pack",
+        visible_alias = "pack",
+        help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
+    )]
     pack: std::path::PathBuf,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
@@ -587,7 +639,11 @@ struct JujuK8sArgs {
 struct JujuMachineArgs {
     #[arg(long)]
     tenant: String,
-    #[arg(long)]
+    #[arg(
+        long = "bundle-pack",
+        visible_alias = "pack",
+        help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
+    )]
     pack: std::path::PathBuf,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
@@ -625,7 +681,11 @@ struct JujuMachineArgs {
 struct OperatorArgs {
     #[arg(long)]
     tenant: String,
-    #[arg(long)]
+    #[arg(
+        long = "bundle-pack",
+        visible_alias = "pack",
+        help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
+    )]
     pack: std::path::PathBuf,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
@@ -663,7 +723,11 @@ struct OperatorArgs {
 struct ServerlessArgs {
     #[arg(long)]
     tenant: String,
-    #[arg(long)]
+    #[arg(
+        long = "bundle-pack",
+        visible_alias = "pack",
+        help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
+    )]
     pack: std::path::PathBuf,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
@@ -701,7 +765,11 @@ struct ServerlessArgs {
 struct SnapArgs {
     #[arg(long)]
     tenant: String,
-    #[arg(long)]
+    #[arg(
+        long = "bundle-pack",
+        visible_alias = "pack",
+        help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
+    )]
     pack: std::path::PathBuf,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
@@ -879,6 +947,8 @@ fn run_multi_target(command: MultiTargetCommand) -> Result<()> {
         deploy_flow_id_override: args.deploy_flow_id,
         bundle_source: None,
         bundle_digest: None,
+        repo_registry_base: None,
+        store_registry_base: None,
     })
 }
 
@@ -1021,6 +1091,8 @@ fn run_aws(command: AwsCommand) -> Result<()> {
         pack_path: args.pack,
         bundle_source: args.bundle_source,
         bundle_digest: args.bundle_digest,
+        repo_registry_base: args.repo_registry_base,
+        store_registry_base: args.store_registry_base,
         provider_pack: args.provider_pack,
         deploy_pack_id_override: args.deploy_pack_id,
         deploy_flow_id_override: args.deploy_flow_id,
@@ -1062,6 +1134,10 @@ fn run_azure(command: AzureCommand) -> Result<()> {
         capability,
         tenant: args.tenant,
         pack_path: args.pack,
+        bundle_source: args.bundle_source,
+        bundle_digest: args.bundle_digest,
+        repo_registry_base: args.repo_registry_base,
+        store_registry_base: args.store_registry_base,
         provider_pack: args.provider_pack,
         deploy_pack_id_override: args.deploy_pack_id,
         deploy_flow_id_override: args.deploy_flow_id,
@@ -1103,6 +1179,10 @@ fn run_gcp(command: GcpCommand) -> Result<()> {
         capability,
         tenant: args.tenant,
         pack_path: args.pack,
+        bundle_source: args.bundle_source,
+        bundle_digest: args.bundle_digest,
+        repo_registry_base: args.repo_registry_base,
+        store_registry_base: args.store_registry_base,
         provider_pack: args.provider_pack,
         deploy_pack_id_override: args.deploy_pack_id,
         deploy_flow_id_override: args.deploy_flow_id,

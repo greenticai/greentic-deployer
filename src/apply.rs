@@ -4,6 +4,7 @@
 //! used for non-single-vm targets. The stable OSS single-VM path lives in
 //! `crate::single_vm`.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -627,10 +628,10 @@ fn synthesize_local_execution_outcome(
     if config.execute_local && uses_terraform_handoff(config) {
         match config.capability {
             DeployerCapability::Apply => {
-                return execute_local_terraform_operation(runtime_artifacts, "apply");
+                return execute_local_terraform_operation(config, runtime_artifacts, "apply");
             }
             DeployerCapability::Destroy => {
-                return execute_local_terraform_operation(runtime_artifacts, "destroy");
+                return execute_local_terraform_operation(config, runtime_artifacts, "destroy");
             }
             _ => {}
         }
@@ -639,6 +640,7 @@ fn synthesize_local_execution_outcome(
         match config.capability {
             DeployerCapability::Apply => {
                 return execute_local_scripted_operation(
+                    config,
                     runtime_artifacts,
                     "operator-apply.sh",
                     "operator-apply",
@@ -649,6 +651,7 @@ fn synthesize_local_execution_outcome(
             }
             DeployerCapability::Destroy => {
                 return execute_local_scripted_operation(
+                    config,
                     runtime_artifacts,
                     "operator-delete.sh",
                     "operator-destroy",
@@ -664,6 +667,7 @@ fn synthesize_local_execution_outcome(
         match config.capability {
             DeployerCapability::Apply => {
                 return execute_local_scripted_operation(
+                    config,
                     runtime_artifacts,
                     "serverless-deploy.sh",
                     "serverless-apply",
@@ -674,6 +678,7 @@ fn synthesize_local_execution_outcome(
             }
             DeployerCapability::Destroy => {
                 return execute_local_scripted_operation(
+                    config,
                     runtime_artifacts,
                     "serverless-destroy.sh",
                     "serverless-destroy",
@@ -689,6 +694,7 @@ fn synthesize_local_execution_outcome(
         match config.capability {
             DeployerCapability::Apply => {
                 return execute_local_scripted_operation(
+                    config,
                     runtime_artifacts,
                     "snap-install.sh",
                     "snap-apply",
@@ -699,6 +705,7 @@ fn synthesize_local_execution_outcome(
             }
             DeployerCapability::Destroy => {
                 return execute_local_scripted_operation(
+                    config,
                     runtime_artifacts,
                     "snap-remove.sh",
                     "snap-destroy",
@@ -714,6 +721,7 @@ fn synthesize_local_execution_outcome(
         match config.capability {
             DeployerCapability::Apply => {
                 return execute_local_scripted_operation(
+                    config,
                     runtime_artifacts,
                     "juju-machine-deploy.sh",
                     "juju-machine-apply",
@@ -724,6 +732,7 @@ fn synthesize_local_execution_outcome(
             }
             DeployerCapability::Destroy => {
                 return execute_local_scripted_operation(
+                    config,
                     runtime_artifacts,
                     "juju-machine-remove.sh",
                     "juju-machine-destroy",
@@ -739,6 +748,7 @@ fn synthesize_local_execution_outcome(
         match config.capability {
             DeployerCapability::Apply => {
                 return execute_local_scripted_operation(
+                    config,
                     runtime_artifacts,
                     "juju-k8s-deploy.sh",
                     "juju-k8s-apply",
@@ -749,6 +759,7 @@ fn synthesize_local_execution_outcome(
             }
             DeployerCapability::Destroy => {
                 return execute_local_scripted_operation(
+                    config,
                     runtime_artifacts,
                     "juju-k8s-remove.sh",
                     "juju-k8s-destroy",
@@ -761,10 +772,11 @@ fn synthesize_local_execution_outcome(
         }
     }
     if config.capability == DeployerCapability::Status && uses_terraform_handoff(config) {
-        return synthesize_local_terraform_status(runtime_artifacts);
+        return synthesize_local_terraform_status(config, runtime_artifacts);
     }
     if config.capability == DeployerCapability::Status && uses_operator_handoff(config) {
         return synthesize_scripted_handoff_status(
+            config,
             runtime_artifacts,
             "operator-handoff.txt",
             vec![
@@ -778,6 +790,7 @@ fn synthesize_local_execution_outcome(
     }
     if config.capability == DeployerCapability::Status && uses_serverless_handoff(config) {
         return synthesize_scripted_handoff_status(
+            config,
             runtime_artifacts,
             "serverless-handoff.txt",
             vec![
@@ -794,6 +807,7 @@ fn synthesize_local_execution_outcome(
     }
     if config.capability == DeployerCapability::Status && uses_snap_handoff(config) {
         return synthesize_scripted_handoff_status(
+            config,
             runtime_artifacts,
             "snap-handoff.txt",
             vec![
@@ -808,6 +822,7 @@ fn synthesize_local_execution_outcome(
     }
     if config.capability == DeployerCapability::Status && uses_juju_machine_handoff(config) {
         return synthesize_scripted_handoff_status(
+            config,
             runtime_artifacts,
             "juju-machine-handoff.txt",
             vec![
@@ -821,6 +836,7 @@ fn synthesize_local_execution_outcome(
     }
     if config.capability == DeployerCapability::Status && uses_juju_k8s_handoff(config) {
         return synthesize_scripted_handoff_status(
+            config,
             runtime_artifacts,
             "juju-k8s-handoff.txt",
             vec![
@@ -871,6 +887,7 @@ enum ScriptedPayloadKind {
 }
 
 fn execute_local_terraform_operation(
+    config: &DeployerConfig,
     runtime_artifacts: &RuntimeArtifacts,
     operation: &str,
 ) -> Result<Option<ExecutionOutcome>> {
@@ -928,11 +945,19 @@ fn execute_local_terraform_operation(
     } else {
         Vec::new()
     };
+    let output_refs = if operation == "apply" {
+        collect_terraform_output_refs(runtime_artifacts)
+    } else {
+        BTreeMap::new()
+    };
     let payload = if operation == "apply" {
         ExecutionOutcomePayload::Apply(crate::deployment::ApplyExecutionOutcome {
             deployment_id: runtime_artifacts.handoff.output_dir.clone(),
             state: state.to_string(),
+            provider: Some(config.provider.as_str().to_string()),
+            strategy: Some(config.strategy.clone()),
             endpoints,
+            output_refs,
         })
     } else {
         ExecutionOutcomePayload::Destroy(crate::deployment::DestroyExecutionOutcome {
@@ -954,6 +979,7 @@ fn execute_local_terraform_operation(
 }
 
 fn execute_local_scripted_operation(
+    config: &DeployerConfig,
     runtime_artifacts: &RuntimeArtifacts,
     script_name: &str,
     log_prefix: &str,
@@ -998,12 +1024,20 @@ fn execute_local_scripted_operation(
     } else {
         Vec::new()
     };
+    let output_refs = if matches!(payload_kind, ScriptedPayloadKind::Apply) {
+        collect_terraform_output_refs(runtime_artifacts)
+    } else {
+        BTreeMap::new()
+    };
     let payload = match payload_kind {
         ScriptedPayloadKind::Apply => {
             ExecutionOutcomePayload::Apply(crate::deployment::ApplyExecutionOutcome {
                 deployment_id: runtime_artifacts.handoff.output_dir.clone(),
                 state: state.to_string(),
+                provider: Some(config.provider.as_str().to_string()),
+                strategy: Some(config.strategy.clone()),
                 endpoints,
+                output_refs,
             })
         }
         ScriptedPayloadKind::Destroy => {
@@ -1024,6 +1058,7 @@ fn execute_local_scripted_operation(
 }
 
 fn synthesize_local_terraform_status(
+    config: &DeployerConfig,
     runtime_artifacts: &RuntimeArtifacts,
 ) -> Result<Option<ExecutionOutcome>> {
     let runtime_path = runtime_artifacts.deploy_dir.join("terraform-runtime.json");
@@ -1065,6 +1100,8 @@ fn synthesize_local_terraform_status(
     } else {
         "handoff_incomplete"
     };
+    let endpoints = collect_runtime_endpoints(runtime_artifacts);
+    let output_refs = collect_terraform_output_refs(runtime_artifacts);
 
     Ok(Some(ExecutionOutcome {
         status: Some(state.to_string()),
@@ -1082,7 +1119,12 @@ fn synthesize_local_terraform_status(
             crate::deployment::StatusExecutionOutcome {
                 deployment_id: runtime_artifacts.handoff.output_dir.clone(),
                 state: state.to_string(),
+                provider: Some(config.provider.as_str().to_string()),
+                strategy: Some(config.strategy.clone()),
+                status_source: Some("terraform_handoff".into()),
+                endpoints,
                 health_checks,
+                output_refs,
             },
         )),
     }))
@@ -1106,6 +1148,14 @@ fn collect_runtime_endpoints(runtime_artifacts: &RuntimeArtifacts) -> Vec<String
     };
 
     parse_dns_name_endpoint(&contents).into_iter().collect()
+}
+
+fn collect_terraform_output_refs(runtime_artifacts: &RuntimeArtifacts) -> BTreeMap<String, String> {
+    let outputs_path = runtime_artifacts.deploy_dir.join("terraform-outputs.json");
+    let Ok(contents) = fs::read_to_string(outputs_path) else {
+        return BTreeMap::new();
+    };
+    parse_terraform_output_refs(&contents)
 }
 
 fn capture_terraform_outputs(runtime_artifacts: &RuntimeArtifacts) -> Result<()> {
@@ -1213,7 +1263,28 @@ fn parse_terraform_output_endpoints(contents: &str) -> Vec<String> {
     endpoints
 }
 
+fn parse_terraform_output_refs(contents: &str) -> BTreeMap<String, String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(contents) else {
+        return BTreeMap::new();
+    };
+    let Some(map) = value.as_object() else {
+        return BTreeMap::new();
+    };
+
+    let mut refs = BTreeMap::new();
+    for (key, value) in map {
+        let Some(output_value) = value.get("value") else {
+            continue;
+        };
+        if let Some(text) = output_value.as_str() {
+            refs.insert(key.clone(), text.to_string());
+        }
+    }
+    refs
+}
+
 fn synthesize_scripted_handoff_status(
+    config: &DeployerConfig,
     runtime_artifacts: &RuntimeArtifacts,
     handoff_note: &str,
     checks: Vec<(&str, &str)>,
@@ -1254,7 +1325,12 @@ fn synthesize_scripted_handoff_status(
             crate::deployment::StatusExecutionOutcome {
                 deployment_id: runtime_artifacts.handoff.output_dir.clone(),
                 state: state.to_string(),
+                provider: Some(config.provider.as_str().to_string()),
+                strategy: Some(config.strategy.clone()),
+                status_source: Some("scripted_handoff".into()),
+                endpoints: Vec::new(),
                 health_checks,
+                output_refs: BTreeMap::new(),
             },
         )),
     }))
@@ -1623,6 +1699,7 @@ fn materialize_terraform_handoff_assets(
     if local_terraform.exists() {
         set_executable_if_unix(&local_terraform)?;
     }
+    prune_generated_terraform_root(config, &terraform_root)?;
     configure_terraform_backend(config, &terraform_root, deploy_dir)?;
 
     let tfvars_example = resolve_tfvars_example_name(&terraform_root, &config.environment)?;
@@ -1699,6 +1776,86 @@ fn materialize_terraform_handoff_assets(
     Ok(())
 }
 
+fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path) -> Result<()> {
+    let (module_name, module_source, module_inputs) = match config.provider {
+        crate::config::Provider::Aws => (
+            "operator",
+            "./modules/operator",
+            r#"  cloud                 = var.cloud
+  operator_image        = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
+  bundle_source         = var.bundle_source
+  bundle_digest         = var.bundle_digest
+  repo_registry_base    = var.repo_registry_base
+  store_registry_base   = var.store_registry_base
+  admin_allowed_clients = var.admin_allowed_clients
+  public_base_url       = var.public_base_url"#,
+        ),
+        crate::config::Provider::Azure => (
+            "operator",
+            "./modules/operator-azure",
+            r#"  cloud                 = var.cloud
+  environment           = var.environment
+  bundle_digest         = var.bundle_digest
+  bundle_source         = var.bundle_source
+  repo_registry_base    = var.repo_registry_base
+  store_registry_base   = var.store_registry_base
+  operator_image        = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
+  admin_allowed_clients = var.admin_allowed_clients
+  public_base_url       = var.public_base_url
+  azure_key_vault_uri   = var.azure_key_vault_uri
+  azure_key_vault_id    = var.azure_key_vault_id
+  azure_location        = var.azure_location"#,
+        ),
+        crate::config::Provider::Gcp => (
+            "operator",
+            "./modules/operator-gcp",
+            r#"  cloud                 = var.cloud
+  environment           = var.environment
+  bundle_digest         = var.bundle_digest
+  bundle_source         = var.bundle_source
+  repo_registry_base    = var.repo_registry_base
+  store_registry_base   = var.store_registry_base
+  operator_image        = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
+  admin_allowed_clients = var.admin_allowed_clients
+  public_base_url       = var.public_base_url
+  gcp_project_id        = var.gcp_project_id
+  gcp_region            = var.gcp_region"#,
+        ),
+        _ => return Ok(()),
+    };
+
+    let main_tf = format!(
+        "module \"{module_name}\" {{\n  source = \"{module_source}\"\n\n{module_inputs}\n}}\n\nmodule \"dns\" {{\n  count  = var.dns_name != \"\" ? 1 : 0\n  source = \"./modules/dns\"\n\n  dns_name = var.dns_name\n}}\n\nmodule \"registry\" {{\n  source = \"./modules/registry\"\n\n  bundle_source = var.bundle_source\n  bundle_digest = var.bundle_digest\n}}\n"
+    );
+    fs::write(terraform_root.join("main.tf"), main_tf)?;
+
+    let outputs_tf = format!(
+        r#"output "operator_endpoint" {{
+  value = module.{module_name}.operator_endpoint
+}}
+
+output "cloud_provider" {{
+  value = var.cloud
+}}
+
+output "admin_ca_secret_ref" {{
+  value = module.{module_name}.admin_ca_secret_ref
+}}
+
+output "admin_server_cert_secret_ref" {{
+  value = module.{module_name}.admin_server_cert_secret_ref
+}}
+
+output "admin_server_key_secret_ref" {{
+  value = module.{module_name}.admin_server_key_secret_ref
+}}
+"#
+    );
+    fs::write(terraform_root.join("outputs.tf"), outputs_tf)?;
+
+    Ok(())
+}
+
 fn materialize_generated_tfvars(
     config: &DeployerConfig,
     terraform_root: &Path,
@@ -1726,6 +1883,12 @@ fn materialize_generated_tfvars(
     }
     if let Some(bundle_digest) = config.bundle_digest.as_ref() {
         replace_tfvars_assignment(&mut contents, "bundle_digest", bundle_digest);
+    }
+    if let Some(repo_registry_base) = config.repo_registry_base.as_ref() {
+        replace_tfvars_assignment(&mut contents, "repo_registry_base", repo_registry_base);
+    }
+    if let Some(store_registry_base) = config.store_registry_base.as_ref() {
+        replace_tfvars_assignment(&mut contents, "store_registry_base", store_registry_base);
     }
     for (key, value) in terraform_env_overrides() {
         replace_tfvars_assignment(&mut contents, &key, &value);
@@ -2173,10 +2336,21 @@ fn configure_terraform_backend(
         return Ok(());
     }
 
-    let rewritten = contents.replace(
-        "backend \"s3\" {}",
-        "backend \"local\" {\n    path = \"terraform.tfstate\"\n  }",
-    );
+    let rewritten = match config.provider {
+        crate::config::Provider::Aws => {
+            "terraform {\n  required_version = \">= 1.8.0\"\n  backend \"local\" {\n    path = \"terraform.tfstate\"\n  }\n}\n".to_string()
+        }
+        crate::config::Provider::Azure => {
+            "terraform {\n  required_version = \">= 1.8.0\"\n  backend \"local\" {\n    path = \"terraform.tfstate\"\n  }\n\n  required_providers {\n    azurerm = {\n      source = \"hashicorp/azurerm\"\n    }\n  }\n}\n\nprovider \"azurerm\" {\n  features {}\n}\n".to_string()
+        }
+        crate::config::Provider::Gcp => {
+            "terraform {\n  required_version = \">= 1.8.0\"\n  backend \"local\" {\n    path = \"terraform.tfstate\"\n  }\n\n  required_providers {\n    google = {\n      source = \"hashicorp/google\"\n    }\n  }\n}\n\nprovider \"google\" {\n  project = trimspace(var.gcp_project_id) != \"\" ? var.gcp_project_id : \"greentic-placeholder\"\n  region  = trimspace(var.gcp_region) != \"\" ? var.gcp_region : \"us-central1\"\n}\n".to_string()
+        }
+        _ => contents.replace(
+            "backend \"s3\" {}",
+            "backend \"local\" {\n    path = \"terraform.tfstate\"\n  }",
+        ),
+    };
     fs::write(providers_path, rewritten)?;
     Ok(())
 }
@@ -2532,6 +2706,8 @@ mod tests {
             deploy_flow_id_override: None,
             bundle_source: None,
             bundle_digest: None,
+            repo_registry_base: None,
+            store_registry_base: None,
         }
     }
 
@@ -2710,7 +2886,7 @@ metadata:
             append_tar_entry(
                 &mut builder,
                 "assets/schemas/apply-execution-output.schema.json",
-                br#"{"type":"object","required":["kind","deployment_id","state","endpoints"],"properties":{"kind":{"const":"apply"},"deployment_id":{"type":"string"},"state":{"type":"string"},"endpoints":{"type":"array","items":{"type":"string"}}}}"#,
+                br#"{"type":"object","required":["kind","deployment_id","state","endpoints"],"properties":{"kind":{"const":"apply"},"deployment_id":{"type":"string"},"state":{"type":"string"},"provider":{"type":"string"},"strategy":{"type":"string"},"endpoints":{"type":"array","items":{"type":"string"}},"output_refs":{"type":"object","additionalProperties":{"type":"string"}}}}"#,
             );
             append_tar_entry(
                 &mut builder,
@@ -2725,7 +2901,7 @@ metadata:
             append_tar_entry(
                 &mut builder,
                 "assets/schemas/status-execution-output.schema.json",
-                br#"{"type":"object","required":["kind","deployment_id","state","health_checks"],"properties":{"kind":{"const":"status"},"deployment_id":{"type":"string"},"state":{"type":"string"},"health_checks":{"type":"array","items":{"type":"string"}}}}"#,
+                br#"{"type":"object","required":["kind","deployment_id","state","health_checks"],"properties":{"kind":{"const":"status"},"deployment_id":{"type":"string"},"state":{"type":"string"},"provider":{"type":"string"},"strategy":{"type":"string"},"status_source":{"type":"string"},"endpoints":{"type":"array","items":{"type":"string"}},"health_checks":{"type":"array","items":{"type":"string"}},"output_refs":{"type":"object","additionalProperties":{"type":"string"}}}}"#,
             );
             append_tar_entry(
                 &mut builder,
@@ -2878,7 +3054,13 @@ kind: Deployment
                         "kind": { "const": "apply" },
                         "deployment_id": { "type": "string" },
                         "state": { "type": "string" },
-                        "endpoints": { "type": "array", "items": { "type": "string" } }
+                        "provider": { "type": "string" },
+                        "strategy": { "type": "string" },
+                        "endpoints": { "type": "array", "items": { "type": "string" } },
+                        "output_refs": {
+                            "type": "object",
+                            "additionalProperties": { "type": "string" }
+                        }
                     }
                 })),
                 text: None,
@@ -2899,7 +3081,10 @@ kind: Deployment
                     crate::deployment::ApplyExecutionOutcome {
                         deployment_id: "dep-42".into(),
                         state: "ready".into(),
+                        provider: Some("aws".into()),
+                        strategy: Some("iac-only".into()),
                         endpoints: vec!["https://ready.example.test".into()],
+                        output_refs: BTreeMap::new(),
                     },
                 )),
             }),
@@ -3056,7 +3241,15 @@ kind: Deployment
                         "kind": { "const": "status" },
                         "deployment_id": { "type": "string" },
                         "state": { "type": "string" },
-                        "health_checks": { "type": "array", "items": { "type": "string" } }
+                        "provider": { "type": "string" },
+                        "strategy": { "type": "string" },
+                        "status_source": { "type": "string" },
+                        "endpoints": { "type": "array", "items": { "type": "string" } },
+                        "health_checks": { "type": "array", "items": { "type": "string" } },
+                        "output_refs": {
+                            "type": "object",
+                            "additionalProperties": { "type": "string" }
+                        }
                     }
                 })),
                 text: None,
@@ -3077,7 +3270,12 @@ kind: Deployment
                     crate::deployment::StatusExecutionOutcome {
                         deployment_id: "dep-42".into(),
                         state: "healthy".into(),
+                        provider: Some("aws".into()),
+                        strategy: Some("iac-only".into()),
+                        status_source: Some("terraform_handoff".into()),
+                        endpoints: vec!["https://ready.example.test".into()],
                         health_checks: vec!["http:ok".into()],
+                        output_refs: BTreeMap::new(),
                     },
                 )),
             }),
@@ -3151,6 +3349,8 @@ kind: Deployment
             deploy_flow_id_override: None,
             bundle_source: None,
             bundle_digest: None,
+            repo_registry_base: None,
+            store_registry_base: None,
         })
         .await
         .expect("terraform status runs");
@@ -3221,6 +3421,8 @@ kind: Deployment
             bundle_digest: Some(
                 "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             ),
+            repo_registry_base: None,
+            store_registry_base: None,
         })
         .await
         .expect("terraform apply runs");
@@ -3304,6 +3506,8 @@ kind: Deployment
             bundle_digest: Some(
                 "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
             ),
+            repo_registry_base: None,
+            store_registry_base: None,
         };
         let plan = pack_introspect::build_plan(&config).expect("build plan");
         let deploy_dir = dir.path().join("output");
@@ -3417,6 +3621,8 @@ kind: Deployment
             bundle_digest: Some(
                 "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
             ),
+            repo_registry_base: None,
+            store_registry_base: None,
         };
         let plan = pack_introspect::build_plan(&config).expect("build plan");
         let deploy_dir = dir.path().join("output");
@@ -3567,6 +3773,8 @@ kind: Deployment
             deploy_flow_id_override: None,
             bundle_source: None,
             bundle_digest: None,
+            repo_registry_base: None,
+            store_registry_base: None,
         };
         let plan = pack_introspect::build_plan(&config).expect("build plan");
         let deploy_dir = dir.path().join("output");
@@ -3655,6 +3863,8 @@ kind: Deployment
             deploy_flow_id_override: None,
             bundle_source: None,
             bundle_digest: None,
+            repo_registry_base: None,
+            store_registry_base: None,
         };
         let plan = pack_introspect::build_plan(&config).expect("build plan");
         let deploy_dir = dir.path().join("output");
