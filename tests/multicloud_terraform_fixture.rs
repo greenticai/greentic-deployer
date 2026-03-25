@@ -26,7 +26,9 @@ fn azure_module_materializes_key_vault_and_runtime_resources() {
     assert!(main_tf.contains("resource \"azurerm_key_vault_secret\" \"admin_ca\""));
     assert!(main_tf.contains("resource \"azurerm_key_vault_secret\" \"admin_server_cert\""));
     assert!(main_tf.contains("resource \"azurerm_key_vault_secret\" \"admin_server_key\""));
-    assert!(main_tf.contains("resource \"azurerm_container_group\" \"this\""));
+    assert!(main_tf.contains("resource \"azurerm_log_analytics_workspace\" \"this\""));
+    assert!(main_tf.contains("resource \"azurerm_container_app_environment\" \"this\""));
+    assert!(main_tf.contains("resource \"azurerm_container_app\" \"this\""));
     assert!(main_tf.contains("GREENTIC_ADMIN_CA_PEM"));
     assert!(main_tf.contains("GREENTIC_ADMIN_SERVER_CERT_PEM"));
     assert!(main_tf.contains("GREENTIC_ADMIN_SERVER_KEY_PEM"));
