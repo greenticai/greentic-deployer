@@ -20,7 +20,7 @@ Current scope:
 - Azure and GCP module skeleton directories now exist so parity work can land on a stable module layout
 - Azure/GCP skeleton modules now emit canonical secret refs in cloud-native string formats
 - the Azure module can now materialize admin cert secrets into an existing Key Vault when `azure_key_vault_id` is provided
-- the Azure module now also provisions a minimal public Azure Container Instance runtime with the same admin PEM/env contract used by AWS
+- the Azure module now also provisions a minimal public Azure Container Apps runtime with the same admin PEM/env contract used by AWS
 - the GCP module now provisions Secret Manager secrets plus a minimal public Cloud Run runtime with the same admin PEM/env contract used by AWS
 
 Production-oriented admin cert flow:
@@ -62,7 +62,7 @@ Azure note:
   - `greentic-admin-server-cert-<environment>`
   - `greentic-admin-server-key-<environment>`
 - `azure_location` selects the deployment region for the Azure runtime slice
-- Azure runtime currently uses Azure Container Instances for the first real deployment path
+- Azure runtime currently uses Azure Container Apps for the first real deployment path
 - Azure still lacks AWS-level parity for ingress, logs, and status depth
 
 GCP note:

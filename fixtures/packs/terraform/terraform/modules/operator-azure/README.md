@@ -16,12 +16,12 @@ Current status:
 - output contract and naming are implemented
 - admin CA, server cert, and server key can be materialized into an existing
   Azure Key Vault when `azure_key_vault_id` is provided
-- a minimal Azure Container Instance runtime is provisioned with the same
+- a minimal Azure Container Apps runtime is provisioned with the same
   bundle/admin env contract used by AWS
 - `operator_endpoint` already resolves from `public_base_url` when provided
 - this module exists so Azure parity work can land without changing the pack layout again
 
 Current limitations:
 
-- ingress and networking are much simpler than the AWS ALB path
+- ingress and networking are still simpler than the AWS ALB path
 - logs and status integration are not yet at AWS depth
