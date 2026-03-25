@@ -45,15 +45,7 @@ pub fn build_plan(config: &DeployerConfig) -> Result<PlanContext> {
         PackSource::from_registry(pack_ref.clone(), source)?
     } else {
         let safe_path = if config.pack_path.is_absolute() {
-            let canon = config.pack_path.canonicalize()?;
-            if !canon.starts_with(&cwd) {
-                return Err(DeployerError::Pack(format!(
-                    "absolute pack path escapes root {}: {}",
-                    cwd.display(),
-                    canon.display()
-                )));
-            }
-            canon
+            config.pack_path.canonicalize()?
         } else {
             normalize_under_root(&cwd, &config.pack_path)
                 .map_err(|err| DeployerError::Pack(err.to_string()))?
