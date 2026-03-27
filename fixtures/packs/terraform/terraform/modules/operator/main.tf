@@ -244,7 +244,7 @@ resource "aws_iam_role_policy_attachment" "task_execution" {
 }
 
 resource "aws_secretsmanager_secret" "admin_ca" {
-  name = "${local.admin_secret_prefix}/ca"
+  name_prefix = "${local.admin_secret_prefix}/ca-"
 
   recovery_window_in_days = 0
 
@@ -257,7 +257,7 @@ resource "aws_secretsmanager_secret_version" "admin_ca" {
 }
 
 resource "aws_secretsmanager_secret" "admin_server_cert" {
-  name = "${local.admin_secret_prefix}/server-cert"
+  name_prefix = "${local.admin_secret_prefix}/server-cert-"
 
   recovery_window_in_days = 0
 
@@ -270,7 +270,7 @@ resource "aws_secretsmanager_secret_version" "admin_server_cert" {
 }
 
 resource "aws_secretsmanager_secret" "admin_server_key" {
-  name = "${local.admin_secret_prefix}/server-key"
+  name_prefix = "${local.admin_secret_prefix}/server-key-"
 
   recovery_window_in_days = 0
 
