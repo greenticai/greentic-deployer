@@ -29,3 +29,8 @@ variable "admin_allowed_clients" {
 variable "public_base_url" {
   type = string
 }
+
+variable "use_default_vpc" {
+  type    = bool
+  default = true
+}
