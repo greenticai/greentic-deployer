@@ -2,12 +2,33 @@ data "aws_availability_zones" "available" {
   state = "available"
 }
 
+data "aws_vpc" "default" {
+  count   = var.use_default_vpc ? 1 : 0
+  default = true
+}
+
+data "aws_subnets" "default" {
+  count = var.use_default_vpc ? 1 : 0
+
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default[0].id]
+  }
+
+  filter {
+    name   = "default-for-az"
+    values = ["true"]
+  }
+}
+
 locals {
   name_prefix = "greentic-${substr(md5(var.bundle_digest), 0, 8)}"
   app_port    = 8080
   admin_port  = 8433
   admin_bind  = "127.0.0.1:${local.admin_port}"
   admin_secret_prefix = "greentic/admin/${local.name_prefix}"
+  effective_vpc_id = var.use_default_vpc ? data.aws_vpc.default[0].id : aws_vpc.this[0].id
+  effective_subnet_ids = var.use_default_vpc ? slice(data.aws_subnets.default[0].ids, 0, min(2, length(data.aws_subnets.default[0].ids))) : aws_subnet.public[*].id
   common_tags = {
     ManagedBy = "greentic-demo"
     Bundle    = var.bundle_digest
@@ -67,6 +88,8 @@ resource "tls_locally_signed_cert" "admin_server" {
 }
 
 resource "aws_vpc" "this" {
+  count = var.use_default_vpc ? 0 : 1
+
   cidr_block           = "10.42.0.0/16"
   enable_dns_hostnames = true
   enable_dns_support   = true
@@ -77,7 +100,9 @@ resource "aws_vpc" "this" {
 }
 
 resource "aws_internet_gateway" "this" {
-  vpc_id = aws_vpc.this.id
+  count = var.use_default_vpc ? 0 : 1
+
+  vpc_id = aws_vpc.this[0].id
 
   tags = merge(local.common_tags, {
     Name = "${local.name_prefix}-igw"
@@ -85,10 +110,10 @@ resource "aws_internet_gateway" "this" {
 }
 
 resource "aws_subnet" "public" {
-  count = 2
+  count = var.use_default_vpc ? 0 : 2
 
-  vpc_id                  = aws_vpc.this.id
-  cidr_block              = cidrsubnet(aws_vpc.this.cidr_block, 8, count.index)
+  vpc_id                  = aws_vpc.this[0].id
+  cidr_block              = cidrsubnet(aws_vpc.this[0].cidr_block, 8, count.index)
   availability_zone       = data.aws_availability_zones.available.names[count.index]
   map_public_ip_on_launch = true
 
@@ -98,11 +123,13 @@ resource "aws_subnet" "public" {
 }
 
 resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.this.id
+  count = var.use_default_vpc ? 0 : 1
+
+  vpc_id = aws_vpc.this[0].id
 
   route {
     cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.this.id
+    gateway_id = aws_internet_gateway.this[0].id
   }
 
   tags = merge(local.common_tags, {
@@ -111,16 +138,16 @@ resource "aws_route_table" "public" {
 }
 
 resource "aws_route_table_association" "public" {
-  count = 2
+  count = var.use_default_vpc ? 0 : 2
 
   subnet_id      = aws_subnet.public[count.index].id
-  route_table_id = aws_route_table.public.id
+  route_table_id = aws_route_table.public[0].id
 }
 
 resource "aws_security_group" "alb" {
   name        = "${local.name_prefix}-alb"
   description = "ALB ingress for Greentic demo"
-  vpc_id      = aws_vpc.this.id
+  vpc_id      = local.effective_vpc_id
 
   ingress {
     from_port   = 80
@@ -142,7 +169,7 @@ resource "aws_security_group" "alb" {
 resource "aws_security_group" "service" {
   name        = "${local.name_prefix}-svc"
   description = "ECS service ingress from ALB"
-  vpc_id      = aws_vpc.this.id
+  vpc_id      = local.effective_vpc_id
 
   ingress {
     from_port       = local.app_port
@@ -166,7 +193,7 @@ resource "aws_lb" "this" {
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
-  subnets            = aws_subnet.public[*].id
+  subnets            = local.effective_subnet_ids
 
   tags = local.common_tags
 }
@@ -176,7 +203,7 @@ resource "aws_lb_target_group" "this" {
   port        = local.app_port
   protocol    = "HTTP"
   target_type = "ip"
-  vpc_id      = aws_vpc.this.id
+  vpc_id      = local.effective_vpc_id
 
   lifecycle {
     create_before_destroy = true
@@ -434,7 +461,7 @@ resource "aws_ecs_service" "this" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets          = aws_subnet.public[*].id
+    subnets          = local.effective_subnet_ids
     security_groups  = [aws_security_group.service.id]
     assign_public_ip = true
   }

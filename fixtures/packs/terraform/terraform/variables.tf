@@ -71,3 +71,8 @@ variable "public_base_url" {
 variable "remote_state_backend" {
   type = string
 }
+
+variable "aws_use_default_vpc" {
+  type    = bool
+  default = true
+}

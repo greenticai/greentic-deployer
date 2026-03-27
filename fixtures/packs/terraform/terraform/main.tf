@@ -7,14 +7,15 @@ module "operator_aws" {
   count  = var.cloud == "aws" ? 1 : 0
   source = "./modules/operator"
 
-  cloud = var.cloud
-  operator_image = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
-  bundle_source  = var.bundle_source
-  bundle_digest  = var.bundle_digest
+  cloud               = var.cloud
+  operator_image      = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
+  bundle_source       = var.bundle_source
+  bundle_digest       = var.bundle_digest
   repo_registry_base  = var.repo_registry_base
   store_registry_base = var.store_registry_base
   admin_allowed_clients = var.admin_allowed_clients
-  public_base_url = var.public_base_url
+  public_base_url     = var.public_base_url
+  use_default_vpc     = var.aws_use_default_vpc
 }
 
 module "operator_azure" {
