@@ -35,6 +35,11 @@ variable "operator_image_digest" {
   type = string
 }
 
+variable "operator_image" {
+  type    = string
+  default = ""
+}
+
 variable "dns_name" {
   type    = string
   default = ""
