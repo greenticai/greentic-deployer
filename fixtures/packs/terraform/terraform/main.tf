@@ -1,6 +1,7 @@
 locals {
   name_prefix         = "greentic-${substr(md5(var.bundle_digest), 0, 8)}"
   admin_secret_prefix = "greentic/admin/${local.name_prefix}"
+  operator_image      = var.operator_image != "" ? var.operator_image : "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
 }
 
 module "operator_aws" {
@@ -8,7 +9,7 @@ module "operator_aws" {
   source = "./modules/operator"
 
   cloud               = var.cloud
-  operator_image      = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
+  operator_image      = local.operator_image
   bundle_source       = var.bundle_source
   bundle_digest       = var.bundle_digest
   repo_registry_base  = var.repo_registry_base
@@ -28,7 +29,7 @@ module "operator_azure" {
   bundle_source       = var.bundle_source
   repo_registry_base  = var.repo_registry_base
   store_registry_base = var.store_registry_base
-  operator_image      = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
+  operator_image      = local.operator_image
   admin_allowed_clients = var.admin_allowed_clients
   public_base_url     = var.public_base_url
   azure_key_vault_uri = var.azure_key_vault_uri
@@ -46,7 +47,7 @@ module "operator_gcp" {
   bundle_source       = var.bundle_source
   repo_registry_base  = var.repo_registry_base
   store_registry_base = var.store_registry_base
-  operator_image      = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
+  operator_image      = local.operator_image
   admin_allowed_clients = var.admin_allowed_clients
   public_base_url     = var.public_base_url
   gcp_project_id      = var.gcp_project_id
