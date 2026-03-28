@@ -1,31 +1,24 @@
 # Security Fix Report
 
-Date (UTC): 2026-03-28
-Reviewer Role: CI Security Reviewer
+## Scope
+- Security alerts input analyzed:
+  - Dependabot alerts: `0`
+  - Code scanning alerts: `0`
+- PR dependency vulnerability list analyzed: `0` items
+- PR dependency-file changes reviewed against `origin/main`.
 
-## Inputs Reviewed
-- Dependabot alerts: `[]`
-- Code scanning alerts: `[]`
-- New PR dependency vulnerabilities: `[]`
-
-## Repository Checks Performed
-- Enumerated dependency manifests/locks in repository:
-  - `Cargo.toml`
-  - `Cargo.lock`
-  - `components/iac-write-files/Cargo.toml`
-- Reviewed Rust manifests for risky dependency patterns (e.g., git/path dependency injection, unpinned wildcards, prerelease pins).
-- Checked current diff for dependency-file changes:
-  - Modified file in working tree: `pr-comment.md`
-  - No dependency manifest/lock changes detected in current diff.
+## Findings
+- No Dependabot vulnerabilities were present in the provided alert payload.
+- No code-scanning vulnerabilities were present in the provided alert payload.
+- No new PR dependency vulnerabilities were present in `pr-vulnerable-changes.json`.
+- Dependency-file diff for this PR includes:
+  - `Cargo.toml`: package version bump `0.4.35` -> `0.4.36`
+  - `Cargo.lock`: workspace package entry version bump `0.4.35` -> `0.4.36`
+- No third-party dependency additions, removals, or version changes were introduced.
 
 ## Remediation Actions
-- No vulnerabilities were reported in provided alert inputs.
-- No new PR dependency vulnerabilities were reported.
-- No code or dependency changes were required for remediation.
+- No vulnerability remediation changes were required.
+- No dependency security patches were applied because no actionable vulnerabilities were detected.
 
-## Verification Notes
-- Attempted to run `cargo audit` for additional validation, but execution was blocked by the CI sandbox/toolchain environment (`rustup` temp file write failure under read-only path), so advisory-db validation could not be completed in this environment.
-- Given empty alert sources and no dependency-file modifications in this PR diff, no actionable remediation was identified.
-
-## Outcome
-- Security status for provided inputs: **No findings requiring fixes**.
+## Result
+- Security review outcome: **no actionable vulnerabilities detected** for the supplied alerts and PR dependency changes.
