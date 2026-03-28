@@ -905,23 +905,69 @@ fn execute_local_terraform_operation(
         return Ok(None);
     }
 
-    let output = Command::new(&script_path)
-        .current_dir(&runtime_artifacts.deploy_dir)
-        .output()
-        .map_err(DeployerError::Io)?;
-
     let stdout_log = format!("terraform-{operation}.stdout.log");
     let stderr_log = format!("terraform-{operation}.stderr.log");
-    fs::write(
-        runtime_artifacts.deploy_dir.join(&stdout_log),
-        &output.stdout,
-    )?;
-    fs::write(
-        runtime_artifacts.deploy_dir.join(&stderr_log),
-        &output.stderr,
+    let output = run_script_capture_logs(
+        &script_path,
+        &runtime_artifacts.deploy_dir,
+        runtime_artifacts,
+        &stdout_log,
+        &stderr_log,
     )?;
 
     if !output.status.success() {
+        if operation == "destroy" && config.provider == crate::config::Provider::Aws {
+            let cleanup_script = runtime_artifacts
+                .deploy_dir
+                .join("terraform-aws-cleanup.sh");
+            if cleanup_script.exists() {
+                let cleanup_stdout = "terraform-destroy-cleanup.stdout.log";
+                let cleanup_stderr = "terraform-destroy-cleanup.stderr.log";
+                let cleanup = run_script_capture_logs(
+                    &cleanup_script,
+                    &runtime_artifacts.deploy_dir,
+                    runtime_artifacts,
+                    cleanup_stdout,
+                    cleanup_stderr,
+                )?;
+                if cleanup.status.success() {
+                    let retry_stdout = "terraform-destroy-retry.stdout.log";
+                    let retry_stderr = "terraform-destroy-retry.stderr.log";
+                    let retry = run_script_capture_logs(
+                        &script_path,
+                        &runtime_artifacts.deploy_dir,
+                        runtime_artifacts,
+                        retry_stdout,
+                        retry_stderr,
+                    )?;
+                    if retry.status.success() {
+                        let payload = ExecutionOutcomePayload::Destroy(
+                            crate::deployment::DestroyExecutionOutcome {
+                                deployment_id: runtime_artifacts.handoff.output_dir.clone(),
+                                state: "destroyed".to_string(),
+                                destroyed_resources: Vec::new(),
+                            },
+                        );
+                        return Ok(Some(ExecutionOutcome {
+                            status: Some("destroyed".to_string()),
+                            message: Some(format!(
+                                "terraform destroy executed locally via {} after AWS cleanup fallback",
+                                script_path.display()
+                            )),
+                            output_files: vec![
+                                stdout_log,
+                                stderr_log,
+                                cleanup_stdout.to_string(),
+                                cleanup_stderr.to_string(),
+                                retry_stdout.to_string(),
+                                retry_stderr.to_string(),
+                            ],
+                            payload: Some(payload),
+                        }));
+                    }
+                }
+            }
+        }
         let code = output
             .status
             .code()
@@ -976,6 +1022,28 @@ fn execute_local_terraform_operation(
         output_files: vec![stdout_log, stderr_log],
         payload: Some(payload),
     }))
+}
+
+fn run_script_capture_logs(
+    script_path: &Path,
+    current_dir: &Path,
+    runtime_artifacts: &RuntimeArtifacts,
+    stdout_log: &str,
+    stderr_log: &str,
+) -> Result<std::process::Output> {
+    let output = Command::new(script_path)
+        .current_dir(current_dir)
+        .output()
+        .map_err(DeployerError::Io)?;
+    fs::write(
+        runtime_artifacts.deploy_dir.join(stdout_log),
+        &output.stdout,
+    )?;
+    fs::write(
+        runtime_artifacts.deploy_dir.join(stderr_log),
+        &output.stderr,
+    )?;
+    Ok(output)
 }
 
 fn execute_local_scripted_operation(
@@ -1709,6 +1777,7 @@ fn materialize_terraform_handoff_assets(
     let apply_script = "terraform-apply.sh";
     let destroy_script = "terraform-destroy.sh";
     let status_script = "terraform-status.sh";
+    let aws_cleanup_script = "terraform-aws-cleanup.sh";
     write_executable_script(&deploy_dir.join(init_script), terraform_init_script())?;
     write_executable_script(
         &deploy_dir.join(plan_script),
@@ -1726,17 +1795,25 @@ fn materialize_terraform_handoff_assets(
         &deploy_dir.join(status_script),
         terraform_script_prelude("\"$TERRAFORM_BIN\" show -json \"$@\""),
     )?;
+    let mut scripts = vec![
+        init_script.to_string(),
+        plan_script.to_string(),
+        apply_script.to_string(),
+        destroy_script.to_string(),
+        status_script.to_string(),
+    ];
+    if config.provider == crate::config::Provider::Aws {
+        write_executable_script(
+            &deploy_dir.join(aws_cleanup_script),
+            terraform_aws_cleanup_script(generated_tfvars.as_deref(), &tfvars_example),
+        )?;
+        scripts.push(aws_cleanup_script.to_string());
+    }
 
     let metadata = TerraformRuntimeMetadata {
         terraform_root: terraform_root.display().to_string(),
         copied_files: copied.clone(),
-        scripts: vec![
-            init_script.to_string(),
-            plan_script.to_string(),
-            apply_script.to_string(),
-            destroy_script.to_string(),
-            status_script.to_string(),
-        ],
+        scripts,
         generated_tfvars: generated_tfvars.clone(),
         init_command: format!("./{init_script}"),
         plan_command: format!("./{plan_script}"),
@@ -1767,6 +1844,9 @@ fn materialize_terraform_handoff_assets(
     note.push_str(
         "scripts=terraform-init.sh, terraform-plan.sh, terraform-apply.sh, terraform-destroy.sh, terraform-status.sh\n",
     );
+    if config.provider == crate::config::Provider::Aws {
+        note.push_str("aws_cleanup_command=./terraform-aws-cleanup.sh\n");
+    }
     note.push_str(&format!("status_command={}\n", metadata.status_command));
     note.push_str("copied_files:\n");
     for path in copied {
@@ -2293,6 +2373,21 @@ fn terraform_plan_like_script(
     };
     format!(
         "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\nBACKEND_ARGS=()\nif [ -f \"${{SCRIPT_DIR}}/backend.hcl\" ]; then\n  BACKEND_ARGS=(-backend-config=\"${{SCRIPT_DIR}}/backend.hcl\")\nfi\n\"$TERRAFORM_BIN\" init -input=false \"${{BACKEND_ARGS[@]}}\"\nVAR_FILE=\"\"\n{tfvars_lookup}\nif [ -n \"$VAR_FILE\" ]; then\n  \"$TERRAFORM_BIN\" {operation}{extra_args} -var-file=\"$VAR_FILE\" \"$@\"\nelse\n  \"$TERRAFORM_BIN\" {operation}{extra_args} \"$@\"\nfi\n"
+    )
+}
+
+fn terraform_aws_cleanup_script(generated_tfvars: Option<&str>, tfvars_example: &str) -> String {
+    let tfvars_lookup = if let Some(generated_tfvars) = generated_tfvars {
+        format!(
+            "if [ -f \"{generated_tfvars}\" ]; then\n  VAR_FILE=\"{generated_tfvars}\"\nelif [ -f \"{tfvars_example}\" ]; then\n  VAR_FILE=\"{tfvars_example}\"\nelse\n  for candidate in *.tfvars *.tfvars.example; do\n    if [ -f \"$candidate\" ]; then\n      VAR_FILE=\"$candidate\"\n      break\n    fi\n  done\nfi"
+        )
+    } else {
+        format!(
+            "if [ -f \"{tfvars_example}\" ]; then\n  VAR_FILE=\"{tfvars_example}\"\nelse\n  for candidate in *.tfvars *.tfvars.example; do\n    if [ -f \"$candidate\" ]; then\n      VAR_FILE=\"$candidate\"\n      break\n    fi\n  done\nfi"
+        )
+    };
+    format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nVAR_FILE=\"\"\n{tfvars_lookup}\nif ! command -v aws >/dev/null 2>&1; then\n  echo \"aws cli not found; skipping AWS cleanup fallback\"\n  exit 0\nfi\nBUNDLE_DIGEST=\"\"\nif [ -n \"$VAR_FILE\" ] && [ -f \"$VAR_FILE\" ]; then\n  BUNDLE_DIGEST=$(sed -n 's/^bundle_digest = \"\\(.*\\)\"$/\\1/p' \"$VAR_FILE\" | head -n 1)\nfi\nif [ -z \"$BUNDLE_DIGEST\" ]; then\n  echo \"bundle_digest not found; skipping AWS cleanup fallback\"\n  exit 0\nfi\nAWS_REGION_VALUE=\"${{AWS_REGION:-${{AWS_DEFAULT_REGION:-}}}}\"\nif [ -z \"$AWS_REGION_VALUE\" ]; then\n  echo \"AWS region not set; skipping AWS cleanup fallback\"\n  exit 0\nfi\nSHORT_ID=$(printf '%s' \"$BUNDLE_DIGEST\" | md5sum | awk '{{print substr($1,1,8)}}')\nNAME_PREFIX=\"greentic-${{SHORT_ID}}\"\nSECRET_PREFIX=\"greentic/admin/${{NAME_PREFIX}}/\"\nLOG_GROUP=\"/greentic/demo/${{NAME_PREFIX}}\"\nROLE_NAME=\"${{NAME_PREFIX}}-task-exec\"\nCLUSTER_NAME=\"${{NAME_PREFIX}}-cluster\"\nSERVICE_NAME=\"${{NAME_PREFIX}}-service\"\nLB_NAME=\"${{NAME_PREFIX}}-alb\"\naws logs delete-log-group --region \"$AWS_REGION_VALUE\" --log-group-name \"$LOG_GROUP\" >/dev/null 2>&1 || true\nSECRET_ARNS=$(aws secretsmanager list-secrets --region \"$AWS_REGION_VALUE\" --filters Key=name,Values=\"$SECRET_PREFIX\" --query 'SecretList[].ARN' --output text 2>/dev/null || true)\nfor secret_arn in $SECRET_ARNS; do\n  aws secretsmanager delete-secret --region \"$AWS_REGION_VALUE\" --secret-id \"$secret_arn\" --force-delete-without-recovery >/dev/null 2>&1 || true\ndone\nINLINE_POLICIES=$(aws iam list-role-policies --role-name \"$ROLE_NAME\" --query 'PolicyNames[]' --output text 2>/dev/null || true)\nfor policy_name in $INLINE_POLICIES; do\n  aws iam delete-role-policy --role-name \"$ROLE_NAME\" --policy-name \"$policy_name\" >/dev/null 2>&1 || true\ndone\nATTACHED_POLICIES=$(aws iam list-attached-role-policies --role-name \"$ROLE_NAME\" --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null || true)\nfor policy_arn in $ATTACHED_POLICIES; do\n  aws iam detach-role-policy --role-name \"$ROLE_NAME\" --policy-arn \"$policy_arn\" >/dev/null 2>&1 || true\ndone\naws iam delete-role --role-name \"$ROLE_NAME\" >/dev/null 2>&1 || true\nLB_ARN=$(aws elbv2 describe-load-balancers --region \"$AWS_REGION_VALUE\" --names \"$LB_NAME\" --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || true)\nif [ -n \"$LB_ARN\" ] && [ \"$LB_ARN\" != \"None\" ]; then\n  aws elbv2 delete-load-balancer --region \"$AWS_REGION_VALUE\" --load-balancer-arn \"$LB_ARN\" >/dev/null 2>&1 || true\nfi\naws ecs update-service --region \"$AWS_REGION_VALUE\" --cluster \"$CLUSTER_NAME\" --service \"$SERVICE_NAME\" --desired-count 0 >/dev/null 2>&1 || true\naws ecs delete-service --region \"$AWS_REGION_VALUE\" --cluster \"$CLUSTER_NAME\" --service \"$SERVICE_NAME\" --force >/dev/null 2>&1 || true\naws ecs delete-cluster --region \"$AWS_REGION_VALUE\" --cluster \"$CLUSTER_NAME\" >/dev/null 2>&1 || true\n"
     )
 }
 
@@ -3578,6 +3673,110 @@ kind: Deployment
         assert!(note.contains("copied_files:"));
         assert!(note.contains("modules/operator/main.tf"));
         assert!(note.contains("status_command=./terraform-status.sh"));
+    }
+
+    #[test]
+    fn persist_runtime_artifacts_materializes_aws_cleanup_helper_for_aws() {
+        let base = std::env::current_dir()
+            .expect("cwd")
+            .join("target/tmp-tests");
+        std::fs::create_dir_all(&base).expect("create tmp base");
+        let dir = tempfile::tempdir_in(base).expect("temp dir");
+        let pack_path = write_test_pack(true);
+
+        let mut greentic = greentic_config::ConfigResolver::new()
+            .load()
+            .expect("load default config")
+            .config;
+        greentic.paths.state_dir = dir.path().join(".greentic-state");
+
+        let config = DeployerConfig {
+            capability: DeployerCapability::Plan,
+            provider: Provider::Aws,
+            strategy: "iac-only".into(),
+            tenant: "acme".into(),
+            environment: "staging".into(),
+            pack_path: pack_path.clone(),
+            providers_dir: PathBuf::from("providers/deployer"),
+            packs_dir: PathBuf::from("packs"),
+            provider_pack: Some(pack_path.clone()),
+            pack_ref: None,
+            distributor_url: None,
+            distributor_token: None,
+            preview: false,
+            dry_run: false,
+            execute_local: false,
+            output: crate::config::OutputFormat::Json,
+            greentic,
+            provenance: greentic_config::ProvenanceMap::new(),
+            config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
+            bundle_source: Some("file:///tmp/demo.gtbundle".into()),
+            bundle_digest: Some(
+                "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
+            ),
+            repo_registry_base: None,
+            store_registry_base: None,
+        };
+        let plan = pack_introspect::build_plan(&config).expect("build plan");
+        let deploy_dir = dir.path().join("output");
+        std::fs::create_dir_all(&deploy_dir).expect("create output dir");
+        let selection = DeploymentPackSelection {
+            dispatch: crate::deployment::DeploymentDispatch {
+                capability: DeployerCapability::Plan,
+                pack_id: "greentic.deploy.terraform".into(),
+                flow_id: "plan_terraform".into(),
+            },
+            pack_path,
+            manifest: PackManifest {
+                schema_version: "pack-v1".to_string(),
+                pack_id: PackId::from_str("greentic.deploy.terraform").unwrap(),
+                name: None,
+                version: Version::new(0, 1, 0),
+                kind: PackKind::Application,
+                publisher: "greentic".to_string(),
+                secret_requirements: Vec::new(),
+                components: Vec::new(),
+                flows: Vec::new(),
+                dependencies: Vec::new(),
+                capabilities: Vec::new(),
+                signatures: Default::default(),
+                bootstrap: None,
+                extensions: None,
+            },
+            origin: "test".into(),
+            candidates: Vec::new(),
+        };
+
+        let artifacts = persist_runtime_artifacts(&config, &plan, &selection, &deploy_dir)
+            .expect("persist runtime artifacts");
+        assert!(
+            artifacts
+                .deploy_dir
+                .join("terraform-aws-cleanup.sh")
+                .exists()
+        );
+
+        let metadata: TerraformRuntimeMetadata = serde_json::from_slice(
+            &std::fs::read(artifacts.deploy_dir.join("terraform-runtime.json"))
+                .expect("read terraform runtime metadata"),
+        )
+        .expect("parse terraform runtime metadata");
+        assert!(
+            metadata
+                .scripts
+                .iter()
+                .any(|entry| entry == "terraform-aws-cleanup.sh")
+        );
+
+        let cleanup =
+            std::fs::read_to_string(artifacts.deploy_dir.join("terraform-aws-cleanup.sh"))
+                .expect("read aws cleanup script");
+        assert!(cleanup.contains("bundle_digest not found; skipping AWS cleanup fallback"));
+        assert!(cleanup.contains("aws secretsmanager delete-secret"));
+        assert!(cleanup.contains("aws iam delete-role"));
+        assert!(cleanup.contains("aws ecs delete-service"));
     }
 
     #[test]

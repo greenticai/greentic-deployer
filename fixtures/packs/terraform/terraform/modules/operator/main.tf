@@ -386,6 +386,14 @@ resource "aws_ecs_task_definition" "this" {
             value = local.admin_bind
           },
           {
+            name  = "GREENTIC_GATEWAY_LISTEN_ADDR"
+            value = "0.0.0.0"
+          },
+          {
+            name  = "GREENTIC_GATEWAY_PORT"
+            value = tostring(local.app_port)
+          },
+          {
             name  = "GREENTIC_ADMIN_CA_SECRET_REF"
             value = aws_secretsmanager_secret.admin_ca.arn
           },

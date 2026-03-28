@@ -232,6 +232,16 @@ resource "azurerm_container_app" "this" {
       }
 
       env {
+        name  = "GREENTIC_GATEWAY_LISTEN_ADDR"
+        value = "0.0.0.0"
+      }
+
+      env {
+        name  = "GREENTIC_GATEWAY_PORT"
+        value = tostring(local.app_port)
+      }
+
+      env {
         name  = "GREENTIC_ADMIN_CA_SECRET_REF"
         value = local.can_manage_key_vault_secrets ? azurerm_key_vault_secret.admin_ca[0].versionless_id : (local.secret_prefix != null ? "${local.secret_prefix}/secrets/${local.admin_ca_secret_name}" : "")
       }
