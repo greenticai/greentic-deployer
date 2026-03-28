@@ -164,6 +164,16 @@ resource "google_cloud_run_v2_service" "this" {
       }
 
       env {
+        name  = "GREENTIC_GATEWAY_LISTEN_ADDR"
+        value = "0.0.0.0"
+      }
+
+      env {
+        name  = "GREENTIC_GATEWAY_PORT"
+        value = tostring(local.app_port)
+      }
+
+      env {
         name  = "GREENTIC_ADMIN_CA_SECRET_REF"
         value = google_secret_manager_secret.admin_ca.id
       }
