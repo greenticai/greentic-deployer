@@ -331,6 +331,27 @@ resource "aws_iam_role_policy" "task_execution_admin_secrets" {
   })
 }
 
+resource "aws_iam_role_policy" "task_execution_ecs_exec" {
+  name = "${local.name_prefix}-task-exec-ecs-exec"
+  role = aws_iam_role.task_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ssmmessages:CreateControlChannel",
+          "ssmmessages:CreateDataChannel",
+          "ssmmessages:OpenControlChannel",
+          "ssmmessages:OpenDataChannel"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
 resource "aws_ecs_task_definition" "this" {
   family                   = "${local.name_prefix}-task"
   requires_compatibilities = ["FARGATE"]
@@ -338,6 +359,7 @@ resource "aws_ecs_task_definition" "this" {
   cpu                      = 256
   memory                   = 512
   execution_role_arn       = aws_iam_role.task_execution.arn
+  task_role_arn            = aws_iam_role.task_execution.arn
 
   container_definitions = jsonencode([
     {
@@ -467,6 +489,7 @@ resource "aws_ecs_service" "this" {
   task_definition = aws_ecs_task_definition.this.arn
   desired_count   = 1
   launch_type     = "FARGATE"
+  enable_execute_command = true
 
   network_configuration {
     subnets          = local.effective_subnet_ids
