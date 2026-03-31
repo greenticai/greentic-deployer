@@ -63,6 +63,11 @@ resource "tls_private_key" "admin_server" {
   rsa_bits  = 2048
 }
 
+resource "tls_private_key" "admin_client" {
+  algorithm = "RSA"
+  rsa_bits  = 2048
+}
+
 resource "tls_cert_request" "admin_server" {
   private_key_pem = tls_private_key.admin_server.private_key_pem
 
@@ -75,6 +80,15 @@ resource "tls_cert_request" "admin_server" {
   ip_addresses = ["127.0.0.1"]
 }
 
+resource "tls_cert_request" "admin_client" {
+  private_key_pem = tls_private_key.admin_client.private_key_pem
+
+  subject {
+    common_name  = "local-admin"
+    organization = "Greentic"
+  }
+}
+
 resource "tls_locally_signed_cert" "admin_server" {
   cert_request_pem      = tls_cert_request.admin_server.cert_request_pem
   ca_private_key_pem    = tls_private_key.admin_ca.private_key_pem
@@ -84,6 +98,18 @@ resource "tls_locally_signed_cert" "admin_server" {
     "digital_signature",
     "key_encipherment",
     "server_auth",
+  ]
+}
+
+resource "tls_locally_signed_cert" "admin_client" {
+  cert_request_pem      = tls_cert_request.admin_client.cert_request_pem
+  ca_private_key_pem    = tls_private_key.admin_ca.private_key_pem
+  ca_cert_pem           = tls_self_signed_cert.admin_ca.cert_pem
+  validity_period_hours = 24 * 365
+  allowed_uses = [
+    "digital_signature",
+    "key_encipherment",
+    "client_auth",
   ]
 }
 
@@ -307,6 +333,32 @@ resource "aws_secretsmanager_secret" "admin_server_key" {
 resource "aws_secretsmanager_secret_version" "admin_server_key" {
   secret_id     = aws_secretsmanager_secret.admin_server_key.id
   secret_string = tls_private_key.admin_server.private_key_pem
+}
+
+resource "aws_secretsmanager_secret" "admin_client_cert" {
+  name_prefix = "${local.admin_secret_prefix}/client-cert-"
+
+  recovery_window_in_days = 0
+
+  tags = local.common_tags
+}
+
+resource "aws_secretsmanager_secret_version" "admin_client_cert" {
+  secret_id     = aws_secretsmanager_secret.admin_client_cert.id
+  secret_string = tls_locally_signed_cert.admin_client.cert_pem
+}
+
+resource "aws_secretsmanager_secret" "admin_client_key" {
+  name_prefix = "${local.admin_secret_prefix}/client-key-"
+
+  recovery_window_in_days = 0
+
+  tags = local.common_tags
+}
+
+resource "aws_secretsmanager_secret_version" "admin_client_key" {
+  secret_id     = aws_secretsmanager_secret.admin_client_key.id
+  secret_string = tls_private_key.admin_client.private_key_pem
 }
 
 resource "aws_iam_role_policy" "task_execution_admin_secrets" {
