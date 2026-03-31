@@ -19,3 +19,11 @@ output "admin_server_key_secret_ref" {
     local.secret_prefix != null ? "${local.secret_prefix}/secrets/${local.admin_server_key_secret_name}" : null
   )
 }
+
+output "admin_client_cert_secret_ref" {
+  value = null
+}
+
+output "admin_client_key_secret_ref" {
+  value = null
+}

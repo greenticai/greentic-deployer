@@ -1929,6 +1929,14 @@ output "admin_server_cert_secret_ref" {{
 output "admin_server_key_secret_ref" {{
   value = module.{module_name}.admin_server_key_secret_ref
 }}
+
+output "admin_client_cert_secret_ref" {{
+  value = module.{module_name}.admin_client_cert_secret_ref
+}}
+
+output "admin_client_key_secret_ref" {{
+  value = module.{module_name}.admin_client_key_secret_ref
+}}
 "#
     );
     fs::write(terraform_root.join("outputs.tf"), outputs_tf)?;

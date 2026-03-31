@@ -25,3 +25,15 @@ output "admin_server_key_secret_ref" {
     var.cloud == "azure" ? module.operator_azure[0].admin_server_key_secret_ref : module.operator_gcp[0].admin_server_key_secret_ref
   )
 }
+
+output "admin_client_cert_secret_ref" {
+  value = var.cloud == "aws" ? module.operator_aws[0].admin_client_cert_secret_ref : (
+    var.cloud == "azure" ? module.operator_azure[0].admin_client_cert_secret_ref : module.operator_gcp[0].admin_client_cert_secret_ref
+  )
+}
+
+output "admin_client_key_secret_ref" {
+  value = var.cloud == "aws" ? module.operator_aws[0].admin_client_key_secret_ref : (
+    var.cloud == "azure" ? module.operator_azure[0].admin_client_key_secret_ref : module.operator_gcp[0].admin_client_key_secret_ref
+  )
+}
