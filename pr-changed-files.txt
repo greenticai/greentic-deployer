@@ -1,8 +1,8 @@
-Cargo.lock
-Cargo.toml
-fixtures/packs/terraform/terraform/modules/operator-azure/outputs.tf
-fixtures/packs/terraform/terraform/modules/operator-gcp/outputs.tf
-fixtures/packs/terraform/terraform/modules/operator/main.tf
-fixtures/packs/terraform/terraform/modules/operator/outputs.tf
-fixtures/packs/terraform/terraform/outputs.tf
+SECURITY_FIX_REPORT.md
+all-code-scanning-alerts.json
+codex-prompt.txt
+pr-changed-files.txt
+pr-code-scanning-filtered.json
+pr-comment.md
+security-alerts.json
 src/apply.rs
