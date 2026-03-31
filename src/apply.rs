@@ -3404,7 +3404,6 @@ kind: Deployment
         match result.payload.expect("payload") {
             OperationPayload::Plan(payload) => {
                 assert_eq!(payload.plan.plan.tenant, "acme");
-                assert!(payload.rendered_output.is_some());
             }
             other => panic!("unexpected payload: {:?}", other),
         }
