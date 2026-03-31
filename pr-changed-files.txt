@@ -1,0 +1,8 @@
+Cargo.lock
+Cargo.toml
+fixtures/packs/terraform/terraform/modules/operator-azure/outputs.tf
+fixtures/packs/terraform/terraform/modules/operator-gcp/outputs.tf
+fixtures/packs/terraform/terraform/modules/operator/main.tf
+fixtures/packs/terraform/terraform/modules/operator/outputs.tf
+fixtures/packs/terraform/terraform/outputs.tf
+src/apply.rs
