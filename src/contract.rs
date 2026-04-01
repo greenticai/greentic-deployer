@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -7,10 +8,15 @@ use greentic_types::pack_manifest::{ExtensionInline, ExtensionRef, PackManifest}
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+use crate::Provider;
 use crate::error::{DeployerError, Result};
 use crate::pack_introspect::read_entry_from_gtpack;
 
 pub const EXT_DEPLOYER_V1: &str = "greentic.deployer.v1";
+pub const DEFAULT_GHCR_OPERATOR_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless@sha256:a7f4741a1206900b73a77c5e40860c2695206274374546dd3bb9cab8e752f79b";
+pub const DEFAULT_GCP_OPERATOR_IMAGE: &str = "europe-west1-docker.pkg.dev/x-plateau-483512-p6/greentic-images/greentic-start-distroless@sha256:555fb6ebdac836c16c5c11fce0f4080a0d7ccda03abd9e89bb9d561280ca67db";
+pub const DEFAULT_OPERATOR_IMAGE_DIGEST: &str =
+    "sha256:a7f4741a1206900b73a77c5e40860c2695206274374546dd3bb9cab8e752f79b";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -48,10 +54,34 @@ pub enum CloudCredentialKind {
     GcpAccessToken,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptFieldKindV1 {
+    Required,
+    Optional,
+    Secret,
+    OptionalSecret,
+    Static,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptFieldSpecV1 {
+    pub env_name: String,
+    pub prompt: String,
+    pub kind: PromptFieldKindV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_value: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialRequirementV1 {
     pub kind: CloudCredentialKind,
+    pub label: String,
     pub env_vars: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub satisfaction_env_groups: Vec<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompt_fields: Vec<PromptFieldSpecV1>,
     pub help: String,
 }
 
@@ -61,6 +91,8 @@ pub struct VariableRequirementV1 {
     #[serde(default)]
     pub required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_value: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -69,7 +101,13 @@ pub struct VariableRequirementV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudTargetRequirementsV1 {
     pub target: String,
+    pub target_label: String,
+    pub provider_pack_filename: String,
     pub remote_bundle_source_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_bundle_source_help: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub informational_notes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credential_requirements: Vec<CredentialRequirementV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -80,24 +118,98 @@ impl CloudTargetRequirementsV1 {
     pub fn aws() -> Self {
         Self {
             target: "aws".to_string(),
+            target_label: "AWS".to_string(),
+            provider_pack_filename: "terraform.gtpack".to_string(),
             remote_bundle_source_required: true,
+            remote_bundle_source_help: Some(
+                "Pass --deploy-bundle-source https://.../bundle.gtbundle or set GREENTIC_DEPLOY_BUNDLE_SOURCE"
+                    .to_string(),
+            ),
+            informational_notes: vec!["Internal AWS bootstrap now handles admin TLS server secrets"
+                .to_string()],
             credential_requirements: vec![
                 CredentialRequirementV1 {
                     kind: CloudCredentialKind::AwsAccessKey,
+                    label: "Access key pair".to_string(),
                     env_vars: vec![
                         "AWS_ACCESS_KEY_ID".to_string(),
                         "AWS_SECRET_ACCESS_KEY".to_string(),
+                    ],
+                    satisfaction_env_groups: vec![vec![
+                        "AWS_ACCESS_KEY_ID".to_string(),
+                        "AWS_SECRET_ACCESS_KEY".to_string(),
+                    ]],
+                    prompt_fields: vec![
+                        PromptFieldSpecV1 {
+                            env_name: "AWS_ACCESS_KEY_ID".to_string(),
+                            prompt: "AWS access key ID:".to_string(),
+                            kind: PromptFieldKindV1::Required,
+                            static_value: None,
+                        },
+                        PromptFieldSpecV1 {
+                            env_name: "AWS_SECRET_ACCESS_KEY".to_string(),
+                            prompt: "AWS secret access key:".to_string(),
+                            kind: PromptFieldKindV1::Secret,
+                            static_value: None,
+                        },
+                        PromptFieldSpecV1 {
+                            env_name: "AWS_SESSION_TOKEN".to_string(),
+                            prompt: "AWS session token (optional):".to_string(),
+                            kind: PromptFieldKindV1::OptionalSecret,
+                            static_value: None,
+                        },
+                        PromptFieldSpecV1 {
+                            env_name: "AWS_DEFAULT_REGION".to_string(),
+                            prompt: "AWS default region (optional):".to_string(),
+                            kind: PromptFieldKindV1::Optional,
+                            static_value: None,
+                        },
                     ],
                     help: "AWS access key credentials".to_string(),
                 },
                 CredentialRequirementV1 {
                     kind: CloudCredentialKind::AwsProfile,
                     env_vars: vec!["AWS_PROFILE".to_string(), "AWS_DEFAULT_PROFILE".to_string()],
+                    label: "AWS profile".to_string(),
+                    satisfaction_env_groups: vec![
+                        vec!["AWS_PROFILE".to_string()],
+                        vec!["AWS_DEFAULT_PROFILE".to_string()],
+                    ],
+                    prompt_fields: vec![
+                        PromptFieldSpecV1 {
+                            env_name: "AWS_PROFILE".to_string(),
+                            prompt: "AWS profile:".to_string(),
+                            kind: PromptFieldKindV1::Required,
+                            static_value: None,
+                        },
+                        PromptFieldSpecV1 {
+                            env_name: "AWS_DEFAULT_REGION".to_string(),
+                            prompt: "AWS default region (optional):".to_string(),
+                            kind: PromptFieldKindV1::Optional,
+                            static_value: None,
+                        },
+                    ],
                     help: "AWS shared profile credentials".to_string(),
                 },
                 CredentialRequirementV1 {
                     kind: CloudCredentialKind::AwsWebIdentity,
+                    label: "Web identity token file".to_string(),
                     env_vars: vec!["AWS_WEB_IDENTITY_TOKEN_FILE".to_string()],
+                    satisfaction_env_groups: vec![vec!["AWS_WEB_IDENTITY_TOKEN_FILE".to_string()]],
+                    prompt_fields: vec![
+                        PromptFieldSpecV1 {
+                            env_name: "AWS_WEB_IDENTITY_TOKEN_FILE".to_string(),
+                            prompt: "AWS web identity token file:".to_string(),
+                            kind: PromptFieldKindV1::Required,
+                            static_value: None,
+                        },
+                        PromptFieldSpecV1 {
+                            env_name: "AWS_ROLE_ARN".to_string(),
+                            prompt: "AWS role ARN (optional):".to_string(),
+                            kind: PromptFieldKindV1::Optional,
+                            static_value: None,
+                        },
+                    ],
                     help: "AWS web identity credentials".to_string(),
                 },
             ],
@@ -105,24 +217,28 @@ impl CloudTargetRequirementsV1 {
                 VariableRequirementV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_REMOTE_STATE_BACKEND".to_string(),
                     required: true,
+                    prompt: Some("Terraform remote state backend:".to_string()),
                     default_value: None,
                     description: Some("Terraform remote state backend".to_string()),
                 },
                 VariableRequirementV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE".to_string(),
                     required: false,
-                    default_value: None,
+                    prompt: None,
+                    default_value: Some(DEFAULT_GHCR_OPERATOR_IMAGE.to_string()),
                     description: Some("Optional operator image override".to_string()),
                 },
                 VariableRequirementV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE_DIGEST".to_string(),
                     required: false,
-                    default_value: None,
+                    prompt: None,
+                    default_value: Some(DEFAULT_OPERATOR_IMAGE_DIGEST.to_string()),
                     description: Some("Optional operator image digest override".to_string()),
                 },
                 VariableRequirementV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_DNS_NAME".to_string(),
                     required: false,
+                    prompt: None,
                     default_value: None,
                     description: Some("Optional personalized DNS name".to_string()),
                 },
@@ -133,24 +249,104 @@ impl CloudTargetRequirementsV1 {
     pub fn azure() -> Self {
         Self {
             target: "azure".to_string(),
+            target_label: "Azure".to_string(),
+            provider_pack_filename: "terraform.gtpack".to_string(),
             remote_bundle_source_required: true,
+            remote_bundle_source_help: Some(
+                "Pass --deploy-bundle-source https://.../bundle.gtbundle or set GREENTIC_DEPLOY_BUNDLE_SOURCE"
+                    .to_string(),
+            ),
+            informational_notes: Vec::new(),
             credential_requirements: vec![
                 CredentialRequirementV1 {
                     kind: CloudCredentialKind::AzureClientSecret,
+                    label: "ARM service principal".to_string(),
                     env_vars: vec![
                         "ARM_CLIENT_ID".to_string(),
                         "ARM_TENANT_ID".to_string(),
                         "ARM_SUBSCRIPTION_ID".to_string(),
                     ],
+                    satisfaction_env_groups: vec![vec![
+                        "ARM_CLIENT_ID".to_string(),
+                        "ARM_TENANT_ID".to_string(),
+                        "ARM_SUBSCRIPTION_ID".to_string(),
+                        "ARM_CLIENT_SECRET".to_string(),
+                    ]],
+                    prompt_fields: vec![
+                        PromptFieldSpecV1 {
+                            env_name: "ARM_SUBSCRIPTION_ID".to_string(),
+                            prompt: "Azure subscription ID:".to_string(),
+                            kind: PromptFieldKindV1::Required,
+                            static_value: None,
+                        },
+                        PromptFieldSpecV1 {
+                            env_name: "ARM_TENANT_ID".to_string(),
+                            prompt: "Azure tenant ID:".to_string(),
+                            kind: PromptFieldKindV1::Required,
+                            static_value: None,
+                        },
+                        PromptFieldSpecV1 {
+                            env_name: "ARM_CLIENT_ID".to_string(),
+                            prompt: "Azure client ID:".to_string(),
+                            kind: PromptFieldKindV1::Required,
+                            static_value: None,
+                        },
+                        PromptFieldSpecV1 {
+                            env_name: "ARM_CLIENT_SECRET".to_string(),
+                            prompt: "Azure client secret:".to_string(),
+                            kind: PromptFieldKindV1::Secret,
+                            static_value: None,
+                        },
+                    ],
                     help: "Azure ARM client-secret style credentials".to_string(),
                 },
                 CredentialRequirementV1 {
                     kind: CloudCredentialKind::AzureOidc,
+                    label: "Azure OIDC".to_string(),
                     env_vars: vec![
                         "ARM_USE_OIDC".to_string(),
                         "AZURE_CLIENT_ID".to_string(),
                         "AZURE_TENANT_ID".to_string(),
                         "AZURE_SUBSCRIPTION_ID".to_string(),
+                    ],
+                    satisfaction_env_groups: vec![
+                        vec![
+                            "ARM_CLIENT_ID".to_string(),
+                            "ARM_TENANT_ID".to_string(),
+                            "ARM_SUBSCRIPTION_ID".to_string(),
+                            "ARM_USE_OIDC".to_string(),
+                        ],
+                        vec![
+                            "AZURE_CLIENT_ID".to_string(),
+                            "AZURE_TENANT_ID".to_string(),
+                            "AZURE_SUBSCRIPTION_ID".to_string(),
+                        ],
+                    ],
+                    prompt_fields: vec![
+                        PromptFieldSpecV1 {
+                            env_name: "ARM_SUBSCRIPTION_ID".to_string(),
+                            prompt: "Azure subscription ID:".to_string(),
+                            kind: PromptFieldKindV1::Required,
+                            static_value: None,
+                        },
+                        PromptFieldSpecV1 {
+                            env_name: "ARM_TENANT_ID".to_string(),
+                            prompt: "Azure tenant ID:".to_string(),
+                            kind: PromptFieldKindV1::Required,
+                            static_value: None,
+                        },
+                        PromptFieldSpecV1 {
+                            env_name: "ARM_CLIENT_ID".to_string(),
+                            prompt: "Azure client ID:".to_string(),
+                            kind: PromptFieldKindV1::Required,
+                            static_value: None,
+                        },
+                        PromptFieldSpecV1 {
+                            env_name: "ARM_USE_OIDC".to_string(),
+                            prompt: String::new(),
+                            kind: PromptFieldKindV1::Static,
+                            static_value: Some("true".to_string()),
+                        },
                     ],
                     help: "Azure OIDC credentials".to_string(),
                 },
@@ -159,31 +355,36 @@ impl CloudTargetRequirementsV1 {
                 VariableRequirementV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_REMOTE_STATE_BACKEND".to_string(),
                     required: true,
+                    prompt: Some("Terraform remote state backend:".to_string()),
                     default_value: None,
                     description: Some("Terraform remote state backend".to_string()),
                 },
                 VariableRequirementV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_AZURE_KEY_VAULT_ID".to_string(),
                     required: true,
+                    prompt: Some("Azure Key Vault resource ID:".to_string()),
                     default_value: None,
                     description: Some("Azure Key Vault resource ID".to_string()),
                 },
                 VariableRequirementV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_AZURE_LOCATION".to_string(),
                     required: true,
-                    default_value: None,
+                    prompt: Some("Azure location:".to_string()),
+                    default_value: Some("westeurope".to_string()),
                     description: Some("Azure location".to_string()),
                 },
                 VariableRequirementV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE".to_string(),
                     required: false,
-                    default_value: None,
+                    prompt: None,
+                    default_value: Some(DEFAULT_GHCR_OPERATOR_IMAGE.to_string()),
                     description: Some("Optional operator image override".to_string()),
                 },
                 VariableRequirementV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE_DIGEST".to_string(),
                     required: false,
-                    default_value: None,
+                    prompt: None,
+                    default_value: Some(DEFAULT_OPERATOR_IMAGE_DIGEST.to_string()),
                     description: Some("Optional operator image digest override".to_string()),
                 },
             ],
@@ -193,19 +394,47 @@ impl CloudTargetRequirementsV1 {
     pub fn gcp() -> Self {
         Self {
             target: "gcp".to_string(),
+            target_label: "GCP".to_string(),
+            provider_pack_filename: "terraform.gtpack".to_string(),
             remote_bundle_source_required: true,
+            remote_bundle_source_help: Some(
+                "Pass --deploy-bundle-source https://.../bundle.gtbundle or set GREENTIC_DEPLOY_BUNDLE_SOURCE"
+                    .to_string(),
+            ),
+            informational_notes: Vec::new(),
             credential_requirements: vec![
                 CredentialRequirementV1 {
                     kind: CloudCredentialKind::GcpApplicationCredentials,
+                    label: "Service account credentials file".to_string(),
                     env_vars: vec!["GOOGLE_APPLICATION_CREDENTIALS".to_string()],
+                    satisfaction_env_groups: vec![vec![
+                        "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+                    ]],
+                    prompt_fields: vec![PromptFieldSpecV1 {
+                        env_name: "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+                        prompt: "GOOGLE_APPLICATION_CREDENTIALS path:".to_string(),
+                        kind: PromptFieldKindV1::Required,
+                        static_value: None,
+                    }],
                     help: "GCP application credentials JSON".to_string(),
                 },
                 CredentialRequirementV1 {
                     kind: CloudCredentialKind::GcpAccessToken,
+                    label: "Access token".to_string(),
                     env_vars: vec![
                         "GOOGLE_OAUTH_ACCESS_TOKEN".to_string(),
                         "CLOUDSDK_AUTH_ACCESS_TOKEN".to_string(),
                     ],
+                    satisfaction_env_groups: vec![
+                        vec!["GOOGLE_OAUTH_ACCESS_TOKEN".to_string()],
+                        vec!["CLOUDSDK_AUTH_ACCESS_TOKEN".to_string()],
+                    ],
+                    prompt_fields: vec![PromptFieldSpecV1 {
+                        env_name: "CLOUDSDK_AUTH_ACCESS_TOKEN".to_string(),
+                        prompt: "GCP access token:".to_string(),
+                        kind: PromptFieldKindV1::Secret,
+                        static_value: None,
+                    }],
                     help: "GCP access token credentials".to_string(),
                 },
             ],
@@ -213,36 +442,103 @@ impl CloudTargetRequirementsV1 {
                 VariableRequirementV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_REMOTE_STATE_BACKEND".to_string(),
                     required: true,
+                    prompt: Some("Terraform remote state backend:".to_string()),
                     default_value: None,
                     description: Some("Terraform remote state backend".to_string()),
                 },
                 VariableRequirementV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_GCP_PROJECT_ID".to_string(),
                     required: true,
+                    prompt: Some("GCP project ID:".to_string()),
                     default_value: None,
                     description: Some("GCP project ID".to_string()),
                 },
                 VariableRequirementV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_GCP_REGION".to_string(),
                     required: true,
-                    default_value: None,
+                    prompt: Some("GCP region:".to_string()),
+                    default_value: Some("us-central1".to_string()),
                     description: Some("GCP region".to_string()),
                 },
                 VariableRequirementV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE".to_string(),
                     required: false,
-                    default_value: None,
+                    prompt: None,
+                    default_value: Some(DEFAULT_GCP_OPERATOR_IMAGE.to_string()),
                     description: Some("Optional operator image override".to_string()),
                 },
                 VariableRequirementV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE_DIGEST".to_string(),
                     required: false,
-                    default_value: None,
+                    prompt: None,
+                    default_value: Some(DEFAULT_OPERATOR_IMAGE_DIGEST.to_string()),
                     description: Some("Optional operator image digest override".to_string()),
                 },
             ],
         }
     }
+
+    pub fn for_provider(provider: Provider) -> Option<Self> {
+        let mut requirements = match provider {
+            Provider::Aws => Some(Self::aws()),
+            Provider::Azure => Some(Self::azure()),
+            Provider::Gcp => Some(Self::gcp()),
+            Provider::Local | Provider::K8s | Provider::Generic => None,
+        }?;
+        apply_operator_image_defaults_for_provider(&mut requirements, provider);
+        Some(requirements)
+    }
+}
+
+fn apply_operator_image_defaults_for_provider(
+    requirements: &mut CloudTargetRequirementsV1,
+    provider: Provider,
+) {
+    let operator_image_default = operator_image_default_for_provider(provider);
+    for requirement in &mut requirements.variable_requirements {
+        match requirement.name.as_str() {
+            "GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE" => {
+                requirement.default_value = Some(operator_image_default.to_string());
+            }
+            "GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE_DIGEST" => {
+                requirement.default_value = Some(DEFAULT_OPERATOR_IMAGE_DIGEST.to_string());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn operator_image_default_for_provider(provider: Provider) -> &'static str {
+    match operator_image_source_for_provider(provider) {
+        OperatorImageSource::Ghcr => DEFAULT_GHCR_OPERATOR_IMAGE,
+        OperatorImageSource::GcpArtifactRegistry => DEFAULT_GCP_OPERATOR_IMAGE,
+    }
+}
+
+fn operator_image_source_for_provider(provider: Provider) -> OperatorImageSource {
+    let env_name = format!(
+        "GREENTIC_DEPLOY_DEFAULT_OPERATOR_IMAGE_SOURCE_{}",
+        provider.as_str().to_ascii_uppercase().replace('-', "_")
+    );
+    match non_empty_env_var(&env_name).as_deref() {
+        Some("gcp-artifact-registry") => OperatorImageSource::GcpArtifactRegistry,
+        Some("ghcr") => OperatorImageSource::Ghcr,
+        _ if provider == Provider::Gcp => OperatorImageSource::GcpArtifactRegistry,
+        _ => OperatorImageSource::Ghcr,
+    }
+}
+
+fn non_empty_env_var(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperatorImageSource {
+    Ghcr,
+    GcpArtifactRegistry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -889,5 +1185,22 @@ mod tests {
         header.set_mode(0o644);
         header.set_cksum();
         builder.append_data(&mut header, path, bytes).unwrap();
+    }
+
+    #[test]
+    fn cloud_target_requirements_apply_operator_image_source_override() {
+        unsafe {
+            std::env::set_var("GREENTIC_DEPLOY_DEFAULT_OPERATOR_IMAGE_SOURCE_GCP", "ghcr");
+        }
+        let gcp = CloudTargetRequirementsV1::for_provider(Provider::Gcp).expect("gcp contract");
+        let image_default = gcp
+            .variable_requirements
+            .iter()
+            .find(|requirement| requirement.name == "GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE")
+            .and_then(|requirement| requirement.default_value.as_deref());
+        assert_eq!(image_default, Some(DEFAULT_GHCR_OPERATOR_IMAGE));
+        unsafe {
+            std::env::remove_var("GREENTIC_DEPLOY_DEFAULT_OPERATOR_IMAGE_SOURCE_GCP");
+        }
     }
 }
