@@ -34,8 +34,10 @@ pub use aws::AwsRequest;
 pub use azure::AzureRequest;
 pub use config::{DeployerConfig, DeployerRequest, OutputFormat, Provider};
 pub use contract::{
-    CapabilitySpecV1, ContractAsset, DeployerCapability, DeployerContractV1, PlannerSpecV1,
+    CapabilitySpecV1, CloudCredentialKind, CloudTargetRequirementsV1, ContractAsset,
+    CredentialRequirementV1, DeployerCapability, DeployerContractV1, PlannerSpecV1,
     ResolvedCapabilityContract, ResolvedDeployerContract, ResolvedPlannerContract,
+    VariableRequirementV1,
 };
 pub use deployment::{
     ApplyExecutionOutcome, DestroyExecutionOutcome, ExecutionOutcome, ExecutionOutcomePayload,
