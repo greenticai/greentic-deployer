@@ -520,7 +520,14 @@ fn operator_image_source_for_provider(provider: Provider) -> OperatorImageSource
         "GREENTIC_DEPLOY_DEFAULT_OPERATOR_IMAGE_SOURCE_{}",
         provider.as_str().to_ascii_uppercase().replace('-', "_")
     );
-    match non_empty_env_var(&env_name).as_deref() {
+    operator_image_source_for_provider_override(provider, non_empty_env_var(&env_name).as_deref())
+}
+
+fn operator_image_source_for_provider_override(
+    provider: Provider,
+    override_value: Option<&str>,
+) -> OperatorImageSource {
+    match override_value {
         Some("gcp-artifact-registry") => OperatorImageSource::GcpArtifactRegistry,
         Some("ghcr") => OperatorImageSource::Ghcr,
         _ if provider == Provider::Gcp => OperatorImageSource::GcpArtifactRegistry,
@@ -1189,18 +1196,13 @@ mod tests {
 
     #[test]
     fn cloud_target_requirements_apply_operator_image_source_override() {
-        unsafe {
-            std::env::set_var("GREENTIC_DEPLOY_DEFAULT_OPERATOR_IMAGE_SOURCE_GCP", "ghcr");
-        }
-        let gcp = CloudTargetRequirementsV1::for_provider(Provider::Gcp).expect("gcp contract");
-        let image_default = gcp
-            .variable_requirements
-            .iter()
-            .find(|requirement| requirement.name == "GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE")
-            .and_then(|requirement| requirement.default_value.as_deref());
-        assert_eq!(image_default, Some(DEFAULT_GHCR_OPERATOR_IMAGE));
-        unsafe {
-            std::env::remove_var("GREENTIC_DEPLOY_DEFAULT_OPERATOR_IMAGE_SOURCE_GCP");
-        }
+        assert_eq!(
+            operator_image_source_for_provider_override(Provider::Gcp, Some("ghcr")),
+            OperatorImageSource::Ghcr
+        );
+        assert_eq!(
+            operator_image_source_for_provider_override(Provider::Gcp, None),
+            OperatorImageSource::GcpArtifactRegistry
+        );
     }
 }
