@@ -36,6 +36,215 @@ impl DeployerCapability {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudCredentialKind {
+    AwsAccessKey,
+    AwsProfile,
+    AwsWebIdentity,
+    AzureClientSecret,
+    AzureOidc,
+    GcpApplicationCredentials,
+    GcpAccessToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialRequirementV1 {
+    pub kind: CloudCredentialKind,
+    pub env_vars: Vec<String>,
+    pub help: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VariableRequirementV1 {
+    pub name: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudTargetRequirementsV1 {
+    pub target: String,
+    pub remote_bundle_source_required: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_requirements: Vec<CredentialRequirementV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variable_requirements: Vec<VariableRequirementV1>,
+}
+
+impl CloudTargetRequirementsV1 {
+    pub fn aws() -> Self {
+        Self {
+            target: "aws".to_string(),
+            remote_bundle_source_required: true,
+            credential_requirements: vec![
+                CredentialRequirementV1 {
+                    kind: CloudCredentialKind::AwsAccessKey,
+                    env_vars: vec![
+                        "AWS_ACCESS_KEY_ID".to_string(),
+                        "AWS_SECRET_ACCESS_KEY".to_string(),
+                    ],
+                    help: "AWS access key credentials".to_string(),
+                },
+                CredentialRequirementV1 {
+                    kind: CloudCredentialKind::AwsProfile,
+                    env_vars: vec!["AWS_PROFILE".to_string(), "AWS_DEFAULT_PROFILE".to_string()],
+                    help: "AWS shared profile credentials".to_string(),
+                },
+                CredentialRequirementV1 {
+                    kind: CloudCredentialKind::AwsWebIdentity,
+                    env_vars: vec!["AWS_WEB_IDENTITY_TOKEN_FILE".to_string()],
+                    help: "AWS web identity credentials".to_string(),
+                },
+            ],
+            variable_requirements: vec![
+                VariableRequirementV1 {
+                    name: "GREENTIC_DEPLOY_TERRAFORM_VAR_REMOTE_STATE_BACKEND".to_string(),
+                    required: true,
+                    default_value: None,
+                    description: Some("Terraform remote state backend".to_string()),
+                },
+                VariableRequirementV1 {
+                    name: "GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE".to_string(),
+                    required: false,
+                    default_value: None,
+                    description: Some("Optional operator image override".to_string()),
+                },
+                VariableRequirementV1 {
+                    name: "GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE_DIGEST".to_string(),
+                    required: false,
+                    default_value: None,
+                    description: Some("Optional operator image digest override".to_string()),
+                },
+                VariableRequirementV1 {
+                    name: "GREENTIC_DEPLOY_TERRAFORM_VAR_DNS_NAME".to_string(),
+                    required: false,
+                    default_value: None,
+                    description: Some("Optional personalized DNS name".to_string()),
+                },
+            ],
+        }
+    }
+
+    pub fn azure() -> Self {
+        Self {
+            target: "azure".to_string(),
+            remote_bundle_source_required: true,
+            credential_requirements: vec![
+                CredentialRequirementV1 {
+                    kind: CloudCredentialKind::AzureClientSecret,
+                    env_vars: vec![
+                        "ARM_CLIENT_ID".to_string(),
+                        "ARM_TENANT_ID".to_string(),
+                        "ARM_SUBSCRIPTION_ID".to_string(),
+                    ],
+                    help: "Azure ARM client-secret style credentials".to_string(),
+                },
+                CredentialRequirementV1 {
+                    kind: CloudCredentialKind::AzureOidc,
+                    env_vars: vec![
+                        "ARM_USE_OIDC".to_string(),
+                        "AZURE_CLIENT_ID".to_string(),
+                        "AZURE_TENANT_ID".to_string(),
+                        "AZURE_SUBSCRIPTION_ID".to_string(),
+                    ],
+                    help: "Azure OIDC credentials".to_string(),
+                },
+            ],
+            variable_requirements: vec![
+                VariableRequirementV1 {
+                    name: "GREENTIC_DEPLOY_TERRAFORM_VAR_REMOTE_STATE_BACKEND".to_string(),
+                    required: true,
+                    default_value: None,
+                    description: Some("Terraform remote state backend".to_string()),
+                },
+                VariableRequirementV1 {
+                    name: "GREENTIC_DEPLOY_TERRAFORM_VAR_AZURE_KEY_VAULT_ID".to_string(),
+                    required: true,
+                    default_value: None,
+                    description: Some("Azure Key Vault resource ID".to_string()),
+                },
+                VariableRequirementV1 {
+                    name: "GREENTIC_DEPLOY_TERRAFORM_VAR_AZURE_LOCATION".to_string(),
+                    required: true,
+                    default_value: None,
+                    description: Some("Azure location".to_string()),
+                },
+                VariableRequirementV1 {
+                    name: "GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE".to_string(),
+                    required: false,
+                    default_value: None,
+                    description: Some("Optional operator image override".to_string()),
+                },
+                VariableRequirementV1 {
+                    name: "GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE_DIGEST".to_string(),
+                    required: false,
+                    default_value: None,
+                    description: Some("Optional operator image digest override".to_string()),
+                },
+            ],
+        }
+    }
+
+    pub fn gcp() -> Self {
+        Self {
+            target: "gcp".to_string(),
+            remote_bundle_source_required: true,
+            credential_requirements: vec![
+                CredentialRequirementV1 {
+                    kind: CloudCredentialKind::GcpApplicationCredentials,
+                    env_vars: vec!["GOOGLE_APPLICATION_CREDENTIALS".to_string()],
+                    help: "GCP application credentials JSON".to_string(),
+                },
+                CredentialRequirementV1 {
+                    kind: CloudCredentialKind::GcpAccessToken,
+                    env_vars: vec![
+                        "GOOGLE_OAUTH_ACCESS_TOKEN".to_string(),
+                        "CLOUDSDK_AUTH_ACCESS_TOKEN".to_string(),
+                    ],
+                    help: "GCP access token credentials".to_string(),
+                },
+            ],
+            variable_requirements: vec![
+                VariableRequirementV1 {
+                    name: "GREENTIC_DEPLOY_TERRAFORM_VAR_REMOTE_STATE_BACKEND".to_string(),
+                    required: true,
+                    default_value: None,
+                    description: Some("Terraform remote state backend".to_string()),
+                },
+                VariableRequirementV1 {
+                    name: "GREENTIC_DEPLOY_TERRAFORM_VAR_GCP_PROJECT_ID".to_string(),
+                    required: true,
+                    default_value: None,
+                    description: Some("GCP project ID".to_string()),
+                },
+                VariableRequirementV1 {
+                    name: "GREENTIC_DEPLOY_TERRAFORM_VAR_GCP_REGION".to_string(),
+                    required: true,
+                    default_value: None,
+                    description: Some("GCP region".to_string()),
+                },
+                VariableRequirementV1 {
+                    name: "GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE".to_string(),
+                    required: false,
+                    default_value: None,
+                    description: Some("Optional operator image override".to_string()),
+                },
+                VariableRequirementV1 {
+                    name: "GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE_DIGEST".to_string(),
+                    required: false,
+                    default_value: None,
+                    description: Some("Optional operator image digest override".to_string()),
+                },
+            ],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeployerContractV1 {
     pub schema_version: u32,
