@@ -597,6 +597,13 @@ pub fn clear_deployment_executor() {
     *slot = None;
 }
 
+/// Serializes tests that mutate the global `EXECUTOR` singleton.
+/// Must be held by every test in any module that calls
+/// `set_deployment_executor` or `clear_deployment_executor`.
+#[cfg(test)]
+pub static EXECUTOR_TEST_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
+
 fn deployment_executor() -> Option<Arc<dyn DeploymentExecutor>> {
     EXECUTOR
         .read()
@@ -717,6 +724,7 @@ mod tests {
 
     #[tokio::test]
     async fn executes_via_registered_executor() {
+        let _guard = EXECUTOR_TEST_LOCK.lock().await;
         clear_deployment_executor();
         let hits = Arc::new(AtomicUsize::new(0));
         set_deployment_executor(Arc::new(TestExecutor { hits: hits.clone() }));
