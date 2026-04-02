@@ -1,8 +1,8 @@
 # Security Fix Report
 
 Date: 2026-04-02 (UTC)
-Branch: `chore/add-concurrency-groups`
-Commit reviewed: `6a31b98`
+Branch: `fix/ci-concurrency-group`
+Commit reviewed: `a40003e`
 
 ## 1) Security Alerts Analysis
 Input alerts JSON reviewed:
