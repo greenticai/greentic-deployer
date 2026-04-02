@@ -18,7 +18,8 @@ use greentic_deployer::{
     multi_target, operator, plan_single_vm_spec_path, preview_single_vm_apply_plan_output,
     preview_single_vm_destroy_plan_output, render_operation_result, render_single_vm_apply_report,
     render_single_vm_destroy_report, render_single_vm_plan_output, render_single_vm_status_report,
-    serverless, snap, status_single_vm_plan_output, terraform,
+    resolve_builtin_extension_for_provider, serverless, single_vm_builtin_extension, snap,
+    status_single_vm_plan_output, terraform,
 };
 
 #[derive(Parser)]
@@ -31,6 +32,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum TopLevelCommand {
     TargetRequirements(TargetRequirementsArgs),
+    ExtensionResolve(ExtensionResolveArgs),
     SingleVm(SingleVmCommand),
     MultiTarget(MultiTargetCommand),
     Aws(AwsCommand),
@@ -50,6 +52,12 @@ enum TopLevelCommand {
 struct TargetRequirementsArgs {
     #[arg(long, value_enum)]
     provider: CliProvider,
+}
+
+#[derive(Parser)]
+struct ExtensionResolveArgs {
+    #[arg(long)]
+    target: String,
 }
 
 #[derive(Parser)]
@@ -907,6 +915,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         TopLevelCommand::TargetRequirements(args) => run_target_requirements(args),
+        TopLevelCommand::ExtensionResolve(args) => run_extension_resolve(args),
         TopLevelCommand::SingleVm(command) => run_single_vm(command),
         TopLevelCommand::MultiTarget(command) => run_multi_target(command),
         TopLevelCommand::Aws(command) => run_aws(command),
@@ -932,6 +941,22 @@ fn run_target_requirements(args: TargetRequirementsArgs) -> Result<()> {
         )
     })?;
     println!("{}", serde_json::to_string_pretty(&requirements)?);
+    Ok(())
+}
+
+fn run_extension_resolve(args: ExtensionResolveArgs) -> Result<()> {
+    let descriptor = match args.target.trim() {
+        "single-vm" | "single_vm" => Some(single_vm_builtin_extension()),
+        "local" => resolve_builtin_extension_for_provider(Provider::Local),
+        "aws" => resolve_builtin_extension_for_provider(Provider::Aws),
+        "azure" => resolve_builtin_extension_for_provider(Provider::Azure),
+        "gcp" => resolve_builtin_extension_for_provider(Provider::Gcp),
+        "k8s" => resolve_builtin_extension_for_provider(Provider::K8s),
+        "generic" => resolve_builtin_extension_for_provider(Provider::Generic),
+        _ => None,
+    }
+    .ok_or_else(|| anyhow::anyhow!("unknown built-in deployment extension target: {}", args.target))?;
+    println!("{}", serde_json::to_string_pretty(&descriptor)?);
     Ok(())
 }
 
@@ -1861,6 +1886,27 @@ fn run_multi_target_request(request: DeployerRequest) -> Result<()> {
         .build()?;
     let result = runtime.block_on(multi_target::run(config))?;
     print_multi_target_operation_result(&result, output_format)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_extension_resolve;
+
+    #[test]
+    fn extension_resolve_supports_single_vm_builtin_target() {
+        let args = super::ExtensionResolveArgs {
+            target: "single-vm".to_string(),
+        };
+        run_extension_resolve(args).expect("single-vm extension");
+    }
+
+    #[test]
+    fn extension_resolve_supports_cloud_builtin_target() {
+        let args = super::ExtensionResolveArgs {
+            target: "aws".to_string(),
+        };
+        run_extension_resolve(args).expect("aws extension");
+    }
 }
 
 fn print_single_vm_apply_report(

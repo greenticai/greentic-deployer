@@ -11,6 +11,7 @@ pub mod config;
 pub mod contract;
 pub mod deployment;
 pub mod error;
+pub mod extension;
 pub mod gcp;
 pub mod helm;
 pub mod juju_k8s;
@@ -44,6 +45,10 @@ pub use deployment::{
     StatusExecutionOutcome,
 };
 pub use error::DeployerError;
+pub use extension::{
+    DeploymentExtensionDescriptor, DeploymentExtensionKind, resolve_builtin_extension_for_provider,
+    single_vm_builtin_extension,
+};
 pub use gcp::GcpRequest;
 pub use helm::HelmRequest;
 pub use juju_k8s::JujuK8sRequest;
