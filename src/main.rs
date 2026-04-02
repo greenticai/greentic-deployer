@@ -8,9 +8,12 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use greentic_deployer::{
-    CloudTargetRequirementsV1, DeployerCapability, DeployerConfig, DeployerRequest, OutputFormat,
-    Provider, SingleVmApplyOptions, SingleVmDestroyOptions,
-    apply_single_vm_plan_output_with_options, aws, azure,
+    AdminEndpointSpec, BundleFormat, BundleSpec, CloudTargetRequirementsV1,
+    DEPLOYMENT_SPEC_API_VERSION_V1ALPHA1, DEPLOYMENT_SPEC_KIND, DeployerCapability, DeployerConfig,
+    DeployerRequest, DeploymentMetadata, DeploymentSpecBody, DeploymentSpecV1, DeploymentTarget,
+    HealthSpec, LinuxArch, MtlsSpec, OutputFormat, Provider, RolloutSpec, RolloutStrategy,
+    RuntimeSpec, ServiceManager, ServiceSpec, SingleVmApplyOptions, SingleVmDestroyOptions,
+    StorageSpec, apply_single_vm_plan_output_with_options, aws, azure,
     destroy_single_vm_plan_output_with_options, gcp, helm, juju_k8s, juju_machine, k8s_raw,
     multi_target, operator, plan_single_vm_spec_path, preview_single_vm_apply_plan_output,
     preview_single_vm_destroy_plan_output, render_operation_result, render_single_vm_apply_report,
@@ -129,6 +132,7 @@ struct SnapCommand {
 
 #[derive(Subcommand)]
 enum SingleVmSubcommand {
+    RenderSpec(SingleVmRenderSpecArgs),
     Plan(SingleVmPlanArgs),
     Apply(SingleVmApplyArgs),
     Destroy(SingleVmDestroyArgs),
@@ -254,6 +258,37 @@ enum SnapSubcommand {
     Destroy(SnapArgs),
     Status(SnapArgs),
     Rollback(SnapArgs),
+}
+
+#[derive(Parser)]
+struct SingleVmRenderSpecArgs {
+    #[arg(long)]
+    out: std::path::PathBuf,
+    #[arg(long)]
+    name: String,
+    #[arg(long = "bundle-source")]
+    bundle_source: String,
+    #[arg(long)]
+    state_dir: std::path::PathBuf,
+    #[arg(long)]
+    cache_dir: std::path::PathBuf,
+    #[arg(long)]
+    log_dir: std::path::PathBuf,
+    #[arg(long)]
+    temp_dir: std::path::PathBuf,
+    #[arg(long, default_value = "127.0.0.1:8433")]
+    admin_bind: String,
+    #[arg(long = "admin-ca-file")]
+    admin_ca_file: std::path::PathBuf,
+    #[arg(long = "admin-cert-file")]
+    admin_cert_file: std::path::PathBuf,
+    #[arg(long = "admin-key-file")]
+    admin_key_file: std::path::PathBuf,
+    #[arg(
+        long,
+        default_value = "ghcr.io/greentic-ai/operator-distroless:0.1.0-distroless"
+    )]
+    image: String,
 }
 
 #[derive(Parser)]
@@ -902,6 +937,7 @@ fn run_target_requirements(args: TargetRequirementsArgs) -> Result<()> {
 
 fn run_single_vm(command: SingleVmCommand) -> Result<()> {
     match command.command {
+        SingleVmSubcommand::RenderSpec(args) => run_single_vm_render_spec(args),
         SingleVmSubcommand::Plan(args) => {
             let output = plan_single_vm_spec_path(&args.spec)?;
             println!(
@@ -948,6 +984,60 @@ fn run_single_vm(command: SingleVmCommand) -> Result<()> {
             print_single_vm_status_report(&report, args.output.into())
         }
     }
+}
+
+fn run_single_vm_render_spec(args: SingleVmRenderSpecArgs) -> Result<()> {
+    let spec = DeploymentSpecV1 {
+        api_version: DEPLOYMENT_SPEC_API_VERSION_V1ALPHA1.to_string(),
+        kind: DEPLOYMENT_SPEC_KIND.to_string(),
+        metadata: DeploymentMetadata { name: args.name },
+        spec: DeploymentSpecBody {
+            target: DeploymentTarget::SingleVm,
+            bundle: BundleSpec {
+                source: args.bundle_source,
+                format: BundleFormat::Squashfs,
+            },
+            runtime: RuntimeSpec {
+                image: args.image,
+                arch: LinuxArch::X86_64,
+                admin: AdminEndpointSpec {
+                    bind: args.admin_bind,
+                    mtls: MtlsSpec {
+                        ca_file: args.admin_ca_file,
+                        cert_file: args.admin_cert_file,
+                        key_file: args.admin_key_file,
+                    },
+                },
+            },
+            storage: StorageSpec {
+                state_dir: args.state_dir,
+                cache_dir: args.cache_dir,
+                log_dir: args.log_dir,
+                temp_dir: args.temp_dir,
+            },
+            service: ServiceSpec {
+                manager: ServiceManager::Systemd,
+                user: "greentic".to_string(),
+                group: "greentic".to_string(),
+            },
+            health: HealthSpec {
+                readiness_path: "/ready".to_string(),
+                liveness_path: "/health".to_string(),
+                startup_timeout_seconds: 120,
+            },
+            rollout: RolloutSpec {
+                strategy: RolloutStrategy::Recreate,
+            },
+        },
+    };
+    spec.validate()?;
+    if let Some(parent) = args.out.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&args.out, serde_yaml_bw::to_string(&spec)?)?;
+    Ok(())
 }
 
 fn run_multi_target(command: MultiTargetCommand) -> Result<()> {
