@@ -994,11 +994,13 @@ fn load_contract_asset(pack_path: &Path, asset_ref: &str) -> Result<ContractAsse
 mod tests {
     use super::*;
     use greentic_types::PackId;
-    use greentic_types::pack_manifest::{PackKind, PackManifest};
+    use greentic_types::pack_manifest::{ExtensionInline, ExtensionRef, PackKind, PackManifest};
+    use greentic_types::provider::ProviderExtensionInline;
     use semver::Version;
     use std::io::Write;
     use std::str::FromStr;
     use tar::Builder;
+    use zip::write::SimpleFileOptions;
 
     fn sample_manifest() -> PackManifest {
         PackManifest {
@@ -1203,6 +1205,223 @@ mod tests {
         assert_eq!(
             operator_image_source_for_provider_override(Provider::Gcp, None),
             OperatorImageSource::GcpArtifactRegistry
+        );
+    }
+
+    #[test]
+    fn cloud_target_requirements_for_provider_cover_cloud_targets_only() {
+        let aws = CloudTargetRequirementsV1::for_provider(Provider::Aws).expect("aws");
+        assert_eq!(aws.target, "aws");
+        assert_eq!(aws.target_label, "AWS");
+        assert_eq!(aws.provider_pack_filename, "terraform.gtpack");
+        assert!(aws.remote_bundle_source_required);
+        assert!(!aws.credential_requirements.is_empty());
+        assert!(aws
+            .variable_requirements
+            .iter()
+            .any(|entry| entry.name == "GREENTIC_DEPLOY_TERRAFORM_VAR_REMOTE_STATE_BACKEND"
+                && entry.required));
+
+        let azure = CloudTargetRequirementsV1::for_provider(Provider::Azure).expect("azure");
+        assert_eq!(azure.target_label, "Azure");
+        assert!(azure
+            .variable_requirements
+            .iter()
+            .any(|entry| entry.name == "GREENTIC_DEPLOY_TERRAFORM_VAR_AZURE_KEY_VAULT_ID"
+                && entry.required));
+
+        let gcp = CloudTargetRequirementsV1::for_provider(Provider::Gcp).expect("gcp");
+        assert_eq!(gcp.target_label, "GCP");
+        assert!(gcp
+            .variable_requirements
+            .iter()
+            .any(|entry| entry.name == "GREENTIC_DEPLOY_TERRAFORM_VAR_GCP_PROJECT_ID"
+                && entry.required));
+        assert_eq!(
+            gcp.variable_requirements
+                .iter()
+                .find(|entry| entry.name == "GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE")
+                .and_then(|entry| entry.default_value.as_deref()),
+            Some(DEFAULT_GCP_OPERATOR_IMAGE)
+        );
+
+        assert!(CloudTargetRequirementsV1::for_provider(Provider::Local).is_none());
+        assert!(CloudTargetRequirementsV1::for_provider(Provider::K8s).is_none());
+        assert!(CloudTargetRequirementsV1::for_provider(Provider::Generic).is_none());
+    }
+
+    #[test]
+    fn contract_validation_rejects_invalid_shapes_and_finds_capabilities() {
+        let mut missing_plan = sample_contract();
+        missing_plan
+            .capabilities
+            .retain(|entry| entry.capability != DeployerCapability::Plan);
+        let err = missing_plan.validate().unwrap_err();
+        assert!(err.to_string().contains("must declare the `plan` capability"));
+
+        let mut bad_schema = sample_contract();
+        bad_schema.schema_version = 2;
+        let err = bad_schema.validate().unwrap_err();
+        assert!(err.to_string().contains("unsupported"));
+
+        let mut empty_planner = sample_contract();
+        empty_planner.planner.flow_id.clear();
+        let err = empty_planner.validate().unwrap_err();
+        assert!(err.to_string().contains("planner.flow_id must not be empty"));
+
+        let mut empty_capability_flow = sample_contract();
+        empty_capability_flow.capabilities[0].flow_id.clear();
+        let err = empty_capability_flow.validate().unwrap_err();
+        assert!(err.to_string().contains("has empty flow_id"));
+
+        let contract = sample_contract();
+        assert_eq!(
+            contract
+                .capability(DeployerCapability::Apply)
+                .map(|entry| entry.flow_id.as_str()),
+            Some("apply_flow")
+        );
+        assert!(contract.capability(DeployerCapability::Rollback).is_none());
+    }
+
+    #[test]
+    fn get_deployer_contract_rejects_unexpected_inline_type() {
+        let mut manifest = sample_manifest();
+        let extensions = manifest.extensions.get_or_insert_with(Default::default);
+        extensions.insert(
+            EXT_DEPLOYER_V1.to_string(),
+            ExtensionRef {
+                kind: EXT_DEPLOYER_V1.to_string(),
+                version: "1.0.0".to_string(),
+                digest: None,
+                location: None,
+                inline: Some(ExtensionInline::Provider(ProviderExtensionInline::default())),
+            },
+        );
+        let err = get_deployer_contract_v1(&manifest).unwrap_err();
+        assert!(err.to_string().contains("unexpected type"));
+    }
+
+    #[test]
+    fn read_pack_asset_and_copy_subtree_reject_parent_refs() {
+        let base = std::env::current_dir().unwrap().join("target/tmp-tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(&base).unwrap();
+
+        let err = read_pack_asset(dir.path(), "../secrets.txt").unwrap_err();
+        assert!(err.to_string().contains("pack asset ref must stay pack-relative"));
+
+        let err =
+            copy_pack_subtree(dir.path(), "../terraform", &dir.path().join("out")).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("pack subtree ref must stay pack-relative"));
+    }
+
+    #[test]
+    fn copy_pack_subtree_from_zip_gtpack() {
+        let base = std::env::current_dir().unwrap().join("target/tmp-tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(&base).unwrap();
+
+        let zip_path = dir.path().join("sample.gtpack");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.start_file("terraform/main.tf", options).unwrap();
+        zip.write_all(br#"module "root" {}"#).unwrap();
+        zip.start_file("terraform/modules/operator/main.tf", options)
+            .unwrap();
+        zip.write_all(br#"module "operator" {}"#).unwrap();
+        zip.finish().unwrap();
+
+        let copied =
+            copy_pack_subtree(&zip_path, "terraform", &dir.path().join("out-zip")).unwrap();
+        assert_eq!(
+            copied,
+            vec![
+                "main.tf".to_string(),
+                "modules/operator/main.tf".to_string()
+            ]
+        );
+        assert!(dir.path().join("out-zip/main.tf").exists());
+        assert!(
+            dir.path()
+                .join("out-zip/modules/operator/main.tf")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn resolve_deployer_contract_assets_loads_referenced_files() {
+        let base = std::env::current_dir().unwrap().join("target/tmp-tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(&base).unwrap();
+
+        let planner_input = dir.path().join("assets/schemas/deployer-plan-input.schema.json");
+        let planner_output = dir.path().join("assets/schemas/deployer-plan-output.schema.json");
+        let apply_output = dir
+            .path()
+            .join("assets/schemas/apply-execution-output.schema.json");
+        let destroy_output = dir
+            .path()
+            .join("assets/schemas/destroy-execution-output.schema.json");
+        let status_output = dir
+            .path()
+            .join("assets/schemas/status-execution-output.schema.json");
+        let planner_qa = dir.path().join("assets/qaspecs/plan.json");
+        let example = dir.path().join("assets/examples/plan.json");
+        std::fs::create_dir_all(planner_input.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(planner_qa.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(example.parent().unwrap()).unwrap();
+        std::fs::write(&planner_input, br#"{"type":"object"}"#).unwrap();
+        std::fs::write(&planner_output, br#"{"type":"object","title":"plan"}"#).unwrap();
+        std::fs::write(&apply_output, br#"{"type":"object","title":"apply"}"#).unwrap();
+        std::fs::write(&destroy_output, br#"{"type":"object","title":"destroy"}"#).unwrap();
+        std::fs::write(&status_output, br#"{"type":"object","title":"status"}"#).unwrap();
+        std::fs::write(&planner_qa, br#"{"questions":[]}"#).unwrap();
+        std::fs::write(&example, br#"{"kind":"plan"}"#).unwrap();
+
+        let mut manifest = sample_manifest();
+        set_deployer_contract_v1(&mut manifest, sample_contract()).unwrap();
+        let resolved =
+            resolve_deployer_contract_assets(&manifest, dir.path()).unwrap().expect("resolved");
+
+        assert_eq!(resolved.schema_version, 1);
+        assert_eq!(resolved.planner.flow_id, "plan_flow");
+        assert_eq!(
+            resolved
+                .planner
+                .input_schema
+                .as_ref()
+                .and_then(|asset| asset.json.as_ref())
+                .and_then(|json| json.get("type"))
+                .and_then(|value| value.as_str()),
+            Some("object")
+        );
+        assert_eq!(
+            resolved
+                .planner
+                .qa_spec
+                .as_ref()
+                .map(|asset| asset.path.as_str()),
+            Some("assets/qaspecs/plan.json")
+        );
+        let plan_capability = resolved
+            .capabilities
+            .iter()
+            .find(|entry| entry.capability == DeployerCapability::Plan)
+            .expect("plan capability");
+        assert_eq!(plan_capability.flow_id, "plan_flow");
+        assert_eq!(plan_capability.examples.len(), 1);
+        assert_eq!(plan_capability.examples[0].path, "assets/examples/plan.json");
+        assert_eq!(
+            plan_capability.examples[0]
+                .json
+                .as_ref()
+                .and_then(|json| json.get("kind"))
+                .and_then(|value| value.as_str()),
+            Some("plan")
         );
     }
 }

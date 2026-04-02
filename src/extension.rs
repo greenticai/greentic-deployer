@@ -133,13 +133,17 @@ mod tests {
 
     #[test]
     fn resolve_builtin_extension_for_config_uses_provider() {
+        let base = std::env::current_dir().unwrap().join("target/tmp-tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(&base).unwrap();
+
         let request = DeployerRequest {
             capability: DeployerCapability::Apply,
             provider: Provider::Aws,
             strategy: "iac-only".to_string(),
             tenant: "demo".to_string(),
             environment: Some("dev".to_string()),
-            pack_path: PathBuf::from("/tmp/demo.gtpack"),
+            pack_path: dir.path().to_path_buf(),
             bundle_source: None,
             bundle_digest: None,
             repo_registry_base: None,
@@ -147,7 +151,7 @@ mod tests {
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
             provider_pack: None,
-            pack_id: Some("demo".to_string()),
+            pack_id: None,
             pack_version: None,
             pack_digest: None,
             distributor_url: None,

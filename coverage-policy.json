@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "global": {
+    "line_coverage_min": 60.0
+  },
+  "defaults": {
+    "per_file_line_coverage_min": 60.0
+  },
+  "exclusions": {
+    "files": [
+      "src/main.rs",
+      "src/bin/build_fixture_gtpacks.rs",
+      "src/bin/replay_deployer_scaffolds.rs"
+    ]
+  },
+  "per_file": {}
+}
