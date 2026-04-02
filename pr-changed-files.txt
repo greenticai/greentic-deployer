@@ -4,3 +4,7 @@
 .github/workflows/dependabot-automerge.yml
 .github/workflows/dependency-review.yml
 .github/workflows/release.yml
+SECURITY_FIX_REPORT.md
+pr-changed-files.txt
+src/apply.rs
+src/deployment.rs
