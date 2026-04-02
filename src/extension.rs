@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::adapter::{AdapterFamily, MultiTargetKind, UnifiedTargetSelection};
-use crate::config::Provider;
+use crate::config::{DeployerConfig, Provider};
+use crate::error::{DeployerError, Result};
+use crate::multi_target::OperationResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,9 +85,35 @@ pub fn single_vm_builtin_extension() -> DeploymentExtensionDescriptor {
     )
 }
 
+pub fn resolve_builtin_extension_for_config(
+    config: &DeployerConfig,
+) -> Option<DeploymentExtensionDescriptor> {
+    resolve_builtin_extension_for_provider(config.provider)
+}
+
+pub async fn run_builtin_extension(config: DeployerConfig) -> Result<OperationResult> {
+    let descriptor = resolve_builtin_extension_for_config(&config).ok_or_else(|| {
+        DeployerError::Other(format!(
+            "no built-in deployment extension registered for provider {}",
+            config.provider.as_str()
+        ))
+    })?;
+
+    match descriptor.target {
+        UnifiedTargetSelection::MultiTarget(_) => crate::multi_target::run(config).await,
+        UnifiedTargetSelection::SingleVm => Err(DeployerError::Other(
+            "single-vm execution must use the single-vm adapter path, not multi-target dispatch"
+                .to_string(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{DeployerRequest, OutputFormat};
+    use crate::contract::DeployerCapability;
+    use std::path::PathBuf;
 
     #[test]
     fn cloud_providers_resolve_to_builtin_multi_target_extensions() {
@@ -101,5 +129,40 @@ mod tests {
         assert_eq!(descriptor.id, "builtin.single_vm.core");
         assert_eq!(descriptor.kind, DeploymentExtensionKind::Builtin);
         assert_eq!(descriptor.adapter_family(), AdapterFamily::SingleVm);
+    }
+
+    #[test]
+    fn resolve_builtin_extension_for_config_uses_provider() {
+        let request = DeployerRequest {
+            capability: DeployerCapability::Apply,
+            provider: Provider::Aws,
+            strategy: "iac-only".to_string(),
+            tenant: "demo".to_string(),
+            environment: Some("dev".to_string()),
+            pack_path: PathBuf::from("/tmp/demo.gtpack"),
+            bundle_source: None,
+            bundle_digest: None,
+            repo_registry_base: None,
+            store_registry_base: None,
+            providers_dir: PathBuf::from("providers/deployer"),
+            packs_dir: PathBuf::from("packs"),
+            provider_pack: None,
+            pack_id: Some("demo".to_string()),
+            pack_version: None,
+            pack_digest: None,
+            distributor_url: None,
+            distributor_token: None,
+            preview: false,
+            dry_run: false,
+            execute_local: false,
+            output: OutputFormat::Json,
+            config_path: None,
+            allow_remote_in_offline: false,
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
+        };
+        let config = DeployerConfig::resolve(request).expect("config");
+        let descriptor = resolve_builtin_extension_for_config(&config).expect("descriptor");
+        assert_eq!(descriptor.id, "builtin.multi_target.aws");
     }
 }

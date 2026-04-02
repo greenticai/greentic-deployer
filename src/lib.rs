@@ -46,8 +46,8 @@ pub use deployment::{
 };
 pub use error::DeployerError;
 pub use extension::{
-    DeploymentExtensionDescriptor, DeploymentExtensionKind, resolve_builtin_extension_for_provider,
-    single_vm_builtin_extension,
+    DeploymentExtensionDescriptor, DeploymentExtensionKind, resolve_builtin_extension_for_config,
+    resolve_builtin_extension_for_provider, run_builtin_extension, single_vm_builtin_extension,
 };
 pub use gcp::GcpRequest;
 pub use helm::HelmRequest;

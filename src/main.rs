@@ -15,11 +15,11 @@ use greentic_deployer::{
     RuntimeSpec, ServiceManager, ServiceSpec, SingleVmApplyOptions, SingleVmDestroyOptions,
     StorageSpec, apply_single_vm_plan_output_with_options, aws, azure,
     destroy_single_vm_plan_output_with_options, gcp, helm, juju_k8s, juju_machine, k8s_raw,
-    multi_target, operator, plan_single_vm_spec_path, preview_single_vm_apply_plan_output,
+    operator, plan_single_vm_spec_path, preview_single_vm_apply_plan_output,
     preview_single_vm_destroy_plan_output, render_operation_result, render_single_vm_apply_report,
     render_single_vm_destroy_report, render_single_vm_plan_output, render_single_vm_status_report,
-    resolve_builtin_extension_for_provider, serverless, single_vm_builtin_extension, snap,
-    status_single_vm_plan_output, terraform,
+    resolve_builtin_extension_for_provider, run_builtin_extension, serverless,
+    single_vm_builtin_extension, snap, status_single_vm_plan_output, terraform,
 };
 
 #[derive(Parser)]
@@ -1884,7 +1884,7 @@ fn run_multi_target_request(request: DeployerRequest) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let result = runtime.block_on(multi_target::run(config))?;
+    let result = runtime.block_on(run_builtin_extension(config))?;
     print_multi_target_operation_result(&result, output_format)
 }
 
