@@ -2765,21 +2765,17 @@ mod tests {
         CapabilitySpecV1, DeployerCapability, DeployerContractV1, PlannerSpecV1,
         set_deployer_contract_v1,
     };
-    use crate::deployment::clear_deployment_executor;
+    use crate::deployment::{EXECUTOR_TEST_LOCK, clear_deployment_executor};
     use greentic_types::cbor::encode_pack_manifest;
     use greentic_types::component::{ComponentCapabilities, ComponentManifest, ComponentProfiles};
     use greentic_types::flow::{Flow, FlowHasher, FlowKind, FlowMetadata};
     use greentic_types::pack_manifest::{PackFlowEntry, PackKind, PackManifest};
     use greentic_types::{ComponentId, FlowId, PackId};
     use indexmap::IndexMap;
-    use once_cell::sync::Lazy;
     use semver::Version;
     use std::path::PathBuf;
     use std::str::FromStr;
     use tar::Builder;
-    use tokio::sync::Mutex;
-
-    static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     fn config_for(pack_path: PathBuf, capability: DeployerCapability) -> DeployerConfig {
         DeployerConfig {
@@ -3395,7 +3391,7 @@ kind: Deployment
 
     #[tokio::test]
     async fn plan_result_contains_typed_payload() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = EXECUTOR_TEST_LOCK.lock().await;
         clear_deployment_executor();
         let pack_path = write_test_pack(true);
         let result = run(config_for(pack_path, DeployerCapability::Plan))
@@ -3412,7 +3408,7 @@ kind: Deployment
 
     #[tokio::test]
     async fn terraform_status_synthesizes_local_execution_outcome() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = EXECUTOR_TEST_LOCK.lock().await;
         clear_deployment_executor();
         let base = std::env::current_dir()
             .expect("cwd")
@@ -3483,7 +3479,7 @@ kind: Deployment
 
     #[tokio::test]
     async fn terraform_apply_execute_runs_local_script_via_fake_terraform() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = EXECUTOR_TEST_LOCK.lock().await;
         clear_deployment_executor();
         let base = std::env::current_dir()
             .expect("cwd")
@@ -4123,7 +4119,7 @@ kind: Deployment
 
     #[tokio::test]
     async fn plan_result_without_contract_schema_skips_validation() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = EXECUTOR_TEST_LOCK.lock().await;
         clear_deployment_executor();
         let pack_path = write_test_pack(false);
         let result = run(config_for(pack_path, DeployerCapability::Plan))
@@ -4134,7 +4130,7 @@ kind: Deployment
 
     #[tokio::test]
     async fn generate_result_contains_capability_payload() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = EXECUTOR_TEST_LOCK.lock().await;
         clear_deployment_executor();
         let pack_path = write_test_pack(true);
         let result = run(config_for(pack_path, DeployerCapability::Generate))
@@ -4176,7 +4172,7 @@ kind: Deployment
 
     #[tokio::test]
     async fn preview_destroy_result_uses_destroy_payload_kind() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = EXECUTOR_TEST_LOCK.lock().await;
         clear_deployment_executor();
         let pack_path = write_test_pack(true);
         let mut config = config_for(pack_path, DeployerCapability::Destroy);
@@ -4202,7 +4198,7 @@ kind: Deployment
 
     #[tokio::test]
     async fn preview_apply_result_contains_runner_handoff() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = EXECUTOR_TEST_LOCK.lock().await;
         clear_deployment_executor();
         let pack_path = write_test_pack(true);
         let mut config = config_for(pack_path, DeployerCapability::Apply);
@@ -4228,7 +4224,7 @@ kind: Deployment
 
     #[tokio::test]
     async fn status_result_contains_dispatch_metadata() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = EXECUTOR_TEST_LOCK.lock().await;
         clear_deployment_executor();
         let pack_path = write_test_pack(true);
         let result = run(config_for(pack_path, DeployerCapability::Status))
@@ -4247,7 +4243,7 @@ kind: Deployment
 
     #[tokio::test]
     async fn rollback_result_contains_target_capability() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = EXECUTOR_TEST_LOCK.lock().await;
         clear_deployment_executor();
         let pack_path = write_test_pack(true);
         let result = run(config_for(pack_path, DeployerCapability::Rollback))
