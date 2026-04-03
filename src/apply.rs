@@ -141,6 +141,7 @@ pub struct ExecutionReport {
     pub invoke_path: String,
     pub handoff_path: String,
     pub runner_command_path: String,
+    pub handler_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -163,6 +164,7 @@ pub struct OperationResult {
     pub invoke_path: String,
     pub pack_id: String,
     pub flow_id: String,
+    pub handler_id: String,
     pub pack_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contract: Option<ResolvedDeployerContract>,
@@ -196,6 +198,7 @@ fn render_operation_result_text(value: &OperationResult) -> String {
     ));
     out.push_str(&format!("pack_id={}\n", value.pack_id));
     out.push_str(&format!("flow_id={}\n", value.flow_id));
+    out.push_str(&format!("handler_id={}\n", value.handler_id));
     out.push_str(&format!("pack_path={}\n", value.pack_path));
     out.push_str(&format!("output_dir={}\n", value.output_dir));
     out.push_str(&format!("plan_path={}\n", value.plan_path));
@@ -1525,6 +1528,7 @@ fn build_operation_result(
 ) -> OperationResult {
     let execution = data.executed.then(|| {
         build_execution_report(
+            &selection.dispatch.handler_id,
             runtime_artifacts,
             data.capability_contract.as_ref(),
             data.execution_outcome,
@@ -1539,6 +1543,7 @@ fn build_operation_result(
         invoke_path: runtime_artifacts.invoke.display().to_string(),
         pack_id: selection.dispatch.pack_id.clone(),
         flow_id: selection.dispatch.flow_id.clone(),
+        handler_id: selection.dispatch.handler_id.clone(),
         pack_path: selection.pack_path.display().to_string(),
         contract: data.contract,
         capability_contract: data.capability_contract,
@@ -1549,6 +1554,7 @@ fn build_operation_result(
 }
 
 fn build_execution_report(
+    handler_id: &str,
     runtime_artifacts: &RuntimeArtifacts,
     capability_contract: Option<&ResolvedCapabilityContract>,
     execution_outcome: Option<ExecutionOutcome>,
@@ -1591,6 +1597,7 @@ fn build_execution_report(
         invoke_path: runtime_artifacts.invoke.display().to_string(),
         handoff_path: runtime_artifacts.handoff_path.display().to_string(),
         runner_command_path: runtime_artifacts.runner_command_path.display().to_string(),
+        handler_id: handler_id.to_string(),
         status,
         message,
         output_files,
@@ -1706,6 +1713,7 @@ fn persist_runtime_artifacts(
         plan_path: plan_path.display().to_string(),
         pack_id: selection.dispatch.pack_id.clone(),
         flow_id: selection.dispatch.flow_id.clone(),
+        handler_id: selection.dispatch.handler_id.clone(),
         pack_path: selection.pack_path.display().to_string(),
     };
     let invoke_path = runtime_dir.join("invoke.json");
@@ -2518,6 +2526,7 @@ struct RuntimeInvocation {
     plan_path: String,
     pack_id: String,
     flow_id: String,
+    handler_id: String,
     pack_path: String,
 }
 
@@ -2526,6 +2535,7 @@ struct DeployerInvocation {
     capability: String,
     pack_id: String,
     flow_id: String,
+    handler_id: String,
     pack_path: String,
     output_dir: String,
     runner_cmd: Vec<String>,
@@ -2593,6 +2603,7 @@ fn build_deployer_invocation(
         capability: selection.dispatch.capability.as_str().to_string(),
         pack_id: selection.dispatch.pack_id.clone(),
         flow_id: selection.dispatch.flow_id.clone(),
+        handler_id: selection.dispatch.handler_id.clone(),
         pack_path: selection.pack_path.display().to_string(),
         output_dir: deploy_dir.display().to_string(),
         runner_cmd: vec![
@@ -3130,6 +3141,7 @@ kind: Deployment
             handoff: DeployerInvocation {
                 capability: "apply".into(),
                 pack_id: "greentic.deploy.aws".into(),
+                handler_id: "builtin.aws".into(),
                 flow_id: "deploy_aws_iac".into(),
                 pack_path: "/tmp/sample.gtpack".into(),
                 output_dir: deploy_dir.display().to_string(),
@@ -3170,6 +3182,7 @@ kind: Deployment
         };
 
         let report = build_execution_report(
+            "builtin.aws",
             &runtime_artifacts,
             Some(&capability_contract),
             Some(ExecutionOutcome {
@@ -3233,6 +3246,7 @@ kind: Deployment
             handoff: DeployerInvocation {
                 capability: "destroy".into(),
                 pack_id: "greentic.deploy.aws".into(),
+                handler_id: "builtin.aws".into(),
                 flow_id: "destroy_pack".into(),
                 pack_path: "/tmp/sample.gtpack".into(),
                 output_dir: deploy_dir.display().to_string(),
@@ -3270,6 +3284,7 @@ kind: Deployment
         };
 
         let report = build_execution_report(
+            "builtin.aws",
             &runtime_artifacts,
             Some(&capability_contract),
             Some(ExecutionOutcome {
@@ -3312,6 +3327,7 @@ kind: Deployment
             handoff: DeployerInvocation {
                 capability: "status".into(),
                 pack_id: "greentic.deploy.aws".into(),
+                handler_id: "builtin.aws".into(),
                 flow_id: "status_pack".into(),
                 pack_path: "/tmp/sample.gtpack".into(),
                 output_dir: deploy_dir.display().to_string(),
@@ -3359,6 +3375,7 @@ kind: Deployment
         };
 
         let report = build_execution_report(
+            "builtin.aws",
             &runtime_artifacts,
             Some(&capability_contract),
             Some(ExecutionOutcome {
@@ -3615,6 +3632,7 @@ kind: Deployment
                 capability: DeployerCapability::Plan,
                 pack_id: "greentic.deploy.terraform".into(),
                 flow_id: "plan_terraform".into(),
+                handler_id: "builtin.terraform".into(),
             },
             pack_path,
             manifest: PackManifest {
@@ -3730,6 +3748,7 @@ kind: Deployment
                 capability: DeployerCapability::Plan,
                 pack_id: "greentic.deploy.terraform".into(),
                 flow_id: "plan_terraform".into(),
+                handler_id: "builtin.terraform".into(),
             },
             pack_path,
             manifest: PackManifest {
@@ -3834,6 +3853,7 @@ kind: Deployment
                 capability: DeployerCapability::Plan,
                 pack_id: "greentic.deploy.terraform".into(),
                 flow_id: "plan_terraform".into(),
+                handler_id: "builtin.terraform".into(),
             },
             pack_path,
             manifest: PackManifest {
@@ -3914,6 +3934,7 @@ kind: Deployment
             invoke_path: "/tmp/invoke.json".into(),
             pack_id: "greentic.deploy.terraform".into(),
             flow_id: "status_terraform".into(),
+            handler_id: "builtin.terraform".into(),
             pack_path: "/tmp/provider.gtpack".into(),
             contract: None,
             capability_contract: None,
@@ -3930,6 +3951,7 @@ kind: Deployment
         });
 
         assert!(rendered.contains("terraform_runtime.present=true"));
+        assert!(rendered.contains("handler_id=builtin.terraform"));
         assert!(
             rendered.contains("terraform_runtime.copied_files=main.tf, modules/operator/main.tf")
         );
@@ -3986,6 +4008,7 @@ kind: Deployment
                 capability: DeployerCapability::Plan,
                 pack_id: "greentic.deploy.k8s".into(),
                 flow_id: "plan_k8s_raw".into(),
+                handler_id: "builtin.k8s_raw".into(),
             },
             pack_path,
             manifest: PackManifest {
@@ -4076,6 +4099,7 @@ kind: Deployment
                 capability: DeployerCapability::Plan,
                 pack_id: "greentic.deploy.helm".into(),
                 flow_id: "plan_helm".into(),
+                handler_id: "builtin.helm".into(),
             },
             pack_path,
             manifest: PackManifest {

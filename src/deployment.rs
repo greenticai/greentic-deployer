@@ -7,6 +7,7 @@ use std::sync::{Arc, RwLock};
 use crate::config::DeployerConfig;
 use crate::contract::{DeployerCapability, get_deployer_contract_v1};
 use crate::error::{DeployerError, Result};
+use crate::extension_sources::resolve_pack_deployment_dispatch;
 use crate::pack_introspect::{read_manifest_from_directory, read_manifest_from_gtpack};
 use crate::plan::PlanContext;
 use async_trait::async_trait;
@@ -27,6 +28,7 @@ pub struct DeploymentDispatch {
     pub capability: DeployerCapability,
     pub pack_id: String,
     pub flow_id: String,
+    pub handler_id: String,
 }
 
 /// Resolved deployment pack selection including discovered manifest.
@@ -52,6 +54,7 @@ pub fn default_dispatch_table() -> HashMap<DeploymentTarget, DeploymentDispatch>
             capability: DeployerCapability::Apply,
             pack_id: "greentic.deploy.aws".into(),
             flow_id: "deploy_aws_iac".into(),
+            handler_id: "builtin.aws".into(),
         },
     );
     map.insert(
@@ -63,6 +66,7 @@ pub fn default_dispatch_table() -> HashMap<DeploymentTarget, DeploymentDispatch>
             capability: DeployerCapability::Apply,
             pack_id: "greentic.deploy.local".into(),
             flow_id: "deploy_local_iac".into(),
+            handler_id: "builtin.juju_machine".into(),
         },
     );
     map.insert(
@@ -74,6 +78,7 @@ pub fn default_dispatch_table() -> HashMap<DeploymentTarget, DeploymentDispatch>
             capability: DeployerCapability::Apply,
             pack_id: "greentic.deploy.azure".into(),
             flow_id: "deploy_azure_iac".into(),
+            handler_id: "builtin.azure".into(),
         },
     );
     map.insert(
@@ -85,6 +90,7 @@ pub fn default_dispatch_table() -> HashMap<DeploymentTarget, DeploymentDispatch>
             capability: DeployerCapability::Apply,
             pack_id: "greentic.deploy.gcp".into(),
             flow_id: "deploy_gcp_iac".into(),
+            handler_id: "builtin.gcp".into(),
         },
     );
     map.insert(
@@ -96,6 +102,7 @@ pub fn default_dispatch_table() -> HashMap<DeploymentTarget, DeploymentDispatch>
             capability: DeployerCapability::Apply,
             pack_id: "greentic.deploy.k8s".into(),
             flow_id: "deploy_k8s_iac".into(),
+            handler_id: "builtin.helm".into(),
         },
     );
     map.insert(
@@ -107,6 +114,7 @@ pub fn default_dispatch_table() -> HashMap<DeploymentTarget, DeploymentDispatch>
             capability: DeployerCapability::Apply,
             pack_id: "greentic.deploy.generic".into(),
             flow_id: "deploy_generic_iac".into(),
+            handler_id: "builtin.terraform".into(),
         },
     );
     map
@@ -165,6 +173,7 @@ fn explicit_dispatch_override(
             capability,
             pack_id: pack_id.clone(),
             flow_id: flow_id.clone(),
+            handler_id: format!("override.{}", pack_id),
         })),
         (None, None) => Ok(None),
         _ => Err(DeployerError::Config(
@@ -180,43 +189,14 @@ fn dispatch_from_provider_pack(
     let Some(path) = config.provider_pack.as_ref() else {
         return Ok(None);
     };
-    let manifest = load_manifest(path)?;
-    let pack_id = manifest.pack_id.to_string();
-
-    if let Some(contract) = get_deployer_contract_v1(&manifest)? {
-        let flow_id = match capability {
-            DeployerCapability::Plan => contract.planner.flow_id,
-            _ => contract
-                .capability(capability)
-                .map(|spec| spec.flow_id.clone())
-                .or_else(|| manifest.flows.first().map(|flow| flow.id.to_string()))
-                .ok_or_else(|| {
-                    DeployerError::Config(format!(
-                        "deployment pack {} does not declare `{}` and has no fallback flows",
-                        pack_id,
-                        capability.as_str()
-                    ))
-                })?,
-        };
-        return Ok(Some(DeploymentDispatch {
-            capability,
-            pack_id,
-            flow_id,
-        }));
-    }
-
-    let Some(first_flow) = manifest.flows.first() else {
-        return Err(DeployerError::Config(format!(
-            "deployment pack {} has no contract and no flows",
-            pack_id
-        )));
-    };
-
-    Ok(Some(DeploymentDispatch {
-        capability,
-        pack_id,
-        flow_id: first_flow.id.to_string(),
-    }))
+    Ok(
+        resolve_pack_deployment_dispatch(path, capability)?.map(|dispatch| DeploymentDispatch {
+            capability: dispatch.capability,
+            pack_id: dispatch.pack_id,
+            flow_id: dispatch.flow_id,
+            handler_id: dispatch.handler_id,
+        }),
+    )
 }
 
 fn resolve_contract_dispatch(
@@ -229,6 +209,7 @@ fn resolve_contract_dispatch(
             capability,
             pack_id: fallback.pack_id.clone(),
             flow_id: fallback.flow_id.clone(),
+            handler_id: fallback.handler_id.clone(),
         });
     };
 
@@ -245,6 +226,7 @@ fn resolve_contract_dispatch(
         capability,
         pack_id: manifest.pack_id.to_string(),
         flow_id: spec.flow_id.clone(),
+        handler_id: fallback.handler_id.clone(),
     })
 }
 
@@ -299,6 +281,7 @@ where
             capability: DeployerCapability::Apply,
             pack_id,
             flow_id,
+            handler_id: format!("override.{}", prefix.to_ascii_lowercase()),
         })),
         (None, None) => Ok(None),
         (Some(_), None) | (None, Some(_)) => Err(DeployerError::Config(format!(
@@ -512,6 +495,7 @@ pub async fn execute_deployment_pack(
         strategy = %plan.deployment.strategy,
         pack_id = %dispatch.pack_id,
         flow_id = %dispatch.flow_id,
+        handler_id = %dispatch.handler_id,
         "deployment executor not registered"
     );
     Ok(None)
@@ -764,6 +748,7 @@ mod tests {
             capability: DeployerCapability::Apply,
             pack_id: "test.pack".into(),
             flow_id: "deploy_flow".into(),
+            handler_id: "pack.test.pack".into(),
         };
         let ran = execute_deployment_pack(&config, &plan, &dispatch)
             .await
@@ -900,6 +885,7 @@ mod tests {
             capability: DeployerCapability::Apply,
             pack_id: "greentic.deploy.aws".into(),
             flow_id: "deploy_aws_iac".into(),
+            handler_id: "builtin.aws".into(),
         };
         let resolved =
             resolve_contract_dispatch(&manifest, DeployerCapability::Destroy, &fallback).unwrap();
@@ -953,6 +939,7 @@ mod tests {
             capability: DeployerCapability::Apply,
             pack_id: "greentic.deploy.aws".into(),
             flow_id: "deploy_aws_iac".into(),
+            handler_id: "builtin.aws".into(),
         };
         let err = resolve_contract_dispatch(&manifest, DeployerCapability::Rollback, &fallback)
             .unwrap_err();

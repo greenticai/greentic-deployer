@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use crate::config::OutputFormat;
 use crate::error::{DeployerError, Result};
 use crate::spec::{
-    BundleFormat, DeploymentSpecV1, DeploymentTarget, LinuxArch, RolloutStrategy, ServiceManager,
+    AdminEndpointSpec, BundleFormat, BundleSpec, DEPLOYMENT_SPEC_API_VERSION_V1ALPHA1,
+    DEPLOYMENT_SPEC_KIND, DeploymentMetadata, DeploymentSpecBody, DeploymentSpecV1,
+    DeploymentTarget, HealthSpec, LinuxArch, MtlsSpec, RolloutSpec, RolloutStrategy, RuntimeSpec,
+    ServiceManager, ServiceSpec, StorageSpec,
 };
 
 const DEFAULT_RUNTIME_SERVICE_NAME: &str = "greentic-runtime";
@@ -166,6 +169,81 @@ pub struct SingleVmApplyOptions {
 pub struct SingleVmDestroyOptions {
     pub stop_service: bool,
     pub disable_service: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingleVmRenderSpecRequest {
+    pub out: PathBuf,
+    pub name: String,
+    pub bundle_source: String,
+    pub state_dir: PathBuf,
+    pub cache_dir: PathBuf,
+    pub log_dir: PathBuf,
+    pub temp_dir: PathBuf,
+    pub admin_bind: String,
+    pub admin_ca_file: PathBuf,
+    pub admin_cert_file: PathBuf,
+    pub admin_key_file: PathBuf,
+    pub image: String,
+}
+
+pub fn write_single_vm_spec(args: &SingleVmRenderSpecRequest) -> Result<()> {
+    let spec = DeploymentSpecV1 {
+        api_version: DEPLOYMENT_SPEC_API_VERSION_V1ALPHA1.to_string(),
+        kind: DEPLOYMENT_SPEC_KIND.to_string(),
+        metadata: DeploymentMetadata {
+            name: args.name.clone(),
+        },
+        spec: DeploymentSpecBody {
+            target: DeploymentTarget::SingleVm,
+            bundle: BundleSpec {
+                source: args.bundle_source.clone(),
+                format: BundleFormat::Squashfs,
+            },
+            runtime: RuntimeSpec {
+                image: args.image.clone(),
+                arch: LinuxArch::X86_64,
+                admin: AdminEndpointSpec {
+                    bind: args.admin_bind.clone(),
+                    mtls: MtlsSpec {
+                        ca_file: args.admin_ca_file.clone(),
+                        cert_file: args.admin_cert_file.clone(),
+                        key_file: args.admin_key_file.clone(),
+                    },
+                },
+            },
+            storage: StorageSpec {
+                state_dir: args.state_dir.clone(),
+                cache_dir: args.cache_dir.clone(),
+                log_dir: args.log_dir.clone(),
+                temp_dir: args.temp_dir.clone(),
+            },
+            service: ServiceSpec {
+                manager: ServiceManager::Systemd,
+                user: "greentic".to_string(),
+                group: "greentic".to_string(),
+            },
+            health: HealthSpec {
+                readiness_path: "/ready".to_string(),
+                liveness_path: "/health".to_string(),
+                startup_timeout_seconds: 120,
+            },
+            rollout: RolloutSpec {
+                strategy: RolloutStrategy::Recreate,
+            },
+        },
+    };
+    spec.validate()?;
+    if let Some(parent) = args.out.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let spec_yaml = serde_yaml_bw::to_string(&spec).map_err(|err| {
+        DeployerError::Other(format!("failed to serialize single-vm spec: {err}"))
+    })?;
+    fs::write(&args.out, spec_yaml)?;
+    Ok(())
 }
 
 pub fn build_single_vm_plan(spec: &DeploymentSpecV1) -> Result<SingleVmPlan> {
