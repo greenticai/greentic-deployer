@@ -1216,27 +1216,21 @@ mod tests {
         assert_eq!(aws.provider_pack_filename, "terraform.gtpack");
         assert!(aws.remote_bundle_source_required);
         assert!(!aws.credential_requirements.is_empty());
-        assert!(aws
-            .variable_requirements
-            .iter()
-            .any(|entry| entry.name == "GREENTIC_DEPLOY_TERRAFORM_VAR_REMOTE_STATE_BACKEND"
-                && entry.required));
+        assert!(aws.variable_requirements.iter().any(|entry| entry.name
+            == "GREENTIC_DEPLOY_TERRAFORM_VAR_REMOTE_STATE_BACKEND"
+            && entry.required));
 
         let azure = CloudTargetRequirementsV1::for_provider(Provider::Azure).expect("azure");
         assert_eq!(azure.target_label, "Azure");
-        assert!(azure
-            .variable_requirements
-            .iter()
-            .any(|entry| entry.name == "GREENTIC_DEPLOY_TERRAFORM_VAR_AZURE_KEY_VAULT_ID"
-                && entry.required));
+        assert!(azure.variable_requirements.iter().any(|entry| entry.name
+            == "GREENTIC_DEPLOY_TERRAFORM_VAR_AZURE_KEY_VAULT_ID"
+            && entry.required));
 
         let gcp = CloudTargetRequirementsV1::for_provider(Provider::Gcp).expect("gcp");
         assert_eq!(gcp.target_label, "GCP");
-        assert!(gcp
-            .variable_requirements
-            .iter()
-            .any(|entry| entry.name == "GREENTIC_DEPLOY_TERRAFORM_VAR_GCP_PROJECT_ID"
-                && entry.required));
+        assert!(gcp.variable_requirements.iter().any(|entry| entry.name
+            == "GREENTIC_DEPLOY_TERRAFORM_VAR_GCP_PROJECT_ID"
+            && entry.required));
         assert_eq!(
             gcp.variable_requirements
                 .iter()
@@ -1257,7 +1251,10 @@ mod tests {
             .capabilities
             .retain(|entry| entry.capability != DeployerCapability::Plan);
         let err = missing_plan.validate().unwrap_err();
-        assert!(err.to_string().contains("must declare the `plan` capability"));
+        assert!(
+            err.to_string()
+                .contains("must declare the `plan` capability")
+        );
 
         let mut bad_schema = sample_contract();
         bad_schema.schema_version = 2;
@@ -1267,7 +1264,10 @@ mod tests {
         let mut empty_planner = sample_contract();
         empty_planner.planner.flow_id.clear();
         let err = empty_planner.validate().unwrap_err();
-        assert!(err.to_string().contains("planner.flow_id must not be empty"));
+        assert!(
+            err.to_string()
+                .contains("planner.flow_id must not be empty")
+        );
 
         let mut empty_capability_flow = sample_contract();
         empty_capability_flow.capabilities[0].flow_id.clear();
@@ -1309,13 +1309,17 @@ mod tests {
         let dir = tempfile::tempdir_in(&base).unwrap();
 
         let err = read_pack_asset(dir.path(), "../secrets.txt").unwrap_err();
-        assert!(err.to_string().contains("pack asset ref must stay pack-relative"));
+        assert!(
+            err.to_string()
+                .contains("pack asset ref must stay pack-relative")
+        );
 
         let err =
             copy_pack_subtree(dir.path(), "../terraform", &dir.path().join("out")).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("pack subtree ref must stay pack-relative"));
+        assert!(
+            err.to_string()
+                .contains("pack subtree ref must stay pack-relative")
+        );
     }
 
     #[test]
@@ -1345,11 +1349,7 @@ mod tests {
             ]
         );
         assert!(dir.path().join("out-zip/main.tf").exists());
-        assert!(
-            dir.path()
-                .join("out-zip/modules/operator/main.tf")
-                .exists()
-        );
+        assert!(dir.path().join("out-zip/modules/operator/main.tf").exists());
     }
 
     #[test]
@@ -1358,8 +1358,12 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let dir = tempfile::tempdir_in(&base).unwrap();
 
-        let planner_input = dir.path().join("assets/schemas/deployer-plan-input.schema.json");
-        let planner_output = dir.path().join("assets/schemas/deployer-plan-output.schema.json");
+        let planner_input = dir
+            .path()
+            .join("assets/schemas/deployer-plan-input.schema.json");
+        let planner_output = dir
+            .path()
+            .join("assets/schemas/deployer-plan-output.schema.json");
         let apply_output = dir
             .path()
             .join("assets/schemas/apply-execution-output.schema.json");
@@ -1384,8 +1388,9 @@ mod tests {
 
         let mut manifest = sample_manifest();
         set_deployer_contract_v1(&mut manifest, sample_contract()).unwrap();
-        let resolved =
-            resolve_deployer_contract_assets(&manifest, dir.path()).unwrap().expect("resolved");
+        let resolved = resolve_deployer_contract_assets(&manifest, dir.path())
+            .unwrap()
+            .expect("resolved");
 
         assert_eq!(resolved.schema_version, 1);
         assert_eq!(resolved.planner.flow_id, "plan_flow");
@@ -1414,7 +1419,10 @@ mod tests {
             .expect("plan capability");
         assert_eq!(plan_capability.flow_id, "plan_flow");
         assert_eq!(plan_capability.examples.len(), 1);
-        assert_eq!(plan_capability.examples[0].path, "assets/examples/plan.json");
+        assert_eq!(
+            plan_capability.examples[0].path,
+            "assets/examples/plan.json"
+        );
         assert_eq!(
             plan_capability.examples[0]
                 .json
