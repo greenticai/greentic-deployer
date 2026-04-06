@@ -1,8 +1,11 @@
 use std::process::Command;
 
+#[path = "support/cli_binary.rs"]
+mod cli_binary;
 #[path = "support/provider_pack.rs"]
 mod provider_pack;
 
+use cli_binary::{command_output_with_busy_retry, copied_test_binary};
 use provider_pack::{build_provider_gtpack, example_pack_path, write_fake_terraform_bin};
 
 #[test]
@@ -11,22 +14,20 @@ fn aws_generate_cli_renders_json_output() {
     let provider_pack = dir.path().join("provider.gtpack");
     build_provider_gtpack("terraform", &provider_pack, "greentic.deploy.aws");
     let pack = example_pack_path();
+    let binary = copied_test_binary(&dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_greentic-deployer"))
-        .args([
-            "aws",
-            "generate",
-            "--tenant",
-            "acme",
-            "--pack",
-            pack.to_str().expect("pack path"),
-            "--provider-pack",
-            provider_pack.to_str().expect("provider pack"),
-            "--output",
-            "json",
-        ])
-        .output()
-        .expect("run greentic-deployer");
+    let output = command_output_with_busy_retry(Command::new(&binary).args([
+        "aws",
+        "generate",
+        "--tenant",
+        "acme",
+        "--pack",
+        pack.to_str().expect("pack path"),
+        "--provider-pack",
+        provider_pack.to_str().expect("provider pack"),
+        "--output",
+        "json",
+    ]));
 
     assert!(
         output.status.success(),
@@ -47,22 +48,20 @@ fn aws_status_cli_renders_json_output() {
     let provider_pack = dir.path().join("provider.gtpack");
     build_provider_gtpack("terraform", &provider_pack, "greentic.deploy.aws");
     let pack = example_pack_path();
+    let binary = copied_test_binary(&dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_greentic-deployer"))
-        .args([
-            "aws",
-            "status",
-            "--tenant",
-            "acme",
-            "--pack",
-            pack.to_str().expect("pack path"),
-            "--provider-pack",
-            provider_pack.to_str().expect("provider pack"),
-            "--output",
-            "json",
-        ])
-        .output()
-        .expect("run greentic-deployer");
+    let output = command_output_with_busy_retry(Command::new(&binary).args([
+        "aws",
+        "status",
+        "--tenant",
+        "acme",
+        "--pack",
+        pack.to_str().expect("pack path"),
+        "--provider-pack",
+        provider_pack.to_str().expect("provider pack"),
+        "--output",
+        "json",
+    ]));
 
     assert!(
         output.status.success(),
@@ -87,12 +86,12 @@ fn aws_apply_execute_cli_runs_local_terraform_scaffold() {
     std::fs::create_dir_all(&fake_bin_dir).expect("create fake bin dir");
     write_fake_terraform_bin(&fake_bin_dir);
     let pack = example_pack_path();
+    let binary = copied_test_binary(&dir);
     let path = std::env::var("PATH").unwrap_or_default();
     let combined_path = format!("{}:{path}", fake_bin_dir.display());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_greentic-deployer"))
-        .env("PATH", combined_path)
-        .args([
+    let output =
+        command_output_with_busy_retry(Command::new(&binary).env("PATH", combined_path).args([
             "aws",
             "apply",
             "--tenant",
@@ -104,9 +103,7 @@ fn aws_apply_execute_cli_runs_local_terraform_scaffold() {
             "--execute",
             "--output",
             "json",
-        ])
-        .output()
-        .expect("run greentic-deployer");
+        ]));
 
     assert!(
         output.status.success(),
