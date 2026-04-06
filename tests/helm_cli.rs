@@ -1,8 +1,11 @@
 use std::process::Command;
 
+#[path = "support/cli_binary.rs"]
+mod cli_binary;
 #[path = "support/provider_pack.rs"]
 mod provider_pack;
 
+use cli_binary::{command_output_with_busy_retry, copied_test_binary};
 use provider_pack::{build_provider_gtpack, example_pack_path};
 
 #[test]
@@ -11,22 +14,20 @@ fn helm_generate_cli_renders_json_output() {
     let provider_pack = dir.path().join("provider.gtpack");
     build_provider_gtpack("helm", &provider_pack, "greentic.deploy.helm");
     let pack = example_pack_path();
+    let binary = copied_test_binary(&dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_greentic-deployer"))
-        .args([
-            "helm",
-            "generate",
-            "--tenant",
-            "acme",
-            "--pack",
-            pack.to_str().expect("pack path"),
-            "--provider-pack",
-            provider_pack.to_str().expect("provider pack"),
-            "--output",
-            "json",
-        ])
-        .output()
-        .expect("run greentic-deployer");
+    let output = command_output_with_busy_retry(Command::new(&binary).args([
+        "helm",
+        "generate",
+        "--tenant",
+        "acme",
+        "--pack",
+        pack.to_str().expect("pack path"),
+        "--provider-pack",
+        provider_pack.to_str().expect("provider pack"),
+        "--output",
+        "json",
+    ]));
 
     assert!(
         output.status.success(),
@@ -47,22 +48,20 @@ fn helm_status_cli_renders_json_output() {
     let provider_pack = dir.path().join("provider.gtpack");
     build_provider_gtpack("helm", &provider_pack, "greentic.deploy.helm");
     let pack = example_pack_path();
+    let binary = copied_test_binary(&dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_greentic-deployer"))
-        .args([
-            "helm",
-            "status",
-            "--tenant",
-            "acme",
-            "--pack",
-            pack.to_str().expect("pack path"),
-            "--provider-pack",
-            provider_pack.to_str().expect("provider pack"),
-            "--output",
-            "json",
-        ])
-        .output()
-        .expect("run greentic-deployer");
+    let output = command_output_with_busy_retry(Command::new(&binary).args([
+        "helm",
+        "status",
+        "--tenant",
+        "acme",
+        "--pack",
+        pack.to_str().expect("pack path"),
+        "--provider-pack",
+        provider_pack.to_str().expect("provider pack"),
+        "--output",
+        "json",
+    ]));
 
     assert!(
         output.status.success(),
