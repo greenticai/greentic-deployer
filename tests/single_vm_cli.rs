@@ -1,5 +1,10 @@
 use std::process::Command;
 
+#[path = "support/cli_binary.rs"]
+mod cli_binary;
+
+use cli_binary::{command_output_with_busy_retry, copied_test_binary};
+
 fn example_spec_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
@@ -63,19 +68,18 @@ spec:
 
 #[test]
 fn single_vm_plan_cli_renders_json_output() {
+    let dir = tempfile::tempdir().expect("tempdir");
     let spec = example_spec_path();
+    let binary = copied_test_binary(&dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_greentic-deployer"))
-        .args([
-            "single-vm",
-            "plan",
-            "--spec",
-            spec.to_str().expect("spec path"),
-            "--output",
-            "json",
-        ])
-        .output()
-        .expect("run greentic-deployer");
+    let output = command_output_with_busy_retry(Command::new(&binary).args([
+        "single-vm",
+        "plan",
+        "--spec",
+        spec.to_str().expect("spec path"),
+        "--output",
+        "json",
+    ]));
 
     assert!(
         output.status.success(),
@@ -92,19 +96,18 @@ fn single_vm_plan_cli_renders_json_output() {
 
 #[test]
 fn single_vm_apply_cli_renders_text_output() {
+    let dir = tempfile::tempdir().expect("tempdir");
     let spec = writable_spec_path();
+    let binary = copied_test_binary(&dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_greentic-deployer"))
-        .args([
-            "single-vm",
-            "apply",
-            "--spec",
-            spec.to_str().expect("spec path"),
-            "--output",
-            "text",
-        ])
-        .output()
-        .expect("run greentic-deployer");
+    let output = command_output_with_busy_retry(Command::new(&binary).args([
+        "single-vm",
+        "apply",
+        "--spec",
+        spec.to_str().expect("spec path"),
+        "--output",
+        "text",
+    ]));
 
     assert!(
         output.status.success(),
@@ -122,19 +125,18 @@ fn single_vm_apply_cli_renders_text_output() {
 
 #[test]
 fn single_vm_destroy_cli_renders_text_output() {
+    let dir = tempfile::tempdir().expect("tempdir");
     let spec = writable_spec_path();
+    let binary = copied_test_binary(&dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_greentic-deployer"))
-        .args([
-            "single-vm",
-            "destroy",
-            "--spec",
-            spec.to_str().expect("spec path"),
-            "--output",
-            "text",
-        ])
-        .output()
-        .expect("run greentic-deployer");
+    let output = command_output_with_busy_retry(Command::new(&binary).args([
+        "single-vm",
+        "destroy",
+        "--spec",
+        spec.to_str().expect("spec path"),
+        "--output",
+        "text",
+    ]));
 
     assert!(
         output.status.success(),
@@ -152,19 +154,18 @@ fn single_vm_destroy_cli_renders_text_output() {
 
 #[test]
 fn single_vm_status_cli_reports_not_installed_for_fresh_spec() {
+    let dir = tempfile::tempdir().expect("tempdir");
     let spec = writable_spec_path();
+    let binary = copied_test_binary(&dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_greentic-deployer"))
-        .args([
-            "single-vm",
-            "status",
-            "--spec",
-            spec.to_str().expect("spec path"),
-            "--output",
-            "json",
-        ])
-        .output()
-        .expect("run greentic-deployer");
+    let output = command_output_with_busy_retry(Command::new(&binary).args([
+        "single-vm",
+        "status",
+        "--spec",
+        spec.to_str().expect("spec path"),
+        "--output",
+        "json",
+    ]));
 
     assert!(
         output.status.success(),
@@ -182,6 +183,7 @@ fn single_vm_status_cli_reports_not_installed_for_fresh_spec() {
 fn single_vm_plan_cli_rejects_non_x86_64_arch() {
     let dir = tempfile::tempdir().expect("tempdir");
     let spec = dir.path().join("single-vm-aarch64.yaml");
+    let binary = copied_test_binary(&dir);
     std::fs::write(
         &spec,
         r#"apiVersion: greentic.ai/v1alpha1
@@ -221,15 +223,12 @@ spec:
     )
     .expect("write spec");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_greentic-deployer"))
-        .args([
-            "single-vm",
-            "plan",
-            "--spec",
-            spec.to_str().expect("spec path"),
-        ])
-        .output()
-        .expect("run greentic-deployer");
+    let output = command_output_with_busy_retry(Command::new(&binary).args([
+        "single-vm",
+        "plan",
+        "--spec",
+        spec.to_str().expect("spec path"),
+    ]));
 
     assert!(!output.status.success(), "command unexpectedly succeeded");
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
