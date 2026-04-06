@@ -2542,8 +2542,14 @@ fn generic_root_script(root_var: &str, command: &str) -> String {
 }
 
 fn write_executable_script(path: &Path, contents: String) -> Result<()> {
-    fs::write(path, contents)?;
-    set_executable_if_unix(path)?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| DeployerError::Other(format!("invalid script path {}", path.display())))?;
+    let tmp_path = path.with_file_name(format!(".{file_name}.tmp"));
+    fs::write(&tmp_path, contents)?;
+    set_executable_if_unix(&tmp_path)?;
+    fs::rename(&tmp_path, path)?;
     Ok(())
 }
 
