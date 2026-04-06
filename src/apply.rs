@@ -14,6 +14,7 @@ use tracing::{info, info_span};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+use crate::Provider;
 use crate::config::{DeployerConfig, OutputFormat};
 use crate::contract::{
     DeployerCapability, ResolvedCapabilityContract, ResolvedDeployerContract, copy_pack_subtree,
@@ -1974,6 +1975,13 @@ fn materialize_generated_tfvars(
         String::new()
     };
 
+    replace_tfvars_assignment(&mut contents, "cloud", config.provider.as_str());
+    replace_tfvars_assignment(&mut contents, "environment", &config.environment);
+
+    for (key, value) in terraform_contract_default_overrides(config.provider) {
+        replace_tfvars_assignment(&mut contents, &key, &value);
+    }
+
     if let Some(bundle_source) = config.bundle_source.as_ref() {
         replace_tfvars_assignment(&mut contents, "bundle_source", bundle_source);
     }
@@ -1992,6 +2000,41 @@ fn materialize_generated_tfvars(
 
     fs::write(output_path, contents)?;
     Ok(Some(output_name))
+}
+
+fn terraform_contract_default_overrides(provider: Provider) -> Vec<(String, String)> {
+    let Some(requirements) = crate::contract::CloudTargetRequirementsV1::for_provider(provider)
+    else {
+        return Vec::new();
+    };
+
+    let mut overrides = requirements
+        .variable_requirements
+        .into_iter()
+        .filter_map(|entry| {
+            let key = normalize_terraform_requirement_name(&entry.name)?;
+            let value = entry.default_value?;
+            Some((key, value))
+        })
+        .collect::<Vec<_>>();
+    overrides.sort_by(|a, b| a.0.cmp(&b.0));
+    overrides
+}
+
+fn normalize_terraform_requirement_name(name: &str) -> Option<String> {
+    const PREFIX: &str = "GREENTIC_DEPLOY_TERRAFORM_VAR_";
+    let suffix = name.strip_prefix(PREFIX)?;
+    let normalized = suffix.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(
+        normalized
+            .to_ascii_lowercase()
+            .replace("__", "-")
+            .replace('_', ".")
+            .replace('.', "_"),
+    )
 }
 
 fn resolve_tfvars_example_name(terraform_root: &Path, environment: &str) -> Result<String> {
@@ -3818,8 +3861,8 @@ kind: Deployment
 
         let config = DeployerConfig {
             capability: DeployerCapability::Plan,
-            provider: Provider::Generic,
-            strategy: "terraform".into(),
+            provider: Provider::Aws,
+            strategy: "iac-only".into(),
             tenant: "acme".into(),
             environment: "dev".into(),
             pack_path: pack_path.clone(),
@@ -3878,18 +3921,20 @@ kind: Deployment
 
         let artifacts = persist_runtime_artifacts(&config, &plan, &selection, &deploy_dir)
             .expect("persist runtime artifacts");
-        let metadata: TerraformRuntimeMetadata = serde_json::from_slice(
-            &std::fs::read(artifacts.deploy_dir.join("terraform-runtime.json"))
-                .expect("read terraform runtime metadata"),
-        )
-        .expect("parse terraform runtime metadata");
-        assert_eq!(metadata.generated_tfvars.as_deref(), Some("dev.tfvars"));
-
         let generated = std::fs::read_to_string(artifacts.deploy_dir.join("terraform/dev.tfvars"))
             .expect("read generated tfvars");
+        assert!(generated.contains("cloud = \"aws\""));
+        assert!(generated.contains("environment = \"dev\""));
         assert!(generated.contains("bundle_source = \"file:///tmp/demo.gtbundle\""));
         assert!(generated.contains(
             "bundle_digest = \"sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd\""
+        ));
+        assert!(generated.contains(&format!(
+            "operator_image_digest = \"{}\"",
+            crate::contract::DEFAULT_OPERATOR_IMAGE_DIGEST
+        )));
+        assert!(!generated.contains(
+            "operator_image_digest = \"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\""
         ));
 
         let destroy_script =
