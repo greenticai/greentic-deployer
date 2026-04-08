@@ -20,7 +20,9 @@ fn cli_test_lock() -> &'static Mutex<()> {
 }
 
 fn command_output_with_busy_retry(command: &mut Command) -> std::process::Output {
-    let _guard = cli_test_lock().lock().expect("lock cli test process execution");
+    let _guard = cli_test_lock()
+        .lock()
+        .expect("lock cli test process execution");
     let mut attempts = 0;
     loop {
         match command.output() {
