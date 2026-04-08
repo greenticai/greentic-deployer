@@ -667,6 +667,33 @@ fn synthesize_local_execution_outcome(
             _ => {}
         }
     }
+    if config.execute_local && uses_helm_handoff(config) {
+        match config.capability {
+            DeployerCapability::Apply => {
+                return execute_local_scripted_operation(
+                    config,
+                    runtime_artifacts,
+                    "helm-upgrade.sh",
+                    "helm-apply",
+                    "applied",
+                    ScriptedPayloadKind::Apply,
+                    "helm apply executed locally",
+                );
+            }
+            DeployerCapability::Destroy => {
+                return execute_local_scripted_operation(
+                    config,
+                    runtime_artifacts,
+                    "helm-rollback.sh",
+                    "helm-destroy",
+                    "destroyed",
+                    ScriptedPayloadKind::Destroy,
+                    "helm destroy executed locally",
+                );
+            }
+            _ => {}
+        }
+    }
     if config.execute_local && uses_serverless_handoff(config) {
         match config.capability {
             DeployerCapability::Apply => {
@@ -792,6 +819,20 @@ fn synthesize_local_execution_outcome(
             "operator status synthesized from local handoff artifacts",
         );
     }
+    if config.capability == DeployerCapability::Status && uses_helm_handoff(config) {
+        return synthesize_scripted_handoff_status(
+            config,
+            runtime_artifacts,
+            "helm-handoff.txt",
+            vec![
+                ("helm_chart", "helm-chart/Chart.yaml"),
+                ("helm_upgrade_script", "helm-upgrade.sh"),
+                ("helm_rollback_script", "helm-rollback.sh"),
+                ("helm_status_script", "helm-status.sh"),
+            ],
+            "helm status synthesized from local handoff artifacts",
+        );
+    }
     if config.capability == DeployerCapability::Status && uses_serverless_handoff(config) {
         return synthesize_scripted_handoff_status(
             config,
@@ -867,6 +908,10 @@ fn uses_terraform_handoff(config: &DeployerConfig) -> bool {
 
 fn uses_operator_handoff(config: &DeployerConfig) -> bool {
     config.provider == crate::config::Provider::K8s && config.strategy == "operator"
+}
+
+fn uses_helm_handoff(config: &DeployerConfig) -> bool {
+    config.provider == crate::config::Provider::K8s && config.strategy == "helm"
 }
 
 fn uses_serverless_handoff(config: &DeployerConfig) -> bool {
@@ -991,7 +1036,7 @@ fn execute_local_terraform_operation(
         "destroyed"
     };
     if operation == "apply" {
-        let _ = capture_terraform_outputs(runtime_artifacts);
+        let _ = capture_terraform_outputs(config.provider, runtime_artifacts);
     }
     let endpoints = if operation == "apply" {
         collect_runtime_endpoints(runtime_artifacts)
@@ -1079,8 +1124,9 @@ fn execute_local_scripted_operation(
         return Ok(None);
     }
 
-    let output = Command::new(&script_path)
+    let output = Command::new("bash")
         .current_dir(&runtime_artifacts.deploy_dir)
+        .arg(&script_path)
         .output()
         .map_err(DeployerError::Io)?;
 
@@ -1245,7 +1291,10 @@ fn collect_terraform_output_refs(runtime_artifacts: &RuntimeArtifacts) -> BTreeM
     parse_terraform_output_refs(&contents)
 }
 
-fn capture_terraform_outputs(runtime_artifacts: &RuntimeArtifacts) -> Result<()> {
+fn capture_terraform_outputs(
+    provider: crate::config::Provider,
+    runtime_artifacts: &RuntimeArtifacts,
+) -> Result<()> {
     let terraform_root = runtime_artifacts.deploy_dir.join("terraform");
     if !terraform_root.exists() {
         return Ok(());
@@ -1261,7 +1310,7 @@ fn capture_terraform_outputs(runtime_artifacts: &RuntimeArtifacts) -> Result<()>
         .current_dir(&terraform_root)
         .arg("output")
         .arg("-json");
-    apply_default_cloud_envs(&mut command, runtime_artifacts.handoff.provider);
+    apply_default_cloud_envs(&mut command, provider);
     let output = command.output().map_err(DeployerError::Io)?;
 
     if !output.status.success() {
@@ -2013,9 +2062,34 @@ fn materialize_generated_tfvars(
     for (key, value) in terraform_env_overrides() {
         replace_tfvars_assignment(&mut contents, &key, &value);
     }
+    normalize_public_base_url_assignment(&mut contents);
 
     fs::write(output_path, contents)?;
     Ok(Some(output_name))
+}
+
+fn normalize_public_base_url_assignment(contents: &mut String) {
+    let dns_name = read_tfvars_assignment(contents, "dns_name");
+    let public_base_url = read_tfvars_assignment(contents, "public_base_url");
+
+    if let Some(dns_name) = dns_name.filter(|value| !value.trim().is_empty()) {
+        replace_tfvars_assignment(contents, "public_base_url", &format!("https://{dns_name}"));
+        return;
+    }
+
+    if let Some(public_base_url) = public_base_url {
+        let normalized = public_base_url
+            .trim()
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
+        let is_placeholder = normalized.is_empty()
+            || normalized.contains("example.com")
+            || normalized.contains("localhost")
+            || normalized.contains("127.0.0.1");
+        if is_placeholder {
+            replace_tfvars_assignment(contents, "public_base_url", "");
+        }
+    }
 }
 
 fn terraform_contract_default_overrides(provider: Provider) -> Vec<(String, String)> {
@@ -2116,6 +2190,27 @@ fn replace_tfvars_assignment(contents: &mut String, key: &str, value: &str) {
     }
     *contents = rewritten.join("\n");
     contents.push('\n');
+}
+
+fn read_tfvars_assignment(contents: &str, key: &str) -> Option<String> {
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+            continue;
+        }
+        let (lhs, rhs) = trimmed.split_once('=')?;
+        if lhs.trim() != key {
+            continue;
+        }
+        let value = rhs
+            .split('#')
+            .next()
+            .map(str::trim)
+            .map(|segment| segment.trim_matches('"'))
+            .unwrap_or_default();
+        return Some(value.to_string());
+    }
+    None
 }
 
 fn materialize_k8s_raw_handoff_assets(
