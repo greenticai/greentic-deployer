@@ -991,7 +991,7 @@ fn execute_local_terraform_operation(
         "destroyed"
     };
     if operation == "apply" {
-        let _ = capture_terraform_outputs(runtime_artifacts);
+        let _ = capture_terraform_outputs(config.provider, runtime_artifacts);
     }
     let endpoints = if operation == "apply" {
         collect_runtime_endpoints(runtime_artifacts)
@@ -1245,7 +1245,10 @@ fn collect_terraform_output_refs(runtime_artifacts: &RuntimeArtifacts) -> BTreeM
     parse_terraform_output_refs(&contents)
 }
 
-fn capture_terraform_outputs(runtime_artifacts: &RuntimeArtifacts) -> Result<()> {
+fn capture_terraform_outputs(
+    provider: crate::config::Provider,
+    runtime_artifacts: &RuntimeArtifacts,
+) -> Result<()> {
     let terraform_root = runtime_artifacts.deploy_dir.join("terraform");
     if !terraform_root.exists() {
         return Ok(());
@@ -1261,7 +1264,7 @@ fn capture_terraform_outputs(runtime_artifacts: &RuntimeArtifacts) -> Result<()>
         .current_dir(&terraform_root)
         .arg("output")
         .arg("-json");
-    apply_default_cloud_envs(&mut command, runtime_artifacts.handoff.provider);
+    apply_default_cloud_envs(&mut command, provider);
     let output = command.output().map_err(DeployerError::Io)?;
 
     if !output.status.success() {
