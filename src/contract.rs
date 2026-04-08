@@ -13,10 +13,10 @@ use crate::error::{DeployerError, Result};
 use crate::pack_introspect::read_entry_from_gtpack;
 
 pub const EXT_DEPLOYER_V1: &str = "greentic.deployer.v1";
-pub const DEFAULT_GHCR_OPERATOR_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless@sha256:a7f4741a1206900b73a77c5e40860c2695206274374546dd3bb9cab8e752f79b";
+pub const DEFAULT_GHCR_OPERATOR_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless@sha256:9c8f32854e54102a328490e33a3ed6b3d8f082bf29fba4b47e6518a5ee01f225";
 pub const DEFAULT_GCP_OPERATOR_IMAGE: &str = "europe-west1-docker.pkg.dev/x-plateau-483512-p6/greentic-images/greentic-start-distroless@sha256:555fb6ebdac836c16c5c11fce0f4080a0d7ccda03abd9e89bb9d561280ca67db";
 pub const DEFAULT_OPERATOR_IMAGE_DIGEST: &str =
-    "sha256:a7f4741a1206900b73a77c5e40860c2695206274374546dd3bb9cab8e752f79b";
+    "sha256:9c8f32854e54102a328490e33a3ed6b3d8f082bf29fba4b47e6518a5ee01f225";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -160,9 +160,9 @@ impl CloudTargetRequirementsV1 {
                         },
                         PromptFieldSpecV1 {
                             env_name: "AWS_DEFAULT_REGION".to_string(),
-                            prompt: "AWS default region (optional):".to_string(),
-                            kind: PromptFieldKindV1::Optional,
-                            static_value: None,
+                            prompt: "AWS default region:".to_string(),
+                            kind: PromptFieldKindV1::Static,
+                            static_value: Some("eu-north-1".to_string()),
                         },
                     ],
                     help: "AWS access key credentials".to_string(),
@@ -184,9 +184,9 @@ impl CloudTargetRequirementsV1 {
                         },
                         PromptFieldSpecV1 {
                             env_name: "AWS_DEFAULT_REGION".to_string(),
-                            prompt: "AWS default region (optional):".to_string(),
-                            kind: PromptFieldKindV1::Optional,
-                            static_value: None,
+                            prompt: "AWS default region:".to_string(),
+                            kind: PromptFieldKindV1::Static,
+                            static_value: Some("eu-north-1".to_string()),
                         },
                     ],
                     help: "AWS shared profile credentials".to_string(),
@@ -218,7 +218,7 @@ impl CloudTargetRequirementsV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_REMOTE_STATE_BACKEND".to_string(),
                     required: true,
                     prompt: Some("Terraform remote state backend:".to_string()),
-                    default_value: None,
+                    default_value: Some("s3".to_string()),
                     description: Some("Terraform remote state backend".to_string()),
                 },
                 VariableRequirementV1 {
