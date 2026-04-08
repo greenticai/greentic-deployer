@@ -914,6 +914,7 @@ fn execute_local_terraform_operation(
     let output = run_script_capture_logs(
         &script_path,
         &runtime_artifacts.deploy_dir,
+        config.provider,
         runtime_artifacts,
         &stdout_log,
         &stderr_log,
@@ -930,6 +931,7 @@ fn execute_local_terraform_operation(
                 let cleanup = run_script_capture_logs(
                     &cleanup_script,
                     &runtime_artifacts.deploy_dir,
+                    config.provider,
                     runtime_artifacts,
                     cleanup_stdout,
                     cleanup_stderr,
@@ -940,6 +942,7 @@ fn execute_local_terraform_operation(
                     let retry = run_script_capture_logs(
                         &script_path,
                         &runtime_artifacts.deploy_dir,
+                        config.provider,
                         runtime_artifacts,
                         retry_stdout,
                         retry_stderr,
@@ -1028,17 +1031,29 @@ fn execute_local_terraform_operation(
     }))
 }
 
+fn apply_default_cloud_envs(command: &mut Command, provider: crate::config::Provider) {
+    if provider == crate::config::Provider::Aws {
+        if std::env::var_os("AWS_REGION").is_none() {
+            command.env("AWS_REGION", "eu-north-1");
+        }
+        if std::env::var_os("AWS_DEFAULT_REGION").is_none() {
+            command.env("AWS_DEFAULT_REGION", "eu-north-1");
+        }
+    }
+}
+
 fn run_script_capture_logs(
     script_path: &Path,
     current_dir: &Path,
+    provider: crate::config::Provider,
     runtime_artifacts: &RuntimeArtifacts,
     stdout_log: &str,
     stderr_log: &str,
 ) -> Result<std::process::Output> {
-    let output = Command::new(script_path)
-        .current_dir(current_dir)
-        .output()
-        .map_err(DeployerError::Io)?;
+    let mut command = Command::new(script_path);
+    command.current_dir(current_dir);
+    apply_default_cloud_envs(&mut command, provider);
+    let output = command.output().map_err(DeployerError::Io)?;
     fs::write(
         runtime_artifacts.deploy_dir.join(stdout_log),
         &output.stdout,
@@ -1241,12 +1256,13 @@ fn capture_terraform_outputs(runtime_artifacts: &RuntimeArtifacts) -> Result<()>
     } else {
         PathBuf::from("terraform")
     };
-    let output = Command::new(terraform_bin)
+    let mut command = Command::new(terraform_bin);
+    command
         .current_dir(&terraform_root)
         .arg("output")
-        .arg("-json")
-        .output()
-        .map_err(DeployerError::Io)?;
+        .arg("-json");
+    apply_default_cloud_envs(&mut command, runtime_artifacts.handoff.provider);
+    let output = command.output().map_err(DeployerError::Io)?;
 
     if !output.status.success() {
         return Ok(());
@@ -2472,7 +2488,8 @@ fn configure_terraform_backend(
         let region = std::env::var("GREENTIC_TERRAFORM_BACKEND_REGION")
             .ok()
             .or_else(|| std::env::var("AWS_REGION").ok())
-            .unwrap_or_else(|| "us-east-1".to_string());
+            .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+            .unwrap_or_else(|| "eu-north-1".to_string());
         let key = std::env::var("GREENTIC_TERRAFORM_BACKEND_KEY")
             .ok()
             .filter(|value| !value.trim().is_empty())
