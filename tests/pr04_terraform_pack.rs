@@ -228,3 +228,18 @@ fn terraform_runtime_module_uses_distroless_command_and_admin_secrets() {
     assert!(module_tf.contains("GREENTIC_ADMIN_ALLOWED_CLIENTS"));
     assert!(module_tf.contains("PUBLIC_BASE_URL"));
 }
+
+#[test]
+fn terraform_aws_module_derives_public_base_url_from_alb_when_unset() {
+    let module_tf = fs::read_to_string(fixture_root().join("terraform/modules/operator/main.tf"))
+        .expect("read module");
+    let outputs_tf =
+        fs::read_to_string(fixture_root().join("terraform/modules/operator/outputs.tf"))
+            .expect("read outputs");
+
+    assert!(module_tf.contains("effective_public_base_url"));
+    assert!(module_tf.contains("\"http://${aws_lb.this.dns_name}\""));
+    assert!(module_tf.contains("name  = \"PUBLIC_BASE_URL\""));
+    assert!(module_tf.contains("value = local.effective_public_base_url"));
+    assert!(outputs_tf.contains("value = local.effective_public_base_url"));
+}

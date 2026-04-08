@@ -26,6 +26,7 @@ locals {
   app_port    = 8080
   admin_port  = 8433
   admin_bind  = "127.0.0.1:${local.admin_port}"
+  effective_public_base_url = trimspace(var.public_base_url) != "" ? var.public_base_url : "http://${aws_lb.this.dns_name}"
   admin_secret_prefix = "greentic/admin/${local.name_prefix}"
   effective_vpc_id = var.use_default_vpc ? data.aws_vpc.default[0].id : aws_vpc.this[0].id
   effective_subnet_ids = var.use_default_vpc ? slice(data.aws_subnets.default[0].ids, 0, min(2, length(data.aws_subnets.default[0].ids))) : aws_subnet.public[*].id
@@ -492,12 +493,12 @@ resource "aws_ecs_task_definition" "this" {
             value = "120"
           }
         ],
-        var.public_base_url != "" ? [
+        [
           {
             name  = "PUBLIC_BASE_URL"
-            value = var.public_base_url
+            value = local.effective_public_base_url
           }
-        ] : [],
+        ],
         var.admin_allowed_clients != "" ? [
           {
             name  = "GREENTIC_ADMIN_ALLOWED_CLIENTS"
