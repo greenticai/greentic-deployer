@@ -1079,8 +1079,9 @@ fn execute_local_scripted_operation(
         return Ok(None);
     }
 
-    let output = Command::new(&script_path)
+    let output = Command::new("bash")
         .current_dir(&runtime_artifacts.deploy_dir)
+        .arg(&script_path)
         .output()
         .map_err(DeployerError::Io)?;
 
