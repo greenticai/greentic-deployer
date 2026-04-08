@@ -55,7 +55,8 @@ pub fn build_provider_gtpack(fixture_name: &str, output_path: &Path, pack_id: &s
     let mut builder = Builder::new(file);
     append_bytes(&mut builder, Path::new("manifest.cbor"), &encoded);
     append_fixture_tree(&mut builder, &fixture_dir, &fixture_dir);
-    builder.finish().expect("finish archive");
+    let file = builder.into_inner().expect("finish archive");
+    file.sync_all().expect("sync output archive");
 }
 
 #[allow(dead_code)]
@@ -134,7 +135,8 @@ pub fn build_operator_provider_gtpack(output_path: &Path) {
 }
 "#,
     );
-    builder.finish().expect("finish archive");
+    let file = builder.into_inner().expect("finish archive");
+    file.sync_all().expect("sync output archive");
 }
 
 fn contract_flow_entries(contract: &DeployerContractV1) -> Vec<PackFlowEntry> {
