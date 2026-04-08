@@ -2013,9 +2013,34 @@ fn materialize_generated_tfvars(
     for (key, value) in terraform_env_overrides() {
         replace_tfvars_assignment(&mut contents, &key, &value);
     }
+    normalize_public_base_url_assignment(&mut contents);
 
     fs::write(output_path, contents)?;
     Ok(Some(output_name))
+}
+
+fn normalize_public_base_url_assignment(contents: &mut String) {
+    let dns_name = read_tfvars_assignment(contents, "dns_name");
+    let public_base_url = read_tfvars_assignment(contents, "public_base_url");
+
+    if let Some(dns_name) = dns_name.filter(|value| !value.trim().is_empty()) {
+        replace_tfvars_assignment(contents, "public_base_url", &format!("https://{dns_name}"));
+        return;
+    }
+
+    if let Some(public_base_url) = public_base_url {
+        let normalized = public_base_url
+            .trim()
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
+        let is_placeholder = normalized.is_empty()
+            || normalized.contains("example.com")
+            || normalized.contains("localhost")
+            || normalized.contains("127.0.0.1");
+        if is_placeholder {
+            replace_tfvars_assignment(contents, "public_base_url", "");
+        }
+    }
 }
 
 fn terraform_contract_default_overrides(provider: Provider) -> Vec<(String, String)> {
@@ -2116,6 +2141,27 @@ fn replace_tfvars_assignment(contents: &mut String, key: &str, value: &str) {
     }
     *contents = rewritten.join("\n");
     contents.push('\n');
+}
+
+fn read_tfvars_assignment(contents: &str, key: &str) -> Option<String> {
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+            continue;
+        }
+        let (lhs, rhs) = trimmed.split_once('=')?;
+        if lhs.trim() != key {
+            continue;
+        }
+        let value = rhs
+            .split('#')
+            .next()
+            .map(str::trim)
+            .map(|segment| segment.trim_matches('"'))
+            .unwrap_or_default();
+        return Some(value.to_string());
+    }
+    None
 }
 
 fn materialize_k8s_raw_handoff_assets(
