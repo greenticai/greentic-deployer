@@ -667,6 +667,33 @@ fn synthesize_local_execution_outcome(
             _ => {}
         }
     }
+    if config.execute_local && uses_helm_handoff(config) {
+        match config.capability {
+            DeployerCapability::Apply => {
+                return execute_local_scripted_operation(
+                    config,
+                    runtime_artifacts,
+                    "helm-upgrade.sh",
+                    "helm-apply",
+                    "applied",
+                    ScriptedPayloadKind::Apply,
+                    "helm apply executed locally",
+                );
+            }
+            DeployerCapability::Destroy => {
+                return execute_local_scripted_operation(
+                    config,
+                    runtime_artifacts,
+                    "helm-rollback.sh",
+                    "helm-destroy",
+                    "destroyed",
+                    ScriptedPayloadKind::Destroy,
+                    "helm destroy executed locally",
+                );
+            }
+            _ => {}
+        }
+    }
     if config.execute_local && uses_serverless_handoff(config) {
         match config.capability {
             DeployerCapability::Apply => {
@@ -792,6 +819,20 @@ fn synthesize_local_execution_outcome(
             "operator status synthesized from local handoff artifacts",
         );
     }
+    if config.capability == DeployerCapability::Status && uses_helm_handoff(config) {
+        return synthesize_scripted_handoff_status(
+            config,
+            runtime_artifacts,
+            "helm-handoff.txt",
+            vec![
+                ("helm_chart", "helm-chart/Chart.yaml"),
+                ("helm_upgrade_script", "helm-upgrade.sh"),
+                ("helm_rollback_script", "helm-rollback.sh"),
+                ("helm_status_script", "helm-status.sh"),
+            ],
+            "helm status synthesized from local handoff artifacts",
+        );
+    }
     if config.capability == DeployerCapability::Status && uses_serverless_handoff(config) {
         return synthesize_scripted_handoff_status(
             config,
@@ -867,6 +908,10 @@ fn uses_terraform_handoff(config: &DeployerConfig) -> bool {
 
 fn uses_operator_handoff(config: &DeployerConfig) -> bool {
     config.provider == crate::config::Provider::K8s && config.strategy == "operator"
+}
+
+fn uses_helm_handoff(config: &DeployerConfig) -> bool {
+    config.provider == crate::config::Provider::K8s && config.strategy == "helm"
 }
 
 fn uses_serverless_handoff(config: &DeployerConfig) -> bool {
