@@ -1,5 +1,5 @@
 output "operator_endpoint" {
-  value = "http://${aws_lb.this.dns_name}"
+  value = local.effective_public_base_url
 }
 
 output "admin_ca_secret_ref" {
