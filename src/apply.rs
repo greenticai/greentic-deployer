@@ -1900,15 +1900,30 @@ fn materialize_terraform_handoff_assets(
     write_executable_script(&deploy_dir.join(init_script), terraform_init_script())?;
     write_executable_script(
         &deploy_dir.join(plan_script),
-        terraform_plan_like_script("plan", generated_tfvars.as_deref(), &tfvars_example),
+        terraform_plan_like_script(
+            "plan",
+            config.provider,
+            generated_tfvars.as_deref(),
+            &tfvars_example,
+        ),
     )?;
     write_executable_script(
         &deploy_dir.join(apply_script),
-        terraform_plan_like_script("apply", generated_tfvars.as_deref(), &tfvars_example),
+        terraform_plan_like_script(
+            "apply",
+            config.provider,
+            generated_tfvars.as_deref(),
+            &tfvars_example,
+        ),
     )?;
     write_executable_script(
         &deploy_dir.join(destroy_script),
-        terraform_plan_like_script("destroy", generated_tfvars.as_deref(), &tfvars_example),
+        terraform_plan_like_script(
+            "destroy",
+            config.provider,
+            generated_tfvars.as_deref(),
+            &tfvars_example,
+        ),
     )?;
     write_executable_script(
         &deploy_dir.join(status_script),
@@ -2570,6 +2585,7 @@ fn terraform_init_script() -> String {
 
 fn terraform_plan_like_script(
     operation: &str,
+    provider: crate::config::Provider,
     generated_tfvars: Option<&str>,
     tfvars_example: &str,
 ) -> String {
@@ -2586,8 +2602,79 @@ fn terraform_plan_like_script(
             "if [ -f \"{tfvars_example}\" ]; then\n  VAR_FILE=\"{tfvars_example}\"\nelse\n  for candidate in *.tfvars *.tfvars.example; do\n    if [ -f \"$candidate\" ]; then\n      VAR_FILE=\"$candidate\"\n      break\n    fi\n  done\nfi"
         )
     };
+    let pre_apply_hook = if operation == "apply" && provider == crate::config::Provider::Azure {
+        r#"
+if command -v az >/dev/null 2>&1 && [ -n "${ARM_SUBSCRIPTION_ID:-}" ]; then
+  MODULE_ADDR=""
+  if grep -q 'module "operator_azure"' main.tf; then
+    MODULE_ADDR="module.operator_azure[0]"
+  elif grep -q 'module "operator"' main.tf; then
+    MODULE_ADDR="module.operator"
+  fi
+  if [ -n "$MODULE_ADDR" ]; then
+    BUNDLE_DIGEST_VALUE=""
+    ENVIRONMENT_VALUE="dev"
+    KEY_VAULT_ID_VALUE=""
+    if [ -n "$VAR_FILE" ] && [ -f "$VAR_FILE" ]; then
+      BUNDLE_DIGEST_VALUE=$(sed -n 's/^bundle_digest = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+      ENVIRONMENT_VALUE=$(sed -n 's/^environment = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+      KEY_VAULT_ID_VALUE=$(sed -n 's/^azure_key_vault_id = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+    fi
+    if [ -n "$BUNDLE_DIGEST_VALUE" ]; then
+      SHORT_ID=$(printf '%s' "$BUNDLE_DIGEST_VALUE" | md5sum | awk '{print substr($1,1,8)}')
+      NAME_PREFIX="greentic-${SHORT_ID}"
+      RESOURCE_GROUP_NAME="${NAME_PREFIX}-rg"
+      LOG_ANALYTICS_NAME="${NAME_PREFIX}-logs"
+      CONTAINER_ENV_NAME="${NAME_PREFIX}-cae"
+      CONTAINER_APP_NAME="${NAME_PREFIX}-app"
+      import_if_missing() {
+        local address="$1"
+        local id="$2"
+        if "$TERRAFORM_BIN" state show "$address" >/dev/null 2>&1; then
+          return 0
+        fi
+        "$TERRAFORM_BIN" import -input=false "$address" "$id"
+      }
+      if az group show --name "$RESOURCE_GROUP_NAME" >/dev/null 2>&1; then
+        import_if_missing "${MODULE_ADDR}.azurerm_resource_group.this" "/subscriptions/${ARM_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP_NAME}"
+      fi
+      LOG_ANALYTICS_ID=$(az monitor log-analytics workspace show --resource-group "$RESOURCE_GROUP_NAME" --workspace-name "$LOG_ANALYTICS_NAME" --query id -o tsv 2>/dev/null || true)
+      if [ -n "$LOG_ANALYTICS_ID" ]; then
+        import_if_missing "${MODULE_ADDR}.azurerm_log_analytics_workspace.this" "$LOG_ANALYTICS_ID"
+      fi
+      CONTAINER_ENV_ID=$(az resource show --ids "/subscriptions/${ARM_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP_NAME}/providers/Microsoft.App/managedEnvironments/${CONTAINER_ENV_NAME}" --query id -o tsv 2>/dev/null || true)
+      if [ -n "$CONTAINER_ENV_ID" ]; then
+        import_if_missing "${MODULE_ADDR}.azurerm_container_app_environment.this" "$CONTAINER_ENV_ID"
+      fi
+      CONTAINER_APP_ID=$(az resource show --ids "/subscriptions/${ARM_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP_NAME}/providers/Microsoft.App/containerApps/${CONTAINER_APP_NAME}" --query id -o tsv 2>/dev/null || true)
+      if [ -n "$CONTAINER_APP_ID" ]; then
+        import_if_missing "${MODULE_ADDR}.azurerm_container_app.this" "$CONTAINER_APP_ID"
+      fi
+      if [ -n "$KEY_VAULT_ID_VALUE" ]; then
+        KEY_VAULT_NAME=$(basename "$KEY_VAULT_ID_VALUE")
+        ADMIN_CA_SECRET_ID=$(az keyvault secret show --vault-name "$KEY_VAULT_NAME" --name "greentic-admin-ca-${ENVIRONMENT_VALUE}" --query id -o tsv 2>/dev/null || true)
+        if [ -n "$ADMIN_CA_SECRET_ID" ]; then
+          import_if_missing "${MODULE_ADDR}.azurerm_key_vault_secret.admin_ca[0]" "$ADMIN_CA_SECRET_ID"
+        fi
+        ADMIN_SERVER_CERT_SECRET_ID=$(az keyvault secret show --vault-name "$KEY_VAULT_NAME" --name "greentic-admin-server-cert-${ENVIRONMENT_VALUE}" --query id -o tsv 2>/dev/null || true)
+        if [ -n "$ADMIN_SERVER_CERT_SECRET_ID" ]; then
+          import_if_missing "${MODULE_ADDR}.azurerm_key_vault_secret.admin_server_cert[0]" "$ADMIN_SERVER_CERT_SECRET_ID"
+        fi
+        ADMIN_SERVER_KEY_SECRET_ID=$(az keyvault secret show --vault-name "$KEY_VAULT_NAME" --name "greentic-admin-server-key-${ENVIRONMENT_VALUE}" --query id -o tsv 2>/dev/null || true)
+        if [ -n "$ADMIN_SERVER_KEY_SECRET_ID" ]; then
+          import_if_missing "${MODULE_ADDR}.azurerm_key_vault_secret.admin_server_key[0]" "$ADMIN_SERVER_KEY_SECRET_ID"
+        fi
+      fi
+    fi
+  fi
+fi
+"#
+        .to_string()
+    } else {
+        String::new()
+    };
     format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\nBACKEND_ARGS=()\nif [ -f \"${{SCRIPT_DIR}}/backend.hcl\" ]; then\n  BACKEND_ARGS=(-backend-config=\"${{SCRIPT_DIR}}/backend.hcl\")\nfi\n\"$TERRAFORM_BIN\" init -input=false \"${{BACKEND_ARGS[@]}}\"\nVAR_FILE=\"\"\n{tfvars_lookup}\nif [ -n \"$VAR_FILE\" ]; then\n  \"$TERRAFORM_BIN\" {operation}{extra_args} -var-file=\"$VAR_FILE\" \"$@\"\nelse\n  \"$TERRAFORM_BIN\" {operation}{extra_args} \"$@\"\nfi\n"
+        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\nBACKEND_ARGS=()\nif [ -f \"${{SCRIPT_DIR}}/backend.hcl\" ]; then\n  BACKEND_ARGS=(-backend-config=\"${{SCRIPT_DIR}}/backend.hcl\")\nfi\n\"$TERRAFORM_BIN\" init -input=false \"${{BACKEND_ARGS[@]}}\"\nVAR_FILE=\"\"\n{tfvars_lookup}\n{pre_apply_hook}if [ -n \"$VAR_FILE\" ]; then\n  \"$TERRAFORM_BIN\" {operation}{extra_args} -var-file=\"$VAR_FILE\" \"$@\"\nelse\n  \"$TERRAFORM_BIN\" {operation}{extra_args} \"$@\"\nfi\n"
     )
 }
 
@@ -3900,6 +3987,34 @@ kind: Deployment
         assert!(note.contains("copied_files:"));
         assert!(note.contains("modules/operator/main.tf"));
         assert!(note.contains("status_command=./terraform-status.sh"));
+    }
+
+    #[test]
+    fn terraform_apply_script_for_azure_imports_existing_resources() {
+        let rendered = terraform_plan_like_script(
+            "apply",
+            Provider::Azure,
+            Some("dev.tfvars"),
+            "staging.tfvars.example",
+        );
+        assert!(rendered.contains("az keyvault secret show"));
+        assert!(rendered.contains("azurerm_container_app_environment.this"));
+        assert!(rendered.contains("azurerm_container_app.this"));
+        assert!(rendered.contains("module.operator_azure[0]"));
+        assert!(rendered.contains("module.operator"));
+        assert!(rendered.contains("import -input=false"));
+    }
+
+    #[test]
+    fn terraform_apply_script_for_non_azure_does_not_include_import_hook() {
+        let rendered = terraform_plan_like_script(
+            "apply",
+            Provider::Aws,
+            Some("dev.tfvars"),
+            "staging.tfvars.example",
+        );
+        assert!(!rendered.contains("az keyvault secret show"));
+        assert!(!rendered.contains("azurerm_container_app_environment.this"));
     }
 
     #[test]
