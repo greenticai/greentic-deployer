@@ -356,7 +356,7 @@ impl CloudTargetRequirementsV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_REMOTE_STATE_BACKEND".to_string(),
                     required: true,
                     prompt: Some("Terraform remote state backend:".to_string()),
-                    default_value: None,
+                    default_value: Some("azurerm".to_string()),
                     description: Some("Terraform remote state backend".to_string()),
                 },
                 VariableRequirementV1 {

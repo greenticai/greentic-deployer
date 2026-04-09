@@ -90,20 +90,24 @@ fn azure_apply_execute_cli_runs_local_terraform_scaffold() {
     let path = std::env::var("PATH").unwrap_or_default();
     let combined_path = format!("{}:{path}", fake_bin_dir.display());
 
-    let output =
-        command_output_with_busy_retry(Command::new(&binary).env("PATH", combined_path).args([
-            "azure",
-            "apply",
-            "--tenant",
-            "acme-azure-apply",
-            "--pack",
-            pack.to_str().expect("pack path"),
-            "--provider-pack",
-            provider_pack.to_str().expect("provider pack"),
-            "--execute",
-            "--output",
-            "json",
-        ]));
+    let output = command_output_with_busy_retry(
+        Command::new(&binary)
+            .env("PATH", combined_path)
+            .env("GREENTIC_DEPLOY_SKIP_ENDPOINT_READY_CHECK", "1")
+            .args([
+                "azure",
+                "apply",
+                "--tenant",
+                "acme-azure-apply",
+                "--pack",
+                pack.to_str().expect("pack path"),
+                "--provider-pack",
+                provider_pack.to_str().expect("provider pack"),
+                "--execute",
+                "--output",
+                "json",
+            ]),
+    );
 
     assert!(
         output.status.success(),

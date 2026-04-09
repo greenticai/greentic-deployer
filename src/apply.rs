@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread::sleep;
+use std::time::Duration;
 
 use tracing::{info, info_span};
 
@@ -1082,6 +1084,7 @@ fn execute_local_terraform_operation(
     };
     if operation == "apply" {
         let _ = capture_terraform_outputs(config.provider, runtime_artifacts);
+        wait_for_runtime_readiness(config.provider, runtime_artifacts)?;
     }
     let endpoints = if operation == "apply" {
         collect_runtime_endpoints(runtime_artifacts)
@@ -1334,6 +1337,71 @@ fn collect_terraform_output_refs(runtime_artifacts: &RuntimeArtifacts) -> BTreeM
         return BTreeMap::new();
     };
     parse_terraform_output_refs(&contents)
+}
+
+fn wait_for_runtime_readiness(
+    provider: crate::config::Provider,
+    runtime_artifacts: &RuntimeArtifacts,
+) -> Result<()> {
+    if provider != crate::config::Provider::Azure {
+        return Ok(());
+    }
+    if std::env::var("GREENTIC_DEPLOY_SKIP_ENDPOINT_READY_CHECK")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    let endpoints = collect_runtime_endpoints(runtime_artifacts);
+    let Some(endpoint) = endpoints.first() else {
+        return Err(DeployerError::Other(
+            "azure apply completed without operator endpoint output".to_string(),
+        ));
+    };
+    let ready_url = format!("{}/readyz", endpoint.trim_end_matches('/'));
+    let max_attempts = std::env::var("GREENTIC_DEPLOY_ENDPOINT_READY_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(18);
+    let retry_delay_seconds = std::env::var("GREENTIC_DEPLOY_ENDPOINT_READY_RETRY_DELAY_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(10);
+
+    for attempt in 1..=max_attempts {
+        let status = Command::new("curl")
+            .arg("-sS")
+            .arg("-o")
+            .arg("/dev/null")
+            .arg("-w")
+            .arg("%{http_code}")
+            .arg("--max-time")
+            .arg("10")
+            .arg(&ready_url)
+            .output();
+
+        match status {
+            Ok(output) if output.status.success() => {
+                let code = String::from_utf8_lossy(&output.stdout);
+                if code.trim() == "200" {
+                    return Ok(());
+                }
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => {}
+        }
+
+        if attempt < max_attempts {
+            sleep(Duration::from_secs(retry_delay_seconds));
+        }
+    }
+
+    Err(DeployerError::Other(format!(
+        "azure endpoint readiness check failed for {}; /readyz did not return 200",
+        ready_url
+    )))
 }
 
 fn capture_terraform_outputs(
@@ -2611,30 +2679,46 @@ if command -v az >/dev/null 2>&1 && [ -n "${ARM_SUBSCRIPTION_ID:-}" ]; then
   elif grep -q 'module "operator"' main.tf; then
     MODULE_ADDR="module.operator"
   fi
-  if [ -n "$MODULE_ADDR" ]; then
-    BUNDLE_DIGEST_VALUE=""
-    ENVIRONMENT_VALUE="dev"
-    KEY_VAULT_ID_VALUE=""
-    if [ -n "$VAR_FILE" ] && [ -f "$VAR_FILE" ]; then
-      BUNDLE_DIGEST_VALUE=$(sed -n 's/^bundle_digest = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
-      ENVIRONMENT_VALUE=$(sed -n 's/^environment = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
-      KEY_VAULT_ID_VALUE=$(sed -n 's/^azure_key_vault_id = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
-    fi
-    if [ -n "$BUNDLE_DIGEST_VALUE" ]; then
-      SHORT_ID=$(printf '%s' "$BUNDLE_DIGEST_VALUE" | md5sum | awk '{print substr($1,1,8)}')
-      NAME_PREFIX="greentic-${SHORT_ID}"
-      RESOURCE_GROUP_NAME="${NAME_PREFIX}-rg"
+    if [ -n "$MODULE_ADDR" ]; then
+      BUNDLE_DIGEST_VALUE=""
+      ENVIRONMENT_VALUE="dev"
+      CLOUD_VALUE=""
+      OPERATOR_IMAGE_DIGEST_VALUE=""
+      BUNDLE_SOURCE_VALUE=""
+      REMOTE_STATE_BACKEND_VALUE=""
+      KEY_VAULT_ID_VALUE=""
+      if [ -n "$VAR_FILE" ] && [ -f "$VAR_FILE" ]; then
+        CLOUD_VALUE=$(sed -n 's/^cloud = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+        BUNDLE_DIGEST_VALUE=$(sed -n 's/^bundle_digest = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+        ENVIRONMENT_VALUE=$(sed -n 's/^environment = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+        OPERATOR_IMAGE_DIGEST_VALUE=$(sed -n 's/^operator_image_digest = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+        BUNDLE_SOURCE_VALUE=$(sed -n 's/^bundle_source = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+        REMOTE_STATE_BACKEND_VALUE=$(sed -n 's/^remote_state_backend = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+        KEY_VAULT_ID_VALUE=$(sed -n 's/^azure_key_vault_id = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+      fi
+      if [ -n "$BUNDLE_DIGEST_VALUE" ]; then
+        export TF_VAR_cloud="${CLOUD_VALUE:-azure}"
+        export TF_VAR_environment="${ENVIRONMENT_VALUE:-dev}"
+        export TF_VAR_operator_image_digest="$OPERATOR_IMAGE_DIGEST_VALUE"
+        export TF_VAR_bundle_source="$BUNDLE_SOURCE_VALUE"
+        export TF_VAR_bundle_digest="$BUNDLE_DIGEST_VALUE"
+        export TF_VAR_remote_state_backend="$REMOTE_STATE_BACKEND_VALUE"
+        export TF_VAR_azure_key_vault_id="$KEY_VAULT_ID_VALUE"
+        export TF_VAR_azure_location="${GREENTIC_DEPLOY_TERRAFORM_VAR_AZURE_LOCATION:-}"
+        SHORT_ID=$(printf '%s' "$BUNDLE_DIGEST_VALUE" | md5sum | awk '{print substr($1,1,8)}')
+        NAME_PREFIX="greentic-${SHORT_ID}"
+        RESOURCE_GROUP_NAME="${NAME_PREFIX}-rg"
       LOG_ANALYTICS_NAME="${NAME_PREFIX}-logs"
       CONTAINER_ENV_NAME="${NAME_PREFIX}-cae"
       CONTAINER_APP_NAME="${NAME_PREFIX}-app"
-      import_if_missing() {
-        local address="$1"
-        local id="$2"
-        if "$TERRAFORM_BIN" state show "$address" >/dev/null 2>&1; then
-          return 0
-        fi
-        "$TERRAFORM_BIN" import -input=false "$address" "$id"
-      }
+        import_if_missing() {
+          local address="$1"
+          local id="$2"
+          if "$TERRAFORM_BIN" state show "$address" >/dev/null 2>&1; then
+            return 0
+          fi
+          "$TERRAFORM_BIN" import -input=false "$address" "$id"
+        }
       if az group show --name "$RESOURCE_GROUP_NAME" >/dev/null 2>&1; then
         import_if_missing "${MODULE_ADDR}.azurerm_resource_group.this" "/subscriptions/${ARM_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP_NAME}"
       fi
@@ -2673,8 +2757,25 @@ fi
     } else {
         String::new()
     };
+    let apply_invocation = format!(
+        "if [ -n \"$VAR_FILE\" ]; then\n  \"$TERRAFORM_BIN\" {operation}{extra_args} -var-file=\"$VAR_FILE\" \"$@\"\nelse\n  \"$TERRAFORM_BIN\" {operation}{extra_args} \"$@\"\nfi"
+    );
+    let operation_block = if operation == "apply" && provider == crate::config::Provider::Azure {
+        format!(
+            "AZURE_APPLY_MAX_ATTEMPTS=\"${{GREENTIC_AZURE_APPLY_MAX_ATTEMPTS:-6}}\"\nAZURE_APPLY_RETRY_DELAY_SECONDS=\"${{GREENTIC_AZURE_APPLY_RETRY_DELAY_SECONDS:-20}}\"\nattempt=1\nwhile true; do\n  stdout_file=\"$(mktemp)\"\n  stderr_file=\"$(mktemp)\"\n  set +e\n{apply_invocation_with_redirection}\n  status=$?\n  set -e\n  cat \"$stdout_file\"\n  cat \"$stderr_file\" >&2\n  if [ \"$status\" -eq 0 ]; then\n    rm -f \"$stdout_file\" \"$stderr_file\"\n    break\n  fi\n  retry_reason=\"\"\n  if grep -q 'ResourceGroupBeingDeleted' \"$stderr_file\"; then\n    retry_reason='resource group is still being deleted'\n  elif grep -q 'ManagedEnvironmentNotProvisioned' \"$stderr_file\"; then\n    retry_reason='container app environment is not fully provisioned yet'\n  elif grep -q 'Operation was canceled' \"$stderr_file\"; then\n    retry_reason='azure control plane canceled the previous environment operation'\n  fi\n  if [ -n \"$retry_reason\" ] && [ \"$attempt\" -lt \"$AZURE_APPLY_MAX_ATTEMPTS\" ]; then\n    echo \"Azure apply hit transient condition: $retry_reason; retrying in ${{AZURE_APPLY_RETRY_DELAY_SECONDS}}s (attempt ${{attempt}}/${{AZURE_APPLY_MAX_ATTEMPTS}})\" >&2\n    rm -f \"$stdout_file\" \"$stderr_file\" .terraform.tfstate.lock.info\n    sleep \"$AZURE_APPLY_RETRY_DELAY_SECONDS\"\n    attempt=$((attempt + 1))\n    continue\n  fi\n  rm -f \"$stdout_file\" \"$stderr_file\"\n  exit \"$status\"\ndone",
+            apply_invocation_with_redirection = if apply_invocation
+                .contains("-var-file=\"$VAR_FILE\"")
+            {
+                "  if [ -n \"$VAR_FILE\" ]; then\n    \"$TERRAFORM_BIN\" apply -auto-approve -input=false -var-file=\"$VAR_FILE\" \"$@\" >\"$stdout_file\" 2>\"$stderr_file\"\n  else\n    \"$TERRAFORM_BIN\" apply -auto-approve -input=false \"$@\" >\"$stdout_file\" 2>\"$stderr_file\"\n  fi"
+            } else {
+                "  \"$TERRAFORM_BIN\" apply -auto-approve -input=false \"$@\" >\"$stdout_file\" 2>\"$stderr_file\""
+            }
+        )
+    } else {
+        apply_invocation
+    };
     format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\nBACKEND_ARGS=()\nif [ -f \"${{SCRIPT_DIR}}/backend.hcl\" ]; then\n  BACKEND_ARGS=(-backend-config=\"${{SCRIPT_DIR}}/backend.hcl\")\nfi\n\"$TERRAFORM_BIN\" init -input=false \"${{BACKEND_ARGS[@]}}\"\nVAR_FILE=\"\"\n{tfvars_lookup}\n{pre_apply_hook}if [ -n \"$VAR_FILE\" ]; then\n  \"$TERRAFORM_BIN\" {operation}{extra_args} -var-file=\"$VAR_FILE\" \"$@\"\nelse\n  \"$TERRAFORM_BIN\" {operation}{extra_args} \"$@\"\nfi\n"
+        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nTERRAFORM_BIN=\"terraform\"\nif [ -x \"$TF_ROOT/terraform\" ]; then\n  TERRAFORM_BIN=\"$TF_ROOT/terraform\"\nfi\nBACKEND_ARGS=()\nif [ -f \"${{SCRIPT_DIR}}/backend.hcl\" ]; then\n  BACKEND_ARGS=(-backend-config=\"${{SCRIPT_DIR}}/backend.hcl\")\nfi\n\"$TERRAFORM_BIN\" init -input=false \"${{BACKEND_ARGS[@]}}\"\nVAR_FILE=\"\"\n{tfvars_lookup}\n{pre_apply_hook}{operation_block}\n"
     )
 }
 
