@@ -211,6 +211,7 @@ fn terraform_providers_and_remote_state_are_templated() {
     assert!(!providers.contains("provider \"aws\" {}"));
     assert!(providers.contains("provider \"google\""));
     assert!(providers.contains("provider \"azurerm\""));
+    assert!(providers.contains("resource_provider_registrations = \"none\""));
 }
 
 #[test]
