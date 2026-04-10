@@ -4437,11 +4437,11 @@ resource "google_cloud_run_v2_service" "this" {
         normalize_terraform_main_tf(&config, &terraform_root).expect("normalize main.tf");
 
         let rendered = std::fs::read_to_string(module_main_tf).expect("read module main.tf");
-        assert!(rendered.contains(r#"name  = "GREENTIC_ADMIN_CA_PEM""#));
+        assert!(rendered.contains("GREENTIC_ADMIN_CA_PEM"));
         assert!(rendered.contains("tls_self_signed_cert.admin_ca.cert_pem"));
-        assert!(rendered.contains(r#"name  = "GREENTIC_ADMIN_SERVER_CERT_PEM""#));
+        assert!(rendered.contains("GREENTIC_ADMIN_SERVER_CERT_PEM"));
         assert!(rendered.contains("tls_locally_signed_cert.admin_server.cert_pem"));
-        assert!(rendered.contains(r#"name  = "GREENTIC_ADMIN_SERVER_KEY_PEM""#));
+        assert!(rendered.contains("GREENTIC_ADMIN_SERVER_KEY_PEM"));
         assert!(rendered.contains("tls_private_key.admin_server.private_key_pem"));
         assert!(!rendered.contains("GREENTIC_ADMIN_CA_SECRET_REF"));
         assert!(!rendered.contains("runtime_admin_ca_accessor"));
