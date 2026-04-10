@@ -55,9 +55,10 @@ fn gcp_module_materializes_secret_manager_and_cloud_run_resources() {
     assert!(main_tf.contains("GREENTIC_ADMIN_CA_PEM"));
     assert!(main_tf.contains("GREENTIC_ADMIN_SERVER_CERT_PEM"));
     assert!(main_tf.contains("GREENTIC_ADMIN_SERVER_KEY_PEM"));
-    assert!(main_tf.contains("GREENTIC_ADMIN_CA_SECRET_REF"));
-    assert!(main_tf.contains("GREENTIC_ADMIN_SERVER_CERT_SECRET_REF"));
-    assert!(main_tf.contains("GREENTIC_ADMIN_SERVER_KEY_SECRET_REF"));
+    assert!(main_tf.contains("deletion_protection = false"));
+    assert!(!main_tf.contains("GREENTIC_ADMIN_CA_SECRET_REF"));
+    assert!(!main_tf.contains("GREENTIC_ADMIN_SERVER_CERT_SECRET_REF"));
+    assert!(!main_tf.contains("GREENTIC_ADMIN_SERVER_KEY_SECRET_REF"));
 }
 
 #[test]
