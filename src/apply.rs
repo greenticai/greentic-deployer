@@ -4411,18 +4411,18 @@ resource "google_cloud_run_v2_service" "this" {
     }
 
     env {
-      name  = "GREENTIC_ADMIN_CA_SECRET_REF"
-      value = google_secret_manager_secret.admin_ca.id
+        name  = "GREENTIC_ADMIN_CA_SECRET_REF"
+        value = google_secret_manager_secret.admin_ca.id
     }
 
     env {
-      name  = "GREENTIC_ADMIN_SERVER_CERT_SECRET_REF"
-      value = google_secret_manager_secret.admin_server_cert.id
+        name  = "GREENTIC_ADMIN_SERVER_CERT_SECRET_REF"
+        value = google_secret_manager_secret.admin_server_cert.id
     }
 
     env {
-      name  = "GREENTIC_ADMIN_SERVER_KEY_SECRET_REF"
-      value = google_secret_manager_secret.admin_server_key.id
+        name  = "GREENTIC_ADMIN_SERVER_KEY_SECRET_REF"
+        value = google_secret_manager_secret.admin_server_key.id
     }
   }
 }
