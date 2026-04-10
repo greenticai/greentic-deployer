@@ -14,7 +14,7 @@ use crate::pack_introspect::read_entry_from_gtpack;
 
 pub const EXT_DEPLOYER_V1: &str = "greentic.deployer.v1";
 pub const DEFAULT_GHCR_OPERATOR_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless@sha256:9c8f32854e54102a328490e33a3ed6b3d8f082bf29fba4b47e6518a5ee01f225";
-pub const DEFAULT_GCP_OPERATOR_IMAGE: &str = "europe-west1-docker.pkg.dev/x-plateau-483512-p6/greentic-images/greentic-start-distroless@sha256:555fb6ebdac836c16c5c11fce0f4080a0d7ccda03abd9e89bb9d561280ca67db";
+pub const DEFAULT_GCP_OPERATOR_IMAGE: &str = "europe-west1-docker.pkg.dev/x-plateau-483512-p6/greentic-images/greentic-start-distroless@sha256:9c8f32854e54102a328490e33a3ed6b3d8f082bf29fba4b47e6518a5ee01f225";
 pub const DEFAULT_OPERATOR_IMAGE_DIGEST: &str =
     "sha256:9c8f32854e54102a328490e33a3ed6b3d8f082bf29fba4b47e6518a5ee01f225";
 

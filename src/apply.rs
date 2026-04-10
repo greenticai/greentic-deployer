@@ -1956,6 +1956,7 @@ fn materialize_terraform_handoff_assets(
     }
     prune_generated_terraform_root(config, &terraform_root)?;
     configure_terraform_backend(config, &terraform_root, deploy_dir)?;
+    normalize_terraform_main_tf(config, &terraform_root)?;
 
     let tfvars_example = resolve_tfvars_example_name(&terraform_root, &config.environment)?;
     let generated_tfvars = materialize_generated_tfvars(config, &terraform_root, &tfvars_example)?;
@@ -2717,7 +2718,11 @@ if command -v az >/dev/null 2>&1 && [ -n "${ARM_SUBSCRIPTION_ID:-}" ]; then
           if "$TERRAFORM_BIN" state show "$address" >/dev/null 2>&1; then
             return 0
           fi
-          "$TERRAFORM_BIN" import -input=false "$address" "$id"
+          if [ -n "$VAR_FILE" ] && [ -f "$VAR_FILE" ]; then
+            "$TERRAFORM_BIN" import -input=false -var-file="$VAR_FILE" "$address" "$id"
+          else
+            "$TERRAFORM_BIN" import -input=false "$address" "$id"
+          fi
         }
       if az group show --name "$RESOURCE_GROUP_NAME" >/dev/null 2>&1; then
         import_if_missing "${MODULE_ADDR}.azurerm_resource_group.this" "/subscriptions/${ARM_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP_NAME}"
@@ -2747,6 +2752,64 @@ if command -v az >/dev/null 2>&1 && [ -n "${ARM_SUBSCRIPTION_ID:-}" ]; then
         ADMIN_SERVER_KEY_SECRET_ID=$(az keyvault secret show --vault-name "$KEY_VAULT_NAME" --name "greentic-admin-server-key-${ENVIRONMENT_VALUE}" --query id -o tsv 2>/dev/null || true)
         if [ -n "$ADMIN_SERVER_KEY_SECRET_ID" ]; then
           import_if_missing "${MODULE_ADDR}.azurerm_key_vault_secret.admin_server_key[0]" "$ADMIN_SERVER_KEY_SECRET_ID"
+        fi
+      fi
+    fi
+  fi
+fi
+"#
+        .to_string()
+    } else if operation == "apply" && provider == crate::config::Provider::Gcp {
+        r#"
+if command -v gcloud >/dev/null 2>&1; then
+  MODULE_ADDR=""
+  if grep -q 'module "operator_gcp"' main.tf; then
+    MODULE_ADDR="module.operator_gcp[0]"
+  elif grep -q 'module "operator"' main.tf; then
+    MODULE_ADDR="module.operator"
+  fi
+  if [ -n "$MODULE_ADDR" ]; then
+    GCP_PROJECT_ID_VALUE=""
+    GCP_REGION_VALUE="us-central1"
+    ENVIRONMENT_VALUE="dev"
+    BUNDLE_DIGEST_VALUE=""
+    if [ -n "$VAR_FILE" ] && [ -f "$VAR_FILE" ]; then
+      GCP_PROJECT_ID_VALUE=$(sed -n 's/^gcp_project_id = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+      GCP_REGION_VALUE=$(sed -n 's/^gcp_region = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+      ENVIRONMENT_VALUE=$(sed -n 's/^environment = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+      BUNDLE_DIGEST_VALUE=$(sed -n 's/^bundle_digest = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+    fi
+    if [ -n "$GCP_PROJECT_ID_VALUE" ]; then
+      import_if_missing() {
+        local address="$1"
+        local id="$2"
+        if "$TERRAFORM_BIN" state show "$address" >/dev/null 2>&1; then
+          return 0
+        fi
+        if [ -n "$VAR_FILE" ] && [ -f "$VAR_FILE" ]; then
+          "$TERRAFORM_BIN" import -input=false -var-file="$VAR_FILE" "$address" "$id"
+        else
+          "$TERRAFORM_BIN" import -input=false "$address" "$id"
+        fi
+      }
+      import_gcp_secret_if_exists() {
+        local address="$1"
+        local secret_name="$2"
+        local secret_id
+        secret_id=$(gcloud secrets describe "$secret_name" --project "$GCP_PROJECT_ID_VALUE" --format='value(name)' 2>/dev/null || true)
+        if [ -n "$secret_id" ]; then
+          import_if_missing "$address" "$secret_id"
+        fi
+      }
+      import_gcp_secret_if_exists "${MODULE_ADDR}.google_secret_manager_secret.admin_ca" "greentic-admin-ca-${ENVIRONMENT_VALUE}"
+      import_gcp_secret_if_exists "${MODULE_ADDR}.google_secret_manager_secret.admin_server_cert" "greentic-admin-server-cert-${ENVIRONMENT_VALUE}"
+      import_gcp_secret_if_exists "${MODULE_ADDR}.google_secret_manager_secret.admin_server_key" "greentic-admin-server-key-${ENVIRONMENT_VALUE}"
+      if [ -n "$BUNDLE_DIGEST_VALUE" ]; then
+        SHORT_ID=$(printf '%s' "$BUNDLE_DIGEST_VALUE" | md5sum | awk '{print substr($1,1,8)}')
+        CLOUD_RUN_SERVICE_NAME="greentic-${SHORT_ID}-run"
+        CLOUD_RUN_SERVICE_ID=$(gcloud run services describe "$CLOUD_RUN_SERVICE_NAME" --project "$GCP_PROJECT_ID_VALUE" --region "$GCP_REGION_VALUE" --format='value(metadata.name)' 2>/dev/null || true)
+        if [ -n "$CLOUD_RUN_SERVICE_ID" ]; then
+          import_if_missing "${MODULE_ADDR}.google_cloud_run_v2_service.this" "projects/${GCP_PROJECT_ID_VALUE}/locations/${GCP_REGION_VALUE}/services/${CLOUD_RUN_SERVICE_NAME}"
         fi
       fi
     fi
@@ -2851,6 +2914,162 @@ fn configure_terraform_backend(
         ),
     };
     fs::write(providers_path, rewritten)?;
+    Ok(())
+}
+
+fn normalize_terraform_main_tf(config: &DeployerConfig, terraform_root: &Path) -> Result<()> {
+    if config.provider != crate::config::Provider::Gcp {
+        return Ok(());
+    }
+
+    let main_tf_path = terraform_root.join("main.tf");
+    if main_tf_path.exists() {
+        let contents = fs::read_to_string(&main_tf_path)?;
+        let old = r#"  operator_image        = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}""#;
+        let new = r#"  operator_image        = var.operator_image != "" ? var.operator_image : "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}""#;
+        if contents.contains(old) {
+            fs::write(&main_tf_path, contents.replace(old, new))?;
+        }
+    }
+    normalize_gcp_operator_module_main_tf(terraform_root)?;
+    Ok(())
+}
+
+fn normalize_gcp_operator_module_main_tf(terraform_root: &Path) -> Result<()> {
+    let module_main_tf_path = terraform_root.join("modules/operator-gcp/main.tf");
+    if !module_main_tf_path.exists() {
+        return Ok(());
+    }
+
+    let mut contents = fs::read_to_string(&module_main_tf_path)?;
+    contents = contents.replace(
+        r#"        name  = "GREENTIC_ADMIN_CA_SECRET_REF"
+        value = google_secret_manager_secret.admin_ca.id"#,
+        r#"        name  = "GREENTIC_ADMIN_CA_PEM"
+        value = tls_self_signed_cert.admin_ca.cert_pem"#,
+    );
+    contents = contents.replace(
+        r#"        name  = "GREENTIC_ADMIN_SERVER_CERT_SECRET_REF"
+        value = google_secret_manager_secret.admin_server_cert.id"#,
+        r#"        name  = "GREENTIC_ADMIN_SERVER_CERT_PEM"
+        value = tls_locally_signed_cert.admin_server.cert_pem"#,
+    );
+    contents = contents.replace(
+        r#"        name  = "GREENTIC_ADMIN_SERVER_KEY_SECRET_REF"
+        value = google_secret_manager_secret.admin_server_key.id"#,
+        r#"        name  = "GREENTIC_ADMIN_SERVER_KEY_PEM"
+        value = tls_private_key.admin_server.private_key_pem"#,
+    );
+    contents = contents.replace(
+        "  ingress  = \"INGRESS_TRAFFIC_ALL\"\n\n  template {",
+        "  ingress  = \"INGRESS_TRAFFIC_ALL\"\n  deletion_protection = false\n\n  template {",
+    );
+
+    for snippet in [
+        r#"
+      env {
+        name = "GREENTIC_ADMIN_CA_PEM"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.admin_ca.secret_id
+            version = "latest"
+          }
+        }
+      }
+"#,
+        r#"
+      env {
+        name = "GREENTIC_ADMIN_SERVER_CERT_PEM"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.admin_server_cert.secret_id
+            version = "latest"
+          }
+        }
+      }
+"#,
+        r#"
+      env {
+        name = "GREENTIC_ADMIN_SERVER_KEY_PEM"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.admin_server_key.secret_id
+            version = "latest"
+          }
+        }
+      }
+"#,
+        r#"
+resource "google_service_account" "runtime" {
+  project      = var.gcp_project_id
+  account_id   = "${local.name_prefix}-run"
+  display_name = "Greentic runtime"
+}
+"#,
+        r#"
+resource "google_secret_manager_secret_iam_member" "runtime_admin_ca_accessor" {
+  project   = var.gcp_project_id
+  secret_id = google_secret_manager_secret.admin_ca.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.runtime.email}"
+}
+"#,
+        r#"
+resource "google_secret_manager_secret_iam_member" "runtime_admin_server_cert_accessor" {
+  project   = var.gcp_project_id
+  secret_id = google_secret_manager_secret.admin_server_cert.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.runtime.email}"
+}
+"#,
+        r#"
+resource "google_secret_manager_secret_iam_member" "runtime_admin_server_key_accessor" {
+  project   = var.gcp_project_id
+  secret_id = google_secret_manager_secret.admin_server_key.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.runtime.email}"
+}
+"#,
+        r#"
+resource "google_secret_manager_secret_iam_member" "runtime_admin_ca_accessor" {
+  project   = var.gcp_project_id
+  secret_id = google_secret_manager_secret.admin_ca.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${local.runtime_service_account_email}"
+}
+"#,
+        r#"
+resource "google_secret_manager_secret_iam_member" "runtime_admin_server_cert_accessor" {
+  project   = var.gcp_project_id
+  secret_id = google_secret_manager_secret.admin_server_cert.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${local.runtime_service_account_email}"
+}
+"#,
+        r#"
+resource "google_secret_manager_secret_iam_member" "runtime_admin_server_key_accessor" {
+  project   = var.gcp_project_id
+  secret_id = google_secret_manager_secret.admin_server_key.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${local.runtime_service_account_email}"
+}
+"#,
+        r#"  project_number                = split("/", google_secret_manager_secret.admin_ca.id)[1]
+  runtime_service_account_email = "${local.project_number}-compute@developer.gserviceaccount.com"
+"#,
+        r#"  depends_on = [
+    google_secret_manager_secret_iam_member.runtime_admin_ca_accessor,
+    google_secret_manager_secret_iam_member.runtime_admin_server_cert_accessor,
+    google_secret_manager_secret_iam_member.runtime_admin_server_key_accessor,
+  ]
+"#,
+        r#"    service_account = google_service_account.runtime.email
+"#,
+    ] {
+        contents = contents.replace(snippet, "");
+    }
+
+    fs::write(module_main_tf_path, contents)?;
     Ok(())
 }
 
@@ -4104,6 +4323,128 @@ kind: Deployment
         assert!(rendered.contains("module.operator_azure[0]"));
         assert!(rendered.contains("module.operator"));
         assert!(rendered.contains("import -input=false"));
+    }
+
+    #[test]
+    fn terraform_apply_script_for_gcp_imports_existing_secrets() {
+        let rendered = terraform_plan_like_script(
+            "apply",
+            Provider::Gcp,
+            Some("dev.tfvars"),
+            "staging.tfvars.example",
+        );
+        assert!(rendered.contains("gcloud secrets describe"));
+        assert!(rendered.contains("google_secret_manager_secret.admin_ca"));
+        assert!(rendered.contains("google_secret_manager_secret.admin_server_cert"));
+        assert!(rendered.contains("google_secret_manager_secret.admin_server_key"));
+        assert!(rendered.contains("gcloud run services describe"));
+        assert!(rendered.contains("google_cloud_run_v2_service.this"));
+        assert!(rendered.contains("module.operator_gcp[0]"));
+        assert!(rendered.contains("import -input=false"));
+    }
+
+    #[test]
+    fn normalize_terraform_main_tf_for_gcp_respects_operator_image_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let terraform_root = dir.path().join("terraform");
+        std::fs::create_dir_all(&terraform_root).expect("terraform root");
+        let main_tf = terraform_root.join("main.tf");
+        std::fs::write(
+            &main_tf,
+            r#"
+module "operator" {
+  source = "./modules/operator-gcp"
+  operator_image        = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
+}
+"#,
+        )
+        .expect("write main.tf");
+
+        let config = DeployerConfig {
+            provider: Provider::Gcp,
+            ..test_config()
+        };
+        normalize_terraform_main_tf(&config, &terraform_root).expect("normalize main.tf");
+
+        let rendered = std::fs::read_to_string(main_tf).expect("read main.tf");
+        assert!(rendered.contains(
+            r#"operator_image        = var.operator_image != "" ? var.operator_image : "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}""#
+        ));
+    }
+
+    #[test]
+    fn normalize_terraform_main_tf_for_gcp_switches_operator_module_to_direct_pem_envs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let terraform_root = dir.path().join("terraform");
+        let module_root = terraform_root.join("modules/operator-gcp");
+        std::fs::create_dir_all(&module_root).expect("module root");
+        let main_tf = terraform_root.join("main.tf");
+        std::fs::write(
+            &main_tf,
+            r#"
+module "operator" {
+  source = "./modules/operator-gcp"
+  operator_image        = var.operator_image != "" ? var.operator_image : "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
+}
+"#,
+        )
+        .expect("write main.tf");
+        let module_main_tf = module_root.join("main.tf");
+        std::fs::write(
+            &module_main_tf,
+            r#"
+resource "google_secret_manager_secret_version" "admin_server_key" {
+  secret      = google_secret_manager_secret.admin_server_key.id
+  secret_data = tls_private_key.admin_server.private_key_pem
+}
+
+resource "google_cloud_run_v2_service" "this" {
+  name     = local.service_name
+  location = var.gcp_region
+  project  = var.gcp_project_id
+  ingress  = "INGRESS_TRAFFIC_ALL"
+
+  template {
+    scaling {
+      min_instance_count = 1
+      max_instance_count = 1
+    }
+
+    env {
+      name  = "GREENTIC_ADMIN_CA_SECRET_REF"
+      value = google_secret_manager_secret.admin_ca.id
+    }
+
+    env {
+      name  = "GREENTIC_ADMIN_SERVER_CERT_SECRET_REF"
+      value = google_secret_manager_secret.admin_server_cert.id
+    }
+
+    env {
+      name  = "GREENTIC_ADMIN_SERVER_KEY_SECRET_REF"
+      value = google_secret_manager_secret.admin_server_key.id
+    }
+  }
+}
+"#,
+        )
+        .expect("write module main.tf");
+
+        let config = DeployerConfig {
+            provider: Provider::Gcp,
+            ..test_config()
+        };
+        normalize_terraform_main_tf(&config, &terraform_root).expect("normalize main.tf");
+
+        let rendered = std::fs::read_to_string(module_main_tf).expect("read module main.tf");
+        assert!(rendered.contains(r#"name  = "GREENTIC_ADMIN_CA_PEM""#));
+        assert!(rendered.contains("tls_self_signed_cert.admin_ca.cert_pem"));
+        assert!(rendered.contains(r#"name  = "GREENTIC_ADMIN_SERVER_CERT_PEM""#));
+        assert!(rendered.contains("tls_locally_signed_cert.admin_server.cert_pem"));
+        assert!(rendered.contains(r#"name  = "GREENTIC_ADMIN_SERVER_KEY_PEM""#));
+        assert!(rendered.contains("tls_private_key.admin_server.private_key_pem"));
+        assert!(!rendered.contains("GREENTIC_ADMIN_CA_SECRET_REF"));
+        assert!(!rendered.contains("runtime_admin_ca_accessor"));
     }
 
     #[test]

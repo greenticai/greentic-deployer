@@ -112,6 +112,7 @@ resource "google_cloud_run_v2_service" "this" {
   location = var.gcp_region
   project  = var.gcp_project_id
   ingress  = "INGRESS_TRAFFIC_ALL"
+  deletion_protection = false
 
   template {
     scaling {
@@ -174,18 +175,18 @@ resource "google_cloud_run_v2_service" "this" {
       }
 
       env {
-        name  = "GREENTIC_ADMIN_CA_SECRET_REF"
-        value = google_secret_manager_secret.admin_ca.id
+        name  = "GREENTIC_ADMIN_CA_PEM"
+        value = tls_self_signed_cert.admin_ca.cert_pem
       }
 
       env {
-        name  = "GREENTIC_ADMIN_SERVER_CERT_SECRET_REF"
-        value = google_secret_manager_secret.admin_server_cert.id
+        name  = "GREENTIC_ADMIN_SERVER_CERT_PEM"
+        value = tls_locally_signed_cert.admin_server.cert_pem
       }
 
       env {
-        name  = "GREENTIC_ADMIN_SERVER_KEY_SECRET_REF"
-        value = google_secret_manager_secret.admin_server_key.id
+        name  = "GREENTIC_ADMIN_SERVER_KEY_PEM"
+        value = tls_private_key.admin_server.private_key_pem
       }
 
       env {
@@ -216,36 +217,6 @@ resource "google_cloud_run_v2_service" "this" {
         content {
           name  = "GREENTIC_ADMIN_ALLOWED_CLIENTS"
           value = env.value
-        }
-      }
-
-      env {
-        name = "GREENTIC_ADMIN_CA_PEM"
-        value_source {
-          secret_key_ref {
-            secret  = google_secret_manager_secret.admin_ca.secret_id
-            version = "latest"
-          }
-        }
-      }
-
-      env {
-        name = "GREENTIC_ADMIN_SERVER_CERT_PEM"
-        value_source {
-          secret_key_ref {
-            secret  = google_secret_manager_secret.admin_server_cert.secret_id
-            version = "latest"
-          }
-        }
-      }
-
-      env {
-        name = "GREENTIC_ADMIN_SERVER_KEY_PEM"
-        value_source {
-          secret_key_ref {
-            secret  = google_secret_manager_secret.admin_server_key.secret_id
-            version = "latest"
-          }
         }
       }
     }
