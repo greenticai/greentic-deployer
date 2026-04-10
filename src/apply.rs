@@ -4362,7 +4362,7 @@ module "operator" {
 
         let config = DeployerConfig {
             provider: Provider::Gcp,
-            ..test_config()
+            ..config_for(terraform_root.clone(), DeployerCapability::Apply)
         };
         normalize_terraform_main_tf(&config, &terraform_root).expect("normalize main.tf");
 
@@ -4432,7 +4432,7 @@ resource "google_cloud_run_v2_service" "this" {
 
         let config = DeployerConfig {
             provider: Provider::Gcp,
-            ..test_config()
+            ..config_for(terraform_root.clone(), DeployerCapability::Apply)
         };
         normalize_terraform_main_tf(&config, &terraform_root).expect("normalize main.tf");
 
