@@ -1,9 +1,12 @@
 name: Publish and Release
 
+# Tag-triggered: fires after `tag-on-version-bump.yml` detects a Cargo.toml
+# version change on main and pushes `v{version}`. Crates.io publish is
+# handled by `crates-publish.yml` (shared reusable); this workflow covers
+# binary release assets + GHCR OCI .gtpack publishing.
 on:
   push:
-    branches:
-      - main
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -23,9 +26,6 @@ jobs:
     needs: ci
     permissions:
       contents: write
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     strategy:
       fail-fast: false
       matrix:
@@ -112,9 +112,6 @@ jobs:
     needs: binary-release-assets
     permissions:
       contents: write
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     steps:
       - uses: actions/checkout@v4
       - name: Read crate version
@@ -148,47 +145,12 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
 
-  crate-publish:
-    runs-on: ubuntu-latest
-    needs: ci
-    permissions:
-      contents: read
-    if: github.event_name != 'pull_request'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.91.1
-          components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: Publish to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          set -euo pipefail
-          publish_output=$(cargo publish --locked 2>&1) || status=$?
-          echo "$publish_output"
-          if [ "${status:-0}" -ne 0 ]; then
-            if echo "$publish_output" | grep -qi "already uploaded"; then
-              echo "Version already published; skipping error."
-              exit 0
-            fi
-            if echo "$publish_output" | grep -qi "already exists on crates.io index"; then
-              echo "Crate version already on crates.io; skipping publish error."
-              exit 0
-            fi
-            exit ${status:-1}
-          fi
-
   gtpack-publish:
     runs-on: ubuntu-latest
     needs: ci
     permissions:
       contents: read
       packages: write
-    if: |
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
