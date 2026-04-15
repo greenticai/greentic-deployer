@@ -6,6 +6,11 @@ variable "environment" {
   type = string
 }
 
+variable "deployment_name_prefix" {
+  type    = string
+  default = ""
+}
+
 variable "azure_key_vault_uri" {
   type    = string
   default = ""

@@ -6,6 +6,11 @@ variable "environment" {
   type = string
 }
 
+variable "deployment_name_prefix" {
+  type    = string
+  default = ""
+}
+
 variable "operator_image" {
   type = string
 }
