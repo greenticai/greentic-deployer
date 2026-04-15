@@ -27,22 +27,22 @@ pub fn init(config: &DeployerConfig) -> Result<()> {
 fn export_from_config(cfg: &ResolvedTelemetryConfig) -> ExportConfig {
     let sampling = Sampling::TraceIdRatio(cfg.sampling as f64);
 
+    let mut export = ExportConfig::json_default();
+    export.sampling = sampling;
+
     match cfg.exporter {
-        TelemetryExporterKind::Stdout => ExportConfig {
-            sampling,
-            ..ExportConfig::json_default()
-        },
-        TelemetryExporterKind::Otlp => ExportConfig {
-            mode: ExportMode::OtlpGrpc,
-            endpoint: cfg
+        TelemetryExporterKind::Stdout => export,
+        TelemetryExporterKind::Otlp => {
+            export.mode = ExportMode::OtlpGrpc;
+            export.endpoint = cfg
                 .endpoint
                 .clone()
                 .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())
-                .or_else(|| Some("https://otel.greentic.ai".to_string())),
-            headers: HashMap::new(),
-            sampling,
-            compression: None,
-        },
+                .or_else(|| Some("https://otel.greentic.ai".to_string()));
+            export.headers = HashMap::new();
+            export.compression = None;
+            export
+        }
         TelemetryExporterKind::None => ExportConfig::json_default(),
     }
 }

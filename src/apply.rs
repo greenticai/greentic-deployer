@@ -6,8 +6,9 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -2065,6 +2066,7 @@ fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path
             "operator",
             "./modules/operator",
             r#"  cloud                 = var.cloud
+  deployment_name_prefix = var.deployment_name_prefix
   operator_image        = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
   bundle_source         = var.bundle_source
   bundle_digest         = var.bundle_digest
@@ -2078,6 +2080,7 @@ fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path
             "./modules/operator-azure",
             r#"  cloud                 = var.cloud
   environment           = var.environment
+  deployment_name_prefix = var.deployment_name_prefix
   bundle_digest         = var.bundle_digest
   bundle_source         = var.bundle_source
   repo_registry_base    = var.repo_registry_base
@@ -2094,6 +2097,7 @@ fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path
             "./modules/operator-gcp",
             r#"  cloud                 = var.cloud
   environment           = var.environment
+  deployment_name_prefix = var.deployment_name_prefix
   bundle_digest         = var.bundle_digest
   bundle_source         = var.bundle_source
   repo_registry_base    = var.repo_registry_base
@@ -2143,7 +2147,64 @@ output "admin_client_key_secret_ref" {{
 "#
     );
     fs::write(terraform_root.join("outputs.tf"), outputs_tf)?;
+    ensure_terraform_variable_declared(
+        &terraform_root.join("variables.tf"),
+        "deployment_name_prefix",
+        "string",
+        Some(""),
+    )?;
+    match config.provider {
+        crate::config::Provider::Aws => ensure_terraform_variable_declared(
+            &terraform_root.join("modules/operator/variables.tf"),
+            "deployment_name_prefix",
+            "string",
+            Some(""),
+        )?,
+        crate::config::Provider::Azure => ensure_terraform_variable_declared(
+            &terraform_root.join("modules/operator-azure/variables.tf"),
+            "deployment_name_prefix",
+            "string",
+            Some(""),
+        )?,
+        crate::config::Provider::Gcp => ensure_terraform_variable_declared(
+            &terraform_root.join("modules/operator-gcp/variables.tf"),
+            "deployment_name_prefix",
+            "string",
+            Some(""),
+        )?,
+        _ => {}
+    }
 
+    Ok(())
+}
+
+fn ensure_terraform_variable_declared(
+    path: &Path,
+    name: &str,
+    ty: &str,
+    default: Option<&str>,
+) -> Result<()> {
+    let declaration = match default {
+        Some(value) => format!(
+            "variable \"{name}\" {{\n  type    = {ty}\n  default = {}\n}}\n",
+            serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+        ),
+        None => format!("variable \"{name}\" {{\n  type = {ty}\n}}\n"),
+    };
+
+    let mut contents = if path.exists() {
+        fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+    if contents.contains(&format!("variable \"{name}\"")) {
+        return Ok(());
+    }
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(&declaration);
+    fs::write(path, contents)?;
     Ok(())
 }
 
@@ -2171,6 +2232,12 @@ fn materialize_generated_tfvars(
 
     replace_tfvars_assignment(&mut contents, "cloud", config.provider.as_str());
     replace_tfvars_assignment(&mut contents, "environment", &config.environment);
+    let deployment_name_prefix = resolve_terraform_deployment_name_prefix(config, &output_path);
+    replace_tfvars_assignment(
+        &mut contents,
+        "deployment_name_prefix",
+        &deployment_name_prefix,
+    );
 
     for (key, value) in terraform_contract_default_overrides(config.provider) {
         replace_tfvars_assignment(&mut contents, &key, &value);
@@ -2195,6 +2262,70 @@ fn materialize_generated_tfvars(
 
     fs::write(output_path, contents)?;
     Ok(Some(output_name))
+}
+
+fn resolve_terraform_deployment_name_prefix(config: &DeployerConfig, output_path: &Path) -> String {
+    if let Ok(existing) = fs::read_to_string(output_path) {
+        if let Some(prefix) = read_tfvars_assignment(&existing, "deployment_name_prefix")
+            .filter(|value| !value.trim().is_empty())
+        {
+            return prefix;
+        }
+        if let Some(bundle_digest) = read_tfvars_assignment(&existing, "bundle_digest")
+            .filter(|value| !value.trim().is_empty())
+            && let Some(prefix) = legacy_bundle_name_prefix(&bundle_digest)
+        {
+            return prefix;
+        }
+    }
+
+    stable_deployment_name_prefix(config)
+}
+
+fn stable_deployment_name_prefix(config: &DeployerConfig) -> String {
+    let seed = format!(
+        "{}\0{}\0{}",
+        config.provider.as_str(),
+        config.tenant,
+        config.environment
+    );
+    format!("greentic-{:08x}", fnv1a32(seed.as_bytes()))
+}
+
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    const OFFSET: u32 = 0x811c9dc5;
+    const PRIME: u32 = 0x01000193;
+
+    let mut hash = OFFSET;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+fn legacy_bundle_name_prefix(bundle_digest: &str) -> Option<String> {
+    Some(format!("greentic-{}", md5_hex_prefix(bundle_digest, 8)?))
+}
+
+fn md5_hex_prefix(input: &str, len: usize) -> Option<String> {
+    let mut child = Command::new("md5sum")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    stdin.write_all(input.as_bytes()).ok()?;
+    drop(stdin);
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let hash = String::from_utf8(output.stdout).ok()?;
+    let hex = hash.split_whitespace().next()?;
+    Some(hex.chars().take(len).collect())
 }
 
 fn normalize_public_base_url_assignment(contents: &mut String) {
@@ -2671,7 +2802,83 @@ fn terraform_plan_like_script(
             "if [ -f \"{tfvars_example}\" ]; then\n  VAR_FILE=\"{tfvars_example}\"\nelse\n  for candidate in *.tfvars *.tfvars.example; do\n    if [ -f \"$candidate\" ]; then\n      VAR_FILE=\"$candidate\"\n      break\n    fi\n  done\nfi"
         )
     };
-    let pre_apply_hook = if operation == "apply" && provider == crate::config::Provider::Azure {
+    let pre_apply_hook = if operation == "apply" && provider == crate::config::Provider::Aws {
+        r#"
+if command -v aws >/dev/null 2>&1; then
+  MODULE_ADDR=""
+  if grep -q 'module "operator_aws"' main.tf; then
+    MODULE_ADDR="module.operator_aws[0]"
+  elif grep -q 'module "operator"' main.tf; then
+    MODULE_ADDR="module.operator"
+  fi
+  if [ -n "$MODULE_ADDR" ]; then
+    BUNDLE_DIGEST_VALUE=""
+    DEPLOYMENT_NAME_PREFIX_VALUE=""
+    AWS_REGION_VALUE="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
+    if [ -n "$VAR_FILE" ] && [ -f "$VAR_FILE" ]; then
+      BUNDLE_DIGEST_VALUE=$(sed -n 's/^bundle_digest = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+      DEPLOYMENT_NAME_PREFIX_VALUE=$(sed -n 's/^deployment_name_prefix = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+    fi
+    NAME_PREFIX="$DEPLOYMENT_NAME_PREFIX_VALUE"
+    if [ -z "$NAME_PREFIX" ] && [ -n "$BUNDLE_DIGEST_VALUE" ]; then
+      SHORT_ID=$(printf '%s' "$BUNDLE_DIGEST_VALUE" | md5sum | awk '{print substr($1,1,8)}')
+      NAME_PREFIX="greentic-${SHORT_ID}"
+    fi
+    if [ -n "$NAME_PREFIX" ] && [ -n "$AWS_REGION_VALUE" ]; then
+      export AWS_REGION="$AWS_REGION_VALUE"
+      export AWS_DEFAULT_REGION="$AWS_REGION_VALUE"
+      import_if_missing() {
+        local address="$1"
+        local id="$2"
+        if "$TERRAFORM_BIN" state show "$address" >/dev/null 2>&1; then
+          return 0
+        fi
+        if [ -n "$VAR_FILE" ] && [ -f "$VAR_FILE" ]; then
+          "$TERRAFORM_BIN" import -input=false -var-file="$VAR_FILE" "$address" "$id"
+        else
+          "$TERRAFORM_BIN" import -input=false "$address" "$id"
+        fi
+      }
+      SECURITY_GROUP_ALB_NAME="${NAME_PREFIX}-alb"
+      SECURITY_GROUP_SERVICE_NAME="${NAME_PREFIX}-svc"
+      ALB_NAME="${NAME_PREFIX}-alb"
+      CLUSTER_NAME="${NAME_PREFIX}-cluster"
+      LOG_GROUP_NAME="/greentic/demo/${NAME_PREFIX}"
+      ROLE_NAME="${NAME_PREFIX}-task-exec"
+      SERVICE_NAME="${NAME_PREFIX}-service"
+      ALB_GROUP_ID=$(aws ec2 describe-security-groups --region "$AWS_REGION_VALUE" --filters Name=group-name,Values="$SECURITY_GROUP_ALB_NAME" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
+      if [ -n "$ALB_GROUP_ID" ] && [ "$ALB_GROUP_ID" != "None" ]; then
+        import_if_missing "${MODULE_ADDR}.aws_security_group.alb" "$ALB_GROUP_ID"
+      fi
+      SERVICE_GROUP_ID=$(aws ec2 describe-security-groups --region "$AWS_REGION_VALUE" --filters Name=group-name,Values="$SECURITY_GROUP_SERVICE_NAME" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
+      if [ -n "$SERVICE_GROUP_ID" ] && [ "$SERVICE_GROUP_ID" != "None" ]; then
+        import_if_missing "${MODULE_ADDR}.aws_security_group.service" "$SERVICE_GROUP_ID"
+      fi
+      ALB_ARN=$(aws elbv2 describe-load-balancers --region "$AWS_REGION_VALUE" --names "$ALB_NAME" --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || true)
+      if [ -n "$ALB_ARN" ] && [ "$ALB_ARN" != "None" ]; then
+        import_if_missing "${MODULE_ADDR}.aws_lb.this" "$ALB_ARN"
+      fi
+      CLUSTER_FOUND=$(aws ecs describe-clusters --region "$AWS_REGION_VALUE" --clusters "$CLUSTER_NAME" --query 'clusters[0].clusterName' --output text 2>/dev/null || true)
+      if [ -n "$CLUSTER_FOUND" ] && [ "$CLUSTER_FOUND" != "None" ] && [ "$CLUSTER_FOUND" != "MISSING" ]; then
+        import_if_missing "${MODULE_ADDR}.aws_ecs_cluster.this" "$CLUSTER_NAME"
+      fi
+      LOG_GROUP_FOUND=$(aws logs describe-log-groups --region "$AWS_REGION_VALUE" --log-group-name-prefix "$LOG_GROUP_NAME" --query 'logGroups[?logGroupName==`'"$LOG_GROUP_NAME"'`].logGroupName | [0]' --output text 2>/dev/null || true)
+      if [ -n "$LOG_GROUP_FOUND" ] && [ "$LOG_GROUP_FOUND" != "None" ]; then
+        import_if_missing "${MODULE_ADDR}.aws_cloudwatch_log_group.this" "$LOG_GROUP_NAME"
+      fi
+      if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+        import_if_missing "${MODULE_ADDR}.aws_iam_role.task_execution" "$ROLE_NAME"
+      fi
+      SERVICE_FOUND=$(aws ecs describe-services --region "$AWS_REGION_VALUE" --cluster "$CLUSTER_NAME" --services "$SERVICE_NAME" --query 'services[0].serviceName' --output text 2>/dev/null || true)
+      if [ -n "$SERVICE_FOUND" ] && [ "$SERVICE_FOUND" != "None" ] && [ "$SERVICE_FOUND" != "MISSING" ]; then
+        import_if_missing "${MODULE_ADDR}.aws_ecs_service.this" "${CLUSTER_NAME}/${SERVICE_NAME}"
+      fi
+    fi
+  fi
+fi
+"#
+        .to_string()
+    } else if operation == "apply" && provider == crate::config::Provider::Azure {
         r#"
 if command -v az >/dev/null 2>&1 && [ -n "${ARM_SUBSCRIPTION_ID:-}" ]; then
   MODULE_ADDR=""
@@ -2688,6 +2895,7 @@ if command -v az >/dev/null 2>&1 && [ -n "${ARM_SUBSCRIPTION_ID:-}" ]; then
       BUNDLE_SOURCE_VALUE=""
       REMOTE_STATE_BACKEND_VALUE=""
       KEY_VAULT_ID_VALUE=""
+      DEPLOYMENT_NAME_PREFIX_VALUE=""
       if [ -n "$VAR_FILE" ] && [ -f "$VAR_FILE" ]; then
         CLOUD_VALUE=$(sed -n 's/^cloud = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
         BUNDLE_DIGEST_VALUE=$(sed -n 's/^bundle_digest = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
@@ -2696,6 +2904,7 @@ if command -v az >/dev/null 2>&1 && [ -n "${ARM_SUBSCRIPTION_ID:-}" ]; then
         BUNDLE_SOURCE_VALUE=$(sed -n 's/^bundle_source = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
         REMOTE_STATE_BACKEND_VALUE=$(sed -n 's/^remote_state_backend = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
         KEY_VAULT_ID_VALUE=$(sed -n 's/^azure_key_vault_id = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+        DEPLOYMENT_NAME_PREFIX_VALUE=$(sed -n 's/^deployment_name_prefix = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
       fi
       if [ -n "$BUNDLE_DIGEST_VALUE" ]; then
         export TF_VAR_cloud="${CLOUD_VALUE:-azure}"
@@ -2706,8 +2915,11 @@ if command -v az >/dev/null 2>&1 && [ -n "${ARM_SUBSCRIPTION_ID:-}" ]; then
         export TF_VAR_remote_state_backend="$REMOTE_STATE_BACKEND_VALUE"
         export TF_VAR_azure_key_vault_id="$KEY_VAULT_ID_VALUE"
         export TF_VAR_azure_location="${GREENTIC_DEPLOY_TERRAFORM_VAR_AZURE_LOCATION:-}"
-        SHORT_ID=$(printf '%s' "$BUNDLE_DIGEST_VALUE" | md5sum | awk '{print substr($1,1,8)}')
-        NAME_PREFIX="greentic-${SHORT_ID}"
+        NAME_PREFIX="$DEPLOYMENT_NAME_PREFIX_VALUE"
+        if [ -z "$NAME_PREFIX" ]; then
+          SHORT_ID=$(printf '%s' "$BUNDLE_DIGEST_VALUE" | md5sum | awk '{print substr($1,1,8)}')
+          NAME_PREFIX="greentic-${SHORT_ID}"
+        fi
         RESOURCE_GROUP_NAME="${NAME_PREFIX}-rg"
       LOG_ANALYTICS_NAME="${NAME_PREFIX}-logs"
       CONTAINER_ENV_NAME="${NAME_PREFIX}-cae"
@@ -2757,7 +2969,7 @@ if command -v az >/dev/null 2>&1 && [ -n "${ARM_SUBSCRIPTION_ID:-}" ]; then
     fi
   fi
 fi
-"#
+"# 
         .to_string()
     } else if operation == "apply" && provider == crate::config::Provider::Gcp {
         r#"
@@ -2773,11 +2985,13 @@ if command -v gcloud >/dev/null 2>&1; then
     GCP_REGION_VALUE="us-central1"
     ENVIRONMENT_VALUE="dev"
     BUNDLE_DIGEST_VALUE=""
+    DEPLOYMENT_NAME_PREFIX_VALUE=""
     if [ -n "$VAR_FILE" ] && [ -f "$VAR_FILE" ]; then
       GCP_PROJECT_ID_VALUE=$(sed -n 's/^gcp_project_id = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
       GCP_REGION_VALUE=$(sed -n 's/^gcp_region = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
       ENVIRONMENT_VALUE=$(sed -n 's/^environment = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
       BUNDLE_DIGEST_VALUE=$(sed -n 's/^bundle_digest = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
+      DEPLOYMENT_NAME_PREFIX_VALUE=$(sed -n 's/^deployment_name_prefix = "\(.*\)"$/\1/p' "$VAR_FILE" | head -n 1)
     fi
     if [ -n "$GCP_PROJECT_ID_VALUE" ]; then
       import_if_missing() {
@@ -2805,8 +3019,12 @@ if command -v gcloud >/dev/null 2>&1; then
       import_gcp_secret_if_exists "${MODULE_ADDR}.google_secret_manager_secret.admin_server_cert" "greentic-admin-server-cert-${ENVIRONMENT_VALUE}"
       import_gcp_secret_if_exists "${MODULE_ADDR}.google_secret_manager_secret.admin_server_key" "greentic-admin-server-key-${ENVIRONMENT_VALUE}"
       if [ -n "$BUNDLE_DIGEST_VALUE" ]; then
-        SHORT_ID=$(printf '%s' "$BUNDLE_DIGEST_VALUE" | md5sum | awk '{print substr($1,1,8)}')
-        CLOUD_RUN_SERVICE_NAME="greentic-${SHORT_ID}-run"
+        NAME_PREFIX="$DEPLOYMENT_NAME_PREFIX_VALUE"
+        if [ -z "$NAME_PREFIX" ]; then
+          SHORT_ID=$(printf '%s' "$BUNDLE_DIGEST_VALUE" | md5sum | awk '{print substr($1,1,8)}')
+          NAME_PREFIX="greentic-${SHORT_ID}"
+        fi
+        CLOUD_RUN_SERVICE_NAME="${NAME_PREFIX}-run"
         CLOUD_RUN_SERVICE_ID=$(gcloud run services describe "$CLOUD_RUN_SERVICE_NAME" --project "$GCP_PROJECT_ID_VALUE" --region "$GCP_REGION_VALUE" --format='value(metadata.name)' 2>/dev/null || true)
         if [ -n "$CLOUD_RUN_SERVICE_ID" ]; then
           import_if_missing "${MODULE_ADDR}.google_cloud_run_v2_service.this" "projects/${GCP_PROJECT_ID_VALUE}/locations/${GCP_REGION_VALUE}/services/${CLOUD_RUN_SERVICE_NAME}"
@@ -2823,16 +3041,26 @@ fi
     let apply_invocation = format!(
         "if [ -n \"$VAR_FILE\" ]; then\n  \"$TERRAFORM_BIN\" {operation}{extra_args} -var-file=\"$VAR_FILE\" \"$@\"\nelse\n  \"$TERRAFORM_BIN\" {operation}{extra_args} \"$@\"\nfi"
     );
+    let apply_invocation_with_redirection = if apply_invocation.contains("-var-file=\"$VAR_FILE\"")
+    {
+        "  if [ -n \"$VAR_FILE\" ]; then\n    \"$TERRAFORM_BIN\" apply -auto-approve -input=false -var-file=\"$VAR_FILE\" \"$@\" >\"$stdout_file\" 2>\"$stderr_file\"\n  else\n    \"$TERRAFORM_BIN\" apply -auto-approve -input=false \"$@\" >\"$stdout_file\" 2>\"$stderr_file\"\n  fi"
+    } else {
+        "  \"$TERRAFORM_BIN\" apply -auto-approve -input=false \"$@\" >\"$stdout_file\" 2>\"$stderr_file\""
+    };
     let operation_block = if operation == "apply" && provider == crate::config::Provider::Azure {
         format!(
             "AZURE_APPLY_MAX_ATTEMPTS=\"${{GREENTIC_AZURE_APPLY_MAX_ATTEMPTS:-6}}\"\nAZURE_APPLY_RETRY_DELAY_SECONDS=\"${{GREENTIC_AZURE_APPLY_RETRY_DELAY_SECONDS:-20}}\"\nattempt=1\nwhile true; do\n  stdout_file=\"$(mktemp)\"\n  stderr_file=\"$(mktemp)\"\n  set +e\n{apply_invocation_with_redirection}\n  status=$?\n  set -e\n  cat \"$stdout_file\"\n  cat \"$stderr_file\" >&2\n  if [ \"$status\" -eq 0 ]; then\n    rm -f \"$stdout_file\" \"$stderr_file\"\n    break\n  fi\n  retry_reason=\"\"\n  if grep -q 'ResourceGroupBeingDeleted' \"$stderr_file\"; then\n    retry_reason='resource group is still being deleted'\n  elif grep -q 'ManagedEnvironmentNotProvisioned' \"$stderr_file\"; then\n    retry_reason='container app environment is not fully provisioned yet'\n  elif grep -q 'Operation was canceled' \"$stderr_file\"; then\n    retry_reason='azure control plane canceled the previous environment operation'\n  fi\n  if [ -n \"$retry_reason\" ] && [ \"$attempt\" -lt \"$AZURE_APPLY_MAX_ATTEMPTS\" ]; then\n    echo \"Azure apply hit transient condition: $retry_reason; retrying in ${{AZURE_APPLY_RETRY_DELAY_SECONDS}}s (attempt ${{attempt}}/${{AZURE_APPLY_MAX_ATTEMPTS}})\" >&2\n    rm -f \"$stdout_file\" \"$stderr_file\" .terraform.tfstate.lock.info\n    sleep \"$AZURE_APPLY_RETRY_DELAY_SECONDS\"\n    attempt=$((attempt + 1))\n    continue\n  fi\n  rm -f \"$stdout_file\" \"$stderr_file\"\n  exit \"$status\"\ndone",
-            apply_invocation_with_redirection = if apply_invocation
-                .contains("-var-file=\"$VAR_FILE\"")
-            {
-                "  if [ -n \"$VAR_FILE\" ]; then\n    \"$TERRAFORM_BIN\" apply -auto-approve -input=false -var-file=\"$VAR_FILE\" \"$@\" >\"$stdout_file\" 2>\"$stderr_file\"\n  else\n    \"$TERRAFORM_BIN\" apply -auto-approve -input=false \"$@\" >\"$stdout_file\" 2>\"$stderr_file\"\n  fi"
-            } else {
-                "  \"$TERRAFORM_BIN\" apply -auto-approve -input=false \"$@\" >\"$stdout_file\" 2>\"$stderr_file\""
-            }
+            apply_invocation_with_redirection = apply_invocation_with_redirection
+        )
+    } else if operation == "apply" && provider == crate::config::Provider::Aws {
+        format!(
+            "AWS_APPLY_MAX_ATTEMPTS=\"${{GREENTIC_AWS_APPLY_MAX_ATTEMPTS:-6}}\"\nAWS_APPLY_RETRY_DELAY_SECONDS=\"${{GREENTIC_AWS_APPLY_RETRY_DELAY_SECONDS:-20}}\"\nattempt=1\nwhile true; do\n  stdout_file=\"$(mktemp)\"\n  stderr_file=\"$(mktemp)\"\n  set +e\n{apply_invocation_with_redirection}\n  status=$?\n  set -e\n  cat \"$stdout_file\"\n  cat \"$stderr_file\" >&2\n  if [ \"$status\" -eq 0 ]; then\n    rm -f \"$stdout_file\" \"$stderr_file\"\n    break\n  fi\n  retry_reason=\"\"\n  if grep -q 'DuplicateLoadBalancerName' \"$stderr_file\"; then\n    retry_reason='load balancer is still being deleted or reused'\n  elif grep -q 'EntityAlreadyExists' \"$stderr_file\"; then\n    retry_reason='iam or log resource still exists while aws control plane converges'\n  elif grep -q 'already exists' \"$stderr_file\"; then\n    retry_reason='aws resource name is still reserved while the previous deployment is converging'\n  elif grep -q 'OperationAborted' \"$stderr_file\"; then\n    retry_reason='aws control plane reported an in-progress conflicting operation'\n  fi\n  if [ -n \"$retry_reason\" ] && [ \"$attempt\" -lt \"$AWS_APPLY_MAX_ATTEMPTS\" ]; then\n    echo \"AWS apply hit transient condition: $retry_reason; retrying in ${{AWS_APPLY_RETRY_DELAY_SECONDS}}s (attempt ${{attempt}}/${{AWS_APPLY_MAX_ATTEMPTS}})\" >&2\n    rm -f \"$stdout_file\" \"$stderr_file\" .terraform.tfstate.lock.info\n    sleep \"$AWS_APPLY_RETRY_DELAY_SECONDS\"\n    attempt=$((attempt + 1))\n    continue\n  fi\n  rm -f \"$stdout_file\" \"$stderr_file\"\n  exit \"$status\"\ndone",
+            apply_invocation_with_redirection = apply_invocation_with_redirection
+        )
+    } else if operation == "apply" && provider == crate::config::Provider::Gcp {
+        format!(
+            "GCP_APPLY_MAX_ATTEMPTS=\"${{GREENTIC_GCP_APPLY_MAX_ATTEMPTS:-6}}\"\nGCP_APPLY_RETRY_DELAY_SECONDS=\"${{GREENTIC_GCP_APPLY_RETRY_DELAY_SECONDS:-20}}\"\nattempt=1\nwhile true; do\n  stdout_file=\"$(mktemp)\"\n  stderr_file=\"$(mktemp)\"\n  set +e\n{apply_invocation_with_redirection}\n  status=$?\n  set -e\n  cat \"$stdout_file\"\n  cat \"$stderr_file\" >&2\n  if [ \"$status\" -eq 0 ]; then\n    rm -f \"$stdout_file\" \"$stderr_file\"\n    break\n  fi\n  retry_reason=\"\"\n  if grep -q 'being deleted' \"$stderr_file\"; then\n    retry_reason='gcp resource is still being deleted'\n  elif grep -q 'already exists' \"$stderr_file\"; then\n    retry_reason='gcp resource name is still reserved while the previous deployment is converging'\n  elif grep -q 'operation is already in progress' \"$stderr_file\"; then\n    retry_reason='gcp control plane already has an operation in progress'\n  fi\n  if [ -n \"$retry_reason\" ] && [ \"$attempt\" -lt \"$GCP_APPLY_MAX_ATTEMPTS\" ]; then\n    echo \"GCP apply hit transient condition: $retry_reason; retrying in ${{GCP_APPLY_RETRY_DELAY_SECONDS}}s (attempt ${{attempt}}/${{GCP_APPLY_MAX_ATTEMPTS}})\" >&2\n    rm -f \"$stdout_file\" \"$stderr_file\" .terraform.tfstate.lock.info\n    sleep \"$GCP_APPLY_RETRY_DELAY_SECONDS\"\n    attempt=$((attempt + 1))\n    continue\n  fi\n  rm -f \"$stdout_file\" \"$stderr_file\"\n  exit \"$status\"\ndone",
+            apply_invocation_with_redirection = apply_invocation_with_redirection
         )
     } else {
         apply_invocation
@@ -2853,7 +3081,7 @@ fn terraform_aws_cleanup_script(generated_tfvars: Option<&str>, tfvars_example: 
         )
     };
     format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nVAR_FILE=\"\"\n{tfvars_lookup}\nif ! command -v aws >/dev/null 2>&1; then\n  echo \"aws cli not found; skipping AWS cleanup fallback\"\n  exit 0\nfi\nBUNDLE_DIGEST=\"\"\nif [ -n \"$VAR_FILE\" ] && [ -f \"$VAR_FILE\" ]; then\n  BUNDLE_DIGEST=$(sed -n 's/^bundle_digest = \"\\(.*\\)\"$/\\1/p' \"$VAR_FILE\" | head -n 1)\nfi\nif [ -z \"$BUNDLE_DIGEST\" ]; then\n  echo \"bundle_digest not found; skipping AWS cleanup fallback\"\n  exit 0\nfi\nAWS_REGION_VALUE=\"${{AWS_REGION:-${{AWS_DEFAULT_REGION:-}}}}\"\nif [ -z \"$AWS_REGION_VALUE\" ]; then\n  echo \"AWS region not set; skipping AWS cleanup fallback\"\n  exit 0\nfi\nSHORT_ID=$(printf '%s' \"$BUNDLE_DIGEST\" | md5sum | awk '{{print substr($1,1,8)}}')\nNAME_PREFIX=\"greentic-${{SHORT_ID}}\"\nSECRET_PREFIX=\"greentic/admin/${{NAME_PREFIX}}/\"\nLOG_GROUP=\"/greentic/demo/${{NAME_PREFIX}}\"\nROLE_NAME=\"${{NAME_PREFIX}}-task-exec\"\nCLUSTER_NAME=\"${{NAME_PREFIX}}-cluster\"\nSERVICE_NAME=\"${{NAME_PREFIX}}-service\"\nLB_NAME=\"${{NAME_PREFIX}}-alb\"\naws logs delete-log-group --region \"$AWS_REGION_VALUE\" --log-group-name \"$LOG_GROUP\" >/dev/null 2>&1 || true\nSECRET_ARNS=$(aws secretsmanager list-secrets --region \"$AWS_REGION_VALUE\" --filters Key=name,Values=\"$SECRET_PREFIX\" --query 'SecretList[].ARN' --output text 2>/dev/null || true)\nfor secret_arn in $SECRET_ARNS; do\n  aws secretsmanager delete-secret --region \"$AWS_REGION_VALUE\" --secret-id \"$secret_arn\" --force-delete-without-recovery >/dev/null 2>&1 || true\ndone\nINLINE_POLICIES=$(aws iam list-role-policies --role-name \"$ROLE_NAME\" --query 'PolicyNames[]' --output text 2>/dev/null || true)\nfor policy_name in $INLINE_POLICIES; do\n  aws iam delete-role-policy --role-name \"$ROLE_NAME\" --policy-name \"$policy_name\" >/dev/null 2>&1 || true\ndone\nATTACHED_POLICIES=$(aws iam list-attached-role-policies --role-name \"$ROLE_NAME\" --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null || true)\nfor policy_arn in $ATTACHED_POLICIES; do\n  aws iam detach-role-policy --role-name \"$ROLE_NAME\" --policy-arn \"$policy_arn\" >/dev/null 2>&1 || true\ndone\naws iam delete-role --role-name \"$ROLE_NAME\" >/dev/null 2>&1 || true\nLB_ARN=$(aws elbv2 describe-load-balancers --region \"$AWS_REGION_VALUE\" --names \"$LB_NAME\" --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || true)\nif [ -n \"$LB_ARN\" ] && [ \"$LB_ARN\" != \"None\" ]; then\n  aws elbv2 delete-load-balancer --region \"$AWS_REGION_VALUE\" --load-balancer-arn \"$LB_ARN\" >/dev/null 2>&1 || true\nfi\naws ecs update-service --region \"$AWS_REGION_VALUE\" --cluster \"$CLUSTER_NAME\" --service \"$SERVICE_NAME\" --desired-count 0 >/dev/null 2>&1 || true\naws ecs delete-service --region \"$AWS_REGION_VALUE\" --cluster \"$CLUSTER_NAME\" --service \"$SERVICE_NAME\" --force >/dev/null 2>&1 || true\naws ecs delete-cluster --region \"$AWS_REGION_VALUE\" --cluster \"$CLUSTER_NAME\" >/dev/null 2>&1 || true\n"
+        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nTF_ROOT=\"${{SCRIPT_DIR}}/terraform\"\ncd \"$TF_ROOT\"\nVAR_FILE=\"\"\n{tfvars_lookup}\nif ! command -v aws >/dev/null 2>&1; then\n  echo \"aws cli not found; skipping AWS cleanup fallback\"\n  exit 0\nfi\nBUNDLE_DIGEST=\"\"\nNAME_PREFIX=\"\"\nif [ -n \"$VAR_FILE\" ] && [ -f \"$VAR_FILE\" ]; then\n  BUNDLE_DIGEST=$(sed -n 's/^bundle_digest = \"\\(.*\\)\"$/\\1/p' \"$VAR_FILE\" | head -n 1)\n  NAME_PREFIX=$(sed -n 's/^deployment_name_prefix = \"\\(.*\\)\"$/\\1/p' \"$VAR_FILE\" | head -n 1)\nfi\nif [ -z \"$NAME_PREFIX\" ]; then\n  if [ -z \"$BUNDLE_DIGEST\" ]; then\n    echo \"bundle_digest not found; skipping AWS cleanup fallback\"\n    exit 0\n  fi\n  SHORT_ID=$(printf '%s' \"$BUNDLE_DIGEST\" | md5sum | awk '{{print substr($1,1,8)}}')\n  NAME_PREFIX=\"greentic-${{SHORT_ID}}\"\nfi\nAWS_REGION_VALUE=\"${{AWS_REGION:-${{AWS_DEFAULT_REGION:-}}}}\"\nif [ -z \"$AWS_REGION_VALUE\" ]; then\n  echo \"AWS region not set; skipping AWS cleanup fallback\"\n  exit 0\nfi\nSECRET_PREFIX=\"greentic/admin/${{NAME_PREFIX}}/\"\nLOG_GROUP=\"/greentic/demo/${{NAME_PREFIX}}\"\nROLE_NAME=\"${{NAME_PREFIX}}-task-exec\"\nCLUSTER_NAME=\"${{NAME_PREFIX}}-cluster\"\nSERVICE_NAME=\"${{NAME_PREFIX}}-service\"\nLB_NAME=\"${{NAME_PREFIX}}-alb\"\naws logs delete-log-group --region \"$AWS_REGION_VALUE\" --log-group-name \"$LOG_GROUP\" >/dev/null 2>&1 || true\nSECRET_ARNS=$(aws secretsmanager list-secrets --region \"$AWS_REGION_VALUE\" --filters Key=name,Values=\"$SECRET_PREFIX\" --query 'SecretList[].ARN' --output text 2>/dev/null || true)\nfor secret_arn in $SECRET_ARNS; do\n  aws secretsmanager delete-secret --region \"$AWS_REGION_VALUE\" --secret-id \"$secret_arn\" --force-delete-without-recovery >/dev/null 2>&1 || true\ndone\nINLINE_POLICIES=$(aws iam list-role-policies --role-name \"$ROLE_NAME\" --query 'PolicyNames[]' --output text 2>/dev/null || true)\nfor policy_name in $INLINE_POLICIES; do\n  aws iam delete-role-policy --role-name \"$ROLE_NAME\" --policy-name \"$policy_name\" >/dev/null 2>&1 || true\ndone\nATTACHED_POLICIES=$(aws iam list-attached-role-policies --role-name \"$ROLE_NAME\" --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null || true)\nfor policy_arn in $ATTACHED_POLICIES; do\n  aws iam detach-role-policy --role-name \"$ROLE_NAME\" --policy-arn \"$policy_arn\" >/dev/null 2>&1 || true\ndone\naws iam delete-role --role-name \"$ROLE_NAME\" >/dev/null 2>&1 || true\nLB_ARN=$(aws elbv2 describe-load-balancers --region \"$AWS_REGION_VALUE\" --names \"$LB_NAME\" --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || true)\nif [ -n \"$LB_ARN\" ] && [ \"$LB_ARN\" != \"None\" ]; then\n  aws elbv2 delete-load-balancer --region \"$AWS_REGION_VALUE\" --load-balancer-arn \"$LB_ARN\" >/dev/null 2>&1 || true\nfi\naws ecs update-service --region \"$AWS_REGION_VALUE\" --cluster \"$CLUSTER_NAME\" --service \"$SERVICE_NAME\" --desired-count 0 >/dev/null 2>&1 || true\naws ecs delete-service --region \"$AWS_REGION_VALUE\" --cluster \"$CLUSTER_NAME\" --service \"$SERVICE_NAME\" --force >/dev/null 2>&1 || true\naws ecs delete-cluster --region \"$AWS_REGION_VALUE\" --cluster \"$CLUSTER_NAME\" >/dev/null 2>&1 || true\n"
     )
 }
 
@@ -4341,6 +4569,7 @@ kind: Deployment
         assert!(rendered.contains("google_cloud_run_v2_service.this"));
         assert!(rendered.contains("module.operator_gcp[0]"));
         assert!(rendered.contains("import -input=false"));
+        assert!(rendered.contains("GCP apply hit transient condition"));
     }
 
     #[test]
@@ -4448,15 +4677,21 @@ resource "google_cloud_run_v2_service" "this" {
     }
 
     #[test]
-    fn terraform_apply_script_for_non_azure_does_not_include_import_hook() {
+    fn terraform_apply_script_for_aws_imports_existing_fixed_name_resources() {
         let rendered = terraform_plan_like_script(
             "apply",
             Provider::Aws,
             Some("dev.tfvars"),
             "staging.tfvars.example",
         );
-        assert!(!rendered.contains("az keyvault secret show"));
-        assert!(!rendered.contains("azurerm_container_app_environment.this"));
+        assert!(rendered.contains("module.operator_aws[0]"));
+        assert!(rendered.contains("aws ec2 describe-security-groups"));
+        assert!(rendered.contains("aws elbv2 describe-load-balancers"));
+        assert!(rendered.contains("aws ecs describe-clusters"));
+        assert!(rendered.contains("aws ecs describe-services"));
+        assert!(rendered.contains("aws_cloudwatch_log_group.this"));
+        assert!(rendered.contains("aws_iam_role.task_execution"));
+        assert!(rendered.contains("AWS apply hit transient condition"));
     }
 
     #[test]
@@ -4645,6 +4880,7 @@ resource "google_cloud_run_v2_service" "this" {
             .expect("read generated tfvars");
         assert!(generated.contains("cloud = \"aws\""));
         assert!(generated.contains("environment = \"dev\""));
+        assert!(generated.contains("deployment_name_prefix = \"greentic-"));
         assert!(generated.contains("bundle_source = \"file:///tmp/demo.gtbundle\""));
         assert!(generated.contains(
             "bundle_digest = \"sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd\""
@@ -4662,6 +4898,71 @@ resource "google_cloud_run_v2_service" "this" {
                 .expect("read destroy script");
         assert!(destroy_script.contains("VAR_FILE=\"dev.tfvars\""));
         assert!(destroy_script.contains("elif [ -f \"staging.tfvars.example\" ]; then"));
+    }
+
+    #[test]
+    fn generated_tfvars_preserves_existing_legacy_prefix_for_updates() {
+        let base = std::env::current_dir()
+            .expect("cwd")
+            .join("target/tmp-tests");
+        std::fs::create_dir_all(&base).expect("create tmp base");
+        let dir = tempfile::tempdir_in(base).expect("temp dir");
+        let terraform_root = dir.path().join("terraform");
+        std::fs::create_dir_all(&terraform_root).expect("create terraform dir");
+        std::fs::write(
+            terraform_root.join("staging.tfvars.example"),
+            "cloud = \"aws\"\nenvironment = \"staging\"\n",
+        )
+        .expect("write example");
+        std::fs::write(
+            terraform_root.join("dev.tfvars"),
+            "bundle_digest = \"sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd\"\n",
+        )
+        .expect("write existing tfvars");
+
+        let mut greentic = greentic_config::ConfigResolver::new()
+            .load()
+            .expect("load default config")
+            .config;
+        greentic.paths.state_dir = dir.path().join(".greentic-state");
+        let config = DeployerConfig {
+            capability: DeployerCapability::Plan,
+            provider: Provider::Aws,
+            strategy: "iac-only".into(),
+            tenant: "acme".into(),
+            environment: "dev".into(),
+            pack_path: dir.path().join("bundle"),
+            providers_dir: PathBuf::from("providers/deployer"),
+            packs_dir: PathBuf::from("packs"),
+            provider_pack: None,
+            pack_ref: None,
+            distributor_url: None,
+            distributor_token: None,
+            preview: false,
+            dry_run: false,
+            execute_local: false,
+            output: crate::config::OutputFormat::Json,
+            greentic,
+            provenance: greentic_config::ProvenanceMap::new(),
+            config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
+            bundle_source: Some("file:///tmp/demo-v2.gtbundle".into()),
+            bundle_digest: Some(
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            ),
+            repo_registry_base: None,
+            store_registry_base: None,
+        };
+
+        let generated =
+            materialize_generated_tfvars(&config, &terraform_root, "staging.tfvars.example")
+                .expect("generate tfvars")
+                .expect("generated filename");
+        let contents =
+            std::fs::read_to_string(terraform_root.join(generated)).expect("read generated tfvars");
+        assert!(contents.contains("deployment_name_prefix = \"greentic-"));
+        assert!(contents.contains("deployment_name_prefix = \"greentic-4f680ffc\""));
     }
 
     #[test]
