@@ -50,3 +50,8 @@ variable "azure_key_vault_id" {
 variable "azure_location" {
   type = string
 }
+
+variable "admin_access_mode" {
+  type    = string
+  default = "http-bearer-relay"
+}

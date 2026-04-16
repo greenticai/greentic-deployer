@@ -46,3 +46,8 @@ variable "gcp_project_id" {
 variable "gcp_region" {
   type = string
 }
+
+variable "admin_access_mode" {
+  type    = string
+  default = "http-bearer-relay"
+}

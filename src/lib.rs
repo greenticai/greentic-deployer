@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adapter;
+pub mod admin_access;
 /// Legacy/provider-oriented multi-target implementation module.
 ///
 /// Prefer `multi_target` or `surface::multi_target` for new call sites.
@@ -32,6 +33,13 @@ pub mod telemetry;
 pub mod terraform;
 
 pub use adapter::{AdapterFamily, MultiTargetKind, UnifiedTargetSelection};
+pub use admin_access::{
+    AdminAccessInfo, AdminAccessMode, AdminHealthProbe, AdminSecretRefs, AdminTunnelSupport,
+    MaterializedAdminCerts, MaterializedAdminRelayToken, materialize_admin_client_certs,
+    materialize_admin_relay_token, probe_admin_health, render_admin_access,
+    render_admin_health_probe, render_materialized_admin_certs,
+    render_materialized_admin_relay_token, resolve_admin_access,
+};
 pub use aws::{AwsAdminTunnelRequest, AwsRequest};
 pub use azure::AzureRequest;
 pub use config::{DeployerConfig, DeployerRequest, OutputFormat, Provider};

@@ -1,11 +1,13 @@
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+use crate::admin_access::{
+    load_terraform_outputs, resolve_latest_deploy_dir, terraform_output_string,
+    tunnel_admin_cert_dir,
+};
 use crate::config::{DeployerConfig, DeployerRequest, OutputFormat, Provider};
 use crate::contract::DeployerCapability;
 use crate::error::{DeployerError, Result};
@@ -156,7 +158,7 @@ pub async fn run_config_with_plan(
 }
 
 pub fn run_admin_tunnel(args: AwsAdminTunnelRequest) -> Result<()> {
-    let deploy_dir = resolve_latest_aws_deploy_dir(&args.bundle_dir)?;
+    let deploy_dir = resolve_latest_deploy_dir(&args.bundle_dir, "aws")?;
     let outputs_path = deploy_dir.join("terraform-outputs.json");
     let outputs = load_terraform_outputs(&outputs_path)?;
     let Some(admin_ca_secret_ref) = terraform_output_string(&outputs, "admin_ca_secret_ref") else {
@@ -295,77 +297,8 @@ pub fn run_admin_tunnel(args: AwsAdminTunnelRequest) -> Result<()> {
     }
 }
 
-fn resolve_latest_aws_deploy_dir(bundle_dir: &Path) -> Result<PathBuf> {
-    let mut candidates = vec![bundle_dir.join(".greentic").join("deploy").join("aws")];
-    if let Some(parent) = bundle_dir.parent() {
-        candidates.push(parent.join(".greentic").join("deploy").join("aws"));
-    }
-    if let Some(home_dir) = env::var_os("HOME") {
-        candidates.push(
-            PathBuf::from(home_dir)
-                .join(".greentic")
-                .join("deploy")
-                .join("aws"),
-        );
-    }
-    let mut latest: Option<(SystemTime, PathBuf)> = None;
-    for root in candidates {
-        if root.as_os_str().is_empty() || !root.exists() {
-            continue;
-        }
-        let mut stack = vec![root];
-        while let Some(dir) = stack.pop() {
-            let entries = fs::read_dir(&dir)?;
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let outputs = path.join("terraform-outputs.json");
-                    if outputs.is_file() {
-                        let modified = fs::metadata(&outputs)
-                            .and_then(|meta| meta.modified())
-                            .unwrap_or(UNIX_EPOCH);
-                        match latest.as_ref() {
-                            Some((current, _)) if modified <= *current => {}
-                            _ => latest = Some((modified, path.clone())),
-                        }
-                    }
-                    stack.push(path);
-                }
-            }
-        }
-    }
-
-    latest.map(|(_, path)| path).ok_or_else(|| {
-        DeployerError::Other(format!(
-            "aws deploy state not found under {}, its parent workspace, or ~/.greentic/deploy/aws; deploy the bundle first",
-            bundle_dir.join(".greentic").join("deploy").join("aws").display()
-        ))
-    })
-}
-
-fn load_terraform_outputs(path: &Path) -> Result<Value> {
-    let raw = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&raw)?)
-}
-
-fn terraform_output_string(outputs: &Value, key: &str) -> Option<String> {
-    outputs
-        .get(key)
-        .and_then(|value| value.get("value"))
-        .and_then(Value::as_str)
-        .map(|value| value.to_string())
-}
-
 fn aws_region_from_secret_arn(secret_arn: &str) -> Option<String> {
     secret_arn.split(':').nth(3).map(|value| value.to_string())
-}
-
-fn tunnel_admin_cert_dir(bundle_dir: &Path, deploy_name_prefix: &str) -> PathBuf {
-    bundle_dir
-        .join(".greentic")
-        .join("admin")
-        .join("tunnels")
-        .join(deploy_name_prefix)
 }
 
 fn maybe_write_tunnel_admin_certs(
