@@ -22,19 +22,40 @@ fn azure_module_materializes_key_vault_and_runtime_resources() {
         .join("modules")
         .join("operator-azure");
     let main_tf = read(&root.join("main.tf"));
+    let outputs_tf = read(&root.join("outputs.tf"));
+    let variables_tf = read(&root.join("variables.tf"));
 
     assert!(main_tf.contains("resource \"azurerm_key_vault_secret\" \"admin_ca\""));
     assert!(main_tf.contains("resource \"azurerm_key_vault_secret\" \"admin_server_cert\""));
     assert!(main_tf.contains("resource \"azurerm_key_vault_secret\" \"admin_server_key\""));
+    assert!(main_tf.contains("resource \"azurerm_key_vault_secret\" \"admin_client_cert\""));
+    assert!(main_tf.contains("resource \"azurerm_key_vault_secret\" \"admin_client_key\""));
+    assert!(main_tf.contains("resource \"azurerm_key_vault_secret\" \"admin_relay_token\""));
     assert!(main_tf.contains("resource \"azurerm_log_analytics_workspace\" \"this\""));
     assert!(main_tf.contains("resource \"azurerm_container_app_environment\" \"this\""));
     assert!(main_tf.contains("resource \"azurerm_container_app\" \"this\""));
     assert!(main_tf.contains("GREENTIC_ADMIN_CA_PEM"));
     assert!(main_tf.contains("GREENTIC_ADMIN_SERVER_CERT_PEM"));
     assert!(main_tf.contains("GREENTIC_ADMIN_SERVER_KEY_PEM"));
+    assert!(main_tf.contains("GREENTIC_ADMIN_CLIENT_CERT_PEM"));
+    assert!(main_tf.contains("GREENTIC_ADMIN_CLIENT_KEY_PEM"));
+    assert!(main_tf.contains("GREENTIC_ADMIN_RELAY_TOKEN"));
     assert!(main_tf.contains("GREENTIC_ADMIN_CA_SECRET_REF"));
     assert!(main_tf.contains("GREENTIC_ADMIN_SERVER_CERT_SECRET_REF"));
     assert!(main_tf.contains("GREENTIC_ADMIN_SERVER_KEY_SECRET_REF"));
+    assert!(main_tf.contains("GREENTIC_ADMIN_CLIENT_CERT_SECRET_REF"));
+    assert!(main_tf.contains("GREENTIC_ADMIN_CLIENT_KEY_SECRET_REF"));
+    assert!(main_tf.contains("GREENTIC_ADMIN_RELAY_TOKEN_SECRET_REF"));
+
+    assert!(outputs_tf.contains("output \"admin_access_mode\""));
+    assert!(outputs_tf.contains("output \"admin_public_endpoint\""));
+    assert!(outputs_tf.contains("output \"admin_client_cert_secret_ref\""));
+    assert!(outputs_tf.contains("output \"admin_client_key_secret_ref\""));
+    assert!(outputs_tf.contains("output \"admin_relay_token_secret_ref\""));
+    assert!(outputs_tf.contains("/admin-relay/v1"));
+
+    assert!(variables_tf.contains("variable \"admin_access_mode\""));
+    assert!(variables_tf.contains("default = \"http-bearer-relay\""));
 }
 
 #[test]
@@ -44,10 +65,15 @@ fn gcp_module_materializes_secret_manager_and_cloud_run_resources() {
         .join("modules")
         .join("operator-gcp");
     let main_tf = read(&root.join("main.tf"));
+    let outputs_tf = read(&root.join("outputs.tf"));
+    let variables_tf = read(&root.join("variables.tf"));
 
     assert!(main_tf.contains("resource \"google_secret_manager_secret\" \"admin_ca\""));
     assert!(main_tf.contains("resource \"google_secret_manager_secret\" \"admin_server_cert\""));
     assert!(main_tf.contains("resource \"google_secret_manager_secret\" \"admin_server_key\""));
+    assert!(main_tf.contains("resource \"google_secret_manager_secret\" \"admin_client_cert\""));
+    assert!(main_tf.contains("resource \"google_secret_manager_secret\" \"admin_client_key\""));
+    assert!(main_tf.contains("resource \"google_secret_manager_secret\" \"admin_relay_token\""));
     assert!(main_tf.contains("resource \"google_cloud_run_v2_service\" \"this\""));
     assert!(
         main_tf.contains("resource \"google_cloud_run_v2_service_iam_member\" \"public_invoker\"")
@@ -55,10 +81,26 @@ fn gcp_module_materializes_secret_manager_and_cloud_run_resources() {
     assert!(main_tf.contains("GREENTIC_ADMIN_CA_PEM"));
     assert!(main_tf.contains("GREENTIC_ADMIN_SERVER_CERT_PEM"));
     assert!(main_tf.contains("GREENTIC_ADMIN_SERVER_KEY_PEM"));
+    assert!(main_tf.contains("GREENTIC_ADMIN_CLIENT_CERT_PEM"));
+    assert!(main_tf.contains("GREENTIC_ADMIN_CLIENT_KEY_PEM"));
+    assert!(main_tf.contains("GREENTIC_ADMIN_RELAY_TOKEN"));
+    assert!(main_tf.contains("GREENTIC_ADMIN_CLIENT_CERT_SECRET_REF"));
+    assert!(main_tf.contains("GREENTIC_ADMIN_CLIENT_KEY_SECRET_REF"));
+    assert!(main_tf.contains("GREENTIC_ADMIN_RELAY_TOKEN_SECRET_REF"));
     assert!(main_tf.contains("deletion_protection = false"));
     assert!(!main_tf.contains("GREENTIC_ADMIN_CA_SECRET_REF"));
     assert!(!main_tf.contains("GREENTIC_ADMIN_SERVER_CERT_SECRET_REF"));
     assert!(!main_tf.contains("GREENTIC_ADMIN_SERVER_KEY_SECRET_REF"));
+
+    assert!(outputs_tf.contains("output \"admin_access_mode\""));
+    assert!(outputs_tf.contains("output \"admin_public_endpoint\""));
+    assert!(outputs_tf.contains("output \"admin_client_cert_secret_ref\""));
+    assert!(outputs_tf.contains("output \"admin_client_key_secret_ref\""));
+    assert!(outputs_tf.contains("output \"admin_relay_token_secret_ref\""));
+    assert!(outputs_tf.contains("/admin-relay/v1"));
+
+    assert!(variables_tf.contains("variable \"admin_access_mode\""));
+    assert!(variables_tf.contains("default = \"http-bearer-relay\""));
 }
 
 #[test]

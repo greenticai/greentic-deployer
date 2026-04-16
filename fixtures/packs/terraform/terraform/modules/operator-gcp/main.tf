@@ -8,6 +8,10 @@ locals {
   admin_ca_secret_name          = "greentic-admin-ca-${var.environment}"
   admin_server_cert_secret_name = "greentic-admin-server-cert-${var.environment}"
   admin_server_key_secret_name  = "greentic-admin-server-key-${var.environment}"
+  admin_client_cert_secret_name = "greentic-admin-client-cert-${var.environment}"
+  admin_client_key_secret_name  = "greentic-admin-client-key-${var.environment}"
+  admin_relay_token_secret_name = "greentic-admin-relay-token-${var.environment}"
+  admin_relay_token             = sha256(tls_private_key.admin_client.private_key_pem)
   service_name                  = "${local.name_prefix}-run"
 
   operator_endpoint = trimspace(var.public_base_url) != "" ? var.public_base_url : google_cloud_run_v2_service.this.uri
@@ -41,6 +45,11 @@ resource "tls_private_key" "admin_server" {
   rsa_bits  = 2048
 }
 
+resource "tls_private_key" "admin_client" {
+  algorithm = "RSA"
+  rsa_bits  = 2048
+}
+
 resource "tls_cert_request" "admin_server" {
   private_key_pem = tls_private_key.admin_server.private_key_pem
 
@@ -53,6 +62,15 @@ resource "tls_cert_request" "admin_server" {
   ip_addresses = ["127.0.0.1"]
 }
 
+resource "tls_cert_request" "admin_client" {
+  private_key_pem = tls_private_key.admin_client.private_key_pem
+
+  subject {
+    common_name  = "local-admin"
+    organization = "Greentic"
+  }
+}
+
 resource "tls_locally_signed_cert" "admin_server" {
   cert_request_pem      = tls_cert_request.admin_server.cert_request_pem
   ca_private_key_pem    = tls_private_key.admin_ca.private_key_pem
@@ -62,6 +80,18 @@ resource "tls_locally_signed_cert" "admin_server" {
     "digital_signature",
     "key_encipherment",
     "server_auth",
+  ]
+}
+
+resource "tls_locally_signed_cert" "admin_client" {
+  cert_request_pem      = tls_cert_request.admin_client.cert_request_pem
+  ca_private_key_pem    = tls_private_key.admin_ca.private_key_pem
+  ca_cert_pem           = tls_self_signed_cert.admin_ca.cert_pem
+  validity_period_hours = 24 * 365
+  allowed_uses = [
+    "digital_signature",
+    "key_encipherment",
+    "client_auth",
   ]
 }
 
@@ -105,6 +135,48 @@ resource "google_secret_manager_secret" "admin_server_key" {
 resource "google_secret_manager_secret_version" "admin_server_key" {
   secret      = google_secret_manager_secret.admin_server_key.id
   secret_data = tls_private_key.admin_server.private_key_pem
+}
+
+resource "google_secret_manager_secret" "admin_client_cert" {
+  project   = var.gcp_project_id
+  secret_id = local.admin_client_cert_secret_name
+
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_version" "admin_client_cert" {
+  secret      = google_secret_manager_secret.admin_client_cert.id
+  secret_data = tls_locally_signed_cert.admin_client.cert_pem
+}
+
+resource "google_secret_manager_secret" "admin_client_key" {
+  project   = var.gcp_project_id
+  secret_id = local.admin_client_key_secret_name
+
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_version" "admin_client_key" {
+  secret      = google_secret_manager_secret.admin_client_key.id
+  secret_data = tls_private_key.admin_client.private_key_pem
+}
+
+resource "google_secret_manager_secret" "admin_relay_token" {
+  project   = var.gcp_project_id
+  secret_id = local.admin_relay_token_secret_name
+
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_version" "admin_relay_token" {
+  secret      = google_secret_manager_secret.admin_relay_token.id
+  secret_data = local.admin_relay_token
 }
 
 resource "google_cloud_run_v2_service" "this" {
@@ -187,6 +259,36 @@ resource "google_cloud_run_v2_service" "this" {
       env {
         name  = "GREENTIC_ADMIN_SERVER_KEY_PEM"
         value = tls_private_key.admin_server.private_key_pem
+      }
+
+      env {
+        name  = "GREENTIC_ADMIN_CLIENT_CERT_PEM"
+        value = tls_locally_signed_cert.admin_client.cert_pem
+      }
+
+      env {
+        name  = "GREENTIC_ADMIN_CLIENT_KEY_PEM"
+        value = tls_private_key.admin_client.private_key_pem
+      }
+
+      env {
+        name  = "GREENTIC_ADMIN_RELAY_TOKEN"
+        value = local.admin_relay_token
+      }
+
+      env {
+        name  = "GREENTIC_ADMIN_CLIENT_CERT_SECRET_REF"
+        value = google_secret_manager_secret.admin_client_cert.id
+      }
+
+      env {
+        name  = "GREENTIC_ADMIN_CLIENT_KEY_SECRET_REF"
+        value = google_secret_manager_secret.admin_client_key.id
+      }
+
+      env {
+        name  = "GREENTIC_ADMIN_RELAY_TOKEN_SECRET_REF"
+        value = google_secret_manager_secret.admin_relay_token.id
       }
 
       env {

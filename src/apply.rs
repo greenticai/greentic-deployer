@@ -2116,6 +2116,25 @@ fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path
     );
     fs::write(terraform_root.join("main.tf"), main_tf)?;
 
+    let relay_outputs = match config.provider {
+        crate::config::Provider::Azure | crate::config::Provider::Gcp => format!(
+            r#"
+output "admin_access_mode" {{
+  value = module.{module_name}.admin_access_mode
+}}
+
+output "admin_public_endpoint" {{
+  value = module.{module_name}.admin_public_endpoint
+}}
+
+output "admin_relay_token_secret_ref" {{
+  value = module.{module_name}.admin_relay_token_secret_ref
+}}
+"#
+        ),
+        _ => String::new(),
+    };
+
     let outputs_tf = format!(
         r#"output "operator_endpoint" {{
   value = module.{module_name}.operator_endpoint
@@ -2144,7 +2163,7 @@ output "admin_client_cert_secret_ref" {{
 output "admin_client_key_secret_ref" {{
   value = module.{module_name}.admin_client_key_secret_ref
 }}
-"#
+{relay_outputs}"#
     );
     fs::write(terraform_root.join("outputs.tf"), outputs_tf)?;
     ensure_terraform_variable_declared(
@@ -3018,6 +3037,9 @@ if command -v gcloud >/dev/null 2>&1; then
       import_gcp_secret_if_exists "${MODULE_ADDR}.google_secret_manager_secret.admin_ca" "greentic-admin-ca-${ENVIRONMENT_VALUE}"
       import_gcp_secret_if_exists "${MODULE_ADDR}.google_secret_manager_secret.admin_server_cert" "greentic-admin-server-cert-${ENVIRONMENT_VALUE}"
       import_gcp_secret_if_exists "${MODULE_ADDR}.google_secret_manager_secret.admin_server_key" "greentic-admin-server-key-${ENVIRONMENT_VALUE}"
+      import_gcp_secret_if_exists "${MODULE_ADDR}.google_secret_manager_secret.admin_client_cert" "greentic-admin-client-cert-${ENVIRONMENT_VALUE}"
+      import_gcp_secret_if_exists "${MODULE_ADDR}.google_secret_manager_secret.admin_client_key" "greentic-admin-client-key-${ENVIRONMENT_VALUE}"
+      import_gcp_secret_if_exists "${MODULE_ADDR}.google_secret_manager_secret.admin_relay_token" "greentic-admin-relay-token-${ENVIRONMENT_VALUE}"
       if [ -n "$BUNDLE_DIGEST_VALUE" ]; then
         NAME_PREFIX="$DEPLOYMENT_NAME_PREFIX_VALUE"
         if [ -z "$NAME_PREFIX" ]; then
