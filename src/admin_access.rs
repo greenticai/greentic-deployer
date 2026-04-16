@@ -260,9 +260,9 @@ pub fn render_admin_health_probe(value: &AdminHealthProbe, output: OutputFormat)
 }
 
 pub(crate) fn resolve_latest_deploy_dir(bundle_dir: &Path, provider: &str) -> Result<PathBuf> {
-    let mut candidates = vec![bundle_dir.join(".greentic").join("deploy").join(provider)];
-    if let Some(parent) = bundle_dir.parent() {
-        candidates.push(parent.join(".greentic").join("deploy").join(provider));
+    let mut candidates = Vec::new();
+    for ancestor in bundle_dir.ancestors() {
+        candidates.push(ancestor.join(".greentic").join("deploy").join(provider));
     }
     if let Some(home_dir) = env::var_os("HOME") {
         candidates.push(
@@ -302,9 +302,10 @@ pub(crate) fn resolve_latest_deploy_dir(bundle_dir: &Path, provider: &str) -> Re
 
     latest.map(|(_, path)| path).ok_or_else(|| {
         DeployerError::Other(format!(
-            "{} deploy state not found under {}, its parent workspace, or ~/.greentic/deploy/{}; deploy the bundle first",
+            "{} deploy state not found under {} or any parent workspace .greentic/deploy/{}, or ~/.greentic/deploy/{}; deploy the bundle first",
             provider,
             bundle_dir.join(".greentic").join("deploy").join(provider).display(),
+            provider,
             provider
         ))
     })
@@ -843,7 +844,8 @@ fn fetch_secret_value(
                 "az", "keyvault", "secret", "show", "--id", secret_ref, "--query", "value",
                 "--output", "tsv",
             ],
-        ),
+        )
+        .or_else(|_| azure_secret_value_from_terraform_state(info, secret_ref)),
         Provider::Gcp => {
             let (project_id, secret_name) = parse_gcp_secret_ref(secret_ref)?;
             cli_capture(
@@ -860,6 +862,7 @@ fn fetch_secret_value(
                     &secret_name,
                 ],
             )
+            .or_else(|_| gcp_secret_value_from_terraform_state(info, secret_ref))
         }
         other => Err(DeployerError::Other(format!(
             "admin cert materialization is only available for aws, azure, gcp; got {}",
@@ -903,6 +906,96 @@ fn parse_gcp_secret_ref(secret_ref: &str) -> Result<(String, String)> {
         .get(secret_idx + 1)
         .ok_or_else(|| DeployerError::Other(format!("invalid GCP secret ref: {secret_ref}")))?;
     Ok(((*project_id).to_string(), (*secret_name).to_string()))
+}
+
+fn gcp_secret_value_from_terraform_state(
+    info: &AdminAccessInfo,
+    secret_ref: &str,
+) -> Result<String> {
+    for state_path in [
+        info.deploy_dir.join("terraform").join("terraform.tfstate"),
+        info.deploy_dir
+            .join("terraform")
+            .join("terraform.tfstate.backup"),
+    ] {
+        if !state_path.is_file() {
+            continue;
+        }
+        let raw = fs::read_to_string(&state_path)?;
+        let state: Value = serde_json::from_str(&raw)?;
+        let Some(resources) = state.get("resources").and_then(Value::as_array) else {
+            continue;
+        };
+        for resource in resources {
+            if resource.get("type").and_then(Value::as_str)
+                != Some("google_secret_manager_secret_version")
+            {
+                continue;
+            }
+            let Some(instances) = resource.get("instances").and_then(Value::as_array) else {
+                continue;
+            };
+            for instance in instances {
+                let Some(attributes) = instance.get("attributes").and_then(Value::as_object) else {
+                    continue;
+                };
+                if attributes.get("secret").and_then(Value::as_str) != Some(secret_ref) {
+                    continue;
+                }
+                if let Some(secret_data) = attributes.get("secret_data").and_then(Value::as_str) {
+                    return Ok(secret_data.to_string());
+                }
+            }
+        }
+    }
+
+    Err(DeployerError::Other(format!(
+        "gcp secret value not found in terraform state for {secret_ref}"
+    )))
+}
+
+fn azure_secret_value_from_terraform_state(
+    info: &AdminAccessInfo,
+    secret_ref: &str,
+) -> Result<String> {
+    for state_path in [
+        info.deploy_dir.join("terraform").join("terraform.tfstate"),
+        info.deploy_dir
+            .join("terraform")
+            .join("terraform.tfstate.backup"),
+    ] {
+        if !state_path.is_file() {
+            continue;
+        }
+        let raw = fs::read_to_string(&state_path)?;
+        let state: Value = serde_json::from_str(&raw)?;
+        let Some(resources) = state.get("resources").and_then(Value::as_array) else {
+            continue;
+        };
+        for resource in resources {
+            if resource.get("type").and_then(Value::as_str) != Some("azurerm_key_vault_secret") {
+                continue;
+            }
+            let Some(instances) = resource.get("instances").and_then(Value::as_array) else {
+                continue;
+            };
+            for instance in instances {
+                let Some(attributes) = instance.get("attributes").and_then(Value::as_object) else {
+                    continue;
+                };
+                if attributes.get("versionless_id").and_then(Value::as_str) != Some(secret_ref) {
+                    continue;
+                }
+                if let Some(value) = attributes.get("value").and_then(Value::as_str) {
+                    return Ok(value.to_string());
+                }
+            }
+        }
+    }
+
+    Err(DeployerError::Other(format!(
+        "azure secret value not found in terraform state for {secret_ref}"
+    )))
 }
 
 fn host_from_url(value: &str) -> Option<String> {
@@ -1086,11 +1179,166 @@ mod tests {
     }
 
     #[test]
+    fn resolve_latest_deploy_dir_finds_state_in_repo_root_for_nested_bundle() {
+        let tmp = tempdir().expect("tempdir");
+        let bundle_dir = tmp.path().join("gcp3").join("cloud-deploy-demo-bundle");
+        let deploy_dir = tmp
+            .path()
+            .join(".greentic")
+            .join("deploy")
+            .join("gcp")
+            .join("demo")
+            .join("state");
+        fs::create_dir_all(&bundle_dir).expect("create bundle dir");
+        fs::create_dir_all(&deploy_dir).expect("create deploy dir");
+        fs::write(deploy_dir.join("terraform-outputs.json"), b"{}").expect("write outputs");
+
+        let resolved = resolve_latest_deploy_dir(&bundle_dir, "gcp").expect("resolve");
+        assert_eq!(resolved, deploy_dir);
+    }
+
+    #[test]
     fn parse_gcp_secret_ref_extracts_project_and_secret_name() {
         let (project_id, secret_name) =
             parse_gcp_secret_ref("projects/demo-project/secrets/admin-client-cert").expect("parse");
         assert_eq!(project_id, "demo-project");
         assert_eq!(secret_name, "admin-client-cert");
+    }
+
+    #[test]
+    fn gcp_secret_value_from_terraform_state_reads_secret_data() {
+        let tmp = tempdir().expect("tempdir");
+        let deploy_dir = tmp.path().join("deploy");
+        fs::create_dir_all(deploy_dir.join("terraform")).expect("create terraform dir");
+        fs::write(
+            deploy_dir.join("terraform").join("terraform.tfstate"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "resources": [
+                    {
+                        "type": "google_secret_manager_secret_version",
+                        "instances": [
+                            {
+                                "attributes": {
+                                    "secret": "projects/demo-project/secrets/admin-relay-token",
+                                    "secret_data": "demo-token"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write state");
+
+        let info = AdminAccessInfo {
+            provider: "gcp".to_string(),
+            bundle_dir: tmp.path().join("bundle"),
+            deploy_dir,
+            local_cert_dir: tmp.path().join("certs"),
+            admin_access_mode: None,
+            admin_public_endpoint: None,
+            operator_endpoint: None,
+            deployment_name_prefix: None,
+            operator_host: None,
+            provider_details: AdminProviderDetails::default(),
+            admin_listener: "127.0.0.1:8433".to_string(),
+            admin_secret_refs: AdminSecretRefs {
+                admin_ca_secret_ref: None,
+                admin_server_cert_secret_ref: None,
+                admin_server_key_secret_ref: None,
+                admin_client_cert_secret_ref: None,
+                admin_client_key_secret_ref: None,
+                admin_relay_token_secret_ref: None,
+            },
+            client_credentials_available: false,
+            missing_requirements: Vec::new(),
+            tunnel_support: AdminTunnelSupport {
+                supported: false,
+                mode: None,
+                reason: None,
+                command_hint: None,
+                local_port_default: 8443,
+            },
+            suggested_commands: Vec::new(),
+            curl_health_example: None,
+            notes: Vec::new(),
+        };
+
+        let value = gcp_secret_value_from_terraform_state(
+            &info,
+            "projects/demo-project/secrets/admin-relay-token",
+        )
+        .expect("read token");
+        assert_eq!(value, "demo-token");
+    }
+
+    #[test]
+    fn azure_secret_value_from_terraform_state_reads_value() {
+        let tmp = tempdir().expect("tempdir");
+        let deploy_dir = tmp.path().join("deploy");
+        fs::create_dir_all(deploy_dir.join("terraform")).expect("create terraform dir");
+        fs::write(
+            deploy_dir.join("terraform").join("terraform.tfstate"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "resources": [
+                    {
+                        "type": "azurerm_key_vault_secret",
+                        "instances": [
+                            {
+                                "attributes": {
+                                    "versionless_id": "https://vault.example.net/secrets/admin-relay-token",
+                                    "value": "demo-azure-token"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write state");
+
+        let info = AdminAccessInfo {
+            provider: "azure".to_string(),
+            bundle_dir: tmp.path().join("bundle"),
+            deploy_dir,
+            local_cert_dir: tmp.path().join("certs"),
+            admin_access_mode: None,
+            admin_public_endpoint: None,
+            operator_endpoint: None,
+            deployment_name_prefix: None,
+            operator_host: None,
+            provider_details: AdminProviderDetails::default(),
+            admin_listener: "127.0.0.1:8433".to_string(),
+            admin_secret_refs: AdminSecretRefs {
+                admin_ca_secret_ref: None,
+                admin_server_cert_secret_ref: None,
+                admin_server_key_secret_ref: None,
+                admin_client_cert_secret_ref: None,
+                admin_client_key_secret_ref: None,
+                admin_relay_token_secret_ref: None,
+            },
+            client_credentials_available: false,
+            missing_requirements: Vec::new(),
+            tunnel_support: AdminTunnelSupport {
+                supported: false,
+                mode: None,
+                reason: None,
+                command_hint: None,
+                local_port_default: 8443,
+            },
+            suggested_commands: Vec::new(),
+            curl_health_example: None,
+            notes: Vec::new(),
+        };
+
+        let value = azure_secret_value_from_terraform_state(
+            &info,
+            "https://vault.example.net/secrets/admin-relay-token",
+        )
+        .expect("read token");
+        assert_eq!(value, "demo-azure-token");
     }
 
     #[test]
