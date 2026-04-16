@@ -539,6 +539,9 @@ fn client_credentials_available(outputs: &Value) -> bool {
 
 fn missing_requirements(outputs: &Value, provider: Provider) -> Vec<String> {
     let mut missing = Vec::new();
+    let has_public_relay = matches!(provider, Provider::Azure | Provider::Gcp)
+        && terraform_output_string(outputs, "admin_public_endpoint").is_some()
+        && terraform_output_string(outputs, "admin_relay_token_secret_ref").is_some();
     if terraform_output_string(outputs, "admin_client_cert_secret_ref").is_none() {
         missing.push("admin client certificate reference".to_string());
     }
@@ -555,11 +558,7 @@ fn missing_requirements(outputs: &Value, provider: Provider) -> Vec<String> {
     {
         missing.push("public admin relay endpoint".to_string());
     }
-    if !tunnel_support_for_provider(provider).supported
-        && !(matches!(provider, Provider::Azure | Provider::Gcp)
-            && terraform_output_string(outputs, "admin_public_endpoint").is_some()
-            && terraform_output_string(outputs, "admin_relay_token_secret_ref").is_some())
-    {
+    if !(tunnel_support_for_provider(provider).supported || has_public_relay) {
         missing.push("cloud-side tunnel or controlled admin access path".to_string());
     }
     missing
@@ -581,9 +580,10 @@ fn suggested_commands(outputs: &Value, provider: Provider) -> Vec<String> {
                 commands.push(format!(
                     "aws ecs list-tasks --region {region} --cluster {cluster} --service-name {service}"
                 ));
-                commands.push(format!(
+                commands.push(
                     "greentic-deployer aws admin-tunnel --bundle-dir <BUNDLE_DIR> --local-port 8443"
-                ));
+                        .to_string(),
+                );
                 commands.push(
                     "curl --cacert <CERT_DIR>/ca.crt --cert <CERT_DIR>/client.crt --key <CERT_DIR>/client.key https://127.0.0.1:8443/admin/v1/health".to_string(),
                 );
