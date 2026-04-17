@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod cli_builtin_dispatch;
 
@@ -11,6 +11,7 @@ use greentic_deployer::ext;
 use greentic_deployer::{
     AwsAdminTunnelRequest, BuiltinBackendId, CloudTargetRequirementsV1, DeployerCapability,
     DeployerConfig, DeployerRequest, DeploymentExtensionSourceOptions, OutputFormat, Provider,
+    MaterializedAdminCerts,
     SingleVmApplyOptions, SingleVmDestroyOptions, SingleVmRenderSpecRequest,
     apply_single_vm_plan_output_with_options, aws, azure,
     destroy_single_vm_plan_output_with_options, gcp, helm, juju_k8s, juju_machine, k8s_raw,
@@ -18,7 +19,7 @@ use greentic_deployer::{
     materialize_admin_relay_token, operator, plan_single_vm_spec_path,
     preview_single_vm_apply_plan_output, preview_single_vm_destroy_plan_output, probe_admin_health,
     render_admin_access, render_admin_health_probe, render_materialized_admin_certs,
-    render_materialized_admin_relay_token, render_operation_result, render_single_vm_apply_report,
+    render_operation_result, render_single_vm_apply_report,
     render_single_vm_destroy_report, render_single_vm_plan_output, render_single_vm_status_report,
     resolve_admin_access,
     resolve_deployment_extension_contract_for_target_name_from_sources_with_options,
@@ -1683,7 +1684,16 @@ fn run_admin_access_command(provider: Provider, args: AdminAccessArgs) -> Result
 }
 
 fn run_admin_certs_command(provider: Provider, args: AdminAccessArgs) -> Result<()> {
-    let materialized = materialize_admin_client_certs(&args.bundle_dir, provider)?;
+    materialize_admin_client_certs(&args.bundle_dir, provider)?;
+    let info = resolve_admin_access(&args.bundle_dir, provider)?;
+    let cert_dir = info.local_cert_dir;
+    let materialized = MaterializedAdminCerts {
+        provider: provider.as_str().to_string(),
+        cert_dir: cert_dir.clone(),
+        ca_cert_path: cert_dir.join("ca.crt"),
+        client_cert_path: cert_dir.join("client.crt"),
+        client_key_path: cert_dir.join("client.key"),
+    };
     println!(
         "{}",
         render_materialized_admin_certs(&materialized, args.output.into())?
@@ -1693,11 +1703,41 @@ fn run_admin_certs_command(provider: Provider, args: AdminAccessArgs) -> Result<
 
 fn run_admin_token_command(provider: Provider, args: AdminAccessArgs) -> Result<()> {
     let token = materialize_admin_relay_token(&args.bundle_dir, provider)?;
+    let info = resolve_admin_access(&args.bundle_dir, provider)?;
+    std::fs::create_dir_all(&info.local_cert_dir)?;
+    let token_path = info.local_cert_dir.join("relay.token");
+    std::fs::write(&token_path, token)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))?;
+    }
     println!(
         "{}",
-        render_materialized_admin_relay_token(provider, &token, args.output.into())?
+        render_materialized_admin_relay_token_path(provider, &token_path, args.output.into())?
     );
     Ok(())
+}
+
+fn render_materialized_admin_relay_token_path(
+    provider: Provider,
+    token_path: &Path,
+    output: OutputFormat,
+) -> Result<String> {
+    let provider_name = provider.as_str();
+    let token_path = token_path.display().to_string();
+    match output {
+        OutputFormat::Text => Ok(format!("provider: {provider_name}\ntoken_path: {token_path}")),
+        OutputFormat::Json => Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "provider": provider_name,
+            "token_path": token_path,
+        }))?),
+        OutputFormat::Yaml => Ok(serde_yaml::to_string(&serde_json::json!({
+            "provider": provider_name,
+            "token_path": token_path,
+        }))?),
+    }
 }
 
 fn run_admin_health_command(provider: Provider, args: AdminAccessArgs) -> Result<()> {
