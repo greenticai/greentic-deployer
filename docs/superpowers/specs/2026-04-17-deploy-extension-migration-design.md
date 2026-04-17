@@ -360,27 +360,29 @@ Host (Rust)                                       WASM (extension)
 
 ### 5.4 Canonical `BuiltinBackendId` strings
 
-`execution.builtin.backend` must be one of the existing `BuiltinBackendId` variant names (case-sensitive, CamelCase):
+`execution.builtin.backend` must be one of the existing `BuiltinBackendId` variant names as serialized by `#[serde(rename_all = "snake_case")]` (i.e. lowercase with underscores). Case-sensitive.
 
-| Backend | Handlers supported | Notes |
-| --- | --- | --- |
-| `Desktop` **(new in Phase A)** | `docker-compose`, `podman` | New `BuiltinBackendId::Desktop` + `src/desktop.rs` backend |
-| `SingleVm` | `None` (single handler) | Existing |
-| `Aws` | `eks`, `ecs-fargate`, `lambda-container` (subset of current aws.rs capabilities) | Existing |
-| `Azure` | `container-apps`, `aks` | Existing |
-| `Gcp` | `cloud-run`, `gke` | Existing |
-| `Terraform` | `None` | Existing |
-| `Helm` | `None` | Existing |
-| `K8sRaw` | `None` | Existing |
-| `JujuK8s` | `None` | Existing |
-| `JujuMachine` | `None` | Existing |
-| `Operator` | `None` | Existing |
-| `Serverless` | `None` | Existing |
-| `Snap` | `None` | Existing |
+| Backend string | Variant | Handlers supported | Notes |
+| --- | --- | --- | --- |
+| `desktop` **(new in Phase A)** | `Desktop` | `docker-compose`, `podman` | New variant + `src/desktop.rs` backend |
+| `aws` | `Aws` | None (Phase A: single handler) | Existing |
+| `azure` | `Azure` | None | Existing |
+| `gcp` | `Gcp` | None | Existing |
+| `terraform` | `Terraform` | None | Existing |
+| `helm` | `Helm` | None | Existing |
+| `k8s_raw` | `K8sRaw` | None | Existing |
+| `juju_k8s` | `JujuK8s` | None | Existing |
+| `juju_machine` | `JujuMachine` | None | Existing |
+| `operator` | `Operator` | None | Existing |
+| `serverless` | `Serverless` | None | Existing |
+| `snap` | `Snap` | None | Existing |
+
+`SingleVm` is NOT in `BuiltinBackendId` today — it dispatches via its own CLI subcommand path (`src/single_vm.rs`), not through pack-based dispatch. Extensions that want to target single-vm deploys would need Phase B custom execution or a separate bridge path (deferred).
 
 Implementation additions needed:
-- `impl FromStr for BuiltinBackendId` (if not already present).
-- `fn BuiltinBackendId::handler_matches(&self, handler: Option<&str>) -> bool` for registry-build-time validation.
+- `impl FromStr for BuiltinBackendId` (not present on `main`).
+- `fn BuiltinBackendId::as_str(self) -> &'static str` mirror of serde serialization.
+- `fn BuiltinBackendId::handler_matches(&self, Option<&str>) -> bool` for registry-build-time validation.
 
 ## 6. Error handling
 
