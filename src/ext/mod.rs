@@ -13,3 +13,4 @@ pub mod dispatcher;
 pub mod cli;
 
 pub use errors::ExtensionError;
+pub use registry::ExtensionRegistry;
