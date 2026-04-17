@@ -15,6 +15,7 @@ categories = ["development-tools"]
 [features]
 default = []
 internal-tools = []
+test-utils = []
 extensions = [
     "dep:greentic-ext-runtime",
     "dep:greentic-ext-contract",
