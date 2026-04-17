@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use serde_yaml_bw as serde_yaml;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
@@ -1727,7 +1728,9 @@ fn render_materialized_admin_relay_token_path(
     let provider_name = provider.as_str();
     let token_path = token_path.display().to_string();
     match output {
-        OutputFormat::Text => Ok(format!("provider: {provider_name}\ntoken_path: {token_path}")),
+        OutputFormat::Text => Ok(format!(
+            "provider: {provider_name}\ntoken_path: {token_path}"
+        )),
         OutputFormat::Json => Ok(serde_json::to_string_pretty(&serde_json::json!({
             "provider": provider_name,
             "token_path": token_path,
