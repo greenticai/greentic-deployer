@@ -23,6 +23,7 @@ pub enum BuiltinBackendId {
     Operator,
     Serverless,
     Snap,
+    Desktop,
 }
 
 impl BuiltinBackendId {
@@ -39,16 +40,19 @@ impl BuiltinBackendId {
             Self::Operator    => "operator",
             Self::Serverless  => "serverless",
             Self::Snap        => "snap",
+            Self::Desktop     => "desktop",
         }
     }
 
     /// Return `true` iff this backend accepts the given handler string.
-    /// Phase A: every existing backend has a single implicit handler; `None`
-    /// always matches and any other value is rejected.
-    /// Re-evaluate when a backend grows multi-handler dispatch.
+    /// Desktop accepts `None`, `"docker-compose"`, or `"podman"`.
+    /// All other backends have a single implicit handler; `None` matches
+    /// and any explicit value is rejected.
     pub fn handler_matches(self, handler: Option<&str>) -> bool {
-        let _ = self;
-        handler.is_none()
+        match self {
+            Self::Desktop => matches!(handler, None | Some("docker-compose") | Some("podman")),
+            _ => handler.is_none(),
+        }
     }
 }
 
@@ -68,6 +72,7 @@ impl std::str::FromStr for BuiltinBackendId {
             "operator"     => Self::Operator,
             "serverless"   => Self::Serverless,
             "snap"         => Self::Snap,
+            "desktop"      => Self::Desktop,
             other => return Err(UnknownBuiltinBackendStr(other.to_string())),
         })
     }
@@ -99,6 +104,7 @@ pub enum BuiltinBackendHandlerId {
     Operator,
     Serverless,
     Snap,
+    Desktop,
 }
 
 impl BuiltinBackendHandlerId {
@@ -115,6 +121,7 @@ impl BuiltinBackendHandlerId {
             Self::Operator => "operator",
             Self::Serverless => "serverless",
             Self::Snap => "snap",
+            Self::Desktop => "desktop",
         }
     }
 }
@@ -888,5 +895,20 @@ mod ext_roundtrip_tests {
     #[test]
     fn handler_matches_rejects_unknown_for_all_existing() {
         assert!(!BuiltinBackendId::Aws.handler_matches(Some("eks")));
+    }
+
+    #[test]
+    fn desktop_variant_roundtrip() {
+        use std::str::FromStr;
+        assert_eq!(BuiltinBackendId::from_str("desktop").unwrap(), BuiltinBackendId::Desktop);
+        assert_eq!(BuiltinBackendId::Desktop.as_str(), "desktop");
+    }
+
+    #[test]
+    fn desktop_handler_matches_docker_compose_and_podman() {
+        assert!(BuiltinBackendId::Desktop.handler_matches(Some("docker-compose")));
+        assert!(BuiltinBackendId::Desktop.handler_matches(Some("podman")));
+        assert!(!BuiltinBackendId::Desktop.handler_matches(Some("kubernetes")));
+        assert!(BuiltinBackendId::Desktop.handler_matches(None));
     }
 }

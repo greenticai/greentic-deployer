@@ -83,4 +83,25 @@ mod tests {
         let err = resolve(&exec, "t").unwrap_err();
         assert!(matches!(err, ExtensionError::ModeBNotImplemented));
     }
+
+    #[test]
+    fn resolve_desktop_with_docker_compose_handler() {
+        let exec = Execution::Builtin {
+            backend: "desktop".into(),
+            handler: Some("docker-compose".into()),
+        };
+        let r = resolve(&exec, "docker-compose-local").unwrap();
+        assert_eq!(r.backend, BuiltinBackendId::Desktop);
+        assert_eq!(r.handler.as_deref(), Some("docker-compose"));
+    }
+
+    #[test]
+    fn resolve_desktop_rejects_kubernetes_handler() {
+        let exec = Execution::Builtin {
+            backend: "desktop".into(),
+            handler: Some("kubernetes".into()),
+        };
+        let err = resolve(&exec, "x").unwrap_err();
+        assert!(matches!(err, ExtensionError::UnsupportedHandler { .. }));
+    }
 }
