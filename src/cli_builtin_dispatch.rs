@@ -194,3 +194,32 @@ pub(crate) fn dispatch_builtin_backend_command(command: BuiltinBackendCommand) -
     })?;
     handler(command)
 }
+
+#[cfg(feature = "extensions")]
+pub fn maybe_dispatch_via_extensions(target_id: &str) -> anyhow::Result<()> {
+    use std::str::FromStr;
+
+    if greentic_deployer::extension::BuiltinBackendId::from_str(target_id).is_ok() {
+        anyhow::bail!(
+            "target '{}' is a built-in backend — use the dedicated subcommand",
+            target_id
+        );
+    }
+
+    let dir = greentic_deployer::ext::loader::resolve_extension_dir(None);
+    let loaded = greentic_deployer::ext::loader::scan(&dir)
+        .map_err(|e| anyhow::anyhow!("load extensions: {e}"))?;
+    let reg = greentic_deployer::ext::registry::ExtensionRegistry::build(loaded);
+    let resolved = reg
+        .resolve(target_id)
+        .map_err(|e| anyhow::anyhow!("resolve '{target_id}': {e}"))?;
+    tracing::info!(
+        target_id = %target_id,
+        ext_id = %resolved.ext_id,
+        "extension target resolved; wiring into execution is PR#2 scope"
+    );
+    anyhow::bail!(
+        "extension-provided target '{target_id}' requires PR#2 (deploy-desktop); \
+         see docs/superpowers/plans/2026-04-17-deploy-extension-pr1.md"
+    )
+}
