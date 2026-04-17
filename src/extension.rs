@@ -23,7 +23,64 @@ pub enum BuiltinBackendId {
     Operator,
     Serverless,
     Snap,
+    Desktop,
 }
+
+impl BuiltinBackendId {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Terraform => "terraform",
+            Self::K8sRaw => "k8s_raw",
+            Self::Helm => "helm",
+            Self::Aws => "aws",
+            Self::Azure => "azure",
+            Self::Gcp => "gcp",
+            Self::JujuK8s => "juju_k8s",
+            Self::JujuMachine => "juju_machine",
+            Self::Operator => "operator",
+            Self::Serverless => "serverless",
+            Self::Snap => "snap",
+            Self::Desktop => "desktop",
+        }
+    }
+
+    /// Return `true` iff this backend accepts the given handler string.
+    /// Desktop accepts `None`, `"docker-compose"`, or `"podman"`.
+    /// All other backends have a single implicit handler; `None` matches
+    /// and any explicit value is rejected.
+    pub fn handler_matches(self, handler: Option<&str>) -> bool {
+        match self {
+            Self::Desktop => matches!(handler, None | Some("docker-compose") | Some("podman")),
+            _ => handler.is_none(),
+        }
+    }
+}
+
+impl std::str::FromStr for BuiltinBackendId {
+    type Err = UnknownBuiltinBackendStr;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(match s {
+            "terraform" => Self::Terraform,
+            "k8s_raw" => Self::K8sRaw,
+            "helm" => Self::Helm,
+            "aws" => Self::Aws,
+            "azure" => Self::Azure,
+            "gcp" => Self::Gcp,
+            "juju_k8s" => Self::JujuK8s,
+            "juju_machine" => Self::JujuMachine,
+            "operator" => Self::Operator,
+            "serverless" => Self::Serverless,
+            "snap" => Self::Snap,
+            "desktop" => Self::Desktop,
+            other => return Err(UnknownBuiltinBackendStr(other.to_string())),
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("unknown builtin backend id: '{0}'")]
+pub struct UnknownBuiltinBackendStr(pub String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +104,7 @@ pub enum BuiltinBackendHandlerId {
     Operator,
     Serverless,
     Snap,
+    Desktop,
 }
 
 impl BuiltinBackendHandlerId {
@@ -63,6 +121,7 @@ impl BuiltinBackendHandlerId {
             Self::Operator => "operator",
             Self::Serverless => "serverless",
             Self::Snap => "snap",
+            Self::Desktop => "desktop",
         }
     }
 }
@@ -781,5 +840,78 @@ mod tests {
                 .iter()
                 .any(|contract| contract.extension.id == "builtin.single_vm.core")
         );
+    }
+}
+
+#[cfg(test)]
+mod ext_roundtrip_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn from_str_all_variants_roundtrip() {
+        let cases = [
+            ("terraform", BuiltinBackendId::Terraform),
+            ("k8s_raw", BuiltinBackendId::K8sRaw),
+            ("helm", BuiltinBackendId::Helm),
+            ("aws", BuiltinBackendId::Aws),
+            ("azure", BuiltinBackendId::Azure),
+            ("gcp", BuiltinBackendId::Gcp),
+            ("juju_k8s", BuiltinBackendId::JujuK8s),
+            ("juju_machine", BuiltinBackendId::JujuMachine),
+            ("operator", BuiltinBackendId::Operator),
+            ("serverless", BuiltinBackendId::Serverless),
+            ("snap", BuiltinBackendId::Snap),
+        ];
+        for (s, expected) in cases {
+            assert_eq!(BuiltinBackendId::from_str(s).unwrap(), expected);
+            assert_eq!(expected.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn from_str_rejects_unknown() {
+        let err = BuiltinBackendId::from_str("mystery").unwrap_err();
+        assert!(err.to_string().contains("mystery"));
+    }
+
+    #[test]
+    fn from_str_is_case_sensitive() {
+        assert!(BuiltinBackendId::from_str("AWS").is_err());
+        assert!(BuiltinBackendId::from_str("Terraform").is_err());
+    }
+
+    #[test]
+    fn handler_matches_permits_none_for_all() {
+        for b in [
+            BuiltinBackendId::Terraform,
+            BuiltinBackendId::Aws,
+            BuiltinBackendId::Helm,
+        ] {
+            assert!(b.handler_matches(None));
+        }
+    }
+
+    #[test]
+    fn handler_matches_rejects_unknown_for_all_existing() {
+        assert!(!BuiltinBackendId::Aws.handler_matches(Some("eks")));
+    }
+
+    #[test]
+    fn desktop_variant_roundtrip() {
+        use std::str::FromStr;
+        assert_eq!(
+            BuiltinBackendId::from_str("desktop").unwrap(),
+            BuiltinBackendId::Desktop
+        );
+        assert_eq!(BuiltinBackendId::Desktop.as_str(), "desktop");
+    }
+
+    #[test]
+    fn desktop_handler_matches_docker_compose_and_podman() {
+        assert!(BuiltinBackendId::Desktop.handler_matches(Some("docker-compose")));
+        assert!(BuiltinBackendId::Desktop.handler_matches(Some("podman")));
+        assert!(!BuiltinBackendId::Desktop.handler_matches(Some("kubernetes")));
+        assert!(BuiltinBackendId::Desktop.handler_matches(None));
     }
 }

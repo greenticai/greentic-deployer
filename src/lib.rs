@@ -11,6 +11,7 @@ pub mod azure;
 pub mod config;
 pub mod contract;
 pub mod deployment;
+pub mod desktop;
 pub mod error;
 pub mod extension;
 pub mod extension_sources;
@@ -114,3 +115,6 @@ pub use spec::{
     ServiceManager, ServiceSpec, StorageSpec,
 };
 pub use terraform::TerraformRequest;
+
+#[cfg(feature = "extensions")]
+pub mod ext;

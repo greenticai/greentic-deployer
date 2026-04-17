@@ -1,9 +1,13 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use serde_yaml_bw as serde_yaml;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod cli_builtin_dispatch;
+
+#[cfg(feature = "extensions")]
+use greentic_deployer::ext;
 
 use greentic_deployer::{
     AwsAdminTunnelRequest, BuiltinBackendId, CloudTargetRequirementsV1, DeployerCapability,
@@ -14,8 +18,7 @@ use greentic_deployer::{
     list_deployment_extension_contracts_from_sources_with_options, materialize_admin_client_certs,
     materialize_admin_relay_token, operator, plan_single_vm_spec_path,
     preview_single_vm_apply_plan_output, preview_single_vm_destroy_plan_output, probe_admin_health,
-    render_admin_access, render_admin_health_probe, render_materialized_admin_certs,
-    render_materialized_admin_relay_token, render_operation_result, render_single_vm_apply_report,
+    render_admin_health_probe, render_operation_result, render_single_vm_apply_report,
     render_single_vm_destroy_report, render_single_vm_plan_output, render_single_vm_status_report,
     resolve_admin_access,
     resolve_deployment_extension_contract_for_target_name_from_sources_with_options,
@@ -48,6 +51,8 @@ enum TopLevelCommand {
     Serverless(ServerlessCommand),
     Snap(SnapCommand),
     Terraform(TerraformCommand),
+    #[cfg(feature = "extensions")]
+    Ext(ext::cli::ExtCommand),
 }
 
 enum BuiltinBackendCommand {
@@ -1212,6 +1217,11 @@ fn main() -> Result<()> {
                 BuiltinBackendCommand::Terraform(command),
             )
         }
+        #[cfg(feature = "extensions")]
+        TopLevelCommand::Ext(cmd) => {
+            ext::cli::run(cmd).map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(())
+        }
     }
 }
 
@@ -1668,26 +1678,99 @@ fn run_gcp(command: GcpCommand) -> Result<()> {
 
 fn run_admin_access_command(provider: Provider, args: AdminAccessArgs) -> Result<()> {
     let info = resolve_admin_access(&args.bundle_dir, provider)?;
-    println!("{}", render_admin_access(&info, args.output.into())?);
+    println!(
+        "{}",
+        render_admin_access_summary(provider, info.tunnel_support.supported, args.output.into(),)?
+    );
     Ok(())
 }
 
 fn run_admin_certs_command(provider: Provider, args: AdminAccessArgs) -> Result<()> {
-    let materialized = materialize_admin_client_certs(&args.bundle_dir, provider)?;
+    materialize_admin_client_certs(&args.bundle_dir, provider)?;
     println!(
         "{}",
-        render_materialized_admin_certs(&materialized, args.output.into())?
+        render_admin_certs_summary(provider, args.output.into())?
     );
     Ok(())
 }
 
 fn run_admin_token_command(provider: Provider, args: AdminAccessArgs) -> Result<()> {
     let token = materialize_admin_relay_token(&args.bundle_dir, provider)?;
+    let info = resolve_admin_access(&args.bundle_dir, provider)?;
+    std::fs::create_dir_all(&info.local_cert_dir)?;
+    let token_path = info.local_cert_dir.join("relay.token");
+    std::fs::write(&token_path, token)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))?;
+    }
     println!(
         "{}",
-        render_materialized_admin_relay_token(provider, &token, args.output.into())?
+        render_materialized_admin_relay_token_path(provider, &token_path, args.output.into())?
     );
     Ok(())
+}
+
+fn render_materialized_admin_relay_token_path(
+    provider: Provider,
+    token_path: &Path,
+    output: OutputFormat,
+) -> Result<String> {
+    let provider_name = provider.as_str();
+    let token_path = token_path.display().to_string();
+    match output {
+        OutputFormat::Text => Ok(format!(
+            "provider: {provider_name}\ntoken_path: {token_path}"
+        )),
+        OutputFormat::Json => Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "provider": provider_name,
+            "token_path": token_path,
+        }))?),
+        OutputFormat::Yaml => Ok(serde_yaml::to_string(&serde_json::json!({
+            "provider": provider_name,
+            "token_path": token_path,
+        }))?),
+    }
+}
+
+fn render_admin_access_summary(
+    provider: Provider,
+    tunnel_supported: bool,
+    output: OutputFormat,
+) -> Result<String> {
+    let provider_name = provider.as_str();
+    match output {
+        OutputFormat::Text => Ok(format!(
+            "provider: {provider_name}\ntunnel_supported: {tunnel_supported}"
+        )),
+        OutputFormat::Json => Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "provider": provider_name,
+            "tunnel_supported": tunnel_supported,
+        }))?),
+        OutputFormat::Yaml => Ok(serde_yaml::to_string(&serde_json::json!({
+            "provider": provider_name,
+            "tunnel_supported": tunnel_supported,
+        }))?),
+    }
+}
+
+fn render_admin_certs_summary(provider: Provider, output: OutputFormat) -> Result<String> {
+    let provider_name = provider.as_str();
+    match output {
+        OutputFormat::Text => Ok(format!(
+            "provider: {provider_name}\ncerts_materialized: true"
+        )),
+        OutputFormat::Json => Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "provider": provider_name,
+            "certs_materialized": true,
+        }))?),
+        OutputFormat::Yaml => Ok(serde_yaml::to_string(&serde_json::json!({
+            "provider": provider_name,
+            "certs_materialized": true,
+        }))?),
+    }
 }
 
 fn run_admin_health_command(provider: Provider, args: AdminAccessArgs) -> Result<()> {

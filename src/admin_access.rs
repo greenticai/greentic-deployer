@@ -197,15 +197,15 @@ pub fn materialize_admin_relay_token(bundle_dir: &Path, provider: Provider) -> R
 
 pub fn render_materialized_admin_relay_token(
     provider: Provider,
-    token: &str,
+    _token: &str,
     output: OutputFormat,
 ) -> Result<String> {
     let value = MaterializedAdminRelayToken {
         provider: provider.as_str().to_string(),
-        token: token.to_string(),
+        token: "[REDACTED]".to_string(),
     };
     match output {
-        OutputFormat::Text => Ok(value.token),
+        OutputFormat::Text => Ok("[REDACTED]".to_string()),
         OutputFormat::Json => serde_json::to_string_pretty(&value)
             .map_err(|err| DeployerError::Other(err.to_string())),
         OutputFormat::Yaml => {
@@ -1356,5 +1356,17 @@ mod tests {
         assert!(rendered.contains("ca_cert_path: /tmp/demo/ca.crt"));
         assert!(rendered.contains("client_cert_path: /tmp/demo/client.crt"));
         assert!(rendered.contains("client_key_path: /tmp/demo/client.key"));
+    }
+
+    #[test]
+    fn render_materialized_admin_relay_token_redacts_secret_value() {
+        let rendered = render_materialized_admin_relay_token(
+            Provider::Aws,
+            "super-secret-token",
+            OutputFormat::Json,
+        )
+        .expect("render");
+        assert!(rendered.contains("\"token\": \"[REDACTED]\""));
+        assert!(!rendered.contains("super-secret-token"));
     }
 }
