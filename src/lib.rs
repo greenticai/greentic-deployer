@@ -10,6 +10,7 @@ pub mod aws;
 pub mod azure;
 pub mod config;
 pub mod contract;
+pub mod desktop;
 pub mod deployment;
 pub mod error;
 pub mod extension;
