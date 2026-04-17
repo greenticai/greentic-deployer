@@ -74,7 +74,7 @@ jobs:
           fi
           echo "value=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.94.0
         with:
           toolchain: 1.91.1
           targets: ${{ matrix.target }}
@@ -153,7 +153,7 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.94.0
         with:
           toolchain: 1.91.1
       - uses: Swatinem/rust-cache@v2
