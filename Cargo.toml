@@ -71,6 +71,10 @@ required-features = ["extensions"]
 name = "ext_dispatch"
 required-features = ["extensions", "test-utils"]
 
+[[test]]
+name = "ext_cli"
+required-features = ["extensions"]
+
 [dev-dependencies]
 tempfile = "3"
 wat = "1"
