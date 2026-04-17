@@ -1680,11 +1680,7 @@ fn run_admin_access_command(provider: Provider, args: AdminAccessArgs) -> Result
     let info = resolve_admin_access(&args.bundle_dir, provider)?;
     println!(
         "{}",
-        render_admin_access_summary(
-            provider,
-            info.tunnel_support.supported,
-            args.output.into(),
-        )?
+        render_admin_access_summary(provider, info.tunnel_support.supported, args.output.into(),)?
     );
     Ok(())
 }
@@ -1763,7 +1759,9 @@ fn render_admin_access_summary(
 fn render_admin_certs_summary(provider: Provider, output: OutputFormat) -> Result<String> {
     let provider_name = provider.as_str();
     match output {
-        OutputFormat::Text => Ok(format!("provider: {provider_name}\ncerts_materialized: true")),
+        OutputFormat::Text => Ok(format!(
+            "provider: {provider_name}\ncerts_materialized: true"
+        )),
         OutputFormat::Json => Ok(serde_json::to_string_pretty(&serde_json::json!({
             "provider": provider_name,
             "certs_materialized": true,
