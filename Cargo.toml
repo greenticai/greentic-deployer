@@ -15,6 +15,10 @@ categories = ["development-tools"]
 [features]
 default = []
 internal-tools = []
+extensions = [
+    "dep:greentic-ext-runtime",
+    "dep:greentic-ext-contract",
+]
 
 [[bin]]
 name = "greentic-deployer"
@@ -54,6 +58,8 @@ reqwest = { version = "0.13", features = ["blocking", "json", "rustls"] }
 toml = "0.9"
 indexmap = "2"
 jsonschema = "0.45"
+greentic-ext-runtime  = { git = "ssh://git@github.com/greentic-biz/greentic-designer-extensions", branch = "feat/foundation", optional = true, package = "greentic-ext-runtime" }
+greentic-ext-contract = { git = "ssh://git@github.com/greentic-biz/greentic-designer-extensions", branch = "feat/foundation", optional = true, package = "greentic-ext-contract" }
 
 [dev-dependencies]
 tempfile = "3"
