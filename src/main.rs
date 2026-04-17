@@ -11,15 +11,13 @@ use greentic_deployer::ext;
 use greentic_deployer::{
     AwsAdminTunnelRequest, BuiltinBackendId, CloudTargetRequirementsV1, DeployerCapability,
     DeployerConfig, DeployerRequest, DeploymentExtensionSourceOptions, OutputFormat, Provider,
-    MaterializedAdminCerts,
     SingleVmApplyOptions, SingleVmDestroyOptions, SingleVmRenderSpecRequest,
     apply_single_vm_plan_output_with_options, aws, azure,
     destroy_single_vm_plan_output_with_options, gcp, helm, juju_k8s, juju_machine, k8s_raw,
     list_deployment_extension_contracts_from_sources_with_options, materialize_admin_client_certs,
     materialize_admin_relay_token, operator, plan_single_vm_spec_path,
     preview_single_vm_apply_plan_output, preview_single_vm_destroy_plan_output, probe_admin_health,
-    render_admin_access, render_admin_health_probe, render_materialized_admin_certs,
-    render_operation_result, render_single_vm_apply_report,
+    render_admin_health_probe, render_operation_result, render_single_vm_apply_report,
     render_single_vm_destroy_report, render_single_vm_plan_output, render_single_vm_status_report,
     resolve_admin_access,
     resolve_deployment_extension_contract_for_target_name_from_sources_with_options,
@@ -1679,24 +1677,25 @@ fn run_gcp(command: GcpCommand) -> Result<()> {
 
 fn run_admin_access_command(provider: Provider, args: AdminAccessArgs) -> Result<()> {
     let info = resolve_admin_access(&args.bundle_dir, provider)?;
-    println!("{}", render_admin_access(&info, args.output.into())?);
+    println!(
+        "{}",
+        render_admin_access_summary(
+            provider,
+            info.local_cert_dir.as_path(),
+            info.admin_public_endpoint.as_deref(),
+            info.tunnel_support.supported,
+            args.output.into(),
+        )?
+    );
     Ok(())
 }
 
 fn run_admin_certs_command(provider: Provider, args: AdminAccessArgs) -> Result<()> {
     materialize_admin_client_certs(&args.bundle_dir, provider)?;
     let info = resolve_admin_access(&args.bundle_dir, provider)?;
-    let cert_dir = info.local_cert_dir;
-    let materialized = MaterializedAdminCerts {
-        provider: provider.as_str().to_string(),
-        cert_dir: cert_dir.clone(),
-        ca_cert_path: cert_dir.join("ca.crt"),
-        client_cert_path: cert_dir.join("client.crt"),
-        client_key_path: cert_dir.join("client.key"),
-    };
     println!(
         "{}",
-        render_materialized_admin_certs(&materialized, args.output.into())?
+        render_admin_certs_summary(provider, info.local_cert_dir.as_path(), args.output.into())?
     );
     Ok(())
 }
@@ -1736,6 +1735,66 @@ fn render_materialized_admin_relay_token_path(
         OutputFormat::Yaml => Ok(serde_yaml::to_string(&serde_json::json!({
             "provider": provider_name,
             "token_path": token_path,
+        }))?),
+    }
+}
+
+fn render_admin_access_summary(
+    provider: Provider,
+    local_cert_dir: &Path,
+    admin_public_endpoint: Option<&str>,
+    tunnel_supported: bool,
+    output: OutputFormat,
+) -> Result<String> {
+    let provider_name = provider.as_str();
+    let cert_dir = local_cert_dir.display().to_string();
+    match output {
+        OutputFormat::Text => Ok(format!(
+            "provider: {provider_name}\nlocal_cert_dir: {cert_dir}\nadmin_public_endpoint: {}\ntunnel_supported: {tunnel_supported}",
+            admin_public_endpoint.unwrap_or("(missing)")
+        )),
+        OutputFormat::Json => Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "provider": provider_name,
+            "local_cert_dir": cert_dir,
+            "admin_public_endpoint": admin_public_endpoint,
+            "tunnel_supported": tunnel_supported,
+        }))?),
+        OutputFormat::Yaml => Ok(serde_yaml::to_string(&serde_json::json!({
+            "provider": provider_name,
+            "local_cert_dir": cert_dir,
+            "admin_public_endpoint": admin_public_endpoint,
+            "tunnel_supported": tunnel_supported,
+        }))?),
+    }
+}
+
+fn render_admin_certs_summary(
+    provider: Provider,
+    local_cert_dir: &Path,
+    output: OutputFormat,
+) -> Result<String> {
+    let provider_name = provider.as_str();
+    let cert_dir = local_cert_dir.display().to_string();
+    let ca_cert_path = local_cert_dir.join("ca.crt").display().to_string();
+    let client_cert_path = local_cert_dir.join("client.crt").display().to_string();
+    let client_key_path = local_cert_dir.join("client.key").display().to_string();
+    match output {
+        OutputFormat::Text => Ok(format!(
+            "provider: {provider_name}\ncert_dir: {cert_dir}\nca_cert_path: {ca_cert_path}\nclient_cert_path: {client_cert_path}\nclient_key_path: {client_key_path}"
+        )),
+        OutputFormat::Json => Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "provider": provider_name,
+            "cert_dir": cert_dir,
+            "ca_cert_path": ca_cert_path,
+            "client_cert_path": client_cert_path,
+            "client_key_path": client_key_path,
+        }))?),
+        OutputFormat::Yaml => Ok(serde_yaml::to_string(&serde_json::json!({
+            "provider": provider_name,
+            "cert_dir": cert_dir,
+            "ca_cert_path": ca_cert_path,
+            "client_cert_path": client_cert_path,
+            "client_key_path": client_key_path,
         }))?),
     }
 }
