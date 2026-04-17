@@ -196,6 +196,7 @@ pub(crate) fn dispatch_builtin_backend_command(command: BuiltinBackendCommand) -
 }
 
 #[cfg(feature = "extensions")]
+#[allow(dead_code)]
 pub fn maybe_dispatch_via_extensions(target_id: &str) -> anyhow::Result<()> {
     use std::str::FromStr;
 

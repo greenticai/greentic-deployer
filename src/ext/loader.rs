@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::ext::describe::{parse_describe, DeployExtensionDescribe};
+use crate::ext::describe::{DeployExtensionDescribe, parse_describe};
 use crate::ext::errors::{ExtensionError, ExtensionResult};
 
 /// Default on-disk root for deploy extensions.
@@ -27,17 +27,20 @@ fn resolve_extension_dir_with_env(
     if let Some(p) = explicit {
         return p.to_path_buf();
     }
-    if let Some(e) = env_lookup(DEFAULT_DIR_ENV) {
-        if !e.is_empty() {
-            return PathBuf::from(e);
-        }
+    if let Some(e) = env_lookup(DEFAULT_DIR_ENV)
+        && !e.is_empty()
+    {
+        return PathBuf::from(e);
     }
     dirs_root_default()
 }
 
 fn dirs_root_default() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".greentic").join("extensions").join("deploy");
+        return PathBuf::from(home)
+            .join(".greentic")
+            .join("extensions")
+            .join("deploy");
     }
     PathBuf::from("/var/empty/greentic/extensions/deploy")
 }
@@ -54,7 +57,8 @@ pub fn scan(dir: &Path) -> ExtensionResult<Vec<LoadedExtension>> {
         return Err(ExtensionError::DirNotFound(dir.to_path_buf()));
     }
     let mut out = Vec::new();
-    let entries = std::fs::read_dir(dir).map_err(|_| ExtensionError::DirNotFound(dir.to_path_buf()))?;
+    let entries =
+        std::fs::read_dir(dir).map_err(|_| ExtensionError::DirNotFound(dir.to_path_buf()))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {

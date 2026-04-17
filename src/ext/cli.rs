@@ -41,7 +41,7 @@ fn run_list(dir: &Path) -> ExtensionResult<()> {
     let reg = ExtensionRegistry::build(loaded);
     let mut targets: Vec<_> = reg.list().collect();
     targets.sort_by(|a, b| a.contribution.id.cmp(&b.contribution.id));
-    println!("{:<30}  {:<30}  {}", "TARGET", "EXTENSION", "EXECUTION");
+    println!("{:<30}  {:<30}  {:<30}", "TARGET", "EXTENSION", "EXECUTION");
     for t in targets {
         let exec = match &t.contribution.execution {
             crate::ext::describe::Execution::Builtin { backend, handler } => match handler {
@@ -53,7 +53,10 @@ fn run_list(dir: &Path) -> ExtensionResult<()> {
         println!("{:<30}  {:<30}  {}", t.contribution.id, t.ext_id, exec);
     }
     if !reg.conflicts().is_empty() {
-        eprintln!("\nWARNING: {} target id conflict(s) detected.", reg.conflicts().len());
+        eprintln!(
+            "\nWARNING: {} target id conflict(s) detected.",
+            reg.conflicts().len()
+        );
         for c in reg.conflicts() {
             eprintln!("  {} provided by: {:?}", c.target_id, c.providers);
         }
