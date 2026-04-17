@@ -4,7 +4,7 @@
 //! extension flow (`src/ext/`) via the `desktop` backend id.
 
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -162,9 +162,6 @@ pub fn preflight_check(runtime: RuntimeKind) -> Result<()> {
     }
     Ok(())
 }
-
-#[allow(dead_code)]
-fn _suppress_unused_path(_p: &Path) {}
 
 #[cfg(test)]
 mod tests {

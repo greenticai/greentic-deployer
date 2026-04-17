@@ -2,6 +2,9 @@ use std::path::Path;
 
 use crate::ext::errors::{ExtensionError, ExtensionResult};
 
+// Re-export so existing call sites using `crate::ext::wasm::Diagnostic` keep working.
+pub use crate::ext::diagnostic::{Diagnostic, DiagnosticSeverity};
+
 /// The deploy-specific slice of extension surface that the dispatcher calls into.
 /// `deploy`/`poll`/`rollback` are intentionally NOT on this trait in Phase A —
 /// Mode A routes them to the built-in bridge; Mode B returns `ModeBNotImplemented`.
@@ -15,46 +18,6 @@ pub trait WasmInvoker: Send + Sync {
         target_id: &str,
         creds_json: &str,
     ) -> ExtensionResult<Vec<Diagnostic>>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Diagnostic {
-    pub severity: DiagnosticSeverity,
-    pub code: String,
-    pub message: String,
-    pub path: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiagnosticSeverity {
-    Error,
-    Warning,
-    Info,
-}
-
-impl<'de> serde::Deserialize<'de> for Diagnostic {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Raw {
-            severity: String,
-            code: String,
-            message: String,
-            #[serde(default)]
-            path: Option<String>,
-        }
-        let r = Raw::deserialize(d)?;
-        Ok(Diagnostic {
-            severity: match r.severity.as_str() {
-                "error" => DiagnosticSeverity::Error,
-                "warning" => DiagnosticSeverity::Warning,
-                _ => DiagnosticSeverity::Info,
-            },
-            code: r.code,
-            message: r.message,
-            path: r.path,
-        })
-    }
 }
 
 /// Production invoker: wraps `greentic_ext_runtime::ExtensionRuntime`.
@@ -136,7 +99,11 @@ impl WasmInvoker for WasmtimeInvoker {
             .runtime
             .invoke_tool(ext_id, "validate-credentials", &args)
             .map_err(|e| ExtensionError::WasmRuntime(anyhow::anyhow!("{e}")))?;
-        let diags: Vec<Diagnostic> = serde_json::from_str(&out).unwrap_or_default();
+        let diags: Vec<Diagnostic> = serde_json::from_str(&out).map_err(|e| {
+            ExtensionError::WasmRuntime(anyhow::anyhow!(
+                "parse diagnostics from wasm extension '{ext_id}' for target '{target_id}': {e}"
+            ))
+        })?;
         Ok(diags)
     }
 }

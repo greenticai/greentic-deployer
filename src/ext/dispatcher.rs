@@ -2,9 +2,10 @@ use jsonschema::Validator;
 
 use crate::ext::builtin_bridge::{self, BridgeResolved};
 use crate::ext::describe::Execution;
+use crate::ext::diagnostic::DiagnosticSeverity;
 use crate::ext::errors::{ExtensionError, ExtensionResult};
 use crate::ext::registry::ExtensionRegistry;
-use crate::ext::wasm::{DiagnosticSeverity, WasmInvoker};
+use crate::ext::wasm::WasmInvoker;
 
 #[derive(Debug, Clone)]
 pub enum DispatchAction {
@@ -46,6 +47,7 @@ pub fn dispatch_extension(
     if fatal > 0 || (input.strict_validate && warn_count > 0) {
         return Err(ExtensionError::ValidationFailed {
             n: fatal + warn_count,
+            diagnostics,
         });
     }
 
@@ -72,10 +74,18 @@ fn validate_against_schema(schema_str: &str, value_str: &str, label: &str) -> Ex
     // jsonschema 0.45 uses `Validator::new` (no `JSONSchema::compile`).
     let compiled = Validator::new(&schema_val)
         .map_err(|e| ExtensionError::WasmRuntime(anyhow::anyhow!("invalid {label} schema: {e}")))?;
-    // `iter_errors` returns an iterator of `ValidationError`; count to get n.
-    let n = compiled.iter_errors(&value_val).count();
-    if n > 0 {
-        return Err(ExtensionError::ValidationFailed { n });
+    let diagnostics: Vec<crate::ext::diagnostic::Diagnostic> = compiled
+        .iter_errors(&value_val)
+        .map(|e| crate::ext::diagnostic::Diagnostic {
+            severity: crate::ext::diagnostic::DiagnosticSeverity::Error,
+            code: format!("{label}-schema-violation"),
+            message: e.to_string(),
+            path: Some(e.instance_path().to_string()),
+        })
+        .collect();
+    if !diagnostics.is_empty() {
+        let n = diagnostics.len();
+        return Err(ExtensionError::ValidationFailed { n, diagnostics });
     }
     Ok(())
 }

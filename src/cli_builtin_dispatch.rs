@@ -195,9 +195,16 @@ pub(crate) fn dispatch_builtin_backend_command(command: BuiltinBackendCommand) -
     handler(command)
 }
 
+/// Resolve a non-builtin target-id through the extension registry.
+///
+/// **Phase A (PR#1) status:** Defined and tested-buildable but NOT yet
+/// wired into the CLI dispatch path. PR#2 (`greentic-deployer-extensions`
+/// sibling repo) will add the call site once `deploy-desktop` ships.
+/// The function bails with a clear "PR#2 required" message on success path
+/// to make this explicit at runtime.
 #[cfg(feature = "extensions")]
-#[allow(dead_code)]
-pub fn maybe_dispatch_via_extensions(target_id: &str) -> anyhow::Result<()> {
+#[allow(dead_code)] // wired in PR#2 — see deploy-extension-migration spec §11
+pub(crate) fn maybe_dispatch_via_extensions(target_id: &str) -> anyhow::Result<()> {
     use std::str::FromStr;
 
     if greentic_deployer::extension::BuiltinBackendId::from_str(target_id).is_ok() {

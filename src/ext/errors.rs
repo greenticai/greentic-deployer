@@ -35,7 +35,10 @@ pub enum ExtensionError {
     },
 
     #[error("credential validation failed with {n} error(s)")]
-    ValidationFailed { n: usize },
+    ValidationFailed {
+        n: usize,
+        diagnostics: Vec<crate::ext::diagnostic::Diagnostic>,
+    },
 
     #[error("WASM invocation failed: {0}")]
     WasmRuntime(#[from] anyhow::Error),

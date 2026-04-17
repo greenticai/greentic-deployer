@@ -6,6 +6,7 @@
 pub mod builtin_bridge;
 pub mod cli;
 pub mod describe;
+pub mod diagnostic;
 pub mod dispatcher;
 pub mod errors;
 pub mod loader;
