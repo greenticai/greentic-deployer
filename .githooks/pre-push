@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Pre-push hook: run the full ci/local_check.sh before pushing.
+# Expensive but authoritative — matches CI exactly.
+#
+# Bypass for emergency (not recommended):
+#   git push --no-verify
+#
+# Enable once per checkout with:
+#   scripts/install-hooks.sh
+# or:
+#   git config core.hooksPath .githooks
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+echo "pre-push: running ci/local_check.sh"
+if ! bash ci/local_check.sh; then
+    echo
+    echo "pre-push FAILED: ci/local_check.sh reported errors."
+    echo "Fix them and retry. If you must skip, use 'git push --no-verify'."
+    exit 1
+fi
+
+echo "pre-push OK"
