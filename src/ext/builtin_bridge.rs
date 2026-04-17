@@ -30,7 +30,10 @@ pub fn resolve(execution: &Execution, target_id: &str) -> ExtensionResult<Bridge
                     handler: handler.clone(),
                 });
             }
-            Ok(BridgeResolved { backend: id, handler: handler.clone() })
+            Ok(BridgeResolved {
+                backend: id,
+                handler: handler.clone(),
+            })
         }
         Execution::Wasm => Err(ExtensionError::ModeBNotImplemented),
     }
@@ -42,7 +45,10 @@ mod tests {
 
     #[test]
     fn resolve_builtin_known_backend_no_handler() {
-        let exec = Execution::Builtin { backend: "terraform".into(), handler: None };
+        let exec = Execution::Builtin {
+            backend: "terraform".into(),
+            handler: None,
+        };
         let r = resolve(&exec, "some-tf-target").unwrap();
         assert_eq!(r.backend, BuiltinBackendId::Terraform);
         assert!(r.handler.is_none());
@@ -50,7 +56,10 @@ mod tests {
 
     #[test]
     fn resolve_unknown_backend_errors_with_target_id() {
-        let exec = Execution::Builtin { backend: "mystery".into(), handler: None };
+        let exec = Execution::Builtin {
+            backend: "mystery".into(),
+            handler: None,
+        };
         let err = resolve(&exec, "t").unwrap_err();
         match err {
             ExtensionError::UnknownBuiltinBackend { backend, target_id } => {

@@ -128,7 +128,11 @@ pub fn apply(plan: &DesktopPlan) -> Result<()> {
         .status()
         .with_context(|| format!("spawn {}", plan.runtime.cmd_name()))?;
     if !status.success() {
-        anyhow::bail!("{} up exited with status {}", plan.runtime.cmd_name(), status);
+        anyhow::bail!(
+            "{} up exited with status {}",
+            plan.runtime.cmd_name(),
+            status
+        );
     }
     Ok(())
 }
@@ -138,7 +142,11 @@ pub fn destroy(plan: &DesktopPlan) -> Result<()> {
         .status()
         .with_context(|| format!("spawn {}", plan.runtime.cmd_name()))?;
     if !status.success() {
-        anyhow::bail!("{} down exited with status {}", plan.runtime.cmd_name(), status);
+        anyhow::bail!(
+            "{} down exited with status {}",
+            plan.runtime.cmd_name(),
+            status
+        );
     }
     Ok(())
 }
@@ -186,17 +194,31 @@ mod tests {
         let mut cfg = sample_config();
         cfg.compose_file = None;
         let p = plan(RuntimeKind::Podman, &cfg).unwrap();
-        assert_eq!(p.compose_file, PathBuf::from("/tmp/proj/docker-compose.yml"));
+        assert_eq!(
+            p.compose_file,
+            PathBuf::from("/tmp/proj/docker-compose.yml")
+        );
     }
 
     #[test]
     fn up_command_docker_compose_args() {
         let p = plan(RuntimeKind::DockerCompose, &sample_config()).unwrap();
         let cmd = build_up_command(&p);
-        let args: Vec<_> = cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
         assert_eq!(
             args,
-            vec!["compose", "-p", "my-app", "-f", "/tmp/compose.yml", "up", "-d"]
+            vec![
+                "compose",
+                "-p",
+                "my-app",
+                "-f",
+                "/tmp/compose.yml",
+                "up",
+                "-d"
+            ]
         );
         assert_eq!(cmd.get_program(), "docker");
     }
@@ -205,7 +227,10 @@ mod tests {
     fn up_command_podman_args() {
         let p = plan(RuntimeKind::Podman, &sample_config()).unwrap();
         let cmd = build_up_command(&p);
-        let args: Vec<_> = cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
         assert_eq!(args, vec!["play", "kube", "/tmp/compose.yml"]);
         assert_eq!(cmd.get_program(), "podman");
     }
@@ -214,7 +239,10 @@ mod tests {
     fn down_command_docker_compose_args() {
         let p = plan(RuntimeKind::DockerCompose, &sample_config()).unwrap();
         let cmd = build_down_command(&p);
-        let args: Vec<_> = cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
         assert_eq!(
             args,
             vec!["compose", "-p", "my-app", "-f", "/tmp/compose.yml", "down"]
@@ -225,7 +253,10 @@ mod tests {
     fn status_command_docker_compose_args() {
         let p = plan(RuntimeKind::DockerCompose, &sample_config()).unwrap();
         let cmd = build_status_command(&p);
-        let args: Vec<_> = cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
         assert_eq!(
             args,
             vec!["compose", "-p", "my-app", "ps", "--format", "json"]

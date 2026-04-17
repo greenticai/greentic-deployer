@@ -39,20 +39,21 @@ impl ExtensionRegistry {
                     .entry(contrib.id.clone())
                     .or_default()
                     .push(ext_id.clone());
-                entries
-                    .entry(contrib.id.clone())
-                    .or_insert(ResolvedTarget {
-                        ext_id: ext_id.clone(),
-                        wasm_path: ext.wasm_path.clone(),
-                        contribution: contrib,
-                    });
+                entries.entry(contrib.id.clone()).or_insert(ResolvedTarget {
+                    ext_id: ext_id.clone(),
+                    wasm_path: ext.wasm_path.clone(),
+                    contribution: contrib,
+                });
             }
         }
 
         let conflicts: Vec<ConflictRecord> = providers
             .into_iter()
             .filter(|(_, v)| v.len() > 1)
-            .map(|(target_id, providers)| ConflictRecord { target_id, providers })
+            .map(|(target_id, providers)| ConflictRecord {
+                target_id,
+                providers,
+            })
             .collect();
 
         for c in &conflicts {
@@ -103,7 +104,11 @@ mod tests {
             describe: DeployExtensionDescribe {
                 api_version: "greentic.ai/v1".into(),
                 kind: "DeployExtension".into(),
-                metadata: Metadata { id: id.into(), version: "0.1.0".into(), summary: None },
+                metadata: Metadata {
+                    id: id.into(),
+                    version: "0.1.0".into(),
+                    summary: None,
+                },
                 engine: Engine::default(),
                 capabilities: Capabilities::default(),
                 runtime: RuntimeSpec {

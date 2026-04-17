@@ -60,8 +60,8 @@ reqwest = { version = "0.13", features = ["blocking", "json", "rustls"] }
 toml = "0.9"
 indexmap = "2"
 jsonschema = "0.45"
-greentic-ext-runtime  = { git = "ssh://git@github.com/greentic-biz/greentic-designer-extensions", branch = "feat/foundation", optional = true, package = "greentic-ext-runtime" }
-greentic-ext-contract = { git = "ssh://git@github.com/greentic-biz/greentic-designer-extensions", branch = "feat/foundation", optional = true, package = "greentic-ext-contract" }
+greentic-ext-runtime  = { git = "ssh://git@github.com/greentic-biz/greentic-designer-extensions", rev = "5317c43a2f99cde6beb68c1bd3830344d07ad2f9", optional = true, package = "greentic-ext-runtime" }
+greentic-ext-contract = { git = "ssh://git@github.com/greentic-biz/greentic-designer-extensions", rev = "5317c43a2f99cde6beb68c1bd3830344d07ad2f9", optional = true, package = "greentic-ext-contract" }
 
 [[test]]
 name = "ext_loader"

@@ -1540,7 +1540,7 @@ dependencies = [
 [[package]]
 name = "greentic-ext-contract"
 version = "0.1.0"
-source = "git+ssh://git@github.com/greentic-biz/greentic-designer-extensions?branch=feat%2Ffoundation#1659c762ab50b015c16db08ab0a879082f140065"
+source = "git+ssh://git@github.com/greentic-biz/greentic-designer-extensions?rev=5317c43a2f99cde6beb68c1bd3830344d07ad2f9#5317c43a2f99cde6beb68c1bd3830344d07ad2f9"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1556,7 +1556,7 @@ dependencies = [
 [[package]]
 name = "greentic-ext-runtime"
 version = "0.1.0"
-source = "git+ssh://git@github.com/greentic-biz/greentic-designer-extensions?branch=feat%2Ffoundation#1659c762ab50b015c16db08ab0a879082f140065"
+source = "git+ssh://git@github.com/greentic-biz/greentic-designer-extensions?rev=5317c43a2f99cde6beb68c1bd3830344d07ad2f9#5317c43a2f99cde6beb68c1bd3830344d07ad2f9"
 dependencies = [
  "anyhow",
  "arc-swap",

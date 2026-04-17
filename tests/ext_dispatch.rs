@@ -1,6 +1,6 @@
 #![cfg(feature = "extensions")]
 
-use greentic_deployer::ext::dispatcher::{dispatch_extension, DispatchAction, DispatchInput};
+use greentic_deployer::ext::dispatcher::{DispatchAction, DispatchInput, dispatch_extension};
 use greentic_deployer::ext::loader::scan;
 use greentic_deployer::ext::registry::ExtensionRegistry;
 use greentic_deployer::ext::wasm::MockInvoker;
@@ -17,11 +17,17 @@ fn dispatch_mode_a_routes_to_terraform_backend_id() {
     let reg = ExtensionRegistry::build(loaded);
     let mut invoker = MockInvoker::default();
     invoker.schemas_creds.insert(
-        ("greentic.deploy-testfixture".into(), "testfixture-noop".into()),
+        (
+            "greentic.deploy-testfixture".into(),
+            "testfixture-noop".into(),
+        ),
         r#"{"type":"object"}"#.into(),
     );
     invoker.schemas_config.insert(
-        ("greentic.deploy-testfixture".into(), "testfixture-noop".into()),
+        (
+            "greentic.deploy-testfixture".into(),
+            "testfixture-noop".into(),
+        ),
         r#"{"type":"object"}"#.into(),
     );
     let action = dispatch_extension(

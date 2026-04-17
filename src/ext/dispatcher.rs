@@ -44,7 +44,9 @@ pub fn dispatch_extension(
         .filter(|d| matches!(d.severity, DiagnosticSeverity::Warning))
         .count();
     if fatal > 0 || (input.strict_validate && warn_count > 0) {
-        return Err(ExtensionError::ValidationFailed { n: fatal + warn_count });
+        return Err(ExtensionError::ValidationFailed {
+            n: fatal + warn_count,
+        });
     }
 
     match &execution {
@@ -56,11 +58,7 @@ pub fn dispatch_extension(
     }
 }
 
-fn validate_against_schema(
-    schema_str: &str,
-    value_str: &str,
-    label: &str,
-) -> ExtensionResult<()> {
+fn validate_against_schema(schema_str: &str, value_str: &str, label: &str) -> ExtensionResult<()> {
     let schema_val: serde_json::Value =
         serde_json::from_str(schema_str).map_err(|e| ExtensionError::DescribeParse {
             path: std::path::PathBuf::from(format!("<schema:{label}>")),
@@ -72,9 +70,8 @@ fn validate_against_schema(
             source: e,
         })?;
     // jsonschema 0.45 uses `Validator::new` (no `JSONSchema::compile`).
-    let compiled = Validator::new(&schema_val).map_err(|e| {
-        ExtensionError::WasmRuntime(anyhow::anyhow!("invalid {label} schema: {e}"))
-    })?;
+    let compiled = Validator::new(&schema_val)
+        .map_err(|e| ExtensionError::WasmRuntime(anyhow::anyhow!("invalid {label} schema: {e}")))?;
     // `iter_errors` returns an iterator of `ValidationError`; count to get n.
     let n = compiled.iter_errors(&value_val).count();
     if n > 0 {
@@ -101,7 +98,11 @@ mod tests {
             describe: DeployExtensionDescribe {
                 api_version: "greentic.ai/v1".into(),
                 kind: "DeployExtension".into(),
-                metadata: Metadata { id: ext_id.into(), version: "0.1.0".into(), summary: None },
+                metadata: Metadata {
+                    id: ext_id.into(),
+                    version: "0.1.0".into(),
+                    summary: None,
+                },
                 engine: Engine::default(),
                 capabilities: Capabilities::default(),
                 runtime: RuntimeSpec {
@@ -128,7 +129,10 @@ mod tests {
         let reg = registry_with(
             "greentic.a",
             "docker-compose-local",
-            Execution::Builtin { backend: "terraform".into(), handler: None },
+            Execution::Builtin {
+                backend: "terraform".into(),
+                handler: None,
+            },
         );
         let mut invoker = MockInvoker::default();
         invoker.schemas_creds.insert(
@@ -180,7 +184,10 @@ mod tests {
         let reg = registry_with(
             "greentic.a",
             "t",
-            Execution::Builtin { backend: "terraform".into(), handler: None },
+            Execution::Builtin {
+                backend: "terraform".into(),
+                handler: None,
+            },
         );
         let mut invoker = MockInvoker::default();
         invoker.schemas_creds.insert(
@@ -206,7 +213,10 @@ mod tests {
         let reg = registry_with(
             "greentic.a",
             "t",
-            Execution::Builtin { backend: "terraform".into(), handler: None },
+            Execution::Builtin {
+                backend: "terraform".into(),
+                handler: None,
+            },
         );
         let mut invoker = MockInvoker::default();
         invoker.validate_diagnostics.insert(
@@ -237,7 +247,10 @@ mod tests {
         let reg = registry_with(
             "greentic.a",
             "t",
-            Execution::Builtin { backend: "terraform".into(), handler: None },
+            Execution::Builtin {
+                backend: "terraform".into(),
+                handler: None,
+            },
         );
         let mut invoker = MockInvoker::default();
         invoker.validate_diagnostics.insert(

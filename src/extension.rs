@@ -29,18 +29,18 @@ pub enum BuiltinBackendId {
 impl BuiltinBackendId {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Terraform   => "terraform",
-            Self::K8sRaw      => "k8s_raw",
-            Self::Helm        => "helm",
-            Self::Aws         => "aws",
-            Self::Azure       => "azure",
-            Self::Gcp         => "gcp",
-            Self::JujuK8s     => "juju_k8s",
+            Self::Terraform => "terraform",
+            Self::K8sRaw => "k8s_raw",
+            Self::Helm => "helm",
+            Self::Aws => "aws",
+            Self::Azure => "azure",
+            Self::Gcp => "gcp",
+            Self::JujuK8s => "juju_k8s",
             Self::JujuMachine => "juju_machine",
-            Self::Operator    => "operator",
-            Self::Serverless  => "serverless",
-            Self::Snap        => "snap",
-            Self::Desktop     => "desktop",
+            Self::Operator => "operator",
+            Self::Serverless => "serverless",
+            Self::Snap => "snap",
+            Self::Desktop => "desktop",
         }
     }
 
@@ -61,18 +61,18 @@ impl std::str::FromStr for BuiltinBackendId {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         Ok(match s {
-            "terraform"    => Self::Terraform,
-            "k8s_raw"      => Self::K8sRaw,
-            "helm"         => Self::Helm,
-            "aws"          => Self::Aws,
-            "azure"        => Self::Azure,
-            "gcp"          => Self::Gcp,
-            "juju_k8s"     => Self::JujuK8s,
+            "terraform" => Self::Terraform,
+            "k8s_raw" => Self::K8sRaw,
+            "helm" => Self::Helm,
+            "aws" => Self::Aws,
+            "azure" => Self::Azure,
+            "gcp" => Self::Gcp,
+            "juju_k8s" => Self::JujuK8s,
             "juju_machine" => Self::JujuMachine,
-            "operator"     => Self::Operator,
-            "serverless"   => Self::Serverless,
-            "snap"         => Self::Snap,
-            "desktop"      => Self::Desktop,
+            "operator" => Self::Operator,
+            "serverless" => Self::Serverless,
+            "snap" => Self::Snap,
+            "desktop" => Self::Desktop,
             other => return Err(UnknownBuiltinBackendStr(other.to_string())),
         })
     }
@@ -851,17 +851,17 @@ mod ext_roundtrip_tests {
     #[test]
     fn from_str_all_variants_roundtrip() {
         let cases = [
-            ("terraform",    BuiltinBackendId::Terraform),
-            ("k8s_raw",      BuiltinBackendId::K8sRaw),
-            ("helm",         BuiltinBackendId::Helm),
-            ("aws",          BuiltinBackendId::Aws),
-            ("azure",        BuiltinBackendId::Azure),
-            ("gcp",          BuiltinBackendId::Gcp),
-            ("juju_k8s",     BuiltinBackendId::JujuK8s),
+            ("terraform", BuiltinBackendId::Terraform),
+            ("k8s_raw", BuiltinBackendId::K8sRaw),
+            ("helm", BuiltinBackendId::Helm),
+            ("aws", BuiltinBackendId::Aws),
+            ("azure", BuiltinBackendId::Azure),
+            ("gcp", BuiltinBackendId::Gcp),
+            ("juju_k8s", BuiltinBackendId::JujuK8s),
             ("juju_machine", BuiltinBackendId::JujuMachine),
-            ("operator",     BuiltinBackendId::Operator),
-            ("serverless",   BuiltinBackendId::Serverless),
-            ("snap",         BuiltinBackendId::Snap),
+            ("operator", BuiltinBackendId::Operator),
+            ("serverless", BuiltinBackendId::Serverless),
+            ("snap", BuiltinBackendId::Snap),
         ];
         for (s, expected) in cases {
             assert_eq!(BuiltinBackendId::from_str(s).unwrap(), expected);
@@ -900,7 +900,10 @@ mod ext_roundtrip_tests {
     #[test]
     fn desktop_variant_roundtrip() {
         use std::str::FromStr;
-        assert_eq!(BuiltinBackendId::from_str("desktop").unwrap(), BuiltinBackendId::Desktop);
+        assert_eq!(
+            BuiltinBackendId::from_str("desktop").unwrap(),
+            BuiltinBackendId::Desktop
+        );
         assert_eq!(BuiltinBackendId::Desktop.as_str(), "desktop");
     }
 

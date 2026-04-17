@@ -207,8 +207,10 @@ mod tests {
     #[test]
     fn mock_invoker_returns_configured_values() {
         let mut m = MockInvoker::default();
-        m.schemas_creds
-            .insert(("greentic.a".into(), "t1".into()), r#"{"type":"object"}"#.into());
+        m.schemas_creds.insert(
+            ("greentic.a".into(), "t1".into()),
+            r#"{"type":"object"}"#.into(),
+        );
         assert_eq!(
             m.credential_schema("greentic.a", "t1").unwrap(),
             r#"{"type":"object"}"#

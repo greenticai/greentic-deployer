@@ -11,9 +11,12 @@ fn fixture_dir() -> PathBuf {
 fn loader_discovers_in_repo_fixture() {
     let v = scan(&fixture_dir()).expect("scan");
     assert!(
-        v.iter().any(|e| e.describe.metadata.id == "greentic.deploy-testfixture"),
+        v.iter()
+            .any(|e| e.describe.metadata.id == "greentic.deploy-testfixture"),
         "expected testfixture to be discovered; got {:?}",
-        v.iter().map(|e| &e.describe.metadata.id).collect::<Vec<_>>()
+        v.iter()
+            .map(|e| &e.describe.metadata.id)
+            .collect::<Vec<_>>()
     );
     let ext = v
         .iter()

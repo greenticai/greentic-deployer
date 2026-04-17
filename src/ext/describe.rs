@@ -82,11 +82,9 @@ pub enum Execution {
 }
 
 pub fn parse_describe(path: &Path) -> ExtensionResult<DeployExtensionDescribe> {
-    let contents = std::fs::read_to_string(path).map_err(|e| {
-        ExtensionError::DescribeParse {
-            path: path.to_path_buf(),
-            source: serde::de::Error::custom(format!("io: {e}")),
-        }
+    let contents = std::fs::read_to_string(path).map_err(|e| ExtensionError::DescribeParse {
+        path: path.to_path_buf(),
+        source: serde::de::Error::custom(format!("io: {e}")),
     })?;
     serde_json::from_str(&contents).map_err(|source| ExtensionError::DescribeParse {
         path: path.to_path_buf(),
@@ -172,7 +170,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_json(&dir, "describe.json", VALID_WASM);
         let d = parse_describe(&p).expect("parse");
-        assert!(matches!(d.contributions.targets[0].execution, Execution::Wasm));
+        assert!(matches!(
+            d.contributions.targets[0].execution,
+            Execution::Wasm
+        ));
     }
 
     #[test]
