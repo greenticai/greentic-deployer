@@ -19,6 +19,7 @@ test-utils = []
 extensions = [
     "dep:greentic-ext-runtime",
     "dep:greentic-ext-contract",
+    "test-utils",
 ]
 
 [[bin]]
@@ -61,6 +62,14 @@ indexmap = "2"
 jsonschema = "0.45"
 greentic-ext-runtime  = { git = "ssh://git@github.com/greentic-biz/greentic-designer-extensions", branch = "feat/foundation", optional = true, package = "greentic-ext-runtime" }
 greentic-ext-contract = { git = "ssh://git@github.com/greentic-biz/greentic-designer-extensions", branch = "feat/foundation", optional = true, package = "greentic-ext-contract" }
+
+[[test]]
+name = "ext_loader"
+required-features = ["extensions"]
+
+[[test]]
+name = "ext_dispatch"
+required-features = ["extensions", "test-utils"]
 
 [dev-dependencies]
 tempfile = "3"
