@@ -114,3 +114,6 @@ pub use spec::{
     ServiceManager, ServiceSpec, StorageSpec,
 };
 pub use terraform::TerraformRequest;
+
+#[cfg(feature = "extensions")]
+pub mod ext;
