@@ -1481,7 +1481,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "0.4.53"
+version = "0.4.54"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1540,7 +1540,7 @@ dependencies = [
 [[package]]
 name = "greentic-ext-contract"
 version = "0.1.0"
-source = "git+https://github.com/greentic-biz/greentic-designer-extensions?rev=5317c43a2f99cde6beb68c1bd3830344d07ad2f9#5317c43a2f99cde6beb68c1bd3830344d07ad2f9"
+source = "git+https://github.com/greentic-biz/greentic-designer-extensions?rev=94e6ba406269c53297918bb14716255835331354#94e6ba406269c53297918bb14716255835331354"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1548,6 +1548,7 @@ dependencies = [
  "jsonschema 0.30.0",
  "semver",
  "serde",
+ "serde_jcs",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
@@ -1556,7 +1557,7 @@ dependencies = [
 [[package]]
 name = "greentic-ext-runtime"
 version = "0.1.0"
-source = "git+https://github.com/greentic-biz/greentic-designer-extensions?rev=5317c43a2f99cde6beb68c1bd3830344d07ad2f9#5317c43a2f99cde6beb68c1bd3830344d07ad2f9"
+source = "git+https://github.com/greentic-biz/greentic-designer-extensions?rev=94e6ba406269c53297918bb14716255835331354#94e6ba406269c53297918bb14716255835331354"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3629,6 +3630,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "ryu-js"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6518fc26bced4d53678a22d6e423e9d8716377def84545fe328236e3af070e7f"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3782,6 +3789,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "serde_jcs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cacecf649bc1a7c5f0e299cc813977c6a78116abda2b93b1ee01735b71ead9a8"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
