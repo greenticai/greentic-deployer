@@ -919,4 +919,21 @@ mod ext_roundtrip_tests {
         assert!(!BuiltinBackendId::Desktop.handler_matches(Some("kubernetes")));
         assert!(BuiltinBackendId::Desktop.handler_matches(None));
     }
+
+    #[test]
+    fn single_vm_variant_roundtrip() {
+        use std::str::FromStr;
+        assert_eq!(
+            BuiltinBackendId::from_str("single_vm").unwrap(),
+            BuiltinBackendId::SingleVm
+        );
+        assert_eq!(BuiltinBackendId::SingleVm.as_str(), "single_vm");
+    }
+
+    #[test]
+    fn single_vm_handler_matches_rejects_any_handler() {
+        assert!(BuiltinBackendId::SingleVm.handler_matches(None));
+        assert!(!BuiltinBackendId::SingleVm.handler_matches(Some("docker")));
+        assert!(!BuiltinBackendId::SingleVm.handler_matches(Some("foo")));
+    }
 }
