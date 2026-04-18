@@ -24,6 +24,7 @@ pub enum BuiltinBackendId {
     Serverless,
     Snap,
     Desktop,
+    SingleVm,
 }
 
 impl BuiltinBackendId {
@@ -41,6 +42,7 @@ impl BuiltinBackendId {
             Self::Serverless => "serverless",
             Self::Snap => "snap",
             Self::Desktop => "desktop",
+            Self::SingleVm => "single_vm",
         }
     }
 
@@ -73,6 +75,7 @@ impl std::str::FromStr for BuiltinBackendId {
             "serverless" => Self::Serverless,
             "snap" => Self::Snap,
             "desktop" => Self::Desktop,
+            "single_vm" => Self::SingleVm,
             other => return Err(UnknownBuiltinBackendStr(other.to_string())),
         })
     }
@@ -105,6 +108,7 @@ pub enum BuiltinBackendHandlerId {
     Serverless,
     Snap,
     Desktop,
+    SingleVm,
 }
 
 impl BuiltinBackendHandlerId {
@@ -122,6 +126,7 @@ impl BuiltinBackendHandlerId {
             Self::Serverless => "serverless",
             Self::Snap => "snap",
             Self::Desktop => "desktop",
+            Self::SingleVm => "single_vm",
         }
     }
 }
