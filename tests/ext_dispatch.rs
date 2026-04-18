@@ -1,5 +1,9 @@
 #![cfg(feature = "extensions")]
 
+#[path = "support/env_guard.rs"]
+mod env_guard;
+
+use env_guard::EnvGuard;
 use greentic_deployer::ext::dispatcher::{DispatchAction, DispatchInput, dispatch_extension};
 use greentic_deployer::ext::loader::scan;
 use greentic_deployer::ext::registry::ExtensionRegistry;
@@ -13,6 +17,7 @@ fn fixture_dir() -> PathBuf {
 
 #[test]
 fn dispatch_mode_a_routes_to_terraform_backend_id() {
+    let _env = EnvGuard::set("GREENTIC_EXT_ALLOW_UNSIGNED", "1");
     let loaded = scan(&fixture_dir()).expect("scan");
     let reg = ExtensionRegistry::build(loaded);
     let mut invoker = MockInvoker::default();
@@ -51,6 +56,7 @@ fn dispatch_mode_a_routes_to_terraform_backend_id() {
 
 #[test]
 fn dispatch_unknown_target_returns_not_found() {
+    let _env = EnvGuard::set("GREENTIC_EXT_ALLOW_UNSIGNED", "1");
     let loaded = scan(&fixture_dir()).expect("scan");
     let reg = ExtensionRegistry::build(loaded);
     let invoker = MockInvoker::default();
