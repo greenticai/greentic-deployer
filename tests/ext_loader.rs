@@ -1,5 +1,9 @@
 #![cfg(feature = "extensions")]
 
+#[path = "support/env_guard.rs"]
+mod env_guard;
+
+use env_guard::EnvGuard;
 use greentic_deployer::ext::loader::scan;
 use std::path::PathBuf;
 
@@ -9,6 +13,7 @@ fn fixture_dir() -> PathBuf {
 
 #[test]
 fn loader_discovers_in_repo_fixture() {
+    let _env = EnvGuard::set("GREENTIC_EXT_ALLOW_UNSIGNED", "1");
     let v = scan(&fixture_dir()).expect("scan");
     assert!(
         v.iter()
