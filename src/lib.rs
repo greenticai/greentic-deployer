@@ -93,14 +93,15 @@ pub use plan::{
 pub use serverless::ServerlessRequest;
 pub use single_vm::{
     SingleVmAdminPlan, SingleVmApplyOptions, SingleVmApplyReport, SingleVmBundlePlan,
-    SingleVmDeploymentStatus, SingleVmDestroyOptions, SingleVmDestroyReport, SingleVmHealthPlan,
-    SingleVmLastAction, SingleVmPersistedState, SingleVmPlan, SingleVmPlanOutput,
+    SingleVmDeploymentStatus, SingleVmDestroyOptions, SingleVmDestroyReport,
+    SingleVmHealthPlan, SingleVmLastAction, SingleVmPersistedState, SingleVmPlan, SingleVmPlanOutput,
     SingleVmPlannedFile, SingleVmPlannedFileKind, SingleVmRenderSpecRequest, SingleVmRolloutPlan,
     SingleVmRuntimePlan, SingleVmServicePlan, SingleVmStatusReport, SingleVmStoragePlan,
     apply_single_vm_plan_output, apply_single_vm_plan_output_with_options, apply_single_vm_spec,
     apply_single_vm_spec_path, build_single_vm_plan, destroy_single_vm_plan_output,
     destroy_single_vm_plan_output_with_options, destroy_single_vm_spec,
-    destroy_single_vm_spec_path, plan_single_vm_spec, plan_single_vm_spec_path,
+    destroy_single_vm_spec_path,
+    plan_single_vm_spec, plan_single_vm_spec_path,
     preview_single_vm_apply_plan_output, preview_single_vm_destroy_plan_output, render_env_file,
     render_single_vm_apply_report, render_single_vm_destroy_report, render_single_vm_plan,
     render_single_vm_plan_output, render_single_vm_status_report, render_systemd_unit,
