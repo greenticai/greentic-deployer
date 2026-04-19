@@ -101,6 +101,34 @@ impl AzureRequest {
     }
 }
 
+/// Configuration shape consumed by `ext apply --target azure-container-apps-local`.
+///
+/// Mirrors the JSON schema declared by the `deploy-azure` reference extension.
+/// Keys use camelCase on the wire; Rust field names use snake_case with serde rename.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AzureContainerAppsExtConfig {
+    pub location: String,
+    pub key_vault_uri: String,
+    pub key_vault_id: String,
+    pub environment: String,
+    pub operator_image_digest: String,
+    pub bundle_source: String,
+    pub bundle_digest: String,
+    pub remote_state_backend: String,
+    pub dns_name: Option<String>,
+    pub public_base_url: Option<String>,
+    pub repo_registry_base: Option<String>,
+    pub store_registry_base: Option<String>,
+    pub admin_allowed_clients: Option<String>,
+    #[serde(default = "default_ext_tenant")]
+    pub tenant: String,
+}
+
+fn default_ext_tenant() -> String {
+    "default".to_string()
+}
+
 pub fn resolve_config(request: AzureRequest) -> Result<DeployerConfig> {
     DeployerConfig::resolve(request.into_deployer_request())
 }
@@ -155,5 +183,63 @@ mod tests {
         assert_eq!(request.provider, Provider::Azure);
         assert_eq!(request.strategy, "iac-only");
         assert_eq!(request.tenant, "acme");
+    }
+
+    #[test]
+    fn ext_config_parses_minimum_fields() {
+        let json = r#"{
+            "location": "eastus",
+            "keyVaultUri": "https://my-vault.vault.azure.net/",
+            "keyVaultId": "/subscriptions/aaa/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/my-vault",
+            "environment": "staging",
+            "operatorImageDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "bundleSource": "oci://registry.example/acme/prod-bundle@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "bundleDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "remoteStateBackend": "azurerm://storage/container/key"
+        }"#;
+        let cfg: AzureContainerAppsExtConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.location, "eastus");
+        assert_eq!(cfg.key_vault_uri, "https://my-vault.vault.azure.net/");
+        assert_eq!(cfg.tenant, "default");
+        assert!(cfg.dns_name.is_none());
+    }
+
+    #[test]
+    fn ext_config_accepts_all_optionals() {
+        let json = r#"{
+            "location": "eastus",
+            "keyVaultUri": "https://my-vault.vault.azure.net/",
+            "keyVaultId": "/subscriptions/aaa/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/my-vault",
+            "environment": "prod",
+            "operatorImageDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "bundleSource": "oci://...",
+            "bundleDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "remoteStateBackend": "azurerm://...",
+            "dnsName": "api.example.com",
+            "publicBaseUrl": "https://api.example.com",
+            "repoRegistryBase": "https://repo.example.com",
+            "storeRegistryBase": "https://store.example.com",
+            "adminAllowedClients": "CN=admin",
+            "tenant": "acme"
+        }"#;
+        let cfg: AzureContainerAppsExtConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.dns_name.as_deref(), Some("api.example.com"));
+        assert_eq!(cfg.tenant, "acme");
+    }
+
+    #[test]
+    fn ext_config_rejects_missing_location() {
+        let json = r#"{
+            "keyVaultUri": "https://my-vault.vault.azure.net/",
+            "keyVaultId": "/subscriptions/aaa/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/my-vault",
+            "environment": "staging",
+            "operatorImageDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "bundleSource": "oci://...",
+            "bundleDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "remoteStateBackend": "azurerm://..."
+        }"#;
+        let err = serde_json::from_str::<AzureContainerAppsExtConfig>(json).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("location"), "got: {msg}");
     }
 }
