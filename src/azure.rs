@@ -144,6 +144,83 @@ pub fn ensure_azure_config(config: &DeployerConfig) -> Result<()> {
     Ok(())
 }
 
+/// Build an `AzureRequest` from the extension-provided config.
+fn build_azure_request_from_ext(
+    capability: DeployerCapability,
+    cfg: &AzureContainerAppsExtConfig,
+    pack_path: Option<&std::path::Path>,
+) -> AzureRequest {
+    AzureRequest {
+        capability,
+        tenant: cfg.tenant.clone(),
+        pack_path: pack_path
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default(),
+        bundle_source: Some(cfg.bundle_source.clone()),
+        bundle_digest: Some(cfg.bundle_digest.clone()),
+        repo_registry_base: cfg.repo_registry_base.clone(),
+        store_registry_base: cfg.store_registry_base.clone(),
+        provider_pack: None,
+        deploy_pack_id_override: None,
+        deploy_flow_id_override: None,
+        environment: Some(cfg.environment.clone()),
+        pack_id: None,
+        pack_version: None,
+        pack_digest: None,
+        distributor_url: None,
+        distributor_token: None,
+        preview: false,
+        dry_run: false,
+        execute_local: true,
+        output: crate::config::OutputFormat::Text,
+        config_path: None,
+        allow_remote_in_offline: false,
+        providers_dir: std::path::PathBuf::from("providers/deployer"),
+        packs_dir: std::path::PathBuf::from("packs"),
+    }
+}
+
+/// Extension-driven apply entry point: parse JSON config, build request,
+/// delegate to existing `resolve_config` + `apply::run` pipeline.
+///
+/// `_creds_json` is reserved for future secret URI resolution (Phase B #2);
+/// today, Azure credentials come from the ambient Azure auth chain
+/// (`az login`, `AZURE_*` env vars, or managed identity).
+pub fn apply_from_ext(
+    config_json: &str,
+    _creds_json: &str,
+    pack_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let cfg: AzureContainerAppsExtConfig =
+        serde_json::from_str(config_json).context("parse azure container-apps config JSON")?;
+    let request = build_azure_request_from_ext(DeployerCapability::Apply, &cfg, pack_path);
+    let config = resolve_config(request).context("resolve Azure deployer config")?;
+    let rt = tokio::runtime::Runtime::new().context("create tokio runtime for Azure deploy")?;
+    let _outcome = rt
+        .block_on(crate::apply::run(config))
+        .context("run Azure deployment pipeline")?;
+    Ok(())
+}
+
+/// Extension-driven destroy entry point.
+pub fn destroy_from_ext(
+    config_json: &str,
+    _creds_json: &str,
+    pack_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let cfg: AzureContainerAppsExtConfig =
+        serde_json::from_str(config_json).context("parse azure container-apps config JSON")?;
+    let request = build_azure_request_from_ext(DeployerCapability::Destroy, &cfg, pack_path);
+    let config = resolve_config(request).context("resolve Azure deployer config")?;
+    let rt = tokio::runtime::Runtime::new().context("create tokio runtime for Azure destroy")?;
+    let _outcome = rt
+        .block_on(crate::apply::run(config))
+        .context("run Azure destroy pipeline")?;
+    Ok(())
+}
+
 pub async fn run(request: AzureRequest) -> Result<multi_target::OperationResult> {
     let config = resolve_config(request)?;
     run_config(config).await
@@ -241,5 +318,30 @@ mod tests {
         let err = serde_json::from_str::<AzureContainerAppsExtConfig>(json).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("location"), "got: {msg}");
+    }
+
+    #[test]
+    fn apply_from_ext_rejects_invalid_json() {
+        let err = apply_from_ext("not json", "{}", None).unwrap_err();
+        assert!(format!("{err}").contains("parse"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_from_ext_rejects_missing_required_field() {
+        let json = r#"{"location":"eastus"}"#;
+        let err = apply_from_ext(json, "{}", None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("missing field")
+                || msg.contains("keyVaultUri")
+                || msg.contains("key_vault_uri"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn destroy_from_ext_rejects_invalid_json() {
+        let err = destroy_from_ext("not json", "{}", None).unwrap_err();
+        assert!(format!("{err}").contains("parse"), "got: {err}");
     }
 }
