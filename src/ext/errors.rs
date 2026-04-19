@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::extension::BuiltinBackendId;
+
 #[derive(thiserror::Error, Debug)]
 pub enum ExtensionError {
     #[error("extension directory not found: {0}")]
@@ -45,6 +47,81 @@ pub enum ExtensionError {
 
     #[error("Mode B (full WASM execution) not yet implemented — see spec §8 Phase B")]
     ModeBNotImplemented,
+
+    #[error("failed to read creds file '{path}': {source}")]
+    CredsReadError {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to read config file '{path}': {source}")]
+    ConfigReadError {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "backend '{backend:?}' has no execution adapter wired (Phase B #4a supports: Desktop, SingleVm)"
+    )]
+    AdapterNotImplemented { backend: BuiltinBackendId },
+
+    #[error("backend '{backend:?}' execution failed: {source}")]
+    BackendExecutionFailed {
+        backend: BuiltinBackendId,
+        #[source]
+        source: anyhow::Error,
+    },
 }
 
 pub type ExtensionResult<T> = Result<T, ExtensionError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extension::BuiltinBackendId;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn creds_read_error_displays_path() {
+        let err = ExtensionError::CredsReadError {
+            path: PathBuf::from("/nope/creds.json"),
+            source: std::io::Error::new(ErrorKind::NotFound, "not found"),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("/nope/creds.json"), "got: {msg}");
+        assert!(msg.contains("creds"), "got: {msg}");
+    }
+
+    #[test]
+    fn config_read_error_displays_path() {
+        let err = ExtensionError::ConfigReadError {
+            path: PathBuf::from("/nope/config.json"),
+            source: std::io::Error::new(ErrorKind::PermissionDenied, "denied"),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("/nope/config.json"), "got: {msg}");
+        assert!(msg.contains("config"), "got: {msg}");
+    }
+
+    #[test]
+    fn adapter_not_implemented_displays_backend() {
+        let err = ExtensionError::AdapterNotImplemented {
+            backend: BuiltinBackendId::Aws,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("Aws"), "got: {msg}");
+        assert!(msg.contains("Phase B #4a"), "got: {msg}");
+    }
+
+    #[test]
+    fn backend_execution_failed_displays_source() {
+        let err = ExtensionError::BackendExecutionFailed {
+            backend: BuiltinBackendId::Desktop,
+            source: anyhow::anyhow!("docker-compose: exit 1"),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("Desktop"), "got: {msg}");
+    }
+}
