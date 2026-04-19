@@ -1399,18 +1399,16 @@ from Wave 3."
 cat tests/ext_cli.rs
 ```
 
-- [ ] **Step 8.2: Add smoke tests**
+- [ ] **Step 8.2: Add smoke tests (uses existing cli_binary support helper)**
 
-Append to `tests/ext_cli.rs`:
+Append to `tests/ext_cli.rs` (note: reuses existing `cli_binary` support module already imported at file top):
 
 ```rust
 #[test]
 fn ext_apply_help_lists_required_flags() {
-    let output = assert_cmd::Command::cargo_bin("greentic-deployer")
-        .unwrap()
-        .args(["ext", "apply", "--help"])
-        .output()
-        .expect("run");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let binary = copied_test_binary(&dir);
+    let output = command_output_with_busy_retry(Command::new(&binary).args(["ext", "apply", "--help"]));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--target"), "stdout: {stdout}");
     assert!(stdout.contains("--creds"), "stdout: {stdout}");
@@ -1421,11 +1419,9 @@ fn ext_apply_help_lists_required_flags() {
 
 #[test]
 fn ext_destroy_help_lists_required_flags() {
-    let output = assert_cmd::Command::cargo_bin("greentic-deployer")
-        .unwrap()
-        .args(["ext", "destroy", "--help"])
-        .output()
-        .expect("run");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let binary = copied_test_binary(&dir);
+    let output = command_output_with_busy_retry(Command::new(&binary).args(["ext", "destroy", "--help"]));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--target"), "stdout: {stdout}");
     assert!(stdout.contains("--creds"), "stdout: {stdout}");
@@ -1434,11 +1430,9 @@ fn ext_destroy_help_lists_required_flags() {
 
 #[test]
 fn ext_apply_without_required_flags_errors() {
-    let output = assert_cmd::Command::cargo_bin("greentic-deployer")
-        .unwrap()
-        .args(["ext", "apply"])
-        .output()
-        .expect("run");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let binary = copied_test_binary(&dir);
+    let output = command_output_with_busy_retry(Command::new(&binary).args(["ext", "apply"]));
     assert!(!output.status.success(), "should fail without --target");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -1449,29 +1443,29 @@ fn ext_apply_without_required_flags_errors() {
 
 #[test]
 fn ext_apply_unknown_target_exits_nonzero() {
-    let tmp = tempfile::tempdir().unwrap();
-    let creds = tmp.path().join("creds.json");
-    let config = tmp.path().join("config.json");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let binary = copied_test_binary(&dir);
+    let tmp_creds_dir = tempfile::tempdir().expect("tempdir");
+    let creds = tmp_creds_dir.path().join("creds.json");
+    let config = tmp_creds_dir.path().join("config.json");
     std::fs::write(&creds, "{}").unwrap();
     std::fs::write(&config, "{}").unwrap();
-    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/ext");
-    let output = assert_cmd::Command::cargo_bin("greentic-deployer")
-        .unwrap()
-        .env("GREENTIC_EXT_ALLOW_UNSIGNED", "1")
-        .args([
-            "ext",
-            "apply",
-            "--ext-dir",
-            fixture.to_str().unwrap(),
-            "--target",
-            "does-not-exist",
-            "--creds",
-            creds.to_str().unwrap(),
-            "--config",
-            config.to_str().unwrap(),
-        ])
-        .output()
-        .expect("run");
+    let output = command_output_with_busy_retry(
+        Command::new(&binary)
+            .env("GREENTIC_EXT_ALLOW_UNSIGNED", "1")
+            .args([
+                "ext",
+                "apply",
+                "--ext-dir",
+                fixture_dir().to_str().unwrap(),
+                "--target",
+                "does-not-exist",
+                "--creds",
+                creds.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+            ]),
+    );
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -1481,7 +1475,7 @@ fn ext_apply_unknown_target_exits_nonzero() {
 }
 ```
 
-**Note:** `assert_cmd` and `tempfile` must be in `[dev-dependencies]`. Check with `grep -E 'assert_cmd|tempfile' Cargo.toml`. Existing tests use both, should be present.
+**Note:** Uses existing `cli_binary::copied_test_binary` + `command_output_with_busy_retry` helpers already imported in `tests/ext_cli.rs:9`. No new dev-dependencies needed.
 
 - [ ] **Step 8.3: Run smoke tests**
 
