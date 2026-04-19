@@ -7,7 +7,7 @@ use crate::ext::dispatcher::{DispatchAction, DispatchInput, dispatch_extension};
 use crate::ext::errors::{ExtensionError, ExtensionResult};
 use crate::ext::loader::{resolve_extension_dir, scan};
 use crate::ext::registry::ExtensionRegistry;
-use crate::ext::wasm::WasmtimeInvoker;
+use crate::ext::wasm::{WasmInvoker, WasmtimeInvoker};
 
 #[derive(Parser)]
 pub struct ExtCommand {
@@ -144,6 +144,22 @@ fn run_validate(dir: &Path) -> ExtensionResult<()> {
 }
 
 pub fn run_apply(dir: &Path, args: ExtApplyArgs) -> ExtensionResult<()> {
+    let loaded = scan(dir)?;
+    let roots: Vec<&Path> = loaded.iter().map(|e| e.root_dir.as_path()).collect();
+    let invoker = WasmtimeInvoker::new(&roots)?;
+    let reg = ExtensionRegistry::build(loaded);
+    run_apply_with_invoker(args, &reg, &invoker)
+}
+
+/// Injectable variant of [`run_apply`] that accepts a caller-supplied [`WasmInvoker`].
+///
+/// Used by integration tests with [`crate::ext::wasm::MockInvoker`] to avoid
+/// loading real WASM components.
+pub fn run_apply_with_invoker(
+    args: ExtApplyArgs,
+    reg: &ExtensionRegistry,
+    invoker: &dyn WasmInvoker,
+) -> ExtensionResult<()> {
     let creds_json =
         std::fs::read_to_string(&args.creds).map_err(|source| ExtensionError::CredsReadError {
             path: args.creds.clone(),
@@ -156,12 +172,9 @@ pub fn run_apply(dir: &Path, args: ExtApplyArgs) -> ExtensionResult<()> {
         }
     })?;
 
-    let loaded = scan(dir)?;
-    let reg = ExtensionRegistry::build(loaded);
-    let invoker = WasmtimeInvoker::new(&[dir])?;
     let action = dispatch_extension(
-        &reg,
-        &invoker,
+        reg,
+        invoker,
         DispatchInput {
             target_id: &args.target,
             creds_json: &creds_json,
@@ -182,6 +195,22 @@ pub fn run_apply(dir: &Path, args: ExtApplyArgs) -> ExtensionResult<()> {
 }
 
 pub fn run_destroy(dir: &Path, args: ExtDestroyArgs) -> ExtensionResult<()> {
+    let loaded = scan(dir)?;
+    let roots: Vec<&Path> = loaded.iter().map(|e| e.root_dir.as_path()).collect();
+    let invoker = WasmtimeInvoker::new(&roots)?;
+    let reg = ExtensionRegistry::build(loaded);
+    run_destroy_with_invoker(args, &reg, &invoker)
+}
+
+/// Injectable variant of [`run_destroy`] that accepts a caller-supplied [`WasmInvoker`].
+///
+/// Used by integration tests with [`crate::ext::wasm::MockInvoker`] to avoid
+/// loading real WASM components.
+pub fn run_destroy_with_invoker(
+    args: ExtDestroyArgs,
+    reg: &ExtensionRegistry,
+    invoker: &dyn WasmInvoker,
+) -> ExtensionResult<()> {
     let creds_json =
         std::fs::read_to_string(&args.creds).map_err(|source| ExtensionError::CredsReadError {
             path: args.creds.clone(),
@@ -194,12 +223,9 @@ pub fn run_destroy(dir: &Path, args: ExtDestroyArgs) -> ExtensionResult<()> {
         }
     })?;
 
-    let loaded = scan(dir)?;
-    let reg = ExtensionRegistry::build(loaded);
-    let invoker = WasmtimeInvoker::new(&[dir])?;
     let action = dispatch_extension(
-        &reg,
-        &invoker,
+        reg,
+        invoker,
         DispatchInput {
             target_id: &args.target,
             creds_json: &creds_json,

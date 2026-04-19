@@ -75,6 +75,10 @@ required-features = ["extensions", "test-utils"]
 name = "ext_cli"
 required-features = ["extensions"]
 
+[[test]]
+name = "ext_apply_integration"
+required-features = ["extensions", "test-utils"]
+
 [dev-dependencies]
 tempfile = "3"
 wat = "1"
