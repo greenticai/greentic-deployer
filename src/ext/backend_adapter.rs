@@ -68,6 +68,14 @@ pub fn run(
             crate::gcp::destroy_from_ext(config_json, creds_json, pack_path)
                 .map_err(|e| ExtensionError::BackendExecutionFailed { backend, source: e })
         }
+        (BuiltinBackendId::Azure, ExtAction::Apply) => {
+            crate::azure::apply_from_ext(config_json, creds_json, pack_path)
+                .map_err(|e| ExtensionError::BackendExecutionFailed { backend, source: e })
+        }
+        (BuiltinBackendId::Azure, ExtAction::Destroy) => {
+            crate::azure::destroy_from_ext(config_json, creds_json, pack_path)
+                .map_err(|e| ExtensionError::BackendExecutionFailed { backend, source: e })
+        }
         _ => Err(ExtensionError::AdapterNotImplemented { backend }),
     }
 }
@@ -79,7 +87,7 @@ mod tests {
     #[test]
     fn unsupported_backend_returns_adapter_not_implemented_apply() {
         let err = run(
-            BuiltinBackendId::Azure,
+            BuiltinBackendId::Terraform,
             None,
             ExtAction::Apply,
             "{}",
@@ -90,7 +98,7 @@ mod tests {
         assert!(matches!(
             err,
             ExtensionError::AdapterNotImplemented {
-                backend: BuiltinBackendId::Azure
+                backend: BuiltinBackendId::Terraform
             }
         ));
     }
@@ -98,7 +106,7 @@ mod tests {
     #[test]
     fn unsupported_backend_returns_adapter_not_implemented_destroy() {
         let err = run(
-            BuiltinBackendId::Azure,
+            BuiltinBackendId::Terraform,
             None,
             ExtAction::Destroy,
             "{}",
@@ -109,7 +117,7 @@ mod tests {
         assert!(matches!(
             err,
             ExtensionError::AdapterNotImplemented {
-                backend: BuiltinBackendId::Azure
+                backend: BuiltinBackendId::Terraform
             }
         ));
     }
@@ -229,6 +237,46 @@ mod tests {
             err,
             ExtensionError::BackendExecutionFailed {
                 backend: BuiltinBackendId::Aws,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn azure_invalid_config_surfaces_as_backend_execution_failed() {
+        let err = run(
+            BuiltinBackendId::Azure,
+            None,
+            ExtAction::Apply,
+            "{}",
+            "not json",
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionError::BackendExecutionFailed {
+                backend: BuiltinBackendId::Azure,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn azure_destroy_invalid_config_surfaces_as_backend_execution_failed() {
+        let err = run(
+            BuiltinBackendId::Azure,
+            None,
+            ExtAction::Destroy,
+            "{}",
+            "not json",
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionError::BackendExecutionFailed {
+                backend: BuiltinBackendId::Azure,
                 ..
             }
         ));

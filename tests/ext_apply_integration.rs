@@ -189,3 +189,27 @@ fn ext_apply_gcp_target_requires_required_config_fields() {
         "got: {err:?}"
     );
 }
+
+#[test]
+#[ignore = "unignore when deploy-azure fixture lands in testdata/ext/ (Phase B #4d Azure follow-up)"]
+fn ext_apply_azure_target_requires_required_config_fields() {
+    let _env = EnvGuard::set("GREENTIC_EXT_ALLOW_UNSIGNED", "1");
+    let tmp = tempfile::tempdir().unwrap();
+    let creds = write_tempfile(tmp.path(), "creds.json", "{}");
+    let config = write_tempfile(tmp.path(), "config.json", r#"{"location":"eastus"}"#);
+    let args = ExtApplyArgs {
+        target: "azure-container-apps-local".into(),
+        creds,
+        config,
+        pack: None,
+        strict_validate: false,
+    };
+    let err = run_apply(&fixture_dir(), args).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ExtensionError::ValidationFailed { .. } | ExtensionError::TargetNotFound(_)
+        ),
+        "got: {err:?}"
+    );
+}
