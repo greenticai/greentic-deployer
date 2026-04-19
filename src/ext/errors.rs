@@ -63,7 +63,7 @@ pub enum ExtensionError {
     },
 
     #[error(
-        "backend '{backend:?}' has no execution adapter wired (supported: Desktop, SingleVm, Aws)"
+        "backend '{backend:?}' has no execution adapter wired (supported: Desktop, SingleVm, Aws, Gcp)"
     )]
     AdapterNotImplemented { backend: BuiltinBackendId },
 
@@ -108,13 +108,14 @@ mod tests {
     #[test]
     fn adapter_not_implemented_displays_backend() {
         let err = ExtensionError::AdapterNotImplemented {
-            backend: BuiltinBackendId::Gcp,
+            backend: BuiltinBackendId::Azure,
         };
         let msg = format!("{err}");
-        assert!(msg.contains("Gcp"), "got: {msg}");
+        assert!(msg.contains("Azure"), "got: {msg}");
         assert!(msg.contains("Desktop"), "got: {msg}");
         assert!(msg.contains("SingleVm"), "got: {msg}");
         assert!(msg.contains("Aws"), "got: {msg}");
+        assert!(msg.contains("Gcp"), "got: {msg}");
     }
 
     #[test]
