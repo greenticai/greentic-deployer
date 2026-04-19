@@ -50,6 +50,32 @@ pub struct AwsAdminTunnelRequest {
     pub container: String,
 }
 
+/// Configuration shape consumed by `ext apply --target aws-ecs-fargate-local`.
+///
+/// Mirrors the JSON schema declared by the `deploy-aws` reference extension.
+/// Keys use camelCase on the wire; Rust field names use snake_case with serde rename.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AwsEcsFargateExtConfig {
+    pub region: String,
+    pub environment: String,
+    pub operator_image_digest: String,
+    pub bundle_source: String,
+    pub bundle_digest: String,
+    pub remote_state_backend: String,
+    pub dns_name: Option<String>,
+    pub public_base_url: Option<String>,
+    pub repo_registry_base: Option<String>,
+    pub store_registry_base: Option<String>,
+    pub admin_allowed_clients: Option<String>,
+    #[serde(default = "default_ext_tenant")]
+    pub tenant: String,
+}
+
+fn default_ext_tenant() -> String {
+    "default".to_string()
+}
+
 impl AwsRequest {
     pub fn new(
         capability: DeployerCapability,
@@ -421,5 +447,61 @@ mod tests {
         assert_eq!(request.provider, Provider::Aws);
         assert_eq!(request.strategy, "iac-only");
         assert_eq!(request.tenant, "acme");
+    }
+
+    #[test]
+    fn ext_config_parses_minimum_fields() {
+        let json = r#"{
+            "region": "us-east-1",
+            "environment": "staging",
+            "operatorImageDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "bundleSource": "oci://registry.example/acme/prod-bundle@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "bundleDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "remoteStateBackend": "s3://my-tf-state-bucket/greentic/staging"
+        }"#;
+        let cfg: AwsEcsFargateExtConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.region, "us-east-1");
+        assert_eq!(cfg.environment, "staging");
+        assert_eq!(cfg.tenant, "default");
+        assert!(cfg.dns_name.is_none());
+        assert!(cfg.public_base_url.is_none());
+    }
+
+    #[test]
+    fn ext_config_accepts_all_optionals() {
+        let json = r#"{
+            "region": "us-east-1",
+            "environment": "prod",
+            "operatorImageDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "bundleSource": "oci://registry.example/acme/prod-bundle@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "bundleDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "remoteStateBackend": "s3://my-tf-state-bucket/greentic/prod",
+            "dnsName": "api.example.com",
+            "publicBaseUrl": "https://api.example.com",
+            "repoRegistryBase": "https://repo.example.com",
+            "storeRegistryBase": "https://store.example.com",
+            "adminAllowedClients": "CN=admin",
+            "tenant": "acme"
+        }"#;
+        let cfg: AwsEcsFargateExtConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.dns_name.as_deref(), Some("api.example.com"));
+        assert_eq!(
+            cfg.public_base_url.as_deref(),
+            Some("https://api.example.com")
+        );
+        assert_eq!(cfg.tenant, "acme");
+    }
+
+    #[test]
+    fn ext_config_rejects_missing_region() {
+        let json = r#"{
+            "environment": "staging",
+            "operatorImageDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "bundleSource": "oci://...",
+            "bundleDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "remoteStateBackend": "s3://..."
+        }"#;
+        let err = serde_json::from_str::<AwsEcsFargateExtConfig>(json).unwrap_err();
+        assert!(format!("{err}").contains("region"), "got: {err}");
     }
 }
