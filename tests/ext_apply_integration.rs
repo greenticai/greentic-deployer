@@ -160,3 +160,32 @@ fn ext_apply_aws_target_requires_required_config_fields() {
         "got: {err:?}"
     );
 }
+
+#[test]
+#[ignore = "unignore when deploy-gcp fixture lands in testdata/ext/ (Phase B #4d follow-up)"]
+fn ext_apply_gcp_target_requires_required_config_fields() {
+    let _env = EnvGuard::set("GREENTIC_EXT_ALLOW_UNSIGNED", "1");
+    let tmp = tempfile::tempdir().unwrap();
+    let creds = write_tempfile(tmp.path(), "creds.json", "{}");
+    // Missing required fields (only region provided)
+    let config = write_tempfile(tmp.path(), "config.json", r#"{"region":"us-central1"}"#);
+    let args = ExtApplyArgs {
+        target: "gcp-cloud-run-local".into(),
+        creds,
+        config,
+        pack: None,
+        strict_validate: false,
+    };
+    // Requires testdata/ext/greentic.deploy-gcp-stub/ with describe.json + WASM.
+    // Currently ignored; will be unignored after #4d publishes deploy-gcp@0.1.0
+    // and we copy a stub into this repo's testdata/.
+    let err = run_apply(&fixture_dir(), args).unwrap_err();
+    // Either ValidationFailed (schema) or TargetNotFound depending on fixture state
+    assert!(
+        matches!(
+            err,
+            ExtensionError::ValidationFailed { .. } | ExtensionError::TargetNotFound(_)
+        ),
+        "got: {err:?}"
+    );
+}
