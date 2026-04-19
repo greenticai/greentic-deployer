@@ -193,20 +193,12 @@ pub fn runtime_from_handler(handler: Option<&str>) -> Result<RuntimeKind> {
 }
 
 /// Extension-driven apply: parse JSON config, dispatch to real runner.
-pub fn apply_from_ext(
-    handler: Option<&str>,
-    config_json: &str,
-    creds_json: &str,
-) -> Result<()> {
+pub fn apply_from_ext(handler: Option<&str>, config_json: &str, creds_json: &str) -> Result<()> {
     apply_from_ext_with_runner(handler, config_json, creds_json, &RealCommandRunner)
 }
 
 /// Extension-driven destroy: parse JSON config, dispatch to real runner.
-pub fn destroy_from_ext(
-    handler: Option<&str>,
-    config_json: &str,
-    creds_json: &str,
-) -> Result<()> {
+pub fn destroy_from_ext(handler: Option<&str>, config_json: &str, creds_json: &str) -> Result<()> {
     destroy_from_ext_with_runner(handler, config_json, creds_json, &RealCommandRunner)
 }
 
@@ -378,9 +370,10 @@ mod tests {
 
     impl CommandRunner for RecordingRunner {
         fn run(&self, cmd: &mut Command) -> anyhow::Result<std::process::ExitStatus> {
-            let argv: Vec<String> = std::iter::once(cmd.get_program().to_string_lossy().to_string())
-                .chain(cmd.get_args().map(|a| a.to_string_lossy().to_string()))
-                .collect();
+            let argv: Vec<String> =
+                std::iter::once(cmd.get_program().to_string_lossy().to_string())
+                    .chain(cmd.get_args().map(|a| a.to_string_lossy().to_string()))
+                    .collect();
             self.captured.lock().unwrap().push(argv);
             Ok(fake_exit_success())
         }
@@ -414,13 +407,8 @@ mod tests {
     #[test]
     fn apply_from_ext_with_runner_invokes_up_command() {
         let runner = RecordingRunner::default();
-        apply_from_ext_with_runner(
-            Some("docker-compose"),
-            &sample_config_json(),
-            "{}",
-            &runner,
-        )
-        .expect("apply ok");
+        apply_from_ext_with_runner(Some("docker-compose"), &sample_config_json(), "{}", &runner)
+            .expect("apply ok");
         let captured = runner.captured.lock().unwrap();
         assert_eq!(captured.len(), 1);
         let argv = &captured[0];
@@ -432,13 +420,8 @@ mod tests {
     #[test]
     fn destroy_from_ext_with_runner_invokes_down_command() {
         let runner = RecordingRunner::default();
-        destroy_from_ext_with_runner(
-            Some("docker-compose"),
-            &sample_config_json(),
-            "{}",
-            &runner,
-        )
-        .expect("destroy ok");
+        destroy_from_ext_with_runner(Some("docker-compose"), &sample_config_json(), "{}", &runner)
+            .expect("destroy ok");
         let captured = runner.captured.lock().unwrap();
         assert_eq!(captured.len(), 1);
         assert!(captured[0].contains(&"down".to_string()));
@@ -447,26 +430,17 @@ mod tests {
     #[test]
     fn apply_from_ext_rejects_invalid_json() {
         let runner = RecordingRunner::default();
-        let err = apply_from_ext_with_runner(
-            Some("docker-compose"),
-            "not json",
-            "{}",
-            &runner,
-        )
-        .unwrap_err();
+        let err = apply_from_ext_with_runner(Some("docker-compose"), "not json", "{}", &runner)
+            .unwrap_err();
         assert!(format!("{err}").contains("parse"));
     }
 
     #[test]
     fn apply_from_ext_rejects_unknown_handler() {
         let runner = RecordingRunner::default();
-        let err = apply_from_ext_with_runner(
-            Some("kubernetes"),
-            &sample_config_json(),
-            "{}",
-            &runner,
-        )
-        .unwrap_err();
+        let err =
+            apply_from_ext_with_runner(Some("kubernetes"), &sample_config_json(), "{}", &runner)
+                .unwrap_err();
         assert!(format!("{err}").contains("kubernetes"));
     }
 
