@@ -57,7 +57,7 @@ tar = "0.4"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 once_cell = "1"
 reqwest = { version = "0.13", features = ["blocking", "json", "rustls"] }
-toml = "0.9"
+toml = "1.1"
 indexmap = "2"
 jsonschema = "0.45"
 greentic-ext-runtime  = { git = "https://github.com/greentic-biz/greentic-designer-extensions", rev = "94e6ba406269c53297918bb14716255835331354", optional = true, package = "greentic-ext-runtime" }
