@@ -52,6 +52,14 @@ pub fn run(
                 }
             })
         }
+        (BuiltinBackendId::Aws, ExtAction::Apply) => {
+            crate::aws::apply_from_ext(config_json, creds_json, pack_path)
+                .map_err(|e| ExtensionError::BackendExecutionFailed { backend, source: e })
+        }
+        (BuiltinBackendId::Aws, ExtAction::Destroy) => {
+            crate::aws::destroy_from_ext(config_json, creds_json, pack_path)
+                .map_err(|e| ExtensionError::BackendExecutionFailed { backend, source: e })
+        }
         _ => Err(ExtensionError::AdapterNotImplemented { backend }),
     }
 }
@@ -63,7 +71,7 @@ mod tests {
     #[test]
     fn unsupported_backend_returns_adapter_not_implemented_apply() {
         let err = run(
-            BuiltinBackendId::Aws,
+            BuiltinBackendId::Gcp,
             None,
             ExtAction::Apply,
             "{}",
@@ -74,7 +82,7 @@ mod tests {
         assert!(matches!(
             err,
             ExtensionError::AdapterNotImplemented {
-                backend: BuiltinBackendId::Aws
+                backend: BuiltinBackendId::Gcp
             }
         ));
     }
@@ -133,6 +141,46 @@ mod tests {
             err,
             ExtensionError::BackendExecutionFailed {
                 backend: BuiltinBackendId::SingleVm,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn aws_invalid_config_surfaces_as_backend_execution_failed() {
+        let err = run(
+            BuiltinBackendId::Aws,
+            None,
+            ExtAction::Apply,
+            "{}",
+            "not json",
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionError::BackendExecutionFailed {
+                backend: BuiltinBackendId::Aws,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn aws_destroy_invalid_config_surfaces_as_backend_execution_failed() {
+        let err = run(
+            BuiltinBackendId::Aws,
+            None,
+            ExtAction::Destroy,
+            "{}",
+            "not json",
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionError::BackendExecutionFailed {
+                backend: BuiltinBackendId::Aws,
                 ..
             }
         ));
