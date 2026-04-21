@@ -74,9 +74,9 @@ jobs:
           fi
           echo "value=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
-          toolchain: 1.91.1
+          toolchain: 1.95.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
@@ -153,9 +153,9 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
-          toolchain: 1.91.1
+          toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
       - uses: oras-project/setup-oras@v1
       - name: Build fixture gtpacks
