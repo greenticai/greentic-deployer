@@ -2,7 +2,7 @@ name: Codex Semver Fix
 on:
   schedule:
     # 05:11 UTC — staggered to avoid hot-spots.
-    - cron: "11 5 * * *"
+    - cron: "31 3 * * *"
   workflow_dispatch:
     inputs:
       branch:
