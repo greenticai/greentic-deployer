@@ -101,6 +101,33 @@ impl GcpRequest {
     }
 }
 
+/// Configuration shape consumed by `ext apply --target gcp-cloud-run-local`.
+///
+/// Mirrors the JSON schema declared by the `deploy-gcp` reference extension.
+/// Keys use camelCase on the wire; Rust field names use snake_case with serde rename.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GcpCloudRunExtConfig {
+    pub project_id: String,
+    pub region: String,
+    pub environment: String,
+    pub operator_image_digest: String,
+    pub bundle_source: String,
+    pub bundle_digest: String,
+    pub remote_state_backend: String,
+    pub dns_name: Option<String>,
+    pub public_base_url: Option<String>,
+    pub repo_registry_base: Option<String>,
+    pub store_registry_base: Option<String>,
+    pub admin_allowed_clients: Option<String>,
+    #[serde(default = "default_ext_tenant")]
+    pub tenant: String,
+}
+
+fn default_ext_tenant() -> String {
+    "default".to_string()
+}
+
 pub fn resolve_config(request: GcpRequest) -> Result<DeployerConfig> {
     DeployerConfig::resolve(request.into_deployer_request())
 }
@@ -113,6 +140,87 @@ pub fn ensure_gcp_config(config: &DeployerConfig) -> Result<()> {
             config.strategy
         )));
     }
+    Ok(())
+}
+
+/// Build a `GcpRequest` from the extension-provided config. Used by
+/// `apply_from_ext` / `destroy_from_ext`. Fields unused by the extension
+/// path default to `None` / `false` / sensible defaults.
+fn build_gcp_request_from_ext(
+    capability: DeployerCapability,
+    cfg: &GcpCloudRunExtConfig,
+    pack_path: Option<&std::path::Path>,
+) -> GcpRequest {
+    GcpRequest {
+        capability,
+        tenant: cfg.tenant.clone(),
+        pack_path: pack_path
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default(),
+        bundle_source: Some(cfg.bundle_source.clone()),
+        bundle_digest: Some(cfg.bundle_digest.clone()),
+        repo_registry_base: cfg.repo_registry_base.clone(),
+        store_registry_base: cfg.store_registry_base.clone(),
+        provider_pack: None,
+        deploy_pack_id_override: None,
+        deploy_flow_id_override: None,
+        environment: Some(cfg.environment.clone()),
+        pack_id: None,
+        pack_version: None,
+        pack_digest: None,
+        distributor_url: None,
+        distributor_token: None,
+        preview: false,
+        dry_run: false,
+        execute_local: true,
+        output: crate::config::OutputFormat::Text,
+        config_path: None,
+        allow_remote_in_offline: false,
+        providers_dir: std::path::PathBuf::from("providers/deployer"),
+        packs_dir: std::path::PathBuf::from("packs"),
+    }
+}
+
+/// Extension-driven apply entry point: parse JSON config, build request,
+/// delegate to existing `resolve_config` + `apply::run` pipeline.
+///
+/// `_creds_json` is reserved for future secret URI resolution (Phase B #2);
+/// today, GCP credentials come from the ambient Google Application Default
+/// Credentials (ADC) chain (`gcloud auth application-default login` or
+/// `GOOGLE_APPLICATION_CREDENTIALS`).
+pub fn apply_from_ext(
+    config_json: &str,
+    _creds_json: &str,
+    pack_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let cfg: GcpCloudRunExtConfig =
+        serde_json::from_str(config_json).context("parse gcp cloud-run config JSON")?;
+    let request = build_gcp_request_from_ext(DeployerCapability::Apply, &cfg, pack_path);
+    let config = resolve_config(request).context("resolve GCP deployer config")?;
+    let rt = tokio::runtime::Runtime::new().context("create tokio runtime for GCP deploy")?;
+    let _outcome = rt
+        .block_on(crate::apply::run(config))
+        .context("run GCP deployment pipeline")?;
+    Ok(())
+}
+
+/// Extension-driven destroy entry point: same shape as `apply_from_ext`
+/// with `capability: Destroy`.
+pub fn destroy_from_ext(
+    config_json: &str,
+    _creds_json: &str,
+    pack_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let cfg: GcpCloudRunExtConfig =
+        serde_json::from_str(config_json).context("parse gcp cloud-run config JSON")?;
+    let request = build_gcp_request_from_ext(DeployerCapability::Destroy, &cfg, pack_path);
+    let config = resolve_config(request).context("resolve GCP deployer config")?;
+    let rt = tokio::runtime::Runtime::new().context("create tokio runtime for GCP destroy")?;
+    let _outcome = rt
+        .block_on(crate::apply::run(config))
+        .context("run GCP destroy pipeline")?;
     Ok(())
 }
 
@@ -154,5 +262,94 @@ mod tests {
         assert_eq!(request.provider, Provider::Gcp);
         assert_eq!(request.strategy, "iac-only");
         assert_eq!(request.tenant, "acme");
+    }
+
+    #[test]
+    fn ext_config_parses_minimum_fields() {
+        let json = r#"{
+            "projectId": "my-gcp-project-12345",
+            "region": "us-central1",
+            "environment": "staging",
+            "operatorImageDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "bundleSource": "oci://registry.example/acme/prod-bundle@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "bundleDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "remoteStateBackend": "gs://my-tf-state-bucket/greentic/staging"
+        }"#;
+        let cfg: GcpCloudRunExtConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.project_id, "my-gcp-project-12345");
+        assert_eq!(cfg.region, "us-central1");
+        assert_eq!(cfg.environment, "staging");
+        assert_eq!(cfg.tenant, "default");
+        assert!(cfg.dns_name.is_none());
+        assert!(cfg.public_base_url.is_none());
+    }
+
+    #[test]
+    fn ext_config_accepts_all_optionals() {
+        let json = r#"{
+            "projectId": "my-gcp-project-12345",
+            "region": "us-central1",
+            "environment": "prod",
+            "operatorImageDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "bundleSource": "oci://registry.example/acme/prod-bundle@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "bundleDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "remoteStateBackend": "gs://my-tf-state-bucket/greentic/prod",
+            "dnsName": "api.example.com",
+            "publicBaseUrl": "https://api.example.com",
+            "repoRegistryBase": "https://repo.example.com",
+            "storeRegistryBase": "https://store.example.com",
+            "adminAllowedClients": "CN=admin",
+            "tenant": "acme"
+        }"#;
+        let cfg: GcpCloudRunExtConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.dns_name.as_deref(), Some("api.example.com"));
+        assert_eq!(
+            cfg.public_base_url.as_deref(),
+            Some("https://api.example.com")
+        );
+        assert_eq!(cfg.tenant, "acme");
+    }
+
+    #[test]
+    fn ext_config_rejects_missing_project_id() {
+        let json = r#"{
+            "region": "us-central1",
+            "environment": "staging",
+            "operatorImageDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "bundleSource": "oci://...",
+            "bundleDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "remoteStateBackend": "gs://..."
+        }"#;
+        let err = serde_json::from_str::<GcpCloudRunExtConfig>(json).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("projectId") || msg.contains("project_id"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_from_ext_rejects_invalid_json() {
+        let err = apply_from_ext("not json", "{}", None).unwrap_err();
+        assert!(format!("{err}").contains("parse"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_from_ext_rejects_missing_required_field() {
+        let json = r#"{"projectId":"my-project"}"#;
+        let err = apply_from_ext(json, "{}", None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("missing field")
+                || msg.contains("bundleSource")
+                || msg.contains("bundle_source"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn destroy_from_ext_rejects_invalid_json() {
+        let err = destroy_from_ext("not json", "{}", None).unwrap_err();
+        assert!(format!("{err}").contains("parse"), "got: {err}");
     }
 }

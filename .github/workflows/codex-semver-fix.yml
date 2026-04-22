@@ -1,0 +1,28 @@
+name: Codex Semver Fix
+on:
+  schedule:
+    # 05:11 UTC — staggered to avoid hot-spots.
+    - cron: "31 3 * * *"
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to scan and patch (only for manual run)"
+        required: false
+        default: ""
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semver-fix:
+    # Do not run on fork PRs to avoid passing untrusted refs into privileged remediation workflows.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: greenticai/.github/.github/workflows/codex-semver-fix.yml@main
+    with:
+      branch: ${{ github.event.inputs.branch || '' }}
+      rust-version: 1.95.0
+    secrets: inherit

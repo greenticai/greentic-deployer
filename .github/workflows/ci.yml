@@ -10,14 +10,21 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  local-check:
+  ci:
+    uses: greenticai/.github/.github/workflows/pr-ci.yml@main
+    with:
+      variant: host
+
+  # Entangled steps from ci/local_check.sh that pr-ci.yml does not cover:
+  # scaffold replay, fixture gtpack build, cargo doc, feature-matrix builds,
+  # and extension-gated tests.
+  extras:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      CARGO_TERM_COLOR: always
     steps:
       - name: Free disk space
         run: |
@@ -25,9 +32,25 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
-          toolchain: 1.91.1
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: ./ci/local_check.sh
+
+      - name: Replay deployer scaffolds
+        run: cargo run --features internal-tools --bin replay_deployer_scaffolds
+
+      - name: Build and validate fixture gtpacks
+        run: cargo run --features internal-tools --bin build_fixture_gtpacks
+
+      - name: Cargo doc
+        run: cargo doc --no-deps
+
+      - name: Build (no default features)
+        run: cargo build --no-default-features
+
+      - name: Build (extensions)
+        run: cargo build --features extensions
+
+      - name: Test (extensions)
+        run: cargo test --features extensions

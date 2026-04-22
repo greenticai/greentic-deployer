@@ -37,3 +37,21 @@ output "admin_client_key_secret_ref" {
     var.cloud == "azure" ? module.operator_azure[0].admin_client_key_secret_ref : module.operator_gcp[0].admin_client_key_secret_ref
   )
 }
+
+output "admin_access_mode" {
+  value = var.cloud == "aws" ? null : (
+    var.cloud == "azure" ? module.operator_azure[0].admin_access_mode : module.operator_gcp[0].admin_access_mode
+  )
+}
+
+output "admin_public_endpoint" {
+  value = var.cloud == "aws" ? null : (
+    var.cloud == "azure" ? module.operator_azure[0].admin_public_endpoint : module.operator_gcp[0].admin_public_endpoint
+  )
+}
+
+output "admin_relay_token_secret_ref" {
+  value = var.cloud == "aws" ? null : (
+    var.cloud == "azure" ? module.operator_azure[0].admin_relay_token_secret_ref : module.operator_gcp[0].admin_relay_token_secret_ref
+  )
+}

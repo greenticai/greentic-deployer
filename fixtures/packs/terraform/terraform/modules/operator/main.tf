@@ -22,7 +22,7 @@ data "aws_subnets" "default" {
 }
 
 locals {
-  name_prefix = "greentic-${substr(md5(var.bundle_digest), 0, 8)}"
+  name_prefix = trimspace(var.deployment_name_prefix) != "" ? var.deployment_name_prefix : "greentic-${substr(md5(var.bundle_digest), 0, 8)}"
   app_port    = 8080
   admin_port  = 8433
   admin_bind  = "127.0.0.1:${local.admin_port}"

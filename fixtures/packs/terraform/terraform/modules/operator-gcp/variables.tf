@@ -6,6 +6,11 @@ variable "environment" {
   type = string
 }
 
+variable "deployment_name_prefix" {
+  type    = string
+  default = ""
+}
+
 variable "operator_image" {
   type = string
 }
@@ -40,4 +45,9 @@ variable "gcp_project_id" {
 
 variable "gcp_region" {
   type = string
+}
+
+variable "admin_access_mode" {
+  type    = string
+  default = "http-bearer-relay"
 }

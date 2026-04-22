@@ -1,11 +1,13 @@
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+use crate::admin_access::{
+    load_terraform_outputs, resolve_latest_deploy_dir, terraform_output_string,
+    tunnel_admin_cert_dir,
+};
 use crate::config::{DeployerConfig, DeployerRequest, OutputFormat, Provider};
 use crate::contract::DeployerCapability;
 use crate::error::{DeployerError, Result};
@@ -46,6 +48,32 @@ pub struct AwsAdminTunnelRequest {
     pub bundle_dir: PathBuf,
     pub local_port: String,
     pub container: String,
+}
+
+/// Configuration shape consumed by `ext apply --target aws-ecs-fargate-local`.
+///
+/// Mirrors the JSON schema declared by the `deploy-aws` reference extension.
+/// Keys use camelCase on the wire; Rust field names use snake_case with serde rename.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AwsEcsFargateExtConfig {
+    pub region: String,
+    pub environment: String,
+    pub operator_image_digest: String,
+    pub bundle_source: String,
+    pub bundle_digest: String,
+    pub remote_state_backend: String,
+    pub dns_name: Option<String>,
+    pub public_base_url: Option<String>,
+    pub repo_registry_base: Option<String>,
+    pub store_registry_base: Option<String>,
+    pub admin_allowed_clients: Option<String>,
+    #[serde(default = "default_ext_tenant")]
+    pub tenant: String,
+}
+
+fn default_ext_tenant() -> String {
+    "default".to_string()
 }
 
 impl AwsRequest {
@@ -129,6 +157,85 @@ pub fn ensure_aws_config(config: &DeployerConfig) -> Result<()> {
     Ok(())
 }
 
+/// Build an `AwsRequest` from the extension-provided config. Used by
+/// `apply_from_ext` / `destroy_from_ext`. Fields unused by the extension
+/// path default to `None` / `false` / sensible defaults.
+fn build_aws_request_from_ext(
+    capability: DeployerCapability,
+    cfg: &AwsEcsFargateExtConfig,
+    pack_path: Option<&std::path::Path>,
+) -> AwsRequest {
+    AwsRequest {
+        capability,
+        tenant: cfg.tenant.clone(),
+        pack_path: pack_path
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default(),
+        bundle_source: Some(cfg.bundle_source.clone()),
+        bundle_digest: Some(cfg.bundle_digest.clone()),
+        repo_registry_base: cfg.repo_registry_base.clone(),
+        store_registry_base: cfg.store_registry_base.clone(),
+        provider_pack: None,
+        deploy_pack_id_override: None,
+        deploy_flow_id_override: None,
+        environment: Some(cfg.environment.clone()),
+        pack_id: None,
+        pack_version: None,
+        pack_digest: None,
+        distributor_url: None,
+        distributor_token: None,
+        preview: false,
+        dry_run: false,
+        execute_local: true,
+        output: crate::config::OutputFormat::Text,
+        config_path: None,
+        allow_remote_in_offline: false,
+        providers_dir: std::path::PathBuf::from("providers/deployer"),
+        packs_dir: std::path::PathBuf::from("packs"),
+    }
+}
+
+/// Extension-driven apply entry point: parse JSON config, build request,
+/// delegate to existing `resolve_config` + `apply::run` pipeline.
+///
+/// `_creds_json` is reserved for future secret URI resolution (Phase B #2);
+/// today, AWS credentials come from the ambient provider chain.
+pub fn apply_from_ext(
+    config_json: &str,
+    _creds_json: &str,
+    pack_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let cfg: AwsEcsFargateExtConfig =
+        serde_json::from_str(config_json).context("parse aws ecs-fargate config JSON")?;
+    let request = build_aws_request_from_ext(DeployerCapability::Apply, &cfg, pack_path);
+    let config = resolve_config(request).context("resolve AWS deployer config")?;
+    let rt = tokio::runtime::Runtime::new().context("create tokio runtime for AWS deploy")?;
+    let _outcome = rt
+        .block_on(crate::apply::run(config))
+        .context("run AWS deployment pipeline")?;
+    Ok(())
+}
+
+/// Extension-driven destroy entry point: same shape as `apply_from_ext`
+/// with `capability: Destroy`.
+pub fn destroy_from_ext(
+    config_json: &str,
+    _creds_json: &str,
+    pack_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let cfg: AwsEcsFargateExtConfig =
+        serde_json::from_str(config_json).context("parse aws ecs-fargate config JSON")?;
+    let request = build_aws_request_from_ext(DeployerCapability::Destroy, &cfg, pack_path);
+    let config = resolve_config(request).context("resolve AWS deployer config")?;
+    let rt = tokio::runtime::Runtime::new().context("create tokio runtime for AWS destroy")?;
+    let _outcome = rt
+        .block_on(crate::apply::run(config))
+        .context("run AWS destroy pipeline")?;
+    Ok(())
+}
+
 pub async fn run(request: AwsRequest) -> Result<multi_target::OperationResult> {
     let config = resolve_config(request)?;
     run_config(config).await
@@ -156,7 +263,7 @@ pub async fn run_config_with_plan(
 }
 
 pub fn run_admin_tunnel(args: AwsAdminTunnelRequest) -> Result<()> {
-    let deploy_dir = resolve_latest_aws_deploy_dir(&args.bundle_dir)?;
+    let deploy_dir = resolve_latest_deploy_dir(&args.bundle_dir, "aws")?;
     let outputs_path = deploy_dir.join("terraform-outputs.json");
     let outputs = load_terraform_outputs(&outputs_path)?;
     let Some(admin_ca_secret_ref) = terraform_output_string(&outputs, "admin_ca_secret_ref") else {
@@ -295,77 +402,8 @@ pub fn run_admin_tunnel(args: AwsAdminTunnelRequest) -> Result<()> {
     }
 }
 
-fn resolve_latest_aws_deploy_dir(bundle_dir: &Path) -> Result<PathBuf> {
-    let mut candidates = vec![bundle_dir.join(".greentic").join("deploy").join("aws")];
-    if let Some(parent) = bundle_dir.parent() {
-        candidates.push(parent.join(".greentic").join("deploy").join("aws"));
-    }
-    if let Some(home_dir) = env::var_os("HOME") {
-        candidates.push(
-            PathBuf::from(home_dir)
-                .join(".greentic")
-                .join("deploy")
-                .join("aws"),
-        );
-    }
-    let mut latest: Option<(SystemTime, PathBuf)> = None;
-    for root in candidates {
-        if root.as_os_str().is_empty() || !root.exists() {
-            continue;
-        }
-        let mut stack = vec![root];
-        while let Some(dir) = stack.pop() {
-            let entries = fs::read_dir(&dir)?;
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let outputs = path.join("terraform-outputs.json");
-                    if outputs.is_file() {
-                        let modified = fs::metadata(&outputs)
-                            .and_then(|meta| meta.modified())
-                            .unwrap_or(UNIX_EPOCH);
-                        match latest.as_ref() {
-                            Some((current, _)) if modified <= *current => {}
-                            _ => latest = Some((modified, path.clone())),
-                        }
-                    }
-                    stack.push(path);
-                }
-            }
-        }
-    }
-
-    latest.map(|(_, path)| path).ok_or_else(|| {
-        DeployerError::Other(format!(
-            "aws deploy state not found under {}, its parent workspace, or ~/.greentic/deploy/aws; deploy the bundle first",
-            bundle_dir.join(".greentic").join("deploy").join("aws").display()
-        ))
-    })
-}
-
-fn load_terraform_outputs(path: &Path) -> Result<Value> {
-    let raw = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&raw)?)
-}
-
-fn terraform_output_string(outputs: &Value, key: &str) -> Option<String> {
-    outputs
-        .get(key)
-        .and_then(|value| value.get("value"))
-        .and_then(Value::as_str)
-        .map(|value| value.to_string())
-}
-
 fn aws_region_from_secret_arn(secret_arn: &str) -> Option<String> {
     secret_arn.split(':').nth(3).map(|value| value.to_string())
-}
-
-fn tunnel_admin_cert_dir(bundle_dir: &Path, deploy_name_prefix: &str) -> PathBuf {
-    bundle_dir
-        .join(".greentic")
-        .join("admin")
-        .join("tunnels")
-        .join(deploy_name_prefix)
 }
 
 fn maybe_write_tunnel_admin_certs(
@@ -488,5 +526,88 @@ mod tests {
         assert_eq!(request.provider, Provider::Aws);
         assert_eq!(request.strategy, "iac-only");
         assert_eq!(request.tenant, "acme");
+    }
+
+    #[test]
+    fn ext_config_parses_minimum_fields() {
+        let json = r#"{
+            "region": "us-east-1",
+            "environment": "staging",
+            "operatorImageDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "bundleSource": "oci://registry.example/acme/prod-bundle@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "bundleDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "remoteStateBackend": "s3://my-tf-state-bucket/greentic/staging"
+        }"#;
+        let cfg: AwsEcsFargateExtConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.region, "us-east-1");
+        assert_eq!(cfg.environment, "staging");
+        assert_eq!(cfg.tenant, "default");
+        assert!(cfg.dns_name.is_none());
+        assert!(cfg.public_base_url.is_none());
+    }
+
+    #[test]
+    fn ext_config_accepts_all_optionals() {
+        let json = r#"{
+            "region": "us-east-1",
+            "environment": "prod",
+            "operatorImageDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "bundleSource": "oci://registry.example/acme/prod-bundle@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "bundleDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "remoteStateBackend": "s3://my-tf-state-bucket/greentic/prod",
+            "dnsName": "api.example.com",
+            "publicBaseUrl": "https://api.example.com",
+            "repoRegistryBase": "https://repo.example.com",
+            "storeRegistryBase": "https://store.example.com",
+            "adminAllowedClients": "CN=admin",
+            "tenant": "acme"
+        }"#;
+        let cfg: AwsEcsFargateExtConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.dns_name.as_deref(), Some("api.example.com"));
+        assert_eq!(
+            cfg.public_base_url.as_deref(),
+            Some("https://api.example.com")
+        );
+        assert_eq!(cfg.tenant, "acme");
+    }
+
+    #[test]
+    fn ext_config_rejects_missing_region() {
+        let json = r#"{
+            "environment": "staging",
+            "operatorImageDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "bundleSource": "oci://...",
+            "bundleDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "remoteStateBackend": "s3://..."
+        }"#;
+        let err = serde_json::from_str::<AwsEcsFargateExtConfig>(json).unwrap_err();
+        assert!(format!("{err}").contains("region"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_from_ext_rejects_invalid_json() {
+        let err = apply_from_ext("not json", "{}", None).unwrap_err();
+        assert!(format!("{err}").contains("parse"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_from_ext_rejects_missing_required_field() {
+        let json = r#"{"region":"us-east-1"}"#;
+        let err = apply_from_ext(json, "{}", None).unwrap_err();
+        // Use alternate display to include the full error chain (context + serde cause)
+        let msg = format!("{err:#}");
+        // serde error mentions missing field by name — either the Rust field or the JSON key
+        assert!(
+            msg.contains("missing field")
+                || msg.contains("bundleSource")
+                || msg.contains("bundle_source"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn destroy_from_ext_rejects_invalid_json() {
+        let err = destroy_from_ext("not json", "{}", None).unwrap_err();
+        assert!(format!("{err}").contains("parse"), "got: {err}");
     }
 }

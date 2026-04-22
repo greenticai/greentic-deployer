@@ -1,9 +1,13 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use serde_yaml_bw as serde_yaml;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod cli_builtin_dispatch;
+
+#[cfg(feature = "extensions")]
+use greentic_deployer::ext;
 
 use greentic_deployer::{
     AwsAdminTunnelRequest, BuiltinBackendId, CloudTargetRequirementsV1, DeployerCapability,
@@ -11,10 +15,12 @@ use greentic_deployer::{
     SingleVmApplyOptions, SingleVmDestroyOptions, SingleVmRenderSpecRequest,
     apply_single_vm_plan_output_with_options, aws, azure,
     destroy_single_vm_plan_output_with_options, gcp, helm, juju_k8s, juju_machine, k8s_raw,
-    list_deployment_extension_contracts_from_sources_with_options, operator,
-    plan_single_vm_spec_path, preview_single_vm_apply_plan_output,
-    preview_single_vm_destroy_plan_output, render_operation_result, render_single_vm_apply_report,
+    list_deployment_extension_contracts_from_sources_with_options, materialize_admin_client_certs,
+    materialize_admin_relay_token, operator, plan_single_vm_spec_path,
+    preview_single_vm_apply_plan_output, preview_single_vm_destroy_plan_output, probe_admin_health,
+    render_admin_health_probe, render_operation_result, render_single_vm_apply_report,
     render_single_vm_destroy_report, render_single_vm_plan_output, render_single_vm_status_report,
+    resolve_admin_access,
     resolve_deployment_extension_contract_for_target_name_from_sources_with_options,
     run_builtin_extension, serverless, snap, status_single_vm_plan_output, terraform,
     write_single_vm_spec,
@@ -45,6 +51,8 @@ enum TopLevelCommand {
     Serverless(ServerlessCommand),
     Snap(SnapCommand),
     Terraform(TerraformCommand),
+    #[cfg(feature = "extensions")]
+    Ext(ext::cli::ExtCommand),
 }
 
 enum BuiltinBackendCommand {
@@ -234,6 +242,10 @@ enum AwsSubcommand {
     Destroy(AwsArgs),
     Status(AwsArgs),
     Rollback(AwsArgs),
+    AdminAccess(AdminAccessArgs),
+    AdminCerts(AdminAccessArgs),
+    AdminToken(AdminAccessArgs),
+    AdminHealth(AdminAccessArgs),
     AdminTunnel(AwsAdminTunnelArgs),
 }
 
@@ -245,6 +257,10 @@ enum AzureSubcommand {
     Destroy(AzureArgs),
     Status(AzureArgs),
     Rollback(AzureArgs),
+    AdminAccess(AdminAccessArgs),
+    AdminCerts(AdminAccessArgs),
+    AdminToken(AdminAccessArgs),
+    AdminHealth(AdminAccessArgs),
 }
 
 #[derive(Subcommand)]
@@ -255,6 +271,10 @@ enum GcpSubcommand {
     Destroy(GcpArgs),
     Status(GcpArgs),
     Rollback(GcpArgs),
+    AdminAccess(AdminAccessArgs),
+    AdminCerts(AdminAccessArgs),
+    AdminToken(AdminAccessArgs),
+    AdminHealth(AdminAccessArgs),
 }
 
 #[derive(Subcommand)]
@@ -598,6 +618,14 @@ struct AwsAdminTunnelArgs {
     local_port: String,
     #[arg(long, default_value = "app")]
     container: String,
+}
+
+#[derive(Parser, Clone)]
+struct AdminAccessArgs {
+    #[arg(long)]
+    bundle_dir: PathBuf,
+    #[arg(long, value_enum, default_value_t = CliOutputFormat::Json)]
+    output: CliOutputFormat,
 }
 
 #[derive(Parser, Clone)]
@@ -1189,6 +1217,11 @@ fn main() -> Result<()> {
                 BuiltinBackendCommand::Terraform(command),
             )
         }
+        #[cfg(feature = "extensions")]
+        TopLevelCommand::Ext(cmd) => {
+            ext::cli::run(cmd).map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(())
+        }
     }
 }
 
@@ -1454,6 +1487,18 @@ fn run_helm(command: HelmCommand) -> Result<()> {
 }
 
 fn run_aws(command: AwsCommand) -> Result<()> {
+    if let AwsSubcommand::AdminAccess(args) = &command.command {
+        return run_admin_access_command(Provider::Aws, args.clone());
+    }
+    if let AwsSubcommand::AdminCerts(args) = &command.command {
+        return run_admin_certs_command(Provider::Aws, args.clone());
+    }
+    if let AwsSubcommand::AdminToken(args) = &command.command {
+        return run_admin_token_command(Provider::Aws, args.clone());
+    }
+    if let AwsSubcommand::AdminHealth(args) = &command.command {
+        return run_admin_health_command(Provider::Aws, args.clone());
+    }
     if let AwsSubcommand::AdminTunnel(args) = command.command {
         return run_aws_admin_tunnel(args);
     }
@@ -1465,6 +1510,10 @@ fn run_aws(command: AwsCommand) -> Result<()> {
         AwsSubcommand::Destroy(args) => (DeployerCapability::Destroy, args),
         AwsSubcommand::Status(args) => (DeployerCapability::Status, args),
         AwsSubcommand::Rollback(args) => (DeployerCapability::Rollback, args),
+        AwsSubcommand::AdminAccess(_) => unreachable!("handled above"),
+        AwsSubcommand::AdminCerts(_) => unreachable!("handled above"),
+        AwsSubcommand::AdminToken(_) => unreachable!("handled above"),
+        AwsSubcommand::AdminHealth(_) => unreachable!("handled above"),
         AwsSubcommand::AdminTunnel(_) => unreachable!("handled above"),
     };
     run_cloud_backend(
@@ -1510,6 +1559,18 @@ fn run_aws_admin_tunnel(args: AwsAdminTunnelArgs) -> Result<()> {
 }
 
 fn run_azure(command: AzureCommand) -> Result<()> {
+    if let AzureSubcommand::AdminAccess(args) = &command.command {
+        return run_admin_access_command(Provider::Azure, args.clone());
+    }
+    if let AzureSubcommand::AdminCerts(args) = &command.command {
+        return run_admin_certs_command(Provider::Azure, args.clone());
+    }
+    if let AzureSubcommand::AdminToken(args) = &command.command {
+        return run_admin_token_command(Provider::Azure, args.clone());
+    }
+    if let AzureSubcommand::AdminHealth(args) = &command.command {
+        return run_admin_health_command(Provider::Azure, args.clone());
+    }
     let (capability, args) = match command.command {
         AzureSubcommand::Generate(args) => (DeployerCapability::Generate, args),
         AzureSubcommand::Plan(args) => (DeployerCapability::Plan, args),
@@ -1517,6 +1578,10 @@ fn run_azure(command: AzureCommand) -> Result<()> {
         AzureSubcommand::Destroy(args) => (DeployerCapability::Destroy, args),
         AzureSubcommand::Status(args) => (DeployerCapability::Status, args),
         AzureSubcommand::Rollback(args) => (DeployerCapability::Rollback, args),
+        AzureSubcommand::AdminAccess(_) => unreachable!("handled above"),
+        AzureSubcommand::AdminCerts(_) => unreachable!("handled above"),
+        AzureSubcommand::AdminToken(_) => unreachable!("handled above"),
+        AzureSubcommand::AdminHealth(_) => unreachable!("handled above"),
     };
     run_cloud_backend(
         capability,
@@ -1553,6 +1618,18 @@ fn run_azure(command: AzureCommand) -> Result<()> {
 }
 
 fn run_gcp(command: GcpCommand) -> Result<()> {
+    if let GcpSubcommand::AdminAccess(args) = &command.command {
+        return run_admin_access_command(Provider::Gcp, args.clone());
+    }
+    if let GcpSubcommand::AdminCerts(args) = &command.command {
+        return run_admin_certs_command(Provider::Gcp, args.clone());
+    }
+    if let GcpSubcommand::AdminToken(args) = &command.command {
+        return run_admin_token_command(Provider::Gcp, args.clone());
+    }
+    if let GcpSubcommand::AdminHealth(args) = &command.command {
+        return run_admin_health_command(Provider::Gcp, args.clone());
+    }
     let (capability, args) = match command.command {
         GcpSubcommand::Generate(args) => (DeployerCapability::Generate, args),
         GcpSubcommand::Plan(args) => (DeployerCapability::Plan, args),
@@ -1560,6 +1637,10 @@ fn run_gcp(command: GcpCommand) -> Result<()> {
         GcpSubcommand::Destroy(args) => (DeployerCapability::Destroy, args),
         GcpSubcommand::Status(args) => (DeployerCapability::Status, args),
         GcpSubcommand::Rollback(args) => (DeployerCapability::Rollback, args),
+        GcpSubcommand::AdminAccess(_) => unreachable!("handled above"),
+        GcpSubcommand::AdminCerts(_) => unreachable!("handled above"),
+        GcpSubcommand::AdminToken(_) => unreachable!("handled above"),
+        GcpSubcommand::AdminHealth(_) => unreachable!("handled above"),
     };
     run_cloud_backend(
         capability,
@@ -1593,6 +1674,109 @@ fn run_gcp(command: GcpCommand) -> Result<()> {
         gcp::resolve_config,
         gcp::run_config,
     )
+}
+
+fn run_admin_access_command(provider: Provider, args: AdminAccessArgs) -> Result<()> {
+    let info = resolve_admin_access(&args.bundle_dir, provider)?;
+    println!(
+        "{}",
+        render_admin_access_summary(provider, info.tunnel_support.supported, args.output.into(),)?
+    );
+    Ok(())
+}
+
+fn run_admin_certs_command(provider: Provider, args: AdminAccessArgs) -> Result<()> {
+    materialize_admin_client_certs(&args.bundle_dir, provider)?;
+    println!(
+        "{}",
+        render_admin_certs_summary(provider, args.output.into())?
+    );
+    Ok(())
+}
+
+fn run_admin_token_command(provider: Provider, args: AdminAccessArgs) -> Result<()> {
+    let token = materialize_admin_relay_token(&args.bundle_dir, provider)?;
+    let info = resolve_admin_access(&args.bundle_dir, provider)?;
+    std::fs::create_dir_all(&info.local_cert_dir)?;
+    let token_path = info.local_cert_dir.join("relay.token");
+    std::fs::write(&token_path, token)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    println!(
+        "{}",
+        render_materialized_admin_relay_token_path(provider, &token_path, args.output.into())?
+    );
+    Ok(())
+}
+
+fn render_materialized_admin_relay_token_path(
+    provider: Provider,
+    token_path: &Path,
+    output: OutputFormat,
+) -> Result<String> {
+    let provider_name = provider.as_str();
+    let token_path = token_path.display().to_string();
+    match output {
+        OutputFormat::Text => Ok(format!(
+            "provider: {provider_name}\ntoken_path: {token_path}"
+        )),
+        OutputFormat::Json => Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "provider": provider_name,
+            "token_path": token_path,
+        }))?),
+        OutputFormat::Yaml => Ok(serde_yaml::to_string(&serde_json::json!({
+            "provider": provider_name,
+            "token_path": token_path,
+        }))?),
+    }
+}
+
+fn render_admin_access_summary(
+    provider: Provider,
+    tunnel_supported: bool,
+    output: OutputFormat,
+) -> Result<String> {
+    let provider_name = provider.as_str();
+    match output {
+        OutputFormat::Text => Ok(format!(
+            "provider: {provider_name}\ntunnel_supported: {tunnel_supported}"
+        )),
+        OutputFormat::Json => Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "provider": provider_name,
+            "tunnel_supported": tunnel_supported,
+        }))?),
+        OutputFormat::Yaml => Ok(serde_yaml::to_string(&serde_json::json!({
+            "provider": provider_name,
+            "tunnel_supported": tunnel_supported,
+        }))?),
+    }
+}
+
+fn render_admin_certs_summary(provider: Provider, output: OutputFormat) -> Result<String> {
+    let provider_name = provider.as_str();
+    match output {
+        OutputFormat::Text => Ok(format!(
+            "provider: {provider_name}\ncerts_materialized: true"
+        )),
+        OutputFormat::Json => Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "provider": provider_name,
+            "certs_materialized": true,
+        }))?),
+        OutputFormat::Yaml => Ok(serde_yaml::to_string(&serde_json::json!({
+            "provider": provider_name,
+            "certs_materialized": true,
+        }))?),
+    }
+}
+
+fn run_admin_health_command(provider: Provider, args: AdminAccessArgs) -> Result<()> {
+    let probe = probe_admin_health(&args.bundle_dir, provider)?;
+    println!("{}", render_admin_health_probe(&probe, args.output.into())?);
+    Ok(())
 }
 
 fn run_operator(command: OperatorCommand) -> Result<()> {

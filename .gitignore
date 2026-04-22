@@ -4,6 +4,7 @@
 /dist
 providers/*/dist
 .greentic
+.worktrees/
 
 # OS
 .DS_Store

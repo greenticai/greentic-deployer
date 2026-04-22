@@ -158,6 +158,7 @@ pub enum SingleVmDeploymentStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct SingleVmApplyOptions {
     pub pull_image: bool,
     pub daemon_reload: bool,
@@ -166,9 +167,23 @@ pub struct SingleVmApplyOptions {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct SingleVmDestroyOptions {
     pub stop_service: bool,
     pub disable_service: bool,
+}
+
+/// Extension-contributed config shape for single-vm apply/destroy via
+/// `ext::backend_adapter`. Extensions declare a matching JSON schema in their
+/// `config-schema`; this struct is the Rust-side view.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SingleVmExtConfig {
+    pub spec_path: PathBuf,
+    #[serde(default)]
+    pub apply_options: SingleVmApplyOptions,
+    #[serde(default)]
+    pub destroy_options: SingleVmDestroyOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -540,6 +555,33 @@ pub fn destroy_single_vm_spec(spec: &DeploymentSpecV1) -> Result<SingleVmDestroy
 pub fn destroy_single_vm_spec_path(path: impl AsRef<Path>) -> Result<SingleVmDestroyReport> {
     let output = plan_single_vm_spec_path(path)?;
     destroy_single_vm_plan_output(&output)
+}
+
+/// Extension-driven apply: parse JSON config, load spec path, call existing
+/// `apply_single_vm_plan_output_with_options`. `pack_path` reserved for future
+/// use (cloud refs); ignored by single-vm.
+pub fn apply_from_ext(
+    config_json: &str,
+    _creds_json: &str,
+    _pack_path: Option<&std::path::Path>,
+) -> Result<()> {
+    let cfg: SingleVmExtConfig = serde_json::from_str(config_json)
+        .map_err(|e| DeployerError::Other(format!("parse single-vm config JSON: {e}")))?;
+    let plan = plan_single_vm_spec_path(&cfg.spec_path)
+        .map_err(|e| DeployerError::Other(format!("plan single-vm: {e}")))?;
+    let _report = apply_single_vm_plan_output_with_options(&plan, &cfg.apply_options)?;
+    Ok(())
+}
+
+/// Extension-driven destroy: parse JSON config, load spec path, call existing
+/// `destroy_single_vm_plan_output_with_options`.
+pub fn destroy_from_ext(config_json: &str, _creds_json: &str) -> Result<()> {
+    let cfg: SingleVmExtConfig = serde_json::from_str(config_json)
+        .map_err(|e| DeployerError::Other(format!("parse single-vm config JSON: {e}")))?;
+    let plan = plan_single_vm_spec_path(&cfg.spec_path)
+        .map_err(|e| DeployerError::Other(format!("plan single-vm: {e}")))?;
+    let _report = destroy_single_vm_plan_output_with_options(&plan, &cfg.destroy_options)?;
+    Ok(())
 }
 
 pub fn status_single_vm_plan_output(output: &SingleVmPlanOutput) -> Result<SingleVmStatusReport> {
@@ -1359,5 +1401,59 @@ spec:
         assert!(rendered.contains("status report:"));
         assert!(rendered.contains("Applied"));
         assert!(rendered.contains("acme.service"));
+    }
+
+    #[test]
+    fn ext_config_parses_minimum_fields() {
+        let json = r#"{"specPath": "/tmp/spec.yaml"}"#;
+        let cfg: SingleVmExtConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.spec_path, PathBuf::from("/tmp/spec.yaml"));
+        assert!(!cfg.apply_options.pull_image);
+        assert!(!cfg.destroy_options.stop_service);
+    }
+
+    #[test]
+    fn ext_config_accepts_options() {
+        let json = r#"{
+            "specPath": "/tmp/spec.yaml",
+            "applyOptions": {
+                "pullImage": true,
+                "daemonReload": true,
+                "enableService": false,
+                "restartService": true
+            },
+            "destroyOptions": {
+                "stopService": true,
+                "disableService": false
+            }
+        }"#;
+        let cfg: SingleVmExtConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.apply_options.pull_image);
+        assert!(cfg.apply_options.daemon_reload);
+        assert!(!cfg.apply_options.enable_service);
+        assert!(cfg.apply_options.restart_service);
+        assert!(cfg.destroy_options.stop_service);
+        assert!(!cfg.destroy_options.disable_service);
+    }
+
+    #[test]
+    fn apply_from_ext_rejects_invalid_json() {
+        let err = apply_from_ext("not json", "{}", None).unwrap_err();
+        assert!(format!("{err}").contains("parse"));
+    }
+
+    #[test]
+    fn apply_from_ext_rejects_missing_spec_path() {
+        let err = apply_from_ext(r#"{"applyOptions": {}}"#, "{}", None).unwrap_err();
+        assert!(
+            format!("{err}").contains("specPath") || format!("{err}").contains("missing field"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn destroy_from_ext_rejects_invalid_json() {
+        let err = destroy_from_ext("not json", "{}").unwrap_err();
+        assert!(format!("{err}").contains("parse"));
     }
 }

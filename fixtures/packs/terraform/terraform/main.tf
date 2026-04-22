@@ -1,5 +1,5 @@
 locals {
-  name_prefix         = "greentic-${substr(md5(var.bundle_digest), 0, 8)}"
+  name_prefix         = trimspace(var.deployment_name_prefix) != "" ? var.deployment_name_prefix : "greentic-${substr(md5(var.bundle_digest), 0, 8)}"
   admin_secret_prefix = "greentic/admin/${local.name_prefix}"
   operator_image      = var.operator_image != "" ? var.operator_image : "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
 }
@@ -9,6 +9,7 @@ module "operator_aws" {
   source = "./modules/operator"
 
   cloud               = var.cloud
+  deployment_name_prefix = local.name_prefix
   operator_image      = local.operator_image
   bundle_source       = var.bundle_source
   bundle_digest       = var.bundle_digest
@@ -25,6 +26,7 @@ module "operator_azure" {
 
   cloud               = var.cloud
   environment         = var.environment
+  deployment_name_prefix = local.name_prefix
   bundle_digest       = var.bundle_digest
   bundle_source       = var.bundle_source
   repo_registry_base  = var.repo_registry_base
@@ -43,6 +45,7 @@ module "operator_gcp" {
 
   cloud               = var.cloud
   environment         = var.environment
+  deployment_name_prefix = local.name_prefix
   bundle_digest       = var.bundle_digest
   bundle_source       = var.bundle_source
   repo_registry_base  = var.repo_registry_base

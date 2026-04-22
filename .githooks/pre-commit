@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Pre-commit hook: enforce rustfmt + clippy on staged files before commit.
+# Fast path — full CI runs on pre-push.
+#
+# Enable once per checkout with:
+#   scripts/install-hooks.sh
+# or:
+#   git config core.hooksPath .githooks
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+# Skip if no Rust files staged.
+if ! git diff --cached --name-only --diff-filter=ACM | grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$'; then
+    exit 0
+fi
+
+echo "pre-commit: cargo fmt --all --check"
+if ! cargo fmt --all -- --check; then
+    echo
+    echo "pre-commit FAILED: rustfmt violations."
+    echo "Run 'cargo fmt --all' and re-stage changes."
+    exit 1
+fi
+
+echo "pre-commit: cargo clippy --all-targets -- -D warnings"
+if ! cargo clippy --all-targets -- -D warnings; then
+    echo
+    echo "pre-commit FAILED: clippy warnings."
+    echo "Fix the warnings above and re-stage changes."
+    exit 1
+fi
+
+echo "pre-commit OK"
