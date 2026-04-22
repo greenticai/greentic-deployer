@@ -1,9 +1,9 @@
 name: Publish and Release
 
 # Tag-triggered: fires after `tag-on-version-bump.yml` detects a Cargo.toml
-# version change on main and pushes `v{version}`. Crates.io publish is
-# handled by `crates-publish.yml` (shared reusable); this workflow covers
-# binary release assets + GHCR OCI .gtpack publishing.
+# version change on main and pushes `v{version}`. Covers binary release
+# assets, GHCR OCI .gtpack publishing, and crates.io publish (gated on the
+# GH release job).
 on:
   push:
     tags: ["v*"]
@@ -201,3 +201,13 @@ jobs:
               --annotation "org.opencontainers.image.revision=${REVISION}" \
               "${pack_path}:application/vnd.greentic.gtpack.layer.v1+tar"
           done
+
+  publish_crates:
+    name: Publish to crates.io
+    needs: [publish-version-release]
+    permissions:
+      contents: read
+    uses: greenticai/.github/.github/workflows/crates-publish.yml@main
+    with:
+      crates: "greentic-deployer"
+    secrets: inherit
