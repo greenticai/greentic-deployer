@@ -7,7 +7,7 @@ name: Nightly Semver Advisory
 on:
   schedule:
     # 06:35 UTC — staggered to avoid hot-spots.
-    - cron: "35 6 * * *"
+    - cron: "55 3 * * *"
   workflow_dispatch:
     inputs:
       baseline-rev:
