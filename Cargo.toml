@@ -1,6 +1,6 @@
 [package]
 name = "greentic-deployer"
-version = "0.4.54"
+version = "0.5.0-dev.0"
 edition = "2024"
 rust-version = "1.91"
 description = "Greentic deployer runtime for plan construction and deployment-pack dispatch"
@@ -9,8 +9,15 @@ readme = "README.md"
 repository = "https://github.com/greenticai/greentic-deployer"
 homepage = "https://github.com/greenticai/greentic-deployer"
 documentation = "https://docs.greentic.ai/deployer"
-keywords = ["greentic", "deployer", "deployment-pack", "runner"]
-categories = ["development-tools"]
+keywords = [
+    "greentic",
+    "deployer",
+    "deployment-pack",
+    "runner",
+]
+categories = [
+    "development-tools",
+]
 
 [features]
 default = []
@@ -29,55 +36,120 @@ path = "src/main.rs"
 [[bin]]
 name = "build_fixture_gtpacks"
 path = "src/bin/build_fixture_gtpacks.rs"
-required-features = ["internal-tools"]
+required-features = [
+    "internal-tools",
+]
 
 [[bin]]
 name = "replay_deployer_scaffolds"
 path = "src/bin/replay_deployer_scaffolds.rs"
-required-features = ["internal-tools"]
+required-features = [
+    "internal-tools",
+]
 
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-clap = { version = "4.5", features = ["derive"] }
-greentic-telemetry = { version = "0.4", features = ["otlp"] }
-greentic-types = { version = "0.4" }
-greentic-distributor-client = { version = "0.4" }
-greentic-config = "0.4"
-greentic-config-types = "0.4"
-serde = { version = "1", features = ["derive"] }
+greentic-config = ">=0.5.0-dev, <0.6.0-0"
+greentic-config-types = ">=0.5.0-dev, <0.6.0-0"
 serde_json = "1"
-serde_yaml_bw = {package="serde_yaml_gtc", version="2.5.2"}
 semver = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tar = "0.4"
-zip = { version = "8", default-features = false, features = ["deflate"] }
 once_cell = "1"
-reqwest = { version = "0.13", features = ["blocking", "json", "rustls"] }
 toml = "0.9"
 indexmap = "2"
 jsonschema = "0.45"
-greentic-ext-runtime  = { git = "https://github.com/greentic-biz/greentic-designer-extensions", rev = "94e6ba406269c53297918bb14716255835331354", optional = true, package = "greentic-ext-runtime" }
-greentic-ext-contract = { git = "https://github.com/greentic-biz/greentic-designer-extensions", rev = "94e6ba406269c53297918bb14716255835331354", optional = true, package = "greentic-ext-contract" }
+
+[dependencies.clap]
+version = "4.5"
+features = [
+    "derive",
+]
+
+[dependencies.greentic-telemetry]
+version = ">=0.5.0-dev, <0.6.0-0"
+features = [
+    "otlp",
+]
+
+[dependencies.greentic-types]
+version = ">=0.5.0-dev, <0.6.0-0"
+
+[dependencies.greentic-distributor-client]
+version = ">=0.5.0-dev, <0.6.0-0"
+
+[dependencies.serde]
+version = "1"
+features = [
+    "derive",
+]
+
+[dependencies.serde_yaml_bw]
+package = "serde_yaml_gtc"
+version = "2.5.2"
+
+[dependencies.tokio]
+version = "1"
+features = [
+    "rt-multi-thread",
+    "macros",
+]
+
+[dependencies.zip]
+version = "8"
+default-features = false
+features = [
+    "deflate",
+]
+
+[dependencies.reqwest]
+version = "0.13"
+features = [
+    "blocking",
+    "json",
+    "rustls",
+]
+
+[dependencies.greentic-ext-runtime]
+git = "https://github.com/greentic-biz/greentic-designer-extensions"
+rev = "94e6ba406269c53297918bb14716255835331354"
+optional = true
+package = "greentic-ext-runtime"
+
+[dependencies.greentic-ext-contract]
+git = "https://github.com/greentic-biz/greentic-designer-extensions"
+rev = "94e6ba406269c53297918bb14716255835331354"
+optional = true
+package = "greentic-ext-contract"
 
 [[test]]
 name = "ext_loader"
-required-features = ["extensions"]
+required-features = [
+    "extensions",
+]
 
 [[test]]
 name = "ext_dispatch"
-required-features = ["extensions", "test-utils"]
+required-features = [
+    "extensions",
+    "test-utils",
+]
 
 [[test]]
 name = "ext_cli"
-required-features = ["extensions"]
+required-features = [
+    "extensions",
+]
 
 [[test]]
 name = "ext_apply_integration"
-required-features = ["extensions", "test-utils"]
+required-features = [
+    "extensions",
+    "test-utils",
+]
 
 [dev-dependencies]
 tempfile = "3"
