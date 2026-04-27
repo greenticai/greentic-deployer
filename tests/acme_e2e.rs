@@ -71,6 +71,7 @@ fn sample_flow(id: &str, kind: FlowKind, component: &ComponentManifest) -> Flow 
             output: OutputMapping {
                 mapping: serde_json::Value::Null,
             },
+            err_map: None,
             routing: Routing::End,
             telemetry: Default::default(),
         },
