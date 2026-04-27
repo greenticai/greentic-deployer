@@ -1000,6 +1000,7 @@ mod tests {
                 output: OutputMapping {
                     mapping: JsonValue::Null,
                 },
+                err_map: None,
                 routing: greentic_types::flow::Routing::End,
                 telemetry: Default::default(),
             },
