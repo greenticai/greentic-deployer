@@ -6,9 +6,6 @@ use std::path::{Path, PathBuf};
 
 mod cli_builtin_dispatch;
 
-#[cfg(feature = "extensions")]
-use greentic_deployer::ext;
-
 use greentic_deployer::{
     AwsAdminTunnelRequest, BuiltinBackendId, CloudTargetRequirementsV1, DeployerCapability,
     DeployerConfig, DeployerRequest, DeploymentExtensionSourceOptions, OutputFormat, Provider,
@@ -51,8 +48,6 @@ enum TopLevelCommand {
     Serverless(ServerlessCommand),
     Snap(SnapCommand),
     Terraform(TerraformCommand),
-    #[cfg(feature = "extensions")]
-    Ext(ext::cli::ExtCommand),
 }
 
 enum BuiltinBackendCommand {
@@ -1216,11 +1211,6 @@ fn main() -> Result<()> {
             cli_builtin_dispatch::dispatch_builtin_backend_command(
                 BuiltinBackendCommand::Terraform(command),
             )
-        }
-        #[cfg(feature = "extensions")]
-        TopLevelCommand::Ext(cmd) => {
-            ext::cli::run(cmd).map_err(|e| anyhow::anyhow!("{e}"))?;
-            Ok(())
         }
     }
 }

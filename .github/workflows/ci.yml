@@ -48,9 +48,3 @@ jobs:
 
       - name: Build (no default features)
         run: cargo build --no-default-features
-
-      - name: Build (extensions)
-        run: cargo build --features extensions
-
-      - name: Test (extensions)
-        run: cargo test --features extensions

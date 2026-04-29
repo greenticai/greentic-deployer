@@ -1,6 +1,6 @@
 [package]
 name = "greentic-deployer"
-version = "0.4.54"
+version = "0.4.55"
 edition = "2024"
 rust-version = "1.91"
 description = "Greentic deployer runtime for plan construction and deployment-pack dispatch"
@@ -16,11 +16,6 @@ categories = ["development-tools"]
 default = []
 internal-tools = []
 test-utils = []
-extensions = [
-    "dep:greentic-ext-runtime",
-    "dep:greentic-ext-contract",
-    "test-utils",
-]
 
 [[bin]]
 name = "greentic-deployer"
@@ -60,24 +55,6 @@ reqwest = { version = "0.13", features = ["blocking", "json", "rustls"] }
 toml = "0.9"
 indexmap = "2"
 jsonschema = "0.45"
-greentic-ext-runtime  = { git = "https://github.com/greentic-biz/greentic-designer-extensions", rev = "94e6ba406269c53297918bb14716255835331354", optional = true, package = "greentic-ext-runtime" }
-greentic-ext-contract = { git = "https://github.com/greentic-biz/greentic-designer-extensions", rev = "94e6ba406269c53297918bb14716255835331354", optional = true, package = "greentic-ext-contract" }
-
-[[test]]
-name = "ext_loader"
-required-features = ["extensions"]
-
-[[test]]
-name = "ext_dispatch"
-required-features = ["extensions", "test-utils"]
-
-[[test]]
-name = "ext_cli"
-required-features = ["extensions"]
-
-[[test]]
-name = "ext_apply_integration"
-required-features = ["extensions", "test-utils"]
 
 [dev-dependencies]
 tempfile = "3"
