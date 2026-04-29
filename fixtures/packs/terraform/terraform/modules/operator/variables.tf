@@ -2,6 +2,10 @@ variable "cloud" {
   type = string
 }
 
+variable "tenant" {
+  type = string
+}
+
 variable "deployment_name_prefix" {
   type    = string
   default = ""

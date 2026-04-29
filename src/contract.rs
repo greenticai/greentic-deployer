@@ -13,10 +13,10 @@ use crate::error::{DeployerError, Result};
 use crate::pack_introspect::read_entry_from_gtpack;
 
 pub const EXT_DEPLOYER_V1: &str = "greentic.deployer.v1";
-pub const DEFAULT_GHCR_OPERATOR_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless@sha256:1114cca5b76a8aabc72675f9fe5b556e3927bb9dd6f7bc41eb76d7e8ef1770eb";
-pub const DEFAULT_GCP_OPERATOR_IMAGE: &str = "europe-west1-docker.pkg.dev/x-plateau-483512-p6/greentic-images/greentic-start-distroless@sha256:c43088bc2d70c989cdb4d4835afd80b45d19e391489ac16adf8def3e983f21e2";
+pub const DEFAULT_GHCR_OPERATOR_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless@sha256:28e43c2fca55c124c6b6930f9ec6d00b5c27e9dd003f9c574b996bdaff621802";
+pub const DEFAULT_GCP_OPERATOR_IMAGE: &str = "europe-west1-docker.pkg.dev/x-plateau-483512-p6/greentic-images/greentic-start-distroless@sha256:d71fe64e0e719bec6df45aaee4712d2990a7975cc07f1a6003549a5f249490f7";
 pub const DEFAULT_OPERATOR_IMAGE_DIGEST: &str =
-    "sha256:1114cca5b76a8aabc72675f9fe5b556e3927bb9dd6f7bc41eb76d7e8ef1770eb";
+    "sha256:28e43c2fca55c124c6b6930f9ec6d00b5c27e9dd003f9c574b996bdaff621802";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

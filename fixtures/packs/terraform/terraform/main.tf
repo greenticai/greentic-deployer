@@ -9,6 +9,7 @@ module "operator_aws" {
   source = "./modules/operator"
 
   cloud               = var.cloud
+  tenant              = var.tenant
   deployment_name_prefix = local.name_prefix
   operator_image      = local.operator_image
   bundle_source       = var.bundle_source
@@ -25,6 +26,7 @@ module "operator_azure" {
   source = "./modules/operator-azure"
 
   cloud               = var.cloud
+  tenant              = var.tenant
   environment         = var.environment
   deployment_name_prefix = local.name_prefix
   bundle_digest       = var.bundle_digest
@@ -44,6 +46,7 @@ module "operator_gcp" {
   source = "./modules/operator-gcp"
 
   cloud               = var.cloud
+  tenant              = var.tenant
   environment         = var.environment
   deployment_name_prefix = local.name_prefix
   bundle_digest       = var.bundle_digest
