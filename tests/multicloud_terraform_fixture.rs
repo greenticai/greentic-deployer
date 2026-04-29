@@ -46,6 +46,8 @@ fn azure_module_materializes_key_vault_and_runtime_resources() {
     assert!(main_tf.contains("GREENTIC_ADMIN_CLIENT_CERT_SECRET_REF"));
     assert!(main_tf.contains("GREENTIC_ADMIN_CLIENT_KEY_SECRET_REF"));
     assert!(main_tf.contains("GREENTIC_ADMIN_RELAY_TOKEN_SECRET_REF"));
+    assert!(main_tf.contains("\"--tenant\","));
+    assert!(main_tf.contains("var.tenant"));
 
     assert!(outputs_tf.contains("output \"admin_access_mode\""));
     assert!(outputs_tf.contains("output \"admin_public_endpoint\""));
@@ -56,6 +58,7 @@ fn azure_module_materializes_key_vault_and_runtime_resources() {
 
     assert!(variables_tf.contains("variable \"admin_access_mode\""));
     assert!(variables_tf.contains("default = \"http-bearer-relay\""));
+    assert!(variables_tf.contains("variable \"tenant\""));
 }
 
 #[test]
@@ -87,6 +90,8 @@ fn gcp_module_materializes_secret_manager_and_cloud_run_resources() {
     assert!(main_tf.contains("GREENTIC_ADMIN_CLIENT_CERT_SECRET_REF"));
     assert!(main_tf.contains("GREENTIC_ADMIN_CLIENT_KEY_SECRET_REF"));
     assert!(main_tf.contains("GREENTIC_ADMIN_RELAY_TOKEN_SECRET_REF"));
+    assert!(main_tf.contains("\"--tenant\","));
+    assert!(main_tf.contains("var.tenant"));
     assert!(main_tf.contains("deletion_protection = false"));
     assert!(!main_tf.contains("GREENTIC_ADMIN_CA_SECRET_REF"));
     assert!(!main_tf.contains("GREENTIC_ADMIN_SERVER_CERT_SECRET_REF"));
@@ -101,6 +106,7 @@ fn gcp_module_materializes_secret_manager_and_cloud_run_resources() {
 
     assert!(variables_tf.contains("variable \"admin_access_mode\""));
     assert!(variables_tf.contains("default = \"http-bearer-relay\""));
+    assert!(variables_tf.contains("variable \"tenant\""));
 }
 
 #[test]

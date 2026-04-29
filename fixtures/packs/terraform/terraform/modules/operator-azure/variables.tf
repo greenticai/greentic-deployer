@@ -2,6 +2,10 @@ variable "cloud" {
   type = string
 }
 
+variable "tenant" {
+  type = string
+}
+
 variable "environment" {
   type = string
 }

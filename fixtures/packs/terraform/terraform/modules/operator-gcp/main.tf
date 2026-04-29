@@ -198,6 +198,8 @@ resource "google_cloud_run_v2_service" "this" {
         "start",
         "--bundle",
         var.bundle_source,
+        "--tenant",
+        var.tenant,
         "--cloudflared",
         "off",
         "--ngrok",
