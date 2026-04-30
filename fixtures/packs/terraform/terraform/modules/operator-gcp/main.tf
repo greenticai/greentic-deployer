@@ -192,6 +192,8 @@ resource "google_cloud_run_v2_service" "this" {
       max_instance_count = 1
     }
 
+    max_instance_request_concurrency = 8
+
     containers {
       image = var.operator_image
       args = [
@@ -321,6 +323,13 @@ resource "google_cloud_run_v2_service" "this" {
         content {
           name  = "GREENTIC_ADMIN_ALLOWED_CLIENTS"
           value = env.value
+        }
+      }
+
+      resources {
+        limits = {
+          cpu    = "2000m"
+          memory = "1Gi"
         }
       }
     }
