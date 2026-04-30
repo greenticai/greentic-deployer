@@ -1369,4 +1369,74 @@ mod tests {
         assert!(rendered.contains("\"token\": \"[REDACTED]\""));
         assert!(!rendered.contains("super-secret-token"));
     }
+
+    #[test]
+    fn helper_parsers_extract_cloud_specific_values() {
+        assert_eq!(
+            host_from_url("https://demo-app--green.eastus.azurecontainerapps.io/health").as_deref(),
+            Some("demo-app--green.eastus.azurecontainerapps.io")
+        );
+        assert_eq!(host_from_url("not-a-url"), None);
+
+        assert_eq!(
+            aws_region_from_secret_arn(
+                "arn:aws:secretsmanager:eu-north-1:123456789012:secret:greentic/admin/demo/ca"
+            )
+            .as_deref(),
+            Some("eu-north-1")
+        );
+        assert_eq!(
+            deploy_name_prefix_from_aws_secret_arn(
+                "arn:aws:secretsmanager:eu-north-1:123456789012:secret:greentic/admin/demo/ca"
+            )
+            .as_deref(),
+            Some("demo")
+        );
+        assert_eq!(
+            gcp_project_id_from_secret_ref("projects/demo-project/secrets/admin-relay-token")
+                .as_deref(),
+            Some("demo-project")
+        );
+        assert_eq!(
+            azure_container_app_name_from_host("demo-app--green.eastus.azurecontainerapps.io")
+                .as_deref(),
+            Some("demo-app")
+        );
+        assert_eq!(
+            gcp_cloud_run_service_name_from_host("demo-admin-uc.a.run.app").as_deref(),
+            Some("demo")
+        );
+    }
+
+    #[test]
+    fn azure_commands_and_requirements_use_public_relay_details() {
+        let outputs = serde_json::json!({
+            "operator_endpoint": { "value": "https://demo-app--green.eastus.azurecontainerapps.io" },
+            "admin_client_cert_secret_ref": { "value": "https://vault.example.net/secrets/admin-client-cert" },
+            "admin_client_key_secret_ref": { "value": "https://vault.example.net/secrets/admin-client-key" },
+            "admin_relay_token_secret_ref": { "value": "https://vault.example.net/secrets/admin-relay-token" },
+            "admin_public_endpoint": { "value": "https://admin.example.com" }
+        });
+
+        let missing = missing_requirements(&outputs, Provider::Azure);
+        assert!(
+            !missing
+                .iter()
+                .any(|value| value.contains("cloud-side tunnel"))
+        );
+
+        let commands = suggested_commands(&outputs, Provider::Azure);
+        assert!(
+            commands
+                .iter()
+                .any(|value| value
+                    == "greentic-deployer azure admin-token --bundle-dir <BUNDLE_DIR>")
+        );
+        assert!(commands.iter().any(|value| {
+            value == "az containerapp show --resource-group demo-rg --name demo-app"
+        }));
+        assert!(commands.iter().any(|value| {
+            value == "az containerapp logs show --resource-group demo-rg --name demo-app --follow"
+        }));
+    }
 }
