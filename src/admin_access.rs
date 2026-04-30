@@ -1419,20 +1419,24 @@ mod tests {
         });
 
         let missing = missing_requirements(&outputs, Provider::Azure);
-        assert!(!missing.iter().any(|value| value.contains("cloud-side tunnel")));
+        assert!(
+            !missing
+                .iter()
+                .any(|value| value.contains("cloud-side tunnel"))
+        );
 
         let commands = suggested_commands(&outputs, Provider::Azure);
         assert!(
             commands
                 .iter()
-                .any(|value| value == "greentic-deployer azure admin-token --bundle-dir <BUNDLE_DIR>")
+                .any(|value| value
+                    == "greentic-deployer azure admin-token --bundle-dir <BUNDLE_DIR>")
         );
         assert!(commands.iter().any(|value| {
             value == "az containerapp show --resource-group demo-rg --name demo-app"
         }));
         assert!(commands.iter().any(|value| {
-            value
-                == "az containerapp logs show --resource-group demo-rg --name demo-app --follow"
+            value == "az containerapp logs show --resource-group demo-rg --name demo-app --follow"
         }));
     }
 }

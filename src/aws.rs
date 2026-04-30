@@ -639,7 +639,10 @@ mod tests {
         assert_eq!(request.capability, DeployerCapability::Destroy);
         assert_eq!(request.tenant, "acme");
         assert_eq!(request.pack_path, PathBuf::from("/tmp/demo-pack"));
-        assert_eq!(request.bundle_source.as_deref(), Some("oci://registry.example/app@sha256:1111"));
+        assert_eq!(
+            request.bundle_source.as_deref(),
+            Some("oci://registry.example/app@sha256:1111")
+        );
         assert_eq!(request.bundle_digest.as_deref(), Some("sha256:2222"));
         assert_eq!(request.environment.as_deref(), Some("prod"));
         assert_eq!(

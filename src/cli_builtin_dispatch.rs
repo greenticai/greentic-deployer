@@ -239,7 +239,14 @@ mod tests {
 
     #[test]
     fn dispatch_functions_reject_commands_for_the_wrong_backend() {
-        let aws_args = ["aws", "generate", "--tenant", "acme", "--bundle-pack", "bundle"];
+        let aws_args = [
+            "aws",
+            "generate",
+            "--tenant",
+            "acme",
+            "--bundle-pack",
+            "bundle",
+        ];
         let terraform_args = [
             "terraform",
             "generate",
@@ -252,16 +259,19 @@ mod tests {
         let err = dispatch_terraform_backend_command(parse_builtin_command(&aws_args)).unwrap_err();
         assert!(format!("{err}").contains("is not terraform"));
 
-        let err = dispatch_k8s_raw_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
+        let err =
+            dispatch_k8s_raw_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
         assert!(format!("{err}").contains("is not k8s-raw"));
 
-        let err = dispatch_helm_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
+        let err =
+            dispatch_helm_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
         assert!(format!("{err}").contains("is not helm"));
 
         let err = dispatch_aws_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
         assert!(format!("{err}").contains("is not aws"));
 
-        let err = dispatch_azure_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
+        let err =
+            dispatch_azure_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
         assert!(format!("{err}").contains("is not azure"));
 
         let err = dispatch_gcp_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
@@ -271,20 +281,20 @@ mod tests {
             dispatch_juju_k8s_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
         assert!(format!("{err}").contains("is not juju-k8s"));
 
-        let err =
-            dispatch_juju_machine_backend_command(parse_builtin_command(&terraform_args))
-                .unwrap_err();
+        let err = dispatch_juju_machine_backend_command(parse_builtin_command(&terraform_args))
+            .unwrap_err();
         assert!(format!("{err}").contains("is not juju-machine"));
 
-        let err = dispatch_operator_backend_command(parse_builtin_command(&terraform_args))
-            .unwrap_err();
+        let err =
+            dispatch_operator_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
         assert!(format!("{err}").contains("is not operator"));
 
         let err = dispatch_serverless_backend_command(parse_builtin_command(&terraform_args))
             .unwrap_err();
         assert!(format!("{err}").contains("is not serverless"));
 
-        let err = dispatch_snap_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
+        let err =
+            dispatch_snap_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
         assert!(format!("{err}").contains("is not snap"));
     }
 
