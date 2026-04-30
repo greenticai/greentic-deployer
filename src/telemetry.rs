@@ -32,7 +32,10 @@ fn export_from_config(cfg: &ResolvedTelemetryConfig) -> ExportConfig {
 
     match cfg.exporter {
         TelemetryExporterKind::Stdout => export,
-        TelemetryExporterKind::Otlp => {
+        TelemetryExporterKind::Otlp
+        | TelemetryExporterKind::Gcp
+        | TelemetryExporterKind::Azure
+        | TelemetryExporterKind::Aws => {
             export.mode = ExportMode::OtlpGrpc;
             export.endpoint = cfg
                 .endpoint
