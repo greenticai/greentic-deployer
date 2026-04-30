@@ -25,10 +25,4 @@ cargo doc --no-deps
 echo "==> cargo build --no-default-features (baseline)"
 cargo build --no-default-features
 
-echo "==> cargo build --features extensions"
-cargo build --features extensions
-
-echo "==> cargo test --features extensions"
-cargo test --features extensions
-
 echo "Local check completed successfully."

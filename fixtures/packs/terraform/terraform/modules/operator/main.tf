@@ -423,6 +423,8 @@ resource "aws_ecs_task_definition" "this" {
         "start",
         "--bundle",
         var.bundle_source,
+        "--tenant",
+        var.tenant,
         "--cloudflared",
         "off",
         "--ngrok",

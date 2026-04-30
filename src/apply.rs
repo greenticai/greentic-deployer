@@ -2066,6 +2066,7 @@ fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path
             "operator",
             "./modules/operator",
             r#"  cloud                 = var.cloud
+  tenant                = var.tenant
   deployment_name_prefix = var.deployment_name_prefix
   operator_image        = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
   bundle_source         = var.bundle_source
@@ -2079,6 +2080,7 @@ fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path
             "operator",
             "./modules/operator-azure",
             r#"  cloud                 = var.cloud
+  tenant                = var.tenant
   environment           = var.environment
   deployment_name_prefix = var.deployment_name_prefix
   bundle_digest         = var.bundle_digest
@@ -2096,6 +2098,7 @@ fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path
             "operator",
             "./modules/operator-gcp",
             r#"  cloud                 = var.cloud
+  tenant                = var.tenant
   environment           = var.environment
   deployment_name_prefix = var.deployment_name_prefix
   bundle_digest         = var.bundle_digest
@@ -2250,6 +2253,7 @@ fn materialize_generated_tfvars(
     };
 
     replace_tfvars_assignment(&mut contents, "cloud", config.provider.as_str());
+    replace_tfvars_assignment(&mut contents, "tenant", &config.tenant);
     replace_tfvars_assignment(&mut contents, "environment", &config.environment);
     let deployment_name_prefix = resolve_terraform_deployment_name_prefix(config, &output_path);
     replace_tfvars_assignment(
