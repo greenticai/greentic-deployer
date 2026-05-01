@@ -1,0 +1,10 @@
+{
+  "kind": "destroy",
+  "deployment_id": "greentic-staging",
+  "state": "destroyed",
+  "destroyed_resources": [
+    "module.operator",
+    "module.dns",
+    "module.redis"
+  ]
+}

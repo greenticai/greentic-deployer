@@ -13,6 +13,9 @@ use crate::error::{DeployerError, Result};
 use crate::pack_introspect::read_entry_from_gtpack;
 
 pub const EXT_DEPLOYER_V1: &str = "greentic.deployer.v1";
+pub const EXT_DEPLOY_AWS: &str = "greentic.deploy-aws";
+pub const EXT_DEPLOY_AZURE: &str = "greentic.deploy-azure";
+pub const EXT_DEPLOY_GCP: &str = "greentic.deploy-gcp";
 pub const DEFAULT_GHCR_OPERATOR_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless@sha256:6287eafd5f54b6be400e9d19f87791866dd23d8e0a71d1a5fdde7604d842edc8";
 pub const DEFAULT_GCP_OPERATOR_IMAGE: &str = "europe-west1-docker.pkg.dev/x-plateau-483512-p6/greentic-images/greentic-start-distroless@sha256:5f7e4b70271c09b2a099e2c6d5c8641cbdb5a20698dcbba0e3b0f90a0f3e0e48";
 pub const DEFAULT_OPERATOR_IMAGE_DIGEST: &str =
@@ -114,12 +117,22 @@ pub struct CloudTargetRequirementsV1 {
     pub variable_requirements: Vec<VariableRequirementV1>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudDeployerExtensionDescriptorV1 {
+    pub extension_id: String,
+    pub extension_version: String,
+    pub provider: String,
+    pub deployer_pack_id: String,
+    pub provider_pack_filename: String,
+    pub target_id: String,
+}
+
 impl CloudTargetRequirementsV1 {
     pub fn aws() -> Self {
         Self {
             target: "aws".to_string(),
             target_label: "AWS".to_string(),
-            provider_pack_filename: "terraform.gtpack".to_string(),
+            provider_pack_filename: "aws.gtpack".to_string(),
             remote_bundle_source_required: true,
             remote_bundle_source_help: Some(
                 "Pass --deploy-bundle-source https://.../bundle.gtbundle or set GREENTIC_DEPLOY_BUNDLE_SOURCE"
@@ -236,6 +249,18 @@ impl CloudTargetRequirementsV1 {
                     description: Some("Optional operator image digest override".to_string()),
                 },
                 VariableRequirementV1 {
+                    name: "GREENTIC_DEPLOY_TERRAFORM_VAR_REDIS_URL".to_string(),
+                    required: false,
+                    prompt: Some(
+                        "Shared Redis URL (recommended for cloud webchat/state):".to_string(),
+                    ),
+                    default_value: None,
+                    description: Some(
+                        "Optional shared Redis URL for multi-instance state (for example redis://host:6379/0)"
+                            .to_string(),
+                    ),
+                },
+                VariableRequirementV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_DNS_NAME".to_string(),
                     required: false,
                     prompt: None,
@@ -250,7 +275,7 @@ impl CloudTargetRequirementsV1 {
         Self {
             target: "azure".to_string(),
             target_label: "Azure".to_string(),
-            provider_pack_filename: "terraform.gtpack".to_string(),
+            provider_pack_filename: "azure.gtpack".to_string(),
             remote_bundle_source_required: true,
             remote_bundle_source_help: Some(
                 "Pass --deploy-bundle-source https://.../bundle.gtbundle or set GREENTIC_DEPLOY_BUNDLE_SOURCE"
@@ -395,7 +420,7 @@ impl CloudTargetRequirementsV1 {
         Self {
             target: "gcp".to_string(),
             target_label: "GCP".to_string(),
-            provider_pack_filename: "terraform.gtpack".to_string(),
+            provider_pack_filename: "gcp.gtpack".to_string(),
             remote_bundle_source_required: true,
             remote_bundle_source_help: Some(
                 "Pass --deploy-bundle-source https://.../bundle.gtbundle or set GREENTIC_DEPLOY_BUNDLE_SOURCE"
@@ -487,6 +512,34 @@ impl CloudTargetRequirementsV1 {
         }?;
         apply_operator_image_defaults_for_provider(&mut requirements, provider);
         Some(requirements)
+    }
+}
+
+impl CloudDeployerExtensionDescriptorV1 {
+    pub fn for_provider(provider: Provider) -> Option<Self> {
+        let (extension_id, target_id, deployer_pack_id) = match provider {
+            Provider::Aws => (
+                EXT_DEPLOY_AWS,
+                "aws-ecs-fargate-local",
+                "greentic.deploy.aws",
+            ),
+            Provider::Azure => (
+                EXT_DEPLOY_AZURE,
+                "azure-container-apps-local",
+                "greentic.deploy.azure",
+            ),
+            Provider::Gcp => (EXT_DEPLOY_GCP, "gcp-cloud-run-local", "greentic.deploy.gcp"),
+            Provider::Local | Provider::K8s | Provider::Generic => return None,
+        };
+        let requirements = CloudTargetRequirementsV1::for_provider(provider)?;
+        Some(Self {
+            extension_id: extension_id.to_string(),
+            extension_version: "0.1.0".to_string(),
+            provider: provider.as_str().to_string(),
+            deployer_pack_id: deployer_pack_id.to_string(),
+            provider_pack_filename: requirements.provider_pack_filename,
+            target_id: target_id.to_string(),
+        })
     }
 }
 
@@ -728,6 +781,37 @@ pub fn set_deployer_contract_v1(
         ExtensionRef {
             kind: EXT_DEPLOYER_V1.to_string(),
             version: "1.0.0".to_string(),
+            digest: None,
+            location: None,
+            inline: Some(ExtensionInline::Other(inline)),
+        },
+    );
+    Ok(())
+}
+
+pub fn set_cloud_deployer_extension_ref(
+    manifest: &mut PackManifest,
+    provider: Provider,
+) -> Result<()> {
+    let descriptor =
+        CloudDeployerExtensionDescriptorV1::for_provider(provider).ok_or_else(|| {
+            DeployerError::Contract(format!(
+                "cloud deployer extension is not defined for provider {}",
+                provider.as_str()
+            ))
+        })?;
+    let inline = serde_json::to_value(&descriptor).map_err(|err| {
+        DeployerError::Contract(format!(
+            "{} serialize failed: {}",
+            descriptor.extension_id, err
+        ))
+    })?;
+    let extensions = manifest.extensions.get_or_insert_with(Default::default);
+    extensions.insert(
+        descriptor.extension_id.clone(),
+        ExtensionRef {
+            kind: descriptor.extension_id,
+            version: descriptor.extension_version,
             digest: None,
             location: None,
             inline: Some(ExtensionInline::Other(inline)),
@@ -1213,21 +1297,26 @@ mod tests {
         let aws = CloudTargetRequirementsV1::for_provider(Provider::Aws).expect("aws");
         assert_eq!(aws.target, "aws");
         assert_eq!(aws.target_label, "AWS");
-        assert_eq!(aws.provider_pack_filename, "terraform.gtpack");
+        assert_eq!(aws.provider_pack_filename, "aws.gtpack");
         assert!(aws.remote_bundle_source_required);
         assert!(!aws.credential_requirements.is_empty());
         assert!(aws.variable_requirements.iter().any(|entry| entry.name
             == "GREENTIC_DEPLOY_TERRAFORM_VAR_REMOTE_STATE_BACKEND"
             && entry.required));
+        assert!(aws.variable_requirements.iter().any(|entry| entry.name
+            == "GREENTIC_DEPLOY_TERRAFORM_VAR_REDIS_URL"
+            && !entry.required));
 
         let azure = CloudTargetRequirementsV1::for_provider(Provider::Azure).expect("azure");
         assert_eq!(azure.target_label, "Azure");
+        assert_eq!(azure.provider_pack_filename, "azure.gtpack");
         assert!(azure.variable_requirements.iter().any(|entry| entry.name
             == "GREENTIC_DEPLOY_TERRAFORM_VAR_AZURE_KEY_VAULT_ID"
             && entry.required));
 
         let gcp = CloudTargetRequirementsV1::for_provider(Provider::Gcp).expect("gcp");
         assert_eq!(gcp.target_label, "GCP");
+        assert_eq!(gcp.provider_pack_filename, "gcp.gtpack");
         assert!(gcp.variable_requirements.iter().any(|entry| entry.name
             == "GREENTIC_DEPLOY_TERRAFORM_VAR_GCP_PROJECT_ID"
             && entry.required));
@@ -1242,6 +1331,64 @@ mod tests {
         assert!(CloudTargetRequirementsV1::for_provider(Provider::Local).is_none());
         assert!(CloudTargetRequirementsV1::for_provider(Provider::K8s).is_none());
         assert!(CloudTargetRequirementsV1::for_provider(Provider::Generic).is_none());
+    }
+
+    #[test]
+    fn cloud_deployer_extension_descriptor_for_provider_is_canonical() {
+        let aws = CloudDeployerExtensionDescriptorV1::for_provider(Provider::Aws).expect("aws");
+        assert_eq!(aws.extension_id, EXT_DEPLOY_AWS);
+        assert_eq!(aws.deployer_pack_id, "greentic.deploy.aws");
+        assert_eq!(aws.provider_pack_filename, "aws.gtpack");
+        assert_eq!(aws.target_id, "aws-ecs-fargate-local");
+
+        let azure =
+            CloudDeployerExtensionDescriptorV1::for_provider(Provider::Azure).expect("azure");
+        assert_eq!(azure.extension_id, EXT_DEPLOY_AZURE);
+        assert_eq!(azure.deployer_pack_id, "greentic.deploy.azure");
+        assert_eq!(azure.provider_pack_filename, "azure.gtpack");
+        assert_eq!(azure.target_id, "azure-container-apps-local");
+
+        let gcp = CloudDeployerExtensionDescriptorV1::for_provider(Provider::Gcp).expect("gcp");
+        assert_eq!(gcp.extension_id, EXT_DEPLOY_GCP);
+        assert_eq!(gcp.deployer_pack_id, "greentic.deploy.gcp");
+        assert_eq!(gcp.provider_pack_filename, "gcp.gtpack");
+        assert_eq!(gcp.target_id, "gcp-cloud-run-local");
+
+        assert!(CloudDeployerExtensionDescriptorV1::for_provider(Provider::Local).is_none());
+        assert!(CloudDeployerExtensionDescriptorV1::for_provider(Provider::K8s).is_none());
+        assert!(CloudDeployerExtensionDescriptorV1::for_provider(Provider::Generic).is_none());
+    }
+
+    #[test]
+    fn set_cloud_deployer_extension_ref_writes_manifest_extensions() {
+        let mut manifest = sample_manifest();
+        set_cloud_deployer_extension_ref(&mut manifest, Provider::Aws).expect("aws ext");
+        set_cloud_deployer_extension_ref(&mut manifest, Provider::Gcp).expect("gcp ext");
+
+        let extensions = manifest.extensions.expect("extensions");
+        let aws = extensions.get(EXT_DEPLOY_AWS).expect("aws ext entry");
+        assert_eq!(aws.kind, EXT_DEPLOY_AWS);
+        assert_eq!(aws.version, "0.1.0");
+        let aws_inline = aws.inline.as_ref().expect("aws inline");
+        let ExtensionInline::Other(aws_value) = aws_inline else {
+            panic!("expected Other inline payload for aws");
+        };
+        let aws_descriptor: CloudDeployerExtensionDescriptorV1 =
+            serde_json::from_value(aws_value.clone()).expect("aws descriptor");
+        assert_eq!(aws_descriptor.deployer_pack_id, "greentic.deploy.aws");
+        assert_eq!(aws_descriptor.provider_pack_filename, "aws.gtpack");
+
+        let gcp = extensions.get(EXT_DEPLOY_GCP).expect("gcp ext entry");
+        assert_eq!(gcp.kind, EXT_DEPLOY_GCP);
+        assert_eq!(gcp.version, "0.1.0");
+        let gcp_inline = gcp.inline.as_ref().expect("gcp inline");
+        let ExtensionInline::Other(gcp_value) = gcp_inline else {
+            panic!("expected Other inline payload for gcp");
+        };
+        let gcp_descriptor: CloudDeployerExtensionDescriptorV1 =
+            serde_json::from_value(gcp_value.clone()).expect("gcp descriptor");
+        assert_eq!(gcp_descriptor.deployer_pack_id, "greentic.deploy.gcp");
+        assert_eq!(gcp_descriptor.provider_pack_filename, "gcp.gtpack");
     }
 
     #[test]

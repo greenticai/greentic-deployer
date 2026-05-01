@@ -1,0 +1,30 @@
+{
+  "type": "object",
+  "required": [
+    "kind",
+    "deployment_id",
+    "state",
+    "health_checks"
+  ],
+  "properties": {
+    "kind": { "const": "status" },
+    "deployment_id": { "type": "string" },
+    "state": { "type": "string" },
+    "provider": { "type": "string" },
+    "strategy": { "type": "string" },
+    "status_source": { "type": "string" },
+    "endpoints": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "health_checks": {
+      "type": "array",
+      "items": { "type": "string" },
+      "contains": { "pattern": "^terraform_root:" }
+    },
+    "output_refs": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  }
+}

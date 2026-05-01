@@ -1,0 +1,7 @@
+{
+  "kind": "rollback",
+  "release_name": "greentic-staging",
+  "target_revision": 3,
+  "command": "terraform apply -var-file=staging.tfvars.example"
+}
+

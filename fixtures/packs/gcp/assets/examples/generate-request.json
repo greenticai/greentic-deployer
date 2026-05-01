@@ -1,0 +1,14 @@
+{
+  "environment": "staging",
+  "operator_image_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "dns_name": "",
+  "bundle_source": "oci://registry.greentic.ai/bundles/operator",
+  "bundle_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "repo_registry_base": "",
+  "store_registry_base": "",
+  "gcp_project_id": "greentic-staging",
+  "gcp_region": "us-central1",
+  "admin_allowed_clients": "local-admin,ops-admin",
+  "public_base_url": "https://operator.greentic.example.com",
+  "remote_state_backend": "gcs"
+}

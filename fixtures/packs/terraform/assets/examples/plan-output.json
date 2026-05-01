@@ -9,6 +9,7 @@
     "operator_image_digest",
     "bundle_source",
     "bundle_digest",
+    "redis_url",
     "dns_name",
     "remote_state_backend"
   ]
