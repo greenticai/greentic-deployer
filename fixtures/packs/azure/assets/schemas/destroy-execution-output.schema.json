@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "required": [
+    "kind",
+    "deployment_id",
+    "state",
+    "destroyed_resources"
+  ],
+  "properties": {
+    "kind": { "const": "destroy" },
+    "deployment_id": { "type": "string" },
+    "state": { "type": "string" },
+    "destroyed_resources": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

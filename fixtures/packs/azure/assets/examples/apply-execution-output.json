@@ -1,0 +1,17 @@
+{
+  "kind": "apply",
+  "deployment_id": "greentic-staging",
+  "state": "applied",
+  "provider": "azure",
+  "strategy": "iac-only",
+  "endpoints": [
+    "https://operator.greentic.example.com"
+  ],
+  "output_refs": {
+    "admin_ca_secret_ref": "https://greentic-staging.vault.azure.net/secrets/greentic-admin-ca-staging",
+    "admin_server_cert_secret_ref": "https://greentic-staging.vault.azure.net/secrets/greentic-admin-server-cert-staging",
+    "admin_server_key_secret_ref": "https://greentic-staging.vault.azure.net/secrets/greentic-admin-server-key-staging",
+    "cloud_provider": "azure",
+    "operator_endpoint": "https://operator.greentic.example.com"
+  }
+}
