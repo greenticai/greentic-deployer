@@ -9,6 +9,7 @@ operator_image_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 dns_name = ""
 bundle_source = "oci://registry.greentic.ai/bundles/operator"
 bundle_digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+redis_url = "redis://shared-state.greentic.internal:6379/0"
 repo_registry_base = ""
 store_registry_base = ""
 admin_allowed_clients = "local-admin,ops-admin"

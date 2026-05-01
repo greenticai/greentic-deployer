@@ -14,6 +14,7 @@ module "operator_aws" {
   operator_image      = local.operator_image
   bundle_source       = var.bundle_source
   bundle_digest       = var.bundle_digest
+  redis_url           = var.redis_url
   repo_registry_base  = var.repo_registry_base
   store_registry_base = var.store_registry_base
   admin_allowed_clients = var.admin_allowed_clients

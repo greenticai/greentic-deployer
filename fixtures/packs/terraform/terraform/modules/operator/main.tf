@@ -499,8 +499,30 @@ resource "aws_ecs_task_definition" "this" {
           {
             name  = "PUBLIC_BASE_URL"
             value = local.effective_public_base_url
+          },
+          {
+            name  = "GREENTIC_WEBCHAT_BASE_URL"
+            value = local.effective_public_base_url
+          },
+          {
+            name  = "GREENTIC_WEBCHAT_ROUTE"
+            value = "webchat"
+          },
+          {
+            name  = "GREENTIC_WEBCHAT_TENANT_CHANNEL_ID"
+            value = "${var.tenant}:webchat"
           }
         ],
+        var.redis_url != "" ? [
+          {
+            name  = "GREENTIC_WEBCHAT_MODE"
+            value = "websocket"
+          },
+          {
+            name  = "REDIS_URL"
+            value = var.redis_url
+          }
+        ] : [],
         var.admin_allowed_clients != "" ? [
           {
             name  = "GREENTIC_ADMIN_ALLOWED_CLIENTS"

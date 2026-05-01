@@ -63,6 +63,7 @@ pub struct AwsEcsFargateExtConfig {
     pub bundle_source: String,
     pub bundle_digest: String,
     pub remote_state_backend: String,
+    pub redis_url: Option<String>,
     pub dns_name: Option<String>,
     pub public_base_url: Option<String>,
     pub repo_registry_base: Option<String>,
@@ -542,6 +543,7 @@ mod tests {
         assert_eq!(cfg.region, "us-east-1");
         assert_eq!(cfg.environment, "staging");
         assert_eq!(cfg.tenant, "default");
+        assert!(cfg.redis_url.is_none());
         assert!(cfg.dns_name.is_none());
         assert!(cfg.public_base_url.is_none());
     }
@@ -555,6 +557,7 @@ mod tests {
             "bundleSource": "oci://registry.example/acme/prod-bundle@sha256:1111111111111111111111111111111111111111111111111111111111111111",
             "bundleDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
             "remoteStateBackend": "s3://my-tf-state-bucket/greentic/prod",
+            "redisUrl": "redis://shared.example.com:6379/0",
             "dnsName": "api.example.com",
             "publicBaseUrl": "https://api.example.com",
             "repoRegistryBase": "https://repo.example.com",
@@ -563,6 +566,10 @@ mod tests {
             "tenant": "acme"
         }"#;
         let cfg: AwsEcsFargateExtConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.redis_url.as_deref(),
+            Some("redis://shared.example.com:6379/0")
+        );
         assert_eq!(cfg.dns_name.as_deref(), Some("api.example.com"));
         assert_eq!(
             cfg.public_base_url.as_deref(),

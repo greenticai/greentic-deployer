@@ -23,6 +23,11 @@ variable "bundle_source" {
   type = string
 }
 
+variable "redis_url" {
+  type    = string
+  default = ""
+}
+
 variable "repo_registry_base" {
   type = string
 }

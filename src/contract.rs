@@ -236,6 +236,18 @@ impl CloudTargetRequirementsV1 {
                     description: Some("Optional operator image digest override".to_string()),
                 },
                 VariableRequirementV1 {
+                    name: "GREENTIC_DEPLOY_TERRAFORM_VAR_REDIS_URL".to_string(),
+                    required: false,
+                    prompt: Some(
+                        "Shared Redis URL (recommended for cloud webchat/state):".to_string(),
+                    ),
+                    default_value: None,
+                    description: Some(
+                        "Optional shared Redis URL for multi-instance state (for example redis://host:6379/0)"
+                            .to_string(),
+                    ),
+                },
+                VariableRequirementV1 {
                     name: "GREENTIC_DEPLOY_TERRAFORM_VAR_DNS_NAME".to_string(),
                     required: false,
                     prompt: None,
@@ -1219,6 +1231,9 @@ mod tests {
         assert!(aws.variable_requirements.iter().any(|entry| entry.name
             == "GREENTIC_DEPLOY_TERRAFORM_VAR_REMOTE_STATE_BACKEND"
             && entry.required));
+        assert!(aws.variable_requirements.iter().any(|entry| entry.name
+            == "GREENTIC_DEPLOY_TERRAFORM_VAR_REDIS_URL"
+            && !entry.required));
 
         let azure = CloudTargetRequirementsV1::for_provider(Provider::Azure).expect("azure");
         assert_eq!(azure.target_label, "Azure");
