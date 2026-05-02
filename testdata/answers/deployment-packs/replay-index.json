@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "replays": [
+    "examples/answers/deployment-packs/aws.plan.json",
     "examples/answers/deployment-packs/k8s-raw.generate.json",
     "examples/answers/deployment-packs/helm.generate.json",
     "examples/answers/deployment-packs/terraform.plan.json",

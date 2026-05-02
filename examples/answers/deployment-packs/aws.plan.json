@@ -1,0 +1,11 @@
+{
+  "wizard": "greentic-pack wizard",
+  "pack_fixture": "fixtures/packs/aws",
+  "capability": "plan",
+  "answers": {
+    "provider": "aws",
+    "strategy": "iac-only",
+    "example_request": "assets/examples/generate-request.json",
+    "expected_output": "assets/examples/plan-output.json"
+  }
+}

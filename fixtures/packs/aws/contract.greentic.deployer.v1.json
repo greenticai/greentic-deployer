@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "planner": {
+    "flow_id": "plan_aws",
+    "input_schema_ref": "assets/schemas/generate-input.schema.json",
+    "output_schema_ref": "assets/schemas/plan-output.schema.json"
+  },
+  "capabilities": [
+    {
+      "capability": "generate",
+      "flow_id": "generate_aws",
+      "input_schema_ref": "assets/schemas/generate-input.schema.json",
+      "output_schema_ref": "assets/schemas/generate-output.schema.json",
+      "example_refs": [
+        "assets/examples/generate-request.json",
+        "assets/examples/generate-output.json"
+      ]
+    },
+    {
+      "capability": "plan",
+      "flow_id": "plan_aws",
+      "input_schema_ref": "assets/schemas/generate-input.schema.json",
+      "output_schema_ref": "assets/schemas/plan-output.schema.json",
+      "example_refs": [
+        "assets/examples/plan-output.json"
+      ]
+    },
+    {
+      "capability": "apply",
+      "flow_id": "apply_aws",
+      "execution_output_schema_ref": "assets/schemas/apply-execution-output.schema.json",
+      "example_refs": [
+        "assets/examples/apply-execution-output.json"
+      ]
+    },
+    {
+      "capability": "destroy",
+      "flow_id": "destroy_aws",
+      "execution_output_schema_ref": "assets/schemas/destroy-execution-output.schema.json",
+      "example_refs": [
+        "assets/examples/destroy-execution-output.json"
+      ]
+    },
+    {
+      "capability": "status",
+      "flow_id": "status_aws",
+      "output_schema_ref": "assets/schemas/status-output.schema.json",
+      "execution_output_schema_ref": "assets/schemas/status-execution-output.schema.json",
+      "example_refs": [
+        "assets/examples/status-output.json",
+        "assets/examples/status-execution-output.json"
+      ]
+    },
+    {
+      "capability": "rollback",
+      "flow_id": "rollback_aws",
+      "execution_output_schema_ref": "assets/schemas/rollback-execution-output.schema.json",
+      "example_refs": [
+        "assets/examples/rollback-execution-output.json"
+      ]
+    }
+  ]
+}
