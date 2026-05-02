@@ -1,0 +1,11 @@
+{
+  "wizard": "greentic-pack wizard",
+  "pack_fixture": "fixtures/packs/azure",
+  "capability": "plan",
+  "answers": {
+    "provider": "azure",
+    "strategy": "iac-only",
+    "example_request": "assets/examples/generate-request.json",
+    "expected_output": "assets/examples/plan-output.json"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "kind": "status",
+  "deployment_id": "deploy/azure/acme/staging",
+  "state": "handoff_ready",
+  "provider": "azure",
+  "strategy": "iac-only",
+  "status_source": "terraform_handoff",
+  "endpoints": [
+    "https://operator.greentic.example.com"
+  ],
+  "health_checks": [
+    "terraform_runtime_json:deploy/azure/acme/staging/terraform-runtime.json",
+    "terraform_root:present",
+    "script:terraform-status.sh:present"
+  ],
+  "output_refs": {
+    "admin_ca_secret_ref": "https://greentic-staging.vault.azure.net/secrets/greentic-admin-ca-staging",
+    "admin_server_cert_secret_ref": "https://greentic-staging.vault.azure.net/secrets/greentic-admin-server-cert-staging",
+    "admin_server_key_secret_ref": "https://greentic-staging.vault.azure.net/secrets/greentic-admin-server-key-staging",
+    "admin_relay_token_secret_ref": "https://greentic-staging.vault.azure.net/secrets/greentic-admin-relay-token-staging",
+    "cloud_provider": "azure",
+    "operator_endpoint": "https://operator.greentic.example.com"
+  }
+}

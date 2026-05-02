@@ -1,0 +1,32 @@
+{
+  "type": "object",
+  "required": [
+    "kind",
+    "capability",
+    "provider",
+    "strategy",
+    "terraform_init_command",
+    "terraform_plan_command",
+    "expected_variables"
+  ],
+  "properties": {
+    "kind": { "const": "plan" },
+    "capability": { "const": "plan" },
+    "provider": { "const": "generic" },
+    "strategy": { "const": "terraform" },
+    "terraform_init_command": {
+      "type": "string",
+      "pattern": "terraform init"
+    },
+    "terraform_plan_command": {
+      "type": "string",
+      "pattern": "terraform plan"
+    },
+    "expected_variables": {
+      "type": "array",
+      "items": { "type": "string" },
+      "contains": { "const": "operator_image_digest" }
+    }
+  }
+}
+

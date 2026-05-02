@@ -1,0 +1,29 @@
+{
+  "kind": "generate",
+  "capability": "generate",
+  "provider": "generic",
+  "strategy": "terraform",
+  "terraform_root": "terraform",
+  "supported_clouds": [
+    "azure"
+  ],
+  "cloud_modules": {
+    "azure": "modules/operator"
+  },
+  "generated_files": [
+    "main.tf",
+    "variables.tf",
+    "outputs.tf",
+    "providers.tf",
+    "staging.tfvars.example",
+    "modules/operator/main.tf",
+    "modules/operator/variables.tf",
+    "modules/operator/outputs.tf",
+    "modules/dns/main.tf",
+    "modules/dns/variables.tf",
+    "modules/redis/main.tf",
+    "modules/redis/variables.tf",
+    "modules/registry/main.tf",
+    "modules/registry/variables.tf"
+  ]
+}
