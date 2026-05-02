@@ -1,0 +1,24 @@
+{
+  "kind": "status",
+  "deployment_id": "deploy/gcp/acme/staging",
+  "state": "handoff_ready",
+  "provider": "gcp",
+  "strategy": "iac-only",
+  "status_source": "terraform_handoff",
+  "endpoints": [
+    "https://operator.greentic.example.com"
+  ],
+  "health_checks": [
+    "terraform_runtime_json:deploy/gcp/acme/staging/terraform-runtime.json",
+    "terraform_root:present",
+    "script:terraform-status.sh:present"
+  ],
+  "output_refs": {
+    "admin_ca_secret_ref": "projects/greentic-staging/secrets/greentic-admin-ca-staging/versions/1",
+    "admin_server_cert_secret_ref": "projects/greentic-staging/secrets/greentic-admin-server-cert-staging/versions/1",
+    "admin_server_key_secret_ref": "projects/greentic-staging/secrets/greentic-admin-server-key-staging/versions/1",
+    "admin_relay_token_secret_ref": "projects/greentic-staging/secrets/greentic-admin-relay-token-staging/versions/1",
+    "cloud_provider": "gcp",
+    "operator_endpoint": "https://operator.greentic.example.com"
+  }
+}

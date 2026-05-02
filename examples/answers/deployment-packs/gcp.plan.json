@@ -1,0 +1,11 @@
+{
+  "wizard": "greentic-pack wizard",
+  "pack_fixture": "fixtures/packs/gcp",
+  "capability": "plan",
+  "answers": {
+    "provider": "gcp",
+    "strategy": "iac-only",
+    "example_request": "assets/examples/generate-request.json",
+    "expected_output": "assets/examples/plan-output.json"
+  }
+}

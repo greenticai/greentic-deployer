@@ -1,0 +1,15 @@
+{
+  "kind": "plan",
+  "capability": "plan",
+  "provider": "generic",
+  "strategy": "terraform",
+  "terraform_init_command": "terraform init -backend-config=backend.hcl",
+  "terraform_plan_command": "terraform plan -var-file=staging.tfvars.example",
+  "expected_variables": [
+    "operator_image_digest",
+    "bundle_source",
+    "bundle_digest",
+    "dns_name",
+    "remote_state_backend"
+  ]
+}
