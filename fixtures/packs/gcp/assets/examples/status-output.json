@@ -1,0 +1,8 @@
+{
+  "kind": "status",
+  "capability": "status",
+  "provider": "gcp",
+  "strategy": "terraform",
+  "pack_id": "greentic.deploy.gcp",
+  "flow_id": "status_terraform"
+}

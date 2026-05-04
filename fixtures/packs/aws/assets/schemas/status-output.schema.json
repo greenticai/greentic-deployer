@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "required": [
+    "kind",
+    "capability",
+    "provider",
+    "strategy",
+    "pack_id",
+    "flow_id"
+  ],
+  "properties": {
+    "kind": { "const": "status" },
+    "capability": { "const": "status" },
+    "provider": { "type": "string" },
+    "strategy": { "const": "terraform" },
+    "pack_id": { "type": "string" },
+    "flow_id": { "type": "string" }
+  }
+}

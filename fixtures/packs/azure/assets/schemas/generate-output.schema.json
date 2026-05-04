@@ -1,0 +1,43 @@
+{
+  "type": "object",
+  "required": [
+    "kind",
+    "capability",
+    "provider",
+    "strategy",
+    "terraform_root",
+    "generated_files",
+    "supported_clouds",
+    "cloud_modules"
+  ],
+  "properties": {
+    "kind": { "const": "generate" },
+    "capability": { "const": "generate" },
+    "provider": { "const": "azure" },
+    "strategy": { "const": "terraform" },
+    "terraform_root": { "const": "terraform" },
+    "supported_clouds": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["azure"]
+      },
+      "minItems": 1,
+      "maxItems": 1
+    },
+    "cloud_modules": {
+      "type": "object",
+      "required": ["azure"],
+      "properties": {
+        "azure": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "generated_files": {
+      "type": "array",
+      "items": { "type": "string" },
+      "contains": { "const": "main.tf" },
+      "minItems": 11
+    }
+  }
+}

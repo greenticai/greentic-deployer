@@ -12,5 +12,6 @@ crate-type = ["cdylib"]
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-wasmtime = { version = "40", features = ["wasi-preview1"] }
 
+[dev-dependencies]
+tempfile = "3"

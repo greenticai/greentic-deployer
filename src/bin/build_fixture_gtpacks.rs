@@ -144,8 +144,16 @@ fn build_manifest(fixture_dir: &Path, contract: &DeployerContractV1) -> Result<P
 }
 
 fn fixture_pack_id(fixture_name: &str) -> Result<PackId> {
-    let pack_id = fixture_name.replace('-', ".");
-    PackId::from_str(&format!("greentic.fixture.{pack_id}.gtpack")).context("build pack id")
+    let pack_id = match fixture_name {
+        "aws" => "greentic.deploy.aws".to_string(),
+        "azure" => "greentic.deploy.azure".to_string(),
+        "gcp" => "greentic.deploy.gcp".to_string(),
+        other => {
+            let suffix = other.replace('-', ".");
+            format!("greentic.fixture.{suffix}.gtpack")
+        }
+    };
+    PackId::from_str(&pack_id).context("build pack id")
 }
 
 fn contract_flow_entries(contract: &DeployerContractV1) -> Result<Vec<PackFlowEntry>> {
@@ -216,7 +224,23 @@ mod tests {
     use super::fixture_pack_id;
 
     #[test]
-    fn fixture_pack_ids_keep_gtpack_suffix() {
+    fn cloud_fixture_pack_ids_use_canonical_deploy_names() {
+        assert_eq!(
+            fixture_pack_id("aws").unwrap().to_string(),
+            "greentic.deploy.aws"
+        );
+        assert_eq!(
+            fixture_pack_id("azure").unwrap().to_string(),
+            "greentic.deploy.azure"
+        );
+        assert_eq!(
+            fixture_pack_id("gcp").unwrap().to_string(),
+            "greentic.deploy.gcp"
+        );
+    }
+
+    #[test]
+    fn non_cloud_fixture_pack_ids_keep_gtpack_suffix() {
         assert_eq!(
             fixture_pack_id("helm").unwrap().to_string(),
             "greentic.fixture.helm.gtpack"
