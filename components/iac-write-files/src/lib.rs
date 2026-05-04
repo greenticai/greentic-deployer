@@ -90,7 +90,6 @@ fn sanitize_rel_path(path: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use tempfile::tempdir;
 
     #[test]

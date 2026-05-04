@@ -73,6 +73,7 @@ fn sample_flow(id: &str, kind: FlowKind, component: &ComponentManifest) -> Flow 
             },
             routing: Routing::End,
             telemetry: Default::default(),
+            err_map: Default::default(),
         },
     );
 

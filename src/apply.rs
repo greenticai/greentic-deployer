@@ -1144,6 +1144,8 @@ fn run_script_capture_logs(
     stdout_log: &str,
     stderr_log: &str,
 ) -> Result<std::process::Output> {
+    // Accepted risk: script_path is a deployer-generated executable path and is invoked without a shell.
+    // foxguard: ignore[rs/no-command-injection]
     let mut command = Command::new(script_path);
     command.current_dir(current_dir);
     apply_default_cloud_envs(&mut command, provider);
@@ -1419,6 +1421,8 @@ fn capture_terraform_outputs(
     } else {
         PathBuf::from("terraform")
     };
+    // Accepted risk: terraform_bin is either the generated local Terraform binary or the fixed PATH lookup "terraform"; no shell is used.
+    // foxguard: ignore[rs/no-command-injection]
     let mut command = Command::new(terraform_bin);
     command
         .current_dir(&terraform_root)
