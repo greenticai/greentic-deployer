@@ -1,6 +1,9 @@
 {
   "schema_version": 1,
   "answers": [
+    "examples/answers/deployer-scaffolds/aws.json",
+    "examples/answers/deployer-scaffolds/azure.json",
+    "examples/answers/deployer-scaffolds/gcp.json",
     "examples/answers/deployer-scaffolds/helm.json",
     "examples/answers/deployer-scaffolds/juju-k8s.json",
     "examples/answers/deployer-scaffolds/juju-machine.json",

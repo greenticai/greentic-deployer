@@ -1198,6 +1198,116 @@ mod tests {
     }
 
     #[test]
+    fn resolve_admin_access_reports_gcp_public_relay_details() {
+        let tmp = tempdir().expect("tempdir");
+        let bundle_dir = tmp.path().join("bundle");
+        let deploy_dir = bundle_dir
+            .join(".greentic")
+            .join("deploy")
+            .join("gcp")
+            .join("demo")
+            .join("state");
+        fs::create_dir_all(&deploy_dir).expect("create deploy dir");
+        fs::write(
+            deploy_dir.join("terraform-outputs.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "operator_endpoint": {
+                    "value": "https://greentic-demo-run-abc123-uc.a.run.app"
+                },
+                "admin_public_endpoint": {
+                    "value": "https://greentic-demo-run-abc123-uc.a.run.app/admin"
+                },
+                "admin_relay_token_secret_ref": {
+                    "value": "projects/demo-project/secrets/admin-relay-token"
+                },
+                "admin_ca_secret_ref": {
+                    "value": "projects/demo-project/secrets/greentic-demo-admin-ca"
+                },
+                "admin_client_cert_secret_ref": {
+                    "value": "projects/demo-project/secrets/admin-client-cert"
+                },
+                "admin_client_key_secret_ref": {
+                    "value": "projects/demo-project/secrets/admin-client-key"
+                }
+            }))
+            .expect("serialize outputs"),
+        )
+        .expect("write outputs");
+
+        let info = resolve_admin_access(&bundle_dir, Provider::Gcp).expect("resolve");
+        assert_eq!(info.provider, "gcp");
+        assert_eq!(
+            info.provider_details.gcp_project_id.as_deref(),
+            Some("demo-project")
+        );
+        assert_eq!(
+            info.provider_details.gcp_cloud_run_service_name.as_deref(),
+            Some("greentic-demo-run")
+        );
+        assert!(info.client_credentials_available);
+        assert!(info.missing_requirements.is_empty());
+        assert!(
+            info.suggested_commands
+                .iter()
+                .any(|command| command.contains("gcloud run services describe greentic-demo-run"))
+        );
+    }
+
+    #[test]
+    fn render_admin_access_supports_text_json_and_yaml() {
+        let info = AdminAccessInfo {
+            provider: "azure".to_string(),
+            bundle_dir: PathBuf::from("/tmp/bundle"),
+            deploy_dir: PathBuf::from("/tmp/bundle/.greentic/deploy/azure/demo/state"),
+            local_cert_dir: PathBuf::from("/tmp/bundle/.greentic/admin/certs/demo"),
+            admin_access_mode: Some("internal".to_string()),
+            admin_public_endpoint: Some("https://admin.example.test".to_string()),
+            operator_endpoint: Some("https://greentic-demo-app.example.test".to_string()),
+            deployment_name_prefix: Some("greentic-demo".to_string()),
+            operator_host: Some("greentic-demo-app.example.test".to_string()),
+            provider_details: AdminProviderDetails {
+                azure_resource_group_name: Some("greentic-demo-rg".to_string()),
+                azure_container_app_name: Some("greentic-demo-app".to_string()),
+                ..Default::default()
+            },
+            admin_listener: "127.0.0.1:8433".to_string(),
+            admin_secret_refs: AdminSecretRefs {
+                admin_ca_secret_ref: Some("https://vault.example/secrets/ca".to_string()),
+                admin_server_cert_secret_ref: None,
+                admin_server_key_secret_ref: None,
+                admin_client_cert_secret_ref: Some(
+                    "https://vault.example/secrets/client-cert".to_string(),
+                ),
+                admin_client_key_secret_ref: Some(
+                    "https://vault.example/secrets/client-key".to_string(),
+                ),
+                admin_relay_token_secret_ref: Some(
+                    "https://vault.example/secrets/relay-token".to_string(),
+                ),
+            },
+            client_credentials_available: true,
+            missing_requirements: Vec::new(),
+            tunnel_support: tunnel_support_for_provider(Provider::Azure),
+            suggested_commands: suggested_commands(&serde_json::json!({}), Provider::Azure),
+            curl_health_example: curl_health_example(Provider::Azure),
+            notes: notes_for_provider(Provider::Azure),
+        };
+
+        let text = render_admin_access(&info, OutputFormat::Text).expect("render text");
+        assert!(text.contains("provider: azure"));
+        assert!(text.contains("admin_public_endpoint: https://admin.example.test"));
+        assert!(text.contains("tunnel_supported: false"));
+
+        let json = render_admin_access(&info, OutputFormat::Json).expect("render json");
+        assert!(json.contains(r#""provider": "azure""#));
+        assert!(json.contains(r#""admin_access_mode": "internal""#));
+
+        let yaml = render_admin_access(&info, OutputFormat::Yaml).expect("render yaml");
+        assert!(yaml.contains("provider: azure"));
+        assert!(yaml.contains("admin_access_mode: internal"));
+    }
+
+    #[test]
     fn parse_gcp_secret_ref_extracts_project_and_secret_name() {
         let (project_id, secret_name) =
             parse_gcp_secret_ref("projects/demo-project/secrets/admin-client-cert").expect("parse");

@@ -167,6 +167,7 @@ fn terraform_plan_output_declares_commands_and_variables() {
         .collect::<Vec<_>>();
     assert!(vars.contains(&"operator_image_digest"));
     assert!(vars.contains(&"bundle_digest"));
+    assert!(vars.contains(&"redis_url"));
     assert!(vars.contains(&"dns_name"));
     assert!(vars.contains(&"remote_state_backend"));
 }
@@ -228,6 +229,11 @@ fn terraform_runtime_module_uses_distroless_command_and_admin_secrets() {
     assert!(module_tf.contains("GREENTIC_ADMIN_SERVER_KEY_PEM"));
     assert!(module_tf.contains("GREENTIC_ADMIN_ALLOWED_CLIENTS"));
     assert!(module_tf.contains("PUBLIC_BASE_URL"));
+    assert!(module_tf.contains("GREENTIC_WEBCHAT_BASE_URL"));
+    assert!(module_tf.contains("GREENTIC_WEBCHAT_ROUTE"));
+    assert!(module_tf.contains("GREENTIC_WEBCHAT_TENANT_CHANNEL_ID"));
+    assert!(module_tf.contains("GREENTIC_WEBCHAT_MODE"));
+    assert!(module_tf.contains("REDIS_URL"));
 }
 
 #[test]

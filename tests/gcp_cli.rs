@@ -12,7 +12,7 @@ use provider_pack::{build_provider_gtpack, example_pack_path, write_fake_terrafo
 fn gcp_generate_cli_renders_json_output() {
     let dir = tempfile::tempdir().expect("tempdir");
     let provider_pack = dir.path().join("provider.gtpack");
-    build_provider_gtpack("terraform", &provider_pack, "greentic.deploy.gcp");
+    build_provider_gtpack("gcp", &provider_pack, "greentic.deploy.gcp");
     let pack = example_pack_path();
     let binary = copied_test_binary(&dir);
 
@@ -46,7 +46,7 @@ fn gcp_generate_cli_renders_json_output() {
 fn gcp_status_cli_renders_json_output() {
     let dir = tempfile::tempdir().expect("tempdir");
     let provider_pack = dir.path().join("provider.gtpack");
-    build_provider_gtpack("terraform", &provider_pack, "greentic.deploy.gcp");
+    build_provider_gtpack("gcp", &provider_pack, "greentic.deploy.gcp");
     let pack = example_pack_path();
     let binary = copied_test_binary(&dir);
 
@@ -81,7 +81,7 @@ fn gcp_status_cli_renders_json_output() {
 fn gcp_apply_execute_cli_runs_local_terraform_scaffold() {
     let dir = tempfile::tempdir().expect("tempdir");
     let provider_pack = dir.path().join("provider.gtpack");
-    build_provider_gtpack("terraform", &provider_pack, "greentic.deploy.gcp");
+    build_provider_gtpack("gcp", &provider_pack, "greentic.deploy.gcp");
     let fake_bin_dir = dir.path().join("bin");
     std::fs::create_dir_all(&fake_bin_dir).expect("create fake bin dir");
     write_fake_terraform_bin(&fake_bin_dir);

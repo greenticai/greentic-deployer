@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::config::DeployerConfig;
-use crate::contract::{DeployerCapability, get_deployer_contract_v1};
+use crate::contract::{CloudTargetRequirementsV1, DeployerCapability, get_deployer_contract_v1};
 use crate::error::{DeployerError, Result};
 use crate::extension_sources::resolve_pack_deployment_dispatch;
 use crate::pack_introspect::{read_manifest_from_directory, read_manifest_from_gtpack};
@@ -424,12 +424,28 @@ fn build_search_paths(config: &DeployerConfig) -> Vec<SearchPath> {
 }
 
 fn resolve_direct_pack_path(config: &DeployerConfig, target: &DeploymentTarget) -> Option<PathBuf> {
-    let pack_path = config.providers_dir.join(&target.provider);
-    if pack_path.exists() {
-        Some(pack_path)
-    } else {
-        None
+    direct_pack_candidates(config, target)
+        .into_iter()
+        .find(|path| path.exists())
+}
+
+fn direct_pack_candidates(config: &DeployerConfig, target: &DeploymentTarget) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(filename) = provider_pack_filename_for_provider(config.provider) {
+        candidates.push(config.providers_dir.join(filename));
     }
+    candidates.push(config.providers_dir.join(&target.provider));
+    candidates.push(
+        config
+            .providers_dir
+            .join(format!("{}.gtpack", target.provider.trim())),
+    );
+    candidates
+}
+
+fn provider_pack_filename_for_provider(provider: crate::config::Provider) -> Option<String> {
+    CloudTargetRequirementsV1::for_provider(provider)
+        .map(|requirements| requirements.provider_pack_filename)
 }
 
 fn gather_candidates(path: &Path) -> Vec<PathBuf> {
@@ -606,8 +622,10 @@ mod tests {
     use crate::pack_introspect;
     use greentic_types::cbor::encode_pack_manifest;
     use greentic_types::component::{ComponentCapabilities, ComponentManifest, ComponentProfiles};
-    use greentic_types::pack_manifest::{PackKind, PackManifest};
-    use greentic_types::{ComponentId, PackId};
+    use greentic_types::flow::{Flow, FlowHasher, FlowKind, FlowMetadata};
+    use greentic_types::pack_manifest::{PackFlowEntry, PackKind, PackManifest};
+    use greentic_types::{ComponentId, FlowId, PackId};
+    use indexmap::IndexMap;
     use semver::Version;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -783,12 +801,17 @@ mod tests {
 
     #[allow(deprecated)]
     fn write_test_pack() -> PathBuf {
+        write_test_pack_with_id("dev.greentic.sample")
+    }
+
+    #[allow(deprecated)]
+    fn write_test_pack_with_id(pack_id: &str) -> PathBuf {
         let base = env::current_dir().expect("cwd").join("target/tmp-tests");
         std::fs::create_dir_all(&base).expect("create tmp base");
         let dir = tempfile::tempdir_in(base).expect("temp dir");
         let manifest = PackManifest {
             schema_version: "pack-v1".to_string(),
-            pack_id: PackId::try_from("dev.greentic.sample").unwrap(),
+            pack_id: PackId::try_from(pack_id).unwrap(),
             name: None,
             version: Version::new(0, 1, 0),
             kind: PackKind::Application,
@@ -817,6 +840,178 @@ mod tests {
         let bytes = encode_pack_manifest(&manifest).expect("encode manifest");
         std::fs::write(dir.path().join("manifest.cbor"), bytes).expect("write manifest");
         dir.into_path()
+    }
+
+    #[allow(deprecated)]
+    fn write_test_deployer_pack(
+        pack_id: &str,
+        flow_id: &str,
+        capability: DeployerCapability,
+    ) -> PathBuf {
+        let path = write_test_pack_with_id(pack_id);
+        let mut manifest = read_manifest_from_directory(&path).expect("read pack");
+        let flow_id_typed = FlowId::try_from(flow_id).expect("flow id");
+        manifest.flows = vec![PackFlowEntry {
+            id: flow_id_typed.clone(),
+            kind: FlowKind::Messaging,
+            flow: Flow {
+                schema_version: "flowir-v1".to_string(),
+                id: flow_id_typed.clone(),
+                kind: FlowKind::Messaging,
+                entrypoints: Default::default(),
+                nodes: IndexMap::<_, _, FlowHasher>::default(),
+                metadata: FlowMetadata::default(),
+            },
+            tags: Vec::new(),
+            entrypoints: Vec::new(),
+        }];
+        set_deployer_contract_v1(
+            &mut manifest,
+            DeployerContractV1 {
+                schema_version: 1,
+                planner: PlannerSpecV1 {
+                    flow_id: "plan_pack".to_string(),
+                    input_schema_ref: None,
+                    output_schema_ref: None,
+                    qa_spec_ref: None,
+                },
+                capabilities: vec![
+                    CapabilitySpecV1 {
+                        capability: DeployerCapability::Plan,
+                        flow_id: "plan_pack".to_string(),
+                        input_schema_ref: None,
+                        output_schema_ref: None,
+                        execution_output_schema_ref: None,
+                        qa_spec_ref: None,
+                        example_refs: Vec::new(),
+                    },
+                    CapabilitySpecV1 {
+                        capability,
+                        flow_id: flow_id.to_string(),
+                        input_schema_ref: None,
+                        output_schema_ref: None,
+                        execution_output_schema_ref: None,
+                        qa_spec_ref: None,
+                        example_refs: Vec::new(),
+                    },
+                ],
+            },
+        )
+        .expect("set contract");
+        let bytes = encode_pack_manifest(&manifest).expect("encode manifest");
+        std::fs::write(path.join("manifest.cbor"), bytes).expect("rewrite manifest");
+        path
+    }
+
+    #[test]
+    fn resolve_direct_pack_path_prefers_provider_specific_filename() {
+        let providers_dir = tempfile::tempdir().expect("tempdir");
+        let aws_pack = providers_dir.path().join("aws.gtpack");
+        std::fs::rename(
+            write_test_deployer_pack(
+                "greentic.deploy.aws",
+                "apply_pack",
+                DeployerCapability::Apply,
+            ),
+            &aws_pack,
+        )
+        .expect("move aws fixture");
+
+        let config = DeployerConfig {
+            capability: DeployerCapability::Apply,
+            provider: Provider::Aws,
+            strategy: "iac-only".into(),
+            tenant: "acme".into(),
+            environment: "staging".into(),
+            pack_path: write_test_pack(),
+            providers_dir: providers_dir.path().to_path_buf(),
+            packs_dir: PathBuf::from("packs"),
+            provider_pack: None,
+            pack_ref: None,
+            distributor_url: None,
+            distributor_token: None,
+            preview: false,
+            dry_run: false,
+            execute_local: false,
+            output: crate::config::OutputFormat::Text,
+            greentic: greentic_config::ConfigResolver::new()
+                .load()
+                .expect("load default config")
+                .config,
+            provenance: greentic_config::ProvenanceMap::new(),
+            config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
+            bundle_source: None,
+            bundle_digest: None,
+            repo_registry_base: None,
+            store_registry_base: None,
+        };
+        let target = DeploymentTarget {
+            provider: "aws".into(),
+            strategy: "iac-only".into(),
+        };
+
+        let resolved = resolve_direct_pack_path(&config, &target).expect("direct path");
+        assert_eq!(resolved, aws_pack);
+    }
+
+    #[test]
+    fn resolve_deployment_pack_uses_provider_specific_filename_without_override() {
+        let providers_dir = tempfile::tempdir().expect("tempdir");
+        let aws_pack = providers_dir.path().join("aws.gtpack");
+        std::fs::rename(
+            write_test_deployer_pack(
+                "greentic.deploy.aws",
+                "apply_pack",
+                DeployerCapability::Apply,
+            ),
+            &aws_pack,
+        )
+        .expect("move aws fixture");
+
+        let config = DeployerConfig {
+            capability: DeployerCapability::Apply,
+            provider: Provider::Aws,
+            strategy: "iac-only".into(),
+            tenant: "acme".into(),
+            environment: "staging".into(),
+            pack_path: write_test_pack(),
+            providers_dir: providers_dir.path().to_path_buf(),
+            packs_dir: PathBuf::from("packs"),
+            provider_pack: None,
+            pack_ref: None,
+            distributor_url: None,
+            distributor_token: None,
+            preview: false,
+            dry_run: false,
+            execute_local: false,
+            output: crate::config::OutputFormat::Text,
+            greentic: greentic_config::ConfigResolver::new()
+                .load()
+                .expect("load default config")
+                .config,
+            provenance: greentic_config::ProvenanceMap::new(),
+            config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
+            bundle_source: None,
+            bundle_digest: None,
+            repo_registry_base: None,
+            store_registry_base: None,
+        };
+        let target = DeploymentTarget {
+            provider: "aws".into(),
+            strategy: "iac-only".into(),
+        };
+
+        let resolved =
+            resolve_deployment_pack_for_capability(&config, &target, DeployerCapability::Apply)
+                .expect("resolve deployment pack");
+        assert_eq!(resolved.dispatch.pack_id, "greentic.deploy.aws");
+        assert_eq!(resolved.dispatch.flow_id, "apply_pack");
+        assert_eq!(resolved.pack_path, aws_pack);
+        assert!(resolved.origin.contains("providers-dir"));
     }
 
     #[test]
