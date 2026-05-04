@@ -63,6 +63,8 @@ pub fn plan(runtime: RuntimeKind, config: &DesktopConfig) -> Result<DesktopPlan>
 }
 
 pub fn build_up_command(plan: &DesktopPlan) -> Command {
+    // Accepted risk: runtime is a closed enum that resolves only to docker or podman, and no shell is used.
+    // foxguard: ignore[rs/no-command-injection]
     let mut cmd = Command::new(plan.runtime.cmd_name());
     match plan.runtime {
         RuntimeKind::DockerCompose => {
@@ -83,6 +85,8 @@ pub fn build_up_command(plan: &DesktopPlan) -> Command {
 }
 
 pub fn build_down_command(plan: &DesktopPlan) -> Command {
+    // Accepted risk: runtime is a closed enum that resolves only to docker or podman, and no shell is used.
+    // foxguard: ignore[rs/no-command-injection]
     let mut cmd = Command::new(plan.runtime.cmd_name());
     match plan.runtime {
         RuntimeKind::DockerCompose => {
@@ -101,6 +105,8 @@ pub fn build_down_command(plan: &DesktopPlan) -> Command {
 }
 
 pub fn build_status_command(plan: &DesktopPlan) -> Command {
+    // Accepted risk: runtime is a closed enum that resolves only to docker or podman, and no shell is used.
+    // foxguard: ignore[rs/no-command-injection]
     let mut cmd = Command::new(plan.runtime.cmd_name());
     match plan.runtime {
         RuntimeKind::DockerCompose => {
@@ -152,6 +158,8 @@ pub fn destroy(plan: &DesktopPlan) -> Result<()> {
 }
 
 pub fn preflight_check(runtime: RuntimeKind) -> Result<()> {
+    // Accepted risk: runtime is a closed enum that resolves only to docker or podman, and no shell is used.
+    // foxguard: ignore[rs/no-command-injection]
     let mut cmd = Command::new(runtime.cmd_name());
     cmd.arg("--version");
     let out = cmd

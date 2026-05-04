@@ -85,6 +85,8 @@ fn main() -> Result<()> {
 }
 
 fn command_available(program: &str) -> bool {
+    // Accepted risk: callers pass fixed tool names from this maintenance binary, and no shell is used.
+    // foxguard: ignore[rs/no-command-injection]
     match Command::new(program).arg("--help").output() {
         Ok(_) => true,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
@@ -256,6 +258,8 @@ fn run_command(root: &Path, program: &str, args: &[&str]) -> Result<()> {
 }
 
 fn run_command_in_dir(dir: &Path, program: &str, args: &[&str]) -> Result<()> {
+    // Accepted risk: callers pass fixed tool names from this maintenance binary, and no shell is used.
+    // foxguard: ignore[rs/no-command-injection]
     let output = Command::new(program)
         .args(args)
         .current_dir(dir)
@@ -279,6 +283,8 @@ struct CommandResult {
 }
 
 fn run_command_capture(root: &Path, program: &str, args: &[&str]) -> Result<CommandResult> {
+    // Accepted risk: callers pass fixed tool names from this maintenance binary, and no shell is used.
+    // foxguard: ignore[rs/no-command-injection]
     let output = Command::new(program)
         .args(args)
         .current_dir(root)

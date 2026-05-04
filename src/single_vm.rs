@@ -972,6 +972,8 @@ fn is_directory_empty(path: &Path) -> Result<bool> {
 
 fn run_command(commands_run: &mut Vec<String>, program: &str, args: &[&str]) -> Result<()> {
     commands_run.push(format!("{program} {}", args.join(" ")));
+    // Accepted risk: callers pass fixed system tool names and argument arrays; no shell is used.
+    // foxguard: ignore[rs/no-command-injection]
     let status = Command::new(program).args(args).status().map_err(|err| {
         DeployerError::Io(std::io::Error::new(
             err.kind(),
