@@ -530,6 +530,177 @@ mod tests {
     }
 
     #[test]
+    fn ensure_aws_config_rejects_non_aws_provider() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut request = AwsRequest::new(DeployerCapability::Plan, "acme", tmp.path().into())
+            .into_deployer_request();
+        request.provider = Provider::Gcp;
+        let config = DeployerConfig::resolve(request).expect("resolve config");
+
+        let err = ensure_aws_config(&config).expect_err("non-aws config should fail");
+        assert!(
+            err.to_string().contains("provider=gcp strategy=iac-only"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn ensure_aws_config_accepts_aws_iac_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let request = AwsRequest::new(DeployerCapability::Plan, "acme", tmp.path().into())
+            .into_deployer_request();
+        let config = DeployerConfig::resolve(request).expect("resolve config");
+
+        ensure_aws_config(&config).expect("aws config");
+    }
+
+    #[test]
+    fn build_aws_request_from_ext_maps_cloud_bundle_fields() {
+        let cfg = AwsEcsFargateExtConfig {
+            region: "eu-north-1".to_string(),
+            environment: "prod".to_string(),
+            operator_image_digest: "sha256:0000".to_string(),
+            bundle_source: "oci://registry.example/acme/prod".to_string(),
+            bundle_digest: "sha256:1111".to_string(),
+            remote_state_backend: "s3://state/greentic/prod".to_string(),
+            redis_url: Some("redis://cache.example:6379/0".to_string()),
+            dns_name: Some("admin.example.com".to_string()),
+            public_base_url: Some("https://admin.example.com".to_string()),
+            repo_registry_base: Some("https://repo.example.com".to_string()),
+            store_registry_base: Some("https://store.example.com".to_string()),
+            admin_allowed_clients: Some("CN=admin".to_string()),
+            tenant: "acme".to_string(),
+        };
+
+        let request =
+            build_aws_request_from_ext(DeployerCapability::Destroy, &cfg, Some(Path::new("pack")));
+
+        assert_eq!(request.capability, DeployerCapability::Destroy);
+        assert_eq!(request.tenant, "acme");
+        assert_eq!(request.pack_path, PathBuf::from("pack"));
+        assert_eq!(
+            request.bundle_source.as_deref(),
+            Some("oci://registry.example/acme/prod")
+        );
+        assert_eq!(request.bundle_digest.as_deref(), Some("sha256:1111"));
+        assert_eq!(
+            request.repo_registry_base.as_deref(),
+            Some("https://repo.example.com")
+        );
+        assert_eq!(
+            request.store_registry_base.as_deref(),
+            Some("https://store.example.com")
+        );
+        assert_eq!(request.environment.as_deref(), Some("prod"));
+        assert!(request.execute_local);
+        assert_eq!(request.providers_dir, PathBuf::from("providers/deployer"));
+        assert_eq!(request.packs_dir, PathBuf::from("packs"));
+    }
+
+    #[test]
+    fn run_admin_tunnel_reports_missing_admin_ca_before_aws_cli() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bundle_dir = tmp.path().join("bundle");
+        let deploy_dir = bundle_dir
+            .join(".greentic")
+            .join("deploy")
+            .join("aws")
+            .join("acme")
+            .join("staging");
+        fs::create_dir_all(&deploy_dir).expect("create deploy dir");
+        fs::write(
+            deploy_dir.join("terraform-outputs.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({})).expect("serialize outputs"),
+        )
+        .expect("write outputs");
+
+        let err = run_admin_tunnel(AwsAdminTunnelRequest {
+            bundle_dir: bundle_dir.clone(),
+            local_port: "9443".to_string(),
+            container: "operator".to_string(),
+        })
+        .expect_err("missing ca ref should fail");
+
+        assert!(
+            err.to_string().contains("missing admin_ca_secret_ref"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn run_admin_tunnel_rejects_malformed_admin_ca_ref_before_aws_cli() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bundle_dir = tmp.path().join("bundle");
+        let deploy_dir = bundle_dir
+            .join(".greentic")
+            .join("deploy")
+            .join("aws")
+            .join("acme")
+            .join("staging");
+        fs::create_dir_all(&deploy_dir).expect("create deploy dir");
+        fs::write(
+            deploy_dir.join("terraform-outputs.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "admin_ca_secret_ref": { "value": "not-an-arn" }
+            }))
+            .expect("serialize outputs"),
+        )
+        .expect("write outputs");
+
+        let err = run_admin_tunnel(AwsAdminTunnelRequest {
+            bundle_dir,
+            local_port: "9443".to_string(),
+            container: "operator".to_string(),
+        })
+        .expect_err("malformed ca ref should fail");
+
+        assert!(
+            err.to_string().contains("failed to derive AWS region"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn aws_admin_tunnel_helpers_parse_secret_and_task_refs() {
+        let secret_arn =
+            "arn:aws:secretsmanager:eu-north-1:123456789012:secret:greentic/admin/acme-prod/ca";
+        assert_eq!(
+            aws_region_from_secret_arn(secret_arn).as_deref(),
+            Some("eu-north-1")
+        );
+        assert_eq!(
+            deploy_name_prefix_from_secret_arn(secret_arn).as_deref(),
+            Some("acme-prod")
+        );
+        assert_eq!(
+            deploy_name_prefix_from_secret_arn(
+                "arn:aws:secretsmanager:eu-north-1:123:secret:other/path"
+            ),
+            None
+        );
+        assert_eq!(
+            task_id_from_arn("arn:aws:ecs:eu-north-1:123456789012:task/acme-prod-cluster/abc123")
+                .as_deref(),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn maybe_write_tunnel_admin_certs_skips_when_refs_are_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outputs = serde_json::json!({
+            "admin_ca_secret_ref": {
+                "value": "arn:aws:secretsmanager:eu-north-1:123456789012:secret:greentic/admin/acme-prod/ca"
+            }
+        });
+
+        maybe_write_tunnel_admin_certs(tmp.path(), &outputs, "eu-north-1", "acme-prod")
+            .expect("missing optional refs should skip");
+
+        assert!(!tunnel_admin_cert_dir(tmp.path(), "acme-prod").exists());
+    }
+
+    #[test]
     fn ext_config_parses_minimum_fields() {
         let json = r#"{
             "region": "us-east-1",

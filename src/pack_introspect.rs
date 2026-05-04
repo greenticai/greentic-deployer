@@ -1002,6 +1002,7 @@ mod tests {
                 },
                 routing: greentic_types::flow::Routing::End,
                 telemetry: Default::default(),
+                err_map: Default::default(),
             },
         );
 

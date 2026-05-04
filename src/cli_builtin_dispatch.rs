@@ -194,3 +194,81 @@ pub(crate) fn dispatch_builtin_backend_command(command: BuiltinBackendCommand) -
     })?;
     handler(command)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        AdminAccessArgs, AwsCommand, AwsSubcommand, CliOutputFormat, TerraformArgs,
+        TerraformCommand, TerraformSubcommand,
+    };
+    use std::path::PathBuf;
+
+    #[test]
+    fn all_builtin_handlers_have_execution_dispatchers() {
+        for handler_id in [
+            BuiltinBackendHandlerId::Terraform,
+            BuiltinBackendHandlerId::K8sRaw,
+            BuiltinBackendHandlerId::Helm,
+            BuiltinBackendHandlerId::Aws,
+            BuiltinBackendHandlerId::Azure,
+            BuiltinBackendHandlerId::Gcp,
+            BuiltinBackendHandlerId::JujuK8s,
+            BuiltinBackendHandlerId::JujuMachine,
+            BuiltinBackendHandlerId::Operator,
+            BuiltinBackendHandlerId::Serverless,
+            BuiltinBackendHandlerId::Snap,
+        ] {
+            assert!(
+                resolve_builtin_execution_handler(handler_id).is_some(),
+                "missing execution dispatcher for {handler_id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_dispatchers_reject_misrouted_commands() {
+        let terraform_command = BuiltinBackendCommand::Terraform(TerraformCommand {
+            command: TerraformSubcommand::Status(TerraformArgs {
+                tenant: "acme".to_string(),
+                pack: PathBuf::from("pack.gtpack"),
+                provider_pack: None,
+                deploy_pack_id: None,
+                deploy_flow_id: None,
+                environment: None,
+                pack_id: None,
+                pack_version: None,
+                pack_digest: None,
+                distributor_url: None,
+                distributor_token: None,
+                preview: false,
+                execute: false,
+                dry_run: false,
+                config: None,
+                allow_remote_in_offline: false,
+                output: CliOutputFormat::Json,
+            }),
+        });
+        let err = dispatch_aws_backend_command(terraform_command)
+            .expect_err("terraform command should not route to aws");
+        assert!(
+            err.to_string()
+                .contains("was routed to aws dispatch but is not aws"),
+            "got: {err}"
+        );
+
+        let aws_command = BuiltinBackendCommand::Aws(AwsCommand {
+            command: AwsSubcommand::AdminAccess(AdminAccessArgs {
+                bundle_dir: PathBuf::from("bundle"),
+                output: CliOutputFormat::Json,
+            }),
+        });
+        let err = dispatch_terraform_backend_command(aws_command)
+            .expect_err("aws command should not route to terraform");
+        assert!(
+            err.to_string()
+                .contains("was routed to terraform dispatch but is not terraform"),
+            "got: {err}"
+        );
+    }
+}

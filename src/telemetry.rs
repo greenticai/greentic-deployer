@@ -43,6 +43,21 @@ fn export_from_config(cfg: &ResolvedTelemetryConfig) -> ExportConfig {
             export.compression = None;
             export
         }
+        TelemetryExporterKind::Gcp => {
+            export.mode = ExportMode::GcpCloudTrace;
+            export.endpoint = cfg.endpoint.clone();
+            export
+        }
+        TelemetryExporterKind::Azure => {
+            export.mode = ExportMode::AzureAppInsights;
+            export.endpoint = cfg.endpoint.clone();
+            export
+        }
+        TelemetryExporterKind::Aws => {
+            export.mode = ExportMode::AwsXRay;
+            export.endpoint = cfg.endpoint.clone();
+            export
+        }
         TelemetryExporterKind::None => ExportConfig::json_default(),
     }
 }
@@ -74,5 +89,20 @@ mod tests {
         let export = export_from_config(&base_config(TelemetryExporterKind::Otlp));
         assert!(matches!(export.mode, ExportMode::OtlpGrpc));
         assert_eq!(export.endpoint.as_deref(), Some("https://otel.test"));
+    }
+
+    #[test]
+    fn cloud_exporters_use_cloud_modes() {
+        let gcp = export_from_config(&base_config(TelemetryExporterKind::Gcp));
+        assert!(matches!(gcp.mode, ExportMode::GcpCloudTrace));
+        assert_eq!(gcp.endpoint.as_deref(), Some("https://otel.test"));
+
+        let azure = export_from_config(&base_config(TelemetryExporterKind::Azure));
+        assert!(matches!(azure.mode, ExportMode::AzureAppInsights));
+        assert_eq!(azure.endpoint.as_deref(), Some("https://otel.test"));
+
+        let aws = export_from_config(&base_config(TelemetryExporterKind::Aws));
+        assert!(matches!(aws.mode, ExportMode::AwsXRay));
+        assert_eq!(aws.endpoint.as_deref(), Some("https://otel.test"));
     }
 }
