@@ -2070,7 +2070,6 @@ fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path
             "operator",
             "./modules/operator",
             r#"  cloud                 = var.cloud
-  tenant                = var.tenant
   deployment_name_prefix = var.deployment_name_prefix
   operator_image        = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
   bundle_source         = var.bundle_source
@@ -2885,7 +2884,7 @@ if command -v aws >/dev/null 2>&1; then
       if [ -n "$ALB_ARN" ] && [ "$ALB_ARN" != "None" ]; then
         import_if_missing "${MODULE_ADDR}.aws_lb.this" "$ALB_ARN"
       fi
-      CLUSTER_FOUND=$(aws ecs describe-clusters --region "$AWS_REGION_VALUE" --clusters "$CLUSTER_NAME" --query 'clusters[0].clusterName' --output text 2>/dev/null || true)
+      CLUSTER_FOUND=$(aws ecs describe-clusters --region "$AWS_REGION_VALUE" --clusters "$CLUSTER_NAME" --query 'clusters[?status==`ACTIVE`].clusterName | [0]' --output text 2>/dev/null || true)
       if [ -n "$CLUSTER_FOUND" ] && [ "$CLUSTER_FOUND" != "None" ] && [ "$CLUSTER_FOUND" != "MISSING" ]; then
         import_if_missing "${MODULE_ADDR}.aws_ecs_cluster.this" "$CLUSTER_NAME"
       fi
@@ -2896,7 +2895,7 @@ if command -v aws >/dev/null 2>&1; then
       if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
         import_if_missing "${MODULE_ADDR}.aws_iam_role.task_execution" "$ROLE_NAME"
       fi
-      SERVICE_FOUND=$(aws ecs describe-services --region "$AWS_REGION_VALUE" --cluster "$CLUSTER_NAME" --services "$SERVICE_NAME" --query 'services[0].serviceName' --output text 2>/dev/null || true)
+      SERVICE_FOUND=$(aws ecs describe-services --region "$AWS_REGION_VALUE" --cluster "$CLUSTER_NAME" --services "$SERVICE_NAME" --query 'services[?status==`ACTIVE`].serviceName | [0]' --output text 2>/dev/null || true)
       if [ -n "$SERVICE_FOUND" ] && [ "$SERVICE_FOUND" != "None" ] && [ "$SERVICE_FOUND" != "MISSING" ]; then
         import_if_missing "${MODULE_ADDR}.aws_ecs_service.this" "${CLUSTER_NAME}/${SERVICE_NAME}"
       fi
