@@ -74,7 +74,6 @@ fn sample_flow(id: &str, kind: FlowKind, component: &ComponentManifest) -> Flow 
             err_map: None,
             routing: Routing::End,
             telemetry: Default::default(),
-            err_map: Default::default(),
         },
     );
 
