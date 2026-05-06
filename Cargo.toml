@@ -1,6 +1,6 @@
 [package]
 name = "greentic-deployer"
-version = "0.6.0-dev.1"
+version = "1.1.0-dev.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic deployer runtime for plan construction and deployment-pack dispatch"
@@ -45,8 +45,8 @@ required-features = [
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-greentic-config = ">=0.5.0-dev, <0.6.0-0"
-greentic-config-types = ">=0.5.0-dev, <0.6.0-0"
+greentic-config = ">=1.1.0-dev, <1.2.0-0"
+greentic-config-types = ">=1.1.0-dev, <1.2.0-0"
 serde_json = "1"
 semver = "1"
 thiserror = "2"
@@ -65,16 +65,16 @@ features = [
 ]
 
 [dependencies.greentic-telemetry]
-version = ">=0.5.0-dev, <0.6.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 features = [
     "otlp",
 ]
 
 [dependencies.greentic-types]
-version = ">=0.5.0-dev, <0.6.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 
 [dependencies.greentic-distributor-client]
-version = ">=0.5.0-dev, <0.6.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 
 [dependencies.serde]
 version = "1"
