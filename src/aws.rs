@@ -800,6 +800,7 @@ mod tests {
             bundle_source: "oci://registry.example/app@sha256:1111".to_string(),
             bundle_digest: "sha256:2222".to_string(),
             remote_state_backend: "s3://demo/state".to_string(),
+            redis_url: None,
             dns_name: Some("api.example.com".to_string()),
             public_base_url: Some("https://api.example.com".to_string()),
             repo_registry_base: Some("https://repo.example.com".to_string()),
