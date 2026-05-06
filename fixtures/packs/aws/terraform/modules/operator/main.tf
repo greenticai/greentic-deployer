@@ -511,13 +511,13 @@ resource "aws_ecs_task_definition" "this" {
           {
             name  = "GREENTIC_WEBCHAT_TENANT_CHANNEL_ID"
             value = "${var.tenant}:webchat"
-          }
-        ],
-        var.redis_url != "" ? [
+          },
           {
             name  = "GREENTIC_WEBCHAT_MODE"
             value = "websocket"
-          },
+          }
+        ],
+        var.redis_url != "" ? [
           {
             name  = "REDIS_URL"
             value = var.redis_url
