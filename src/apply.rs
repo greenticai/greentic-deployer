@@ -2070,6 +2070,7 @@ fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path
             "operator",
             "./modules/operator",
             r#"  cloud                 = var.cloud
+  tenant                = var.tenant
   deployment_name_prefix = var.deployment_name_prefix
   operator_image        = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
   bundle_source         = var.bundle_source
@@ -4721,6 +4722,28 @@ resource "google_cloud_run_v2_service" "this" {
         assert!(rendered.contains("aws_cloudwatch_log_group.this"));
         assert!(rendered.contains("aws_iam_role.task_execution"));
         assert!(rendered.contains("AWS apply hit transient condition"));
+    }
+
+    #[test]
+    fn prune_generated_terraform_root_for_aws_includes_tenant_argument() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let terraform_root = dir.path().join("terraform");
+        std::fs::create_dir_all(&terraform_root).expect("terraform root");
+        std::fs::create_dir_all(terraform_root.join("modules/operator")).expect("module root");
+        std::fs::write(terraform_root.join("variables.tf"), "").expect("write variables.tf");
+        std::fs::write(terraform_root.join("modules/operator/variables.tf"), "")
+            .expect("write module variables.tf");
+
+        let config = DeployerConfig {
+            provider: Provider::Aws,
+            ..config_for(terraform_root.clone(), DeployerCapability::Apply)
+        };
+
+        prune_generated_terraform_root(&config, &terraform_root).expect("prune terraform root");
+
+        let rendered =
+            std::fs::read_to_string(terraform_root.join("main.tf")).expect("read main.tf");
+        assert!(rendered.contains(r#"tenant                = var.tenant"#));
     }
 
     #[test]
