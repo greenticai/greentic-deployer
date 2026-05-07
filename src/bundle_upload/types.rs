@@ -28,7 +28,8 @@ impl UploadOptions {
 
     /// Clamp expiry to S3 maximum.
     pub fn clamped_for_s3(&self) -> u64 {
-        self.presign_expires_secs.min(Self::S3_MAX_PRESIGN_EXPIRES_SECS)
+        self.presign_expires_secs
+            .min(Self::S3_MAX_PRESIGN_EXPIRES_SECS)
     }
 }
 

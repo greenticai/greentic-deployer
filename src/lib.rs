@@ -7,8 +7,8 @@ pub mod admin_access;
 /// Prefer `multi_target` or `surface::multi_target` for new call sites.
 pub mod apply;
 pub mod aws;
-pub mod bundle_upload;
 pub mod azure;
+pub mod bundle_upload;
 pub mod config;
 pub mod contract;
 pub mod deployment;

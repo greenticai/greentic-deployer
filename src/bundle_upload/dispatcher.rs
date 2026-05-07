@@ -3,8 +3,8 @@ use super::uploader::BundleUploader;
 
 /// Resolve a `BundleUploader` impl from the URL scheme.
 pub fn from_url(url: &str) -> BundleUploadResult<Box<dyn BundleUploader>> {
-    let parsed = url::Url::parse(url)
-        .map_err(|_| BundleUploadError::InvalidUrl(url.to_string()))?;
+    let parsed =
+        url::Url::parse(url).map_err(|_| BundleUploadError::InvalidUrl(url.to_string()))?;
 
     match parsed.scheme() {
         "s3" => from_s3_url(url),
@@ -96,7 +96,10 @@ mod tests {
             assert!(matches!(result.unwrap_err(), BundleUploadError::Other(_)));
         }
         #[cfg(not(feature = "bundle-upload-aws"))]
-        assert!(matches!(result.unwrap_err(), BundleUploadError::FeatureNotEnabled { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            BundleUploadError::FeatureNotEnabled { .. }
+        ));
     }
 
     #[test]

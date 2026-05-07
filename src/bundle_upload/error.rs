@@ -2,13 +2,17 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum BundleUploadError {
-    #[error("unsupported upload scheme '{0}'; expected one of: s3://, gs://, https://*.blob.core.windows.net/")]
+    #[error(
+        "unsupported upload scheme '{0}'; expected one of: s3://, gs://, https://*.blob.core.windows.net/"
+    )]
     InvalidUrl(String),
 
     #[error("scheme '{scheme}' requires building greentic-deployer with --features {feature}")]
     FeatureNotEnabled { scheme: String, feature: String },
 
-    #[error("bucket '{0}' is taken in the global S3 namespace; pick another name (S3 bucket names are globally unique)")]
+    #[error(
+        "bucket '{0}' is taken in the global S3 namespace; pick another name (S3 bucket names are globally unique)"
+    )]
     BucketAlreadyExistsInOtherAccount(String),
 
     #[error("access denied for {action} on {resource}: required IAM permissions: {required_perms}")]
@@ -27,7 +31,9 @@ pub enum BundleUploadError {
     #[error("network error after retries: {0}")]
     NetworkTransient(String),
 
-    #[error("AWS credentials could not be resolved; configure with `aws configure` or set AWS_PROFILE / AWS_ACCESS_KEY_ID env vars")]
+    #[error(
+        "AWS credentials could not be resolved; configure with `aws configure` or set AWS_PROFILE / AWS_ACCESS_KEY_ID env vars"
+    )]
     CredentialsUnresolved,
 
     #[error("digest mismatch: expected {expected}, computed {actual}")]
