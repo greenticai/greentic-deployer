@@ -14,7 +14,7 @@
 use std::env;
 use std::io::Write;
 
-use greentic_deployer::bundle_upload::{from_url, BundleUploadError, UploadOptions};
+use greentic_deployer::bundle_upload::{BundleUploadError, UploadOptions, from_url};
 
 fn localstack_endpoint() -> Option<String> {
     env::var("LOCALSTACK_ENDPOINT").ok()
@@ -48,7 +48,11 @@ async fn happy_path_upload_and_presign() {
     assert!(result.url.starts_with("http"));
     assert!(result.digest.starts_with("sha256:"));
     assert!(result.expires_at.is_some());
-    assert!(result.object_ref.starts_with("s3://test-happy-path-bucket/"));
+    assert!(
+        result
+            .object_ref
+            .starts_with("s3://test-happy-path-bucket/")
+    );
 }
 
 #[tokio::test]
@@ -67,8 +71,14 @@ async fn idempotent_reupload_skips_putobject() {
     let url = "s3://test-idempotent-bucket/bundles/";
     let uploader = from_url(url).expect("uploader");
     let opts = UploadOptions::default();
-    let r1 = uploader.upload(bundle.path(), &opts).await.expect("first upload");
-    let r2 = uploader.upload(bundle.path(), &opts).await.expect("second upload");
+    let r1 = uploader
+        .upload(bundle.path(), &opts)
+        .await
+        .expect("first upload");
+    let r2 = uploader
+        .upload(bundle.path(), &opts)
+        .await
+        .expect("second upload");
     assert_eq!(r1.digest, r2.digest);
     assert_eq!(r1.object_ref, r2.object_ref);
     // URLs may differ (re-presigned), but both must be valid and refer to same key.
@@ -116,7 +126,10 @@ async fn refresh_missing_object_returns_error() {
     let uploader = from_url(url).expect("uploader");
     let opts = UploadOptions::default();
     let err = uploader
-        .refresh_url("s3://test-missing-bucket/bundles/does-not-exist.gtbundle", &opts)
+        .refresh_url(
+            "s3://test-missing-bucket/bundles/does-not-exist.gtbundle",
+            &opts,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, BundleUploadError::ObjectMissing(_)));

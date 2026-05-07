@@ -1255,7 +1255,7 @@ fn main() -> Result<()> {
 }
 
 fn run_bundle_upload(cmd: BundleUploadCommand) -> Result<()> {
-    use greentic_deployer::bundle_upload::{from_url, UploadOptions};
+    use greentic_deployer::bundle_upload::{UploadOptions, from_url};
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -17,8 +17,8 @@ pub struct S3Target {
 
 impl S3Target {
     pub fn parse(url: &str) -> BundleUploadResult<Self> {
-        let parsed = url::Url::parse(url)
-            .map_err(|_| BundleUploadError::InvalidUrl(url.to_string()))?;
+        let parsed =
+            url::Url::parse(url).map_err(|_| BundleUploadError::InvalidUrl(url.to_string()))?;
         if parsed.scheme() != "s3" {
             return Err(BundleUploadError::InvalidUrl(url.to_string()));
         }
@@ -75,8 +75,7 @@ impl S3Uploader {
             .map(|r| r.to_string())
             .ok_or_else(|| {
                 BundleUploadError::Other(
-                    "AWS region not configured; set AWS_REGION or ~/.aws/config region"
-                        .to_string(),
+                    "AWS region not configured; set AWS_REGION or ~/.aws/config region".to_string(),
                 )
             })
     }
@@ -137,7 +136,10 @@ impl S3Uploader {
             .send()
             .await
             .map_err(|err| {
-                BundleUploadError::Other(format!("put_public_access_block: {:?}", err.into_service_error()))
+                BundleUploadError::Other(format!(
+                    "put_public_access_block: {:?}",
+                    err.into_service_error()
+                ))
             })?;
 
         // Enable versioning (idempotent).
@@ -152,7 +154,10 @@ impl S3Uploader {
             .send()
             .await
             .map_err(|err| {
-                BundleUploadError::Other(format!("put_bucket_versioning: {:?}", err.into_service_error()))
+                BundleUploadError::Other(format!(
+                    "put_bucket_versioning: {:?}",
+                    err.into_service_error()
+                ))
             })?;
 
         // Enable SSE-S3 default encryption (idempotent).
@@ -167,7 +172,9 @@ impl S3Uploader {
                                 ServerSideEncryptionByDefault::builder()
                                     .sse_algorithm(ServerSideEncryption::Aes256)
                                     .build()
-                                    .map_err(|e| BundleUploadError::Other(format!("SSE config: {e}")))?,
+                                    .map_err(|e| {
+                                        BundleUploadError::Other(format!("SSE config: {e}"))
+                                    })?,
                             )
                             .build(),
                     )
@@ -177,7 +184,10 @@ impl S3Uploader {
             .send()
             .await
             .map_err(|err| {
-                BundleUploadError::Other(format!("put_bucket_encryption: {:?}", err.into_service_error()))
+                BundleUploadError::Other(format!(
+                    "put_bucket_encryption: {:?}",
+                    err.into_service_error()
+                ))
             })?;
 
         Ok(())
@@ -204,7 +214,10 @@ impl S3Uploader {
             .presigned(presigning)
             .await
             .map_err(|err| {
-                BundleUploadError::Other(format!("presign get_object: {:?}", err.into_service_error()))
+                BundleUploadError::Other(format!(
+                    "presign get_object: {:?}",
+                    err.into_service_error()
+                ))
             })?;
 
         let url = presigned.uri().to_string();

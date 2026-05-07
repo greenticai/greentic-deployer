@@ -83,9 +83,16 @@ mod tests {
     fn accepts_s3_url_with_aws_feature() {
         let result = from_url("s3://my-bucket/my-key/");
         #[cfg(feature = "bundle-upload-aws")]
-        assert!(result.is_ok(), "expected Ok with aws feature: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "expected Ok with aws feature: {:?}",
+            result.err()
+        );
         #[cfg(not(feature = "bundle-upload-aws"))]
-        assert!(matches!(result.unwrap_err(), BundleUploadError::FeatureNotEnabled { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            BundleUploadError::FeatureNotEnabled { .. }
+        ));
     }
 
     #[test]
