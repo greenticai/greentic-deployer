@@ -182,29 +182,155 @@ impl S3Uploader {
 
         Ok(())
     }
+
+    async fn presign_get(
+        &self,
+        client: &aws_sdk_s3::Client,
+        key: &str,
+        digest: &str,
+        object_ref: &str,
+        opts: &UploadOptions,
+    ) -> BundleUploadResult<UploadedBundle> {
+        use aws_sdk_s3::presigning::PresigningConfig;
+        use std::time::Duration;
+
+        let expires_secs = opts.clamped_for_s3();
+        let presigning = PresigningConfig::expires_in(Duration::from_secs(expires_secs))
+            .map_err(|e| BundleUploadError::Other(format!("presigning config: {e}")))?;
+        let presigned = client
+            .get_object()
+            .bucket(&self.target.bucket)
+            .key(key)
+            .presigned(presigning)
+            .await
+            .map_err(|err| {
+                BundleUploadError::Other(format!("presign get_object: {:?}", err.into_service_error()))
+            })?;
+
+        let url = presigned.uri().to_string();
+        let expires_at = chrono::Utc::now() + chrono::Duration::seconds(expires_secs as i64);
+
+        Ok(UploadedBundle {
+            url,
+            digest: digest.to_string(),
+            expires_at: Some(expires_at),
+            object_ref: object_ref.to_string(),
+        })
+    }
 }
 
 #[async_trait::async_trait]
 impl BundleUploader for S3Uploader {
     async fn upload(
         &self,
-        _bundle_path: &Path,
-        _opts: &UploadOptions,
+        bundle_path: &Path,
+        opts: &UploadOptions,
     ) -> BundleUploadResult<UploadedBundle> {
-        // Filled in by subsequent tasks.
-        Err(BundleUploadError::Other(
-            "S3Uploader::upload not yet implemented".to_string(),
-        ))
+        let client = self.s3_client().await?;
+        self.ensure_bucket(&client).await?;
+
+        let (full_digest, short_digest) = digest_file(bundle_path).await?;
+        let key = self.target.compose_key(&format!("{short_digest}.gtbundle"));
+
+        // Idempotency: HeadObject; skip PutObject if metadata matches.
+        let head = client
+            .head_object()
+            .bucket(&self.target.bucket)
+            .key(&key)
+            .send()
+            .await;
+
+        let must_upload = match head {
+            Ok(out) => {
+                let existing = out
+                    .metadata()
+                    .and_then(|m| m.get("greentic-bundle-digest"))
+                    .map(|s| s.as_str());
+                existing != Some(full_digest.as_str())
+            }
+            Err(sdk_err) => match sdk_err.into_service_error() {
+                aws_sdk_s3::operation::head_object::HeadObjectError::NotFound(_) => true,
+                other => {
+                    return Err(BundleUploadError::Other(format!(
+                        "head_object {}: {other:?}",
+                        key
+                    )));
+                }
+            },
+        };
+
+        if must_upload {
+            let body = aws_sdk_s3::primitives::ByteStream::from_path(bundle_path)
+                .await
+                .map_err(|e| BundleUploadError::Other(format!("read bundle: {e}")))?;
+            client
+                .put_object()
+                .bucket(&self.target.bucket)
+                .key(&key)
+                .body(body)
+                .metadata("greentic-bundle-digest", &full_digest)
+                .content_type("application/octet-stream")
+                .send()
+                .await
+                .map_err(|err| {
+                    BundleUploadError::Other(format!("put_object: {:?}", err.into_service_error()))
+                })?;
+        }
+
+        let object_ref = format!("s3://{}/{}", self.target.bucket, key);
+        let uploaded = self
+            .presign_get(&client, &key, &full_digest, &object_ref, opts)
+            .await?;
+        Ok(uploaded)
     }
 
     async fn refresh_url(
         &self,
-        _object_ref: &str,
-        _opts: &UploadOptions,
+        object_ref: &str,
+        opts: &UploadOptions,
     ) -> BundleUploadResult<UploadedBundle> {
-        Err(BundleUploadError::Other(
-            "S3Uploader::refresh_url not yet implemented".to_string(),
-        ))
+        // Parse object_ref back into bucket + key.
+        let parsed = url::Url::parse(object_ref)
+            .map_err(|_| BundleUploadError::InvalidUrl(object_ref.to_string()))?;
+        if parsed.scheme() != "s3" {
+            return Err(BundleUploadError::InvalidUrl(object_ref.to_string()));
+        }
+        let bucket = parsed
+            .host_str()
+            .ok_or_else(|| BundleUploadError::InvalidUrl(object_ref.to_string()))?;
+        let key = parsed.path().trim_start_matches('/');
+        if bucket != self.target.bucket {
+            return Err(BundleUploadError::Other(format!(
+                "object_ref bucket {bucket} does not match uploader bucket {}",
+                self.target.bucket
+            )));
+        }
+
+        let client = self.s3_client().await?;
+        // Confirm object exists + extract digest from metadata.
+        let head = client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|err| {
+                if let aws_sdk_s3::operation::head_object::HeadObjectError::NotFound(_) =
+                    err.into_service_error()
+                {
+                    BundleUploadError::ObjectMissing(object_ref.to_string())
+                } else {
+                    BundleUploadError::Other(format!("head_object {key}"))
+                }
+            })?;
+        let digest = head
+            .metadata()
+            .and_then(|m| m.get("greentic-bundle-digest"))
+            .cloned()
+            .unwrap_or_else(|| "sha256:unknown".to_string());
+
+        self.presign_get(&client, key, &digest, object_ref, opts)
+            .await
     }
 }
 
