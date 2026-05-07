@@ -98,6 +98,12 @@ mod tests {
     #[test]
     fn rejects_gs_url_without_gcp_feature() {
         let err = from_url("gs://my-bucket/my-key/").unwrap_err();
+        #[cfg(feature = "bundle-upload-gcp")]
+        assert!(
+            matches!(err, BundleUploadError::Other(_)),
+            "expected not-yet-implemented error with gcp feature: {err:?}"
+        );
+        #[cfg(not(feature = "bundle-upload-gcp"))]
         assert!(matches!(err, BundleUploadError::FeatureNotEnabled { .. }));
     }
 
