@@ -8,6 +8,7 @@ pub mod admin_access;
 pub mod apply;
 pub mod aws;
 pub mod azure;
+pub mod bundle_upload;
 pub mod config;
 pub mod contract;
 pub mod deployment;
