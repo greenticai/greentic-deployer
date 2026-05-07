@@ -10,7 +10,7 @@ use super::types::{UploadOptions, UploadedBundle};
 /// - `GcsUploader` (feature `bundle-upload-gcp`, currently stub)
 /// - `AzureUploader` (feature `bundle-upload-azure`, currently stub)
 #[async_trait::async_trait]
-pub trait BundleUploader: Send + Sync {
+pub trait BundleUploader: Send + Sync + std::fmt::Debug {
     /// Upload `bundle_path`. If an object with matching digest already exists at
     /// the target key, skip the byte upload and proceed to URL issuance.
     async fn upload(
