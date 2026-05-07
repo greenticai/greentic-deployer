@@ -80,6 +80,108 @@ impl S3Uploader {
                 )
             })
     }
+
+    /// Ensure bucket exists with private + versioned + SSE-S3 defaults.
+    /// Idempotent: re-applies versioning + encryption + BPA on every call.
+    async fn ensure_bucket(&self, client: &aws_sdk_s3::Client) -> BundleUploadResult<()> {
+        use aws_sdk_s3::operation::head_bucket::HeadBucketError;
+        use aws_sdk_s3::types::*;
+
+        let bucket = &self.target.bucket;
+        let head = client.head_bucket().bucket(bucket).send().await;
+        let must_create = match head {
+            Ok(_) => false,
+            Err(sdk_err) => match sdk_err.into_service_error() {
+                HeadBucketError::NotFound(_) => true,
+                other => {
+                    return Err(BundleUploadError::Other(format!(
+                        "head_bucket {bucket}: {other:?}"
+                    )));
+                }
+            },
+        };
+
+        if must_create {
+            let region = Self::region_or_error(client)?;
+            let mut create = client.create_bucket().bucket(bucket);
+            // us-east-1 is the AWS default and must NOT have a LocationConstraint.
+            if region != "us-east-1" {
+                let constraint = BucketLocationConstraint::from(region.as_str());
+                let cfg = CreateBucketConfiguration::builder()
+                    .location_constraint(constraint)
+                    .build();
+                create = create.create_bucket_configuration(cfg);
+            }
+            create.send().await.map_err(|err| {
+                let svc = err.into_service_error();
+                if let aws_sdk_s3::operation::create_bucket::CreateBucketError::BucketAlreadyExists(_) = svc {
+                    BundleUploadError::BucketAlreadyExistsInOtherAccount(bucket.clone())
+                } else {
+                    BundleUploadError::Other(format!("create_bucket {bucket}: {svc:?}"))
+                }
+            })?;
+        }
+
+        // Block all public access (idempotent).
+        client
+            .put_public_access_block()
+            .bucket(bucket)
+            .public_access_block_configuration(
+                PublicAccessBlockConfiguration::builder()
+                    .block_public_acls(true)
+                    .ignore_public_acls(true)
+                    .block_public_policy(true)
+                    .restrict_public_buckets(true)
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|err| {
+                BundleUploadError::Other(format!("put_public_access_block: {:?}", err.into_service_error()))
+            })?;
+
+        // Enable versioning (idempotent).
+        client
+            .put_bucket_versioning()
+            .bucket(bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|err| {
+                BundleUploadError::Other(format!("put_bucket_versioning: {:?}", err.into_service_error()))
+            })?;
+
+        // Enable SSE-S3 default encryption (idempotent).
+        client
+            .put_bucket_encryption()
+            .bucket(bucket)
+            .server_side_encryption_configuration(
+                ServerSideEncryptionConfiguration::builder()
+                    .rules(
+                        ServerSideEncryptionRule::builder()
+                            .apply_server_side_encryption_by_default(
+                                ServerSideEncryptionByDefault::builder()
+                                    .sse_algorithm(ServerSideEncryption::Aes256)
+                                    .build()
+                                    .map_err(|e| BundleUploadError::Other(format!("SSE config: {e}")))?,
+                            )
+                            .build(),
+                    )
+                    .build()
+                    .map_err(|e| BundleUploadError::Other(format!("encryption config: {e}")))?,
+            )
+            .send()
+            .await
+            .map_err(|err| {
+                BundleUploadError::Other(format!("put_bucket_encryption: {:?}", err.into_service_error()))
+            })?;
+
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
