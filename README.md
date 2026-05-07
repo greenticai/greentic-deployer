@@ -494,3 +494,42 @@ Today it uses a manifest handoff baseline and materializes
 `output_dir/serverless/deployment-descriptor.json` and helper scripts such as
 `serverless-deploy.sh` and `serverless-status.sh` when the provider pack
 includes the serverless fixture descriptor.
+
+## Bundle upload (`bundle-upload` subcommand)
+
+The deployer can upload a local `.gtbundle` to cloud object storage and emit a
+fetchable URL + content digest as JSON, intended for use as the
+`--deploy-bundle-source` input to `gtc start --cloud aws`.
+
+```bash
+greentic-deployer bundle-upload upload \
+  --target s3://my-bundle-bucket/path/ \
+  --bundle ./dist/bundle-warmed-0.5.18.gtbundle \
+  --presign-expires 604800
+```
+
+JSON output:
+
+```json
+{
+  "url": "https://...presigned...",
+  "digest": "sha256:abc...",
+  "expires_at": "2026-05-14T07:18:32Z",
+  "object_ref": "s3://my-bundle-bucket/path/abc123.gtbundle"
+}
+```
+
+To refresh the presigned URL on an already-uploaded bundle (e.g. weekly cron):
+
+```bash
+greentic-deployer bundle-upload refresh-url \
+  --object-ref s3://my-bundle-bucket/path/abc123.gtbundle
+```
+
+Cargo features:
+
+- `bundle-upload-aws` — default-on. S3 implementation.
+- `bundle-upload-gcp` — off. GCS stub.
+- `bundle-upload-azure` — off. Azure Blob stub.
+
+Design + plan: `docs/superpowers/specs/2026-05-07-gtc-bundle-upload-flag-design.md`
