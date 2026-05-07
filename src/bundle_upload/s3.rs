@@ -1,2 +1,148 @@
-//! Phase 1 placeholder. Phase 2A will replace this with the full S3Uploader impl.
-//! PHASE_2A_FIXUP: replace this entire file.
+// greentic-deployer/src/bundle_upload/s3.rs
+//! S3 implementation of `BundleUploader`.
+//!
+//! Compiled only when the `bundle-upload-aws` cargo feature is enabled.
+
+use std::path::Path;
+
+use super::error::{BundleUploadError, BundleUploadResult};
+use super::types::{UploadOptions, UploadedBundle};
+use super::uploader::BundleUploader;
+
+#[derive(Debug, Clone)]
+pub struct S3Target {
+    pub bucket: String,
+    pub key_prefix: String,
+}
+
+impl S3Target {
+    pub fn parse(url: &str) -> BundleUploadResult<Self> {
+        let parsed = url::Url::parse(url)
+            .map_err(|_| BundleUploadError::InvalidUrl(url.to_string()))?;
+        if parsed.scheme() != "s3" {
+            return Err(BundleUploadError::InvalidUrl(url.to_string()));
+        }
+        let bucket = parsed
+            .host_str()
+            .ok_or_else(|| BundleUploadError::InvalidUrl(url.to_string()))?
+            .to_string();
+        if bucket.is_empty() {
+            return Err(BundleUploadError::InvalidUrl(url.to_string()));
+        }
+        // Strip leading slash; keep trailing slash semantics intact.
+        let key_prefix = parsed.path().trim_start_matches('/').to_string();
+        Ok(Self { bucket, key_prefix })
+    }
+
+    /// Compose an S3 key by joining `key_prefix` with a deterministic filename.
+    pub fn compose_key(&self, filename: &str) -> String {
+        if self.key_prefix.is_empty() {
+            filename.to_string()
+        } else if self.key_prefix.ends_with('/') {
+            format!("{}{}", self.key_prefix, filename)
+        } else {
+            format!("{}/{}", self.key_prefix, filename)
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct S3Uploader {
+    target: S3Target,
+}
+
+impl S3Uploader {
+    pub fn from_url(url: &str) -> BundleUploadResult<Self> {
+        Ok(Self {
+            target: S3Target::parse(url)?,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl BundleUploader for S3Uploader {
+    async fn upload(
+        &self,
+        _bundle_path: &Path,
+        _opts: &UploadOptions,
+    ) -> BundleUploadResult<UploadedBundle> {
+        // Filled in by subsequent tasks.
+        Err(BundleUploadError::Other(
+            "S3Uploader::upload not yet implemented".to_string(),
+        ))
+    }
+
+    async fn refresh_url(
+        &self,
+        _object_ref: &str,
+        _opts: &UploadOptions,
+    ) -> BundleUploadResult<UploadedBundle> {
+        Err(BundleUploadError::Other(
+            "S3Uploader::refresh_url not yet implemented".to_string(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_bucket_and_empty_prefix() {
+        let target = S3Target::parse("s3://my-bucket/").unwrap();
+        assert_eq!(target.bucket, "my-bucket");
+        assert_eq!(target.key_prefix, "");
+    }
+
+    #[test]
+    fn parses_bucket_and_simple_prefix() {
+        let target = S3Target::parse("s3://my-bucket/bundles/").unwrap();
+        assert_eq!(target.bucket, "my-bucket");
+        assert_eq!(target.key_prefix, "bundles/");
+    }
+
+    #[test]
+    fn parses_bucket_and_nested_prefix_no_trailing_slash() {
+        let target = S3Target::parse("s3://my-bucket/path/to/bundles").unwrap();
+        assert_eq!(target.bucket, "my-bucket");
+        assert_eq!(target.key_prefix, "path/to/bundles");
+    }
+
+    #[test]
+    fn rejects_non_s3_scheme() {
+        assert!(S3Target::parse("https://my-bucket/").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_bucket() {
+        // s3:/// has no host
+        assert!(S3Target::parse("s3:///key").is_err());
+    }
+
+    #[test]
+    fn compose_key_with_trailing_slash_prefix() {
+        let target = S3Target {
+            bucket: "b".into(),
+            key_prefix: "bundles/".into(),
+        };
+        assert_eq!(target.compose_key("abc.gtbundle"), "bundles/abc.gtbundle");
+    }
+
+    #[test]
+    fn compose_key_without_trailing_slash_prefix() {
+        let target = S3Target {
+            bucket: "b".into(),
+            key_prefix: "bundles".into(),
+        };
+        assert_eq!(target.compose_key("abc.gtbundle"), "bundles/abc.gtbundle");
+    }
+
+    #[test]
+    fn compose_key_empty_prefix() {
+        let target = S3Target {
+            bucket: "b".into(),
+            key_prefix: "".into(),
+        };
+        assert_eq!(target.compose_key("abc.gtbundle"), "abc.gtbundle");
+    }
+}
