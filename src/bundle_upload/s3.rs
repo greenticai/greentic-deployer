@@ -57,6 +57,29 @@ impl S3Uploader {
             target: S3Target::parse(url)?,
         })
     }
+
+    async fn s3_client(&self) -> BundleUploadResult<aws_sdk_s3::Client> {
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .load()
+            .await;
+        if config.credentials_provider().is_none() {
+            return Err(BundleUploadError::CredentialsUnresolved);
+        }
+        Ok(aws_sdk_s3::Client::new(&config))
+    }
+
+    fn region_or_error(client: &aws_sdk_s3::Client) -> BundleUploadResult<String> {
+        client
+            .config()
+            .region()
+            .map(|r| r.to_string())
+            .ok_or_else(|| {
+                BundleUploadError::Other(
+                    "AWS region not configured; set AWS_REGION or ~/.aws/config region"
+                        .to_string(),
+                )
+            })
+    }
 }
 
 #[async_trait::async_trait]
