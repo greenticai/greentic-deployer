@@ -186,6 +186,7 @@ jobs:
             pack_file="$(basename "$pack_path")"
             version_ref="${GHCR_NAMESPACE}/${pack_id}:${pack_version}"
             latest_ref="${GHCR_NAMESPACE}/${pack_id}:latest"
+            stable_ref="${GHCR_NAMESPACE}/${pack_id}:stable"
 
             echo "Publishing ${pack_file} -> ${version_ref}"
             oras push "${version_ref}" \
@@ -196,6 +197,13 @@ jobs:
 
             echo "Publishing ${pack_file} -> ${latest_ref}"
             oras push "${latest_ref}" \
+              --artifact-type application/vnd.greentic.gtpack.v1 \
+              --annotation "org.opencontainers.image.title=${pack_file}" \
+              --annotation "org.opencontainers.image.revision=${REVISION}" \
+              "${pack_path}:application/vnd.greentic.gtpack.layer.v1+tar"
+
+            echo "Publishing ${pack_file} -> ${stable_ref}"
+            oras push "${stable_ref}" \
               --artifact-type application/vnd.greentic.gtpack.v1 \
               --annotation "org.opencontainers.image.title=${pack_file}" \
               --annotation "org.opencontainers.image.revision=${REVISION}" \

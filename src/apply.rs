@@ -2885,7 +2885,7 @@ if command -v aws >/dev/null 2>&1; then
       if [ -n "$ALB_ARN" ] && [ "$ALB_ARN" != "None" ]; then
         import_if_missing "${MODULE_ADDR}.aws_lb.this" "$ALB_ARN"
       fi
-      CLUSTER_FOUND=$(aws ecs describe-clusters --region "$AWS_REGION_VALUE" --clusters "$CLUSTER_NAME" --query 'clusters[0].clusterName' --output text 2>/dev/null || true)
+      CLUSTER_FOUND=$(aws ecs describe-clusters --region "$AWS_REGION_VALUE" --clusters "$CLUSTER_NAME" --query 'clusters[?status==`ACTIVE`].clusterName | [0]' --output text 2>/dev/null || true)
       if [ -n "$CLUSTER_FOUND" ] && [ "$CLUSTER_FOUND" != "None" ] && [ "$CLUSTER_FOUND" != "MISSING" ]; then
         import_if_missing "${MODULE_ADDR}.aws_ecs_cluster.this" "$CLUSTER_NAME"
       fi
@@ -2896,7 +2896,7 @@ if command -v aws >/dev/null 2>&1; then
       if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
         import_if_missing "${MODULE_ADDR}.aws_iam_role.task_execution" "$ROLE_NAME"
       fi
-      SERVICE_FOUND=$(aws ecs describe-services --region "$AWS_REGION_VALUE" --cluster "$CLUSTER_NAME" --services "$SERVICE_NAME" --query 'services[0].serviceName' --output text 2>/dev/null || true)
+      SERVICE_FOUND=$(aws ecs describe-services --region "$AWS_REGION_VALUE" --cluster "$CLUSTER_NAME" --services "$SERVICE_NAME" --query 'services[?status==`ACTIVE`].serviceName | [0]' --output text 2>/dev/null || true)
       if [ -n "$SERVICE_FOUND" ] && [ "$SERVICE_FOUND" != "None" ] && [ "$SERVICE_FOUND" != "MISSING" ]; then
         import_if_missing "${MODULE_ADDR}.aws_ecs_service.this" "${CLUSTER_NAME}/${SERVICE_NAME}"
       fi
@@ -4722,6 +4722,28 @@ resource "google_cloud_run_v2_service" "this" {
         assert!(rendered.contains("aws_cloudwatch_log_group.this"));
         assert!(rendered.contains("aws_iam_role.task_execution"));
         assert!(rendered.contains("AWS apply hit transient condition"));
+    }
+
+    #[test]
+    fn prune_generated_terraform_root_for_aws_includes_tenant_argument() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let terraform_root = dir.path().join("terraform");
+        std::fs::create_dir_all(&terraform_root).expect("terraform root");
+        std::fs::create_dir_all(terraform_root.join("modules/operator")).expect("module root");
+        std::fs::write(terraform_root.join("variables.tf"), "").expect("write variables.tf");
+        std::fs::write(terraform_root.join("modules/operator/variables.tf"), "")
+            .expect("write module variables.tf");
+
+        let config = DeployerConfig {
+            provider: Provider::Aws,
+            ..config_for(terraform_root.clone(), DeployerCapability::Apply)
+        };
+
+        prune_generated_terraform_root(&config, &terraform_root).expect("prune terraform root");
+
+        let rendered =
+            std::fs::read_to_string(terraform_root.join("main.tf")).expect("read main.tf");
+        assert!(rendered.contains(r#"tenant                = var.tenant"#));
     }
 
     #[test]
