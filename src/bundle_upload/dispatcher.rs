@@ -20,14 +20,9 @@ fn is_azure_blob_host(host: &str) -> bool {
     host.ends_with(".blob.core.windows.net")
 }
 
-// PHASE_2A_FIXUP: replace this placeholder with Ok(Box::new(super::s3::S3Uploader::from_url(url)?))
-// when Phase 2A lands s3.rs.
 #[cfg(feature = "bundle-upload-aws")]
 fn from_s3_url(url: &str) -> BundleUploadResult<Box<dyn BundleUploader>> {
-    let _ = url;
-    Err(BundleUploadError::Other(
-        "S3Uploader not yet wired (Phase 2A will replace this)".to_string(),
-    ))
+    Ok(Box::new(super::s3::S3Uploader::from_url(url)?))
 }
 
 #[cfg(not(feature = "bundle-upload-aws"))]
@@ -84,22 +79,13 @@ mod tests {
         assert!(matches!(err, BundleUploadError::InvalidUrl(_)));
     }
 
-    // PHASE_2A_FIXUP: flip the cfg(feature = "bundle-upload-aws") branch to assert Ok
-    // once Phase 2A wires S3Uploader via super::s3::S3Uploader::from_url.
     #[test]
     fn accepts_s3_url_with_aws_feature() {
         let result = from_url("s3://my-bucket/my-key/");
         #[cfg(feature = "bundle-upload-aws")]
-        {
-            // Phase 1 placeholder: returns Other error until Phase 2A wires S3Uploader.
-            // Phase 2A reviewer must flip this to assert Ok.
-            assert!(matches!(result.unwrap_err(), BundleUploadError::Other(_)));
-        }
+        assert!(result.is_ok(), "expected Ok with aws feature: {:?}", result.err());
         #[cfg(not(feature = "bundle-upload-aws"))]
-        assert!(matches!(
-            result.unwrap_err(),
-            BundleUploadError::FeatureNotEnabled { .. }
-        ));
+        assert!(matches!(result.unwrap_err(), BundleUploadError::FeatureNotEnabled { .. }));
     }
 
     #[test]
