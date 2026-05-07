@@ -83,6 +83,27 @@ impl BundleUploader for S3Uploader {
     }
 }
 
+/// Compute SHA256 of a file using streaming reads (handles arbitrarily large bundles).
+/// Returns `("sha256:<full_hex>", "<short_hex_16>")`.
+pub(crate) async fn digest_file(path: &Path) -> BundleUploadResult<(String, String)> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let full_hex = hex::encode(hasher.finalize());
+    let short_hex = full_hex[..16].to_string();
+    Ok((format!("sha256:{full_hex}"), short_hex))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +165,20 @@ mod tests {
             key_prefix: "".into(),
         };
         assert_eq!(target.compose_key("abc.gtbundle"), "abc.gtbundle");
+    }
+
+    #[tokio::test]
+    async fn digest_known_fixture() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"hello world").unwrap();
+        tmp.flush().unwrap();
+        let (full, short) = digest_file(tmp.path()).await.unwrap();
+        // SHA256("hello world") = b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+        assert_eq!(
+            full,
+            "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        assert_eq!(short, "b94d27b9934d3e08");
     }
 }
