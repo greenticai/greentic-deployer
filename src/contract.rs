@@ -16,7 +16,7 @@ pub const EXT_DEPLOYER_V1: &str = "greentic.deployer.v1";
 pub const EXT_DEPLOY_AWS: &str = "greentic.deploy-aws";
 pub const EXT_DEPLOY_AZURE: &str = "greentic.deploy-azure";
 pub const EXT_DEPLOY_GCP: &str = "greentic.deploy-gcp";
-pub const DEFAULT_GHCR_OPERATOR_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless@sha256:b754d51503b075df3d0d2b9e56226f395febaba7a988f19096334c112c8a8d91";
+pub const DEFAULT_GHCR_OPERATOR_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless@sha256:dee2fba62575f16675b150f7dd712db545aa62ddcf5bbd11d3ee26c76bedc240";
 pub const DEFAULT_GCP_OPERATOR_IMAGE: &str = "europe-west1-docker.pkg.dev/x-plateau-483512-p6/greentic-images/greentic-start-distroless@sha256:5f7e4b70271c09b2a099e2c6d5c8641cbdb5a20698dcbba0e3b0f90a0f3e0e48";
 pub const DEFAULT_OPERATOR_IMAGE_DIGEST: &str =
     "sha256:b754d51503b075df3d0d2b9e56226f395febaba7a988f19096334c112c8a8d91";
