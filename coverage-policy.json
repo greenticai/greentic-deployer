@@ -10,7 +10,10 @@
     "files": [
       "src/main.rs",
       "src/bin/build_fixture_gtpacks.rs",
-      "src/bin/replay_deployer_scaffolds.rs"
+      "src/bin/replay_deployer_scaffolds.rs",
+      "src/bundle_upload/azure.rs",
+      "src/bundle_upload/gcs.rs",
+      "src/bundle_upload/s3.rs"
     ]
   },
   "per_file": {}
