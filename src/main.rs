@@ -639,7 +639,7 @@ struct AwsArgs {
     config: Option<std::path::PathBuf>,
     #[arg(long)]
     allow_remote_in_offline: bool,
-    #[arg(long, value_enum, default_value_t = CliOutputFormat::Json)]
+    #[arg(long, value_enum, default_value_t = CliOutputFormat::Text)]
     output: CliOutputFormat,
 }
 
@@ -707,7 +707,7 @@ struct AzureArgs {
     config: Option<std::path::PathBuf>,
     #[arg(long)]
     allow_remote_in_offline: bool,
-    #[arg(long, value_enum, default_value_t = CliOutputFormat::Json)]
+    #[arg(long, value_enum, default_value_t = CliOutputFormat::Text)]
     output: CliOutputFormat,
 }
 
@@ -757,7 +757,7 @@ struct GcpArgs {
     config: Option<std::path::PathBuf>,
     #[arg(long)]
     allow_remote_in_offline: bool,
-    #[arg(long, value_enum, default_value_t = CliOutputFormat::Json)]
+    #[arg(long, value_enum, default_value_t = CliOutputFormat::Text)]
     output: CliOutputFormat,
 }
 

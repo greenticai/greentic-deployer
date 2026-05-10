@@ -36,6 +36,21 @@ pub enum BundleUploadError {
     )]
     CredentialsUnresolved,
 
+    #[error(
+        "AWS credentials need to be refreshed while {action}.\n\nIf you use access keys, configure or refresh them:\n  {configure_command}\n\nIf access keys are configured but AWS still reports an expired token, check for a stale session token:\n  {session_token_check_command}\n  {session_token_unset_command}\n\nIf you use AWS SSO, reauthenticate:\n  {sso_login_command}\n\nIf you use a named profile:\n  {profile_env_command}\n  {profile_configure_command}\n  {profile_sso_login_command}\n\nVerify the same credentials with:\n  {verify_command}"
+    )]
+    AwsCredentialsRefreshRequired {
+        action: String,
+        configure_command: &'static str,
+        session_token_check_command: &'static str,
+        session_token_unset_command: &'static str,
+        sso_login_command: &'static str,
+        profile_env_command: &'static str,
+        profile_configure_command: &'static str,
+        profile_sso_login_command: &'static str,
+        verify_command: &'static str,
+    },
+
     #[error("digest mismatch: expected {expected}, computed {actual}")]
     DigestMismatch { expected: String, actual: String },
 
@@ -44,6 +59,29 @@ pub enum BundleUploadError {
 
     #[error("{0}")]
     Other(String),
+}
+
+impl BundleUploadError {
+    pub fn message_key(&self) -> &'static str {
+        match self {
+            Self::InvalidUrl(_) => "bundle_upload.invalid_url",
+            Self::FeatureNotEnabled { .. } => "bundle_upload.feature_not_enabled",
+            Self::BucketAlreadyExistsInOtherAccount(_) => {
+                "bundle_upload.s3.bucket_already_exists_in_other_account"
+            }
+            Self::AccessDenied { .. } => "bundle_upload.access_denied",
+            Self::ObjectMissing(_) => "bundle_upload.object_missing",
+            Self::WarmupFailed { .. } => "bundle_upload.warmup_failed",
+            Self::NetworkTransient(_) => "bundle_upload.network_transient",
+            Self::CredentialsUnresolved => "bundle_upload.aws.credentials_unresolved",
+            Self::AwsCredentialsRefreshRequired { .. } => {
+                "bundle_upload.aws.credentials_refresh_required"
+            }
+            Self::DigestMismatch { .. } => "bundle_upload.digest_mismatch",
+            Self::Io(_) => "bundle_upload.io",
+            Self::Other(_) => "bundle_upload.other",
+        }
+    }
 }
 
 pub type BundleUploadResult<T> = std::result::Result<T, BundleUploadError>;
