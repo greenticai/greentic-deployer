@@ -13,6 +13,7 @@ use crate::error::{DeployerError, Result};
 use crate::pack_introspect::read_entry_from_gtpack;
 
 pub const EXT_DEPLOYER_V1: &str = "greentic.deployer.v1";
+pub const EXT_DEPLOYER_CONTRACT_V1: &str = "greentic.deployer.contract.v1";
 pub const EXT_DEPLOY_AWS: &str = "greentic.deploy-aws";
 pub const EXT_DEPLOY_AZURE: &str = "greentic.deploy-azure";
 pub const EXT_DEPLOY_GCP: &str = "greentic.deploy-gcp";
@@ -745,10 +746,11 @@ pub struct ResolvedDeployerContract {
 }
 
 pub fn get_deployer_contract_v1(manifest: &PackManifest) -> Result<Option<DeployerContractV1>> {
-    let extension = manifest
-        .extensions
-        .as_ref()
-        .and_then(|extensions| extensions.get(EXT_DEPLOYER_V1));
+    let extension = manifest.extensions.as_ref().and_then(|extensions| {
+        extensions
+            .get(EXT_DEPLOYER_CONTRACT_V1)
+            .or_else(|| extensions.get(EXT_DEPLOYER_V1))
+    });
     let inline = match extension.and_then(|entry| entry.inline.as_ref()) {
         Some(ExtensionInline::Other(value)) => value,
         Some(_) => {
@@ -777,9 +779,9 @@ pub fn set_deployer_contract_v1(
     })?;
     let extensions = manifest.extensions.get_or_insert_with(Default::default);
     extensions.insert(
-        EXT_DEPLOYER_V1.to_string(),
+        EXT_DEPLOYER_CONTRACT_V1.to_string(),
         ExtensionRef {
-            kind: EXT_DEPLOYER_V1.to_string(),
+            kind: EXT_DEPLOYER_CONTRACT_V1.to_string(),
             version: "1.0.0".to_string(),
             digest: None,
             location: None,

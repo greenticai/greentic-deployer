@@ -1,25 +1,17 @@
-use std::collections::BTreeSet;
 use std::fs;
-use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
+use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
 use greentic_deployer::contract::{
     DeployerContractV1, get_deployer_contract_v1, resolve_deployer_contract_assets,
-    set_deployer_contract_v1,
 };
 use greentic_deployer::pack_introspect::read_manifest_from_gtpack;
-use greentic_types::flow::{Flow, FlowHasher, FlowKind, FlowMetadata};
-use greentic_types::pack_manifest::{PackFlowEntry, PackKind, PackManifest};
-use greentic_types::{FlowId, PackId};
-use indexmap::IndexMap;
-use semver::Version;
-use tar::Builder;
 
 fn main() -> Result<()> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let fixtures_root = root.join("fixtures/packs");
+    let scaffold_root = root.join("target/replayed-pack-scaffolds");
     let output_root = root.join("dist");
 
     fs::create_dir_all(&output_root).context("create output directory")?;
@@ -36,14 +28,19 @@ fn main() -> Result<()> {
         bail!("no fixture packs found under {}", fixtures_root.display());
     }
 
+    ensure_replayed_scaffolds(&root, &scaffold_root, &fixture_dirs)?;
+
     for fixture_dir in fixture_dirs {
         let fixture_name = fixture_dir
             .file_name()
             .and_then(|name| name.to_str())
             .context("fixture name missing")?;
+        let pack_root = scaffold_root.join(fixture_name);
         let output_path = output_root.join(format!("{fixture_name}.gtpack"));
-        let manifest = build_fixture_gtpack(&fixture_dir, &output_path)?;
+        build_fixture_gtpack(&pack_root, &output_path)?;
         validate_fixture_gtpack(&fixture_dir, &output_path)?;
+        let manifest = read_manifest_from_gtpack(&output_path)
+            .with_context(|| format!("read manifest from {}", output_path.display()))?;
         println!("built and validated {}", output_path.display());
         let relative_output_path = output_path.strip_prefix(&root).with_context(|| {
             format!("compute relative output path for {}", output_path.display())
@@ -59,21 +56,69 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_fixture_gtpack(fixture_dir: &Path, output_path: &Path) -> Result<PackManifest> {
-    let contract = load_contract(fixture_dir)?;
-    let manifest = build_manifest(fixture_dir, &contract)?;
-    let encoded =
-        greentic_types::cbor::encode_pack_manifest(&manifest).context("encode manifest")?;
+fn ensure_replayed_scaffolds(
+    root: &Path,
+    scaffold_root: &Path,
+    fixture_dirs: &[PathBuf],
+) -> Result<()> {
+    let missing_any = fixture_dirs.iter().any(|fixture_dir| {
+        let Some(fixture_name) = fixture_dir.file_name() else {
+            return true;
+        };
+        !scaffold_root.join(fixture_name).join("pack.yaml").is_file()
+    });
+    if !missing_any {
+        return Ok(());
+    }
 
-    let file = File::create(output_path)
-        .with_context(|| format!("create output archive {}", output_path.display()))?;
-    let mut builder = Builder::new(file);
+    run_command(
+        "cargo",
+        &[
+            "run",
+            "--features",
+            "internal-tools",
+            "--bin",
+            "replay_deployer_scaffolds",
+        ],
+        Some(root),
+    )
+    .context("replay deployer scaffolds before building fixture gtpacks")
+}
 
-    append_bytes(&mut builder, Path::new("manifest.cbor"), &encoded)?;
-    append_fixture_tree(&mut builder, fixture_dir, fixture_dir)?;
-    builder.finish().context("finish gtpack archive")?;
+fn build_fixture_gtpack(pack_root: &Path, output_path: &Path) -> Result<()> {
+    ensure!(
+        pack_root.join("pack.yaml").is_file(),
+        "missing replayed scaffold at {}; run `cargo run --features internal-tools --bin replay_deployer_scaffolds` first",
+        pack_root.display()
+    );
 
-    Ok(manifest)
+    run_command(
+        "greentic-pack",
+        &["build", "--in", pack_root.to_str().unwrap()],
+        None,
+    )?;
+
+    let fixture_name = pack_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("pack root name missing")?;
+    let built_path = pack_root
+        .join("dist")
+        .join(format!("{fixture_name}.gtpack"));
+    ensure!(
+        built_path.is_file(),
+        "greentic-pack did not produce {}",
+        built_path.display()
+    );
+    fs::copy(&built_path, output_path).with_context(|| {
+        format!(
+            "copy built gtpack {} -> {}",
+            built_path.display(),
+            output_path.display()
+        )
+    })?;
+
+    Ok(())
 }
 
 fn validate_fixture_gtpack(fixture_dir: &Path, gtpack_path: &Path) -> Result<()> {
@@ -116,142 +161,24 @@ fn load_contract(fixture_dir: &Path) -> Result<DeployerContractV1> {
     serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
 }
 
-fn build_manifest(fixture_dir: &Path, contract: &DeployerContractV1) -> Result<PackManifest> {
-    let fixture_name = fixture_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("fixture name missing")?;
-    let package_version =
-        Version::parse(env!("CARGO_PKG_VERSION")).context("parse package version")?;
-    let mut manifest = PackManifest {
-        schema_version: "pack-v1".to_string(),
-        pack_id: fixture_pack_id(fixture_name)?,
-        name: Some(format!("Fixture {}", fixture_name)),
-        version: package_version,
-        kind: PackKind::Application,
-        publisher: "greentic".to_string(),
-        secret_requirements: Vec::new(),
-        components: Vec::new(),
-        flows: contract_flow_entries(contract)?,
-        dependencies: Vec::new(),
-        capabilities: Vec::new(),
-        signatures: Default::default(),
-        bootstrap: None,
-        extensions: None,
-    };
-    set_deployer_contract_v1(&mut manifest, contract.clone()).context("embed deployer contract")?;
-    Ok(manifest)
-}
-
-fn fixture_pack_id(fixture_name: &str) -> Result<PackId> {
-    let pack_id = match fixture_name {
-        "aws" => "greentic.deploy.aws".to_string(),
-        "azure" => "greentic.deploy.azure".to_string(),
-        "gcp" => "greentic.deploy.gcp".to_string(),
-        other => {
-            let suffix = other.replace('-', ".");
-            format!("greentic.fixture.{suffix}.gtpack")
-        }
-    };
-    PackId::from_str(&pack_id).context("build pack id")
-}
-
-fn contract_flow_entries(contract: &DeployerContractV1) -> Result<Vec<PackFlowEntry>> {
-    let mut ids = BTreeSet::new();
-    ids.insert(contract.planner.flow_id.clone());
-    for capability in &contract.capabilities {
-        ids.insert(capability.flow_id.clone());
+fn run_command(program: &str, args: &[&str], current_dir: Option<&Path>) -> Result<()> {
+    // Accepted risk: callers pass fixed tool names from this maintenance binary, and no shell is used.
+    // foxguard: ignore[rs/no-command-injection]
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
     }
-
-    ids.into_iter()
-        .map(|id| {
-            let flow_id = FlowId::from_str(&id)
-                .with_context(|| format!("invalid flow id in contract: {id}"))?;
-            Ok(PackFlowEntry {
-                id: flow_id.clone(),
-                kind: FlowKind::Messaging,
-                flow: Flow {
-                    schema_version: "flowir-v1".to_string(),
-                    id: flow_id,
-                    kind: FlowKind::Messaging,
-                    entrypoints: Default::default(),
-                    nodes: IndexMap::<_, _, FlowHasher>::default(),
-                    metadata: FlowMetadata::default(),
-                },
-                tags: Vec::new(),
-                entrypoints: Vec::new(),
-            })
-        })
-        .collect()
-}
-
-fn append_fixture_tree(builder: &mut Builder<File>, root: &Path, current: &Path) -> Result<()> {
-    let mut entries = fs::read_dir(current)
-        .with_context(|| format!("read directory {}", current.display()))?
-        .flatten()
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    entries.sort();
-
-    for path in entries {
-        if path.is_dir() {
-            append_fixture_tree(builder, root, &path)?;
-        } else if path.is_file() {
-            let relative = path
-                .strip_prefix(root)
-                .with_context(|| format!("compute relative path for {}", path.display()))?;
-            let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-            append_bytes(builder, relative, &bytes)?;
-        }
+    let output = command
+        .output()
+        .with_context(|| format!("run {} {}", program, args.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
     }
-
-    Ok(())
-}
-
-fn append_bytes(builder: &mut Builder<File>, path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut header = tar::Header::new_gnu();
-    header.set_size(bytes.len() as u64);
-    header.set_mode(0o644);
-    header.set_cksum();
-    builder
-        .append_data(&mut header, path, bytes)
-        .with_context(|| format!("append {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::fixture_pack_id;
-
-    #[test]
-    fn cloud_fixture_pack_ids_use_canonical_deploy_names() {
-        assert_eq!(
-            fixture_pack_id("aws").unwrap().to_string(),
-            "greentic.deploy.aws"
-        );
-        assert_eq!(
-            fixture_pack_id("azure").unwrap().to_string(),
-            "greentic.deploy.azure"
-        );
-        assert_eq!(
-            fixture_pack_id("gcp").unwrap().to_string(),
-            "greentic.deploy.gcp"
-        );
-    }
-
-    #[test]
-    fn non_cloud_fixture_pack_ids_keep_gtpack_suffix() {
-        assert_eq!(
-            fixture_pack_id("helm").unwrap().to_string(),
-            "greentic.fixture.helm.gtpack"
-        );
-        assert_eq!(
-            fixture_pack_id("k8s-raw").unwrap().to_string(),
-            "greentic.fixture.k8s.raw.gtpack"
-        );
-        assert_eq!(
-            fixture_pack_id("juju-machine").unwrap().to_string(),
-            "greentic.fixture.juju.machine.gtpack"
-        );
-    }
+    bail!(
+        "{} {} failed:\n{}",
+        program,
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
