@@ -53,7 +53,8 @@ jobs:
         run: rustup component add llvm-tools-preview
 
       - name: Validate coverage policy
-        run: "$HOME/.cargo/bin/greentic-dev" coverage
+        run: |
+          "$HOME/.cargo/bin/greentic-dev" coverage
 
       - name: Upload coverage report
         if: always()
