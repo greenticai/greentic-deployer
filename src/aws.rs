@@ -756,6 +756,88 @@ mod tests {
     }
 
     #[test]
+    fn aws_request_preserves_all_passthrough_fields() {
+        let mut request =
+            AwsRequest::new(DeployerCapability::Apply, "acme", PathBuf::from("pack-dir"));
+        request.bundle_root = Some(PathBuf::from("bundle-root"));
+        request.bundle_source = Some("s3://bucket/bundle.gtbundle".into());
+        request.bundle_digest = Some("sha256:abc".into());
+        request.repo_registry_base = Some("https://repo.example".into());
+        request.store_registry_base = Some("https://store.example".into());
+        request.provider_pack = Some(PathBuf::from("providers/deployer/aws.gtpack"));
+        request.deploy_pack_id_override = Some("greentic.deploy.aws".into());
+        request.deploy_flow_id_override = Some("apply_terraform".into());
+        request.environment = Some("prod".into());
+        request.pack_id = Some("pack-id".into());
+        request.pack_version = Some("1.2.3".into());
+        request.pack_digest = Some("sha256:def".into());
+        request.distributor_url = Some("https://dist.example".into());
+        request.distributor_token = Some("token".into());
+        request.preview = true;
+        request.dry_run = true;
+        request.execute_local = true;
+        request.output = OutputFormat::Json;
+        request.config_path = Some(PathBuf::from("greentic.toml"));
+        request.allow_remote_in_offline = true;
+        request.providers_dir = PathBuf::from("providers");
+        request.packs_dir = PathBuf::from("packs-dir");
+
+        let deployer = request.into_deployer_request();
+
+        assert_eq!(deployer.capability, DeployerCapability::Apply);
+        assert_eq!(deployer.provider, Provider::Aws);
+        assert_eq!(
+            deployer.bundle_root.as_deref(),
+            Some(Path::new("bundle-root"))
+        );
+        assert_eq!(
+            deployer.bundle_source.as_deref(),
+            Some("s3://bucket/bundle.gtbundle")
+        );
+        assert_eq!(deployer.bundle_digest.as_deref(), Some("sha256:abc"));
+        assert_eq!(
+            deployer.repo_registry_base.as_deref(),
+            Some("https://repo.example")
+        );
+        assert_eq!(
+            deployer.store_registry_base.as_deref(),
+            Some("https://store.example")
+        );
+        assert_eq!(
+            deployer.provider_pack.as_deref(),
+            Some(Path::new("providers/deployer/aws.gtpack"))
+        );
+        assert_eq!(
+            deployer.deploy_pack_id_override.as_deref(),
+            Some("greentic.deploy.aws")
+        );
+        assert_eq!(
+            deployer.deploy_flow_id_override.as_deref(),
+            Some("apply_terraform")
+        );
+        assert_eq!(deployer.environment.as_deref(), Some("prod"));
+        assert_eq!(deployer.pack_id.as_deref(), Some("pack-id"));
+        assert_eq!(deployer.pack_version.as_deref(), Some("1.2.3"));
+        assert_eq!(deployer.pack_digest.as_deref(), Some("sha256:def"));
+        assert_eq!(
+            deployer.distributor_url.as_deref(),
+            Some("https://dist.example")
+        );
+        assert_eq!(deployer.distributor_token.as_deref(), Some("token"));
+        assert!(deployer.preview);
+        assert!(deployer.dry_run);
+        assert!(deployer.execute_local);
+        assert_eq!(deployer.output, OutputFormat::Json);
+        assert_eq!(
+            deployer.config_path.as_deref(),
+            Some(Path::new("greentic.toml"))
+        );
+        assert!(deployer.allow_remote_in_offline);
+        assert_eq!(deployer.providers_dir, PathBuf::from("providers"));
+        assert_eq!(deployer.packs_dir, PathBuf::from("packs-dir"));
+    }
+
+    #[test]
     fn ensure_aws_config_rejects_non_aws_provider() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut request = AwsRequest::new(DeployerCapability::Plan, "acme", tmp.path().into())
@@ -821,6 +903,90 @@ mod tests {
         assert!(request.execute_local);
         assert_eq!(request.providers_dir, PathBuf::from("providers/deployer"));
         assert_eq!(request.packs_dir, PathBuf::from("packs"));
+    }
+
+    #[test]
+    fn build_aws_request_from_ext_uses_empty_pack_when_missing() {
+        let cfg = AwsEcsFargateExtConfig {
+            region: "eu-north-1".to_string(),
+            environment: "dev".to_string(),
+            operator_image_digest: "sha256:0000".to_string(),
+            bundle_source: "s3://bucket/bundle.gtbundle".to_string(),
+            bundle_digest: "sha256:1111".to_string(),
+            remote_state_backend: "s3://state".to_string(),
+            redis_url: None,
+            dns_name: None,
+            public_base_url: None,
+            repo_registry_base: None,
+            store_registry_base: None,
+            admin_allowed_clients: None,
+            tenant: default_ext_tenant(),
+        };
+
+        let request = build_aws_request_from_ext(DeployerCapability::Apply, &cfg, None);
+
+        assert_eq!(request.capability, DeployerCapability::Apply);
+        assert_eq!(request.tenant, "default");
+        assert_eq!(request.pack_path, PathBuf::new());
+        assert_eq!(
+            request.bundle_source.as_deref(),
+            Some("s3://bucket/bundle.gtbundle")
+        );
+        assert_eq!(request.bundle_digest.as_deref(), Some("sha256:1111"));
+        assert!(request.repo_registry_base.is_none());
+        assert!(request.store_registry_base.is_none());
+        assert_eq!(request.output, OutputFormat::Text);
+        assert!(request.execute_local);
+        assert!(!request.preview);
+        assert!(!request.dry_run);
+    }
+
+    #[cfg(feature = "runtime-secrets-aws")]
+    #[test]
+    fn aws_secret_tags_include_management_scope_and_bundle_digest() {
+        let tags = aws_secret_tags(
+            "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key",
+            Some("sha256:bundle"),
+            "dev",
+            "demo",
+            "_",
+        );
+
+        assert!(tags.contains(&("greentic:managed-by".into(), "greentic-deployer".into())));
+        assert!(tags.contains(&(
+            "greentic:secret-manager".into(),
+            "aws-secrets-manager".into()
+        )));
+        assert!(tags.contains(&("greentic:environment".into(), "dev".into())));
+        assert!(tags.contains(&("greentic:tenant".into(), "demo".into())));
+        assert!(tags.contains(&("greentic:team".into(), "_".into())));
+        assert!(tags.contains(&("greentic:bundle-digest".into(), "sha256:bundle".into())));
+        assert!(tags.iter().any(|(key, value)| {
+            key == "greentic:secret-uri" && value.contains("messaging-webchat-gui")
+        }));
+    }
+
+    #[cfg(feature = "runtime-secrets-aws")]
+    #[test]
+    fn aws_secret_tags_omit_bundle_digest_when_absent() {
+        let tags = aws_secret_tags(
+            "secrets://dev/demo/_/deep-research-demo/api_key_secret",
+            None,
+            "dev",
+            "demo",
+            "_",
+        );
+
+        assert!(tags.contains(&("greentic:provider".into(), "aws".into())));
+        assert!(tags.contains(&(
+            "greentic:secret-uri".into(),
+            "secrets://dev/demo/_/deep-research-demo/api_key_secret".into()
+        )));
+        assert!(
+            !tags
+                .iter()
+                .any(|(key, _value)| key == "greentic:bundle-digest")
+        );
     }
 
     #[test]
@@ -905,10 +1071,23 @@ mod tests {
             None
         );
         assert_eq!(
+            deploy_name_prefix_from_secret_arn(
+                "arn:aws:secretsmanager:eu-north-1:123:secret:greentic/admin//ca"
+            ),
+            None
+        );
+        assert_eq!(aws_region_from_secret_arn("not-an-arn"), None);
+        assert_eq!(
+            aws_region_from_secret_arn("arn:aws:secretsmanager::123:secret:name").as_deref(),
+            Some("")
+        );
+        assert_eq!(
             task_id_from_arn("arn:aws:ecs:eu-north-1:123456789012:task/acme-prod-cluster/abc123")
                 .as_deref(),
             Some("abc123")
         );
+        assert_eq!(task_id_from_arn("abc123").as_deref(), Some("abc123"));
+        assert_eq!(task_id_from_arn("cluster/").as_deref(), Some(""));
     }
 
     #[test]
@@ -922,6 +1101,35 @@ mod tests {
 
         maybe_write_tunnel_admin_certs(tmp.path(), &outputs, "eu-north-1", "acme-prod")
             .expect("missing optional refs should skip");
+
+        assert!(!tunnel_admin_cert_dir(tmp.path(), "acme-prod").exists());
+    }
+
+    #[test]
+    fn maybe_write_tunnel_admin_certs_skips_for_each_missing_ref() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ca_ref =
+            "arn:aws:secretsmanager:eu-north-1:123456789012:secret:greentic/admin/acme-prod/ca";
+        let cert_ref = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:greentic/admin/acme-prod/client-cert";
+        let key_ref = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:greentic/admin/acme-prod/client-key";
+
+        for outputs in [
+            serde_json::json!({
+                "admin_client_cert_secret_ref": { "value": cert_ref },
+                "admin_client_key_secret_ref": { "value": key_ref }
+            }),
+            serde_json::json!({
+                "admin_client_cert_secret_ref": { "value": cert_ref },
+                "admin_ca_secret_ref": { "value": ca_ref }
+            }),
+            serde_json::json!({
+                "admin_client_key_secret_ref": { "value": key_ref },
+                "admin_ca_secret_ref": { "value": ca_ref }
+            }),
+        ] {
+            maybe_write_tunnel_admin_certs(tmp.path(), &outputs, "eu-north-1", "acme-prod")
+                .expect("incomplete cert refs should skip without shelling out");
+        }
 
         assert!(!tunnel_admin_cert_dir(tmp.path(), "acme-prod").exists());
     }
@@ -1013,5 +1221,18 @@ mod tests {
     fn destroy_from_ext_rejects_invalid_json() {
         let err = destroy_from_ext("not json", "{}", None).unwrap_err();
         assert!(format!("{err}").contains("parse"), "got: {err}");
+    }
+
+    #[test]
+    fn destroy_from_ext_rejects_missing_required_field() {
+        let json = r#"{"region":"eu-north-1"}"#;
+        let err = destroy_from_ext(json, "{}", None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("missing field")
+                || msg.contains("bundleSource")
+                || msg.contains("bundle_source"),
+            "got: {msg}"
+        );
     }
 }

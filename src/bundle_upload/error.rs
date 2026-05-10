@@ -117,3 +117,110 @@ impl BundleUploadError {
 }
 
 pub type BundleUploadResult<T> = std::result::Result<T, BundleUploadError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_keys_cover_all_error_variants() {
+        let io_error = std::io::Error::other("disk full");
+        let cases = vec![
+            (
+                BundleUploadError::InvalidUrl("ftp://bundle".into()),
+                "bundle_upload.invalid_url",
+            ),
+            (
+                BundleUploadError::FeatureNotEnabled {
+                    scheme: "gs".into(),
+                    feature: "bundle-upload-gcp".into(),
+                },
+                "bundle_upload.feature_not_enabled",
+            ),
+            (
+                BundleUploadError::BucketAlreadyExistsInOtherAccount("taken".into()),
+                "bundle_upload.s3.bucket_already_exists_in_other_account",
+            ),
+            (
+                BundleUploadError::AccessDenied {
+                    action: "PutObject".into(),
+                    resource: "s3://bucket/key".into(),
+                    required_perms: "s3:PutObject".into(),
+                },
+                "bundle_upload.access_denied",
+            ),
+            (
+                BundleUploadError::ObjectMissing("s3://bucket/key".into()),
+                "bundle_upload.object_missing",
+            ),
+            (
+                BundleUploadError::WarmupFailed {
+                    exit_code: 42,
+                    stderr: "boom".into(),
+                },
+                "bundle_upload.warmup_failed",
+            ),
+            (
+                BundleUploadError::NetworkTransient("timeout".into()),
+                "bundle_upload.network_transient",
+            ),
+            (
+                BundleUploadError::CredentialsUnresolved,
+                "bundle_upload.aws.credentials_unresolved",
+            ),
+            (
+                BundleUploadError::AwsCredentialsRefreshRequired {
+                    action: "uploading bundle".into(),
+                    help: &TEST_AWS_HELP,
+                },
+                "bundle_upload.aws.credentials_refresh_required",
+            ),
+            (
+                BundleUploadError::DigestMismatch {
+                    expected: "sha256:expected".into(),
+                    actual: "sha256:actual".into(),
+                },
+                "bundle_upload.digest_mismatch",
+            ),
+            (BundleUploadError::Io(io_error), "bundle_upload.io"),
+            (
+                BundleUploadError::Other("misc".into()),
+                "bundle_upload.other",
+            ),
+        ];
+
+        for (err, key) in cases {
+            assert_eq!(err.message_key(), key);
+            assert!(!err.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn aws_credentials_refresh_help_renders_all_commands() {
+        let rendered = TEST_AWS_HELP.to_string();
+        for expected in [
+            "aws configure",
+            "aws configure get aws_session_token",
+            "unset AWS_SESSION_TOKEN",
+            "aws sso login",
+            "export AWS_PROFILE",
+            "aws sts get-caller-identity",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}: {rendered}"
+            );
+        }
+    }
+
+    static TEST_AWS_HELP: AwsCredentialsRefreshHelp = AwsCredentialsRefreshHelp {
+        configure_command: "aws configure",
+        session_token_check_command: "aws configure get aws_session_token",
+        session_token_unset_command: "unset AWS_SESSION_TOKEN AWS_SECURITY_TOKEN",
+        sso_login_command: "aws sso login",
+        profile_env_command: "export AWS_PROFILE=<profile>",
+        profile_configure_command: "aws configure --profile <profile>",
+        profile_sso_login_command: "aws sso login --profile <profile>",
+        verify_command: "aws sts get-caller-identity",
+    };
+}
