@@ -8,57 +8,63 @@ module "operator_aws" {
   count  = var.cloud == "aws" ? 1 : 0
   source = "./modules/operator"
 
-  cloud               = var.cloud
-  tenant              = var.tenant
+  cloud                  = var.cloud
+  tenant                 = var.tenant
   deployment_name_prefix = local.name_prefix
-  operator_image      = local.operator_image
-  bundle_source       = var.bundle_source
-  bundle_digest       = var.bundle_digest
-  redis_url           = var.redis_url
-  repo_registry_base  = var.repo_registry_base
-  store_registry_base = var.store_registry_base
-  admin_allowed_clients = var.admin_allowed_clients
-  public_base_url     = var.public_base_url
-  use_default_vpc     = var.aws_use_default_vpc
+  operator_image         = local.operator_image
+  bundle_source          = var.bundle_source
+  bundle_digest          = var.bundle_digest
+  redis_url              = var.redis_url
+  repo_registry_base     = var.repo_registry_base
+  store_registry_base    = var.store_registry_base
+  admin_allowed_clients  = var.admin_allowed_clients
+  public_base_url        = var.public_base_url
+  runtime_secret_prefix  = var.runtime_secret_prefix
+  runtime_secret_env     = var.runtime_secret_env
+  use_default_vpc        = var.aws_use_default_vpc
 }
 
 module "operator_azure" {
   count  = var.cloud == "azure" ? 1 : 0
   source = "./modules/operator-azure"
 
-  cloud               = var.cloud
-  tenant              = var.tenant
-  environment         = var.environment
+  cloud                  = var.cloud
+  tenant                 = var.tenant
+  environment            = var.environment
   deployment_name_prefix = local.name_prefix
-  bundle_digest       = var.bundle_digest
-  bundle_source       = var.bundle_source
-  repo_registry_base  = var.repo_registry_base
-  store_registry_base = var.store_registry_base
-  operator_image      = local.operator_image
-  admin_allowed_clients = var.admin_allowed_clients
-  public_base_url     = var.public_base_url
-  azure_key_vault_uri = var.azure_key_vault_uri
-  azure_key_vault_id  = var.azure_key_vault_id
-  azure_location      = var.azure_location
+  bundle_digest          = var.bundle_digest
+  bundle_source          = var.bundle_source
+  repo_registry_base     = var.repo_registry_base
+  store_registry_base    = var.store_registry_base
+  operator_image         = local.operator_image
+  admin_allowed_clients  = var.admin_allowed_clients
+  public_base_url        = var.public_base_url
+  azure_key_vault_uri    = var.azure_key_vault_uri
+  azure_key_vault_id     = var.azure_key_vault_id
+  azure_location         = var.azure_location
+  runtime_secret_prefix  = var.runtime_secret_prefix
+  runtime_secret_env     = var.runtime_secret_env
 }
 
 module "operator_gcp" {
   count  = var.cloud == "gcp" ? 1 : 0
   source = "./modules/operator-gcp"
 
-  cloud               = var.cloud
-  tenant              = var.tenant
-  environment         = var.environment
+  cloud                  = var.cloud
+  tenant                 = var.tenant
+  environment            = var.environment
   deployment_name_prefix = local.name_prefix
-  bundle_digest       = var.bundle_digest
-  bundle_source       = var.bundle_source
-  repo_registry_base  = var.repo_registry_base
-  store_registry_base = var.store_registry_base
-  operator_image      = local.operator_image
-  admin_allowed_clients = var.admin_allowed_clients
-  public_base_url     = var.public_base_url
-  gcp_project_id      = var.gcp_project_id
-  gcp_region          = var.gcp_region
+  bundle_digest          = var.bundle_digest
+  bundle_source          = var.bundle_source
+  repo_registry_base     = var.repo_registry_base
+  store_registry_base    = var.store_registry_base
+  operator_image         = local.operator_image
+  admin_allowed_clients  = var.admin_allowed_clients
+  public_base_url        = var.public_base_url
+  gcp_project_id         = var.gcp_project_id
+  gcp_region             = var.gcp_region
+  runtime_secret_prefix  = var.runtime_secret_prefix
+  runtime_secret_env     = var.runtime_secret_env
 }
 
 module "dns" {

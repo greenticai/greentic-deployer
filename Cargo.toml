@@ -1,6 +1,6 @@
 [package]
 name = "greentic-deployer"
-version = "0.5.10"
+version = "0.5.11"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic deployer runtime for plan construction and deployment-pack dispatch"
@@ -13,10 +13,11 @@ keywords = ["greentic", "deployer", "deployment-pack", "runner"]
 categories = ["development-tools"]
 
 [features]
-default = ["bundle-upload-aws"]
+default = ["bundle-upload-aws", "runtime-secrets-aws"]
 internal-tools = []
 test-utils = []
 bundle-upload-aws = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime-api"]
+runtime-secrets-aws = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "dep:aws-smithy-runtime-api"]
 bundle-upload-gcp = []
 bundle-upload-azure = []
 
@@ -43,6 +44,7 @@ greentic-types = { version = "0.5" }
 greentic-distributor-client = { version = "0.5" }
 greentic-config = "0.5"
 greentic-config-types = "0.5"
+greentic-secrets-lib = { version = "0.5", features = ["providers-dev"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_bw = {package="serde_yaml_gtc", version="2.5.2"}
@@ -50,6 +52,7 @@ semver = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
 aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-secretsmanager = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-config = { version = "1", optional = true, default-features = false, features = ["rustls", "rt-tokio", "credentials-login"] }
 aws-smithy-runtime-api = { version = "1", optional = true }
 sha2 = "0.11"
@@ -65,7 +68,7 @@ reqwest = { version = "0.13", features = ["blocking", "json", "rustls"] }
 toml = "1"
 indexmap = "2"
 jsonschema = "0.46"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 wat = "1"

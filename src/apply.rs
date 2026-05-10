@@ -6,9 +6,8 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -185,12 +184,23 @@ pub struct OperationResult {
 pub fn render_operation_result(value: &OperationResult, format: OutputFormat) -> Result<String> {
     match format {
         OutputFormat::Text => Ok(render_operation_result_text(value)),
-        OutputFormat::Json => {
-            serde_json::to_string_pretty(value).map_err(|err| DeployerError::Other(err.to_string()))
-        }
-        OutputFormat::Yaml => {
-            serde_yaml::to_string(value).map_err(|err| DeployerError::Other(err.to_string()))
-        }
+        OutputFormat::Json => match apply_success_webchat_url(value) {
+            Some(webchat_url) => serde_json::to_string_pretty(&serde_json::json!({
+                "webchat_url": webchat_url,
+            }))
+            .map_err(|err| DeployerError::Other(err.to_string())),
+            None => serde_json::to_string_pretty(value)
+                .map_err(|err| DeployerError::Other(err.to_string())),
+        },
+        OutputFormat::Yaml => match apply_success_webchat_url(value) {
+            Some(webchat_url) => serde_yaml::to_string(&serde_json::json!({
+                "webchat_url": webchat_url,
+            }))
+            .map_err(|err| DeployerError::Other(err.to_string())),
+            None => {
+                serde_yaml::to_string(value).map_err(|err| DeployerError::Other(err.to_string()))
+            }
+        },
     }
 }
 
@@ -227,6 +237,10 @@ fn render_operation_result_text(value: &OperationResult) -> String {
 }
 
 fn render_apply_success_summary(value: &OperationResult) -> Option<String> {
+    apply_success_webchat_url(value).map(|webchat_url| format!("{webchat_url}\n"))
+}
+
+fn apply_success_webchat_url(value: &OperationResult) -> Option<String> {
     if value.capability != "apply" || !value.executed || value.preview {
         return None;
     }
@@ -243,14 +257,7 @@ fn render_apply_success_summary(value: &OperationResult) -> Option<String> {
         .get("operator_endpoint")
         .or_else(|| payload.endpoints.first())?;
     let tenant = operation_result_tenant(value).unwrap_or("demo");
-    let webchat_url = webchat_gui_url(endpoint, tenant);
-
-    let mut out = String::new();
-    out.push_str("Deployment applied successfully.\n");
-    out.push_str(&format!("Endpoint: {endpoint}\n"));
-    out.push_str(&format!("Webchat: {webchat_url}\n"));
-    out.push_str(&format!("Output directory: {}\n", value.output_dir));
-    Some(out)
+    Some(webchat_gui_url(endpoint, tenant))
 }
 
 fn operation_result_tenant(value: &OperationResult) -> Option<&str> {
@@ -2014,6 +2021,13 @@ fn materialize_terraform_handoff_assets(
 
     let tfvars_example = resolve_tfvars_example_name(&terraform_root, &config.environment)?;
     let generated_tfvars = materialize_generated_tfvars(config, &terraform_root, &tfvars_example)?;
+    let script_tfvars = generated_tfvars.clone().or_else(|| {
+        let env_tfvars = format!("{}.tfvars", config.environment);
+        terraform_root
+            .join(&env_tfvars)
+            .exists()
+            .then_some(env_tfvars)
+    });
     let init_script = "terraform-init.sh";
     let plan_script = "terraform-plan.sh";
     let apply_script = "terraform-apply.sh";
@@ -2026,7 +2040,7 @@ fn materialize_terraform_handoff_assets(
         terraform_plan_like_script(
             "plan",
             config.provider,
-            generated_tfvars.as_deref(),
+            script_tfvars.as_deref(),
             &tfvars_example,
         ),
     )?;
@@ -2035,7 +2049,7 @@ fn materialize_terraform_handoff_assets(
         terraform_plan_like_script(
             "apply",
             config.provider,
-            generated_tfvars.as_deref(),
+            script_tfvars.as_deref(),
             &tfvars_example,
         ),
     )?;
@@ -2044,7 +2058,7 @@ fn materialize_terraform_handoff_assets(
         terraform_plan_like_script(
             "destroy",
             config.provider,
-            generated_tfvars.as_deref(),
+            script_tfvars.as_deref(),
             &tfvars_example,
         ),
     )?;
@@ -2062,7 +2076,7 @@ fn materialize_terraform_handoff_assets(
     if config.provider == crate::config::Provider::Aws {
         write_executable_script(
             &deploy_dir.join(aws_cleanup_script),
-            terraform_aws_cleanup_script(generated_tfvars.as_deref(), &tfvars_example),
+            terraform_aws_cleanup_script(script_tfvars.as_deref(), &tfvars_example),
         )?;
         scripts.push(aws_cleanup_script.to_string());
     }
@@ -2127,7 +2141,9 @@ fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path
   repo_registry_base    = var.repo_registry_base
   store_registry_base   = var.store_registry_base
   admin_allowed_clients = var.admin_allowed_clients
-  public_base_url       = var.public_base_url"#,
+  public_base_url       = var.public_base_url
+  runtime_secret_prefix = var.runtime_secret_prefix
+  runtime_secret_env    = var.runtime_secret_env"#,
         ),
         crate::config::Provider::Azure => (
             "operator",
@@ -2145,7 +2161,9 @@ fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path
   public_base_url       = var.public_base_url
   azure_key_vault_uri   = var.azure_key_vault_uri
   azure_key_vault_id    = var.azure_key_vault_id
-  azure_location        = var.azure_location"#,
+  azure_location        = var.azure_location
+  runtime_secret_prefix = var.runtime_secret_prefix
+  runtime_secret_env    = var.runtime_secret_env"#,
         ),
         crate::config::Provider::Gcp => (
             "operator",
@@ -2162,7 +2180,9 @@ fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path
   admin_allowed_clients = var.admin_allowed_clients
   public_base_url       = var.public_base_url
   gcp_project_id        = var.gcp_project_id
-  gcp_region            = var.gcp_region"#,
+  gcp_region            = var.gcp_region
+  runtime_secret_prefix = var.runtime_secret_prefix
+  runtime_secret_env    = var.runtime_secret_env"#,
         ),
         _ => return Ok(()),
     };
@@ -2228,28 +2248,186 @@ output "admin_client_key_secret_ref" {{
         "string",
         Some(""),
     )?;
-    match config.provider {
-        crate::config::Provider::Aws => ensure_terraform_variable_declared(
-            &terraform_root.join("modules/operator/variables.tf"),
+    ensure_terraform_variable_declared(
+        &terraform_root.join("variables.tf"),
+        "runtime_secret_prefix",
+        "string",
+        Some(""),
+    )?;
+    ensure_terraform_variable_declared(
+        &terraform_root.join("variables.tf"),
+        "runtime_secret_env",
+        "map(string)",
+        Some("{}"),
+    )?;
+    let module_variables = match config.provider {
+        crate::config::Provider::Aws => Some(terraform_root.join("modules/operator/variables.tf")),
+        crate::config::Provider::Azure => {
+            Some(terraform_root.join("modules/operator-azure/variables.tf"))
+        }
+        crate::config::Provider::Gcp => {
+            Some(terraform_root.join("modules/operator-gcp/variables.tf"))
+        }
+        _ => None,
+    };
+    if let Some(module_variables) = module_variables {
+        ensure_terraform_variable_declared(
+            &module_variables,
             "deployment_name_prefix",
             "string",
             Some(""),
-        )?,
-        crate::config::Provider::Azure => ensure_terraform_variable_declared(
-            &terraform_root.join("modules/operator-azure/variables.tf"),
-            "deployment_name_prefix",
+        )?;
+        ensure_terraform_variable_declared(
+            &module_variables,
+            "runtime_secret_prefix",
             "string",
             Some(""),
-        )?,
-        crate::config::Provider::Gcp => ensure_terraform_variable_declared(
-            &terraform_root.join("modules/operator-gcp/variables.tf"),
-            "deployment_name_prefix",
-            "string",
-            Some(""),
-        )?,
-        _ => {}
+        )?;
+        ensure_terraform_variable_declared(
+            &module_variables,
+            "runtime_secret_env",
+            "map(string)",
+            Some("{}"),
+        )?;
+    }
+    if config.provider == crate::config::Provider::Aws {
+        ensure_aws_runtime_secret_wiring(&terraform_root.join("modules/operator/main.tf"))?;
     }
 
+    Ok(())
+}
+
+fn ensure_aws_runtime_secret_wiring(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut contents = fs::read_to_string(path)?;
+    if contents.contains("GREENTIC_SECRETS_BACKEND")
+        && contents.contains("GREENTIC_ALLOW_ENV_SECRETS")
+        && contents.contains("runtime_secret_env")
+        && contents.contains("task_runtime_secrets")
+    {
+        return Ok(());
+    }
+    if !contents.contains(r#"data "aws_caller_identity" "current""#) {
+        contents = format!("data \"aws_caller_identity\" \"current\" {{}}\n\n{contents}");
+    }
+    if !contents.contains("task_runtime_secrets") {
+        let marker = r#"resource "aws_ecs_task_definition" "this" {"#;
+        let policy = r#"resource "aws_iam_role_policy" "task_runtime_secrets" {
+  count = trimspace(var.runtime_secret_prefix) != "" ? 1 : 0
+  name  = "${local.name_prefix}-task-runtime-secrets"
+  role  = aws_iam_role.task_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = [
+          "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:${trim(var.runtime_secret_prefix, "/")}/*"
+        ]
+      }
+    ]
+  })
+}
+
+"#;
+        contents = contents.replacen(marker, &format!("{policy}{marker}"), 1);
+    }
+    if !contents.contains(r#"data "aws_secretsmanager_secret" "runtime""#) {
+        let marker = r#"resource "aws_ecs_task_definition" "this" {"#;
+        let data_source = r#"data "aws_secretsmanager_secret" "runtime" {
+  for_each = var.runtime_secret_env
+  name     = each.value
+}
+
+"#;
+        contents = contents.replacen(marker, &format!("{data_source}{marker}"), 1);
+    }
+    contents = contents.replace(
+        r#"            value = "aws-secrets-manager""#,
+        r#"            value = "env""#,
+    );
+    contents = contents.replace(
+        r#"          {
+            name  = "GREENTIC_SECRETS_AWS_REGION"
+            value = data.aws_region.current.name
+          },
+          {
+            name  = "GREENTIC_SECRETS_AWS_PREFIX"
+            value = trim(var.runtime_secret_prefix, "/")
+          }"#,
+        r#"          {
+            name  = "GREENTIC_ALLOW_ENV_SECRETS"
+            value = "1"
+          },
+          {
+            name  = "GREENTIC_SECRETS_MANAGER_PACK"
+            value = "providers/deployer/aws.gtpack"
+          }"#,
+    );
+    if !contents.contains("GREENTIC_SECRETS_BACKEND") {
+        let marker = r#"        ],
+        [
+          {
+            name  = "PUBLIC_BASE_URL""#;
+        let replacement = r#"        ],
+        trimspace(var.runtime_secret_prefix) != "" ? [
+          {
+            name  = "GREENTIC_SECRETS_BACKEND"
+            value = "env"
+          },
+          {
+            name  = "GREENTIC_ALLOW_ENV_SECRETS"
+            value = "1"
+          },
+          {
+            name  = "GREENTIC_SECRETS_MANAGER_PACK"
+            value = "providers/deployer/aws.gtpack"
+          }
+        ] : [],
+        [
+          {
+            name  = "PUBLIC_BASE_URL""#;
+        contents = contents.replacen(marker, replacement, 1);
+    }
+    if !contents.contains("for name, secret_name in var.runtime_secret_env") {
+        contents = contents.replace(
+            r#"      secrets = [
+        {
+          name      = "GREENTIC_ADMIN_CA_PEM"
+          valueFrom = aws_secretsmanager_secret.admin_ca.arn
+        },"#,
+            r#"      secrets = concat(
+        [
+          {
+            name      = "GREENTIC_ADMIN_CA_PEM"
+            valueFrom = aws_secretsmanager_secret.admin_ca.arn
+          },"#,
+        );
+        contents = contents.replace(
+            r#"          name      = "GREENTIC_ADMIN_SERVER_KEY_PEM"
+          valueFrom = aws_secretsmanager_secret.admin_server_key.arn
+        }
+      ]"#,
+            r#"          name      = "GREENTIC_ADMIN_SERVER_KEY_PEM"
+          valueFrom = aws_secretsmanager_secret.admin_server_key.arn
+        }
+        ],
+        [
+          for name, secret_name in var.runtime_secret_env : {
+            name      = name
+            valueFrom = data.aws_secretsmanager_secret.runtime[name].arn
+          }
+        ]
+      )"#,
+        );
+    }
+    fs::write(path, contents)?;
     Ok(())
 }
 
@@ -2260,10 +2438,16 @@ fn ensure_terraform_variable_declared(
     default: Option<&str>,
 ) -> Result<()> {
     let declaration = match default {
-        Some(value) => format!(
-            "variable \"{name}\" {{\n  type    = {ty}\n  default = {}\n}}\n",
-            serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
-        ),
+        Some(value) => {
+            let rendered_default = if ty.starts_with("map(") && value == "{}" {
+                "{}".to_string()
+            } else {
+                serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+            };
+            format!(
+                "variable \"{name}\" {{\n  type    = {ty}\n  default = {rendered_default}\n}}\n"
+            )
+        }
         None => format!("variable \"{name}\" {{\n  type = {ty}\n}}\n"),
     };
 
@@ -2331,6 +2515,24 @@ fn materialize_generated_tfvars(
     if let Some(store_registry_base) = config.store_registry_base.as_ref() {
         replace_tfvars_assignment(&mut contents, "store_registry_base", store_registry_base);
     }
+    if matches!(
+        config.provider,
+        crate::config::Provider::Aws
+            | crate::config::Provider::Azure
+            | crate::config::Provider::Gcp
+    ) {
+        replace_tfvars_assignment(
+            &mut contents,
+            "runtime_secret_prefix",
+            &crate::runtime_secrets::default_cloud_secret_prefix(
+                &config.environment,
+                &config.tenant,
+                None,
+            ),
+        );
+        let runtime_secret_env = crate::runtime_secrets::runtime_secret_env_map_for_cloud(config)?;
+        replace_tfvars_map_assignment(&mut contents, "runtime_secret_env", &runtime_secret_env);
+    }
     for (key, value) in terraform_env_overrides() {
         replace_tfvars_assignment(&mut contents, &key, &value);
     }
@@ -2341,18 +2543,16 @@ fn materialize_generated_tfvars(
 }
 
 fn resolve_terraform_deployment_name_prefix(config: &DeployerConfig, output_path: &Path) -> String {
-    if let Ok(existing) = fs::read_to_string(output_path) {
-        if let Some(prefix) = read_tfvars_assignment(&existing, "deployment_name_prefix")
+    if let Some(prefix) = explicit_deployment_name_prefix() {
+        return prefix;
+    }
+
+    if let Ok(existing) = fs::read_to_string(output_path)
+        && let Some(prefix) = read_tfvars_assignment(&existing, "deployment_name_prefix")
             .filter(|value| !value.trim().is_empty())
-        {
-            return prefix;
-        }
-        if let Some(bundle_digest) = read_tfvars_assignment(&existing, "bundle_digest")
-            .filter(|value| !value.trim().is_empty())
-            && let Some(prefix) = legacy_bundle_name_prefix(&bundle_digest)
-        {
-            return prefix;
-        }
+        && prefix != legacy_shared_deployment_name_prefix(config)
+    {
+        return prefix;
     }
 
     stable_deployment_name_prefix(config)
@@ -2360,12 +2560,88 @@ fn resolve_terraform_deployment_name_prefix(config: &DeployerConfig, output_path
 
 fn stable_deployment_name_prefix(config: &DeployerConfig) -> String {
     let seed = format!(
+        "{}\0{}\0{}\0{}",
+        config.provider.as_str(),
+        config.tenant,
+        config.environment,
+        local_deployment_identity_seed(config),
+    );
+    format!("greentic-{:08x}", fnv1a32(seed.as_bytes()))
+}
+
+fn legacy_shared_deployment_name_prefix(config: &DeployerConfig) -> String {
+    let seed = format!(
         "{}\0{}\0{}",
         config.provider.as_str(),
         config.tenant,
-        config.environment
+        config.environment,
     );
     format!("greentic-{:08x}", fnv1a32(seed.as_bytes()))
+}
+
+fn explicit_deployment_name_prefix() -> Option<String> {
+    std::env::var("GREENTIC_DEPLOY_TERRAFORM_VAR_DEPLOYMENT_NAME_PREFIX")
+        .ok()
+        .or_else(|| std::env::var("GREENTIC_DEPLOYMENT_NAME_PREFIX").ok())
+        .and_then(|value| {
+            let normalized = normalize_deployment_name_prefix(&value);
+            (!normalized.is_empty()).then_some(normalized)
+        })
+}
+
+fn local_deployment_identity_seed(config: &DeployerConfig) -> String {
+    std::env::var("GREENTIC_DEPLOYMENT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            let owner = std::env::var("GREENTIC_DEPLOYMENT_OWNER")
+                .ok()
+                .or_else(|| std::env::var("USER").ok())
+                .or_else(|| std::env::var("USERNAME").ok())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "unknown".to_string());
+            let workspace = config
+                .bundle_root
+                .as_ref()
+                .and_then(|path| path.canonicalize().ok())
+                .or_else(|| std::env::current_dir().ok())
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("{owner}\0{workspace}")
+        })
+}
+
+fn normalize_deployment_name_prefix(value: &str) -> String {
+    let mut normalized = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while normalized.contains("--") {
+        normalized = normalized.replace("--", "-");
+    }
+    normalized = normalized.trim_matches('-').to_string();
+    if normalized.is_empty() {
+        return normalized;
+    }
+    if !normalized
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic())
+    {
+        normalized = format!("greentic-{normalized}");
+    }
+    if normalized.len() > 24 {
+        normalized.truncate(24);
+        normalized = normalized.trim_end_matches('-').to_string();
+    }
+    normalized
 }
 
 fn fnv1a32(bytes: &[u8]) -> u32 {
@@ -2378,35 +2654,6 @@ fn fnv1a32(bytes: &[u8]) -> u32 {
         hash = hash.wrapping_mul(PRIME);
     }
     hash
-}
-
-fn legacy_bundle_name_prefix(bundle_digest: &str) -> Option<String> {
-    Some(format!("greentic-{}", md5_hex_prefix(bundle_digest, 8)?))
-}
-
-fn md5_hex_prefix(input: &str, len: usize) -> Option<String> {
-    command_md5_hex_prefix("md5sum", &["-"], input, len)
-        .or_else(|| command_md5_hex_prefix("md5", &["-q"], input, len))
-}
-
-fn command_md5_hex_prefix(command: &str, args: &[&str], input: &str, len: usize) -> Option<String> {
-    let mut child = Command::new(command)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdin = child.stdin.take()?;
-    stdin.write_all(input.as_bytes()).ok()?;
-    drop(stdin);
-    let output = child.wait_with_output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let hash = String::from_utf8(output.stdout).ok()?;
-    let hex = hash.split_whitespace().next()?;
-    Some(hex.chars().take(len).collect())
 }
 
 fn normalize_public_base_url_assignment(contents: &mut String) {
@@ -2522,6 +2769,54 @@ fn replace_tfvars_assignment(contents: &mut String, key: &str, value: &str) {
         if !replaced && trimmed.starts_with(&format!("{key} =")) {
             rewritten.push(replacement.clone());
             replaced = true;
+        } else {
+            rewritten.push(line.to_string());
+        }
+    }
+    if !replaced {
+        rewritten.push(replacement);
+    }
+    *contents = rewritten.join("\n");
+    contents.push('\n');
+}
+
+fn replace_tfvars_map_assignment(
+    contents: &mut String,
+    key: &str,
+    values: &BTreeMap<String, String>,
+) {
+    let replacement = if values.is_empty() {
+        format!("{key} = {{}}")
+    } else {
+        let mut out = format!("{key} = {{\n");
+        for (map_key, value) in values {
+            out.push_str(&format!(
+                "  {} = {}\n",
+                serde_json::to_string(map_key).unwrap_or_else(|_| format!("\"{map_key}\"")),
+                serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
+            ));
+        }
+        out.push('}');
+        out
+    };
+
+    let mut rewritten = Vec::new();
+    let mut replaced = false;
+    let mut skipping_multiline = false;
+    for line in contents.lines() {
+        let trimmed = line.trim_start();
+        if skipping_multiline {
+            if trimmed == "}" {
+                skipping_multiline = false;
+            }
+            continue;
+        }
+        if !replaced && trimmed.starts_with(&format!("{key} =")) {
+            rewritten.push(replacement.clone());
+            replaced = true;
+            if trimmed.ends_with('{') && !trimmed.contains('}') {
+                skipping_multiline = true;
+            }
         } else {
             rewritten.push(line.to_string());
         }
@@ -3214,11 +3509,14 @@ fn configure_terraform_backend(
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| {
+                let deployment_name_prefix = explicit_deployment_name_prefix()
+                    .unwrap_or_else(|| stable_deployment_name_prefix(config));
                 format!(
-                    "greentic/{}/{}/{}/terraform.tfstate",
+                    "greentic/{}/{}/{}/{}/terraform.tfstate",
                     config.provider.as_str(),
                     config.tenant,
-                    config.environment
+                    config.environment,
+                    deployment_name_prefix
                 )
             });
         let backend_hcl =
@@ -3738,6 +4036,7 @@ mod tests {
             tenant: "acme".into(),
             environment: "staging".into(),
             pack_path: pack_path.clone(),
+            bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
             provider_pack: Some(pack_path),
@@ -4389,6 +4688,7 @@ kind: Deployment
             tenant: "acme".into(),
             environment: "staging".into(),
             pack_path: pack_path.clone(),
+            bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
             provider_pack: Some(pack_path),
@@ -4459,6 +4759,7 @@ kind: Deployment
             tenant: "acme".into(),
             environment: "staging".into(),
             pack_path: pack_path.clone(),
+            bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
             provider_pack: Some(pack_path),
@@ -4544,6 +4845,7 @@ kind: Deployment
             tenant: "acme".into(),
             environment: "staging".into(),
             pack_path: pack_path.clone(),
+            bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
             provider_pack: Some(pack_path.clone()),
@@ -4814,6 +5116,38 @@ resource "google_cloud_run_v2_service" "this" {
         std::fs::write(terraform_root.join("variables.tf"), "").expect("write variables.tf");
         std::fs::write(terraform_root.join("modules/operator/variables.tf"), "")
             .expect("write module variables.tf");
+        std::fs::write(
+            terraform_root.join("modules/operator/main.tf"),
+            r#"resource "aws_iam_role_policy" "task_execution_ecs_exec" {
+  name = "${local.name_prefix}-task-exec-ecs-exec"
+  role = aws_iam_role.task_execution.id
+}
+
+resource "aws_ecs_task_definition" "this" {
+  container_definitions = jsonencode([
+    {
+      environment = concat(
+        [
+          {
+            name  = "GREENTIC_BUNDLE_SOURCE"
+            value = var.bundle_source
+          }
+        ],
+        [
+          {
+            name  = "PUBLIC_BASE_URL"
+            value = local.effective_public_base_url
+          }
+        ]
+      )
+    }
+  ])
+}
+
+data "aws_region" "current" {}
+"#,
+        )
+        .expect("write module main.tf");
 
         let config = DeployerConfig {
             provider: Provider::Aws,
@@ -4825,6 +5159,17 @@ resource "google_cloud_run_v2_service" "this" {
         let rendered =
             std::fs::read_to_string(terraform_root.join("main.tf")).expect("read main.tf");
         assert!(rendered.contains(r#"tenant                = var.tenant"#));
+        let variables =
+            std::fs::read_to_string(terraform_root.join("variables.tf")).expect("read variables");
+        assert!(variables.contains(r#"variable "runtime_secret_prefix""#));
+        let module_variables =
+            std::fs::read_to_string(terraform_root.join("modules/operator/variables.tf"))
+                .expect("read module variables");
+        assert!(module_variables.contains(r#"variable "runtime_secret_prefix""#));
+        let module_main = std::fs::read_to_string(terraform_root.join("modules/operator/main.tf"))
+            .expect("read module main");
+        assert!(module_main.contains("GREENTIC_SECRETS_BACKEND"));
+        assert!(module_main.contains("task_runtime_secrets"));
     }
 
     #[test]
@@ -4849,6 +5194,7 @@ resource "google_cloud_run_v2_service" "this" {
             tenant: "acme".into(),
             environment: "staging".into(),
             pack_path: pack_path.clone(),
+            bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
             provider_pack: Some(pack_path.clone()),
@@ -4958,6 +5304,7 @@ resource "google_cloud_run_v2_service" "this" {
             tenant: "acme".into(),
             environment: "dev".into(),
             pack_path: pack_path.clone(),
+            bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
             provider_pack: Some(pack_path.clone()),
@@ -5038,7 +5385,7 @@ resource "google_cloud_run_v2_service" "this" {
     }
 
     #[test]
-    fn generated_tfvars_preserves_existing_legacy_prefix_for_updates() {
+    fn generated_tfvars_ignores_legacy_bundle_digest_prefix_for_new_cloud_identity() {
         let base = std::env::current_dir()
             .expect("cwd")
             .join("target/tmp-tests");
@@ -5069,6 +5416,7 @@ resource "google_cloud_run_v2_service" "this" {
             tenant: "acme".into(),
             environment: "dev".into(),
             pack_path: dir.path().join("bundle"),
+            bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
             provider_pack: None,
@@ -5091,6 +5439,14 @@ resource "google_cloud_run_v2_service" "this" {
             repo_registry_base: None,
             store_registry_base: None,
         };
+        let legacy_shared_prefix = legacy_shared_deployment_name_prefix(&config);
+        std::fs::write(
+            terraform_root.join("dev.tfvars"),
+            format!(
+                "deployment_name_prefix = \"{legacy_shared_prefix}\"\nbundle_digest = \"sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd\"\n"
+            ),
+        )
+        .expect("write existing tfvars");
 
         let generated =
             materialize_generated_tfvars(&config, &terraform_root, "staging.tfvars.example")
@@ -5099,7 +5455,21 @@ resource "google_cloud_run_v2_service" "this" {
         let contents =
             std::fs::read_to_string(terraform_root.join(generated)).expect("read generated tfvars");
         assert!(contents.contains("deployment_name_prefix = \"greentic-"));
-        assert!(contents.contains("deployment_name_prefix = \"greentic-4f680ffc\""));
+        assert!(!contents.contains(&format!(
+            "deployment_name_prefix = \"{legacy_shared_prefix}\""
+        )));
+    }
+
+    #[test]
+    fn deployment_name_prefix_normalization_keeps_cloud_names_bounded() {
+        assert_eq!(
+            normalize_deployment_name_prefix(" Maarten/Deep Research Demo!!! "),
+            "maarten-deep-research-de"
+        );
+        assert_eq!(
+            normalize_deployment_name_prefix("123-dev"),
+            "greentic-123-dev"
+        );
     }
 
     #[test]
@@ -5213,14 +5583,74 @@ resource "google_cloud_run_v2_service" "this" {
             }),
         });
 
-        assert!(rendered.contains("Deployment applied successfully."));
-        assert!(rendered.contains("Endpoint: http://greentic.example.elb.amazonaws.com"));
-        assert!(
-            rendered.contains(
-                "Webchat: http://greentic.example.elb.amazonaws.com/v1/web/webchat/demo/"
-            )
+        assert_eq!(
+            rendered,
+            "http://greentic.example.elb.amazonaws.com/v1/web/webchat/demo/\n"
         );
         assert!(!rendered.contains("capability=apply"));
+    }
+
+    #[test]
+    fn render_operation_result_json_summarizes_apply_success_with_webchat_url() {
+        let rendered = render_operation_result(
+            &OperationResult {
+                capability: "apply".into(),
+                executed: true,
+                preview: false,
+                output_dir: "/tmp/deploy".into(),
+                plan_path: "/tmp/plan.json".into(),
+                invoke_path: "/tmp/invoke.json".into(),
+                pack_id: "greentic.deploy.aws".into(),
+                flow_id: "apply_terraform".into(),
+                handler_id: "pack.greentic.deploy.aws".into(),
+                pack_path: "/tmp/aws.gtpack".into(),
+                contract: None,
+                capability_contract: None,
+                payload: Some(OperationPayload::Apply(Box::new(ApplyPayload {
+                    capability: "apply".into(),
+                    provider: "aws".into(),
+                    strategy: "iac-only".into(),
+                    pack_id: "greentic.deploy.aws".into(),
+                    flow_id: "apply_terraform".into(),
+                    output_dir: "/tmp/deploy".into(),
+                    plan_path: "/tmp/plan.json".into(),
+                    invoke_path: "/tmp/invoke.json".into(),
+                    runner_cmd: vec![],
+                    runner_env: vec![("GREENTIC_TENANT".into(), "demo".into())],
+                }))),
+                output_validation: None,
+                execution: Some(ExecutionReport {
+                    output_dir: "/tmp/deploy".into(),
+                    plan_path: "/tmp/plan.json".into(),
+                    invoke_path: "/tmp/invoke.json".into(),
+                    handoff_path: "/tmp/handoff.json".into(),
+                    runner_command_path: "/tmp/runner.txt".into(),
+                    handler_id: "pack.greentic.deploy.aws".into(),
+                    status: Some("applied".into()),
+                    message: None,
+                    output_files: vec![],
+                    outcome_payload: Some(ExecutionOutcomePayload::Apply(
+                        crate::deployment::ApplyExecutionOutcome {
+                            deployment_id: "/tmp/deploy".into(),
+                            state: "applied".into(),
+                            provider: Some("aws".into()),
+                            strategy: Some("iac-only".into()),
+                            endpoints: vec!["http://greentic.example.elb.amazonaws.com".into()],
+                            output_refs: BTreeMap::new(),
+                        },
+                    )),
+                    outcome_validation: None,
+                }),
+            },
+            OutputFormat::Json,
+        )
+        .expect("render json");
+
+        assert_eq!(
+            rendered,
+            "{\n  \"webchat_url\": \"http://greentic.example.elb.amazonaws.com/v1/web/webchat/demo/\"\n}"
+        );
+        assert!(!rendered.contains("contract"));
     }
 
     #[test]
@@ -5245,6 +5675,7 @@ resource "google_cloud_run_v2_service" "this" {
             tenant: "acme".into(),
             environment: "staging".into(),
             pack_path: pack_path.clone(),
+            bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
             provider_pack: Some(pack_path.clone()),
@@ -5336,6 +5767,7 @@ resource "google_cloud_run_v2_service" "this" {
             tenant: "acme".into(),
             environment: "staging".into(),
             pack_path: pack_path.clone(),
+            bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
             provider_pack: Some(pack_path.clone()),

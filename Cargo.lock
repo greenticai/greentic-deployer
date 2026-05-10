@@ -289,6 +289,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-secretsmanager"
+version = "1.104.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "811bcb3da8bf26e571da7a248c0a93152bba9642aa4c8c907c58d949fa5f1d5c"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-signin"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1691,18 +1715,20 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "0.5.10"
+version = "0.5.11"
 dependencies = [
  "anyhow",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
+ "aws-sdk-secretsmanager",
  "aws-smithy-runtime-api",
  "chrono",
  "clap",
  "greentic-config",
  "greentic-config-types",
  "greentic-distributor-client",
+ "greentic-secrets-lib",
  "greentic-telemetry",
  "greentic-types",
  "hex",

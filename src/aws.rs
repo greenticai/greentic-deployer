@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(feature = "runtime-secrets-aws")]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
@@ -13,6 +15,10 @@ use crate::contract::DeployerCapability;
 use crate::error::{DeployerError, Result};
 use crate::multi_target;
 use crate::plan::PlanContext;
+use crate::runtime_secrets::{
+    PromoteRuntimeSecretsReport, ResolvedRuntimeSecret, default_cloud_secret_prefix,
+    resolve_for_cloud_apply,
+};
 
 /// Library-facing request for the explicit AWS adapter surface.
 #[derive(Debug, Clone)]
@@ -20,6 +26,7 @@ pub struct AwsRequest {
     pub capability: DeployerCapability,
     pub tenant: String,
     pub pack_path: PathBuf,
+    pub bundle_root: Option<PathBuf>,
     pub bundle_source: Option<String>,
     pub bundle_digest: Option<String>,
     pub repo_registry_base: Option<String>,
@@ -87,6 +94,7 @@ impl AwsRequest {
             capability,
             tenant: tenant.into(),
             pack_path,
+            bundle_root: None,
             bundle_source: None,
             bundle_digest: None,
             repo_registry_base: None,
@@ -119,6 +127,7 @@ impl AwsRequest {
             tenant: self.tenant,
             environment: self.environment,
             pack_path: self.pack_path,
+            bundle_root: self.bundle_root,
             bundle_source: self.bundle_source,
             bundle_digest: self.bundle_digest,
             repo_registry_base: self.repo_registry_base,
@@ -172,6 +181,7 @@ fn build_aws_request_from_ext(
         pack_path: pack_path
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default(),
+        bundle_root: None,
         bundle_source: Some(cfg.bundle_source.clone()),
         bundle_digest: Some(cfg.bundle_digest.clone()),
         repo_registry_base: cfg.repo_registry_base.clone(),
@@ -244,6 +254,7 @@ pub async fn run(request: AwsRequest) -> Result<multi_target::OperationResult> {
 
 pub async fn run_config(config: DeployerConfig) -> Result<multi_target::OperationResult> {
     ensure_aws_config(&config)?;
+    promote_runtime_secrets_for_apply(&config).await?;
     multi_target::run(config).await
 }
 
@@ -260,7 +271,222 @@ pub async fn run_config_with_plan(
     plan: PlanContext,
 ) -> Result<multi_target::OperationResult> {
     ensure_aws_config(&config)?;
+    promote_runtime_secrets_for_apply(&config).await?;
     multi_target::run_with_plan(config, plan).await
+}
+
+async fn promote_runtime_secrets_for_apply(config: &DeployerConfig) -> Result<()> {
+    let Some(resolution) = resolve_for_cloud_apply(config).await? else {
+        return Ok(());
+    };
+    let prefix = default_cloud_secret_prefix(&config.environment, &config.tenant, None);
+    promote_to_aws_secrets_manager(
+        &resolution.resolved,
+        &prefix,
+        config.bundle_digest.as_deref(),
+        &config.environment,
+        &config.tenant,
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+#[cfg(feature = "runtime-secrets-aws")]
+async fn promote_to_aws_secrets_manager(
+    resolved: &[ResolvedRuntimeSecret],
+    prefix: &str,
+    bundle_digest: Option<&str>,
+    environment: &str,
+    tenant: &str,
+    team: Option<&str>,
+) -> Result<PromoteRuntimeSecretsReport> {
+    let region = aws_runtime_secrets_region();
+    let mut report = PromoteRuntimeSecretsReport::default();
+
+    for secret in resolved {
+        let remote_name = crate::runtime_secrets::cloud_secret_name(
+            prefix,
+            &secret.requirement.provider_id,
+            &secret.requirement.key,
+        );
+        put_aws_secret_with_cli(
+            secret,
+            &remote_name,
+            bundle_digest,
+            environment,
+            tenant,
+            team.unwrap_or("_"),
+            &region,
+        )?;
+        report
+            .promoted
+            .push(crate::runtime_secrets::PromotedRuntimeSecret {
+                uri: secret.requirement.uri.clone(),
+                remote_name,
+            });
+    }
+
+    Ok(report)
+}
+
+#[cfg(feature = "runtime-secrets-aws")]
+fn aws_runtime_secrets_region() -> String {
+    std::env::var("AWS_REGION")
+        .ok()
+        .filter(|region| !region.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AWS_DEFAULT_REGION")
+                .ok()
+                .filter(|region| !region.trim().is_empty())
+        })
+        .or_else(aws_cli_config_region)
+        .unwrap_or_else(|| "eu-north-1".to_string())
+}
+
+#[cfg(feature = "runtime-secrets-aws")]
+fn aws_cli_config_region() -> Option<String> {
+    let output = ProcessCommand::new("aws")
+        .args(["configure", "get", "region"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let region = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!region.is_empty()).then_some(region)
+}
+
+#[cfg(not(feature = "runtime-secrets-aws"))]
+async fn promote_to_aws_secrets_manager(
+    _resolved: &[ResolvedRuntimeSecret],
+    _prefix: &str,
+    _bundle_digest: Option<&str>,
+    _environment: &str,
+    _tenant: &str,
+    _team: Option<&str>,
+) -> Result<PromoteRuntimeSecretsReport> {
+    Err(DeployerError::Config(
+        "AWS runtime secret promotion is not enabled".to_string(),
+    ))
+}
+
+#[cfg(feature = "runtime-secrets-aws")]
+fn put_aws_secret_with_cli(
+    secret: &ResolvedRuntimeSecret,
+    remote_name: &str,
+    bundle_digest: Option<&str>,
+    environment: &str,
+    tenant: &str,
+    team: &str,
+    region: &str,
+) -> Result<()> {
+    let mut temp = tempfile::NamedTempFile::new()
+        .map_err(|err| DeployerError::Other(format!("create temporary secret file: {err}")))?;
+    temp.write_all(secret.value.expose().as_bytes())?;
+    temp.flush()?;
+    let secret_file = format!(
+        "file://{}",
+        temp.path().to_str().ok_or_else(|| {
+            DeployerError::Other("temporary secret path is not UTF-8".to_string())
+        })?
+    );
+
+    let mut create = ProcessCommand::new("aws");
+    create.args([
+        "secretsmanager",
+        "create-secret",
+        "--region",
+        region,
+        "--name",
+        remote_name,
+        "--secret-string",
+        &secret_file,
+    ]);
+    for (key, value) in aws_secret_tags(
+        &secret.requirement.uri,
+        bundle_digest,
+        environment,
+        tenant,
+        team,
+    ) {
+        create.arg("--tags").arg(format!("Key={key},Value={value}"));
+    }
+
+    let create = create
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| {
+            DeployerError::Other(format!("run aws secretsmanager create-secret: {err}"))
+        })?;
+    if create.status.success() {
+        return Ok(());
+    }
+
+    let create_stderr = String::from_utf8_lossy(&create.stderr);
+    if !create_stderr.contains("ResourceExistsException") {
+        return Err(DeployerError::Other(format!(
+            "create AWS Secrets Manager secret {remote_name}: {}",
+            create_stderr.trim()
+        )));
+    }
+
+    #[cfg(feature = "runtime-secrets-aws")]
+    let update = ProcessCommand::new("aws")
+        .args([
+            "secretsmanager",
+            "put-secret-value",
+            "--region",
+            region,
+            "--secret-id",
+            remote_name,
+            "--secret-string",
+            &secret_file,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| {
+            DeployerError::Other(format!("run aws secretsmanager put-secret-value: {err}"))
+        })?;
+    if update.status.success() {
+        Ok(())
+    } else {
+        Err(DeployerError::Other(format!(
+            "update AWS Secrets Manager secret {remote_name}: {}",
+            String::from_utf8_lossy(&update.stderr).trim()
+        )))
+    }
+}
+
+#[cfg(feature = "runtime-secrets-aws")]
+fn aws_secret_tags(
+    secret_uri: &str,
+    bundle_digest: Option<&str>,
+    environment: &str,
+    tenant: &str,
+    team: &str,
+) -> Vec<(String, String)> {
+    let mut tags = vec![
+        (
+            "greentic:managed-by".to_string(),
+            "greentic-deployer".to_string(),
+        ),
+        ("greentic:provider".to_string(), "aws".to_string()),
+        (
+            "greentic:secret-manager".to_string(),
+            "aws-secrets-manager".to_string(),
+        ),
+        ("greentic:environment".to_string(), environment.to_string()),
+        ("greentic:tenant".to_string(), tenant.to_string()),
+        ("greentic:team".to_string(), team.to_string()),
+        ("greentic:secret-uri".to_string(), secret_uri.to_string()),
+    ];
+    if let Some(digest) = bundle_digest {
+        tags.push(("greentic:bundle-digest".to_string(), digest.to_string()));
+    }
+    tags
 }
 
 pub fn run_admin_tunnel(args: AwsAdminTunnelRequest) -> Result<()> {

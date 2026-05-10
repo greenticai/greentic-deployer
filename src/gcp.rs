@@ -1,10 +1,16 @@
+use std::io::Write;
 use std::path::PathBuf;
+use std::process::{Command as ProcessCommand, Stdio};
 
 use crate::config::{DeployerConfig, DeployerRequest, OutputFormat, Provider};
 use crate::contract::DeployerCapability;
 use crate::error::{DeployerError, Result};
 use crate::multi_target;
 use crate::plan::PlanContext;
+use crate::runtime_secrets::{
+    PromoteRuntimeSecretsReport, ResolvedRuntimeSecret, default_cloud_secret_prefix,
+    flat_cloud_secret_name, resolve_for_cloud_apply,
+};
 
 /// Library-facing request for the explicit GCP adapter surface.
 #[derive(Debug, Clone)]
@@ -12,6 +18,7 @@ pub struct GcpRequest {
     pub capability: DeployerCapability,
     pub tenant: String,
     pub pack_path: PathBuf,
+    pub bundle_root: Option<PathBuf>,
     pub bundle_source: Option<String>,
     pub bundle_digest: Option<String>,
     pub repo_registry_base: Option<String>,
@@ -45,6 +52,7 @@ impl GcpRequest {
             capability,
             tenant: tenant.into(),
             pack_path,
+            bundle_root: None,
             bundle_source: None,
             bundle_digest: None,
             repo_registry_base: None,
@@ -77,6 +85,7 @@ impl GcpRequest {
             tenant: self.tenant,
             environment: self.environment,
             pack_path: self.pack_path,
+            bundle_root: self.bundle_root,
             bundle_source: self.bundle_source,
             bundle_digest: self.bundle_digest,
             repo_registry_base: self.repo_registry_base,
@@ -157,6 +166,7 @@ fn build_gcp_request_from_ext(
         pack_path: pack_path
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default(),
+        bundle_root: None,
         bundle_source: Some(cfg.bundle_source.clone()),
         bundle_digest: Some(cfg.bundle_digest.clone()),
         repo_registry_base: cfg.repo_registry_base.clone(),
@@ -231,6 +241,7 @@ pub async fn run(request: GcpRequest) -> Result<multi_target::OperationResult> {
 
 pub async fn run_config(config: DeployerConfig) -> Result<multi_target::OperationResult> {
     ensure_gcp_config(&config)?;
+    promote_runtime_secrets_for_apply(&config).await?;
     multi_target::run(config).await
 }
 
@@ -247,7 +258,133 @@ pub async fn run_config_with_plan(
     plan: PlanContext,
 ) -> Result<multi_target::OperationResult> {
     ensure_gcp_config(&config)?;
+    promote_runtime_secrets_for_apply(&config).await?;
     multi_target::run_with_plan(config, plan).await
+}
+
+async fn promote_runtime_secrets_for_apply(config: &DeployerConfig) -> Result<()> {
+    let Some(resolution) = resolve_for_cloud_apply(config).await? else {
+        return Ok(());
+    };
+    let project_id = gcp_project_id()?;
+    let prefix = default_cloud_secret_prefix(&config.environment, &config.tenant, None);
+    promote_to_gcp_secret_manager(&resolution.resolved, &project_id, &prefix).await?;
+    Ok(())
+}
+
+async fn promote_to_gcp_secret_manager(
+    resolved: &[ResolvedRuntimeSecret],
+    project_id: &str,
+    prefix: &str,
+) -> Result<PromoteRuntimeSecretsReport> {
+    let mut report = PromoteRuntimeSecretsReport::default();
+    for secret in resolved {
+        let remote_name = flat_cloud_secret_name(
+            prefix,
+            &secret.requirement.provider_id,
+            &secret.requirement.key,
+            255,
+        );
+        ensure_gcp_secret(project_id, &remote_name)?;
+        add_gcp_secret_version(project_id, &remote_name, secret.value.expose())?;
+        report
+            .promoted
+            .push(crate::runtime_secrets::PromotedRuntimeSecret {
+                uri: secret.requirement.uri.clone(),
+                remote_name,
+            });
+    }
+    Ok(report)
+}
+
+fn gcp_project_id() -> Result<String> {
+    std::env::var("GREENTIC_DEPLOY_TERRAFORM_VAR_GCP_PROJECT_ID")
+        .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
+        .or_else(|_| std::env::var("GCLOUD_PROJECT"))
+        .map(|value| value.trim().to_string())
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            DeployerError::Config(
+                "GCP runtime secret promotion requires GREENTIC_DEPLOY_TERRAFORM_VAR_GCP_PROJECT_ID, GOOGLE_CLOUD_PROJECT, or GCLOUD_PROJECT"
+                    .to_string(),
+            )
+        })
+}
+
+fn ensure_gcp_secret(project_id: &str, secret_name: &str) -> Result<()> {
+    let status = ProcessCommand::new("gcloud")
+        .args([
+            "secrets",
+            "create",
+            secret_name,
+            "--project",
+            project_id,
+            "--replication-policy",
+            "automatic",
+            "--quiet",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .map_err(|err| DeployerError::Other(format!("run gcloud secrets create: {err}")))?;
+    if status.success() {
+        return Ok(());
+    }
+
+    let describe = ProcessCommand::new("gcloud")
+        .args([
+            "secrets",
+            "describe",
+            secret_name,
+            "--project",
+            project_id,
+            "--quiet",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|err| DeployerError::Other(format!("run gcloud secrets describe: {err}")))?;
+    if describe.success() {
+        Ok(())
+    } else {
+        Err(DeployerError::Other(format!(
+            "create GCP Secret Manager secret {secret_name} failed"
+        )))
+    }
+}
+
+fn add_gcp_secret_version(project_id: &str, secret_name: &str, value: &str) -> Result<()> {
+    let mut child = ProcessCommand::new("gcloud")
+        .args([
+            "secrets",
+            "versions",
+            "add",
+            secret_name,
+            "--project",
+            project_id,
+            "--data-file",
+            "-",
+            "--quiet",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| DeployerError::Other(format!("run gcloud secrets versions add: {err}")))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(value.as_bytes())?;
+    }
+    let output = child.wait_with_output().map_err(|err| {
+        DeployerError::Other(format!("wait for gcloud secrets versions add: {err}"))
+    })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(DeployerError::Other(format!(
+            "add GCP Secret Manager version for {secret_name} failed"
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -262,6 +399,20 @@ mod tests {
         assert_eq!(request.provider, Provider::Gcp);
         assert_eq!(request.strategy, "iac-only");
         assert_eq!(request.tenant, "acme");
+    }
+
+    #[test]
+    fn gcp_secret_names_are_flat_and_bounded() {
+        let name = flat_cloud_secret_name(
+            "greentic/dev/demo/_",
+            "messaging-telegram",
+            "TELEGRAM_BOT_TOKEN",
+            255,
+        );
+        assert_eq!(
+            name,
+            "greentic-dev-demo-messaging-telegram-telegram-bot-token"
+        );
     }
 
     #[test]
