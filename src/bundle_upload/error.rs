@@ -29,6 +29,7 @@ impl std::fmt::Display for AwsCredentialsRefreshHelp {
     }
 }
 
+#[cfg(feature = "bundle-upload-aws")]
 pub static AWS_CREDENTIALS_REFRESH_HELP: AwsCredentialsRefreshHelp = AwsCredentialsRefreshHelp {
     configure_command: "aws configure",
     session_token_check_command: "aws configure get aws_session_token",
