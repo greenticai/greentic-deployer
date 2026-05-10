@@ -28,6 +28,8 @@ fn main() -> Result<()> {
         bail!("no fixture packs found under {}", fixtures_root.display());
     }
 
+    ensure_replayed_scaffolds(&root, &scaffold_root, &fixture_dirs)?;
+
     for fixture_dir in fixture_dirs {
         let fixture_name = fixture_dir
             .file_name()
@@ -54,6 +56,35 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn ensure_replayed_scaffolds(
+    root: &Path,
+    scaffold_root: &Path,
+    fixture_dirs: &[PathBuf],
+) -> Result<()> {
+    let missing_any = fixture_dirs.iter().any(|fixture_dir| {
+        let Some(fixture_name) = fixture_dir.file_name() else {
+            return true;
+        };
+        !scaffold_root.join(fixture_name).join("pack.yaml").is_file()
+    });
+    if !missing_any {
+        return Ok(());
+    }
+
+    run_command(
+        "cargo",
+        &[
+            "run",
+            "--features",
+            "internal-tools",
+            "--bin",
+            "replay_deployer_scaffolds",
+        ],
+        Some(root),
+    )
+    .context("replay deployer scaffolds before building fixture gtpacks")
+}
+
 fn build_fixture_gtpack(pack_root: &Path, output_path: &Path) -> Result<()> {
     ensure!(
         pack_root.join("pack.yaml").is_file(),
@@ -64,6 +95,7 @@ fn build_fixture_gtpack(pack_root: &Path, output_path: &Path) -> Result<()> {
     run_command(
         "greentic-pack",
         &["build", "--in", pack_root.to_str().unwrap()],
+        None,
     )?;
 
     let fixture_name = pack_root
@@ -129,11 +161,15 @@ fn load_contract(fixture_dir: &Path) -> Result<DeployerContractV1> {
     serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
 }
 
-fn run_command(program: &str, args: &[&str]) -> Result<()> {
+fn run_command(program: &str, args: &[&str], current_dir: Option<&Path>) -> Result<()> {
     // Accepted risk: callers pass fixed tool names from this maintenance binary, and no shell is used.
     // foxguard: ignore[rs/no-command-injection]
-    let output = Command::new(program)
-        .args(args)
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
+    }
+    let output = command
         .output()
         .with_context(|| format!("run {} {}", program, args.join(" ")))?;
     if output.status.success() {

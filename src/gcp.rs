@@ -402,6 +402,113 @@ mod tests {
     }
 
     #[test]
+    fn gcp_request_preserves_all_passthrough_fields() {
+        let mut request =
+            GcpRequest::new(DeployerCapability::Apply, "acme", PathBuf::from("pack-dir"));
+        request.bundle_root = Some(PathBuf::from("bundle-root"));
+        request.bundle_source = Some("gs://bucket/bundle.gtbundle".into());
+        request.bundle_digest = Some("sha256:abc".into());
+        request.repo_registry_base = Some("https://repo.example".into());
+        request.store_registry_base = Some("https://store.example".into());
+        request.provider_pack = Some(PathBuf::from("providers/deployer/gcp.gtpack"));
+        request.deploy_pack_id_override = Some("greentic.deploy.gcp".into());
+        request.deploy_flow_id_override = Some("apply_terraform".into());
+        request.environment = Some("prod".into());
+        request.pack_id = Some("pack-id".into());
+        request.pack_version = Some("1.2.3".into());
+        request.pack_digest = Some("sha256:def".into());
+        request.distributor_url = Some("https://dist.example".into());
+        request.distributor_token = Some("token".into());
+        request.preview = true;
+        request.dry_run = true;
+        request.execute_local = true;
+        request.output = OutputFormat::Yaml;
+        request.config_path = Some(PathBuf::from("greentic.toml"));
+        request.allow_remote_in_offline = true;
+        request.providers_dir = PathBuf::from("providers");
+        request.packs_dir = PathBuf::from("packs-dir");
+
+        let deployer = request.into_deployer_request();
+
+        assert_eq!(deployer.capability, DeployerCapability::Apply);
+        assert_eq!(deployer.provider, Provider::Gcp);
+        assert_eq!(
+            deployer.bundle_root.as_deref(),
+            Some(std::path::Path::new("bundle-root"))
+        );
+        assert_eq!(
+            deployer.bundle_source.as_deref(),
+            Some("gs://bucket/bundle.gtbundle")
+        );
+        assert_eq!(deployer.bundle_digest.as_deref(), Some("sha256:abc"));
+        assert_eq!(
+            deployer.repo_registry_base.as_deref(),
+            Some("https://repo.example")
+        );
+        assert_eq!(
+            deployer.store_registry_base.as_deref(),
+            Some("https://store.example")
+        );
+        assert_eq!(
+            deployer.provider_pack.as_deref(),
+            Some(std::path::Path::new("providers/deployer/gcp.gtpack"))
+        );
+        assert_eq!(
+            deployer.deploy_pack_id_override.as_deref(),
+            Some("greentic.deploy.gcp")
+        );
+        assert_eq!(
+            deployer.deploy_flow_id_override.as_deref(),
+            Some("apply_terraform")
+        );
+        assert_eq!(deployer.environment.as_deref(), Some("prod"));
+        assert_eq!(deployer.pack_id.as_deref(), Some("pack-id"));
+        assert_eq!(deployer.pack_version.as_deref(), Some("1.2.3"));
+        assert_eq!(deployer.pack_digest.as_deref(), Some("sha256:def"));
+        assert_eq!(
+            deployer.distributor_url.as_deref(),
+            Some("https://dist.example")
+        );
+        assert_eq!(deployer.distributor_token.as_deref(), Some("token"));
+        assert!(deployer.preview);
+        assert!(deployer.dry_run);
+        assert!(deployer.execute_local);
+        assert_eq!(deployer.output, OutputFormat::Yaml);
+        assert_eq!(
+            deployer.config_path.as_deref(),
+            Some(std::path::Path::new("greentic.toml"))
+        );
+        assert!(deployer.allow_remote_in_offline);
+        assert_eq!(deployer.providers_dir, PathBuf::from("providers"));
+        assert_eq!(deployer.packs_dir, PathBuf::from("packs-dir"));
+    }
+
+    #[test]
+    fn ensure_gcp_config_rejects_non_gcp_provider() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut request = GcpRequest::new(DeployerCapability::Plan, "acme", tmp.path().into())
+            .into_deployer_request();
+        request.provider = Provider::Aws;
+        let config = DeployerConfig::resolve(request).expect("resolve config");
+
+        let err = ensure_gcp_config(&config).expect_err("non-gcp config should fail");
+        assert!(
+            err.to_string().contains("provider=aws strategy=iac-only"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn ensure_gcp_config_accepts_gcp_iac_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let request = GcpRequest::new(DeployerCapability::Plan, "acme", tmp.path().into())
+            .into_deployer_request();
+        let config = DeployerConfig::resolve(request).expect("resolve config");
+
+        ensure_gcp_config(&config).expect("gcp config");
+    }
+
+    #[test]
     fn gcp_secret_names_are_flat_and_bounded() {
         let name = flat_cloud_secret_name(
             "greentic/dev/demo/_",
@@ -459,6 +566,50 @@ mod tests {
             Some("https://api.example.com")
         );
         assert_eq!(cfg.tenant, "acme");
+    }
+
+    #[test]
+    fn build_gcp_request_from_ext_maps_cloud_bundle_fields() {
+        let cfg = GcpCloudRunExtConfig {
+            project_id: "project-123".to_string(),
+            region: "europe-west1".to_string(),
+            environment: "prod".to_string(),
+            operator_image_digest: "sha256:0000".to_string(),
+            bundle_source: "oci://registry.example/acme/prod".to_string(),
+            bundle_digest: "sha256:1111".to_string(),
+            remote_state_backend: "gs://state/greentic/prod".to_string(),
+            dns_name: Some("api.example.com".to_string()),
+            public_base_url: Some("https://api.example.com".to_string()),
+            repo_registry_base: Some("https://repo.example.com".to_string()),
+            store_registry_base: Some("https://store.example.com".to_string()),
+            admin_allowed_clients: Some("CN=admin".to_string()),
+            tenant: "acme".to_string(),
+        };
+
+        let request = build_gcp_request_from_ext(
+            DeployerCapability::Destroy,
+            &cfg,
+            Some(std::path::Path::new("pack")),
+        );
+
+        assert_eq!(request.capability, DeployerCapability::Destroy);
+        assert_eq!(request.tenant, "acme");
+        assert_eq!(request.pack_path, PathBuf::from("pack"));
+        assert_eq!(
+            request.bundle_source.as_deref(),
+            Some("oci://registry.example/acme/prod")
+        );
+        assert_eq!(request.bundle_digest.as_deref(), Some("sha256:1111"));
+        assert_eq!(
+            request.repo_registry_base.as_deref(),
+            Some("https://repo.example.com")
+        );
+        assert_eq!(
+            request.store_registry_base.as_deref(),
+            Some("https://store.example.com")
+        );
+        assert_eq!(request.environment.as_deref(), Some("prod"));
+        assert!(request.execute_local);
     }
 
     #[test]
