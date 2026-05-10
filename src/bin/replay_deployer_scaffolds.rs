@@ -23,11 +23,10 @@ fn main() -> Result<()> {
         .filter(|tool| !command_available(tool))
         .collect::<Vec<_>>();
     if !missing_tools.is_empty() {
-        eprintln!(
-            "skipping replay_deployer_scaffolds: missing external tool(s): {}",
+        bail!(
+            "missing external tool(s): {}; install them with `cargo binstall --no-confirm greentic-pack@0.5.6 greentic-flow@0.5.8`",
             missing_tools.join(", ")
         );
-        return Ok(());
     }
 
     let output_root = root.join("target/replayed-pack-scaffolds");
