@@ -43,13 +43,17 @@ jobs:
         run: |
           cargo binstall -y cargo-llvm-cov
           cargo binstall -y cargo-nextest
+
+      - name: Install greentic-dev
+        run: |
           cargo binstall -y greentic-dev
+          "$HOME/.cargo/bin/greentic-dev" --version
 
       - name: Install llvm-tools-preview
         run: rustup component add llvm-tools-preview
 
       - name: Validate coverage policy
-        run: greentic-dev coverage
+        run: "$HOME/.cargo/bin/greentic-dev" coverage
 
       - name: Upload coverage report
         if: always()

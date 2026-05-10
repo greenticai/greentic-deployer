@@ -49,7 +49,7 @@ serde_yaml_bw = {package="serde_yaml_gtc", version="2.5.2"}
 semver = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
-aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["rustls", "rt-tokio"] }
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-config = { version = "1", optional = true, default-features = false, features = ["rustls", "rt-tokio"] }
 aws-smithy-runtime-api = { version = "1", optional = true }
 sha2 = "0.10"
