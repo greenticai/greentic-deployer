@@ -46,15 +46,16 @@ jobs:
 
       - name: Install greentic-dev
         run: |
-          cargo binstall -y greentic-dev
-          "$HOME/.cargo/bin/greentic-dev" --version
+          cargo binstall -y --force greentic-dev
+          command -v greentic-dev
+          greentic-dev --version
 
       - name: Install llvm-tools-preview
         run: rustup component add llvm-tools-preview
 
       - name: Validate coverage policy
         run: |
-          "$HOME/.cargo/bin/greentic-dev" coverage
+          greentic-dev coverage
 
       - name: Upload coverage report
         if: always()
