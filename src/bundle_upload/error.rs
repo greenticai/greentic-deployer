@@ -1,5 +1,46 @@
 use thiserror::Error;
 
+#[derive(Debug)]
+pub struct AwsCredentialsRefreshHelp {
+    pub configure_command: &'static str,
+    pub session_token_check_command: &'static str,
+    pub session_token_unset_command: &'static str,
+    pub sso_login_command: &'static str,
+    pub profile_env_command: &'static str,
+    pub profile_configure_command: &'static str,
+    pub profile_sso_login_command: &'static str,
+    pub verify_command: &'static str,
+}
+
+impl std::fmt::Display for AwsCredentialsRefreshHelp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "If you use access keys, configure or refresh them:\n  {}\n\nIf access keys are configured but AWS still reports an expired token, check for a stale session token:\n  {}\n  {}\n\nIf you use AWS SSO, reauthenticate:\n  {}\n\nIf you use a named profile:\n  {}\n  {}\n  {}\n\nVerify the same credentials with:\n  {}",
+            self.configure_command,
+            self.session_token_check_command,
+            self.session_token_unset_command,
+            self.sso_login_command,
+            self.profile_env_command,
+            self.profile_configure_command,
+            self.profile_sso_login_command,
+            self.verify_command
+        )
+    }
+}
+
+#[cfg(feature = "bundle-upload-aws")]
+pub static AWS_CREDENTIALS_REFRESH_HELP: AwsCredentialsRefreshHelp = AwsCredentialsRefreshHelp {
+    configure_command: "aws configure",
+    session_token_check_command: "aws configure get aws_session_token",
+    session_token_unset_command: "unset AWS_SESSION_TOKEN AWS_SECURITY_TOKEN",
+    sso_login_command: "aws sso login",
+    profile_env_command: "export AWS_PROFILE=<profile>",
+    profile_configure_command: "aws configure --profile <profile>",
+    profile_sso_login_command: "aws sso login --profile <profile>",
+    verify_command: "aws sts get-caller-identity",
+};
+
 #[derive(Debug, Error)]
 pub enum BundleUploadError {
     #[error(
@@ -36,6 +77,12 @@ pub enum BundleUploadError {
     )]
     CredentialsUnresolved,
 
+    #[error("AWS credentials need to be refreshed while {action}.\n\n{help}")]
+    AwsCredentialsRefreshRequired {
+        action: String,
+        help: &'static AwsCredentialsRefreshHelp,
+    },
+
     #[error("digest mismatch: expected {expected}, computed {actual}")]
     DigestMismatch { expected: String, actual: String },
 
@@ -44,6 +91,29 @@ pub enum BundleUploadError {
 
     #[error("{0}")]
     Other(String),
+}
+
+impl BundleUploadError {
+    pub fn message_key(&self) -> &'static str {
+        match self {
+            Self::InvalidUrl(_) => "bundle_upload.invalid_url",
+            Self::FeatureNotEnabled { .. } => "bundle_upload.feature_not_enabled",
+            Self::BucketAlreadyExistsInOtherAccount(_) => {
+                "bundle_upload.s3.bucket_already_exists_in_other_account"
+            }
+            Self::AccessDenied { .. } => "bundle_upload.access_denied",
+            Self::ObjectMissing(_) => "bundle_upload.object_missing",
+            Self::WarmupFailed { .. } => "bundle_upload.warmup_failed",
+            Self::NetworkTransient(_) => "bundle_upload.network_transient",
+            Self::CredentialsUnresolved => "bundle_upload.aws.credentials_unresolved",
+            Self::AwsCredentialsRefreshRequired { .. } => {
+                "bundle_upload.aws.credentials_refresh_required"
+            }
+            Self::DigestMismatch { .. } => "bundle_upload.digest_mismatch",
+            Self::Io(_) => "bundle_upload.io",
+            Self::Other(_) => "bundle_upload.other",
+        }
+    }
 }
 
 pub type BundleUploadResult<T> = std::result::Result<T, BundleUploadError>;
