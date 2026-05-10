@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::error::{BundleUploadError, BundleUploadResult};
+use super::error::{AWS_CREDENTIALS_REFRESH_HELP, BundleUploadError, BundleUploadResult};
 use super::types::{UploadOptions, UploadedBundle};
 use super::uploader::BundleUploader;
 
@@ -60,10 +60,10 @@ impl S3Uploader {
 
     async fn s3_client(&self) -> BundleUploadResult<aws_sdk_s3::Client> {
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
-        if !env_has_explicit_aws_access_key() {
-            if let Some(credentials) = load_shared_file_static_credentials() {
-                loader = loader.credentials_provider(credentials);
-            }
+        if !env_has_explicit_aws_access_key()
+            && let Some(credentials) = load_shared_file_static_credentials()
+        {
+            loader = loader.credentials_provider(credentials);
         }
         let config = loader.load().await;
         if config.credentials_provider().is_none() {
@@ -89,14 +89,7 @@ impl S3Uploader {
         if is_aws_credentials_refresh_required(&detail) {
             BundleUploadError::AwsCredentialsRefreshRequired {
                 action: action.to_string(),
-                configure_command: "aws configure",
-                session_token_check_command: "aws configure get aws_session_token",
-                session_token_unset_command: "unset AWS_SESSION_TOKEN AWS_SECURITY_TOKEN",
-                sso_login_command: "aws sso login",
-                profile_env_command: "export AWS_PROFILE=<profile>",
-                profile_configure_command: "aws configure --profile <profile>",
-                profile_sso_login_command: "aws sso login --profile <profile>",
-                verify_command: "aws sts get-caller-identity",
+                help: &AWS_CREDENTIALS_REFRESH_HELP,
             }
         } else {
             BundleUploadError::Other(format!("{action}: {detail}"))
@@ -445,10 +438,10 @@ fn selected_aws_profile() -> String {
 }
 
 fn shared_credentials_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("AWS_SHARED_CREDENTIALS_FILE") {
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
-        }
+    if let Some(path) = std::env::var_os("AWS_SHARED_CREDENTIALS_FILE")
+        && !path.is_empty()
+    {
+        return Some(PathBuf::from(path));
     }
     std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
@@ -608,50 +601,30 @@ mod tests {
             "ProviderError RefreshFailed AccessDeniedException TokenExpired The refresh token has expired",
         );
         match err {
-            BundleUploadError::AwsCredentialsRefreshRequired {
-                action,
-                configure_command,
-                session_token_check_command,
-                session_token_unset_command,
-                sso_login_command,
-                profile_env_command,
-                profile_configure_command,
-                profile_sso_login_command,
-                verify_command,
-            } => {
+            BundleUploadError::AwsCredentialsRefreshRequired { action, help } => {
                 assert_eq!(action, "checking S3 bucket demo");
-                assert_eq!(configure_command, "aws configure");
+                assert_eq!(help.configure_command, "aws configure");
                 assert_eq!(
-                    session_token_check_command,
+                    help.session_token_check_command,
                     "aws configure get aws_session_token"
                 );
                 assert_eq!(
-                    session_token_unset_command,
+                    help.session_token_unset_command,
                     "unset AWS_SESSION_TOKEN AWS_SECURITY_TOKEN"
                 );
-                assert_eq!(sso_login_command, "aws sso login");
-                assert_eq!(profile_env_command, "export AWS_PROFILE=<profile>");
+                assert_eq!(help.sso_login_command, "aws sso login");
+                assert_eq!(help.profile_env_command, "export AWS_PROFILE=<profile>");
                 assert_eq!(
-                    profile_configure_command,
+                    help.profile_configure_command,
                     "aws configure --profile <profile>"
                 );
                 assert_eq!(
-                    profile_sso_login_command,
+                    help.profile_sso_login_command,
                     "aws sso login --profile <profile>"
                 );
-                assert_eq!(verify_command, "aws sts get-caller-identity");
-                let rendered = BundleUploadError::AwsCredentialsRefreshRequired {
-                    action,
-                    configure_command,
-                    session_token_check_command,
-                    session_token_unset_command,
-                    sso_login_command,
-                    profile_env_command,
-                    profile_configure_command,
-                    profile_sso_login_command,
-                    verify_command,
-                }
-                .to_string();
+                assert_eq!(help.verify_command, "aws sts get-caller-identity");
+                let rendered =
+                    BundleUploadError::AwsCredentialsRefreshRequired { action, help }.to_string();
                 assert!(rendered.contains("AWS credentials need to be refreshed"));
                 assert!(rendered.contains("aws configure"));
                 assert!(rendered.contains("aws configure get aws_session_token"));

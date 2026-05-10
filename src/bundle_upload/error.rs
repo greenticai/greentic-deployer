@@ -1,5 +1,45 @@
 use thiserror::Error;
 
+#[derive(Debug)]
+pub struct AwsCredentialsRefreshHelp {
+    pub configure_command: &'static str,
+    pub session_token_check_command: &'static str,
+    pub session_token_unset_command: &'static str,
+    pub sso_login_command: &'static str,
+    pub profile_env_command: &'static str,
+    pub profile_configure_command: &'static str,
+    pub profile_sso_login_command: &'static str,
+    pub verify_command: &'static str,
+}
+
+impl std::fmt::Display for AwsCredentialsRefreshHelp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "If you use access keys, configure or refresh them:\n  {}\n\nIf access keys are configured but AWS still reports an expired token, check for a stale session token:\n  {}\n  {}\n\nIf you use AWS SSO, reauthenticate:\n  {}\n\nIf you use a named profile:\n  {}\n  {}\n  {}\n\nVerify the same credentials with:\n  {}",
+            self.configure_command,
+            self.session_token_check_command,
+            self.session_token_unset_command,
+            self.sso_login_command,
+            self.profile_env_command,
+            self.profile_configure_command,
+            self.profile_sso_login_command,
+            self.verify_command
+        )
+    }
+}
+
+pub static AWS_CREDENTIALS_REFRESH_HELP: AwsCredentialsRefreshHelp = AwsCredentialsRefreshHelp {
+    configure_command: "aws configure",
+    session_token_check_command: "aws configure get aws_session_token",
+    session_token_unset_command: "unset AWS_SESSION_TOKEN AWS_SECURITY_TOKEN",
+    sso_login_command: "aws sso login",
+    profile_env_command: "export AWS_PROFILE=<profile>",
+    profile_configure_command: "aws configure --profile <profile>",
+    profile_sso_login_command: "aws sso login --profile <profile>",
+    verify_command: "aws sts get-caller-identity",
+};
+
 #[derive(Debug, Error)]
 pub enum BundleUploadError {
     #[error(
@@ -36,19 +76,10 @@ pub enum BundleUploadError {
     )]
     CredentialsUnresolved,
 
-    #[error(
-        "AWS credentials need to be refreshed while {action}.\n\nIf you use access keys, configure or refresh them:\n  {configure_command}\n\nIf access keys are configured but AWS still reports an expired token, check for a stale session token:\n  {session_token_check_command}\n  {session_token_unset_command}\n\nIf you use AWS SSO, reauthenticate:\n  {sso_login_command}\n\nIf you use a named profile:\n  {profile_env_command}\n  {profile_configure_command}\n  {profile_sso_login_command}\n\nVerify the same credentials with:\n  {verify_command}"
-    )]
+    #[error("AWS credentials need to be refreshed while {action}.\n\n{help}")]
     AwsCredentialsRefreshRequired {
         action: String,
-        configure_command: &'static str,
-        session_token_check_command: &'static str,
-        session_token_unset_command: &'static str,
-        sso_login_command: &'static str,
-        profile_env_command: &'static str,
-        profile_configure_command: &'static str,
-        profile_sso_login_command: &'static str,
-        verify_command: &'static str,
+        help: &'static AwsCredentialsRefreshHelp,
     },
 
     #[error("digest mismatch: expected {expected}, computed {actual}")]
