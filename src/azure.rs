@@ -1,10 +1,16 @@
+use std::io::Write;
 use std::path::PathBuf;
+use std::process::{Command as ProcessCommand, Stdio};
 
 use crate::config::{DeployerConfig, DeployerRequest, OutputFormat, Provider};
 use crate::contract::DeployerCapability;
 use crate::error::{DeployerError, Result};
 use crate::multi_target;
 use crate::plan::PlanContext;
+use crate::runtime_secrets::{
+    PromoteRuntimeSecretsReport, ResolvedRuntimeSecret, default_cloud_secret_prefix,
+    flat_cloud_secret_name, resolve_for_cloud_apply,
+};
 
 /// Library-facing request for the explicit Azure adapter surface.
 #[derive(Debug, Clone)]
@@ -12,6 +18,7 @@ pub struct AzureRequest {
     pub capability: DeployerCapability,
     pub tenant: String,
     pub pack_path: PathBuf,
+    pub bundle_root: Option<PathBuf>,
     pub bundle_source: Option<String>,
     pub bundle_digest: Option<String>,
     pub repo_registry_base: Option<String>,
@@ -45,6 +52,7 @@ impl AzureRequest {
             capability,
             tenant: tenant.into(),
             pack_path,
+            bundle_root: None,
             bundle_source: None,
             bundle_digest: None,
             repo_registry_base: None,
@@ -77,6 +85,7 @@ impl AzureRequest {
             tenant: self.tenant,
             environment: self.environment,
             pack_path: self.pack_path,
+            bundle_root: self.bundle_root,
             bundle_source: self.bundle_source,
             bundle_digest: self.bundle_digest,
             repo_registry_base: self.repo_registry_base,
@@ -156,6 +165,7 @@ fn build_azure_request_from_ext(
         pack_path: pack_path
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default(),
+        bundle_root: None,
         bundle_source: Some(cfg.bundle_source.clone()),
         bundle_digest: Some(cfg.bundle_digest.clone()),
         repo_registry_base: cfg.repo_registry_base.clone(),
@@ -228,6 +238,7 @@ pub async fn run(request: AzureRequest) -> Result<multi_target::OperationResult>
 
 pub async fn run_config(config: DeployerConfig) -> Result<multi_target::OperationResult> {
     ensure_azure_config(&config)?;
+    promote_runtime_secrets_for_apply(&config).await?;
     multi_target::run(config).await
 }
 
@@ -244,7 +255,129 @@ pub async fn run_config_with_plan(
     plan: PlanContext,
 ) -> Result<multi_target::OperationResult> {
     ensure_azure_config(&config)?;
+    promote_runtime_secrets_for_apply(&config).await?;
     multi_target::run_with_plan(config, plan).await
+}
+
+async fn promote_runtime_secrets_for_apply(config: &DeployerConfig) -> Result<()> {
+    let Some(resolution) = resolve_for_cloud_apply(config).await? else {
+        return Ok(());
+    };
+    let vault_name = azure_key_vault_name()?;
+    let prefix = default_cloud_secret_prefix(&config.environment, &config.tenant, None);
+    promote_to_azure_key_vault(&resolution.resolved, &vault_name, &prefix).await?;
+    Ok(())
+}
+
+async fn promote_to_azure_key_vault(
+    resolved: &[ResolvedRuntimeSecret],
+    vault_name: &str,
+    prefix: &str,
+) -> Result<PromoteRuntimeSecretsReport> {
+    let mut report = PromoteRuntimeSecretsReport::default();
+    for secret in resolved {
+        let remote_name = flat_cloud_secret_name(
+            prefix,
+            &secret.requirement.provider_id,
+            &secret.requirement.key,
+            127,
+        );
+        set_azure_key_vault_secret(vault_name, &remote_name, secret.value.expose())?;
+        report
+            .promoted
+            .push(crate::runtime_secrets::PromotedRuntimeSecret {
+                uri: secret.requirement.uri.clone(),
+                remote_name,
+            });
+    }
+    Ok(report)
+}
+
+fn azure_key_vault_name() -> Result<String> {
+    if let Some(value) = std::env::var("GREENTIC_DEPLOY_TERRAFORM_VAR_AZURE_KEY_VAULT_NAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(value);
+    }
+    if let Some(value) = std::env::var("GREENTIC_DEPLOY_TERRAFORM_VAR_AZURE_KEY_VAULT_URI")
+        .ok()
+        .and_then(|value| key_vault_name_from_uri(&value))
+    {
+        return Ok(value);
+    }
+    if let Some(value) = std::env::var("GREENTIC_DEPLOY_TERRAFORM_VAR_AZURE_KEY_VAULT_ID")
+        .ok()
+        .and_then(|value| key_vault_name_from_id(&value))
+    {
+        return Ok(value);
+    }
+    Err(DeployerError::Config(
+        "Azure runtime secret promotion requires GREENTIC_DEPLOY_TERRAFORM_VAR_AZURE_KEY_VAULT_NAME, _URI, or _ID"
+            .to_string(),
+    ))
+}
+
+fn key_vault_name_from_uri(uri: &str) -> Option<String> {
+    let host = uri
+        .trim()
+        .trim_end_matches('/')
+        .strip_prefix("https://")
+        .unwrap_or(uri.trim())
+        .split('/')
+        .next()?;
+    host.split('.')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn key_vault_name_from_id(id: &str) -> Option<String> {
+    id.trim()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn set_azure_key_vault_secret(vault_name: &str, secret_name: &str, value: &str) -> Result<()> {
+    let mut temp = tempfile::NamedTempFile::new()
+        .map_err(|err| DeployerError::Other(format!("create temporary secret file: {err}")))?;
+    temp.write_all(value.as_bytes())?;
+    temp.flush()?;
+
+    let status = ProcessCommand::new("az")
+        .args([
+            "keyvault",
+            "secret",
+            "set",
+            "--vault-name",
+            vault_name,
+            "--name",
+            secret_name,
+            "--file",
+            temp.path().to_str().ok_or_else(|| {
+                DeployerError::Other("temporary secret path is not UTF-8".to_string())
+            })?,
+            "--only-show-errors",
+            "--output",
+            "none",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .map_err(|err| DeployerError::Other(format!("run az keyvault secret set: {err}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(DeployerError::Other(format!(
+            "set Azure Key Vault secret {secret_name} in vault {vault_name} failed"
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +393,21 @@ mod tests {
         assert_eq!(request.provider, Provider::Azure);
         assert_eq!(request.strategy, "iac-only");
         assert_eq!(request.tenant, "acme");
+    }
+
+    #[test]
+    fn parses_key_vault_name_from_uri_and_id() {
+        assert_eq!(
+            key_vault_name_from_uri("https://my-vault.vault.azure.net/").as_deref(),
+            Some("my-vault")
+        );
+        assert_eq!(
+            key_vault_name_from_id(
+                "/subscriptions/aaa/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/my-vault"
+            )
+            .as_deref(),
+            Some("my-vault")
+        );
     }
 
     #[test]

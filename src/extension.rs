@@ -695,6 +695,7 @@ mod tests {
             tenant: "demo".to_string(),
             environment: Some("dev".to_string()),
             pack_path: dir.path().to_path_buf(),
+            bundle_root: None,
             bundle_source: None,
             bundle_digest: None,
             repo_registry_base: None,

@@ -68,6 +68,7 @@ impl JujuMachineRequest {
             tenant: self.tenant,
             environment: self.environment,
             pack_path: self.pack_path,
+            bundle_root: None,
             providers_dir: self.providers_dir,
             packs_dir: self.packs_dir,
             provider_pack: self.provider_pack,

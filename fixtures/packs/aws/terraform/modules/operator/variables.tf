@@ -44,6 +44,16 @@ variable "public_base_url" {
   type = string
 }
 
+variable "runtime_secret_prefix" {
+  type    = string
+  default = ""
+}
+
+variable "runtime_secret_env" {
+  type    = map(string)
+  default = {}
+}
+
 variable "use_default_vpc" {
   type    = bool
   default = true
