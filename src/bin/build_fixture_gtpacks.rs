@@ -61,16 +61,15 @@ fn ensure_replayed_scaffolds(
     scaffold_root: &Path,
     fixture_dirs: &[PathBuf],
 ) -> Result<()> {
-    let missing_any = fixture_dirs.iter().any(|fixture_dir| {
-        let Some(fixture_name) = fixture_dir.file_name() else {
-            return true;
-        };
-        !scaffold_root.join(fixture_name).join("pack.yaml").is_file()
-    });
-    if !missing_any {
+    let missing_before = missing_replayed_scaffolds(scaffold_root, fixture_dirs)?;
+    if missing_before.is_empty() {
         return Ok(());
     }
 
+    eprintln!(
+        "replaying deployer scaffolds before fixture gtpack build; missing: {}",
+        missing_before.join(", ")
+    );
     run_command(
         "cargo",
         &[
@@ -82,7 +81,32 @@ fn ensure_replayed_scaffolds(
         ],
         Some(root),
     )
-    .context("replay deployer scaffolds before building fixture gtpacks")
+    .context("replay deployer scaffolds before building fixture gtpacks")?;
+
+    let missing_after = missing_replayed_scaffolds(scaffold_root, fixture_dirs)?;
+    ensure!(
+        missing_after.is_empty(),
+        "replay_deployer_scaffolds completed but did not create pack.yaml for: {}",
+        missing_after.join(", ")
+    );
+    Ok(())
+}
+
+fn missing_replayed_scaffolds(
+    scaffold_root: &Path,
+    fixture_dirs: &[PathBuf],
+) -> Result<Vec<String>> {
+    let mut missing = Vec::new();
+    for fixture_dir in fixture_dirs {
+        let fixture_name = fixture_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("fixture name missing for {}", fixture_dir.display()))?;
+        if !scaffold_root.join(fixture_name).join("pack.yaml").is_file() {
+            missing.push(fixture_name.to_string());
+        }
+    }
+    Ok(missing)
 }
 
 fn build_fixture_gtpack(pack_root: &Path, output_path: &Path) -> Result<()> {
