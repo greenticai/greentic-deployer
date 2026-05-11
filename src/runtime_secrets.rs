@@ -281,6 +281,23 @@ pub async fn resolve_runtime_secrets(
                 && let Ok(value) = String::from_utf8(bytes)
                 && !value.is_empty()
             {
+                // `gtc setup --non-interactive` writes raw `${VAR}` placeholders
+                // into the dev secrets store too — not just into setup-answers.
+                // Expand them here against the process env so the promoted
+                // cloud secret carries the actual value, not the placeholder
+                // string. If the env var is unset, treat the dev-store entry
+                // as unresolved and fall back to setup-answers (where the same
+                // expansion runs as a second chance) before marking missing.
+                if let Some(env_key) = extract_env_placeholder(&value) {
+                    checked_sources.push(format!("env ${{{env_key}}} (from dev store)"));
+                    match env::var(&env_key) {
+                        Ok(resolved) if !resolved.is_empty() => {
+                            found = Some((path.clone(), resolved));
+                            break;
+                        }
+                        _ => continue,
+                    }
+                }
                 found = Some((path.clone(), value));
                 break;
             }
