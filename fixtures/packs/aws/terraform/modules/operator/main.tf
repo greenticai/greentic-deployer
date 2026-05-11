@@ -217,6 +217,62 @@ resource "aws_security_group" "service" {
   tags = local.common_tags
 }
 
+# Managed Redis for state-redis pack. Provisioned only when var.provision_redis
+# is true AND no external redis_url was passed in. Single-node cache.t3.micro
+# is enough for the demo path; multi-AZ + replication can be layered on later
+# without breaking the URL contract here.
+resource "aws_elasticache_subnet_group" "managed_redis" {
+  count      = var.cloud == "aws" && var.provision_redis && var.redis_url == "" ? 1 : 0
+  name       = "${local.name_prefix}-redis"
+  subnet_ids = local.effective_subnet_ids
+  tags       = local.common_tags
+}
+
+resource "aws_security_group" "managed_redis" {
+  count       = var.cloud == "aws" && var.provision_redis && var.redis_url == "" ? 1 : 0
+  name        = "${local.name_prefix}-redis"
+  description = "ElastiCache Redis ingress from greentic ECS service"
+  vpc_id      = local.effective_vpc_id
+
+  ingress {
+    description     = "Redis from ECS task"
+    from_port       = 6379
+    to_port         = 6379
+    protocol        = "tcp"
+    security_groups = [aws_security_group.service.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = local.common_tags
+}
+
+resource "aws_elasticache_cluster" "managed_redis" {
+  count                = var.cloud == "aws" && var.provision_redis && var.redis_url == "" ? 1 : 0
+  cluster_id           = "${local.name_prefix}-redis"
+  engine               = "redis"
+  engine_version       = var.redis_engine_version
+  node_type            = var.redis_node_type
+  num_cache_nodes      = 1
+  port                 = 6379
+  subnet_group_name    = aws_elasticache_subnet_group.managed_redis[0].name
+  security_group_ids   = [aws_security_group.managed_redis[0].id]
+  parameter_group_name = "default.redis7"
+  apply_immediately    = true
+
+  tags = local.common_tags
+}
+
+locals {
+  managed_redis_url = length(aws_elasticache_cluster.managed_redis) > 0 ? "redis://${aws_elasticache_cluster.managed_redis[0].cache_nodes[0].address}:${aws_elasticache_cluster.managed_redis[0].cache_nodes[0].port}/0" : ""
+  effective_redis_url = var.redis_url != "" ? var.redis_url : local.managed_redis_url
+}
+
 resource "aws_lb" "this" {
   name               = "${local.name_prefix}-alb"
   internal           = false
@@ -559,10 +615,10 @@ resource "aws_ecs_task_definition" "this" {
             value = "websocket"
           }
         ],
-        var.redis_url != "" ? [
+        local.effective_redis_url != "" ? [
           {
             name  = "REDIS_URL"
-            value = var.redis_url
+            value = local.effective_redis_url
           }
         ] : [],
         var.admin_allowed_clients != "" ? [

@@ -105,3 +105,19 @@ variable "aws_use_default_vpc" {
   type    = bool
   default = true
 }
+
+variable "aws_provision_redis" {
+  type        = bool
+  default     = false
+  description = "When true, the AWS operator module provisions a single-node ElastiCache Redis cluster and wires REDIS_URL on the ECS task. Ignored if redis_url is non-empty (external Redis takes precedence)."
+}
+
+variable "aws_redis_node_type" {
+  type    = string
+  default = "cache.t3.micro"
+}
+
+variable "aws_redis_engine_version" {
+  type    = string
+  default = "7.1"
+}

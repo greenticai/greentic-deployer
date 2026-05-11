@@ -58,3 +58,18 @@ variable "use_default_vpc" {
   type    = bool
   default = true
 }
+
+variable "provision_redis" {
+  type    = bool
+  default = false
+}
+
+variable "redis_node_type" {
+  type    = string
+  default = "cache.t3.micro"
+}
+
+variable "redis_engine_version" {
+  type    = string
+  default = "7.1"
+}

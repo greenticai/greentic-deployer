@@ -22,6 +22,9 @@ module "operator_aws" {
   runtime_secret_prefix  = var.runtime_secret_prefix
   runtime_secret_env     = var.runtime_secret_env
   use_default_vpc        = var.aws_use_default_vpc
+  provision_redis        = var.aws_provision_redis
+  redis_node_type        = var.aws_redis_node_type
+  redis_engine_version   = var.aws_redis_engine_version
 }
 
 module "operator_azure" {
