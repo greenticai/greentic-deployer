@@ -49,7 +49,11 @@ jobs:
         if: steps.cargo-binstall.outputs.available != 'true'
       - name: Install Greentic fixture tools
         run: |
-          cargo binstall --no-confirm greentic-pack@0.5.6 greentic-flow@0.5.8
+          # rust-cache restores ~/.cargo/.crates.toml but not ~/.cargo/bin,
+          # so binstall may say "already installed" while the binary is gone.
+          if ! command -v greentic-pack >/dev/null || ! command -v greentic-flow >/dev/null; then
+            cargo binstall --no-confirm --force greentic-pack@0.5.6 greentic-flow@0.5.8
+          fi
 
       - name: Replay deployer scaffolds
         run: cargo run --features internal-tools --bin replay_deployer_scaffolds
