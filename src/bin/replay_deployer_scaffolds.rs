@@ -4,8 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
-use greentic_deployer::contract::DeployerContractV1;
+use greentic_deployer::contract::{DeployerContractV1, EXT_DEPLOYER_CONTRACT_V1};
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
+use serde_yaml_bw as serde_yaml;
 
 #[derive(Debug, Deserialize)]
 struct ScaffoldIndex {
@@ -21,11 +23,10 @@ fn main() -> Result<()> {
         .filter(|tool| !command_available(tool))
         .collect::<Vec<_>>();
     if !missing_tools.is_empty() {
-        eprintln!(
-            "skipping replay_deployer_scaffolds: missing external tool(s): {}",
+        bail!(
+            "missing external tool(s): {}; install them with `cargo binstall --no-confirm greentic-pack@0.5.6 greentic-flow@0.5.8`",
             missing_tools.join(", ")
         );
-        return Ok(());
     }
 
     let output_root = root.join("target/replayed-pack-scaffolds");
@@ -77,6 +78,7 @@ fn main() -> Result<()> {
             load_json(&fixture_root.join("contract.greentic.deployer.v1.json"))?;
         sync_scaffold_flows(&root, &pack_root, &contract)?;
         overlay_fixture_content(&fixture_root, &pack_root)?;
+        sync_pack_metadata(&pack_root, &contract)?;
         run_command_in_dir(&pack_root, "greentic-pack", &["doctor"])?;
         println!("replayed scaffold {}", pack_root.display());
     }
@@ -111,15 +113,45 @@ fn materialize_answers(template: &Path, output: &Path, pack_root: &Path) -> Resu
 }
 
 fn overlay_fixture_content(fixture_root: &Path, pack_root: &Path) -> Result<()> {
-    copy_if_exists(
-        &fixture_root.join("README.md"),
-        &pack_root.join("README.md"),
-    )?;
-    copy_if_exists(
-        &fixture_root.join("contract.greentic.deployer.v1.json"),
-        &pack_root.join("contract.greentic.deployer.v1.json"),
-    )?;
-    copy_tree(&fixture_root.join("assets"), &pack_root.join("assets"))?;
+    for entry in
+        fs::read_dir(fixture_root).with_context(|| format!("read {}", fixture_root.display()))?
+    {
+        let entry = entry?;
+        let source = entry.path();
+        let target = pack_root.join(entry.file_name());
+        if source.is_dir() {
+            copy_tree(&source, &target)?;
+        } else if source.is_file() {
+            copy_if_exists(&source, &target)?;
+        }
+    }
+    Ok(())
+}
+
+fn sync_pack_metadata(pack_root: &Path, contract: &DeployerContractV1) -> Result<()> {
+    let pack_yaml = pack_root.join("pack.yaml");
+    let content =
+        fs::read_to_string(&pack_yaml).with_context(|| format!("read {}", pack_yaml.display()))?;
+    let mut document: JsonValue =
+        serde_yaml::from_str(&content).with_context(|| format!("parse {}", pack_yaml.display()))?;
+    if let Some(mapping) = document.as_object_mut() {
+        mapping.insert(
+            "version".to_string(),
+            JsonValue::String(env!("CARGO_PKG_VERSION").to_string()),
+        );
+    }
+    let contract_extension = serde_json::json!({
+        "kind": EXT_DEPLOYER_CONTRACT_V1,
+        "version": "1.0.0",
+        "inline": contract,
+    });
+    let extensions = document
+        .pointer_mut("/extensions")
+        .and_then(JsonValue::as_object_mut)
+        .context("missing extensions mapping")?;
+    extensions.insert(EXT_DEPLOYER_CONTRACT_V1.to_string(), contract_extension);
+    let updated = serde_yaml::to_string(&document).context("render pack.yaml")?;
+    fs::write(&pack_yaml, updated).with_context(|| format!("write {}", pack_yaml.display()))?;
     Ok(())
 }
 

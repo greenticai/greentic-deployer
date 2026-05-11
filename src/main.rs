@@ -38,6 +38,7 @@ enum TopLevelCommand {
     SingleVm(SingleVmCommand),
     MultiTarget(MultiTargetCommand),
     Aws(AwsCommand),
+    BundleUpload(BundleUploadCommand),
     Azure(AzureCommand),
     Gcp(GcpCommand),
     Helm(HelmCommand),
@@ -136,6 +137,43 @@ struct HelmCommand {
 struct AwsCommand {
     #[command(subcommand)]
     command: AwsSubcommand,
+}
+
+#[derive(Parser)]
+struct BundleUploadCommand {
+    #[command(subcommand)]
+    command: BundleUploadSubcommand,
+}
+
+#[derive(Subcommand)]
+enum BundleUploadSubcommand {
+    /// Upload a local bundle to cloud storage and emit a presigned/public URL.
+    Upload(BundleUploadArgs),
+    /// Re-issue a fresh URL for an already-uploaded bundle without re-uploading.
+    RefreshUrl(BundleRefreshArgs),
+}
+
+#[derive(Parser)]
+struct BundleUploadArgs {
+    /// Cloud storage target URL: s3://bucket/prefix/, gs://..., https://*.blob.core.windows.net/...
+    #[arg(long)]
+    target: String,
+    /// Path to local .gtbundle file.
+    #[arg(long)]
+    bundle: PathBuf,
+    /// Presigned URL expiry in seconds (S3 hard-caps at 604800).
+    #[arg(long, default_value_t = 604800)]
+    presign_expires: u64,
+}
+
+#[derive(Parser)]
+struct BundleRefreshArgs {
+    /// Cloud-native object reference, e.g. `s3://bucket/key`.
+    #[arg(long)]
+    object_ref: String,
+    /// Presigned URL expiry in seconds.
+    #[arg(long, default_value_t = 604800)]
+    presign_expires: u64,
 }
 
 #[derive(Parser)]
@@ -566,6 +604,8 @@ struct AwsArgs {
     )]
     pack: std::path::PathBuf,
     #[arg(long)]
+    bundle_root: Option<std::path::PathBuf>,
+    #[arg(long)]
     bundle_source: Option<String>,
     #[arg(long)]
     bundle_digest: Option<String>,
@@ -601,7 +641,7 @@ struct AwsArgs {
     config: Option<std::path::PathBuf>,
     #[arg(long)]
     allow_remote_in_offline: bool,
-    #[arg(long, value_enum, default_value_t = CliOutputFormat::Json)]
+    #[arg(long, value_enum, default_value_t = CliOutputFormat::Text)]
     output: CliOutputFormat,
 }
 
@@ -634,6 +674,8 @@ struct AzureArgs {
     )]
     pack: std::path::PathBuf,
     #[arg(long)]
+    bundle_root: Option<std::path::PathBuf>,
+    #[arg(long)]
     bundle_source: Option<String>,
     #[arg(long)]
     bundle_digest: Option<String>,
@@ -669,7 +711,7 @@ struct AzureArgs {
     config: Option<std::path::PathBuf>,
     #[arg(long)]
     allow_remote_in_offline: bool,
-    #[arg(long, value_enum, default_value_t = CliOutputFormat::Json)]
+    #[arg(long, value_enum, default_value_t = CliOutputFormat::Text)]
     output: CliOutputFormat,
 }
 
@@ -684,6 +726,8 @@ struct GcpArgs {
     )]
     pack: std::path::PathBuf,
     #[arg(long)]
+    bundle_root: Option<std::path::PathBuf>,
+    #[arg(long)]
     bundle_source: Option<String>,
     #[arg(long)]
     bundle_digest: Option<String>,
@@ -719,7 +763,7 @@ struct GcpArgs {
     config: Option<std::path::PathBuf>,
     #[arg(long)]
     allow_remote_in_offline: bool,
-    #[arg(long, value_enum, default_value_t = CliOutputFormat::Json)]
+    #[arg(long, value_enum, default_value_t = CliOutputFormat::Text)]
     output: CliOutputFormat,
 }
 
@@ -1002,6 +1046,7 @@ struct ExecutableRequestData {
 #[derive(Clone)]
 struct CloudRequestData {
     executable: ExecutableRequestData,
+    bundle_root: Option<PathBuf>,
     bundle_source: Option<String>,
     bundle_digest: Option<String>,
     repo_registry_base: Option<String>,
@@ -1032,6 +1077,7 @@ trait HasExecutableRequestArgs: HasCommonRequestArgs {
 }
 
 trait HasCloudRequestArgs: HasExecutableRequestArgs {
+    fn bundle_root(&self) -> Option<PathBuf>;
     fn bundle_source(&self) -> Option<String>;
     fn bundle_digest(&self) -> Option<String>;
     fn repo_registry_base(&self) -> Option<String>;
@@ -1077,6 +1123,7 @@ macro_rules! impl_cloud_request_args {
     ($($ty:ty),+ $(,)?) => {
         $(
             impl HasCloudRequestArgs for $ty {
+                fn bundle_root(&self) -> Option<PathBuf> { self.bundle_root.clone() }
                 fn bundle_source(&self) -> Option<String> { self.bundle_source.clone() }
                 fn bundle_digest(&self) -> Option<String> { self.bundle_digest.clone() }
                 fn repo_registry_base(&self) -> Option<String> { self.repo_registry_base.clone() }
@@ -1146,6 +1193,7 @@ fn executable_request_data(args: &impl HasExecutableRequestArgs) -> ExecutableRe
 fn cloud_request_data(args: &impl HasCloudRequestArgs) -> CloudRequestData {
     CloudRequestData {
         executable: executable_request_data(args),
+        bundle_root: args.bundle_root(),
         bundle_source: args.bundle_source(),
         bundle_digest: args.bundle_digest(),
         repo_registry_base: args.repo_registry_base(),
@@ -1172,6 +1220,7 @@ fn main() -> Result<()> {
         TopLevelCommand::Aws(command) => cli_builtin_dispatch::dispatch_builtin_backend_command(
             BuiltinBackendCommand::Aws(command),
         ),
+        TopLevelCommand::BundleUpload(cmd) => run_bundle_upload(cmd),
         TopLevelCommand::Azure(command) => cli_builtin_dispatch::dispatch_builtin_backend_command(
             BuiltinBackendCommand::Azure(command),
         ),
@@ -1213,6 +1262,39 @@ fn main() -> Result<()> {
             )
         }
     }
+}
+
+fn run_bundle_upload(cmd: BundleUploadCommand) -> Result<()> {
+    use greentic_deployer::bundle_upload::{UploadOptions, from_url};
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    let opts = match &cmd.command {
+        BundleUploadSubcommand::Upload(args) => UploadOptions {
+            presign_expires_secs: args.presign_expires,
+        },
+        BundleUploadSubcommand::RefreshUrl(args) => UploadOptions {
+            presign_expires_secs: args.presign_expires,
+        },
+    };
+
+    let result = runtime.block_on(async {
+        match cmd.command {
+            BundleUploadSubcommand::Upload(args) => {
+                let uploader = from_url(&args.target)?;
+                uploader.upload(&args.bundle, &opts).await
+            }
+            BundleUploadSubcommand::RefreshUrl(args) => {
+                let uploader = from_url(&args.object_ref)?;
+                uploader.refresh_url(&args.object_ref, &opts).await
+            }
+        }
+    })?;
+
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(())
 }
 
 fn run_target_requirements(args: TargetRequirementsArgs) -> Result<()> {
@@ -1336,6 +1418,7 @@ fn run_multi_target(command: MultiTargetCommand) -> Result<()> {
         tenant: shared.tenant,
         environment: shared.environment,
         pack_path: shared.pack_path,
+        bundle_root: None,
         providers_dir: default_providers_dir(),
         packs_dir: default_packs_dir(),
         provider_pack: shared.provider_pack,
@@ -1513,6 +1596,7 @@ fn run_aws(command: AwsCommand) -> Result<()> {
             capability,
             tenant: shared.executable.common.tenant,
             pack_path: shared.executable.common.pack_path,
+            bundle_root: shared.bundle_root,
             bundle_source: shared.bundle_source,
             bundle_digest: shared.bundle_digest,
             repo_registry_base: shared.repo_registry_base,
@@ -1580,6 +1664,7 @@ fn run_azure(command: AzureCommand) -> Result<()> {
             capability,
             tenant: shared.executable.common.tenant,
             pack_path: shared.executable.common.pack_path,
+            bundle_root: shared.bundle_root,
             bundle_source: shared.bundle_source,
             bundle_digest: shared.bundle_digest,
             repo_registry_base: shared.repo_registry_base,
@@ -1639,6 +1724,7 @@ fn run_gcp(command: GcpCommand) -> Result<()> {
             capability,
             tenant: shared.executable.common.tenant,
             pack_path: shared.executable.common.pack_path,
+            bundle_root: shared.bundle_root,
             bundle_source: shared.bundle_source,
             bundle_digest: shared.bundle_digest,
             repo_registry_base: shared.repo_registry_base,

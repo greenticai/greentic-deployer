@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(feature = "runtime-secrets-aws")]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
@@ -13,6 +15,10 @@ use crate::contract::DeployerCapability;
 use crate::error::{DeployerError, Result};
 use crate::multi_target;
 use crate::plan::PlanContext;
+use crate::runtime_secrets::{
+    PromoteRuntimeSecretsReport, ResolvedRuntimeSecret, default_cloud_secret_prefix,
+    resolve_for_cloud_apply,
+};
 
 /// Library-facing request for the explicit AWS adapter surface.
 #[derive(Debug, Clone)]
@@ -20,6 +26,7 @@ pub struct AwsRequest {
     pub capability: DeployerCapability,
     pub tenant: String,
     pub pack_path: PathBuf,
+    pub bundle_root: Option<PathBuf>,
     pub bundle_source: Option<String>,
     pub bundle_digest: Option<String>,
     pub repo_registry_base: Option<String>,
@@ -87,6 +94,7 @@ impl AwsRequest {
             capability,
             tenant: tenant.into(),
             pack_path,
+            bundle_root: None,
             bundle_source: None,
             bundle_digest: None,
             repo_registry_base: None,
@@ -119,6 +127,7 @@ impl AwsRequest {
             tenant: self.tenant,
             environment: self.environment,
             pack_path: self.pack_path,
+            bundle_root: self.bundle_root,
             bundle_source: self.bundle_source,
             bundle_digest: self.bundle_digest,
             repo_registry_base: self.repo_registry_base,
@@ -172,6 +181,7 @@ fn build_aws_request_from_ext(
         pack_path: pack_path
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default(),
+        bundle_root: None,
         bundle_source: Some(cfg.bundle_source.clone()),
         bundle_digest: Some(cfg.bundle_digest.clone()),
         repo_registry_base: cfg.repo_registry_base.clone(),
@@ -244,6 +254,7 @@ pub async fn run(request: AwsRequest) -> Result<multi_target::OperationResult> {
 
 pub async fn run_config(config: DeployerConfig) -> Result<multi_target::OperationResult> {
     ensure_aws_config(&config)?;
+    promote_runtime_secrets_for_apply(&config).await?;
     multi_target::run(config).await
 }
 
@@ -260,7 +271,222 @@ pub async fn run_config_with_plan(
     plan: PlanContext,
 ) -> Result<multi_target::OperationResult> {
     ensure_aws_config(&config)?;
+    promote_runtime_secrets_for_apply(&config).await?;
     multi_target::run_with_plan(config, plan).await
+}
+
+async fn promote_runtime_secrets_for_apply(config: &DeployerConfig) -> Result<()> {
+    let Some(resolution) = resolve_for_cloud_apply(config).await? else {
+        return Ok(());
+    };
+    let prefix = default_cloud_secret_prefix(&config.environment, &config.tenant, None);
+    promote_to_aws_secrets_manager(
+        &resolution.resolved,
+        &prefix,
+        config.bundle_digest.as_deref(),
+        &config.environment,
+        &config.tenant,
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+#[cfg(feature = "runtime-secrets-aws")]
+async fn promote_to_aws_secrets_manager(
+    resolved: &[ResolvedRuntimeSecret],
+    prefix: &str,
+    bundle_digest: Option<&str>,
+    environment: &str,
+    tenant: &str,
+    team: Option<&str>,
+) -> Result<PromoteRuntimeSecretsReport> {
+    let region = aws_runtime_secrets_region();
+    let mut report = PromoteRuntimeSecretsReport::default();
+
+    for secret in resolved {
+        let remote_name = crate::runtime_secrets::cloud_secret_name(
+            prefix,
+            &secret.requirement.provider_id,
+            &secret.requirement.key,
+        );
+        put_aws_secret_with_cli(
+            secret,
+            &remote_name,
+            bundle_digest,
+            environment,
+            tenant,
+            team.unwrap_or("_"),
+            &region,
+        )?;
+        report
+            .promoted
+            .push(crate::runtime_secrets::PromotedRuntimeSecret {
+                uri: secret.requirement.uri.clone(),
+                remote_name,
+            });
+    }
+
+    Ok(report)
+}
+
+#[cfg(feature = "runtime-secrets-aws")]
+fn aws_runtime_secrets_region() -> String {
+    std::env::var("AWS_REGION")
+        .ok()
+        .filter(|region| !region.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AWS_DEFAULT_REGION")
+                .ok()
+                .filter(|region| !region.trim().is_empty())
+        })
+        .or_else(aws_cli_config_region)
+        .unwrap_or_else(|| "eu-north-1".to_string())
+}
+
+#[cfg(feature = "runtime-secrets-aws")]
+fn aws_cli_config_region() -> Option<String> {
+    let output = ProcessCommand::new("aws")
+        .args(["configure", "get", "region"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let region = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!region.is_empty()).then_some(region)
+}
+
+#[cfg(not(feature = "runtime-secrets-aws"))]
+async fn promote_to_aws_secrets_manager(
+    _resolved: &[ResolvedRuntimeSecret],
+    _prefix: &str,
+    _bundle_digest: Option<&str>,
+    _environment: &str,
+    _tenant: &str,
+    _team: Option<&str>,
+) -> Result<PromoteRuntimeSecretsReport> {
+    Err(DeployerError::Config(
+        "AWS runtime secret promotion is not enabled".to_string(),
+    ))
+}
+
+#[cfg(feature = "runtime-secrets-aws")]
+fn put_aws_secret_with_cli(
+    secret: &ResolvedRuntimeSecret,
+    remote_name: &str,
+    bundle_digest: Option<&str>,
+    environment: &str,
+    tenant: &str,
+    team: &str,
+    region: &str,
+) -> Result<()> {
+    let mut temp = tempfile::NamedTempFile::new()
+        .map_err(|err| DeployerError::Other(format!("create temporary secret file: {err}")))?;
+    temp.write_all(secret.value.expose().as_bytes())?;
+    temp.flush()?;
+    let secret_file = format!(
+        "file://{}",
+        temp.path().to_str().ok_or_else(|| {
+            DeployerError::Other("temporary secret path is not UTF-8".to_string())
+        })?
+    );
+
+    let mut create = ProcessCommand::new("aws");
+    create.args([
+        "secretsmanager",
+        "create-secret",
+        "--region",
+        region,
+        "--name",
+        remote_name,
+        "--secret-string",
+        &secret_file,
+    ]);
+    for (key, value) in aws_secret_tags(
+        &secret.requirement.uri,
+        bundle_digest,
+        environment,
+        tenant,
+        team,
+    ) {
+        create.arg("--tags").arg(format!("Key={key},Value={value}"));
+    }
+
+    let create = create
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| {
+            DeployerError::Other(format!("run aws secretsmanager create-secret: {err}"))
+        })?;
+    if create.status.success() {
+        return Ok(());
+    }
+
+    let create_stderr = String::from_utf8_lossy(&create.stderr);
+    if !create_stderr.contains("ResourceExistsException") {
+        return Err(DeployerError::Other(format!(
+            "create AWS Secrets Manager secret {remote_name}: {}",
+            create_stderr.trim()
+        )));
+    }
+
+    #[cfg(feature = "runtime-secrets-aws")]
+    let update = ProcessCommand::new("aws")
+        .args([
+            "secretsmanager",
+            "put-secret-value",
+            "--region",
+            region,
+            "--secret-id",
+            remote_name,
+            "--secret-string",
+            &secret_file,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| {
+            DeployerError::Other(format!("run aws secretsmanager put-secret-value: {err}"))
+        })?;
+    if update.status.success() {
+        Ok(())
+    } else {
+        Err(DeployerError::Other(format!(
+            "update AWS Secrets Manager secret {remote_name}: {}",
+            String::from_utf8_lossy(&update.stderr).trim()
+        )))
+    }
+}
+
+#[cfg(feature = "runtime-secrets-aws")]
+fn aws_secret_tags(
+    secret_uri: &str,
+    bundle_digest: Option<&str>,
+    environment: &str,
+    tenant: &str,
+    team: &str,
+) -> Vec<(String, String)> {
+    let mut tags = vec![
+        (
+            "greentic:managed-by".to_string(),
+            "greentic-deployer".to_string(),
+        ),
+        ("greentic:provider".to_string(), "aws".to_string()),
+        (
+            "greentic:secret-manager".to_string(),
+            "aws-secrets-manager".to_string(),
+        ),
+        ("greentic:environment".to_string(), environment.to_string()),
+        ("greentic:tenant".to_string(), tenant.to_string()),
+        ("greentic:team".to_string(), team.to_string()),
+        ("greentic:secret-uri".to_string(), secret_uri.to_string()),
+    ];
+    if let Some(digest) = bundle_digest {
+        tags.push(("greentic:bundle-digest".to_string(), digest.to_string()));
+    }
+    tags
 }
 
 pub fn run_admin_tunnel(args: AwsAdminTunnelRequest) -> Result<()> {
@@ -532,6 +758,88 @@ mod tests {
     }
 
     #[test]
+    fn aws_request_preserves_all_passthrough_fields() {
+        let mut request =
+            AwsRequest::new(DeployerCapability::Apply, "acme", PathBuf::from("pack-dir"));
+        request.bundle_root = Some(PathBuf::from("bundle-root"));
+        request.bundle_source = Some("s3://bucket/bundle.gtbundle".into());
+        request.bundle_digest = Some("sha256:abc".into());
+        request.repo_registry_base = Some("https://repo.example".into());
+        request.store_registry_base = Some("https://store.example".into());
+        request.provider_pack = Some(PathBuf::from("providers/deployer/aws.gtpack"));
+        request.deploy_pack_id_override = Some("greentic.deploy.aws".into());
+        request.deploy_flow_id_override = Some("apply_terraform".into());
+        request.environment = Some("prod".into());
+        request.pack_id = Some("pack-id".into());
+        request.pack_version = Some("1.2.3".into());
+        request.pack_digest = Some("sha256:def".into());
+        request.distributor_url = Some("https://dist.example".into());
+        request.distributor_token = Some("token".into());
+        request.preview = true;
+        request.dry_run = true;
+        request.execute_local = true;
+        request.output = OutputFormat::Json;
+        request.config_path = Some(PathBuf::from("greentic.toml"));
+        request.allow_remote_in_offline = true;
+        request.providers_dir = PathBuf::from("providers");
+        request.packs_dir = PathBuf::from("packs-dir");
+
+        let deployer = request.into_deployer_request();
+
+        assert_eq!(deployer.capability, DeployerCapability::Apply);
+        assert_eq!(deployer.provider, Provider::Aws);
+        assert_eq!(
+            deployer.bundle_root.as_deref(),
+            Some(Path::new("bundle-root"))
+        );
+        assert_eq!(
+            deployer.bundle_source.as_deref(),
+            Some("s3://bucket/bundle.gtbundle")
+        );
+        assert_eq!(deployer.bundle_digest.as_deref(), Some("sha256:abc"));
+        assert_eq!(
+            deployer.repo_registry_base.as_deref(),
+            Some("https://repo.example")
+        );
+        assert_eq!(
+            deployer.store_registry_base.as_deref(),
+            Some("https://store.example")
+        );
+        assert_eq!(
+            deployer.provider_pack.as_deref(),
+            Some(Path::new("providers/deployer/aws.gtpack"))
+        );
+        assert_eq!(
+            deployer.deploy_pack_id_override.as_deref(),
+            Some("greentic.deploy.aws")
+        );
+        assert_eq!(
+            deployer.deploy_flow_id_override.as_deref(),
+            Some("apply_terraform")
+        );
+        assert_eq!(deployer.environment.as_deref(), Some("prod"));
+        assert_eq!(deployer.pack_id.as_deref(), Some("pack-id"));
+        assert_eq!(deployer.pack_version.as_deref(), Some("1.2.3"));
+        assert_eq!(deployer.pack_digest.as_deref(), Some("sha256:def"));
+        assert_eq!(
+            deployer.distributor_url.as_deref(),
+            Some("https://dist.example")
+        );
+        assert_eq!(deployer.distributor_token.as_deref(), Some("token"));
+        assert!(deployer.preview);
+        assert!(deployer.dry_run);
+        assert!(deployer.execute_local);
+        assert_eq!(deployer.output, OutputFormat::Json);
+        assert_eq!(
+            deployer.config_path.as_deref(),
+            Some(Path::new("greentic.toml"))
+        );
+        assert!(deployer.allow_remote_in_offline);
+        assert_eq!(deployer.providers_dir, PathBuf::from("providers"));
+        assert_eq!(deployer.packs_dir, PathBuf::from("packs-dir"));
+    }
+
+    #[test]
     fn ensure_aws_config_rejects_non_aws_provider() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut request = AwsRequest::new(DeployerCapability::Plan, "acme", tmp.path().into())
@@ -597,6 +905,90 @@ mod tests {
         assert!(request.execute_local);
         assert_eq!(request.providers_dir, PathBuf::from("providers/deployer"));
         assert_eq!(request.packs_dir, PathBuf::from("packs"));
+    }
+
+    #[test]
+    fn build_aws_request_from_ext_uses_empty_pack_when_missing() {
+        let cfg = AwsEcsFargateExtConfig {
+            region: "eu-north-1".to_string(),
+            environment: "dev".to_string(),
+            operator_image_digest: "sha256:0000".to_string(),
+            bundle_source: "s3://bucket/bundle.gtbundle".to_string(),
+            bundle_digest: "sha256:1111".to_string(),
+            remote_state_backend: "s3://state".to_string(),
+            redis_url: None,
+            dns_name: None,
+            public_base_url: None,
+            repo_registry_base: None,
+            store_registry_base: None,
+            admin_allowed_clients: None,
+            tenant: default_ext_tenant(),
+        };
+
+        let request = build_aws_request_from_ext(DeployerCapability::Apply, &cfg, None);
+
+        assert_eq!(request.capability, DeployerCapability::Apply);
+        assert_eq!(request.tenant, "default");
+        assert_eq!(request.pack_path, PathBuf::new());
+        assert_eq!(
+            request.bundle_source.as_deref(),
+            Some("s3://bucket/bundle.gtbundle")
+        );
+        assert_eq!(request.bundle_digest.as_deref(), Some("sha256:1111"));
+        assert!(request.repo_registry_base.is_none());
+        assert!(request.store_registry_base.is_none());
+        assert_eq!(request.output, OutputFormat::Text);
+        assert!(request.execute_local);
+        assert!(!request.preview);
+        assert!(!request.dry_run);
+    }
+
+    #[cfg(feature = "runtime-secrets-aws")]
+    #[test]
+    fn aws_secret_tags_include_management_scope_and_bundle_digest() {
+        let tags = aws_secret_tags(
+            "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key",
+            Some("sha256:bundle"),
+            "dev",
+            "demo",
+            "_",
+        );
+
+        assert!(tags.contains(&("greentic:managed-by".into(), "greentic-deployer".into())));
+        assert!(tags.contains(&(
+            "greentic:secret-manager".into(),
+            "aws-secrets-manager".into()
+        )));
+        assert!(tags.contains(&("greentic:environment".into(), "dev".into())));
+        assert!(tags.contains(&("greentic:tenant".into(), "demo".into())));
+        assert!(tags.contains(&("greentic:team".into(), "_".into())));
+        assert!(tags.contains(&("greentic:bundle-digest".into(), "sha256:bundle".into())));
+        assert!(tags.iter().any(|(key, value)| {
+            key == "greentic:secret-uri" && value.contains("messaging-webchat-gui")
+        }));
+    }
+
+    #[cfg(feature = "runtime-secrets-aws")]
+    #[test]
+    fn aws_secret_tags_omit_bundle_digest_when_absent() {
+        let tags = aws_secret_tags(
+            "secrets://dev/demo/_/deep-research-demo/api_key_secret",
+            None,
+            "dev",
+            "demo",
+            "_",
+        );
+
+        assert!(tags.contains(&("greentic:provider".into(), "aws".into())));
+        assert!(tags.contains(&(
+            "greentic:secret-uri".into(),
+            "secrets://dev/demo/_/deep-research-demo/api_key_secret".into()
+        )));
+        assert!(
+            !tags
+                .iter()
+                .any(|(key, _value)| key == "greentic:bundle-digest")
+        );
     }
 
     #[test]
@@ -681,10 +1073,23 @@ mod tests {
             None
         );
         assert_eq!(
+            deploy_name_prefix_from_secret_arn(
+                "arn:aws:secretsmanager:eu-north-1:123:secret:greentic/admin//ca"
+            ),
+            None
+        );
+        assert_eq!(aws_region_from_secret_arn("not-an-arn"), None);
+        assert_eq!(
+            aws_region_from_secret_arn("arn:aws:secretsmanager::123:secret:name").as_deref(),
+            Some("")
+        );
+        assert_eq!(
             task_id_from_arn("arn:aws:ecs:eu-north-1:123456789012:task/acme-prod-cluster/abc123")
                 .as_deref(),
             Some("abc123")
         );
+        assert_eq!(task_id_from_arn("abc123").as_deref(), Some("abc123"));
+        assert_eq!(task_id_from_arn("cluster/").as_deref(), Some(""));
     }
 
     #[test]
@@ -698,6 +1103,35 @@ mod tests {
 
         maybe_write_tunnel_admin_certs(tmp.path(), &outputs, "eu-north-1", "acme-prod")
             .expect("missing optional refs should skip");
+
+        assert!(!tunnel_admin_cert_dir(tmp.path(), "acme-prod").exists());
+    }
+
+    #[test]
+    fn maybe_write_tunnel_admin_certs_skips_for_each_missing_ref() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ca_ref =
+            "arn:aws:secretsmanager:eu-north-1:123456789012:secret:greentic/admin/acme-prod/ca";
+        let cert_ref = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:greentic/admin/acme-prod/client-cert";
+        let key_ref = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:greentic/admin/acme-prod/client-key";
+
+        for outputs in [
+            serde_json::json!({
+                "admin_client_cert_secret_ref": { "value": cert_ref },
+                "admin_client_key_secret_ref": { "value": key_ref }
+            }),
+            serde_json::json!({
+                "admin_client_cert_secret_ref": { "value": cert_ref },
+                "admin_ca_secret_ref": { "value": ca_ref }
+            }),
+            serde_json::json!({
+                "admin_client_key_secret_ref": { "value": key_ref },
+                "admin_ca_secret_ref": { "value": ca_ref }
+            }),
+        ] {
+            maybe_write_tunnel_admin_certs(tmp.path(), &outputs, "eu-north-1", "acme-prod")
+                .expect("incomplete cert refs should skip without shelling out");
+        }
 
         assert!(!tunnel_admin_cert_dir(tmp.path(), "acme-prod").exists());
     }
@@ -789,6 +1223,19 @@ mod tests {
     fn destroy_from_ext_rejects_invalid_json() {
         let err = destroy_from_ext("not json", "{}", None).unwrap_err();
         assert!(format!("{err}").contains("parse"), "got: {err}");
+    }
+
+    #[test]
+    fn destroy_from_ext_rejects_missing_required_field() {
+        let json = r#"{"region":"eu-north-1"}"#;
+        let err = destroy_from_ext(json, "{}", None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("missing field")
+                || msg.contains("bundleSource")
+                || msg.contains("bundle_source"),
+            "got: {msg}"
+        );
     }
 
     #[test]

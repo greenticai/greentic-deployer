@@ -2,6 +2,8 @@ data "aws_availability_zones" "available" {
   state = "available"
 }
 
+data "aws_caller_identity" "current" {}
+
 data "aws_vpc" "default" {
   count   = var.use_default_vpc ? 1 : 0
   default = true
@@ -22,14 +24,14 @@ data "aws_subnets" "default" {
 }
 
 locals {
-  name_prefix = trimspace(var.deployment_name_prefix) != "" ? var.deployment_name_prefix : "greentic-${substr(md5(var.bundle_digest), 0, 8)}"
-  app_port    = 8080
-  admin_port  = 8433
-  admin_bind  = "127.0.0.1:${local.admin_port}"
+  name_prefix               = trimspace(var.deployment_name_prefix) != "" ? var.deployment_name_prefix : "greentic-${substr(md5(var.bundle_digest), 0, 8)}"
+  app_port                  = 8080
+  admin_port                = 8433
+  admin_bind                = "127.0.0.1:${local.admin_port}"
   effective_public_base_url = trimspace(var.public_base_url) != "" ? var.public_base_url : "http://${aws_lb.this.dns_name}"
-  admin_secret_prefix = "greentic/admin/${local.name_prefix}"
-  effective_vpc_id = var.use_default_vpc ? data.aws_vpc.default[0].id : aws_vpc.this[0].id
-  effective_subnet_ids = var.use_default_vpc ? slice(data.aws_subnets.default[0].ids, 0, min(2, length(data.aws_subnets.default[0].ids))) : aws_subnet.public[*].id
+  admin_secret_prefix       = "greentic/admin/${local.name_prefix}"
+  effective_vpc_id          = var.use_default_vpc ? data.aws_vpc.default[0].id : aws_vpc.this[0].id
+  effective_subnet_ids      = var.use_default_vpc ? slice(data.aws_subnets.default[0].ids, 0, min(2, length(data.aws_subnets.default[0].ids))) : aws_subnet.public[*].id
   common_tags = {
     ManagedBy = "greentic-demo"
     Bundle    = var.bundle_digest
@@ -362,6 +364,11 @@ resource "aws_secretsmanager_secret_version" "admin_client_key" {
   secret_string = tls_private_key.admin_client.private_key_pem
 }
 
+data "aws_secretsmanager_secret" "runtime" {
+  for_each = var.runtime_secret_env
+  name     = each.value
+}
+
 resource "aws_iam_role_policy" "task_execution_admin_secrets" {
   name = "${local.name_prefix}-task-exec-admin-secrets"
   role = aws_iam_role.task_execution.id
@@ -400,6 +407,27 @@ resource "aws_iam_role_policy" "task_execution_ecs_exec" {
           "ssmmessages:OpenDataChannel"
         ]
         Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "task_runtime_secrets" {
+  count = trimspace(var.runtime_secret_prefix) != "" ? 1 : 0
+  name  = "${local.name_prefix}-task-runtime-secrets"
+  role  = aws_iam_role.task_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = [
+          "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:${trim(var.runtime_secret_prefix, "/")}/*"
+        ]
       }
     ]
   })
@@ -495,6 +523,20 @@ resource "aws_ecs_task_definition" "this" {
             value = "120"
           }
         ],
+        trimspace(var.runtime_secret_prefix) != "" ? [
+          {
+            name  = "GREENTIC_SECRETS_BACKEND"
+            value = "env"
+          },
+          {
+            name  = "GREENTIC_ALLOW_ENV_SECRETS"
+            value = "1"
+          },
+          {
+            name  = "GREENTIC_SECRETS_MANAGER_PACK"
+            value = "providers/deployer/aws.gtpack"
+          }
+        ] : [],
         [
           {
             name  = "PUBLIC_BASE_URL"
@@ -530,20 +572,28 @@ resource "aws_ecs_task_definition" "this" {
           }
         ] : []
       )
-      secrets = [
-        {
-          name      = "GREENTIC_ADMIN_CA_PEM"
-          valueFrom = aws_secretsmanager_secret.admin_ca.arn
-        },
-        {
-          name      = "GREENTIC_ADMIN_SERVER_CERT_PEM"
-          valueFrom = aws_secretsmanager_secret.admin_server_cert.arn
-        },
-        {
-          name      = "GREENTIC_ADMIN_SERVER_KEY_PEM"
-          valueFrom = aws_secretsmanager_secret.admin_server_key.arn
-        }
-      ]
+      secrets = concat(
+        [
+          {
+            name      = "GREENTIC_ADMIN_CA_PEM"
+            valueFrom = aws_secretsmanager_secret.admin_ca.arn
+          },
+          {
+            name      = "GREENTIC_ADMIN_SERVER_CERT_PEM"
+            valueFrom = aws_secretsmanager_secret.admin_server_cert.arn
+          },
+          {
+            name      = "GREENTIC_ADMIN_SERVER_KEY_PEM"
+            valueFrom = aws_secretsmanager_secret.admin_server_key.arn
+          }
+        ],
+        [
+          for name, secret_name in var.runtime_secret_env : {
+            name      = name
+            valueFrom = data.aws_secretsmanager_secret.runtime[name].arn
+          }
+        ]
+      )
       logConfiguration = {
         logDriver = "awslogs"
         options = {
@@ -561,11 +611,11 @@ resource "aws_ecs_task_definition" "this" {
 data "aws_region" "current" {}
 
 resource "aws_ecs_service" "this" {
-  name            = "${local.name_prefix}-service"
-  cluster         = aws_ecs_cluster.this.id
-  task_definition = aws_ecs_task_definition.this.arn
-  desired_count   = 1
-  launch_type     = "FARGATE"
+  name                   = "${local.name_prefix}-service"
+  cluster                = aws_ecs_cluster.this.id
+  task_definition        = aws_ecs_task_definition.this.arn
+  desired_count          = 1
+  launch_type            = "FARGATE"
   enable_execute_command = true
 
   network_configuration {

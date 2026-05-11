@@ -42,14 +42,21 @@ jobs:
       - name: Install coverage toolchain
         run: |
           cargo binstall -y cargo-llvm-cov
-          cargo binstall -y cargo-nextest
-          cargo binstall -y greentic-dev
+          cargo binstall -y --force cargo-nextest
+          command -v cargo-nextest
+
+      - name: Install greentic-dev
+        run: |
+          cargo binstall -y --force greentic-dev
+          command -v greentic-dev
+          greentic-dev --version
 
       - name: Install llvm-tools-preview
         run: rustup component add llvm-tools-preview
 
       - name: Validate coverage policy
-        run: greentic-dev coverage
+        run: |
+          greentic-dev coverage
 
       - name: Upload coverage report
         if: always()

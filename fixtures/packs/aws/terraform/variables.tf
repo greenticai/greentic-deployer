@@ -87,6 +87,16 @@ variable "public_base_url" {
   default = ""
 }
 
+variable "runtime_secret_prefix" {
+  type    = string
+  default = ""
+}
+
+variable "runtime_secret_env" {
+  type    = map(string)
+  default = {}
+}
+
 variable "remote_state_backend" {
   type = string
 }

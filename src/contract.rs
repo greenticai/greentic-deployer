@@ -13,13 +13,14 @@ use crate::error::{DeployerError, Result};
 use crate::pack_introspect::read_entry_from_gtpack;
 
 pub const EXT_DEPLOYER_V1: &str = "greentic.deployer.v1";
+pub const EXT_DEPLOYER_CONTRACT_V1: &str = "greentic.deployer.contract.v1";
 pub const EXT_DEPLOY_AWS: &str = "greentic.deploy-aws";
 pub const EXT_DEPLOY_AZURE: &str = "greentic.deploy-azure";
 pub const EXT_DEPLOY_GCP: &str = "greentic.deploy-gcp";
-pub const DEFAULT_GHCR_OPERATOR_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless@sha256:b754d51503b075df3d0d2b9e56226f395febaba7a988f19096334c112c8a8d91";
+pub const DEFAULT_GHCR_OPERATOR_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless@sha256:570b83b5ba9e999ef34a752f1a5061c3ff3f2d8d5fac40dc58ee00d39164e12e";
 pub const DEFAULT_GCP_OPERATOR_IMAGE: &str = "europe-west1-docker.pkg.dev/x-plateau-483512-p6/greentic-images/greentic-start-distroless@sha256:5f7e4b70271c09b2a099e2c6d5c8641cbdb5a20698dcbba0e3b0f90a0f3e0e48";
 pub const DEFAULT_OPERATOR_IMAGE_DIGEST: &str =
-    "sha256:b754d51503b075df3d0d2b9e56226f395febaba7a988f19096334c112c8a8d91";
+    "sha256:570b83b5ba9e999ef34a752f1a5061c3ff3f2d8d5fac40dc58ee00d39164e12e";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -745,10 +746,11 @@ pub struct ResolvedDeployerContract {
 }
 
 pub fn get_deployer_contract_v1(manifest: &PackManifest) -> Result<Option<DeployerContractV1>> {
-    let extension = manifest
-        .extensions
-        .as_ref()
-        .and_then(|extensions| extensions.get(EXT_DEPLOYER_V1));
+    let extension = manifest.extensions.as_ref().and_then(|extensions| {
+        extensions
+            .get(EXT_DEPLOYER_CONTRACT_V1)
+            .or_else(|| extensions.get(EXT_DEPLOYER_V1))
+    });
     let inline = match extension.and_then(|entry| entry.inline.as_ref()) {
         Some(ExtensionInline::Other(value)) => value,
         Some(_) => {
@@ -777,9 +779,9 @@ pub fn set_deployer_contract_v1(
     })?;
     let extensions = manifest.extensions.get_or_insert_with(Default::default);
     extensions.insert(
-        EXT_DEPLOYER_V1.to_string(),
+        EXT_DEPLOYER_CONTRACT_V1.to_string(),
         ExtensionRef {
-            kind: EXT_DEPLOYER_V1.to_string(),
+            kind: EXT_DEPLOYER_CONTRACT_V1.to_string(),
             version: "1.0.0".to_string(),
             digest: None,
             location: None,
