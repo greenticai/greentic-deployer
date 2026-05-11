@@ -741,10 +741,32 @@ fn resolve_from_setup_answers(
         if let Some(value) = value.as_str()
             && !value.is_empty()
         {
+            if let Some(env_key) = extract_env_placeholder(value) {
+                checked_sources.push(format!("env ${{{env_key}}} (from setup-answers)"));
+                return match env::var(&env_key) {
+                    Ok(resolved) if !resolved.is_empty() => Some((path, resolved)),
+                    _ => None,
+                };
+            }
             return Some((path, value.to_string()));
         }
     }
     None
+}
+
+// Parse a whole-string `${VAR}` placeholder and return `VAR`.
+// `greentic-setup` persists unresolved env-var references in setup-answers.json
+// when a non-interactive run cannot prompt. Without expansion here, those
+// placeholders would propagate to the cloud secrets store verbatim and break
+// providers that try to use the value (e.g. state-redis treating `${REDIS_URL}`
+// as a connection string).
+fn extract_env_placeholder(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let inner = trimmed.strip_prefix("${")?.strip_suffix('}')?;
+    if inner.is_empty() || inner.contains(|c: char| c.is_whitespace() || c == '$' || c == '{') {
+        return None;
+    }
+    Some(inner.to_string())
 }
 
 fn default_required() -> bool {
@@ -754,6 +776,33 @@ fn default_required() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_env_placeholder_matches_whole_string_dollar_brace_form() {
+        assert_eq!(
+            extract_env_placeholder("${REDIS_URL}").as_deref(),
+            Some("REDIS_URL")
+        );
+        assert_eq!(
+            extract_env_placeholder("${OPENAI_API_KEY}").as_deref(),
+            Some("OPENAI_API_KEY")
+        );
+        assert_eq!(
+            extract_env_placeholder("  ${PUBLIC_BASE_URL}  ").as_deref(),
+            Some("PUBLIC_BASE_URL"),
+            "surrounding whitespace is allowed"
+        );
+    }
+
+    #[test]
+    fn extract_env_placeholder_rejects_partial_or_malformed_patterns() {
+        assert_eq!(extract_env_placeholder("redis://host:6379/0"), None);
+        assert_eq!(extract_env_placeholder("prefix-${VAR}"), None);
+        assert_eq!(extract_env_placeholder("${VAR}-suffix"), None);
+        assert_eq!(extract_env_placeholder("${}"), None);
+        assert_eq!(extract_env_placeholder("${VAR WITH SPACE}"), None);
+        assert_eq!(extract_env_placeholder("${NESTED${INNER}}"), None);
+    }
 
     #[test]
     fn canonical_env_key_matches_start_runtime_shape() {
