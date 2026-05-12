@@ -41,8 +41,15 @@ jobs:
 
       - name: Install coverage toolchain
         run: |
-          cargo binstall -y cargo-llvm-cov
-          cargo binstall -y --force cargo-nextest
+          # rust-cache restores ~/.cargo/.crates.toml but not ~/.cargo/bin,
+          # so binstall may say "already installed" while the binary is gone.
+          if ! command -v cargo-llvm-cov >/dev/null; then
+            cargo binstall -y --force cargo-llvm-cov
+          fi
+          if ! command -v cargo-nextest >/dev/null; then
+            cargo binstall -y --force cargo-nextest
+          fi
+          command -v cargo-llvm-cov
           command -v cargo-nextest
 
       - name: Install greentic-dev
