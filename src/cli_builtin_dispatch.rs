@@ -197,15 +197,26 @@ pub(crate) fn dispatch_builtin_backend_command(command: BuiltinBackendCommand) -
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+    use greentic_deployer::BuiltinBackendHandlerId;
+
     use super::*;
-    use crate::{
-        AdminAccessArgs, AwsCommand, AwsSubcommand, CliOutputFormat, TerraformArgs,
-        TerraformCommand, TerraformSubcommand,
-    };
-    use std::path::PathBuf;
+
+    fn parse_builtin_command(args: &[&str]) -> BuiltinBackendCommand {
+        let cli = crate::Cli::try_parse_from(
+            std::iter::once("greentic-deployer").chain(args.iter().copied()),
+        )
+        .expect("parse builtin command");
+
+        match cli.command {
+            crate::TopLevelCommand::Aws(command) => BuiltinBackendCommand::Aws(command),
+            crate::TopLevelCommand::Terraform(command) => BuiltinBackendCommand::Terraform(command),
+            _ => panic!("unexpected parsed command"),
+        }
+    }
 
     #[test]
-    fn all_builtin_handlers_have_execution_dispatchers() {
+    fn resolve_builtin_execution_handler_registers_every_builtin_handler() {
         for handler_id in [
             BuiltinBackendHandlerId::Terraform,
             BuiltinBackendHandlerId::K8sRaw,
@@ -221,54 +232,84 @@ mod tests {
         ] {
             assert!(
                 resolve_builtin_execution_handler(handler_id).is_some(),
-                "missing execution dispatcher for {handler_id:?}"
+                "missing handler for {handler_id:?}"
             );
         }
     }
 
     #[test]
-    fn backend_dispatchers_reject_misrouted_commands() {
-        let terraform_command = BuiltinBackendCommand::Terraform(TerraformCommand {
-            command: TerraformSubcommand::Status(TerraformArgs {
-                tenant: "acme".to_string(),
-                pack: PathBuf::from("pack.gtpack"),
-                provider_pack: None,
-                deploy_pack_id: None,
-                deploy_flow_id: None,
-                environment: None,
-                pack_id: None,
-                pack_version: None,
-                pack_digest: None,
-                distributor_url: None,
-                distributor_token: None,
-                preview: false,
-                execute: false,
-                dry_run: false,
-                config: None,
-                allow_remote_in_offline: false,
-                output: CliOutputFormat::Json,
-            }),
-        });
-        let err = dispatch_aws_backend_command(terraform_command)
-            .expect_err("terraform command should not route to aws");
-        assert!(
-            err.to_string()
-                .contains("was routed to aws dispatch but is not aws"),
-            "got: {err}"
-        );
+    fn dispatch_functions_reject_commands_for_the_wrong_backend() {
+        let aws_args = [
+            "aws",
+            "generate",
+            "--tenant",
+            "acme",
+            "--bundle-pack",
+            "bundle",
+        ];
+        let terraform_args = [
+            "terraform",
+            "generate",
+            "--tenant",
+            "acme",
+            "--bundle-pack",
+            "bundle",
+        ];
 
-        let aws_command = BuiltinBackendCommand::Aws(AwsCommand {
-            command: AwsSubcommand::AdminAccess(AdminAccessArgs {
-                bundle_dir: PathBuf::from("bundle"),
-                output: CliOutputFormat::Json,
-            }),
-        });
-        let err = dispatch_terraform_backend_command(aws_command)
-            .expect_err("aws command should not route to terraform");
-        assert!(
-            err.to_string()
-                .contains("was routed to terraform dispatch but is not terraform"),
-            "got: {err}"
-        );
+        let err = dispatch_terraform_backend_command(parse_builtin_command(&aws_args)).unwrap_err();
+        assert!(format!("{err}").contains("is not terraform"));
+
+        let err =
+            dispatch_k8s_raw_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
+        assert!(format!("{err}").contains("is not k8s-raw"));
+
+        let err =
+            dispatch_helm_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
+        assert!(format!("{err}").contains("is not helm"));
+
+        let err = dispatch_aws_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
+        assert!(format!("{err}").contains("is not aws"));
+
+        let err =
+            dispatch_azure_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
+        assert!(format!("{err}").contains("is not azure"));
+
+        let err = dispatch_gcp_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
+        assert!(format!("{err}").contains("is not gcp"));
+
+        let err =
+            dispatch_juju_k8s_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
+        assert!(format!("{err}").contains("is not juju-k8s"));
+
+        let err = dispatch_juju_machine_backend_command(parse_builtin_command(&terraform_args))
+            .unwrap_err();
+        assert!(format!("{err}").contains("is not juju-machine"));
+
+        let err =
+            dispatch_operator_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
+        assert!(format!("{err}").contains("is not operator"));
+
+        let err = dispatch_serverless_backend_command(parse_builtin_command(&terraform_args))
+            .unwrap_err();
+        assert!(format!("{err}").contains("is not serverless"));
+
+        let err =
+            dispatch_snap_backend_command(parse_builtin_command(&terraform_args)).unwrap_err();
+        assert!(format!("{err}").contains("is not snap"));
+    }
+
+    #[test]
+    fn dispatch_builtin_backend_command_uses_registered_backend_handler() {
+        let command = parse_builtin_command(&[
+            "terraform",
+            "generate",
+            "--tenant",
+            "acme",
+            "--bundle-pack",
+            "does-not-exist",
+        ]);
+
+        let err = dispatch_builtin_backend_command(command).unwrap_err();
+        assert!(format!("{err}").contains("pack path does-not-exist does not exist"));
     }
 }
