@@ -9,6 +9,7 @@ pub mod apply;
 pub mod aws;
 pub mod azure;
 pub mod bundle_upload;
+pub mod cli;
 pub mod config;
 pub mod contract;
 pub mod deployment;

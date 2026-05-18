@@ -356,7 +356,7 @@ fn try_acquire_blocks_while_transact_holds_lock() {
                 attempt.is_none(),
                 "second flock acquire must fail while transact holds the lock"
             );
-            Ok(())
+            Ok::<(), StoreError>(())
         })
         .unwrap();
     // After transact returns, the lock is released and try_acquire succeeds.
@@ -382,7 +382,7 @@ fn transact_load_then_save_does_not_deadlock() {
             locked.save(&env)?;
             // Compound: mutate pack-answers within the same transaction.
             locked.save_pack_answers(CapabilitySlot::Secrets, &json!({ "rotated": true }))?;
-            Ok(())
+            Ok::<(), StoreError>(())
         })
         .unwrap();
 

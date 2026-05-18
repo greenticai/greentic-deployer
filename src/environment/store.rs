@@ -402,11 +402,21 @@ impl LocalFsStore {
     /// Reads (`load`, `load_runtime`, `load_pack_answers`, `exists`,
     /// `list`) do not take the lock and are also available on the
     /// `Locked` handle for convenience.
-    pub fn transact<F, R>(&self, env_id: &EnvId, f: F) -> Result<R, StoreError>
+    ///
+    /// Generic over the closure's error type via `E: From<StoreError>` so
+    /// callers that mix storage errors with their own domain errors (e.g.
+    /// the `cli::*` operator surface using `OpError`) can run validation +
+    /// load + mutate + save in a single critical section without an
+    /// outer-layer error-mapping dance. Existing callers passing
+    /// `Result<_, StoreError>` continue to work because
+    /// `From<StoreError> for StoreError` is automatic.
+    pub fn transact<F, R, E>(&self, env_id: &EnvId, f: F) -> Result<R, E>
     where
-        F: FnOnce(&Locked<'_>) -> Result<R, StoreError>,
+        F: FnOnce(&Locked<'_>) -> Result<R, E>,
+        E: From<StoreError>,
     {
-        let _guard = EnvFlock::acquire(&self.lock_path(env_id)?)?;
+        let lock_path = self.lock_path(env_id).map_err(E::from)?;
+        let _guard = EnvFlock::acquire(&lock_path).map_err(|e| E::from(StoreError::Lock(e)))?;
         let locked = Locked {
             store: self,
             env_id: env_id.clone(),
