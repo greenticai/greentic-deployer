@@ -13,6 +13,7 @@ pub mod config;
 pub mod contract;
 pub mod deployment;
 pub mod desktop;
+pub mod environment;
 pub mod error;
 pub mod extension;
 pub mod extension_sources;

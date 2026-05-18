@@ -152,6 +152,18 @@ impl Environment {
                         actual_deployment: referenced.deployment_id,
                     });
                 }
+                // A `BundleDeployment` is `(deployment_id, bundle_id)`-shaped;
+                // a revision whose `bundle_id` does not match the deployment's
+                // would let the deployment route or bill a different bundle's
+                // revisions. Reject statically.
+                if referenced.bundle_id != bundle.bundle_id {
+                    return Err(SpecError::BundleRevisionWrongBundle {
+                        deployment: bundle.deployment_id,
+                        revision: *rev_id,
+                        expected_bundle: bundle.bundle_id.clone(),
+                        actual_bundle: referenced.bundle_id.clone(),
+                    });
+                }
             }
         }
 
@@ -164,12 +176,21 @@ impl Environment {
                 });
             }
             split.validate()?;
-            if !self
+            // Resolve the referenced BundleDeployment and assert that its
+            // bundle_id matches the split's. Without this, a split's
+            // (deployment_id, bundle_id) pair can diverge from the
+            // deployment's recorded bundle and cross-route traffic.
+            let referenced_bundle = self
                 .bundles
                 .iter()
-                .any(|b| b.deployment_id == split.deployment_id)
-            {
-                return Err(SpecError::UnknownDeployment(split.deployment_id));
+                .find(|b| b.deployment_id == split.deployment_id)
+                .ok_or(SpecError::UnknownDeployment(split.deployment_id))?;
+            if referenced_bundle.bundle_id != split.bundle_id {
+                return Err(SpecError::SplitDeploymentBundleMismatch {
+                    deployment: split.deployment_id,
+                    split_bundle: split.bundle_id.clone(),
+                    deployment_bundle: referenced_bundle.bundle_id.clone(),
+                });
             }
             for entry in &split.entries {
                 let referenced = self

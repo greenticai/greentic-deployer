@@ -353,6 +353,68 @@ fn bundle_current_revisions_must_reference_known_revision() {
 }
 
 #[test]
+fn bundle_current_revisions_must_match_bundle_id() {
+    // Codex finding: BundleDeployment(D, bundle=A) with current_revisions
+    // pointing at a Revision(D, bundle=B). Old validate() checked only the
+    // deployment_id and let this through, so a deployment record could
+    // route/bill another bundle's revisions.
+    let dep = DeploymentId::new();
+    let bundle_a = BundleId::new("a");
+    let bundle_b = BundleId::new("b");
+    let rev = RevisionId::new();
+    let r = revision(rev, local(), dep, bundle_b.clone());
+    let b = bundle(dep, local(), bundle_a.clone(), vec![rev]);
+    let e = env_with(local(), vec![b], vec![r], vec![]);
+    let err = e.validate().unwrap_err();
+    assert_eq!(
+        err,
+        SpecError::BundleRevisionWrongBundle {
+            deployment: dep,
+            revision: rev,
+            expected_bundle: bundle_a,
+            actual_bundle: bundle_b,
+        }
+    );
+}
+
+#[test]
+fn split_bundle_must_match_referenced_deployment_bundle() {
+    // Codex finding: TrafficSplit(deployment=D, bundle=B) that resolves to
+    // BundleDeployment(D, bundle=A). The split's revisions could all match
+    // bundle=B and pass the existing per-entry checks, but the deployment
+    // itself is anchored to bundle=A — the mismatch means split routing /
+    // billing carries the wrong bundle identity.
+    let dep = DeploymentId::new();
+    let bundle_a = BundleId::new("a");
+    let bundle_b = BundleId::new("b");
+    let rev = RevisionId::new();
+    // Bundle deployment is anchored to A.
+    let b = bundle(dep, local(), bundle_a.clone(), vec![]);
+    // Revision and split both claim B — internally consistent with each
+    // other but inconsistent with the deployment record.
+    let r = revision(rev, local(), dep, bundle_b.clone());
+    let s = split(
+        local(),
+        dep,
+        bundle_b.clone(),
+        vec![TrafficSplitEntry {
+            revision_id: rev,
+            weight_bps: 10_000,
+        }],
+    );
+    let e = env_with(local(), vec![b], vec![r], vec![s]);
+    let err = e.validate().unwrap_err();
+    assert_eq!(
+        err,
+        SpecError::SplitDeploymentBundleMismatch {
+            deployment: dep,
+            split_bundle: bundle_b,
+            deployment_bundle: bundle_a,
+        }
+    );
+}
+
+#[test]
 fn well_formed_environment_with_split_and_bundle_passes() {
     let dep = DeploymentId::new();
     let bundle_id = BundleId::new("b");

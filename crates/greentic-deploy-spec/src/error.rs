@@ -69,4 +69,23 @@ pub enum SpecError {
         revision: RevisionId,
         actual_deployment: DeploymentId,
     },
+
+    #[error(
+        "bundle deployment `{deployment}` current_revision `{revision}` belongs to bundle `{actual_bundle}`, not deployment's `{expected_bundle}`"
+    )]
+    BundleRevisionWrongBundle {
+        deployment: DeploymentId,
+        revision: RevisionId,
+        expected_bundle: BundleId,
+        actual_bundle: BundleId,
+    },
+
+    #[error(
+        "traffic split for deployment `{deployment}` carries bundle `{split_bundle}`, but the BundleDeployment record holds bundle `{deployment_bundle}`"
+    )]
+    SplitDeploymentBundleMismatch {
+        deployment: DeploymentId,
+        split_bundle: BundleId,
+        deployment_bundle: BundleId,
+    },
 }
