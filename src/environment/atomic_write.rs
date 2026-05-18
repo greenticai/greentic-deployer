@@ -44,6 +44,8 @@ pub enum AtomicWriteError {
         #[source]
         source: tempfile::PersistError,
     },
+    #[error("could not allocate a unique backup name at {0} after {1} attempts")]
+    BackupCollision(std::path::PathBuf, u32),
 }
 
 /// Atomically write `bytes` to `target`, fsyncing the parent directory afterward.
@@ -104,23 +106,58 @@ pub fn copy_to_backup(
     })?;
     let filename = target
         .file_name()
+        .and_then(|s| s.to_str())
         .ok_or_else(|| AtomicWriteError::NoParent(target.to_path_buf()))?;
-    let stamp = Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
-    let mut backup = backup_dir.join(filename);
-    let new_name = format!(
-        "{}.{}.bak",
-        backup
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("backup"),
-        stamp
-    );
-    backup.set_file_name(new_name);
-    fs::copy(target, &backup).map_err(|e| AtomicWriteError::Io {
-        path: backup.clone(),
-        source: e,
-    })?;
-    Ok(Some(backup))
+    // Nanosecond precision so back-to-back mutations under the per-env flock
+    // (which can complete in well under a millisecond) get distinct backup
+    // filenames. Disambiguate with a sequence suffix on the off-chance that
+    // two writes land in the same nanosecond (the OS clock may not provide
+    // ns resolution on all platforms).
+    let stamp = Utc::now().format("%Y%m%dT%H%M%S%.9fZ").to_string();
+    const MAX_ATTEMPTS: u32 = 1024;
+    for attempt in 0..MAX_ATTEMPTS {
+        let candidate = if attempt == 0 {
+            backup_dir.join(format!("{filename}.{stamp}.bak"))
+        } else {
+            backup_dir.join(format!("{filename}.{stamp}.{attempt}.bak"))
+        };
+        // `OpenOptions::create_new` reserves the destination atomically (the
+        // syscall sets `O_CREAT | O_EXCL`), so a concurrent backup with the
+        // same name cannot clobber ours.
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_handle) => {
+                // Drop the empty file we just created so the rest of the copy
+                // does a real overwrite of our reservation rather than failing
+                // on Windows (where `fs::copy` to an open file is allowed,
+                // but cross-platform behavior is cleaner if we close first).
+                drop(_handle);
+                fs::copy(target, &candidate).map_err(|e| AtomicWriteError::Io {
+                    path: candidate.clone(),
+                    source: e,
+                })?;
+                return Ok(Some(candidate));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Same nanosecond + same suffix as a previous backup on this
+                // host. Try the next sequence number.
+                continue;
+            }
+            Err(e) => {
+                return Err(AtomicWriteError::Io {
+                    path: candidate,
+                    source: e,
+                });
+            }
+        }
+    }
+    Err(AtomicWriteError::BackupCollision(
+        backup_dir.to_path_buf(),
+        MAX_ATTEMPTS,
+    ))
 }
 
 #[cfg(unix)]

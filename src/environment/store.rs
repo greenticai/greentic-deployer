@@ -41,6 +41,10 @@ pub enum StoreError {
     NotFound(EnvId),
     #[error("environment_id mismatch: file is `{file}`, value is `{value}`")]
     EnvIdMismatch { file: EnvId, value: EnvId },
+    #[error(
+        "environment id `{0}` is not safe as a path segment (rejects \"\", \".\", \"..\", and ids containing path separators)"
+    )]
+    UnsafeEnvId(EnvId),
     #[error("spec validation failed: {0}")]
     Spec(#[from] SpecError),
     #[error(transparent)]
@@ -59,6 +63,23 @@ pub enum StoreError {
         #[source]
         source: serde_json::Error,
     },
+}
+
+/// Reject env ids that, while valid per the upstream `EnvId` validator
+/// (which allows `.` and `..` as full strings), would escape the store
+/// root when used as a path segment. The upstream validator already
+/// rejects `/`, `\`, `:`, and whitespace; this is the narrow gap to close.
+fn safe_env_segment(env_id: &EnvId) -> Result<&str, StoreError> {
+    let s = env_id.as_str();
+    if s.is_empty() || s == "." || s == ".." {
+        return Err(StoreError::UnsafeEnvId(env_id.clone()));
+    }
+    // Defense-in-depth: even though the upstream validator should already
+    // strip these, refuse anything that looks like a multi-segment path.
+    if s.contains('/') || s.contains('\\') || s.contains(':') || s.contains('\0') {
+        return Err(StoreError::UnsafeEnvId(env_id.clone()));
+    }
+    Ok(s)
 }
 
 /// Local-FS persistence contract.
@@ -113,37 +134,47 @@ impl LocalFsStore {
         &self.root
     }
 
-    fn env_dir(&self, env_id: &EnvId) -> PathBuf {
-        self.root.join(env_id.as_str())
+    fn env_dir(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
+        Ok(self.root.join(safe_env_segment(env_id)?))
     }
 
-    fn lock_path(&self, env_id: &EnvId) -> PathBuf {
-        self.env_dir(env_id).join(".lock")
+    fn lock_path(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
+        Ok(self.env_dir(env_id)?.join(".lock"))
     }
 
-    fn environment_path(&self, env_id: &EnvId) -> PathBuf {
-        self.env_dir(env_id).join("environment.json")
+    fn environment_path(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
+        Ok(self.env_dir(env_id)?.join("environment.json"))
     }
 
-    fn runtime_path(&self, env_id: &EnvId) -> PathBuf {
-        self.env_dir(env_id).join("runtime.json")
+    fn runtime_path(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
+        Ok(self.env_dir(env_id)?.join("runtime.json"))
     }
 
-    fn pack_answers_path(&self, env_id: &EnvId, slot: CapabilitySlot) -> PathBuf {
-        self.env_dir(env_id)
+    fn pack_answers_path(
+        &self,
+        env_id: &EnvId,
+        slot: CapabilitySlot,
+    ) -> Result<PathBuf, StoreError> {
+        Ok(self
+            .env_dir(env_id)?
             .join("env-packs")
             .join(slot.as_str())
-            .join("answers.json")
+            .join("answers.json"))
     }
 
-    fn backups_dir(&self, env_id: &EnvId) -> PathBuf {
-        self.env_dir(env_id).join("backups")
+    fn backups_dir(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
+        Ok(self.env_dir(env_id)?.join("backups"))
     }
 
-    fn pack_backups_dir(&self, env_id: &EnvId, slot: CapabilitySlot) -> PathBuf {
-        self.backups_dir(env_id)
+    fn pack_backups_dir(
+        &self,
+        env_id: &EnvId,
+        slot: CapabilitySlot,
+    ) -> Result<PathBuf, StoreError> {
+        Ok(self
+            .backups_dir(env_id)?
             .join("env-packs")
-            .join(slot.as_str())
+            .join(slot.as_str()))
     }
 
     fn read_json<T: serde::de::DeserializeOwned>(&self, path: &Path) -> Result<T, StoreError> {
@@ -176,30 +207,54 @@ impl EnvironmentStore for LocalFsStore {
             if !path.is_dir() {
                 continue;
             }
-            if !path.join("environment.json").exists() {
-                continue;
-            }
             let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if let Ok(id) = EnvId::try_from(name) {
-                out.push(id);
+            let Ok(id) = EnvId::try_from(name) else {
+                continue;
+            };
+            // Skip ids that escape the root segment (e.g. `.` or `..`).
+            if safe_env_segment(&id).is_err() {
+                continue;
             }
+            let env_path = path.join("environment.json");
+            if !env_path.exists() {
+                continue;
+            }
+            // Silently skip envs whose on-disk file is unreadable, fails to
+            // deserialize, or carries a mismatched `environment_id`. Without
+            // this check a corrupted document could surface in `list()` under
+            // a name that does not match its own contents.
+            let Ok(env) = self.read_json::<Environment>(&env_path) else {
+                continue;
+            };
+            if env.environment_id != id {
+                continue;
+            }
+            out.push(id);
         }
         out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         Ok(out)
     }
 
     fn exists(&self, env_id: &EnvId) -> Result<bool, StoreError> {
-        Ok(self.environment_path(env_id).exists())
+        Ok(self.environment_path(env_id)?.exists())
     }
 
     fn load(&self, env_id: &EnvId) -> Result<Environment, StoreError> {
-        let path = self.environment_path(env_id);
+        let path = self.environment_path(env_id)?;
         if !path.exists() {
             return Err(StoreError::NotFound(env_id.clone()));
         }
-        self.read_json(&path)
+        let env: Environment = self.read_json(&path)?;
+        if env.environment_id != *env_id {
+            return Err(StoreError::EnvIdMismatch {
+                file: env_id.clone(),
+                value: env.environment_id,
+            });
+        }
+        env.validate()?;
+        Ok(env)
     }
 
     fn save(&self, env: &Environment) -> Result<(), StoreError> {
@@ -215,19 +270,32 @@ impl EnvironmentStore for LocalFsStore {
             }));
         }
         let env_id = &env.environment_id;
-        let _guard = EnvFlock::acquire(&self.lock_path(env_id))?;
-        let target = self.environment_path(env_id);
-        copy_to_backup(&target, &self.backups_dir(env_id))?;
+        let _guard = EnvFlock::acquire(&self.lock_path(env_id)?)?;
+        let target = self.environment_path(env_id)?;
+        copy_to_backup(&target, &self.backups_dir(env_id)?)?;
         atomic_write_json(&target, env)?;
         Ok(())
     }
 
     fn load_runtime(&self, env_id: &EnvId) -> Result<Option<EnvironmentRuntime>, StoreError> {
-        let path = self.runtime_path(env_id);
+        let path = self.runtime_path(env_id)?;
         if !path.exists() {
             return Ok(None);
         }
-        Ok(Some(self.read_json(&path)?))
+        let runtime: EnvironmentRuntime = self.read_json(&path)?;
+        if runtime.environment_id != *env_id {
+            return Err(StoreError::EnvIdMismatch {
+                file: env_id.clone(),
+                value: runtime.environment_id,
+            });
+        }
+        if runtime.schema.as_str() != SchemaVersion::ENVIRONMENT_RUNTIME_V1 {
+            return Err(StoreError::Spec(SpecError::SchemaMismatch {
+                expected: SchemaVersion::ENVIRONMENT_RUNTIME_V1,
+                actual: runtime.schema.as_str().to_string(),
+            }));
+        }
+        Ok(Some(runtime))
     }
 
     fn save_runtime(&self, runtime: &EnvironmentRuntime) -> Result<(), StoreError> {
@@ -238,9 +306,9 @@ impl EnvironmentStore for LocalFsStore {
             }));
         }
         let env_id = &runtime.environment_id;
-        let _guard = EnvFlock::acquire(&self.lock_path(env_id))?;
-        let target = self.runtime_path(env_id);
-        copy_to_backup(&target, &self.backups_dir(env_id))?;
+        let _guard = EnvFlock::acquire(&self.lock_path(env_id)?)?;
+        let target = self.runtime_path(env_id)?;
+        copy_to_backup(&target, &self.backups_dir(env_id)?)?;
         atomic_write_json(&target, runtime)?;
         Ok(())
     }
@@ -250,7 +318,7 @@ impl EnvironmentStore for LocalFsStore {
         env_id: &EnvId,
         slot: CapabilitySlot,
     ) -> Result<Option<Value>, StoreError> {
-        let path = self.pack_answers_path(env_id, slot);
+        let path = self.pack_answers_path(env_id, slot)?;
         if !path.exists() {
             return Ok(None);
         }
@@ -263,19 +331,19 @@ impl EnvironmentStore for LocalFsStore {
         slot: CapabilitySlot,
         answers: &Value,
     ) -> Result<(), StoreError> {
-        let _guard = EnvFlock::acquire(&self.lock_path(env_id))?;
-        let target = self.pack_answers_path(env_id, slot);
-        copy_to_backup(&target, &self.pack_backups_dir(env_id, slot))?;
+        let _guard = EnvFlock::acquire(&self.lock_path(env_id)?)?;
+        let target = self.pack_answers_path(env_id, slot)?;
+        copy_to_backup(&target, &self.pack_backups_dir(env_id, slot)?)?;
         atomic_write_json(&target, answers)?;
         Ok(())
     }
 
     fn delete_pack_answers(&self, env_id: &EnvId, slot: CapabilitySlot) -> Result<(), StoreError> {
-        let _guard = EnvFlock::acquire(&self.lock_path(env_id))?;
-        let target = self.pack_answers_path(env_id, slot);
+        let _guard = EnvFlock::acquire(&self.lock_path(env_id)?)?;
+        let target = self.pack_answers_path(env_id, slot)?;
         if target.exists() {
             // Snapshot before removal so the previous answers can be recovered.
-            copy_to_backup(&target, &self.pack_backups_dir(env_id, slot))?;
+            copy_to_backup(&target, &self.pack_backups_dir(env_id, slot)?)?;
             std::fs::remove_file(&target).map_err(|source| StoreError::Io {
                 path: target,
                 source,
@@ -285,7 +353,7 @@ impl EnvironmentStore for LocalFsStore {
     }
 
     fn lock(&self, env_id: &EnvId) -> Result<EnvFlock, StoreError> {
-        Ok(EnvFlock::acquire(&self.lock_path(env_id))?)
+        Ok(EnvFlock::acquire(&self.lock_path(env_id)?)?)
     }
 }
 

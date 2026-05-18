@@ -362,6 +362,221 @@ fn mint_ids_are_unique() {
     assert_ne!(c, d);
 }
 
+// ----------------------------------------------------------------------------
+// Codex adversarial-review regressions
+// ----------------------------------------------------------------------------
+
+#[test]
+fn save_rejects_env_id_equal_to_dotdot() {
+    // Without the safe_env_segment guard, `EnvId("..")` would resolve to
+    // <root>/.. and write `environment.json` into the parent directory.
+    let (_tmp, store) = fresh_store();
+    let id = env_id("..");
+    let env = minimal_environment(&id);
+    let err = store.save(&env).expect_err("must reject `..`");
+    assert!(
+        matches!(err, StoreError::UnsafeEnvId(_)),
+        "expected UnsafeEnvId, got {err:?}"
+    );
+    // Nothing escaped into the parent of the temp root.
+    assert!(!store.root().join("..").join("environment.json").exists());
+}
+
+#[test]
+fn save_rejects_env_id_equal_to_dot() {
+    let (_tmp, store) = fresh_store();
+    let id = env_id(".");
+    let env = minimal_environment(&id);
+    let err = store.save(&env).expect_err("must reject `.`");
+    assert!(matches!(err, StoreError::UnsafeEnvId(_)));
+}
+
+#[test]
+fn load_runtime_answers_lock_all_reject_unsafe_env_id() {
+    let (_tmp, store) = fresh_store();
+    let bad = env_id("..");
+    assert!(matches!(
+        store.load(&bad).unwrap_err(),
+        StoreError::UnsafeEnvId(_)
+    ));
+    assert!(matches!(
+        store.load_runtime(&bad).unwrap_err(),
+        StoreError::UnsafeEnvId(_)
+    ));
+    assert!(matches!(
+        store.exists(&bad).unwrap_err(),
+        StoreError::UnsafeEnvId(_)
+    ));
+    assert!(matches!(
+        store
+            .load_pack_answers(&bad, CapabilitySlot::Secrets)
+            .unwrap_err(),
+        StoreError::UnsafeEnvId(_)
+    ));
+    assert!(matches!(
+        store
+            .save_pack_answers(&bad, CapabilitySlot::Secrets, &json!({}))
+            .unwrap_err(),
+        StoreError::UnsafeEnvId(_)
+    ));
+    assert!(matches!(
+        store
+            .delete_pack_answers(&bad, CapabilitySlot::Secrets)
+            .unwrap_err(),
+        StoreError::UnsafeEnvId(_)
+    ));
+    assert!(matches!(
+        store.lock(&bad).unwrap_err(),
+        StoreError::UnsafeEnvId(_)
+    ));
+}
+
+#[test]
+fn load_rejects_corrupted_file_with_mismatched_env_id() {
+    // Simulate a restored / corrupted file where environment_id does not
+    // match the directory the file lives in.
+    let (tmp, store) = fresh_store();
+    let dir_id = env_id("local");
+    let value_id = env_id("prod");
+    let mut env = minimal_environment(&value_id);
+    env.name = "stolen".into();
+
+    let dir = tmp.path().join("local");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("environment.json"),
+        serde_json::to_vec_pretty(&env).unwrap(),
+    )
+    .unwrap();
+
+    let err = store.load(&dir_id).expect_err("must reject id mismatch");
+    match err {
+        StoreError::EnvIdMismatch { file, value } => {
+            assert_eq!(file, dir_id);
+            assert_eq!(value, value_id);
+        }
+        other => panic!("expected EnvIdMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn load_validates_environment_after_deserialize() {
+    // Hand-written file with a slot duplicated would pass deserialize but
+    // fail validate(). Old load() would happily return it.
+    let (tmp, store) = fresh_store();
+    let id = env_id("local");
+    let mut env = minimal_environment(&id);
+    env.packs.push(EnvPackBinding {
+        slot: CapabilitySlot::Deployer,
+        kind: pack_descriptor("greentic.deployer.k8s@1.0.0"),
+        pack_ref: PackId::new("k8s"),
+        answers_ref: None,
+        generation: 0,
+        previous_binding_ref: None,
+    });
+    let dir = tmp.path().join("local");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("environment.json"),
+        serde_json::to_vec_pretty(&env).unwrap(),
+    )
+    .unwrap();
+
+    let err = store
+        .load(&id)
+        .expect_err("load must run spec validate() on result");
+    assert!(matches!(err, StoreError::Spec(_)));
+}
+
+#[test]
+fn load_runtime_rejects_mismatched_env_id() {
+    let (tmp, store) = fresh_store();
+    let dir_id = env_id("local");
+    let value_id = env_id("prod");
+
+    let runtime = EnvironmentRuntime {
+        schema: SchemaVersion::from(SchemaVersion::ENVIRONMENT_RUNTIME_V1),
+        environment_id: value_id.clone(),
+        discovered: Default::default(),
+        generated_at: chrono::Utc::now(),
+        generated_by: pack_descriptor("greentic.deployer.local-process@1.0.0"),
+        generation: 1,
+    };
+    let dir = tmp.path().join("local");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("runtime.json"),
+        serde_json::to_vec_pretty(&runtime).unwrap(),
+    )
+    .unwrap();
+
+    let err = store
+        .load_runtime(&dir_id)
+        .expect_err("must reject id mismatch");
+    match err {
+        StoreError::EnvIdMismatch { file, value } => {
+            assert_eq!(file, dir_id);
+            assert_eq!(value, value_id);
+        }
+        other => panic!("expected EnvIdMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn list_silently_skips_corrupted_files() {
+    let (tmp, store) = fresh_store();
+
+    // A perfectly fine env.
+    store.save(&minimal_environment(&env_id("good"))).unwrap();
+
+    // A directory with malformed JSON.
+    let bad_dir = tmp.path().join("malformed");
+    std::fs::create_dir_all(&bad_dir).unwrap();
+    std::fs::write(bad_dir.join("environment.json"), b"{not json").unwrap();
+
+    // A directory whose environment_id field doesn't match the dir name.
+    let mismatch_dir = tmp.path().join("mismatch");
+    std::fs::create_dir_all(&mismatch_dir).unwrap();
+    let env = minimal_environment(&env_id("totally-different"));
+    std::fs::write(
+        mismatch_dir.join("environment.json"),
+        serde_json::to_vec_pretty(&env).unwrap(),
+    )
+    .unwrap();
+
+    let envs = store.list().unwrap();
+    let names: Vec<_> = envs.iter().map(|e| e.as_str().to_string()).collect();
+    assert_eq!(names, vec!["good"]);
+}
+
+#[test]
+fn backups_survive_rapid_successive_saves() {
+    // Codex finding: ms-precision filenames + fs::copy(no-clobber-off) means
+    // two saves landing in the same millisecond would overwrite each other's
+    // backup. With ns precision + create_new reservation, both must survive.
+    let (tmp, store) = fresh_store();
+    let id = env_id("local");
+    let mut env = minimal_environment(&id);
+    store.save(&env).unwrap(); // initial → no backup
+    const ROUNDS: usize = 20;
+    for i in 0..ROUNDS {
+        env.name = format!("rev-{i}");
+        store.save(&env).unwrap();
+    }
+    let backups_dir = tmp.path().join("local").join("backups");
+    let backups: Vec<_> = std::fs::read_dir(&backups_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("environment.json.") && n.ends_with(".bak"))
+        .collect();
+    assert_eq!(
+        backups.len(),
+        ROUNDS,
+        "expected one backup per non-initial save, got {backups:?}"
+    );
+}
+
 #[test]
 fn default_root_under_home() {
     if let Some(root) = LocalFsStore::default_root() {
