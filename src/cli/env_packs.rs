@@ -332,6 +332,18 @@ fn load_previous(prev_ref: &std::path::Path) -> Option<Value> {
 // Minimal URL-safe base64 (no_pad). Keeps the crate dep tree clean — `base64`
 // is not currently a deployer dep, and pulling it in for an encoding used
 // only by this one short path is the wrong trade.
+
+/// Re-export for sibling cli modules (e.g. `traffic`) that want to reuse the
+/// same `inline://` stash scheme.
+pub(crate) fn base64_encode_public(input: &[u8]) -> String {
+    base64_encode(input)
+}
+
+/// Re-export for sibling cli modules. Returns `None` on any malformed input.
+pub(crate) fn base64_decode_public(input: &str) -> Option<Vec<u8>> {
+    base64_decode(input)
+}
+
 fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
