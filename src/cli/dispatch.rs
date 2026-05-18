@@ -15,8 +15,23 @@ use crate::environment::LocalFsStore;
 use super::{OpError, OpFlags, OpOutcome, render_error};
 
 /// `greentic-deployer op …`. Mirrors the `gtc op …` surface; the gtc-side
-/// passthrough is wired in a follow-up PR.
+/// passthrough shells out to `greentic-operator op …`, which dispatches
+/// through the same `OpCommand` clap tree.
 #[derive(Parser, Debug)]
+#[command(
+    after_help = "Nouns: env, env-packs, bundles, revisions, traffic, config, credentials, secrets.\n\
+                  Every verb honors:\n\
+                    --schema             dump the JSON schema of the payload it would accept, then exit\n\
+                    --answers <PATH>     read the payload from a JSON or YAML file\n\n\
+                  Examples:\n\
+                    greentic-operator op env create --answers env.json\n\
+                    greentic-operator op revisions warm --answers warm.yaml\n\
+                    greentic-operator op env show <env-id>\n\n\
+                  Errors are written to stderr as a JSON envelope:\n\
+                    {\"op\":\"<verb>\",\"noun\":\"<noun>\",\"error\":{\"kind\":\"…\",\"message\":\"…\"}}\n\
+                  Success output goes to stdout as:\n\
+                    {\"op\":\"<verb>\",\"noun\":\"<noun>\",\"result\":…}"
+)]
 pub struct OpCommand {
     /// Optional root for the local `EnvironmentStore`. Defaults to
     /// `~/.greentic/environments`.
@@ -191,13 +206,20 @@ pub fn print_error(noun: &'static str, op: &'static str, err: &OpError) {
 /// Top-level dispatcher. The verb modules each load their own payload via
 /// `--answers` or `--payload-json`; this function only routes argv into
 /// the right library call.
+///
+/// On success, the per-verb result is written to stdout as the documented
+/// `{op, noun, result}` envelope. On error, the documented
+/// `{op, noun, error: {kind, message}}` envelope is written to stderr and
+/// the same `OpError` is returned so callers can map it to a process exit
+/// code without re-rendering. Stdout and stderr never cross-contaminate.
 pub fn dispatch_op(cmd: OpCommand) -> Result<(), OpError> {
     let flags = OpFlags {
         schema_only: cmd.schema,
         answers: cmd.answers.clone(),
     };
-    let store = build_store(&cmd)?;
-    match cmd.noun {
+    let (noun, verb) = noun_verb_labels(&cmd.noun);
+    let store = build_store(&cmd).inspect_err(|err| print_error(noun, verb, err))?;
+    let result = match cmd.noun {
         OpNoun::Env { verb } => dispatch_env(&store, &flags, verb),
         OpNoun::EnvPacks { verb } => dispatch_env_packs(&store, &flags, verb),
         OpNoun::Bundles { verb } => dispatch_bundles(&store, &flags, verb),
@@ -206,6 +228,87 @@ pub fn dispatch_op(cmd: OpCommand) -> Result<(), OpError> {
         OpNoun::Config { verb } => dispatch_config(&store, &flags, verb),
         OpNoun::Credentials { verb } => dispatch_credentials(&store, &flags, verb),
         OpNoun::Secrets { verb } => dispatch_secrets(&store, &flags, verb),
+    };
+    result.inspect_err(|err| print_error(noun, verb, err))
+}
+
+/// Map an [`OpNoun`] to its `(noun, verb)` static label pair for envelope
+/// rendering. Kept in lockstep with the verb enums above; adding a new
+/// noun/verb requires extending the match here too.
+pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
+    match noun {
+        OpNoun::Env { verb } => (
+            "env",
+            match verb {
+                EnvVerb::Create => "create",
+                EnvVerb::Update => "update",
+                EnvVerb::List => "list",
+                EnvVerb::Show { .. } => "show",
+                EnvVerb::Doctor { .. } => "doctor",
+                EnvVerb::Destroy { .. } => "destroy",
+            },
+        ),
+        OpNoun::EnvPacks { verb } => (
+            "env-packs",
+            match verb {
+                EnvPacksVerb::Add => "add",
+                EnvPacksVerb::Update => "update",
+                EnvPacksVerb::Remove => "remove",
+                EnvPacksVerb::Rollback => "rollback",
+                EnvPacksVerb::List { .. } => "list",
+            },
+        ),
+        OpNoun::Bundles { verb } => (
+            "bundles",
+            match verb {
+                BundlesVerb::Add => "add",
+                BundlesVerb::Update => "update",
+                BundlesVerb::Remove => "remove",
+                BundlesVerb::List { .. } => "list",
+            },
+        ),
+        OpNoun::Revisions { verb } => (
+            "revisions",
+            match verb {
+                RevisionsVerb::Stage => "stage",
+                RevisionsVerb::Warm => "warm",
+                RevisionsVerb::Drain => "drain",
+                RevisionsVerb::Archive => "archive",
+                RevisionsVerb::List { .. } => "list",
+            },
+        ),
+        OpNoun::Traffic { verb } => (
+            "traffic",
+            match verb {
+                TrafficVerb::Set => "set",
+                TrafficVerb::Show => "show",
+                TrafficVerb::Rollback => "rollback",
+            },
+        ),
+        OpNoun::Config { verb } => (
+            "config",
+            match verb {
+                ConfigVerb::Show => "show",
+                ConfigVerb::Set => "set",
+            },
+        ),
+        OpNoun::Credentials { verb } => (
+            "credentials",
+            match verb {
+                CredentialsVerb::Requirements => "requirements",
+                CredentialsVerb::Bootstrap => "bootstrap",
+                CredentialsVerb::Rotate => "rotate",
+            },
+        ),
+        OpNoun::Secrets { verb } => (
+            "secrets",
+            match verb {
+                SecretsVerb::List => "list",
+                SecretsVerb::Put => "put",
+                SecretsVerb::Get => "get",
+                SecretsVerb::Rotate => "rotate",
+            },
+        ),
     }
 }
 
