@@ -906,7 +906,14 @@ mod tests {
 
     #[test]
     fn resolve_direct_pack_path_prefers_provider_specific_filename() {
-        let providers_dir = tempfile::tempdir().expect("tempdir");
+        // Same parent dir as `write_test_deployer_pack` so the rename below
+        // stays on a single filesystem; bare `tempfile::tempdir()` lands in
+        // $TMPDIR (often a separate tmpfs mount) and trips `EXDEV` on hosts
+        // where /tmp and the source tree sit on different volumes.
+        let providers_base = env::current_dir().expect("cwd").join("target/tmp-tests");
+        std::fs::create_dir_all(&providers_base).expect("create tmp base");
+        let providers_dir =
+            tempfile::tempdir_in(&providers_base).expect("tempdir in same fs as source pack");
         let aws_pack = providers_dir.path().join("aws.gtpack");
         std::fs::rename(
             write_test_deployer_pack(
@@ -960,7 +967,12 @@ mod tests {
 
     #[test]
     fn resolve_deployment_pack_uses_provider_specific_filename_without_override() {
-        let providers_dir = tempfile::tempdir().expect("tempdir");
+        // Same-filesystem tempdir — see resolve_direct_pack_path_prefers_provider_specific_filename
+        // for the rationale.
+        let providers_base = env::current_dir().expect("cwd").join("target/tmp-tests");
+        std::fs::create_dir_all(&providers_base).expect("create tmp base");
+        let providers_dir =
+            tempfile::tempdir_in(&providers_base).expect("tempdir in same fs as source pack");
         let aws_pack = providers_dir.path().join("aws.gtpack");
         std::fs::rename(
             write_test_deployer_pack(
