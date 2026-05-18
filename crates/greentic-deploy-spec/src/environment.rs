@@ -83,8 +83,18 @@ impl Environment {
         self.packs.iter().find(|b| b.slot == slot)
     }
 
-    /// Validates spec-level invariants: schema discriminator, slot uniqueness,
-    /// and basis-points sums on contained TrafficSplits / BundleDeployments.
+    /// Validates spec-level invariants:
+    /// - schema discriminator matches `greentic.environment.v1`,
+    /// - slot uniqueness across `packs`,
+    /// - basis-points sums on contained `TrafficSplit` / `BundleDeployment`,
+    /// - `env_id` ownership across `host_config`, `revisions`, `bundles`, and
+    ///   `traffic_splits` (every nested doc carries the same env identifier),
+    /// - referential integrity: split entries reference a `Revision` in this
+    ///   env whose `deployment_id` + `bundle_id` match the split's, and every
+    ///   bundle's `current_revisions` references a `Revision` whose
+    ///   `deployment_id` matches the bundle's. Lifecycle-state checks (e.g.
+    ///   `lifecycle == Ready` for split entries per `§5.3`) stay at apply
+    ///   time — pure data invariants only here.
     pub fn validate(&self) -> Result<(), SpecError> {
         if self.schema.as_str() != SchemaVersion::ENVIRONMENT_V1 {
             return Err(SpecError::SchemaMismatch {
@@ -92,6 +102,15 @@ impl Environment {
                 actual: self.schema.as_str().to_string(),
             });
         }
+
+        if self.host_config.env_id != self.environment_id {
+            return Err(SpecError::EnvIdMismatch {
+                context: "host_config",
+                expected: self.environment_id.clone(),
+                actual: self.host_config.env_id.clone(),
+            });
+        }
+
         let mut seen = [false; 6];
         for binding in &self.packs {
             let idx = binding.slot as usize;
@@ -100,12 +119,81 @@ impl Environment {
             }
             seen[idx] = true;
         }
-        for split in &self.traffic_splits {
-            split.validate()?;
+
+        for revision in &self.revisions {
+            if revision.env_id != self.environment_id {
+                return Err(SpecError::EnvIdMismatch {
+                    context: "revision",
+                    expected: self.environment_id.clone(),
+                    actual: revision.env_id.clone(),
+                });
+            }
         }
+
         for bundle in &self.bundles {
+            if bundle.env_id != self.environment_id {
+                return Err(SpecError::EnvIdMismatch {
+                    context: "bundle_deployment",
+                    expected: self.environment_id.clone(),
+                    actual: bundle.env_id.clone(),
+                });
+            }
             bundle.validate()?;
+            for rev_id in &bundle.current_revisions {
+                let referenced = self
+                    .revisions
+                    .iter()
+                    .find(|r| r.revision_id == *rev_id)
+                    .ok_or(SpecError::UnknownRevision(*rev_id))?;
+                if referenced.deployment_id != bundle.deployment_id {
+                    return Err(SpecError::BundleRevisionWrongDeployment {
+                        deployment: bundle.deployment_id,
+                        revision: *rev_id,
+                        actual_deployment: referenced.deployment_id,
+                    });
+                }
+            }
         }
+
+        for split in &self.traffic_splits {
+            if split.env_id != self.environment_id {
+                return Err(SpecError::EnvIdMismatch {
+                    context: "traffic_split",
+                    expected: self.environment_id.clone(),
+                    actual: split.env_id.clone(),
+                });
+            }
+            split.validate()?;
+            if !self
+                .bundles
+                .iter()
+                .any(|b| b.deployment_id == split.deployment_id)
+            {
+                return Err(SpecError::UnknownDeployment(split.deployment_id));
+            }
+            for entry in &split.entries {
+                let referenced = self
+                    .revisions
+                    .iter()
+                    .find(|r| r.revision_id == entry.revision_id)
+                    .ok_or(SpecError::UnknownRevision(entry.revision_id))?;
+                if referenced.deployment_id != split.deployment_id {
+                    return Err(SpecError::SplitRevisionWrongDeployment {
+                        revision: entry.revision_id,
+                        expected_deployment: split.deployment_id,
+                        actual_deployment: referenced.deployment_id,
+                    });
+                }
+                if referenced.bundle_id != split.bundle_id {
+                    return Err(SpecError::SplitRevisionWrongBundle {
+                        revision: entry.revision_id,
+                        expected_bundle: split.bundle_id.clone(),
+                        actual_bundle: referenced.bundle_id.clone(),
+                    });
+                }
+            }
+        }
+
         Ok(())
     }
 }

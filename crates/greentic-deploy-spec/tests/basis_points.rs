@@ -48,6 +48,31 @@ fn traffic_split_rejects_oversum() {
     assert_eq!(err, SpecError::BasisPointsSum { sum: 10_001 });
 }
 
+#[test]
+fn traffic_split_rejects_entry_above_10000() {
+    let err = split(&[10_001]).validate().unwrap_err();
+    assert_eq!(err, SpecError::BasisPointsEntryTooLarge { value: 10_001 });
+}
+
+#[test]
+fn traffic_split_rejects_u32_max_wraparound() {
+    // [u32::MAX, 10001] wraps to exactly 10000 under release u32 arithmetic.
+    // Validator must reject the oversized entry before summing.
+    let err = split(&[u32::MAX, 10_001]).validate().unwrap_err();
+    assert_eq!(err, SpecError::BasisPointsEntryTooLarge { value: u32::MAX });
+}
+
+#[test]
+fn traffic_split_rejects_summed_overflow_when_entries_are_in_range() {
+    // Each entry is ≤ 10_000, but they sum past 10_000. Must reject with sum error,
+    // and the sum reported must reflect the widened u64 (no wraparound).
+    let weights: Vec<u32> = (0..50_000).map(|_| 9_999).collect();
+    let s = split(&weights);
+    let err = s.validate().unwrap_err();
+    let expected_sum: u64 = 50_000 * 9_999;
+    assert_eq!(err, SpecError::BasisPointsSum { sum: expected_sum });
+}
+
 fn deployment(shares: &[u32]) -> BundleDeployment {
     BundleDeployment {
         schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
@@ -90,4 +115,17 @@ fn revenue_share_accepts_sum_10000() {
 fn revenue_share_rejects_wrong_sum() {
     let err = deployment(&[1_000, 2_000]).validate().unwrap_err();
     assert_eq!(err, SpecError::BasisPointsSum { sum: 3_000 });
+}
+
+#[test]
+fn revenue_share_rejects_entry_above_10000() {
+    let err = deployment(&[10_001]).validate().unwrap_err();
+    assert_eq!(err, SpecError::BasisPointsEntryTooLarge { value: 10_001 });
+}
+
+#[test]
+fn revenue_share_rejects_u32_max_wraparound() {
+    // [u32::MAX, 10001] wraps to exactly 10000 under release u32 arithmetic.
+    let err = deployment(&[u32::MAX, 10_001]).validate().unwrap_err();
+    assert_eq!(err, SpecError::BasisPointsEntryTooLarge { value: u32::MAX });
 }

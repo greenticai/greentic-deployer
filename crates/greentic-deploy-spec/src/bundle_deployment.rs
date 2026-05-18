@@ -75,9 +75,21 @@ impl BundleDeployment {
     }
 
     /// `§5.4`: sum of revenue-share basis points MUST equal 10,000.
+    ///
+    /// Sum widens into `u64` and rejects any per-entry value above 10,000 so a
+    /// crafted document like `[u32::MAX, 10001]` cannot wrap to exactly 10,000
+    /// in release builds.
     pub fn validate(&self) -> Result<(), SpecError> {
-        let sum: u32 = self.revenue_share.iter().map(|e| e.basis_points).sum();
-        if sum != BASIS_POINTS_TOTAL {
+        let mut sum: u64 = 0;
+        for entry in &self.revenue_share {
+            if entry.basis_points > BASIS_POINTS_TOTAL {
+                return Err(SpecError::BasisPointsEntryTooLarge {
+                    value: entry.basis_points,
+                });
+            }
+            sum += u64::from(entry.basis_points);
+        }
+        if sum != u64::from(BASIS_POINTS_TOTAL) {
             return Err(SpecError::BasisPointsSum { sum });
         }
         Ok(())

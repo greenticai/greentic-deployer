@@ -40,9 +40,21 @@ impl TrafficSplit {
     }
 
     /// `§5.3`: sum of `weight_bps` MUST equal 10,000.
+    ///
+    /// Sum widens into `u64` and rejects any per-entry value above 10,000 so a
+    /// crafted document like `[u32::MAX, 10001]` cannot wrap to exactly 10,000
+    /// in release builds.
     pub fn validate(&self) -> Result<(), SpecError> {
-        let sum: u32 = self.entries.iter().map(|e| e.weight_bps).sum();
-        if sum != BASIS_POINTS_TOTAL {
+        let mut sum: u64 = 0;
+        for entry in &self.entries {
+            if entry.weight_bps > BASIS_POINTS_TOTAL {
+                return Err(SpecError::BasisPointsEntryTooLarge {
+                    value: entry.weight_bps,
+                });
+            }
+            sum += u64::from(entry.weight_bps);
+        }
+        if sum != u64::from(BASIS_POINTS_TOTAL) {
             return Err(SpecError::BasisPointsSum { sum });
         }
         Ok(())
