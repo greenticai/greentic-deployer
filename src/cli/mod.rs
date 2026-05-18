@@ -3,7 +3,7 @@
 //! Library-level command implementations for the operator wizard. Each
 //! submodule exposes one noun:
 //!
-//! - [`env`] — Environment CRUD (`create`, `update`, `list`, `show`, `doctor`, `destroy`)
+//! - [`mod@env`] — Environment CRUD (`create`, `update`, `list`, `show`, `doctor`, `destroy`)
 //! - [`env_packs`] — Env-pack bindings (`add`, `update`, `remove`, `rollback`, `list`)
 //! - [`bundles`] — Application bundle deployments (`add`, `update`, `remove`, `list`)
 //! - [`revisions`] — Revision lifecycle (`stage`, `warm`, `drain`, `archive`, `list`)

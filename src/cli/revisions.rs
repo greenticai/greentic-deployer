@@ -3,7 +3,7 @@
 //! Manages `Environment.revisions: Vec<Revision>` and the per-deployment
 //! `current_revisions` list on each `BundleDeployment`. Lifecycle transitions
 //! are validated against the spec's pure
-//! [`is_valid_transition`](greentic_deploy_spec::is_valid_transition)
+//! [`is_valid_transition`]
 //! predicate so the operator can't put a Revision into an impossible state.
 //!
 //! Heavy lifting deferred:
