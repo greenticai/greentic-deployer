@@ -74,12 +74,19 @@ impl BundleDeployment {
         SchemaVersion::BUNDLE_DEPLOYMENT_V1
     }
 
-    /// `§5.4`: sum of revenue-share basis points MUST equal 10,000.
+    /// `§5.4`: schema discriminator equals `greentic.bundle-deployment.v1`
+    /// and the sum of revenue-share basis points MUST equal 10,000.
     ///
     /// Sum widens into `u64` and rejects any per-entry value above 10,000 so a
     /// crafted document like `[u32::MAX, 10001]` cannot wrap to exactly 10,000
     /// in release builds.
     pub fn validate(&self) -> Result<(), SpecError> {
+        if self.schema.as_str() != SchemaVersion::BUNDLE_DEPLOYMENT_V1 {
+            return Err(SpecError::SchemaMismatch {
+                expected: SchemaVersion::BUNDLE_DEPLOYMENT_V1,
+                actual: self.schema.as_str().to_string(),
+            });
+        }
         let mut sum: u64 = 0;
         for entry in &self.revenue_share {
             if entry.basis_points > BASIS_POINTS_TOTAL {

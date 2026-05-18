@@ -414,6 +414,146 @@ fn split_bundle_must_match_referenced_deployment_bundle() {
     );
 }
 
+// ----------------------------------------------------------------------------
+// Codex round 2: env-scoped refs + nested schema discriminators
+// ----------------------------------------------------------------------------
+
+#[test]
+fn credentials_ref_must_be_scoped_to_environment_id() {
+    // Codex finding: credentials_ref documented as secret://<env>/...
+    // but SecretRef::try_new accepted any non-empty secret:// URI and
+    // Environment::validate did not enforce the scope. Without this
+    // check a `local` env could persist a pointer into `prod`'s secrets
+    // backend.
+    use greentic_deploy_spec::SecretRef;
+    let mut e = env_with(local(), vec![], vec![], vec![]);
+    e.credentials_ref = Some(SecretRef::try_new("secret://prod/credentials/admin").unwrap());
+    let err = e.validate().unwrap_err();
+    match err {
+        SpecError::CrossEnvRef {
+            context,
+            ref expected_env,
+            ref actual_env,
+            ..
+        } => {
+            assert_eq!(context, "credentials_ref");
+            assert_eq!(expected_env, &local());
+            assert_eq!(actual_env, "prod");
+        }
+        other => panic!("expected CrossEnvRef, got {other:?}"),
+    }
+}
+
+#[test]
+fn credentials_ref_matching_env_passes() {
+    use greentic_deploy_spec::SecretRef;
+    let mut e = env_with(local(), vec![], vec![], vec![]);
+    e.credentials_ref = Some(SecretRef::try_new("secret://local/credentials/admin").unwrap());
+    assert!(e.validate().is_ok());
+}
+
+#[test]
+fn secret_ref_rejects_missing_env_segment() {
+    use greentic_deploy_spec::{SecretRef, SecretRefParseError};
+    let err = SecretRef::try_new("secret:///credentials/admin").unwrap_err();
+    assert_eq!(err, SecretRefParseError::EmptyEnvSegment);
+}
+
+#[test]
+fn runtime_ref_rejects_missing_env_segment() {
+    use greentic_deploy_spec::{RuntimeRef, RuntimeRefParseError};
+    let err = RuntimeRef::try_new("runtime:///discovered/x").unwrap_err();
+    assert_eq!(err, RuntimeRefParseError::EmptyEnvSegment);
+}
+
+#[test]
+fn credentials_validate_rejects_cross_env_provided_ref() {
+    // The Credentials document is a separate top-level type; its own
+    // validate() must scope every embedded SecretRef to self.env_id.
+    use chrono::Utc;
+    use greentic_deploy_spec::{
+        Credentials, CredentialsMode, CredentialsValidation, CredentialsValidationResult,
+        PackDescriptor, SchemaVersion, SecretRef,
+    };
+    let creds = Credentials {
+        schema: SchemaVersion::new(SchemaVersion::CREDENTIALS_V1),
+        env_id: local(),
+        deployer_kind: PackDescriptor::try_new("greentic.deployer.local-process@1.0.0").unwrap(),
+        mode: CredentialsMode::Requirements,
+        provided_credentials_ref: SecretRef::try_new("secret://prod/credentials/admin").unwrap(),
+        validation: CredentialsValidation {
+            last_run_at: Utc::now(),
+            result: CredentialsValidationResult::Pass,
+            missing_capabilities: vec![],
+        },
+        bootstrap: None,
+        expiry: None,
+    };
+    let err = creds.validate().unwrap_err();
+    matches!(err, SpecError::CrossEnvRef { .. });
+}
+
+#[test]
+fn revision_with_wrong_schema_rejected_by_environment() {
+    // Codex finding: Environment::validate never verified Revision.schema,
+    // BundleDeployment.schema, or TrafficSplit.schema against the v1
+    // constants. A mixed-version document could survive a round-trip.
+    let dep = DeploymentId::new();
+    let bundle_id = BundleId::new("b");
+    let mut r = revision(RevisionId::new(), local(), dep, bundle_id.clone());
+    r.schema = SchemaVersion::new("greentic.revision.v999");
+    let e = env_with(local(), vec![], vec![r], vec![]);
+    let err = e.validate().unwrap_err();
+    match err {
+        SpecError::SchemaMismatch { expected, .. } => {
+            assert_eq!(expected, SchemaVersion::REVISION_V1);
+        }
+        other => panic!("expected nested-schema SchemaMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn bundle_deployment_with_wrong_schema_rejected_by_environment() {
+    let dep = DeploymentId::new();
+    let mut b = bundle(dep, local(), BundleId::new("b"), vec![]);
+    b.schema = SchemaVersion::new("greentic.bundle-deployment.v999");
+    let e = env_with(local(), vec![b], vec![], vec![]);
+    let err = e.validate().unwrap_err();
+    match err {
+        SpecError::SchemaMismatch { expected, .. } => {
+            assert_eq!(expected, SchemaVersion::BUNDLE_DEPLOYMENT_V1);
+        }
+        other => panic!("expected nested-schema SchemaMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn traffic_split_with_wrong_schema_rejected_by_environment() {
+    let dep = DeploymentId::new();
+    let bundle_id = BundleId::new("b");
+    let rev_id = RevisionId::new();
+    let r = revision(rev_id, local(), dep, bundle_id.clone());
+    let b = bundle(dep, local(), bundle_id.clone(), vec![rev_id]);
+    let mut s = split(
+        local(),
+        dep,
+        bundle_id,
+        vec![TrafficSplitEntry {
+            revision_id: rev_id,
+            weight_bps: 10_000,
+        }],
+    );
+    s.schema = SchemaVersion::new("greentic.traffic-split.v999");
+    let e = env_with(local(), vec![b], vec![r], vec![s]);
+    let err = e.validate().unwrap_err();
+    match err {
+        SpecError::SchemaMismatch { expected, .. } => {
+            assert_eq!(expected, SchemaVersion::TRAFFIC_SPLIT_V1);
+        }
+        other => panic!("expected nested-schema SchemaMismatch, got {other:?}"),
+    }
+}
+
 #[test]
 fn well_formed_environment_with_split_and_bundle_passes() {
     let dep = DeploymentId::new();

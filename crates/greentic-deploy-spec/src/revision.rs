@@ -102,4 +102,17 @@ impl Revision {
     pub fn schema_str() -> &'static str {
         SchemaVersion::REVISION_V1
     }
+
+    /// Schema-discriminator check. Called by [`Environment::validate`] for
+    /// every nested revision so a mixed-version document cannot survive a
+    /// round-trip through the env compose view.
+    pub fn validate(&self) -> Result<(), crate::error::SpecError> {
+        if self.schema.as_str() != SchemaVersion::REVISION_V1 {
+            return Err(crate::error::SpecError::SchemaMismatch {
+                expected: SchemaVersion::REVISION_V1,
+                actual: self.schema.as_str().to_string(),
+            });
+        }
+        Ok(())
+    }
 }

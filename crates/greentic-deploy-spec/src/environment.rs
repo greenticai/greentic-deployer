@@ -120,7 +120,24 @@ impl Environment {
             seen[idx] = true;
         }
 
+        // `credentials_ref` is documented as `secret://<env>/credentials/...`.
+        // Without this scope check, a saved Environment could persist a
+        // pointer into a different env's secrets backend and bypass tenant
+        // isolation at resolve time.
+        if let Some(cred_ref) = &self.credentials_ref {
+            let actual = cred_ref.env_segment();
+            if actual != self.environment_id.as_str() {
+                return Err(SpecError::CrossEnvRef {
+                    context: "credentials_ref",
+                    uri: cred_ref.as_str().to_string(),
+                    expected_env: self.environment_id.clone(),
+                    actual_env: actual.to_string(),
+                });
+            }
+        }
+
         for revision in &self.revisions {
+            revision.validate()?;
             if revision.env_id != self.environment_id {
                 return Err(SpecError::EnvIdMismatch {
                     context: "revision",

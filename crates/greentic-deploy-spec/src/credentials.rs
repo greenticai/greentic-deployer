@@ -4,6 +4,7 @@
 //! `admin_credential_consumed_at` records the fact that they were used.
 
 use crate::capability_slot::PackDescriptor;
+use crate::error::SpecError;
 use crate::refs::SecretRef;
 use crate::version::SchemaVersion;
 use chrono::{DateTime, Utc};
@@ -67,4 +68,48 @@ impl Credentials {
     pub fn schema_str() -> &'static str {
         SchemaVersion::CREDENTIALS_V1
     }
+
+    /// Validate the credentials document against its own invariants:
+    /// schema discriminator equals `greentic.credentials.v1`, and every
+    /// embedded [`SecretRef`] is scoped to `self.env_id`. Without the
+    /// scope check a Credentials document for env A could carry pointers
+    /// into env B's secrets backend, bypassing tenant isolation.
+    pub fn validate(&self) -> Result<(), SpecError> {
+        if self.schema.as_str() != SchemaVersion::CREDENTIALS_V1 {
+            return Err(SpecError::SchemaMismatch {
+                expected: SchemaVersion::CREDENTIALS_V1,
+                actual: self.schema.as_str().to_string(),
+            });
+        }
+        check_secret_ref_env(
+            "credentials.provided_credentials_ref",
+            &self.provided_credentials_ref,
+            &self.env_id,
+        )?;
+        if let Some(bootstrap) = &self.bootstrap {
+            check_secret_ref_env(
+                "credentials.bootstrap.generated_credentials_ref",
+                &bootstrap.generated_credentials_ref,
+                &self.env_id,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn check_secret_ref_env(
+    context: &'static str,
+    secret_ref: &SecretRef,
+    expected_env: &EnvId,
+) -> Result<(), SpecError> {
+    let actual = secret_ref.env_segment();
+    if actual != expected_env.as_str() {
+        return Err(SpecError::CrossEnvRef {
+            context,
+            uri: secret_ref.as_str().to_string(),
+            expected_env: expected_env.clone(),
+            actual_env: actual.to_string(),
+        });
+    }
+    Ok(())
 }

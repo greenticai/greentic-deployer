@@ -30,11 +30,35 @@ macro_rules! uri_ref {
                 if raw.len() == $scheme.len() {
                     return Err($err::EmptyPath);
                 }
+                // First segment after the scheme is the env identifier; refs
+                // are documented as `<scheme>://<env>/<path...>`. The env
+                // segment must be present and non-empty so callers can scope
+                // a ref to its owning environment.
+                let after_scheme = &raw[$scheme.len()..];
+                let env_seg = match after_scheme.find('/') {
+                    Some(idx) => &after_scheme[..idx],
+                    None => after_scheme,
+                };
+                if env_seg.is_empty() {
+                    return Err($err::EmptyEnvSegment);
+                }
                 Ok(Self(raw))
             }
 
             pub fn as_str(&self) -> &str {
                 &self.0
+            }
+
+            /// First path segment after the scheme — the env id the ref is
+            /// scoped to. Returns `None` if the ref was constructed by a
+            /// future version of this crate that bypassed [`Self::try_new`]
+            /// (current invariant: `Self::try_new` always populates this).
+            pub fn env_segment(&self) -> &str {
+                let after_scheme = &self.0[$scheme.len()..];
+                match after_scheme.find('/') {
+                    Some(idx) => &after_scheme[..idx],
+                    None => after_scheme,
+                }
             }
         }
 
@@ -85,6 +109,8 @@ pub enum SecretRefParseError {
     MissingScheme,
     #[error("secret-ref path is empty")]
     EmptyPath,
+    #[error("secret-ref must carry an env segment: `secret://<env>/<path>`")]
+    EmptyEnvSegment,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -93,4 +119,6 @@ pub enum RuntimeRefParseError {
     MissingScheme,
     #[error("runtime-ref path is empty")]
     EmptyPath,
+    #[error("runtime-ref must carry an env segment: `runtime://<env>/<path>`")]
+    EmptyEnvSegment,
 }
