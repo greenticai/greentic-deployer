@@ -2,6 +2,7 @@
 
 pub mod adapter;
 pub mod admin_access;
+pub mod cli;
 /// Legacy/provider-oriented multi-target implementation module.
 ///
 /// Prefer `multi_target` or `surface::multi_target` for new call sites.
