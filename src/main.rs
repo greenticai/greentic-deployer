@@ -1266,7 +1266,13 @@ fn main() -> Result<()> {
             )
         }
         TopLevelCommand::Op(op) => {
-            greentic_deployer::cli::dispatch::dispatch_op(op).map_err(anyhow::Error::from)
+            // dispatch_op already wrote the JSON error envelope to stderr;
+            // swallow the OpError here so anyhow doesn't re-render it as
+            // plain `Error: …` text and double up.
+            match greentic_deployer::cli::dispatch::dispatch_op(op) {
+                Ok(()) => Ok(()),
+                Err(_) => std::process::exit(1),
+            }
         }
     }
 }
