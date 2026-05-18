@@ -38,8 +38,8 @@
 use std::path::PathBuf;
 
 pub mod env;
+pub mod env_packs;
 // Wired in subsequent A3 commits:
-// pub mod env_packs;
 // pub mod bundles;
 // pub mod revisions;
 // pub mod traffic;
