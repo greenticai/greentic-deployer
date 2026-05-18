@@ -8,7 +8,7 @@ use greentic_deploy_spec::{EnvId, Environment, EnvironmentHostConfig, SchemaVers
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::EnvironmentStore;
+use crate::environment::{EnvironmentStore, LocalFsStore};
 
 use super::{OpError, OpFlags, OpOutcome};
 
@@ -59,8 +59,8 @@ impl From<&Environment> for EnvSummary {
 
 /// `op env create`. Idempotent: if the env already exists, fails with
 /// `OpError::Conflict` — callers wanting upsert semantics should use `update`.
-pub fn create<S: EnvironmentStore>(
-    store: &S,
+pub fn create(
+    store: &LocalFsStore,
     flags: &OpFlags,
     payload: Option<EnvCreatePayload>,
 ) -> Result<OpOutcome, OpError> {
@@ -70,30 +70,34 @@ pub fn create<S: EnvironmentStore>(
     let payload = resolve_payload::<EnvCreatePayload>(flags, payload)?;
     let env_id = EnvId::try_from(payload.environment_id.as_str())
         .map_err(|e| OpError::InvalidArgument(format!("environment_id: {e}")))?;
-    if store.exists(&env_id)? {
-        return Err(OpError::Conflict(format!(
-            "environment `{env_id}` already exists"
-        )));
-    }
-    let env = Environment {
-        schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
-        environment_id: env_id.clone(),
-        name: payload.name,
-        host_config: EnvironmentHostConfig {
-            env_id,
-            region: payload.region,
-            tenant_org_id: payload.tenant_org_id,
-        },
-        packs: Vec::new(),
-        credentials_ref: None,
-        bundles: Vec::new(),
-        revisions: Vec::new(),
-        traffic_splits: Vec::new(),
-        revocation: Default::default(),
-        retention: Default::default(),
-        health: Default::default(),
-    };
-    store.save(&env)?;
+    let env = store.transact(&env_id, |locked| -> Result<Environment, OpError> {
+        if locked.load().is_ok() {
+            return Err(OpError::Conflict(format!(
+                "environment `{}` already exists",
+                locked.env_id()
+            )));
+        }
+        let env = Environment {
+            schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
+            environment_id: locked.env_id().clone(),
+            name: payload.name.clone(),
+            host_config: EnvironmentHostConfig {
+                env_id: locked.env_id().clone(),
+                region: payload.region.clone(),
+                tenant_org_id: payload.tenant_org_id.clone(),
+            },
+            packs: Vec::new(),
+            credentials_ref: None,
+            bundles: Vec::new(),
+            revisions: Vec::new(),
+            traffic_splits: Vec::new(),
+            revocation: Default::default(),
+            retention: Default::default(),
+            health: Default::default(),
+        };
+        locked.save(&env)?;
+        Ok(env)
+    })?;
     Ok(OpOutcome::new(
         NOUN,
         "create",
@@ -104,8 +108,8 @@ pub fn create<S: EnvironmentStore>(
 /// `op env update`. Replaces `name`, `region`, and `tenant_org_id` on an
 /// existing env. The `packs`/`bundles`/`revisions`/`traffic_splits` arrays
 /// stay untouched — manage those via their own subcommands.
-pub fn update<S: EnvironmentStore>(
-    store: &S,
+pub fn update(
+    store: &LocalFsStore,
     flags: &OpFlags,
     payload: Option<EnvCreatePayload>,
 ) -> Result<OpOutcome, OpError> {
@@ -115,19 +119,20 @@ pub fn update<S: EnvironmentStore>(
     let payload = resolve_payload::<EnvCreatePayload>(flags, payload)?;
     let env_id = EnvId::try_from(payload.environment_id.as_str())
         .map_err(|e| OpError::InvalidArgument(format!("environment_id: {e}")))?;
-    if !store.exists(&env_id)? {
-        return Err(OpError::NotFound(format!("environment `{env_id}`")));
-    }
-    let mut env = store.load(&env_id)?;
-    if env.environment_id != env_id {
-        return Err(OpError::InvalidArgument(
-            "environment_id in payload does not match the stored env id".to_string(),
-        ));
-    }
-    env.name = payload.name;
-    env.host_config.region = payload.region;
-    env.host_config.tenant_org_id = payload.tenant_org_id;
-    store.save(&env)?;
+    let env = store.transact(&env_id, |locked| -> Result<Environment, OpError> {
+        let mut env = match locked.load() {
+            Ok(env) => env,
+            Err(crate::environment::StoreError::NotFound(id)) => {
+                return Err(OpError::NotFound(format!("environment `{id}`")));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        env.name = payload.name.clone();
+        env.host_config.region = payload.region.clone();
+        env.host_config.tenant_org_id = payload.tenant_org_id.clone();
+        locked.save(&env)?;
+        Ok(env)
+    })?;
     Ok(OpOutcome::new(
         NOUN,
         "update",
@@ -136,7 +141,7 @@ pub fn update<S: EnvironmentStore>(
 }
 
 /// `op env list`.
-pub fn list<S: EnvironmentStore>(store: &S, flags: &OpFlags) -> Result<OpOutcome, OpError> {
+pub fn list(store: &LocalFsStore, flags: &OpFlags) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         // `list` has no input; produce a null-input schema as a placeholder.
         return Ok(OpOutcome::new(
@@ -158,11 +163,7 @@ pub fn list<S: EnvironmentStore>(store: &S, flags: &OpFlags) -> Result<OpOutcome
 }
 
 /// `op env show <env_id>`.
-pub fn show<S: EnvironmentStore>(
-    store: &S,
-    flags: &OpFlags,
-    env_id: &str,
-) -> Result<OpOutcome, OpError> {
+pub fn show(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(
             NOUN,
@@ -190,11 +191,7 @@ pub fn show<S: EnvironmentStore>(
 /// `op env doctor <env_id>`. Re-validates the env against `Environment::validate`
 /// and checks for missing capability slots. Returns a structured report
 /// instead of failing on the first issue.
-pub fn doctor<S: EnvironmentStore>(
-    store: &S,
-    flags: &OpFlags,
-    env_id: &str,
-) -> Result<OpOutcome, OpError> {
+pub fn doctor(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(
             NOUN,
@@ -239,8 +236,8 @@ pub fn doctor<S: EnvironmentStore>(
 /// Force-free safety net: the caller must pass `confirm = true`. The
 /// `--confirm` flag is the operator-binary's responsibility; this library
 /// just enforces the gate.
-pub fn destroy<S: EnvironmentStore>(
-    store: &S,
+pub fn destroy(
+    store: &LocalFsStore,
     flags: &OpFlags,
     env_id: &str,
     confirm: bool,

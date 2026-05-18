@@ -110,27 +110,110 @@ pub fn set(
     }
     let payload = resolve_payload::<TrafficSetPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let mut env = store.load(&env_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
-    let deployment = env
-        .bundles
-        .iter()
-        .find(|b| b.deployment_id == deployment_id)
-        .ok_or_else(|| {
-            OpError::NotFound(format!(
-                "deployment `{deployment_id}` not found in env `{env_id}`"
-            ))
-        })?;
-    let bundle_id: BundleId = deployment.bundle_id.clone();
-    // Convert entries to basis points.
-    let mut entries: Vec<TrafficSplitEntry> = Vec::with_capacity(payload.entries.len());
-    for entry in &payload.entries {
+    // Pre-parse + pre-validate the entries outside the lock. If anything
+    // here is malformed the caller hears about it without contending for
+    // the env's flock.
+    let parsed_entries = parse_entries(&payload.entries)?;
+    let split = store.transact(&env_id, |locked| -> Result<TrafficSplit, OpError> {
+        let mut env = locked.load()?;
+        let deployment = env
+            .bundles
+            .iter()
+            .find(|b| b.deployment_id == deployment_id)
+            .ok_or_else(|| {
+                OpError::NotFound(format!(
+                    "deployment `{deployment_id}` not found in env `{env_id}`"
+                ))
+            })?;
+        let bundle_id: BundleId = deployment.bundle_id.clone();
+        // Revision-belongs-to-deployment check (operator-friendly error
+        // instead of waiting for Environment::validate to fire).
+        for entry in &parsed_entries {
+            let rev = env
+                .revisions
+                .iter()
+                .find(|r| r.revision_id == entry.revision_id)
+                .ok_or_else(|| {
+                    OpError::NotFound(format!(
+                        "revision `{}` not found in env `{env_id}`",
+                        entry.revision_id
+                    ))
+                })?;
+            if rev.deployment_id != deployment_id {
+                return Err(OpError::InvalidArgument(format!(
+                    "revision `{}` belongs to deployment `{}`, not `{}`",
+                    entry.revision_id, rev.deployment_id, deployment_id,
+                )));
+            }
+        }
+        // Idempotency check: a retry with the same key against the same
+        // (deployment, entries) is a no-op success; same key + different
+        // payload is a conflict; new key advances generation.
+        let prev_split_idx = env
+            .traffic_splits
+            .iter()
+            .position(|s| s.deployment_id == deployment_id);
+        if let Some(idx) = prev_split_idx {
+            let prev = &env.traffic_splits[idx];
+            if prev.idempotency_key == payload.idempotency_key {
+                if entries_match(&prev.entries, &parsed_entries) {
+                    // No-op replay. Return the current split unchanged.
+                    return Ok(prev.clone());
+                }
+                return Err(OpError::Conflict(format!(
+                    "idempotency key `{}` already used for deployment `{}` with different entries",
+                    payload.idempotency_key, deployment_id
+                )));
+            }
+        }
+        let (generation, previous_split_ref) = match prev_split_idx {
+            Some(idx) => {
+                let prev = &env.traffic_splits[idx];
+                let snapshot = serde_json::to_value(prev)
+                    .map_err(|e| OpError::InvalidArgument(format!("snapshot prior split: {e}")))?;
+                (prev.generation + 1, Some(stash_inline(snapshot)))
+            }
+            None => (0, None),
+        };
+        let split = TrafficSplit {
+            schema: SchemaVersion::new(SchemaVersion::TRAFFIC_SPLIT_V1),
+            env_id: env_id.clone(),
+            deployment_id,
+            bundle_id,
+            generation,
+            entries: parsed_entries.clone(),
+            updated_at: Utc::now(),
+            updated_by: payload.updated_by.clone(),
+            idempotency_key: payload.idempotency_key.clone(),
+            authorization_ref: payload.authorization_ref.clone(),
+            previous_split_ref,
+        };
+        split.validate().map_err(OpError::Spec)?;
+        match prev_split_idx {
+            Some(idx) => env.traffic_splits[idx] = split.clone(),
+            None => env.traffic_splits.push(split.clone()),
+        }
+        locked.save(&env)?;
+        Ok(split)
+    })?;
+    Ok(OpOutcome::new(
+        NOUN,
+        "set",
+        serde_json::to_value(TrafficSummary::from(&env_id, &split))
+            .expect("TrafficSummary is json-safe"),
+    ))
+}
+
+fn parse_entries(entries: &[TrafficSetEntryPayload]) -> Result<Vec<TrafficSplitEntry>, OpError> {
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
         let bps = match (entry.weight_bps, entry.weight_percent) {
             (Some(bps), _) => bps,
             (None, Some(pct)) => {
                 if pct > 100 {
                     return Err(OpError::InvalidArgument(format!(
-                        "weight_percent {pct} > 100",
+                        "weight_percent {pct} > 100"
                     )));
                 }
                 pct.saturating_mul(100)
@@ -142,68 +225,28 @@ pub fn set(
             }
         };
         let revision_id = parse_revision_id(&entry.revision_id)?;
-        // Sanity: the revision must exist in this env and belong to this
-        // deployment. Environment::validate would catch a mismatch but the
-        // operator-side check yields a cleaner error.
-        let rev = env
-            .revisions
-            .iter()
-            .find(|r| r.revision_id == revision_id)
-            .ok_or_else(|| {
-                OpError::NotFound(format!(
-                    "revision `{revision_id}` not found in env `{env_id}`"
-                ))
-            })?;
-        if rev.deployment_id != deployment_id {
-            return Err(OpError::InvalidArgument(format!(
-                "revision `{}` belongs to deployment `{}`, not `{}`",
-                revision_id, rev.deployment_id, deployment_id,
-            )));
-        }
-        entries.push(TrafficSplitEntry {
+        out.push(TrafficSplitEntry {
             revision_id,
             weight_bps: bps,
         });
     }
-    let prev_split_idx = env
-        .traffic_splits
-        .iter()
-        .position(|s| s.deployment_id == deployment_id);
-    let (generation, previous_split_ref) = match prev_split_idx {
-        Some(idx) => {
-            let prev = &env.traffic_splits[idx];
-            let snapshot = serde_json::to_value(prev)
-                .map_err(|e| OpError::InvalidArgument(format!("snapshot prior split: {e}")))?;
-            (prev.generation + 1, Some(stash_inline(snapshot)))
-        }
-        None => (0, None),
-    };
-    let split = TrafficSplit {
-        schema: SchemaVersion::new(SchemaVersion::TRAFFIC_SPLIT_V1),
-        env_id: env_id.clone(),
-        deployment_id,
-        bundle_id,
-        generation,
-        entries,
-        updated_at: Utc::now(),
-        updated_by: payload.updated_by,
-        idempotency_key: payload.idempotency_key,
-        authorization_ref: payload.authorization_ref,
-        previous_split_ref,
-    };
-    // Validate sum == 10_000 before we touch disk.
-    split.validate().map_err(OpError::Spec)?;
-    match prev_split_idx {
-        Some(idx) => env.traffic_splits[idx] = split.clone(),
-        None => env.traffic_splits.push(split.clone()),
+    Ok(out)
+}
+
+/// Order-insensitive equality on basis-points-per-revision_id. Two payloads
+/// that route the same percentage to the same revision_id (in any
+/// permutation) collapse to "same" for idempotency purposes.
+fn entries_match(a: &[TrafficSplitEntry], b: &[TrafficSplitEntry]) -> bool {
+    if a.len() != b.len() {
+        return false;
     }
-    store.save(&env)?;
-    Ok(OpOutcome::new(
-        NOUN,
-        "set",
-        serde_json::to_value(TrafficSummary::from(&env_id, &split))
-            .expect("TrafficSummary is json-safe"),
-    ))
+    let mut a_sorted: Vec<(&RevisionId, u32)> =
+        a.iter().map(|e| (&e.revision_id, e.weight_bps)).collect();
+    let mut b_sorted: Vec<(&RevisionId, u32)> =
+        b.iter().map(|e| (&e.revision_id, e.weight_bps)).collect();
+    a_sorted.sort_by_key(|(r, _)| r.to_string());
+    b_sorted.sort_by_key(|(r, _)| r.to_string());
+    a_sorted == b_sorted
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,41 +294,43 @@ pub fn rollback(
     }
     let payload = resolve_payload::<TrafficShowPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let mut env = store.load(&env_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
-    let idx = env
-        .traffic_splits
-        .iter()
-        .position(|s| s.deployment_id == deployment_id)
-        .ok_or_else(|| {
+    let restored = store.transact(&env_id, |locked| -> Result<TrafficSplit, OpError> {
+        let mut env = locked.load()?;
+        let idx = env
+            .traffic_splits
+            .iter()
+            .position(|s| s.deployment_id == deployment_id)
+            .ok_or_else(|| {
+                OpError::NotFound(format!(
+                    "no traffic split for deployment `{deployment_id}` in env `{env_id}`"
+                ))
+            })?;
+        let prev_ref = env.traffic_splits[idx]
+            .previous_split_ref
+            .clone()
+            .ok_or_else(|| {
+                OpError::Conflict(format!(
+                    "traffic split for `{deployment_id}` has no prior version to roll back to"
+                ))
+            })?;
+        let prev_value = load_inline(&prev_ref).ok_or_else(|| {
             OpError::NotFound(format!(
-                "no traffic split for deployment `{deployment_id}` in env `{env_id}`"
+                "previous split payload `{}` missing",
+                prev_ref.display()
             ))
         })?;
-    let prev_ref = env.traffic_splits[idx]
-        .previous_split_ref
-        .clone()
-        .ok_or_else(|| {
-            OpError::Conflict(format!(
-                "traffic split for `{deployment_id}` has no prior version to roll back to"
-            ))
-        })?;
-    let prev_value = load_inline(&prev_ref).ok_or_else(|| {
-        OpError::NotFound(format!(
-            "previous split payload `{}` missing",
-            prev_ref.display()
-        ))
+        let mut restored: TrafficSplit = serde_json::from_value(prev_value)
+            .map_err(|e| OpError::InvalidArgument(format!("deserialise previous split: {e}")))?;
+        restored.generation = env.traffic_splits[idx].generation + 1;
+        restored.previous_split_ref = None;
+        restored.updated_at = Utc::now();
+        restored.idempotency_key = format!("rollback-{}", env.traffic_splits[idx].idempotency_key);
+        restored.validate().map_err(OpError::Spec)?;
+        env.traffic_splits[idx] = restored.clone();
+        locked.save(&env)?;
+        Ok(restored)
     })?;
-    let mut restored: TrafficSplit = serde_json::from_value(prev_value)
-        .map_err(|e| OpError::InvalidArgument(format!("deserialise previous split: {e}")))?;
-    // Bump generation past the current one so rollback is monotonic.
-    restored.generation = env.traffic_splits[idx].generation + 1;
-    restored.previous_split_ref = None;
-    restored.updated_at = Utc::now();
-    restored.idempotency_key = format!("rollback-{}", env.traffic_splits[idx].idempotency_key);
-    restored.validate().map_err(OpError::Spec)?;
-    env.traffic_splits[idx] = restored.clone();
-    store.save(&env)?;
     Ok(OpOutcome::new(
         NOUN,
         "rollback",
@@ -598,5 +643,163 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn set_same_idempotency_key_same_payload_is_no_op() {
+        // Codex regression: a retried set with the same key + same entries
+        // must not snapshot the current split as its own previous_split_ref
+        // (which would orphan the real rollback target). Verify generation
+        // stays put and previous_split_ref stays empty.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, _) = seed_env(&store);
+        let payload = TrafficSetPayload {
+            environment_id: "local".to_string(),
+            deployment_id: did.to_string(),
+            entries: vec![TrafficSetEntryPayload {
+                revision_id: rid1.to_string(),
+                weight_bps: Some(10_000),
+                weight_percent: None,
+            }],
+            updated_by: "test".to_string(),
+            idempotency_key: "k1".to_string(),
+            authorization_ref: default_authorization_ref(),
+        };
+        let first = set(&store, &OpFlags::default(), Some(payload.clone())).unwrap();
+        assert_eq!(
+            first.result.get("generation").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        // Retry with the same key + same payload — must replay as no-op.
+        let retry = set(&store, &OpFlags::default(), Some(payload)).unwrap();
+        assert_eq!(
+            retry.result.get("generation").and_then(|v| v.as_u64()),
+            Some(0),
+            "generation must stay at 0 on idempotent retry"
+        );
+        assert_eq!(
+            retry.result.get("has_previous").and_then(|v| v.as_bool()),
+            Some(false),
+            "previous_split_ref must stay empty on idempotent retry"
+        );
+    }
+
+    #[test]
+    fn set_same_idempotency_key_different_payload_conflicts() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, rid2) = seed_env(&store);
+        let p1 = TrafficSetPayload {
+            environment_id: "local".to_string(),
+            deployment_id: did.to_string(),
+            entries: vec![TrafficSetEntryPayload {
+                revision_id: rid1.to_string(),
+                weight_bps: Some(10_000),
+                weight_percent: None,
+            }],
+            updated_by: "test".to_string(),
+            idempotency_key: "k1".to_string(),
+            authorization_ref: default_authorization_ref(),
+        };
+        set(&store, &OpFlags::default(), Some(p1)).unwrap();
+        // Same key, different entries.
+        let p2 = TrafficSetPayload {
+            environment_id: "local".to_string(),
+            deployment_id: did.to_string(),
+            entries: vec![
+                TrafficSetEntryPayload {
+                    revision_id: rid1.to_string(),
+                    weight_percent: Some(50),
+                    weight_bps: None,
+                },
+                TrafficSetEntryPayload {
+                    revision_id: rid2.to_string(),
+                    weight_percent: Some(50),
+                    weight_bps: None,
+                },
+            ],
+            updated_by: "test".to_string(),
+            idempotency_key: "k1".to_string(),
+            authorization_ref: default_authorization_ref(),
+        };
+        let err = set(&store, &OpFlags::default(), Some(p2)).unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn set_retry_preserves_rollback_target() {
+        // Codex regression: prior to the idempotency check, a retried set
+        // would overwrite previous_split_ref with itself, and a later
+        // rollback would land on the retried split instead of the pre-change
+        // traffic. Verify the rollback target is still the pre-change split.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, rid2) = seed_env(&store);
+        // k1: 100% rev1.
+        set(
+            &store,
+            &OpFlags::default(),
+            Some(TrafficSetPayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+                entries: vec![TrafficSetEntryPayload {
+                    revision_id: rid1.to_string(),
+                    weight_bps: Some(10_000),
+                    weight_percent: None,
+                }],
+                updated_by: "test".to_string(),
+                idempotency_key: "k1".to_string(),
+                authorization_ref: default_authorization_ref(),
+            }),
+        )
+        .unwrap();
+        // k2: 50/50. This is the change rollback must undo.
+        let k2_payload = TrafficSetPayload {
+            environment_id: "local".to_string(),
+            deployment_id: did.to_string(),
+            entries: vec![
+                TrafficSetEntryPayload {
+                    revision_id: rid1.to_string(),
+                    weight_percent: Some(50),
+                    weight_bps: None,
+                },
+                TrafficSetEntryPayload {
+                    revision_id: rid2.to_string(),
+                    weight_percent: Some(50),
+                    weight_bps: None,
+                },
+            ],
+            updated_by: "test".to_string(),
+            idempotency_key: "k2".to_string(),
+            authorization_ref: default_authorization_ref(),
+        };
+        set(&store, &OpFlags::default(), Some(k2_payload.clone())).unwrap();
+        // Retry k2 — should be no-op, must not overwrite previous_split_ref.
+        set(&store, &OpFlags::default(), Some(k2_payload)).unwrap();
+        // Rollback: must restore 100% rev1, not the retried 50/50.
+        let rolled = rollback(
+            &store,
+            &OpFlags::default(),
+            Some(TrafficShowPayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+            }),
+        )
+        .unwrap();
+        let entries = rolled
+            .result
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "rollback must restore the single-entry k1 split, not the retried k2"
+        );
+        assert_eq!(
+            entries[0].get("weight_bps").and_then(|v| v.as_u64()),
+            Some(10_000)
+        );
     }
 }

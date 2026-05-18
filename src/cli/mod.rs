@@ -40,6 +40,7 @@ use std::path::PathBuf;
 pub mod bundles;
 pub mod config;
 pub mod credentials;
+pub mod dispatch;
 pub mod env;
 pub mod env_packs;
 pub mod revisions;

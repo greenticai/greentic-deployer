@@ -49,6 +49,10 @@ enum TopLevelCommand {
     Serverless(ServerlessCommand),
     Snap(SnapCommand),
     Terraform(TerraformCommand),
+    /// `gtc op …` command surface (A3). Operates on the local
+    /// `EnvironmentStore` rooted at `~/.greentic/environments` (or
+    /// `--store-root <path>`).
+    Op(greentic_deployer::cli::dispatch::OpCommand),
 }
 
 enum BuiltinBackendCommand {
@@ -1260,6 +1264,9 @@ fn main() -> Result<()> {
             cli_builtin_dispatch::dispatch_builtin_backend_command(
                 BuiltinBackendCommand::Terraform(command),
             )
+        }
+        TopLevelCommand::Op(op) => {
+            greentic_deployer::cli::dispatch::dispatch_op(op).map_err(anyhow::Error::from)
         }
     }
 }

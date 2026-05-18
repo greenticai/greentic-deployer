@@ -112,82 +112,80 @@ pub fn stage(
     }
     let payload = resolve_payload::<RevisionStagePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let mut env = store.load(&env_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
-    let deployment = env
-        .bundles
-        .iter()
-        .find(|b| b.deployment_id == deployment_id)
-        .ok_or_else(|| {
-            OpError::NotFound(format!(
-                "deployment `{deployment_id}` not found in env `{env_id}`"
-            ))
-        })?
-        .clone();
-    let bundle_id = deployment.bundle_id.clone();
-    let next_sequence = env
-        .revisions
-        .iter()
-        .filter(|r| r.deployment_id == deployment_id)
-        .map(|r| r.sequence)
-        .max()
-        .unwrap_or(0)
-        + 1;
-    let now = Utc::now();
-    let revision = Revision {
-        schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
-        revision_id: crate::environment::mint_revision_id(),
-        env_id: env_id.clone(),
-        bundle_id,
-        deployment_id,
-        sequence: next_sequence,
-        created_at: now,
-        bundle_digest: payload.bundle_digest,
-        pack_list: payload
-            .pack_list
-            .into_iter()
-            .map(|e| {
-                Ok::<_, OpError>(PackListEntry {
-                    pack_id: PackId::new(e.pack_id),
-                    version: e
-                        .version
-                        .parse::<SemVer>()
-                        .map_err(|err| OpError::InvalidArgument(format!("pack version: {err}")))?,
-                    digest: e.digest,
-                    source_uri: e.source_uri,
-                })
+    // Pre-parse the pack list outside the lock so a payload error doesn't
+    // hold the flock.
+    let pack_list = payload
+        .pack_list
+        .into_iter()
+        .map(|e| {
+            Ok::<_, OpError>(PackListEntry {
+                pack_id: PackId::new(e.pack_id),
+                version: e
+                    .version
+                    .parse::<SemVer>()
+                    .map_err(|err| OpError::InvalidArgument(format!("pack version: {err}")))?,
+                digest: e.digest,
+                source_uri: e.source_uri,
             })
-            .collect::<Result<Vec<_>, _>>()?,
-        pack_list_lock_ref: payload.pack_list_lock_ref,
-        config_digest: payload.config_digest,
-        signature_sidecar_ref: payload.signature_sidecar_ref,
-        // Stage transition: every new Revision starts at `inactive` then
-        // immediately moves to `staged`. Validate the transition with the
-        // pure predicate to keep the spec honest even at insertion time.
-        lifecycle: RevisionLifecycle::Inactive,
-        staged_at: None,
-        warmed_at: None,
-        drain_seconds: payload.drain_seconds,
-        abort_metrics: Vec::new(),
-    };
-    if !is_valid_transition(revision.lifecycle, RevisionLifecycle::Staged) {
-        return Err(OpError::Conflict(format!(
-            "cannot transition from `{:?}` to `staged`",
-            revision.lifecycle
-        )));
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !is_valid_transition(RevisionLifecycle::Inactive, RevisionLifecycle::Staged) {
+        return Err(OpError::Conflict(
+            "spec rejects inactive → staged".to_string(),
+        ));
     }
-    let mut staged = revision;
-    staged.lifecycle = RevisionLifecycle::Staged;
-    staged.staged_at = Some(now);
-    let revision_id = staged.revision_id;
-    env.revisions.push(staged);
-    store.save(&env)?;
-    let summary = RevisionSummary::from(
-        env.revisions
+    let summary = store.transact(&env_id, |locked| -> Result<RevisionSummary, OpError> {
+        let mut env = locked.load()?;
+        let deployment = env
+            .bundles
             .iter()
-            .find(|r| r.revision_id == revision_id)
-            .expect("just pushed"),
-    );
+            .find(|b| b.deployment_id == deployment_id)
+            .ok_or_else(|| {
+                OpError::NotFound(format!(
+                    "deployment `{deployment_id}` not found in env `{env_id}`"
+                ))
+            })?
+            .clone();
+        let bundle_id = deployment.bundle_id.clone();
+        let next_sequence = env
+            .revisions
+            .iter()
+            .filter(|r| r.deployment_id == deployment_id)
+            .map(|r| r.sequence)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let now = Utc::now();
+        let staged = Revision {
+            schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
+            revision_id: crate::environment::mint_revision_id(),
+            env_id: env_id.clone(),
+            bundle_id,
+            deployment_id,
+            sequence: next_sequence,
+            created_at: now,
+            bundle_digest: payload.bundle_digest.clone(),
+            pack_list: pack_list.clone(),
+            pack_list_lock_ref: payload.pack_list_lock_ref.clone(),
+            config_digest: payload.config_digest.clone(),
+            signature_sidecar_ref: payload.signature_sidecar_ref.clone(),
+            lifecycle: RevisionLifecycle::Staged,
+            staged_at: Some(now),
+            warmed_at: None,
+            drain_seconds: payload.drain_seconds,
+            abort_metrics: Vec::new(),
+        };
+        let revision_id = staged.revision_id;
+        env.revisions.push(staged);
+        locked.save(&env)?;
+        Ok(RevisionSummary::from(
+            env.revisions
+                .iter()
+                .find(|r| r.revision_id == revision_id)
+                .expect("just pushed"),
+        ))
+    })?;
     Ok(OpOutcome::new(
         NOUN,
         "stage",
@@ -309,58 +307,56 @@ fn transition<F: FnMut(&mut Revision)>(
 ) -> Result<OpOutcome, OpError> {
     let payload = resolve_payload::<RevisionTransitionPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let mut env = store.load(&env_id)?;
     let revision_id = parse_revision_id(&payload.revision_id)?;
-    let idx = env
-        .revisions
-        .iter()
-        .position(|r| r.revision_id == revision_id)
-        .ok_or_else(|| {
-            OpError::NotFound(format!(
-                "revision `{revision_id}` not found in env `{env_id}`"
-            ))
-        })?;
-    // Apply the chain step by step, validating each hop.
-    for (from, to) in accepted_chain {
-        if env.revisions[idx].lifecycle == *from {
-            if !is_valid_transition(*from, *to) {
-                return Err(OpError::Conflict(format!(
-                    "spec rejects transition `{:?} → {:?}`",
-                    from, to
-                )));
-            }
-            env.revisions[idx].lifecycle = *to;
-        }
-    }
-    let final_state = accepted_chain
-        .last()
-        .map(|(_, to)| *to)
-        .ok_or_else(|| OpError::InvalidArgument("empty transition chain".to_string()))?;
-    if env.revisions[idx].lifecycle != final_state {
-        return Err(OpError::Conflict(format!(
-            "revision `{revision_id}` is in `{:?}`; expected one of {:?}",
-            env.revisions[idx].lifecycle,
-            accepted_chain.iter().map(|(f, _)| f).collect::<Vec<_>>(),
-        )));
-    }
-    on_final(&mut env.revisions[idx]);
-    if prune_from_splits {
-        for split in env.traffic_splits.iter_mut() {
-            split.entries.retain(|e| e.revision_id != revision_id);
-        }
-        // Also remove from each bundle's current_revisions list.
-        let deployment_id = env.revisions[idx].deployment_id;
-        for bundle in env.bundles.iter_mut() {
-            if bundle.deployment_id == deployment_id {
-                bundle.current_revisions.retain(|r| *r != revision_id);
+    let summary = store.transact(&env_id, |locked| -> Result<RevisionSummary, OpError> {
+        let mut env = locked.load()?;
+        let idx = env
+            .revisions
+            .iter()
+            .position(|r| r.revision_id == revision_id)
+            .ok_or_else(|| {
+                OpError::NotFound(format!(
+                    "revision `{revision_id}` not found in env `{env_id}`"
+                ))
+            })?;
+        for (from, to) in accepted_chain {
+            if env.revisions[idx].lifecycle == *from {
+                if !is_valid_transition(*from, *to) {
+                    return Err(OpError::Conflict(format!(
+                        "spec rejects transition `{:?} → {:?}`",
+                        from, to
+                    )));
+                }
+                env.revisions[idx].lifecycle = *to;
             }
         }
-        // Drop empty splits — Environment::validate refuses a zero-entry
-        // split (BasisPointsSum != 10_000).
-        env.traffic_splits.retain(|s| !s.entries.is_empty());
-    }
-    store.save(&env)?;
-    let summary = RevisionSummary::from(&env.revisions[idx]);
+        let final_state = accepted_chain
+            .last()
+            .map(|(_, to)| *to)
+            .ok_or_else(|| OpError::InvalidArgument("empty transition chain".to_string()))?;
+        if env.revisions[idx].lifecycle != final_state {
+            return Err(OpError::Conflict(format!(
+                "revision `{revision_id}` is in `{:?}`; expected one of {:?}",
+                env.revisions[idx].lifecycle,
+                accepted_chain.iter().map(|(f, _)| f).collect::<Vec<_>>(),
+            )));
+        }
+        on_final(&mut env.revisions[idx]);
+        if prune_from_splits {
+            for split in env.traffic_splits.iter_mut() {
+                split.entries.retain(|e| e.revision_id != revision_id);
+            }
+            let deployment_id = env.revisions[idx].deployment_id;
+            for bundle in env.bundles.iter_mut() {
+                if bundle.deployment_id == deployment_id {
+                    bundle.current_revisions.retain(|r| *r != revision_id);
+                }
+            }
+            env.traffic_splits.retain(|s| !s.entries.is_empty());
+        }
+        locked.save(&env)?;
+        Ok(RevisionSummary::from(&env.revisions[idx]))
+    })?;
     Ok(OpOutcome::new(
         NOUN,
         op,

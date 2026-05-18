@@ -69,16 +69,21 @@ pub fn add(
     let payload = resolve_payload(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let binding = build_binding(&payload, 0, None)?;
-    let mut env = store.load(&env_id)?;
-    if env.pack_for_slot(binding.slot).is_some() {
-        return Err(OpError::Conflict(format!(
-            "slot `{}` already bound on env `{}`; use update",
-            binding.slot, env_id
-        )));
-    }
-    env.packs.push(binding);
-    store.save(&env)?;
-    let summary = BindingSummary::from_binding(&env_id, env.packs.last().expect("just pushed"));
+    let summary = store.transact(&env_id, |locked| -> Result<BindingSummary, OpError> {
+        let mut env = locked.load()?;
+        if env.pack_for_slot(binding.slot).is_some() {
+            return Err(OpError::Conflict(format!(
+                "slot `{}` already bound on env `{}`; use update",
+                binding.slot, env_id
+            )));
+        }
+        env.packs.push(binding.clone());
+        locked.save(&env)?;
+        Ok(BindingSummary::from_binding(
+            &env_id,
+            env.packs.last().expect("just pushed"),
+        ))
+    })?;
     Ok(OpOutcome::new(
         NOUN,
         "add",
@@ -96,25 +101,27 @@ pub fn update(
     }
     let payload = resolve_payload(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let mut env = store.load(&env_id)?;
-    let idx = env
-        .packs
-        .iter()
-        .position(|b| b.slot == payload.slot)
-        .ok_or_else(|| {
-            OpError::NotFound(format!(
-                "slot `{}` not bound on env `{}`",
-                payload.slot, env_id
-            ))
-        })?;
-    let prev_generation = env.packs[idx].generation;
-    let prev_snapshot = serde_json::to_value(&env.packs[idx])
-        .map_err(|e| OpError::InvalidArgument(format!("snapshot prior binding: {e}")))?;
-    let mut new_binding = build_binding(&payload, prev_generation + 1, None)?;
-    new_binding.previous_binding_ref = Some(stash_previous(prev_snapshot));
-    env.packs[idx] = new_binding;
-    store.save(&env)?;
-    let summary = BindingSummary::from_binding(&env_id, &env.packs[idx]);
+    let summary = store.transact(&env_id, |locked| -> Result<BindingSummary, OpError> {
+        let mut env = locked.load()?;
+        let idx = env
+            .packs
+            .iter()
+            .position(|b| b.slot == payload.slot)
+            .ok_or_else(|| {
+                OpError::NotFound(format!(
+                    "slot `{}` not bound on env `{}`",
+                    payload.slot, env_id
+                ))
+            })?;
+        let prev_generation = env.packs[idx].generation;
+        let prev_snapshot = serde_json::to_value(&env.packs[idx])
+            .map_err(|e| OpError::InvalidArgument(format!("snapshot prior binding: {e}")))?;
+        let mut new_binding = build_binding(&payload, prev_generation + 1, None)?;
+        new_binding.previous_binding_ref = Some(stash_previous(prev_snapshot));
+        env.packs[idx] = new_binding;
+        locked.save(&env)?;
+        Ok(BindingSummary::from_binding(&env_id, &env.packs[idx]))
+    })?;
     Ok(OpOutcome::new(
         NOUN,
         "update",
@@ -138,20 +145,22 @@ pub fn remove(
     }
     let payload = resolve_payload::<EnvPackRemovePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let mut env = store.load(&env_id)?;
-    let idx = env
-        .packs
-        .iter()
-        .position(|b| b.slot == payload.slot)
-        .ok_or_else(|| {
-            OpError::NotFound(format!(
-                "slot `{}` not bound on env `{}`",
-                payload.slot, env_id
-            ))
-        })?;
-    let removed = env.packs.remove(idx);
-    store.save(&env)?;
-    let summary = BindingSummary::from_binding(&env_id, &removed);
+    let summary = store.transact(&env_id, |locked| -> Result<BindingSummary, OpError> {
+        let mut env = locked.load()?;
+        let idx = env
+            .packs
+            .iter()
+            .position(|b| b.slot == payload.slot)
+            .ok_or_else(|| {
+                OpError::NotFound(format!(
+                    "slot `{}` not bound on env `{}`",
+                    payload.slot, env_id
+                ))
+            })?;
+        let removed = env.packs.remove(idx);
+        locked.save(&env)?;
+        Ok(BindingSummary::from_binding(&env_id, &removed))
+    })?;
     Ok(OpOutcome::new(
         NOUN,
         "remove",
@@ -169,38 +178,39 @@ pub fn rollback(
     }
     let payload = resolve_payload::<EnvPackRemovePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let mut env = store.load(&env_id)?;
-    let idx = env
-        .packs
-        .iter()
-        .position(|b| b.slot == payload.slot)
-        .ok_or_else(|| {
-            OpError::NotFound(format!(
-                "slot `{}` not bound on env `{}`",
+    let summary = store.transact(&env_id, |locked| -> Result<BindingSummary, OpError> {
+        let mut env = locked.load()?;
+        let idx = env
+            .packs
+            .iter()
+            .position(|b| b.slot == payload.slot)
+            .ok_or_else(|| {
+                OpError::NotFound(format!(
+                    "slot `{}` not bound on env `{}`",
+                    payload.slot, env_id
+                ))
+            })?;
+        let prev_ref = env.packs[idx].previous_binding_ref.clone().ok_or_else(|| {
+            OpError::Conflict(format!(
+                "slot `{}` on env `{}` has no previous binding to roll back to",
                 payload.slot, env_id
             ))
         })?;
-    let prev_ref = env.packs[idx].previous_binding_ref.clone().ok_or_else(|| {
-        OpError::Conflict(format!(
-            "slot `{}` on env `{}` has no previous binding to roll back to",
-            payload.slot, env_id
-        ))
+        let prev_value = load_previous(&prev_ref).ok_or_else(|| {
+            OpError::NotFound(format!(
+                "previous binding payload `{}` missing for slot `{}`",
+                prev_ref.display(),
+                payload.slot
+            ))
+        })?;
+        let mut restored: EnvPackBinding = serde_json::from_value(prev_value)
+            .map_err(|e| OpError::InvalidArgument(format!("deserialise previous binding: {e}")))?;
+        restored.generation = env.packs[idx].generation + 1;
+        restored.previous_binding_ref = None;
+        env.packs[idx] = restored;
+        locked.save(&env)?;
+        Ok(BindingSummary::from_binding(&env_id, &env.packs[idx]))
     })?;
-    let prev_value = load_previous(&prev_ref).ok_or_else(|| {
-        OpError::NotFound(format!(
-            "previous binding payload `{}` missing for slot `{}`",
-            prev_ref.display(),
-            payload.slot
-        ))
-    })?;
-    let mut restored: EnvPackBinding = serde_json::from_value(prev_value)
-        .map_err(|e| OpError::InvalidArgument(format!("deserialise previous binding: {e}")))?;
-    // Bump generation past the current one so rollback is monotonic.
-    restored.generation = env.packs[idx].generation + 1;
-    restored.previous_binding_ref = None;
-    env.packs[idx] = restored;
-    store.save(&env)?;
-    let summary = BindingSummary::from_binding(&env_id, &env.packs[idx]);
     Ok(OpOutcome::new(
         NOUN,
         "rollback",
@@ -560,5 +570,57 @@ mod tests {
             let decoded = base64_decode(&encoded).expect("decode");
             assert_eq!(decoded.as_slice(), case);
         }
+    }
+
+    #[test]
+    fn concurrent_pack_adds_both_land() {
+        // Codex regression: previously every mutator did bare
+        // `store.load() → mutate → store.save()`, with the per-env flock
+        // only held during save. Two parallel `add`s could both read the
+        // same preimage and the later save would clobber the earlier
+        // mutation. With every mutator now wrapped in `transact()`, both
+        // bindings must survive.
+        use std::sync::Arc;
+        use std::thread;
+        let dir = tempdir().unwrap();
+        let store = Arc::new(LocalFsStore::new(dir.path()));
+        store.save(&make_env("local")).unwrap();
+        let store_a = Arc::clone(&store);
+        let store_b = Arc::clone(&store);
+        // Two slots, two threads. Without transact, one of these stomps
+        // the other roughly half the time on a busy system.
+        let h_a = thread::spawn(move || {
+            add(
+                &store_a,
+                &OpFlags::default(),
+                Some(local_payload(
+                    CapabilitySlot::Secrets,
+                    "greentic.secrets.dev-store@1.0.0",
+                )),
+            )
+        });
+        let h_b = thread::spawn(move || {
+            add(
+                &store_b,
+                &OpFlags::default(),
+                Some(local_payload(
+                    CapabilitySlot::Telemetry,
+                    "greentic.telemetry.stdout@1.0.0",
+                )),
+            )
+        });
+        h_a.join().unwrap().unwrap();
+        h_b.join().unwrap().unwrap();
+        let listed = list(&store, &OpFlags::default(), "local").unwrap();
+        let bindings = listed
+            .result
+            .get("bindings")
+            .and_then(|v| v.as_array())
+            .expect("bindings array");
+        assert_eq!(
+            bindings.len(),
+            2,
+            "both slot bindings must survive concurrent transact()s"
+        );
     }
 }

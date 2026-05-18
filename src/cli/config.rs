@@ -94,24 +94,27 @@ pub fn set(
     }
     let payload = resolve_payload::<ConfigSetPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let mut env = store.load(&env_id)?;
-    if let Some(name) = payload.name {
-        env.name = name;
-    }
-    if let Some(region) = payload.region {
-        env.host_config.region = Some(region);
-    }
-    if let Some(org) = payload.tenant_org_id {
-        env.host_config.tenant_org_id = Some(org);
-    }
-    store.save(&env)?;
+    let (host_config, name) = store.transact(&env_id, |locked| -> Result<_, OpError> {
+        let mut env = locked.load()?;
+        if let Some(name) = payload.name.clone() {
+            env.name = name;
+        }
+        if let Some(region) = payload.region.clone() {
+            env.host_config.region = Some(region);
+        }
+        if let Some(org) = payload.tenant_org_id.clone() {
+            env.host_config.tenant_org_id = Some(org);
+        }
+        locked.save(&env)?;
+        Ok((env.host_config.clone(), env.name.clone()))
+    })?;
     Ok(OpOutcome::new(
         NOUN,
         "set",
         json!({
             "environment_id": env_id.as_str(),
-            "host_config": env.host_config,
-            "name": env.name,
+            "host_config": host_config,
+            "name": name,
         }),
     ))
 }

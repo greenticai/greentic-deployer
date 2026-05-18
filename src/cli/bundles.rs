@@ -111,47 +111,51 @@ pub fn add(
     }
     let payload = resolve_payload(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let mut env = store.load(&env_id)?;
     let bundle_id = BundleId::new(payload.bundle_id);
-    // Reject duplicate (bundle_id, customer_id) — that combination is the
-    // P6 anchor (§5.4: one BundleDeployment per `(env_id, bundle_id,
-    // customer_id)`).
     let customer_id = CustomerId::new(payload.customer_id);
-    if env
-        .bundles
-        .iter()
-        .any(|b| b.bundle_id == bundle_id && b.customer_id == customer_id)
-    {
-        return Err(OpError::Conflict(format!(
-            "bundle `{}` for customer `{}` already deployed in env `{}`",
-            bundle_id, customer_id, env_id
-        )));
-    }
-    let deployment = BundleDeployment {
-        schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
-        deployment_id: crate::environment::mint_deployment_id(),
-        env_id: env_id.clone(),
-        bundle_id,
-        customer_id,
-        status: BundleDeploymentStatus::Active,
-        current_revisions: Vec::new(),
-        route_binding: into_route_binding(payload.route_binding),
-        revenue_share: payload
-            .revenue_share
-            .into_iter()
-            .map(|e| RevenueShareEntry {
-                party_id: greentic_deploy_spec::PartyId::new(e.party_id),
-                basis_points: e.basis_points,
-            })
-            .collect(),
-        revenue_policy_ref: payload.revenue_policy_ref,
-        usage: None,
-        created_at: Utc::now(),
-        authorization_ref: payload.authorization_ref,
-    };
-    env.bundles.push(deployment);
-    store.save(&env)?;
-    let summary = BundleSummary::from(&env_id, env.bundles.last().expect("just pushed"));
+    let summary = store.transact(&env_id, |locked| -> Result<BundleSummary, OpError> {
+        let mut env = locked.load()?;
+        // P6 anchor (§5.4): one BundleDeployment per (env_id, bundle_id, customer_id).
+        if env
+            .bundles
+            .iter()
+            .any(|b| b.bundle_id == bundle_id && b.customer_id == customer_id)
+        {
+            return Err(OpError::Conflict(format!(
+                "bundle `{}` for customer `{}` already deployed in env `{}`",
+                bundle_id, customer_id, env_id
+            )));
+        }
+        let deployment = BundleDeployment {
+            schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
+            deployment_id: crate::environment::mint_deployment_id(),
+            env_id: env_id.clone(),
+            bundle_id: bundle_id.clone(),
+            customer_id: customer_id.clone(),
+            status: BundleDeploymentStatus::Active,
+            current_revisions: Vec::new(),
+            route_binding: into_route_binding(payload.route_binding.clone()),
+            revenue_share: payload
+                .revenue_share
+                .iter()
+                .cloned()
+                .map(|e| RevenueShareEntry {
+                    party_id: greentic_deploy_spec::PartyId::new(e.party_id),
+                    basis_points: e.basis_points,
+                })
+                .collect(),
+            revenue_policy_ref: payload.revenue_policy_ref.clone(),
+            usage: None,
+            created_at: Utc::now(),
+            authorization_ref: payload.authorization_ref.clone(),
+        };
+        env.bundles.push(deployment);
+        locked.save(&env)?;
+        Ok(BundleSummary::from(
+            &env_id,
+            env.bundles.last().expect("just pushed"),
+        ))
+    })?;
     Ok(OpOutcome::new(
         NOUN,
         "add",
@@ -181,34 +185,36 @@ pub fn update(
     }
     let payload = resolve_payload::<BundleUpdatePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let mut env = store.load(&env_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
-    let idx = env
-        .bundles
-        .iter()
-        .position(|b| b.deployment_id == deployment_id)
-        .ok_or_else(|| {
-            OpError::NotFound(format!(
-                "deployment `{deployment_id}` not found in env `{env_id}`"
-            ))
-        })?;
-    if let Some(status) = payload.status {
-        env.bundles[idx].status = status;
-    }
-    if let Some(rb) = payload.route_binding {
-        env.bundles[idx].route_binding = into_route_binding(rb);
-    }
-    if let Some(shares) = payload.revenue_share {
-        env.bundles[idx].revenue_share = shares
-            .into_iter()
-            .map(|e| RevenueShareEntry {
-                party_id: greentic_deploy_spec::PartyId::new(e.party_id),
-                basis_points: e.basis_points,
-            })
-            .collect();
-    }
-    store.save(&env)?;
-    let summary = BundleSummary::from(&env_id, &env.bundles[idx]);
+    let summary = store.transact(&env_id, |locked| -> Result<BundleSummary, OpError> {
+        let mut env = locked.load()?;
+        let idx = env
+            .bundles
+            .iter()
+            .position(|b| b.deployment_id == deployment_id)
+            .ok_or_else(|| {
+                OpError::NotFound(format!(
+                    "deployment `{deployment_id}` not found in env `{env_id}`"
+                ))
+            })?;
+        if let Some(status) = payload.status {
+            env.bundles[idx].status = status;
+        }
+        if let Some(rb) = payload.route_binding.clone() {
+            env.bundles[idx].route_binding = into_route_binding(rb);
+        }
+        if let Some(shares) = payload.revenue_share.clone() {
+            env.bundles[idx].revenue_share = shares
+                .into_iter()
+                .map(|e| RevenueShareEntry {
+                    party_id: greentic_deploy_spec::PartyId::new(e.party_id),
+                    basis_points: e.basis_points,
+                })
+                .collect();
+        }
+        locked.save(&env)?;
+        Ok(BundleSummary::from(&env_id, &env.bundles[idx]))
+    })?;
     Ok(OpOutcome::new(
         NOUN,
         "update",
@@ -232,34 +238,52 @@ pub fn remove(
     }
     let payload = resolve_payload::<BundleRemovePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let mut env = store.load(&env_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
-    let idx = env
-        .bundles
-        .iter()
-        .position(|b| b.deployment_id == deployment_id)
-        .ok_or_else(|| {
-            OpError::NotFound(format!(
-                "deployment `{deployment_id}` not found in env `{env_id}`"
-            ))
-        })?;
-    // Refuse to remove a deployment whose revisions are still live. A5/A7
-    // will gate this on the lifecycle audit log; for now we enforce the
-    // simpler invariant: a deployment with current_revisions must be archived
-    // first.
-    if !env.bundles[idx].current_revisions.is_empty() {
-        return Err(OpError::Conflict(format!(
-            "deployment `{deployment_id}` has {} active revision(s); archive them first",
-            env.bundles[idx].current_revisions.len()
-        )));
-    }
-    let removed = env.bundles.remove(idx);
-    // Also remove any TrafficSplit and orphan revisions for this deployment.
-    env.traffic_splits
-        .retain(|s| s.deployment_id != deployment_id);
-    env.revisions.retain(|r| r.deployment_id != deployment_id);
-    store.save(&env)?;
-    let summary = BundleSummary::from(&env_id, &removed);
+    let summary = store.transact(&env_id, |locked| -> Result<BundleSummary, OpError> {
+        let mut env = locked.load()?;
+        let idx = env
+            .bundles
+            .iter()
+            .position(|b| b.deployment_id == deployment_id)
+            .ok_or_else(|| {
+                OpError::NotFound(format!(
+                    "deployment `{deployment_id}` not found in env `{env_id}`"
+                ))
+            })?;
+        // Live-state guard. `current_revisions` is plan-level future signal
+        // that A3's stage/warm path does not yet maintain, so it can't be
+        // the gate. The actual live-state proof is: any traffic split
+        // pointing at this deployment, or any non-archived Revision for it.
+        let active_splits = env
+            .traffic_splits
+            .iter()
+            .filter(|s| s.deployment_id == deployment_id)
+            .count();
+        let active_revisions = env
+            .revisions
+            .iter()
+            .filter(|r| {
+                r.deployment_id == deployment_id
+                    && !matches!(
+                        r.lifecycle,
+                        greentic_deploy_spec::RevisionLifecycle::Archived
+                    )
+            })
+            .count();
+        if active_splits > 0 || active_revisions > 0 {
+            return Err(OpError::Conflict(format!(
+                "deployment `{deployment_id}` is still live: {active_splits} traffic split(s), \
+                 {active_revisions} non-archived revision(s). Archive revisions and clear the \
+                 split first."
+            )));
+        }
+        let removed = env.bundles.remove(idx);
+        // No live state to nuke at this point; drop the archived revisions
+        // for this deployment so the env stays compact.
+        env.revisions.retain(|r| r.deployment_id != deployment_id);
+        locked.save(&env)?;
+        Ok(BundleSummary::from(&env_id, &removed))
+    })?;
     Ok(OpOutcome::new(
         NOUN,
         "remove",
@@ -550,5 +574,80 @@ mod tests {
         let listed = list(&store, &OpFlags::default(), "local").unwrap();
         let deployments = listed.result.get("deployments").and_then(|v| v.as_array());
         assert!(deployments.map(|v| v.is_empty()).unwrap_or(false));
+    }
+
+    #[test]
+    fn remove_rejects_when_traffic_split_references_deployment() {
+        // Codex regression: the prior guard checked `current_revisions`,
+        // which the CLI stage/warm/traffic path never populates. Verify
+        // that a live traffic split blocks removal even when
+        // current_revisions is empty.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        let bundle = crate::cli::tests_common::make_bundle_deployment("local", "fast2flow");
+        let did = bundle.deployment_id;
+        // Note: current_revisions intentionally left empty — matches the
+        // CLI path's state.
+        let revision = crate::cli::tests_common::make_revision(
+            "local",
+            "fast2flow",
+            &did,
+            1,
+            greentic_deploy_spec::RevisionLifecycle::Ready,
+        );
+        let split = crate::cli::tests_common::make_traffic_split(
+            "local",
+            "fast2flow",
+            &did,
+            &revision.revision_id,
+            "k1",
+        );
+        env.bundles.push(bundle);
+        env.revisions.push(revision);
+        env.traffic_splits.push(split);
+        store.save(&env).unwrap();
+        let err = remove(
+            &store,
+            &OpFlags::default(),
+            Some(BundleRemovePayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn remove_rejects_when_non_archived_revision_exists() {
+        // Same C4 finding, the other live-state signal: a non-archived
+        // revision (even one that's not yet referenced by a traffic split)
+        // must block removal.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        let bundle = crate::cli::tests_common::make_bundle_deployment("local", "fast2flow");
+        let did = bundle.deployment_id;
+        let revision = crate::cli::tests_common::make_revision(
+            "local",
+            "fast2flow",
+            &did,
+            1,
+            greentic_deploy_spec::RevisionLifecycle::Staged,
+        );
+        env.bundles.push(bundle);
+        env.revisions.push(revision);
+        store.save(&env).unwrap();
+        let err = remove(
+            &store,
+            &OpFlags::default(),
+            Some(BundleRemovePayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
     }
 }
