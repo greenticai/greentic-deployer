@@ -188,8 +188,8 @@ pub fn show<S: EnvironmentStore>(
 }
 
 /// `op env doctor <env_id>`. Re-validates the env against `Environment::validate`
-/// + checks for missing capability slots. Returns a structured report instead
-/// of failing on the first issue.
+/// and checks for missing capability slots. Returns a structured report
+/// instead of failing on the first issue.
 pub fn doctor<S: EnvironmentStore>(
     store: &S,
     flags: &OpFlags,

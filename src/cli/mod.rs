@@ -38,11 +38,13 @@
 use std::path::PathBuf;
 
 pub mod bundles;
+pub mod config;
+pub mod credentials;
 pub mod env;
 pub mod env_packs;
 pub mod revisions;
+pub mod secrets;
 pub mod traffic;
-// Wired in subsequent A3 commits:
 // pub mod bundles;
 // pub mod revisions;
 // pub mod traffic;

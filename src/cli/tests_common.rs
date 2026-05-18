@@ -58,7 +58,7 @@ pub fn make_revision(
         revision_id: RevisionId::new(),
         env_id: EnvId::try_from(env_id).expect("test env_id"),
         bundle_id: BundleId::new(bundle_id),
-        deployment_id: deployment_id.clone(),
+        deployment_id: *deployment_id,
         sequence,
         created_at: Utc.with_ymd_and_hms(2026, 5, 18, 12, 0, 0).unwrap(),
         bundle_digest: "sha256:00".to_string(),
@@ -119,11 +119,11 @@ pub fn make_traffic_split(
     TrafficSplit {
         schema: SchemaVersion::new(SchemaVersion::TRAFFIC_SPLIT_V1),
         env_id: EnvId::try_from(env_id).expect("test env_id"),
-        deployment_id: deployment_id.clone(),
+        deployment_id: *deployment_id,
         bundle_id: BundleId::new(bundle_id),
         generation: 0,
         entries: vec![TrafficSplitEntry {
-            revision_id: revision_id.clone(),
+            revision_id: *revision_id,
             weight_bps: 10_000,
         }],
         updated_at: Utc.with_ymd_and_hms(2026, 5, 18, 12, 0, 0).unwrap(),

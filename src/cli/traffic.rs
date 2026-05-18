@@ -192,7 +192,7 @@ pub fn set(
         previous_split_ref,
     };
     // Validate sum == 10_000 before we touch disk.
-    split.validate().map_err(|e| OpError::Spec(e))?;
+    split.validate().map_err(OpError::Spec)?;
     match prev_split_idx {
         Some(idx) => env.traffic_splits[idx] = split.clone(),
         None => env.traffic_splits.push(split.clone()),
@@ -283,7 +283,7 @@ pub fn rollback(
     restored.previous_split_ref = None;
     restored.updated_at = Utc::now();
     restored.idempotency_key = format!("rollback-{}", env.traffic_splits[idx].idempotency_key);
-    restored.validate().map_err(|e| OpError::Spec(e))?;
+    restored.validate().map_err(OpError::Spec)?;
     env.traffic_splits[idx] = restored.clone();
     store.save(&env)?;
     Ok(OpOutcome::new(
@@ -401,11 +401,11 @@ mod tests {
     fn seed_env(store: &LocalFsStore) -> (DeploymentId, RevisionId, RevisionId) {
         let mut env = make_env("local");
         let deployment = make_bundle_deployment("local", "fast2flow");
-        let did = deployment.deployment_id.clone();
+        let did = deployment.deployment_id;
         let r1 = make_revision("local", "fast2flow", &did, 1, RevisionLifecycle::Ready);
         let r2 = make_revision("local", "fast2flow", &did, 2, RevisionLifecycle::Ready);
-        let rid1 = r1.revision_id.clone();
-        let rid2 = r2.revision_id.clone();
+        let rid1 = r1.revision_id;
+        let rid2 = r2.revision_id;
         env.bundles.push(deployment);
         env.revisions.push(r1);
         env.revisions.push(r2);
@@ -565,14 +565,14 @@ mod tests {
         // Seed env with two deployments, two revisions, one in each.
         let mut env = make_env("local");
         let d1 = make_bundle_deployment("local", "fast2flow");
-        let did1 = d1.deployment_id.clone();
+        let did1 = d1.deployment_id;
         let mut d2 = make_bundle_deployment("local", "llm-router");
         d2.customer_id = greentic_deploy_spec::CustomerId::new("local-dev");
         // Force a distinct (bundle, customer) — they already differ on bundle.
-        let did2 = d2.deployment_id.clone();
+        let did2 = d2.deployment_id;
         let r1 = make_revision("local", "fast2flow", &did1, 1, RevisionLifecycle::Ready);
         let r2 = make_revision("local", "llm-router", &did2, 1, RevisionLifecycle::Ready);
-        let rid2 = r2.revision_id.clone();
+        let rid2 = r2.revision_id;
         env.bundles.push(d1);
         env.bundles.push(d2);
         env.revisions.push(r1);

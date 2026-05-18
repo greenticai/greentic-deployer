@@ -179,7 +179,7 @@ pub fn stage(
     let mut staged = revision;
     staged.lifecycle = RevisionLifecycle::Staged;
     staged.staged_at = Some(now);
-    let revision_id = staged.revision_id.clone();
+    let revision_id = staged.revision_id;
     env.revisions.push(staged);
     store.save(&env)?;
     let summary = RevisionSummary::from(
@@ -349,7 +349,7 @@ fn transition<F: FnMut(&mut Revision)>(
             split.entries.retain(|e| e.revision_id != revision_id);
         }
         // Also remove from each bundle's current_revisions list.
-        let deployment_id = env.revisions[idx].deployment_id.clone();
+        let deployment_id = env.revisions[idx].deployment_id;
         for bundle in env.bundles.iter_mut() {
             if bundle.deployment_id == deployment_id {
                 bundle.current_revisions.retain(|r| *r != revision_id);
@@ -451,7 +451,7 @@ mod tests {
     fn seed_env_with_deployment(store: &LocalFsStore) -> DeploymentId {
         let mut env = make_env("local");
         let deployment = make_bundle_deployment("local", "fast2flow");
-        let did = deployment.deployment_id.clone();
+        let did = deployment.deployment_id;
         env.bundles.push(deployment);
         store.save(&env).unwrap();
         did
@@ -585,7 +585,7 @@ mod tests {
         // Seed with: deployment + ready revision + traffic split + bundle.current_revisions
         let mut env = make_env("local");
         let mut deployment = make_bundle_deployment("local", "fast2flow");
-        let did = deployment.deployment_id.clone();
+        let did = deployment.deployment_id;
         let revision = crate::cli::tests_common::make_revision(
             "local",
             "fast2flow",
@@ -593,8 +593,8 @@ mod tests {
             1,
             RevisionLifecycle::Ready,
         );
-        let rid = revision.revision_id.clone();
-        deployment.current_revisions.push(rid.clone());
+        let rid = revision.revision_id;
+        deployment.current_revisions.push(rid);
         let split = crate::cli::tests_common::make_traffic_split(
             "local",
             "fast2flow",

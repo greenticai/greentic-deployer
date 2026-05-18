@@ -500,7 +500,7 @@ mod tests {
         let store = LocalFsStore::new(dir.path());
         let mut env = make_env("local");
         let mut bundle = crate::cli::tests_common::make_bundle_deployment("local", "fast2flow");
-        let did = bundle.deployment_id.clone();
+        let did = bundle.deployment_id;
         // `Environment::validate` requires every `current_revisions` id to
         // resolve to a real Revision in the env, so push a matching one.
         let revision = crate::cli::tests_common::make_revision(
@@ -510,7 +510,7 @@ mod tests {
             1,
             greentic_deploy_spec::RevisionLifecycle::Ready,
         );
-        bundle.current_revisions.push(revision.revision_id.clone());
+        bundle.current_revisions.push(revision.revision_id);
         env.bundles.push(bundle);
         env.revisions.push(revision);
         store.save(&env).unwrap();
