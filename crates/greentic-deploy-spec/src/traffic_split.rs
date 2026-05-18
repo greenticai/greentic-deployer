@@ -39,12 +39,19 @@ impl TrafficSplit {
         SchemaVersion::TRAFFIC_SPLIT_V1
     }
 
-    /// `§5.3`: sum of `weight_bps` MUST equal 10,000.
+    /// `§5.3`: schema discriminator equals `greentic.traffic-split.v1` and
+    /// the sum of `weight_bps` MUST equal 10,000.
     ///
     /// Sum widens into `u64` and rejects any per-entry value above 10,000 so a
     /// crafted document like `[u32::MAX, 10001]` cannot wrap to exactly 10,000
     /// in release builds.
     pub fn validate(&self) -> Result<(), SpecError> {
+        if self.schema.as_str() != SchemaVersion::TRAFFIC_SPLIT_V1 {
+            return Err(SpecError::SchemaMismatch {
+                expected: SchemaVersion::TRAFFIC_SPLIT_V1,
+                actual: self.schema.as_str().to_string(),
+            });
+        }
         let mut sum: u64 = 0;
         for entry in &self.entries {
             if entry.weight_bps > BASIS_POINTS_TOTAL {

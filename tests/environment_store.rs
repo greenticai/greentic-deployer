@@ -343,13 +343,75 @@ fn lock_serializes_concurrent_writers() {
 }
 
 #[test]
-fn try_acquire_blocks_while_lock_held() {
+fn try_acquire_blocks_while_transact_holds_lock() {
     let (_tmp, store) = fresh_store();
     let id = env_id("local");
-    let lock_path = store.root().join("local").join(".lock");
-    let _guard = store.lock(&id).unwrap();
-    let attempt = EnvFlock::try_acquire(&lock_path).unwrap();
-    assert!(attempt.is_none());
+    let lock_path = store.env_lock_path(&id).unwrap();
+    // Capture the path before transact takes the lock; once inside the
+    // closure another `EnvFlock::try_acquire` must fail.
+    store
+        .transact(&id, |_locked| {
+            let attempt = EnvFlock::try_acquire(&lock_path).unwrap();
+            assert!(
+                attempt.is_none(),
+                "second flock acquire must fail while transact holds the lock"
+            );
+            Ok(())
+        })
+        .unwrap();
+    // After transact returns, the lock is released and try_acquire succeeds.
+    let after = EnvFlock::try_acquire(&lock_path).unwrap();
+    assert!(after.is_some());
+}
+
+#[test]
+fn transact_load_then_save_does_not_deadlock() {
+    // Regression: the pre-fix trait advertised `EnvironmentStore::lock` as
+    // the entry point for compound mutations, but every `save_*` re-acquired
+    // the same per-FD flock blocking, so `let g = store.lock(&id); store.save()`
+    // would self-deadlock. The replacement closure-based `transact` API must
+    // make the natural pattern (load → mutate → save) work.
+    let (_tmp, store) = fresh_store();
+    let id = env_id("local");
+    store.save(&minimal_environment(&id)).unwrap();
+
+    store
+        .transact(&id, |locked| {
+            let mut env = locked.load()?;
+            env.name = "transacted".into();
+            locked.save(&env)?;
+            // Compound: mutate pack-answers within the same transaction.
+            locked.save_pack_answers(CapabilitySlot::Secrets, &json!({ "rotated": true }))?;
+            Ok(())
+        })
+        .unwrap();
+
+    let env = store.load(&id).unwrap();
+    assert_eq!(env.name, "transacted");
+    let ans = store
+        .load_pack_answers(&id, CapabilitySlot::Secrets)
+        .unwrap();
+    assert_eq!(ans, Some(json!({ "rotated": true })));
+}
+
+#[test]
+fn transact_rejects_mismatched_env_id_in_payload() {
+    // Lock is scoped to `local`; trying to save a payload whose
+    // environment_id is `prod` must be rejected — otherwise the closure
+    // could bypass `prod`'s flock entirely.
+    let (_tmp, store) = fresh_store();
+    let local_id = env_id("local");
+    let prod_id = env_id("prod");
+    store.save(&minimal_environment(&local_id)).unwrap();
+    store.save(&minimal_environment(&prod_id)).unwrap();
+
+    let err = store
+        .transact(&local_id, |locked| {
+            let prod_env = minimal_environment(&env_id("prod"));
+            locked.save(&prod_env)
+        })
+        .expect_err("transact must reject cross-env payload");
+    assert!(matches!(err, StoreError::EnvIdMismatch { .. }));
 }
 
 #[test]
@@ -426,9 +488,13 @@ fn load_runtime_answers_lock_all_reject_unsafe_env_id() {
         StoreError::UnsafeEnvId(_)
     ));
     assert!(matches!(
-        store.lock(&bad).unwrap_err(),
+        store.env_lock_path(&bad).unwrap_err(),
         StoreError::UnsafeEnvId(_)
     ));
+    let err = store
+        .transact(&bad, |_| Ok(()))
+        .expect_err("transact must reject unsafe env id");
+    assert!(matches!(err, StoreError::UnsafeEnvId(_)));
 }
 
 #[test]

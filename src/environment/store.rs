@@ -108,11 +108,6 @@ pub trait EnvironmentStore: Send + Sync {
         answers: &Value,
     ) -> Result<(), StoreError>;
     fn delete_pack_answers(&self, env_id: &EnvId, slot: CapabilitySlot) -> Result<(), StoreError>;
-
-    /// Acquire the per-env exclusive lock for a multi-step transaction. The
-    /// individual `save_*` methods acquire this internally; callers only need
-    /// it for atomic compound mutations.
-    fn lock(&self, env_id: &EnvId) -> Result<EnvFlock, StoreError>;
 }
 
 #[derive(Debug, Clone)]
@@ -261,20 +256,9 @@ impl EnvironmentStore for LocalFsStore {
         // Validate first so a bad value never touches disk and never claims
         // the lock from another writer.
         env.validate()?;
-        // Discriminator double-check (validate() already does this, but the
-        // explicit error surface here is clearer).
-        if env.schema.as_str() != SchemaVersion::ENVIRONMENT_V1 {
-            return Err(StoreError::Spec(SpecError::SchemaMismatch {
-                expected: SchemaVersion::ENVIRONMENT_V1,
-                actual: env.schema.as_str().to_string(),
-            }));
-        }
         let env_id = &env.environment_id;
         let _guard = EnvFlock::acquire(&self.lock_path(env_id)?)?;
-        let target = self.environment_path(env_id)?;
-        copy_to_backup(&target, &self.backups_dir(env_id)?)?;
-        atomic_write_json(&target, env)?;
-        Ok(())
+        self.save_locked(env)
     }
 
     fn load_runtime(&self, env_id: &EnvId) -> Result<Option<EnvironmentRuntime>, StoreError> {
@@ -299,18 +283,9 @@ impl EnvironmentStore for LocalFsStore {
     }
 
     fn save_runtime(&self, runtime: &EnvironmentRuntime) -> Result<(), StoreError> {
-        if runtime.schema.as_str() != SchemaVersion::ENVIRONMENT_RUNTIME_V1 {
-            return Err(StoreError::Spec(SpecError::SchemaMismatch {
-                expected: SchemaVersion::ENVIRONMENT_RUNTIME_V1,
-                actual: runtime.schema.as_str().to_string(),
-            }));
-        }
         let env_id = &runtime.environment_id;
         let _guard = EnvFlock::acquire(&self.lock_path(env_id)?)?;
-        let target = self.runtime_path(env_id)?;
-        copy_to_backup(&target, &self.backups_dir(env_id)?)?;
-        atomic_write_json(&target, runtime)?;
-        Ok(())
+        self.save_runtime_locked(runtime)
     }
 
     fn load_pack_answers(
@@ -332,14 +307,71 @@ impl EnvironmentStore for LocalFsStore {
         answers: &Value,
     ) -> Result<(), StoreError> {
         let _guard = EnvFlock::acquire(&self.lock_path(env_id)?)?;
+        self.save_pack_answers_locked(env_id, slot, answers)
+    }
+
+    fn delete_pack_answers(&self, env_id: &EnvId, slot: CapabilitySlot) -> Result<(), StoreError> {
+        let _guard = EnvFlock::acquire(&self.lock_path(env_id)?)?;
+        self.delete_pack_answers_locked(env_id, slot)
+    }
+}
+
+// --- Locked-but-no-relock inner helpers ----------------------------------
+//
+// Each `save_*` and `delete_*` on `LocalFsStore` extracts to a `_locked`
+// inner that assumes the caller already holds the env flock. The trait
+// methods take the lock themselves; [`LocalFsStore::transact`] takes it
+// once and dispatches through [`Locked`].
+
+impl LocalFsStore {
+    fn save_locked(&self, env: &Environment) -> Result<(), StoreError> {
+        // Discriminator double-check (validate() also covers this, but the
+        // explicit error surface here is clearer).
+        if env.schema.as_str() != SchemaVersion::ENVIRONMENT_V1 {
+            return Err(StoreError::Spec(SpecError::SchemaMismatch {
+                expected: SchemaVersion::ENVIRONMENT_V1,
+                actual: env.schema.as_str().to_string(),
+            }));
+        }
+        env.validate()?;
+        let env_id = &env.environment_id;
+        let target = self.environment_path(env_id)?;
+        copy_to_backup(&target, &self.backups_dir(env_id)?)?;
+        atomic_write_json(&target, env)?;
+        Ok(())
+    }
+
+    fn save_runtime_locked(&self, runtime: &EnvironmentRuntime) -> Result<(), StoreError> {
+        if runtime.schema.as_str() != SchemaVersion::ENVIRONMENT_RUNTIME_V1 {
+            return Err(StoreError::Spec(SpecError::SchemaMismatch {
+                expected: SchemaVersion::ENVIRONMENT_RUNTIME_V1,
+                actual: runtime.schema.as_str().to_string(),
+            }));
+        }
+        let env_id = &runtime.environment_id;
+        let target = self.runtime_path(env_id)?;
+        copy_to_backup(&target, &self.backups_dir(env_id)?)?;
+        atomic_write_json(&target, runtime)?;
+        Ok(())
+    }
+
+    fn save_pack_answers_locked(
+        &self,
+        env_id: &EnvId,
+        slot: CapabilitySlot,
+        answers: &Value,
+    ) -> Result<(), StoreError> {
         let target = self.pack_answers_path(env_id, slot)?;
         copy_to_backup(&target, &self.pack_backups_dir(env_id, slot)?)?;
         atomic_write_json(&target, answers)?;
         Ok(())
     }
 
-    fn delete_pack_answers(&self, env_id: &EnvId, slot: CapabilitySlot) -> Result<(), StoreError> {
-        let _guard = EnvFlock::acquire(&self.lock_path(env_id)?)?;
+    fn delete_pack_answers_locked(
+        &self,
+        env_id: &EnvId,
+        slot: CapabilitySlot,
+    ) -> Result<(), StoreError> {
         let target = self.pack_answers_path(env_id, slot)?;
         if target.exists() {
             // Snapshot before removal so the previous answers can be recovered.
@@ -352,8 +384,100 @@ impl EnvironmentStore for LocalFsStore {
         Ok(())
     }
 
-    fn lock(&self, env_id: &EnvId) -> Result<EnvFlock, StoreError> {
-        Ok(EnvFlock::acquire(&self.lock_path(env_id)?)?)
+    /// Resolve the per-env lock path. Public so external callers that need
+    /// raw `EnvFlock` semantics can grab the path without poking at private
+    /// internals — but they must understand that each mutating call already
+    /// re-acquires this lock blocking, so externally-held guards combined
+    /// with `save_*` on the same instance will deadlock. Prefer
+    /// [`LocalFsStore::transact`] for compound mutations.
+    pub fn env_lock_path(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
+        self.lock_path(env_id)
+    }
+
+    /// Run `f` while holding the env's exclusive lock. The closure receives
+    /// a [`Locked`] view whose mutator methods skip lock acquisition, so a
+    /// natural `load → mutate → save` flow inside the closure does not
+    /// re-enter (and deadlock on) the per-FD flock.
+    ///
+    /// Reads (`load`, `load_runtime`, `load_pack_answers`, `exists`,
+    /// `list`) do not take the lock and are also available on the
+    /// `Locked` handle for convenience.
+    pub fn transact<F, R>(&self, env_id: &EnvId, f: F) -> Result<R, StoreError>
+    where
+        F: FnOnce(&Locked<'_>) -> Result<R, StoreError>,
+    {
+        let _guard = EnvFlock::acquire(&self.lock_path(env_id)?)?;
+        let locked = Locked {
+            store: self,
+            env_id: env_id.clone(),
+        };
+        f(&locked)
+    }
+}
+
+/// Lock-holding handle returned by [`LocalFsStore::transact`]. All mutator
+/// methods on this type skip lock acquisition; the lock is held by the
+/// enclosing `transact` scope and released on its return.
+///
+/// Mutators on this handle reject writes whose embedded `environment_id`
+/// (or runtime `environment_id`) does not match the env the transaction is
+/// scoped to — the lock guards exactly one env's state, so accidentally
+/// writing a different env's payload inside the closure would bypass that
+/// env's flock entirely.
+#[derive(Debug)]
+pub struct Locked<'a> {
+    store: &'a LocalFsStore,
+    env_id: EnvId,
+}
+
+impl<'a> Locked<'a> {
+    pub fn env_id(&self) -> &EnvId {
+        &self.env_id
+    }
+
+    pub fn load(&self) -> Result<Environment, StoreError> {
+        self.store.load(&self.env_id)
+    }
+
+    pub fn save(&self, env: &Environment) -> Result<(), StoreError> {
+        if env.environment_id != self.env_id {
+            return Err(StoreError::EnvIdMismatch {
+                file: self.env_id.clone(),
+                value: env.environment_id.clone(),
+            });
+        }
+        self.store.save_locked(env)
+    }
+
+    pub fn load_runtime(&self) -> Result<Option<EnvironmentRuntime>, StoreError> {
+        self.store.load_runtime(&self.env_id)
+    }
+
+    pub fn save_runtime(&self, runtime: &EnvironmentRuntime) -> Result<(), StoreError> {
+        if runtime.environment_id != self.env_id {
+            return Err(StoreError::EnvIdMismatch {
+                file: self.env_id.clone(),
+                value: runtime.environment_id.clone(),
+            });
+        }
+        self.store.save_runtime_locked(runtime)
+    }
+
+    pub fn load_pack_answers(&self, slot: CapabilitySlot) -> Result<Option<Value>, StoreError> {
+        self.store.load_pack_answers(&self.env_id, slot)
+    }
+
+    pub fn save_pack_answers(
+        &self,
+        slot: CapabilitySlot,
+        answers: &Value,
+    ) -> Result<(), StoreError> {
+        self.store
+            .save_pack_answers_locked(&self.env_id, slot, answers)
+    }
+
+    pub fn delete_pack_answers(&self, slot: CapabilitySlot) -> Result<(), StoreError> {
+        self.store.delete_pack_answers_locked(&self.env_id, slot)
     }
 }
 

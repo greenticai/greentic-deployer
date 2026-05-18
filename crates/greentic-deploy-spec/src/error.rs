@@ -88,4 +88,12 @@ pub enum SpecError {
         split_bundle: BundleId,
         deployment_bundle: BundleId,
     },
+
+    #[error("{context} ref `{uri}` is scoped to env `{actual_env}`, expected `{expected_env}`")]
+    CrossEnvRef {
+        context: &'static str,
+        uri: String,
+        expected_env: EnvId,
+        actual_env: String,
+    },
 }
