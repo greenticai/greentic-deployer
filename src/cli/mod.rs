@@ -62,7 +62,7 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::environment::StoreError;
+use crate::environment::{LifecycleError, StoreError};
 use greentic_deploy_spec::SpecError;
 
 /// Top-level error shared across `op` command implementations.
@@ -90,6 +90,33 @@ pub enum OpError {
     NotYetImplemented(&'static str),
     #[error("conflict: {0}")]
     Conflict(String),
+}
+
+impl From<LifecycleError> for OpError {
+    fn from(err: LifecycleError) -> Self {
+        match err {
+            LifecycleError::NotFound {
+                env_id,
+                revision_id,
+            } => OpError::NotFound(format!(
+                "revision `{revision_id}` not found in env `{env_id}`"
+            )),
+            LifecycleError::InvalidTransition { from, to } => {
+                OpError::Conflict(format!("spec rejects transition `{from:?} → {to:?}`"))
+            }
+            LifecycleError::Conflict {
+                revision_id,
+                actual,
+                expected_starts,
+            } => OpError::Conflict(format!(
+                "revision `{revision_id}` is in `{actual:?}`; expected one of {expected_starts:?}"
+            )),
+            LifecycleError::EmptyChain => {
+                OpError::InvalidArgument("empty transition chain".to_string())
+            }
+            LifecycleError::Store(source) => OpError::Store(source),
+        }
+    }
 }
 
 impl OpError {
