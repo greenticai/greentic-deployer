@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
-use super::{OpError, OpFlags, OpOutcome};
+use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
 
 const NOUN: &str = "traffic";
 const PREV_PREFIX: &str = "inline://";
@@ -115,7 +115,17 @@ pub fn set(
     // here is malformed the caller hears about it without contending for
     // the env's flock.
     let parsed_entries = parse_entries(&payload.entries)?;
-    let split = store.transact(&env_id, |locked| -> Result<TrafficSplit, OpError> {
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "set",
+        target: json!({"deployment_id": deployment_id.to_string()}),
+        previous_generation: None,
+        idempotency_key: Some(payload.idempotency_key.clone()),
+    };
+    audit_and_record(store, ctx, || {
+        let gens_cell = std::cell::Cell::new(super::AuditGens::NONE);
+        let split = store.transact(&env_id, |locked| -> Result<TrafficSplit, OpError> {
         let mut env = locked.load()?;
         let deployment = env
             .bundles
@@ -167,14 +177,18 @@ pub fn set(
                 )));
             }
         }
-        let (generation, previous_split_ref) = match prev_split_idx {
+        let (generation, previous_split_ref, prev_gen) = match prev_split_idx {
             Some(idx) => {
                 let prev = &env.traffic_splits[idx];
                 let snapshot = serde_json::to_value(prev)
                     .map_err(|e| OpError::InvalidArgument(format!("snapshot prior split: {e}")))?;
-                (prev.generation + 1, Some(stash_inline(snapshot)))
+                (
+                    prev.generation + 1,
+                    Some(stash_inline(snapshot)),
+                    Some(prev.generation),
+                )
             }
-            None => (0, None),
+            None => (0, None, None),
         };
         let split = TrafficSplit {
             schema: SchemaVersion::new(SchemaVersion::TRAFFIC_SPLIT_V1),
@@ -195,14 +209,20 @@ pub fn set(
             None => env.traffic_splits.push(split.clone()),
         }
         locked.save(&env)?;
+        gens_cell.set(super::AuditGens {
+            previous: prev_gen,
+            new: Some(generation),
+        });
         Ok(split)
     })?;
-    Ok(OpOutcome::new(
-        NOUN,
-        "set",
-        serde_json::to_value(TrafficSummary::from(&env_id, &split))
-            .expect("TrafficSummary is json-safe"),
-    ))
+        let outcome = OpOutcome::new(
+            NOUN,
+            "set",
+            serde_json::to_value(TrafficSummary::from(&env_id, &split))
+                .expect("TrafficSummary is json-safe"),
+        );
+        Ok((outcome, gens_cell.get()))
+    })
 }
 
 fn parse_entries(entries: &[TrafficSetEntryPayload]) -> Result<Vec<TrafficSplitEntry>, OpError> {
@@ -295,48 +315,67 @@ pub fn rollback(
     let payload = resolve_payload::<TrafficShowPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
-    let restored = store.transact(&env_id, |locked| -> Result<TrafficSplit, OpError> {
-        let mut env = locked.load()?;
-        let idx = env
-            .traffic_splits
-            .iter()
-            .position(|s| s.deployment_id == deployment_id)
-            .ok_or_else(|| {
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "rollback",
+        target: json!({"deployment_id": deployment_id.to_string()}),
+        previous_generation: None,
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || {
+        let gens_cell = std::cell::Cell::new(super::AuditGens::NONE);
+        let restored = store.transact(&env_id, |locked| -> Result<TrafficSplit, OpError> {
+            let mut env = locked.load()?;
+            let idx = env
+                .traffic_splits
+                .iter()
+                .position(|s| s.deployment_id == deployment_id)
+                .ok_or_else(|| {
+                    OpError::NotFound(format!(
+                        "no traffic split for deployment `{deployment_id}` in env `{env_id}`"
+                    ))
+                })?;
+            let prev_split_generation = env.traffic_splits[idx].generation;
+            let prev_ref = env.traffic_splits[idx]
+                .previous_split_ref
+                .clone()
+                .ok_or_else(|| {
+                    OpError::Conflict(format!(
+                        "traffic split for `{deployment_id}` has no prior version to roll back to"
+                    ))
+                })?;
+            let prev_value = load_inline(&prev_ref).ok_or_else(|| {
                 OpError::NotFound(format!(
-                    "no traffic split for deployment `{deployment_id}` in env `{env_id}`"
+                    "previous split payload `{}` missing",
+                    prev_ref.display()
                 ))
             })?;
-        let prev_ref = env.traffic_splits[idx]
-            .previous_split_ref
-            .clone()
-            .ok_or_else(|| {
-                OpError::Conflict(format!(
-                    "traffic split for `{deployment_id}` has no prior version to roll back to"
-                ))
+            let mut restored: TrafficSplit = serde_json::from_value(prev_value).map_err(|e| {
+                OpError::InvalidArgument(format!("deserialise previous split: {e}"))
             })?;
-        let prev_value = load_inline(&prev_ref).ok_or_else(|| {
-            OpError::NotFound(format!(
-                "previous split payload `{}` missing",
-                prev_ref.display()
-            ))
+            restored.generation = prev_split_generation + 1;
+            restored.previous_split_ref = None;
+            restored.updated_at = Utc::now();
+            restored.idempotency_key =
+                format!("rollback-{}", env.traffic_splits[idx].idempotency_key);
+            restored.validate().map_err(OpError::Spec)?;
+            env.traffic_splits[idx] = restored.clone();
+            locked.save(&env)?;
+            gens_cell.set(super::AuditGens {
+                previous: Some(prev_split_generation),
+                new: Some(prev_split_generation + 1),
+            });
+            Ok(restored)
         })?;
-        let mut restored: TrafficSplit = serde_json::from_value(prev_value)
-            .map_err(|e| OpError::InvalidArgument(format!("deserialise previous split: {e}")))?;
-        restored.generation = env.traffic_splits[idx].generation + 1;
-        restored.previous_split_ref = None;
-        restored.updated_at = Utc::now();
-        restored.idempotency_key = format!("rollback-{}", env.traffic_splits[idx].idempotency_key);
-        restored.validate().map_err(OpError::Spec)?;
-        env.traffic_splits[idx] = restored.clone();
-        locked.save(&env)?;
-        Ok(restored)
-    })?;
-    Ok(OpOutcome::new(
-        NOUN,
-        "rollback",
-        serde_json::to_value(TrafficSummary::from(&env_id, &restored))
-            .expect("TrafficSummary is json-safe"),
-    ))
+        let outcome = OpOutcome::new(
+            NOUN,
+            "rollback",
+            serde_json::to_value(TrafficSummary::from(&env_id, &restored))
+                .expect("TrafficSummary is json-safe"),
+        );
+        Ok((outcome, gens_cell.get()))
+    })
 }
 
 // --- internals -----------------------------------------------------------
@@ -801,5 +840,37 @@ mod tests {
             entries[0].get("weight_bps").and_then(|v| v.as_u64()),
             Some(10_000)
         );
+    }
+
+    #[test]
+    fn set_records_idempotency_key_and_generation_in_audit() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, _) = seed_env(&store);
+        set(
+            &store,
+            &OpFlags::default(),
+            Some(TrafficSetPayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+                entries: vec![TrafficSetEntryPayload {
+                    revision_id: rid1.to_string(),
+                    weight_bps: Some(10_000),
+                    weight_percent: None,
+                }],
+                updated_by: "test".to_string(),
+                idempotency_key: "k1".to_string(),
+                authorization_ref: default_authorization_ref(),
+            }),
+        )
+        .unwrap();
+        let log = dir.path().join("local").join("audit").join("events.jsonl");
+        let raw = std::fs::read_to_string(&log).unwrap();
+        let event: crate::environment::AuditEvent = serde_json::from_str(raw.trim_end()).unwrap();
+        assert_eq!(event.noun, "traffic");
+        assert_eq!(event.verb, "set");
+        assert_eq!(event.idempotency_key.as_deref(), Some("k1"));
+        assert_eq!(event.previous_generation, None);
+        assert_eq!(event.new_generation, Some(0));
     }
 }

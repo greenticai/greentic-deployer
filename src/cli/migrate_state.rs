@@ -20,7 +20,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::migrate::{FindingSeverity, MigrationFinding};
-use super::{OpError, OpFlags, OpOutcome};
+use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
 use crate::environment::store::dirs_home;
 use crate::environment::{EnvFlock, EnvironmentStore, LocalFsStore};
 
@@ -98,7 +98,18 @@ pub fn apply(
     let env_id = parse_env_id(target)?;
     require_env_exists(store, &env_id)?;
     let state_dir = resolve_state_dir(state_dir_override)?;
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: OP,
+        target: json!({"state_dir": state_dir.display().to_string()}),
+        previous_generation: None,
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || apply_inner(&env_id, &state_dir))
+}
 
+fn apply_inner(env_id: &EnvId, state_dir: &Path) -> Result<(OpOutcome, super::AuditGens), OpError> {
     // Acquire the state-dir migration lock for the entire scan → decide →
     // rename → verify critical section. Prevents two concurrent
     // `migrate-state --apply` invocations from observing the same `clean`
@@ -113,13 +124,13 @@ pub fn apply(
     // `GreenticConfig::paths.state_dir`) and is tracked as a separate
     // hardening step. Operators should quiesce deploys before running
     // `--apply`.
-    let lock_path = migration_lock_path(&state_dir);
+    let lock_path = migration_lock_path(state_dir);
     let _lock = EnvFlock::acquire(&lock_path).map_err(|source| OpError::Store(source.into()))?;
 
     // Re-scan inside the lock so a concurrent writer that landed changes
     // between the resolver and the lock acquisition cannot bypass the
     // blocking-finding gate.
-    let report = run_check(&env_id, &state_dir);
+    let report = run_check(env_id, state_dir);
     if !report.clean {
         let blocking = report
             .findings
@@ -142,10 +153,13 @@ pub fn apply(
                 legacy_dir_renamed_to: None,
                 scanned_paths_count: 0,
             };
-            return Ok(OpOutcome::new(
-                NOUN,
-                OP,
-                serde_json::to_value(outcome).expect("apply outcome is json-safe"),
+            return Ok((
+                OpOutcome::new(
+                    NOUN,
+                    OP,
+                    serde_json::to_value(outcome).expect("apply outcome is json-safe"),
+                ),
+                super::AuditGens::NONE,
             ));
         }
         Err(err) => {
@@ -156,7 +170,7 @@ pub fn apply(
         }
         Ok(true) => {}
     }
-    let renamed = rename_legacy_tree(&state_dir, &deploy_dir)?;
+    let renamed = rename_legacy_tree(state_dir, &deploy_dir)?;
     // A successful atomic rename leaves zero residue; a non-empty post-scan
     // implies a concurrent writer recreated the tree.
     let (post, _) = scan_legacy_deploy_dir(&deploy_dir);
@@ -172,10 +186,13 @@ pub fn apply(
         legacy_dir_renamed_to: Some(renamed.display().to_string()),
         scanned_paths_count,
     };
-    Ok(OpOutcome::new(
-        NOUN,
-        OP,
-        serde_json::to_value(outcome).expect("apply outcome is json-safe"),
+    Ok((
+        OpOutcome::new(
+            NOUN,
+            OP,
+            serde_json::to_value(outcome).expect("apply outcome is json-safe"),
+        ),
+        super::AuditGens::NONE,
     ))
 }
 

@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
-use super::{OpError, OpFlags, OpOutcome};
+use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
 
 const NOUN: &str = "secrets";
 
@@ -112,27 +112,37 @@ pub fn put(
     }
     let payload = resolve_payload::<SecretsPutPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let env = store.load(&env_id)?;
-    let secrets = require_secrets_pack(&env, &env_id)?;
-    // Build the resolved SecretRef so we can validate the env-scoping.
-    let secret_uri = format!(
-        "secret://{}/{}",
-        env_id.as_str(),
-        payload.path.trim_start_matches('/')
-    );
-    SecretRef::try_new(secret_uri.clone())
-        .map_err(|e| OpError::InvalidArgument(format!("secret path: {e}")))?;
-    // Make sure the value is non-empty — writing empty strings to a real
-    // backend is almost always a bug.
-    if payload.value.is_empty() {
-        return Err(OpError::InvalidArgument(
-            "value must not be empty".to_string(),
-        ));
-    }
-    let _kind = secrets.kind.to_string();
-    Err(OpError::NotYetImplemented(
-        "secrets backend dispatch lands in A9 (env-pack registry); A3 wires the surface only",
-    ))
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "put",
+        target: json!({"path": payload.path}),
+        previous_generation: None,
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || {
+        let env = store.load(&env_id)?;
+        let secrets = require_secrets_pack(&env, &env_id)?;
+        // Build the resolved SecretRef so we can validate the env-scoping.
+        let secret_uri = format!(
+            "secret://{}/{}",
+            env_id.as_str(),
+            payload.path.trim_start_matches('/')
+        );
+        SecretRef::try_new(secret_uri.clone())
+            .map_err(|e| OpError::InvalidArgument(format!("secret path: {e}")))?;
+        // Make sure the value is non-empty — writing empty strings to a real
+        // backend is almost always a bug.
+        if payload.value.is_empty() {
+            return Err(OpError::InvalidArgument(
+                "value must not be empty".to_string(),
+            ));
+        }
+        let _kind = secrets.kind.to_string();
+        Err(OpError::NotYetImplemented(
+            "secrets backend dispatch lands in A9 (env-pack registry); A3 wires the surface only",
+        ))
+    })
 }
 
 pub fn get(
@@ -168,17 +178,27 @@ pub fn rotate(
     }
     let payload = resolve_payload::<SecretsRotatePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let env = store.load(&env_id)?;
-    let _secrets = require_secrets_pack(&env, &env_id)?;
-    SecretRef::try_new(format!(
-        "secret://{}/{}",
-        env_id.as_str(),
-        payload.path.trim_start_matches('/')
-    ))
-    .map_err(|e| OpError::InvalidArgument(format!("secret path: {e}")))?;
-    Err(OpError::NotYetImplemented(
-        "secret rotation depends on backend-specific rotate hooks; lands in A9",
-    ))
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "rotate",
+        target: json!({"path": payload.path}),
+        previous_generation: None,
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || {
+        let env = store.load(&env_id)?;
+        let _secrets = require_secrets_pack(&env, &env_id)?;
+        SecretRef::try_new(format!(
+            "secret://{}/{}",
+            env_id.as_str(),
+            payload.path.trim_start_matches('/')
+        ))
+        .map_err(|e| OpError::InvalidArgument(format!("secret path: {e}")))?;
+        Err(OpError::NotYetImplemented(
+            "secret rotation depends on backend-specific rotate hooks; lands in A9",
+        ))
+    })
 }
 
 // --- internals -----------------------------------------------------------

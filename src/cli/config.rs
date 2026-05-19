@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
-use super::{OpError, OpFlags, OpOutcome};
+use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
 
 const NOUN: &str = "config";
 
@@ -94,29 +94,50 @@ pub fn set(
     }
     let payload = resolve_payload::<ConfigSetPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let (host_config, name) = store.transact(&env_id, |locked| -> Result<_, OpError> {
-        let mut env = locked.load()?;
-        if let Some(name) = payload.name.clone() {
-            env.name = name;
-        }
-        if let Some(region) = payload.region.clone() {
-            env.host_config.region = Some(region);
-        }
-        if let Some(org) = payload.tenant_org_id.clone() {
-            env.host_config.tenant_org_id = Some(org);
-        }
-        locked.save(&env)?;
-        Ok((env.host_config.clone(), env.name.clone()))
-    })?;
-    Ok(OpOutcome::new(
-        NOUN,
-        "set",
-        json!({
-            "environment_id": env_id.as_str(),
-            "host_config": host_config,
-            "name": name,
-        }),
-    ))
+    let mut fields = Vec::new();
+    if payload.name.is_some() {
+        fields.push("name");
+    }
+    if payload.region.is_some() {
+        fields.push("region");
+    }
+    if payload.tenant_org_id.is_some() {
+        fields.push("tenant_org_id");
+    }
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "set",
+        target: json!({"fields": fields}),
+        previous_generation: None,
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || {
+        let (host_config, name) = store.transact(&env_id, |locked| -> Result<_, OpError> {
+            let mut env = locked.load()?;
+            if let Some(name) = payload.name.clone() {
+                env.name = name;
+            }
+            if let Some(region) = payload.region.clone() {
+                env.host_config.region = Some(region);
+            }
+            if let Some(org) = payload.tenant_org_id.clone() {
+                env.host_config.tenant_org_id = Some(org);
+            }
+            locked.save(&env)?;
+            Ok((env.host_config.clone(), env.name.clone()))
+        })?;
+        let outcome = OpOutcome::new(
+            NOUN,
+            "set",
+            json!({
+                "environment_id": env_id.as_str(),
+                "host_config": host_config,
+                "name": name,
+            }),
+        );
+        Ok((outcome, super::AuditGens::NONE))
+    })
 }
 
 // --- internals -----------------------------------------------------------

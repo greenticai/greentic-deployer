@@ -63,8 +63,11 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::environment::{LifecycleError, StoreError};
-use greentic_deploy_spec::SpecError;
+use crate::environment::{
+    AuditDecision, AuditEvent, AuditLog, AuditResult, LifecycleError, LocalFsStore, StoreError,
+    authorize_local_only, current_local_actor,
+};
+use greentic_deploy_spec::{EnvId, SpecError};
 
 /// Top-level error shared across `op` command implementations.
 #[derive(Debug, Error)]
@@ -91,6 +94,8 @@ pub enum OpError {
     NotYetImplemented(&'static str),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("unauthorized: {policy} — {reason}")]
+    Unauthorized { policy: String, reason: String },
 }
 
 impl From<LifecycleError> for OpError {
@@ -151,8 +156,131 @@ impl OpError {
             OpError::NotFound(_) => "not-found",
             OpError::NotYetImplemented(_) => "not-yet-implemented",
             OpError::Conflict(_) => "conflict",
+            OpError::Unauthorized { .. } => "unauthorized",
         }
     }
+}
+
+/// Context for [`audit_and_record`] — everything the helper needs to build an
+/// [`AuditEvent`] except the mutation's generations (which the closure
+/// returns).
+#[derive(Debug)]
+pub(crate) struct AuditCtx {
+    pub env_id: EnvId,
+    pub noun: &'static str,
+    pub verb: &'static str,
+    pub target: Value,
+    pub previous_generation: Option<u64>,
+    pub idempotency_key: Option<String>,
+}
+
+/// Closure return — the pre- and post-mutation generations.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct AuditGens {
+    pub previous: Option<u64>,
+    pub new: Option<u64>,
+}
+
+impl AuditGens {
+    pub const NONE: Self = Self {
+        previous: None,
+        new: None,
+    };
+}
+
+/// Wrap a mutating verb body in local-only authorization + append-only audit.
+///
+/// 1. Runs [`authorize_local_only`] against `ctx.env_id`.
+/// 2. On `Deny`: returns `OpError::Unauthorized` without calling `mutate`.
+/// 3. On `Allow`: runs `mutate` and records the outcome.
+/// 4. Always appends an [`AuditEvent`] to `<store_root>/<env_id>/audit/events.jsonl`.
+///
+/// Audit-append failures are demoted to `tracing::warn!` so a broken audit
+/// directory cannot mask the actual op result. The plan is explicit: non-local
+/// mutations fail closed via the authorize gate, but local mutations stay
+/// completable if the audit dir is unwritable. A8's remote pipeline can flip
+/// this to fail-loud.
+///
+/// The closure returns `(OpOutcome, AuditGens)` where `AuditGens` carries the
+/// `previous_generation` (read under the env flock inside the closure, when
+/// applicable) and `new_generation` (the post-mutation value). Both default
+/// to `None` for verbs that don't track generations (env/bundles/revisions/
+/// credentials/secrets/config/migrate-*). When the closure returns a
+/// `previous_generation`, it overrides the value passed in via `AuditCtx`
+/// (which is treated as a default).
+pub(crate) fn audit_and_record<F>(
+    store: &LocalFsStore,
+    ctx: AuditCtx,
+    mutate: F,
+) -> Result<OpOutcome, OpError>
+where
+    F: FnOnce() -> Result<(OpOutcome, AuditGens), OpError>,
+{
+    let decision = authorize_local_only(&ctx.env_id);
+    let (result, gens) = match &decision {
+        AuditDecision::Deny { policy, reason } => (
+            Err(OpError::Unauthorized {
+                policy: policy.clone(),
+                reason: reason.clone(),
+            }),
+            AuditGens::default(),
+        ),
+        AuditDecision::Allow { .. } => match mutate() {
+            Ok((outcome, g)) => (Ok(outcome), g),
+            Err(err) => (Err(err), AuditGens::default()),
+        },
+    };
+    let previous_generation = gens.previous.or(ctx.previous_generation);
+
+    let audit_result = match &result {
+        Ok(_) => AuditResult::Ok,
+        Err(OpError::NotYetImplemented(detail)) => AuditResult::NotYetImplemented {
+            detail: (*detail).to_string(),
+        },
+        Err(err) => AuditResult::Error {
+            kind: err.kind().to_string(),
+            message: err.to_string(),
+        },
+    };
+
+    let event = AuditEvent {
+        schema: crate::environment::AUDIT_EVENT_SCHEMA_V1.to_string(),
+        event_id: ulid::Ulid::new().to_string(),
+        ts: chrono::Utc::now(),
+        actor: current_local_actor(),
+        env_id: ctx.env_id.as_str().to_string(),
+        noun: ctx.noun.to_string(),
+        verb: ctx.verb.to_string(),
+        target: ctx.target,
+        previous_generation,
+        new_generation: gens.new,
+        idempotency_key: ctx.idempotency_key,
+        authorization: decision,
+        result: audit_result,
+    };
+
+    match AuditLog::for_env(store, &ctx.env_id) {
+        Ok(log) => {
+            if let Err(e) = log.append(&event) {
+                tracing::warn!(
+                    target: "greentic.audit",
+                    error = %e,
+                    event_id = %event.event_id,
+                    "failed to append audit event; continuing with op result"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "greentic.audit",
+                error = %e,
+                event_id = %event.event_id,
+                "failed to resolve audit log path; event dropped"
+            );
+        }
+    }
+
+    result
 }
 
 /// Mode flags shared by every `op` subcommand.

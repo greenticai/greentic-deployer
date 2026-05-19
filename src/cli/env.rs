@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
-use super::{OpError, OpFlags, OpOutcome};
+use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
 
 const NOUN: &str = "env";
 
@@ -70,39 +70,50 @@ pub fn create(
     let payload = resolve_payload::<EnvCreatePayload>(flags, payload)?;
     let env_id = EnvId::try_from(payload.environment_id.as_str())
         .map_err(|e| OpError::InvalidArgument(format!("environment_id: {e}")))?;
-    let env = store.transact(&env_id, |locked| -> Result<Environment, OpError> {
-        if locked.load().is_ok() {
-            return Err(OpError::Conflict(format!(
-                "environment `{}` already exists",
-                locked.env_id()
-            )));
-        }
-        let env = Environment {
-            schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
-            environment_id: locked.env_id().clone(),
-            name: payload.name.clone(),
-            host_config: EnvironmentHostConfig {
-                env_id: locked.env_id().clone(),
-                region: payload.region.clone(),
-                tenant_org_id: payload.tenant_org_id.clone(),
-            },
-            packs: Vec::new(),
-            credentials_ref: None,
-            bundles: Vec::new(),
-            revisions: Vec::new(),
-            traffic_splits: Vec::new(),
-            revocation: Default::default(),
-            retention: Default::default(),
-            health: Default::default(),
-        };
-        locked.save(&env)?;
-        Ok(env)
-    })?;
-    Ok(OpOutcome::new(
-        NOUN,
-        "create",
-        serde_json::to_value(EnvSummary::from(&env)).expect("EnvSummary is json-safe"),
-    ))
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "create",
+        target: json!({"environment_id": env_id.as_str()}),
+        previous_generation: None,
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || {
+        let env = store.transact(&env_id, |locked| -> Result<Environment, OpError> {
+            if locked.load().is_ok() {
+                return Err(OpError::Conflict(format!(
+                    "environment `{}` already exists",
+                    locked.env_id()
+                )));
+            }
+            let env = Environment {
+                schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
+                environment_id: locked.env_id().clone(),
+                name: payload.name.clone(),
+                host_config: EnvironmentHostConfig {
+                    env_id: locked.env_id().clone(),
+                    region: payload.region.clone(),
+                    tenant_org_id: payload.tenant_org_id.clone(),
+                },
+                packs: Vec::new(),
+                credentials_ref: None,
+                bundles: Vec::new(),
+                revisions: Vec::new(),
+                traffic_splits: Vec::new(),
+                revocation: Default::default(),
+                retention: Default::default(),
+                health: Default::default(),
+            };
+            locked.save(&env)?;
+            Ok(env)
+        })?;
+        let outcome = OpOutcome::new(
+            NOUN,
+            "create",
+            serde_json::to_value(EnvSummary::from(&env)).expect("EnvSummary is json-safe"),
+        );
+        Ok((outcome, super::AuditGens::NONE))
+    })
 }
 
 /// `op env update`. Replaces `name`, `region`, and `tenant_org_id` on an
@@ -119,25 +130,46 @@ pub fn update(
     let payload = resolve_payload::<EnvCreatePayload>(flags, payload)?;
     let env_id = EnvId::try_from(payload.environment_id.as_str())
         .map_err(|e| OpError::InvalidArgument(format!("environment_id: {e}")))?;
-    let env = store.transact(&env_id, |locked| -> Result<Environment, OpError> {
-        let mut env = match locked.load() {
-            Ok(env) => env,
-            Err(crate::environment::StoreError::NotFound(id)) => {
-                return Err(OpError::NotFound(format!("environment `{id}`")));
-            }
-            Err(e) => return Err(e.into()),
-        };
-        env.name = payload.name.clone();
-        env.host_config.region = payload.region.clone();
-        env.host_config.tenant_org_id = payload.tenant_org_id.clone();
-        locked.save(&env)?;
-        Ok(env)
-    })?;
-    Ok(OpOutcome::new(
-        NOUN,
-        "update",
-        serde_json::to_value(EnvSummary::from(&env)).expect("EnvSummary is json-safe"),
-    ))
+    let mut fields = Vec::new();
+    if payload.name != payload.environment_id {
+        fields.push("name");
+    }
+    if payload.region.is_some() {
+        fields.push("region");
+    }
+    if payload.tenant_org_id.is_some() {
+        fields.push("tenant_org_id");
+    }
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "update",
+        target: json!({"environment_id": env_id.as_str(), "fields": fields}),
+        previous_generation: None,
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || {
+        let env = store.transact(&env_id, |locked| -> Result<Environment, OpError> {
+            let mut env = match locked.load() {
+                Ok(env) => env,
+                Err(crate::environment::StoreError::NotFound(id)) => {
+                    return Err(OpError::NotFound(format!("environment `{id}`")));
+                }
+                Err(e) => return Err(e.into()),
+            };
+            env.name = payload.name.clone();
+            env.host_config.region = payload.region.clone();
+            env.host_config.tenant_org_id = payload.tenant_org_id.clone();
+            locked.save(&env)?;
+            Ok(env)
+        })?;
+        let outcome = OpOutcome::new(
+            NOUN,
+            "update",
+            serde_json::to_value(EnvSummary::from(&env)).expect("EnvSummary is json-safe"),
+        );
+        Ok((outcome, super::AuditGens::NONE))
+    })
 }
 
 /// `op env list`.
@@ -256,16 +288,25 @@ pub fn destroy(
     }
     let env_id =
         EnvId::try_from(env_id).map_err(|e| OpError::InvalidArgument(format!("env_id: {e}")))?;
-    if !store.exists(&env_id)? {
-        return Err(OpError::NotFound(format!("environment `{env_id}`")));
-    }
-    // The A2 trait does not yet expose a remove API. Phase A intentionally
-    // leaves destructive removal to A7's audit-log-aware wrapper; the
-    // operator surface here records the intent and reports the path for
-    // manual cleanup (matching the deny-by-default posture of the plan).
-    Err(OpError::NotYetImplemented(
-        "`op env destroy` requires the A7 audit-log + retention path; use the LocalFsStore root path returned by `op env show` for manual cleanup in Phase A",
-    ))
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "destroy",
+        target: json!({"environment_id": env_id.as_str(), "confirm": confirm}),
+        previous_generation: None,
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || {
+        if !store.exists(&env_id)? {
+            return Err(OpError::NotFound(format!("environment `{env_id}`")));
+        }
+        // The A2 trait does not yet expose a remove API. Destructive removal
+        // ships with the bundle-deployment retention path (B-phase); A7 wires
+        // the audit + authorize surface so the destroy intent is logged today.
+        Err(OpError::NotYetImplemented(
+            "`op env destroy` requires the retention path (B-phase); use the LocalFsStore root path returned by `op env show` for manual cleanup",
+        ))
+    })
 }
 
 fn resolve_payload<T: serde::de::DeserializeOwned>(
@@ -390,11 +431,13 @@ mod tests {
     fn update_rejects_missing_env() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
+        // env_id stays "local" so the A7 authorize gate allows the call
+        // through; the NotFound branch is what we want to assert.
         let err = update(
             &store,
             &OpFlags::default(),
             Some(EnvCreatePayload {
-                environment_id: "missing".to_string(),
+                environment_id: "local".to_string(),
                 name: "x".to_string(),
                 region: None,
                 tenant_org_id: None,
@@ -458,5 +501,76 @@ mod tests {
         store.save(&make_env("local")).unwrap();
         let err = destroy(&store, &OpFlags::default(), "local", true).unwrap_err();
         assert!(matches!(err, OpError::NotYetImplemented(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn create_non_local_env_refuses_and_audits_deny() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let err = create(
+            &store,
+            &OpFlags::default(),
+            Some(EnvCreatePayload {
+                environment_id: "prod".to_string(),
+                name: "prod".to_string(),
+                region: None,
+                tenant_org_id: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, OpError::Unauthorized { .. }),
+            "got {err:?}; deny-path must surface as Unauthorized"
+        );
+        // No environment.json was created.
+        let env_json = dir.path().join("prod").join("environment.json");
+        assert!(
+            !env_json.exists(),
+            "deny must not leave behind environment.json"
+        );
+        // Audit event was written under the denied env's audit dir.
+        let log = dir.path().join("prod").join("audit").join("events.jsonl");
+        let raw = std::fs::read_to_string(&log).expect("audit log must exist on deny");
+        let event: crate::environment::AuditEvent = serde_json::from_str(raw.trim_end()).unwrap();
+        assert_eq!(event.env_id, "prod");
+        assert_eq!(event.noun, "env");
+        assert_eq!(event.verb, "create");
+        matches!(
+            event.authorization,
+            crate::environment::AuditDecision::Deny { .. }
+        );
+        match event.result {
+            crate::environment::AuditResult::Error { kind, .. } => {
+                assert_eq!(kind, "unauthorized");
+            }
+            other => panic!("expected Error result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_local_env_writes_ok_audit_event() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        create(
+            &store,
+            &OpFlags::default(),
+            Some(EnvCreatePayload {
+                environment_id: "local".to_string(),
+                name: "local".to_string(),
+                region: None,
+                tenant_org_id: None,
+            }),
+        )
+        .unwrap();
+        let log = dir.path().join("local").join("audit").join("events.jsonl");
+        let raw = std::fs::read_to_string(&log).unwrap();
+        let event: crate::environment::AuditEvent = serde_json::from_str(raw.trim_end()).unwrap();
+        assert_eq!(event.noun, "env");
+        assert_eq!(event.verb, "create");
+        matches!(
+            event.authorization,
+            crate::environment::AuditDecision::Allow { .. }
+        );
+        matches!(event.result, crate::environment::AuditResult::Ok);
     }
 }

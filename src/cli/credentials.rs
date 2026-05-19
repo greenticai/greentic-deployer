@@ -32,7 +32,7 @@ use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
-use super::{OpError, OpFlags, OpOutcome};
+use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
 
 const NOUN: &str = "credentials";
 
@@ -94,21 +94,31 @@ pub fn bootstrap(
     }
     let payload = resolve_payload::<CredentialsBootstrapPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let env = store.load(&env_id)?;
-    let deployer = env.pack_for_slot(CapabilitySlot::Deployer).ok_or_else(|| {
-        OpError::Conflict(format!(
-            "env `{env_id}` has no deployer env-pack bound; bind one with `op env-packs add` first"
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "bootstrap",
+        target: json!({"admin_profile": payload.admin_profile}),
+        previous_generation: None,
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || {
+        let env = store.load(&env_id)?;
+        let deployer = env.pack_for_slot(CapabilitySlot::Deployer).ok_or_else(|| {
+            OpError::Conflict(format!(
+                "env `{env_id}` has no deployer env-pack bound; bind one with `op env-packs add` first"
+            ))
+        })?;
+        if env.credentials_ref.is_some() {
+            return Err(OpError::Conflict(format!(
+                "env `{env_id}` already has credentials_ref; use `rotate` instead of `bootstrap`"
+            )));
+        }
+        let _ = describe_intent("bootstrap", &env_id, deployer, None);
+        Err(OpError::NotYetImplemented(
+            "bootstrap runs the deployer env-pack's bootstrap module against ephemeral admin credentials; lands in A5+Phase D",
         ))
-    })?;
-    if env.credentials_ref.is_some() {
-        return Err(OpError::Conflict(format!(
-            "env `{env_id}` already has credentials_ref; use `rotate` instead of `bootstrap`"
-        )));
-    }
-    let _ = describe_intent("bootstrap", &env_id, deployer, None);
-    Err(OpError::NotYetImplemented(
-        "bootstrap runs the deployer env-pack's bootstrap module against ephemeral admin credentials; lands in A5+Phase D",
-    ))
+    })
 }
 
 pub fn rotate(
@@ -121,17 +131,27 @@ pub fn rotate(
     }
     let payload = resolve_payload::<CredentialsRotatePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let env = store.load(&env_id)?;
-    let deployer = env.pack_for_slot(CapabilitySlot::Deployer).ok_or_else(|| {
-        OpError::Conflict(format!("env `{env_id}` has no deployer env-pack bound"))
-    })?;
-    let creds_ref: &SecretRef = env.credentials_ref.as_ref().ok_or_else(|| {
-        OpError::Conflict(format!("env `{env_id}` has no credentials_ref to rotate"))
-    })?;
-    let _ = describe_intent("rotate", &env_id, deployer, Some(creds_ref));
-    Err(OpError::NotYetImplemented(
-        "credential rotation depends on deployer-specific session/token rotation hooks; lands in A5+Phase D",
-    ))
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "rotate",
+        target: json!({}),
+        previous_generation: None,
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || {
+        let env = store.load(&env_id)?;
+        let deployer = env.pack_for_slot(CapabilitySlot::Deployer).ok_or_else(|| {
+            OpError::Conflict(format!("env `{env_id}` has no deployer env-pack bound"))
+        })?;
+        let creds_ref: &SecretRef = env.credentials_ref.as_ref().ok_or_else(|| {
+            OpError::Conflict(format!("env `{env_id}` has no credentials_ref to rotate"))
+        })?;
+        let _ = describe_intent("rotate", &env_id, deployer, Some(creds_ref));
+        Err(OpError::NotYetImplemented(
+            "credential rotation depends on deployer-specific session/token rotation hooks; lands in A5+Phase D",
+        ))
+    })
 }
 
 // --- internals -----------------------------------------------------------
@@ -314,5 +334,38 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, OpError::NotYetImplemented(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn bootstrap_stub_records_not_yet_implemented_audit_result() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.aws-ecs@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let err = bootstrap(
+            &store,
+            &OpFlags::default(),
+            Some(CredentialsBootstrapPayload {
+                environment_id: "local".to_string(),
+                admin_profile: "admin".to_string(),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::NotYetImplemented(_)));
+        let log = dir.path().join("local").join("audit").join("events.jsonl");
+        let raw = std::fs::read_to_string(&log).unwrap();
+        let event: crate::environment::AuditEvent = serde_json::from_str(raw.trim_end()).unwrap();
+        // Stub verbs MUST record `NotYetImplemented` (distinct from `Error`) so
+        // post-A7 readers can filter stub attempts from real errors.
+        match event.result {
+            crate::environment::AuditResult::NotYetImplemented { detail } => {
+                assert!(detail.contains("bootstrap"), "detail: {detail}");
+            }
+            other => panic!("expected NotYetImplemented, got {other:?}"),
+        }
     }
 }
