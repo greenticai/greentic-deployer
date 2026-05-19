@@ -113,6 +113,19 @@ pub enum EnvVerb {
         #[arg(long)]
         confirm: bool,
     },
+    /// Migrate the legacy `dev` environment to `<target>` (typically `local`).
+    /// Run with `--check` to scan without touching state; `--apply` performs
+    /// the one-shot rewrite only when the check is clean (A4b).
+    MigrateDev {
+        /// Target env id — typically `local`.
+        target: String,
+        /// Scan for blocking findings and report; do not touch state.
+        #[arg(long, conflicts_with = "apply")]
+        check: bool,
+        /// Re-run the check; if clean, perform the migration.
+        #[arg(long, conflicts_with = "check")]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -246,6 +259,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 EnvVerb::Show { .. } => "show",
                 EnvVerb::Doctor { .. } => "doctor",
                 EnvVerb::Destroy { .. } => "destroy",
+                EnvVerb::MigrateDev { .. } => "migrate-dev",
             },
         ),
         OpNoun::EnvPacks { verb } => (
@@ -321,6 +335,22 @@ fn dispatch_env(store: &LocalFsStore, flags: &OpFlags, verb: EnvVerb) -> Result<
         EnvVerb::Doctor { env_id } => super::env::doctor(store, flags, &env_id)?,
         EnvVerb::Destroy { env_id, confirm } => {
             super::env::destroy(store, flags, &env_id, confirm)?
+        }
+        EnvVerb::MigrateDev {
+            target,
+            check,
+            apply,
+        } => {
+            if !(check ^ apply) {
+                return Err(OpError::InvalidArgument(
+                    "migrate-dev requires exactly one of --check or --apply".to_string(),
+                ));
+            }
+            if check {
+                super::migrate::check(store, flags, &target)?
+            } else {
+                super::migrate::apply(store, flags, &target)?
+            }
         }
     };
     print_outcome(&outcome)

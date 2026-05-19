@@ -192,6 +192,62 @@ fn op_help_renders_envelope_contract_in_after_help() {
 }
 
 #[test]
+fn op_env_migrate_dev_check_on_empty_store_is_clean() {
+    let dir = tempdir().expect("tempdir");
+    let out = Command::new(deployer_bin())
+        .args([
+            "op",
+            "--store-root",
+            dir.path().to_str().unwrap(),
+            "env",
+            "migrate-dev",
+            "local",
+            "--check",
+        ])
+        .output()
+        .expect("spawn migrate-dev --check");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("migrate-dev stdout is json");
+    assert_eq!(json["noun"], "env");
+    assert_eq!(json["op"], "migrate-dev");
+    assert_eq!(json["result"]["clean"], true);
+    assert_eq!(json["result"]["from_env"], "dev");
+    assert_eq!(json["result"]["to_env"], "local");
+}
+
+#[test]
+fn op_env_migrate_dev_requires_check_or_apply() {
+    let dir = tempdir().expect("tempdir");
+    let out = Command::new(deployer_bin())
+        .args([
+            "op",
+            "--store-root",
+            dir.path().to_str().unwrap(),
+            "env",
+            "migrate-dev",
+            "local",
+        ])
+        .output()
+        .expect("spawn migrate-dev without flags");
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit when both --check and --apply are absent; stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let envelope: serde_json::Value = serde_json::from_str(stderr.trim())
+        .unwrap_or_else(|err| panic!("stderr is not JSON (err={err}): {stderr}"));
+    assert_eq!(envelope["op"], "migrate-dev");
+    assert_eq!(envelope["error"]["kind"], "invalid-argument");
+}
+
+#[test]
 fn op_env_schema_dumps_payload_schema() {
     let dir = tempdir().expect("tempdir");
     let out = Command::new(deployer_bin())
