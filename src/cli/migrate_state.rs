@@ -1,65 +1,16 @@
-//! `gtc op env migrate-state <env_id>` (`A6` of `plans/next-gen-deployment.md`).
+//! `gtc op env migrate-state <env_id>` — archive the legacy
+//! `<state_dir>/deploy/` artifact tree (A6 of `plans/next-gen-deployment.md`).
 //!
-//! **This verb archives the legacy `<state_dir>/deploy/` tree; it does NOT
-//! copy its contents into the new env-pack-bound layout.** The verb name
-//! "migrate-state" reflects the Phase A → Phase B contract (A6 archives,
-//! Phase B redirects writes into `~/.greentic/environments/<env_id>/...`);
-//! by itself this verb leaves the legacy artifacts in a hidden
-//! `.deploy-migrated-<ts>/` sentinel under the same parent for manual
-//! cleanup. Callers expecting their legacy artifacts to land in the new
-//! layout should NOT run `--apply` until Phase B ships and any required
-//! content-bearing migration is in place.
+//! `--apply` renames `<state_dir>/deploy/` to a hidden
+//! `.deploy-migrated-<ts>/` sentinel under the same parent. Contents are
+//! NOT copied into the new env-pack-bound layout — Phase B's path-flip
+//! handles future writes; the legacy artifacts (`plan.json`, `invoke.json`,
+//! adapter handoffs) have no downstream readers.
 //!
-//! The tree is written by [`crate::apply::run`] via
-//! [`crate::config::DeployerConfig::provider_output_dir`] every deploy run
-//! (`plan.json`, `invoke.json`, `runner-handoff.json`, adapter outputs).
-//!
-//! Per the A6 audit, no production reader downstream of `apply::run`
-//! consumes these artifacts at runtime — they are transient build outputs,
-//! recomputed on the next deploy. A6 archives them out of the way so Phase
-//! B's path-flip (writing into `~/.greentic/environments/<env_id>/...`)
-//! lands cleanly.
-//!
-//! Two verbs (mirroring A4b's `migrate-dev`):
-//!
-//! - `--check` runs the scanner and emits a [`MigrateStateReport`]. `clean`
-//!   is `true` iff no scanner reported a [`FindingSeverity::Blocking`]
-//!   finding. Read-only; not lock-coordinated against concurrent
-//!   `--apply` (which would invalidate the snapshot anyway).
-//! - `--apply` acquires the state-dir migration lock, re-runs the check
-//!   inside the lock, refuses with [`OpError::Conflict`] if not clean,
-//!   then performs a single [`std::fs::rename`] of `<state_dir>/deploy/`
-//!   to `<state_dir>/.deploy-migrated-<ts>/`, then re-scans inside the
-//!   lock to verify zero residue. Idempotent. Two concurrent `--apply`
-//!   invocations on the same `state_dir` serialize on the lock.
-//!
-//! Scope is intentionally narrow:
-//!
-//! - Covers only `<state_dir>/deploy/`. `state/runtime/` is live cross-crate
-//!   data exchange (greentic-start writes / greentic-setup reads
-//!   `endpoints.json`) and ships with Phase B's atomic flip.
-//!   `.dev.secrets.env` is hardcoded across four crates plus vendored copies
-//!   and ships as a separate coordinated effort.
-//! - Discard-only rename. No reader of the legacy tree exists, so the
-//!   contents are not preserved into the new layout — Phase B writers will
-//!   recreate the artifacts they need.
-//! - The `<env_id>` argument gates apply on env-existence in the
-//!   [`crate::environment::EnvironmentStore`]. It does not constrain *which*
-//!   subdirectories get renamed — the entire `<state_dir>/deploy/` tree
-//!   moves regardless.
-//!
-//! Known limitations:
-//!
-//! - **Cross-module race vs. live deploys.** `apply::run` does not
-//!   participate in the migration lock today (its `state_dir` is resolved
-//!   from `GreenticConfig::paths.state_dir`, which may differ from this
-//!   verb's `$HOME`-anchored default). A concurrent live deploy may race
-//!   with the rename. Operators should quiesce deploys before running
-//!   `--apply`. Cross-module lock participation is tracked as Phase B
-//!   hardening alongside the path-flip.
-//! - **EXDEV on rename.** Source and destination share `<state_dir>/`, so
-//!   `EXDEV` is extremely unlikely; unusual bind-mount setups would
-//!   surface it as [`OpError::Io`].
+//! `--apply` takes an `<state_dir>/.migrate-state.lock` flock for the
+//! scan → decide → rename → verify critical section. `apply::run` does not
+//! participate in this lock today; operators must quiesce live deploys
+//! before running `--apply`.
 
 use std::path::{Path, PathBuf};
 
@@ -70,15 +21,16 @@ use serde_json::{Value, json};
 
 use super::migrate::{FindingSeverity, MigrationFinding};
 use super::{OpError, OpFlags, OpOutcome};
+use crate::environment::store::dirs_home;
 use crate::environment::{EnvFlock, EnvironmentStore, LocalFsStore};
 
 const NOUN: &str = "env";
 const OP: &str = "migrate-state";
-
-/// Marker prefix prepended to the legacy tree on `--apply`. Starts with a `.`
-/// so directory listings de-emphasize it; not interpreted by
-/// `EnvironmentStore` (this lives under `state/`, not `environments/`).
 const MIGRATED_PREFIX: &str = ".deploy-migrated-";
+const FINDING_DEPLOY_TREE: &str = "legacy-deploy-tree";
+const FINDING_DEPLOY_UNREADABLE: &str = "legacy-deploy-unreadable";
+
+const NOTE_SUFFIX: &str = " note: this verb renames the legacy tree to a hidden `.deploy-migrated-<ts>/` sentinel — it does NOT move contents into the new env-pack-bound layout. `greentic-deployer::apply::run` still writes to this location until Phase B ships the path flip; re-running `--check` after a deploy will surface new findings.";
 
 /// `--check` report.
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +39,8 @@ pub struct MigrateStateReport {
     pub state_dir: String,
     /// `true` iff no scanner reported a [`FindingSeverity::Blocking`] finding.
     pub clean: bool,
+    /// Total `<provider>/<tenant>/<env>/<scope>` leaf directories observed.
+    pub leaf_count: usize,
     pub findings: Vec<MigrationFinding>,
 }
 
@@ -177,14 +131,9 @@ pub fn apply(
         )));
     }
     let deploy_dir = state_dir.join("deploy");
-    let scanned_paths_count = report
-        .findings
-        .iter()
-        .filter(|f| f.kind == "legacy-deploy-tree")
-        .map(|f| count_from_finding(f).unwrap_or(0))
-        .sum::<usize>();
-    // Probe with `try_exists` so a permission-denied stat surfaces, rather
-    // than collapsing into the no-op path.
+    let scanned_paths_count = report.leaf_count;
+    // `try_exists` so a permission-denied stat surfaces rather than
+    // collapsing into the no-op path.
     match deploy_dir.try_exists() {
         Ok(false) => {
             let outcome = MigrateStateApplyOutcome {
@@ -208,10 +157,9 @@ pub fn apply(
         Ok(true) => {}
     }
     let renamed = rename_legacy_tree(&state_dir, &deploy_dir)?;
-    // Verify-after-apply: a successful atomic rename leaves zero residue.
-    // A non-empty re-scan implies a concurrent writer recreated the tree
-    // between the rename and the re-scan.
-    let post = scan_legacy_deploy_dir(&deploy_dir);
+    // A successful atomic rename leaves zero residue; a non-empty post-scan
+    // implies a concurrent writer recreated the tree.
+    let (post, _) = scan_legacy_deploy_dir(&deploy_dir);
     if !post.is_empty() {
         return Err(OpError::Conflict(format!(
             "residue detected after rename — concurrent writer or partial permissions issue; {} finding(s) remain",
@@ -240,7 +188,7 @@ fn migration_lock_path(state_dir: &Path) -> PathBuf {
 
 fn run_check(env_id: &EnvId, state_dir: &Path) -> MigrateStateReport {
     let deploy_dir = state_dir.join("deploy");
-    let findings = scan_legacy_deploy_dir(&deploy_dir);
+    let (findings, leaf_count) = scan_legacy_deploy_dir(&deploy_dir);
     let clean = !findings
         .iter()
         .any(|f| f.severity == FindingSeverity::Blocking);
@@ -248,37 +196,27 @@ fn run_check(env_id: &EnvId, state_dir: &Path) -> MigrateStateReport {
         env_id: env_id.as_str().to_string(),
         state_dir: state_dir.display().to_string(),
         clean,
+        leaf_count,
         findings,
     }
 }
 
-/// Scans `<state_dir>/deploy/` and returns observations.
+/// Scans `<state_dir>/deploy/` and returns (findings, leaf_count).
 ///
-/// Fails loud on residue: every IO error encountered while walking the tree
-/// (existence probe, `read_dir`, `DirEntry`, `metadata`) is propagated as a
-/// [`FindingSeverity::Blocking`] finding rather than silently skipped.
-/// `--apply` refuses on any blocking finding, so an unreadable subtree
-/// cannot mask itself as `clean=true`.
-///
-/// - Top-level not present (`try_exists` = `Ok(false)`) → empty vec.
-/// - Top-level probe IO error (`try_exists` = `Err`) → one blocking finding.
-/// - Top-level exists but is not a directory → one blocking finding.
-/// - Directory exists but empty → one `legacy-deploy-tree` info finding.
-/// - Directory populated → one `legacy-deploy-tree` info finding listing the
-///   `<provider>/<tenant>/<env>` tuples discovered and a total count of leaf
-///   scope-key directories. Any per-subtree IO error appends an additional
-///   `legacy-deploy-unreadable` blocking finding (does not stop the walk).
-fn scan_legacy_deploy_dir(deploy_dir: &Path) -> Vec<MigrationFinding> {
+/// Every IO error encountered while walking the tree is propagated as a
+/// [`FindingSeverity::Blocking`] finding rather than silently skipped, so an
+/// unreadable subtree cannot mask itself as `clean=true`.
+fn scan_legacy_deploy_dir(deploy_dir: &Path) -> (Vec<MigrationFinding>, usize) {
     let mut findings: Vec<MigrationFinding> = Vec::new();
     match deploy_dir.try_exists() {
-        Ok(false) => return findings,
+        Ok(false) => return (findings, 0),
         Ok(true) => {}
         Err(err) => {
             findings.push(blocking(
                 deploy_dir,
                 format!("existence probe failed: {err}"),
             ));
-            return findings;
+            return (findings, 0);
         }
     }
     let md = match std::fs::symlink_metadata(deploy_dir) {
@@ -288,7 +226,7 @@ fn scan_legacy_deploy_dir(deploy_dir: &Path) -> Vec<MigrationFinding> {
                 deploy_dir,
                 format!("symlink_metadata failed: {err}"),
             ));
-            return findings;
+            return (findings, 0);
         }
     };
     if !md.file_type().is_dir() {
@@ -300,23 +238,21 @@ fn scan_legacy_deploy_dir(deploy_dir: &Path) -> Vec<MigrationFinding> {
                 md.file_type()
             ),
         ));
-        return findings;
+        return (findings, 0);
     }
     let mut tuples: Vec<String> = Vec::new();
     let mut leaf_count: usize = 0;
     if !walk_provider_layer(deploy_dir, &mut tuples, &mut leaf_count, &mut findings) {
-        // Top-level read_dir failed → blocking finding already pushed; no
-        // tuple info to report.
-        return findings;
+        return (findings, leaf_count);
     }
     let message = if tuples.is_empty() {
         format!(
-            "legacy `{}` exists but is empty; eligible for `--apply` rename (hygiene). note: this verb renames the legacy tree to a hidden `.deploy-migrated-<ts>/` sentinel — it does NOT move contents into the new env-pack-bound layout. `greentic-deployer::apply::run` still writes to this location until Phase B ships the path flip; re-running `--check` after a deploy will surface new findings.",
+            "legacy `{}` exists but is empty; eligible for `--apply` rename (hygiene).{NOTE_SUFFIX}",
             deploy_dir.display()
         )
     } else {
         format!(
-            "legacy `{}` contains {} `<provider>/<tenant>/<env>` tuple(s): [{}] across {} leaf scope dir(s). eligible for `--apply` rename. note: this verb renames the legacy tree to a hidden `.deploy-migrated-<ts>/` sentinel — it does NOT move contents into the new env-pack-bound layout. `greentic-deployer::apply::run` still writes to this location until Phase B ships the path flip; re-running `--check` after a deploy will surface new findings.",
+            "legacy `{}` contains {} `<provider>/<tenant>/<env>` tuple(s): [{}] across {} leaf scope dir(s). eligible for `--apply` rename.{NOTE_SUFFIX}",
             deploy_dir.display(),
             tuples.len(),
             tuples.join(", "),
@@ -324,16 +260,17 @@ fn scan_legacy_deploy_dir(deploy_dir: &Path) -> Vec<MigrationFinding> {
         )
     };
     findings.push(MigrationFinding {
-        kind: "legacy-deploy-tree",
+        kind: FINDING_DEPLOY_TREE,
         severity: FindingSeverity::Info,
         location: deploy_dir.display().to_string(),
         message,
     });
-    findings
+    (findings, leaf_count)
 }
 
-/// Walks `<deploy>/<provider>/<tenant>/<env>/<scope>/`. Returns `false` only
-/// if the top-level `read_dir` failed (no tuple info reachable).
+/// Returns `false` only if the top-level `read_dir` failed (no tuple info
+/// reachable); per-subtree errors are pushed as findings and the walk
+/// continues.
 fn walk_provider_layer(
     deploy_dir: &Path,
     tuples: &mut Vec<String>,
@@ -460,9 +397,8 @@ fn count_scope_leafs(env_dir: &Path, leaf_count: &mut usize, findings: &mut Vec<
     }
 }
 
-/// `symlink_metadata`-based dir check that surfaces IO failures as blocking
-/// findings rather than silently treating the entry as "not a dir". Returns
-/// `true` only if the entry is a real directory.
+/// Surfaces IO failures as blocking findings rather than silently treating
+/// the entry as "not a dir".
 fn is_dir_loud(path: &Path, findings: &mut Vec<MigrationFinding>) -> bool {
     match std::fs::symlink_metadata(path) {
         Ok(md) => md.file_type().is_dir(),
@@ -475,7 +411,7 @@ fn is_dir_loud(path: &Path, findings: &mut Vec<MigrationFinding>) -> bool {
 
 fn blocking(location: &Path, message: String) -> MigrationFinding {
     MigrationFinding {
-        kind: "legacy-deploy-unreadable",
+        kind: FINDING_DEPLOY_UNREADABLE,
         severity: FindingSeverity::Blocking,
         location: location.display().to_string(),
         message,
@@ -498,18 +434,16 @@ fn require_env_exists(store: &LocalFsStore, env_id: &EnvId) -> Result<(), OpErro
 }
 
 /// Resolve `<state_dir>` either from the explicit override or by anchoring
-/// at `$HOME/.greentic/state/`. Mirrors
-/// [`crate::environment::LocalFsStore::default_root`]'s `$HOME`-based shape.
+/// at `$HOME/.greentic/state/`, mirroring [`LocalFsStore::default_root`].
 fn resolve_state_dir(override_path: Option<&Path>) -> Result<PathBuf, OpError> {
     if let Some(p) = override_path {
         return Ok(p.to_path_buf());
     }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    dirs_home()
+        .map(|h| h.join(".greentic").join("state"))
         .ok_or_else(|| {
             OpError::InvalidArgument("no --state-dir and HOME / USERPROFILE not set".to_string())
-        })?;
-    Ok(PathBuf::from(home).join(".greentic").join("state"))
+        })
 }
 
 /// Rename `<state_dir>/deploy/` to `<state_dir>/.deploy-migrated-<rfc3339-nanos>/`.
@@ -524,17 +458,6 @@ fn rename_legacy_tree(state_dir: &Path, deploy_dir: &Path) -> Result<PathBuf, Op
         source,
     })?;
     Ok(dst)
-}
-
-/// Best-effort extraction of the leaf-scope count from a `legacy-deploy-tree`
-/// finding so the apply outcome can report it without re-walking the tree
-/// (which is now renamed). Falls back to `None` if the message shape changes.
-fn count_from_finding(f: &MigrationFinding) -> Option<usize> {
-    let needle = "across ";
-    let i = f.message.find(needle)?;
-    let rest = &f.message[i + needle.len()..];
-    let end = rest.find(' ')?;
-    rest[..end].parse().ok()
 }
 
 fn schema() -> Value {
@@ -601,6 +524,7 @@ mod tests {
         );
         let outcome = check(&store, &OpFlags::default(), "local", Some(&state_dir)).unwrap();
         assert_eq!(outcome.result["clean"], true);
+        assert_eq!(outcome.result["leaf_count"], 2);
         let findings = outcome.result["findings"].as_array().unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0]["kind"], "legacy-deploy-tree");
@@ -770,9 +694,9 @@ mod tests {
         }
     }
 
-    /// Verifies Codex finding #2: an unreadable provider subtree must
-    /// surface as a blocking finding rather than being silently skipped
-    /// by `.flatten()`. Unix-only because the test relies on `chmod 000`.
+    /// An unreadable provider subtree must surface as a blocking finding
+    /// rather than being silently skipped. Unix-only because the test
+    /// relies on `chmod 000`.
     #[cfg(unix)]
     #[test]
     fn check_blocks_on_unreadable_provider_subtree() {
@@ -821,10 +745,8 @@ mod tests {
         );
     }
 
-    /// Verifies Codex finding #2: top-level `existence probe` failures
-    /// surface as blocking findings rather than collapsing to "not
-    /// present". Implemented via a path with an unreadable parent so
-    /// `try_exists()` returns `Err` rather than `Ok(false)`.
+    /// Top-level `try_exists()` failures (e.g. unreadable parent) must
+    /// surface as blocking findings rather than collapsing to "not present".
     #[cfg(unix)]
     #[test]
     fn check_blocks_on_top_level_probe_io_error() {
@@ -862,10 +784,10 @@ mod tests {
         );
     }
 
-    /// Verifies Codex finding #3: two concurrent `--apply` invocations on
-    /// the same `state_dir` serialize through the `<state_dir>/.migrate-state.lock`
-    /// flock — only one rename succeeds; the second observes a clean tree
-    /// post-rename and returns the idempotent no-op.
+    /// Two concurrent `--apply` invocations on the same `state_dir`
+    /// serialize through `<state_dir>/.migrate-state.lock`. Only one
+    /// rename succeeds; the second observes the post-rename empty tree
+    /// and returns the idempotent no-op.
     #[test]
     fn apply_serializes_under_state_dir_lock() {
         let dir = tempdir().unwrap();

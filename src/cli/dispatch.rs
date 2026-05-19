@@ -127,22 +127,9 @@ pub enum EnvVerb {
         apply: bool,
     },
     /// Archive the legacy `<state_dir>/deploy/` artifact tree (A6).
-    ///
-    /// `--apply` renames the tree to a hidden `.deploy-migrated-<ts>/`
-    /// sentinel under the same parent. It does NOT copy contents into the
-    /// new env-pack-bound layout — Phase B's path-flip handles future
-    /// writes. The legacy artifacts are transient build output
-    /// (`plan.json`, `invoke.json`, adapter handoffs) and have no
-    /// downstream readers; they are safe to discard.
-    ///
-    /// The `<target>` env id gates apply on env-existence in the store;
-    /// the rename itself is global on the state directory. Defaults to
-    /// `$HOME/.greentic/state`; pass `--state-dir` to override.
-    ///
-    /// Operators should quiesce live deploys before running `--apply`:
-    /// `greentic-deployer::apply::run` writes under `<state_dir>/deploy/`
-    /// without participating in the migration lock today (cross-module
-    /// lock participation is Phase B work).
+    /// `--apply` renames it to a hidden `.deploy-migrated-<ts>/` sentinel;
+    /// contents are NOT copied into the new layout. Quiesce live deploys
+    /// first — `apply::run` does not participate in the migration lock.
     MigrateState {
         /// Target env id — must exist in EnvironmentStore.
         target: String,
