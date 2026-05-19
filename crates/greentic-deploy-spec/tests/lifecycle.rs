@@ -6,6 +6,7 @@ fn matrix_allows_documented_transitions() {
     let allowed = [
         (Inactive, Staged),
         (Inactive, Failed),
+        (Inactive, Archived),
         (Staged, Warming),
         (Staged, Failed),
         (Staged, Archived),
@@ -34,6 +35,7 @@ fn matrix_denies_all_other_transitions() {
     let allowed_set: std::collections::HashSet<_> = [
         (Inactive, Staged),
         (Inactive, Failed),
+        (Inactive, Archived),
         (Staged, Warming),
         (Staged, Failed),
         (Staged, Archived),
@@ -82,4 +84,17 @@ fn no_self_transitions() {
             "self-transition should not be allowed for {s:?}",
         );
     }
+}
+
+/// Drain-completion path: `ready → draining → inactive → archived` is the
+/// public operator workflow for retiring a live revision. Without
+/// `inactive → archived`, a revision that reaches `Draining` (operator
+/// action) and then `Inactive` (runtime drain-complete) would be stranded
+/// behind the spec matrix.
+#[test]
+fn drain_completion_walk_reaches_archived() {
+    use RevisionLifecycle::*;
+    assert!(is_valid_transition(Ready, Draining));
+    assert!(is_valid_transition(Draining, Inactive));
+    assert!(is_valid_transition(Inactive, Archived));
 }

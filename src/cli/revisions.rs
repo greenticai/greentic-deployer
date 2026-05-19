@@ -8,11 +8,16 @@
 //!
 //! Heavy lifting deferred:
 //!
-//! - Bundle-archive staging (resolving `.gtbundle` → `pack_list`) is the
-//!   distributor-client `stage_bundle` call; A5 wraps that with atomic-write
-//!   semantics. A3 records the `bundle_digest`/`pack_list` from the payload
-//!   and trusts the caller; integration with the live distributor lives in
-//!   A5 + Phase D.
+//! - Bundle-archive staging (resolving `.gtbundle` → `pack_list` via the
+//!   distributor-client's `stage_bundle` call, digest-verifying the
+//!   artifact, and writing the pack-list lockfile atomically before the
+//!   revision becomes `Staged`) is **Phase D** work — tracked at
+//!   <https://github.com/greenticai/greentic-deployer/issues/209>. Today
+//!   `stage` trusts caller-supplied `bundle_digest` / `pack_list` /
+//!   `*_ref` fields verbatim. A5 delivered the lifecycle storage guard
+//!   (`environment::lifecycle::apply_revision_transition`) and the
+//!   distributor-client's `set_bundle_state` atomic-write + transition
+//!   matrix, but did NOT integrate `stage_bundle` here.
 //! - Runner warm/drain hooks (route-table build, in-flight session
 //!   accounting) are owned by `greentic-start`; A3 only updates the
 //!   lifecycle bit and stamps `warmed_at`. The full warm/drain dance lands
@@ -242,8 +247,15 @@ pub fn drain(
     )
 }
 
-/// `op revisions archive`. Drops the revision from any traffic split, then
-/// transitions the lifecycle to `archived`.
+/// `op revisions archive`. Transitions the lifecycle to `archived` and
+/// removes the revision from `BundleDeployment.current_revisions`. Refuses
+/// archival of any revision still referenced by a live `TrafficSplit` —
+/// callers must rebalance traffic through `gtc op traffic set` first.
+///
+/// Accepts the full retirement walk: `Staged | Warming | Ready | Failed`
+/// archive in one hop; a revision already drained (Draining → Inactive
+/// via the runtime) completes through `Inactive → Archived` in the same
+/// CLI call.
 pub fn archive(
     store: &LocalFsStore,
     flags: &OpFlags,
@@ -262,6 +274,8 @@ pub fn archive(
             (RevisionLifecycle::Warming, RevisionLifecycle::Archived),
             (RevisionLifecycle::Ready, RevisionLifecycle::Archived),
             (RevisionLifecycle::Failed, RevisionLifecycle::Archived),
+            (RevisionLifecycle::Draining, RevisionLifecycle::Inactive),
+            (RevisionLifecycle::Inactive, RevisionLifecycle::Archived),
         ],
         |_| {},
         true,
@@ -539,10 +553,59 @@ mod tests {
     }
 
     #[test]
-    fn archive_prunes_split_and_current_revisions() {
+    fn archive_prunes_current_revisions_when_no_live_traffic() {
+        // After the A5 follow-up landed the active-traffic guard, archive
+        // no longer silently prunes live splits. This test exercises the
+        // happy path: revision is in `current_revisions` but NOT in any
+        // traffic split. Archive succeeds and strips the tracking
+        // reference; no traffic state is touched.
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
-        // Seed with: deployment + ready revision + traffic split + bundle.current_revisions
+        let mut env = make_env("local");
+        let mut deployment = make_bundle_deployment("local", "fast2flow");
+        let did = deployment.deployment_id;
+        let revision = crate::cli::tests_common::make_revision(
+            "local",
+            "fast2flow",
+            &did,
+            1,
+            RevisionLifecycle::Ready,
+        );
+        let rid = revision.revision_id;
+        deployment.current_revisions.push(rid);
+        env.bundles.push(deployment);
+        env.revisions.push(revision);
+        store.save(&env).unwrap();
+
+        let outcome = archive(
+            &store,
+            &OpFlags::default(),
+            Some(RevisionTransitionPayload {
+                environment_id: "local".to_string(),
+                revision_id: rid.to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.result.get("lifecycle").and_then(|v| v.as_str()),
+            Some("archived")
+        );
+
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert!(
+            env.bundles[0].current_revisions.is_empty(),
+            "current_revisions should be pruned"
+        );
+    }
+
+    #[test]
+    fn archive_refuses_when_revision_is_in_live_traffic_split() {
+        // Operator workflow guarantee: archiving a revision that still
+        // routes live traffic surfaces a Conflict pointing at the splits
+        // to rebalance. The CLI maps `LifecycleError::ActiveTrafficReference`
+        // through `From<LifecycleError> for OpError`.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
         let mut env = make_env("local");
         let mut deployment = make_bundle_deployment("local", "fast2flow");
         let did = deployment.deployment_id;
@@ -567,6 +630,55 @@ mod tests {
         env.traffic_splits.push(split);
         store.save(&env).unwrap();
 
+        let err = archive(
+            &store,
+            &OpFlags::default(),
+            Some(RevisionTransitionPayload {
+                environment_id: "local".to_string(),
+                revision_id: rid.to_string(),
+            }),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => {
+                assert!(
+                    msg.contains("live traffic split")
+                        && msg.contains("rebalance via `gtc op traffic set`"),
+                    "expected actionable conflict message, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict, got `{other:?}`"),
+        }
+
+        // Nothing persisted: lifecycle still Ready, split intact.
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Ready);
+        assert_eq!(env.traffic_splits.len(), 1);
+        assert!(env.bundles[0].current_revisions.contains(&rid));
+    }
+
+    #[test]
+    fn archive_completes_a_drained_revision_through_inactive() {
+        // Operator action: `drain` moved Ready → Draining; runtime
+        // separately moved Draining → Inactive (simulated here via the
+        // store). Archive walks Inactive → Archived in a single CLI call.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        let deployment = make_bundle_deployment("local", "fast2flow");
+        let did = deployment.deployment_id;
+        let revision = crate::cli::tests_common::make_revision(
+            "local",
+            "fast2flow",
+            &did,
+            1,
+            RevisionLifecycle::Inactive,
+        );
+        let rid = revision.revision_id;
+        env.bundles.push(deployment);
+        env.revisions.push(revision);
+        store.save(&env).unwrap();
+
         let outcome = archive(
             &store,
             &OpFlags::default(),
@@ -579,13 +691,6 @@ mod tests {
         assert_eq!(
             outcome.result.get("lifecycle").and_then(|v| v.as_str()),
             Some("archived")
-        );
-
-        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
-        assert!(env.traffic_splits.is_empty(), "split should be dropped");
-        assert!(
-            env.bundles[0].current_revisions.is_empty(),
-            "current_revisions should be pruned"
         );
     }
 
