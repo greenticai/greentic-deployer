@@ -8,11 +8,9 @@
 //! Heavy resolution of the descriptor strings to concrete handlers is the
 //! env-pack registry's job (A9); A4 only persists the binding intent.
 
-use greentic_deploy_spec::{
-    EnvId, Environment, EnvironmentHostConfig, SchemaVersion,
-    defaults::{LOCAL_ENV_ID, local_pack_bindings},
-};
+use greentic_deploy_spec::{EnvId, Environment, EnvironmentHostConfig, SchemaVersion};
 
+use crate::defaults::{LOCAL_ENV_ID, local_pack_bindings};
 use crate::environment::LocalFsStore;
 
 use super::OpError;
@@ -75,13 +73,11 @@ pub fn ensure_local_environment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use greentic_deploy_spec::{
-        CapabilitySlot,
-        defaults::{
-            LOCAL_DEPLOYER_PACK, LOCAL_SECRETS_PACK, LOCAL_SESSIONS_PACK, LOCAL_STATE_PACK,
-            LOCAL_TELEMETRY_PACK,
-        },
+    use crate::defaults::{
+        LOCAL_DEPLOYER_PACK, LOCAL_SECRETS_PACK, LOCAL_SESSIONS_PACK, LOCAL_STATE_PACK,
+        LOCAL_TELEMETRY_PACK,
     };
+    use greentic_deploy_spec::CapabilitySlot;
     use tempfile::TempDir;
 
     fn store() -> (TempDir, LocalFsStore) {
