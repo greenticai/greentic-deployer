@@ -37,6 +37,7 @@
 
 use std::path::PathBuf;
 
+pub mod bootstrap;
 pub mod bundles;
 pub mod config;
 pub mod credentials;
