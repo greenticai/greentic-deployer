@@ -25,10 +25,26 @@
 //! `Revision` struct itself and pushes it onto `Environment.revisions`. The
 //! lifecycle guard only owns transitions between *existing* revisions.
 
-use greentic_deploy_spec::{Revision, RevisionId, RevisionLifecycle, is_valid_transition};
+use greentic_deploy_spec::{
+    BundleId, DeploymentId, Revision, RevisionId, RevisionLifecycle, is_valid_transition,
+};
 use thiserror::Error;
 
 use crate::environment::{Locked, StoreError};
+
+/// Identifies a `TrafficSplit` (by its `(deployment_id, bundle_id)` key)
+/// for error-reporting purposes. Surfaced in
+/// [`LifecycleError::ActiveTrafficReference`] so operators can locate the
+/// splits they need to rebalance before retrying the archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveSplitRef {
+    pub deployment_id: DeploymentId,
+    pub bundle_id: BundleId,
+    /// Weight (basis points) of the *archived* revision's entry in this
+    /// split. Lets callers distinguish "100% live route" from "partial
+    /// canary" without re-loading the env.
+    pub weight_bps: u32,
+}
 
 /// Errors produced by [`apply_revision_transition`]. Cleanly maps onto
 /// `cli::OpError` via the `From` impl in `cli/mod.rs`.
@@ -65,6 +81,21 @@ pub enum LifecycleError {
     /// The caller passed an empty `accepted_chain`. Internal-API misuse.
     #[error("transition chain is empty; cannot apply any state change")]
     EmptyChain,
+    /// The archive path (`prune_from_splits = true`) was invoked against a
+    /// revision still referenced by one or more live traffic splits.
+    /// Blindly pruning the entry would either silently drop the route
+    /// (100%-single-entry split) or produce a split whose weights no
+    /// longer sum to 10,000 bps (the spec invariant), so the helper
+    /// refuses. Callers must rebalance traffic via `gtc op traffic set`
+    /// before retrying. `splits` carries the offending references for
+    /// rendering an actionable error.
+    #[error(
+        "revision `{revision_id}` is still referenced by {} live traffic split(s); rebalance via `gtc op traffic set` before archiving", splits.len()
+    )]
+    ActiveTrafficReference {
+        revision_id: RevisionId,
+        splits: Vec<ActiveSplitRef>,
+    },
     /// Underlying storage layer failure (load/save through the `Locked<'_>`).
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -92,12 +123,17 @@ pub enum LifecycleError {
 /// timestamps like `warmed_at`. The helper expects `FnOnce` because each
 /// transition is a one-shot.
 ///
-/// `prune_from_splits = true` is the archive-path knob: after the lifecycle
-/// is in its final state, the revision is removed from every
-/// [`TrafficSplit::entries`](greentic_deploy_spec::TrafficSplit::entries),
-/// and from each [`BundleDeployment::current_revisions`](greentic_deploy_spec::BundleDeployment::current_revisions)
-/// whose `deployment_id` matches the archived revision's. Splits whose
-/// entry list becomes empty after the prune are dropped from the env.
+/// `prune_from_splits = true` is the archive-path knob. Before pruning,
+/// the helper scans every `TrafficSplit.entries` for references to the
+/// archived revision: if any are found, it refuses with
+/// [`LifecycleError::ActiveTrafficReference`] (no save, no mutation) so
+/// the operator can rebalance traffic through `gtc op traffic set`
+/// first. If no live references exist, the revision is removed from each
+/// [`BundleDeployment::current_revisions`](greentic_deploy_spec::BundleDeployment::current_revisions)
+/// whose `deployment_id` matches the archived revision's (a tracking
+/// field, not a routing-impact one). Empty traffic splits are not
+/// possible at this point because the guard would have caught them; the
+/// invariant is preserved across the save.
 ///
 /// The helper saves the env through `locked.save(...)` before returning,
 /// so the entire read-modify-write completes inside the caller's
@@ -156,21 +192,48 @@ where
         });
     }
 
+    if prune_from_splits {
+        // Refuse to archive a revision that still routes live traffic.
+        // Blindly pruning would either silently drop the route (100%
+        // single-entry split) or produce weights that no longer sum to
+        // 10,000 bps (the spec invariant — `locked.save` would reject
+        // with a SpecError that doesn't explain the live-traffic angle).
+        let active_refs: Vec<ActiveSplitRef> = env
+            .traffic_splits
+            .iter()
+            .flat_map(|split| {
+                split
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.revision_id == revision_id)
+                    .map(|entry| ActiveSplitRef {
+                        deployment_id: split.deployment_id,
+                        bundle_id: split.bundle_id.clone(),
+                        weight_bps: entry.weight_bps,
+                    })
+            })
+            .collect();
+        if !active_refs.is_empty() {
+            return Err(LifecycleError::ActiveTrafficReference {
+                revision_id,
+                splits: active_refs,
+            });
+        }
+    }
+
     on_final(&mut env.revisions[idx]);
 
     if prune_from_splits {
+        // No live traffic references at this point (guard above).
+        // Remove the revision from each matching deployment's tracking
+        // list; traffic splits themselves are untouched (none referenced
+        // this revision anyway).
         let deployment_id = env.revisions[idx].deployment_id;
-        for split in env.traffic_splits.iter_mut() {
-            split
-                .entries
-                .retain(|entry| entry.revision_id != revision_id);
-        }
         for bundle in env.bundles.iter_mut() {
             if bundle.deployment_id == deployment_id {
                 bundle.current_revisions.retain(|rid| *rid != revision_id);
             }
         }
-        env.traffic_splits.retain(|split| !split.entries.is_empty());
     }
 
     locked.save(&env)?;
@@ -453,9 +516,38 @@ mod tests {
     }
 
     #[test]
-    fn archive_prunes_revision_from_splits_and_current_revisions() {
+    fn archive_succeeds_and_prunes_current_revisions_when_no_live_traffic() {
+        // Happy path: revision is not in any traffic split (or no splits
+        // exist at all). The archive helper transitions the lifecycle and
+        // strips the revision from each matching deployment's tracking
+        // list. Traffic splits are untouched.
         let (store, env_id, rid) = seed_one_revision(RevisionLifecycle::Ready);
-        // Add a traffic split routing 100% to this revision.
+
+        let archived = store
+            .transact(&env_id, |locked| -> Result<Revision, LifecycleError> {
+                apply_revision_transition(
+                    locked,
+                    rid,
+                    &[(RevisionLifecycle::Ready, RevisionLifecycle::Archived)],
+                    |_| {},
+                    true,
+                )
+            })
+            .unwrap();
+        assert_eq!(archived.lifecycle, RevisionLifecycle::Archived);
+
+        let env = store.load(&env_id).unwrap();
+        assert!(env.bundles[0].current_revisions.is_empty());
+        assert!(env.traffic_splits.is_empty());
+    }
+
+    #[test]
+    fn archive_refuses_when_revision_owns_100_percent_of_a_split() {
+        // The most acute outage path: a single-entry 100%-bps split is the
+        // deployment's only live route. Silent prune would either drop the
+        // route entirely (operational outage) or — with empty-split
+        // cleanup — leave the deployment unreachable. Guard refuses.
+        let (store, env_id, rid) = seed_one_revision(RevisionLifecycle::Ready);
         let mut env = store.load(&env_id).unwrap();
         let did = env.bundles[0].deployment_id;
         env.traffic_splits.push(TrafficSplit {
@@ -474,9 +566,10 @@ mod tests {
             authorization_ref: PathBuf::from("auth.json"),
             previous_split_ref: None,
         });
+        env.bundles[0].current_revisions.push(rid);
         store.save(&env).unwrap();
 
-        let archived = store
+        let err = store
             .transact(&env_id, |locked| -> Result<Revision, LifecycleError> {
                 apply_revision_transition(
                     locked,
@@ -486,13 +579,134 @@ mod tests {
                     true,
                 )
             })
+            .unwrap_err();
+        match err {
+            LifecycleError::ActiveTrafficReference {
+                revision_id,
+                splits,
+            } => {
+                assert_eq!(revision_id, rid);
+                assert_eq!(splits.len(), 1);
+                assert_eq!(splits[0].deployment_id, did);
+                assert_eq!(splits[0].weight_bps, 10_000);
+            }
+            other => panic!("expected ActiveTrafficReference, got `{other:?}`"),
+        }
+
+        // Nothing persisted: lifecycle still Ready, split still owns the route,
+        // current_revisions still references the revision.
+        let env = store.load(&env_id).unwrap();
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Ready);
+        assert_eq!(env.traffic_splits.len(), 1);
+        assert_eq!(env.traffic_splits[0].entries.len(), 1);
+        assert!(env.bundles[0].current_revisions.contains(&rid));
+    }
+
+    #[test]
+    fn archive_refuses_when_revision_owns_partial_traffic_in_a_split() {
+        // Multi-entry canary split: archiving the canary revision would
+        // leave the other entries summing to <10_000 bps (a spec invariant
+        // violation that would surface as a save-time SpecError). Guard
+        // refuses before any mutation.
+        let (store, env_id, rid) = seed_one_revision(RevisionLifecycle::Ready);
+        let mut env = store.load(&env_id).unwrap();
+        let did = env.bundles[0].deployment_id;
+
+        // Add a second revision (the "main" line) and a 30/70 canary split.
+        let main_revision = make_revision(did, RevisionLifecycle::Ready);
+        let main_rid = main_revision.revision_id;
+        env.revisions.push(main_revision);
+        env.bundles[0].current_revisions.push(rid);
+        env.bundles[0].current_revisions.push(main_rid);
+        env.traffic_splits.push(TrafficSplit {
+            schema: SchemaVersion::new(SchemaVersion::TRAFFIC_SPLIT_V1),
+            env_id: env_id.clone(),
+            deployment_id: did,
+            bundle_id: BundleId::new("fast2flow"),
+            generation: 0,
+            entries: vec![
+                TrafficSplitEntry {
+                    revision_id: rid,
+                    weight_bps: 3_000,
+                },
+                TrafficSplitEntry {
+                    revision_id: main_rid,
+                    weight_bps: 7_000,
+                },
+            ],
+            updated_at: fixed_now(),
+            updated_by: "test".to_string(),
+            idempotency_key: "k1".to_string(),
+            authorization_ref: PathBuf::from("auth.json"),
+            previous_split_ref: None,
+        });
+        store.save(&env).unwrap();
+
+        let err = store
+            .transact(&env_id, |locked| -> Result<Revision, LifecycleError> {
+                apply_revision_transition(
+                    locked,
+                    rid,
+                    &[(RevisionLifecycle::Ready, RevisionLifecycle::Archived)],
+                    |_| {},
+                    true,
+                )
+            })
+            .unwrap_err();
+        match err {
+            LifecycleError::ActiveTrafficReference {
+                revision_id,
+                splits,
+            } => {
+                assert_eq!(revision_id, rid);
+                assert_eq!(splits.len(), 1);
+                assert_eq!(splits[0].weight_bps, 3_000);
+            }
+            other => panic!("expected ActiveTrafficReference, got `{other:?}`"),
+        }
+
+        // Split is intact, weights still sum to 10_000.
+        let env = store.load(&env_id).unwrap();
+        let sum: u32 = env.traffic_splits[0]
+            .entries
+            .iter()
+            .map(|e| e.weight_bps)
+            .sum();
+        assert_eq!(sum, 10_000);
+    }
+
+    #[test]
+    fn drain_then_archive_walk_retires_a_live_revision_to_terminal() {
+        // The full operator workflow: a Ready revision is drained, runtime
+        // moves Draining → Inactive (simulated here via a direct save),
+        // operator then archives. The widened archive chain accepts
+        // Draining → Inactive → Archived so the drained revision completes
+        // to the terminal state without manual state edits.
+        let (store, env_id, rid) = seed_one_revision(RevisionLifecycle::Draining);
+        // Simulate the runtime completing the drain.
+        let mut env = store.load(&env_id).unwrap();
+        env.revisions[0].lifecycle = RevisionLifecycle::Inactive;
+        store.save(&env).unwrap();
+
+        let archived = store
+            .transact(&env_id, |locked| -> Result<Revision, LifecycleError> {
+                apply_revision_transition(
+                    locked,
+                    rid,
+                    &[
+                        (RevisionLifecycle::Staged, RevisionLifecycle::Archived),
+                        (RevisionLifecycle::Warming, RevisionLifecycle::Archived),
+                        (RevisionLifecycle::Ready, RevisionLifecycle::Archived),
+                        (RevisionLifecycle::Failed, RevisionLifecycle::Archived),
+                        (RevisionLifecycle::Draining, RevisionLifecycle::Inactive),
+                        (RevisionLifecycle::Inactive, RevisionLifecycle::Archived),
+                    ],
+                    |_| {},
+                    true,
+                )
+            })
             .unwrap();
         assert_eq!(archived.lifecycle, RevisionLifecycle::Archived);
-
-        let env = store.load(&env_id).unwrap();
-        assert!(env.bundles[0].current_revisions.is_empty());
-        // Split lost its only entry and was dropped entirely.
-        assert!(env.traffic_splits.is_empty());
     }
 
     #[test]
@@ -505,6 +719,7 @@ mod tests {
         for (from, to) in &[
             (Inactive, Staged),
             (Inactive, Failed),
+            (Inactive, Archived),
             (Staged, Warming),
             (Staged, Failed),
             (Staged, Archived),

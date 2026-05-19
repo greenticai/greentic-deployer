@@ -27,7 +27,7 @@ pub enum RevisionLifecycle {
 /// Pure spec-level predicate for the state-transition matrix at `§5.2`.
 ///
 /// ```text
-/// inactive → staged | failed
+/// inactive → staged | failed | archived
 /// staged   → warming | failed | archived
 /// warming  → ready | failed | archived
 /// ready    → draining | failed | archived
@@ -35,6 +35,13 @@ pub enum RevisionLifecycle {
 /// failed   → staged (retry) | archived
 /// archived → (terminal)
 /// ```
+///
+/// `Inactive → Archived` closes the drain-complete loop: a revision that
+/// reaches `Draining` (via the `ready → draining` operator action) is moved
+/// to `Inactive` by the runtime when drain completes (`draining → inactive`);
+/// the operator then archives the now-quiesced revision with `inactive → archived`.
+/// Without this edge, drained revisions are stranded behind a runtime-only
+/// transition because no `inactive → *` archival path exists.
 ///
 /// A5 wraps this with the storage-level guard; consumers that need the predicate
 /// without depending on the deployer should use this function directly.
@@ -44,6 +51,7 @@ pub fn is_valid_transition(from: RevisionLifecycle, to: RevisionLifecycle) -> bo
         (from, to),
         (Inactive, Staged)
             | (Inactive, Failed)
+            | (Inactive, Archived)
             | (Staged, Warming)
             | (Staged, Failed)
             | (Staged, Archived)

@@ -114,6 +114,24 @@ impl From<LifecycleError> for OpError {
             LifecycleError::EmptyChain => {
                 OpError::InvalidArgument("empty transition chain".to_string())
             }
+            LifecycleError::ActiveTrafficReference {
+                revision_id,
+                splits,
+            } => {
+                let detail = splits
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "deployment `{}` / bundle `{}` ({}bps)",
+                            s.deployment_id, s.bundle_id, s.weight_bps
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                OpError::Conflict(format!(
+                    "revision `{revision_id}` is still referenced by live traffic split(s): [{detail}]; rebalance via `gtc op traffic set` before archiving"
+                ))
+            }
             LifecycleError::Store(source) => OpError::Store(source),
         }
     }
