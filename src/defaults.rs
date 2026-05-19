@@ -7,9 +7,9 @@
 //! propagate as [`PackDescriptorParseError`] but are unreachable for the
 //! compile-time constants below.
 
-use crate::capability_slot::{CapabilitySlot, PackDescriptor, PackDescriptorParseError};
-use crate::environment::EnvPackBinding;
-use crate::ids::PackId;
+use greentic_deploy_spec::{
+    CapabilitySlot, EnvPackBinding, PackDescriptor, PackDescriptorParseError, PackId,
+};
 
 /// `EnvId` string used by the bootstrap environment.
 pub const LOCAL_ENV_ID: &str = "local";

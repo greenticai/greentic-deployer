@@ -12,6 +12,7 @@ pub mod bundle_upload;
 pub mod cli;
 pub mod config;
 pub mod contract;
+pub mod defaults;
 pub mod deployment;
 pub mod desktop;
 pub mod environment;

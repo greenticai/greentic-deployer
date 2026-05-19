@@ -13,7 +13,6 @@ pub mod adapters;
 pub mod bundle_deployment;
 pub mod capability_slot;
 pub mod credentials;
-pub mod defaults;
 pub mod environment;
 pub mod environment_runtime;
 pub mod error;
