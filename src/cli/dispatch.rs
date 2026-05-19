@@ -126,6 +126,24 @@ pub enum EnvVerb {
         #[arg(long, conflicts_with = "check")]
         apply: bool,
     },
+    /// Clean up the legacy `<state_dir>/deploy/` artifact tree (A6). The
+    /// `<target>` env id gates apply on env-existence in the store; the
+    /// rename itself is global on the state directory. Defaults to
+    /// `$HOME/.greentic/state`; pass `--state-dir` to override.
+    MigrateState {
+        /// Target env id — must exist in EnvironmentStore.
+        target: String,
+        /// Scan for blocking findings and report; do not touch state.
+        #[arg(long, conflicts_with = "apply")]
+        check: bool,
+        /// Re-run the check; if clean, rename the legacy tree.
+        #[arg(long, conflicts_with = "check")]
+        apply: bool,
+        /// Override the legacy state-dir root. Defaults to
+        /// `$HOME/.greentic/state`.
+        #[arg(long = "state-dir")]
+        state_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -260,6 +278,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 EnvVerb::Doctor { .. } => "doctor",
                 EnvVerb::Destroy { .. } => "destroy",
                 EnvVerb::MigrateDev { .. } => "migrate-dev",
+                EnvVerb::MigrateState { .. } => "migrate-state",
             },
         ),
         OpNoun::EnvPacks { verb } => (
@@ -350,6 +369,23 @@ fn dispatch_env(store: &LocalFsStore, flags: &OpFlags, verb: EnvVerb) -> Result<
                 super::migrate::check(store, flags, &target)?
             } else {
                 super::migrate::apply(store, flags, &target)?
+            }
+        }
+        EnvVerb::MigrateState {
+            target,
+            check,
+            apply,
+            state_dir,
+        } => {
+            if !(check ^ apply) {
+                return Err(OpError::InvalidArgument(
+                    "migrate-state requires exactly one of --check or --apply".to_string(),
+                ));
+            }
+            if check {
+                super::migrate_state::check(store, flags, &target, state_dir.as_deref())?
+            } else {
+                super::migrate_state::apply(store, flags, &target, state_dir.as_deref())?
             }
         }
     };

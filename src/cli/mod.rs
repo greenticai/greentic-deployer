@@ -45,6 +45,7 @@ pub mod dispatch;
 pub mod env;
 pub mod env_packs;
 pub mod migrate;
+pub mod migrate_state;
 pub mod revisions;
 pub mod secrets;
 pub mod traffic;
