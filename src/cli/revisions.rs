@@ -292,71 +292,35 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
 
 // --- internals -----------------------------------------------------------
 
-/// Walk the `accepted_chain` until the revision is in the final state, or
-/// fail with a structured conflict. When `prune_from_splits` is true, the
-/// revision is also removed from any `TrafficSplit.entries` referencing it
-/// (archive path).
-fn transition<F: FnMut(&mut Revision)>(
+/// CLI-side adapter over [`crate::environment::apply_revision_transition`].
+/// Resolves the payload, drives the env transact, and renders the outcome
+/// envelope. The lifecycle matrix walk lives in
+/// [`crate::environment::lifecycle`] so future B-phase consumers (gtc start
+/// orchestration #221, B9 warm/ready gate, A7 audit emission) can call
+/// it without going through the CLI shell.
+fn transition<F: FnOnce(&mut Revision)>(
     store: &LocalFsStore,
     flags: &OpFlags,
     payload: Option<RevisionTransitionPayload>,
     op: &'static str,
     accepted_chain: &[(RevisionLifecycle, RevisionLifecycle)],
-    mut on_final: F,
+    on_final: F,
     prune_from_splits: bool,
 ) -> Result<OpOutcome, OpError> {
     let payload = resolve_payload::<RevisionTransitionPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let revision_id = parse_revision_id(&payload.revision_id)?;
-    let summary = store.transact(&env_id, |locked| -> Result<RevisionSummary, OpError> {
-        let mut env = locked.load()?;
-        let idx = env
-            .revisions
-            .iter()
-            .position(|r| r.revision_id == revision_id)
-            .ok_or_else(|| {
-                OpError::NotFound(format!(
-                    "revision `{revision_id}` not found in env `{env_id}`"
-                ))
-            })?;
-        for (from, to) in accepted_chain {
-            if env.revisions[idx].lifecycle == *from {
-                if !is_valid_transition(*from, *to) {
-                    return Err(OpError::Conflict(format!(
-                        "spec rejects transition `{:?} → {:?}`",
-                        from, to
-                    )));
-                }
-                env.revisions[idx].lifecycle = *to;
-            }
-        }
-        let final_state = accepted_chain
-            .last()
-            .map(|(_, to)| *to)
-            .ok_or_else(|| OpError::InvalidArgument("empty transition chain".to_string()))?;
-        if env.revisions[idx].lifecycle != final_state {
-            return Err(OpError::Conflict(format!(
-                "revision `{revision_id}` is in `{:?}`; expected one of {:?}",
-                env.revisions[idx].lifecycle,
-                accepted_chain.iter().map(|(f, _)| f).collect::<Vec<_>>(),
-            )));
-        }
-        on_final(&mut env.revisions[idx]);
-        if prune_from_splits {
-            for split in env.traffic_splits.iter_mut() {
-                split.entries.retain(|e| e.revision_id != revision_id);
-            }
-            let deployment_id = env.revisions[idx].deployment_id;
-            for bundle in env.bundles.iter_mut() {
-                if bundle.deployment_id == deployment_id {
-                    bundle.current_revisions.retain(|r| *r != revision_id);
-                }
-            }
-            env.traffic_splits.retain(|s| !s.entries.is_empty());
-        }
-        locked.save(&env)?;
-        Ok(RevisionSummary::from(&env.revisions[idx]))
+    let revision = store.transact(&env_id, |locked| -> Result<Revision, OpError> {
+        crate::environment::apply_revision_transition(
+            locked,
+            revision_id,
+            accepted_chain,
+            on_final,
+            prune_from_splits,
+        )
+        .map_err(OpError::from)
     })?;
+    let summary = RevisionSummary::from(&revision);
     Ok(OpOutcome::new(
         NOUN,
         op,
