@@ -3,9 +3,9 @@
 //! Pack-descriptor strings are exposed as `&'static str` constants so callers
 //! that need only the names (CLI output, telemetry tags) can avoid parsing.
 //! [`local_pack_bindings`] returns the five [`EnvPackBinding`]s ready to drop
-//! into [`Environment::packs`](crate::Environment::packs); parsing failures
-//! propagate as [`PackDescriptorParseError`] but are unreachable for the
-//! compile-time constants below.
+//! into [`greentic_deploy_spec::Environment::packs`]; parsing failures propagate
+//! as [`PackDescriptorParseError`] but are unreachable for the compile-time
+//! constants below.
 
 use greentic_deploy_spec::{
     CapabilitySlot, EnvPackBinding, PackDescriptor, PackDescriptorParseError, PackId,
