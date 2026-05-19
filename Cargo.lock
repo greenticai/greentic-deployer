@@ -1169,9 +1169,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-common"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77727bb15fa921304124b128af125e7e3b968275d1b108b379190264f4423710"
+checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
 ]
@@ -1266,7 +1266,7 @@ checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.0",
  "const-oid 0.10.2",
- "crypto-common 0.2.1",
+ "crypto-common 0.2.2",
  "ctutils",
 ]
 
@@ -1778,9 +1778,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-distributor-client"
-version = "1.1.0-dev.25902983221"
+version = "1.1.0-dev.26111348565"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf7f91e57590fd63e8ddf40e105b30c439f5cbeee89e983393ba441f459c5e11"
+checksum = "cd6f395e2e3f19e0989bc9e6952610277f295fc2fcce7665029cc897d4dfcf96"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1797,6 +1797,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
