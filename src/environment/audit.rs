@@ -136,7 +136,7 @@ pub struct AuditLog {
 impl AuditLog {
     /// Resolve the audit log path for `env_id` under `store`'s root.
     ///
-    /// The path is built via [`LocalFsStore::env_dir`] so it shares the same
+    /// The path is built via the store's `env_dir` so it shares the same
     /// safe-env-segment validation that the rest of the store uses (rejects
     /// `.`, `..`, ids with separators).
     pub fn for_env(store: &LocalFsStore, env_id: &EnvId) -> Result<Self, AuditError> {

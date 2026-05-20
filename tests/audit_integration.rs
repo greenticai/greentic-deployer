@@ -211,3 +211,67 @@ fn audit_log_uses_safe_env_segment_rejecting_dotdot() {
     let result = greentic_deployer::environment::AuditLog::for_env(&store, &env_id);
     assert!(result.is_err(), "audit log must reject unsafe env segments");
 }
+
+#[test]
+fn committed_mutation_with_unwritable_audit_dir_fails_closed() {
+    // Codex finding [high]: a committed mutation must not report success when
+    // the audit event cannot be persisted. Inject failure by occupying the
+    // audit dir path with a regular file so `create_dir_all` fails.
+    let dir = tempdir().unwrap();
+    let store = LocalFsStore::new(dir.path());
+    std::fs::create_dir_all(dir.path().join("local")).unwrap();
+    std::fs::write(dir.path().join("local").join("audit"), b"not a dir").unwrap();
+
+    let err = create(
+        &store,
+        &OpFlags::default(),
+        Some(EnvCreatePayload {
+            environment_id: "local".to_string(),
+            name: "local".to_string(),
+            region: None,
+            tenant_org_id: None,
+        }),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, OpError::Audit(_)),
+        "committed mutation with broken audit dir must surface OpError::Audit, got {err:?}"
+    );
+    // The state did commit (we cannot un-commit a flushed transact); the point
+    // is that the call does NOT report success without a durable audit record.
+    assert!(
+        dir.path().join("local").join("environment.json").exists(),
+        "the mutation itself committed before the audit append was attempted"
+    );
+}
+
+#[test]
+fn denied_mutation_with_unwritable_audit_dir_still_returns_unauthorized() {
+    // Counterpart to the fail-closed test: a DENIED op commits no state, so an
+    // unwritable audit dir must not upgrade the error to OpError::Audit — the
+    // caller still sees the authorization denial.
+    let dir = tempdir().unwrap();
+    let store = LocalFsStore::new(dir.path());
+    std::fs::create_dir_all(dir.path().join("prod")).unwrap();
+    std::fs::write(dir.path().join("prod").join("audit"), b"not a dir").unwrap();
+
+    let err = create(
+        &store,
+        &OpFlags::default(),
+        Some(EnvCreatePayload {
+            environment_id: "prod".to_string(),
+            name: "prod".to_string(),
+            region: None,
+            tenant_org_id: None,
+        }),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, OpError::Unauthorized { .. }),
+        "denied op must surface Unauthorized even when audit append fails, got {err:?}"
+    );
+    assert!(
+        !dir.path().join("prod").join("environment.json").exists(),
+        "deny must not commit state"
+    );
+}

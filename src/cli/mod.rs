@@ -96,6 +96,8 @@ pub enum OpError {
     Conflict(String),
     #[error("unauthorized: {policy} — {reason}")]
     Unauthorized { policy: String, reason: String },
+    #[error("audit log write failed after the mutation committed: {0}")]
+    Audit(String),
 }
 
 impl From<LifecycleError> for OpError {
@@ -157,6 +159,7 @@ impl OpError {
             OpError::NotYetImplemented(_) => "not-yet-implemented",
             OpError::Conflict(_) => "conflict",
             OpError::Unauthorized { .. } => "unauthorized",
+            OpError::Audit(_) => "audit",
         }
     }
 }
@@ -195,11 +198,19 @@ impl AuditGens {
 /// 3. On `Allow`: runs `mutate` and records the outcome.
 /// 4. Always appends an [`AuditEvent`] to `<store_root>/<env_id>/audit/events.jsonl`.
 ///
-/// Audit-append failures are demoted to `tracing::warn!` so a broken audit
-/// directory cannot mask the actual op result. The plan is explicit: non-local
-/// mutations fail closed via the authorize gate, but local mutations stay
-/// completable if the audit dir is unwritable. A8's remote pipeline can flip
-/// this to fail-loud.
+/// Audit persistence is **fail-closed for committed mutations**: if `mutate`
+/// returned `Ok` (state committed) but the audit event could not be appended,
+/// the helper discards the success and returns [`OpError::Audit`]. A
+/// state-changing op never reports success without a durable audit record.
+///
+/// For non-committing outcomes (authorization denials, mutation errors,
+/// `NotYetImplemented` stubs) there is no committed state to protect, so an
+/// audit-append failure is demoted to `tracing::warn!` and the original
+/// (error) result is returned unchanged.
+///
+/// Note this closes the "unwritable/full audit dir" gap but not the
+/// process-death-between-write-and-append window — durable write-ahead intent
+/// belongs to A8's transactional remote store.
 ///
 /// The closure returns `(OpOutcome, AuditGens)` where `AuditGens` carries the
 /// `previous_generation` (read under the env flock inside the closure, when
@@ -230,6 +241,9 @@ where
             Err(err) => (Err(err), AuditGens::default()),
         },
     };
+    // Only an `Ok` from an allowed mutation commits durable state; that is the
+    // case where a missing audit record violates the A7 guarantee.
+    let committed = result.is_ok();
     let previous_generation = gens.previous.or(ctx.previous_generation);
 
     let audit_result = match &result {
@@ -259,25 +273,23 @@ where
         result: audit_result,
     };
 
-    match AuditLog::for_env(store, &ctx.env_id) {
-        Ok(log) => {
-            if let Err(e) = log.append(&event) {
-                tracing::warn!(
-                    target: "greentic.audit",
-                    error = %e,
-                    event_id = %event.event_id,
-                    "failed to append audit event; continuing with op result"
-                );
-            }
+    let append_outcome = AuditLog::for_env(store, &ctx.env_id).and_then(|log| log.append(&event));
+    if let Err(e) = append_outcome {
+        if committed {
+            // Fail-closed: a committed mutation must not report success without
+            // a durable audit record. Surface the failure so the operator can
+            // reconcile the (already-persisted) state change.
+            return Err(OpError::Audit(format!(
+                "{e} (event_id={}, {}.{} on env `{}`)",
+                event.event_id, event.noun, event.verb, event.env_id
+            )));
         }
-        Err(e) => {
-            tracing::warn!(
-                target: "greentic.audit",
-                error = %e,
-                event_id = %event.event_id,
-                "failed to resolve audit log path; event dropped"
-            );
-        }
+        tracing::warn!(
+            target: "greentic.audit",
+            error = %e,
+            event_id = %event.event_id,
+            "failed to append audit event for a non-committing op; continuing with op result"
+        );
     }
 
     result
