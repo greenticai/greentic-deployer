@@ -57,9 +57,8 @@ impl EnvPackRegistry {
         Self::default()
     }
 
-    /// A registry pre-loaded with the five built-in `local` handlers
-    /// (local-process deployer, dev-store secrets, stdout telemetry, in-memory
-    /// sessions, in-memory state).
+    /// A registry pre-loaded with the built-in `local` handlers
+    /// ([`BUILTIN_HANDLERS`]).
     pub fn with_builtins() -> Self {
         let mut registry = Self::new();
         for handler in BUILTIN_HANDLERS {
@@ -125,16 +124,6 @@ impl EnvPackRegistry {
             });
         }
         Ok(handler)
-    }
-
-    /// Whether a handler is registered for this descriptor's path.
-    pub fn is_registered(&self, kind: &PackDescriptor) -> bool {
-        self.handlers.contains_key(kind.path())
-    }
-
-    /// Registered descriptor paths, sorted.
-    pub fn descriptor_paths(&self) -> impl Iterator<Item = &str> {
-        self.handlers.keys().map(String::as_str)
     }
 
     /// Number of registered handlers.
@@ -248,14 +237,5 @@ mod tests {
         let registry = EnvPackRegistry::new();
         assert!(registry.is_empty());
         assert_eq!(registry.len(), 0);
-    }
-
-    #[test]
-    fn descriptor_paths_are_sorted() {
-        let registry = EnvPackRegistry::with_builtins();
-        let paths: Vec<&str> = registry.descriptor_paths().collect();
-        let mut sorted = paths.clone();
-        sorted.sort_unstable();
-        assert_eq!(paths, sorted);
     }
 }

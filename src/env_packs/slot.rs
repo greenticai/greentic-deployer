@@ -1,11 +1,11 @@
 //! Env-pack handler abstraction (`A9`).
 //!
 //! An [`EnvPackHandler`] is the native counterpart of a [`PackDescriptor`] bound
-//! to a [`CapabilitySlot`]: it declares which slot it serves and carries the
-//! metadata callers need to describe the binding. Phase A handlers are
-//! **metadata-only** — the slot-specific behavior (deploy, read a secret, emit a
-//! span) lands in Phase D. The trait is the seam Phase D plug-ins implement when
-//! they register through [`EnvPackRegistry::register`](super::registry::EnvPackRegistry::register).
+//! to a [`CapabilitySlot`]: it declares which slot and which descriptor versions
+//! it serves. Phase A handlers are **metadata-only** — the slot-specific
+//! behavior (deploy, read a secret, emit a span) lands in Phase D. The trait is
+//! the seam Phase D plug-ins implement when they register through
+//! [`EnvPackRegistry::register`](super::registry::EnvPackRegistry::register).
 //!
 //! The built-in set ([`BUILTIN_HANDLERS`]) covers the five default `local`
 //! bindings. The registry locates a handler by its version-independent
@@ -16,7 +16,6 @@
 
 use greentic_deploy_spec::CapabilitySlot;
 use semver::VersionReq;
-use serde::{Deserialize, Serialize};
 
 /// Native handler bound to one [`CapabilitySlot`].
 ///
@@ -30,12 +29,6 @@ pub trait EnvPackHandler: std::fmt::Debug + Send + Sync {
     /// This is the registry key — `kind@<semver>` resolves on the path alone.
     fn descriptor_path(&self) -> &str;
 
-    /// Human-friendly handler name for CLI/telemetry output.
-    fn label(&self) -> &str;
-
-    /// One-line description of what this handler provides.
-    fn summary(&self) -> &str;
-
     /// Descriptor versions this native handler implements.
     ///
     /// A binding's `kind@<semver>` is rejected when its version does not match
@@ -44,29 +37,6 @@ pub trait EnvPackHandler: std::fmt::Debug + Send + Sync {
     /// [`VersionReq`] (not a string) makes an unparseable requirement
     /// unrepresentable.
     fn supported_versions(&self) -> VersionReq;
-
-    /// Serializable snapshot of this handler's identity.
-    fn describe(&self) -> HandlerInfo {
-        HandlerInfo {
-            slot: self.slot(),
-            descriptor_path: self.descriptor_path().to_string(),
-            label: self.label().to_string(),
-            summary: self.summary().to_string(),
-            supported_versions: self.supported_versions().to_string(),
-            builtin: true,
-        }
-    }
-}
-
-/// Serializable handler metadata, surfaced in CLI envelopes and `doctor` reports.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HandlerInfo {
-    pub slot: CapabilitySlot,
-    pub descriptor_path: String,
-    pub label: String,
-    pub summary: String,
-    pub supported_versions: String,
-    pub builtin: bool,
 }
 
 /// A built-in, metadata-only handler. One value per default `local` binding.
@@ -74,10 +44,8 @@ pub struct HandlerInfo {
 pub struct BuiltinHandler {
     slot: CapabilitySlot,
     descriptor_path: &'static str,
-    label: &'static str,
-    summary: &'static str,
-    /// `VersionReq` source string; parsed in [`EnvPackHandler::supported_versions`].
-    /// Validity is guarded by a unit test, so the parse is infallible here.
+    /// Validity is guarded by a unit test, so the parse in `supported_versions`
+    /// is infallible.
     version_req: &'static str,
 }
 
@@ -87,12 +55,6 @@ impl EnvPackHandler for BuiltinHandler {
     }
     fn descriptor_path(&self) -> &str {
         self.descriptor_path
-    }
-    fn label(&self) -> &str {
-        self.label
-    }
-    fn summary(&self) -> &str {
-        self.summary
     }
     fn supported_versions(&self) -> VersionReq {
         self.version_req
@@ -110,36 +72,26 @@ pub const BUILTIN_HANDLERS: &[BuiltinHandler] = &[
     BuiltinHandler {
         slot: CapabilitySlot::Deployer,
         descriptor_path: "greentic.deployer.local-process",
-        label: "Local process deployer",
-        summary: "Runs bundles as local child processes under ~/.greentic.",
         version_req: "^0.1.0",
     },
     BuiltinHandler {
         slot: CapabilitySlot::Secrets,
         descriptor_path: "greentic.secrets.dev-store",
-        label: "Dev-store secrets backend",
-        summary: "File-backed developer secret store for the local environment.",
         version_req: "^0.1.0",
     },
     BuiltinHandler {
         slot: CapabilitySlot::Telemetry,
         descriptor_path: "greentic.telemetry.stdout",
-        label: "Stdout telemetry exporter",
-        summary: "Writes spans and metrics to stdout for local inspection.",
         version_req: "^0.1.0",
     },
     BuiltinHandler {
         slot: CapabilitySlot::Sessions,
         descriptor_path: "greentic.sessions.in-memory",
-        label: "In-memory session store",
-        summary: "Process-local session storage; cleared on restart.",
         version_req: "^0.1.0",
     },
     BuiltinHandler {
         slot: CapabilitySlot::State,
         descriptor_path: "greentic.state.in-memory",
-        label: "In-memory state store",
-        summary: "Process-local working-memory store; cleared on restart.",
         version_req: "^0.1.0",
     },
 ];
@@ -174,15 +126,6 @@ mod tests {
         let defaults_refs: Vec<(CapabilitySlot, &str)> =
             defaults.iter().map(|(s, p)| (*s, p.as_str())).collect();
         assert_eq!(handlers, defaults_refs);
-    }
-
-    #[test]
-    fn describe_reports_builtin_identity() {
-        let info = BUILTIN_HANDLERS[0].describe();
-        assert_eq!(info.slot, CapabilitySlot::Deployer);
-        assert_eq!(info.descriptor_path, "greentic.deployer.local-process");
-        assert_eq!(info.supported_versions, "^0.1.0");
-        assert!(info.builtin);
     }
 
     #[test]

@@ -60,7 +60,7 @@ pub use deployment::{
     ApplyExecutionOutcome, DestroyExecutionOutcome, ExecutionOutcome, ExecutionOutcomePayload,
     StatusExecutionOutcome,
 };
-pub use env_packs::{EnvPackHandler, EnvPackRegistry, HandlerInfo, RegistryError};
+pub use env_packs::{EnvPackHandler, EnvPackRegistry, RegistryError};
 pub use error::DeployerError;
 pub use extension::{
     BuiltinBackendDescriptor, BuiltinBackendExecutionKind, BuiltinBackendHandlerId,

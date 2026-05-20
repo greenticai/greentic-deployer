@@ -274,7 +274,11 @@ pub fn doctor(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpO
                 "requested": requested,
                 "supported": supported,
             })),
-            Err(crate::env_packs::RegistryError::DuplicateRegistration(_)) => {}
+            // `resolve_for_slot` only produces the three variants above;
+            // `DuplicateRegistration` comes solely from `register`.
+            Err(err @ crate::env_packs::RegistryError::DuplicateRegistration(_)) => {
+                unreachable!("resolve_for_slot never returns {err:?}")
+            }
         }
     }
     Ok(OpOutcome::new(

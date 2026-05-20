@@ -10,4 +10,4 @@ pub mod registry;
 pub mod slot;
 
 pub use registry::{EnvPackRegistry, RegistryError};
-pub use slot::{BUILTIN_HANDLERS, BuiltinHandler, EnvPackHandler, HandlerInfo};
+pub use slot::{BUILTIN_HANDLERS, BuiltinHandler, EnvPackHandler};
