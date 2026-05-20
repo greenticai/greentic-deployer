@@ -38,6 +38,7 @@ pub mod spec;
 pub mod surface;
 pub mod telemetry;
 pub mod terraform;
+pub mod tool_check;
 
 pub use adapter::{AdapterFamily, MultiTargetKind, UnifiedTargetSelection};
 pub use admin_access::{
@@ -122,3 +123,4 @@ pub use spec::{
     ServiceManager, ServiceSpec, StorageSpec,
 };
 pub use terraform::TerraformRequest;
+pub use tool_check::{ToolCheck, ToolCheckOutcome};

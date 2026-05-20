@@ -17,6 +17,8 @@
 use greentic_deploy_spec::CapabilitySlot;
 use semver::VersionReq;
 
+use crate::tool_check::ToolCheck;
+
 /// Native handler bound to one [`CapabilitySlot`].
 ///
 /// Object-safe so the registry can hold `Box<dyn EnvPackHandler>` and Phase D
@@ -37,6 +39,19 @@ pub trait EnvPackHandler: std::fmt::Debug + Send + Sync {
     /// [`VersionReq`] (not a string) makes an unparseable requirement
     /// unrepresentable.
     fn supported_versions(&self) -> VersionReq;
+
+    /// Preflight checks the handler needs to pass before it can do real work
+    /// (`C3`). Returns the list of [`ToolCheck`] results — handlers compose
+    /// the primitives + named-tool catalog in [`crate::tool_check`].
+    ///
+    /// The default returns an empty vec, which is the honest answer for
+    /// in-process Phase A built-ins (`local-process`, `dev-store`, `stdout`,
+    /// `in-memory`): they need no external tools. Phase D handlers (K8s,
+    /// cloud) override this to compose the named-tool checks they shell out
+    /// to.
+    fn preflight(&self) -> Vec<ToolCheck> {
+        Vec::new()
+    }
 }
 
 /// A built-in, metadata-only handler. One value per default `local` binding.
