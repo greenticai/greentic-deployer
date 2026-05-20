@@ -9,69 +9,25 @@
 //! The append uses a per-file `fs4` flock on the audit file itself (not the
 //! env's `.lock` sentinel), so emit can happen INSIDE a `transact` closure
 //! without deadlocking on the env flock.
+//!
+//! The serializable audit shapes ([`AuditEvent`] et al.) are owned by
+//! `greentic-deploy-spec` (the A8 remote-store contract reuses them) and
+//! re-exported here; this module keeps the local FS writer and authz gate.
 
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 
-use chrono::{DateTime, Utc};
 use fs4::fs_std::FileExt;
-use greentic_deploy_spec::EnvId;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use greentic_deploy_spec::{EnvId, SchemaVersion};
 use thiserror::Error;
 
 use super::file_lock::LockError;
 use super::store::{LocalFsStore, StoreError};
 
-pub const AUDIT_EVENT_SCHEMA_V1: &str = "greentic.audit.event.v1";
+pub use greentic_deploy_spec::{Actor, AuditDecision, AuditEvent, AuditResult, POLICY_LOCAL_ONLY};
 
-/// Phase A authorization policy identifier.
-pub const POLICY_LOCAL_ONLY: &str = "local-only";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuditEvent {
-    pub schema: String,
-    pub event_id: String,
-    pub ts: DateTime<Utc>,
-    pub actor: Actor,
-    pub env_id: String,
-    pub noun: String,
-    pub verb: String,
-    pub target: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_generation: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub new_generation: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub idempotency_key: Option<String>,
-    pub authorization: AuditDecision,
-    pub result: AuditResult,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Actor {
-    pub kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub uid: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "decision", rename_all = "kebab-case")]
-pub enum AuditDecision {
-    Allow { policy: String, reason: String },
-    Deny { policy: String, reason: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "kebab-case")]
-pub enum AuditResult {
-    Ok,
-    Error { kind: String, message: String },
-    NotYetImplemented { detail: String },
-}
+pub const AUDIT_EVENT_SCHEMA_V1: &str = SchemaVersion::AUDIT_EVENT_V1;
 
 #[derive(Debug, Error)]
 pub enum AuditError {
@@ -190,11 +146,12 @@ impl AuditLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use tempfile::tempdir;
 
     fn make_event(env_id: &str, verb: &str) -> AuditEvent {
         AuditEvent {
-            schema: AUDIT_EVENT_SCHEMA_V1.to_string(),
+            schema: AUDIT_EVENT_SCHEMA_V1.into(),
             event_id: ulid::Ulid::new().to_string(),
             ts: Utc::now(),
             actor: Actor {

@@ -1724,11 +1724,13 @@ dependencies = [
  "chrono",
  "greentic-config-types",
  "greentic-types 1.1.0-dev.25540461571",
+ "hex",
  "schemars 0.8.22",
  "semver",
  "serde",
  "serde_json",
  "serde_yaml_gtc",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "ulid",
 ]
