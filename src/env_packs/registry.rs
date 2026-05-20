@@ -1,16 +1,19 @@
 //! Env-pack registry (`A9`).
 //!
 //! [`EnvPackRegistry`] maps a [`PackDescriptor`] to its native
-//! [`EnvPackHandler`]. Lookup keys on the descriptor's version-independent
-//! [`path`](PackDescriptor::path), so `greentic.secrets.dev-store@0.1.0` and
-//! `@0.2.0` resolve to the same handler — pack revisions don't fork the
-//! binding. [`with_builtins`](EnvPackRegistry::with_builtins) registers the
-//! five default `local` handlers; [`register`](EnvPackRegistry::register) is
-//! the Phase D plug-in hook.
+//! [`EnvPackHandler`]. Lookup locates the handler by the descriptor's
+//! version-independent [`path`](PackDescriptor::path), then validates the
+//! requested `@<semver>` against the handler's
+//! [`supported_versions`](EnvPackHandler::supported_versions): a version the
+//! native handler does not implement is rejected with
+//! [`RegistryError::VersionUnsupported`] rather than silently certified.
+//! [`with_builtins`](EnvPackRegistry::with_builtins) registers the five default
+//! `local` handlers; [`register`](EnvPackRegistry::register) is the Phase D
+//! plug-in hook.
 //!
 //! Phase A handlers are metadata-only (see [`slot`](super::slot)); resolution
 //! itself is real and is what `op env doctor` uses to flag bindings whose
-//! `kind` no native handler backs.
+//! `kind` no native handler backs, or whose pinned version no handler supports.
 
 use std::collections::BTreeMap;
 
@@ -29,6 +32,14 @@ pub enum RegistryError {
         kind: String,
         expected: CapabilitySlot,
         actual: CapabilitySlot,
+    },
+    #[error(
+        "env-pack `{kind}` pins version `{requested}` but the native handler implements `{supported}`"
+    )]
+    VersionUnsupported {
+        kind: String,
+        requested: String,
+        supported: String,
     },
     #[error("an env-pack handler is already registered for path `{0}`")]
     DuplicateRegistration(String),
@@ -72,12 +83,27 @@ impl EnvPackRegistry {
         Ok(())
     }
 
-    /// Resolve a descriptor to its handler, keying on the version-independent path.
+    /// Resolve a descriptor to its handler.
+    ///
+    /// Locates the handler by the version-independent path, then rejects a
+    /// pinned version the handler does not implement
+    /// ([`RegistryError::VersionUnsupported`]) so version skew can't pass as
+    /// healthy.
     pub fn resolve(&self, kind: &PackDescriptor) -> Result<&dyn EnvPackHandler, RegistryError> {
-        self.handlers
+        let handler = self
+            .handlers
             .get(kind.path())
             .map(|h| h.as_ref())
-            .ok_or_else(|| RegistryError::Unknown(kind.as_str().to_string()))
+            .ok_or_else(|| RegistryError::Unknown(kind.as_str().to_string()))?;
+        let req = handler.supported_versions();
+        if !req.matches(&kind.version().0) {
+            return Err(RegistryError::VersionUnsupported {
+                kind: kind.as_str().to_string(),
+                requested: kind.version().to_string(),
+                supported: req.to_string(),
+            });
+        }
+        Ok(handler)
     }
 
     /// Resolve a descriptor and assert its handler serves `expected`.
@@ -146,13 +172,31 @@ mod tests {
     }
 
     #[test]
-    fn resolve_ignores_version() {
+    fn resolve_accepts_compatible_version() {
         let registry = EnvPackRegistry::with_builtins();
-        // A different semver of a built-in still resolves on the path.
+        // A patch within the supported `^0.1.0` line resolves.
         let handler = registry
-            .resolve(&descriptor("greentic.secrets.dev-store@9.9.9"))
+            .resolve(&descriptor("greentic.secrets.dev-store@0.1.7"))
             .unwrap();
         assert_eq!(handler.slot(), CapabilitySlot::Secrets);
+    }
+
+    #[test]
+    fn resolve_rejects_unsupported_version() {
+        let registry = EnvPackRegistry::with_builtins();
+        // The path is known, but the built-in implements only `^0.1.0`; a
+        // future major must not pass as healthy.
+        let err = registry
+            .resolve(&descriptor("greentic.secrets.dev-store@9.9.9"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RegistryError::VersionUnsupported {
+                requested,
+                supported,
+                ..
+            } if requested == "9.9.9" && supported == "^0.1.0"
+        ));
     }
 
     #[test]
