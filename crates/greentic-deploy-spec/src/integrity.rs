@@ -11,8 +11,6 @@
 //! ordering) so the digest is identical whether or not the `preserve_order`
 //! feature is unified into the build.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -72,16 +70,16 @@ pub fn canonical_json<T: Serialize>(value: &T) -> Result<String, IntegrityError>
 fn canonicalize(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
-            // Insert in sorted order so the resulting Map emits sorted keys
-            // regardless of whether serde_json's `preserve_order` is active.
-            let sorted: serde_json::Map<String, Value> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), v))
-                .collect::<BTreeMap<_, _>>()
-                .into_iter()
-                .map(|(k, v)| (k, canonicalize(v)))
-                .collect();
-            Value::Object(sorted)
+            // Emit keys in sorted order regardless of whether serde_json's
+            // `preserve_order` is active in the build.
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by_key(|(k, _)| *k);
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k.clone(), canonicalize(v)))
+                    .collect(),
+            )
         }
         Value::Array(items) => Value::Array(items.iter().map(canonicalize).collect()),
         other => other.clone(),

@@ -9,6 +9,10 @@
 //! The append uses a per-file `fs4` flock on the audit file itself (not the
 //! env's `.lock` sentinel), so emit can happen INSIDE a `transact` closure
 //! without deadlocking on the env flock.
+//!
+//! The serializable audit shapes ([`AuditEvent`] et al.) are owned by
+//! `greentic-deploy-spec` (the A8 remote-store contract reuses them) and
+//! re-exported here; this module keeps the local FS writer and authz gate.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -21,9 +25,6 @@ use thiserror::Error;
 use super::file_lock::LockError;
 use super::store::{LocalFsStore, StoreError};
 
-// The audit-event wire shapes are owned by `greentic-deploy-spec` (the A8
-// remote-store contract reuses them); this module keeps the local FS append
-// writer and the local authorization gate.
 pub use greentic_deploy_spec::{Actor, AuditDecision, AuditEvent, AuditResult, POLICY_LOCAL_ONLY};
 
 pub const AUDIT_EVENT_SCHEMA_V1: &str = SchemaVersion::AUDIT_EVENT_V1;
@@ -150,7 +151,7 @@ mod tests {
 
     fn make_event(env_id: &str, verb: &str) -> AuditEvent {
         AuditEvent {
-            schema: AUDIT_EVENT_SCHEMA_V1.to_string(),
+            schema: AUDIT_EVENT_SCHEMA_V1.into(),
             event_id: ulid::Ulid::new().to_string(),
             ts: Utc::now(),
             actor: Actor {

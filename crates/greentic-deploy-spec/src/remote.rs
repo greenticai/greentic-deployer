@@ -23,6 +23,7 @@ use thiserror::Error;
 use crate::EnvId;
 use crate::audit::{Actor, AuditDecision, AuditEvent};
 use crate::integrity::{IntegrityError, StateIntegrity};
+use crate::version::SchemaVersion;
 
 /// Strong entity-tag for a persisted resource. The validator is the resource's
 /// SHA-256 content hash (same digest as [`StateIntegrity`]), so a stale writer
@@ -251,7 +252,7 @@ pub struct MutationResponse {
 /// Metadata describing one stored backup of an environment's state (#5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupManifest {
-    pub schema: String,
+    pub schema: SchemaVersion,
     pub backup_id: String,
     pub env_id: EnvId,
     pub created_at: DateTime<Utc>,
@@ -283,12 +284,20 @@ impl RestoreRequest {
     }
 }
 
-/// Outcome of a completed restore (#5).
+/// Outcome of a completed restore (#5). The strong ETag is derived from
+/// `integrity` (it is the same digest), so it is exposed as [`RestoreOutcome::etag`]
+/// rather than stored as a second, divergeable field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreOutcome {
     pub restored_generation: u64,
-    pub etag: StateEtag,
     pub integrity: StateIntegrity,
+}
+
+impl RestoreOutcome {
+    /// The strong ETag of the restored state (the integrity digest).
+    pub fn etag(&self) -> StateEtag {
+        StateEtag::from_integrity(&self.integrity)
+    }
 }
 
 /// Errors a remote store can return, each mapped to its HTTP status so the
@@ -342,8 +351,7 @@ impl From<PreconditionError> for RemoteStoreError {
     fn from(err: PreconditionError) -> Self {
         match err {
             PreconditionError::Required => RemoteStoreError::PreconditionRequired {
-                detail: "a conditional write must pin If-Match and/or expected generation"
-                    .to_string(),
+                detail: PreconditionError::Required.to_string(),
             },
             PreconditionError::Conflict(conflict) => RemoteStoreError::PreconditionFailed(conflict),
         }
@@ -385,7 +393,7 @@ mod tests {
             generation,
             idempotency: IdempotencyOutcome::Applied,
             audit: AuditEvent {
-                schema: crate::version::SchemaVersion::AUDIT_EVENT_V1.to_string(),
+                schema: SchemaVersion::AUDIT_EVENT_V1.into(),
                 event_id: "01JTKW5B4W4Q5Y1CQW93F7S5VH".to_string(),
                 ts: "2026-05-20T00:00:00Z".parse().unwrap(),
                 actor: Actor {
@@ -419,8 +427,6 @@ mod tests {
 
     #[test]
     fn precondition_empty_is_rejected_not_blindly_passed() {
-        // Finding #1: an empty precondition must NOT silently pass a guarded
-        // write — it maps to 428 Precondition Required, not a blind write.
         assert!(!Precondition::default().is_conditional());
         let err = Precondition::default().check(&etag("abc"), 7).unwrap_err();
         assert_eq!(err, PreconditionError::Required);
@@ -467,8 +473,6 @@ mod tests {
 
     #[test]
     fn restore_request_requires_conditional_precondition() {
-        // Finding #1: restore is never a create, so a missing/empty precondition
-        // must be rejected rather than blindly clobbering a newer generation.
         let blind = RestoreRequest {
             backup_id: "b1".to_string(),
             precondition: Precondition::default(),
@@ -535,8 +539,6 @@ mod tests {
 
     #[test]
     fn idempotency_replay_returns_original_response_and_audit_verbatim() {
-        // Finding #2: a replay must return the original response body — ETag,
-        // generation, and the original audit event — without re-applying state.
         let body = serde_json::json!({"split": [{"rev": "a", "bps": 10000}]});
         let original = sample_response("abc", 3);
         let record = IdempotencyRecord {

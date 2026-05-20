@@ -256,7 +256,7 @@ where
     };
 
     let event = AuditEvent {
-        schema: crate::environment::AUDIT_EVENT_SCHEMA_V1.to_string(),
+        schema: crate::environment::AUDIT_EVENT_SCHEMA_V1.into(),
         event_id: ulid::Ulid::new().to_string(),
         ts: chrono::Utc::now(),
         actor: current_local_actor(),

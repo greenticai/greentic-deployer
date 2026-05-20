@@ -130,7 +130,7 @@ fn non_local_env_create_denies_and_audits() {
 
     // The schema field round-trips.
     assert_eq!(
-        events[0].schema,
+        events[0].schema.as_str(),
         greentic_deployer::environment::AUDIT_EVENT_SCHEMA_V1
     );
 

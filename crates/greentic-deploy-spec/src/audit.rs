@@ -11,13 +11,15 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::version::SchemaVersion;
+
 /// Phase A authorization policy identifier (`AuditDecision.policy`).
 pub const POLICY_LOCAL_ONLY: &str = "local-only";
 
 /// One append-only audit record. Covers every field plan §389 requires.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
-    pub schema: String,
+    pub schema: SchemaVersion,
     pub event_id: String,
     pub ts: DateTime<Utc>,
     pub actor: Actor,
@@ -70,7 +72,7 @@ mod tests {
 
     fn sample() -> AuditEvent {
         AuditEvent {
-            schema: crate::version::SchemaVersion::AUDIT_EVENT_V1.to_string(),
+            schema: SchemaVersion::AUDIT_EVENT_V1.into(),
             event_id: "01JTKW5B4W4Q5Y1CQW93F7S5VH".to_string(),
             ts: "2026-05-20T00:00:00Z".parse().unwrap(),
             actor: Actor {
