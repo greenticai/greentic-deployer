@@ -20,6 +20,7 @@ module "operator_aws" {
   admin_allowed_clients = var.admin_allowed_clients
   public_base_url     = var.public_base_url
   use_default_vpc     = var.aws_use_default_vpc
+  secrets_map         = var.secrets_map
 }
 
 module "operator_azure" {
@@ -40,6 +41,7 @@ module "operator_azure" {
   azure_key_vault_uri = var.azure_key_vault_uri
   azure_key_vault_id  = var.azure_key_vault_id
   azure_location      = var.azure_location
+  secrets_map         = var.secrets_map
 }
 
 module "operator_gcp" {
@@ -59,6 +61,7 @@ module "operator_gcp" {
   public_base_url     = var.public_base_url
   gcp_project_id      = var.gcp_project_id
   gcp_region          = var.gcp_region
+  secrets_map         = var.secrets_map
 }
 
 module "dns" {

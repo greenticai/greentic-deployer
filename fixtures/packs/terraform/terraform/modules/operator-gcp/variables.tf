@@ -55,3 +55,13 @@ variable "admin_access_mode" {
   type    = string
   default = "http-bearer-relay"
 }
+
+# PR-08: accepted for parity with the AWS operator module so the top-level
+# module call's pass-through compiles. Full Secret Manager + Cloud Run
+# env-from-secret wiring lands in a follow-up; until then the value is
+# unused on GCP and operator secrets do not reach the deployed runtime there.
+variable "secrets_map" {
+  type      = map(string)
+  default   = {}
+  sensitive = true
+}

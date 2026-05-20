@@ -362,6 +362,35 @@ resource "aws_secretsmanager_secret_version" "admin_client_key" {
   secret_string = tls_private_key.admin_client.private_key_pem
 }
 
+# PR-08: one Secrets Manager entry per operator-provided secret keyed by the
+# canonical `secrets://...` URI. AWS SM names cannot contain `:` or `/`, so
+# the URI is normalised (`:` -> empty, `/` -> `_`) and placed under the
+# deployment's `${admin_secret_prefix}/operator/` namespace. The original URI
+# is preserved as a tag for round-trip lookup. Empty `secrets_map` (the
+# default) creates no resources and leaves task-definition behaviour
+# identical to before this PR.
+locals {
+  operator_secret_name_prefix = "${local.admin_secret_prefix}/operator"
+}
+
+resource "aws_secretsmanager_secret" "operator" {
+  for_each = var.secrets_map
+
+  name_prefix             = "${local.operator_secret_name_prefix}/${replace(replace(each.key, ":", ""), "/", "_")}-"
+  recovery_window_in_days = 0
+
+  tags = merge(local.common_tags, {
+    GreenticSecretUri = each.key
+  })
+}
+
+resource "aws_secretsmanager_secret_version" "operator" {
+  for_each = var.secrets_map
+
+  secret_id     = aws_secretsmanager_secret.operator[each.key].id
+  secret_string = each.value
+}
+
 resource "aws_iam_role_policy" "task_execution_admin_secrets" {
   name = "${local.name_prefix}-task-exec-admin-secrets"
   role = aws_iam_role.task_execution.id
@@ -374,11 +403,14 @@ resource "aws_iam_role_policy" "task_execution_admin_secrets" {
         Action = [
           "secretsmanager:GetSecretValue"
         ]
-        Resource = [
-          aws_secretsmanager_secret.admin_ca.arn,
-          aws_secretsmanager_secret.admin_server_cert.arn,
-          aws_secretsmanager_secret.admin_server_key.arn
-        ]
+        Resource = concat(
+          [
+            aws_secretsmanager_secret.admin_ca.arn,
+            aws_secretsmanager_secret.admin_server_cert.arn,
+            aws_secretsmanager_secret.admin_server_key.arn,
+          ],
+          [for s in aws_secretsmanager_secret.operator : s.arn],
+        )
       }
     ]
   })
@@ -530,20 +562,33 @@ resource "aws_ecs_task_definition" "this" {
           }
         ] : []
       )
-      secrets = [
-        {
-          name      = "GREENTIC_ADMIN_CA_PEM"
-          valueFrom = aws_secretsmanager_secret.admin_ca.arn
-        },
-        {
-          name      = "GREENTIC_ADMIN_SERVER_CERT_PEM"
-          valueFrom = aws_secretsmanager_secret.admin_server_cert.arn
-        },
-        {
-          name      = "GREENTIC_ADMIN_SERVER_KEY_PEM"
-          valueFrom = aws_secretsmanager_secret.admin_server_key.arn
-        }
-      ]
+      secrets = concat(
+        [
+          {
+            name      = "GREENTIC_ADMIN_CA_PEM"
+            valueFrom = aws_secretsmanager_secret.admin_ca.arn
+          },
+          {
+            name      = "GREENTIC_ADMIN_SERVER_CERT_PEM"
+            valueFrom = aws_secretsmanager_secret.admin_server_cert.arn
+          },
+          {
+            name      = "GREENTIC_ADMIN_SERVER_KEY_PEM"
+            valueFrom = aws_secretsmanager_secret.admin_server_key.arn
+          }
+        ],
+        # PR-08: operator-provided secrets, one task `secrets` entry per
+        # canonical `secrets://...` URI. ECS injects the resolved value
+        # into the container env under that URI as the name, so the runtime
+        # `EnvSecretsManager::read(uri)` -> `std::env::var(uri)` returns it.
+        [
+          for k, s in aws_secretsmanager_secret.operator :
+          {
+            name      = k
+            valueFrom = s.arn
+          }
+        ]
+      )
       logConfiguration = {
         logDriver = "awslogs"
         options = {
