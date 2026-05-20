@@ -301,6 +301,76 @@ pub fn doctor(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpO
     ))
 }
 
+/// `op env init`. Idempotent bootstrap of the `local` env with its five
+/// default env-pack bindings. Wraps the A4 helper
+/// [`super::bootstrap::ensure_local_environment`] so first-run installs can
+/// create the env without going through `gtc setup` (which requires a bundle
+/// to validate) or `gtc start` (which requires a bundle to start).
+///
+/// Outcome JSON discriminator:
+/// - `"created"` — env did not exist; all 5 default bindings written.
+/// - `"healed"` — env existed but was missing one or more default bindings;
+///   the missing slots were filled. User-bound non-default descriptors on
+///   already-present slots are NEVER overwritten.
+/// - `"untouched"` — env already satisfied the A4 invariant.
+pub fn init(store: &LocalFsStore, flags: &OpFlags) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(
+            NOUN,
+            "init",
+            json!({ "input_schema": "no input" }),
+        ));
+    }
+    let env_id = EnvId::try_from(crate::defaults::LOCAL_ENV_ID).map_err(|e| {
+        OpError::InvalidArgument(format!(
+            "default env id `{}`: {}",
+            crate::defaults::LOCAL_ENV_ID,
+            e
+        ))
+    })?;
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "init",
+        target: json!({"environment_id": env_id.as_str()}),
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || {
+        let (env, outcome) = super::bootstrap::ensure_local_environment(store)?;
+        let bound_slots: Vec<String> = env.packs.iter().map(|b| b.slot.to_string()).collect();
+        let mut payload = json!({
+            "environment_id": env.environment_id.as_str(),
+            "bound_slots": bound_slots,
+            "pack_count": env.packs.len(),
+        });
+        let payload_obj = payload
+            .as_object_mut()
+            .expect("payload constructed as object");
+        match outcome {
+            super::bootstrap::LocalEnvOutcome::Created => {
+                payload_obj.insert("outcome".into(), json!("created"));
+            }
+            super::bootstrap::LocalEnvOutcome::AlreadyExists => {
+                payload_obj.insert("outcome".into(), json!("untouched"));
+            }
+            super::bootstrap::LocalEnvOutcome::Healed { added_slots } => {
+                payload_obj.insert("outcome".into(), json!("healed"));
+                payload_obj.insert(
+                    "added_slots".into(),
+                    json!(
+                        added_slots
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                    ),
+                );
+            }
+        }
+        let outcome = OpOutcome::new(NOUN, "init", payload);
+        Ok((outcome, super::AuditGens::NONE))
+    })
+}
+
 /// `op env destroy <env_id> --confirm`. Removes the env's on-disk state.
 ///
 /// Force-free safety net: the caller must pass `confirm = true`. The
@@ -502,6 +572,82 @@ mod tests {
             .filter_map(|e| e.get("environment_id").and_then(|v| v.as_str()))
             .collect();
         assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn init_creates_local_env_when_missing() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let outcome = init(&store, &OpFlags::default()).unwrap();
+        assert_eq!(outcome.op, "init");
+        assert_eq!(outcome.noun, "env");
+        assert_eq!(
+            outcome.result.get("outcome").and_then(|v| v.as_str()),
+            Some("created")
+        );
+        assert_eq!(
+            outcome.result.get("pack_count").and_then(|v| v.as_u64()),
+            Some(5)
+        );
+        // No `added_slots` key on "created" — that's a "healed" thing.
+        assert!(outcome.result.get("added_slots").is_none());
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert_eq!(env.packs.len(), 5);
+    }
+
+    #[test]
+    fn init_heals_partially_bound_env() {
+        use crate::defaults::LOCAL_DEPLOYER_PACK;
+        use greentic_deploy_spec::{CapabilitySlot, EnvPackBinding, PackDescriptor, PackId};
+
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        // Seed an env with only the deployer slot bound — mimics the
+        // `op env create local` → empty-packs → user adds one binding flow.
+        let mut env = make_env("local");
+        env.packs = vec![EnvPackBinding {
+            slot: CapabilitySlot::Deployer,
+            kind: PackDescriptor::try_new(LOCAL_DEPLOYER_PACK).unwrap(),
+            pack_ref: PackId::new(LOCAL_DEPLOYER_PACK),
+            answers_ref: None,
+            generation: 0,
+            previous_binding_ref: None,
+        }];
+        store.save(&env).unwrap();
+
+        let outcome = init(&store, &OpFlags::default()).unwrap();
+        assert_eq!(
+            outcome.result.get("outcome").and_then(|v| v.as_str()),
+            Some("healed")
+        );
+        let added: Vec<String> = outcome
+            .result
+            .get("added_slots")
+            .and_then(|v| v.as_array())
+            .expect("added_slots present on healed")
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert_eq!(
+            added,
+            vec!["secrets", "telemetry", "sessions", "state"],
+            "only the 4 missing slots are reported as added"
+        );
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert_eq!(env.packs.len(), 5);
+    }
+
+    #[test]
+    fn init_is_idempotent_and_reports_untouched_on_second_call() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        init(&store, &OpFlags::default()).unwrap();
+        let outcome = init(&store, &OpFlags::default()).unwrap();
+        assert_eq!(
+            outcome.result.get("outcome").and_then(|v| v.as_str()),
+            Some("untouched")
+        );
+        assert!(outcome.result.get("added_slots").is_none());
     }
 
     #[test]

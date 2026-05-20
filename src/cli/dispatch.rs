@@ -99,6 +99,12 @@ pub enum OpNoun {
 
 #[derive(Subcommand, Debug)]
 pub enum EnvVerb {
+    /// Idempotent bootstrap of the `local` environment with the five default
+    /// env-pack bindings (A4 helper exposed as a CLI verb). Creates the env
+    /// if missing, fills in any missing default bindings on an existing env,
+    /// or reports `untouched` if the env is already complete. User-bound
+    /// non-default descriptors are NEVER overwritten.
+    Init,
     Create,
     Update,
     List,
@@ -271,6 +277,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
         OpNoun::Env { verb } => (
             "env",
             match verb {
+                EnvVerb::Init => "init",
                 EnvVerb::Create => "create",
                 EnvVerb::Update => "update",
                 EnvVerb::List => "list",
@@ -347,6 +354,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
 
 fn dispatch_env(store: &LocalFsStore, flags: &OpFlags, verb: EnvVerb) -> Result<(), OpError> {
     let outcome = match verb {
+        EnvVerb::Init => super::env::init(store, flags)?,
         EnvVerb::Create => super::env::create(store, flags, None)?,
         EnvVerb::Update => super::env::update(store, flags, None)?,
         EnvVerb::List => super::env::list(store, flags)?,
