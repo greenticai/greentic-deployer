@@ -68,13 +68,28 @@ impl Precondition {
         }
     }
 
-    /// Check the precondition against the server's current state. Returns the
-    /// [`ConcurrencyConflict`] a `412 Precondition Failed` carries when stale.
+    /// True if the precondition pins prior state (an `If-Match` and/or an
+    /// expected generation). An empty precondition pins nothing.
+    pub fn is_conditional(&self) -> bool {
+        self.if_match.is_some() || self.expected_generation.is_some()
+    }
+
+    /// Check the precondition against the server's current state for a guarded
+    /// (update/restore/delete) write.
+    ///
+    /// An **empty** precondition is rejected with [`PreconditionError::Required`]
+    /// rather than silently passing — a conditional write must pin prior state,
+    /// otherwise a stale or malformed client clobbers a newer generation. The
+    /// create-if-absent path does not call `check`; it is gated by an existence
+    /// check on the server (see the contract doc).
     pub fn check(
         &self,
         current_etag: &StateEtag,
         current_generation: u64,
-    ) -> Result<(), ConcurrencyConflict> {
+    ) -> Result<(), PreconditionError> {
+        if !self.is_conditional() {
+            return Err(PreconditionError::Required);
+        }
         let etag_ok = self.if_match.as_ref().is_none_or(|e| e == current_etag);
         let gen_ok = self
             .expected_generation
@@ -82,17 +97,29 @@ impl Precondition {
         if etag_ok && gen_ok {
             Ok(())
         } else {
-            Err(ConcurrencyConflict {
+            Err(PreconditionError::Conflict(ConcurrencyConflict {
                 expected_etag: self.if_match.as_ref().map(|e| e.0.clone()),
                 actual_etag: current_etag.0.clone(),
                 expected_generation: self.expected_generation,
                 actual_generation: current_generation,
-            })
+            }))
         }
     }
 }
 
-/// The mismatch a failed [`Precondition`] reports (the `412` response body).
+/// Why a guarded write's [`Precondition`] did not pass.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum PreconditionError {
+    /// The precondition pinned no prior state (empty `If-Match`/generation) on a
+    /// path where pinning is mandatory — `428 Precondition Required`.
+    #[error("a conditional write must pin If-Match and/or expected generation")]
+    Required,
+    /// The pinned state is stale — `412 Precondition Failed`.
+    #[error("precondition failed (stale generation/etag)")]
+    Conflict(ConcurrencyConflict),
+}
+
+/// The mismatch a stale [`Precondition`] reports (the `412` response body).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConcurrencyConflict {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,15 +164,21 @@ impl From<IdempotencyKey> for String {
 }
 
 /// Server-stored memo of a previously applied mutating request, keyed by its
-/// [`IdempotencyKey`]. Lets a retry be classified without re-applying (#2).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// [`IdempotencyKey`] (#2).
+///
+/// Stores the **full original [`MutationResponse`]** — not just its ETag and
+/// generation — so a retry whose original HTTP response was lost can be replied
+/// to verbatim, including the original [`AuditEvent`], without re-applying
+/// state. Persisting only the etag/generation would force a replay to re-run
+/// the mutation or fabricate a fresh audit event, breaking audit fidelity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdempotencyRecord {
     pub key: IdempotencyKey,
     /// SHA-256 over the canonical request body, so a same-key retry can be told
     /// apart from a same-key *different* request.
     pub request_fingerprint: String,
-    pub response_etag: StateEtag,
-    pub response_generation: u64,
+    /// The original response, returned verbatim on a matching replay.
+    pub response: MutationResponse,
     pub stored_at: DateTime<Utc>,
 }
 
@@ -155,31 +188,42 @@ impl IdempotencyRecord {
         Ok(StateIntegrity::sha256_of(request)?.digest)
     }
 
-    /// Classify an incoming request that reuses this record's key: a matching
-    /// fingerprint is a [`IdempotencyOutcome::Replayed`]; a different one is a
-    /// [`IdempotencyOutcome::Conflict`] (same key, different body — `409`).
-    pub fn classify(&self, incoming_fingerprint: &str) -> IdempotencyOutcome {
+    /// Match an incoming request that reuses this record's key. A matching
+    /// fingerprint yields the stored original response to return **verbatim,
+    /// without re-applying state**; a different fingerprint is a `409` conflict.
+    pub fn match_request(&self, incoming_fingerprint: &str) -> IdempotencyReplay<'_> {
         if self.request_fingerprint == incoming_fingerprint {
-            IdempotencyOutcome::Replayed
+            IdempotencyReplay::Replay(&self.response)
         } else {
-            IdempotencyOutcome::Conflict {
+            IdempotencyReplay::Conflict {
                 reason: "idempotency key reused with a different request body".to_string(),
             }
         }
     }
 }
 
+/// Result of matching a key-reusing request against a stored [`IdempotencyRecord`].
+#[derive(Debug)]
+pub enum IdempotencyReplay<'a> {
+    /// Same key + same request — return this stored response verbatim; no
+    /// state was re-applied.
+    Replay(&'a MutationResponse),
+    /// Same key + different request body — maps to
+    /// [`RemoteStoreError::IdempotencyConflict`] (`409`).
+    Conflict { reason: String },
+}
+
 /// How the server treated a mutating request with respect to its idempotency
-/// key (#2). Mirrors the local `traffic::set` replay semantics.
+/// key, recorded on the returned [`MutationResponse`] (#2). Conflicts are not a
+/// success outcome — they surface as [`RemoteStoreError::IdempotencyConflict`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "idempotency", rename_all = "kebab-case")]
 pub enum IdempotencyOutcome {
     /// New key — the mutation was applied.
     Applied,
-    /// Known key, same request — the stored response is returned, no re-apply.
+    /// Known key, same request — this response is a verbatim replay of the
+    /// original; the embedded audit event is the original event, unchanged.
     Replayed,
-    /// Known key, different request — rejected.
-    Conflict { reason: String },
 }
 
 /// An authorization (RBAC) decision request (#3). The decision returned is an
@@ -216,13 +260,27 @@ pub struct BackupManifest {
     pub size_bytes: u64,
 }
 
-/// Request to restore an environment from a named backup (#5). The precondition
-/// guards against clobbering a newer generation than the operator expects.
+/// Request to restore an environment from a named backup (#5).
+///
+/// `precondition` is mandatory and must pin prior state: a restore is never a
+/// create, so an empty (blind) precondition could clobber a newer generation.
+/// The field has no serde default — a request omitting it fails to deserialize
+/// — and [`RestoreRequest::validate`] additionally rejects a present-but-empty
+/// precondition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreRequest {
     pub backup_id: String,
-    #[serde(default)]
     pub precondition: Precondition,
+}
+
+impl RestoreRequest {
+    /// Reject a restore that pins no prior state (an empty precondition).
+    pub fn validate(&self) -> Result<(), RemoteContractError> {
+        if !self.precondition.is_conditional() {
+            return Err(RemoteContractError::UnconditionalRestore);
+        }
+        Ok(())
+    }
 }
 
 /// Outcome of a completed restore (#5).
@@ -241,6 +299,9 @@ pub enum RemoteStoreError {
     /// `If-Match`/generation precondition failed — `412`.
     #[error("precondition failed (stale generation/etag)")]
     PreconditionFailed(ConcurrencyConflict),
+    /// A guarded write pinned no prior state — `428`.
+    #[error("precondition required: {detail}")]
+    PreconditionRequired { detail: String },
     /// Idempotency key reused with a different request — `409`.
     #[error("idempotency conflict: {reason}")]
     IdempotencyConflict { reason: String },
@@ -266,12 +327,25 @@ impl RemoteStoreError {
     pub fn http_status(&self) -> u16 {
         match self {
             Self::PreconditionFailed(_) => 412,
+            Self::PreconditionRequired { .. } => 428,
             Self::IdempotencyConflict { .. } => 409,
             Self::Unauthorized { .. } => 403,
             Self::NotFound => 404,
             Self::IntegrityMismatch { .. } => 422,
             Self::NotYetImplemented { .. } => 501,
             Self::Internal { .. } => 500,
+        }
+    }
+}
+
+impl From<PreconditionError> for RemoteStoreError {
+    fn from(err: PreconditionError) -> Self {
+        match err {
+            PreconditionError::Required => RemoteStoreError::PreconditionRequired {
+                detail: "a conditional write must pin If-Match and/or expected generation"
+                    .to_string(),
+            },
+            PreconditionError::Conflict(conflict) => RemoteStoreError::PreconditionFailed(conflict),
         }
     }
 }
@@ -292,14 +366,47 @@ impl From<AuditDecision> for Result<(), RemoteStoreError> {
 pub enum RemoteContractError {
     #[error("idempotency key must not be empty")]
     EmptyIdempotencyKey,
+    #[error("restore requires a precondition that pins prior state")]
+    UnconditionalRestore,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::AuditResult;
 
     fn etag(s: &str) -> StateEtag {
         StateEtag(s.to_string())
+    }
+
+    fn sample_response(etag_value: &str, generation: u64) -> MutationResponse {
+        MutationResponse {
+            etag: etag(etag_value),
+            generation,
+            idempotency: IdempotencyOutcome::Applied,
+            audit: AuditEvent {
+                schema: crate::version::SchemaVersion::AUDIT_EVENT_V1.to_string(),
+                event_id: "01JTKW5B4W4Q5Y1CQW93F7S5VH".to_string(),
+                ts: "2026-05-20T00:00:00Z".parse().unwrap(),
+                actor: Actor {
+                    kind: "local-user".to_string(),
+                    user: Some("tester".to_string()),
+                    uid: Some(1000),
+                },
+                env_id: "local".to_string(),
+                noun: "traffic".to_string(),
+                verb: "set".to_string(),
+                target: serde_json::json!({"env": "local"}),
+                previous_generation: Some(generation.saturating_sub(1)),
+                new_generation: Some(generation),
+                idempotency_key: Some("k1".to_string()),
+                authorization: AuditDecision::Allow {
+                    policy: "local-only".to_string(),
+                    reason: "ok".to_string(),
+                },
+                result: AuditResult::Ok,
+            },
+        }
     }
 
     #[test]
@@ -311,20 +418,39 @@ mod tests {
     }
 
     #[test]
-    fn precondition_empty_always_matches() {
-        assert!(Precondition::default().check(&etag("abc"), 7).is_ok());
+    fn precondition_empty_is_rejected_not_blindly_passed() {
+        // Finding #1: an empty precondition must NOT silently pass a guarded
+        // write — it maps to 428 Precondition Required, not a blind write.
+        assert!(!Precondition::default().is_conditional());
+        let err = Precondition::default().check(&etag("abc"), 7).unwrap_err();
+        assert_eq!(err, PreconditionError::Required);
+        let mapped: RemoteStoreError = err.into();
+        assert_eq!(mapped.http_status(), 428);
     }
 
     #[test]
     fn precondition_matching_etag_and_generation_passes() {
         let pre = Precondition::matching(etag("abc"), 7);
+        assert!(pre.is_conditional());
         assert!(pre.check(&etag("abc"), 7).is_ok());
+    }
+
+    #[test]
+    fn precondition_generation_only_is_conditional() {
+        let pre = Precondition {
+            if_match: None,
+            expected_generation: Some(7),
+        };
+        assert!(pre.is_conditional());
+        assert!(pre.check(&etag("anything"), 7).is_ok());
     }
 
     #[test]
     fn precondition_stale_generation_conflicts() {
         let pre = Precondition::matching(etag("abc"), 6);
-        let conflict = pre.check(&etag("abc"), 7).unwrap_err();
+        let PreconditionError::Conflict(conflict) = pre.check(&etag("abc"), 7).unwrap_err() else {
+            panic!("expected a conflict");
+        };
         assert_eq!(conflict.expected_generation, Some(6));
         assert_eq!(conflict.actual_generation, 7);
     }
@@ -332,9 +458,42 @@ mod tests {
     #[test]
     fn precondition_stale_etag_conflicts() {
         let pre = Precondition::matching(etag("old"), 7);
-        let conflict = pre.check(&etag("new"), 7).unwrap_err();
+        let PreconditionError::Conflict(conflict) = pre.check(&etag("new"), 7).unwrap_err() else {
+            panic!("expected a conflict");
+        };
         assert_eq!(conflict.expected_etag.as_deref(), Some("old"));
         assert_eq!(conflict.actual_etag, "new");
+    }
+
+    #[test]
+    fn restore_request_requires_conditional_precondition() {
+        // Finding #1: restore is never a create, so a missing/empty precondition
+        // must be rejected rather than blindly clobbering a newer generation.
+        let blind = RestoreRequest {
+            backup_id: "b1".to_string(),
+            precondition: Precondition::default(),
+        };
+        assert_eq!(
+            blind.validate().unwrap_err(),
+            RemoteContractError::UnconditionalRestore
+        );
+
+        let guarded = RestoreRequest {
+            backup_id: "b1".to_string(),
+            precondition: Precondition::matching(etag("abc"), 3),
+        };
+        assert!(guarded.validate().is_ok());
+    }
+
+    #[test]
+    fn restore_request_precondition_is_not_serde_defaulted() {
+        // Omitting the precondition is a hard deserialize error, not a silent
+        // empty (blind) precondition.
+        let err = serde_json::from_str::<RestoreRequest>(r#"{"backup_id":"b1"}"#);
+        assert!(
+            err.is_err(),
+            "missing precondition must fail to deserialize"
+        );
     }
 
     #[test]
@@ -356,20 +515,50 @@ mod tests {
         let record = IdempotencyRecord {
             key: IdempotencyKey::new("k1").unwrap(),
             request_fingerprint: IdempotencyRecord::fingerprint(&body).unwrap(),
-            response_etag: etag("abc"),
-            response_generation: 3,
+            response: sample_response("abc", 3),
             stored_at: Utc::now(),
         };
 
         let same = IdempotencyRecord::fingerprint(&body).unwrap();
-        assert_eq!(record.classify(&same), IdempotencyOutcome::Replayed);
+        assert!(matches!(
+            record.match_request(&same),
+            IdempotencyReplay::Replay(_)
+        ));
 
         let other = serde_json::json!({"split": [{"rev": "b", "bps": 10000}]});
         let other_fp = IdempotencyRecord::fingerprint(&other).unwrap();
         assert!(matches!(
-            record.classify(&other_fp),
-            IdempotencyOutcome::Conflict { .. }
+            record.match_request(&other_fp),
+            IdempotencyReplay::Conflict { .. }
         ));
+    }
+
+    #[test]
+    fn idempotency_replay_returns_original_response_and_audit_verbatim() {
+        // Finding #2: a replay must return the original response body — ETag,
+        // generation, and the original audit event — without re-applying state.
+        let body = serde_json::json!({"split": [{"rev": "a", "bps": 10000}]});
+        let original = sample_response("abc", 3);
+        let record = IdempotencyRecord {
+            key: IdempotencyKey::new("k1").unwrap(),
+            request_fingerprint: IdempotencyRecord::fingerprint(&body).unwrap(),
+            response: original.clone(),
+            stored_at: Utc::now(),
+        };
+
+        let same = IdempotencyRecord::fingerprint(&body).unwrap();
+        let IdempotencyReplay::Replay(replayed) = record.match_request(&same) else {
+            panic!("expected a replay");
+        };
+        assert_eq!(replayed.etag, original.etag);
+        assert_eq!(replayed.generation, original.generation);
+        assert_eq!(replayed.audit.event_id, original.audit.event_id);
+        assert_eq!(replayed.audit.verb, "set");
+        // The full record survives a JSON round-trip, so the stored response is
+        // durably replayable across process restarts.
+        let json = serde_json::to_string(&record).unwrap();
+        let back: IdempotencyRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.response.audit.event_id, original.audit.event_id);
     }
 
     #[test]
@@ -402,6 +591,13 @@ mod tests {
             })
             .http_status(),
             412
+        );
+        assert_eq!(
+            RemoteStoreError::PreconditionRequired {
+                detail: "x".to_string()
+            }
+            .http_status(),
+            428
         );
         assert_eq!(
             RemoteStoreError::IdempotencyConflict {

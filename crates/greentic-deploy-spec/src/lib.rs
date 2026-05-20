@@ -50,8 +50,8 @@ pub use pack_config::PackConfig;
 pub use refs::{RuntimeRef, RuntimeRefParseError, SecretRef, SecretRefParseError};
 pub use remote::{
     BackupManifest, ConcurrencyConflict, IdempotencyKey, IdempotencyOutcome, IdempotencyRecord,
-    MutationResponse, Precondition, RbacRequest, RemoteContractError, RemoteStoreError,
-    RestoreOutcome, RestoreRequest, StateEtag,
+    IdempotencyReplay, MutationResponse, Precondition, PreconditionError, RbacRequest,
+    RemoteContractError, RemoteStoreError, RestoreOutcome, RestoreRequest, StateEtag,
 };
 pub use retention::{HealthState, HealthStatus, RetentionPolicy, RevocationConfig};
 pub use revision::{PackListEntry, Revision, RevisionLifecycle, is_valid_transition};
