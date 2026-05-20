@@ -129,7 +129,7 @@ impl LocalFsStore {
         &self.root
     }
 
-    fn env_dir(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
+    pub(crate) fn env_dir(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
         Ok(self.root.join(safe_env_segment(env_id)?))
     }
 

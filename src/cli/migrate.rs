@@ -33,7 +33,7 @@ use greentic_deploy_spec::{EnvId, EnvPackBinding, Environment};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{OpError, OpFlags, OpOutcome};
+use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
 use crate::defaults::LOCAL_ENV_ID;
 use crate::environment::{EnvironmentStore, LocalFsStore, StoreError};
 
@@ -355,68 +355,86 @@ pub fn apply(store: &LocalFsStore, flags: &OpFlags, target: &str) -> Result<OpOu
         return Ok(OpOutcome::new(NOUN, OP, schema()));
     }
     let (from, to) = resolve_endpoints(target)?;
-    let report = run_check(store, &from, &to)?;
-    if !report.clean {
-        return Err(OpError::Conflict(format!(
-            "migrate-dev refuses --apply: {} blocking finding(s); run `--check` for the full list",
-            report
-                .findings
-                .iter()
-                .filter(|f| f.severity == FindingSeverity::Blocking)
-                .count()
-        )));
-    }
-    if !store.exists(&from)? {
-        // Idempotent no-op: nothing to migrate.
+    let ctx = AuditCtx {
+        env_id: to.clone(),
+        noun: NOUN,
+        verb: OP,
+        target: json!({
+            "from_env": from.as_str(),
+            "to_env": to.as_str(),
+        }),
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || {
+        let report = run_check(store, &from, &to)?;
+        if !report.clean {
+            return Err(OpError::Conflict(format!(
+                "migrate-dev refuses --apply: {} blocking finding(s); run `--check` for the full list",
+                report
+                    .findings
+                    .iter()
+                    .filter(|f| f.severity == FindingSeverity::Blocking)
+                    .count()
+            )));
+        }
+        if !store.exists(&from)? {
+            // Idempotent no-op: nothing to migrate.
+            let outcome = MigrateDevApplyOutcome {
+                from_env: from.as_str().to_string(),
+                to_env: to.as_str().to_string(),
+                merged_slots: Vec::new(),
+                legacy_dir_renamed_to: None,
+            };
+            return Ok((
+                OpOutcome::new(
+                    NOUN,
+                    OP,
+                    serde_json::to_value(outcome).expect("apply outcome is json-safe"),
+                ),
+                super::AuditGens::NONE,
+            ));
+        }
+        let source = store.load(&from)?;
+        if classify_source(&source).is_some() {
+            // run_check should have flagged this, but guard against a scanner
+            // bypass.
+            return Err(OpError::Conflict(
+                "source env is not eligible for simple migration (see `--check`)".to_string(),
+            ));
+        }
+        let merged_slots = store.transact(&to, |locked| -> Result<Vec<String>, OpError> {
+            let mut target_env = match locked.load() {
+                Ok(env) => env,
+                Err(StoreError::NotFound(_)) => seed_target_from_source(&source, locked.env_id()),
+                Err(e) => return Err(e.into()),
+            };
+            let mut added = Vec::new();
+            for binding in &source.packs {
+                if target_env.packs.iter().any(|b| b.slot == binding.slot) {
+                    continue;
+                }
+                added.push(binding.slot.to_string());
+                target_env.packs.push(cloned_binding(binding));
+            }
+            locked.save(&target_env)?;
+            Ok(added)
+        })?;
+        let renamed = rename_legacy_dir(store, &from)?;
         let outcome = MigrateDevApplyOutcome {
             from_env: from.as_str().to_string(),
             to_env: to.as_str().to_string(),
-            merged_slots: Vec::new(),
-            legacy_dir_renamed_to: None,
+            merged_slots,
+            legacy_dir_renamed_to: Some(renamed.display().to_string()),
         };
-        return Ok(OpOutcome::new(
-            NOUN,
-            OP,
-            serde_json::to_value(outcome).expect("apply outcome is json-safe"),
-        ));
-    }
-    let source = store.load(&from)?;
-    if classify_source(&source).is_some() {
-        // run_check should have flagged this, but guard against a scanner
-        // bypass.
-        return Err(OpError::Conflict(
-            "source env is not eligible for simple migration (see `--check`)".to_string(),
-        ));
-    }
-    let merged_slots = store.transact(&to, |locked| -> Result<Vec<String>, OpError> {
-        let mut target_env = match locked.load() {
-            Ok(env) => env,
-            Err(StoreError::NotFound(_)) => seed_target_from_source(&source, locked.env_id()),
-            Err(e) => return Err(e.into()),
-        };
-        let mut added = Vec::new();
-        for binding in &source.packs {
-            if target_env.packs.iter().any(|b| b.slot == binding.slot) {
-                continue;
-            }
-            added.push(binding.slot.to_string());
-            target_env.packs.push(cloned_binding(binding));
-        }
-        locked.save(&target_env)?;
-        Ok(added)
-    })?;
-    let renamed = rename_legacy_dir(store, &from)?;
-    let outcome = MigrateDevApplyOutcome {
-        from_env: from.as_str().to_string(),
-        to_env: to.as_str().to_string(),
-        merged_slots,
-        legacy_dir_renamed_to: Some(renamed.display().to_string()),
-    };
-    Ok(OpOutcome::new(
-        NOUN,
-        OP,
-        serde_json::to_value(outcome).expect("apply outcome is json-safe"),
-    ))
+        Ok((
+            OpOutcome::new(
+                NOUN,
+                OP,
+                serde_json::to_value(outcome).expect("apply outcome is json-safe"),
+            ),
+            super::AuditGens::NONE,
+        ))
+    })
 }
 
 fn resolve_endpoints(target: &str) -> Result<(EnvId, EnvId), OpError> {

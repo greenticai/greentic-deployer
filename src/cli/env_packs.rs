@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
-use super::{OpError, OpFlags, OpOutcome};
+use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
 
 const NOUN: &str = "env-packs";
 
@@ -69,26 +69,42 @@ pub fn add(
     let payload = resolve_payload(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let binding = build_binding(&payload, 0, None)?;
-    let summary = store.transact(&env_id, |locked| -> Result<BindingSummary, OpError> {
-        let mut env = locked.load()?;
-        if env.pack_for_slot(binding.slot).is_some() {
-            return Err(OpError::Conflict(format!(
-                "slot `{}` already bound on env `{}`; use update",
-                binding.slot, env_id
-            )));
-        }
-        env.packs.push(binding.clone());
-        locked.save(&env)?;
-        Ok(BindingSummary::from_binding(
-            &env_id,
-            env.packs.last().expect("just pushed"),
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "add",
+        target: json!({"slot": payload.slot, "kind": payload.kind}),
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || {
+        let summary = store.transact(&env_id, |locked| -> Result<BindingSummary, OpError> {
+            let mut env = locked.load()?;
+            if env.pack_for_slot(binding.slot).is_some() {
+                return Err(OpError::Conflict(format!(
+                    "slot `{}` already bound on env `{}`; use update",
+                    binding.slot, env_id
+                )));
+            }
+            env.packs.push(binding.clone());
+            locked.save(&env)?;
+            Ok(BindingSummary::from_binding(
+                &env_id,
+                env.packs.last().expect("just pushed"),
+            ))
+        })?;
+        let outcome = OpOutcome::new(
+            NOUN,
+            "add",
+            serde_json::to_value(summary).expect("BindingSummary is json-safe"),
+        );
+        Ok((
+            outcome,
+            super::AuditGens {
+                previous: None,
+                new: Some(0),
+            },
         ))
-    })?;
-    Ok(OpOutcome::new(
-        NOUN,
-        "add",
-        serde_json::to_value(summary).expect("BindingSummary is json-safe"),
-    ))
+    })
 }
 
 pub fn update(
@@ -101,32 +117,46 @@ pub fn update(
     }
     let payload = resolve_payload(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let summary = store.transact(&env_id, |locked| -> Result<BindingSummary, OpError> {
-        let mut env = locked.load()?;
-        let idx = env
-            .packs
-            .iter()
-            .position(|b| b.slot == payload.slot)
-            .ok_or_else(|| {
-                OpError::NotFound(format!(
-                    "slot `{}` not bound on env `{}`",
-                    payload.slot, env_id
-                ))
-            })?;
-        let prev_generation = env.packs[idx].generation;
-        let prev_snapshot = serde_json::to_value(&env.packs[idx])
-            .map_err(|e| OpError::InvalidArgument(format!("snapshot prior binding: {e}")))?;
-        let mut new_binding = build_binding(&payload, prev_generation + 1, None)?;
-        new_binding.previous_binding_ref = Some(stash_previous(prev_snapshot));
-        env.packs[idx] = new_binding;
-        locked.save(&env)?;
-        Ok(BindingSummary::from_binding(&env_id, &env.packs[idx]))
-    })?;
-    Ok(OpOutcome::new(
-        NOUN,
-        "update",
-        serde_json::to_value(summary).expect("BindingSummary is json-safe"),
-    ))
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "update",
+        target: json!({"slot": payload.slot, "kind": payload.kind}),
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || {
+        let (summary, gens) = store.transact(&env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx = env
+                .packs
+                .iter()
+                .position(|b| b.slot == payload.slot)
+                .ok_or_else(|| {
+                    OpError::NotFound(format!(
+                        "slot `{}` not bound on env `{}`",
+                        payload.slot, env_id
+                    ))
+                })?;
+            let prev_generation = env.packs[idx].generation;
+            let prev_snapshot = serde_json::to_value(&env.packs[idx])
+                .map_err(|e| OpError::InvalidArgument(format!("snapshot prior binding: {e}")))?;
+            let mut new_binding = build_binding(&payload, prev_generation + 1, None)?;
+            new_binding.previous_binding_ref = Some(stash_previous(prev_snapshot));
+            env.packs[idx] = new_binding;
+            locked.save(&env)?;
+            let gens = super::AuditGens {
+                previous: Some(prev_generation),
+                new: Some(prev_generation + 1),
+            };
+            Ok::<_, OpError>((BindingSummary::from_binding(&env_id, &env.packs[idx]), gens))
+        })?;
+        let outcome = OpOutcome::new(
+            NOUN,
+            "update",
+            serde_json::to_value(summary).expect("BindingSummary is json-safe"),
+        );
+        Ok((outcome, gens))
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,27 +175,41 @@ pub fn remove(
     }
     let payload = resolve_payload::<EnvPackRemovePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let summary = store.transact(&env_id, |locked| -> Result<BindingSummary, OpError> {
-        let mut env = locked.load()?;
-        let idx = env
-            .packs
-            .iter()
-            .position(|b| b.slot == payload.slot)
-            .ok_or_else(|| {
-                OpError::NotFound(format!(
-                    "slot `{}` not bound on env `{}`",
-                    payload.slot, env_id
-                ))
-            })?;
-        let removed = env.packs.remove(idx);
-        locked.save(&env)?;
-        Ok(BindingSummary::from_binding(&env_id, &removed))
-    })?;
-    Ok(OpOutcome::new(
-        NOUN,
-        "remove",
-        serde_json::to_value(summary).expect("BindingSummary is json-safe"),
-    ))
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "remove",
+        target: json!({"slot": payload.slot}),
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || {
+        let (summary, gens) = store.transact(&env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx = env
+                .packs
+                .iter()
+                .position(|b| b.slot == payload.slot)
+                .ok_or_else(|| {
+                    OpError::NotFound(format!(
+                        "slot `{}` not bound on env `{}`",
+                        payload.slot, env_id
+                    ))
+                })?;
+            let removed = env.packs.remove(idx);
+            locked.save(&env)?;
+            let gens = super::AuditGens {
+                previous: Some(removed.generation),
+                new: None,
+            };
+            Ok::<_, OpError>((BindingSummary::from_binding(&env_id, &removed), gens))
+        })?;
+        let outcome = OpOutcome::new(
+            NOUN,
+            "remove",
+            serde_json::to_value(summary).expect("BindingSummary is json-safe"),
+        );
+        Ok((outcome, gens))
+    })
 }
 
 pub fn rollback(
@@ -178,44 +222,60 @@ pub fn rollback(
     }
     let payload = resolve_payload::<EnvPackRemovePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let summary = store.transact(&env_id, |locked| -> Result<BindingSummary, OpError> {
-        let mut env = locked.load()?;
-        let idx = env
-            .packs
-            .iter()
-            .position(|b| b.slot == payload.slot)
-            .ok_or_else(|| {
-                OpError::NotFound(format!(
-                    "slot `{}` not bound on env `{}`",
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "rollback",
+        target: json!({"slot": payload.slot}),
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || {
+        let (summary, gens) = store.transact(&env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx = env
+                .packs
+                .iter()
+                .position(|b| b.slot == payload.slot)
+                .ok_or_else(|| {
+                    OpError::NotFound(format!(
+                        "slot `{}` not bound on env `{}`",
+                        payload.slot, env_id
+                    ))
+                })?;
+            let prev_generation = env.packs[idx].generation;
+            let prev_ref = env.packs[idx].previous_binding_ref.clone().ok_or_else(|| {
+                OpError::Conflict(format!(
+                    "slot `{}` on env `{}` has no previous binding to roll back to",
                     payload.slot, env_id
                 ))
             })?;
-        let prev_ref = env.packs[idx].previous_binding_ref.clone().ok_or_else(|| {
-            OpError::Conflict(format!(
-                "slot `{}` on env `{}` has no previous binding to roll back to",
-                payload.slot, env_id
-            ))
+            let prev_value = load_previous(&prev_ref).ok_or_else(|| {
+                OpError::NotFound(format!(
+                    "previous binding payload `{}` missing for slot `{}`",
+                    prev_ref.display(),
+                    payload.slot
+                ))
+            })?;
+            let mut restored: EnvPackBinding = serde_json::from_value(prev_value).map_err(|e| {
+                OpError::InvalidArgument(format!("deserialise previous binding: {e}"))
+            })?;
+            restored.generation = prev_generation + 1;
+            restored.previous_binding_ref = None;
+            env.packs[idx] = restored;
+            locked.save(&env)?;
+            let gens = super::AuditGens {
+                previous: Some(prev_generation),
+                new: Some(prev_generation + 1),
+            };
+            Ok::<_, OpError>((BindingSummary::from_binding(&env_id, &env.packs[idx]), gens))
         })?;
-        let prev_value = load_previous(&prev_ref).ok_or_else(|| {
-            OpError::NotFound(format!(
-                "previous binding payload `{}` missing for slot `{}`",
-                prev_ref.display(),
-                payload.slot
-            ))
-        })?;
-        let mut restored: EnvPackBinding = serde_json::from_value(prev_value)
-            .map_err(|e| OpError::InvalidArgument(format!("deserialise previous binding: {e}")))?;
-        restored.generation = env.packs[idx].generation + 1;
-        restored.previous_binding_ref = None;
-        env.packs[idx] = restored;
-        locked.save(&env)?;
-        Ok(BindingSummary::from_binding(&env_id, &env.packs[idx]))
-    })?;
-    Ok(OpOutcome::new(
-        NOUN,
-        "rollback",
-        serde_json::to_value(summary).expect("BindingSummary is json-safe"),
-    ))
+        let outcome = OpOutcome::new(
+            NOUN,
+            "rollback",
+            serde_json::to_value(summary).expect("BindingSummary is json-safe"),
+        );
+        Ok((outcome, gens))
+    })
 }
 
 pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOutcome, OpError> {
@@ -622,5 +682,24 @@ mod tests {
             2,
             "both slot bindings must survive concurrent transact()s"
         );
+    }
+
+    #[test]
+    fn update_records_previous_and_new_generation_in_audit() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let p1 = local_payload(CapabilitySlot::Secrets, "greentic.secrets.dev-store@1.0.0");
+        add(&store, &OpFlags::default(), Some(p1)).unwrap();
+        let p2 = local_payload(CapabilitySlot::Secrets, "greentic.secrets.aws-sm@1.0.0");
+        update(&store, &OpFlags::default(), Some(p2)).unwrap();
+        let log = dir.path().join("local").join("audit").join("events.jsonl");
+        let raw = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2, "add + update each emit one audit event");
+        let update_event: crate::environment::AuditEvent = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(update_event.verb, "update");
+        assert_eq!(update_event.previous_generation, Some(0));
+        assert_eq!(update_event.new_generation, Some(1));
     }
 }

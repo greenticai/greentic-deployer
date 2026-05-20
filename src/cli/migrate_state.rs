@@ -20,7 +20,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::migrate::{FindingSeverity, MigrationFinding};
-use super::{OpError, OpFlags, OpOutcome};
+use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
 use crate::environment::store::dirs_home;
 use crate::environment::{EnvFlock, EnvironmentStore, LocalFsStore};
 
@@ -96,9 +96,28 @@ pub fn apply(
         return Ok(OpOutcome::new(NOUN, OP, schema()));
     }
     let env_id = parse_env_id(target)?;
-    require_env_exists(store, &env_id)?;
+    // `resolve_state_dir` is a pure path computation (override or $HOME); it
+    // does not probe the env store, so it cannot leak env existence ahead of
+    // the authorization gate.
     let state_dir = resolve_state_dir(state_dir_override)?;
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: OP,
+        target: json!({"state_dir": state_dir.display().to_string()}),
+        idempotency_key: None,
+    };
+    // `require_env_exists` lives inside the closure so a non-local target is
+    // denied + audited by the authorization gate before any store probe —
+    // otherwise an absent non-local env would return NotFound (unaudited) and
+    // a present one Unauthorized, leaking an existence oracle.
+    audit_and_record(store, ctx, || {
+        require_env_exists(store, &env_id)?;
+        apply_inner(&env_id, &state_dir)
+    })
+}
 
+fn apply_inner(env_id: &EnvId, state_dir: &Path) -> Result<(OpOutcome, super::AuditGens), OpError> {
     // Acquire the state-dir migration lock for the entire scan → decide →
     // rename → verify critical section. Prevents two concurrent
     // `migrate-state --apply` invocations from observing the same `clean`
@@ -113,13 +132,13 @@ pub fn apply(
     // `GreenticConfig::paths.state_dir`) and is tracked as a separate
     // hardening step. Operators should quiesce deploys before running
     // `--apply`.
-    let lock_path = migration_lock_path(&state_dir);
+    let lock_path = migration_lock_path(state_dir);
     let _lock = EnvFlock::acquire(&lock_path).map_err(|source| OpError::Store(source.into()))?;
 
     // Re-scan inside the lock so a concurrent writer that landed changes
     // between the resolver and the lock acquisition cannot bypass the
     // blocking-finding gate.
-    let report = run_check(&env_id, &state_dir);
+    let report = run_check(env_id, state_dir);
     if !report.clean {
         let blocking = report
             .findings
@@ -142,10 +161,13 @@ pub fn apply(
                 legacy_dir_renamed_to: None,
                 scanned_paths_count: 0,
             };
-            return Ok(OpOutcome::new(
-                NOUN,
-                OP,
-                serde_json::to_value(outcome).expect("apply outcome is json-safe"),
+            return Ok((
+                OpOutcome::new(
+                    NOUN,
+                    OP,
+                    serde_json::to_value(outcome).expect("apply outcome is json-safe"),
+                ),
+                super::AuditGens::NONE,
             ));
         }
         Err(err) => {
@@ -156,7 +178,7 @@ pub fn apply(
         }
         Ok(true) => {}
     }
-    let renamed = rename_legacy_tree(&state_dir, &deploy_dir)?;
+    let renamed = rename_legacy_tree(state_dir, &deploy_dir)?;
     // A successful atomic rename leaves zero residue; a non-empty post-scan
     // implies a concurrent writer recreated the tree.
     let (post, _) = scan_legacy_deploy_dir(&deploy_dir);
@@ -172,10 +194,13 @@ pub fn apply(
         legacy_dir_renamed_to: Some(renamed.display().to_string()),
         scanned_paths_count,
     };
-    Ok(OpOutcome::new(
-        NOUN,
-        OP,
-        serde_json::to_value(outcome).expect("apply outcome is json-safe"),
+    Ok((
+        OpOutcome::new(
+            NOUN,
+            OP,
+            serde_json::to_value(outcome).expect("apply outcome is json-safe"),
+        ),
+        super::AuditGens::NONE,
     ))
 }
 
@@ -649,6 +674,37 @@ mod tests {
         assert!(matches!(err, OpError::NotFound(_)), "got {err:?}");
         // Verify nothing was renamed.
         assert!(state_dir.join("deploy").exists());
+    }
+
+    #[test]
+    fn apply_non_local_target_denies_before_store_probe() {
+        // Codex finding [medium]: a non-local target must be denied + audited
+        // by the authorization gate before `require_env_exists` probes the
+        // store. Otherwise an absent non-local env returns NotFound (an
+        // existence oracle) and the denied attempt goes unaudited.
+        let dir = tempdir().unwrap();
+        let envs_root = dir.path().join("envs");
+        let store = LocalFsStore::new(&envs_root);
+        // `prod` is never seeded — without the fix this returns NotFound.
+        let state_dir = dir.path().join("state");
+        write_file(
+            &state_dir.join("deploy/aws/acme/prod/scope-xyz/plan.json"),
+            "{}",
+        );
+        let err = apply(&store, &OpFlags::default(), "prod", Some(&state_dir)).unwrap_err();
+        assert!(
+            matches!(err, OpError::Unauthorized { .. }),
+            "non-local target must be denied, not NotFound (no existence oracle); got {err:?}"
+        );
+        // The legacy tree is untouched (closure never ran).
+        assert!(state_dir.join("deploy").exists());
+        // The denied attempt was audited under the target env's audit dir.
+        let log = envs_root.join("prod").join("audit").join("events.jsonl");
+        let raw = std::fs::read_to_string(&log).expect("denied migrate-state must be audited");
+        assert!(
+            raw.contains("\"decision\":\"deny\"") && raw.contains("migrate-state"),
+            "audit event must record the migrate-state denial; got: {raw}"
+        );
     }
 
     #[test]

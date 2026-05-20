@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
-use super::{OpError, OpFlags, OpOutcome};
+use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
 
 const NOUN: &str = "revisions";
 
@@ -140,62 +140,75 @@ pub fn stage(
             "spec rejects inactive → staged".to_string(),
         ));
     }
-    let summary = store.transact(&env_id, |locked| -> Result<RevisionSummary, OpError> {
-        let mut env = locked.load()?;
-        let deployment = env
-            .bundles
-            .iter()
-            .find(|b| b.deployment_id == deployment_id)
-            .ok_or_else(|| {
-                OpError::NotFound(format!(
-                    "deployment `{deployment_id}` not found in env `{env_id}`"
-                ))
-            })?
-            .clone();
-        let bundle_id = deployment.bundle_id.clone();
-        let next_sequence = env
-            .revisions
-            .iter()
-            .filter(|r| r.deployment_id == deployment_id)
-            .map(|r| r.sequence)
-            .max()
-            .unwrap_or(0)
-            + 1;
-        let now = Utc::now();
-        let staged = Revision {
-            schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
-            revision_id: crate::environment::mint_revision_id(),
-            env_id: env_id.clone(),
-            bundle_id,
-            deployment_id,
-            sequence: next_sequence,
-            created_at: now,
-            bundle_digest: payload.bundle_digest.clone(),
-            pack_list: pack_list.clone(),
-            pack_list_lock_ref: payload.pack_list_lock_ref.clone(),
-            config_digest: payload.config_digest.clone(),
-            signature_sidecar_ref: payload.signature_sidecar_ref.clone(),
-            lifecycle: RevisionLifecycle::Staged,
-            staged_at: Some(now),
-            warmed_at: None,
-            drain_seconds: payload.drain_seconds,
-            abort_metrics: Vec::new(),
-        };
-        let revision_id = staged.revision_id;
-        env.revisions.push(staged);
-        locked.save(&env)?;
-        Ok(RevisionSummary::from(
-            env.revisions
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "stage",
+        target: json!({
+            "deployment_id": deployment_id.to_string(),
+            "lifecycle_to": "staged",
+        }),
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || {
+        let summary = store.transact(&env_id, |locked| -> Result<RevisionSummary, OpError> {
+            let mut env = locked.load()?;
+            let deployment = env
+                .bundles
                 .iter()
-                .find(|r| r.revision_id == revision_id)
-                .expect("just pushed"),
-        ))
-    })?;
-    Ok(OpOutcome::new(
-        NOUN,
-        "stage",
-        serde_json::to_value(summary).expect("RevisionSummary is json-safe"),
-    ))
+                .find(|b| b.deployment_id == deployment_id)
+                .ok_or_else(|| {
+                    OpError::NotFound(format!(
+                        "deployment `{deployment_id}` not found in env `{env_id}`"
+                    ))
+                })?
+                .clone();
+            let bundle_id = deployment.bundle_id.clone();
+            let next_sequence = env
+                .revisions
+                .iter()
+                .filter(|r| r.deployment_id == deployment_id)
+                .map(|r| r.sequence)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let now = Utc::now();
+            let staged = Revision {
+                schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
+                revision_id: crate::environment::mint_revision_id(),
+                env_id: env_id.clone(),
+                bundle_id,
+                deployment_id,
+                sequence: next_sequence,
+                created_at: now,
+                bundle_digest: payload.bundle_digest.clone(),
+                pack_list: pack_list.clone(),
+                pack_list_lock_ref: payload.pack_list_lock_ref.clone(),
+                config_digest: payload.config_digest.clone(),
+                signature_sidecar_ref: payload.signature_sidecar_ref.clone(),
+                lifecycle: RevisionLifecycle::Staged,
+                staged_at: Some(now),
+                warmed_at: None,
+                drain_seconds: payload.drain_seconds,
+                abort_metrics: Vec::new(),
+            };
+            let revision_id = staged.revision_id;
+            env.revisions.push(staged);
+            locked.save(&env)?;
+            Ok(RevisionSummary::from(
+                env.revisions
+                    .iter()
+                    .find(|r| r.revision_id == revision_id)
+                    .expect("just pushed"),
+            ))
+        })?;
+        let outcome = OpOutcome::new(
+            NOUN,
+            "stage",
+            serde_json::to_value(summary).expect("RevisionSummary is json-safe"),
+        );
+        Ok((outcome, super::AuditGens::NONE))
+    })
 }
 
 /// `op revisions warm`. `staged → warming → ready`. The two-step move is
@@ -324,22 +337,39 @@ fn transition<F: FnOnce(&mut Revision)>(
     let payload = resolve_payload::<RevisionTransitionPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let revision_id = parse_revision_id(&payload.revision_id)?;
-    let revision = store.transact(&env_id, |locked| -> Result<Revision, OpError> {
-        crate::environment::apply_revision_transition(
-            locked,
-            revision_id,
-            accepted_chain,
-            on_final,
-            prune_from_splits,
-        )
-        .map_err(OpError::from)
-    })?;
-    let summary = RevisionSummary::from(&revision);
-    Ok(OpOutcome::new(
-        NOUN,
-        op,
-        serde_json::to_value(summary).expect("RevisionSummary is json-safe"),
-    ))
+    // The chain's final `to` state is the lifecycle this verb lands on. Serde
+    // emits the canonical lowercase wire form, matching how lifecycle appears
+    // everywhere else.
+    let lifecycle_to = accepted_chain.last().map(|(_, to)| *to);
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: op,
+        target: json!({
+            "revision_id": revision_id.to_string(),
+            "lifecycle_to": lifecycle_to,
+        }),
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, || {
+        let revision = store.transact(&env_id, |locked| -> Result<Revision, OpError> {
+            crate::environment::apply_revision_transition(
+                locked,
+                revision_id,
+                accepted_chain,
+                on_final,
+                prune_from_splits,
+            )
+            .map_err(OpError::from)
+        })?;
+        let summary = RevisionSummary::from(&revision);
+        let outcome = OpOutcome::new(
+            NOUN,
+            op,
+            serde_json::to_value(summary).expect("RevisionSummary is json-safe"),
+        );
+        Ok((outcome, super::AuditGens::NONE))
+    })
 }
 
 fn resolve_payload<T: serde::de::DeserializeOwned>(
