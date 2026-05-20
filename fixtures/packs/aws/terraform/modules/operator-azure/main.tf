@@ -13,6 +13,9 @@ locals {
   admin_client_key_secret_name  = "greentic-admin-client-key-${var.environment}"
   admin_relay_token_secret_name = "greentic-admin-relay-token-${var.environment}"
   admin_relay_token             = sha256(tls_private_key.admin_client.private_key_pem)
+  operator_secret_names = {
+    for uri, _ in var.secrets_map : uri => "operator-${substr(md5(uri), 0, 16)}"
+  }
 
   can_manage_key_vault_secrets = trimspace(var.azure_key_vault_id) != ""
   resource_group_name          = "${local.name_prefix}-rg"
@@ -192,6 +195,22 @@ resource "azurerm_key_vault_secret" "admin_relay_token" {
   }
 }
 
+resource "azurerm_key_vault_secret" "operator" {
+  for_each = local.can_manage_key_vault_secrets ? var.secrets_map : {}
+
+  name         = local.operator_secret_names[each.key]
+  value        = each.value
+  key_vault_id = var.azure_key_vault_id
+  content_type = "text/plain"
+
+  tags = {
+    ManagedBy          = "greentic-demo"
+    Bundle             = var.bundle_digest
+    Purpose            = "operator-secret"
+    GreenticSecretHash = substr(md5(each.key), 0, 16)
+  }
+}
+
 resource "azurerm_resource_group" "this" {
   name     = local.resource_group_name
   location = var.azure_location
@@ -273,6 +292,23 @@ resource "azurerm_container_app" "this" {
       name                = secret.value
       key_vault_secret_id = "${local.secret_prefix}/secrets/${secret.value}"
       identity            = "System"
+    }
+  }
+
+  dynamic "secret" {
+    for_each = local.can_manage_key_vault_secrets ? var.secrets_map : {}
+    content {
+      name                = local.operator_secret_names[secret.key]
+      key_vault_secret_id = azurerm_key_vault_secret.operator[secret.key].versionless_id
+      identity            = "System"
+    }
+  }
+
+  dynamic "secret" {
+    for_each = local.can_manage_key_vault_secrets ? {} : var.secrets_map
+    content {
+      name  = local.operator_secret_names[secret.key]
+      value = secret.value
     }
   }
 
@@ -424,6 +460,14 @@ resource "azurerm_container_app" "this" {
       }
 
       dynamic "env" {
+        for_each = var.secrets_map
+        content {
+          name        = env.key
+          secret_name = local.operator_secret_names[env.key]
+        }
+      }
+
+      dynamic "env" {
         for_each = trimspace(var.public_base_url) != "" ? [var.public_base_url] : []
         content {
           name  = "PUBLIC_BASE_URL"
@@ -478,7 +522,7 @@ resource "azurerm_container_app" "this" {
 }
 
 resource "azurerm_role_assignment" "runtime_secret_reader" {
-  count                = trimspace(var.runtime_secret_prefix) != "" && trimspace(var.azure_key_vault_id) != "" ? 1 : 0
+  count                = (trimspace(var.runtime_secret_prefix) != "" || length(var.secrets_map) > 0) && trimspace(var.azure_key_vault_id) != "" ? 1 : 0
   scope                = var.azure_key_vault_id
   role_definition_name = "Key Vault Secrets User"
   principal_id         = azurerm_container_app.this.identity[0].principal_id

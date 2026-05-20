@@ -13,6 +13,9 @@ locals {
   admin_relay_token_secret_name = "greentic-admin-relay-token-${var.environment}"
   admin_relay_token             = sha256(tls_private_key.admin_client.private_key_pem)
   service_name                  = "${local.name_prefix}-run"
+  operator_secret_names = {
+    for uri, _ in var.secrets_map : uri => "operator-${substr(md5(uri), 0, 16)}"
+  }
 
   operator_endpoint = trimspace(var.public_base_url) != "" ? var.public_base_url : google_cloud_run_v2_service.this.uri
 }
@@ -181,6 +184,29 @@ resource "google_secret_manager_secret" "admin_relay_token" {
 resource "google_secret_manager_secret_version" "admin_relay_token" {
   secret      = google_secret_manager_secret.admin_relay_token.id
   secret_data = local.admin_relay_token
+}
+
+resource "google_secret_manager_secret" "operator" {
+  for_each = var.secrets_map
+
+  project   = var.gcp_project_id
+  secret_id = local.operator_secret_names[each.key]
+
+  replication {
+    auto {}
+  }
+
+  labels = {
+    managed_by           = "greentic-demo"
+    greentic_secret_hash = substr(md5(each.key), 0, 16)
+  }
+}
+
+resource "google_secret_manager_secret_version" "operator" {
+  for_each = var.secrets_map
+
+  secret      = google_secret_manager_secret.operator[each.key].id
+  secret_data = each.value
 }
 
 resource "google_cloud_run_v2_service" "this" {
@@ -354,6 +380,19 @@ resource "google_cloud_run_v2_service" "this" {
       }
 
       dynamic "env" {
+        for_each = var.secrets_map
+        content {
+          name = env.key
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.operator[env.key].secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+
+      dynamic "env" {
         for_each = trimspace(var.public_base_url) != "" ? [var.public_base_url] : []
         content {
           name  = "PUBLIC_BASE_URL"
@@ -380,7 +419,7 @@ resource "google_cloud_run_v2_service" "this" {
 }
 
 resource "google_project_iam_member" "runtime_secret_accessor" {
-  count   = trimspace(var.runtime_secret_prefix) != "" ? 1 : 0
+  count   = trimspace(var.runtime_secret_prefix) != "" || length(var.secrets_map) > 0 ? 1 : 0
   project = var.gcp_project_id
   role    = "roles/secretmanager.secretAccessor"
   member  = "serviceAccount:${data.google_compute_default_service_account.default.email}"

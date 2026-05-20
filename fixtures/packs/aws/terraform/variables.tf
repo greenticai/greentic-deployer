@@ -97,6 +97,11 @@ variable "runtime_secret_env" {
   default = {}
 }
 
+variable "secrets_map" {
+  type    = map(string)
+  default = {}
+}
+
 variable "remote_state_backend" {
   type = string
 }

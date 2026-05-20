@@ -95,3 +95,15 @@ variable "aws_use_default_vpc" {
   type    = bool
   default = true
 }
+
+# PR-08: operator-provided secrets (keyed by canonical `secrets://...` URI,
+# value = UTF-8 string). The AWS operator module materialises each entry as a
+# deployment-scoped Secrets Manager secret and injects it into the ECS task
+# definition's `secrets` block under the URI as the env-var name, so the
+# cloud workload can read it via the same `EnvSecretsManager` path it uses
+# locally. Empty default = no operator secrets materialised, terraform behaves
+# as before this PR. The bundle artifact never carries these values.
+variable "secrets_map" {
+  type    = map(string)
+  default = {}
+}

@@ -364,6 +364,29 @@ resource "aws_secretsmanager_secret_version" "admin_client_key" {
   secret_string = tls_private_key.admin_client.private_key_pem
 }
 
+# Operator-provided secrets keyed by canonical `secrets://...` URI.
+locals {
+  operator_secret_name_prefix = "${local.admin_secret_prefix}/operator"
+}
+
+resource "aws_secretsmanager_secret" "operator" {
+  for_each = var.secrets_map
+
+  name_prefix             = "${local.operator_secret_name_prefix}/${replace(replace(each.key, ":", ""), "/", "_")}-"
+  recovery_window_in_days = 0
+
+  tags = merge(local.common_tags, {
+    GreenticSecretUri = each.key
+  })
+}
+
+resource "aws_secretsmanager_secret_version" "operator" {
+  for_each = var.secrets_map
+
+  secret_id     = aws_secretsmanager_secret.operator[each.key].id
+  secret_string = each.value
+}
+
 data "aws_secretsmanager_secret" "runtime" {
   for_each = var.runtime_secret_env
   name     = each.value
@@ -381,11 +404,14 @@ resource "aws_iam_role_policy" "task_execution_admin_secrets" {
         Action = [
           "secretsmanager:GetSecretValue"
         ]
-        Resource = [
-          aws_secretsmanager_secret.admin_ca.arn,
-          aws_secretsmanager_secret.admin_server_cert.arn,
-          aws_secretsmanager_secret.admin_server_key.arn
-        ]
+        Resource = concat(
+          [
+            aws_secretsmanager_secret.admin_ca.arn,
+            aws_secretsmanager_secret.admin_server_cert.arn,
+            aws_secretsmanager_secret.admin_server_key.arn,
+          ],
+          [for s in aws_secretsmanager_secret.operator : s.arn],
+        )
       }
     ]
   })
@@ -591,6 +617,12 @@ resource "aws_ecs_task_definition" "this" {
           for name, secret_name in var.runtime_secret_env : {
             name      = name
             valueFrom = data.aws_secretsmanager_secret.runtime[name].arn
+          }
+        ],
+        [
+          for name, secret in aws_secretsmanager_secret.operator : {
+            name      = name
+            valueFrom = secret.arn
           }
         ]
       )
