@@ -178,10 +178,6 @@ impl ToolCheck {
     }
 }
 
-// ============================================================================
-// Generic primitives
-// ============================================================================
-
 /// Run `binary` with the given `args` and capture stdout. Returns:
 /// - `Ok(stdout_string)` on exit-0.
 /// - `Err(ProbeFailure::NotFound)` when the binary is not on `$PATH`.
@@ -201,7 +197,6 @@ fn probe(binary: &str, args: &[&str]) -> Result<String, ProbeFailure> {
         Err(ProbeFailure::NonZero {
             code: output.status.code(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         })
     }
 }
@@ -209,12 +204,7 @@ fn probe(binary: &str, args: &[&str]) -> Result<String, ProbeFailure> {
 #[derive(Debug)]
 enum ProbeFailure {
     NotFound,
-    NonZero {
-        code: Option<i32>,
-        stderr: String,
-        #[allow(dead_code)]
-        stdout: String,
-    },
+    NonZero { code: Option<i32>, stderr: String },
     Io(String),
 }
 
@@ -302,21 +292,16 @@ pub fn check_version_probe(
     }
 }
 
-// ============================================================================
-// Version parsers
-// ============================================================================
-
-/// Extract a `MAJOR.MINOR.PATCH` from the first matching whitespace-separated
-/// token. Strips a leading `v` and drops any suffix after `-`/`+` so
-/// `v1.5.7-rc1` parses as `1.5.7`.
+/// Extract a `MAJOR.MINOR.PATCH` from the first token that parses as one.
+/// Strips a leading `v` and drops any suffix after `-`/`+` so `v1.5.7-rc1`
+/// parses as `1.5.7`. `/` is a separator so `aws-cli/2.15.0 Python/3.11.6`
+/// yields `2.15.0`.
 pub fn parse_first_semver_token(stdout: &str) -> Option<Version> {
-    for token in stdout.split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')') {
+    for token in stdout.split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | '/')) {
         let cleaned = token.trim_start_matches('v');
-        // Strip pre-release / build suffix; we accept it as a plain semver
-        // for matching purposes.
+        // Pre-release/build suffixes break VersionReq matching.
         let core = cleaned.split(['-', '+']).next().unwrap_or(cleaned);
-        // Only accept tokens with two dots so we don't pick up a stray "2" or
-        // "1.0".
+        // Require two dots so a stray "2" or "1.0" isn't taken for a version.
         if core.matches('.').count() < 2 {
             continue;
         }
@@ -337,10 +322,6 @@ pub fn parse_kubectl_version(stdout: &str) -> Option<Version> {
     let cleaned = stdout.replace('"', " ");
     parse_first_semver_token(&cleaned)
 }
-
-// ============================================================================
-// Named-tool catalog
-// ============================================================================
 
 /// Minimum supported OpenTofu version. Bumped as the deployer adopts newer
 /// HCL features.
@@ -363,10 +344,10 @@ pub const MIN_GCLOUD_VERSION: &str = "450.0.0";
 /// Minimum supported Azure CLI version.
 pub const MIN_AZ_VERSION: &str = "2.50.0";
 
-fn version_req_caret(min: &str) -> VersionReq {
-    // `^X.Y.Z` is the SemVer-compatible "at least X.Y.Z, less than the next
-    // major" range. All tools we wrap follow SemVer well enough for this to
-    // be the right default.
+/// `>=min`, unbounded above: these are external CLIs we don't own, and a newer
+/// major (terraform 2.x, kubectl 1.31, ...) is the normal upgrade path, not a
+/// break — so we don't cap with a caret the way we do for our own descriptors.
+fn version_req_at_least(min: &str) -> VersionReq {
     format!(">={min}")
         .parse()
         .expect("hardcoded version requirement parses")
@@ -379,7 +360,7 @@ pub fn tofu() -> ToolCheck {
         "tofu",
         &["version", "-json"],
         parse_first_semver_token,
-        &version_req_caret(MIN_TOFU_VERSION),
+        &version_req_at_least(MIN_TOFU_VERSION),
         "Install OpenTofu from https://opentofu.org/docs/intro/install/ (preferred over Terraform).",
     )
 }
@@ -393,7 +374,7 @@ pub fn terraform() -> ToolCheck {
         "terraform",
         &["version", "-json"],
         parse_first_semver_token,
-        &version_req_caret(MIN_TERRAFORM_VERSION),
+        &version_req_at_least(MIN_TERRAFORM_VERSION),
         "Install Terraform >= 1.5.0 from https://developer.hashicorp.com/terraform/install — but prefer `tofu` (OpenTofu).",
     )
 }
@@ -405,7 +386,7 @@ pub fn kubectl() -> ToolCheck {
         "kubectl",
         &["version", "--client", "--output=yaml"],
         parse_kubectl_version,
-        &version_req_caret(MIN_KUBECTL_VERSION),
+        &version_req_at_least(MIN_KUBECTL_VERSION),
         "Install kubectl from https://kubernetes.io/docs/tasks/tools/#kubectl.",
     )
 }
@@ -417,7 +398,7 @@ pub fn helm() -> ToolCheck {
         "helm",
         &["version", "--short"],
         parse_first_semver_token,
-        &version_req_caret(MIN_HELM_VERSION),
+        &version_req_at_least(MIN_HELM_VERSION),
         "Install Helm from https://helm.sh/docs/intro/install/.",
     )
 }
@@ -429,7 +410,7 @@ pub fn docker() -> ToolCheck {
         "docker",
         &["version", "--format", "{{.Client.Version}}"],
         parse_first_semver_token,
-        &version_req_caret(MIN_DOCKER_VERSION),
+        &version_req_at_least(MIN_DOCKER_VERSION),
         "Install Docker from https://docs.docker.com/engine/install/ or use Podman.",
     )
 }
@@ -441,7 +422,7 @@ pub fn podman() -> ToolCheck {
         "podman",
         &["version", "--format", "{{.Client.Version}}"],
         parse_first_semver_token,
-        &version_req_caret(MIN_PODMAN_VERSION),
+        &version_req_at_least(MIN_PODMAN_VERSION),
         "Install Podman from https://podman.io/docs/installation.",
     )
 }
@@ -453,7 +434,7 @@ pub fn aws() -> ToolCheck {
         "aws",
         &["--version"],
         parse_first_semver_token,
-        &version_req_caret(MIN_AWS_VERSION),
+        &version_req_at_least(MIN_AWS_VERSION),
         "Install AWS CLI v2 from https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html.",
     )
 }
@@ -465,7 +446,7 @@ pub fn gcloud() -> ToolCheck {
         "gcloud",
         &["version", "--format=value(\"Google Cloud SDK\")"],
         parse_first_semver_token,
-        &version_req_caret(MIN_GCLOUD_VERSION),
+        &version_req_at_least(MIN_GCLOUD_VERSION),
         "Install gcloud from https://cloud.google.com/sdk/docs/install.",
     )
 }
@@ -477,14 +458,10 @@ pub fn az() -> ToolCheck {
         "az",
         &["version", "--output", "tsv", "--query", "\"azure-cli\""],
         parse_first_semver_token,
-        &version_req_caret(MIN_AZ_VERSION),
+        &version_req_at_least(MIN_AZ_VERSION),
         "Install Azure CLI from https://learn.microsoft.com/cli/azure/install-azure-cli.",
     )
 }
-
-// ============================================================================
-// Auth / scope probes
-// ============================================================================
 
 /// `aws sts get-caller-identity` — verifies AWS credentials are configured
 /// and usable. `region` is optional; when present it is passed as
@@ -518,12 +495,44 @@ pub fn aws_caller_identity(region: Option<&str>) -> ToolCheck {
     }
 }
 
+/// Shared shape for "the first non-empty stdout line is the authenticated
+/// identity". An empty stdout on exit-0 (nothing active) and a non-zero exit
+/// both mean "no usable session" — distinguished only by the detail string.
+/// `gcloud auth list` and `az account show` both fit; `aws_caller_identity`
+/// does not (it has no empty-stdout case) and `kubectl_can_i` parses a
+/// yes/no answer, so they stay bespoke.
+fn auth_probe_first_line(
+    name: &str,
+    description: &str,
+    binary: &str,
+    args: &[&str],
+    empty_detail: &str,
+    missing_hint: &str,
+    recovery_hint: &str,
+) -> ToolCheck {
+    match probe(binary, args) {
+        Ok(stdout) => {
+            let first = stdout.lines().next().map(|s| s.trim()).unwrap_or("");
+            if first.is_empty() {
+                ToolCheck::auth_failed(name, description, empty_detail, recovery_hint)
+            } else {
+                ToolCheck::ok(name, description, Some(first.to_string()))
+            }
+        }
+        Err(ProbeFailure::NotFound) => ToolCheck::missing(name, description, missing_hint),
+        Err(ProbeFailure::NonZero { stderr, .. }) => {
+            ToolCheck::auth_failed(name, description, stderr.trim().to_string(), recovery_hint)
+        }
+        Err(ProbeFailure::Io(detail)) => ToolCheck::probe_error(name, description, detail),
+    }
+}
+
 /// `gcloud auth list --filter=status:ACTIVE` — verifies a gcloud
 /// authentication is active.
 pub fn gcloud_auth_list() -> ToolCheck {
-    let name = "gcloud.auth";
-    let description = "gcloud has an ACTIVE authentication".to_string();
-    match probe(
+    auth_probe_first_line(
+        "gcloud.auth",
+        "gcloud has an ACTIVE authentication",
         "gcloud",
         &[
             "auth",
@@ -531,70 +540,24 @@ pub fn gcloud_auth_list() -> ToolCheck {
             "--filter=status:ACTIVE",
             "--format=value(account)",
         ],
-    ) {
-        Ok(stdout) => {
-            let first = stdout.lines().next().map(|s| s.trim()).unwrap_or("");
-            if first.is_empty() {
-                ToolCheck::auth_failed(
-                    name,
-                    description,
-                    "no ACTIVE account found".to_string(),
-                    "Run `gcloud auth login` (or `gcloud auth activate-service-account`).",
-                )
-            } else {
-                ToolCheck::ok(name, description, Some(first.to_string()))
-            }
-        }
-        Err(ProbeFailure::NotFound) => ToolCheck::missing(
-            name,
-            description,
-            "gcloud not installed; see `gcloud` check.",
-        ),
-        Err(ProbeFailure::NonZero { stderr, .. }) => ToolCheck::auth_failed(
-            name,
-            description,
-            stderr.trim().to_string(),
-            "Run `gcloud auth login`.",
-        ),
-        Err(ProbeFailure::Io(detail)) => ToolCheck::probe_error(name, description, detail),
-    }
+        "no ACTIVE account found",
+        "gcloud not installed; see `gcloud` check.",
+        "Run `gcloud auth login` (or `gcloud auth activate-service-account`).",
+    )
 }
 
 /// `az account show` — verifies an Azure subscription is selected and the
 /// session is not expired.
 pub fn az_account_show() -> ToolCheck {
-    let name = "az.account";
-    let description = "Azure CLI session has an active subscription".to_string();
-    match probe(
+    auth_probe_first_line(
+        "az.account",
+        "Azure CLI session has an active subscription",
         "az",
         &["account", "show", "--output", "tsv", "--query", "id"],
-    ) {
-        Ok(stdout) => {
-            let first = stdout.lines().next().map(|s| s.trim()).unwrap_or("");
-            if first.is_empty() {
-                ToolCheck::auth_failed(
-                    name,
-                    description,
-                    "no active subscription".to_string(),
-                    "Run `az login` and `az account set --subscription <id>`.",
-                )
-            } else {
-                ToolCheck::ok(name, description, Some(first.to_string()))
-            }
-        }
-        Err(ProbeFailure::NotFound) => ToolCheck::missing(
-            name,
-            description,
-            "Azure CLI not installed; see `az` check.",
-        ),
-        Err(ProbeFailure::NonZero { stderr, .. }) => ToolCheck::auth_failed(
-            name,
-            description,
-            stderr.trim().to_string(),
-            "Run `az login`.",
-        ),
-        Err(ProbeFailure::Io(detail)) => ToolCheck::probe_error(name, description, detail),
-    }
+        "no active subscription",
+        "Azure CLI not installed; see `az` check.",
+        "Run `az login` and `az account set --subscription <id>`.",
+    )
 }
 
 /// `kubectl auth can-i <verb> <resource> [-n <namespace>]` — verifies the
@@ -659,10 +622,6 @@ pub fn kubectl_can_i(verb: &str, resource: &str, namespace: Option<&str>) -> Too
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,13 +683,15 @@ mod tests {
             parse_first_semver_token("v3.13.1+gabcdef1"),
             Some(Version::new(3, 13, 1))
         );
-        // `aws --version`: `aws-cli/2.15.0 Python/3.11.6 Linux/...`
+        // `aws --version`: `aws-cli/2.15.0 Python/3.11.6 Linux/...` — the `/`
+        // separator lets us reach the `2.15.0` token (the `aws-cli` prefix and
+        // the `Python/3.11.6` runtime version are skipped: prefix has no dots,
+        // and `2.15.0` is the first 3-part token).
         let aws_out = "aws-cli/2.15.0 Python/3.11.6 Linux/5.15.0 source/x86_64";
-        // The version is embedded with a slash; our token splitter doesn't
-        // split on `/`, so this returns None — that's the documented edge.
-        // The AWS-specific probe will surface as ProbeError rather than
-        // silently mis-parsing.
-        assert!(parse_first_semver_token(aws_out).is_none());
+        assert_eq!(
+            parse_first_semver_token(aws_out),
+            Some(Version::new(2, 15, 0))
+        );
         // Plain semver: `1.30.0`
         assert_eq!(
             parse_first_semver_token("1.30.0"),
@@ -836,7 +797,7 @@ mod tests {
             let _: Version = min.parse().unwrap_or_else(|e| {
                 panic!("MIN_*_VERSION `{min}` is not valid semver: {e}");
             });
-            let _ = version_req_caret(min);
+            let _ = version_req_at_least(min);
         }
     }
 }

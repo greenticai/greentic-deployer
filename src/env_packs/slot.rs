@@ -40,15 +40,14 @@ pub trait EnvPackHandler: std::fmt::Debug + Send + Sync {
     /// unrepresentable.
     fn supported_versions(&self) -> VersionReq;
 
-    /// Preflight checks the handler needs to pass before it can do real work
-    /// (`C3`). Returns the list of [`ToolCheck`] results — handlers compose
-    /// the primitives + named-tool catalog in [`crate::tool_check`].
+    /// Preflight checks the handler needs to pass before it can do real work.
+    /// Returns the list of [`ToolCheck`] results — handlers compose the
+    /// primitives + named-tool catalog in [`crate::tool_check`].
     ///
-    /// The default returns an empty vec, which is the honest answer for
-    /// in-process Phase A built-ins (`local-process`, `dev-store`, `stdout`,
-    /// `in-memory`): they need no external tools. Phase D handlers (K8s,
-    /// cloud) override this to compose the named-tool checks they shell out
-    /// to.
+    /// The default returns an empty vec, which is the honest answer for the
+    /// in-process built-ins (`local-process`, `dev-store`, `stdout`,
+    /// `in-memory`): they need no external tools. Handlers that shell out
+    /// (K8s, cloud) override this to compose the named-tool checks.
     fn preflight(&self) -> Vec<ToolCheck> {
         Vec::new()
     }
