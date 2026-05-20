@@ -20,7 +20,7 @@ echo "Missing Greentic fixture tool(s): ${missing[*]}"
 
 if ! cargo binstall --version >/dev/null 2>&1; then
   echo "cargo-binstall is required to install fixture tools."
-  echo "Install it first with: cargo install cargo-binstall"
+  echo "In GitHub Actions, add a preceding step that uses cargo-bins/cargo-binstall@main."
   exit 1
 fi
 

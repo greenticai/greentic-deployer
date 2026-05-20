@@ -36,17 +36,8 @@ jobs:
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Check cargo-binstall
-        id: cargo-binstall
-        shell: bash
-        run: |
-          if cargo binstall --version >/dev/null 2>&1; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          fi
-      - uses: taiki-e/install-action@cargo-binstall
-        if: steps.cargo-binstall.outputs.available != 'true'
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
       - name: Install Greentic fixture tools
         run: ci/ensure_fixture_tools.sh
 
