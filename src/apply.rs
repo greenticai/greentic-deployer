@@ -6119,7 +6119,10 @@ data "aws_region" "current" {}
     #[test]
     fn render_terraform_map_escapes_special_characters() {
         let mut map = std::collections::BTreeMap::new();
-        map.insert("k".to_string(), "value with \"quotes\" and \\backslash".to_string());
+        map.insert(
+            "k".to_string(),
+            "value with \"quotes\" and \\backslash".to_string(),
+        );
         let rendered = render_terraform_map(&map);
         // JSON-style escapes survive into the HCL literal.
         assert!(
