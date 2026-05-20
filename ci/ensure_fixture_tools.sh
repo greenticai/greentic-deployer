@@ -23,13 +23,18 @@ fi
 
 echo "Missing Greentic fixture tool(s): ${missing[*]}"
 
-if ! cargo binstall --version >/dev/null 2>&1; then
+binstall_bin="$(command -v cargo-binstall || true)"
+if [[ -z "$binstall_bin" && -x "$cargo_home/bin/cargo-binstall" ]]; then
+  binstall_bin="$cargo_home/bin/cargo-binstall"
+fi
+
+if [[ -z "$binstall_bin" ]]; then
   echo "cargo-binstall is required to install fixture tools."
   echo "In GitHub Actions, add a preceding step that uses cargo-bins/cargo-binstall@main."
   exit 1
 fi
 
-cargo binstall --no-confirm "${required_specs[@]}"
+"$binstall_bin" --no-confirm "${required_specs[@]}"
 
 for bin in "${required_bins[@]}"; do
   command -v "$bin" >/dev/null 2>&1
