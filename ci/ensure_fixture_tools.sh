@@ -4,6 +4,11 @@ set -euo pipefail
 required_bins=(greentic-pack greentic-flow)
 required_specs=(greentic-pack@0.5.6 greentic-flow@0.5.8)
 
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+if [[ -d "$cargo_home/bin" ]]; then
+  export PATH="$cargo_home/bin:$PATH"
+fi
+
 missing=()
 for bin in "${required_bins[@]}"; do
   if ! command -v "$bin" >/dev/null 2>&1; then
