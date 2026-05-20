@@ -34,7 +34,7 @@ if [[ -z "$binstall_bin" ]]; then
   exit 1
 fi
 
-"$binstall_bin" --no-confirm "${required_specs[@]}"
+"$binstall_bin" --no-confirm --force "${required_specs[@]}"
 
 for bin in "${required_bins[@]}"; do
   command -v "$bin" >/dev/null 2>&1
