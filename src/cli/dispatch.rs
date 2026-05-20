@@ -114,10 +114,10 @@ pub enum EnvVerb {
     Doctor {
         env_id: String,
     },
-    /// Run per-binding tool preflight (C3). Resolves each env-pack binding
-    /// via the registry and invokes its handler's `preflight()` to check
-    /// external tools (binary presence, version, auth, scope) needed for
-    /// real work. Phase A `local` handlers report no external tools.
+    /// Run per-binding tool preflight. Resolves each env-pack binding via the
+    /// registry and invokes its handler's `preflight()` to check external
+    /// tools (binary presence, version, auth, scope) needed for real work.
+    /// The built-in `local` handlers report no external tools.
     ToolCheck {
         env_id: String,
     },

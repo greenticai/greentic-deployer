@@ -302,15 +302,15 @@ pub fn doctor(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpO
 }
 
 /// `op env tool-check <env_id>`. Runs each binding's
-/// [`crate::env_packs::EnvPackHandler::preflight`] (`C3`) and aggregates the
+/// [`crate::env_packs::EnvPackHandler::preflight`] and aggregates the
 /// per-binding [`crate::tool_check::ToolCheck`] results into a structured
 /// outcome.
 ///
 /// Bindings whose `kind` is not registered (or whose version is rejected by
 /// the env-pack registry) surface as `unresolved_bindings` so the operator
-/// sees both shape errors and tool-preflight errors in one report. Phase A
-/// `local` handlers return empty checks (in-process, no external tools);
-/// Phase D handlers populate this from the named-tool catalog.
+/// sees both shape errors and tool-preflight errors in one report. The
+/// built-in `local` handlers return empty checks (in-process, no external
+/// tools); handlers that shell out populate this from the named-tool catalog.
 pub fn tool_check(
     store: &LocalFsStore,
     flags: &OpFlags,
