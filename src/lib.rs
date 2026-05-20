@@ -15,6 +15,7 @@ pub mod contract;
 pub mod defaults;
 pub mod deployment;
 pub mod desktop;
+pub mod env_packs;
 pub mod environment;
 pub mod error;
 pub mod extension;
@@ -59,6 +60,7 @@ pub use deployment::{
     ApplyExecutionOutcome, DestroyExecutionOutcome, ExecutionOutcome, ExecutionOutcomePayload,
     StatusExecutionOutcome,
 };
+pub use env_packs::{EnvPackHandler, EnvPackRegistry, RegistryError};
 pub use error::DeployerError;
 pub use extension::{
     BuiltinBackendDescriptor, BuiltinBackendExecutionKind, BuiltinBackendHandlerId,

@@ -244,6 +244,43 @@ pub fn doctor(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpO
         .filter(|s| env.pack_for_slot(*s).is_none())
         .map(|s| s.to_string())
         .collect();
+    // Resolve each binding's `kind` against the env-pack registry (A9): a
+    // binding whose descriptor no native handler backs, or whose handler
+    // serves a different slot, is a latent misconfiguration the operator
+    // should see before deploy.
+    let registry = crate::env_packs::EnvPackRegistry::with_builtins();
+    let mut unknown_kinds: Vec<String> = Vec::new();
+    let mut slot_mismatches: Vec<Value> = Vec::new();
+    let mut version_skew: Vec<Value> = Vec::new();
+    for binding in &env.packs {
+        match registry.resolve_for_slot(binding.slot, &binding.kind) {
+            Ok(_) => {}
+            Err(crate::env_packs::RegistryError::Unknown(kind)) => unknown_kinds.push(kind),
+            Err(crate::env_packs::RegistryError::SlotMismatch {
+                kind,
+                expected,
+                actual,
+            }) => slot_mismatches.push(json!({
+                "kind": kind,
+                "bound_slot": expected.to_string(),
+                "handler_slot": actual.to_string(),
+            })),
+            Err(crate::env_packs::RegistryError::VersionUnsupported {
+                kind,
+                requested,
+                supported,
+            }) => version_skew.push(json!({
+                "kind": kind,
+                "requested": requested,
+                "supported": supported,
+            })),
+            // `resolve_for_slot` only produces the three variants above;
+            // `DuplicateRegistration` comes solely from `register`.
+            Err(err @ crate::env_packs::RegistryError::DuplicateRegistration(_)) => {
+                unreachable!("resolve_for_slot never returns {err:?}")
+            }
+        }
+    }
     Ok(OpOutcome::new(
         NOUN,
         "doctor",
@@ -255,6 +292,9 @@ pub fn doctor(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpO
             },
             "bound_slots": bound_slots,
             "missing_slots": missing_slots,
+            "unknown_kinds": unknown_kinds,
+            "slot_mismatches": slot_mismatches,
+            "version_skew": version_skew,
             "has_runtime": runtime.is_some(),
             "checked_at": Utc::now(),
         }),
@@ -479,6 +519,110 @@ mod tests {
         assert_eq!(
             missing.len(),
             greentic_deploy_spec::CapabilitySlot::ALL.len()
+        );
+    }
+
+    #[test]
+    fn doctor_flags_unknown_kind_and_slot_mismatch() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        // Unknown descriptor: no native handler backs `acme-vault`.
+        env.packs.push(make_binding(
+            greentic_deploy_spec::CapabilitySlot::Secrets,
+            "greentic.secrets.acme-vault@1.0.0",
+        ));
+        // Slot mismatch: the State slot bound to a deployer handler's descriptor.
+        env.packs.push(make_binding(
+            greentic_deploy_spec::CapabilitySlot::State,
+            "greentic.deployer.local-process@0.1.0",
+        ));
+        store.save(&env).unwrap();
+        let outcome = doctor(&store, &OpFlags::default(), "local").unwrap();
+        let unknown = outcome
+            .result
+            .get("unknown_kinds")
+            .and_then(|v| v.as_array())
+            .expect("unknown_kinds array");
+        assert_eq!(unknown.len(), 1);
+        assert!(unknown[0].as_str().unwrap().contains("acme-vault"));
+        let mismatches = outcome
+            .result
+            .get("slot_mismatches")
+            .and_then(|v| v.as_array())
+            .expect("slot_mismatches array");
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(
+            mismatches[0].get("handler_slot").and_then(|v| v.as_str()),
+            Some("deployer")
+        );
+        assert_eq!(
+            mismatches[0].get("bound_slot").and_then(|v| v.as_str()),
+            Some("state")
+        );
+    }
+
+    #[test]
+    fn doctor_accepts_built_in_bindings() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            greentic_deploy_spec::CapabilitySlot::Secrets,
+            "greentic.secrets.dev-store@0.1.0",
+        ));
+        store.save(&env).unwrap();
+        let outcome = doctor(&store, &OpFlags::default(), "local").unwrap();
+        for field in ["unknown_kinds", "slot_mismatches", "version_skew"] {
+            assert!(
+                outcome
+                    .result
+                    .get(field)
+                    .and_then(|v| v.as_array())
+                    .unwrap()
+                    .is_empty(),
+                "{field} should be empty for a built-in binding at its supported version"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_flags_unsupported_version() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        // Known path + correct slot, but a version the built-in doesn't implement.
+        env.packs.push(make_binding(
+            greentic_deploy_spec::CapabilitySlot::Secrets,
+            "greentic.secrets.dev-store@9.9.9",
+        ));
+        store.save(&env).unwrap();
+        let outcome = doctor(&store, &OpFlags::default(), "local").unwrap();
+        let skew = outcome
+            .result
+            .get("version_skew")
+            .and_then(|v| v.as_array())
+            .expect("version_skew array");
+        assert_eq!(skew.len(), 1);
+        assert_eq!(
+            skew[0].get("requested").and_then(|v| v.as_str()),
+            Some("9.9.9")
+        );
+        assert_eq!(
+            skew[0].get("supported").and_then(|v| v.as_str()),
+            Some("^0.1.0")
+        );
+        // A version-skewed binding is not also reported as unknown.
+        assert!(
+            outcome
+                .result
+                .get("unknown_kinds")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .is_empty()
         );
     }
 
