@@ -114,6 +114,13 @@ pub enum EnvVerb {
     Doctor {
         env_id: String,
     },
+    /// Run per-binding tool preflight (C3). Resolves each env-pack binding
+    /// via the registry and invokes its handler's `preflight()` to check
+    /// external tools (binary presence, version, auth, scope) needed for
+    /// real work. Phase A `local` handlers report no external tools.
+    ToolCheck {
+        env_id: String,
+    },
     Destroy {
         env_id: String,
         #[arg(long)]
@@ -283,6 +290,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 EnvVerb::List => "list",
                 EnvVerb::Show { .. } => "show",
                 EnvVerb::Doctor { .. } => "doctor",
+                EnvVerb::ToolCheck { .. } => "tool-check",
                 EnvVerb::Destroy { .. } => "destroy",
                 EnvVerb::MigrateDev { .. } => "migrate-dev",
                 EnvVerb::MigrateState { .. } => "migrate-state",
@@ -360,6 +368,7 @@ fn dispatch_env(store: &LocalFsStore, flags: &OpFlags, verb: EnvVerb) -> Result<
         EnvVerb::List => super::env::list(store, flags)?,
         EnvVerb::Show { env_id } => super::env::show(store, flags, &env_id)?,
         EnvVerb::Doctor { env_id } => super::env::doctor(store, flags, &env_id)?,
+        EnvVerb::ToolCheck { env_id } => super::env::tool_check(store, flags, &env_id)?,
         EnvVerb::Destroy { env_id, confirm } => {
             super::env::destroy(store, flags, &env_id, confirm)?
         }

@@ -301,6 +301,72 @@ pub fn doctor(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpO
     ))
 }
 
+/// `op env tool-check <env_id>`. Runs each binding's
+/// [`crate::env_packs::EnvPackHandler::preflight`] (`C3`) and aggregates the
+/// per-binding [`crate::tool_check::ToolCheck`] results into a structured
+/// outcome.
+///
+/// Bindings whose `kind` is not registered (or whose version is rejected by
+/// the env-pack registry) surface as `unresolved_bindings` so the operator
+/// sees both shape errors and tool-preflight errors in one report. Phase A
+/// `local` handlers return empty checks (in-process, no external tools);
+/// Phase D handlers populate this from the named-tool catalog.
+pub fn tool_check(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    env_id: &str,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(
+            NOUN,
+            "tool-check",
+            json!({ "input_schema": "env_id positional" }),
+        ));
+    }
+    let env_id =
+        EnvId::try_from(env_id).map_err(|e| OpError::InvalidArgument(format!("env_id: {e}")))?;
+    if !store.exists(&env_id)? {
+        return Err(OpError::NotFound(format!("environment `{env_id}`")));
+    }
+    let env = store.load(&env_id)?;
+    let registry = crate::env_packs::EnvPackRegistry::with_builtins();
+    let mut bindings: Vec<Value> = Vec::with_capacity(env.packs.len());
+    let mut unresolved_bindings: Vec<Value> = Vec::new();
+    let mut total_checks = 0usize;
+    let mut failed_checks = 0usize;
+    for binding in &env.packs {
+        match registry.resolve_for_slot(binding.slot, &binding.kind) {
+            Ok(handler) => {
+                let checks = handler.preflight();
+                total_checks += checks.len();
+                failed_checks += checks.iter().filter(|c| !c.outcome.is_ok()).count();
+                bindings.push(json!({
+                    "slot": binding.slot.to_string(),
+                    "kind": binding.kind.as_str(),
+                    "checks": checks,
+                }));
+            }
+            Err(e) => unresolved_bindings.push(json!({
+                "slot": binding.slot.to_string(),
+                "kind": binding.kind.as_str(),
+                "error": e.to_string(),
+            })),
+        }
+    }
+    Ok(OpOutcome::new(
+        NOUN,
+        "tool-check",
+        json!({
+            "environment_id": env.environment_id.as_str(),
+            "bindings": bindings,
+            "unresolved_bindings": unresolved_bindings,
+            "total_checks": total_checks,
+            "failed_checks": failed_checks,
+            "checked_at": Utc::now(),
+        }),
+    ))
+}
+
 /// `op env init`. Idempotent bootstrap of the `local` env with its five
 /// default env-pack bindings. Wraps the A4 helper
 /// [`super::bootstrap::ensure_local_environment`] so first-run installs can
@@ -770,6 +836,118 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn tool_check_returns_empty_per_binding_for_local_builtins() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        for (slot, descriptor) in crate::defaults::LOCAL_DEFAULT_BINDINGS {
+            env.packs.push(make_binding(*slot, descriptor));
+        }
+        store.save(&env).unwrap();
+        let outcome = tool_check(&store, &OpFlags::default(), "local").unwrap();
+        let bindings = outcome
+            .result
+            .get("bindings")
+            .and_then(|v| v.as_array())
+            .expect("bindings array");
+        assert_eq!(
+            bindings.len(),
+            crate::defaults::LOCAL_DEFAULT_BINDINGS.len()
+        );
+        for entry in bindings {
+            let checks = entry
+                .get("checks")
+                .and_then(|v| v.as_array())
+                .expect("checks array on binding");
+            assert!(
+                checks.is_empty(),
+                "Phase A built-in handler should report no external tool checks"
+            );
+        }
+        assert_eq!(
+            outcome.result.get("total_checks").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            outcome.result.get("failed_checks").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert!(
+            outcome
+                .result
+                .get("unresolved_bindings")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tool_check_surfaces_unresolved_bindings_alongside_resolved() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        // One resolvable built-in + one bogus kind so the verb has to
+        // distinguish the two paths.
+        env.packs.push(make_binding(
+            greentic_deploy_spec::CapabilitySlot::Secrets,
+            "greentic.secrets.dev-store@0.1.0",
+        ));
+        env.packs.push(make_binding(
+            greentic_deploy_spec::CapabilitySlot::Deployer,
+            "greentic.deployer.does-not-exist@0.1.0",
+        ));
+        store.save(&env).unwrap();
+        let outcome = tool_check(&store, &OpFlags::default(), "local").unwrap();
+        let bindings = outcome
+            .result
+            .get("bindings")
+            .and_then(|v| v.as_array())
+            .expect("bindings array");
+        assert_eq!(bindings.len(), 1, "only the resolvable binding is reported");
+        let unresolved = outcome
+            .result
+            .get("unresolved_bindings")
+            .and_then(|v| v.as_array())
+            .expect("unresolved_bindings array");
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(
+            unresolved[0].get("kind").and_then(|v| v.as_str()),
+            Some("greentic.deployer.does-not-exist@0.1.0")
+        );
+        assert!(
+            unresolved[0]
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn tool_check_schema_only_returns_input_schema() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let flags = OpFlags {
+            schema_only: true,
+            ..Default::default()
+        };
+        let outcome = tool_check(&store, &flags, "local").unwrap();
+        assert_eq!(outcome.op, "tool-check");
+        assert!(outcome.result.get("input_schema").is_some());
+    }
+
+    #[test]
+    fn tool_check_missing_env_errors_not_found() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let err = tool_check(&store, &OpFlags::default(), "local").unwrap_err();
+        assert!(matches!(err, OpError::NotFound(_)), "got {err:?}");
     }
 
     #[test]
