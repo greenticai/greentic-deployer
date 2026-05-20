@@ -109,7 +109,6 @@ pub fn set(
         noun: NOUN,
         verb: "set",
         target: json!({"fields": fields}),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {

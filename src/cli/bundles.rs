@@ -121,7 +121,6 @@ pub fn add(
             "bundle_id": bundle_id.as_str(),
             "customer_id": customer_id.as_str(),
         }),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {
@@ -205,7 +204,6 @@ pub fn update(
         noun: NOUN,
         verb: "update",
         target: json!({"deployment_id": deployment_id.to_string()}),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {
@@ -269,7 +267,6 @@ pub fn remove(
         noun: NOUN,
         verb: "remove",
         target: json!({"deployment_id": deployment_id.to_string()}),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {

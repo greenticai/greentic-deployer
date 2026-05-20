@@ -363,7 +363,6 @@ pub fn apply(store: &LocalFsStore, flags: &OpFlags, target: &str) -> Result<OpOu
             "from_env": from.as_str(),
             "to_env": to.as_str(),
         }),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {

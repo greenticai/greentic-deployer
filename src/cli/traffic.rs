@@ -120,108 +120,107 @@ pub fn set(
         noun: NOUN,
         verb: "set",
         target: json!({"deployment_id": deployment_id.to_string()}),
-        previous_generation: None,
         idempotency_key: Some(payload.idempotency_key.clone()),
     };
     audit_and_record(store, ctx, || {
-        let gens_cell = std::cell::Cell::new(super::AuditGens::NONE);
-        let split = store.transact(&env_id, |locked| -> Result<TrafficSplit, OpError> {
-        let mut env = locked.load()?;
-        let deployment = env
-            .bundles
-            .iter()
-            .find(|b| b.deployment_id == deployment_id)
-            .ok_or_else(|| {
-                OpError::NotFound(format!(
-                    "deployment `{deployment_id}` not found in env `{env_id}`"
-                ))
-            })?;
-        let bundle_id: BundleId = deployment.bundle_id.clone();
-        // Revision-belongs-to-deployment check (operator-friendly error
-        // instead of waiting for Environment::validate to fire).
-        for entry in &parsed_entries {
-            let rev = env
-                .revisions
+        let (split, gens) = store.transact(&env_id, |locked| {
+            let mut env = locked.load()?;
+            let deployment = env
+                .bundles
                 .iter()
-                .find(|r| r.revision_id == entry.revision_id)
+                .find(|b| b.deployment_id == deployment_id)
                 .ok_or_else(|| {
                     OpError::NotFound(format!(
-                        "revision `{}` not found in env `{env_id}`",
-                        entry.revision_id
+                        "deployment `{deployment_id}` not found in env `{env_id}`"
                     ))
                 })?;
-            if rev.deployment_id != deployment_id {
-                return Err(OpError::InvalidArgument(format!(
-                    "revision `{}` belongs to deployment `{}`, not `{}`",
-                    entry.revision_id, rev.deployment_id, deployment_id,
-                )));
-            }
-        }
-        // Idempotency check: a retry with the same key against the same
-        // (deployment, entries) is a no-op success; same key + different
-        // payload is a conflict; new key advances generation.
-        let prev_split_idx = env
-            .traffic_splits
-            .iter()
-            .position(|s| s.deployment_id == deployment_id);
-        if let Some(idx) = prev_split_idx {
-            let prev = &env.traffic_splits[idx];
-            if prev.idempotency_key == payload.idempotency_key {
-                if entries_match(&prev.entries, &parsed_entries) {
-                    // No-op replay. Return the current split unchanged.
-                    return Ok(prev.clone());
+            let bundle_id: BundleId = deployment.bundle_id.clone();
+            // Revision-belongs-to-deployment check (operator-friendly error
+            // instead of waiting for Environment::validate to fire).
+            for entry in &parsed_entries {
+                let rev = env
+                    .revisions
+                    .iter()
+                    .find(|r| r.revision_id == entry.revision_id)
+                    .ok_or_else(|| {
+                        OpError::NotFound(format!(
+                            "revision `{}` not found in env `{env_id}`",
+                            entry.revision_id
+                        ))
+                    })?;
+                if rev.deployment_id != deployment_id {
+                    return Err(OpError::InvalidArgument(format!(
+                        "revision `{}` belongs to deployment `{}`, not `{}`",
+                        entry.revision_id, rev.deployment_id, deployment_id,
+                    )));
                 }
-                return Err(OpError::Conflict(format!(
-                    "idempotency key `{}` already used for deployment `{}` with different entries",
-                    payload.idempotency_key, deployment_id
-                )));
             }
-        }
-        let (generation, previous_split_ref, prev_gen) = match prev_split_idx {
-            Some(idx) => {
+            // Idempotency check: a retry with the same key against the same
+            // (deployment, entries) is a no-op success; same key + different
+            // payload is a conflict; new key advances generation.
+            let prev_split_idx = env
+                .traffic_splits
+                .iter()
+                .position(|s| s.deployment_id == deployment_id);
+            if let Some(idx) = prev_split_idx {
                 let prev = &env.traffic_splits[idx];
-                let snapshot = serde_json::to_value(prev)
-                    .map_err(|e| OpError::InvalidArgument(format!("snapshot prior split: {e}")))?;
-                (
-                    prev.generation + 1,
-                    Some(stash_inline(snapshot)),
-                    Some(prev.generation),
-                )
+                if prev.idempotency_key == payload.idempotency_key {
+                    if entries_match(&prev.entries, &parsed_entries) {
+                        // No-op replay. Return the current split unchanged.
+                        return Ok((prev.clone(), super::AuditGens::NONE));
+                    }
+                    return Err(OpError::Conflict(format!(
+                        "idempotency key `{}` already used for deployment `{}` with different entries",
+                        payload.idempotency_key, deployment_id
+                    )));
+                }
             }
-            None => (0, None, None),
-        };
-        let split = TrafficSplit {
-            schema: SchemaVersion::new(SchemaVersion::TRAFFIC_SPLIT_V1),
-            env_id: env_id.clone(),
-            deployment_id,
-            bundle_id,
-            generation,
-            entries: parsed_entries.clone(),
-            updated_at: Utc::now(),
-            updated_by: payload.updated_by.clone(),
-            idempotency_key: payload.idempotency_key.clone(),
-            authorization_ref: payload.authorization_ref.clone(),
-            previous_split_ref,
-        };
-        split.validate().map_err(OpError::Spec)?;
-        match prev_split_idx {
-            Some(idx) => env.traffic_splits[idx] = split.clone(),
-            None => env.traffic_splits.push(split.clone()),
-        }
-        locked.save(&env)?;
-        gens_cell.set(super::AuditGens {
-            previous: prev_gen,
-            new: Some(generation),
-        });
-        Ok(split)
-    })?;
+            let (generation, previous_split_ref, prev_gen) = match prev_split_idx {
+                Some(idx) => {
+                    let prev = &env.traffic_splits[idx];
+                    let snapshot = serde_json::to_value(prev).map_err(|e| {
+                        OpError::InvalidArgument(format!("snapshot prior split: {e}"))
+                    })?;
+                    (
+                        prev.generation + 1,
+                        Some(stash_inline(snapshot)),
+                        Some(prev.generation),
+                    )
+                }
+                None => (0, None, None),
+            };
+            let split = TrafficSplit {
+                schema: SchemaVersion::new(SchemaVersion::TRAFFIC_SPLIT_V1),
+                env_id: env_id.clone(),
+                deployment_id,
+                bundle_id,
+                generation,
+                entries: parsed_entries.clone(),
+                updated_at: Utc::now(),
+                updated_by: payload.updated_by.clone(),
+                idempotency_key: payload.idempotency_key.clone(),
+                authorization_ref: payload.authorization_ref.clone(),
+                previous_split_ref,
+            };
+            split.validate().map_err(OpError::Spec)?;
+            match prev_split_idx {
+                Some(idx) => env.traffic_splits[idx] = split.clone(),
+                None => env.traffic_splits.push(split.clone()),
+            }
+            locked.save(&env)?;
+            let gens = super::AuditGens {
+                previous: prev_gen,
+                new: Some(generation),
+            };
+            Ok::<_, OpError>((split, gens))
+        })?;
         let outcome = OpOutcome::new(
             NOUN,
             "set",
             serde_json::to_value(TrafficSummary::from(&env_id, &split))
                 .expect("TrafficSummary is json-safe"),
         );
-        Ok((outcome, gens_cell.get()))
+        Ok((outcome, gens))
     })
 }
 
@@ -320,12 +319,10 @@ pub fn rollback(
         noun: NOUN,
         verb: "rollback",
         target: json!({"deployment_id": deployment_id.to_string()}),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {
-        let gens_cell = std::cell::Cell::new(super::AuditGens::NONE);
-        let restored = store.transact(&env_id, |locked| -> Result<TrafficSplit, OpError> {
+        let (restored, gens) = store.transact(&env_id, |locked| {
             let mut env = locked.load()?;
             let idx = env
                 .traffic_splits
@@ -362,11 +359,11 @@ pub fn rollback(
             restored.validate().map_err(OpError::Spec)?;
             env.traffic_splits[idx] = restored.clone();
             locked.save(&env)?;
-            gens_cell.set(super::AuditGens {
+            let gens = super::AuditGens {
                 previous: Some(prev_split_generation),
                 new: Some(prev_split_generation + 1),
-            });
-            Ok(restored)
+            };
+            Ok::<_, OpError>((restored, gens))
         })?;
         let outcome = OpOutcome::new(
             NOUN,
@@ -374,7 +371,7 @@ pub fn rollback(
             serde_json::to_value(TrafficSummary::from(&env_id, &restored))
                 .expect("TrafficSummary is json-safe"),
         );
-        Ok((outcome, gens_cell.get()))
+        Ok((outcome, gens))
     })
 }
 

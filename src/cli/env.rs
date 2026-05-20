@@ -75,7 +75,6 @@ pub fn create(
         noun: NOUN,
         verb: "create",
         target: json!({"environment_id": env_id.as_str()}),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {
@@ -145,7 +144,6 @@ pub fn update(
         noun: NOUN,
         verb: "update",
         target: json!({"environment_id": env_id.as_str(), "fields": fields}),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {
@@ -293,7 +291,6 @@ pub fn destroy(
         noun: NOUN,
         verb: "destroy",
         target: json!({"environment_id": env_id.as_str(), "confirm": confirm}),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {

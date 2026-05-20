@@ -74,7 +74,6 @@ pub fn add(
         noun: NOUN,
         verb: "add",
         target: json!({"slot": payload.slot, "kind": payload.kind}),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {
@@ -123,12 +122,10 @@ pub fn update(
         noun: NOUN,
         verb: "update",
         target: json!({"slot": payload.slot, "kind": payload.kind}),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {
-        let gens_cell = std::cell::Cell::new(super::AuditGens::NONE);
-        let summary = store.transact(&env_id, |locked| -> Result<BindingSummary, OpError> {
+        let (summary, gens) = store.transact(&env_id, |locked| {
             let mut env = locked.load()?;
             let idx = env
                 .packs
@@ -147,18 +144,18 @@ pub fn update(
             new_binding.previous_binding_ref = Some(stash_previous(prev_snapshot));
             env.packs[idx] = new_binding;
             locked.save(&env)?;
-            gens_cell.set(super::AuditGens {
+            let gens = super::AuditGens {
                 previous: Some(prev_generation),
                 new: Some(prev_generation + 1),
-            });
-            Ok(BindingSummary::from_binding(&env_id, &env.packs[idx]))
+            };
+            Ok::<_, OpError>((BindingSummary::from_binding(&env_id, &env.packs[idx]), gens))
         })?;
         let outcome = OpOutcome::new(
             NOUN,
             "update",
             serde_json::to_value(summary).expect("BindingSummary is json-safe"),
         );
-        Ok((outcome, gens_cell.get()))
+        Ok((outcome, gens))
     })
 }
 
@@ -183,12 +180,10 @@ pub fn remove(
         noun: NOUN,
         verb: "remove",
         target: json!({"slot": payload.slot}),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {
-        let gens_cell = std::cell::Cell::new(super::AuditGens::NONE);
-        let summary = store.transact(&env_id, |locked| -> Result<BindingSummary, OpError> {
+        let (summary, gens) = store.transact(&env_id, |locked| {
             let mut env = locked.load()?;
             let idx = env
                 .packs
@@ -201,19 +196,19 @@ pub fn remove(
                     ))
                 })?;
             let removed = env.packs.remove(idx);
-            gens_cell.set(super::AuditGens {
+            locked.save(&env)?;
+            let gens = super::AuditGens {
                 previous: Some(removed.generation),
                 new: None,
-            });
-            locked.save(&env)?;
-            Ok(BindingSummary::from_binding(&env_id, &removed))
+            };
+            Ok::<_, OpError>((BindingSummary::from_binding(&env_id, &removed), gens))
         })?;
         let outcome = OpOutcome::new(
             NOUN,
             "remove",
             serde_json::to_value(summary).expect("BindingSummary is json-safe"),
         );
-        Ok((outcome, gens_cell.get()))
+        Ok((outcome, gens))
     })
 }
 
@@ -232,12 +227,10 @@ pub fn rollback(
         noun: NOUN,
         verb: "rollback",
         target: json!({"slot": payload.slot}),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {
-        let gens_cell = std::cell::Cell::new(super::AuditGens::NONE);
-        let summary = store.transact(&env_id, |locked| -> Result<BindingSummary, OpError> {
+        let (summary, gens) = store.transact(&env_id, |locked| {
             let mut env = locked.load()?;
             let idx = env
                 .packs
@@ -270,18 +263,18 @@ pub fn rollback(
             restored.previous_binding_ref = None;
             env.packs[idx] = restored;
             locked.save(&env)?;
-            gens_cell.set(super::AuditGens {
+            let gens = super::AuditGens {
                 previous: Some(prev_generation),
                 new: Some(prev_generation + 1),
-            });
-            Ok(BindingSummary::from_binding(&env_id, &env.packs[idx]))
+            };
+            Ok::<_, OpError>((BindingSummary::from_binding(&env_id, &env.packs[idx]), gens))
         })?;
         let outcome = OpOutcome::new(
             NOUN,
             "rollback",
             serde_json::to_value(summary).expect("BindingSummary is json-safe"),
         );
-        Ok((outcome, gens_cell.get()))
+        Ok((outcome, gens))
     })
 }
 

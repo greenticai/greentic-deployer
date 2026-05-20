@@ -166,14 +166,13 @@ impl OpError {
 
 /// Context for [`audit_and_record`] — everything the helper needs to build an
 /// [`AuditEvent`] except the mutation's generations (which the closure
-/// returns).
+/// returns as [`AuditGens`]).
 #[derive(Debug)]
 pub(crate) struct AuditCtx {
     pub env_id: EnvId,
     pub noun: &'static str,
     pub verb: &'static str,
     pub target: Value,
-    pub previous_generation: Option<u64>,
     pub idempotency_key: Option<String>,
 }
 
@@ -244,7 +243,6 @@ where
     // Only an `Ok` from an allowed mutation commits durable state; that is the
     // case where a missing audit record violates the A7 guarantee.
     let committed = result.is_ok();
-    let previous_generation = gens.previous.or(ctx.previous_generation);
 
     let audit_result = match &result {
         Ok(_) => AuditResult::Ok,
@@ -266,7 +264,7 @@ where
         noun: ctx.noun.to_string(),
         verb: ctx.verb.to_string(),
         target: ctx.target,
-        previous_generation,
+        previous_generation: gens.previous,
         new_generation: gens.new,
         idempotency_key: ctx.idempotency_key,
         authorization: decision,

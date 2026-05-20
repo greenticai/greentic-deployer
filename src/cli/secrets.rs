@@ -117,7 +117,6 @@ pub fn put(
         noun: NOUN,
         verb: "put",
         target: json!({"path": payload.path}),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {
@@ -183,7 +182,6 @@ pub fn rotate(
         noun: NOUN,
         verb: "rotate",
         target: json!({"path": payload.path}),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {

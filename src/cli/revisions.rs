@@ -148,7 +148,6 @@ pub fn stage(
             "deployment_id": deployment_id.to_string(),
             "lifecycle_to": "staged",
         }),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {
@@ -338,19 +337,18 @@ fn transition<F: FnOnce(&mut Revision)>(
     let payload = resolve_payload::<RevisionTransitionPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let revision_id = parse_revision_id(&payload.revision_id)?;
-    let final_lifecycle_label = accepted_chain
-        .last()
-        .map(|(_, to)| format!("{to:?}").to_lowercase())
-        .unwrap_or_else(|| "<unknown>".to_string());
+    // The chain's final `to` state is the lifecycle this verb lands on. Serde
+    // emits the canonical lowercase wire form, matching how lifecycle appears
+    // everywhere else.
+    let lifecycle_to = accepted_chain.last().map(|(_, to)| *to);
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: op,
         target: json!({
             "revision_id": revision_id.to_string(),
-            "lifecycle_to": final_lifecycle_label,
+            "lifecycle_to": lifecycle_to,
         }),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {

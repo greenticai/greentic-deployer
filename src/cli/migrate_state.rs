@@ -105,7 +105,6 @@ pub fn apply(
         noun: NOUN,
         verb: OP,
         target: json!({"state_dir": state_dir.display().to_string()}),
-        previous_generation: None,
         idempotency_key: None,
     };
     // `require_env_exists` lives inside the closure so a non-local target is

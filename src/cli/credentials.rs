@@ -99,7 +99,6 @@ pub fn bootstrap(
         noun: NOUN,
         verb: "bootstrap",
         target: json!({"admin_profile": payload.admin_profile}),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {
@@ -136,7 +135,6 @@ pub fn rotate(
         noun: NOUN,
         verb: "rotate",
         target: json!({}),
-        previous_generation: None,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, || {
