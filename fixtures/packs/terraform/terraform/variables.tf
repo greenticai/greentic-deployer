@@ -104,7 +104,6 @@ variable "aws_use_default_vpc" {
 # locally. Empty default = no operator secrets materialised, terraform behaves
 # as before this PR. The bundle artifact never carries these values.
 variable "secrets_map" {
-  type      = map(string)
-  default   = {}
-  sensitive = true
+  type    = map(string)
+  default = {}
 }

@@ -21,6 +21,7 @@ module "operator_aws" {
   public_base_url        = var.public_base_url
   runtime_secret_prefix  = var.runtime_secret_prefix
   runtime_secret_env     = var.runtime_secret_env
+  secrets_map            = var.secrets_map
   use_default_vpc        = var.aws_use_default_vpc
 }
 
@@ -44,6 +45,7 @@ module "operator_azure" {
   azure_location         = var.azure_location
   runtime_secret_prefix  = var.runtime_secret_prefix
   runtime_secret_env     = var.runtime_secret_env
+  secrets_map            = var.secrets_map
 }
 
 module "operator_gcp" {
@@ -65,6 +67,7 @@ module "operator_gcp" {
   gcp_region             = var.gcp_region
   runtime_secret_prefix  = var.runtime_secret_prefix
   runtime_secret_env     = var.runtime_secret_env
+  secrets_map            = var.secrets_map
 }
 
 module "dns" {

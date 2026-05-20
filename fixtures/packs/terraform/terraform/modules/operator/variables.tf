@@ -55,7 +55,6 @@ variable "use_default_vpc" {
 # task definition's `secrets` block so the container starts with the URI as
 # an env var name and the value injected from Secrets Manager.
 variable "secrets_map" {
-  type      = map(string)
-  default   = {}
-  sensitive = true
+  type    = map(string)
+  default = {}
 }

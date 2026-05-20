@@ -31,6 +31,7 @@ pub struct RuntimeSecretRequirement {
     pub provider_id: String,
     pub key: String,
     pub required: bool,
+    pub default_value: Option<String>,
     pub source: PathBuf,
 }
 
@@ -61,6 +62,7 @@ pub enum SecretValueSource {
     Env { key: String },
     DevStore { path: PathBuf },
     SetupAnswers { path: PathBuf },
+    SetupDefault,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +173,7 @@ pub fn collect_requirements(ctx: &RuntimeSecretContext) -> Result<Vec<RuntimeSec
                     provider_id: provider_id.clone(),
                     key,
                     required: req.required,
+                    default_value: req.default_value,
                     source: pack_path.clone(),
                 });
         }
@@ -227,7 +230,8 @@ pub fn runtime_secret_env_map_for_cloud(
             }
             _ => continue,
         };
-        env_map.insert(requirement.uri, remote_name);
+        env_map.insert(requirement.uri, remote_name.clone());
+        env_map.insert(requirement.key, remote_name);
     }
     Ok(env_map)
 }
@@ -236,6 +240,13 @@ fn optional_requirement_has_local_value(
     bundle_root: &Path,
     requirement: &RuntimeSecretRequirement,
 ) -> bool {
+    if requirement
+        .default_value
+        .as_ref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        return true;
+    }
     if let Some(env_key) = canonical_secret_store_key(&requirement.uri)
         && let Ok(value) = env::var(env_key)
         && !value.is_empty()
@@ -316,6 +327,17 @@ pub async fn resolve_runtime_secrets(
                 requirement: requirement.clone(),
                 value: SecretValue(value),
                 source: SecretValueSource::SetupAnswers { path },
+            });
+        } else if let Some(value) = requirement
+            .default_value
+            .as_ref()
+            .filter(|value| !value.is_empty())
+        {
+            checked_sources.push("assets/setup.yaml default".to_string());
+            resolved.push(ResolvedRuntimeSecret {
+                requirement: requirement.clone(),
+                value: SecretValue(value.clone()),
+                source: SecretValueSource::SetupDefault,
             });
         } else if requirement.required {
             missing.push(MissingRuntimeSecret {
@@ -684,6 +706,8 @@ struct PackSecretRequirement {
     key: String,
     #[serde(default = "default_required")]
     required: bool,
+    #[serde(default)]
+    default_value: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -697,6 +721,8 @@ struct SetupQuestion {
     name: String,
     #[serde(default)]
     secret_key: Option<String>,
+    #[serde(default)]
+    default: Option<String>,
     #[serde(default)]
     secret: bool,
     #[serde(default)]
@@ -720,6 +746,7 @@ fn parse_setup_secret_requirements(
         .map(|question| PackSecretRequirement {
             key: question.secret_key.unwrap_or(question.name),
             required: question.required,
+            default_value: question.default,
         })
         .collect())
 }
@@ -732,6 +759,9 @@ fn dedup_requirements(requirements: Vec<PackSecretRequirement>) -> Vec<PackSecre
             .entry(key)
             .and_modify(|existing: &mut PackSecretRequirement| {
                 existing.required |= requirement.required;
+                if existing.default_value.is_none() {
+                    existing.default_value = requirement.default_value.clone();
+                }
             })
             .or_insert(requirement);
     }
@@ -990,6 +1020,7 @@ questions:
             provider_id: "demo_pack".into(),
             key: "api_key".into(),
             required: true,
+            default_value: None,
             source: dir.path().join("packs/demo-pack.gtpack"),
         };
 
@@ -1069,8 +1100,69 @@ questions:
 
         let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
         assert!(env_map.contains_key("secrets://dev/demo/_/demo-app/api_key"));
+        assert!(env_map.contains_key("api_key"));
         assert!(env_map.contains_key("secrets://dev/demo/_/demo-app/jwt_signing_key"));
+        assert!(env_map.contains_key("jwt_signing_key"));
         assert!(!env_map.contains_key("secrets://dev/demo/_/demo-app/oauth_client_secret"));
+        assert!(!env_map.contains_key("oauth_client_secret"));
+    }
+
+    #[test]
+    fn runtime_secret_env_map_includes_optional_setup_secret_with_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_root = dir.path();
+        let packs_dir = bundle_root.join("packs");
+        std::fs::create_dir_all(packs_dir.join("deep-research-demo/assets")).unwrap();
+        std::fs::write(
+            packs_dir.join("deep-research-demo/assets/setup.yaml"),
+            r#"
+questions:
+  - name: api_key_secret
+    secret_key: api_key_secret
+    secret: true
+    required: false
+    default: ollama-placeholder
+"#,
+        )
+        .unwrap();
+
+        let config = DeployerConfig {
+            capability: DeployerCapability::Apply,
+            provider: Provider::Aws,
+            strategy: "iac-only".into(),
+            tenant: "demo".into(),
+            environment: "dev".into(),
+            pack_path: packs_dir.join("deep-research-demo"),
+            bundle_root: Some(bundle_root.to_path_buf()),
+            providers_dir: PathBuf::from("providers/deployer"),
+            packs_dir: PathBuf::from("packs"),
+            provider_pack: None,
+            pack_ref: None,
+            distributor_url: None,
+            distributor_token: None,
+            preview: false,
+            dry_run: false,
+            execute_local: true,
+            output: crate::config::OutputFormat::Json,
+            greentic: greentic_config::ConfigResolver::new()
+                .load()
+                .unwrap()
+                .config,
+            provenance: greentic_config::ProvenanceMap::new(),
+            config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
+            bundle_source: Some("file:///tmp/demo.gtbundle".into()),
+            bundle_digest: Some(
+                "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
+            ),
+            repo_registry_base: None,
+            store_registry_base: None,
+        };
+
+        let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
+        assert!(env_map.contains_key("api_key_secret"));
+        assert!(env_map.contains_key("secrets://dev/demo/_/deep-research-demo/api_key_secret"));
     }
 
     #[test]

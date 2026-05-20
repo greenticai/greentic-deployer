@@ -2263,6 +2263,12 @@ output "admin_client_key_secret_ref" {{
         "map(string)",
         Some("{}"),
     )?;
+    ensure_terraform_variable_declared(
+        &terraform_root.join("variables.tf"),
+        "secrets_map",
+        "map(string)",
+        Some("{}"),
+    )?;
     let module_variables = match config.provider {
         crate::config::Provider::Aws => Some(terraform_root.join("modules/operator/variables.tf")),
         crate::config::Provider::Azure => {
@@ -2289,6 +2295,12 @@ output "admin_client_key_secret_ref" {{
         ensure_terraform_variable_declared(
             &module_variables,
             "runtime_secret_env",
+            "map(string)",
+            Some("{}"),
+        )?;
+        ensure_terraform_variable_declared(
+            &module_variables,
+            "secrets_map",
             "map(string)",
             Some("{}"),
         )?;

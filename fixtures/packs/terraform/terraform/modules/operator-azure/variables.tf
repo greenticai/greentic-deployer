@@ -65,7 +65,6 @@ variable "admin_access_mode" {
 # secret wiring lands in a follow-up; until then the value is unused on
 # Azure and operator secrets do not reach the deployed runtime there.
 variable "secrets_map" {
-  type      = map(string)
-  default   = {}
-  sensitive = true
+  type    = map(string)
+  default = {}
 }

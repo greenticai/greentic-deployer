@@ -22,14 +22,14 @@ data "aws_subnets" "default" {
 }
 
 locals {
-  name_prefix = trimspace(var.deployment_name_prefix) != "" ? var.deployment_name_prefix : "greentic-${substr(md5(var.bundle_digest), 0, 8)}"
-  app_port    = 8080
-  admin_port  = 8433
-  admin_bind  = "127.0.0.1:${local.admin_port}"
+  name_prefix               = trimspace(var.deployment_name_prefix) != "" ? var.deployment_name_prefix : "greentic-${substr(md5(var.bundle_digest), 0, 8)}"
+  app_port                  = 8080
+  admin_port                = 8433
+  admin_bind                = "127.0.0.1:${local.admin_port}"
   effective_public_base_url = trimspace(var.public_base_url) != "" ? var.public_base_url : "http://${aws_lb.this.dns_name}"
-  admin_secret_prefix = "greentic/admin/${local.name_prefix}"
-  effective_vpc_id = var.use_default_vpc ? data.aws_vpc.default[0].id : aws_vpc.this[0].id
-  effective_subnet_ids = var.use_default_vpc ? slice(data.aws_subnets.default[0].ids, 0, min(2, length(data.aws_subnets.default[0].ids))) : aws_subnet.public[*].id
+  admin_secret_prefix       = "greentic/admin/${local.name_prefix}"
+  effective_vpc_id          = var.use_default_vpc ? data.aws_vpc.default[0].id : aws_vpc.this[0].id
+  effective_subnet_ids      = var.use_default_vpc ? slice(data.aws_subnets.default[0].ids, 0, min(2, length(data.aws_subnets.default[0].ids))) : aws_subnet.public[*].id
   common_tags = {
     ManagedBy = "greentic-demo"
     Bundle    = var.bundle_digest
@@ -606,11 +606,11 @@ resource "aws_ecs_task_definition" "this" {
 data "aws_region" "current" {}
 
 resource "aws_ecs_service" "this" {
-  name            = "${local.name_prefix}-service"
-  cluster         = aws_ecs_cluster.this.id
-  task_definition = aws_ecs_task_definition.this.arn
-  desired_count   = 1
-  launch_type     = "FARGATE"
+  name                   = "${local.name_prefix}-service"
+  cluster                = aws_ecs_cluster.this.id
+  task_definition        = aws_ecs_task_definition.this.arn
+  desired_count          = 1
+  launch_type            = "FARGATE"
   enable_execute_command = true
 
   network_configuration {
