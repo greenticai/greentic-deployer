@@ -18,7 +18,8 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 use greentic_deploy_spec::{
-    BundleId, DeploymentId, EnvId, RevisionId, SchemaVersion, TrafficSplit, TrafficSplitEntry,
+    BundleId, DeploymentId, EnvId, RevisionId, RevisionLifecycle, SchemaVersion, TrafficSplit,
+    TrafficSplitEntry,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -166,12 +167,33 @@ pub fn set(
                 let prev = &env.traffic_splits[idx];
                 if prev.idempotency_key == payload.idempotency_key {
                     if entries_match(&prev.entries, &parsed_entries) {
-                        // No-op replay. Return the current split unchanged.
+                        // No-op replay. Reconcile the derived runtime-config
+                        // before returning so a retry repairs a publish that
+                        // failed after environment.json was already durable.
+                        locked.refresh_runtime_config()?;
                         return Ok((prev.clone(), super::AuditGens::NONE));
                     }
                     return Err(OpError::Conflict(format!(
                         "idempotency key `{}` already used for deployment `{}` with different entries",
                         payload.idempotency_key, deployment_id
+                    )));
+                }
+            }
+            // §5.3 admission: only `Ready` revisions may receive traffic. B4
+            // materializes this split into live runtime routing, so a staged,
+            // warming, failed, or archived revision must never enter it. Run on
+            // the apply path only — the idempotent no-op replay above stays a
+            // success even if a routed revision later drains.
+            for entry in &parsed_entries {
+                let rev = env
+                    .revisions
+                    .iter()
+                    .find(|r| r.revision_id == entry.revision_id)
+                    .expect("entry revisions validated to exist above");
+                if rev.lifecycle != RevisionLifecycle::Ready {
+                    return Err(OpError::Conflict(format!(
+                        "revision `{}` is `{:?}`; only `Ready` revisions may receive traffic",
+                        entry.revision_id, rev.lifecycle
                     )));
                 }
             }
@@ -358,6 +380,28 @@ pub fn rollback(
             restored.idempotency_key =
                 format!("rollback-{}", env.traffic_splits[idx].idempotency_key);
             restored.validate().map_err(OpError::Spec)?;
+            // §5.3 admission on the restore path: a historical split may route
+            // to revisions that have since been archived or failed. B4 makes
+            // the restored split live, so refuse to roll back to one that no
+            // longer satisfies the Ready rule.
+            for entry in &restored.entries {
+                let rev = env
+                    .revisions
+                    .iter()
+                    .find(|r| r.revision_id == entry.revision_id)
+                    .ok_or_else(|| {
+                        OpError::Conflict(format!(
+                            "cannot roll back: revision `{}` no longer exists in env `{env_id}`",
+                            entry.revision_id
+                        ))
+                    })?;
+                if rev.lifecycle != RevisionLifecycle::Ready {
+                    return Err(OpError::Conflict(format!(
+                        "cannot roll back: revision `{}` is `{:?}`, not `Ready`",
+                        entry.revision_id, rev.lifecycle
+                    )));
+                }
+            }
             env.traffic_splits[idx] = restored.clone();
             locked.save(&env)?;
             locked.refresh_runtime_config()?;
@@ -1004,5 +1048,128 @@ mod tests {
             })
             .unwrap_or(0);
         assert_eq!(backup_count, 0, "no-op refresh must not back up the config");
+    }
+
+    #[test]
+    fn set_rejects_non_ready_revision_and_materializes_nothing() {
+        // §5.3 admission (Codex finding 1): routing traffic to a Staged
+        // revision must be refused, and no runtime-config may be produced.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        let dep = make_bundle_deployment("local", "fast2flow");
+        let did = dep.deployment_id;
+        let staged = make_revision("local", "fast2flow", &did, 1, RevisionLifecycle::Staged);
+        let rid = staged.revision_id;
+        env.bundles.push(dep);
+        env.revisions.push(staged);
+        store.save(&env).unwrap();
+
+        let err = set(
+            &store,
+            &OpFlags::default(),
+            Some(TrafficSetPayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+                entries: vec![TrafficSetEntryPayload {
+                    revision_id: rid.to_string(),
+                    weight_bps: Some(10_000),
+                    weight_percent: None,
+                }],
+                updated_by: "test".to_string(),
+                idempotency_key: "k1".to_string(),
+                authorization_ref: default_authorization_ref(),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+        assert!(
+            !dir.path()
+                .join("local")
+                .join("runtime-config.json")
+                .exists(),
+            "a rejected set must not leave a runtime-config behind"
+        );
+    }
+
+    #[test]
+    fn rollback_refuses_when_restored_revision_no_longer_ready() {
+        // §5.3 admission on the restore path (Codex finding 1): a historical
+        // split routing a since-archived revision must not be brought live.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, rid2) = seed_env(&store);
+        let base = |key: &str, rid: &RevisionId| TrafficSetPayload {
+            environment_id: "local".to_string(),
+            deployment_id: did.to_string(),
+            entries: vec![TrafficSetEntryPayload {
+                revision_id: rid.to_string(),
+                weight_bps: Some(10_000),
+                weight_percent: None,
+            }],
+            updated_by: "test".to_string(),
+            idempotency_key: key.to_string(),
+            authorization_ref: default_authorization_ref(),
+        };
+        // k1 routes rid1; k2 routes rid2 (so the rollback target is k1/rid1).
+        set(&store, &OpFlags::default(), Some(base("k1", &rid1))).unwrap();
+        set(&store, &OpFlags::default(), Some(base("k2", &rid2))).unwrap();
+
+        // rid1 retires out-of-band (it is not in the live k2 split).
+        let env_id = EnvId::try_from("local").unwrap();
+        let mut env = store.load(&env_id).unwrap();
+        let i = env
+            .revisions
+            .iter()
+            .position(|r| r.revision_id == rid1)
+            .unwrap();
+        env.revisions[i].lifecycle = RevisionLifecycle::Archived;
+        store.save(&env).unwrap();
+
+        let err = rollback(
+            &store,
+            &OpFlags::default(),
+            Some(TrafficShowPayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn idempotent_retry_reconciles_stale_runtime_config() {
+        // Codex finding 2: a publish that failed after environment.json was
+        // durable must be repaired by a same-key retry, not hidden by the
+        // no-op replay.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, _) = seed_env(&store);
+        let payload = TrafficSetPayload {
+            environment_id: "local".to_string(),
+            deployment_id: did.to_string(),
+            entries: vec![TrafficSetEntryPayload {
+                revision_id: rid1.to_string(),
+                weight_bps: Some(10_000),
+                weight_percent: None,
+            }],
+            updated_by: "test".to_string(),
+            idempotency_key: "k1".to_string(),
+            authorization_ref: default_authorization_ref(),
+        };
+        set(&store, &OpFlags::default(), Some(payload.clone())).unwrap();
+        let path = dir.path().join("local").join("runtime-config.json");
+        assert!(path.exists());
+
+        // Simulate a refresh that failed after the split was already saved.
+        std::fs::remove_file(&path).unwrap();
+
+        // Idempotent retry (same key + entries) must reconcile the file.
+        set(&store, &OpFlags::default(), Some(payload)).unwrap();
+        assert!(
+            path.exists(),
+            "idempotent retry must reconcile a stale runtime-config"
+        );
     }
 }
