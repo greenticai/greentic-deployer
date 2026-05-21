@@ -353,14 +353,20 @@ fn transition<F: FnOnce(&mut Revision)>(
     };
     audit_and_record(store, ctx, || {
         let revision = store.transact(&env_id, |locked| -> Result<Revision, OpError> {
-            crate::environment::apply_revision_transition(
+            let revision = crate::environment::apply_revision_transition(
                 locked,
                 revision_id,
                 accepted_chain,
                 on_final,
                 prune_from_splits,
             )
-            .map_err(OpError::from)
+            .map_err(OpError::from)?;
+            // Lifecycle transitions don't change traffic splits today, so this
+            // is a no-op refresh (guarded by change-detection); it keeps the
+            // runtime-config contract uniform across every mutating verb.
+            let env = locked.load()?;
+            locked.refresh_runtime_config(&env)?;
+            Ok(revision)
         })?;
         let summary = RevisionSummary::from(&revision);
         let outcome = OpOutcome::new(

@@ -13,6 +13,7 @@ pub mod atomic_write;
 pub mod audit;
 pub mod file_lock;
 pub mod lifecycle;
+pub mod runtime_config;
 pub mod store;
 
 pub use atomic_write::{AtomicWriteError, atomic_write_bytes, atomic_write_json, copy_to_backup};
@@ -22,6 +23,7 @@ pub use audit::{
 };
 pub use file_lock::{EnvFlock, LockError};
 pub use lifecycle::{LifecycleError, apply_revision_transition};
+pub use runtime_config::materialize_runtime_config;
 pub use store::{EnvironmentStore, LocalFsStore, Locked, StoreError};
 
 use greentic_deploy_spec::{DeploymentId, RevisionId};

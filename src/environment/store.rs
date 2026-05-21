@@ -8,6 +8,7 @@
 //!   .lock                              ← per-env exclusive flock target
 //!   environment.json                   ← Environment compose-view (§5.1)
 //!   runtime.json                       ← EnvironmentRuntime (§5.1a, optional)
+//!   runtime-config.json                ← materialized runtime-config.v1 (§5.7, optional)
 //!   env-packs/<slot>/answers.json      ← per-slot opaque answers
 //!   backups/
 //!     environment.json.<ts>.bak
@@ -27,7 +28,7 @@
 use std::path::{Path, PathBuf};
 
 use greentic_deploy_spec::{
-    CapabilitySlot, EnvId, Environment, EnvironmentRuntime, SchemaVersion, SpecError,
+    CapabilitySlot, EnvId, Environment, EnvironmentRuntime, RuntimeConfig, SchemaVersion, SpecError,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -143,6 +144,13 @@ impl LocalFsStore {
 
     fn runtime_path(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
         Ok(self.env_dir(env_id)?.join("runtime.json"))
+    }
+
+    /// The materialized `greentic.runtime-config.v1` document that
+    /// `greentic-start` loads at boot. Distinct from `runtime.json` (the
+    /// `EnvironmentRuntime` host-config view).
+    fn runtime_config_path(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
+        Ok(self.env_dir(env_id)?.join("runtime-config.json"))
     }
 
     fn pack_answers_path(
@@ -355,6 +363,39 @@ impl LocalFsStore {
         Ok(())
     }
 
+    /// Write the materialized runtime-config, skipping the backup+write when
+    /// the on-disk file already matches. Re-materialization runs after every
+    /// traffic mutation, but the projection only changes when `traffic_splits`
+    /// does — the change-detection guard keeps no-op refreshes from churning
+    /// backups.
+    fn save_runtime_config_locked(&self, cfg: &RuntimeConfig) -> Result<(), StoreError> {
+        let env_id = &cfg.env_id;
+        let target = self.runtime_config_path(env_id)?;
+        if let Ok(existing) = self.read_json::<RuntimeConfig>(&target)
+            && &existing == cfg
+        {
+            return Ok(());
+        }
+        copy_to_backup(&target, &self.backups_dir(env_id)?)?;
+        atomic_write_json(&target, cfg)?;
+        Ok(())
+    }
+
+    /// Remove the runtime-config when no split routes any revision. B0 rejects
+    /// a config with an empty `revisions` list, so absence — not an empty file
+    /// — is the correct "nothing live" signal.
+    fn delete_runtime_config_locked(&self, env_id: &EnvId) -> Result<(), StoreError> {
+        let target = self.runtime_config_path(env_id)?;
+        if target.exists() {
+            copy_to_backup(&target, &self.backups_dir(env_id)?)?;
+            std::fs::remove_file(&target).map_err(|source| StoreError::Io {
+                path: target,
+                source,
+            })?;
+        }
+        Ok(())
+    }
+
     fn save_pack_answers_locked(
         &self,
         env_id: &EnvId,
@@ -488,6 +529,22 @@ impl<'a> Locked<'a> {
 
     pub fn delete_pack_answers(&self, slot: CapabilitySlot) -> Result<(), StoreError> {
         self.store.delete_pack_answers_locked(&self.env_id, slot)
+    }
+
+    /// Re-materialize `runtime-config.json` from `env`'s current traffic
+    /// splits. Call with the just-saved env after any mutation that can change
+    /// the `TrafficSplit` set, inside the same `transact` scope, so the file
+    /// `greentic-start` boots from stays in lock-step with `environment.json`.
+    /// Writes the projection, or deletes the file when no split routes a
+    /// revision — `greentic-start` rejects a config with an empty `revisions`
+    /// list, so absence is the correct "nothing live" signal.
+    pub fn refresh_runtime_config(&self, env: &Environment) -> Result<(), StoreError> {
+        let cfg = super::runtime_config::materialize_runtime_config(env);
+        if cfg.revisions.is_empty() {
+            self.store.delete_runtime_config_locked(&self.env_id)
+        } else {
+            self.store.save_runtime_config_locked(&cfg)
+        }
     }
 }
 

@@ -18,7 +18,8 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 use greentic_deploy_spec::{
-    BundleId, DeploymentId, EnvId, RevisionId, SchemaVersion, TrafficSplit, TrafficSplitEntry,
+    BundleId, DeploymentId, EnvId, Environment, RevisionId, RevisionLifecycle, SchemaVersion,
+    TrafficSplit, TrafficSplitEntry,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -166,7 +167,10 @@ pub fn set(
                 let prev = &env.traffic_splits[idx];
                 if prev.idempotency_key == payload.idempotency_key {
                     if entries_match(&prev.entries, &parsed_entries) {
-                        // No-op replay. Return the current split unchanged.
+                        // No-op replay. Reconcile the derived runtime-config
+                        // before returning so a retry repairs a publish that
+                        // failed after environment.json was already durable.
+                        locked.refresh_runtime_config(&env)?;
                         return Ok((prev.clone(), super::AuditGens::NONE));
                     }
                     return Err(OpError::Conflict(format!(
@@ -175,6 +179,10 @@ pub fn set(
                     )));
                 }
             }
+            // §5.3 admission, on the apply path only: the idempotent no-op
+            // replay above must stay a success even if a routed revision later
+            // drains, so a stale split is never rejected on retry.
+            assert_entries_all_ready(&env, &parsed_entries, &env_id)?;
             let (generation, previous_split_ref, prev_gen) = match prev_split_idx {
                 Some(idx) => {
                     let prev = &env.traffic_splits[idx];
@@ -208,6 +216,7 @@ pub fn set(
                 None => env.traffic_splits.push(split.clone()),
             }
             locked.save(&env)?;
+            locked.refresh_runtime_config(&env)?;
             let gens = super::AuditGens {
                 previous: prev_gen,
                 new: Some(generation),
@@ -250,6 +259,36 @@ fn parse_entries(entries: &[TrafficSetEntryPayload]) -> Result<Vec<TrafficSplitE
         });
     }
     Ok(out)
+}
+
+/// §5.3 admission: every entry's revision must exist and be `Ready` before its
+/// split goes live, since the split materializes into runtime routing. Shared
+/// by the `set` apply path and the `rollback` restore path so the rule lives in
+/// one place.
+fn assert_entries_all_ready(
+    env: &Environment,
+    entries: &[TrafficSplitEntry],
+    env_id: &EnvId,
+) -> Result<(), OpError> {
+    for entry in entries {
+        let rev = env
+            .revisions
+            .iter()
+            .find(|r| r.revision_id == entry.revision_id)
+            .ok_or_else(|| {
+                OpError::Conflict(format!(
+                    "revision `{}` not found in env `{env_id}`",
+                    entry.revision_id
+                ))
+            })?;
+        if rev.lifecycle != RevisionLifecycle::Ready {
+            return Err(OpError::Conflict(format!(
+                "revision `{}` is `{:?}`; only `Ready` revisions may receive traffic",
+                entry.revision_id, rev.lifecycle
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Order-insensitive equality on basis-points-per-revision_id. Two payloads
@@ -357,8 +396,12 @@ pub fn rollback(
             restored.idempotency_key =
                 format!("rollback-{}", env.traffic_splits[idx].idempotency_key);
             restored.validate().map_err(OpError::Spec)?;
+            // §5.3 admission on the restore path: a historical split may route
+            // to revisions that have since been archived, failed, or removed.
+            assert_entries_all_ready(&env, &restored.entries, &env_id)?;
             env.traffic_splits[idx] = restored.clone();
             locked.save(&env)?;
+            locked.refresh_runtime_config(&env)?;
             let gens = super::AuditGens {
                 previous: Some(prev_split_generation),
                 new: Some(prev_split_generation + 1),
@@ -869,5 +912,266 @@ mod tests {
         assert_eq!(event.idempotency_key.as_deref(), Some("k1"));
         assert_eq!(event.previous_generation, None);
         assert_eq!(event.new_generation, Some(0));
+    }
+
+    #[test]
+    fn set_materializes_runtime_config_on_disk() {
+        // B4 producer: a traffic set must (re)write runtime-config.json — the
+        // file greentic-start boots from (B0) and routes on (B3) — and the
+        // projection must satisfy B0's per-deployment weight invariant.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, rid2) = seed_env(&store);
+        set(
+            &store,
+            &OpFlags::default(),
+            Some(TrafficSetPayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+                entries: vec![
+                    TrafficSetEntryPayload {
+                        revision_id: rid1.to_string(),
+                        weight_percent: Some(90),
+                        weight_bps: None,
+                    },
+                    TrafficSetEntryPayload {
+                        revision_id: rid2.to_string(),
+                        weight_percent: Some(10),
+                        weight_bps: None,
+                    },
+                ],
+                updated_by: "test".to_string(),
+                idempotency_key: "k1".to_string(),
+                authorization_ref: default_authorization_ref(),
+            }),
+        )
+        .unwrap();
+
+        let path = dir.path().join("local").join("runtime-config.json");
+        assert!(path.exists(), "runtime-config.json must be materialized");
+        let cfg: greentic_deploy_spec::RuntimeConfig =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(cfg.schema.as_str(), SchemaVersion::RUNTIME_CONFIG_V1);
+        assert_eq!(cfg.env_id.as_str(), "local");
+        assert_eq!(cfg.revisions.len(), 2);
+        let sum: u32 = cfg.revisions.iter().map(|b| b.weight_bps).sum();
+        assert_eq!(sum, 10_000);
+    }
+
+    #[test]
+    fn refresh_deletes_runtime_config_when_no_splits_remain() {
+        // B0 rejects an empty-revisions config, so when the last split is gone
+        // the producer must delete the stale file rather than write an empty one.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, _) = seed_env(&store);
+        set(
+            &store,
+            &OpFlags::default(),
+            Some(TrafficSetPayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+                entries: vec![TrafficSetEntryPayload {
+                    revision_id: rid1.to_string(),
+                    weight_bps: Some(10_000),
+                    weight_percent: None,
+                }],
+                updated_by: "test".to_string(),
+                idempotency_key: "k1".to_string(),
+                authorization_ref: default_authorization_ref(),
+            }),
+        )
+        .unwrap();
+        let path = dir.path().join("local").join("runtime-config.json");
+        assert!(path.exists());
+
+        // Drop the split out-of-band, then refresh under the lock.
+        let env_id = EnvId::try_from("local").unwrap();
+        let mut env = store.load(&env_id).unwrap();
+        env.traffic_splits.clear();
+        store.save(&env).unwrap();
+        store
+            .transact(&env_id, |locked| {
+                let env = locked.load()?;
+                locked.refresh_runtime_config(&env)
+            })
+            .unwrap();
+        assert!(
+            !path.exists(),
+            "runtime-config.json must be removed when no split routes a revision"
+        );
+    }
+
+    #[test]
+    fn refresh_is_noop_when_projection_unchanged() {
+        // Change-detection guard: refreshing without a traffic mutation must
+        // not rewrite or back up the file.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, _) = seed_env(&store);
+        set(
+            &store,
+            &OpFlags::default(),
+            Some(TrafficSetPayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+                entries: vec![TrafficSetEntryPayload {
+                    revision_id: rid1.to_string(),
+                    weight_bps: Some(10_000),
+                    weight_percent: None,
+                }],
+                updated_by: "test".to_string(),
+                idempotency_key: "k1".to_string(),
+                authorization_ref: default_authorization_ref(),
+            }),
+        )
+        .unwrap();
+        let path = dir.path().join("local").join("runtime-config.json");
+        let before = std::fs::read(&path).unwrap();
+
+        let env_id = EnvId::try_from("local").unwrap();
+        store
+            .transact(&env_id, |locked| {
+                let env = locked.load()?;
+                locked.refresh_runtime_config(&env)
+            })
+            .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let backups = dir.path().join("local").join("backups");
+        let backup_count = std::fs::read_dir(&backups)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with("runtime-config.json")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(backup_count, 0, "no-op refresh must not back up the config");
+    }
+
+    #[test]
+    fn set_rejects_non_ready_revision_and_materializes_nothing() {
+        // §5.3 admission: routing traffic to a Staged revision must be refused,
+        // and no runtime-config may be produced.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        let dep = make_bundle_deployment("local", "fast2flow");
+        let did = dep.deployment_id;
+        let staged = make_revision("local", "fast2flow", &did, 1, RevisionLifecycle::Staged);
+        let rid = staged.revision_id;
+        env.bundles.push(dep);
+        env.revisions.push(staged);
+        store.save(&env).unwrap();
+
+        let err = set(
+            &store,
+            &OpFlags::default(),
+            Some(TrafficSetPayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+                entries: vec![TrafficSetEntryPayload {
+                    revision_id: rid.to_string(),
+                    weight_bps: Some(10_000),
+                    weight_percent: None,
+                }],
+                updated_by: "test".to_string(),
+                idempotency_key: "k1".to_string(),
+                authorization_ref: default_authorization_ref(),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+        assert!(
+            !dir.path()
+                .join("local")
+                .join("runtime-config.json")
+                .exists(),
+            "a rejected set must not leave a runtime-config behind"
+        );
+    }
+
+    #[test]
+    fn rollback_refuses_when_restored_revision_no_longer_ready() {
+        // §5.3 admission on the restore path: a historical split routing a
+        // since-archived revision must not be brought live.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, rid2) = seed_env(&store);
+        let base = |key: &str, rid: &RevisionId| TrafficSetPayload {
+            environment_id: "local".to_string(),
+            deployment_id: did.to_string(),
+            entries: vec![TrafficSetEntryPayload {
+                revision_id: rid.to_string(),
+                weight_bps: Some(10_000),
+                weight_percent: None,
+            }],
+            updated_by: "test".to_string(),
+            idempotency_key: key.to_string(),
+            authorization_ref: default_authorization_ref(),
+        };
+        // k1 routes rid1; k2 routes rid2 (so the rollback target is k1/rid1).
+        set(&store, &OpFlags::default(), Some(base("k1", &rid1))).unwrap();
+        set(&store, &OpFlags::default(), Some(base("k2", &rid2))).unwrap();
+
+        // rid1 retires out-of-band (it is not in the live k2 split).
+        let env_id = EnvId::try_from("local").unwrap();
+        let mut env = store.load(&env_id).unwrap();
+        let i = env
+            .revisions
+            .iter()
+            .position(|r| r.revision_id == rid1)
+            .unwrap();
+        env.revisions[i].lifecycle = RevisionLifecycle::Archived;
+        store.save(&env).unwrap();
+
+        let err = rollback(
+            &store,
+            &OpFlags::default(),
+            Some(TrafficShowPayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn idempotent_retry_reconciles_stale_runtime_config() {
+        // A publish that failed after environment.json was durable must be
+        // repaired by a same-key retry, not hidden by the no-op replay.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, _) = seed_env(&store);
+        let payload = TrafficSetPayload {
+            environment_id: "local".to_string(),
+            deployment_id: did.to_string(),
+            entries: vec![TrafficSetEntryPayload {
+                revision_id: rid1.to_string(),
+                weight_bps: Some(10_000),
+                weight_percent: None,
+            }],
+            updated_by: "test".to_string(),
+            idempotency_key: "k1".to_string(),
+            authorization_ref: default_authorization_ref(),
+        };
+        set(&store, &OpFlags::default(), Some(payload.clone())).unwrap();
+        let path = dir.path().join("local").join("runtime-config.json");
+        assert!(path.exists());
+
+        // Simulate a refresh that failed after the split was already saved.
+        std::fs::remove_file(&path).unwrap();
+
+        // Idempotent retry (same key + entries) must reconcile the file.
+        set(&store, &OpFlags::default(), Some(payload)).unwrap();
+        assert!(
+            path.exists(),
+            "idempotent retry must reconcile a stale runtime-config"
+        );
     }
 }
