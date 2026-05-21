@@ -1299,7 +1299,7 @@ mod tests {
         );
     }
 
-    // --- B5 clap-arg parser tests --------------------------------------
+    // --- clap-arg parser tests -----------------------------------------
 
     #[test]
     fn parse_entry_arg_accepts_plain_percent() {
@@ -1527,11 +1527,10 @@ mod tests {
 
     #[test]
     fn clap_retry_preserves_rollback_target() {
-        // Codex B5 regression: a retried direct-args invocation with the
-        // same --idempotency-key must replay as a no-op, NOT advance the
-        // generation and snapshot the live split as previous_split_ref.
-        // Mirror of `set_retry_preserves_rollback_target` but driven
-        // through the clap payload builder so it covers the new path.
+        // Regression: a retried direct-args invocation with the same
+        // --idempotency-key must replay as a no-op, NOT advance the
+        // generation and snapshot the live split as previous_split_ref —
+        // otherwise the one-step rollback target is destroyed.
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let (did, rid1, rid2) = seed_env(&store);
