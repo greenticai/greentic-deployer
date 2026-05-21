@@ -266,6 +266,21 @@ pub fn payload_from_set_args(args: TrafficSetArgs) -> Result<Option<TrafficSetPa
             "traffic set: at least one `<revision_id>=<weight>` entry is required".to_string(),
         ));
     }
+    // Required: an auto-generated key per-invocation would break the
+    // rollback target preservation contract — a same-argv retry after a
+    // lost response would look like a brand-new mutation, snapshotting the
+    // already-live split as `previous_split_ref` and overwriting the real
+    // rollback target. The answers-path schema treats `idempotency_key`
+    // as required; the direct-args path matches.
+    let idempotency_key = idempotency_key.ok_or_else(|| {
+        OpError::InvalidArgument(
+            "traffic set: missing `--idempotency-key <KEY>`. Pass any stable string \
+             (ULID, UUID, ticket id) — re-running the same command with the same key \
+             is a no-op replay; a different key (or omitting it) destroys the one-step \
+             rollback target."
+                .to_string(),
+        )
+    })?;
     let entries = entries
         .iter()
         .map(|raw| parse_entry_arg(raw))
@@ -275,7 +290,7 @@ pub fn payload_from_set_args(args: TrafficSetArgs) -> Result<Option<TrafficSetPa
         deployment_id,
         entries,
         updated_by: updated_by.unwrap_or_else(default_updated_by),
-        idempotency_key: idempotency_key.unwrap_or_else(|| ulid::Ulid::new().to_string()),
+        idempotency_key,
         authorization_ref: authorization_ref.unwrap_or_else(default_authorization_ref),
     }))
 }
@@ -1380,13 +1395,39 @@ mod tests {
     }
 
     #[test]
+    fn payload_from_set_args_requires_idempotency_key() {
+        // Direct-arg path mirrors the answers-schema contract: idempotency
+        // key is required. Auto-generating one per invocation would let a
+        // same-argv retry advance generation and overwrite the rollback
+        // target — see `clap_retry_preserves_rollback_target`.
+        let did = DeploymentId::new();
+        let args = TrafficSetArgs {
+            env_id: Some("local".to_string()),
+            entries: vec!["rev1=100".to_string()],
+            deployment: Some(did.to_string()),
+            idempotency_key: None,
+            updated_by: None,
+            authorization_ref: None,
+        };
+        let err = payload_from_set_args(args).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        let OpError::InvalidArgument(msg) = err else {
+            unreachable!()
+        };
+        assert!(
+            msg.contains("--idempotency-key"),
+            "error must mention the flag, got `{msg}`"
+        );
+    }
+
+    #[test]
     fn payload_from_set_args_builds_full_payload_with_defaults() {
         let did = DeploymentId::new();
         let args = TrafficSetArgs {
             env_id: Some("local".to_string()),
             entries: vec!["rev1=90".to_string(), "rev2=10bps".to_string()],
             deployment: Some(did.to_string()),
-            idempotency_key: None,
+            idempotency_key: Some("k-test".to_string()),
             updated_by: None,
             authorization_ref: None,
         };
@@ -1402,13 +1443,7 @@ mod tests {
             PathBuf::from("auth.json"),
             "default authorization ref"
         );
-        // Default idempotency key is a 26-char ULID Crockford string.
-        assert_eq!(
-            payload.idempotency_key.len(),
-            26,
-            "default idempotency key is a ULID, got `{}`",
-            payload.idempotency_key
-        );
+        assert_eq!(payload.idempotency_key, "k-test");
     }
 
     #[test]
@@ -1488,5 +1523,91 @@ mod tests {
             .map(|e| e.get("weight_bps").and_then(|v| v.as_u64()).unwrap())
             .sum();
         assert_eq!(total, 10_000, "clap-built payload must satisfy spec sum");
+    }
+
+    #[test]
+    fn clap_retry_preserves_rollback_target() {
+        // Codex B5 regression: a retried direct-args invocation with the
+        // same --idempotency-key must replay as a no-op, NOT advance the
+        // generation and snapshot the live split as previous_split_ref.
+        // Mirror of `set_retry_preserves_rollback_target` but driven
+        // through the clap payload builder so it covers the new path.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, rid2) = seed_env(&store);
+
+        // A: 100% rev1 (k1).
+        let a_args = TrafficSetArgs {
+            env_id: Some("local".to_string()),
+            entries: vec![format!("{rid1}=100")],
+            deployment: Some(did.to_string()),
+            idempotency_key: Some("k1".to_string()),
+            updated_by: Some("test".to_string()),
+            authorization_ref: None,
+        };
+        set(
+            &store,
+            &OpFlags::default(),
+            payload_from_set_args(a_args).unwrap(),
+        )
+        .unwrap();
+
+        // B: 50/50 (k2). This is the change a rollback should undo.
+        let b_args = || TrafficSetArgs {
+            env_id: Some("local".to_string()),
+            entries: vec![format!("{rid1}=50"), format!("{rid2}=50")],
+            deployment: Some(did.to_string()),
+            idempotency_key: Some("k2".to_string()),
+            updated_by: Some("test".to_string()),
+            authorization_ref: None,
+        };
+        set(
+            &store,
+            &OpFlags::default(),
+            payload_from_set_args(b_args()).unwrap(),
+        )
+        .unwrap();
+
+        // Retry B through the clap path — must be a no-op replay because
+        // the key matches. Without the explicit-key requirement, the CLI
+        // would generate a fresh ULID here and the library would treat it
+        // as a new mutation, overwriting the (A) rollback target.
+        let retry = set(
+            &store,
+            &OpFlags::default(),
+            payload_from_set_args(b_args()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            retry.result.get("generation").and_then(|v| v.as_u64()),
+            Some(1),
+            "retry must replay B's generation, not advance"
+        );
+
+        // Rollback must restore A (100% rev1), not the retried B (50/50).
+        let rolled = rollback(
+            &store,
+            &OpFlags::default(),
+            Some(TrafficShowPayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+            }),
+        )
+        .unwrap();
+        let entries = rolled
+            .result
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "rollback must land on A (single entry), not the retried B"
+        );
+        assert_eq!(
+            entries[0].get("weight_bps").and_then(|v| v.as_u64()),
+            Some(10_000),
+            "rollback must restore 100% rev1"
+        );
     }
 }

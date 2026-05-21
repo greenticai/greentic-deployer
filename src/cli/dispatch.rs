@@ -213,8 +213,12 @@ pub struct TrafficSetArgs {
     /// Deployment ULID.
     #[arg(long)]
     pub deployment: Option<String>,
-    /// Idempotency key. Defaults to a freshly-generated ULID — pass
-    /// explicitly to make a retried CLI invocation idempotent.
+    /// Idempotency key — REQUIRED on the direct-args path. Re-running the
+    /// same command with the same key is a no-op replay; a different key
+    /// (or omitting it) is treated as a brand-new mutation and would
+    /// snapshot the live split as the one-step rollback target, destroying
+    /// the real pre-change rollback target. Use any stable string (ULID,
+    /// UUID, ticket id) — the library never interprets it.
     #[arg(long)]
     pub idempotency_key: Option<String>,
     /// Actor recorded on the split. Defaults to `operator`.
