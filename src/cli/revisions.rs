@@ -361,7 +361,11 @@ fn transition<F: FnOnce(&mut Revision)>(
                 prune_from_splits,
             )
             .map_err(OpError::from)?;
-            locked.refresh_runtime_config()?;
+            // Lifecycle transitions don't change traffic splits today, so this
+            // is a no-op refresh (guarded by change-detection); it keeps the
+            // runtime-config contract uniform across every mutating verb.
+            let env = locked.load()?;
+            locked.refresh_runtime_config(&env)?;
             Ok(revision)
         })?;
         let summary = RevisionSummary::from(&revision);

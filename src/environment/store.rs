@@ -8,6 +8,7 @@
 //!   .lock                              ← per-env exclusive flock target
 //!   environment.json                   ← Environment compose-view (§5.1)
 //!   runtime.json                       ← EnvironmentRuntime (§5.1a, optional)
+//!   runtime-config.json                ← materialized runtime-config.v1 (§5.7, optional)
 //!   env-packs/<slot>/answers.json      ← per-slot opaque answers
 //!   backups/
 //!     environment.json.<ts>.bak
@@ -145,9 +146,9 @@ impl LocalFsStore {
         Ok(self.env_dir(env_id)?.join("runtime.json"))
     }
 
-    /// The materialized `greentic.runtime-config.v1` document (B4 producer)
-    /// that `greentic-start` loads at boot (B0). Distinct from `runtime.json`
-    /// (the `EnvironmentRuntime` host-config view).
+    /// The materialized `greentic.runtime-config.v1` document that
+    /// `greentic-start` loads at boot. Distinct from `runtime.json` (the
+    /// `EnvironmentRuntime` host-config view).
     fn runtime_config_path(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
         Ok(self.env_dir(env_id)?.join("runtime-config.json"))
     }
@@ -530,15 +531,15 @@ impl<'a> Locked<'a> {
         self.store.delete_pack_answers_locked(&self.env_id, slot)
     }
 
-    /// Re-materialize `runtime-config.json` from the env's current traffic
-    /// splits (B4 producer). Call after any mutation that can change the
-    /// `TrafficSplit` set, inside the same `transact` scope, so the file
-    /// `greentic-start` boots from (B0) and routes on (B3) stays in lock-step
-    /// with `environment.json`. Writes the projection, or deletes the file
-    /// when no split routes a revision (B0 bails on an empty-revisions config).
-    pub fn refresh_runtime_config(&self) -> Result<(), StoreError> {
-        let env = self.load()?;
-        let cfg = super::runtime_config::materialize_runtime_config(&env);
+    /// Re-materialize `runtime-config.json` from `env`'s current traffic
+    /// splits. Call with the just-saved env after any mutation that can change
+    /// the `TrafficSplit` set, inside the same `transact` scope, so the file
+    /// `greentic-start` boots from stays in lock-step with `environment.json`.
+    /// Writes the projection, or deletes the file when no split routes a
+    /// revision — `greentic-start` rejects a config with an empty `revisions`
+    /// list, so absence is the correct "nothing live" signal.
+    pub fn refresh_runtime_config(&self, env: &Environment) -> Result<(), StoreError> {
+        let cfg = super::runtime_config::materialize_runtime_config(env);
         if cfg.revisions.is_empty() {
             self.store.delete_runtime_config_locked(&self.env_id)
         } else {
