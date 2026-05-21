@@ -187,9 +187,51 @@ pub enum RevisionsVerb {
 
 #[derive(Subcommand, Debug)]
 pub enum TrafficVerb {
-    Set,
-    Show,
-    Rollback,
+    /// Replace the traffic split for one deployment. Entries are
+    /// `<revision_id>=<percent>` (integer 0..=100, optional `%` suffix) or
+    /// `<revision_id>=<N>bps` (basis points 0..=10_000). Sum must equal
+    /// 100 % (10,000 bps). Validates revisions are `Ready` before saving.
+    Set(TrafficSetArgs),
+    /// Show the live split for one deployment.
+    Show(TrafficTargetArgs),
+    /// Roll back to the previously-saved split for one deployment.
+    Rollback(TrafficTargetArgs),
+}
+
+/// Args for `op traffic set`. All fields are optional at the clap layer so
+/// that `--answers` / `--payload-json` / `--schema` continue to work
+/// unchanged; the dispatcher builds a `TrafficSetPayload` only when the
+/// required clap args are supplied, and otherwise hands `None` to the
+/// library function so it can resolve the payload from `--answers`.
+#[derive(Args, Debug)]
+pub struct TrafficSetArgs {
+    /// Environment id, e.g. `local`.
+    pub env_id: Option<String>,
+    /// Repeated `<revision_id>=<weight>` entries — weight is `N`/`N%`
+    /// (percent) or `Nbps` (basis points). Sum must reach 100 %.
+    pub entries: Vec<String>,
+    /// Deployment ULID.
+    #[arg(long)]
+    pub deployment: Option<String>,
+    /// Idempotency key. Defaults to a freshly-generated ULID — pass
+    /// explicitly to make a retried CLI invocation idempotent.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+    /// Actor recorded on the split. Defaults to `operator`.
+    #[arg(long)]
+    pub updated_by: Option<String>,
+    /// Sidecar authorization-doc path. Defaults to `auth.json`.
+    #[arg(long)]
+    pub authorization_ref: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct TrafficTargetArgs {
+    /// Environment id, e.g. `local`.
+    pub env_id: Option<String>,
+    /// Deployment ULID.
+    #[arg(long)]
+    pub deployment: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -328,9 +370,9 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
         OpNoun::Traffic { verb } => (
             "traffic",
             match verb {
-                TrafficVerb::Set => "set",
-                TrafficVerb::Show => "show",
-                TrafficVerb::Rollback => "rollback",
+                TrafficVerb::Set(_) => "set",
+                TrafficVerb::Show(_) => "show",
+                TrafficVerb::Rollback(_) => "rollback",
             },
         ),
         OpNoun::Config { verb } => (
@@ -459,9 +501,18 @@ fn dispatch_traffic(
     verb: TrafficVerb,
 ) -> Result<(), OpError> {
     let outcome = match verb {
-        TrafficVerb::Set => super::traffic::set(store, flags, None)?,
-        TrafficVerb::Show => super::traffic::show(store, flags, None)?,
-        TrafficVerb::Rollback => super::traffic::rollback(store, flags, None)?,
+        TrafficVerb::Set(args) => {
+            let payload = super::traffic::payload_from_set_args(args)?;
+            super::traffic::set(store, flags, payload)?
+        }
+        TrafficVerb::Show(args) => {
+            let payload = super::traffic::payload_from_target_args(args)?;
+            super::traffic::show(store, flags, payload)?
+        }
+        TrafficVerb::Rollback(args) => {
+            let payload = super::traffic::payload_from_target_args(args)?;
+            super::traffic::rollback(store, flags, payload)?
+        }
     };
     print_outcome(&outcome)
 }

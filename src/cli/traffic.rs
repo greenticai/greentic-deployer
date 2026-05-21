@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
+use super::dispatch::{TrafficSetArgs, TrafficTargetArgs};
 use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
 
 const NOUN: &str = "traffic";
@@ -230,6 +231,114 @@ pub fn set(
                 .expect("TrafficSummary is json-safe"),
         );
         Ok((outcome, gens))
+    })
+}
+
+/// Build a [`TrafficSetPayload`] from clap-derived args.
+///
+/// Returns `Ok(None)` when no clap args were supplied — the caller falls back
+/// to `--answers` / `--payload-json`. Returns `Ok(Some(_))` when the user
+/// passed positional args. A partial set (e.g. `env_id` without
+/// `--deployment`) is a clap-level user error and surfaces as
+/// [`OpError::InvalidArgument`] so the user gets one clear message instead
+/// of being silently routed to the answers path.
+pub fn payload_from_set_args(args: TrafficSetArgs) -> Result<Option<TrafficSetPayload>, OpError> {
+    let TrafficSetArgs {
+        env_id,
+        entries,
+        deployment,
+        idempotency_key,
+        updated_by,
+        authorization_ref,
+    } = args;
+    // No positional args at all → answers/schema path.
+    if env_id.is_none() && deployment.is_none() && entries.is_empty() {
+        return Ok(None);
+    }
+    let environment_id = env_id.ok_or_else(|| {
+        OpError::InvalidArgument("traffic set: missing positional `<env_id>`".to_string())
+    })?;
+    let deployment_id = deployment.ok_or_else(|| {
+        OpError::InvalidArgument("traffic set: missing `--deployment <ULID>`".to_string())
+    })?;
+    if entries.is_empty() {
+        return Err(OpError::InvalidArgument(
+            "traffic set: at least one `<revision_id>=<weight>` entry is required".to_string(),
+        ));
+    }
+    let entries = entries
+        .iter()
+        .map(|raw| parse_entry_arg(raw))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(TrafficSetPayload {
+        environment_id,
+        deployment_id,
+        entries,
+        updated_by: updated_by.unwrap_or_else(default_updated_by),
+        idempotency_key: idempotency_key.unwrap_or_else(|| ulid::Ulid::new().to_string()),
+        authorization_ref: authorization_ref.unwrap_or_else(default_authorization_ref),
+    }))
+}
+
+/// Build a [`TrafficShowPayload`] for `op traffic show` and `op traffic rollback`.
+/// Same fallthrough semantics as [`payload_from_set_args`].
+pub fn payload_from_target_args(
+    args: TrafficTargetArgs,
+) -> Result<Option<TrafficShowPayload>, OpError> {
+    let TrafficTargetArgs { env_id, deployment } = args;
+    if env_id.is_none() && deployment.is_none() {
+        return Ok(None);
+    }
+    let environment_id = env_id.ok_or_else(|| {
+        OpError::InvalidArgument("traffic: missing positional `<env_id>`".to_string())
+    })?;
+    let deployment_id = deployment.ok_or_else(|| {
+        OpError::InvalidArgument("traffic: missing `--deployment <ULID>`".to_string())
+    })?;
+    Ok(Some(TrafficShowPayload {
+        environment_id,
+        deployment_id,
+    }))
+}
+
+/// Parse a `<revision_id>=<weight>` CLI argument into a payload entry.
+///
+/// Weight forms:
+/// - `N` or `N%` — percent (`0..=100`)
+/// - `Nbps` — basis points (`0..=10_000`)
+fn parse_entry_arg(raw: &str) -> Result<TrafficSetEntryPayload, OpError> {
+    let (rid, weight) = raw.split_once('=').ok_or_else(|| {
+        OpError::InvalidArgument(format!(
+            "entry `{raw}` must be `<revision_id>=<percent>` or `<revision_id>=<N>bps`"
+        ))
+    })?;
+    if rid.is_empty() {
+        return Err(OpError::InvalidArgument(format!(
+            "entry `{raw}` has an empty revision_id"
+        )));
+    }
+    let weight = weight.trim();
+    if weight.is_empty() {
+        return Err(OpError::InvalidArgument(format!(
+            "entry `{raw}` has an empty weight"
+        )));
+    }
+    let (weight_bps, weight_percent) = if let Some(rest) = weight.strip_suffix("bps") {
+        let bps: u32 = rest.trim().parse().map_err(|e| {
+            OpError::InvalidArgument(format!("entry `{raw}`: parse basis points: {e}"))
+        })?;
+        (Some(bps), None)
+    } else {
+        let pct_str = weight.strip_suffix('%').unwrap_or(weight).trim();
+        let pct: u32 = pct_str
+            .parse()
+            .map_err(|e| OpError::InvalidArgument(format!("entry `{raw}`: parse percent: {e}")))?;
+        (None, Some(pct))
+    };
+    Ok(TrafficSetEntryPayload {
+        revision_id: rid.to_string(),
+        weight_bps,
+        weight_percent,
     })
 }
 
@@ -1173,5 +1282,211 @@ mod tests {
             path.exists(),
             "idempotent retry must reconcile a stale runtime-config"
         );
+    }
+
+    // --- B5 clap-arg parser tests --------------------------------------
+
+    #[test]
+    fn parse_entry_arg_accepts_plain_percent() {
+        let e = parse_entry_arg("01H000000000000000000000R1=99").unwrap();
+        assert_eq!(e.revision_id, "01H000000000000000000000R1");
+        assert_eq!(e.weight_bps, None);
+        assert_eq!(e.weight_percent, Some(99));
+    }
+
+    #[test]
+    fn parse_entry_arg_accepts_percent_suffix() {
+        let e = parse_entry_arg("rev1=50%").unwrap();
+        assert_eq!(e.weight_percent, Some(50));
+        assert_eq!(e.weight_bps, None);
+    }
+
+    #[test]
+    fn parse_entry_arg_accepts_basis_points() {
+        let e = parse_entry_arg("rev1=2500bps").unwrap();
+        assert_eq!(e.weight_bps, Some(2500));
+        assert_eq!(e.weight_percent, None);
+    }
+
+    #[test]
+    fn parse_entry_arg_rejects_missing_separator() {
+        let err = parse_entry_arg("rev1-99").unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_entry_arg_rejects_empty_revision_id() {
+        let err = parse_entry_arg("=99").unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_entry_arg_rejects_empty_weight() {
+        let err = parse_entry_arg("rev1=").unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_entry_arg_rejects_non_numeric_weight() {
+        let err = parse_entry_arg("rev1=many").unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_entry_arg_rejects_non_numeric_bps() {
+        let err = parse_entry_arg("rev1=manybps").unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn payload_from_set_args_returns_none_when_blank() {
+        let args = TrafficSetArgs {
+            env_id: None,
+            entries: Vec::new(),
+            deployment: None,
+            idempotency_key: None,
+            updated_by: None,
+            authorization_ref: None,
+        };
+        assert!(payload_from_set_args(args).unwrap().is_none());
+    }
+
+    #[test]
+    fn payload_from_set_args_requires_deployment_when_env_present() {
+        let args = TrafficSetArgs {
+            env_id: Some("local".to_string()),
+            entries: vec!["rev1=100".to_string()],
+            deployment: None,
+            idempotency_key: None,
+            updated_by: None,
+            authorization_ref: None,
+        };
+        let err = payload_from_set_args(args).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn payload_from_set_args_requires_entries() {
+        let args = TrafficSetArgs {
+            env_id: Some("local".to_string()),
+            entries: Vec::new(),
+            deployment: Some(DeploymentId::new().to_string()),
+            idempotency_key: None,
+            updated_by: None,
+            authorization_ref: None,
+        };
+        let err = payload_from_set_args(args).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn payload_from_set_args_builds_full_payload_with_defaults() {
+        let did = DeploymentId::new();
+        let args = TrafficSetArgs {
+            env_id: Some("local".to_string()),
+            entries: vec!["rev1=90".to_string(), "rev2=10bps".to_string()],
+            deployment: Some(did.to_string()),
+            idempotency_key: None,
+            updated_by: None,
+            authorization_ref: None,
+        };
+        let payload = payload_from_set_args(args).unwrap().unwrap();
+        assert_eq!(payload.environment_id, "local");
+        assert_eq!(payload.deployment_id, did.to_string());
+        assert_eq!(payload.entries.len(), 2);
+        assert_eq!(payload.entries[0].weight_percent, Some(90));
+        assert_eq!(payload.entries[1].weight_bps, Some(10));
+        assert_eq!(payload.updated_by, "operator", "default actor");
+        assert_eq!(
+            payload.authorization_ref,
+            PathBuf::from("auth.json"),
+            "default authorization ref"
+        );
+        // Default idempotency key is a 26-char ULID Crockford string.
+        assert_eq!(
+            payload.idempotency_key.len(),
+            26,
+            "default idempotency key is a ULID, got `{}`",
+            payload.idempotency_key
+        );
+    }
+
+    #[test]
+    fn payload_from_set_args_honors_explicit_overrides() {
+        let did = DeploymentId::new();
+        let args = TrafficSetArgs {
+            env_id: Some("local".to_string()),
+            entries: vec!["rev1=100".to_string()],
+            deployment: Some(did.to_string()),
+            idempotency_key: Some("k-explicit".to_string()),
+            updated_by: Some("ci".to_string()),
+            authorization_ref: Some(PathBuf::from("custom.json")),
+        };
+        let payload = payload_from_set_args(args).unwrap().unwrap();
+        assert_eq!(payload.idempotency_key, "k-explicit");
+        assert_eq!(payload.updated_by, "ci");
+        assert_eq!(payload.authorization_ref, PathBuf::from("custom.json"));
+    }
+
+    #[test]
+    fn payload_from_target_args_returns_none_when_blank() {
+        let args = TrafficTargetArgs {
+            env_id: None,
+            deployment: None,
+        };
+        assert!(payload_from_target_args(args).unwrap().is_none());
+    }
+
+    #[test]
+    fn payload_from_target_args_requires_both_when_either_present() {
+        let args = TrafficTargetArgs {
+            env_id: Some("local".to_string()),
+            deployment: None,
+        };
+        let err = payload_from_target_args(args).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn payload_from_target_args_builds_payload() {
+        let did = DeploymentId::new();
+        let args = TrafficTargetArgs {
+            env_id: Some("local".to_string()),
+            deployment: Some(did.to_string()),
+        };
+        let payload = payload_from_target_args(args).unwrap().unwrap();
+        assert_eq!(payload.environment_id, "local");
+        assert_eq!(payload.deployment_id, did.to_string());
+    }
+
+    #[test]
+    fn clap_set_payload_drives_real_traffic_set() {
+        // End-to-end smoke: payload_from_set_args + traffic::set against a
+        // real store. Verifies the CLI surface drives the library happy path
+        // with no answers file in sight.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, rid2) = seed_env(&store);
+        let args = TrafficSetArgs {
+            env_id: Some("local".to_string()),
+            entries: vec![format!("{rid1}=90"), format!("{rid2}=10")],
+            deployment: Some(did.to_string()),
+            idempotency_key: Some("k-clap".to_string()),
+            updated_by: Some("test".to_string()),
+            authorization_ref: None,
+        };
+        let payload = payload_from_set_args(args).unwrap();
+        let outcome = set(&store, &OpFlags::default(), payload).unwrap();
+        let entries = outcome
+            .result
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        let total: u64 = entries
+            .iter()
+            .map(|e| e.get("weight_bps").and_then(|v| v.as_u64()).unwrap())
+            .sum();
+        assert_eq!(total, 10_000, "clap-built payload must satisfy spec sum");
     }
 }
