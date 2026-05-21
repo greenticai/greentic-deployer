@@ -208,6 +208,7 @@ pub fn set(
                 None => env.traffic_splits.push(split.clone()),
             }
             locked.save(&env)?;
+            locked.refresh_runtime_config()?;
             let gens = super::AuditGens {
                 previous: prev_gen,
                 new: Some(generation),
@@ -359,6 +360,7 @@ pub fn rollback(
             restored.validate().map_err(OpError::Spec)?;
             env.traffic_splits[idx] = restored.clone();
             locked.save(&env)?;
+            locked.refresh_runtime_config()?;
             let gens = super::AuditGens {
                 previous: Some(prev_split_generation),
                 new: Some(prev_split_generation + 1),
@@ -869,5 +871,138 @@ mod tests {
         assert_eq!(event.idempotency_key.as_deref(), Some("k1"));
         assert_eq!(event.previous_generation, None);
         assert_eq!(event.new_generation, Some(0));
+    }
+
+    #[test]
+    fn set_materializes_runtime_config_on_disk() {
+        // B4 producer: a traffic set must (re)write runtime-config.json — the
+        // file greentic-start boots from (B0) and routes on (B3) — and the
+        // projection must satisfy B0's per-deployment weight invariant.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, rid2) = seed_env(&store);
+        set(
+            &store,
+            &OpFlags::default(),
+            Some(TrafficSetPayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+                entries: vec![
+                    TrafficSetEntryPayload {
+                        revision_id: rid1.to_string(),
+                        weight_percent: Some(90),
+                        weight_bps: None,
+                    },
+                    TrafficSetEntryPayload {
+                        revision_id: rid2.to_string(),
+                        weight_percent: Some(10),
+                        weight_bps: None,
+                    },
+                ],
+                updated_by: "test".to_string(),
+                idempotency_key: "k1".to_string(),
+                authorization_ref: default_authorization_ref(),
+            }),
+        )
+        .unwrap();
+
+        let path = dir.path().join("local").join("runtime-config.json");
+        assert!(path.exists(), "runtime-config.json must be materialized");
+        let cfg: greentic_deploy_spec::RuntimeConfig =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(cfg.schema.as_str(), SchemaVersion::RUNTIME_CONFIG_V1);
+        assert_eq!(cfg.env_id.as_str(), "local");
+        assert_eq!(cfg.revisions.len(), 2);
+        let sum: u32 = cfg.revisions.iter().map(|b| b.weight_bps).sum();
+        assert_eq!(sum, 10_000);
+    }
+
+    #[test]
+    fn refresh_deletes_runtime_config_when_no_splits_remain() {
+        // B0 rejects an empty-revisions config, so when the last split is gone
+        // the producer must delete the stale file rather than write an empty one.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, _) = seed_env(&store);
+        set(
+            &store,
+            &OpFlags::default(),
+            Some(TrafficSetPayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+                entries: vec![TrafficSetEntryPayload {
+                    revision_id: rid1.to_string(),
+                    weight_bps: Some(10_000),
+                    weight_percent: None,
+                }],
+                updated_by: "test".to_string(),
+                idempotency_key: "k1".to_string(),
+                authorization_ref: default_authorization_ref(),
+            }),
+        )
+        .unwrap();
+        let path = dir.path().join("local").join("runtime-config.json");
+        assert!(path.exists());
+
+        // Drop the split out-of-band, then refresh under the lock.
+        let env_id = EnvId::try_from("local").unwrap();
+        let mut env = store.load(&env_id).unwrap();
+        env.traffic_splits.clear();
+        store.save(&env).unwrap();
+        store
+            .transact(&env_id, |locked| locked.refresh_runtime_config())
+            .unwrap();
+        assert!(
+            !path.exists(),
+            "runtime-config.json must be removed when no split routes a revision"
+        );
+    }
+
+    #[test]
+    fn refresh_is_noop_when_projection_unchanged() {
+        // Change-detection guard: refreshing without a traffic mutation must
+        // not rewrite or back up the file.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, _) = seed_env(&store);
+        set(
+            &store,
+            &OpFlags::default(),
+            Some(TrafficSetPayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+                entries: vec![TrafficSetEntryPayload {
+                    revision_id: rid1.to_string(),
+                    weight_bps: Some(10_000),
+                    weight_percent: None,
+                }],
+                updated_by: "test".to_string(),
+                idempotency_key: "k1".to_string(),
+                authorization_ref: default_authorization_ref(),
+            }),
+        )
+        .unwrap();
+        let path = dir.path().join("local").join("runtime-config.json");
+        let before = std::fs::read(&path).unwrap();
+
+        let env_id = EnvId::try_from("local").unwrap();
+        store
+            .transact(&env_id, |locked| locked.refresh_runtime_config())
+            .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let backups = dir.path().join("local").join("backups");
+        let backup_count = std::fs::read_dir(&backups)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with("runtime-config.json")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(backup_count, 0, "no-op refresh must not back up the config");
     }
 }

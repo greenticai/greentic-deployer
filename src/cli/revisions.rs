@@ -353,14 +353,16 @@ fn transition<F: FnOnce(&mut Revision)>(
     };
     audit_and_record(store, ctx, || {
         let revision = store.transact(&env_id, |locked| -> Result<Revision, OpError> {
-            crate::environment::apply_revision_transition(
+            let revision = crate::environment::apply_revision_transition(
                 locked,
                 revision_id,
                 accepted_chain,
                 on_final,
                 prune_from_splits,
             )
-            .map_err(OpError::from)
+            .map_err(OpError::from)?;
+            locked.refresh_runtime_config()?;
+            Ok(revision)
         })?;
         let summary = RevisionSummary::from(&revision);
         let outcome = OpOutcome::new(
