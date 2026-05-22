@@ -766,6 +766,38 @@ mod tests {
     }
 
     #[test]
+    fn add_overwrites_orphan_v1_from_failed_prior_attempt() {
+        // Codex regression: a prior `add` that wrote v1.json but failed before
+        // committing env.json must NOT cause the retry to advance to v2 and
+        // chain through a never-committed/dangling v1. Since the deployment
+        // isn't committed, the retry stays at v1 and overwrites the orphan.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        // Simulate the orphan document left by a failed attempt.
+        let orphan_dir = dir
+            .path()
+            .join("local/billing-policies/fast2flow/local-dev");
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        std::fs::write(orphan_dir.join("v1.json"), b"{\"stale\":true}").unwrap();
+
+        add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
+
+        let env = store.load(&parse_env_id("local").unwrap()).unwrap();
+        assert_eq!(
+            env.bundles[0].revenue_policy_ref,
+            PathBuf::from("billing-policies/fast2flow/local-dev/v1.json.sig"),
+            "retry must reuse v1, not advance past the orphan"
+        );
+        assert!(!orphan_dir.join("v2.json").exists());
+        // The orphan was overwritten with a valid versioned document.
+        let doc: greentic_deploy_spec::RevenuePolicyDocument =
+            serde_json::from_slice(&std::fs::read(orphan_dir.join("v1.json")).unwrap()).unwrap();
+        assert_eq!(doc.version, 1);
+        assert!(doc.validate().is_ok());
+    }
+
+    #[test]
     fn add_local_defaults_customer_id_when_omitted() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());

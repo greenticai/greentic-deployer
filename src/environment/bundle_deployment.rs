@@ -21,11 +21,17 @@
 //! so C2 can attach `signature`/`key_id`/trust-root fields without changing the
 //! on-disk layout or the document format.
 //!
-//! ## Concurrency
+//! ## Concurrency & partial-failure safety
 //!
-//! [`write_revenue_policy_version`] derives the next version by scanning the
-//! existing `vN.json` files, so callers MUST hold the env flock (i.e. run
-//! inside `EnvironmentStore::transact`).
+//! [`write_revenue_policy_version`] derives the next version from the
+//! deployment's **committed** `revenue_policy_ref` (`env.json`), not from a
+//! filesystem scan. Callers persist `env.json` only after this writer returns,
+//! so a failed attempt (sidecar write or env save) leaves the committed ref
+//! unchanged; a retry rewrites the *same* version, overwriting any orphan
+//! files instead of advancing past them. Committed state therefore never
+//! references an uncommitted or dangling version. Callers MUST still run inside
+//! `EnvironmentStore::transact` so the file write and the `env.json` update
+//! share one env flock.
 
 use std::path::{Path, PathBuf};
 
@@ -111,8 +117,15 @@ pub fn write_revenue_policy_version(
     let rel_dir = Path::new(BILLING_DIR).join(bundle_seg).join(customer_seg);
     let abs_dir = env_dir.join(&rel_dir);
 
-    let version = next_version_in(&abs_dir)?;
-    let previous_version_ref = (version > 1).then(|| rel_dir.join(sidecar_name(version - 1)));
+    // Version is derived from the deployment's *committed* `revenue_policy_ref`
+    // (env.json), NOT from a filesystem scan. This keeps the operation
+    // idempotent under partial-I/O retry: callers persist env.json only after
+    // this writer returns, so a failed attempt (sidecar write or env save)
+    // leaves the committed ref unchanged and a retry rewrites the SAME version
+    // — overwriting any orphan files — instead of advancing past them. The
+    // committed state therefore never references an uncommitted or dangling
+    // version, and `previous_version_ref` is always the genuine prior artifact.
+    let (version, previous_version_ref) = next_version_from_ref(&deployment.revenue_policy_ref);
 
     let doc = RevenuePolicyDocument {
         schema: SchemaVersion::new(SchemaVersion::REVENUE_POLICY_V1),
@@ -180,37 +193,29 @@ fn safe_segment(seg: &str) -> Result<&str, BundleDeploymentError> {
     Ok(seg)
 }
 
-/// Next 1-based version in `dir`: `max(existing vN.json) + 1`, or `1` when the
-/// directory is absent or empty. Only `vN.json` documents are counted (the
-/// `.sig` sidecars are ignored), so the two-file write stays in lockstep.
-fn next_version_in(dir: &Path) -> Result<u64, BundleDeploymentError> {
-    let mut max = 0u64;
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(1),
-        Err(source) => {
-            return Err(BundleDeploymentError::Io {
-                path: dir.to_path_buf(),
-                source,
-            });
-        }
-    };
-    for entry in entries {
-        let entry = entry.map_err(|source| BundleDeploymentError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if let Some(num) = name
-            .strip_prefix('v')
-            .and_then(|rest| rest.strip_suffix(".json"))
-            && let Ok(n) = num.parse::<u64>()
-        {
-            max = max.max(n);
-        }
+/// Derive the next version + backward chain from the deployment's committed
+/// `revenue_policy_ref`.
+///
+/// A ref of the shape `…/vN.json.sig` yields `(N + 1, Some(ref))`; anything
+/// else — an empty placeholder on a fresh `add`, or a pre-B10 ref like
+/// `revenue.json` — yields `(1, None)`, i.e. the first B10 version with no
+/// prior artifact to chain to.
+fn next_version_from_ref(current_ref: &Path) -> (u64, Option<PathBuf>) {
+    match parse_sidecar_version(current_ref) {
+        Some(n) => (n + 1, Some(current_ref.to_path_buf())),
+        None => (1, None),
     }
-    Ok(max + 1)
+}
+
+/// Parse the version `N` out of a `…/vN.json.sig` sidecar path.
+fn parse_sidecar_version(ref_path: &Path) -> Option<u64> {
+    ref_path
+        .file_name()?
+        .to_str()?
+        .strip_prefix('v')?
+        .strip_suffix(".json.sig")?
+        .parse::<u64>()
+        .ok()
 }
 
 #[cfg(test)]
@@ -289,8 +294,13 @@ mod tests {
     #[test]
     fn second_write_increments_and_chains() {
         let dir = tempdir().unwrap();
-        let dep = deployment("fast2flow", "cust-acme");
-        write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now()).unwrap();
+        // The version advances off the deployment's *committed* ref, so the
+        // caller threads the prior ref onto the deployment between writes —
+        // exactly what `cli::bundles::update` does after a successful save.
+        let mut dep = deployment("fast2flow", "cust-acme");
+        let v1 =
+            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now()).unwrap();
+        dep.revenue_policy_ref = v1.policy_ref;
         let v2 = write_revenue_policy_version(
             dir.path(),
             &dep,
@@ -312,6 +322,77 @@ mod tests {
             Some(PathBuf::from(
                 "billing-policies/fast2flow/cust-acme/v1.json.sig"
             ))
+        );
+    }
+
+    #[test]
+    fn retry_after_uncommitted_write_reuses_same_version() {
+        // Codex regression: a failed attempt (sidecar write or env.json save)
+        // never advances the committed ref, so a retry must rewrite the SAME
+        // version and overwrite the orphan files rather than advance past them.
+        let dir = tempdir().unwrap();
+        let dep = deployment("fast2flow", "local-dev"); // committed ref is the placeholder
+        // First attempt "fails to commit": files land on disk but the caller
+        // never persists the new ref onto the deployment.
+        let a =
+            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now()).unwrap();
+        assert_eq!(a.version, 1);
+        // Retry with the SAME (still-uncommitted) deployment.
+        let b =
+            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now()).unwrap();
+        assert_eq!(b.version, 1, "retry must not advance past the orphan");
+        // No v2 was ever produced.
+        assert!(
+            !dir.path()
+                .join("billing-policies/fast2flow/local-dev/v2.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn retry_on_update_path_does_not_dangle_chain() {
+        // Update committed v1 (ref threaded), then an update attempt to v2
+        // "fails to commit" (ref left at v1); the retry rewrites v2 and chains
+        // to the committed v1 sidecar — never to a missing/uncommitted one.
+        let dir = tempdir().unwrap();
+        let mut dep = deployment("fast2flow", "cust-acme");
+        let v1 =
+            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now()).unwrap();
+        dep.revenue_policy_ref = v1.policy_ref; // v1 committed
+        // First v2 attempt (uncommitted): ref stays at v1.
+        write_revenue_policy_version(
+            dir.path(),
+            &dep,
+            &shares(&[("greentic", 10_000)]),
+            Utc::now(),
+        )
+        .unwrap();
+        // Retry: still derives v2 from committed v1.
+        let v2 = write_revenue_policy_version(
+            dir.path(),
+            &dep,
+            &shares(&[("greentic", 10_000)]),
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(v2.version, 2);
+        let doc: RevenuePolicyDocument = serde_json::from_slice(
+            &std::fs::read(
+                dir.path()
+                    .join("billing-policies/fast2flow/cust-acme/v2.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let prev = doc.previous_version_ref.expect("v2 chains to v1");
+        assert!(
+            dir.path().join(&prev).is_file(),
+            "previous_version_ref must point at a real (committed) sidecar"
+        );
+        assert!(
+            !dir.path()
+                .join("billing-policies/fast2flow/cust-acme/v3.json")
+                .exists()
         );
     }
 
