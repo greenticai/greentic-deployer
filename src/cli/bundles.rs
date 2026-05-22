@@ -123,7 +123,7 @@ pub fn add(
         }),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let summary = store.transact(&env_id, |locked| -> Result<BundleSummary, OpError> {
             let mut env = locked.load()?;
             // P6 anchor (§5.4): one BundleDeployment per (env_id, bundle_id, customer_id).
@@ -206,7 +206,7 @@ pub fn update(
         target: json!({"deployment_id": deployment_id.to_string()}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let summary = store.transact(&env_id, |locked| -> Result<BundleSummary, OpError> {
             let mut env = locked.load()?;
             let idx = env
@@ -269,7 +269,7 @@ pub fn remove(
         target: json!({"deployment_id": deployment_id.to_string()}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let summary = store.transact(&env_id, |locked| -> Result<BundleSummary, OpError> {
             let mut env = locked.load()?;
             let idx = env

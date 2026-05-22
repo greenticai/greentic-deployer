@@ -119,7 +119,7 @@ pub fn put(
         target: json!({"path": payload.path}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let env = store.load(&env_id)?;
         let secrets = require_secrets_pack(&env, &env_id)?;
         // Build the resolved SecretRef so we can validate the env-scoping.
@@ -184,7 +184,7 @@ pub fn rotate(
         target: json!({"path": payload.path}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let env = store.load(&env_id)?;
         let _secrets = require_secrets_pack(&env, &env_id)?;
         SecretRef::try_new(format!(

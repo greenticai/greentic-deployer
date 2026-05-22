@@ -101,7 +101,7 @@ pub fn bootstrap(
         target: json!({"admin_profile": payload.admin_profile}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let env = store.load(&env_id)?;
         let deployer = env.pack_for_slot(CapabilitySlot::Deployer).ok_or_else(|| {
             OpError::Conflict(format!(
@@ -137,7 +137,7 @@ pub fn rotate(
         target: json!({}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let env = store.load(&env_id)?;
         let deployer = env.pack_for_slot(CapabilitySlot::Deployer).ok_or_else(|| {
             OpError::Conflict(format!("env `{env_id}` has no deployer env-pack bound"))

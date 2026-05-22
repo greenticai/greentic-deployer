@@ -111,7 +111,7 @@ pub fn set(
         target: json!({"fields": fields}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let (host_config, name) = store.transact(&env_id, |locked| -> Result<_, OpError> {
             let mut env = locked.load()?;
             if let Some(name) = payload.name.clone() {

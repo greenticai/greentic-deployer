@@ -26,11 +26,46 @@
 //! lifecycle guard only owns transitions between *existing* revisions.
 
 use greentic_deploy_spec::{
-    BundleId, DeploymentId, Revision, RevisionId, RevisionLifecycle, is_valid_transition,
+    BundleId, DeploymentId, Environment, Revision, RevisionId, RevisionLifecycle,
+    is_valid_transition,
 };
 use thiserror::Error;
 
 use crate::environment::{Locked, StoreError};
+
+/// Identifies which health-gate check failed in [`HealthGateFailure`].
+///
+/// Surfaced via [`LifecycleError::HealthGateFailed`] so operators (and
+/// future audit-log consumers) can render structured failure detail
+/// rather than a free-form message.
+///
+/// The four checks correspond to the warm/ready gate's responsibilities
+/// per `plans/next-gen-deployment.md` B9: route table, runtime config,
+/// signature status, provider health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HealthCheckId {
+    /// Static route table validates against the revision's pack list.
+    RouteTable,
+    /// Materialized `runtime-config.json` loads and validates.
+    RuntimeConfig,
+    /// Revision's `signature_sidecar_ref` exists and verifies.
+    SignatureStatus,
+    /// Providers in the revision's pack list are reachable / healthy.
+    ProviderHealth,
+}
+
+/// Why a [warm/ready health gate](apply_revision_transition_with_health_gate)
+/// rejected a revision. Returned by the closure passed to the gate-aware
+/// helper; surfaced inside [`LifecycleError::HealthGateFailed`] after the
+/// helper has flipped the revision's lifecycle to `Failed` and saved.
+///
+/// `failed_checks` MAY be empty (e.g. the gate aborted before any check
+/// completed) — `message` always carries human-readable detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthGateFailure {
+    pub failed_checks: Vec<HealthCheckId>,
+    pub message: String,
+}
 
 /// Identifies a `TrafficSplit` (by its `(deployment_id, bundle_id)` key)
 /// for error-reporting purposes. Surfaced in
@@ -96,6 +131,21 @@ pub enum LifecycleError {
         revision_id: RevisionId,
         splits: Vec<ActiveSplitRef>,
     },
+    /// The warm/ready health gate rejected the revision after the chain
+    /// reached its final state. The helper has flipped the revision's
+    /// lifecycle to `Failed` and persisted the env before surfacing this
+    /// error, so the on-disk state reflects the failed warm — callers
+    /// then choose to retry (`Failed → Staged`) or retire
+    /// (`Failed → Archived`) via the operator CLI.
+    #[error(
+        "revision `{revision_id}` failed health gate ({} check(s) failed): {message}",
+        failed_checks.len()
+    )]
+    HealthGateFailed {
+        revision_id: RevisionId,
+        failed_checks: Vec<HealthCheckId>,
+        message: String,
+    },
     /// Underlying storage layer failure (load/save through the `Locked<'_>`).
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -152,6 +202,64 @@ pub fn apply_revision_transition<F>(
 where
     F: FnOnce(&mut Revision),
 {
+    apply_revision_transition_with_health_gate(
+        locked,
+        revision_id,
+        accepted_chain,
+        on_final,
+        prune_from_splits,
+        |_env, _revision| Ok(()),
+    )
+}
+
+/// Gate-aware variant of [`apply_revision_transition`] for the B9 warm/ready
+/// health gate.
+///
+/// Behaves exactly like the gate-less helper through chain advance and the
+/// `prune_from_splits` active-traffic guard. The gate fires **only when an
+/// edge in `accepted_chain` actually advanced the lifecycle** — an idempotent
+/// retry against an already-final-state revision skips the gate entirely
+/// (the revision is already committed at its target state, often with live
+/// traffic routing to it; rerunning a transient gate would demote a healthy
+/// live revision to `Failed` while the runtime-config materializer keeps
+/// routing traffic to it). `on_final` still runs on the no-op-walk path per
+/// the existing idempotent-retry contract — `warmed_at` is re-stamped, but
+/// the lifecycle does not change.
+///
+/// When the chain advanced, `health_gate` runs against the freshly-mutated
+/// `(env, revision)` view. The gate sees the **post-chain** revision (e.g.
+/// `Ready`) so checks can branch on the would-be-committed state.
+///
+/// **On gate failure** (`Err(HealthGateFailure)`, chain-advanced path only):
+/// - the revision's lifecycle is flipped to
+///   [`RevisionLifecycle::Failed`] (the spec matrix allows
+///   `Staged|Warming|Ready|Inactive → Failed`),
+/// - `on_final` is **not** run (so `warmed_at` is not stamped on a failed warm),
+/// - the prune mutation is **not** applied (only relevant when
+///   `prune_from_splits = true`, which is archive-only),
+/// - the env is saved through `locked.save(...)` so the on-disk state
+///   reflects the failed warm,
+/// - the helper returns [`LifecycleError::HealthGateFailed`].
+///
+/// If the spec matrix refuses `current → Failed` (no legal warm-chain final
+/// state today triggers this, but defensive for future callers), the helper
+/// surfaces [`LifecycleError::InvalidTransition`] without persisting — the
+/// caller passed a chain that cannot fail to `Failed`.
+///
+/// On gate success, the helper runs `on_final`, prunes if armed, saves, and
+/// returns the revision — identical to the gate-less path.
+pub fn apply_revision_transition_with_health_gate<F, G>(
+    locked: &Locked<'_>,
+    revision_id: RevisionId,
+    accepted_chain: &[(RevisionLifecycle, RevisionLifecycle)],
+    on_final: F,
+    prune_from_splits: bool,
+    health_gate: G,
+) -> Result<Revision, LifecycleError>
+where
+    F: FnOnce(&mut Revision),
+    G: FnOnce(&Environment, &Revision) -> Result<(), HealthGateFailure>,
+{
     if accepted_chain.is_empty() {
         return Err(LifecycleError::EmptyChain);
     }
@@ -166,6 +274,7 @@ where
             revision_id,
         })?;
 
+    let mut chain_advanced = false;
     for (from, to) in accepted_chain {
         if env.revisions[idx].lifecycle == *from {
             if !is_valid_transition(*from, *to) {
@@ -175,6 +284,7 @@ where
                 });
             }
             env.revisions[idx].lifecycle = *to;
+            chain_advanced = true;
         }
     }
 
@@ -219,6 +329,36 @@ where
                 splits: active_refs,
             });
         }
+    }
+
+    // Health gate fires ONLY when the chain actually advanced. An idempotent
+    // retry against an already-final revision (chain walk a no-op) skips
+    // the gate because the revision is already committed at its target
+    // state and may have live traffic routing to it — a transient gate
+    // failure must not demote a healthy live revision to `Failed` while the
+    // runtime-config materializer continues to route traffic to it (route
+    // table is derived from `traffic_splits`, not `lifecycle`). On the
+    // chain-advanced path the gate sees the post-chain `(env, revision)`
+    // view; rejection flips lifecycle to `Failed` and saves before
+    // returning the typed error.
+    if chain_advanced && let Err(failure) = health_gate(&env, &env.revisions[idx]) {
+        let prior = env.revisions[idx].lifecycle;
+        if !is_valid_transition(prior, RevisionLifecycle::Failed) {
+            // Caller passed a chain whose final state can't transition to
+            // Failed (e.g. an archive-style chain). Bail without persisting —
+            // there's no spec-legal way to record "failed gate" from here.
+            return Err(LifecycleError::InvalidTransition {
+                from: prior,
+                to: RevisionLifecycle::Failed,
+            });
+        }
+        env.revisions[idx].lifecycle = RevisionLifecycle::Failed;
+        locked.save(&env)?;
+        return Err(LifecycleError::HealthGateFailed {
+            revision_id,
+            failed_checks: failure.failed_checks,
+            message: failure.message,
+        });
     }
 
     on_final(&mut env.revisions[idx]);
@@ -744,5 +884,356 @@ mod tests {
             );
             assert_eq!(result.unwrap().lifecycle, *to);
         }
+    }
+
+    // --- B9 health-gate tests ---------------------------------------------
+
+    /// The warm chain through a passing gate: revision lands `Ready`,
+    /// `on_final` runs (stamps `warmed_at`), env saved.
+    #[test]
+    fn health_gate_pass_advances_chain_and_runs_on_final() {
+        let (store, env_id, rid) = seed_one_revision(RevisionLifecycle::Staged);
+        let revision = store
+            .transact(&env_id, |locked| -> Result<Revision, LifecycleError> {
+                apply_revision_transition_with_health_gate(
+                    locked,
+                    rid,
+                    &[
+                        (RevisionLifecycle::Staged, RevisionLifecycle::Warming),
+                        (RevisionLifecycle::Warming, RevisionLifecycle::Ready),
+                    ],
+                    |r| r.warmed_at = Some(fixed_now()),
+                    false,
+                    |_env, rev| {
+                        // Gate sees the post-chain lifecycle (Ready).
+                        assert_eq!(rev.lifecycle, RevisionLifecycle::Ready);
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(revision.lifecycle, RevisionLifecycle::Ready);
+        assert_eq!(revision.warmed_at, Some(fixed_now()));
+
+        let env = store.load(&env_id).unwrap();
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Ready);
+        assert_eq!(env.revisions[0].warmed_at, Some(fixed_now()));
+    }
+
+    /// On gate failure, lifecycle flips to `Failed` and is persisted;
+    /// `on_final` does NOT run (no `warmed_at` stamp on failure).
+    #[test]
+    fn health_gate_failure_persists_failed_and_skips_on_final() {
+        let (store, env_id, rid) = seed_one_revision(RevisionLifecycle::Staged);
+        let on_final_ran = std::cell::Cell::new(false);
+        let err = store
+            .transact(&env_id, |locked| -> Result<Revision, LifecycleError> {
+                apply_revision_transition_with_health_gate(
+                    locked,
+                    rid,
+                    &[
+                        (RevisionLifecycle::Staged, RevisionLifecycle::Warming),
+                        (RevisionLifecycle::Warming, RevisionLifecycle::Ready),
+                    ],
+                    |r| {
+                        on_final_ran.set(true);
+                        r.warmed_at = Some(fixed_now());
+                    },
+                    false,
+                    |_env, _rev| {
+                        Err(HealthGateFailure {
+                            failed_checks: vec![
+                                HealthCheckId::RuntimeConfig,
+                                HealthCheckId::SignatureStatus,
+                            ],
+                            message: "synthetic test failure".to_string(),
+                        })
+                    },
+                )
+            })
+            .unwrap_err();
+        match err {
+            LifecycleError::HealthGateFailed {
+                revision_id,
+                failed_checks,
+                message,
+            } => {
+                assert_eq!(revision_id, rid);
+                assert_eq!(
+                    failed_checks,
+                    vec![HealthCheckId::RuntimeConfig, HealthCheckId::SignatureStatus]
+                );
+                assert!(message.contains("synthetic"));
+            }
+            other => panic!("expected HealthGateFailed, got `{other:?}`"),
+        }
+        assert!(
+            !on_final_ran.get(),
+            "on_final must not run on health-gate failure"
+        );
+
+        // On disk: revision is Failed and warmed_at is NOT stamped.
+        let env = store.load(&env_id).unwrap();
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Failed);
+        assert_eq!(env.revisions[0].warmed_at, None);
+    }
+
+    /// Idempotent retry against an already-final revision must NOT invoke
+    /// the gate and must NOT demote lifecycle on a transient failure —
+    /// `runtime-config.json` is materialized from `traffic_splits`, so
+    /// rerunning a flaky gate on a live Ready revision would persist
+    /// `Failed` while the router keeps serving traffic to it. The retry
+    /// stays a successful no-op; `on_final` re-stamps `warmed_at` per the
+    /// existing idempotent contract.
+    #[test]
+    fn idempotent_retry_skips_gate_and_preserves_ready() {
+        let (store, env_id, rid) = seed_one_revision(RevisionLifecycle::Ready);
+        let gate_invoked = std::cell::Cell::new(false);
+        let revision = store
+            .transact(&env_id, |locked| -> Result<Revision, LifecycleError> {
+                apply_revision_transition_with_health_gate(
+                    locked,
+                    rid,
+                    &[
+                        (RevisionLifecycle::Staged, RevisionLifecycle::Warming),
+                        (RevisionLifecycle::Warming, RevisionLifecycle::Ready),
+                    ],
+                    |r| r.warmed_at = Some(fixed_now()),
+                    false,
+                    |_env, _rev| {
+                        gate_invoked.set(true);
+                        Err(HealthGateFailure {
+                            failed_checks: vec![HealthCheckId::ProviderHealth],
+                            message: "would have demoted a live revision".to_string(),
+                        })
+                    },
+                )
+            })
+            .unwrap();
+        assert!(
+            !gate_invoked.get(),
+            "gate must not run on idempotent retry against an already-final revision"
+        );
+        assert_eq!(revision.lifecycle, RevisionLifecycle::Ready);
+        assert_eq!(revision.warmed_at, Some(fixed_now()));
+
+        let env = store.load(&env_id).unwrap();
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Ready);
+    }
+
+    /// The live-traffic protection case Codex flagged: a Ready revision is
+    /// actively serving 100% of a deployment's traffic; a retry warm with
+    /// a (transiently) failing gate must NOT demote it to `Failed` because
+    /// the traffic split still routes to it. After the retry: lifecycle is
+    /// still Ready, the split is intact, the route table stays serviceable.
+    #[test]
+    fn gate_skipped_on_retry_preserves_live_routed_revision() {
+        let (store, env_id, rid) = seed_one_revision(RevisionLifecycle::Ready);
+        let mut env = store.load(&env_id).unwrap();
+        let did = env.bundles[0].deployment_id;
+        env.traffic_splits.push(TrafficSplit {
+            schema: SchemaVersion::new(SchemaVersion::TRAFFIC_SPLIT_V1),
+            env_id: env_id.clone(),
+            deployment_id: did,
+            bundle_id: BundleId::new("fast2flow"),
+            generation: 0,
+            entries: vec![TrafficSplitEntry {
+                revision_id: rid,
+                weight_bps: 10_000,
+            }],
+            updated_at: fixed_now(),
+            updated_by: "test".to_string(),
+            idempotency_key: "k1".to_string(),
+            authorization_ref: PathBuf::from("auth.json"),
+            previous_split_ref: None,
+        });
+        store.save(&env).unwrap();
+
+        let revision = store
+            .transact(&env_id, |locked| -> Result<Revision, LifecycleError> {
+                apply_revision_transition_with_health_gate(
+                    locked,
+                    rid,
+                    &[
+                        (RevisionLifecycle::Staged, RevisionLifecycle::Warming),
+                        (RevisionLifecycle::Warming, RevisionLifecycle::Ready),
+                    ],
+                    |_| {},
+                    false,
+                    |_env, _rev| {
+                        Err(HealthGateFailure {
+                            failed_checks: vec![HealthCheckId::ProviderHealth],
+                            message: "transient — must not demote".to_string(),
+                        })
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(revision.lifecycle, RevisionLifecycle::Ready);
+
+        // Live traffic split untouched, lifecycle still Ready on disk.
+        let env = store.load(&env_id).unwrap();
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Ready);
+        assert_eq!(env.traffic_splits.len(), 1);
+        assert_eq!(env.traffic_splits[0].entries.len(), 1);
+        assert_eq!(env.traffic_splits[0].entries[0].revision_id, rid);
+        assert_eq!(env.traffic_splits[0].entries[0].weight_bps, 10_000);
+    }
+
+    /// Gate-aware path with the gate-less default (Noop closure) is the
+    /// public surface the existing `apply_revision_transition` wraps.
+    /// Sanity-check that wrapper preserves the original behavior verbatim.
+    #[test]
+    fn apply_revision_transition_remains_a_noop_gate_wrapper() {
+        let (store, env_id, rid) = seed_one_revision(RevisionLifecycle::Staged);
+        let revision = store
+            .transact(&env_id, |locked| -> Result<Revision, LifecycleError> {
+                apply_revision_transition(
+                    locked,
+                    rid,
+                    &[
+                        (RevisionLifecycle::Staged, RevisionLifecycle::Warming),
+                        (RevisionLifecycle::Warming, RevisionLifecycle::Ready),
+                    ],
+                    |r| r.warmed_at = Some(fixed_now()),
+                    false,
+                )
+            })
+            .unwrap();
+        assert_eq!(revision.lifecycle, RevisionLifecycle::Ready);
+        assert_eq!(revision.warmed_at, Some(fixed_now()));
+    }
+
+    /// Defensive: a chain whose final state cannot transition to `Failed`
+    /// (`Draining → Failed` is not in the spec matrix) surfaces an
+    /// `InvalidTransition` rather than silently corrupting the lifecycle.
+    /// The env must remain untouched on disk because we never invoke
+    /// `locked.save` on this branch.
+    #[test]
+    fn gate_failure_with_no_legal_failed_transition_surfaces_invalid_transition() {
+        // Seed Ready, drive the legal `Ready → Draining` hop, then have the
+        // gate reject. `Draining → Failed` is not in the spec matrix, so
+        // the helper must bail with InvalidTransition without persisting.
+        let (store, env_id, rid) = seed_one_revision(RevisionLifecycle::Ready);
+        let err = store
+            .transact(&env_id, |locked| -> Result<Revision, LifecycleError> {
+                apply_revision_transition_with_health_gate(
+                    locked,
+                    rid,
+                    &[(RevisionLifecycle::Ready, RevisionLifecycle::Draining)],
+                    |_| {},
+                    false,
+                    |_env, _rev| {
+                        Err(HealthGateFailure {
+                            failed_checks: vec![HealthCheckId::RouteTable],
+                            message: "unreachable in practice for drain".to_string(),
+                        })
+                    },
+                )
+            })
+            .unwrap_err();
+        match err {
+            LifecycleError::InvalidTransition { from, to } => {
+                assert_eq!(from, RevisionLifecycle::Draining);
+                assert_eq!(to, RevisionLifecycle::Failed);
+            }
+            other => panic!("expected InvalidTransition, got `{other:?}`"),
+        }
+
+        // No save happened — revision still in `Ready`.
+        let env = store.load(&env_id).unwrap();
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Ready);
+    }
+
+    /// The gate runs AFTER the `prune_from_splits` active-refs guard, so a
+    /// would-be archive that's blocked by live traffic refuses with the
+    /// active-traffic error and never invokes the gate — guarding against
+    /// running an arbitrary (possibly expensive) gate against a state the
+    /// helper won't transition to.
+    #[test]
+    fn gate_is_not_invoked_when_prune_guard_refuses() {
+        let (store, env_id, rid) = seed_one_revision(RevisionLifecycle::Ready);
+        let mut env = store.load(&env_id).unwrap();
+        let did = env.bundles[0].deployment_id;
+        env.traffic_splits.push(TrafficSplit {
+            schema: SchemaVersion::new(SchemaVersion::TRAFFIC_SPLIT_V1),
+            env_id: env_id.clone(),
+            deployment_id: did,
+            bundle_id: BundleId::new("fast2flow"),
+            generation: 0,
+            entries: vec![TrafficSplitEntry {
+                revision_id: rid,
+                weight_bps: 10_000,
+            }],
+            updated_at: fixed_now(),
+            updated_by: "test".to_string(),
+            idempotency_key: "k1".to_string(),
+            authorization_ref: PathBuf::from("auth.json"),
+            previous_split_ref: None,
+        });
+        store.save(&env).unwrap();
+
+        let gate_invoked = std::cell::Cell::new(false);
+        let err = store
+            .transact(&env_id, |locked| -> Result<Revision, LifecycleError> {
+                apply_revision_transition_with_health_gate(
+                    locked,
+                    rid,
+                    &[(RevisionLifecycle::Ready, RevisionLifecycle::Archived)],
+                    |_| {},
+                    true,
+                    |_env, _rev| {
+                        gate_invoked.set(true);
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap_err();
+        assert!(matches!(err, LifecycleError::ActiveTrafficReference { .. }));
+        assert!(
+            !gate_invoked.get(),
+            "gate must not run when prune guard refuses"
+        );
+    }
+
+    /// An empty `failed_checks` list is allowed (e.g. a gate that aborted
+    /// before any check completed) — `message` carries the detail. The
+    /// helper still flips to Failed and persists.
+    #[test]
+    fn gate_failure_with_empty_failed_checks_is_still_persisted() {
+        let (store, env_id, rid) = seed_one_revision(RevisionLifecycle::Staged);
+        let err = store
+            .transact(&env_id, |locked| -> Result<Revision, LifecycleError> {
+                apply_revision_transition_with_health_gate(
+                    locked,
+                    rid,
+                    &[
+                        (RevisionLifecycle::Staged, RevisionLifecycle::Warming),
+                        (RevisionLifecycle::Warming, RevisionLifecycle::Ready),
+                    ],
+                    |_| {},
+                    false,
+                    |_env, _rev| {
+                        Err(HealthGateFailure {
+                            failed_checks: Vec::new(),
+                            message: "gate aborted before any check completed".to_string(),
+                        })
+                    },
+                )
+            })
+            .unwrap_err();
+        match err {
+            LifecycleError::HealthGateFailed {
+                failed_checks,
+                message,
+                ..
+            } => {
+                assert!(failed_checks.is_empty());
+                assert!(message.contains("aborted"));
+            }
+            other => panic!("expected HealthGateFailed, got `{other:?}`"),
+        }
+        let env = store.load(&env_id).unwrap();
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Failed);
     }
 }

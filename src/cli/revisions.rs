@@ -150,7 +150,7 @@ pub fn stage(
         }),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let summary = store.transact(&env_id, |locked| -> Result<RevisionSummary, OpError> {
             let mut env = locked.load()?;
             let deployment = env
@@ -214,15 +214,48 @@ pub fn stage(
 /// `op revisions warm`. `staged → warming → ready`. The two-step move is
 /// collapsed here for A3 because no async warm hooks exist yet; Phase D wires
 /// the runner warm API.
+///
+/// Default warm path runs a **Noop** health gate so existing CLI callers stay
+/// behavior-compatible. Producers in higher-tier crates (e.g.
+/// `greentic-start`) wire a real B9 warm/ready gate via
+/// [`warm_with_health_gate`].
 pub fn warm(
     store: &LocalFsStore,
     flags: &OpFlags,
     payload: Option<RevisionTransitionPayload>,
 ) -> Result<OpOutcome, OpError> {
+    warm_with_health_gate(store, flags, payload, |_env, _revision| Ok(()))
+}
+
+/// Gate-aware variant of [`warm`] (B9 of `plans/next-gen-deployment.md`).
+///
+/// Drives the same `staged → warming → ready` chain but runs `health_gate`
+/// against the post-chain `(env, revision)` view before `warmed_at` is
+/// stamped and the env is saved. On gate rejection, the revision is
+/// persisted in `Failed` and a `Conflict` (warm/ready health gate) is
+/// surfaced — see
+/// [`crate::environment::apply_revision_transition_with_health_gate`].
+///
+/// Higher-tier consumers construct the gate from concrete validators
+/// (route-table validate, runtime-config load, signature verify, provider
+/// probes); this function only forwards the closure into the lifecycle
+/// helper, keeping `greentic-deployer` free of any health-check producers.
+pub fn warm_with_health_gate<G>(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<RevisionTransitionPayload>,
+    health_gate: G,
+) -> Result<OpOutcome, OpError>
+where
+    G: FnOnce(
+        &greentic_deploy_spec::Environment,
+        &Revision,
+    ) -> Result<(), crate::environment::HealthGateFailure>,
+{
     if flags.schema_only {
         return Ok(OpOutcome::new(NOUN, "warm", transition_schema()));
     }
-    transition(
+    transition_with_health_gate(
         store,
         flags,
         payload,
@@ -235,6 +268,7 @@ pub fn warm(
             r.warmed_at = Some(Utc::now());
         },
         false,
+        health_gate,
     )
 }
 
@@ -323,8 +357,8 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
 /// Resolves the payload, drives the env transact, and renders the outcome
 /// envelope. The lifecycle matrix walk lives in
 /// [`crate::environment::lifecycle`] so future B-phase consumers (gtc start
-/// orchestration #221, B9 warm/ready gate, A7 audit emission) can call
-/// it without going through the CLI shell.
+/// orchestration #221, A7 audit emission) can call it without going through
+/// the CLI shell.
 fn transition<F: FnOnce(&mut Revision)>(
     store: &LocalFsStore,
     flags: &OpFlags,
@@ -334,6 +368,45 @@ fn transition<F: FnOnce(&mut Revision)>(
     on_final: F,
     prune_from_splits: bool,
 ) -> Result<OpOutcome, OpError> {
+    transition_with_health_gate(
+        store,
+        flags,
+        payload,
+        op,
+        accepted_chain,
+        on_final,
+        prune_from_splits,
+        |_env, _revision| Ok(()),
+    )
+}
+
+/// Gate-aware variant of [`transition`] for the B9 warm/ready gate. Routes
+/// `on_final` and the `health_gate` closure through
+/// [`crate::environment::apply_revision_transition_with_health_gate`] inside
+/// the same `store.transact` lock so the gate sees the same snapshot the
+/// chain advance saw and the env is saved once (Failed on rejection, post-
+/// transition otherwise).
+// One extra arg over the 7-arg sibling `transition` to thread the gate
+// closure; bundling into a struct would touch every existing warm/drain/
+// archive caller for no readability win.
+#[allow(clippy::too_many_arguments)]
+fn transition_with_health_gate<F, G>(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<RevisionTransitionPayload>,
+    op: &'static str,
+    accepted_chain: &[(RevisionLifecycle, RevisionLifecycle)],
+    on_final: F,
+    prune_from_splits: bool,
+    health_gate: G,
+) -> Result<OpOutcome, OpError>
+where
+    F: FnOnce(&mut Revision),
+    G: FnOnce(
+        &greentic_deploy_spec::Environment,
+        &Revision,
+    ) -> Result<(), crate::environment::HealthGateFailure>,
+{
     let payload = resolve_payload::<RevisionTransitionPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let revision_id = parse_revision_id(&payload.revision_id)?;
@@ -351,16 +424,36 @@ fn transition<F: FnOnce(&mut Revision)>(
         }),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |committed| {
         let revision = store.transact(&env_id, |locked| -> Result<Revision, OpError> {
-            let revision = crate::environment::apply_revision_transition(
+            let revision = match crate::environment::apply_revision_transition_with_health_gate(
                 locked,
                 revision_id,
                 accepted_chain,
                 on_final,
                 prune_from_splits,
-            )
-            .map_err(OpError::from)?;
+                health_gate,
+            ) {
+                Ok(r) => {
+                    // The lifecycle helper called `locked.save(&env)` before
+                    // returning Ok — env is durable on disk. From this point
+                    // forward, every error path inside the transact (load,
+                    // refresh_runtime_config, …) is *committed-on-error*:
+                    // mark the audit boundary so a follow-up audit-append
+                    // failure fails-closed instead of silently demoting to
+                    // `tracing::warn!`.
+                    committed.mark_committed();
+                    r
+                }
+                Err(e @ crate::environment::LifecycleError::HealthGateFailed { .. }) => {
+                    // Gate-fail path: the lifecycle helper flipped the
+                    // revision to `Failed` and saved before returning this
+                    // error. Same fail-closed rationale as the Ok arm.
+                    committed.mark_committed();
+                    return Err(OpError::from(e));
+                }
+                Err(other) => return Err(OpError::from(other)),
+            };
             // Lifecycle transitions don't change traffic splits today, so this
             // is a no-op refresh (guarded by change-detection); it keeps the
             // runtime-config contract uniform across every mutating verb.
@@ -750,5 +843,241 @@ mod tests {
             .filter_map(|r| r.get("sequence").and_then(|v| v.as_u64()))
             .collect();
         assert_eq!(seqs, vec![1, 2]);
+    }
+
+    // --- B9 warm-with-health-gate tests -----------------------------------
+
+    /// `warm_with_health_gate` with a passing closure behaves exactly like
+    /// the gate-less `warm`: revision lands `Ready`, runtime-config refresh
+    /// runs, and the outcome envelope is the same shape.
+    #[test]
+    fn warm_with_passing_gate_lands_ready() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let did = seed_env_with_deployment(&store);
+        let staged = stage(&store, &OpFlags::default(), Some(stage_payload(&did))).unwrap();
+        let rid = staged
+            .result
+            .get("revision_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let warmed = warm_with_health_gate(
+            &store,
+            &OpFlags::default(),
+            Some(RevisionTransitionPayload {
+                environment_id: "local".to_string(),
+                revision_id: rid,
+            }),
+            |_env, _revision| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            warmed.result.get("lifecycle").and_then(|v| v.as_str()),
+            Some("ready")
+        );
+    }
+
+    /// `warm_with_health_gate` with a failing closure surfaces a Conflict
+    /// (from `OpError::From<LifecycleError>`) and persists the revision in
+    /// `Failed`. The on-disk env reflects the failed warm so a follow-up
+    /// `archive` / retry sees the real state.
+    #[test]
+    fn warm_with_failing_gate_persists_failed_and_returns_conflict() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let did = seed_env_with_deployment(&store);
+        let staged = stage(&store, &OpFlags::default(), Some(stage_payload(&did))).unwrap();
+        let rid_str = staged
+            .result
+            .get("revision_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        let err = warm_with_health_gate(
+            &store,
+            &OpFlags::default(),
+            Some(RevisionTransitionPayload {
+                environment_id: "local".to_string(),
+                revision_id: rid_str.clone(),
+            }),
+            |_env, _revision| {
+                Err(crate::environment::HealthGateFailure {
+                    failed_checks: vec![crate::environment::HealthCheckId::RuntimeConfig],
+                    message: "runtime-config.json missing".to_string(),
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+        let msg = format!("{err}");
+        assert!(msg.contains("warm/ready health gate"), "msg: {msg}");
+        assert!(msg.contains("RuntimeConfig"), "msg: {msg}");
+
+        // On-disk: revision is now Failed.
+        let env_id = EnvId::try_from("local").unwrap();
+        let env = store.load(&env_id).unwrap();
+        assert_eq!(env.revisions.len(), 1);
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Failed);
+    }
+
+    /// Codex finding 2 regression: when the health gate flips a revision to
+    /// `Failed` (state committed) AND the audit-append subsequently fails,
+    /// the audit boundary must fail-closed and surface `OpError::Audit` —
+    /// NOT downgrade to `tracing::warn!` (the old default for `Err`
+    /// returns). We trigger an audit-append failure by placing a regular
+    /// file at `<env_dir>/audit`, so `AuditLog::append`'s `create_dir_all`
+    /// errors with NotADirectory.
+    #[test]
+    fn warm_failing_gate_with_audit_failure_returns_audit_error() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let did = seed_env_with_deployment(&store);
+        let staged = stage(&store, &OpFlags::default(), Some(stage_payload(&did))).unwrap();
+        let rid_str = staged
+            .result
+            .get("revision_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        // Block audit appends: delete the existing events.jsonl (created by
+        // the stage call above) and put a directory at that path instead, so
+        // OpenOptions::open errors with IsADirectory.
+        let env_id = EnvId::try_from("local").unwrap();
+        let env_dir = store.env_dir(&env_id).unwrap();
+        let events_path = env_dir.join("audit").join("events.jsonl");
+        let _ = std::fs::remove_file(&events_path);
+        std::fs::create_dir(&events_path).unwrap();
+
+        let err = warm_with_health_gate(
+            &store,
+            &OpFlags::default(),
+            Some(RevisionTransitionPayload {
+                environment_id: "local".to_string(),
+                revision_id: rid_str.clone(),
+            }),
+            |_env, _revision| {
+                Err(crate::environment::HealthGateFailure {
+                    failed_checks: vec![crate::environment::HealthCheckId::RuntimeConfig],
+                    message: "runtime-config.json missing".to_string(),
+                })
+            },
+        )
+        .unwrap_err();
+
+        // Fail-closed: audit failure on a committed gate-fail must surface
+        // as OpError::Audit, NOT the closure's original Conflict.
+        match &err {
+            OpError::Audit(_) => {}
+            other => panic!("expected OpError::Audit (fail-closed); got `{other:?}`"),
+        }
+
+        // On-disk lifecycle is still Failed (the gate persisted before the
+        // audit attempt).
+        let env = store.load(&env_id).unwrap();
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Failed);
+    }
+
+    /// Negative half of the Finding 2 regression: when a closure returns a
+    /// NON-committed error (e.g. a NotFound from a typo'd revision_id) AND
+    /// the audit append fails, the existing demote-to-warn behavior is
+    /// preserved — the original error reaches the caller, not the audit
+    /// error.
+    #[test]
+    fn warm_uncommitted_error_with_audit_failure_returns_original_error() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let _did = seed_env_with_deployment(&store);
+
+        // Block the audit dir.
+        let env_id = EnvId::try_from("local").unwrap();
+        let env_dir = store.env_dir(&env_id).unwrap();
+        std::fs::write(env_dir.join("audit"), b"audit-blocker").unwrap();
+
+        // Reference a revision that doesn't exist → NotFound, nothing committed.
+        let phantom_rid = ulid::Ulid::new().to_string();
+        let err = warm(
+            &store,
+            &OpFlags::default(),
+            Some(RevisionTransitionPayload {
+                environment_id: "local".to_string(),
+                revision_id: phantom_rid,
+            }),
+        )
+        .unwrap_err();
+
+        // Original error preserved (audit failure demoted to warn).
+        match &err {
+            OpError::NotFound(_) => {}
+            other => panic!("expected OpError::NotFound (audit demoted); got `{other:?}`"),
+        }
+    }
+
+    /// Code-review regression: the `Ok` arm of `apply_revision_transition_
+    /// with_health_gate` ALSO commits state (the lifecycle helper called
+    /// `locked.save` before returning Ok), so subsequent failures inside
+    /// the transact (load / refresh_runtime_config) are committed-on-error
+    /// and must trigger fail-closed audit semantics.
+    ///
+    /// Scenario: passing gate advances Staged → Ready, lifecycle helper
+    /// saves env.json (revision durably Ready), then
+    /// `locked.refresh_runtime_config` fails because the `runtime-config
+    /// .json` path is occupied by a directory; transact returns Err. If
+    /// the audit append ALSO fails (events.jsonl blocked), the caller
+    /// MUST see `OpError::Audit`, not the inner StoreError demoted to a
+    /// warn.
+    #[test]
+    fn warm_ok_with_refresh_failure_and_audit_failure_returns_audit_error() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let did = seed_env_with_deployment(&store);
+        let staged = stage(&store, &OpFlags::default(), Some(stage_payload(&did))).unwrap();
+        let rid_str = staged
+            .result
+            .get("revision_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        let env_id = EnvId::try_from("local").unwrap();
+        let env_dir = store.env_dir(&env_id).unwrap();
+
+        // Block `refresh_runtime_config` by occupying the runtime-config
+        // path with a directory; both save_/delete_ paths fail with IO
+        // errors when the target is a directory.
+        std::fs::create_dir(env_dir.join("runtime-config.json")).unwrap();
+
+        // Block audit append on the same env (same directory-as-file trick
+        // used by the gate-fail audit test).
+        let events_path = env_dir.join("audit").join("events.jsonl");
+        let _ = std::fs::remove_file(&events_path);
+        std::fs::create_dir(&events_path).unwrap();
+
+        let err = warm_with_health_gate(
+            &store,
+            &OpFlags::default(),
+            Some(RevisionTransitionPayload {
+                environment_id: "local".to_string(),
+                revision_id: rid_str,
+            }),
+            |_env, _revision| Ok(()),
+        )
+        .unwrap_err();
+
+        // Fail-closed: the lifecycle helper saved (revision is now Ready
+        // on disk) and refresh failed; audit failure on a committed-on-
+        // error path must surface as OpError::Audit, NOT the original
+        // OpError::Store from the refresh failure.
+        match &err {
+            OpError::Audit(_) => {}
+            other => panic!("expected OpError::Audit (fail-closed); got `{other:?}`"),
+        }
+
+        // The lifecycle save committed before the refresh failed: revision
+        // is Ready on disk.
+        let env = store.load(&env_id).unwrap();
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Ready);
     }
 }
