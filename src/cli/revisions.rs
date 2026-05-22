@@ -434,13 +434,21 @@ where
                 prune_from_splits,
                 health_gate,
             ) {
-                Ok(r) => r,
+                Ok(r) => {
+                    // The lifecycle helper called `locked.save(&env)` before
+                    // returning Ok — env is durable on disk. From this point
+                    // forward, every error path inside the transact (load,
+                    // refresh_runtime_config, …) is *committed-on-error*:
+                    // mark the audit boundary so a follow-up audit-append
+                    // failure fails-closed instead of silently demoting to
+                    // `tracing::warn!`.
+                    committed.mark_committed();
+                    r
+                }
                 Err(e @ crate::environment::LifecycleError::HealthGateFailed { .. }) => {
-                    // The lifecycle helper flipped the revision to `Failed`
-                    // and saved before returning this error. Mark the audit
-                    // boundary so an audit-append failure fails-closed —
-                    // a state-changing error path must not silently drop
-                    // its audit record.
+                    // Gate-fail path: the lifecycle helper flipped the
+                    // revision to `Failed` and saved before returning this
+                    // error. Same fail-closed rationale as the Ok arm.
                     committed.mark_committed();
                     return Err(OpError::from(e));
                 }
@@ -1005,5 +1013,71 @@ mod tests {
             OpError::NotFound(_) => {}
             other => panic!("expected OpError::NotFound (audit demoted); got `{other:?}`"),
         }
+    }
+
+    /// Code-review regression: the `Ok` arm of `apply_revision_transition_
+    /// with_health_gate` ALSO commits state (the lifecycle helper called
+    /// `locked.save` before returning Ok), so subsequent failures inside
+    /// the transact (load / refresh_runtime_config) are committed-on-error
+    /// and must trigger fail-closed audit semantics.
+    ///
+    /// Scenario: passing gate advances Staged → Ready, lifecycle helper
+    /// saves env.json (revision durably Ready), then
+    /// `locked.refresh_runtime_config` fails because the `runtime-config
+    /// .json` path is occupied by a directory; transact returns Err. If
+    /// the audit append ALSO fails (events.jsonl blocked), the caller
+    /// MUST see `OpError::Audit`, not the inner StoreError demoted to a
+    /// warn.
+    #[test]
+    fn warm_ok_with_refresh_failure_and_audit_failure_returns_audit_error() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let did = seed_env_with_deployment(&store);
+        let staged = stage(&store, &OpFlags::default(), Some(stage_payload(&did))).unwrap();
+        let rid_str = staged
+            .result
+            .get("revision_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        let env_id = EnvId::try_from("local").unwrap();
+        let env_dir = store.env_dir(&env_id).unwrap();
+
+        // Block `refresh_runtime_config` by occupying the runtime-config
+        // path with a directory; both save_/delete_ paths fail with IO
+        // errors when the target is a directory.
+        std::fs::create_dir(env_dir.join("runtime-config.json")).unwrap();
+
+        // Block audit append on the same env (same directory-as-file trick
+        // used by the gate-fail audit test).
+        let events_path = env_dir.join("audit").join("events.jsonl");
+        let _ = std::fs::remove_file(&events_path);
+        std::fs::create_dir(&events_path).unwrap();
+
+        let err = warm_with_health_gate(
+            &store,
+            &OpFlags::default(),
+            Some(RevisionTransitionPayload {
+                environment_id: "local".to_string(),
+                revision_id: rid_str,
+            }),
+            |_env, _revision| Ok(()),
+        )
+        .unwrap_err();
+
+        // Fail-closed: the lifecycle helper saved (revision is now Ready
+        // on disk) and refresh failed; audit failure on a committed-on-
+        // error path must surface as OpError::Audit, NOT the original
+        // OpError::Store from the refresh failure.
+        match &err {
+            OpError::Audit(_) => {}
+            other => panic!("expected OpError::Audit (fail-closed); got `{other:?}`"),
+        }
+
+        // The lifecycle save committed before the refresh failed: revision
+        // is Ready on disk.
+        let env = store.load(&env_id).unwrap();
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Ready);
     }
 }
