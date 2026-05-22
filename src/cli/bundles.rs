@@ -109,6 +109,11 @@ pub fn add(
     }
     let payload = resolve_payload(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
+    if payload.bundle_id.trim().is_empty() {
+        return Err(OpError::InvalidArgument(
+            "bundle_id must not be empty".to_string(),
+        ));
+    }
     let bundle_id = BundleId::new(payload.bundle_id);
     // P6 (B10): customer_id is the billing principal. Required for non-local
     // envs; defaults to `local-dev` on `local`. Validated before authz so a
@@ -409,6 +414,9 @@ fn parse_env_id(raw: &str) -> Result<EnvId, OpError> {
 /// when none is supplied; every other env must pass one explicitly.
 fn resolve_customer_id(env_id: &EnvId, supplied: Option<String>) -> Result<CustomerId, OpError> {
     match supplied {
+        Some(c) if c.trim().is_empty() => Err(OpError::InvalidArgument(
+            "customer_id must not be empty".to_string(),
+        )),
         Some(c) => Ok(CustomerId::new(c)),
         None if env_id.as_str() == crate::defaults::LOCAL_ENV_ID => {
             Ok(CustomerId::new(LOCAL_DEV_CUSTOMER_ID))
@@ -795,6 +803,37 @@ mod tests {
             serde_json::from_slice(&std::fs::read(orphan_dir.join("v1.json")).unwrap()).unwrap();
         assert_eq!(doc.version, 1);
         assert!(doc.validate().is_ok());
+    }
+
+    #[test]
+    fn add_rejects_empty_bundle_id_early() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let mut p = payload("fast2flow");
+        p.bundle_id = "".to_string();
+        let err = add(&store, &OpFlags::default(), Some(p)).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("bundle_id")),
+            "got {err:?}"
+        );
+        // No partial billing-policy artifacts left behind.
+        assert!(!dir.path().join("local/billing-policies").exists());
+    }
+
+    #[test]
+    fn add_rejects_empty_customer_id_early() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let mut p = payload("fast2flow");
+        p.customer_id = Some("".to_string());
+        let err = add(&store, &OpFlags::default(), Some(p)).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("customer_id")),
+            "got {err:?}"
+        );
+        assert!(!dir.path().join("local/billing-policies").exists());
     }
 
     #[test]

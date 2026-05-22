@@ -66,6 +66,8 @@ pub enum BundleDeploymentError {
         "unsafe path segment `{0}`: must be a single component, not `.`/`..`, and contain no path separators or NUL"
     )]
     UnsafeSegment(String),
+    #[error("revenue-policy version counter exhausted (committed ref already at the maximum)")]
+    VersionOverflow,
     #[error("revenue-policy io on {path}: {source}")]
     Io {
         path: PathBuf,
@@ -124,8 +126,13 @@ pub fn write_revenue_policy_version(
     // leaves the committed ref unchanged and a retry rewrites the SAME version
     // — overwriting any orphan files — instead of advancing past them. The
     // committed state therefore never references an uncommitted or dangling
-    // version, and `previous_version_ref` is always the genuine prior artifact.
-    let (version, previous_version_ref) = next_version_from_ref(&deployment.revenue_policy_ref);
+    // version.
+    let version = next_version_from_ref(&deployment.revenue_policy_ref)?;
+    // Reconstruct the backward link under THIS deployment's billing dir rather
+    // than copying the committed ref verbatim. In the normal flow the two are
+    // identical (refs are always canonical); reconstructing additionally
+    // refuses to propagate a crafted/cross-env ref out of a tampered env.json.
+    let previous_version_ref = (version > 1).then(|| rel_dir.join(sidecar_name(version - 1)));
 
     let doc = RevenuePolicyDocument {
         schema: SchemaVersion::new(SchemaVersion::REVENUE_POLICY_V1),
@@ -193,29 +200,34 @@ fn safe_segment(seg: &str) -> Result<&str, BundleDeploymentError> {
     Ok(seg)
 }
 
-/// Derive the next version + backward chain from the deployment's committed
-/// `revenue_policy_ref`.
+/// Derive the next version from the deployment's committed `revenue_policy_ref`.
 ///
-/// A ref of the shape `…/vN.json.sig` yields `(N + 1, Some(ref))`; anything
+/// A ref of the shape `…/vN.json.sig` (with `N >= 1`) yields `N + 1`; anything
 /// else — an empty placeholder on a fresh `add`, or a pre-B10 ref like
-/// `revenue.json` — yields `(1, None)`, i.e. the first B10 version with no
-/// prior artifact to chain to.
-fn next_version_from_ref(current_ref: &Path) -> (u64, Option<PathBuf>) {
+/// `revenue.json` — yields `1`, i.e. the first B10 version. A committed ref
+/// already at the maximum returns [`BundleDeploymentError::VersionOverflow`]
+/// rather than panicking (debug) or wrapping to 0 (release).
+fn next_version_from_ref(current_ref: &Path) -> Result<u64, BundleDeploymentError> {
     match parse_sidecar_version(current_ref) {
-        Some(n) => (n + 1, Some(current_ref.to_path_buf())),
-        None => (1, None),
+        Some(n) => n
+            .checked_add(1)
+            .ok_or(BundleDeploymentError::VersionOverflow),
+        None => Ok(1),
     }
 }
 
-/// Parse the version `N` out of a `…/vN.json.sig` sidecar path.
+/// Parse the version `N` out of a `…/vN.json.sig` sidecar path. Returns `None`
+/// for `v0` (not a valid 1-based version) so a corrupted ref is treated as
+/// "no prior version" instead of chaining to a schema-invalid v0.
 fn parse_sidecar_version(ref_path: &Path) -> Option<u64> {
-    ref_path
+    let n = ref_path
         .file_name()?
         .to_str()?
         .strip_prefix('v')?
         .strip_suffix(".json.sig")?
         .parse::<u64>()
-        .ok()
+        .ok()?;
+    (n >= 1).then_some(n)
 }
 
 #[cfg(test)]
@@ -449,5 +461,80 @@ mod tests {
         assert!(matches!(err, BundleDeploymentError::Spec(_)));
         // Nothing should have been written.
         assert!(!dir.path().join("billing-policies").exists());
+    }
+
+    #[test]
+    fn parse_sidecar_version_rejects_zero_and_garbage() {
+        assert_eq!(parse_sidecar_version(Path::new("a/b/v1.json.sig")), Some(1));
+        assert_eq!(
+            parse_sidecar_version(Path::new("a/b/v42.json.sig")),
+            Some(42)
+        );
+        // v0 is not a valid 1-based version → treated as "no prior".
+        assert_eq!(parse_sidecar_version(Path::new("a/b/v0.json.sig")), None);
+        assert_eq!(parse_sidecar_version(Path::new("revenue.json")), None);
+        assert_eq!(parse_sidecar_version(Path::new("v1.json")), None);
+        assert_eq!(parse_sidecar_version(Path::new("")), None);
+    }
+
+    #[test]
+    fn corrupted_v0_ref_starts_fresh_at_v1_without_chain() {
+        let dir = tempdir().unwrap();
+        let mut dep = deployment("fast2flow", "local-dev");
+        dep.revenue_policy_ref = PathBuf::from("billing-policies/fast2flow/local-dev/v0.json.sig");
+        let v =
+            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now()).unwrap();
+        assert_eq!(v.version, 1, "v0 ref must not chain; restart at v1");
+        let doc: RevenuePolicyDocument = serde_json::from_slice(
+            &std::fs::read(
+                dir.path()
+                    .join("billing-policies/fast2flow/local-dev/v1.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(doc.previous_version_ref.is_none());
+    }
+
+    #[test]
+    fn version_counter_overflow_is_an_error_not_a_panic() {
+        let dir = tempdir().unwrap();
+        let mut dep = deployment("fast2flow", "local-dev");
+        dep.revenue_policy_ref = PathBuf::from(format!(
+            "billing-policies/fast2flow/local-dev/v{}.json.sig",
+            u64::MAX
+        ));
+        let err = write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now())
+            .unwrap_err();
+        assert!(matches!(err, BundleDeploymentError::VersionOverflow));
+    }
+
+    #[test]
+    fn previous_version_ref_is_reconstructed_not_copied_verbatim() {
+        // A crafted cross-env committed ref must NOT propagate into the new
+        // doc's previous_version_ref; the link is rebuilt under this
+        // deployment's own billing dir.
+        let dir = tempdir().unwrap();
+        let mut dep = deployment("fast2flow", "cust-acme");
+        dep.revenue_policy_ref =
+            PathBuf::from("../../other-env/billing-policies/victim/cust/v3.json.sig");
+        let v =
+            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now()).unwrap();
+        assert_eq!(v.version, 4); // derived from the parsed v3
+        let doc: RevenuePolicyDocument = serde_json::from_slice(
+            &std::fs::read(
+                dir.path()
+                    .join("billing-policies/fast2flow/cust-acme/v4.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            doc.previous_version_ref,
+            Some(PathBuf::from(
+                "billing-policies/fast2flow/cust-acme/v3.json.sig"
+            )),
+            "previous_version_ref must be rebuilt under this deployment's dir, not the crafted ref"
+        );
     }
 }
