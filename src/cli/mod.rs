@@ -98,6 +98,8 @@ pub enum OpError {
     Unauthorized { policy: String, reason: String },
     #[error("audit log write failed after the mutation committed: {0}")]
     Audit(String),
+    #[error("revenue policy: {0}")]
+    RevenuePolicy(#[from] crate::environment::BundleDeploymentError),
 }
 
 impl From<LifecycleError> for OpError {
@@ -178,6 +180,7 @@ impl OpError {
             OpError::Conflict(_) => "conflict",
             OpError::Unauthorized { .. } => "unauthorized",
             OpError::Audit(_) => "audit",
+            OpError::RevenuePolicy(_) => "revenue-policy",
         }
     }
 }

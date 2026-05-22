@@ -12,6 +12,31 @@ use std::path::PathBuf;
 
 const BASIS_POINTS_TOTAL: u32 = 10_000;
 
+/// Shared `§5.4` revenue-share invariant: every entry's basis points must be
+/// `<= 10,000` and the sum across entries must equal exactly `10,000`.
+///
+/// The sum widens into `u64` and rejects any per-entry value above 10,000 so a
+/// crafted document like `[u32::MAX, 10001]` cannot wrap to exactly 10,000 in
+/// release builds. Shared by [`BundleDeployment::validate`] and the versioned
+/// [`RevenuePolicyDocument`](crate::revenue_policy::RevenuePolicyDocument).
+pub(crate) fn validate_revenue_share_total(
+    revenue_share: &[RevenueShareEntry],
+) -> Result<(), SpecError> {
+    let mut sum: u64 = 0;
+    for entry in revenue_share {
+        if entry.basis_points > BASIS_POINTS_TOTAL {
+            return Err(SpecError::BasisPointsEntryTooLarge {
+                value: entry.basis_points,
+            });
+        }
+        sum += u64::from(entry.basis_points);
+    }
+    if sum != u64::from(BASIS_POINTS_TOTAL) {
+        return Err(SpecError::BasisPointsSum { sum });
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BundleDeploymentStatus {
@@ -87,18 +112,6 @@ impl BundleDeployment {
                 actual: self.schema.as_str().to_string(),
             });
         }
-        let mut sum: u64 = 0;
-        for entry in &self.revenue_share {
-            if entry.basis_points > BASIS_POINTS_TOTAL {
-                return Err(SpecError::BasisPointsEntryTooLarge {
-                    value: entry.basis_points,
-                });
-            }
-            sum += u64::from(entry.basis_points);
-        }
-        if sum != u64::from(BASIS_POINTS_TOTAL) {
-            return Err(SpecError::BasisPointsSum { sum });
-        }
-        Ok(())
+        validate_revenue_share_total(&self.revenue_share)
     }
 }

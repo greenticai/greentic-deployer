@@ -15,6 +15,9 @@ pub enum SpecError {
     #[error("basis-points entry exceeds 10000: {value}")]
     BasisPointsEntryTooLarge { value: u32 },
 
+    #[error("revenue-policy version must be >= 1 (1-based monotonic)")]
+    RevenuePolicyVersionZero,
+
     #[error("duplicate capability slot `{0}` in Environment.packs")]
     DuplicateCapabilitySlot(CapabilitySlot),
 

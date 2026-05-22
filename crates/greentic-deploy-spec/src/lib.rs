@@ -23,6 +23,7 @@ pub mod pack_config;
 pub mod refs;
 pub mod remote;
 pub mod retention;
+pub mod revenue_policy;
 pub mod revision;
 pub mod runtime_config;
 pub mod traffic_split;
@@ -54,6 +55,7 @@ pub use remote::{
     RemoteContractError, RemoteStoreError, RestoreOutcome, RestoreRequest, StateEtag,
 };
 pub use retention::{HealthState, HealthStatus, RetentionPolicy, RevocationConfig};
+pub use revenue_policy::RevenuePolicyDocument;
 pub use revision::{PackListEntry, Revision, RevisionLifecycle, is_valid_transition};
 pub use runtime_config::{RevisionRuntimeBlock, RuntimeConfig};
 pub use traffic_split::{TrafficSplit, TrafficSplitEntry};
