@@ -22,7 +22,10 @@ pub use audit::{
     POLICY_LOCAL_ONLY, authorize_local_only, current_local_actor,
 };
 pub use file_lock::{EnvFlock, LockError};
-pub use lifecycle::{LifecycleError, apply_revision_transition};
+pub use lifecycle::{
+    HealthCheckId, HealthGateFailure, LifecycleError, apply_revision_transition,
+    apply_revision_transition_with_health_gate,
+};
 pub use runtime_config::materialize_runtime_config;
 pub use store::{EnvironmentStore, LocalFsStore, Locked, StoreError};
 

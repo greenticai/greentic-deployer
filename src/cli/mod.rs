@@ -140,6 +140,24 @@ impl From<LifecycleError> for OpError {
                     "revision `{revision_id}` is still referenced by live traffic split(s): [{detail}]; rebalance via `gtc op traffic set` before archiving"
                 ))
             }
+            LifecycleError::HealthGateFailed {
+                revision_id,
+                failed_checks,
+                message,
+            } => {
+                let checks = if failed_checks.is_empty() {
+                    String::from("none reported")
+                } else {
+                    failed_checks
+                        .iter()
+                        .map(|c| format!("{c:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                OpError::Conflict(format!(
+                    "revision `{revision_id}` failed warm/ready health gate (checks: [{checks}]): {message}"
+                ))
+            }
             LifecycleError::Store(source) => OpError::Store(source),
         }
     }
