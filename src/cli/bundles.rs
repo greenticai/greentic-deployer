@@ -27,28 +27,26 @@ const NOUN: &str = "bundles";
 pub struct BundleAddPayload {
     pub environment_id: String,
     pub bundle_id: String,
-    #[serde(default = "default_customer_id")]
-    pub customer_id: String,
+    /// Billing principal (P6). Required for non-`local` envs; defaults to
+    /// [`LOCAL_DEV_CUSTOMER_ID`] when omitted on the `local` env.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customer_id: Option<String>,
     pub route_binding: RouteBindingPayload,
     #[serde(default = "default_revenue_share")]
     pub revenue_share: Vec<RevenueShareEntryPayload>,
-    #[serde(default = "default_revenue_policy_ref")]
-    pub revenue_policy_ref: PathBuf,
     #[serde(default = "default_authorization_ref")]
     pub authorization_ref: PathBuf,
 }
 
-fn default_customer_id() -> String {
-    "local-dev".to_string()
-}
+/// Default `customer_id` for the `local` env when none is supplied. Non-local
+/// envs must pass one explicitly (B10).
+const LOCAL_DEV_CUSTOMER_ID: &str = "local-dev";
+
 fn default_revenue_share() -> Vec<RevenueShareEntryPayload> {
     vec![RevenueShareEntryPayload {
         party_id: "greentic".to_string(),
         basis_points: 10_000,
     }]
-}
-fn default_revenue_policy_ref() -> PathBuf {
-    PathBuf::from("revenue.json")
 }
 fn default_authorization_ref() -> PathBuf {
     PathBuf::from("auth.json")
@@ -111,8 +109,25 @@ pub fn add(
     }
     let payload = resolve_payload(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
+    if payload.bundle_id.trim().is_empty() {
+        return Err(OpError::InvalidArgument(
+            "bundle_id must not be empty".to_string(),
+        ));
+    }
     let bundle_id = BundleId::new(payload.bundle_id);
-    let customer_id = CustomerId::new(payload.customer_id);
+    // P6 (B10): customer_id is the billing principal. Required for non-local
+    // envs; defaults to `local-dev` on `local`. Validated before authz so a
+    // missing principal surfaces as a precise argument error.
+    let customer_id = resolve_customer_id(&env_id, payload.customer_id.clone())?;
+    let revenue_share: Vec<RevenueShareEntry> = payload
+        .revenue_share
+        .iter()
+        .cloned()
+        .map(|e| RevenueShareEntry {
+            party_id: greentic_deploy_spec::PartyId::new(e.party_id),
+            basis_points: e.basis_points,
+        })
+        .collect();
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -120,10 +135,12 @@ pub fn add(
         target: json!({
             "bundle_id": bundle_id.as_str(),
             "customer_id": customer_id.as_str(),
+            "revenue_share": revenue_share_json(&revenue_share),
         }),
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |_committed| {
+        let env_dir = store.env_dir(&env_id)?;
         let summary = store.transact(&env_id, |locked| -> Result<BundleSummary, OpError> {
             let mut env = locked.load()?;
             // P6 anchor (§5.4): one BundleDeployment per (env_id, bundle_id, customer_id).
@@ -137,7 +154,8 @@ pub fn add(
                     bundle_id, customer_id, env_id
                 )));
             }
-            let deployment = BundleDeployment {
+            let created_at = Utc::now();
+            let mut deployment = BundleDeployment {
                 schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
                 deployment_id: crate::environment::mint_deployment_id(),
                 env_id: env_id.clone(),
@@ -146,20 +164,21 @@ pub fn add(
                 status: BundleDeploymentStatus::Active,
                 current_revisions: Vec::new(),
                 route_binding: into_route_binding(payload.route_binding.clone()),
-                revenue_share: payload
-                    .revenue_share
-                    .iter()
-                    .cloned()
-                    .map(|e| RevenueShareEntry {
-                        party_id: greentic_deploy_spec::PartyId::new(e.party_id),
-                        basis_points: e.basis_points,
-                    })
-                    .collect(),
-                revenue_policy_ref: payload.revenue_policy_ref.clone(),
+                revenue_share: revenue_share.clone(),
+                // Replaced with the v1 policy sidecar path below.
+                revenue_policy_ref: PathBuf::new(),
                 usage: None,
-                created_at: Utc::now(),
+                created_at,
                 authorization_ref: payload.authorization_ref.clone(),
             };
+            // Write the v1 signed/versioned revenue policy and pin the ref.
+            let version = crate::environment::write_revenue_policy_version(
+                &env_dir,
+                &deployment,
+                &deployment.revenue_share,
+                created_at,
+            )?;
+            deployment.revenue_policy_ref = version.policy_ref;
             env.bundles.push(deployment);
             locked.save(&env)?;
             Ok(BundleSummary::from(
@@ -199,14 +218,31 @@ pub fn update(
     let payload = resolve_payload::<BundleUpdatePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
+    // Parse the revenue-share change up front so the audit event records it
+    // (the plan requires `bundle update` audit to carry revenue_share changes).
+    let new_revenue_share: Option<Vec<RevenueShareEntry>> =
+        payload.revenue_share.as_ref().map(|s| {
+            s.iter()
+                .cloned()
+                .map(|e| RevenueShareEntry {
+                    party_id: greentic_deploy_spec::PartyId::new(e.party_id),
+                    basis_points: e.basis_points,
+                })
+                .collect()
+        });
+    let mut target = json!({"deployment_id": deployment_id.to_string()});
+    if let Some(shares) = &new_revenue_share {
+        target["revenue_share"] = revenue_share_json(shares);
+    }
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "update",
-        target: json!({"deployment_id": deployment_id.to_string()}),
+        target,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |_committed| {
+        let env_dir = store.env_dir(&env_id)?;
         let summary = store.transact(&env_id, |locked| -> Result<BundleSummary, OpError> {
             let mut env = locked.load()?;
             let idx = env
@@ -224,14 +260,18 @@ pub fn update(
             if let Some(rb) = payload.route_binding.clone() {
                 env.bundles[idx].route_binding = into_route_binding(rb);
             }
-            if let Some(shares) = payload.revenue_share.clone() {
-                env.bundles[idx].revenue_share = shares
-                    .into_iter()
-                    .map(|e| RevenueShareEntry {
-                        party_id: greentic_deploy_spec::PartyId::new(e.party_id),
-                        basis_points: e.basis_points,
-                    })
-                    .collect();
+            if let Some(shares) = new_revenue_share.clone() {
+                // A revenue-share mutation creates a new signed/versioned policy
+                // (B10): set the shares, write v{N+1}, and pin the new ref.
+                env.bundles[idx].revenue_share = shares;
+                let created_at = Utc::now();
+                let version = crate::environment::write_revenue_policy_version(
+                    &env_dir,
+                    &env.bundles[idx],
+                    &env.bundles[idx].revenue_share,
+                    created_at,
+                )?;
+                env.bundles[idx].revenue_policy_ref = version.policy_ref;
             }
             locked.save(&env)?;
             Ok(BundleSummary::from(&env_id, &env.bundles[idx]))
@@ -370,6 +410,33 @@ fn parse_env_id(raw: &str) -> Result<EnvId, OpError> {
     EnvId::try_from(raw).map_err(|e| OpError::InvalidArgument(format!("environment_id: {e}")))
 }
 
+/// P6 (B10): resolve the billing principal. `local` defaults to `local-dev`
+/// when none is supplied; every other env must pass one explicitly.
+fn resolve_customer_id(env_id: &EnvId, supplied: Option<String>) -> Result<CustomerId, OpError> {
+    match supplied {
+        Some(c) if c.trim().is_empty() => Err(OpError::InvalidArgument(
+            "customer_id must not be empty".to_string(),
+        )),
+        Some(c) => Ok(CustomerId::new(c)),
+        None if env_id.as_str() == crate::defaults::LOCAL_ENV_ID => {
+            Ok(CustomerId::new(LOCAL_DEV_CUSTOMER_ID))
+        }
+        None => Err(OpError::InvalidArgument(format!(
+            "customer_id is required for non-local env `{env_id}` (the billing principal; P6)"
+        ))),
+    }
+}
+
+/// Render revenue-share entries for the audit `target` payload.
+fn revenue_share_json(shares: &[RevenueShareEntry]) -> Value {
+    Value::Array(
+        shares
+            .iter()
+            .map(|e| json!({"party_id": e.party_id.as_str(), "basis_points": e.basis_points}))
+            .collect(),
+    )
+}
+
 fn parse_deployment_id(raw: &str) -> Result<DeploymentId, OpError> {
     use std::str::FromStr;
     let ulid = ulid::Ulid::from_str(raw)
@@ -405,10 +472,9 @@ fn add_schema() -> Value {
         "properties": {
             "environment_id": {"type": "string"},
             "bundle_id": {"type": "string"},
-            "customer_id": {"type": "string", "default": "local-dev"},
+            "customer_id": {"type": "string", "description": "billing principal; required for non-local envs, defaults to `local-dev` on `local`"},
             "route_binding": {"type": "object"},
             "revenue_share": {"type": "array"},
-            "revenue_policy_ref": {"type": "string"},
             "authorization_ref": {"type": "string"}
         }
     })
@@ -455,14 +521,13 @@ mod tests {
         BundleAddPayload {
             environment_id: "local".to_string(),
             bundle_id: bundle_id.to_string(),
-            customer_id: "local-dev".to_string(),
+            customer_id: Some("local-dev".to_string()),
             route_binding: RouteBindingPayload {
                 hosts: vec![format!("{bundle_id}.local")],
                 path_prefixes: Vec::new(),
                 tenant_selector: None,
             },
             revenue_share: default_revenue_share(),
-            revenue_policy_ref: default_revenue_policy_ref(),
             authorization_ref: default_authorization_ref(),
         }
     }
@@ -505,7 +570,7 @@ mod tests {
         store.save(&make_env("local")).unwrap();
         add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
         let mut p2 = payload("fast2flow");
-        p2.customer_id = "other".to_string();
+        p2.customer_id = Some("other".to_string());
         let outcome = add(&store, &OpFlags::default(), Some(p2)).unwrap();
         assert_eq!(outcome.op, "add");
     }
@@ -682,5 +747,221 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+    }
+
+    // --- B10: customer_id requirement + signed/versioned revenue policy ----
+
+    #[test]
+    fn add_writes_v1_revenue_policy_and_pins_ref() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
+
+        let env = store.load(&parse_env_id("local").unwrap()).unwrap();
+        let dep = &env.bundles[0];
+        assert_eq!(
+            dep.revenue_policy_ref,
+            PathBuf::from("billing-policies/fast2flow/local-dev/v1.json.sig")
+        );
+        let env_dir = dir.path().join("local");
+        assert!(env_dir.join(&dep.revenue_policy_ref).is_file());
+        assert!(
+            env_dir
+                .join("billing-policies/fast2flow/local-dev/v1.json")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn add_overwrites_orphan_v1_from_failed_prior_attempt() {
+        // Codex regression: a prior `add` that wrote v1.json but failed before
+        // committing env.json must NOT cause the retry to advance to v2 and
+        // chain through a never-committed/dangling v1. Since the deployment
+        // isn't committed, the retry stays at v1 and overwrites the orphan.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        // Simulate the orphan document left by a failed attempt.
+        let orphan_dir = dir
+            .path()
+            .join("local/billing-policies/fast2flow/local-dev");
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        std::fs::write(orphan_dir.join("v1.json"), b"{\"stale\":true}").unwrap();
+
+        add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
+
+        let env = store.load(&parse_env_id("local").unwrap()).unwrap();
+        assert_eq!(
+            env.bundles[0].revenue_policy_ref,
+            PathBuf::from("billing-policies/fast2flow/local-dev/v1.json.sig"),
+            "retry must reuse v1, not advance past the orphan"
+        );
+        assert!(!orphan_dir.join("v2.json").exists());
+        // The orphan was overwritten with a valid versioned document.
+        let doc: greentic_deploy_spec::RevenuePolicyDocument =
+            serde_json::from_slice(&std::fs::read(orphan_dir.join("v1.json")).unwrap()).unwrap();
+        assert_eq!(doc.version, 1);
+        assert!(doc.validate().is_ok());
+    }
+
+    #[test]
+    fn add_rejects_empty_bundle_id_early() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let mut p = payload("fast2flow");
+        p.bundle_id = "".to_string();
+        let err = add(&store, &OpFlags::default(), Some(p)).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("bundle_id")),
+            "got {err:?}"
+        );
+        // No partial billing-policy artifacts left behind.
+        assert!(!dir.path().join("local/billing-policies").exists());
+    }
+
+    #[test]
+    fn add_rejects_empty_customer_id_early() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let mut p = payload("fast2flow");
+        p.customer_id = Some("".to_string());
+        let err = add(&store, &OpFlags::default(), Some(p)).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("customer_id")),
+            "got {err:?}"
+        );
+        assert!(!dir.path().join("local/billing-policies").exists());
+    }
+
+    #[test]
+    fn add_local_defaults_customer_id_when_omitted() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let mut p = payload("fast2flow");
+        p.customer_id = None;
+        let outcome = add(&store, &OpFlags::default(), Some(p)).unwrap();
+        assert_eq!(
+            outcome.result.get("customer_id").and_then(|v| v.as_str()),
+            Some("local-dev")
+        );
+    }
+
+    #[test]
+    fn add_non_local_without_customer_id_is_invalid_argument() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("prod-eu")).unwrap();
+        let mut p = payload("fast2flow");
+        p.environment_id = "prod-eu".to_string();
+        p.customer_id = None;
+        // The argument contract is checked before authorization, so a missing
+        // billing principal surfaces precisely (not as a generic authz deny).
+        let err = add(&store, &OpFlags::default(), Some(p)).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn add_non_local_with_customer_id_is_authz_denied() {
+        // With a billing principal supplied, the arg gate passes and the
+        // non-local env is rejected by the local-only authz policy (A8 ships
+        // real RBAC). Confirms the customer_id gate doesn't let non-local through.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("prod-eu")).unwrap();
+        let mut p = payload("fast2flow");
+        p.environment_id = "prod-eu".to_string();
+        p.customer_id = Some("cust-acme".to_string());
+        let err = add(&store, &OpFlags::default(), Some(p)).unwrap_err();
+        assert!(matches!(err, OpError::Unauthorized { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn update_revenue_share_writes_new_version_and_chains() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let added = add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
+        let did = added
+            .result
+            .get("deployment_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        update(
+            &store,
+            &OpFlags::default(),
+            Some(BundleUpdatePayload {
+                environment_id: "local".to_string(),
+                deployment_id: did,
+                status: None,
+                route_binding: None,
+                revenue_share: Some(vec![
+                    RevenueShareEntryPayload {
+                        party_id: "agency-a".to_string(),
+                        basis_points: 3_000,
+                    },
+                    RevenueShareEntryPayload {
+                        party_id: "greentic".to_string(),
+                        basis_points: 7_000,
+                    },
+                ]),
+            }),
+        )
+        .unwrap();
+
+        let env = store.load(&parse_env_id("local").unwrap()).unwrap();
+        let dep = &env.bundles[0];
+        assert_eq!(
+            dep.revenue_policy_ref,
+            PathBuf::from("billing-policies/fast2flow/local-dev/v2.json.sig")
+        );
+        let env_dir = dir.path().join("local");
+        assert!(
+            env_dir
+                .join("billing-policies/fast2flow/local-dev/v2.json")
+                .is_file()
+        );
+        // Audit recorded the revenue-share change.
+        let audit = std::fs::read_to_string(env_dir.join("audit/events.jsonl")).unwrap();
+        assert!(
+            audit.contains("agency-a") && audit.contains("3000"),
+            "update audit event must carry the revenue_share change: {audit}"
+        );
+    }
+
+    #[test]
+    fn update_without_revenue_share_keeps_policy_ref() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let added = add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
+        let did = added
+            .result
+            .get("deployment_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        update(
+            &store,
+            &OpFlags::default(),
+            Some(BundleUpdatePayload {
+                environment_id: "local".to_string(),
+                deployment_id: did,
+                status: Some(BundleDeploymentStatus::Paused),
+                route_binding: None,
+                revenue_share: None,
+            }),
+        )
+        .unwrap();
+        let env = store.load(&parse_env_id("local").unwrap()).unwrap();
+        assert_eq!(
+            env.bundles[0].revenue_policy_ref,
+            PathBuf::from("billing-policies/fast2flow/local-dev/v1.json.sig")
+        );
     }
 }

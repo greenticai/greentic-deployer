@@ -11,6 +11,7 @@
 
 pub mod atomic_write;
 pub mod audit;
+pub mod bundle_deployment;
 pub mod file_lock;
 pub mod lifecycle;
 pub mod runtime_config;
@@ -20,6 +21,10 @@ pub use atomic_write::{AtomicWriteError, atomic_write_bytes, atomic_write_json, 
 pub use audit::{
     AUDIT_EVENT_SCHEMA_V1, Actor, AuditDecision, AuditError, AuditEvent, AuditLog, AuditResult,
     POLICY_LOCAL_ONLY, authorize_local_only, current_local_actor,
+};
+pub use bundle_deployment::{
+    BundleDeploymentError, RevenuePolicySignature, RevenuePolicyVersion,
+    write_revenue_policy_version,
 };
 pub use file_lock::{EnvFlock, LockError};
 pub use lifecycle::{

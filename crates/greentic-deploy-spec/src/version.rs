@@ -22,6 +22,7 @@ impl SchemaVersion {
     pub const REVISION_V1: &'static str = "greentic.revision.v1";
     pub const TRAFFIC_SPLIT_V1: &'static str = "greentic.traffic-split.v1";
     pub const BUNDLE_DEPLOYMENT_V1: &'static str = "greentic.bundle-deployment.v1";
+    pub const REVENUE_POLICY_V1: &'static str = "greentic.revenue-policy.v1";
     pub const CREDENTIALS_V1: &'static str = "greentic.credentials.v1";
     pub const PACK_CONFIG_V1: &'static str = "greentic.pack-config.v1";
     pub const RUNTIME_CONFIG_V1: &'static str = "greentic.runtime-config.v1";
