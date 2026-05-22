@@ -111,7 +111,7 @@ pub fn apply(
     // denied + audited by the authorization gate before any store probe —
     // otherwise an absent non-local env would return NotFound (unaudited) and
     // a present one Unauthorized, leaking an existence oracle.
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         require_env_exists(store, &env_id)?;
         apply_inner(&env_id, &state_dir)
     })

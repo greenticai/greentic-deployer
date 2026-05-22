@@ -124,7 +124,7 @@ pub fn set(
         target: json!({"deployment_id": deployment_id.to_string()}),
         idempotency_key: Some(payload.idempotency_key.clone()),
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let (split, gens) = store.transact(&env_id, |locked| {
             let mut env = locked.load()?;
             let deployment = env
@@ -484,7 +484,7 @@ pub fn rollback(
         target: json!({"deployment_id": deployment_id.to_string()}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let (restored, gens) = store.transact(&env_id, |locked| {
             let mut env = locked.load()?;
             let idx = env

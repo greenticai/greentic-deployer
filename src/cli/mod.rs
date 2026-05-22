@@ -194,6 +194,42 @@ pub(crate) struct AuditCtx {
     pub idempotency_key: Option<String>,
 }
 
+/// Closure-callable handle for signalling "this mutation persisted state to
+/// disk even though it's returning Err."
+///
+/// `audit_and_record` is fail-closed for committed mutations: if the audit
+/// append fails, a committed mutation's success is downgraded to
+/// [`OpError::Audit`]. The old default was "Ok = committed, Err = not
+/// committed," which is wrong for verbs that persist state on an error
+/// path (the B9 warm/ready gate flips a revision to `Failed` and saves
+/// before surfacing [`LifecycleError::HealthGateFailed`]). Callers on
+/// such paths invoke [`CommitMarker::mark_committed`] before returning
+/// `Err`, and the audit boundary then treats the audit-append failure as
+/// fail-closed instead of demoting it to `tracing::warn!`.
+///
+/// Default behavior is preserved for every other caller: ignore the
+/// parameter (idiomatic `|_committed| { ... }`) and the marker stays
+/// unset, so non-committing errors keep their existing demote-to-warn
+/// semantics.
+pub(crate) struct CommitMarker(std::cell::Cell<bool>);
+
+impl CommitMarker {
+    pub(crate) fn new() -> Self {
+        Self(std::cell::Cell::new(false))
+    }
+
+    /// Mark the mutation as having persisted state before its (forthcoming)
+    /// `Err` return. Calling this on the Ok path is harmless but
+    /// redundant — `Ok(_)` already implies committed.
+    pub fn mark_committed(&self) {
+        self.0.set(true);
+    }
+
+    pub(crate) fn is_committed(&self) -> bool {
+        self.0.get()
+    }
+}
+
 /// Closure return — the pre- and post-mutation generations.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct AuditGens {
@@ -220,10 +256,19 @@ impl AuditGens {
 /// the helper discards the success and returns [`OpError::Audit`]. A
 /// state-changing op never reports success without a durable audit record.
 ///
-/// For non-committing outcomes (authorization denials, mutation errors,
-/// `NotYetImplemented` stubs) there is no committed state to protect, so an
-/// audit-append failure is demoted to `tracing::warn!` and the original
-/// (error) result is returned unchanged.
+/// `mutate` receives a [`CommitMarker`]; closures whose error path *also*
+/// persists state (e.g. the B9 health gate flipping a revision to `Failed`
+/// before surfacing `LifecycleError::HealthGateFailed`) must call
+/// [`CommitMarker::mark_committed`] before returning `Err`, so an
+/// audit-append failure on that path is treated as fail-closed too.
+/// Closures that never persist state on the `Err` path simply ignore the
+/// marker (idiomatic `|_committed| { ... }`) — `Ok` already implies
+/// committed.
+///
+/// For non-committing outcomes (authorization denials, mutation errors that
+/// didn't persist, `NotYetImplemented` stubs) there is no committed state
+/// to protect, so an audit-append failure is demoted to `tracing::warn!`
+/// and the original (error) result is returned unchanged.
 ///
 /// Note this closes the "unwritable/full audit dir" gap but not the
 /// process-death-between-write-and-append window — durable write-ahead intent
@@ -242,9 +287,10 @@ pub(crate) fn audit_and_record<F>(
     mutate: F,
 ) -> Result<OpOutcome, OpError>
 where
-    F: FnOnce() -> Result<(OpOutcome, AuditGens), OpError>,
+    F: FnOnce(&CommitMarker) -> Result<(OpOutcome, AuditGens), OpError>,
 {
     let decision = authorize_local_only(&ctx.env_id);
+    let commit_marker = CommitMarker::new();
     let (result, gens) = match &decision {
         AuditDecision::Deny { policy, reason } => (
             Err(OpError::Unauthorized {
@@ -253,14 +299,15 @@ where
             }),
             AuditGens::default(),
         ),
-        AuditDecision::Allow { .. } => match mutate() {
+        AuditDecision::Allow { .. } => match mutate(&commit_marker) {
             Ok((outcome, g)) => (Ok(outcome), g),
             Err(err) => (Err(err), AuditGens::default()),
         },
     };
-    // Only an `Ok` from an allowed mutation commits durable state; that is the
-    // case where a missing audit record violates the A7 guarantee.
-    let committed = result.is_ok();
+    // Either path can commit: `Ok` implies committed by definition; the
+    // closure also signals committed-on-`Err` (B9 health-gate Failed
+    // persistence) via the CommitMarker.
+    let committed = result.is_ok() || commit_marker.is_committed();
 
     let audit_result = match &result {
         Ok(_) => AuditResult::Ok,

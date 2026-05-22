@@ -365,7 +365,7 @@ pub fn apply(store: &LocalFsStore, flags: &OpFlags, target: &str) -> Result<OpOu
         }),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let report = run_check(store, &from, &to)?;
         if !report.clean {
             return Err(OpError::Conflict(format!(

@@ -76,7 +76,7 @@ pub fn add(
         target: json!({"slot": payload.slot, "kind": payload.kind}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let summary = store.transact(&env_id, |locked| -> Result<BindingSummary, OpError> {
             let mut env = locked.load()?;
             if env.pack_for_slot(binding.slot).is_some() {
@@ -124,7 +124,7 @@ pub fn update(
         target: json!({"slot": payload.slot, "kind": payload.kind}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let (summary, gens) = store.transact(&env_id, |locked| {
             let mut env = locked.load()?;
             let idx = env
@@ -182,7 +182,7 @@ pub fn remove(
         target: json!({"slot": payload.slot}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let (summary, gens) = store.transact(&env_id, |locked| {
             let mut env = locked.load()?;
             let idx = env
@@ -229,7 +229,7 @@ pub fn rollback(
         target: json!({"slot": payload.slot}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let (summary, gens) = store.transact(&env_id, |locked| {
             let mut env = locked.load()?;
             let idx = env

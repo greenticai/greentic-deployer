@@ -77,7 +77,7 @@ pub fn create(
         target: json!({"environment_id": env_id.as_str()}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let env = store.transact(&env_id, |locked| -> Result<Environment, OpError> {
             if locked.load().is_ok() {
                 return Err(OpError::Conflict(format!(
@@ -146,7 +146,7 @@ pub fn update(
         target: json!({"environment_id": env_id.as_str(), "fields": fields}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let env = store.transact(&env_id, |locked| -> Result<Environment, OpError> {
             let mut env = match locked.load() {
                 Ok(env) => env,
@@ -401,7 +401,7 @@ pub fn init(store: &LocalFsStore, flags: &OpFlags) -> Result<OpOutcome, OpError>
         target: json!({"environment_id": env_id.as_str()}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let (env, outcome) = super::bootstrap::ensure_local_environment(store)?;
         let bound_slots: Vec<String> = env.packs.iter().map(|b| b.slot.to_string()).collect();
         let mut payload = json!({
@@ -469,7 +469,7 @@ pub fn destroy(
         target: json!({"environment_id": env_id.as_str(), "confirm": confirm}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         if !store.exists(&env_id)? {
             return Err(OpError::NotFound(format!("environment `{env_id}`")));
         }

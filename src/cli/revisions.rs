@@ -150,7 +150,7 @@ pub fn stage(
         }),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |_committed| {
         let summary = store.transact(&env_id, |locked| -> Result<RevisionSummary, OpError> {
             let mut env = locked.load()?;
             let deployment = env
@@ -424,17 +424,28 @@ where
         }),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, || {
+    audit_and_record(store, ctx, |committed| {
         let revision = store.transact(&env_id, |locked| -> Result<Revision, OpError> {
-            let revision = crate::environment::apply_revision_transition_with_health_gate(
+            let revision = match crate::environment::apply_revision_transition_with_health_gate(
                 locked,
                 revision_id,
                 accepted_chain,
                 on_final,
                 prune_from_splits,
                 health_gate,
-            )
-            .map_err(OpError::from)?;
+            ) {
+                Ok(r) => r,
+                Err(e @ crate::environment::LifecycleError::HealthGateFailed { .. }) => {
+                    // The lifecycle helper flipped the revision to `Failed`
+                    // and saved before returning this error. Mark the audit
+                    // boundary so an audit-append failure fails-closed —
+                    // a state-changing error path must not silently drop
+                    // its audit record.
+                    committed.mark_committed();
+                    return Err(OpError::from(e));
+                }
+                Err(other) => return Err(OpError::from(other)),
+            };
             // Lifecycle transitions don't change traffic splits today, so this
             // is a no-op refresh (guarded by change-detection); it keeps the
             // runtime-config contract uniform across every mutating verb.
@@ -901,5 +912,98 @@ mod tests {
         let env = store.load(&env_id).unwrap();
         assert_eq!(env.revisions.len(), 1);
         assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Failed);
+    }
+
+    /// Codex finding 2 regression: when the health gate flips a revision to
+    /// `Failed` (state committed) AND the audit-append subsequently fails,
+    /// the audit boundary must fail-closed and surface `OpError::Audit` —
+    /// NOT downgrade to `tracing::warn!` (the old default for `Err`
+    /// returns). We trigger an audit-append failure by placing a regular
+    /// file at `<env_dir>/audit`, so `AuditLog::append`'s `create_dir_all`
+    /// errors with NotADirectory.
+    #[test]
+    fn warm_failing_gate_with_audit_failure_returns_audit_error() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let did = seed_env_with_deployment(&store);
+        let staged = stage(&store, &OpFlags::default(), Some(stage_payload(&did))).unwrap();
+        let rid_str = staged
+            .result
+            .get("revision_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        // Block audit appends: delete the existing events.jsonl (created by
+        // the stage call above) and put a directory at that path instead, so
+        // OpenOptions::open errors with IsADirectory.
+        let env_id = EnvId::try_from("local").unwrap();
+        let env_dir = store.env_dir(&env_id).unwrap();
+        let events_path = env_dir.join("audit").join("events.jsonl");
+        let _ = std::fs::remove_file(&events_path);
+        std::fs::create_dir(&events_path).unwrap();
+
+        let err = warm_with_health_gate(
+            &store,
+            &OpFlags::default(),
+            Some(RevisionTransitionPayload {
+                environment_id: "local".to_string(),
+                revision_id: rid_str.clone(),
+            }),
+            |_env, _revision| {
+                Err(crate::environment::HealthGateFailure {
+                    failed_checks: vec![crate::environment::HealthCheckId::RuntimeConfig],
+                    message: "runtime-config.json missing".to_string(),
+                })
+            },
+        )
+        .unwrap_err();
+
+        // Fail-closed: audit failure on a committed gate-fail must surface
+        // as OpError::Audit, NOT the closure's original Conflict.
+        match &err {
+            OpError::Audit(_) => {}
+            other => panic!("expected OpError::Audit (fail-closed); got `{other:?}`"),
+        }
+
+        // On-disk lifecycle is still Failed (the gate persisted before the
+        // audit attempt).
+        let env = store.load(&env_id).unwrap();
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Failed);
+    }
+
+    /// Negative half of the Finding 2 regression: when a closure returns a
+    /// NON-committed error (e.g. a NotFound from a typo'd revision_id) AND
+    /// the audit append fails, the existing demote-to-warn behavior is
+    /// preserved — the original error reaches the caller, not the audit
+    /// error.
+    #[test]
+    fn warm_uncommitted_error_with_audit_failure_returns_original_error() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let _did = seed_env_with_deployment(&store);
+
+        // Block the audit dir.
+        let env_id = EnvId::try_from("local").unwrap();
+        let env_dir = store.env_dir(&env_id).unwrap();
+        std::fs::write(env_dir.join("audit"), b"audit-blocker").unwrap();
+
+        // Reference a revision that doesn't exist → NotFound, nothing committed.
+        let phantom_rid = ulid::Ulid::new().to_string();
+        let err = warm(
+            &store,
+            &OpFlags::default(),
+            Some(RevisionTransitionPayload {
+                environment_id: "local".to_string(),
+                revision_id: phantom_rid,
+            }),
+        )
+        .unwrap_err();
+
+        // Original error preserved (audit failure demoted to warn).
+        match &err {
+            OpError::NotFound(_) => {}
+            other => panic!("expected OpError::NotFound (audit demoted); got `{other:?}`"),
+        }
     }
 }

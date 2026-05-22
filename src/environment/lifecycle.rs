@@ -216,13 +216,21 @@ where
 /// health gate.
 ///
 /// Behaves exactly like the gate-less helper through chain advance and the
-/// `prune_from_splits` active-traffic guard. After the chain reaches its
-/// final state (and the prune guard, if armed, passes), `health_gate` runs
-/// against the freshly-mutated `(env, revision)` view. The gate sees the
-/// **post-chain** revision (e.g. `Ready`) so checks can branch on the
-/// would-be-committed state.
+/// `prune_from_splits` active-traffic guard. The gate fires **only when an
+/// edge in `accepted_chain` actually advanced the lifecycle** — an idempotent
+/// retry against an already-final-state revision skips the gate entirely
+/// (the revision is already committed at its target state, often with live
+/// traffic routing to it; rerunning a transient gate would demote a healthy
+/// live revision to `Failed` while the runtime-config materializer keeps
+/// routing traffic to it). `on_final` still runs on the no-op-walk path per
+/// the existing idempotent-retry contract — `warmed_at` is re-stamped, but
+/// the lifecycle does not change.
 ///
-/// **On gate failure** (`Err(HealthGateFailure)`):
+/// When the chain advanced, `health_gate` runs against the freshly-mutated
+/// `(env, revision)` view. The gate sees the **post-chain** revision (e.g.
+/// `Ready`) so checks can branch on the would-be-committed state.
+///
+/// **On gate failure** (`Err(HealthGateFailure)`, chain-advanced path only):
 /// - the revision's lifecycle is flipped to
 ///   [`RevisionLifecycle::Failed`] (the spec matrix allows
 ///   `Staged|Warming|Ready|Inactive → Failed`),
@@ -266,6 +274,7 @@ where
             revision_id,
         })?;
 
+    let mut chain_advanced = false;
     for (from, to) in accepted_chain {
         if env.revisions[idx].lifecycle == *from {
             if !is_valid_transition(*from, *to) {
@@ -275,6 +284,7 @@ where
                 });
             }
             env.revisions[idx].lifecycle = *to;
+            chain_advanced = true;
         }
     }
 
@@ -321,11 +331,17 @@ where
         }
     }
 
-    // Health gate runs against the post-chain view but BEFORE on_final and
-    // the prune mutation, so a rejected gate leaves `warmed_at` unstamped
-    // and `current_revisions` untouched while still persisting the Failed
-    // lifecycle.
-    if let Err(failure) = health_gate(&env, &env.revisions[idx]) {
+    // Health gate fires ONLY when the chain actually advanced. An idempotent
+    // retry against an already-final revision (chain walk a no-op) skips
+    // the gate because the revision is already committed at its target
+    // state and may have live traffic routing to it — a transient gate
+    // failure must not demote a healthy live revision to `Failed` while the
+    // runtime-config materializer continues to route traffic to it (route
+    // table is derived from `traffic_splits`, not `lifecycle`). On the
+    // chain-advanced path the gate sees the post-chain `(env, revision)`
+    // view; rejection flips lifecycle to `Failed` and saves before
+    // returning the typed error.
+    if chain_advanced && let Err(failure) = health_gate(&env, &env.revisions[idx]) {
         let prior = env.revisions[idx].lifecycle;
         if !is_valid_transition(prior, RevisionLifecycle::Failed) {
             // Caller passed a chain whose final state can't transition to
@@ -962,14 +978,78 @@ mod tests {
         assert_eq!(env.revisions[0].warmed_at, None);
     }
 
-    /// A gate that fails on an already-`Ready` revision (idempotent retry
-    /// path): the chain is a no-op advance, the gate still runs against the
-    /// post-chain (Ready) revision, and a failure flips it to `Failed`. The
-    /// spec matrix allows `Ready → Failed`, so persistence succeeds.
+    /// Idempotent retry against an already-final revision must NOT invoke
+    /// the gate and must NOT demote lifecycle on a transient failure —
+    /// `runtime-config.json` is materialized from `traffic_splits`, so
+    /// rerunning a flaky gate on a live Ready revision would persist
+    /// `Failed` while the router keeps serving traffic to it. The retry
+    /// stays a successful no-op; `on_final` re-stamps `warmed_at` per the
+    /// existing idempotent contract.
     #[test]
-    fn health_gate_failure_on_already_ready_persists_failed() {
+    fn idempotent_retry_skips_gate_and_preserves_ready() {
         let (store, env_id, rid) = seed_one_revision(RevisionLifecycle::Ready);
-        let err = store
+        let gate_invoked = std::cell::Cell::new(false);
+        let revision = store
+            .transact(&env_id, |locked| -> Result<Revision, LifecycleError> {
+                apply_revision_transition_with_health_gate(
+                    locked,
+                    rid,
+                    &[
+                        (RevisionLifecycle::Staged, RevisionLifecycle::Warming),
+                        (RevisionLifecycle::Warming, RevisionLifecycle::Ready),
+                    ],
+                    |r| r.warmed_at = Some(fixed_now()),
+                    false,
+                    |_env, _rev| {
+                        gate_invoked.set(true);
+                        Err(HealthGateFailure {
+                            failed_checks: vec![HealthCheckId::ProviderHealth],
+                            message: "would have demoted a live revision".to_string(),
+                        })
+                    },
+                )
+            })
+            .unwrap();
+        assert!(
+            !gate_invoked.get(),
+            "gate must not run on idempotent retry against an already-final revision"
+        );
+        assert_eq!(revision.lifecycle, RevisionLifecycle::Ready);
+        assert_eq!(revision.warmed_at, Some(fixed_now()));
+
+        let env = store.load(&env_id).unwrap();
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Ready);
+    }
+
+    /// The live-traffic protection case Codex flagged: a Ready revision is
+    /// actively serving 100% of a deployment's traffic; a retry warm with
+    /// a (transiently) failing gate must NOT demote it to `Failed` because
+    /// the traffic split still routes to it. After the retry: lifecycle is
+    /// still Ready, the split is intact, the route table stays serviceable.
+    #[test]
+    fn gate_skipped_on_retry_preserves_live_routed_revision() {
+        let (store, env_id, rid) = seed_one_revision(RevisionLifecycle::Ready);
+        let mut env = store.load(&env_id).unwrap();
+        let did = env.bundles[0].deployment_id;
+        env.traffic_splits.push(TrafficSplit {
+            schema: SchemaVersion::new(SchemaVersion::TRAFFIC_SPLIT_V1),
+            env_id: env_id.clone(),
+            deployment_id: did,
+            bundle_id: BundleId::new("fast2flow"),
+            generation: 0,
+            entries: vec![TrafficSplitEntry {
+                revision_id: rid,
+                weight_bps: 10_000,
+            }],
+            updated_at: fixed_now(),
+            updated_by: "test".to_string(),
+            idempotency_key: "k1".to_string(),
+            authorization_ref: PathBuf::from("auth.json"),
+            previous_split_ref: None,
+        });
+        store.save(&env).unwrap();
+
+        let revision = store
             .transact(&env_id, |locked| -> Result<Revision, LifecycleError> {
                 apply_revision_transition_with_health_gate(
                     locked,
@@ -983,16 +1063,21 @@ mod tests {
                     |_env, _rev| {
                         Err(HealthGateFailure {
                             failed_checks: vec![HealthCheckId::ProviderHealth],
-                            message: "provider unreachable".to_string(),
+                            message: "transient — must not demote".to_string(),
                         })
                     },
                 )
             })
-            .unwrap_err();
-        assert!(matches!(err, LifecycleError::HealthGateFailed { .. }));
+            .unwrap();
+        assert_eq!(revision.lifecycle, RevisionLifecycle::Ready);
 
+        // Live traffic split untouched, lifecycle still Ready on disk.
         let env = store.load(&env_id).unwrap();
-        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Failed);
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Ready);
+        assert_eq!(env.traffic_splits.len(), 1);
+        assert_eq!(env.traffic_splits[0].entries.len(), 1);
+        assert_eq!(env.traffic_splits[0].entries[0].revision_id, rid);
+        assert_eq!(env.traffic_splits[0].entries[0].weight_bps, 10_000);
     }
 
     /// Gate-aware path with the gate-less default (Noop closure) is the
