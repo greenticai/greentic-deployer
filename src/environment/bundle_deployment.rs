@@ -13,13 +13,31 @@
 //! `BundleDeployment.revenue_policy_ref` is set to the **env-relative** path of
 //! the latest sidecar.
 //!
-//! ## Signing posture (B10 vs C2)
+//! ## Signing posture (C2)
 //!
-//! The `.sig` sidecar carries a SHA-256 canonical-JSON integrity envelope
-//! ([`RevenuePolicySignature`]) — tamper-evident, not yet cryptographically
-//! authentic. Real DSSE+Ed25519 signing is C2's scope; the envelope is shaped
-//! so C2 can attach `signature`/`key_id`/trust-root fields without changing the
-//! on-disk layout or the document format.
+//! The `.sig` sidecar is a DSSE envelope (`application/vnd.in-toto+json`)
+//! whose in-toto v1 Statement pins the canonical-JSON SHA-256 of the
+//! corresponding `vN.json` and carries a `greentic.revenue-policy-predicate.v1`
+//! predicate. The envelope is signed Ed25519 with the operator's key (see
+//! [`crate::operator_key`]) and verifiable via
+//! [`greentic_distributor_client::signing::verify_artifact_dsse`] against the
+//! env's [`super::trust_root`].
+//!
+//! ## Trust-root contract (Codex #1 — revocation durability)
+//!
+//! The writer NEVER mutates the env trust root. It loads
+//! `<env_dir>/trust-root.json`, refuses to sign if the operator's `key_id`
+//! is not already a trusted entry, and self-verifies the freshly-written
+//! envelope against that same trust root before returning.
+//!
+//! This makes `gtc op trust-root remove` a real revocation boundary:
+//! after removal, every subsequent `bundle add/update` aborts with
+//! [`BundleDeploymentError::OperatorKeyNotTrusted`] until an authorized
+//! caller runs the explicit `gtc op trust-root bootstrap` verb (or
+//! rotates the operator's local key entirely). An earlier draft of this
+//! writer auto-seeded the operator key on every write — that defeated
+//! revocation because the next mutation always re-inserted the removed
+//! key.
 //!
 //! ## Concurrency & partial-failure safety
 //!
@@ -33,29 +51,35 @@
 //! `EnvironmentStore::transact` so the file write and the `env.json` update
 //! share one env flock.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use greentic_deploy_spec::{
-    BundleDeployment, RevenuePolicyDocument, RevenueShareEntry, SchemaVersion, StateIntegrity,
+    BundleDeployment, RevenuePolicyDocument, RevenueShareEntry, SchemaVersion,
+};
+use greentic_distributor_client::signing::{
+    INTOTO_STATEMENT_TYPE, InTotoStatement, SigningError, Subject, sign_statement,
+    verify_artifact_dsse,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::atomic_write::{AtomicWriteError, atomic_write_json};
+use super::atomic_write::AtomicWriteError;
+use super::trust_root::{self, TrustRootError};
+use crate::operator_key::{OperatorKey, OperatorKeyError};
 
 /// Env-relative root directory holding all revenue-policy versions.
 const BILLING_DIR: &str = "billing-policies";
 
-/// Schema discriminator for the [`RevenuePolicySignature`] sidecar.
-pub const REVENUE_POLICY_SIGNATURE_V1: &str = "greentic.revenue-policy-signature.v1";
+/// Predicate type discriminator for the revenue-policy DSSE statement.
+pub const REVENUE_POLICY_PREDICATE_TYPE_V1: &str = "greentic.revenue-policy-predicate.v1";
 
 #[derive(Debug, Error)]
 pub enum BundleDeploymentError {
     #[error("revenue-policy spec invalid: {0}")]
     Spec(#[from] greentic_deploy_spec::SpecError),
-    #[error("revenue-policy integrity: {0}")]
-    Integrity(#[from] greentic_deploy_spec::IntegrityError),
     #[error("revenue-policy write {path}: {source}")]
     Write {
         path: PathBuf,
@@ -74,16 +98,52 @@ pub enum BundleDeploymentError {
         #[source]
         source: std::io::Error,
     },
+    #[error("revenue-policy signing: {0}")]
+    Sign(#[from] SigningError),
+    #[error("revenue-policy operator key: {0}")]
+    OperatorKey(#[from] OperatorKeyError),
+    #[error("revenue-policy trust-root: {0}")]
+    TrustRoot(#[from] TrustRootError),
+    #[error("revenue-policy serialize: {0}")]
+    Serialize(serde_json::Error),
+    /// The operator's `(key_id, public_pem)` is not in the env trust root.
+    /// Auto-seeding would defeat revocation, so the writer refuses to sign
+    /// until the caller explicitly bootstraps the env trust root.
+    #[error(
+        "operator key `{key_id}` is not trusted in env `{env_dir}` (not present in `trust-root.json`); run `gtc op trust-root bootstrap <env-id>` first, or restore the key via `gtc op trust-root add`"
+    )]
+    OperatorKeyNotTrusted { key_id: String, env_dir: PathBuf },
+    /// Post-write self-verify caught corruption: the on-disk `vN.json`
+    /// hashes to something other than the value the DSSE Statement pinned.
+    /// Surfaces NFS / disk-space / concurrent-rename races at write time.
+    #[error(
+        "revenue-policy document `{path}` was corrupted after write: expected SHA-256 `{expected}`, on-disk SHA-256 `{actual}`"
+    )]
+    DocCorruptedAfterWrite {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
 }
 
-/// Detached sidecar for a revenue-policy version.
+/// Predicate body recorded inside the DSSE Statement. Mirrors the
+/// document's identity fields so a reader of the `.sig` envelope alone can
+/// see what the signature covers without opening `vN.json`.
 ///
-/// B10: integrity-only (SHA-256 canonical JSON). C2 attaches the cryptographic
-/// signature here without changing the layout (see module docs).
+/// `previous_version_ref` is serialized as a forward-slash-normalized
+/// `String` (not a `PathBuf`) so the predicate is portable across
+/// operating systems — Windows back-slashes in a JSON path string would
+/// not resolve on POSIX verifiers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RevenuePolicySignature {
+pub struct RevenuePolicyPredicate {
     pub schema: String,
-    pub integrity: StateIntegrity,
+    pub deployment_id: greentic_deploy_spec::DeploymentId,
+    pub env_id: greentic_deploy_spec::EnvId,
+    pub bundle_id: greentic_deploy_spec::BundleId,
+    pub customer_id: greentic_deploy_spec::CustomerId,
+    pub version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_version_ref: Option<String>,
     pub signed_at: DateTime<Utc>,
 }
 
@@ -93,12 +153,40 @@ pub struct RevenuePolicyVersion {
     /// Env-relative path to the new sidecar (→ `BundleDeployment.revenue_policy_ref`).
     pub policy_ref: PathBuf,
     pub version: u64,
-    pub integrity: StateIntegrity,
+    /// Lowercase-hex SHA-256 of the canonical-JSON bytes pinned by the DSSE
+    /// statement. Same value the envelope's `subject.digest.sha256` carries
+    /// — callers can cross-reference without re-reading the document.
+    pub doc_sha256: String,
+    /// `keyid` recorded in the DSSE envelope (matches the operator's
+    /// canonical key id).
+    pub key_id: String,
+}
+
+/// Convert a `PathBuf` into a `/`-separated string for cross-platform
+/// serialization inside DSSE predicates. On POSIX this is a no-op; on
+/// Windows it replaces `\\` with `/`.
+fn path_to_forward_slash(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
 }
 
 /// Write the next revenue-policy version for `deployment` under `env_dir`,
-/// using `revenue_share` as the version's policy and `created_at` as its
-/// timestamp.
+/// using `revenue_share` as the version's policy, `created_at` as its
+/// timestamp, and `operator_key` for DSSE signing.
+///
+/// On disk, two files land under
+/// `<env_dir>/billing-policies/<bundle_id>/<customer_id>/`:
+/// - `vN.json` — the canonical-JSON [`RevenuePolicyDocument`].
+/// - `vN.json.sig` — a DSSE envelope whose in-toto v1 Statement pins the
+///   document's SHA-256 and carries a [`RevenuePolicyPredicate`].
+///
+/// **Trust-root precondition:** `operator_key.key_id` must already be
+/// present in `<env_dir>/trust-root.json`; the writer never mutates the
+/// trust root (see module docs on revocation durability). Bootstrap an
+/// env's trust root once with `gtc op trust-root bootstrap <env-id>`.
+///
+/// The freshly-written envelope is re-loaded and re-verified against that
+/// trust root before returning — a misconfiguration that would yield an
+/// unverifiable sidecar fails the write rather than landing on disk.
 ///
 /// Returns the env-relative sidecar path the caller should store in
 /// `BundleDeployment.revenue_policy_ref`. Versions are 1-based and monotonic
@@ -111,7 +199,25 @@ pub fn write_revenue_policy_version(
     deployment: &BundleDeployment,
     revenue_share: &[RevenueShareEntry],
     created_at: DateTime<Utc>,
+    operator_key: &OperatorKey,
 ) -> Result<RevenuePolicyVersion, BundleDeploymentError> {
+    // Codex #1: load the env trust root (do NOT mutate it) and refuse to
+    // sign if the operator's key is not already trusted. Runs at the very
+    // top of the function so a failed precondition leaves NO partial
+    // artifacts (empty billing-policies subdirs, etc.) on disk. Auto-seeding
+    // here would defeat `gtc op trust-root remove` as a revocation boundary.
+    let trust_root = trust_root::load(env_dir)?;
+    let trusted = trust_root
+        .keys
+        .iter()
+        .any(|k| k.key_id.eq_ignore_ascii_case(&operator_key.key_id));
+    if !trusted {
+        return Err(BundleDeploymentError::OperatorKeyNotTrusted {
+            key_id: operator_key.key_id.clone(),
+            env_dir: env_dir.to_path_buf(),
+        });
+    }
+
     // `BundleId`/`CustomerId` are opaque, unvalidated strings — guard against
     // path traversal before they become directory segments.
     let bundle_seg = safe_segment(deployment.bundle_id.as_str())?;
@@ -132,7 +238,7 @@ pub fn write_revenue_policy_version(
     // than copying the committed ref verbatim. In the normal flow the two are
     // identical (refs are always canonical); reconstructing additionally
     // refuses to propagate a crafted/cross-env ref out of a tampered env.json.
-    let previous_version_ref = (version > 1).then(|| rel_dir.join(sidecar_name(version - 1)));
+    let previous_version_ref_path = (version > 1).then(|| rel_dir.join(sidecar_name(version - 1)));
 
     let doc = RevenuePolicyDocument {
         schema: SchemaVersion::new(SchemaVersion::REVENUE_POLICY_V1),
@@ -143,16 +249,45 @@ pub fn write_revenue_policy_version(
         customer_id: deployment.customer_id.clone(),
         revenue_share: revenue_share.to_vec(),
         created_at,
-        previous_version_ref,
+        previous_version_ref: previous_version_ref_path.clone(),
     };
     doc.validate()?;
 
-    let integrity = StateIntegrity::sha256_of(&doc)?;
-    let sidecar = RevenuePolicySignature {
-        schema: REVENUE_POLICY_SIGNATURE_V1.to_string(),
-        integrity: integrity.clone(),
+    let doc_bytes = serde_json::to_vec_pretty(&doc).map_err(BundleDeploymentError::Serialize)?;
+    // Lowercase-hex SHA-256 over the exact on-disk bytes — pinned in the
+    // DSSE Statement subject and re-derived in the self-verify below.
+    let doc_sha256_hex = sha256_hex(&doc_bytes);
+
+    let predicate = RevenuePolicyPredicate {
+        schema: REVENUE_POLICY_PREDICATE_TYPE_V1.to_string(),
+        deployment_id: deployment.deployment_id,
+        env_id: deployment.env_id.clone(),
+        bundle_id: deployment.bundle_id.clone(),
+        customer_id: deployment.customer_id.clone(),
+        version,
+        previous_version_ref: previous_version_ref_path
+            .as_deref()
+            .map(path_to_forward_slash),
         signed_at: created_at,
     };
+    let predicate_value =
+        serde_json::to_value(&predicate).map_err(BundleDeploymentError::Serialize)?;
+
+    let mut digest = BTreeMap::new();
+    digest.insert("sha256".to_string(), doc_sha256_hex.clone());
+    let statement = InTotoStatement {
+        type_: INTOTO_STATEMENT_TYPE.to_string(),
+        subject: vec![Subject {
+            name: document_name(version),
+            digest,
+        }],
+        predicate_type: REVENUE_POLICY_PREDICATE_TYPE_V1.to_string(),
+        predicate: predicate_value,
+    };
+
+    let envelope = sign_statement(&statement, &operator_key.private_pem, &operator_key.key_id)?;
+    let envelope_bytes =
+        serde_json::to_vec_pretty(&envelope).map_err(BundleDeploymentError::Serialize)?;
 
     std::fs::create_dir_all(&abs_dir).map_err(|source| BundleDeploymentError::Io {
         path: abs_dir.clone(),
@@ -161,14 +296,57 @@ pub fn write_revenue_policy_version(
 
     let doc_rel = rel_dir.join(document_name(version));
     let sig_rel = rel_dir.join(sidecar_name(version));
-    write_json(&env_dir.join(&doc_rel), &doc)?;
-    write_json(&env_dir.join(&sig_rel), &sidecar)?;
+    let doc_abs = env_dir.join(&doc_rel);
+    let sig_abs = env_dir.join(&sig_rel);
+
+    super::atomic_write::atomic_write_bytes(&doc_abs, &doc_bytes).map_err(|source| {
+        BundleDeploymentError::Write {
+            path: doc_abs.clone(),
+            source,
+        }
+    })?;
+    super::atomic_write::atomic_write_bytes(&sig_abs, &envelope_bytes).map_err(|source| {
+        BundleDeploymentError::Write {
+            path: sig_abs.clone(),
+            source,
+        }
+    })?;
+
+    // Self-verify: re-read BOTH files from disk, re-hash the doc, then
+    // verify the envelope against the digest of what actually landed. The
+    // earlier shape used the in-memory `doc_sha256_hex` for the verify
+    // input, which would pass even if the on-disk doc was truncated or
+    // corrupted between atomic_write and this verify (e.g. NFS / out-of-
+    // disk-space / concurrent rename). Re-hashing the disk bytes catches
+    // write-time corruption at the moment it could be detected cheaply.
+    let on_disk_doc = std::fs::read(&doc_abs).map_err(|source| BundleDeploymentError::Io {
+        path: doc_abs.clone(),
+        source,
+    })?;
+    let on_disk_doc_sha256 = sha256_hex(&on_disk_doc);
+    if on_disk_doc_sha256 != doc_sha256_hex {
+        return Err(BundleDeploymentError::DocCorruptedAfterWrite {
+            path: doc_abs.clone(),
+            expected: doc_sha256_hex.clone(),
+            actual: on_disk_doc_sha256,
+        });
+    }
+    let written = std::fs::read(&sig_abs).map_err(|source| BundleDeploymentError::Io {
+        path: sig_abs.clone(),
+        source,
+    })?;
+    verify_artifact_dsse(&written, &on_disk_doc_sha256, &trust_root)?;
 
     Ok(RevenuePolicyVersion {
         policy_ref: sig_rel,
         version,
-        integrity,
+        doc_sha256: doc_sha256_hex,
+        key_id: operator_key.key_id.clone(),
     })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn document_name(version: u64) -> String {
@@ -177,13 +355,6 @@ fn document_name(version: u64) -> String {
 
 fn sidecar_name(version: u64) -> String {
     format!("v{version}.json.sig")
-}
-
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), BundleDeploymentError> {
-    atomic_write_json(path, value).map_err(|source| BundleDeploymentError::Write {
-        path: path.to_path_buf(),
-        source,
-    })
 }
 
 /// Reject anything that is not a single safe path component.
@@ -233,11 +404,37 @@ fn parse_sidecar_version(ref_path: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator_key::{OperatorKey, load_or_generate_at};
     use greentic_deploy_spec::{
         BundleDeploymentStatus, BundleId, CustomerId, DeploymentId, EnvId, PartyId, RouteBinding,
         TenantSelector,
     };
-    use tempfile::tempdir;
+    use greentic_distributor_client::signing::{DsseEnvelope, TrustedKey, verify_artifact_dsse};
+    use tempfile::{TempDir, tempdir};
+
+    /// Test fixture: load/generate an operator key AND seed it into the env
+    /// trust root. Mirrors the production flow where
+    /// `gtc op trust-root bootstrap` runs once before any revenue-policy
+    /// write. Tests that exercise the "operator not trusted" gate should NOT
+    /// call this — use `test_operator_key_without_bootstrap` instead.
+    fn test_operator_key(workdir: &TempDir) -> OperatorKey {
+        let key = test_operator_key_without_bootstrap(workdir);
+        trust_root::add_trusted_key(
+            workdir.path(),
+            TrustedKey {
+                key_id: key.key_id.clone(),
+                public_key_pem: key.public_pem.clone(),
+            },
+        )
+        .expect("seed operator key into env trust root");
+        key
+    }
+
+    fn test_operator_key_without_bootstrap(workdir: &TempDir) -> OperatorKey {
+        // Each test gets its own key under its own tempdir so writes are
+        // isolated and `~/.greentic/operator/key.pem` is never touched.
+        load_or_generate_at(&workdir.path().join("operator-key.pem")).expect("generate key")
+    }
 
     fn deployment(bundle: &str, customer: &str) -> BundleDeployment {
         BundleDeployment {
@@ -277,9 +474,10 @@ mod tests {
     #[test]
     fn first_write_is_v1_with_files_and_no_previous() {
         let dir = tempdir().unwrap();
+        let op = test_operator_key(&dir);
         let dep = deployment("fast2flow", "local-dev");
-        let v =
-            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now()).unwrap();
+        let v = write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+            .unwrap();
         assert_eq!(v.version, 1);
         assert_eq!(
             v.policy_ref,
@@ -306,18 +504,21 @@ mod tests {
     #[test]
     fn second_write_increments_and_chains() {
         let dir = tempdir().unwrap();
+        let op = test_operator_key(&dir);
         // The version advances off the deployment's *committed* ref, so the
         // caller threads the prior ref onto the deployment between writes —
         // exactly what `cli::bundles::update` does after a successful save.
         let mut dep = deployment("fast2flow", "cust-acme");
         let v1 =
-            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now()).unwrap();
+            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+                .unwrap();
         dep.revenue_policy_ref = v1.policy_ref;
         let v2 = write_revenue_policy_version(
             dir.path(),
             &dep,
             &shares(&[("agency-a", 3_000), ("greentic", 7_000)]),
             Utc::now(),
+            &op,
         )
         .unwrap();
         assert_eq!(v2.version, 2);
@@ -343,15 +544,16 @@ mod tests {
         // never advances the committed ref, so a retry must rewrite the SAME
         // version and overwrite the orphan files rather than advance past them.
         let dir = tempdir().unwrap();
+        let op = test_operator_key(&dir);
         let dep = deployment("fast2flow", "local-dev"); // committed ref is the placeholder
         // First attempt "fails to commit": files land on disk but the caller
         // never persists the new ref onto the deployment.
-        let a =
-            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now()).unwrap();
+        let a = write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+            .unwrap();
         assert_eq!(a.version, 1);
         // Retry with the SAME (still-uncommitted) deployment.
-        let b =
-            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now()).unwrap();
+        let b = write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+            .unwrap();
         assert_eq!(b.version, 1, "retry must not advance past the orphan");
         // No v2 was ever produced.
         assert!(
@@ -367,9 +569,11 @@ mod tests {
         // "fails to commit" (ref left at v1); the retry rewrites v2 and chains
         // to the committed v1 sidecar — never to a missing/uncommitted one.
         let dir = tempdir().unwrap();
+        let op = test_operator_key(&dir);
         let mut dep = deployment("fast2flow", "cust-acme");
         let v1 =
-            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now()).unwrap();
+            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+                .unwrap();
         dep.revenue_policy_ref = v1.policy_ref; // v1 committed
         // First v2 attempt (uncommitted): ref stays at v1.
         write_revenue_policy_version(
@@ -377,6 +581,7 @@ mod tests {
             &dep,
             &shares(&[("greentic", 10_000)]),
             Utc::now(),
+            &op,
         )
         .unwrap();
         // Retry: still derives v2 from committed v1.
@@ -385,6 +590,7 @@ mod tests {
             &dep,
             &shares(&[("greentic", 10_000)]),
             Utc::now(),
+            &op,
         )
         .unwrap();
         assert_eq!(v2.version, 2);
@@ -409,53 +615,174 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_integrity_matches_document() {
+    fn sidecar_is_dsse_envelope_that_verifies_against_doc_sha256() {
         let dir = tempdir().unwrap();
+        let op = test_operator_key(&dir);
         let dep = deployment("fast2flow", "local-dev");
-        let v =
-            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now()).unwrap();
-        let doc: RevenuePolicyDocument = serde_json::from_slice(
-            &std::fs::read(
-                dir.path()
-                    .join("billing-policies/fast2flow/local-dev/v1.json"),
-            )
-            .unwrap(),
+        let v = write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+            .unwrap();
+        assert_eq!(v.key_id, op.key_id);
+
+        let doc_path = dir
+            .path()
+            .join("billing-policies/fast2flow/local-dev/v1.json");
+        let doc_bytes = std::fs::read(&doc_path).unwrap();
+        let doc_sha256 = sha256_hex(&doc_bytes);
+        // Round-trips through serde so the SHA-256 lines up with what the
+        // writer pinned (canonical-JSON via serde_json::to_vec_pretty).
+        let _doc: RevenuePolicyDocument = serde_json::from_slice(&doc_bytes).unwrap();
+
+        let envelope_bytes = std::fs::read(dir.path().join(&v.policy_ref)).unwrap();
+        let parsed: DsseEnvelope = serde_json::from_slice(&envelope_bytes).unwrap();
+        assert_eq!(parsed.payload_type, "application/vnd.in-toto+json");
+        assert_eq!(parsed.signatures.len(), 1);
+        assert_eq!(parsed.signatures[0].keyid, op.key_id);
+
+        // Trust root carries the bootstrapped operator key (fixture-seeded).
+        let trust = super::super::trust_root::load(dir.path()).unwrap();
+        assert!(!trust.is_empty(), "fixture must bootstrap trust-root.json");
+        verify_artifact_dsse(&envelope_bytes, &doc_sha256, &trust)
+            .expect("envelope must verify against the env trust root");
+    }
+
+    #[test]
+    fn previous_version_ref_in_predicate_uses_forward_slashes() {
+        // xhigh #13: PathBuf serialization via Display embeds the platform
+        // separator. On Windows this would be `\` — a verifier on another
+        // OS could not resolve the predicate's `previous_version_ref`.
+        let dir = tempdir().unwrap();
+        let op = test_operator_key(&dir);
+        let mut dep = deployment("fast2flow", "cust-acme");
+        let v1 =
+            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+                .unwrap();
+        dep.revenue_policy_ref = v1.policy_ref;
+        write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+            .unwrap();
+
+        let envelope_bytes = std::fs::read(
+            dir.path()
+                .join("billing-policies/fast2flow/cust-acme/v2.json.sig"),
         )
         .unwrap();
-        let sig: RevenuePolicySignature =
-            serde_json::from_slice(&std::fs::read(dir.path().join(&v.policy_ref)).unwrap())
+        let env: DsseEnvelope = serde_json::from_slice(&envelope_bytes).unwrap();
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(&env.payload)
+            .unwrap();
+        let stmt: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let prev = stmt["predicate"]["previous_version_ref"].as_str().unwrap();
+        assert!(
+            !prev.contains('\\'),
+            "predicate previous_version_ref must not contain backslashes; got {prev:?}"
+        );
+        assert!(
+            prev.starts_with("billing-policies/fast2flow/cust-acme/"),
+            "expected forward-slash-normalized path; got {prev:?}"
+        );
+    }
+
+    #[test]
+    fn writer_does_not_mutate_trust_root() {
+        // Codex #1 revocation durability: two consecutive writes must not
+        // change the trust root — the writer is read-only against it.
+        let dir = tempdir().unwrap();
+        let op = test_operator_key(&dir);
+        let pre = super::super::trust_root::load(dir.path()).unwrap();
+        let mut dep = deployment("fast2flow", "local-dev");
+        let v1 =
+            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
                 .unwrap();
-        assert_eq!(sig.schema, REVENUE_POLICY_SIGNATURE_V1);
-        assert!(sig.integrity.verify(&doc).unwrap());
+        dep.revenue_policy_ref = v1.policy_ref;
+        write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+            .unwrap();
+        let post = super::super::trust_root::load(dir.path()).unwrap();
+        assert_eq!(pre.keys, post.keys, "writer must not mutate trust root");
+    }
+
+    #[test]
+    fn writer_refuses_when_operator_key_not_in_trust_root() {
+        // Codex #1: unbootstrapped trust root is a hard fail, never silent
+        // auto-seed.
+        let dir = tempdir().unwrap();
+        let op = test_operator_key_without_bootstrap(&dir);
+        let dep = deployment("fast2flow", "local-dev");
+        let err =
+            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+                .expect_err("unbootstrapped op must be rejected");
+        match err {
+            BundleDeploymentError::OperatorKeyNotTrusted { key_id, .. } => {
+                assert_eq!(key_id, op.key_id);
+            }
+            other => panic!("expected OperatorKeyNotTrusted, got {other:?}"),
+        }
+        assert!(
+            !dir.path().join("billing-policies").exists(),
+            "no policy artifact must land on a failed precondition"
+        );
+    }
+
+    #[test]
+    fn writer_refuses_after_explicit_trust_root_remove() {
+        // Codex #1 durability: once an operator key is removed via
+        // `trust-root remove`, the writer must keep refusing — never silently
+        // re-seed and resume signing.
+        let dir = tempdir().unwrap();
+        let op = test_operator_key(&dir);
+        let dep = deployment("fast2flow", "local-dev");
+        write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+            .unwrap();
+        super::super::trust_root::remove_trusted_key(dir.path(), &op.key_id).unwrap();
+        let mut dep2 = dep.clone();
+        dep2.bundle_id = BundleId::new("post-revocation");
+        let err =
+            write_revenue_policy_version(dir.path(), &dep2, &dep2.revenue_share, Utc::now(), &op)
+                .expect_err("revoked op must stay revoked");
+        assert!(matches!(
+            err,
+            BundleDeploymentError::OperatorKeyNotTrusted { .. }
+        ));
+        let trust = super::super::trust_root::load(dir.path()).unwrap();
+        assert!(
+            trust.keys.is_empty(),
+            "revocation must be durable; got {:?}",
+            trust.keys
+        );
     }
 
     #[test]
     fn unsafe_bundle_segment_rejected() {
         let dir = tempdir().unwrap();
+        let op = test_operator_key(&dir);
         let dep = deployment("../escape", "local-dev");
-        let err = write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now())
-            .unwrap_err();
+        let err =
+            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+                .unwrap_err();
         assert!(matches!(err, BundleDeploymentError::UnsafeSegment(_)));
     }
 
     #[test]
     fn unsafe_customer_segment_rejected() {
         let dir = tempdir().unwrap();
+        let op = test_operator_key(&dir);
         let dep = deployment("fast2flow", "a/b");
-        let err = write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now())
-            .unwrap_err();
+        let err =
+            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+                .unwrap_err();
         assert!(matches!(err, BundleDeploymentError::UnsafeSegment(_)));
     }
 
     #[test]
     fn invalid_revenue_share_rejected_before_write() {
         let dir = tempdir().unwrap();
+        let op = test_operator_key(&dir);
         let dep = deployment("fast2flow", "local-dev");
         let err = write_revenue_policy_version(
             dir.path(),
             &dep,
             &shares(&[("greentic", 5_000)]),
             Utc::now(),
+            &op,
         )
         .unwrap_err();
         assert!(matches!(err, BundleDeploymentError::Spec(_)));
@@ -480,10 +807,11 @@ mod tests {
     #[test]
     fn corrupted_v0_ref_starts_fresh_at_v1_without_chain() {
         let dir = tempdir().unwrap();
+        let op = test_operator_key(&dir);
         let mut dep = deployment("fast2flow", "local-dev");
         dep.revenue_policy_ref = PathBuf::from("billing-policies/fast2flow/local-dev/v0.json.sig");
-        let v =
-            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now()).unwrap();
+        let v = write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+            .unwrap();
         assert_eq!(v.version, 1, "v0 ref must not chain; restart at v1");
         let doc: RevenuePolicyDocument = serde_json::from_slice(
             &std::fs::read(
@@ -499,13 +827,15 @@ mod tests {
     #[test]
     fn version_counter_overflow_is_an_error_not_a_panic() {
         let dir = tempdir().unwrap();
+        let op = test_operator_key(&dir);
         let mut dep = deployment("fast2flow", "local-dev");
         dep.revenue_policy_ref = PathBuf::from(format!(
             "billing-policies/fast2flow/local-dev/v{}.json.sig",
             u64::MAX
         ));
-        let err = write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now())
-            .unwrap_err();
+        let err =
+            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+                .unwrap_err();
         assert!(matches!(err, BundleDeploymentError::VersionOverflow));
     }
 
@@ -515,11 +845,12 @@ mod tests {
         // doc's previous_version_ref; the link is rebuilt under this
         // deployment's own billing dir.
         let dir = tempdir().unwrap();
+        let op = test_operator_key(&dir);
         let mut dep = deployment("fast2flow", "cust-acme");
         dep.revenue_policy_ref =
             PathBuf::from("../../other-env/billing-policies/victim/cust/v3.json.sig");
-        let v =
-            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now()).unwrap();
+        let v = write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+            .unwrap();
         assert_eq!(v.version, 4); // derived from the parsed v3
         let doc: RevenuePolicyDocument = serde_json::from_slice(
             &std::fs::read(

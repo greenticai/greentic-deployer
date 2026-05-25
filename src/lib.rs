@@ -27,6 +27,7 @@ pub mod juju_machine;
 pub mod k8s_raw;
 pub mod multi_target;
 pub mod operator;
+pub mod operator_key;
 pub mod pack_introspect;
 pub mod path_safety;
 pub mod plan;

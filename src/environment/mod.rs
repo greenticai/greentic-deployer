@@ -16,6 +16,7 @@ pub mod file_lock;
 pub mod lifecycle;
 pub mod runtime_config;
 pub mod store;
+pub mod trust_root;
 
 pub use atomic_write::{AtomicWriteError, atomic_write_bytes, atomic_write_json, copy_to_backup};
 pub use audit::{
@@ -23,8 +24,8 @@ pub use audit::{
     POLICY_LOCAL_ONLY, authorize_local_only, current_local_actor,
 };
 pub use bundle_deployment::{
-    BundleDeploymentError, RevenuePolicySignature, RevenuePolicyVersion,
-    write_revenue_policy_version,
+    BundleDeploymentError, REVENUE_POLICY_PREDICATE_TYPE_V1, RevenuePolicyPredicate,
+    RevenuePolicyVersion, write_revenue_policy_version,
 };
 pub use file_lock::{EnvFlock, LockError};
 pub use lifecycle::{
@@ -33,6 +34,10 @@ pub use lifecycle::{
 };
 pub use runtime_config::materialize_runtime_config;
 pub use store::{EnvironmentStore, LocalFsStore, Locked, StoreError};
+pub use trust_root::{
+    TRUST_ROOT_FILE, TRUST_ROOT_SCHEMA_V1, TrustRootDocument, TrustRootError, add_trusted_key,
+    load as load_trust_root, remove_trusted_key, trust_root_path,
+};
 
 use greentic_deploy_spec::{DeploymentId, RevisionId};
 

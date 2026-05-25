@@ -1,6 +1,6 @@
 //! Shared test fixtures for `cli/*` unit tests.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{TimeZone, Utc};
 use greentic_deploy_spec::{
@@ -9,6 +9,34 @@ use greentic_deploy_spec::{
     PackListEntry, RevenueShareEntry, Revision, RevisionId, RevisionLifecycle, RouteBinding,
     SchemaVersion, SemVer, TenantSelector, TrafficSplit, TrafficSplitEntry,
 };
+use greentic_distributor_client::signing::TrustedKey;
+
+use crate::environment::trust_root::add_trusted_key;
+use crate::operator_key::load_or_generate_at;
+
+/// Seed the local operator key into an env's trust root so revenue-policy
+/// writes succeed under the C2 "writer never mutates the trust root"
+/// contract. Mirrors the production `gtc op trust-root bootstrap` flow,
+/// which is exactly what real users will run once per env. The CLI
+/// `bundles::add/update` paths resolve the operator key via
+/// [`crate::operator_key::load_or_generate`] (default `~/.greentic/operator/key.pem`),
+/// so the fixture seeds *that same key* — using
+/// [`load_or_generate_at`] against an env-local path would leave the
+/// production CLI staring at a different key that isn't in the trust root.
+pub fn bootstrap_env_trust_root(env_dir: &Path) {
+    let _ = load_or_generate_at; // silence unused-import warning when the
+    // fixture only takes the no-path branch
+    let key =
+        crate::operator_key::load_or_generate().expect("load/generate operator key for tests");
+    add_trusted_key(
+        env_dir,
+        TrustedKey {
+            key_id: key.key_id,
+            public_key_pem: key.public_pem,
+        },
+    )
+    .expect("seed operator key into env trust root");
+}
 
 /// Minimal valid `Environment` for unit/integration tests.
 pub fn make_env(env_id: &str) -> Environment {

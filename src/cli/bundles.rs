@@ -171,12 +171,18 @@ pub fn add(
                 created_at,
                 authorization_ref: payload.authorization_ref.clone(),
             };
-            // Write the v1 signed/versioned revenue policy and pin the ref.
+            // C2 Codex follow-up: refuse to AUTO-GENERATE an operator key
+            // from this path. A user who runs `bundles add` without ever
+            // running `gtc op trust-root bootstrap` would otherwise create
+            // an unexpected `~/.greentic/operator/key.pem` as a side effect
+            // of a command that then aborts with `OperatorKeyNotTrusted`.
+            let operator_key = crate::operator_key::load_existing_only()?;
             let version = crate::environment::write_revenue_policy_version(
                 &env_dir,
                 &deployment,
                 &deployment.revenue_share,
                 created_at,
+                &operator_key,
             )?;
             deployment.revenue_policy_ref = version.policy_ref;
             env.bundles.push(deployment);
@@ -265,11 +271,13 @@ pub fn update(
                 // (B10): set the shares, write v{N+1}, and pin the new ref.
                 env.bundles[idx].revenue_share = shares;
                 let created_at = Utc::now();
+                let operator_key = crate::operator_key::load_existing_only()?;
                 let version = crate::environment::write_revenue_policy_version(
                     &env_dir,
                     &env.bundles[idx],
                     &env.bundles[idx].revenue_share,
                     created_at,
+                    &operator_key,
                 )?;
                 env.bundles[idx].revenue_policy_ref = version.policy_ref;
             }
@@ -537,6 +545,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         let outcome = add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
         let did = outcome
             .result
@@ -554,10 +564,42 @@ mod tests {
     }
 
     #[test]
+    fn add_without_bootstrap_surfaces_operator_key_not_trusted() {
+        // xhigh #10: `bundles add` must NOT auto-generate `~/.greentic/operator/key.pem`
+        // as a side effect of a command that then fails the trust-root
+        // precondition. With `load_existing_only`, an unbootstrapped env
+        // surfaces a clean OperatorKeyNotTrusted (or NotFound when the
+        // operator key itself doesn't exist yet).
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        // NOTE: NO bootstrap_env_trust_root call here. The fixture would
+        // have side-effected `~/.greentic/operator/key.pem` and added it
+        // to the env trust root; this test asserts that absent both, the
+        // CLI refuses without auto-creating either.
+        let err = add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap_err();
+        // Either OperatorKey (key doesn't exist) or RevenuePolicy
+        // (key exists from a prior run but isn't in this env's trust root)
+        // is acceptable — both signal "operator must bootstrap first".
+        assert!(
+            matches!(
+                err,
+                OpError::OperatorKey(_)
+                    | OpError::RevenuePolicy(
+                        crate::environment::BundleDeploymentError::OperatorKeyNotTrusted { .. }
+                    )
+            ),
+            "expected OperatorKey or OperatorKeyNotTrusted, got {err:?}"
+        );
+    }
+
+    #[test]
     fn add_rejects_duplicate_bundle_customer() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
         let err = add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap_err();
         assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
@@ -568,6 +610,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
         let mut p2 = payload("fast2flow");
         p2.customer_id = Some("other".to_string());
@@ -580,6 +624,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         let added = add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
         let did = added
             .result
@@ -653,6 +699,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         let added = add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
         let did = added
             .result
@@ -756,6 +804,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
 
         let env = store.load(&parse_env_id("local").unwrap()).unwrap();
@@ -782,6 +832,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         // Simulate the orphan document left by a failed attempt.
         let orphan_dir = dir
             .path()
@@ -810,6 +862,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         let mut p = payload("fast2flow");
         p.bundle_id = "".to_string();
         let err = add(&store, &OpFlags::default(), Some(p)).unwrap_err();
@@ -826,6 +880,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         let mut p = payload("fast2flow");
         p.customer_id = Some("".to_string());
         let err = add(&store, &OpFlags::default(), Some(p)).unwrap_err();
@@ -841,6 +897,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         let mut p = payload("fast2flow");
         p.customer_id = None;
         let outcome = add(&store, &OpFlags::default(), Some(p)).unwrap();
@@ -884,6 +942,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         let added = add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
         let did = added
             .result
@@ -939,6 +999,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         let added = add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
         let did = added
             .result

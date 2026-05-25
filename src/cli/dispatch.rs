@@ -95,6 +95,14 @@ pub enum OpNoun {
         #[command(subcommand)]
         verb: SecretsVerb,
     },
+    /// Per-environment trust-root management (C2). Lists, adds, or removes
+    /// `(key_id, public_pem)` pairs verifiers consult to validate DSSE
+    /// envelopes (revenue policy today; bundle/revision signatures next).
+    #[command(name = "trust-root")]
+    TrustRoot {
+        #[command(subcommand)]
+        verb: TrustRootVerb,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -157,6 +165,39 @@ pub enum EnvVerb {
         #[arg(long = "state-dir")]
         state_dir: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TrustRootVerb {
+    /// Seed the env trust root with the local operator key. The
+    /// revenue-policy writer never auto-seeds, so this verb is the
+    /// authorized path that grants signing rights to a new env. Idempotent.
+    Bootstrap { env_id: Option<String> },
+    /// List trusted keys for one env.
+    List { env_id: String },
+    /// Add a `(key_id, public_pem)` pair. PEM source: `--public-key-pem` (inline)
+    /// or `--public-key-file <PATH>`.
+    Add(TrustRootAddArgs),
+    /// Remove a key by `key_id` (case-insensitive). No-op if absent.
+    Remove(TrustRootRemoveArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct TrustRootAddArgs {
+    pub env_id: Option<String>,
+    #[arg(long = "key-id")]
+    pub key_id: Option<String>,
+    #[arg(long = "public-key-pem")]
+    pub public_key_pem: Option<String>,
+    #[arg(long = "public-key-file")]
+    pub public_key_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct TrustRootRemoveArgs {
+    pub env_id: Option<String>,
+    #[arg(long = "key-id")]
+    pub key_id: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -314,6 +355,7 @@ pub fn dispatch_op(cmd: OpCommand) -> Result<(), OpError> {
         OpNoun::Config { verb } => dispatch_config(&store, &flags, verb),
         OpNoun::Credentials { verb } => dispatch_credentials(&store, &flags, verb),
         OpNoun::Secrets { verb } => dispatch_secrets(&store, &flags, verb),
+        OpNoun::TrustRoot { verb } => dispatch_trust_root(&store, &flags, verb),
     };
     result.inspect_err(|err| print_error(noun, verb, err))
 }
@@ -397,6 +439,15 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 SecretsVerb::Put => "put",
                 SecretsVerb::Get => "get",
                 SecretsVerb::Rotate => "rotate",
+            },
+        ),
+        OpNoun::TrustRoot { verb } => (
+            "trust-root",
+            match verb {
+                TrustRootVerb::Bootstrap { .. } => "bootstrap",
+                TrustRootVerb::List { .. } => "list",
+                TrustRootVerb::Add(_) => "add",
+                TrustRootVerb::Remove(_) => "remove",
             },
         ),
     }
@@ -548,6 +599,44 @@ fn dispatch_secrets(
         SecretsVerb::Put => super::secrets::put(store, flags, None)?,
         SecretsVerb::Get => super::secrets::get(store, flags, None)?,
         SecretsVerb::Rotate => super::secrets::rotate(store, flags, None)?,
+    };
+    print_outcome(&outcome)
+}
+
+fn dispatch_trust_root(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    verb: TrustRootVerb,
+) -> Result<(), OpError> {
+    let outcome = match verb {
+        TrustRootVerb::Bootstrap { env_id } => {
+            let payload = env_id
+                .map(|id| super::trust_root::TrustRootBootstrapPayload { environment_id: id });
+            super::trust_root::bootstrap(store, flags, payload)?
+        }
+        TrustRootVerb::List { env_id } => super::trust_root::list(store, flags, &env_id)?,
+        TrustRootVerb::Add(args) => {
+            let payload = match (args.env_id, args.key_id) {
+                (Some(env_id), Some(key_id)) => Some(super::trust_root::TrustRootAddPayload {
+                    environment_id: env_id,
+                    key_id,
+                    public_key_pem: args.public_key_pem,
+                    public_key_file: args.public_key_file,
+                }),
+                _ => None, // fall through to --answers / --schema
+            };
+            super::trust_root::add(store, flags, payload)?
+        }
+        TrustRootVerb::Remove(args) => {
+            let payload = match (args.env_id, args.key_id) {
+                (Some(env_id), Some(key_id)) => Some(super::trust_root::TrustRootRemovePayload {
+                    environment_id: env_id,
+                    key_id,
+                }),
+                _ => None,
+            };
+            super::trust_root::remove(store, flags, payload)?
+        }
     };
     print_outcome(&outcome)
 }
