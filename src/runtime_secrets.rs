@@ -208,9 +208,25 @@ pub fn runtime_secret_env_map_for_cloud(
         team: None,
     };
     let prefix = default_cloud_secret_prefix(&config.environment, &config.tenant, None);
+    let requirements = collect_requirements(&ctx)?;
+
+    // Unify env-map generation with the resolution that the cloud-secret
+    // promotion path uses. `resolve_runtime_secrets` consults env vars AND
+    // every dev secrets store on disk, so optional secrets backed only by
+    // the DevStore are included in the env_map (Codex review F1: previously
+    // the env-only filter silently skipped DevStore-backed optionals while
+    // the AWS/GCP/Azure apply paths still promoted them, producing
+    // runtime auth failures because Terraform was never given the URI).
+    let resolution = block_on_async_resolution(&ctx, &requirements);
+    let resolved_uris: BTreeSet<String> = resolution
+        .resolved
+        .into_iter()
+        .map(|r| r.requirement.uri)
+        .collect();
+
     let mut env_map = BTreeMap::new();
-    for requirement in collect_requirements(&ctx)? {
-        if !requirement.required && !optional_requirement_has_local_value(&requirement) {
+    for requirement in requirements {
+        if !requirement.required && !resolved_uris.contains(&requirement.uri) {
             continue;
         }
         let remote_name = match config.provider {
@@ -228,14 +244,28 @@ pub fn runtime_secret_env_map_for_cloud(
     Ok(env_map)
 }
 
-fn optional_requirement_has_local_value(requirement: &RuntimeSecretRequirement) -> bool {
-    if let Some(env_key) = canonical_secret_store_key(&requirement.uri)
-        && let Ok(value) = env::var(env_key)
-        && !value.is_empty()
-    {
-        return true;
+/// Run `resolve_runtime_secrets` from inside a sync context. The deployer's
+/// call chain (`apply::run` → … → `runtime_secret_env_map_for_cloud`) starts
+/// async at the top, then hops through several sync helpers before reaching
+/// this function. `block_in_place` + `Handle::current().block_on` keeps the
+/// async tree intact without spawning a nested runtime (which would panic
+/// inside an existing one). When no runtime is current (e.g. unit tests
+/// constructed without `#[tokio::test]`), fall back to a fresh
+/// single-threaded runtime so the function is callable from any context.
+fn block_on_async_resolution(
+    ctx: &RuntimeSecretContext,
+    requirements: &[RuntimeSecretRequirement],
+) -> RuntimeSecretResolution {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(resolve_runtime_secrets(ctx, requirements))
+        }),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create ephemeral tokio runtime for runtime-secret resolution")
+            .block_on(resolve_runtime_secrets(ctx, requirements)),
     }
-    false
 }
 
 pub async fn resolve_runtime_secrets(
@@ -954,15 +984,9 @@ questions:
         );
     }
 
-    #[test]
-    fn runtime_secret_env_map_skips_unresolved_optional_secrets() {
-        // After B12a, `optional_requirement_has_local_value` consults env vars
-        // only. An optional with no env var (no `GREENTIC_SECRET__…`) is
-        // skipped from env_map even if a stale `setup-answers.json` carries a
-        // value — the setup-answers fallback is gone. The required secret is
-        // always included regardless of source.
-        let dir = tempfile::tempdir().unwrap();
-        let bundle_root = dir.path();
+    fn build_skips_unresolved_optional_fixture(
+        bundle_root: &Path,
+    ) -> (PathBuf, std::path::PathBuf) {
         let packs_dir = bundle_root.join("packs");
         let config_dir = bundle_root.join("state/config/demo-app");
         std::fs::create_dir_all(packs_dir.join("demo-app/assets")).unwrap();
@@ -990,14 +1014,17 @@ questions:
             r#"{"api_key":"STALE-PLAINTEXT-MUST-NOT-LEAK"}"#,
         )
         .unwrap();
+        (packs_dir.clone(), packs_dir.join("demo-app"))
+    }
 
-        let config = DeployerConfig {
+    fn deployer_config_for_fixture(bundle_root: &Path, pack_path: PathBuf) -> DeployerConfig {
+        DeployerConfig {
             capability: DeployerCapability::Apply,
             provider: Provider::Aws,
             strategy: "iac-only".into(),
             tenant: "demo".into(),
             environment: "dev".into(),
-            pack_path: packs_dir.join("demo-app"),
+            pack_path,
             bundle_root: Some(bundle_root.to_path_buf()),
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -1023,14 +1050,65 @@ questions:
             ),
             repo_registry_base: None,
             store_registry_base: None,
-        };
+        }
+    }
+
+    #[test]
+    fn runtime_secret_env_map_skips_unresolved_optional_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_root = dir.path();
+        let (_packs_dir, pack_path) = build_skips_unresolved_optional_fixture(bundle_root);
+        let config = deployer_config_for_fixture(bundle_root, pack_path);
 
         let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
         // Required secret is always included.
         assert!(env_map.contains_key("secrets://dev/demo/_/demo-app/jwt_signing_key"));
-        // Optional secrets with no env-var fallback are skipped (post-B12a:
-        // the setup-answers value is ignored even when present on disk).
+        // Optionals with no source in env or DevStore are skipped — the
+        // stale plaintext in setup-answers.json must not contribute.
         assert!(!env_map.contains_key("secrets://dev/demo/_/demo-app/api_key"));
+        assert!(!env_map.contains_key("secrets://dev/demo/_/demo-app/oauth_client_secret"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_secret_env_map_includes_optional_secrets_with_devstore_value() {
+        // Codex F1 regression: an optional secret backed only by the dev
+        // secrets store (no env var) MUST appear in the cloud env_map so
+        // Terraform can wire it through to the runtime. Pre-fix, the env-only
+        // filter silently skipped these, leaving the workload with no
+        // configured URI even though `resolve_runtime_secrets` (used by the
+        // promotion path) found and uploaded the value.
+        use greentic_secrets_lib::{DevStore, SecretFormat};
+
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_root = dir.path();
+        let (_packs_dir, pack_path) = build_skips_unresolved_optional_fixture(bundle_root);
+
+        // Seed the DevStore with a value for the optional `api_key`.
+        let store_path = bundle_root.join(".greentic/state/dev/.dev.secrets.env");
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        let store = DevStore::with_path(&store_path).unwrap();
+        store
+            .put(
+                "secrets://dev/demo/_/demo-app/api_key",
+                SecretFormat::Text,
+                b"from-dev-store",
+            )
+            .await
+            .unwrap();
+
+        let config = deployer_config_for_fixture(bundle_root, pack_path);
+        let env_map =
+            tokio::task::spawn_blocking(move || runtime_secret_env_map_for_cloud(&config))
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert!(
+            env_map.contains_key("secrets://dev/demo/_/demo-app/api_key"),
+            "optional secret with DevStore value MUST appear in env_map: {env_map:?}",
+        );
+        assert!(env_map.contains_key("secrets://dev/demo/_/demo-app/jwt_signing_key"));
+        // Other optional with no source stays skipped.
         assert!(!env_map.contains_key("secrets://dev/demo/_/demo-app/oauth_client_secret"));
     }
 
