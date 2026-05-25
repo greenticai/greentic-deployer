@@ -8,7 +8,6 @@ use std::{
 
 use greentic_secrets_lib::{DevStore, SecretsStore};
 use serde::Deserialize;
-use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use zip::{ZipArchive, result::ZipError};
 
@@ -60,7 +59,6 @@ pub struct ResolvedRuntimeSecret {
 pub enum SecretValueSource {
     Env { key: String },
     DevStore { path: PathBuf },
-    SetupAnswers { path: PathBuf },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,9 +210,7 @@ pub fn runtime_secret_env_map_for_cloud(
     let prefix = default_cloud_secret_prefix(&config.environment, &config.tenant, None);
     let mut env_map = BTreeMap::new();
     for requirement in collect_requirements(&ctx)? {
-        if !requirement.required
-            && !optional_requirement_has_local_value(&ctx.bundle_root, &requirement)
-        {
+        if !requirement.required && !optional_requirement_has_local_value(&requirement) {
             continue;
         }
         let remote_name = match config.provider {
@@ -232,18 +228,14 @@ pub fn runtime_secret_env_map_for_cloud(
     Ok(env_map)
 }
 
-fn optional_requirement_has_local_value(
-    bundle_root: &Path,
-    requirement: &RuntimeSecretRequirement,
-) -> bool {
+fn optional_requirement_has_local_value(requirement: &RuntimeSecretRequirement) -> bool {
     if let Some(env_key) = canonical_secret_store_key(&requirement.uri)
         && let Ok(value) = env::var(env_key)
         && !value.is_empty()
     {
         return true;
     }
-    let mut checked_sources = Vec::new();
-    resolve_from_setup_answers(bundle_root, requirement, &mut checked_sources).is_some()
+    false
 }
 
 pub async fn resolve_runtime_secrets(
@@ -282,12 +274,11 @@ pub async fn resolve_runtime_secrets(
                 && !value.is_empty()
             {
                 // `gtc setup --non-interactive` writes raw `${VAR}` placeholders
-                // into the dev secrets store too — not just into setup-answers.
-                // Expand them here against the process env so the promoted
-                // cloud secret carries the actual value, not the placeholder
-                // string. If the env var is unset, treat the dev-store entry
-                // as unresolved and fall back to setup-answers (where the same
-                // expansion runs as a second chance) before marking missing.
+                // into the dev secrets store. Expand them here against the
+                // process env so the promoted cloud secret carries the actual
+                // value, not the placeholder string. If the env var is unset,
+                // treat the dev-store entry as unresolved and mark the
+                // requirement missing.
                 if let Some(env_key) = extract_env_placeholder(&value) {
                     checked_sources.push(format!("env ${{{env_key}}} (from dev store)"));
                     match env::var(&env_key) {
@@ -308,14 +299,6 @@ pub async fn resolve_runtime_secrets(
                 requirement: requirement.clone(),
                 value: SecretValue(value),
                 source: SecretValueSource::DevStore { path },
-            });
-        } else if let Some((path, value)) =
-            resolve_from_setup_answers(&ctx.bundle_root, requirement, &mut checked_sources)
-        {
-            resolved.push(ResolvedRuntimeSecret {
-                requirement: requirement.clone(),
-                value: SecretValue(value),
-                source: SecretValueSource::SetupAnswers { path },
             });
         } else if requirement.required {
             missing.push(MissingRuntimeSecret {
@@ -538,13 +521,6 @@ fn provider_id_from_pack_path(pack_path: &Path) -> String {
         .unwrap_or_else(|| "provider".to_string())
 }
 
-fn config_id_from_pack_path(pack_path: &Path) -> Option<String> {
-    pack_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .map(ToOwned::to_owned)
-}
-
 fn infer_bundle_root_from_pack_path(pack_path: &Path) -> Option<PathBuf> {
     let mut current = if pack_path.is_dir() {
         Some(pack_path)
@@ -738,42 +714,9 @@ fn dedup_requirements(requirements: Vec<PackSecretRequirement>) -> Vec<PackSecre
     by_key.into_values().collect()
 }
 
-fn resolve_from_setup_answers(
-    bundle_root: &Path,
-    requirement: &RuntimeSecretRequirement,
-    checked_sources: &mut Vec<String>,
-) -> Option<(PathBuf, String)> {
-    let config_id = config_id_from_pack_path(&requirement.source)?;
-    let path = bundle_root
-        .join("state/config")
-        .join(config_id)
-        .join("setup-answers.json");
-    checked_sources.push(path.display().to_string());
-    let contents = std::fs::read_to_string(&path).ok()?;
-    let answers = serde_json::from_str::<BTreeMap<String, JsonValue>>(&contents).ok()?;
-    for (key, value) in answers {
-        if canonical_secret_name(&key) != requirement.key {
-            continue;
-        }
-        if let Some(value) = value.as_str()
-            && !value.is_empty()
-        {
-            if let Some(env_key) = extract_env_placeholder(value) {
-                checked_sources.push(format!("env ${{{env_key}}} (from setup-answers)"));
-                return match env::var(&env_key) {
-                    Ok(resolved) if !resolved.is_empty() => Some((path, resolved)),
-                    _ => None,
-                };
-            }
-            return Some((path, value.to_string()));
-        }
-    }
-    None
-}
-
 // Parse a whole-string `${VAR}` placeholder and return `VAR`.
-// `greentic-setup` persists unresolved env-var references in setup-answers.json
-// when a non-interactive run cannot prompt. Without expansion here, those
+// `greentic-setup` persists unresolved env-var references in the dev secrets
+// store when a non-interactive run cannot prompt. Without expansion here those
 // placeholders would propagate to the cloud secrets store verbatim and break
 // providers that try to use the value (e.g. state-redis treating `${REDIS_URL}`
 // as a connection string).
@@ -969,13 +912,16 @@ questions:
     }
 
     #[tokio::test]
-    async fn resolves_secret_values_from_setup_answers() {
+    async fn resolve_runtime_secrets_no_longer_falls_back_to_setup_answers() {
+        // Pre-B12a, `setup-answers.json` was a secondary source when the dev
+        // store missed. After B12a, the dev store is the only source — a stale
+        // plaintext value at the legacy sink must NOT resolve.
         let dir = tempfile::tempdir().unwrap();
         let answers_dir = dir.path().join("state/config/demo-pack");
         std::fs::create_dir_all(&answers_dir).unwrap();
         std::fs::write(
             answers_dir.join("setup-answers.json"),
-            r#"{"api_key":"secret-value"}"#,
+            r#"{"api_key":"STALE-PLAINTEXT-MUST-NOT-LEAK"}"#,
         )
         .unwrap();
         let ctx = RuntimeSecretContext {
@@ -994,17 +940,27 @@ questions:
         };
 
         let resolution = resolve_runtime_secrets(&ctx, &[requirement]).await;
-        assert!(resolution.missing.is_empty());
-        assert_eq!(resolution.resolved.len(), 1);
-        assert_eq!(resolution.resolved[0].value.expose(), "secret-value");
-        assert!(matches!(
-            resolution.resolved[0].source,
-            SecretValueSource::SetupAnswers { .. }
-        ));
+        assert!(
+            resolution.resolved.is_empty(),
+            "no source means no resolution"
+        );
+        assert_eq!(resolution.missing.len(), 1);
+        assert!(
+            !resolution.missing[0]
+                .checked_sources
+                .iter()
+                .any(|s| s.contains("setup-answers")),
+            "setup-answers must not appear in checked_sources after B12a",
+        );
     }
 
     #[test]
     fn runtime_secret_env_map_skips_unresolved_optional_secrets() {
+        // After B12a, `optional_requirement_has_local_value` consults env vars
+        // only. An optional with no env var (no `GREENTIC_SECRET__…`) is
+        // skipped from env_map even if a stale `setup-answers.json` carries a
+        // value — the setup-answers fallback is gone. The required secret is
+        // always included regardless of source.
         let dir = tempfile::tempdir().unwrap();
         let bundle_root = dir.path();
         let packs_dir = bundle_root.join("packs");
@@ -1027,9 +983,11 @@ questions:
 "#,
         )
         .unwrap();
+        // A stale plaintext in setup-answers.json MUST NOT make api_key
+        // appear in env_map — the setup-answers fallback is gone (B12a).
         std::fs::write(
             config_dir.join("setup-answers.json"),
-            r#"{"api_key":"secret-value"}"#,
+            r#"{"api_key":"STALE-PLAINTEXT-MUST-NOT-LEAK"}"#,
         )
         .unwrap();
 
@@ -1068,8 +1026,11 @@ questions:
         };
 
         let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
-        assert!(env_map.contains_key("secrets://dev/demo/_/demo-app/api_key"));
+        // Required secret is always included.
         assert!(env_map.contains_key("secrets://dev/demo/_/demo-app/jwt_signing_key"));
+        // Optional secrets with no env-var fallback are skipped (post-B12a:
+        // the setup-answers value is ignored even when present on disk).
+        assert!(!env_map.contains_key("secrets://dev/demo/_/demo-app/api_key"));
         assert!(!env_map.contains_key("secrets://dev/demo/_/demo-app/oauth_client_secret"));
     }
 
