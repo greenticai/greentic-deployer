@@ -1,0 +1,490 @@
+//! Operator-key load/generate (C2 of `plans/next-gen-deployment.md`).
+//!
+//! Provides the Ed25519 keypair the operator uses to sign artifacts it owns
+//! (today: B10 revenue-policy DSSE; future: revision manifests, audit-log
+//! tips). Key material lives on the operator's filesystem and is created on
+//! first use; rotation is out of scope for C2 v1 — that's the Trust plan.
+//!
+//! ## Key location
+//!
+//! The path is resolved in this order:
+//!
+//! 1. `$GTC_OPERATOR_KEY_PATH` if set (caller wants a non-default location,
+//!    e.g. a vault-mounted tmpfs path or a CI fixture).
+//! 2. `~/.greentic/operator/key.pem` on POSIX/Windows.
+//! 3. Error — no home directory and no env override.
+//!
+//! Companion file: `<key.pem>.pub` (SPKI PEM). It is derived from the
+//! private key, written next to it on generation, and cross-checked on
+//! subsequent loads — if a `.pub` exists but does not match the canonical
+//! id derived from the private key, the load fails. A stale `.pub` from a
+//! prior `.pem` always indicates operator-side tampering or a partial
+//! rotation; deriving silently from the private key would mask it.
+//!
+//! ## File modes
+//!
+//! On POSIX, the private key is written with mode `0600` and the public
+//! key with mode `0644`. On platforms without `std::os::unix::fs`, the
+//! permissions fall through to the OS default.
+
+use std::path::{Path, PathBuf};
+
+use ed25519_dalek::SigningKey as Ed25519SigningKey;
+use ed25519_dalek::pkcs8::EncodePublicKey;
+use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey};
+use greentic_distributor_client::signing::{SigningError, key_id_for_public_key_pem};
+use rand::TryRngCore;
+use rand::rngs::OsRng;
+use thiserror::Error;
+use zeroize::Zeroizing;
+
+use crate::environment::store::dirs_home;
+
+/// Override for the operator key path. When set, takes precedence over the
+/// `~/.greentic/operator/key.pem` default.
+pub const OPERATOR_KEY_PATH_ENV: &str = "GTC_OPERATOR_KEY_PATH";
+
+#[derive(Debug, Error)]
+pub enum OperatorKeyError {
+    #[error(
+        "cannot resolve operator key path: `${OPERATOR_KEY_PATH_ENV}` is unset and no home directory is available"
+    )]
+    NoHome,
+    #[error("operator key io on {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("operator key parse: {0}")]
+    KeyDecode(String),
+    #[error("operator key derivation: {0}")]
+    Signing(#[from] SigningError),
+    #[error(
+        "operator public key `{pub_path}` is stale: id `{pub_id}` does not match private-key id `{priv_id}` — delete the `.pub` and re-run to regenerate, or restore the matching private key"
+    )]
+    StalePublicKey {
+        pub_path: PathBuf,
+        pub_id: String,
+        priv_id: String,
+    },
+    #[error("operator key entropy: {0}")]
+    Entropy(String),
+}
+
+/// The operator's signing key + its derived id, ready for DSSE signing.
+pub struct OperatorKey {
+    /// Path the key was loaded/generated from (for diagnostics).
+    pub path: PathBuf,
+    /// PKCS#8 PEM private key. `Zeroizing` wipes the heap allocation on drop.
+    pub private_pem: Zeroizing<String>,
+    /// SPKI PEM public key.
+    pub public_pem: String,
+    /// Canonical key id (hex SHA-256 prefix of the public key, lowercase).
+    pub key_id: String,
+}
+
+impl std::fmt::Debug for OperatorKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperatorKey")
+            .field("path", &self.path)
+            .field("private_pem", &"[REDACTED]")
+            .field("public_pem_len", &self.public_pem.len())
+            .field("key_id", &self.key_id)
+            .finish()
+    }
+}
+
+/// Resolve the path the operator key should live at without touching disk.
+pub fn resolve_path() -> Result<PathBuf, OperatorKeyError> {
+    resolve_path_with(std::env::var_os(OPERATOR_KEY_PATH_ENV), dirs_home())
+}
+
+/// Decoupled resolver: explicit `override_path` (typically
+/// `std::env::var_os(OPERATOR_KEY_PATH_ENV)`) and `home`. Exposed for tests
+/// that need to exercise both branches without mutating process env.
+pub(crate) fn resolve_path_with(
+    override_path: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Result<PathBuf, OperatorKeyError> {
+    if let Some(p) = override_path
+        && !p.is_empty()
+    {
+        return Ok(PathBuf::from(p));
+    }
+    home.map(|h| h.join(".greentic").join("operator").join("key.pem"))
+        .ok_or(OperatorKeyError::NoHome)
+}
+
+/// Load the operator key from the resolved path, generating a fresh keypair
+/// if the file does not yet exist.
+///
+/// On generation:
+/// - Parent directory is created (recursively) with default umask.
+/// - Private key written PKCS#8 PEM mode `0600` (POSIX only).
+/// - Public key written SPKI PEM as `<key>.pub` mode `0644` (POSIX only).
+///
+/// On load:
+/// - The private PEM is parsed.
+/// - If a `.pub` sibling exists, its derived id must equal the
+///   private-key-derived id; a mismatch is rejected as a stale `.pub`.
+///   If no `.pub` exists, one is written next to the private key (recovery
+///   for an operator who deleted only the public file).
+pub fn load_or_generate() -> Result<OperatorKey, OperatorKeyError> {
+    let path = resolve_path()?;
+    load_or_generate_at(&path)
+}
+
+/// Like [`load_or_generate`] but with an explicit path (tests + callers
+/// that already resolved the path themselves).
+pub fn load_or_generate_at(path: &Path) -> Result<OperatorKey, OperatorKeyError> {
+    match std::fs::read_to_string(path) {
+        Ok(private_pem) => load_existing(path, private_pem),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => generate_at(path),
+        Err(source) => Err(OperatorKeyError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn load_existing(path: &Path, private_pem: String) -> Result<OperatorKey, OperatorKeyError> {
+    let private_pem = Zeroizing::new(private_pem);
+    let sk = Ed25519SigningKey::from_pkcs8_pem(&private_pem)
+        .map_err(|e| OperatorKeyError::KeyDecode(format!("PKCS#8 private PEM: {e}")))?;
+    let vk = sk.verifying_key();
+    let public_pem = vk
+        .to_public_key_pem(LineEnding::LF)
+        .map_err(|e| OperatorKeyError::KeyDecode(format!("derive SPKI PEM: {e}")))?;
+    drop(sk);
+    let key_id = key_id_for_public_key_pem(&public_pem)?;
+
+    let pub_path = public_sibling(path);
+    match std::fs::read_to_string(&pub_path) {
+        Ok(existing_pub) => {
+            let existing_id = key_id_for_public_key_pem(&existing_pub).map_err(|e| {
+                OperatorKeyError::KeyDecode(format!(
+                    "`.pub` sibling at {}: {e}",
+                    pub_path.display()
+                ))
+            })?;
+            if !existing_id.eq_ignore_ascii_case(&key_id) {
+                return Err(OperatorKeyError::StalePublicKey {
+                    pub_path,
+                    pub_id: existing_id,
+                    priv_id: key_id,
+                });
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Operator deleted only the .pub — regenerate it from the key
+            // we just loaded so verifiers can find a public PEM on disk.
+            write_public_sibling(&pub_path, &public_pem)?;
+        }
+        Err(source) => {
+            return Err(OperatorKeyError::Io {
+                path: pub_path,
+                source,
+            });
+        }
+    }
+
+    Ok(OperatorKey {
+        path: path.to_path_buf(),
+        private_pem,
+        public_pem,
+        key_id,
+    })
+}
+
+fn generate_at(path: &Path) -> Result<OperatorKey, OperatorKeyError> {
+    let mut seed = [0u8; 32];
+    OsRng
+        .try_fill_bytes(&mut seed)
+        .map_err(|e| OperatorKeyError::Entropy(e.to_string()))?;
+    let sk = Ed25519SigningKey::from_bytes(&seed);
+    let vk = sk.verifying_key();
+    let private_pem = sk
+        .to_pkcs8_pem(LineEnding::LF)
+        .map_err(|e| OperatorKeyError::KeyDecode(format!("encode PKCS#8 PEM: {e}")))?
+        .to_string();
+    let private_pem = Zeroizing::new(private_pem);
+    let public_pem = vk
+        .to_public_key_pem(LineEnding::LF)
+        .map_err(|e| OperatorKeyError::KeyDecode(format!("encode SPKI PEM: {e}")))?;
+    drop(sk);
+    let key_id = key_id_for_public_key_pem(&public_pem)?;
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|source| OperatorKeyError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    // Race-safe: `write_private_exclusive` uses `create_new`, so if a
+    // concurrent caller landed first we fall through to the load path
+    // and adopt their key (which has its own `.pub` already written).
+    match write_private_exclusive(path, &private_pem) {
+        Ok(()) => {
+            let pub_path = public_sibling(path);
+            // `.pub` is best-effort: if a racer just wrote one we leave it.
+            let _ = write_public_sibling_exclusive(&pub_path, &public_pem);
+            Ok(OperatorKey {
+                path: path.to_path_buf(),
+                private_pem,
+                public_pem,
+                key_id,
+            })
+        }
+        Err(OperatorKeyError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            // Racer won — adopt their key.
+            let existing =
+                std::fs::read_to_string(path).map_err(|source| OperatorKeyError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            load_existing(path, existing)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+fn public_sibling(private_path: &Path) -> PathBuf {
+    let mut s = private_path.as_os_str().to_owned();
+    s.push(".pub");
+    PathBuf::from(s)
+}
+
+/// Atomically write `contents` to `path`, refusing to overwrite. The write
+/// goes through a temp file in the same directory + `persist_noclobber`,
+/// which uses `link(2)` (POSIX) or its Windows equivalent — readers see
+/// either no file or the fully-written file, never a partial one.
+fn write_exclusive(path: &Path, contents: &str, mode: u32) -> Result<(), OperatorKeyError> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::Path::new(".").to_path_buf());
+    let mut tmp =
+        tempfile::NamedTempFile::new_in(&parent).map_err(|source| OperatorKeyError::Io {
+            path: parent.clone(),
+            source,
+        })?;
+    tmp.write_all(contents.as_bytes())
+        .map_err(|source| OperatorKeyError::Io {
+            path: tmp.path().to_path_buf(),
+            source,
+        })?;
+    tmp.flush().map_err(|source| OperatorKeyError::Io {
+        path: tmp.path().to_path_buf(),
+        source,
+    })?;
+    set_mode(&tmp, mode)?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|source| OperatorKeyError::Io {
+            path: tmp.path().to_path_buf(),
+            source,
+        })?;
+    tmp.persist_noclobber(path)
+        .map_err(|e| OperatorKeyError::Io {
+            path: path.to_path_buf(),
+            source: e.error,
+        })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_mode(tmp: &tempfile::NamedTempFile, mode: u32) -> Result<(), OperatorKeyError> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(mode);
+    std::fs::set_permissions(tmp.path(), perms).map_err(|source| OperatorKeyError::Io {
+        path: tmp.path().to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(not(unix))]
+fn set_mode(_tmp: &tempfile::NamedTempFile, _mode: u32) -> Result<(), OperatorKeyError> {
+    Ok(())
+}
+
+fn write_private_exclusive(path: &Path, contents: &str) -> Result<(), OperatorKeyError> {
+    write_exclusive(path, contents, 0o600)
+}
+
+fn write_public_sibling_exclusive(path: &Path, contents: &str) -> Result<(), OperatorKeyError> {
+    write_exclusive(path, contents, 0o644)
+}
+
+/// Write the public-key sibling unconditionally (used by the load path's
+/// recovery branch when the `.pub` was deleted but the `.pem` is still
+/// present and trusted).
+fn write_public_sibling(path: &Path, contents: &str) -> Result<(), OperatorKeyError> {
+    // Best-effort exclusive write; if a racer just landed a `.pub` we
+    // leave theirs alone (load_existing already validated it matches the
+    // private-key id we share).
+    match write_public_sibling_exclusive(path, contents) {
+        Ok(()) => Ok(()),
+        Err(OperatorKeyError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            Ok(())
+        }
+        Err(other) => Err(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn generate_creates_keypair_with_canonical_id() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+        let key = load_or_generate_at(&path).unwrap();
+        assert_eq!(key.key_id.len(), 32);
+        assert!(key.private_pem.contains("BEGIN PRIVATE KEY"));
+        assert!(key.public_pem.contains("BEGIN PUBLIC KEY"));
+        assert!(path.is_file(), "private key file must exist");
+        let pub_path = public_sibling(&path);
+        assert!(pub_path.is_file(), "public sibling must exist");
+        let pub_id =
+            key_id_for_public_key_pem(&std::fs::read_to_string(&pub_path).unwrap()).unwrap();
+        assert_eq!(pub_id, key.key_id);
+    }
+
+    #[test]
+    fn load_is_idempotent_after_generate() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+        let first = load_or_generate_at(&path).unwrap();
+        let second = load_or_generate_at(&path).unwrap();
+        assert_eq!(first.key_id, second.key_id);
+        assert_eq!(first.public_pem, second.public_pem);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_key_is_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+        load_or_generate_at(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn stale_pub_sibling_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+        load_or_generate_at(&path).unwrap();
+        // Overwrite .pub with a different valid SPKI PEM.
+        let other_sk = Ed25519SigningKey::from_bytes(&[7u8; 32]);
+        let other_pub = other_sk
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let pub_path = public_sibling(&path);
+        std::fs::write(&pub_path, &other_pub).unwrap();
+
+        let err = load_or_generate_at(&path).expect_err("stale pub must be rejected");
+        assert!(matches!(err, OperatorKeyError::StalePublicKey { .. }));
+    }
+
+    #[test]
+    fn missing_pub_sibling_is_regenerated_on_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+        load_or_generate_at(&path).unwrap();
+        let pub_path = public_sibling(&path);
+        std::fs::remove_file(&pub_path).unwrap();
+
+        let key = load_or_generate_at(&path).unwrap();
+        assert!(pub_path.is_file(), "pub sibling must be regenerated");
+        let pub_id =
+            key_id_for_public_key_pem(&std::fs::read_to_string(&pub_path).unwrap()).unwrap();
+        assert_eq!(pub_id, key.key_id);
+    }
+
+    #[test]
+    fn env_override_takes_precedence() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("override.pem");
+        let resolved = resolve_path_with(
+            Some(path.as_os_str().to_owned()),
+            Some(PathBuf::from("/should-not-be-used")),
+        )
+        .unwrap();
+        assert_eq!(resolved, path);
+    }
+
+    #[test]
+    fn empty_env_override_falls_through_to_home() {
+        let home = PathBuf::from("/home/op");
+        let resolved =
+            resolve_path_with(Some(std::ffi::OsString::new()), Some(home.clone())).unwrap();
+        assert_eq!(
+            resolved,
+            home.join(".greentic").join("operator").join("key.pem")
+        );
+    }
+
+    #[test]
+    fn missing_env_and_missing_home_is_no_home_error() {
+        let err = resolve_path_with(None, None).expect_err("must error");
+        assert!(matches!(err, OperatorKeyError::NoHome));
+    }
+
+    #[test]
+    fn debug_redacts_private_pem() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+        let key = load_or_generate_at(&path).unwrap();
+        let dbg = format!("{key:?}");
+        assert!(dbg.contains("[REDACTED]"));
+        assert!(!dbg.contains("BEGIN PRIVATE KEY"));
+    }
+
+    #[test]
+    fn concurrent_generates_converge_on_one_key() {
+        // The cold-start race that motivated the atomic-write fix: N threads
+        // all hit a non-existent path; exactly one wins the exclusive create
+        // and the rest must adopt the winner's key, never a partial PEM.
+        let dir = tempdir().unwrap();
+        let path = std::sync::Arc::new(dir.path().join("key.pem"));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || load_or_generate_at(&p).unwrap().key_id)
+            })
+            .collect();
+        let ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let first = &ids[0];
+        for id in &ids {
+            assert_eq!(id, first, "all racers must adopt one canonical key");
+        }
+    }
+
+    #[test]
+    fn corrupted_private_pem_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+        std::fs::write(
+            &path,
+            "-----BEGIN PRIVATE KEY-----\nnope\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let err = load_or_generate_at(&path).expect_err("bad PEM must reject");
+        assert!(matches!(err, OperatorKeyError::KeyDecode(_)));
+    }
+}

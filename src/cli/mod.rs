@@ -49,6 +49,7 @@ pub mod migrate_state;
 pub mod revisions;
 pub mod secrets;
 pub mod traffic;
+pub mod trust_root;
 // pub mod bundles;
 // pub mod revisions;
 // pub mod traffic;
@@ -100,6 +101,8 @@ pub enum OpError {
     Audit(String),
     #[error("revenue policy: {0}")]
     RevenuePolicy(#[from] crate::environment::BundleDeploymentError),
+    #[error("trust root: {0}")]
+    TrustRoot(#[from] crate::environment::TrustRootError),
 }
 
 impl From<LifecycleError> for OpError {
@@ -181,6 +184,7 @@ impl OpError {
             OpError::Unauthorized { .. } => "unauthorized",
             OpError::Audit(_) => "audit",
             OpError::RevenuePolicy(_) => "revenue-policy",
+            OpError::TrustRoot(_) => "trust-root",
         }
     }
 }

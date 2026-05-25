@@ -172,11 +172,14 @@ pub fn add(
                 authorization_ref: payload.authorization_ref.clone(),
             };
             // Write the v1 signed/versioned revenue policy and pin the ref.
+            let operator_key = crate::operator_key::load_or_generate()
+                .map_err(crate::environment::BundleDeploymentError::from)?;
             let version = crate::environment::write_revenue_policy_version(
                 &env_dir,
                 &deployment,
                 &deployment.revenue_share,
                 created_at,
+                &operator_key,
             )?;
             deployment.revenue_policy_ref = version.policy_ref;
             env.bundles.push(deployment);
@@ -265,11 +268,14 @@ pub fn update(
                 // (B10): set the shares, write v{N+1}, and pin the new ref.
                 env.bundles[idx].revenue_share = shares;
                 let created_at = Utc::now();
+                let operator_key = crate::operator_key::load_or_generate()
+                    .map_err(crate::environment::BundleDeploymentError::from)?;
                 let version = crate::environment::write_revenue_policy_version(
                     &env_dir,
                     &env.bundles[idx],
                     &env.bundles[idx].revenue_share,
                     created_at,
+                    &operator_key,
                 )?;
                 env.bundles[idx].revenue_policy_ref = version.policy_ref;
             }
