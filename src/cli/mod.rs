@@ -103,6 +103,11 @@ pub enum OpError {
     RevenuePolicy(#[from] crate::environment::BundleDeploymentError),
     #[error("trust root: {0}")]
     TrustRoot(#[from] crate::environment::TrustRootError),
+    /// Operator-key load or generation failed. Distinct from `RevenuePolicy`
+    /// so trust-root / bundle verbs surface the right noun in their error
+    /// envelopes.
+    #[error("operator key: {0}")]
+    OperatorKey(#[from] crate::operator_key::OperatorKeyError),
 }
 
 impl From<LifecycleError> for OpError {
@@ -185,6 +190,7 @@ impl OpError {
             OpError::Audit(_) => "audit",
             OpError::RevenuePolicy(_) => "revenue-policy",
             OpError::TrustRoot(_) => "trust-root",
+            OpError::OperatorKey(_) => "operator-key",
         }
     }
 }

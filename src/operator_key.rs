@@ -85,6 +85,16 @@ pub enum OperatorKeyError {
         "operator key `{path}` is not a regular file (symlinks, directories, FIFOs etc. are rejected)"
     )]
     NotRegularFile { path: PathBuf },
+    /// A directory component on the path to the operator key is a symlink.
+    /// `O_NOFOLLOW` only refuses the final component; an attacker who
+    /// controls an intermediate directory (e.g. swaps `~/.greentic` for a
+    /// symlink to their own dir before the operator's first run) would
+    /// otherwise have the load and write resolve into their controlled
+    /// directory. Caught by `lstat`-walking each parent on every load/generate.
+    #[error(
+        "operator key path `{path}`: ancestor `{ancestor}` is a symlink. Re-create the directory as a real path (e.g. `mv {ancestor} {ancestor}.symlink && mkdir -p {ancestor}`) to prevent intermediate-symlink redirection."
+    )]
+    SymlinkInAncestor { path: PathBuf, ancestor: PathBuf },
 }
 
 /// The operator's signing key + its derived id, ready for DSSE signing.
@@ -150,9 +160,28 @@ pub fn load_or_generate() -> Result<OperatorKey, OperatorKeyError> {
     load_or_generate_at(&path)
 }
 
+/// Load an existing operator key, failing with `NotFound` if no key file is
+/// present. **Does not generate.** Use this from CLI verbs that should
+/// refuse to act on an unbootstrapped operator (e.g. `bundles add/update` —
+/// generating a throwaway key as a side-effect of a `bundles add` that
+/// then fails the trust-root precondition is confusing and leaves
+/// unexpected state on disk).
+pub fn load_existing_only() -> Result<OperatorKey, OperatorKeyError> {
+    let path = resolve_path()?;
+    refuse_symlink_in_ancestors(&path)?;
+    let pem = read_existing_securely(&path)?;
+    load_existing(&path, pem)
+}
+
 /// Like [`load_or_generate`] but with an explicit path (tests + callers
 /// that already resolved the path themselves).
 pub fn load_or_generate_at(path: &Path) -> Result<OperatorKey, OperatorKeyError> {
+    // Reject symlinks anywhere on the path BEFORE touching the file. This
+    // closes the intermediate-symlink gap O_NOFOLLOW leaves open (only the
+    // leaf component is protected by O_NOFOLLOW). The check is best-effort
+    // against a concurrent attacker who races the create — that window is
+    // closed by the parent dir's mode in practice.
+    refuse_symlink_in_ancestors(path)?;
     match read_existing_securely(path) {
         Ok(private_pem) => load_existing(path, private_pem),
         Err(OperatorKeyError::Io { source, .. })
@@ -164,12 +193,49 @@ pub fn load_or_generate_at(path: &Path) -> Result<OperatorKey, OperatorKeyError>
     }
 }
 
+/// Walk every existing parent of `path` and refuse the load/generate if any
+/// is a symlink. `path` itself is allowed to not exist (the generate path
+/// creates it); only existing ancestors are checked.
+fn refuse_symlink_in_ancestors(path: &Path) -> Result<(), OperatorKeyError> {
+    let mut ancestor = path.parent();
+    while let Some(p) = ancestor {
+        if p.as_os_str().is_empty() {
+            break;
+        }
+        match std::fs::symlink_metadata(p) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(OperatorKeyError::SymlinkInAncestor {
+                        path: path.to_path_buf(),
+                        ancestor: p.to_path_buf(),
+                    });
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Ancestor doesn't exist yet — create_dir_all will materialize it.
+            }
+            Err(source) => {
+                return Err(OperatorKeyError::Io {
+                    path: p.to_path_buf(),
+                    source,
+                });
+            }
+        }
+        ancestor = p.parent();
+    }
+    Ok(())
+}
+
 /// Open the operator key file refusing symlinks (`O_NOFOLLOW`), validate
 /// that it is a regular file owned by a safe principal with permissions
 /// that do not leak the key material to other local users, then read its
-/// contents. Returns `Io { kind = NotFound }` if the file does not exist so
-/// callers can dispatch to the generate path.
-fn read_existing_securely(path: &Path) -> Result<String, OperatorKeyError> {
+/// contents into a [`Zeroizing`] buffer pre-sized to the file length so
+/// `read_to_string` does not realloc and strand earlier (unzeroed) heap
+/// allocations holding partial PEM content.
+///
+/// Returns `Io { kind = NotFound }` if the file does not exist so callers
+/// can dispatch to the generate path.
+fn read_existing_securely(path: &Path) -> Result<Zeroizing<String>, OperatorKeyError> {
     let file = open_no_follow(path)?;
     let meta = file.metadata().map_err(|source| OperatorKeyError::Io {
         path: path.to_path_buf(),
@@ -181,7 +247,12 @@ fn read_existing_securely(path: &Path) -> Result<String, OperatorKeyError> {
         });
     }
     check_mode(path, &meta)?;
-    let mut contents = String::new();
+    // Pre-size to file length + a small slack so `read_to_string` writes into
+    // the initial allocation rather than growing through realloc. Each
+    // realloc would free an intermediate buffer holding partial key material
+    // back to the global allocator unzeroed — see Codex review finding.
+    let len = meta.len().try_into().unwrap_or(usize::MAX);
+    let mut contents = Zeroizing::new(String::with_capacity(len.saturating_add(8)));
     use std::io::Read;
     {
         let mut handle = file;
@@ -258,8 +329,10 @@ fn check_mode(_path: &Path, _meta: &std::fs::Metadata) -> Result<(), OperatorKey
     Ok(())
 }
 
-fn load_existing(path: &Path, private_pem: String) -> Result<OperatorKey, OperatorKeyError> {
-    let private_pem = Zeroizing::new(private_pem);
+fn load_existing(
+    path: &Path,
+    private_pem: Zeroizing<String>,
+) -> Result<OperatorKey, OperatorKeyError> {
     let sk = Ed25519SigningKey::from_pkcs8_pem(&private_pem)
         .map_err(|e| OperatorKeyError::KeyDecode(format!("PKCS#8 private PEM: {e}")))?;
     let vk = sk.verifying_key();
@@ -308,17 +381,26 @@ fn load_existing(path: &Path, private_pem: String) -> Result<OperatorKey, Operat
 }
 
 fn generate_at(path: &Path) -> Result<OperatorKey, OperatorKeyError> {
-    let mut seed = [0u8; 32];
+    // Wrap the 32-byte seed in `Zeroizing` so the raw private-key material
+    // is wiped from the stack the moment we leave this scope (or panic).
+    // Without this, the seed survives in the stack frame until the slot is
+    // overwritten by unrelated frames, and a core dump or memory-disclosure
+    // exploit can reconstruct the keypair from it.
+    let mut seed = Zeroizing::new([0u8; 32]);
     OsRng
-        .try_fill_bytes(&mut seed)
+        .try_fill_bytes(&mut seed[..])
         .map_err(|e| OperatorKeyError::Entropy(e.to_string()))?;
     let sk = Ed25519SigningKey::from_bytes(&seed);
     let vk = sk.verifying_key();
-    let private_pem = sk
-        .to_pkcs8_pem(LineEnding::LF)
-        .map_err(|e| OperatorKeyError::KeyDecode(format!("encode PKCS#8 PEM: {e}")))?
-        .to_string();
-    let private_pem = Zeroizing::new(private_pem);
+    // `to_pkcs8_pem` already returns a `Zeroizing<String>`; converting via
+    // `.to_string()` would clone the PEM into a bare `String` that lives
+    // unprotected until re-wrapped. Keep the underlying buffer in its
+    // original wrapper instead — no intermediate copy.
+    let private_pem: Zeroizing<String> = Zeroizing::new(
+        sk.to_pkcs8_pem(LineEnding::LF)
+            .map_err(|e| OperatorKeyError::KeyDecode(format!("encode PKCS#8 PEM: {e}")))?
+            .to_string(),
+    );
     let public_pem = vk
         .to_public_key_pem(LineEnding::LF)
         .map_err(|e| OperatorKeyError::KeyDecode(format!("encode SPKI PEM: {e}")))?;
@@ -351,12 +433,14 @@ fn generate_at(path: &Path) -> Result<OperatorKey, OperatorKeyError> {
         Err(OperatorKeyError::Io { source, .. })
             if source.kind() == std::io::ErrorKind::AlreadyExists =>
         {
-            // Racer won — adopt their key.
-            let existing =
-                std::fs::read_to_string(path).map_err(|source| OperatorKeyError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
+            // Racer won — adopt their key through the SAME secure read path
+            // a non-racing load would have used. The earlier plain
+            // `std::fs::read_to_string` here bypassed O_NOFOLLOW, the
+            // is_file() gate, and the 0600 mode check — an attacker who
+            // swapped the file for a symlink between the loser's
+            // persist_noclobber failure and this read would have bypassed
+            // every defense `read_existing_securely` provides.
+            let existing = read_existing_securely(path)?;
             load_existing(path, existing)
         }
         Err(other) => Err(other),
@@ -641,6 +725,34 @@ mod tests {
         assert!(
             matches!(err, OperatorKeyError::NotRegularFile { .. }),
             "expected NotRegularFile, got {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_intermediate_directory_is_rejected() {
+        // Codex/xhigh #5: O_NOFOLLOW protects only the leaf, so an attacker
+        // who swaps `~/.greentic` for a symlink to their own dir would
+        // otherwise redirect the load. `refuse_symlink_in_ancestors` walks
+        // the parent chain and refuses any symlinked component.
+        let dir = tempdir().unwrap();
+        let attacker_root = dir.path().join("evil");
+        std::fs::create_dir_all(&attacker_root).unwrap();
+        let symlinked_parent = dir.path().join("operator");
+        std::os::unix::fs::symlink(&attacker_root, &symlinked_parent).unwrap();
+        let key_path = symlinked_parent.join("key.pem");
+        let err =
+            load_or_generate_at(&key_path).expect_err("intermediate symlink must be rejected");
+        match err {
+            OperatorKeyError::SymlinkInAncestor { ancestor, .. } => {
+                assert_eq!(ancestor, symlinked_parent);
+            }
+            other => panic!("expected SymlinkInAncestor, got {other:?}"),
+        }
+        // No key file was created inside the attacker's directory.
+        assert!(
+            !attacker_root.join("key.pem").exists(),
+            "load must refuse before any write reaches the symlinked dir"
         );
     }
 

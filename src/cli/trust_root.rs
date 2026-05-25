@@ -58,19 +58,20 @@ pub fn bootstrap(
     }
     let payload = resolve_payload::<TrustRootBootstrapPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let op_key = crate::operator_key::load_or_generate()
-        .map_err(crate::environment::BundleDeploymentError::from)?;
+    // Build ctx with a placeholder target; we only know which key we
+    // bootstrapped AFTER `audit_and_record` runs the local-only authz gate.
+    // If the gate denies, we never auto-generate `~/.greentic/operator/key.pem`
+    // as a side effect of a verb that wasn't authorized to touch the env.
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "bootstrap",
-        target: json!({
-            "key_id": op_key.key_id,
-            "public_key_pem": op_key.public_pem,
-        }),
+        target: json!({"environment_id": env_id.as_str()}),
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |_committed| {
+        // Authz passed: now safe to load-or-generate the operator key.
+        let op_key = crate::operator_key::load_or_generate()?;
         let env_dir = store.env_dir(&env_id)?;
         let summary = store.transact(&env_id, |_locked| -> Result<Value, OpError> {
             let trust = store_trust_root::add_trusted_key(
@@ -83,6 +84,7 @@ pub fn bootstrap(
             Ok(json!({
                 "environment_id": env_id.as_str(),
                 "operator_key_id": op_key.key_id,
+                "operator_public_key_pem": op_key.public_pem,
                 "trusted_key_count": trust.keys.len(),
             }))
         })?;
@@ -172,33 +174,35 @@ pub fn remove(
     }
     let payload = resolve_payload::<TrustRootRemovePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    // Codex #3: look up the PEM *before* removal so the audit `target`
-    // captures what is about to be discarded — `key_id` alone is not enough
-    // to reconstruct a removed key.
-    let env_dir = store.env_dir(&env_id)?;
-    let pre_removal = store_trust_root::load(&env_dir)?;
-    let removed_pem = pre_removal
-        .keys
-        .iter()
-        .find(|k| k.key_id.eq_ignore_ascii_case(&payload.key_id))
-        .map(|k| k.public_key_pem.clone());
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "remove",
-        target: json!({
-            "key_id": payload.key_id,
-            "public_key_pem": removed_pem,
-        }),
+        // Audit ctx target carries only the key_id. The full removed PEM
+        // would be ideal for recovery, but capturing it BEFORE the env
+        // flock races with a concurrent `add` — the audit would log a stale
+        // PEM. The trust-root backup file (Codex #3) is the authoritative
+        // recovery artifact; the outcome value below carries the PEM that
+        // was actually removed under the flock.
+        target: json!({"key_id": payload.key_id}),
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |_committed| {
         let env_dir = store.env_dir(&env_id)?;
         let summary = store.transact(&env_id, |_locked| -> Result<Value, OpError> {
+            // Capture the PEM under the flock — no race with concurrent
+            // add/remove can change what we report as "actually removed".
+            let pre = store_trust_root::load(&env_dir)?;
+            let removed_pem = pre
+                .keys
+                .iter()
+                .find(|k| k.key_id.eq_ignore_ascii_case(&payload.key_id))
+                .map(|k| k.public_key_pem.clone());
             let trust = store_trust_root::remove_trusted_key(&env_dir, &payload.key_id)?;
             Ok(json!({
                 "environment_id": env_id.as_str(),
                 "removed_key_id": payload.key_id,
+                "removed_public_key_pem": removed_pem,
                 "trusted_key_count": trust.keys.len(),
             }))
         })?;

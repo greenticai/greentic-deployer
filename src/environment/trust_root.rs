@@ -127,8 +127,13 @@ pub fn load(env_dir: &Path) -> Result<TrustRoot, TrustRootError> {
 /// Idempotent on case-insensitive `key_id` match: the existing entry's PEM
 /// is replaced. Returns the resulting trust root.
 ///
-/// MUST run under the env flock (callers wrap in
-/// [`crate::environment::EnvironmentStore::transact`]).
+/// **Concurrency contract.** This function does not acquire the env flock
+/// itself — callers MUST wrap the call in
+/// [`crate::environment::EnvironmentStore::transact`] so two concurrent
+/// `add`/`remove` invocations don't read-modify-write past each other.
+/// Production callers (`gtc op trust-root *` verbs in
+/// [`crate::cli::trust_root`]) honor this; test fixtures that own the
+/// tempdir exclusively are the only sanctioned exception.
 pub fn add_trusted_key(env_dir: &Path, key: TrustedKey) -> Result<TrustRoot, TrustRootError> {
     if key.key_id.trim().is_empty() {
         return Err(TrustRootError::EmptyKeyId(key.key_id));
@@ -153,13 +158,20 @@ pub fn add_trusted_key(env_dir: &Path, key: TrustedKey) -> Result<TrustRoot, Tru
 }
 
 /// Remove a trusted key by case-insensitive `key_id`. A missing key is a
-/// silent no-op (the trust root is already in the requested state).
+/// silent no-op (the trust root is already in the requested state). The
+/// no-op case skips `save()` entirely — so a `remove` on a fresh env (no
+/// `trust-root.json` yet) does NOT create an empty file where none existed.
 ///
-/// MUST run under the env flock.
+/// **Concurrency contract.** Same as [`add_trusted_key`] — callers MUST
+/// hold the env flock via
+/// [`crate::environment::EnvironmentStore::transact`].
 pub fn remove_trusted_key(env_dir: &Path, key_id: &str) -> Result<TrustRoot, TrustRootError> {
     let mut current = load_keys(env_dir)?;
+    let before = current.len();
     current.retain(|k| !k.key_id.eq_ignore_ascii_case(key_id));
-    save(env_dir, &current)?;
+    if current.len() != before {
+        save(env_dir, &current)?;
+    }
     Ok(TrustRoot::new(current))
 }
 
@@ -366,6 +378,21 @@ mod tests {
         let tr = remove_trusted_key(dir.path(), &id_a).unwrap();
         assert_eq!(tr.keys.len(), 1);
         assert_eq!(tr.keys[0].key_id, id_b);
+    }
+
+    #[test]
+    fn remove_on_fresh_env_does_not_create_trust_root_file() {
+        // xhigh #8: a 'remove' for a non-existent key on a fresh env must
+        // NOT materialize an empty trust-root.json — the absence of the
+        // file is itself meaningful state (bootstrap-detection).
+        let dir = tempdir().unwrap();
+        assert!(!trust_root_path(dir.path()).exists());
+        let tr = remove_trusted_key(dir.path(), "00ff00ff00ff00ff00ff00ff00ff00ff").unwrap();
+        assert!(tr.is_empty());
+        assert!(
+            !trust_root_path(dir.path()).exists(),
+            "no-op remove must not create an empty trust-root.json"
+        );
     }
 
     #[test]

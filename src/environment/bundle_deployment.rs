@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use greentic_deploy_spec::{
-    BundleDeployment, RevenuePolicyDocument, RevenueShareEntry, SchemaVersion, StateIntegrity,
+    BundleDeployment, RevenuePolicyDocument, RevenueShareEntry, SchemaVersion,
 };
 use greentic_distributor_client::signing::{
     INTOTO_STATEMENT_TYPE, InTotoStatement, SigningError, Subject, sign_statement,
@@ -80,8 +80,6 @@ pub const REVENUE_POLICY_PREDICATE_TYPE_V1: &str = "greentic.revenue-policy-pred
 pub enum BundleDeploymentError {
     #[error("revenue-policy spec invalid: {0}")]
     Spec(#[from] greentic_deploy_spec::SpecError),
-    #[error("revenue-policy integrity: {0}")]
-    Integrity(#[from] greentic_deploy_spec::IntegrityError),
     #[error("revenue-policy write {path}: {source}")]
     Write {
         path: PathBuf,
@@ -115,11 +113,27 @@ pub enum BundleDeploymentError {
         "operator key `{key_id}` is not trusted in env `{env_dir}` (not present in `trust-root.json`); run `gtc op trust-root bootstrap <env-id>` first, or restore the key via `gtc op trust-root add`"
     )]
     OperatorKeyNotTrusted { key_id: String, env_dir: PathBuf },
+    /// Post-write self-verify caught corruption: the on-disk `vN.json`
+    /// hashes to something other than the value the DSSE Statement pinned.
+    /// Surfaces NFS / disk-space / concurrent-rename races at write time.
+    #[error(
+        "revenue-policy document `{path}` was corrupted after write: expected SHA-256 `{expected}`, on-disk SHA-256 `{actual}`"
+    )]
+    DocCorruptedAfterWrite {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
 }
 
 /// Predicate body recorded inside the DSSE Statement. Mirrors the
 /// document's identity fields so a reader of the `.sig` envelope alone can
 /// see what the signature covers without opening `vN.json`.
+///
+/// `previous_version_ref` is serialized as a forward-slash-normalized
+/// `String` (not a `PathBuf`) so the predicate is portable across
+/// operating systems — Windows back-slashes in a JSON path string would
+/// not resolve on POSIX verifiers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevenuePolicyPredicate {
     pub schema: String,
@@ -129,7 +143,7 @@ pub struct RevenuePolicyPredicate {
     pub customer_id: greentic_deploy_spec::CustomerId,
     pub version: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_version_ref: Option<PathBuf>,
+    pub previous_version_ref: Option<String>,
     pub signed_at: DateTime<Utc>,
 }
 
@@ -139,12 +153,20 @@ pub struct RevenuePolicyVersion {
     /// Env-relative path to the new sidecar (→ `BundleDeployment.revenue_policy_ref`).
     pub policy_ref: PathBuf,
     pub version: u64,
-    /// Canonical SHA-256 integrity of the on-disk `vN.json` document (the
-    /// digest the DSSE statement pins).
-    pub integrity: StateIntegrity,
+    /// Lowercase-hex SHA-256 of the canonical-JSON bytes pinned by the DSSE
+    /// statement. Same value the envelope's `subject.digest.sha256` carries
+    /// — callers can cross-reference without re-reading the document.
+    pub doc_sha256: String,
     /// `keyid` recorded in the DSSE envelope (matches the operator's
     /// canonical key id).
     pub key_id: String,
+}
+
+/// Convert a `PathBuf` into a `/`-separated string for cross-platform
+/// serialization inside DSSE predicates. On POSIX this is a no-op; on
+/// Windows it replaces `\\` with `/`.
+fn path_to_forward_slash(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
 }
 
 /// Write the next revenue-policy version for `deployment` under `env_dir`,
@@ -216,7 +238,7 @@ pub fn write_revenue_policy_version(
     // than copying the committed ref verbatim. In the normal flow the two are
     // identical (refs are always canonical); reconstructing additionally
     // refuses to propagate a crafted/cross-env ref out of a tampered env.json.
-    let previous_version_ref = (version > 1).then(|| rel_dir.join(sidecar_name(version - 1)));
+    let previous_version_ref_path = (version > 1).then(|| rel_dir.join(sidecar_name(version - 1)));
 
     let doc = RevenuePolicyDocument {
         schema: SchemaVersion::new(SchemaVersion::REVENUE_POLICY_V1),
@@ -227,17 +249,13 @@ pub fn write_revenue_policy_version(
         customer_id: deployment.customer_id.clone(),
         revenue_share: revenue_share.to_vec(),
         created_at,
-        previous_version_ref: previous_version_ref.clone(),
+        previous_version_ref: previous_version_ref_path.clone(),
     };
     doc.validate()?;
 
-    // Integrity envelope (kept on `RevenuePolicyVersion` for back-compat with
-    // callers that previously cared about the SHA-256). The DSSE statement's
-    // pinned digest is the same value.
-    let integrity = StateIntegrity::sha256_of(&doc)?;
     let doc_bytes = serde_json::to_vec_pretty(&doc).map_err(BundleDeploymentError::Serialize)?;
-    // The Statement pins the canonical-JSON SHA-256 of the on-disk doc.
-    // This is the same shape `verify_artifact_dsse` reads.
+    // Lowercase-hex SHA-256 over the exact on-disk bytes — pinned in the
+    // DSSE Statement subject and re-derived in the self-verify below.
     let doc_sha256_hex = sha256_hex(&doc_bytes);
 
     let predicate = RevenuePolicyPredicate {
@@ -247,7 +265,9 @@ pub fn write_revenue_policy_version(
         bundle_id: deployment.bundle_id.clone(),
         customer_id: deployment.customer_id.clone(),
         version,
-        previous_version_ref,
+        previous_version_ref: previous_version_ref_path
+            .as_deref()
+            .map(path_to_forward_slash),
         signed_at: created_at,
     };
     let predicate_value =
@@ -292,18 +312,35 @@ pub fn write_revenue_policy_version(
         }
     })?;
 
-    // Self-verify: re-read from disk and verify against the env trust root.
-    // A misconfigured key or trust-root seed would otherwise leak through.
+    // Self-verify: re-read BOTH files from disk, re-hash the doc, then
+    // verify the envelope against the digest of what actually landed. The
+    // earlier shape used the in-memory `doc_sha256_hex` for the verify
+    // input, which would pass even if the on-disk doc was truncated or
+    // corrupted between atomic_write and this verify (e.g. NFS / out-of-
+    // disk-space / concurrent rename). Re-hashing the disk bytes catches
+    // write-time corruption at the moment it could be detected cheaply.
+    let on_disk_doc = std::fs::read(&doc_abs).map_err(|source| BundleDeploymentError::Io {
+        path: doc_abs.clone(),
+        source,
+    })?;
+    let on_disk_doc_sha256 = sha256_hex(&on_disk_doc);
+    if on_disk_doc_sha256 != doc_sha256_hex {
+        return Err(BundleDeploymentError::DocCorruptedAfterWrite {
+            path: doc_abs.clone(),
+            expected: doc_sha256_hex.clone(),
+            actual: on_disk_doc_sha256,
+        });
+    }
     let written = std::fs::read(&sig_abs).map_err(|source| BundleDeploymentError::Io {
         path: sig_abs.clone(),
         source,
     })?;
-    verify_artifact_dsse(&written, &doc_sha256_hex, &trust_root)?;
+    verify_artifact_dsse(&written, &on_disk_doc_sha256, &trust_root)?;
 
     Ok(RevenuePolicyVersion {
         policy_ref: sig_rel,
         version,
-        integrity,
+        doc_sha256: doc_sha256_hex,
         key_id: operator_key.key_id.clone(),
     })
 }
@@ -606,6 +643,43 @@ mod tests {
         assert!(!trust.is_empty(), "fixture must bootstrap trust-root.json");
         verify_artifact_dsse(&envelope_bytes, &doc_sha256, &trust)
             .expect("envelope must verify against the env trust root");
+    }
+
+    #[test]
+    fn previous_version_ref_in_predicate_uses_forward_slashes() {
+        // xhigh #13: PathBuf serialization via Display embeds the platform
+        // separator. On Windows this would be `\` — a verifier on another
+        // OS could not resolve the predicate's `previous_version_ref`.
+        let dir = tempdir().unwrap();
+        let op = test_operator_key(&dir);
+        let mut dep = deployment("fast2flow", "cust-acme");
+        let v1 =
+            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+                .unwrap();
+        dep.revenue_policy_ref = v1.policy_ref;
+        write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+            .unwrap();
+
+        let envelope_bytes = std::fs::read(
+            dir.path()
+                .join("billing-policies/fast2flow/cust-acme/v2.json.sig"),
+        )
+        .unwrap();
+        let env: DsseEnvelope = serde_json::from_slice(&envelope_bytes).unwrap();
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(&env.payload)
+            .unwrap();
+        let stmt: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let prev = stmt["predicate"]["previous_version_ref"].as_str().unwrap();
+        assert!(
+            !prev.contains('\\'),
+            "predicate previous_version_ref must not contain backslashes; got {prev:?}"
+        );
+        assert!(
+            prev.starts_with("billing-policies/fast2flow/cust-acme/"),
+            "expected forward-slash-normalized path; got {prev:?}"
+        );
     }
 
     #[test]
