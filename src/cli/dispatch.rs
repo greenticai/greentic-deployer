@@ -169,6 +169,10 @@ pub enum EnvVerb {
 
 #[derive(Subcommand, Debug)]
 pub enum TrustRootVerb {
+    /// Seed the env trust root with the local operator key. The
+    /// revenue-policy writer never auto-seeds, so this verb is the
+    /// authorized path that grants signing rights to a new env. Idempotent.
+    Bootstrap { env_id: Option<String> },
     /// List trusted keys for one env.
     List { env_id: String },
     /// Add a `(key_id, public_pem)` pair. PEM source: `--public-key-pem` (inline)
@@ -440,6 +444,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
         OpNoun::TrustRoot { verb } => (
             "trust-root",
             match verb {
+                TrustRootVerb::Bootstrap { .. } => "bootstrap",
                 TrustRootVerb::List { .. } => "list",
                 TrustRootVerb::Add(_) => "add",
                 TrustRootVerb::Remove(_) => "remove",
@@ -604,6 +609,11 @@ fn dispatch_trust_root(
     verb: TrustRootVerb,
 ) -> Result<(), OpError> {
     let outcome = match verb {
+        TrustRootVerb::Bootstrap { env_id } => {
+            let payload = env_id
+                .map(|id| super::trust_root::TrustRootBootstrapPayload { environment_id: id });
+            super::trust_root::bootstrap(store, flags, payload)?
+        }
         TrustRootVerb::List { env_id } => super::trust_root::list(store, flags, &env_id)?,
         TrustRootVerb::Add(args) => {
             let payload = match (args.env_id, args.key_id) {

@@ -37,6 +37,62 @@ pub struct TrustRootRemovePayload {
     pub key_id: String,
 }
 
+/// Payload for `op env trust-root bootstrap`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustRootBootstrapPayload {
+    pub environment_id: String,
+}
+
+/// `op env trust-root bootstrap` — load (or generate) the operator key and
+/// add its `(key_id, public_pem)` to the env trust root. This is the
+/// **only** seeded code path: the revenue-policy writer NEVER mutates the
+/// trust root, so revocation via [`remove`] is a durable boundary. Run
+/// once per env; subsequent runs with the same operator key are a no-op.
+pub fn bootstrap(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<TrustRootBootstrapPayload>,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(NOUN, "bootstrap", bootstrap_schema()));
+    }
+    let payload = resolve_payload::<TrustRootBootstrapPayload>(flags, payload)?;
+    let env_id = parse_env_id(&payload.environment_id)?;
+    let op_key = crate::operator_key::load_or_generate()
+        .map_err(crate::environment::BundleDeploymentError::from)?;
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "bootstrap",
+        target: json!({
+            "key_id": op_key.key_id,
+            "public_key_pem": op_key.public_pem,
+        }),
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, |_committed| {
+        let env_dir = store.env_dir(&env_id)?;
+        let summary = store.transact(&env_id, |_locked| -> Result<Value, OpError> {
+            let trust = store_trust_root::add_trusted_key(
+                &env_dir,
+                TrustedKey {
+                    key_id: op_key.key_id.clone(),
+                    public_key_pem: op_key.public_pem.clone(),
+                },
+            )?;
+            Ok(json!({
+                "environment_id": env_id.as_str(),
+                "operator_key_id": op_key.key_id,
+                "trusted_key_count": trust.keys.len(),
+            }))
+        })?;
+        Ok((
+            OpOutcome::new(NOUN, "bootstrap", summary),
+            super::AuditGens::NONE,
+        ))
+    })
+}
+
 /// `op env trust-root list <env_id>` — return all trusted keys for the env.
 pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
@@ -72,11 +128,17 @@ pub fn add(
     let payload = resolve_payload::<TrustRootAddPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let public_key_pem = resolve_pem(&payload)?;
+    // Codex #3: audit `target` carries the full PEM, so a removed key can be
+    // reconstructed from the audit log alone if the on-disk backup is also
+    // lost. `key_id` alone is not sufficient for recovery.
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "add",
-        target: json!({"key_id": payload.key_id}),
+        target: json!({
+            "key_id": payload.key_id,
+            "public_key_pem": public_key_pem,
+        }),
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |_committed| {
@@ -110,11 +172,24 @@ pub fn remove(
     }
     let payload = resolve_payload::<TrustRootRemovePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
+    // Codex #3: look up the PEM *before* removal so the audit `target`
+    // captures what is about to be discarded — `key_id` alone is not enough
+    // to reconstruct a removed key.
+    let env_dir = store.env_dir(&env_id)?;
+    let pre_removal = store_trust_root::load(&env_dir)?;
+    let removed_pem = pre_removal
+        .keys
+        .iter()
+        .find(|k| k.key_id.eq_ignore_ascii_case(&payload.key_id))
+        .map(|k| k.public_key_pem.clone());
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "remove",
-        target: json!({"key_id": payload.key_id}),
+        target: json!({
+            "key_id": payload.key_id,
+            "public_key_pem": removed_pem,
+        }),
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |_committed| {
@@ -167,6 +242,19 @@ fn resolve_payload<T: serde::de::DeserializeOwned>(
     Err(OpError::InvalidArgument(
         "no payload provided: pass --answers <path> or supply the payload directly".to_string(),
     ))
+}
+
+fn bootstrap_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "TrustRootBootstrapPayload",
+        "type": "object",
+        "required": ["environment_id"],
+        "additionalProperties": false,
+        "properties": {
+            "environment_id": {"type": "string"}
+        }
+    })
 }
 
 fn list_schema() -> Value {
@@ -379,6 +467,56 @@ mod tests {
         let keys = listed.result["keys"].as_array().unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0]["key_id"].as_str().unwrap(), id_b);
+    }
+
+    #[test]
+    fn bootstrap_seeds_operator_key_into_env_trust_root() {
+        // Codex #1: explicit bootstrap is the only authorized path to seed
+        // the operator key into the env trust root.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let outcome = bootstrap(
+            &store,
+            &OpFlags::default(),
+            Some(TrustRootBootstrapPayload {
+                environment_id: "local".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(outcome.op, "bootstrap");
+        assert!(outcome.result["operator_key_id"].is_string());
+        let listed = list(&store, &OpFlags::default(), "local").unwrap();
+        assert_eq!(listed.result["keys"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bootstrap_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        bootstrap(
+            &store,
+            &OpFlags::default(),
+            Some(TrustRootBootstrapPayload {
+                environment_id: "local".into(),
+            }),
+        )
+        .unwrap();
+        bootstrap(
+            &store,
+            &OpFlags::default(),
+            Some(TrustRootBootstrapPayload {
+                environment_id: "local".into(),
+            }),
+        )
+        .unwrap();
+        let listed = list(&store, &OpFlags::default(), "local").unwrap();
+        assert_eq!(
+            listed.result["keys"].as_array().unwrap().len(),
+            1,
+            "second bootstrap must not duplicate the operator key"
+        );
     }
 
     #[test]

@@ -23,13 +23,21 @@
 //! [`greentic_distributor_client::signing::verify_artifact_dsse`] against the
 //! env's [`super::trust_root`].
 //!
-//! `write_revenue_policy_version` idempotently seeds the operator's
-//! `(key_id, public_pem)` into `<env_dir>/trust-root.json` on every write,
-//! so the env is self-consistent for verification without a separate setup
-//! step. The writer self-verifies the freshly-written envelope (load file,
-//! call `verify_artifact_dsse` against the just-seeded trust root) before
-//! returning, so a misconfiguration can never publish an unverifiable
-//! sidecar.
+//! ## Trust-root contract (Codex #1 — revocation durability)
+//!
+//! The writer NEVER mutates the env trust root. It loads
+//! `<env_dir>/trust-root.json`, refuses to sign if the operator's `key_id`
+//! is not already a trusted entry, and self-verifies the freshly-written
+//! envelope against that same trust root before returning.
+//!
+//! This makes `gtc op trust-root remove` a real revocation boundary:
+//! after removal, every subsequent `bundle add/update` aborts with
+//! [`BundleDeploymentError::OperatorKeyNotTrusted`] until an authorized
+//! caller runs the explicit `gtc op trust-root bootstrap` verb (or
+//! rotates the operator's local key entirely). An earlier draft of this
+//! writer auto-seeded the operator key on every write — that defeated
+//! revocation because the next mutation always re-inserted the removed
+//! key.
 //!
 //! ## Concurrency & partial-failure safety
 //!
@@ -51,7 +59,7 @@ use greentic_deploy_spec::{
     BundleDeployment, RevenuePolicyDocument, RevenueShareEntry, SchemaVersion, StateIntegrity,
 };
 use greentic_distributor_client::signing::{
-    INTOTO_STATEMENT_TYPE, InTotoStatement, SigningError, Subject, TrustedKey, sign_statement,
+    INTOTO_STATEMENT_TYPE, InTotoStatement, SigningError, Subject, sign_statement,
     verify_artifact_dsse,
 };
 use serde::{Deserialize, Serialize};
@@ -59,7 +67,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::atomic_write::AtomicWriteError;
-use super::trust_root::{TrustRootError, add_trusted_key};
+use super::trust_root::{self, TrustRootError};
 use crate::operator_key::{OperatorKey, OperatorKeyError};
 
 /// Env-relative root directory holding all revenue-policy versions.
@@ -100,6 +108,13 @@ pub enum BundleDeploymentError {
     TrustRoot(#[from] TrustRootError),
     #[error("revenue-policy serialize: {0}")]
     Serialize(serde_json::Error),
+    /// The operator's `(key_id, public_pem)` is not in the env trust root.
+    /// Auto-seeding would defeat revocation, so the writer refuses to sign
+    /// until the caller explicitly bootstraps the env trust root.
+    #[error(
+        "operator key `{key_id}` is not trusted in env `{env_dir}` (not present in `trust-root.json`); run `gtc op trust-root bootstrap <env-id>` first, or restore the key via `gtc op trust-root add`"
+    )]
+    OperatorKeyNotTrusted { key_id: String, env_dir: PathBuf },
 }
 
 /// Predicate body recorded inside the DSSE Statement. Mirrors the
@@ -142,12 +157,14 @@ pub struct RevenuePolicyVersion {
 /// - `vN.json.sig` — a DSSE envelope whose in-toto v1 Statement pins the
 ///   document's SHA-256 and carries a [`RevenuePolicyPredicate`].
 ///
-/// The operator key is idempotently seeded into
-/// `<env_dir>/trust-root.json` so the env's trust root contains the key
-/// that just signed the envelope. The freshly-written envelope is then
-/// re-loaded and re-verified against that trust root before returning —
-/// a misconfiguration that would yield an unverifiable sidecar fails the
-/// write rather than landing on disk.
+/// **Trust-root precondition:** `operator_key.key_id` must already be
+/// present in `<env_dir>/trust-root.json`; the writer never mutates the
+/// trust root (see module docs on revocation durability). Bootstrap an
+/// env's trust root once with `gtc op trust-root bootstrap <env-id>`.
+///
+/// The freshly-written envelope is re-loaded and re-verified against that
+/// trust root before returning — a misconfiguration that would yield an
+/// unverifiable sidecar fails the write rather than landing on disk.
 ///
 /// Returns the env-relative sidecar path the caller should store in
 /// `BundleDeployment.revenue_policy_ref`. Versions are 1-based and monotonic
@@ -162,6 +179,23 @@ pub fn write_revenue_policy_version(
     created_at: DateTime<Utc>,
     operator_key: &OperatorKey,
 ) -> Result<RevenuePolicyVersion, BundleDeploymentError> {
+    // Codex #1: load the env trust root (do NOT mutate it) and refuse to
+    // sign if the operator's key is not already trusted. Runs at the very
+    // top of the function so a failed precondition leaves NO partial
+    // artifacts (empty billing-policies subdirs, etc.) on disk. Auto-seeding
+    // here would defeat `gtc op trust-root remove` as a revocation boundary.
+    let trust_root = trust_root::load(env_dir)?;
+    let trusted = trust_root
+        .keys
+        .iter()
+        .any(|k| k.key_id.eq_ignore_ascii_case(&operator_key.key_id));
+    if !trusted {
+        return Err(BundleDeploymentError::OperatorKeyNotTrusted {
+            key_id: operator_key.key_id.clone(),
+            env_dir: env_dir.to_path_buf(),
+        });
+    }
+
     // `BundleId`/`CustomerId` are opaque, unvalidated strings — guard against
     // path traversal before they become directory segments.
     let bundle_seg = safe_segment(deployment.bundle_id.as_str())?;
@@ -244,17 +278,6 @@ pub fn write_revenue_policy_version(
     let sig_rel = rel_dir.join(sidecar_name(version));
     let doc_abs = env_dir.join(&doc_rel);
     let sig_abs = env_dir.join(&sig_rel);
-
-    // Seed the env trust root with the operator key BEFORE writing the
-    // envelope — the post-write self-verify will fail otherwise. Idempotent:
-    // a second call with the same (key_id, pem) replaces nothing.
-    let trust_root = add_trusted_key(
-        env_dir,
-        TrustedKey {
-            key_id: operator_key.key_id.clone(),
-            public_key_pem: operator_key.public_pem.clone(),
-        },
-    )?;
 
     super::atomic_write::atomic_write_bytes(&doc_abs, &doc_bytes).map_err(|source| {
         BundleDeploymentError::Write {
@@ -349,10 +372,28 @@ mod tests {
         BundleDeploymentStatus, BundleId, CustomerId, DeploymentId, EnvId, PartyId, RouteBinding,
         TenantSelector,
     };
-    use greentic_distributor_client::signing::{DsseEnvelope, verify_artifact_dsse};
+    use greentic_distributor_client::signing::{DsseEnvelope, TrustedKey, verify_artifact_dsse};
     use tempfile::{TempDir, tempdir};
 
+    /// Test fixture: load/generate an operator key AND seed it into the env
+    /// trust root. Mirrors the production flow where
+    /// `gtc op trust-root bootstrap` runs once before any revenue-policy
+    /// write. Tests that exercise the "operator not trusted" gate should NOT
+    /// call this — use `test_operator_key_without_bootstrap` instead.
     fn test_operator_key(workdir: &TempDir) -> OperatorKey {
+        let key = test_operator_key_without_bootstrap(workdir);
+        trust_root::add_trusted_key(
+            workdir.path(),
+            TrustedKey {
+                key_id: key.key_id.clone(),
+                public_key_pem: key.public_pem.clone(),
+            },
+        )
+        .expect("seed operator key into env trust root");
+        key
+    }
+
+    fn test_operator_key_without_bootstrap(workdir: &TempDir) -> OperatorKey {
         // Each test gets its own key under its own tempdir so writes are
         // isolated and `~/.greentic/operator/key.pem` is never touched.
         load_or_generate_at(&workdir.path().join("operator-key.pem")).expect("generate key")
@@ -560,29 +601,20 @@ mod tests {
         assert_eq!(parsed.signatures.len(), 1);
         assert_eq!(parsed.signatures[0].keyid, op.key_id);
 
-        // Trust root must be the env-seeded one for verify to succeed.
+        // Trust root carries the bootstrapped operator key (fixture-seeded).
         let trust = super::super::trust_root::load(dir.path()).unwrap();
-        assert!(!trust.is_empty(), "writer must seed trust-root.json");
+        assert!(!trust.is_empty(), "fixture must bootstrap trust-root.json");
         verify_artifact_dsse(&envelope_bytes, &doc_sha256, &trust)
             .expect("envelope must verify against the env trust root");
     }
 
     #[test]
-    fn writer_seeds_operator_into_env_trust_root() {
+    fn writer_does_not_mutate_trust_root() {
+        // Codex #1 revocation durability: two consecutive writes must not
+        // change the trust root — the writer is read-only against it.
         let dir = tempdir().unwrap();
         let op = test_operator_key(&dir);
-        let dep = deployment("fast2flow", "local-dev");
-        write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
-            .unwrap();
-        let trust = super::super::trust_root::load(dir.path()).unwrap();
-        assert_eq!(trust.keys.len(), 1);
-        assert!(trust.keys[0].key_id.eq_ignore_ascii_case(&op.key_id));
-    }
-
-    #[test]
-    fn second_write_does_not_duplicate_operator_in_trust_root() {
-        let dir = tempdir().unwrap();
-        let op = test_operator_key(&dir);
+        let pre = super::super::trust_root::load(dir.path()).unwrap();
         let mut dep = deployment("fast2flow", "local-dev");
         let v1 =
             write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
@@ -590,8 +622,58 @@ mod tests {
         dep.revenue_policy_ref = v1.policy_ref;
         write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
             .unwrap();
+        let post = super::super::trust_root::load(dir.path()).unwrap();
+        assert_eq!(pre.keys, post.keys, "writer must not mutate trust root");
+    }
+
+    #[test]
+    fn writer_refuses_when_operator_key_not_in_trust_root() {
+        // Codex #1: unbootstrapped trust root is a hard fail, never silent
+        // auto-seed.
+        let dir = tempdir().unwrap();
+        let op = test_operator_key_without_bootstrap(&dir);
+        let dep = deployment("fast2flow", "local-dev");
+        let err =
+            write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+                .expect_err("unbootstrapped op must be rejected");
+        match err {
+            BundleDeploymentError::OperatorKeyNotTrusted { key_id, .. } => {
+                assert_eq!(key_id, op.key_id);
+            }
+            other => panic!("expected OperatorKeyNotTrusted, got {other:?}"),
+        }
+        assert!(
+            !dir.path().join("billing-policies").exists(),
+            "no policy artifact must land on a failed precondition"
+        );
+    }
+
+    #[test]
+    fn writer_refuses_after_explicit_trust_root_remove() {
+        // Codex #1 durability: once an operator key is removed via
+        // `trust-root remove`, the writer must keep refusing — never silently
+        // re-seed and resume signing.
+        let dir = tempdir().unwrap();
+        let op = test_operator_key(&dir);
+        let dep = deployment("fast2flow", "local-dev");
+        write_revenue_policy_version(dir.path(), &dep, &dep.revenue_share, Utc::now(), &op)
+            .unwrap();
+        super::super::trust_root::remove_trusted_key(dir.path(), &op.key_id).unwrap();
+        let mut dep2 = dep.clone();
+        dep2.bundle_id = BundleId::new("post-revocation");
+        let err =
+            write_revenue_policy_version(dir.path(), &dep2, &dep2.revenue_share, Utc::now(), &op)
+                .expect_err("revoked op must stay revoked");
+        assert!(matches!(
+            err,
+            BundleDeploymentError::OperatorKeyNotTrusted { .. }
+        ));
         let trust = super::super::trust_root::load(dir.path()).unwrap();
-        assert_eq!(trust.keys.len(), 1, "operator key must dedup on re-seed");
+        assert!(
+            trust.keys.is_empty(),
+            "revocation must be durable; got {:?}",
+            trust.keys
+        );
     }
 
     #[test]

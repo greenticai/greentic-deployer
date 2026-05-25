@@ -75,6 +75,7 @@ rustix = { version = "1", features = ["process"], default-features = false }
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "zeroize"] }
 zeroize = "1"
 rand = "0.9"
+libc = "0.2"
 
 [dependencies.clap]
 version = "4.5"

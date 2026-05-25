@@ -1815,6 +1815,7 @@ dependencies = [
  "hex",
  "indexmap 2.14.0",
  "jsonschema",
+ "libc",
  "once_cell",
  "rand 0.9.4",
  "reqwest 0.13.3",

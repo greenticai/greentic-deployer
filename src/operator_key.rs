@@ -71,6 +71,20 @@ pub enum OperatorKeyError {
     },
     #[error("operator key entropy: {0}")]
     Entropy(String),
+    /// The on-disk operator key has group/world-readable permissions. A
+    /// copied or restored key with `0644`/`0660` would otherwise be signed
+    /// with while other local users could exfiltrate it. Reject before use.
+    #[error(
+        "operator key `{path}` has insecure permissions (mode {mode:#o}); expected mode `0600` (owner-only). Restore with `chmod 600 {path}` or delete and regenerate."
+    )]
+    InsecurePermissions { path: PathBuf, mode: u32 },
+    /// The on-disk operator key is not a regular file (symlink, directory,
+    /// FIFO, etc.). `O_NOFOLLOW` would have caught a symlink in `open`; this
+    /// covers everything else after `fstat`.
+    #[error(
+        "operator key `{path}` is not a regular file (symlinks, directories, FIFOs etc. are rejected)"
+    )]
+    NotRegularFile { path: PathBuf },
 }
 
 /// The operator's signing key + its derived id, ready for DSSE signing.
@@ -139,14 +153,109 @@ pub fn load_or_generate() -> Result<OperatorKey, OperatorKeyError> {
 /// Like [`load_or_generate`] but with an explicit path (tests + callers
 /// that already resolved the path themselves).
 pub fn load_or_generate_at(path: &Path) -> Result<OperatorKey, OperatorKeyError> {
-    match std::fs::read_to_string(path) {
+    match read_existing_securely(path) {
         Ok(private_pem) => load_existing(path, private_pem),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => generate_at(path),
-        Err(source) => Err(OperatorKeyError::Io {
+        Err(OperatorKeyError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            generate_at(path)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Open the operator key file refusing symlinks (`O_NOFOLLOW`), validate
+/// that it is a regular file owned by a safe principal with permissions
+/// that do not leak the key material to other local users, then read its
+/// contents. Returns `Io { kind = NotFound }` if the file does not exist so
+/// callers can dispatch to the generate path.
+fn read_existing_securely(path: &Path) -> Result<String, OperatorKeyError> {
+    let file = open_no_follow(path)?;
+    let meta = file.metadata().map_err(|source| OperatorKeyError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !meta.is_file() {
+        return Err(OperatorKeyError::NotRegularFile {
+            path: path.to_path_buf(),
+        });
+    }
+    check_mode(path, &meta)?;
+    let mut contents = String::new();
+    use std::io::Read;
+    {
+        let mut handle = file;
+        handle
+            .read_to_string(&mut contents)
+            .map_err(|source| OperatorKeyError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
+    Ok(contents)
+}
+
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> Result<std::fs::File, OperatorKeyError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NOFOLLOW makes `open` fail with ELOOP if the final path component is
+    // a symlink. Combined with the `is_file()` check on the resulting fd,
+    // this rejects symlinked, directory, FIFO, and device targets.
+    let result = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path);
+    match result {
+        Ok(f) => Ok(f),
+        Err(e) => {
+            // ELOOP from O_NOFOLLOW maps to a "not a regular file" outcome
+            // rather than the raw io error so callers see a meaningful kind.
+            #[allow(clippy::manual_map)]
+            if let Some(raw) = e.raw_os_error()
+                && raw == libc::ELOOP
+            {
+                return Err(OperatorKeyError::NotRegularFile {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(OperatorKeyError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            })
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn open_no_follow(path: &Path) -> Result<std::fs::File, OperatorKeyError> {
+    // Best-effort on non-Unix: just open the file; symlink + permissions
+    // checks are Unix-specific. `read_to_string`-style errors propagate via
+    // OperatorKeyError::Io.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|source| OperatorKeyError::Io {
             path: path.to_path_buf(),
             source,
-        }),
+        })
+}
+
+#[cfg(unix)]
+fn check_mode(path: &Path, meta: &std::fs::Metadata) -> Result<(), OperatorKeyError> {
+    use std::os::unix::fs::MetadataExt;
+    let mode = meta.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(OperatorKeyError::InsecurePermissions {
+            path: path.to_path_buf(),
+            mode,
+        });
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_mode(_path: &Path, _meta: &std::fs::Metadata) -> Result<(), OperatorKeyError> {
+    Ok(())
 }
 
 fn load_existing(path: &Path, private_pem: String) -> Result<OperatorKey, OperatorKeyError> {
@@ -346,6 +455,12 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
     #[test]
     fn generate_creates_keypair_with_canonical_id() {
         let dir = tempdir().unwrap();
@@ -475,6 +590,74 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn existing_key_with_world_readable_mode_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+        load_or_generate_at(&path).unwrap();
+        chmod(&path, 0o644);
+        let err = load_or_generate_at(&path).expect_err("0644 must be rejected");
+        match err {
+            OperatorKeyError::InsecurePermissions { mode, .. } => assert_eq!(mode, 0o644),
+            other => panic!("expected InsecurePermissions, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_key_with_group_readable_mode_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+        load_or_generate_at(&path).unwrap();
+        chmod(&path, 0o660);
+        let err = load_or_generate_at(&path).expect_err("0660 must be rejected");
+        match err {
+            OperatorKeyError::InsecurePermissions { mode, .. } => assert_eq!(mode, 0o660),
+            other => panic!("expected InsecurePermissions, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_key_with_mode_0600_is_accepted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+        let first = load_or_generate_at(&path).unwrap();
+        chmod(&path, 0o600);
+        let second = load_or_generate_at(&path).unwrap();
+        assert_eq!(first.key_id, second.key_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_key_path_is_rejected() {
+        let dir = tempdir().unwrap();
+        let real_path = dir.path().join("real-key.pem");
+        load_or_generate_at(&real_path).unwrap();
+        let link_path = dir.path().join("via-link.pem");
+        std::os::unix::fs::symlink(&real_path, &link_path).unwrap();
+        let err = load_or_generate_at(&link_path).expect_err("symlink target must be rejected");
+        assert!(
+            matches!(err, OperatorKeyError::NotRegularFile { .. }),
+            "expected NotRegularFile, got {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_at_key_path_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+        std::fs::create_dir(&path).unwrap();
+        let err = load_or_generate_at(&path).expect_err("directory must be rejected");
+        // O_NOFOLLOW on a directory opens fine; the is_file check catches it.
+        assert!(
+            matches!(err, OperatorKeyError::NotRegularFile { .. }),
+            "expected NotRegularFile, got {err:?}"
+        );
+    }
+
     #[test]
     fn corrupted_private_pem_is_rejected() {
         let dir = tempdir().unwrap();
@@ -484,6 +667,10 @@ mod tests {
             "-----BEGIN PRIVATE KEY-----\nnope\n-----END PRIVATE KEY-----\n",
         )
         .unwrap();
+        // Set safe mode so the permission gate doesn't fire first — the test
+        // is about PEM corruption, not file permissions.
+        #[cfg(unix)]
+        chmod(&path, 0o600);
         let err = load_or_generate_at(&path).expect_err("bad PEM must reject");
         assert!(matches!(err, OperatorKeyError::KeyDecode(_)));
     }

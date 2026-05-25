@@ -26,7 +26,11 @@ use greentic_distributor_client::signing::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::atomic_write::{AtomicWriteError, atomic_write_json};
+use super::atomic_write::{AtomicWriteError, atomic_write_json, copy_to_backup};
+
+/// Env-relative sub-directory under which previous `trust-root.json`
+/// revisions are copied before each save (Codex #3 recovery hook).
+const TRUST_ROOT_BACKUP_DIR: &str = "backups";
 
 /// Schema discriminator for the trust-root file.
 pub const TRUST_ROOT_SCHEMA_V1: &str = "greentic.trust-root.v1";
@@ -164,8 +168,23 @@ fn load_keys(env_dir: &Path) -> Result<Vec<TrustedKey>, TrustRootError> {
     Ok(root.keys)
 }
 
+/// Atomically replace `<env_dir>/trust-root.json` with `keys`, first
+/// copying the previous file (if any) into `<env_dir>/backups/` with an
+/// RFC-3339 timestamp.
+///
+/// Codex #3: an accidental or malicious `add`/`remove` would otherwise be
+/// unrecoverable — the CLI audit log records only `key_id`, not enough to
+/// reconstruct removed PEMs. The backup keeps the prior trust root one
+/// directory away, and the CLI emits the full `(key_id, public_pem)` pair
+/// in its audit `target`.
 fn save(env_dir: &Path, keys: &[TrustedKey]) -> Result<(), TrustRootError> {
     let path = trust_root_path(env_dir);
+    copy_to_backup(&path, &env_dir.join(TRUST_ROOT_BACKUP_DIR)).map_err(|source| {
+        TrustRootError::Write {
+            path: path.clone(),
+            source,
+        }
+    })?;
     let doc = TrustRootDocument::v1(keys.to_vec());
     atomic_write_json(&path, &doc).map_err(|source| TrustRootError::Write { path, source })
 }
@@ -364,6 +383,80 @@ mod tests {
         let tr = remove_trusted_key(dir.path(), "00ff00ff00ff00ff00ff00ff00ff00ff").unwrap();
         assert_eq!(tr.keys.len(), 1, "non-matching removal is a no-op");
         assert_eq!(tr.keys[0].key_id, id);
+    }
+
+    #[test]
+    fn add_writes_prior_trust_root_to_backups_dir() {
+        // Codex #3: every save copies the previous file aside so a bad
+        // `add`/`remove` is recoverable from disk.
+        let dir = tempdir().unwrap();
+        let (pem_a, id_a) = keypair(40);
+        let (pem_b, id_b) = keypair(41);
+        add_trusted_key(
+            dir.path(),
+            TrustedKey {
+                key_id: id_a.clone(),
+                public_key_pem: pem_a,
+            },
+        )
+        .unwrap();
+        add_trusted_key(
+            dir.path(),
+            TrustedKey {
+                key_id: id_b,
+                public_key_pem: pem_b,
+            },
+        )
+        .unwrap();
+        // Second save copied the v1 (id_a-only) file to backups/.
+        let backups: Vec<_> = std::fs::read_dir(dir.path().join("backups"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("trust-root.json.")
+            })
+            .collect();
+        assert!(
+            !backups.is_empty(),
+            "expected a trust-root backup file under backups/"
+        );
+        let backup_contents = std::fs::read_to_string(backups[0].path()).unwrap();
+        let parsed: TrustRootDocument = serde_json::from_str(&backup_contents).unwrap();
+        assert_eq!(parsed.keys.len(), 1);
+        assert!(parsed.keys[0].key_id.eq_ignore_ascii_case(&id_a));
+    }
+
+    #[test]
+    fn remove_writes_prior_trust_root_to_backups_dir() {
+        let dir = tempdir().unwrap();
+        let (pem, id) = keypair(42);
+        add_trusted_key(
+            dir.path(),
+            TrustedKey {
+                key_id: id.clone(),
+                public_key_pem: pem,
+            },
+        )
+        .unwrap();
+        remove_trusted_key(dir.path(), &id).unwrap();
+        // The `add` saved once (no prior backup), the `remove` saved a
+        // second time copying the post-add file into backups/.
+        let backups: Vec<_> = std::fs::read_dir(dir.path().join("backups"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("trust-root.json.")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "remove must back up its predecessor");
+        let parsed: TrustRootDocument =
+            serde_json::from_str(&std::fs::read_to_string(backups[0].path()).unwrap()).unwrap();
+        assert_eq!(parsed.keys.len(), 1);
+        assert!(parsed.keys[0].key_id.eq_ignore_ascii_case(&id));
     }
 
     #[test]

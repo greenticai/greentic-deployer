@@ -543,6 +543,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         let outcome = add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
         let did = outcome
             .result
@@ -564,6 +566,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
         let err = add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap_err();
         assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
@@ -574,6 +578,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
         let mut p2 = payload("fast2flow");
         p2.customer_id = Some("other".to_string());
@@ -586,6 +592,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         let added = add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
         let did = added
             .result
@@ -659,6 +667,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         let added = add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
         let did = added
             .result
@@ -762,6 +772,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
 
         let env = store.load(&parse_env_id("local").unwrap()).unwrap();
@@ -788,6 +800,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         // Simulate the orphan document left by a failed attempt.
         let orphan_dir = dir
             .path()
@@ -816,6 +830,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         let mut p = payload("fast2flow");
         p.bundle_id = "".to_string();
         let err = add(&store, &OpFlags::default(), Some(p)).unwrap_err();
@@ -832,6 +848,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         let mut p = payload("fast2flow");
         p.customer_id = Some("".to_string());
         let err = add(&store, &OpFlags::default(), Some(p)).unwrap_err();
@@ -847,6 +865,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         let mut p = payload("fast2flow");
         p.customer_id = None;
         let outcome = add(&store, &OpFlags::default(), Some(p)).unwrap();
@@ -890,6 +910,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         let added = add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
         let did = added
             .result
@@ -945,6 +967,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
         let added = add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
         let did = added
             .result
