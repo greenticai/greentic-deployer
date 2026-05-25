@@ -244,28 +244,38 @@ pub fn runtime_secret_env_map_for_cloud(
     Ok(env_map)
 }
 
-/// Run `resolve_runtime_secrets` from inside a sync context. The deployer's
-/// call chain (`apply::run` → … → `runtime_secret_env_map_for_cloud`) starts
-/// async at the top, then hops through several sync helpers before reaching
-/// this function. `block_in_place` + `Handle::current().block_on` keeps the
-/// async tree intact without spawning a nested runtime (which would panic
-/// inside an existing one). When no runtime is current (e.g. unit tests
-/// constructed without `#[tokio::test]`), fall back to a fresh
-/// single-threaded runtime so the function is callable from any context.
+/// Run `resolve_runtime_secrets` from a sync context, regardless of the
+/// caller's runtime.
+///
+/// The deployer's production call chain is `run_cloud_backend` →
+/// `run_backend_operation` (which builds a **current-thread** runtime via
+/// `Builder::new_current_thread().block_on(apply::run)`) → several sync
+/// helpers → `runtime_secret_env_map_for_cloud` → here. We therefore CANNOT
+/// use `tokio::task::block_in_place` (it panics on a current-thread runtime)
+/// nor `Handle::current().block_on` (re-entrant block_on on the same
+/// current-thread runtime panics).
+///
+/// Instead, hop to a dedicated OS thread that owns its own current-thread
+/// runtime. `std::thread::scope` lets the closure borrow `ctx`/`requirements`
+/// without a `'static` bound; the inner runtime is fully independent of the
+/// caller's, so this works whether the caller is on a current-thread runtime,
+/// a multi-thread runtime, or no runtime at all.
 fn block_on_async_resolution(
     ctx: &RuntimeSecretContext,
     requirements: &[RuntimeSecretRequirement],
 ) -> RuntimeSecretResolution {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            handle.block_on(resolve_runtime_secrets(ctx, requirements))
-        }),
-        Err(_) => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to create ephemeral tokio runtime for runtime-secret resolution")
-            .block_on(resolve_runtime_secrets(ctx, requirements)),
-    }
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build runtime for runtime-secret resolution")
+                    .block_on(resolve_runtime_secrets(ctx, requirements))
+            })
+            .join()
+            .expect("runtime-secret resolution thread panicked")
+    })
 }
 
 pub async fn resolve_runtime_secrets(
@@ -1069,40 +1079,30 @@ questions:
         assert!(!env_map.contains_key("secrets://dev/demo/_/demo-app/oauth_client_secret"));
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn runtime_secret_env_map_includes_optional_secrets_with_devstore_value() {
-        // Codex F1 regression: an optional secret backed only by the dev
-        // secrets store (no env var) MUST appear in the cloud env_map so
-        // Terraform can wire it through to the runtime. Pre-fix, the env-only
-        // filter silently skipped these, leaving the workload with no
-        // configured URI even though `resolve_runtime_secrets` (used by the
-        // promotion path) found and uploaded the value.
+    fn seed_devstore_api_key(bundle_root: &Path) {
         use greentic_secrets_lib::{DevStore, SecretFormat};
-
-        let dir = tempfile::tempdir().unwrap();
-        let bundle_root = dir.path();
-        let (_packs_dir, pack_path) = build_skips_unresolved_optional_fixture(bundle_root);
-
-        // Seed the DevStore with a value for the optional `api_key`.
         let store_path = bundle_root.join(".greentic/state/dev/.dev.secrets.env");
         std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
         let store = DevStore::with_path(&store_path).unwrap();
-        store
-            .put(
-                "secrets://dev/demo/_/demo-app/api_key",
-                SecretFormat::Text,
-                b"from-dev-store",
-            )
-            .await
-            .unwrap();
+        // Seed via an isolated current-thread runtime — no ambient runtime
+        // required, matching how the production sync path reaches the store.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                store
+                    .put(
+                        "secrets://dev/demo/_/demo-app/api_key",
+                        SecretFormat::Text,
+                        b"from-dev-store",
+                    )
+                    .await
+                    .unwrap();
+            });
+    }
 
-        let config = deployer_config_for_fixture(bundle_root, pack_path);
-        let env_map =
-            tokio::task::spawn_blocking(move || runtime_secret_env_map_for_cloud(&config))
-                .await
-                .unwrap()
-                .unwrap();
-
+    fn assert_devstore_optional_in_env_map(env_map: &BTreeMap<String, String>) {
         assert!(
             env_map.contains_key("secrets://dev/demo/_/demo-app/api_key"),
             "optional secret with DevStore value MUST appear in env_map: {env_map:?}",
@@ -1110,6 +1110,44 @@ questions:
         assert!(env_map.contains_key("secrets://dev/demo/_/demo-app/jwt_signing_key"));
         // Other optional with no source stays skipped.
         assert!(!env_map.contains_key("secrets://dev/demo/_/demo-app/oauth_client_secret"));
+    }
+
+    #[test]
+    fn runtime_secret_env_map_includes_optional_secrets_with_devstore_value() {
+        // Codex F1 regression: an optional secret backed only by the dev
+        // secrets store (no env var) MUST appear in the cloud env_map so
+        // Terraform can wire it through to the runtime.
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_root = dir.path();
+        let (_packs_dir, pack_path) = build_skips_unresolved_optional_fixture(bundle_root);
+        seed_devstore_api_key(bundle_root);
+
+        let config = deployer_config_for_fixture(bundle_root, pack_path);
+        let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
+        assert_devstore_optional_in_env_map(&env_map);
+    }
+
+    // xhigh review C1 regression: the production cloud-deploy path runs
+    // `runtime_secret_env_map_for_cloud` from *inside* a current-thread tokio
+    // runtime (run_backend_operation builds `Builder::new_current_thread()`).
+    // The previous `block_in_place` bridge panicked there. This test
+    // reproduces that exact reentry shape and must not panic.
+    #[test]
+    fn runtime_secret_env_map_callable_from_within_current_thread_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_root = dir.path();
+        let (_packs_dir, pack_path) = build_skips_unresolved_optional_fixture(bundle_root);
+        seed_devstore_api_key(bundle_root);
+        let config = deployer_config_for_fixture(bundle_root, pack_path);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let env_map = rt
+            .block_on(async { runtime_secret_env_map_for_cloud(&config) })
+            .unwrap();
+        assert_devstore_optional_in_env_map(&env_map);
     }
 
     #[test]
