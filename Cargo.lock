@@ -1811,7 +1811,7 @@ dependencies = [
  "greentic-deploy-spec",
  "greentic-distributor-client",
  "greentic-secrets-lib",
- "greentic-telemetry 1.1.0-dev.26387597611",
+ "greentic-telemetry 1.1.0-dev.26432434860",
  "greentic-types 1.1.0-dev.26386264344",
  "hex",
  "indexmap 2.14.0",
@@ -2008,9 +2008,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-telemetry"
-version = "1.1.0-dev.26387597611"
+version = "1.1.0-dev.26432434860"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "247bc40087a5d22c7e16e7772496f8363ab5f0ff58c1bd9349177d6f19c708bc"
+checksum = "801a6ba9e123c750e3b4eb0859765979ad1315fc9c448b72b273845d4f4ec48c"
 dependencies = [
  "anyhow",
  "once_cell",

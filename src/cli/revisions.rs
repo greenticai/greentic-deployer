@@ -34,6 +34,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
+use crate::rollout_telemetry::emit_lifecycle_event;
+use greentic_deploy_spec::Environment;
+use greentic_telemetry::RolloutEvent;
 
 use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
 
@@ -425,42 +428,79 @@ where
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |committed| {
-        let revision = store.transact(&env_id, |locked| -> Result<Revision, OpError> {
-            let revision = match crate::environment::apply_revision_transition_with_health_gate(
-                locked,
-                revision_id,
-                accepted_chain,
-                on_final,
-                prune_from_splits,
-                health_gate,
-            ) {
-                Ok(r) => {
-                    // The lifecycle helper called `locked.save(&env)` before
-                    // returning Ok — env is durable on disk. From this point
-                    // forward, every error path inside the transact (load,
-                    // refresh_runtime_config, …) is *committed-on-error*:
-                    // mark the audit boundary so a follow-up audit-append
-                    // failure fails-closed instead of silently demoting to
-                    // `tracing::warn!`.
-                    committed.mark_committed();
-                    r
-                }
-                Err(e @ crate::environment::LifecycleError::HealthGateFailed { .. }) => {
-                    // Gate-fail path: the lifecycle helper flipped the
-                    // revision to `Failed` and saved before returning this
-                    // error. Same fail-closed rationale as the Ok arm.
-                    committed.mark_committed();
-                    return Err(OpError::from(e));
-                }
-                Err(other) => return Err(OpError::from(other)),
-            };
-            // Lifecycle transitions don't change traffic splits today, so this
-            // is a no-op refresh (guarded by change-detection); it keeps the
-            // runtime-config contract uniform across every mutating verb.
-            let env = locked.load()?;
-            locked.refresh_runtime_config(&env)?;
-            Ok(revision)
-        })?;
+        let (revision, env, starting_lifecycle) = store.transact(
+            &env_id,
+            |locked| -> Result<(Revision, Environment, Option<RevisionLifecycle>), OpError> {
+                // C5.3: capture the revision's lifecycle BEFORE the helper
+                // walks the chain. The `archive` matrix can traverse
+                // `Draining → Inactive → Archived` end-to-end in one call,
+                // so the final lifecycle alone can't tell us whether we
+                // crossed the `Draining → Inactive` eviction hop. Reading
+                // the env here is the same disk read the helper does
+                // internally, so the extra cost is one in-memory lookup.
+                let starting_lifecycle = locked.load().ok().and_then(|e| {
+                    e.revisions
+                        .iter()
+                        .find(|r| r.revision_id == revision_id)
+                        .map(|r| r.lifecycle)
+                });
+                let revision = match crate::environment::apply_revision_transition_with_health_gate(
+                    locked,
+                    revision_id,
+                    accepted_chain,
+                    on_final,
+                    prune_from_splits,
+                    health_gate,
+                ) {
+                    Ok(r) => {
+                        // The lifecycle helper called `locked.save(&env)` before
+                        // returning Ok — env is durable on disk. From this point
+                        // forward, every error path inside the transact (load,
+                        // refresh_runtime_config, …) is *committed-on-error*:
+                        // mark the audit boundary so a follow-up audit-append
+                        // failure fails-closed instead of silently demoting to
+                        // `tracing::warn!`.
+                        committed.mark_committed();
+                        r
+                    }
+                    Err(e @ crate::environment::LifecycleError::HealthGateFailed { .. }) => {
+                        // Gate-fail path: the lifecycle helper flipped the
+                        // revision to `Failed` and saved before returning this
+                        // error. Emit `HealthGateFailed` here — the env is on
+                        // disk via the helper's save, so a fresh load resolves
+                        // the Failed revision for attribution. Telemetry is
+                        // best-effort: a load failure here must NOT mask the
+                        // original `HealthGateFailed` error, hence `.ok()`.
+                        if let Ok(env_for_emit) = locked.load()
+                            && let Some(rev_for_emit) = env_for_emit
+                                .revisions
+                                .iter()
+                                .find(|r| r.revision_id == revision_id)
+                        {
+                            // `starting_lifecycle` is not used by the
+                            // `gate_failed = true` arm of `emit_for_op`, so
+                            // passing `None` is fine here.
+                            emit_for_op(op, true, None, &env_for_emit, rev_for_emit);
+                        }
+                        committed.mark_committed();
+                        return Err(OpError::from(e));
+                    }
+                    Err(other) => return Err(OpError::from(other)),
+                };
+                // Lifecycle transitions don't change traffic splits today, so this
+                // is a no-op refresh (guarded by change-detection); it keeps the
+                // runtime-config contract uniform across every mutating verb.
+                let env = locked.load()?;
+                locked.refresh_runtime_config(&env)?;
+                Ok((revision, env, starting_lifecycle))
+            },
+        )?;
+        // C5.3: emit the lifecycle event for this verb. Centralized in
+        // `emit_for_op` so the verb→event mapping lives in one place. Best-
+        // effort observability — `emit_rollout_event` is panic-safe with no
+        // subscriber installed, so no fallible path here can affect outcome.
+        emit_for_op(op, false, starting_lifecycle, &env, &revision);
+
         let summary = RevisionSummary::from(&revision);
         let outcome = OpOutcome::new(
             NOUN,
@@ -469,6 +509,50 @@ where
         );
         Ok((outcome, super::AuditGens::NONE))
     })
+}
+
+/// Verb → [`RolloutEvent`] dispatcher (C5.3).
+///
+/// Centralizes which event(s) each lifecycle verb emits on a successful or
+/// health-gate-failed transition, so the verb mapping lives in one place
+/// rather than scattered across [`warm`] / [`drain`] / [`archive`] /
+/// [`decommission`] / [`activate`].
+///
+/// - `warm` Ok → `HealthGatePassed` + `RevisionWarmed` (the warm verb both
+///   passes the gate and lands the revision in `Ready`).
+/// - `warm` health-gate fail → `HealthGateFailed`.
+/// - `drain` Ok → `RevisionDraining`.
+/// - `archive` Ok with `starting_lifecycle == Some(Draining)` →
+///   `RevisionEvicted` (the post-drain eviction hop). The final lifecycle
+///   alone can't discriminate this: the `archive` chain walks
+///   `Draining → Inactive → Archived` end-to-end in one call, so the
+///   revision lands on `Archived` regardless of where it started. We key on
+///   the starting lifecycle so a `Ready → Archived` archive (lifecycle
+///   retirement, NOT a rollout eviction) correctly emits nothing.
+/// - Other verbs and chains: no emit (no live rollout-event match).
+fn emit_for_op(
+    op: &'static str,
+    gate_failed: bool,
+    starting_lifecycle: Option<RevisionLifecycle>,
+    env: &Environment,
+    revision: &Revision,
+) {
+    match (op, gate_failed) {
+        ("warm", false) => {
+            emit_lifecycle_event(RolloutEvent::HealthGatePassed, env, revision);
+            emit_lifecycle_event(RolloutEvent::RevisionWarmed, env, revision);
+        }
+        ("warm", true) => {
+            emit_lifecycle_event(RolloutEvent::HealthGateFailed, env, revision);
+        }
+        ("drain", false) => {
+            emit_lifecycle_event(RolloutEvent::RevisionDraining, env, revision);
+        }
+        ("archive", false) if starting_lifecycle == Some(RevisionLifecycle::Draining) => {
+            emit_lifecycle_event(RolloutEvent::RevisionEvicted, env, revision);
+        }
+        _ => {}
+    }
 }
 
 fn resolve_payload<T: serde::de::DeserializeOwned>(
@@ -1079,5 +1163,251 @@ mod tests {
         // is Ready on disk.
         let env = store.load(&env_id).unwrap();
         assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Ready);
+    }
+
+    // -------------------------------------------------------------------
+    // C5.3 — end-to-end rollout-event capture
+    //
+    // Codex's review found that emitting in scaffolded greentic-start paths
+    // produced silent live operator flows. These tests drive the LIVE CLI
+    // verbs (`warm`, `drain`, `archive`) and capture the resulting
+    // `rollout.*` events through a `tracing_subscriber` layer, so the
+    // verb→event mapping is regression-tested through the same code path
+    // operator HTTP routes use today.
+    // -------------------------------------------------------------------
+
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{Arc, Mutex};
+    use tracing::Subscriber;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id};
+    use tracing_subscriber::layer::{Context, Layer};
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::registry::LookupSpan;
+
+    /// `tracing` layer that records every `rollout.event` discriminant seen
+    /// on a span or event. Used to assert which rollout events fired while
+    /// the captured subscriber was the per-thread default.
+    #[derive(Default, Clone)]
+    struct RolloutCapture {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Default)]
+    struct GrabEvent(BTreeMap<String, String>);
+    impl Visit for GrabEvent {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .entry(field.name().to_string())
+                .or_insert_with(|| format!("{value:?}"));
+        }
+    }
+
+    impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for RolloutCapture {
+        fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+            let mut g = GrabEvent::default();
+            attrs.record(&mut g);
+            if let Some(ev) = g.0.remove("rollout.event") {
+                self.events.lock().unwrap().push(ev);
+            }
+        }
+    }
+
+    impl RolloutCapture {
+        fn observed(&self) -> BTreeSet<String> {
+            self.events.lock().unwrap().iter().cloned().collect()
+        }
+    }
+
+    fn run_with_capture<R>(f: impl FnOnce() -> R) -> (R, RolloutCapture) {
+        let cap = RolloutCapture::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+        let r = tracing::subscriber::with_default(subscriber, f);
+        (r, cap)
+    }
+
+    /// Live `warm` CLI invocation must emit `rollout.health_gate.passed`
+    /// and `rollout.revision.warmed` — Codex's "end-to-end warm test that
+    /// asserts pass rollout events are observed" recommendation.
+    #[test]
+    fn warm_emits_health_gate_passed_and_revision_warmed() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let did = seed_env_with_deployment(&store);
+        let staged = stage(&store, &OpFlags::default(), Some(stage_payload(&did))).unwrap();
+        let rid = staged
+            .result
+            .get("revision_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        let (result, cap) = run_with_capture(|| {
+            warm(
+                &store,
+                &OpFlags::default(),
+                Some(RevisionTransitionPayload {
+                    environment_id: "local".to_string(),
+                    revision_id: rid,
+                }),
+            )
+        });
+        result.unwrap();
+        let observed = cap.observed();
+        assert!(
+            observed.contains("rollout.health_gate.passed"),
+            "observed events: {observed:?}"
+        );
+        assert!(
+            observed.contains("rollout.revision.warmed"),
+            "observed events: {observed:?}"
+        );
+        // No failure event on a happy-path warm.
+        assert!(!observed.contains("rollout.health_gate.failed"));
+    }
+
+    /// Live `warm_with_health_gate` with a failing gate closure must emit
+    /// `rollout.health_gate.failed` — Codex's "fail rollout events are
+    /// observed" recommendation.
+    #[test]
+    fn warm_with_failing_gate_emits_health_gate_failed() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let did = seed_env_with_deployment(&store);
+        let staged = stage(&store, &OpFlags::default(), Some(stage_payload(&did))).unwrap();
+        let rid = staged
+            .result
+            .get("revision_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        let (result, cap) = run_with_capture(|| {
+            warm_with_health_gate(
+                &store,
+                &OpFlags::default(),
+                Some(RevisionTransitionPayload {
+                    environment_id: "local".to_string(),
+                    revision_id: rid,
+                }),
+                |_env, _revision| {
+                    Err(crate::environment::HealthGateFailure {
+                        failed_checks: vec![crate::environment::HealthCheckId::RuntimeConfig],
+                        message: "synthetic gate failure".to_string(),
+                    })
+                },
+            )
+        });
+        result.unwrap_err();
+        let observed = cap.observed();
+        assert!(
+            observed.contains("rollout.health_gate.failed"),
+            "observed events: {observed:?}"
+        );
+        // No passing event when the gate failed.
+        assert!(!observed.contains("rollout.health_gate.passed"));
+        assert!(!observed.contains("rollout.revision.warmed"));
+    }
+
+    /// Live `drain` CLI invocation must emit `rollout.revision.draining`.
+    /// Drives the Ready → Draining transition through the same path the
+    /// operator HTTP route uses.
+    #[test]
+    fn drain_emits_revision_draining() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let did = seed_env_with_deployment(&store);
+        let staged = stage(&store, &OpFlags::default(), Some(stage_payload(&did))).unwrap();
+        let rid = staged
+            .result
+            .get("revision_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        // Walk Staged → Warming → Ready so the drain matrix has a valid `from`.
+        warm(
+            &store,
+            &OpFlags::default(),
+            Some(RevisionTransitionPayload {
+                environment_id: "local".to_string(),
+                revision_id: rid.clone(),
+            }),
+        )
+        .unwrap();
+
+        let (result, cap) = run_with_capture(|| {
+            drain(
+                &store,
+                &OpFlags::default(),
+                Some(RevisionTransitionPayload {
+                    environment_id: "local".to_string(),
+                    revision_id: rid,
+                }),
+            )
+        });
+        result.unwrap();
+        let observed = cap.observed();
+        assert!(
+            observed.contains("rollout.revision.draining"),
+            "observed events: {observed:?}"
+        );
+    }
+
+    /// Live `archive` taking the Draining → Inactive chain must emit
+    /// `rollout.revision.evicted`. Other archive chains (e.g. Ready →
+    /// Archived) must NOT emit `evicted` — that's lifecycle retirement,
+    /// not a rollout eviction.
+    #[test]
+    fn archive_emits_revision_evicted_on_draining_to_inactive() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let did = seed_env_with_deployment(&store);
+        let staged = stage(&store, &OpFlags::default(), Some(stage_payload(&did))).unwrap();
+        let rid = staged
+            .result
+            .get("revision_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        // Walk Staged → Warming → Ready → Draining so archive lands on the
+        // Draining → Inactive chain (the post-drain eviction hop).
+        warm(
+            &store,
+            &OpFlags::default(),
+            Some(RevisionTransitionPayload {
+                environment_id: "local".to_string(),
+                revision_id: rid.clone(),
+            }),
+        )
+        .unwrap();
+        drain(
+            &store,
+            &OpFlags::default(),
+            Some(RevisionTransitionPayload {
+                environment_id: "local".to_string(),
+                revision_id: rid.clone(),
+            }),
+        )
+        .unwrap();
+
+        let (result, cap) = run_with_capture(|| {
+            archive(
+                &store,
+                &OpFlags::default(),
+                Some(RevisionTransitionPayload {
+                    environment_id: "local".to_string(),
+                    revision_id: rid,
+                }),
+            )
+        });
+        result.unwrap();
+        let observed = cap.observed();
+        assert!(
+            observed.contains("rollout.revision.evicted"),
+            "observed events: {observed:?}"
+        );
     }
 }

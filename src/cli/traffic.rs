@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
+use crate::rollout_telemetry::emit_traffic_split_applied;
 
 use super::dispatch::{TrafficSetArgs, TrafficTargetArgs};
 use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
@@ -224,6 +225,23 @@ pub fn set(
             };
             Ok::<_, OpError>((split, gens))
         })?;
+        // C5.3: emit `TrafficSplitApplied` ONLY on a genuine mutation —
+        // `gens.new.is_some()` distinguishes a real split from the idempotent
+        // no-op replay (line above returns `super::AuditGens::NONE` for the
+        // same-key-same-entries retry). Telemetry is best-effort and panic-
+        // safe with no subscriber; a fresh `store.load` is a cheap on-disk
+        // read after a successful split write.
+        if gens.new.is_some()
+            && let Ok(env_for_emit) = store.load(&env_id)
+        {
+            emit_traffic_split_applied(
+                &env_for_emit,
+                split.deployment_id,
+                &split.bundle_id,
+                split.generation,
+            );
+        }
+
         let outcome = OpOutcome::new(
             NOUN,
             "set",
