@@ -1811,7 +1811,7 @@ dependencies = [
  "greentic-deploy-spec",
  "greentic-distributor-client",
  "greentic-secrets-lib",
- "greentic-telemetry 1.1.0-dev.26387597611",
+ "greentic-telemetry 1.1.0-dev.26432434860",
  "greentic-types 1.1.0-dev.26386264344",
  "hex",
  "indexmap 2.14.0",
@@ -1987,9 +1987,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-telemetry"
-version = "0.5.2"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d48786a2dd1d8a6c7169b2ca83cbc528c78aaaf67bff7fa6e53caad46f12ba8"
+checksum = "6afcdc8584859dce6e44eb89914bc779936406bf30a89a0f6740dd353a9fe24d"
 dependencies = [
  "anyhow",
  "once_cell",
@@ -2008,9 +2008,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-telemetry"
-version = "1.1.0-dev.26387597611"
+version = "1.1.0-dev.26432434860"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "247bc40087a5d22c7e16e7772496f8363ab5f0ff58c1bd9349177d6f19c708bc"
+checksum = "801a6ba9e123c750e3b4eb0859765979ad1315fc9c448b72b273845d4f4ec48c"
 dependencies = [
  "anyhow",
  "once_cell",
@@ -2039,7 +2039,7 @@ dependencies = [
  "ciborium",
  "constant_time_eq",
  "fnv",
- "greentic-telemetry 0.5.2",
+ "greentic-telemetry 0.5.4",
  "greentic-types-macros",
  "indexmap 2.14.0",
  "opentelemetry-otlp",
