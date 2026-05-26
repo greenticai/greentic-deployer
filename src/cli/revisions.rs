@@ -1193,62 +1193,24 @@ mod tests {
     // Codex's review found that emitting in scaffolded greentic-start paths
     // produced silent live operator flows. These tests drive the LIVE CLI
     // verbs (`warm`, `drain`, `archive`) and capture the resulting
-    // `rollout.*` events through a `tracing_subscriber` layer, so the
-    // verb→event mapping is regression-tested through the same code path
-    // operator HTTP routes use today.
+    // `rollout.*` events through a global `tracing_subscriber` layer
+    // (`crate::rollout_telemetry::test_capture`), so the verb→event mapping
+    // is regression-tested through the same code path operator HTTP routes
+    // use today.
+    //
+    // The shared capture infra uses one process-global subscriber + a
+    // per-thread `Vec` because `tracing::subscriber::with_default` has
+    // callsite-interest-cache races under parallel test execution — see
+    // the module doc on `test_capture` for the full rationale.
     // -------------------------------------------------------------------
 
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::{Arc, Mutex};
-    use tracing::Subscriber;
-    use tracing::field::{Field, Visit};
-    use tracing::span::{Attributes, Id};
-    use tracing_subscriber::layer::{Context, Layer};
-    use tracing_subscriber::prelude::*;
-    use tracing_subscriber::registry::LookupSpan;
+    use crate::rollout_telemetry::test_capture::capture_events;
+    use std::collections::BTreeSet;
 
-    /// `tracing` layer that records every `rollout.event` discriminant seen
-    /// on a span or event. Used to assert which rollout events fired while
-    /// the captured subscriber was the per-thread default.
-    #[derive(Default, Clone)]
-    struct RolloutCapture {
-        events: Arc<Mutex<Vec<String>>>,
-    }
-
-    #[derive(Default)]
-    struct GrabEvent(BTreeMap<String, String>);
-    impl Visit for GrabEvent {
-        fn record_str(&mut self, field: &Field, value: &str) {
-            self.0.insert(field.name().to_string(), value.to_string());
-        }
-        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            self.0
-                .entry(field.name().to_string())
-                .or_insert_with(|| format!("{value:?}"));
-        }
-    }
-
-    impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for RolloutCapture {
-        fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
-            let mut g = GrabEvent::default();
-            attrs.record(&mut g);
-            if let Some(ev) = g.0.remove("rollout.event") {
-                self.events.lock().unwrap().push(ev);
-            }
-        }
-    }
-
-    impl RolloutCapture {
-        fn observed(&self) -> BTreeSet<String> {
-            self.events.lock().unwrap().iter().cloned().collect()
-        }
-    }
-
-    fn run_with_capture<R>(f: impl FnOnce() -> R) -> (R, RolloutCapture) {
-        let cap = RolloutCapture::default();
-        let subscriber = tracing_subscriber::registry().with(cap.clone());
-        let r = tracing::subscriber::with_default(subscriber, f);
-        (r, cap)
+    /// Convert a flat captured event list into a `BTreeSet` for assert-by-
+    /// membership, matching the prior `RolloutCapture::observed()` shape.
+    fn observed(events: &[String]) -> BTreeSet<String> {
+        events.iter().cloned().collect()
     }
 
     /// Live `warm` CLI invocation must emit `rollout.health_gate.passed`
@@ -1267,7 +1229,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let (result, cap) = run_with_capture(|| {
+        let (result, events) = capture_events(|| {
             warm(
                 &store,
                 &OpFlags::default(),
@@ -1278,7 +1240,7 @@ mod tests {
             )
         });
         result.unwrap();
-        let observed = cap.observed();
+        let observed = observed(&events);
         assert!(
             observed.contains("rollout.health_gate.passed"),
             "observed events: {observed:?}"
@@ -1307,7 +1269,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let (result, cap) = run_with_capture(|| {
+        let (result, events) = capture_events(|| {
             warm_with_health_gate(
                 &store,
                 &OpFlags::default(),
@@ -1324,7 +1286,7 @@ mod tests {
             )
         });
         result.unwrap_err();
-        let observed = cap.observed();
+        let observed = observed(&events);
         assert!(
             observed.contains("rollout.health_gate.failed"),
             "observed events: {observed:?}"
@@ -1360,7 +1322,7 @@ mod tests {
         )
         .unwrap();
 
-        let (result, cap) = run_with_capture(|| {
+        let (result, events) = capture_events(|| {
             drain(
                 &store,
                 &OpFlags::default(),
@@ -1371,7 +1333,7 @@ mod tests {
             )
         });
         result.unwrap();
-        let observed = cap.observed();
+        let observed = observed(&events);
         assert!(
             observed.contains("rollout.revision.draining"),
             "observed events: {observed:?}"
@@ -1415,7 +1377,7 @@ mod tests {
         )
         .unwrap();
 
-        let (result, cap) = run_with_capture(|| {
+        let (result, events) = capture_events(|| {
             archive(
                 &store,
                 &OpFlags::default(),
@@ -1426,7 +1388,7 @@ mod tests {
             )
         });
         result.unwrap();
-        let observed = cap.observed();
+        let observed = observed(&events);
         assert!(
             observed.contains("rollout.revision.evicted"),
             "observed events: {observed:?}"

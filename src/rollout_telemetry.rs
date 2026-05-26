@@ -85,6 +85,104 @@ pub(crate) fn emit_traffic_split_applied(
     emit_rollout_event(RolloutEvent::TrafficSplitApplied, &ctx);
 }
 
+/// Test-only helpers for capturing emitted [`RolloutEvent`] discriminants
+/// during integration tests. Lives in this module (rather than each test's
+/// `mod tests`) so the global capture subscriber is installed exactly once
+/// per test binary — necessary because `tracing`'s callsite interest cache
+/// is global per-callsite and gets stuck on `Interest::never` /
+/// `Interest::sometimes` from the first invocation. `with_default` doesn't
+/// rebuild the cache, so per-test `with_default` calls race with each
+/// other under parallel execution — multiple tests hitting the same
+/// `info_span!("greentic.rollout", ...)` callsite would see the cached
+/// interest from whichever ran first.
+///
+/// The fix is to install one global subscriber up-front (so all callsites
+/// register with it) and route events to a per-thread `Vec`. Each test
+/// clears its thread-local at the start of its capture window and reads
+/// after. Parallel tests stay isolated because cargo test runs each test
+/// on its own thread.
+#[cfg(test)]
+pub(crate) mod test_capture {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::Once;
+    use tracing::Subscriber;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id};
+    use tracing_subscriber::layer::{Context, Layer};
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::registry::LookupSpan;
+
+    thread_local! {
+        /// Per-thread capture of `rollout.event` span discriminants. Cleared
+        /// at the start of each [`capture_events`] call and drained at the
+        /// end.
+        static EVENTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    #[derive(Default)]
+    struct GrabEvent(HashMap<String, String>);
+    impl Visit for GrabEvent {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .entry(field.name().to_string())
+                .or_insert_with(|| format!("{value:?}"));
+        }
+    }
+
+    struct GlobalRolloutCapture;
+
+    impl<S> Layer<S> for GlobalRolloutCapture
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+            let mut g = GrabEvent::default();
+            attrs.record(&mut g);
+            if let Some(ev) = g.0.remove("rollout.event") {
+                EVENTS.with(|e| e.borrow_mut().push(ev));
+            }
+        }
+    }
+
+    static INSTALL: Once = Once::new();
+
+    fn install_once() {
+        INSTALL.call_once(|| {
+            // `try_init` returns Err if another subscriber is already set
+            // (e.g. by a production code path); that's fine — silently skip
+            // and let the existing subscriber handle dispatch. In test
+            // binaries this never happens because no test calls
+            // `init_telemetry`.
+            let _ = tracing_subscriber::registry()
+                .with(GlobalRolloutCapture)
+                .try_init();
+        });
+    }
+
+    /// Run `f`, capturing any `rollout.event`-bearing spans emitted on the
+    /// current thread during the call. Returns `(f's result, captured
+    /// events)`.
+    pub(crate) fn capture_events<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+        install_once();
+        // Reset the per-thread buffer so events from prior setup (e.g.
+        // `warm`/`drain` calls outside the capture window) don't leak in.
+        EVENTS.with(|e| e.borrow_mut().clear());
+        let r = f();
+        let events = EVENTS.with(|e| std::mem::take(&mut *e.borrow_mut()));
+        (r, events)
+    }
+
+    /// Count occurrences of a specific `rollout.event` discriminant in the
+    /// captured set.
+    pub(crate) fn count(events: &[String], discriminant: &str) -> usize {
+        events.iter().filter(|e| e.as_str() == discriminant).count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

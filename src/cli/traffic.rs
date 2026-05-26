@@ -1637,7 +1637,11 @@ mod tests {
     // -------------------------------------------------------------------
     // C5.3 — end-to-end rollout-event capture for traffic verbs
     //
-    // Mirrors the capture pattern from `cli::revisions::tests`. Asserts:
+    // Uses the shared global capture from
+    // `crate::rollout_telemetry::test_capture` (see that module's doc for
+    // why a global subscriber is required instead of per-test
+    // `with_default` — `tracing`'s callsite interest cache races under
+    // parallel test execution). Asserts:
     // - `set` on a genuine mutation emits `rollout.traffic_split.applied`.
     // - `set` on an idempotent same-key-same-entries replay does NOT
     //   double-emit (regression guard for the early-return guard).
@@ -1645,62 +1649,11 @@ mod tests {
     //   forward `set` (parity with the runtime mutation profile).
     // -------------------------------------------------------------------
 
-    use std::collections::{BTreeSet, HashMap};
-    use std::sync::{Arc, Mutex};
-    use tracing::Subscriber;
-    use tracing::field::{Field, Visit};
-    use tracing::span::{Attributes, Id};
-    use tracing_subscriber::layer::{Context, Layer};
-    use tracing_subscriber::prelude::*;
-    use tracing_subscriber::registry::LookupSpan;
+    use crate::rollout_telemetry::test_capture::{capture_events, count};
+    use std::collections::BTreeSet;
 
-    #[derive(Default, Clone)]
-    struct RolloutCapture {
-        events: Arc<Mutex<Vec<String>>>,
-    }
-
-    #[derive(Default)]
-    struct GrabEvent(HashMap<String, String>);
-    impl Visit for GrabEvent {
-        fn record_str(&mut self, field: &Field, value: &str) {
-            self.0.insert(field.name().to_string(), value.to_string());
-        }
-        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            self.0
-                .entry(field.name().to_string())
-                .or_insert_with(|| format!("{value:?}"));
-        }
-    }
-
-    impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for RolloutCapture {
-        fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
-            let mut g = GrabEvent::default();
-            attrs.record(&mut g);
-            if let Some(ev) = g.0.remove("rollout.event") {
-                self.events.lock().unwrap().push(ev);
-            }
-        }
-    }
-
-    impl RolloutCapture {
-        fn observed(&self) -> BTreeSet<String> {
-            self.events.lock().unwrap().iter().cloned().collect()
-        }
-        fn count(&self, discriminant: &str) -> usize {
-            self.events
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|e| e.as_str() == discriminant)
-                .count()
-        }
-    }
-
-    fn run_with_capture<R>(f: impl FnOnce() -> R) -> (R, RolloutCapture) {
-        let cap = RolloutCapture::default();
-        let subscriber = tracing_subscriber::registry().with(cap.clone());
-        let r = tracing::subscriber::with_default(subscriber, f);
-        (r, cap)
+    fn observed(events: &[String]) -> BTreeSet<String> {
+        events.iter().cloned().collect()
     }
 
     fn set_payload(did: &DeploymentId, rid: &RevisionId, key: &str) -> TrafficSetPayload {
@@ -1723,7 +1676,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let (did, rid1, _) = seed_env(&store);
-        let (res, cap) = run_with_capture(|| {
+        let (res, events) = capture_events(|| {
             set(
                 &store,
                 &OpFlags::default(),
@@ -1731,7 +1684,7 @@ mod tests {
             )
         });
         res.unwrap();
-        let observed = cap.observed();
+        let observed = observed(&events);
         assert!(
             observed.contains("rollout.traffic_split.applied"),
             "observed events: {observed:?}"
@@ -1747,7 +1700,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let (did, rid1, _) = seed_env(&store);
-        let (res, cap) = run_with_capture(|| {
+        let (res, events) = capture_events(|| {
             set(
                 &store,
                 &OpFlags::default(),
@@ -1764,11 +1717,11 @@ mod tests {
         });
         res.unwrap();
         assert_eq!(
-            cap.count("rollout.traffic_split.applied"),
+            count(&events, "rollout.traffic_split.applied"),
             1,
             "expected exactly one TrafficSplitApplied event across set + replay; \
              captured: {:?}",
-            cap.observed()
+            observed(&events)
         );
     }
 
@@ -1814,7 +1767,7 @@ mod tests {
         )
         .unwrap();
 
-        let (res, cap) = run_with_capture(|| {
+        let (res, events) = capture_events(|| {
             rollback(
                 &store,
                 &OpFlags::default(),
@@ -1826,11 +1779,11 @@ mod tests {
         });
         res.unwrap();
         assert_eq!(
-            cap.count("rollout.traffic_split.applied"),
+            count(&events, "rollout.traffic_split.applied"),
             1,
             "rollback must emit exactly one TrafficSplitApplied; \
              captured: {:?}",
-            cap.observed()
+            observed(&events)
         );
     }
 }
