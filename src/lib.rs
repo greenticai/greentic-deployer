@@ -31,7 +31,7 @@ pub mod operator_key;
 pub mod pack_introspect;
 pub mod path_safety;
 pub mod plan;
-pub mod rollout_telemetry;
+pub(crate) mod rollout_telemetry;
 pub mod runtime_secrets;
 pub mod serverless;
 pub mod single_vm;

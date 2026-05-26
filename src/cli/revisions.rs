@@ -438,12 +438,31 @@ where
                 // crossed the `Draining → Inactive` eviction hop. Reading
                 // the env here is the same disk read the helper does
                 // internally, so the extra cost is one in-memory lookup.
-                let starting_lifecycle = locked.load().ok().and_then(|e| {
-                    e.revisions
+                //
+                // A load failure leaves `starting_lifecycle = None`, which
+                // makes the eviction emit skip silently — emit a
+                // `tracing::warn!` so the gap is observable rather than
+                // invisible. The lifecycle helper below will likely fail
+                // too, but if it transiently recovers (rare), at least the
+                // missing telemetry has a breadcrumb.
+                let starting_lifecycle = match locked.load() {
+                    Ok(e) => e
+                        .revisions
                         .iter()
                         .find(|r| r.revision_id == revision_id)
-                        .map(|r| r.lifecycle)
-                });
+                        .map(|r| r.lifecycle),
+                    Err(err) => {
+                        tracing::warn!(
+                            op = op,
+                            env_id = %env_id,
+                            revision_id = %revision_id,
+                            error = %err,
+                            "C5.3: failed to capture starting lifecycle; an `archive` \
+                             eviction emit may be skipped"
+                        );
+                        None
+                    }
+                };
                 let revision = match crate::environment::apply_revision_transition_with_health_gate(
                     locked,
                     revision_id,
@@ -466,11 +485,15 @@ where
                     Err(e @ crate::environment::LifecycleError::HealthGateFailed { .. }) => {
                         // Gate-fail path: the lifecycle helper flipped the
                         // revision to `Failed` and saved before returning this
-                        // error. Emit `HealthGateFailed` here — the env is on
-                        // disk via the helper's save, so a fresh load resolves
-                        // the Failed revision for attribution. Telemetry is
-                        // best-effort: a load failure here must NOT mask the
-                        // original `HealthGateFailed` error, hence `.ok()`.
+                        // error. The Failed state is durable, so mark the
+                        // audit boundary BEFORE the best-effort telemetry
+                        // emit — matches the Ok-arm convention
+                        // (commit-then-emit) and keeps the audit failure
+                        // path robust to any unwind from the emit. Telemetry
+                        // is best-effort: a load failure here must NOT mask
+                        // the original `HealthGateFailed` error, hence
+                        // `.ok()`.
+                        committed.mark_committed();
                         if let Ok(env_for_emit) = locked.load()
                             && let Some(rev_for_emit) = env_for_emit
                                 .revisions
@@ -482,7 +505,6 @@ where
                             // passing `None` is fine here.
                             emit_for_op(op, true, None, &env_for_emit, rev_for_emit);
                         }
-                        committed.mark_committed();
                         return Err(OpError::from(e));
                     }
                     Err(other) => return Err(OpError::from(other)),

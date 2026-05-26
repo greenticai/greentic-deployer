@@ -219,28 +219,23 @@ pub fn set(
             }
             locked.save(&env)?;
             locked.refresh_runtime_config(&env)?;
+            // C5.3: emit `TrafficSplitApplied` from INSIDE the transact so the
+            // tenant attribution reads the same env snapshot that was just
+            // saved (no TOCTOU window with a concurrent writer). The idempotent
+            // no-op replay returns earlier with `AuditGens::NONE`, so reaching
+            // this point implies a genuine mutation.
+            emit_traffic_split_applied(
+                &env,
+                split.deployment_id,
+                &split.bundle_id,
+                split.generation,
+            );
             let gens = super::AuditGens {
                 previous: prev_gen,
                 new: Some(generation),
             };
             Ok::<_, OpError>((split, gens))
         })?;
-        // C5.3: emit `TrafficSplitApplied` ONLY on a genuine mutation —
-        // `gens.new.is_some()` distinguishes a real split from the idempotent
-        // no-op replay (line above returns `super::AuditGens::NONE` for the
-        // same-key-same-entries retry). Telemetry is best-effort and panic-
-        // safe with no subscriber; a fresh `store.load` is a cheap on-disk
-        // read after a successful split write.
-        if gens.new.is_some()
-            && let Ok(env_for_emit) = store.load(&env_id)
-        {
-            emit_traffic_split_applied(
-                &env_for_emit,
-                split.deployment_id,
-                &split.bundle_id,
-                split.generation,
-            );
-        }
 
         let outcome = OpOutcome::new(
             NOUN,
@@ -544,6 +539,17 @@ pub fn rollback(
             env.traffic_splits[idx] = restored.clone();
             locked.save(&env)?;
             locked.refresh_runtime_config(&env)?;
+            // C5.3: emit `TrafficSplitApplied` for the rollback path too —
+            // a rollback advances generation and materializes into runtime-
+            // config exactly like a forward `set`, so monitoring pipelines
+            // need the same lifecycle event. Emit from inside the lock so
+            // tenant attribution rides the saved env snapshot.
+            emit_traffic_split_applied(
+                &env,
+                restored.deployment_id,
+                &restored.bundle_id,
+                restored.generation,
+            );
             let gens = super::AuditGens {
                 previous: Some(prev_split_generation),
                 new: Some(prev_split_generation + 1),
@@ -1625,6 +1631,206 @@ mod tests {
             entries[0].get("weight_bps").and_then(|v| v.as_u64()),
             Some(10_000),
             "rollback must restore 100% rev1"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // C5.3 — end-to-end rollout-event capture for traffic verbs
+    //
+    // Mirrors the capture pattern from `cli::revisions::tests`. Asserts:
+    // - `set` on a genuine mutation emits `rollout.traffic_split.applied`.
+    // - `set` on an idempotent same-key-same-entries replay does NOT
+    //   double-emit (regression guard for the early-return guard).
+    // - `rollback` emits `rollout.traffic_split.applied` exactly like a
+    //   forward `set` (parity with the runtime mutation profile).
+    // -------------------------------------------------------------------
+
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::{Arc, Mutex};
+    use tracing::Subscriber;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id};
+    use tracing_subscriber::layer::{Context, Layer};
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::registry::LookupSpan;
+
+    #[derive(Default, Clone)]
+    struct RolloutCapture {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Default)]
+    struct GrabEvent(HashMap<String, String>);
+    impl Visit for GrabEvent {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .entry(field.name().to_string())
+                .or_insert_with(|| format!("{value:?}"));
+        }
+    }
+
+    impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for RolloutCapture {
+        fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+            let mut g = GrabEvent::default();
+            attrs.record(&mut g);
+            if let Some(ev) = g.0.remove("rollout.event") {
+                self.events.lock().unwrap().push(ev);
+            }
+        }
+    }
+
+    impl RolloutCapture {
+        fn observed(&self) -> BTreeSet<String> {
+            self.events.lock().unwrap().iter().cloned().collect()
+        }
+        fn count(&self, discriminant: &str) -> usize {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.as_str() == discriminant)
+                .count()
+        }
+    }
+
+    fn run_with_capture<R>(f: impl FnOnce() -> R) -> (R, RolloutCapture) {
+        let cap = RolloutCapture::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+        let r = tracing::subscriber::with_default(subscriber, f);
+        (r, cap)
+    }
+
+    fn set_payload(did: &DeploymentId, rid: &RevisionId, key: &str) -> TrafficSetPayload {
+        TrafficSetPayload {
+            environment_id: "local".to_string(),
+            deployment_id: did.to_string(),
+            entries: vec![TrafficSetEntryPayload {
+                revision_id: rid.to_string(),
+                weight_bps: Some(10_000),
+                weight_percent: None,
+            }],
+            updated_by: "test".to_string(),
+            idempotency_key: key.to_string(),
+            authorization_ref: default_authorization_ref(),
+        }
+    }
+
+    #[test]
+    fn set_emits_traffic_split_applied() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, _) = seed_env(&store);
+        let (res, cap) = run_with_capture(|| {
+            set(
+                &store,
+                &OpFlags::default(),
+                Some(set_payload(&did, &rid1, "k1")),
+            )
+        });
+        res.unwrap();
+        let observed = cap.observed();
+        assert!(
+            observed.contains("rollout.traffic_split.applied"),
+            "observed events: {observed:?}"
+        );
+    }
+
+    /// Regression guard: a same-key-same-entries replay returns the early
+    /// `AuditGens::NONE` from inside the transact, BEFORE reaching the
+    /// `emit_traffic_split_applied` call. The replay must NOT double-count
+    /// the transition — exactly one event should appear across both calls.
+    #[test]
+    fn set_idempotent_replay_does_not_double_emit() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, _) = seed_env(&store);
+        let (res, cap) = run_with_capture(|| {
+            set(
+                &store,
+                &OpFlags::default(),
+                Some(set_payload(&did, &rid1, "k1")),
+            )
+            .unwrap();
+            // Replay: same key, same entries → no-op success per the
+            // idempotency contract; must NOT emit a second event.
+            set(
+                &store,
+                &OpFlags::default(),
+                Some(set_payload(&did, &rid1, "k1")),
+            )
+        });
+        res.unwrap();
+        assert_eq!(
+            cap.count("rollout.traffic_split.applied"),
+            1,
+            "expected exactly one TrafficSplitApplied event across set + replay; \
+             captured: {:?}",
+            cap.observed()
+        );
+    }
+
+    /// `rollback` advances generation and materializes into runtime-config
+    /// exactly like a forward `set`, so it must emit the same lifecycle
+    /// event. Without this an emergency rollback would produce zero
+    /// telemetry confirmation.
+    #[test]
+    fn rollback_emits_traffic_split_applied() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, rid2) = seed_env(&store);
+        // Establish a prior split (k1, 100% rev1), then overwrite (k2,
+        // 50/50). Now there's a previous_split_ref for rollback to consume.
+        set(
+            &store,
+            &OpFlags::default(),
+            Some(set_payload(&did, &rid1, "k1")),
+        )
+        .unwrap();
+        set(
+            &store,
+            &OpFlags::default(),
+            Some(TrafficSetPayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+                entries: vec![
+                    TrafficSetEntryPayload {
+                        revision_id: rid1.to_string(),
+                        weight_bps: Some(5_000),
+                        weight_percent: None,
+                    },
+                    TrafficSetEntryPayload {
+                        revision_id: rid2.to_string(),
+                        weight_bps: Some(5_000),
+                        weight_percent: None,
+                    },
+                ],
+                updated_by: "test".to_string(),
+                idempotency_key: "k2".to_string(),
+                authorization_ref: default_authorization_ref(),
+            }),
+        )
+        .unwrap();
+
+        let (res, cap) = run_with_capture(|| {
+            rollback(
+                &store,
+                &OpFlags::default(),
+                Some(TrafficShowPayload {
+                    environment_id: "local".to_string(),
+                    deployment_id: did.to_string(),
+                }),
+            )
+        });
+        res.unwrap();
+        assert_eq!(
+            cap.count("rollout.traffic_split.applied"),
+            1,
+            "rollback must emit exactly one TrafficSplitApplied; \
+             captured: {:?}",
+            cap.observed()
         );
     }
 }
