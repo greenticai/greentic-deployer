@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
+use crate::rollout_telemetry::emit_traffic_split_applied;
 
 use super::dispatch::{TrafficSetArgs, TrafficTargetArgs};
 use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
@@ -218,12 +219,24 @@ pub fn set(
             }
             locked.save(&env)?;
             locked.refresh_runtime_config(&env)?;
+            // C5.3: emit `TrafficSplitApplied` from INSIDE the transact so the
+            // tenant attribution reads the same env snapshot that was just
+            // saved (no TOCTOU window with a concurrent writer). The idempotent
+            // no-op replay returns earlier with `AuditGens::NONE`, so reaching
+            // this point implies a genuine mutation.
+            emit_traffic_split_applied(
+                &env,
+                split.deployment_id,
+                &split.bundle_id,
+                split.generation,
+            );
             let gens = super::AuditGens {
                 previous: prev_gen,
                 new: Some(generation),
             };
             Ok::<_, OpError>((split, gens))
         })?;
+
         let outcome = OpOutcome::new(
             NOUN,
             "set",
@@ -526,6 +539,17 @@ pub fn rollback(
             env.traffic_splits[idx] = restored.clone();
             locked.save(&env)?;
             locked.refresh_runtime_config(&env)?;
+            // C5.3: emit `TrafficSplitApplied` for the rollback path too —
+            // a rollback advances generation and materializes into runtime-
+            // config exactly like a forward `set`, so monitoring pipelines
+            // need the same lifecycle event. Emit from inside the lock so
+            // tenant attribution rides the saved env snapshot.
+            emit_traffic_split_applied(
+                &env,
+                restored.deployment_id,
+                &restored.bundle_id,
+                restored.generation,
+            );
             let gens = super::AuditGens {
                 previous: Some(prev_split_generation),
                 new: Some(prev_split_generation + 1),
@@ -1607,6 +1631,159 @@ mod tests {
             entries[0].get("weight_bps").and_then(|v| v.as_u64()),
             Some(10_000),
             "rollback must restore 100% rev1"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // C5.3 — end-to-end rollout-event capture for traffic verbs
+    //
+    // Uses the shared global capture from
+    // `crate::rollout_telemetry::test_capture` (see that module's doc for
+    // why a global subscriber is required instead of per-test
+    // `with_default` — `tracing`'s callsite interest cache races under
+    // parallel test execution). Asserts:
+    // - `set` on a genuine mutation emits `rollout.traffic_split.applied`.
+    // - `set` on an idempotent same-key-same-entries replay does NOT
+    //   double-emit (regression guard for the early-return guard).
+    // - `rollback` emits `rollout.traffic_split.applied` exactly like a
+    //   forward `set` (parity with the runtime mutation profile).
+    // -------------------------------------------------------------------
+
+    use crate::rollout_telemetry::test_capture::{capture_events, count};
+    use std::collections::BTreeSet;
+
+    fn observed(events: &[String]) -> BTreeSet<String> {
+        events.iter().cloned().collect()
+    }
+
+    fn set_payload(did: &DeploymentId, rid: &RevisionId, key: &str) -> TrafficSetPayload {
+        TrafficSetPayload {
+            environment_id: "local".to_string(),
+            deployment_id: did.to_string(),
+            entries: vec![TrafficSetEntryPayload {
+                revision_id: rid.to_string(),
+                weight_bps: Some(10_000),
+                weight_percent: None,
+            }],
+            updated_by: "test".to_string(),
+            idempotency_key: key.to_string(),
+            authorization_ref: default_authorization_ref(),
+        }
+    }
+
+    #[test]
+    fn set_emits_traffic_split_applied() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, _) = seed_env(&store);
+        let (res, events) = capture_events(|| {
+            set(
+                &store,
+                &OpFlags::default(),
+                Some(set_payload(&did, &rid1, "k1")),
+            )
+        });
+        res.unwrap();
+        let observed = observed(&events);
+        assert!(
+            observed.contains("rollout.traffic_split.applied"),
+            "observed events: {observed:?}"
+        );
+    }
+
+    /// Regression guard: a same-key-same-entries replay returns the early
+    /// `AuditGens::NONE` from inside the transact, BEFORE reaching the
+    /// `emit_traffic_split_applied` call. The replay must NOT double-count
+    /// the transition — exactly one event should appear across both calls.
+    #[test]
+    fn set_idempotent_replay_does_not_double_emit() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, _) = seed_env(&store);
+        let (res, events) = capture_events(|| {
+            set(
+                &store,
+                &OpFlags::default(),
+                Some(set_payload(&did, &rid1, "k1")),
+            )
+            .unwrap();
+            // Replay: same key, same entries → no-op success per the
+            // idempotency contract; must NOT emit a second event.
+            set(
+                &store,
+                &OpFlags::default(),
+                Some(set_payload(&did, &rid1, "k1")),
+            )
+        });
+        res.unwrap();
+        assert_eq!(
+            count(&events, "rollout.traffic_split.applied"),
+            1,
+            "expected exactly one TrafficSplitApplied event across set + replay; \
+             captured: {:?}",
+            observed(&events)
+        );
+    }
+
+    /// `rollback` advances generation and materializes into runtime-config
+    /// exactly like a forward `set`, so it must emit the same lifecycle
+    /// event. Without this an emergency rollback would produce zero
+    /// telemetry confirmation.
+    #[test]
+    fn rollback_emits_traffic_split_applied() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (did, rid1, rid2) = seed_env(&store);
+        // Establish a prior split (k1, 100% rev1), then overwrite (k2,
+        // 50/50). Now there's a previous_split_ref for rollback to consume.
+        set(
+            &store,
+            &OpFlags::default(),
+            Some(set_payload(&did, &rid1, "k1")),
+        )
+        .unwrap();
+        set(
+            &store,
+            &OpFlags::default(),
+            Some(TrafficSetPayload {
+                environment_id: "local".to_string(),
+                deployment_id: did.to_string(),
+                entries: vec![
+                    TrafficSetEntryPayload {
+                        revision_id: rid1.to_string(),
+                        weight_bps: Some(5_000),
+                        weight_percent: None,
+                    },
+                    TrafficSetEntryPayload {
+                        revision_id: rid2.to_string(),
+                        weight_bps: Some(5_000),
+                        weight_percent: None,
+                    },
+                ],
+                updated_by: "test".to_string(),
+                idempotency_key: "k2".to_string(),
+                authorization_ref: default_authorization_ref(),
+            }),
+        )
+        .unwrap();
+
+        let (res, events) = capture_events(|| {
+            rollback(
+                &store,
+                &OpFlags::default(),
+                Some(TrafficShowPayload {
+                    environment_id: "local".to_string(),
+                    deployment_id: did.to_string(),
+                }),
+            )
+        });
+        res.unwrap();
+        assert_eq!(
+            count(&events, "rollout.traffic_split.applied"),
+            1,
+            "rollback must emit exactly one TrafficSplitApplied; \
+             captured: {:?}",
+            observed(&events)
         );
     }
 }
