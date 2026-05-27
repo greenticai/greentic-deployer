@@ -58,7 +58,12 @@ pub struct RevisionStagePayload {
     pub bundle_digest: String,
     #[serde(default)]
     pub pack_list: Vec<PackListEntryPayload>,
-    #[serde(default = "default_pack_list_lock_ref")]
+    /// Env-relative pack-list lockfile. Empty (the default) means "no lock
+    /// written": the runtime-config materializer only surfaces a non-empty
+    /// ref, so an unstaged/legacy revision never points greentic-start at a
+    /// file that does not exist. The `--bundle` path overwrites this with the
+    /// real `revisions/<rev>/pack-list.lock` it writes.
+    #[serde(default)]
     pub pack_list_lock_ref: PathBuf,
     #[serde(default = "default_config_digest")]
     pub config_digest: String,
@@ -70,9 +75,6 @@ pub struct RevisionStagePayload {
 
 fn default_bundle_digest() -> String {
     "sha256:00".to_string()
-}
-fn default_pack_list_lock_ref() -> PathBuf {
-    PathBuf::from("pack-list.lock")
 }
 fn default_config_digest() -> String {
     "sha256:00".to_string()
@@ -134,22 +136,29 @@ pub fn stage(
     let env_id = parse_env_id(&payload.environment_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
     // Pre-parse the pack list outside the lock so a payload error doesn't
-    // hold the flock.
-    let pack_list = payload
-        .pack_list
-        .into_iter()
-        .map(|e| {
-            Ok::<_, OpError>(PackListEntry {
-                pack_id: PackId::new(e.pack_id),
-                version: e
-                    .version
-                    .parse::<SemVer>()
-                    .map_err(|err| OpError::InvalidArgument(format!("pack version: {err}")))?,
-                digest: e.digest,
-                source_uri: e.source_uri,
+    // hold the flock. Only the legacy (no-`bundle_path`) path consumes it; on
+    // the bundle path the lock is derived from the artifact, so skip parsing
+    // entirely — a stale/invalid `pack_list` in an answers payload must not
+    // spuriously fail a `--bundle` stage that ignores it.
+    let pack_list = if payload.bundle_path.is_some() {
+        Vec::new()
+    } else {
+        payload
+            .pack_list
+            .into_iter()
+            .map(|e| {
+                Ok::<_, OpError>(PackListEntry {
+                    pack_id: PackId::new(e.pack_id),
+                    version: e
+                        .version
+                        .parse::<SemVer>()
+                        .map_err(|err| OpError::InvalidArgument(format!("pack version: {err}")))?,
+                    digest: e.digest,
+                    source_uri: e.source_uri,
+                })
             })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+    };
     if !is_valid_transition(RevisionLifecycle::Inactive, RevisionLifecycle::Staged) {
         return Err(OpError::Conflict(
             "spec rejects inactive → staged".to_string(),
@@ -655,7 +664,7 @@ pub fn payload_from_stage_args(
         bundle_path: Some(bundle_path),
         bundle_digest: default_bundle_digest(),
         pack_list: Vec::new(),
-        pack_list_lock_ref: default_pack_list_lock_ref(),
+        pack_list_lock_ref: PathBuf::new(),
         config_digest: default_config_digest(),
         signature_sidecar_ref: default_signature_sidecar_ref(),
         drain_seconds: default_drain_seconds(),
@@ -764,7 +773,7 @@ mod tests {
                 digest: "sha256:00".to_string(),
                 source_uri: None,
             }],
-            pack_list_lock_ref: default_pack_list_lock_ref(),
+            pack_list_lock_ref: PathBuf::new(),
             config_digest: default_config_digest(),
             signature_sidecar_ref: default_signature_sidecar_ref(),
             drain_seconds: default_drain_seconds(),

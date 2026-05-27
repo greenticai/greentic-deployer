@@ -50,9 +50,21 @@ pub fn stage_local_bundle(
             bundle_path.display()
         )));
     }
+    let rev_dir = env_dir.join("revisions").join(revision_id.to_string());
+    // No Revision is recorded for a failed stage (the caller's transact rolls
+    // back env.json), so a partial copy/extraction under this freshly-minted
+    // rev dir would be an invisible orphan. Drop the whole rev dir on any error.
+    stage_into(env_dir, &rev_dir, revision_id, bundle_path).inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(&rev_dir);
+    })
+}
 
-    let rev_seg = revision_id.to_string();
-    let rev_dir = env_dir.join("revisions").join(&rev_seg);
+fn stage_into(
+    env_dir: &Path,
+    rev_dir: &Path,
+    revision_id: RevisionId,
+    bundle_path: &Path,
+) -> Result<StagedBundle, OpError> {
     let extract_dir = rev_dir.join("bundle");
 
     // Replace any partial/previous extraction so a re-stage is deterministic.
@@ -79,11 +91,10 @@ pub fn stage_local_bundle(
         path: staged_bundle.clone(),
         source,
     })?;
-    let bundle_bytes = std::fs::read(&staged_bundle).map_err(|source| OpError::Io {
+    let bundle_digest = sha256_file(&staged_bundle).map_err(|source| OpError::Io {
         path: staged_bundle.clone(),
         source,
     })?;
-    let bundle_digest = sha256_hex(&bundle_bytes);
 
     // Hardened SquashFS unpack of the staged copy (path-traversal +
     // symlink-escape guards live in greentic-bundle, not duplicated here).
@@ -131,11 +142,10 @@ pub fn stage_local_bundle(
 
     let mut packs = Vec::with_capacity(gtpacks.len());
     for path in gtpacks {
-        let bytes = std::fs::read(&path).map_err(|source| OpError::Io {
+        let digest = sha256_file(&path).map_err(|source| OpError::Io {
             path: path.clone(),
             source,
         })?;
-        let digest = sha256_hex(&bytes);
         let rel = path
             .strip_prefix(env_dir)
             .map_err(|_| {
@@ -186,8 +196,22 @@ pub fn stage_local_bundle(
     })
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+/// Streaming SHA-256 of a file, returned as `sha256:<lowercase-hex>`. Streams
+/// through a fixed buffer rather than loading the whole artifact into memory,
+/// so a large bundle or pack can't blow up peak RSS.
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 /// Recursively collect `*.gtpack` files under `dir`. Uses `file_type()` (which
