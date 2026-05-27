@@ -46,6 +46,15 @@ const NOUN: &str = "revisions";
 pub struct RevisionStagePayload {
     pub environment_id: String,
     pub deployment_id: String,
+    /// Local `.gtbundle` to resolve. When set, the bundle is extracted under
+    /// the revision dir and its embedded `.gtpack`s are pinned into
+    /// `pack-list.lock` — `bundle_digest` / `pack_list` / `pack_list_lock_ref`
+    /// are then derived from the artifact and any caller-supplied values for
+    /// those fields are ignored. When unset, the legacy path records the
+    /// caller-supplied pointers verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_path: Option<PathBuf>,
+    #[serde(default = "default_bundle_digest")]
     pub bundle_digest: String,
     #[serde(default)]
     pub pack_list: Vec<PackListEntryPayload>,
@@ -59,6 +68,9 @@ pub struct RevisionStagePayload {
     pub drain_seconds: u32,
 }
 
+fn default_bundle_digest() -> String {
+    "sha256:00".to_string()
+}
 fn default_pack_list_lock_ref() -> PathBuf {
     PathBuf::from("pack-list.lock")
 }
@@ -176,17 +188,44 @@ pub fn stage(
                 .unwrap_or(0)
                 + 1;
             let now = Utc::now();
+            // Mint the id first: when resolving a local bundle, it names the
+            // per-revision extract dir the pack-list lock is written under.
+            let revision_id = crate::environment::mint_revision_id();
+
+            // Resolve a local `.gtbundle` (extract + pin packs) when one was
+            // supplied, deriving the artifact pointers; otherwise record the
+            // caller-supplied pointers verbatim (legacy Phase-A behavior).
+            let (bundle_digest, revision_pack_list, pack_list_lock_ref) = match &payload.bundle_path
+            {
+                Some(bundle_path) => {
+                    let env_dir = store.env_dir(&env_id)?;
+                    let staged = super::bundle_stage::stage_local_bundle(
+                        &env_dir,
+                        revision_id,
+                        bundle_path,
+                    )?;
+                    // The lock file is the source of truth for the resolved
+                    // packs; the inline `pack_list` stays empty on this path.
+                    (staged.bundle_digest, Vec::new(), staged.pack_list_lock_ref)
+                }
+                None => (
+                    payload.bundle_digest.clone(),
+                    pack_list.clone(),
+                    payload.pack_list_lock_ref.clone(),
+                ),
+            };
+
             let staged = Revision {
                 schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
-                revision_id: crate::environment::mint_revision_id(),
+                revision_id,
                 env_id: env_id.clone(),
                 bundle_id,
                 deployment_id,
                 sequence: next_sequence,
                 created_at: now,
-                bundle_digest: payload.bundle_digest.clone(),
-                pack_list: pack_list.clone(),
-                pack_list_lock_ref: payload.pack_list_lock_ref.clone(),
+                bundle_digest,
+                pack_list: revision_pack_list,
+                pack_list_lock_ref,
                 config_digest: payload.config_digest.clone(),
                 signature_sidecar_ref: payload.signature_sidecar_ref.clone(),
                 lifecycle: RevisionLifecycle::Staged,
@@ -195,7 +234,6 @@ pub fn stage(
                 drain_seconds: payload.drain_seconds,
                 abort_metrics: Vec::new(),
             };
-            let revision_id = staged.revision_id;
             env.revisions.push(staged);
             locked.save(&env)?;
             Ok(RevisionSummary::from(
@@ -577,6 +615,41 @@ fn emit_for_op(
     }
 }
 
+/// Build a [`RevisionStagePayload`] from direct CLI args, or `None` when no
+/// positional args were supplied (deferring to `--answers` / `--schema`).
+/// Mirrors `traffic::payload_from_set_args`: all clap fields are optional so
+/// the answers/schema paths keep working unchanged.
+pub fn payload_from_stage_args(
+    args: super::dispatch::RevisionStageArgs,
+) -> Result<Option<RevisionStagePayload>, OpError> {
+    let super::dispatch::RevisionStageArgs {
+        env_id,
+        deployment,
+        bundle,
+    } = args;
+    // Nothing positional → answers/schema path.
+    if env_id.is_none() && deployment.is_none() && bundle.is_none() {
+        return Ok(None);
+    }
+    let environment_id = env_id.ok_or_else(|| {
+        OpError::InvalidArgument("revisions stage: missing positional `<env_id>`".to_string())
+    })?;
+    let deployment_id = deployment.ok_or_else(|| {
+        OpError::InvalidArgument("revisions stage: missing `--deployment <ULID>`".to_string())
+    })?;
+    Ok(Some(RevisionStagePayload {
+        environment_id,
+        deployment_id,
+        bundle_path: bundle,
+        bundle_digest: default_bundle_digest(),
+        pack_list: Vec::new(),
+        pack_list_lock_ref: default_pack_list_lock_ref(),
+        config_digest: default_config_digest(),
+        signature_sidecar_ref: default_signature_sidecar_ref(),
+        drain_seconds: default_drain_seconds(),
+    }))
+}
+
 fn resolve_payload<T: serde::de::DeserializeOwned>(
     flags: &OpFlags,
     payload: Option<T>,
@@ -622,11 +695,12 @@ fn stage_schema() -> Value {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "RevisionStagePayload",
         "type": "object",
-        "required": ["environment_id", "deployment_id", "bundle_digest"],
+        "required": ["environment_id", "deployment_id"],
         "additionalProperties": false,
         "properties": {
             "environment_id": {"type": "string"},
             "deployment_id": {"type": "string", "description": "ULID"},
+            "bundle_path": {"type": "string", "description": "Local .gtbundle to extract + pin; derives bundle_digest/pack_list/pack_list_lock_ref"},
             "bundle_digest": {"type": "string"},
             "pack_list": {"type": "array"},
             "pack_list_lock_ref": {"type": "string"},
@@ -670,6 +744,7 @@ mod tests {
         RevisionStagePayload {
             environment_id: "local".to_string(),
             deployment_id: deployment_id.to_string(),
+            bundle_path: None,
             bundle_digest: "sha256:00".to_string(),
             pack_list: vec![PackListEntryPayload {
                 pack_id: "greentic.test.pack".to_string(),
@@ -698,6 +773,86 @@ mod tests {
             outcome.result.get("sequence").and_then(|v| v.as_u64()),
             Some(1)
         );
+    }
+
+    /// `stage --bundle <local .gtbundle>` extracts the bundle, pins every
+    /// embedded `.gtpack` into a `pack-list.lock` under the revision dir, and
+    /// records the env-relative lock ref + a real bundle digest on the
+    /// revision. The lock's per-pack digest must equal the sha256 of the
+    /// extracted `.gtpack` on disk — the exact invariant greentic-start's
+    /// `load_revision` re-checks at boot.
+    #[test]
+    fn stage_with_local_bundle_pins_packs_into_lockfile() {
+        use greentic_deploy_spec::PackListLock;
+        use sha2::{Digest, Sha256};
+
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let did = seed_env_with_deployment(&store);
+
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/bundles/perf-smoke-bundle.gtbundle");
+        let mut payload = stage_payload(&did);
+        payload.bundle_path = Some(fixture);
+        // Caller-supplied pack pointers must be ignored on the bundle path.
+        payload.pack_list = vec![PackListEntryPayload {
+            pack_id: "should.be.ignored".to_string(),
+            version: "9.9.9".to_string(),
+            digest: "sha256:ff".to_string(),
+            source_uri: None,
+        }];
+
+        let outcome = stage(&store, &OpFlags::default(), Some(payload)).unwrap();
+        assert_eq!(
+            outcome.result.get("lifecycle").and_then(|v| v.as_str()),
+            Some("staged")
+        );
+        let rid = outcome
+            .result
+            .get("revision_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        // The stored revision points at the derived lock + a real bundle digest.
+        let env_id = EnvId::try_from("local").unwrap();
+        let env = store.load(&env_id).unwrap();
+        let revision = env
+            .revisions
+            .iter()
+            .find(|r| r.revision_id.to_string() == rid)
+            .expect("revision persisted");
+        assert!(
+            revision.bundle_digest.starts_with("sha256:") && revision.bundle_digest != "sha256:00",
+            "bundle_digest should be the real archive hash, got {}",
+            revision.bundle_digest
+        );
+        // Inline pack_list is empty on the bundle path (lock is source of truth).
+        assert!(revision.pack_list.is_empty());
+
+        let env_dir = store.env_dir(&env_id).unwrap();
+        let lock_path = env_dir.join(&revision.pack_list_lock_ref);
+        assert!(lock_path.is_file(), "pack-list.lock must be a regular file");
+
+        let lock: PackListLock =
+            serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+        assert_eq!(lock.revision_id, revision.revision_id);
+        assert!(!lock.packs.is_empty(), "fixture bundle has a .gtpack");
+
+        for pack in &lock.packs {
+            // Ref is env-relative and resolves under the env dir to a real file.
+            assert!(pack.path.is_relative(), "lock path must be env-relative");
+            let pack_path = env_dir.join(&pack.path);
+            assert!(
+                pack_path.is_file(),
+                "extracted .gtpack must exist: {}",
+                pack_path.display()
+            );
+            // The pinned digest equals the on-disk file's sha256.
+            let bytes = std::fs::read(&pack_path).unwrap();
+            let expected = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
+            assert_eq!(pack.digest, expected, "lock digest must match the file");
+        }
     }
 
     #[test]

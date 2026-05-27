@@ -219,11 +219,27 @@ pub enum BundlesVerb {
 
 #[derive(Subcommand, Debug)]
 pub enum RevisionsVerb {
-    Stage,
+    Stage(RevisionStageArgs),
     Warm,
     Drain,
     Archive,
     List { env_id: String },
+}
+
+/// Args for `op revisions stage`. All fields are optional at the clap layer so
+/// `--answers` / `--payload-json` / `--schema` keep working unchanged; the
+/// dispatcher builds a `RevisionStagePayload` only when the positional args are
+/// supplied, otherwise hands `None` to the library function.
+#[derive(Args, Debug)]
+pub struct RevisionStageArgs {
+    /// Environment id, e.g. `local`.
+    pub env_id: Option<String>,
+    /// Deployment ULID the revision belongs to.
+    #[arg(long)]
+    pub deployment: Option<String>,
+    /// Local `.gtbundle` to extract and pin into the revision's pack-list.
+    #[arg(long)]
+    pub bundle: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -402,7 +418,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
         OpNoun::Revisions { verb } => (
             "revisions",
             match verb {
-                RevisionsVerb::Stage => "stage",
+                RevisionsVerb::Stage(_) => "stage",
                 RevisionsVerb::Warm => "warm",
                 RevisionsVerb::Drain => "drain",
                 RevisionsVerb::Archive => "archive",
@@ -537,7 +553,10 @@ fn dispatch_revisions(
     verb: RevisionsVerb,
 ) -> Result<(), OpError> {
     let outcome = match verb {
-        RevisionsVerb::Stage => super::revisions::stage(store, flags, None)?,
+        RevisionsVerb::Stage(args) => {
+            let payload = super::revisions::payload_from_stage_args(args)?;
+            super::revisions::stage(store, flags, payload)?
+        }
         RevisionsVerb::Warm => super::revisions::warm(store, flags, None)?,
         RevisionsVerb::Drain => super::revisions::drain(store, flags, None)?,
         RevisionsVerb::Archive => super::revisions::archive(store, flags, None)?,

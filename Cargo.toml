@@ -54,6 +54,7 @@ required-features = [
 anyhow = "1"
 async-trait = "0.1"
 fs4 = "0.13"
+greentic-bundle = ">=1.2.0-dev, <1.3.0-0"
 greentic-config = ">=1.1.0-dev, <1.2.0-0"
 greentic-config-types = ">=1.1.0-dev, <1.2.0-0"
 greentic-deploy-spec = { path = "crates/greentic-deploy-spec", version = "0.1" }

@@ -26,6 +26,7 @@ impl SchemaVersion {
     pub const CREDENTIALS_V1: &'static str = "greentic.credentials.v1";
     pub const PACK_CONFIG_V1: &'static str = "greentic.pack-config.v1";
     pub const RUNTIME_CONFIG_V1: &'static str = "greentic.runtime-config.v1";
+    pub const PACK_LIST_LOCK_V1: &'static str = "greentic.pack-list-lock.v1";
     pub const AUDIT_EVENT_V1: &'static str = "greentic.audit.event.v1";
     pub const BACKUP_MANIFEST_V1: &'static str = "greentic.backup-manifest.v1";
 
