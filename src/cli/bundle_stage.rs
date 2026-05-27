@@ -51,13 +51,6 @@ pub fn stage_local_bundle(
         )));
     }
 
-    // Digest the archive itself before unpacking it.
-    let bundle_bytes = std::fs::read(bundle_path).map_err(|source| OpError::Io {
-        path: bundle_path.to_path_buf(),
-        source,
-    })?;
-    let bundle_digest = sha256_hex(&bundle_bytes);
-
     let rev_seg = revision_id.to_string();
     let rev_dir = env_dir.join("revisions").join(&rev_seg);
     let extract_dir = rev_dir.join("bundle");
@@ -74,9 +67,27 @@ pub fn stage_local_bundle(
         source,
     })?;
 
-    // Hardened SquashFS unpack (path-traversal + symlink-escape guards live in
-    // greentic-bundle, not duplicated here).
-    greentic_bundle::build::unbundle_artifact(bundle_path, &extract_dir).map_err(|err| {
+    // Bind the digest to the exact bytes we extract: copy the input into the
+    // revision dir first, then hash AND unpack that immutable staged copy.
+    // Hashing the caller's path and separately re-opening it for extraction
+    // would let a swap between the two operations record one artifact's digest
+    // while pinning another's packs. The staged copy lives under the env flock
+    // (held by the caller) at a freshly-minted revision path, so nothing
+    // rewrites it out from under us.
+    let staged_bundle = rev_dir.join("bundle.gtbundle");
+    std::fs::copy(bundle_path, &staged_bundle).map_err(|source| OpError::Io {
+        path: staged_bundle.clone(),
+        source,
+    })?;
+    let bundle_bytes = std::fs::read(&staged_bundle).map_err(|source| OpError::Io {
+        path: staged_bundle.clone(),
+        source,
+    })?;
+    let bundle_digest = sha256_hex(&bundle_bytes);
+
+    // Hardened SquashFS unpack of the staged copy (path-traversal +
+    // symlink-escape guards live in greentic-bundle, not duplicated here).
+    greentic_bundle::build::unbundle_artifact(&staged_bundle, &extract_dir).map_err(|err| {
         OpError::InvalidArgument(format!(
             "extract bundle `{}`: {err:#}",
             bundle_path.display()
@@ -92,15 +103,28 @@ pub fn stage_local_bundle(
         )));
     }
 
-    // Pin every embedded `.gtpack` with its on-disk sha256.
+    // Pin the embedded `.gtpack`s. Scope the scan to the canonical `packs/`
+    // subtree so a stray `.gtpack` elsewhere in the bundle (e.g. under
+    // `resolved/`) can't silently join the runtime pack set. Each pack's
+    // load-time identity is its content digest + path, re-verified by the
+    // runner host; cross-checking the embedded pack manifest's id/version
+    // against the bundle lock is deferred (needs a `.gtpack` reader) and is
+    // belt-and-suspenders on top of the digest binding + bundle-level DSSE.
+    let packs_dir = extract_dir.join("packs");
+    if !packs_dir.is_dir() {
+        return Err(OpError::InvalidArgument(format!(
+            "bundle `{}` has no packs/ directory",
+            bundle_path.display()
+        )));
+    }
     let mut gtpacks = Vec::new();
-    collect_gtpacks(&extract_dir, &mut gtpacks).map_err(|source| OpError::Io {
-        path: extract_dir.clone(),
+    collect_gtpacks(&packs_dir, &mut gtpacks).map_err(|source| OpError::Io {
+        path: packs_dir.clone(),
         source,
     })?;
     if gtpacks.is_empty() {
         return Err(OpError::InvalidArgument(format!(
-            "bundle `{}` contains no .gtpack artifacts",
+            "bundle `{}` contains no .gtpack artifacts under packs/",
             bundle_path.display()
         )));
     }
@@ -183,4 +207,34 @@ fn collect_gtpacks(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// `collect_gtpacks` recurses into nested dirs and only matches `.gtpack`,
+    /// ignoring other files. `stage_local_bundle` hands it the `packs/` subtree,
+    /// so a `.gtpack` placed outside `packs/` is never pinned.
+    #[test]
+    fn collect_gtpacks_recurses_and_filters_by_extension() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // Canonical layout under packs/.
+        let dist = root.join("packs/alpha/dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("alpha.gtpack"), b"PK\x03\x04").unwrap();
+        std::fs::write(dist.join("readme.txt"), b"not a pack").unwrap();
+
+        // A stray .gtpack OUTSIDE packs/ — must be excluded when we scan packs/.
+        std::fs::write(root.join("stray.gtpack"), b"PK\x03\x04").unwrap();
+
+        let mut found = Vec::new();
+        collect_gtpacks(&root.join("packs"), &mut found).unwrap();
+
+        assert_eq!(found.len(), 1, "only the packs/ .gtpack, got {found:?}");
+        assert!(found[0].ends_with("alpha/dist/alpha.gtpack"));
+    }
 }

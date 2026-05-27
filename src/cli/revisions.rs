@@ -637,10 +637,22 @@ pub fn payload_from_stage_args(
     let deployment_id = deployment.ok_or_else(|| {
         OpError::InvalidArgument("revisions stage: missing `--deployment <ULID>`".to_string())
     })?;
+    // Require `--bundle` on the direct path: without it we'd stage a revision
+    // with a placeholder digest and a `pack_list_lock_ref` pointing at a lock
+    // file that was never written — warmable by the no-op gate, admissible by
+    // traffic, and broken at boot. The legacy verbatim path stays reachable
+    // only via an explicit `--answers <file>`.
+    let bundle_path = bundle.ok_or_else(|| {
+        OpError::InvalidArgument(
+            "revisions stage: missing `--bundle <PATH>`. The direct CLI path stages a local \
+             .gtbundle; use `--answers <file>` for the legacy verbatim path."
+                .to_string(),
+        )
+    })?;
     Ok(Some(RevisionStagePayload {
         environment_id,
         deployment_id,
-        bundle_path: bundle,
+        bundle_path: Some(bundle_path),
         bundle_digest: default_bundle_digest(),
         pack_list: Vec::new(),
         pack_list_lock_ref: default_pack_list_lock_ref(),
@@ -853,6 +865,96 @@ mod tests {
             let expected = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
             assert_eq!(pack.digest, expected, "lock digest must match the file");
         }
+    }
+
+    /// The direct CLI path must reject a stage with env+deployment but no
+    /// `--bundle` — otherwise it would create a placeholder revision pointing
+    /// at a never-written lock file (Codex finding 1).
+    #[test]
+    fn stage_args_without_bundle_is_rejected() {
+        let did = DeploymentId::new();
+        let args = crate::cli::dispatch::RevisionStageArgs {
+            env_id: Some("local".to_string()),
+            deployment: Some(did.to_string()),
+            bundle: None,
+        };
+        let err = payload_from_stage_args(args).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            matches!(err, OpError::InvalidArgument(_)) && msg.contains("--bundle"),
+            "expected a missing --bundle error, got: {msg}"
+        );
+    }
+
+    /// No positional args at all → defer to `--answers` (returns `None`), so
+    /// the legacy path stays reachable.
+    #[test]
+    fn stage_args_empty_defers_to_answers() {
+        let args = crate::cli::dispatch::RevisionStageArgs {
+            env_id: None,
+            deployment: None,
+            bundle: None,
+        };
+        assert!(payload_from_stage_args(args).unwrap().is_none());
+    }
+
+    /// The recorded `bundle_digest` is bound to the immutable staged copy under
+    /// the revision dir, not to the (mutable) input path: mutating the original
+    /// after staging must not change what was pinned (Codex finding 2).
+    #[test]
+    fn stage_bundle_digest_is_bound_to_staged_copy_not_input() {
+        use sha2::{Digest, Sha256};
+
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let did = seed_env_with_deployment(&store);
+
+        // Stage from a temp copy of the fixture so we can mutate "the input"
+        // afterward without touching the committed fixture.
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/bundles/perf-smoke-bundle.gtbundle");
+        let input = dir.path().join("input.gtbundle");
+        std::fs::copy(&fixture, &input).unwrap();
+
+        let mut payload = stage_payload(&did);
+        payload.bundle_path = Some(input.clone());
+        let outcome = stage(&store, &OpFlags::default(), Some(payload)).unwrap();
+        let rid = outcome
+            .result
+            .get("revision_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        let env_id = EnvId::try_from("local").unwrap();
+        let env = store.load(&env_id).unwrap();
+        let revision = env
+            .revisions
+            .iter()
+            .find(|r| r.revision_id.to_string() == rid)
+            .unwrap();
+
+        // The staged copy exists and its sha256 equals the recorded digest.
+        let env_dir = store.env_dir(&env_id).unwrap();
+        let staged = env_dir.join("revisions").join(&rid).join("bundle.gtbundle");
+        assert!(staged.is_file(), "staged bundle copy must persist");
+        let staged_digest = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(std::fs::read(&staged).unwrap()))
+        );
+        assert_eq!(revision.bundle_digest, staged_digest);
+
+        // Corrupt the original input; the staged copy + recorded digest are
+        // unaffected (the digest is over bytes we control, not the input path).
+        std::fs::write(&input, b"tampered-after-stage").unwrap();
+        let staged_digest_after = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(std::fs::read(&staged).unwrap()))
+        );
+        assert_eq!(
+            revision.bundle_digest, staged_digest_after,
+            "input mutation must not change the staged artifact's digest"
+        );
     }
 
     #[test]
