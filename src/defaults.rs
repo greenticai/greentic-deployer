@@ -24,6 +24,8 @@ pub const LOCAL_TELEMETRY_PACK: &str = "greentic.telemetry.stdout@0.1.0";
 pub const LOCAL_SESSIONS_PACK: &str = "greentic.sessions.in-memory@0.1.0";
 /// Pack descriptor for the state slot on the `local` env.
 pub const LOCAL_STATE_PACK: &str = "greentic.state.in-memory@0.1.0";
+/// Pack descriptor for the routing-hook slot on the `local` env.
+pub const LOCAL_ROUTING_HOOK_PACK: &str = "greentic.routing-hook.fast2flow@1.1.0";
 
 /// `(slot, descriptor)` pairs for the five default bindings.
 pub const LOCAL_DEFAULT_BINDINGS: &[(CapabilitySlot, &str)] = &[
@@ -32,6 +34,7 @@ pub const LOCAL_DEFAULT_BINDINGS: &[(CapabilitySlot, &str)] = &[
     (CapabilitySlot::Telemetry, LOCAL_TELEMETRY_PACK),
     (CapabilitySlot::Sessions, LOCAL_SESSIONS_PACK),
     (CapabilitySlot::State, LOCAL_STATE_PACK),
+    (CapabilitySlot::RoutingHook, LOCAL_ROUTING_HOOK_PACK),
 ];
 
 /// Builds the default [`EnvPackBinding`] set for the `local` environment.
@@ -61,9 +64,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_pack_bindings_returns_five_bindings_one_per_slot() {
+    fn local_pack_bindings_returns_six_bindings_one_per_slot() {
         let bindings = local_pack_bindings().expect("default descriptors parse");
-        assert_eq!(bindings.len(), 5);
+        assert_eq!(bindings.len(), 6);
         let slots: Vec<CapabilitySlot> = bindings.iter().map(|b| b.slot).collect();
         assert_eq!(
             slots,
@@ -73,6 +76,7 @@ mod tests {
                 CapabilitySlot::Telemetry,
                 CapabilitySlot::Sessions,
                 CapabilitySlot::State,
+                CapabilitySlot::RoutingHook,
             ]
         );
     }
@@ -89,6 +93,7 @@ mod tests {
                 LOCAL_TELEMETRY_PACK,
                 LOCAL_SESSIONS_PACK,
                 LOCAL_STATE_PACK,
+                LOCAL_ROUTING_HOOK_PACK,
             ]
         );
     }
@@ -114,6 +119,7 @@ mod tests {
             CapabilitySlot::Telemetry,
             CapabilitySlot::Sessions,
             CapabilitySlot::State,
+            CapabilitySlot::RoutingHook,
         ]
         .into_iter()
         .collect();

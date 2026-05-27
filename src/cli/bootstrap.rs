@@ -110,8 +110,8 @@ fn fill_missing_default_bindings(env: &mut Environment) -> Result<Vec<Capability
 mod tests {
     use super::*;
     use crate::defaults::{
-        LOCAL_DEPLOYER_PACK, LOCAL_SECRETS_PACK, LOCAL_SESSIONS_PACK, LOCAL_STATE_PACK,
-        LOCAL_TELEMETRY_PACK,
+        LOCAL_DEPLOYER_PACK, LOCAL_ROUTING_HOOK_PACK, LOCAL_SECRETS_PACK, LOCAL_SESSIONS_PACK,
+        LOCAL_STATE_PACK, LOCAL_TELEMETRY_PACK,
     };
     use greentic_deploy_spec::CapabilitySlot;
     use tempfile::TempDir;
@@ -129,7 +129,7 @@ mod tests {
         assert_eq!(outcome, LocalEnvOutcome::Created);
         assert_eq!(env.environment_id.as_str(), LOCAL_ENV_ID);
         assert_eq!(env.name, LOCAL_ENV_ID);
-        assert_eq!(env.packs.len(), 5);
+        assert_eq!(env.packs.len(), 6);
         env.validate().expect("env is spec-valid");
     }
 
@@ -171,6 +171,10 @@ mod tests {
         assert_eq!(
             by_slot.get(&CapabilitySlot::State).copied(),
             Some(LOCAL_STATE_PACK)
+        );
+        assert_eq!(
+            by_slot.get(&CapabilitySlot::RoutingHook).copied(),
+            Some(LOCAL_ROUTING_HOOK_PACK)
         );
         assert!(!by_slot.contains_key(&CapabilitySlot::Revocation));
     }
@@ -265,13 +269,14 @@ mod tests {
                         CapabilitySlot::Telemetry,
                         CapabilitySlot::Sessions,
                         CapabilitySlot::State,
+                        CapabilitySlot::RoutingHook,
                     ],
-                    "all 5 default slots should be reported as added"
+                    "all 6 default slots should be reported as added"
                 );
             }
             other => panic!("expected Healed, got {other:?}"),
         }
-        assert_eq!(env.packs.len(), 5);
+        assert_eq!(env.packs.len(), 6);
         env.validate().expect("env is spec-valid after heal");
         // Persisted: second call sees a fully-bound env and reports AlreadyExists.
         let (_again, outcome2) = ensure_local_environment(&store).expect("second bootstrap");
@@ -299,13 +304,14 @@ mod tests {
                         CapabilitySlot::Telemetry,
                         CapabilitySlot::Sessions,
                         CapabilitySlot::State,
+                        CapabilitySlot::RoutingHook,
                     ],
-                    "only the 4 missing slots should be reported as added"
+                    "only the 5 missing slots should be reported as added"
                 );
             }
             other => panic!("expected Healed, got {other:?}"),
         }
-        assert_eq!(env.packs.len(), 5);
+        assert_eq!(env.packs.len(), 6);
         env.validate()
             .expect("env is spec-valid after partial heal");
     }
@@ -330,8 +336,9 @@ mod tests {
                         CapabilitySlot::Telemetry,
                         CapabilitySlot::Sessions,
                         CapabilitySlot::State,
+                        CapabilitySlot::RoutingHook,
                     ],
-                    "secrets must NOT be re-added; the 4 other defaults fill the gaps"
+                    "secrets must NOT be re-added; the 5 other defaults fill the gaps"
                 );
             }
             other => panic!("expected Healed, got {other:?}"),
@@ -346,7 +353,7 @@ mod tests {
             secrets_descriptor, custom_secrets,
             "user's custom secrets descriptor must survive bootstrap"
         );
-        assert_eq!(env.packs.len(), 5);
+        assert_eq!(env.packs.len(), 6);
     }
 
     #[test]

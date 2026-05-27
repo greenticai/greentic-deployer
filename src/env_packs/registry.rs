@@ -147,9 +147,9 @@ mod tests {
     }
 
     #[test]
-    fn with_builtins_registers_five_handlers() {
+    fn with_builtins_registers_six_handlers() {
         let registry = EnvPackRegistry::with_builtins();
-        assert_eq!(registry.len(), 5);
+        assert_eq!(registry.len(), 6);
     }
 
     #[test]

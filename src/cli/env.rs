@@ -653,12 +653,12 @@ mod tests {
         );
         assert_eq!(
             outcome.result.get("pack_count").and_then(|v| v.as_u64()),
-            Some(5)
+            Some(6)
         );
         // No `added_slots` key on "created" — that's a "healed" thing.
         assert!(outcome.result.get("added_slots").is_none());
         let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
-        assert_eq!(env.packs.len(), 5);
+        assert_eq!(env.packs.len(), 6);
     }
 
     #[test]
@@ -696,11 +696,11 @@ mod tests {
             .collect();
         assert_eq!(
             added,
-            vec!["secrets", "telemetry", "sessions", "state"],
-            "only the 4 missing slots are reported as added"
+            vec!["secrets", "telemetry", "sessions", "state", "routing-hook"],
+            "only the 5 missing slots are reported as added"
         );
         let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
-        assert_eq!(env.packs.len(), 5);
+        assert_eq!(env.packs.len(), 6);
     }
 
     #[test]

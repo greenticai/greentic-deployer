@@ -108,6 +108,11 @@ pub const BUILTIN_HANDLERS: &[BuiltinHandler] = &[
         descriptor_path: "greentic.state.in-memory",
         version_req: "^0.1.0",
     },
+    BuiltinHandler {
+        slot: CapabilitySlot::RoutingHook,
+        descriptor_path: "greentic.routing-hook.fast2flow",
+        version_req: "^1.1.0",
+    },
 ];
 
 #[cfg(test)]

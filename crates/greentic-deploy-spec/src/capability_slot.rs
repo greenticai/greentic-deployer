@@ -15,7 +15,7 @@ use thiserror::Error;
 
 /// Closed enumeration of capability slots an Environment can bind (`§5.1`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum CapabilitySlot {
     Deployer,
     Secrets,
@@ -23,6 +23,7 @@ pub enum CapabilitySlot {
     Sessions,
     State,
     Revocation,
+    RoutingHook,
 }
 
 impl CapabilitySlot {
@@ -33,6 +34,7 @@ impl CapabilitySlot {
         CapabilitySlot::Sessions,
         CapabilitySlot::State,
         CapabilitySlot::Revocation,
+        CapabilitySlot::RoutingHook,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -43,6 +45,7 @@ impl CapabilitySlot {
             CapabilitySlot::Sessions => "sessions",
             CapabilitySlot::State => "state",
             CapabilitySlot::Revocation => "revocation",
+            CapabilitySlot::RoutingHook => "routing-hook",
         }
     }
 }

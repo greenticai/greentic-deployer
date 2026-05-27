@@ -111,7 +111,7 @@ impl Environment {
             });
         }
 
-        let mut seen = [false; 6];
+        let mut seen = [false; CapabilitySlot::ALL.len()];
         for binding in &self.packs {
             let idx = binding.slot as usize;
             if seen[idx] {
