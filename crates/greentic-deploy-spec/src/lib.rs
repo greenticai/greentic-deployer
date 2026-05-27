@@ -20,6 +20,7 @@ pub mod error;
 pub mod ids;
 pub mod integrity;
 pub mod pack_config;
+pub mod pack_list_lock;
 pub mod refs;
 pub mod remote;
 pub mod retention;
@@ -48,6 +49,7 @@ pub use error::SpecError;
 pub use ids::{BundleId, CustomerId, DeploymentId, PackId, PartyId, RevisionId};
 pub use integrity::{INTEGRITY_ALGORITHM_SHA256, IntegrityError, StateIntegrity, canonical_json};
 pub use pack_config::PackConfig;
+pub use pack_list_lock::{LockedPack, PackListLock};
 pub use refs::{RuntimeRef, RuntimeRefParseError, SecretRef, SecretRefParseError};
 pub use remote::{
     BackupManifest, ConcurrencyConflict, IdempotencyKey, IdempotencyOutcome, IdempotencyRecord,

@@ -22,30 +22,49 @@
 //! ([`super::lifecycle`]) refuses to retire a revision that still owns live
 //! traffic — so faithful projection is both correct and fail-safe.
 //!
-//! `pack_list_refs` / `pack_config_refs` are emitted empty: the per-pack
-//! lockfile materialization is Phase D (greentic-deployer#209) and
-//! `pack-config.v1` is Phase C. B0 accepts empty ref lists (it only file-checks
-//! non-empty ones), so the boot/route seam goes live with weights alone.
+//! `pack_list_refs` is sourced by joining each split entry to its
+//! [`Revision`](greentic_deploy_spec::Revision) (by `(deployment_id,
+//! revision_id)`) and emitting that revision's `pack_list_lock_ref` — the
+//! `pack-list.lock` written at stage time. An entry with no matching revision
+//! (or a revision with an empty lock ref) emits no ref: B0 only file-checks
+//! non-empty refs, so the boot/route seam stays fail-safe. `pack_config_refs`
+//! remains empty pending `pack-config.v1` (Phase C).
 
 use greentic_deploy_spec::{Environment, RevisionRuntimeBlock, RuntimeConfig, SchemaVersion};
+use std::path::PathBuf;
 
 /// Materialize the `runtime-config.v1` projection of an environment's traffic
 /// splits. Pure and total: one [`RevisionRuntimeBlock`] per split entry, in
-/// split-then-entry order. An env with no traffic splits yields an empty
-/// `revisions` list (callers delete the on-disk file rather than write one B0
-/// would reject).
+/// split-then-entry order, with `pack_list_refs` joined from the matching
+/// revision's `pack_list_lock_ref`. An env with no traffic splits yields an
+/// empty `revisions` list (callers delete the on-disk file rather than write
+/// one B0 would reject).
 pub fn materialize_runtime_config(env: &Environment) -> RuntimeConfig {
     let revisions = env
         .traffic_splits
         .iter()
         .flat_map(|split| {
-            split.entries.iter().map(move |entry| RevisionRuntimeBlock {
-                deployment_id: split.deployment_id,
-                revision_id: entry.revision_id,
-                bundle_id: split.bundle_id.clone(),
-                pack_list_refs: Vec::new(),
-                pack_config_refs: Vec::new(),
-                weight_bps: entry.weight_bps,
+            split.entries.iter().map(move |entry| {
+                // Join to the revision to surface its pinned pack-list lockfile.
+                // A missing match or empty ref yields no pack_list_refs, which
+                // B0 treats as "nothing to file-check" rather than an error.
+                let pack_list_refs = env
+                    .revisions
+                    .iter()
+                    .find(|r| {
+                        r.revision_id == entry.revision_id && r.deployment_id == split.deployment_id
+                    })
+                    .filter(|r| !r.pack_list_lock_ref.as_os_str().is_empty())
+                    .map(|r| vec![r.pack_list_lock_ref.clone()])
+                    .unwrap_or_default();
+                RevisionRuntimeBlock {
+                    deployment_id: split.deployment_id,
+                    revision_id: entry.revision_id,
+                    bundle_id: split.bundle_id.clone(),
+                    pack_list_refs,
+                    pack_config_refs: Vec::<PathBuf>::new(),
+                    weight_bps: entry.weight_bps,
+                }
             })
         })
         .collect();
@@ -60,8 +79,8 @@ pub fn materialize_runtime_config(env: &Environment) -> RuntimeConfig {
 mod tests {
     use super::*;
     use greentic_deploy_spec::{
-        BundleId, DeploymentId, EnvId, EnvironmentHostConfig, RevisionId, TrafficSplit,
-        TrafficSplitEntry,
+        BundleId, DeploymentId, EnvId, EnvironmentHostConfig, Revision, RevisionId,
+        RevisionLifecycle, TrafficSplit, TrafficSplitEntry,
     };
     use std::path::PathBuf;
 
@@ -114,6 +133,34 @@ mod tests {
             idempotency_key: "k".to_string(),
             authorization_ref: PathBuf::from("auth.json"),
             previous_split_ref: None,
+        }
+    }
+
+    fn revision(
+        env_id: &str,
+        bundle: &str,
+        deployment_id: DeploymentId,
+        revision_id: RevisionId,
+        pack_list_lock_ref: PathBuf,
+    ) -> Revision {
+        Revision {
+            schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
+            revision_id,
+            env_id: EnvId::try_from(env_id).unwrap(),
+            bundle_id: BundleId::new(bundle),
+            deployment_id,
+            sequence: 1,
+            created_at: chrono::Utc::now(),
+            bundle_digest: "sha256:00".to_string(),
+            pack_list: Vec::new(),
+            pack_list_lock_ref,
+            config_digest: "sha256:00".to_string(),
+            signature_sidecar_ref: PathBuf::from("rev.sig"),
+            lifecycle: RevisionLifecycle::Ready,
+            staged_at: None,
+            warmed_at: None,
+            drain_seconds: 30,
+            abort_metrics: Vec::new(),
         }
     }
 
@@ -195,5 +242,63 @@ mod tests {
         assert_eq!(cfg.revisions.len(), 2);
         assert_eq!(cfg.revisions[1].revision_id, rid2);
         assert_eq!(cfg.revisions[1].weight_bps, 0);
+    }
+
+    #[test]
+    fn split_entry_emits_matching_revisions_pack_list_lock_ref() {
+        // A split entry whose revision carries a pinned pack-list lockfile must
+        // surface that ref so greentic-start can file-check + load it.
+        let did = DeploymentId::new();
+        let rid = RevisionId::new();
+        let lock_ref = PathBuf::from(format!("revisions/{rid}/pack-list.lock"));
+        let mut env = env(
+            "local",
+            vec![split("local", "fast2flow", did, vec![(rid, 10_000)])],
+        );
+        env.revisions
+            .push(revision("local", "fast2flow", did, rid, lock_ref.clone()));
+
+        let cfg = materialize_runtime_config(&env);
+        assert_eq!(cfg.revisions.len(), 1);
+        assert_eq!(cfg.revisions[0].pack_list_refs, vec![lock_ref]);
+        // pack-config refs stay empty (Phase C).
+        assert!(cfg.revisions[0].pack_config_refs.is_empty());
+    }
+
+    #[test]
+    fn split_entry_without_matching_revision_emits_no_refs() {
+        // The split routes a revision id with no matching `Revision` (e.g. one
+        // not yet staged on this host). The block is still projected — weights
+        // must stay intact for B0's 10,000-bps invariant — but with no
+        // pack_list_refs, which B0 treats as nothing-to-file-check.
+        let did = DeploymentId::new();
+        let rid = RevisionId::new();
+        let env = env(
+            "local",
+            vec![split("local", "fast2flow", did, vec![(rid, 10_000)])],
+        );
+
+        let cfg = materialize_runtime_config(&env);
+        assert_eq!(cfg.revisions.len(), 1);
+        assert_eq!(cfg.revisions[0].weight_bps, 10_000);
+        assert!(cfg.revisions[0].pack_list_refs.is_empty());
+    }
+
+    #[test]
+    fn revision_with_empty_lock_ref_emits_no_refs() {
+        // A legacy/empty `pack_list_lock_ref` must not surface as a ref — B0
+        // would reject (or fail to resolve) an empty path. The join filters it.
+        let did = DeploymentId::new();
+        let rid = RevisionId::new();
+        let mut env = env(
+            "local",
+            vec![split("local", "fast2flow", did, vec![(rid, 10_000)])],
+        );
+        env.revisions
+            .push(revision("local", "fast2flow", did, rid, PathBuf::new()));
+
+        let cfg = materialize_runtime_config(&env);
+        assert_eq!(cfg.revisions.len(), 1);
+        assert!(cfg.revisions[0].pack_list_refs.is_empty());
     }
 }

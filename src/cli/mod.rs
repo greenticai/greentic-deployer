@@ -38,6 +38,7 @@
 use std::path::PathBuf;
 
 pub mod bootstrap;
+pub mod bundle_stage;
 pub mod bundles;
 pub mod config;
 pub mod credentials;
