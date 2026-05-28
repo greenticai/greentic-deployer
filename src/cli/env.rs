@@ -29,6 +29,13 @@ pub struct EnvCreatePayload {
     pub region: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_org_id: Option<String>,
+    /// Bind address for the runtime's local HTTP listener (parsed as
+    /// `SocketAddr`). When omitted, the env is created with
+    /// `host_config.listen_addr = None`, and the runtime falls back to
+    /// `DEFAULT_LISTEN_ADDR` via `resolved_listen_addr()`. Set explicitly
+    /// to lock the env to a non-default bind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<String>,
 }
 
 /// Returned by `op env create` / `op env update`.
@@ -38,6 +45,11 @@ pub struct EnvSummary {
     pub name: String,
     pub region: Option<String>,
     pub tenant_org_id: Option<String>,
+    /// Explicit bind address for the runtime's local HTTP listener.
+    /// `None` means the env relies on `DEFAULT_LISTEN_ADDR`; surface the
+    /// effective resolution via `op config show` (full host_config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<std::net::SocketAddr>,
     pub pack_count: usize,
     pub bundle_count: usize,
     pub revision_count: usize,
@@ -50,6 +62,7 @@ impl From<&Environment> for EnvSummary {
             name: env.name.clone(),
             region: env.host_config.region.clone(),
             tenant_org_id: env.host_config.tenant_org_id.clone(),
+            listen_addr: env.host_config.listen_addr,
             pack_count: env.packs.len(),
             bundle_count: env.bundles.len(),
             revision_count: env.revisions.len(),
@@ -70,6 +83,19 @@ pub fn create(
     let payload = resolve_payload::<EnvCreatePayload>(flags, payload)?;
     let env_id = EnvId::try_from(payload.environment_id.as_str())
         .map_err(|e| OpError::InvalidArgument(format!("environment_id: {e}")))?;
+    // Parse the bind address up front so a malformed value is rejected before
+    // we touch the env store or the audit log. Same pattern as `op config set`.
+    let parsed_listen_addr = payload
+        .listen_addr
+        .as_deref()
+        .map(|raw| {
+            raw.parse::<std::net::SocketAddr>().map_err(|e| {
+                OpError::InvalidArgument(format!(
+                    "listen_addr {raw:?} is not a valid socket address: {e}"
+                ))
+            })
+        })
+        .transpose()?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -93,7 +119,7 @@ pub fn create(
                     env_id: locked.env_id().clone(),
                     region: payload.region.clone(),
                     tenant_org_id: payload.tenant_org_id.clone(),
-                    listen_addr: None,
+                    listen_addr: parsed_listen_addr,
                 },
                 packs: Vec::new(),
                 credentials_ref: None,
@@ -541,6 +567,7 @@ mod tests {
                 name: "local".to_string(),
                 region: None,
                 tenant_org_id: None,
+                listen_addr: None,
             }),
         )
         .unwrap();
@@ -569,6 +596,7 @@ mod tests {
                 name: "again".to_string(),
                 region: None,
                 tenant_org_id: None,
+                listen_addr: None,
             }),
         )
         .unwrap_err();
@@ -589,6 +617,7 @@ mod tests {
                 name: "renamed".to_string(),
                 region: Some("eu-west-1".to_string()),
                 tenant_org_id: None,
+                listen_addr: None,
             }),
         )
         .unwrap();
@@ -599,6 +628,89 @@ mod tests {
         let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
         assert_eq!(env.name, "renamed");
         assert_eq!(env.host_config.region.as_deref(), Some("eu-west-1"));
+    }
+
+    #[test]
+    fn create_persists_explicit_listen_addr_and_surfaces_it_in_summary() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let outcome = create(
+            &store,
+            &OpFlags::default(),
+            Some(EnvCreatePayload {
+                environment_id: "local".to_string(),
+                name: "local".to_string(),
+                region: None,
+                tenant_org_id: None,
+                listen_addr: Some("0.0.0.0:9090".to_string()),
+            }),
+        )
+        .unwrap();
+        // Surface check: the create response (EnvSummary) must include the
+        // bind address, otherwise operators can't see what they just set.
+        let listen = outcome
+            .result
+            .get("listen_addr")
+            .and_then(|v| v.as_str())
+            .expect("EnvSummary must expose listen_addr");
+        assert_eq!(listen, "0.0.0.0:9090");
+        // Storage check: the persisted env carries the typed SocketAddr.
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        let expected = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 9090);
+        assert_eq!(env.host_config.listen_addr, Some(expected));
+    }
+
+    #[test]
+    fn create_rejects_malformed_listen_addr_before_touching_store() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let err = create(
+            &store,
+            &OpFlags::default(),
+            Some(EnvCreatePayload {
+                environment_id: "local".to_string(),
+                name: "local".to_string(),
+                region: None,
+                tenant_org_id: None,
+                listen_addr: Some("not-a-socket-addr".to_string()),
+            }),
+        )
+        .expect_err("malformed listen_addr must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("listen_addr") && msg.contains("not-a-socket-addr"),
+            "error must name the offending field + value, got: {msg}"
+        );
+        // Store must be untouched — `op env list` sees zero envs.
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn create_with_no_listen_addr_persists_none_so_runtime_falls_back_to_default() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        create(
+            &store,
+            &OpFlags::default(),
+            Some(EnvCreatePayload {
+                environment_id: "local".to_string(),
+                name: "local".to_string(),
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+            }),
+        )
+        .unwrap();
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        // `None` on disk → `resolved_listen_addr()` returns `DEFAULT_LISTEN_ADDR`.
+        // This is the documented divergence from `op env init` (the local
+        // bootstrap), which writes `Some(DEFAULT_LISTEN_ADDR)` explicitly.
+        assert_eq!(env.host_config.listen_addr, None);
+        assert_eq!(
+            env.host_config.resolved_listen_addr(),
+            greentic_deploy_spec::DEFAULT_LISTEN_ADDR,
+        );
     }
 
     #[test]
@@ -615,6 +727,7 @@ mod tests {
                 name: "x".to_string(),
                 region: None,
                 tenant_org_id: None,
+                listen_addr: None,
             }),
         )
         .unwrap_err();
@@ -981,6 +1094,7 @@ mod tests {
                 name: "prod".to_string(),
                 region: None,
                 tenant_org_id: None,
+                listen_addr: None,
             }),
         )
         .unwrap_err();
@@ -1025,6 +1139,7 @@ mod tests {
                 name: "local".to_string(),
                 region: None,
                 tenant_org_id: None,
+                listen_addr: None,
             }),
         )
         .unwrap();

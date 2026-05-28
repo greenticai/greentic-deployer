@@ -104,14 +104,19 @@ pub fn set(
     let env_id = parse_env_id(&payload.environment_id)?;
     // Parse the bind address up front so a malformed value is rejected before
     // we touch the env store, the audit log, or even the transaction lock.
-    let parsed_listen_addr = match payload.listen_addr.as_deref() {
-        Some(raw) => Some(raw.parse::<std::net::SocketAddr>().map_err(|e| {
-            OpError::InvalidArgument(format!(
-                "listen_addr `{raw}` is not a valid socket address: {e}"
-            ))
-        })?),
-        None => None,
-    };
+    // `{raw:?}` debug-formats the input — escaping newlines/quotes — so a
+    // hostile payload can't break the structured audit log it lands in.
+    let parsed_listen_addr = payload
+        .listen_addr
+        .as_deref()
+        .map(|raw| {
+            raw.parse::<std::net::SocketAddr>().map_err(|e| {
+                OpError::InvalidArgument(format!(
+                    "listen_addr {raw:?} is not a valid socket address: {e}"
+                ))
+            })
+        })
+        .transpose()?;
     let mut fields = Vec::new();
     if payload.name.is_some() {
         fields.push("name");
@@ -377,16 +382,68 @@ mod tests {
     }
 
     #[test]
-    fn set_schema_advertises_listen_addr_field() {
+    fn set_error_debug_formats_hostile_input_to_neutralize_log_injection() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        // A payload that tries to inject a fake structured-log line.
+        let hostile = "1.2.3.4\nlevel=ERROR msg=injected";
+        let err = set(
+            &store,
+            &OpFlags::default(),
+            Some(ConfigSetPayload {
+                environment_id: "local".to_string(),
+                name: None,
+                region: None,
+                tenant_org_id: None,
+                listen_addr: Some(hostile.to_string()),
+            }),
+        )
+        .expect_err("hostile listen_addr must still be rejected");
+        let msg = err.to_string();
+        // Debug-format escapes the newline as `\n`, so the literal newline
+        // doesn't survive into the error message — log shippers see one line.
+        assert!(
+            !msg.contains('\n'),
+            "error message must not contain a raw newline, got: {msg:?}"
+        );
+        assert!(
+            msg.contains("\\n"),
+            "debug-format should have escaped the newline; got: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn set_schema_advertises_every_payload_field_so_strict_properties_does_not_reject() {
+        // `additionalProperties: false` means the schema gate rejects any key
+        // the schema does not list. If a contributor adds a field to
+        // `ConfigSetPayload` and forgets to extend `set_schema()`, callers
+        // can never set it. This test pins the full expected key set so the
+        // failure mode is "test break" not "silent CLI gap".
         let schema = set_schema();
         let props = schema
             .get("properties")
             .and_then(|p| p.as_object())
             .expect("schema has properties");
-        assert!(
-            props.contains_key("listen_addr"),
-            "set_schema must expose listen_addr so callers know it's settable; without it \
-             `additionalProperties: false` would reject the field at the schema gate"
+        let actual: std::collections::BTreeSet<&str> = props.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> = [
+            "environment_id",
+            "name",
+            "region",
+            "tenant_org_id",
+            "listen_addr",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            actual, expected,
+            "set_schema properties must match ConfigSetPayload fields exactly"
+        );
+        assert_eq!(
+            schema.get("additionalProperties"),
+            Some(&json!(false)),
+            "set_schema must keep additionalProperties: false; otherwise the \
+             completeness check above is moot",
         );
     }
 }
