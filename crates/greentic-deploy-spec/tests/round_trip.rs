@@ -26,6 +26,7 @@ fn sample_environment() -> Environment {
             env_id: env_id(),
             region: Some("local".into()),
             tenant_org_id: None,
+            listen_addr: None,
         },
         packs: vec![EnvPackBinding {
             slot: CapabilitySlot::Deployer,
@@ -189,3 +190,64 @@ round_trip_yaml!(bundle_deployment_yaml, sample_bundle_deployment());
 round_trip_yaml!(credentials_yaml, sample_credentials());
 round_trip_yaml!(pack_config_yaml, sample_pack_config());
 round_trip_yaml!(runtime_config_yaml, sample_runtime_config());
+
+#[test]
+fn environment_listen_addr_is_optional_and_defaults_to_none() {
+    let mut env = sample_environment();
+    env.host_config.listen_addr = None;
+    let json = serde_json::to_value(&env).unwrap();
+    assert!(
+        json.get("host_config")
+            .and_then(|hc| hc.get("listen_addr"))
+            .is_none(),
+        "listen_addr should be skipped when None"
+    );
+    let back: Environment = serde_json::from_value(json).unwrap();
+    assert_eq!(back.host_config.listen_addr, None);
+}
+
+#[test]
+fn environment_listen_addr_roundtrips_when_set() {
+    use greentic_deploy_spec::DEFAULT_LISTEN_ADDR;
+    let mut env = sample_environment();
+    env.host_config.listen_addr = Some(DEFAULT_LISTEN_ADDR);
+    let json = serde_json::to_string(&env).unwrap();
+    let back: Environment = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.host_config.listen_addr, Some(DEFAULT_LISTEN_ADDR));
+}
+
+#[test]
+fn environment_host_config_resolved_listen_addr_falls_back_to_default() {
+    use greentic_deploy_spec::DEFAULT_LISTEN_ADDR;
+    let env = sample_environment();
+    assert_eq!(env.host_config.listen_addr, None);
+    assert_eq!(env.host_config.resolved_listen_addr(), DEFAULT_LISTEN_ADDR);
+}
+
+#[test]
+fn environment_host_config_resolved_listen_addr_uses_explicit_when_set() {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    let mut env = sample_environment();
+    let custom = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 9090);
+    env.host_config.listen_addr = Some(custom);
+    assert_eq!(env.host_config.resolved_listen_addr(), custom);
+}
+
+#[test]
+fn environment_listen_addr_rejects_malformed_string_in_json() {
+    let json = r#"{
+        "schema": "greentic.environment.v1",
+        "environment_id": "local",
+        "name": "local",
+        "host_config": {
+            "env_id": "local",
+            "listen_addr": "not-a-socket-addr"
+        },
+        "packs": []
+    }"#;
+    let result: Result<Environment, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "malformed listen_addr must fail deserialization"
+    );
+}

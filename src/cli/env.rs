@@ -93,6 +93,7 @@ pub fn create(
                     env_id: locked.env_id().clone(),
                     region: payload.region.clone(),
                     tenant_org_id: payload.tenant_org_id.clone(),
+                    listen_addr: None,
                 },
                 packs: Vec::new(),
                 credentials_ref: None,

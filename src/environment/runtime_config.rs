@@ -97,6 +97,7 @@ mod tests {
                 env_id: id,
                 region: None,
                 tenant_org_id: None,
+                listen_addr: None,
             },
             packs: Vec::new(),
             credentials_ref: None,

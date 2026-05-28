@@ -43,7 +43,7 @@ pub use credentials::{
     Credentials, CredentialsBootstrap, CredentialsExpiry, CredentialsMode, CredentialsValidation,
     CredentialsValidationResult,
 };
-pub use environment::{EnvPackBinding, Environment, EnvironmentHostConfig};
+pub use environment::{DEFAULT_LISTEN_ADDR, EnvPackBinding, Environment, EnvironmentHostConfig};
 pub use environment_runtime::{EnvironmentRuntime, RuntimeDiscoveryValue};
 pub use error::SpecError;
 pub use ids::{BundleId, CustomerId, DeploymentId, PackId, PartyId, RevisionId};
