@@ -9,7 +9,7 @@
 //! env-pack registry's job (A9); A4 only persists the binding intent.
 
 use greentic_deploy_spec::{
-    CapabilitySlot, EnvId, Environment, EnvironmentHostConfig, SchemaVersion,
+    CapabilitySlot, DEFAULT_LISTEN_ADDR, EnvId, Environment, EnvironmentHostConfig, SchemaVersion,
 };
 
 use crate::defaults::{LOCAL_ENV_ID, local_pack_bindings};
@@ -68,6 +68,7 @@ pub fn ensure_local_environment(
                     env_id: locked.env_id().clone(),
                     region: None,
                     tenant_org_id: None,
+                    listen_addr: Some(DEFAULT_LISTEN_ADDR),
                 },
                 packs,
                 credentials_ref: None,
@@ -195,6 +196,38 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_env_writes_default_listen_addr_so_start_can_resolve_it() {
+        let (_tmp, store) = store();
+        let (env, outcome) = ensure_local_environment(&store).expect("bootstrap");
+        assert_eq!(outcome, LocalEnvOutcome::Created);
+        assert_eq!(
+            env.host_config.listen_addr,
+            Some(DEFAULT_LISTEN_ADDR),
+            "fresh env must carry the canonical loopback default so `gtc start` \
+             on an empty env has a deterministic bind address",
+        );
+        assert_eq!(env.host_config.resolved_listen_addr(), DEFAULT_LISTEN_ADDR);
+    }
+
+    #[test]
+    fn bootstrap_heal_path_preserves_user_set_listen_addr() {
+        use crate::environment::EnvironmentStore;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let (_tmp, store) = store();
+        let (mut env, _) = ensure_local_environment(&store).expect("bootstrap");
+        let custom = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 9090);
+        env.host_config.listen_addr = Some(custom);
+        store.save(&env).expect("user save");
+        let (reloaded, outcome) = ensure_local_environment(&store).expect("second bootstrap");
+        assert_eq!(outcome, LocalEnvOutcome::AlreadyExists);
+        assert_eq!(
+            reloaded.host_config.listen_addr,
+            Some(custom),
+            "user's custom bind must survive re-bootstrap",
+        );
+    }
+
+    #[test]
     fn second_call_does_not_overwrite_user_mutations() {
         use crate::environment::EnvironmentStore;
         let (_tmp, store) = store();
@@ -225,6 +258,7 @@ mod tests {
                 env_id,
                 region: None,
                 tenant_org_id: None,
+                listen_addr: None,
             },
             packs: Vec::new(),
             credentials_ref: None,

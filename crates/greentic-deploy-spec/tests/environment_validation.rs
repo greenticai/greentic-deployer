@@ -25,6 +25,7 @@ fn env(packs: Vec<EnvPackBinding>) -> Environment {
             env_id,
             region: None,
             tenant_org_id: None,
+            listen_addr: None,
         },
         packs,
         credentials_ref: None,

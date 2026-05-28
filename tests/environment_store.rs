@@ -34,6 +34,7 @@ fn minimal_environment(id: &EnvId) -> Environment {
             env_id: id.clone(),
             region: None,
             tenant_org_id: None,
+            listen_addr: None,
         },
         packs: vec![EnvPackBinding {
             slot: CapabilitySlot::Deployer,

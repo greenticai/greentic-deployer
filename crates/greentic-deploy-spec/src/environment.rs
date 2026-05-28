@@ -16,7 +16,15 @@ use crate::traffic_split::TrafficSplit;
 use crate::version::SchemaVersion;
 use greentic_types::EnvId;
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+
+/// Default bind address for the runtime's local HTTP listener when
+/// [`EnvironmentHostConfig::listen_addr`] is unset and no runtime-level
+/// override applies. Loopback by design — exposing externally is an explicit
+/// opt-in via `op config set listen_addr 0.0.0.0:<port>`.
+pub const DEFAULT_LISTEN_ADDR: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
 /// Host-level config moved out of `greentic-config-types::EnvironmentConfig`
 /// (`§5.1`). Identity-only — connectivity, region, and deployment ctx; nothing
@@ -29,6 +37,23 @@ pub struct EnvironmentHostConfig {
     /// Tenant organization the env belongs to. `None` for `local`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_org_id: Option<String>,
+    /// Bind address for the runtime's local HTTP listener. Set at `op env init`
+    /// to [`DEFAULT_LISTEN_ADDR`] so a freshly-initialized env can be started
+    /// with no bundles attached. The runtime (`gtc start`) may layer its own
+    /// env-var override on top — see the `greentic-start` docs for the
+    /// concrete name and precedence; this crate stays implementation-agnostic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<SocketAddr>,
+}
+
+impl EnvironmentHostConfig {
+    /// Resolves the bind address using `self.listen_addr` falling back to
+    /// [`DEFAULT_LISTEN_ADDR`]. Runtime-level env-var precedence (if any) is
+    /// the caller's responsibility — this helper is the persisted-state
+    /// resolution only.
+    pub fn resolved_listen_addr(&self) -> SocketAddr {
+        self.listen_addr.unwrap_or(DEFAULT_LISTEN_ADDR)
+    }
 }
 
 /// Binding from a [`CapabilitySlot`] to a concrete pack (`§5.1`).

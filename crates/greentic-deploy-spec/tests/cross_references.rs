@@ -30,6 +30,7 @@ fn env_with(
             env_id,
             region: None,
             tenant_org_id: None,
+            listen_addr: None,
         },
         packs: vec![EnvPackBinding {
             slot: CapabilitySlot::Deployer,

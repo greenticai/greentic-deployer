@@ -17,6 +17,7 @@ impl From<EnvironmentConfig> for EnvironmentHostConfig {
             env_id: value.env_id,
             region: value.region,
             tenant_org_id: None,
+            listen_addr: None,
         }
     }
 }
@@ -27,6 +28,7 @@ impl From<&EnvironmentConfig> for EnvironmentHostConfig {
             env_id: value.env_id.clone(),
             region: value.region.clone(),
             tenant_org_id: None,
+            listen_addr: None,
         }
     }
 }

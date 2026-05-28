@@ -79,11 +79,19 @@ pub struct ConfigSetPayload {
     pub name: Option<String>,
     pub region: Option<String>,
     pub tenant_org_id: Option<String>,
+    /// Bind address for the runtime's local HTTP listener. Accepted as a
+    /// free-form `SocketAddr` string (e.g. `127.0.0.1:8080`, `0.0.0.0:9090`,
+    /// `[::1]:8443`). Parsed and validated at apply time so a malformed value
+    /// is rejected before the env is touched. `None` leaves the existing
+    /// value unchanged — matches `region`/`tenant_org_id` semantics; there's
+    /// no clear-to-`None` flow today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<String>,
 }
 
-/// `op config set`. Mutates `host_config` fields (region, tenant_org_id) and
-/// the env's display `name`. To change anything inside an env-pack's
-/// answers, use `op env-packs update`.
+/// `op config set`. Mutates `host_config` fields (region, tenant_org_id,
+/// listen_addr) and the env's display `name`. To change anything inside an
+/// env-pack's answers, use `op env-packs update`.
 pub fn set(
     store: &LocalFsStore,
     flags: &OpFlags,
@@ -94,6 +102,21 @@ pub fn set(
     }
     let payload = resolve_payload::<ConfigSetPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
+    // Parse the bind address up front so a malformed value is rejected before
+    // we touch the env store, the audit log, or even the transaction lock.
+    // `{raw:?}` debug-formats the input — escaping newlines/quotes — so a
+    // hostile payload can't break the structured audit log it lands in.
+    let parsed_listen_addr = payload
+        .listen_addr
+        .as_deref()
+        .map(|raw| {
+            raw.parse::<std::net::SocketAddr>().map_err(|e| {
+                OpError::InvalidArgument(format!(
+                    "listen_addr {raw:?} is not a valid socket address: {e}"
+                ))
+            })
+        })
+        .transpose()?;
     let mut fields = Vec::new();
     if payload.name.is_some() {
         fields.push("name");
@@ -103,6 +126,9 @@ pub fn set(
     }
     if payload.tenant_org_id.is_some() {
         fields.push("tenant_org_id");
+    }
+    if parsed_listen_addr.is_some() {
+        fields.push("listen_addr");
     }
     let ctx = AuditCtx {
         env_id: env_id.clone(),
@@ -122,6 +148,9 @@ pub fn set(
             }
             if let Some(org) = payload.tenant_org_id.clone() {
                 env.host_config.tenant_org_id = Some(org);
+            }
+            if let Some(addr) = parsed_listen_addr {
+                env.host_config.listen_addr = Some(addr);
             }
             locked.save(&env)?;
             Ok((env.host_config.clone(), env.name.clone()))
@@ -191,7 +220,11 @@ fn set_schema() -> Value {
             "environment_id": {"type": "string"},
             "name": {"type": ["string", "null"]},
             "region": {"type": ["string", "null"]},
-            "tenant_org_id": {"type": ["string", "null"]}
+            "tenant_org_id": {"type": ["string", "null"]},
+            "listen_addr": {
+                "type": ["string", "null"],
+                "description": "Bind address for the runtime's local HTTP listener (e.g. 127.0.0.1:8080, 0.0.0.0:9090, [::1]:8443). Parsed as SocketAddr; malformed values are rejected."
+            }
         }
     })
 }
@@ -263,6 +296,7 @@ mod tests {
                 name: Some("renamed".to_string()),
                 region: Some("eu-west-1".to_string()),
                 tenant_org_id: Some("acme".to_string()),
+                listen_addr: None,
             }),
         )
         .unwrap();
@@ -270,5 +304,146 @@ mod tests {
         assert_eq!(env.name, "renamed");
         assert_eq!(env.host_config.region.as_deref(), Some("eu-west-1"));
         assert_eq!(env.host_config.tenant_org_id.as_deref(), Some("acme"));
+        // listen_addr is left untouched when payload field is None.
+        assert_eq!(env.host_config.listen_addr, None);
+    }
+
+    #[test]
+    fn set_updates_listen_addr_to_loopback_default() {
+        use greentic_deploy_spec::DEFAULT_LISTEN_ADDR;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let outcome = set(
+            &store,
+            &OpFlags::default(),
+            Some(ConfigSetPayload {
+                environment_id: "local".to_string(),
+                name: None,
+                region: None,
+                tenant_org_id: None,
+                listen_addr: Some("127.0.0.1:8080".to_string()),
+            }),
+        )
+        .unwrap();
+        assert_eq!(outcome.op, "set");
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert_eq!(env.host_config.listen_addr, Some(DEFAULT_LISTEN_ADDR));
+    }
+
+    #[test]
+    fn set_updates_listen_addr_to_explicit_non_loopback() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        set(
+            &store,
+            &OpFlags::default(),
+            Some(ConfigSetPayload {
+                environment_id: "local".to_string(),
+                name: None,
+                region: None,
+                tenant_org_id: None,
+                listen_addr: Some("0.0.0.0:9090".to_string()),
+            }),
+        )
+        .unwrap();
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        let expected = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 9090);
+        assert_eq!(env.host_config.listen_addr, Some(expected));
+    }
+
+    #[test]
+    fn set_rejects_malformed_listen_addr_before_touching_env() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let err = set(
+            &store,
+            &OpFlags::default(),
+            Some(ConfigSetPayload {
+                environment_id: "local".to_string(),
+                name: None,
+                region: None,
+                tenant_org_id: None,
+                listen_addr: Some("not-a-socket-addr".to_string()),
+            }),
+        )
+        .expect_err("malformed listen_addr must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("listen_addr") && msg.contains("not-a-socket-addr"),
+            "error must name the offending field + value, got: {msg}"
+        );
+        // Env state must remain untouched.
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert_eq!(env.host_config.listen_addr, None);
+    }
+
+    #[test]
+    fn set_error_debug_formats_hostile_input_to_neutralize_log_injection() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        // A payload that tries to inject a fake structured-log line.
+        let hostile = "1.2.3.4\nlevel=ERROR msg=injected";
+        let err = set(
+            &store,
+            &OpFlags::default(),
+            Some(ConfigSetPayload {
+                environment_id: "local".to_string(),
+                name: None,
+                region: None,
+                tenant_org_id: None,
+                listen_addr: Some(hostile.to_string()),
+            }),
+        )
+        .expect_err("hostile listen_addr must still be rejected");
+        let msg = err.to_string();
+        // Debug-format escapes the newline as `\n`, so the literal newline
+        // doesn't survive into the error message — log shippers see one line.
+        assert!(
+            !msg.contains('\n'),
+            "error message must not contain a raw newline, got: {msg:?}"
+        );
+        assert!(
+            msg.contains("\\n"),
+            "debug-format should have escaped the newline; got: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn set_schema_advertises_every_payload_field_so_strict_properties_does_not_reject() {
+        // `additionalProperties: false` means the schema gate rejects any key
+        // the schema does not list. If a contributor adds a field to
+        // `ConfigSetPayload` and forgets to extend `set_schema()`, callers
+        // can never set it. This test pins the full expected key set so the
+        // failure mode is "test break" not "silent CLI gap".
+        let schema = set_schema();
+        let props = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("schema has properties");
+        let actual: std::collections::BTreeSet<&str> = props.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> = [
+            "environment_id",
+            "name",
+            "region",
+            "tenant_org_id",
+            "listen_addr",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            actual, expected,
+            "set_schema properties must match ConfigSetPayload fields exactly"
+        );
+        assert_eq!(
+            schema.get("additionalProperties"),
+            Some(&json!(false)),
+            "set_schema must keep additionalProperties: false; otherwise the \
+             completeness check above is moot",
+        );
     }
 }
