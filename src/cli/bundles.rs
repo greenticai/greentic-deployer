@@ -173,9 +173,10 @@ pub fn add(
             };
             // C2 Codex follow-up: refuse to AUTO-GENERATE an operator key
             // from this path. A user who runs `bundles add` without ever
-            // running `gtc op trust-root bootstrap` would otherwise create
-            // an unexpected `~/.greentic/operator/key.pem` as a side effect
-            // of a command that then aborts with `OperatorKeyNotTrusted`.
+            // running `gtc op env init` (N1.4) or `gtc op trust-root bootstrap`
+            // would otherwise create an unexpected `~/.greentic/operator/key.pem`
+            // as a side effect of a command that then aborts with
+            // `OperatorKeyNotTrusted`.
             let operator_key = crate::operator_key::load_existing_only()?;
             let version = crate::environment::write_revenue_policy_version(
                 &env_dir,

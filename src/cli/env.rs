@@ -395,30 +395,16 @@ pub fn tool_check(
 }
 
 /// `op env init`. Idempotent bootstrap of the `local` env with its five
-/// default env-pack bindings, **and** seeds the operator key into the env
-/// trust root so signature-gated verbs (revenue-policy, bundle/revision
-/// DSSE) work out of the box. Wraps the A4 helper
-/// [`super::bootstrap::ensure_local_environment`] so first-run installs can
-/// create the env without going through `gtc setup` (which requires a bundle
-/// to validate) or `gtc start` (which requires a bundle to start).
+/// default env-pack bindings; on first init only also seeds the operator
+/// key into the env trust root so signature-gated verbs (revenue-policy,
+/// bundle/revision DSSE) work out of the box (N1.4). The gate sits on
+/// `<env_dir>/trust-root.json`'s presence, so a routine `init` cannot
+/// re-grant a key revoked via `trust-root remove`.
 ///
-/// Trust-root seeding runs ONLY on first init (when `<env_dir>/trust-root.json`
-/// does not yet exist). Once the operator has touched the trust root —
-/// via `trust-root bootstrap`, `add`, or `remove` — subsequent `init`s
-/// leave it alone, so a routine `init` cannot silently re-grant trust on
-/// a key the operator revoked. Explicit re-grant goes through
-/// `gtc op trust-root bootstrap` (N1.4).
-///
-/// The init outcome carries a nested `trust_root` value: an object with
-/// the seeded `(operator_key_id, public_pem, trusted_key_count)` when the
-/// gate seeded, or `null` when it was skipped.
-///
-/// Outcome JSON discriminator:
-/// - `"created"` — env did not exist; all 5 default bindings written.
-/// - `"healed"` — env existed but was missing one or more default bindings;
-///   the missing slots were filled. User-bound non-default descriptors on
-///   already-present slots are NEVER overwritten.
-/// - `"untouched"` — env already satisfied the A4 invariant.
+/// Outcome JSON:
+/// - `outcome` discriminator: `"created"` | `"healed"` | `"untouched"`.
+/// - `trust_root`: seeded `{operator_key_id, public_pem, trusted_key_count}`
+///   on first init, `null` thereafter.
 pub fn init(store: &LocalFsStore, flags: &OpFlags) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(
@@ -441,19 +427,15 @@ pub fn init(store: &LocalFsStore, flags: &OpFlags) -> Result<OpOutcome, OpError>
         target: json!({"environment_id": env_id.as_str()}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, |_committed| {
+    audit_and_record(store, ctx, |committed| {
         let (env, outcome) = super::bootstrap::ensure_local_environment(store)?;
-        // Authz passed and env is on disk; on FIRST init only (no
-        // `trust-root.json` yet) seed the operator key into the env trust
-        // root so revenue-policy/bundle signature verification works out
-        // of the box. (N1.4 — folds the former `trust-root bootstrap`
-        // step into `env init` so the first-run path is a single command.)
-        //
-        // The seed is gated on absence of `trust-root.json`: once the
-        // operator has touched the trust root (bootstrap, add, or remove),
-        // `init` must NOT silently re-grant trust on a key they may have
-        // deliberately revoked. Explicit re-grant goes through
-        // `gtc op trust-root bootstrap`.
+        // Env is now persisted. Mark committed so a subsequent trust-root
+        // seed failure + audit-append failure still fail-closes (otherwise
+        // the audit-append failure would demote to `tracing::warn!` and
+        // hide the missing audit record for the env we just wrote).
+        committed.mark_committed();
+        // N1.4: seed operator key on first init only — see
+        // [`super::trust_root::seed_operator_key_if_trust_root_absent`].
         let trust_root =
             super::trust_root::seed_operator_key_if_trust_root_absent(store, &env.environment_id)?;
         let bound_slots: Vec<String> = env.packs.iter().map(|b| b.slot.to_string()).collect();
@@ -916,9 +898,17 @@ mod tests {
             .expect("first init seeded a key")
             .to_string();
         let second = init(&store, &OpFlags::default()).unwrap();
+        // `is_some_and(is_null)` distinguishes "key present, null value"
+        // from "key absent" — bare `.is_null()` on indexed Value returns
+        // true for both, masking a future serde change that drops the key.
+        let tr = second
+            .result
+            .as_object()
+            .expect("outcome is a JSON object")
+            .get("trust_root");
         assert!(
-            second.result["trust_root"].is_null(),
-            "second init must not re-seed: trust_root must be null"
+            tr.is_some_and(|v| v.is_null()),
+            "second init must report `trust_root: null` (got {tr:?})"
         );
         let listed = super::super::trust_root::list(&store, &OpFlags::default(), "local").unwrap();
         let keys = listed.result["keys"].as_array().unwrap();
@@ -961,12 +951,17 @@ mod tests {
             "precondition: remove must clear the trust root"
         );
 
-        // Second init MUST NOT re-seed.
+        // Second init MUST NOT re-seed. Use the key-present-and-null check
+        // so a future serde regression that drops the field is also caught.
         let second = init(&store, &OpFlags::default()).unwrap();
+        let tr = second
+            .result
+            .as_object()
+            .expect("outcome is a JSON object")
+            .get("trust_root");
         assert!(
-            second.result["trust_root"].is_null(),
-            "init must not re-grant trust on a revoked key — got {:?}",
-            second.result["trust_root"]
+            tr.is_some_and(|v| v.is_null()),
+            "init must not re-grant trust on a revoked key (got {tr:?})"
         );
         let listed = super::super::trust_root::list(&store, &OpFlags::default(), "local").unwrap();
         assert_eq!(

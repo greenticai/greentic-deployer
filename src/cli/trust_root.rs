@@ -5,7 +5,7 @@
 //! by hand. All mutations run under the env flock via
 //! [`LocalFsStore::transact`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use greentic_deploy_spec::EnvId;
 use greentic_distributor_client::signing::TrustedKey;
@@ -90,82 +90,66 @@ pub(super) struct TrustRootSeedResult {
     pub trusted_key_count: usize,
 }
 
-/// Load (or generate) the operator key and add it to the env trust root.
-/// Internal helper used by [`bootstrap`] — the explicit verb is the
-/// documented escape hatch that unconditionally re-grants trust.
-/// Callers are responsible for wrapping the call in
-/// [`super::audit_and_record`] so the local-only authz gate fires BEFORE
-/// `operator_key::load_or_generate` writes `~/.greentic/operator/key.pem`.
-///
-/// `op env init` does NOT call this — it calls the gated variant
-/// [`seed_operator_key_if_trust_root_absent`] so a routine `init` cannot
-/// silently re-grant a revoked operator key.
+/// Unconditional variant: used by `trust-root bootstrap`, the documented
+/// explicit re-grant verb. Caller wraps in [`super::audit_and_record`] so
+/// authz fires BEFORE `load_or_generate` writes `~/.greentic/operator/key.pem`.
+/// `op env init` uses the gated [`seed_operator_key_if_trust_root_absent`]
+/// instead, so it cannot re-grant a key the operator revoked via
+/// `trust-root remove`.
 pub(super) fn seed_operator_key_into_trust_root(
     store: &LocalFsStore,
     env_id: &EnvId,
 ) -> Result<TrustRootSeedResult, OpError> {
     let op_key = crate::operator_key::load_or_generate()?;
     let env_dir = store.env_dir(env_id)?;
-    store.transact(env_id, |_locked| -> Result<_, OpError> {
-        let trust = store_trust_root::add_trusted_key(
-            &env_dir,
-            TrustedKey {
-                key_id: op_key.key_id.clone(),
-                public_key_pem: op_key.public_pem.clone(),
-            },
-        )?;
-        Ok(TrustRootSeedResult {
-            environment_id: env_id.as_str().to_string(),
-            operator_key_id: op_key.key_id.clone(),
-            operator_public_key_pem: op_key.public_pem.clone(),
-            trusted_key_count: trust.keys.len(),
-        })
+    store.transact(env_id, |_locked| {
+        add_op_key_and_summarize(&env_dir, env_id, &op_key)
     })
 }
 
-/// Same as [`seed_operator_key_into_trust_root`] but **only seeds when
-/// `<env_dir>/trust-root.json` does not yet exist**. Returns `None` when
-/// the file already exists (the operator has bootstrapped, added, or
-/// removed at least one key) — `init` must not silently re-grant trust
-/// on a key the operator may have deliberately revoked via
-/// `trust-root remove`. The existence check happens INSIDE the env flock
-/// so it's race-free with a concurrent `trust-root remove`.
-///
-/// To intentionally re-grant trust after a revoke, run
-/// `gtc op trust-root bootstrap` (which calls
-/// [`seed_operator_key_into_trust_root`] unconditionally).
+/// First-init-only variant: returns `None` when `<env_dir>/trust-root.json`
+/// already exists (bootstrapped/added/removed — the operator has touched
+/// the trust root). Existence check + `load_or_generate` + write all sit
+/// under the env flock so a concurrent `trust-root remove` cannot race
+/// the gate, and `~/.greentic/operator/key.pem` is not auto-generated when
+/// the gate would skip.
 pub(super) fn seed_operator_key_if_trust_root_absent(
     store: &LocalFsStore,
     env_id: &EnvId,
 ) -> Result<Option<TrustRootSeedResult>, OpError> {
     let env_dir = store.env_dir(env_id)?;
     let tr_path = crate::environment::trust_root::trust_root_path(&env_dir);
-    // Existence check + key generation + write must all sit under the env
-    // flock so a concurrent `trust-root {add,remove}` can't slip past the
-    // gate. Tests on a fresh tempdir trigger the seed path; envs with a
-    // pre-existing `trust-root.json` (bootstrapped, added, or post-remove
-    // empty-keys) are skipped.
     store.transact(env_id, |_locked| -> Result<_, OpError> {
         if tr_path.exists() {
             return Ok(None);
         }
-        // load_or_generate happens *inside* the gate so an unauthorized or
-        // already-seeded init doesn't write ~/.greentic/operator/key.pem
-        // as a side effect.
         let op_key = crate::operator_key::load_or_generate()?;
-        let trust = store_trust_root::add_trusted_key(
-            &env_dir,
-            TrustedKey {
-                key_id: op_key.key_id.clone(),
-                public_key_pem: op_key.public_pem.clone(),
-            },
-        )?;
-        Ok(Some(TrustRootSeedResult {
-            environment_id: env_id.as_str().to_string(),
-            operator_key_id: op_key.key_id.clone(),
-            operator_public_key_pem: op_key.public_pem.clone(),
-            trusted_key_count: trust.keys.len(),
-        }))
+        add_op_key_and_summarize(&env_dir, env_id, &op_key).map(Some)
+    })
+}
+
+/// Shared body of the two seed variants: add the operator key to the env
+/// trust root and return the wire-shaped summary. Caller owns the
+/// `load_or_generate` placement (the unconditional variant calls it
+/// outside the flock; the gated variant calls it inside) — this helper
+/// is only the post-key work and assumes the env flock is held.
+fn add_op_key_and_summarize(
+    env_dir: &Path,
+    env_id: &EnvId,
+    op_key: &crate::operator_key::OperatorKey,
+) -> Result<TrustRootSeedResult, OpError> {
+    let trust = store_trust_root::add_trusted_key(
+        env_dir,
+        TrustedKey {
+            key_id: op_key.key_id.clone(),
+            public_key_pem: op_key.public_pem.clone(),
+        },
+    )?;
+    Ok(TrustRootSeedResult {
+        environment_id: env_id.as_str().to_string(),
+        operator_key_id: op_key.key_id.clone(),
+        operator_public_key_pem: op_key.public_pem.clone(),
+        trusted_key_count: trust.keys.len(),
     })
 }
 
