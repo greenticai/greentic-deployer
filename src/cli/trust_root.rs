@@ -71,27 +71,50 @@ pub fn bootstrap(
     };
     audit_and_record(store, ctx, |_committed| {
         // Authz passed: now safe to load-or-generate the operator key.
-        let op_key = crate::operator_key::load_or_generate()?;
-        let env_dir = store.env_dir(&env_id)?;
-        let summary = store.transact(&env_id, |_locked| -> Result<Value, OpError> {
-            let trust = store_trust_root::add_trusted_key(
-                &env_dir,
-                TrustedKey {
-                    key_id: op_key.key_id.clone(),
-                    public_key_pem: op_key.public_pem.clone(),
-                },
-            )?;
-            Ok(json!({
-                "environment_id": env_id.as_str(),
-                "operator_key_id": op_key.key_id,
-                "operator_public_key_pem": op_key.public_pem,
-                "trusted_key_count": trust.keys.len(),
-            }))
-        })?;
+        let seeded = seed_operator_key_into_trust_root(store, &env_id)?;
         Ok((
-            OpOutcome::new(NOUN, "bootstrap", summary),
+            OpOutcome::new(NOUN, "bootstrap", json!(seeded)),
             super::AuditGens::NONE,
         ))
+    })
+}
+
+/// Result of seeding the operator key into the env trust root. Serialized
+/// shape matches the legacy `trust-root bootstrap` outcome and is embedded
+/// under the `trust_root` key on `env.init` outcomes (N1.4).
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct TrustRootSeedResult {
+    pub environment_id: String,
+    pub operator_key_id: String,
+    pub operator_public_key_pem: String,
+    pub trusted_key_count: usize,
+}
+
+/// Load (or generate) the operator key and add it to the env trust root.
+/// Internal helper shared by [`bootstrap`] and [`super::env::init`] (N1.4) —
+/// callers are responsible for wrapping the call in
+/// [`super::audit_and_record`] so the local-only authz gate fires BEFORE
+/// `operator_key::load_or_generate` writes `~/.greentic/operator/key.pem`.
+pub(super) fn seed_operator_key_into_trust_root(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+) -> Result<TrustRootSeedResult, OpError> {
+    let op_key = crate::operator_key::load_or_generate()?;
+    let env_dir = store.env_dir(env_id)?;
+    store.transact(env_id, |_locked| -> Result<_, OpError> {
+        let trust = store_trust_root::add_trusted_key(
+            &env_dir,
+            TrustedKey {
+                key_id: op_key.key_id.clone(),
+                public_key_pem: op_key.public_pem.clone(),
+            },
+        )?;
+        Ok(TrustRootSeedResult {
+            environment_id: env_id.as_str().to_string(),
+            operator_key_id: op_key.key_id.clone(),
+            operator_public_key_pem: op_key.public_pem.clone(),
+            trusted_key_count: trust.keys.len(),
+        })
     })
 }
 

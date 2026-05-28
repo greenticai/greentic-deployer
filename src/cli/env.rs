@@ -395,10 +395,16 @@ pub fn tool_check(
 }
 
 /// `op env init`. Idempotent bootstrap of the `local` env with its five
-/// default env-pack bindings. Wraps the A4 helper
+/// default env-pack bindings, **and** seeds the operator key into the env
+/// trust root so signature-gated verbs (revenue-policy, bundle/revision
+/// DSSE) work out of the box. Wraps the A4 helper
 /// [`super::bootstrap::ensure_local_environment`] so first-run installs can
 /// create the env without going through `gtc setup` (which requires a bundle
 /// to validate) or `gtc start` (which requires a bundle to start).
+///
+/// Trust-root seeding is idempotent and equivalent to running
+/// `gtc op trust-root bootstrap` afterwards (N1.4) — re-running `init` with
+/// the same operator key is a no-op on the trust root.
 ///
 /// Outcome JSON discriminator:
 /// - `"created"` — env did not exist; all 5 default bindings written.
@@ -430,11 +436,19 @@ pub fn init(store: &LocalFsStore, flags: &OpFlags) -> Result<OpOutcome, OpError>
     };
     audit_and_record(store, ctx, |_committed| {
         let (env, outcome) = super::bootstrap::ensure_local_environment(store)?;
+        // Authz passed and env is on disk; seed the operator key into the
+        // env trust root so revenue-policy/bundle signature verification
+        // works out of the box. Idempotent: an already-seeded key is a
+        // no-op (N1.4 — folds the former `trust-root bootstrap` step into
+        // `env init` so the first-run path is a single command).
+        let trust_root =
+            super::trust_root::seed_operator_key_into_trust_root(store, &env.environment_id)?;
         let bound_slots: Vec<String> = env.packs.iter().map(|b| b.slot.to_string()).collect();
         let mut payload = json!({
             "environment_id": env.environment_id.as_str(),
             "bound_slots": bound_slots,
             "pack_count": env.packs.len(),
+            "trust_root": trust_root,
         });
         let payload_obj = payload
             .as_object_mut()
@@ -828,6 +842,65 @@ mod tests {
             Some("untouched")
         );
         assert!(outcome.result.get("added_slots").is_none());
+    }
+
+    #[test]
+    fn init_seeds_operator_key_into_env_trust_root() {
+        // N1.4: env init folds the former `trust-root bootstrap` step so
+        // first-run installs end up with a signature-ready env in one
+        // command. The trust-root summary rides on the init outcome under
+        // a nested `trust_root` key.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let outcome = init(&store, &OpFlags::default()).unwrap();
+        let trust_root = outcome
+            .result
+            .get("trust_root")
+            .expect("init outcome carries `trust_root`");
+        assert_eq!(
+            trust_root.get("environment_id").and_then(|v| v.as_str()),
+            Some("local")
+        );
+        let key_id = trust_root
+            .get("operator_key_id")
+            .and_then(|v| v.as_str())
+            .expect("operator_key_id present");
+        assert!(!key_id.is_empty(), "operator_key_id must not be empty");
+        assert!(
+            trust_root
+                .get("operator_public_key_pem")
+                .and_then(|v| v.as_str())
+                .is_some_and(|pem| pem.starts_with("-----BEGIN PUBLIC KEY-----"))
+        );
+        assert_eq!(
+            trust_root.get("trusted_key_count").and_then(|v| v.as_u64()),
+            Some(1),
+            "first init seeds exactly one operator key"
+        );
+
+        // The trust-root file on disk must contain the same key as the
+        // dedicated `trust-root list` verb would report.
+        let listed = super::super::trust_root::list(&store, &OpFlags::default(), "local").unwrap();
+        let keys = listed.result["keys"].as_array().expect("keys array");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["key_id"].as_str(), Some(key_id));
+    }
+
+    #[test]
+    fn init_is_idempotent_on_trust_root_seeding() {
+        // Re-running init with the same operator key must NOT duplicate the
+        // trust-root entry — both `created`/`healed`/`untouched` paths run
+        // the same idempotent seeder.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        init(&store, &OpFlags::default()).unwrap();
+        init(&store, &OpFlags::default()).unwrap();
+        let listed = super::super::trust_root::list(&store, &OpFlags::default(), "local").unwrap();
+        assert_eq!(
+            listed.result["keys"].as_array().unwrap().len(),
+            1,
+            "second init must not duplicate the operator key in the trust root"
+        );
     }
 
     #[test]
