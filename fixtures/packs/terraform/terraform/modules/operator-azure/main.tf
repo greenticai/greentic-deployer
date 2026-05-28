@@ -1,5 +1,5 @@
 locals {
-  module_kind = "operator-azure"
+  module_kind   = "operator-azure"
   secret_prefix = trimspace(var.azure_key_vault_uri) != "" ? trimsuffix(var.azure_key_vault_uri, "/") : null
   name_prefix   = trimspace(var.deployment_name_prefix) != "" ? var.deployment_name_prefix : "greentic-${substr(md5(var.bundle_digest), 0, 8)}"
   app_port      = 8080
@@ -13,6 +13,9 @@ locals {
   admin_client_key_secret_name  = "greentic-admin-client-key-${var.environment}"
   admin_relay_token_secret_name = "greentic-admin-relay-token-${var.environment}"
   admin_relay_token             = sha256(tls_private_key.admin_client.private_key_pem)
+  operator_secret_names = {
+    for uri, _ in var.secrets_map : uri => "operator-${substr(md5(uri), 0, 16)}"
+  }
 
   can_manage_key_vault_secrets = trimspace(var.azure_key_vault_id) != ""
   resource_group_name          = "${local.name_prefix}-rg"
@@ -192,6 +195,22 @@ resource "azurerm_key_vault_secret" "admin_relay_token" {
   }
 }
 
+resource "azurerm_key_vault_secret" "operator" {
+  for_each = local.can_manage_key_vault_secrets ? var.secrets_map : {}
+
+  name         = local.operator_secret_names[each.key]
+  value        = each.value
+  key_vault_id = var.azure_key_vault_id
+  content_type = "text/plain"
+
+  tags = {
+    ManagedBy          = "greentic-demo"
+    Bundle             = var.bundle_digest
+    Purpose            = "operator-secret"
+    GreenticSecretHash = substr(md5(each.key), 0, 16)
+  }
+}
+
 resource "azurerm_resource_group" "this" {
   name     = local.resource_group_name
   location = var.azure_location
@@ -233,6 +252,10 @@ resource "azurerm_container_app" "this" {
   container_app_environment_id = azurerm_container_app_environment.this.id
   revision_mode                = "Single"
 
+  identity {
+    type = "SystemAssigned"
+  }
+
   secret {
     name  = "admin-ca-pem"
     value = tls_self_signed_cert.admin_ca.cert_pem
@@ -261,6 +284,23 @@ resource "azurerm_container_app" "this" {
   secret {
     name  = "admin-relay-token"
     value = local.admin_relay_token
+  }
+
+  dynamic "secret" {
+    for_each = local.can_manage_key_vault_secrets ? var.secrets_map : {}
+    content {
+      name                = local.operator_secret_names[secret.key]
+      key_vault_secret_id = azurerm_key_vault_secret.operator[secret.key].versionless_id
+      identity            = "System"
+    }
+  }
+
+  dynamic "secret" {
+    for_each = local.can_manage_key_vault_secrets ? {} : var.secrets_map
+    content {
+      name  = local.operator_secret_names[secret.key]
+      value = secret.value
+    }
   }
 
   ingress {
@@ -394,6 +434,14 @@ resource "azurerm_container_app" "this" {
         }
       }
 
+      dynamic "env" {
+        for_each = var.secrets_map
+        content {
+          name        = env.key
+          secret_name = local.operator_secret_names[env.key]
+        }
+      }
+
       env {
         name        = "GREENTIC_ADMIN_CA_PEM"
         secret_name = "admin-ca-pem"
@@ -430,6 +478,13 @@ resource "azurerm_container_app" "this" {
     ManagedBy = "greentic-demo"
     Bundle    = var.bundle_digest
   }
+}
+
+resource "azurerm_role_assignment" "operator_secret_reader" {
+  count                = length(var.secrets_map) > 0 && trimspace(var.azure_key_vault_id) != "" ? 1 : 0
+  scope                = var.azure_key_vault_id
+  role_definition_name = "Key Vault Secrets User"
+  principal_id         = azurerm_container_app.this.identity[0].principal_id
 }
 
 # This module now supports real Key Vault secret materialization when

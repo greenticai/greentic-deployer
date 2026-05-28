@@ -2143,7 +2143,8 @@ fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path
   admin_allowed_clients = var.admin_allowed_clients
   public_base_url       = var.public_base_url
   runtime_secret_prefix = var.runtime_secret_prefix
-  runtime_secret_env    = var.runtime_secret_env"#,
+  runtime_secret_env    = var.runtime_secret_env
+  secrets_map           = var.secrets_map"#,
         ),
         crate::config::Provider::Azure => (
             "operator",
@@ -2163,7 +2164,8 @@ fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path
   azure_key_vault_id    = var.azure_key_vault_id
   azure_location        = var.azure_location
   runtime_secret_prefix = var.runtime_secret_prefix
-  runtime_secret_env    = var.runtime_secret_env"#,
+  runtime_secret_env    = var.runtime_secret_env
+  secrets_map           = var.secrets_map"#,
         ),
         crate::config::Provider::Gcp => (
             "operator",
@@ -2182,7 +2184,8 @@ fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path
   gcp_project_id        = var.gcp_project_id
   gcp_region            = var.gcp_region
   runtime_secret_prefix = var.runtime_secret_prefix
-  runtime_secret_env    = var.runtime_secret_env"#,
+  runtime_secret_env    = var.runtime_secret_env
+  secrets_map           = var.secrets_map"#,
         ),
         _ => return Ok(()),
     };
@@ -2260,6 +2263,12 @@ output "admin_client_key_secret_ref" {{
         "map(string)",
         Some("{}"),
     )?;
+    ensure_terraform_variable_declared(
+        &terraform_root.join("variables.tf"),
+        "secrets_map",
+        "map(string)",
+        Some("{}"),
+    )?;
     let module_variables = match config.provider {
         crate::config::Provider::Aws => Some(terraform_root.join("modules/operator/variables.tf")),
         crate::config::Provider::Azure => {
@@ -2286,6 +2295,12 @@ output "admin_client_key_secret_ref" {{
         ensure_terraform_variable_declared(
             &module_variables,
             "runtime_secret_env",
+            "map(string)",
+            Some("{}"),
+        )?;
+        ensure_terraform_variable_declared(
+            &module_variables,
+            "secrets_map",
             "map(string)",
             Some("{}"),
         )?;
@@ -2536,10 +2551,110 @@ fn materialize_generated_tfvars(
     for (key, value) in terraform_env_overrides() {
         replace_tfvars_assignment(&mut contents, &key, &value);
     }
+    apply_operator_secrets_map_tfvar(&mut contents);
     normalize_public_base_url_assignment(&mut contents);
 
     fs::write(output_path, contents)?;
     Ok(Some(output_name))
+}
+
+/// PR-08: lift operator secrets into the generated tfvars file so the AWS
+/// operator module materialises them as Secrets Manager entries and injects
+/// them into the ECS task definition's `secrets` block.
+///
+/// Source contract (v1): a JSON object at the path indicated by
+/// `GREENTIC_OPERATOR_SECRETS_JSON`, mapping canonical `secrets://...` URIs
+/// to UTF-8 string values. When the env var is unset, the file is missing,
+/// or the JSON is empty, no `secrets_map` assignment is written and the
+/// terraform default (`{}`) applies — no operator-secret resources are
+/// created. The bundle artifact never carries these values.
+///
+/// A future `gtc secrets export --json <path>` will be the canonical
+/// producer; meanwhile the env-var contract lets operators or CI assemble
+/// the JSON out-of-band and hand it to `gtc deploy`.
+///
+/// Logging policy: only the count is printed. Values, keys, and the file
+/// path never leave the deployer process via stdout/stderr.
+fn apply_operator_secrets_map_tfvar(contents: &mut String) {
+    let Some(map) = load_operator_secrets_map() else {
+        return;
+    };
+    if map.is_empty() {
+        return;
+    }
+    let rendered = render_terraform_map(&map);
+    replace_tfvars_assignment_literal(contents, "secrets_map", &rendered);
+    eprintln!(
+        "operator secrets: applied {} entr{} to tfvars (source=GREENTIC_OPERATOR_SECRETS_JSON)",
+        map.len(),
+        if map.len() == 1 { "y" } else { "ies" }
+    );
+}
+
+fn load_operator_secrets_map() -> Option<std::collections::BTreeMap<String, String>> {
+    let path = std::env::var("GREENTIC_OPERATOR_SECRETS_JSON")
+        .ok()
+        .map(std::path::PathBuf::from)?;
+    if !path.is_file() {
+        return None;
+    }
+    let raw = fs::read_to_string(&path).ok()?;
+    let parsed: std::collections::BTreeMap<String, String> = serde_json::from_str(&raw).ok()?;
+    Some(parsed)
+}
+
+/// Render a Rust map as a terraform HCL map literal.
+///
+/// Values are JSON-quoted (the same escape contract `replace_tfvars_assignment`
+/// uses for plain strings), so the result is `{ "k" = "v", ... }` with each
+/// pair on its own line for readability. Terraform marks the variable
+/// `sensitive` at the schema level, so plan/apply suppresses values.
+fn render_terraform_map(map: &std::collections::BTreeMap<String, String>) -> String {
+    let mut out = String::from("{\n");
+    for (key, value) in map {
+        let key_q = serde_json::to_string(key).unwrap_or_else(|_| format!("\"{key}\""));
+        let value_q = serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""));
+        out.push_str(&format!("  {key_q} = {value_q}\n"));
+    }
+    out.push('}');
+    out
+}
+
+/// Like `replace_tfvars_assignment` but treats `value` as an already-rendered
+/// HCL literal (map/list/etc.) instead of JSON-quoting it as a string.
+fn replace_tfvars_assignment_literal(contents: &mut String, key: &str, value_literal: &str) {
+    let replacement = format!("{key} = {value_literal}");
+    let mut rewritten = Vec::new();
+    let mut replaced = false;
+    let mut iter = contents.lines().peekable();
+    while let Some(line) = iter.next() {
+        if !replaced && line.trim_start().starts_with(&format!("{key} = ")) {
+            rewritten.push(replacement.clone());
+            // Skip continuation lines of a previous multi-line literal until
+            // we see a top-level closing `}` (terraform map/list literal).
+            if line.trim_end().ends_with('{') || line.trim_end().ends_with('[') {
+                for cont in iter.by_ref() {
+                    if cont.trim() == "}" || cont.trim() == "]" {
+                        break;
+                    }
+                }
+            }
+            replaced = true;
+            continue;
+        }
+        rewritten.push(line.to_string());
+    }
+    if !replaced {
+        if !contents.is_empty() && !contents.ends_with('\n') {
+            rewritten.push(String::new());
+        }
+        rewritten.push(replacement);
+    }
+    let mut joined = rewritten.join("\n");
+    if !joined.ends_with('\n') {
+        joined.push('\n');
+    }
+    *contents = joined;
 }
 
 fn resolve_terraform_deployment_name_prefix(config: &DeployerConfig, output_path: &Path) -> String {
@@ -5979,5 +6094,78 @@ data "aws_region" "current" {}
             other => panic!("unexpected payload: {:?}", other),
         }
         assert!(result.output_validation.as_ref().expect("validation").valid);
+    }
+
+    // ------------------------------------------------------------------
+    // PR-08 — operator secrets map tfvar emission
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn render_terraform_map_emits_quoted_key_value_pairs() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "secrets://dev/demo/_/messaging-webchat/jwt_signing_key".to_string(),
+            "secret-value".to_string(),
+        );
+        map.insert(
+            "secrets://dev/demo/_/deep-research-demo/api_key_secret".to_string(),
+            "another".to_string(),
+        );
+
+        let rendered = render_terraform_map(&map);
+
+        assert!(rendered.starts_with("{\n"));
+        assert!(rendered.ends_with('}'));
+        // BTreeMap iterates sorted, so the api_key entry lands first.
+        assert!(
+            rendered.contains(
+                "\"secrets://dev/demo/_/deep-research-demo/api_key_secret\" = \"another\""
+            ),
+            "rendered map should contain canonical URI as key: {rendered}"
+        );
+        assert!(rendered.contains(
+            "\"secrets://dev/demo/_/messaging-webchat/jwt_signing_key\" = \"secret-value\""
+        ));
+    }
+
+    #[test]
+    fn render_terraform_map_escapes_special_characters() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "k".to_string(),
+            "value with \"quotes\" and \\backslash".to_string(),
+        );
+        let rendered = render_terraform_map(&map);
+        // JSON-style escapes survive into the HCL literal.
+        assert!(
+            rendered.contains(r#"value with \"quotes\" and \\backslash"#),
+            "escapes preserved: {rendered}"
+        );
+    }
+
+    #[test]
+    fn replace_tfvars_assignment_literal_inserts_new_map_assignment() {
+        let mut contents = String::from("cloud = \"aws\"\ntenant = \"demo\"\n");
+        let map_literal = "{\n  \"k\" = \"v\"\n}";
+        replace_tfvars_assignment_literal(&mut contents, "secrets_map", map_literal);
+        assert!(contents.contains("secrets_map = {\n  \"k\" = \"v\"\n}"));
+        assert!(contents.contains("cloud = \"aws\""));
+        assert!(contents.contains("tenant = \"demo\""));
+    }
+
+    #[test]
+    fn replace_tfvars_assignment_literal_replaces_existing_multiline_map() {
+        // A previous deploy emitted a 3-line map; the next emit must replace
+        // both the assignment and the continuation lines so the file does
+        // not accumulate duplicate entries.
+        let mut contents = String::from(
+            "cloud = \"aws\"\nsecrets_map = {\n  \"old\" = \"old\"\n}\ntenant = \"demo\"\n",
+        );
+        let new_literal = "{\n  \"new\" = \"value\"\n}";
+        replace_tfvars_assignment_literal(&mut contents, "secrets_map", new_literal);
+        assert!(contents.contains("secrets_map = {\n  \"new\" = \"value\"\n}"));
+        assert!(!contents.contains("\"old\""));
+        assert_eq!(contents.matches("secrets_map = ").count(), 1);
+        assert!(contents.contains("tenant = \"demo\""));
     }
 }

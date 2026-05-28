@@ -59,3 +59,18 @@ variable "admin_access_mode" {
   type    = string
   default = "http-bearer-relay"
 }
+
+variable "runtime_secret_prefix" {
+  type    = string
+  default = ""
+}
+
+variable "runtime_secret_env" {
+  type    = map(string)
+  default = {}
+}
+
+variable "secrets_map" {
+  type    = map(string)
+  default = {}
+}

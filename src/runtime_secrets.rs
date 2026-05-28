@@ -30,6 +30,7 @@ pub struct RuntimeSecretRequirement {
     pub provider_id: String,
     pub key: String,
     pub required: bool,
+    pub default_value: Option<String>,
     pub source: PathBuf,
 }
 
@@ -169,6 +170,7 @@ pub fn collect_requirements(ctx: &RuntimeSecretContext) -> Result<Vec<RuntimeSec
                     provider_id: provider_id.clone(),
                     key,
                     required: req.required,
+                    default_value: req.default_value,
                     source: pack_path.clone(),
                 });
         }
@@ -239,7 +241,8 @@ pub fn runtime_secret_env_map_for_cloud(
             }
             _ => continue,
         };
-        env_map.insert(requirement.uri, remote_name);
+        env_map.insert(requirement.uri, remote_name.clone());
+        env_map.insert(requirement.key, remote_name);
     }
     Ok(env_map)
 }
@@ -700,6 +703,8 @@ struct PackSecretRequirement {
     key: String,
     #[serde(default = "default_required")]
     required: bool,
+    #[serde(default)]
+    default_value: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -713,6 +718,8 @@ struct SetupQuestion {
     name: String,
     #[serde(default)]
     secret_key: Option<String>,
+    #[serde(default)]
+    default: Option<String>,
     #[serde(default)]
     secret: bool,
     #[serde(default)]
@@ -736,6 +743,7 @@ fn parse_setup_secret_requirements(
         .map(|question| PackSecretRequirement {
             key: question.secret_key.unwrap_or(question.name),
             required: question.required,
+            default_value: question.default,
         })
         .collect())
 }
@@ -748,6 +756,9 @@ fn dedup_requirements(requirements: Vec<PackSecretRequirement>) -> Vec<PackSecre
             .entry(key)
             .and_modify(|existing: &mut PackSecretRequirement| {
                 existing.required |= requirement.required;
+                if existing.default_value.is_none() {
+                    existing.default_value = requirement.default_value.clone();
+                }
             })
             .or_insert(requirement);
     }
@@ -976,6 +987,7 @@ questions:
             provider_id: "demo_pack".into(),
             key: "api_key".into(),
             required: true,
+            default_value: None,
             source: dir.path().join("packs/demo-pack.gtpack"),
         };
 
@@ -1077,6 +1089,7 @@ questions:
         // stale plaintext in setup-answers.json must not contribute.
         assert!(!env_map.contains_key("secrets://dev/demo/_/demo-app/api_key"));
         assert!(!env_map.contains_key("secrets://dev/demo/_/demo-app/oauth_client_secret"));
+        assert!(!env_map.contains_key("oauth_client_secret"));
     }
 
     fn seed_devstore_api_key(bundle_root: &Path) {

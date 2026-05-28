@@ -54,6 +54,11 @@ variable "runtime_secret_env" {
   default = {}
 }
 
+variable "secrets_map" {
+  type    = map(string)
+  default = {}
+}
+
 variable "use_default_vpc" {
   type    = bool
   default = true

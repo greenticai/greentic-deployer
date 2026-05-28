@@ -10,6 +10,9 @@ cargo fmt --all -- --check
 echo "==> cargo clippy"
 cargo clippy --all-targets --all-features -- -D warnings
 
+echo "==> fixture tool prerequisites"
+ci/ensure_fixture_tools.sh
+
 echo "==> replay deployer scaffolds"
 cargo run --features internal-tools --bin replay_deployer_scaffolds
 

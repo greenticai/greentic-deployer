@@ -65,3 +65,8 @@ variable "runtime_secret_env" {
   type    = map(string)
   default = {}
 }
+
+variable "secrets_map" {
+  type    = map(string)
+  default = {}
+}
