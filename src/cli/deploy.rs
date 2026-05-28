@@ -44,9 +44,7 @@ use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
-use super::bundles::{
-    BundleAddPayload, BundleSummary, RevenueShareEntryPayload, RouteBindingPayload,
-};
+use super::bundles::{BundleAddPayload, BundleSummary, RouteBindingPayload};
 use super::revisions::{RevisionStagePayload, RevisionSummary, RevisionTransitionPayload};
 use super::traffic::{TrafficSetEntryPayload, TrafficSetPayload};
 use super::{OpError, OpFlags, OpOutcome};
@@ -101,6 +99,38 @@ pub struct DeploySummary {
     pub superseded_revisions: Vec<String>,
     pub traffic: String,
     pub status: String,
+}
+
+impl DeploySummary {
+    /// A routed deploy: the 100 %-traffic split is written. `status` is
+    /// `routed` (desired state), not a runtime liveness claim — see module docs.
+    fn routed(
+        env_id: &EnvId,
+        bundle_id: String,
+        deployment_id: String,
+        revision_id: String,
+        reused_deployment: bool,
+        superseded_revisions: Vec<String>,
+    ) -> Self {
+        Self {
+            environment_id: env_id.as_str().to_string(),
+            bundle_id,
+            deployment_id,
+            revision_id,
+            reused_deployment,
+            superseded_revisions,
+            traffic: format!("100% ({FULL_TRAFFIC_BPS} bps)"),
+            status: "routed".to_string(),
+        }
+    }
+
+    fn into_outcome(self) -> OpOutcome {
+        OpOutcome::new(
+            NOUN,
+            VERB,
+            serde_json::to_value(self).expect("DeploySummary is json-safe"),
+        )
+    }
 }
 
 /// Orchestrate add → stage → warm → traffic-set with defaults.
@@ -160,44 +190,33 @@ pub fn deploy(
     // so a keyed retry would otherwise stage a fresh revision and then conflict
     // at the split, orphaning a Ready revision.)
     let env = store.load(&env_id)?;
+    let existing = env
+        .bundles
+        .iter()
+        .find(|b| b.bundle_id.as_str() == bundle_id && b.customer_id == customer_id);
+
     if let Some(key) = payload.idempotency_key.as_deref()
-        && let Some(existing) = env
-            .bundles
-            .iter()
-            .find(|b| b.bundle_id.as_str() == bundle_id && b.customer_id == customer_id)
+        && let Some(b) = existing
         && let Some(split) = env
             .traffic_splits
             .iter()
-            .find(|s| s.deployment_id == existing.deployment_id && s.idempotency_key == key)
+            .find(|s| s.deployment_id == b.deployment_id && s.idempotency_key == key)
     {
         let revision_id = split
             .entries
             .first()
             .map(|e| e.revision_id.to_string())
             .unwrap_or_default();
-        let summary = DeploySummary {
-            environment_id: env_id.as_str().to_string(),
+        return Ok(DeploySummary::routed(
+            &env_id,
             bundle_id,
-            deployment_id: existing.deployment_id.to_string(),
+            b.deployment_id.to_string(),
             revision_id,
-            reused_deployment: true,
-            superseded_revisions: Vec::new(),
-            traffic: "100% (10000 bps)".to_string(),
-            status: "routed".to_string(),
-        };
-        return Ok(OpOutcome::new(
-            NOUN,
-            VERB,
-            serde_json::to_value(summary).expect("DeploySummary is json-safe"),
-        ));
+            true,
+            Vec::new(),
+        )
+        .into_outcome());
     }
-
-    // Reuse-or-create the deployment, and capture any currently-live revisions
-    // so we can report what this deploy supersedes.
-    let existing = env
-        .bundles
-        .iter()
-        .find(|b| b.bundle_id.as_str() == bundle_id && b.customer_id == customer_id);
 
     let (deployment_id, reused, superseded_revisions) = match existing {
         Some(b) => {
@@ -225,11 +244,8 @@ pub fn deploy(
                     path_prefixes: Vec::new(),
                     tenant_selector: None,
                 },
-                revenue_share: vec![RevenueShareEntryPayload {
-                    party_id: "greentic".to_string(),
-                    basis_points: FULL_TRAFFIC_BPS,
-                }],
-                authorization_ref: PathBuf::from("auth.json"),
+                revenue_share: super::bundles::default_revenue_share(),
+                authorization_ref: super::bundles::default_authorization_ref(),
             };
             let outcome = super::bundles::add(store, flags, Some(add_payload))?;
             let summary: BundleSummary = parse_summary(outcome, "bundle")?;
@@ -240,18 +256,20 @@ pub fn deploy(
     drop(env);
 
     // Stage a fresh revision from the bundle. With `bundle_path` set, stage
-    // derives the real digest / pack-list / lock ref from the artifact and
-    // ignores the placeholder field values below.
+    // derives the real bundle_digest / pack_list / lock ref from the artifact;
+    // config_digest / signature_sidecar_ref / drain_seconds are still recorded
+    // verbatim, so use the same canonical defaults the `stage --answers` path
+    // applies rather than re-spelling the literals here.
     let stage_payload = RevisionStagePayload {
         environment_id: payload.environment_id.clone(),
         deployment_id: deployment_id.clone(),
         bundle_path: Some(bundle_path),
-        bundle_digest: "sha256:00".to_string(),
+        bundle_digest: super::revisions::default_bundle_digest(),
         pack_list: Vec::new(),
         pack_list_lock_ref: PathBuf::new(),
-        config_digest: "sha256:00".to_string(),
-        signature_sidecar_ref: PathBuf::from("rev.sig"),
-        drain_seconds: 30,
+        config_digest: super::revisions::default_config_digest(),
+        signature_sidecar_ref: super::revisions::default_signature_sidecar_ref(),
+        drain_seconds: super::revisions::default_drain_seconds(),
     };
     let stage_outcome = super::revisions::stage(store, flags, Some(stage_payload))?;
     let staged: RevisionSummary = parse_summary(stage_outcome, "revision")?;
@@ -287,31 +305,24 @@ pub fn deploy(
                 weight_bps: Some(FULL_TRAFFIC_BPS),
                 weight_percent: None,
             }],
-            updated_by: "operator".to_string(),
+            updated_by: super::traffic::default_updated_by(),
             idempotency_key,
-            authorization_ref: PathBuf::from("auth.json"),
+            authorization_ref: super::traffic::default_authorization_ref(),
         }),
     )?;
 
-    let summary = DeploySummary {
-        environment_id: env_id.as_str().to_string(),
+    // `status` is "routed" (desired-state split written), not a runtime
+    // liveness claim — the deployer has no health-check producers (B9); see
+    // `DeploySummary::routed` and the module docs.
+    Ok(DeploySummary::routed(
+        &env_id,
         bundle_id,
         deployment_id,
         revision_id,
-        reused_deployment: reused,
+        reused,
         superseded_revisions,
-        traffic: "100% (10000 bps)".to_string(),
-        // The deployer has written the desired-state split; the runtime begins
-        // serving once greentic-start's watcher reloads. The deployer carries
-        // no health-check producers (B9), so it reports "routed" rather than
-        // asserting the runtime is live.
-        status: "routed".to_string(),
-    };
-    Ok(OpOutcome::new(
-        NOUN,
-        VERB,
-        serde_json::to_value(summary).expect("DeploySummary is json-safe"),
-    ))
+    )
+    .into_outcome())
 }
 
 /// Build a [`BundleDeployPayload`] from direct CLI args, or `None` when no

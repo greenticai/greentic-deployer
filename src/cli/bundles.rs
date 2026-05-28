@@ -42,13 +42,13 @@ pub struct BundleAddPayload {
 /// envs must pass one explicitly (B10).
 const LOCAL_DEV_CUSTOMER_ID: &str = "local-dev";
 
-fn default_revenue_share() -> Vec<RevenueShareEntryPayload> {
+pub(super) fn default_revenue_share() -> Vec<RevenueShareEntryPayload> {
     vec![RevenueShareEntryPayload {
         party_id: "greentic".to_string(),
         basis_points: 10_000,
     }]
 }
-fn default_authorization_ref() -> PathBuf {
+pub(super) fn default_authorization_ref() -> PathBuf {
     PathBuf::from("auth.json")
 }
 

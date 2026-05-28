@@ -73,16 +73,16 @@ pub struct RevisionStagePayload {
     pub drain_seconds: u32,
 }
 
-fn default_bundle_digest() -> String {
+pub(super) fn default_bundle_digest() -> String {
     "sha256:00".to_string()
 }
-fn default_config_digest() -> String {
+pub(super) fn default_config_digest() -> String {
     "sha256:00".to_string()
 }
-fn default_signature_sidecar_ref() -> PathBuf {
+pub(super) fn default_signature_sidecar_ref() -> PathBuf {
     PathBuf::from("rev.sig")
 }
-fn default_drain_seconds() -> u32 {
+pub(super) fn default_drain_seconds() -> u32 {
     30
 }
 
