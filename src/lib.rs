@@ -9,10 +9,14 @@ pub mod apply;
 pub mod aws;
 pub mod azure;
 pub mod bundle_upload;
+pub mod cli;
 pub mod config;
 pub mod contract;
+pub mod defaults;
 pub mod deployment;
 pub mod desktop;
+pub mod env_packs;
+pub mod environment;
 pub mod error;
 pub mod extension;
 pub mod extension_sources;
@@ -23,9 +27,11 @@ pub mod juju_machine;
 pub mod k8s_raw;
 pub mod multi_target;
 pub mod operator;
+pub mod operator_key;
 pub mod pack_introspect;
 pub mod path_safety;
 pub mod plan;
+pub(crate) mod rollout_telemetry;
 pub mod runtime_secrets;
 pub mod serverless;
 pub mod single_vm;
@@ -34,6 +40,7 @@ pub mod spec;
 pub mod surface;
 pub mod telemetry;
 pub mod terraform;
+pub mod tool_check;
 
 pub use adapter::{AdapterFamily, MultiTargetKind, UnifiedTargetSelection};
 pub use admin_access::{
@@ -56,6 +63,7 @@ pub use deployment::{
     ApplyExecutionOutcome, DestroyExecutionOutcome, ExecutionOutcome, ExecutionOutcomePayload,
     StatusExecutionOutcome,
 };
+pub use env_packs::{EnvPackHandler, EnvPackRegistry, RegistryError};
 pub use error::DeployerError;
 pub use extension::{
     BuiltinBackendDescriptor, BuiltinBackendExecutionKind, BuiltinBackendHandlerId,
@@ -117,3 +125,4 @@ pub use spec::{
     ServiceManager, ServiceSpec, StorageSpec,
 };
 pub use terraform::TerraformRequest;
+pub use tool_check::{ToolCheck, ToolCheckOutcome};

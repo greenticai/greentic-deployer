@@ -424,8 +424,11 @@ kind = "none"
 
     #[test]
     fn defaults_to_dev_environment_when_missing() {
+        // A4b flipped `greentic-config::default_env_id()` from `dev` to `local`;
+        // the cargo-update bump in this PR pulled that change into the deployer's
+        // dep graph for the first time. The test name kept its historical form.
         let config = DeployerConfig::resolve(base_request()).expect("config builds");
-        assert_eq!(config.environment, "dev");
+        assert_eq!(config.environment, "local");
     }
 
     #[test]

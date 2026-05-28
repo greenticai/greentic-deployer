@@ -8,7 +8,6 @@ use std::{
 
 use greentic_secrets_lib::{DevStore, SecretsStore};
 use serde::Deserialize;
-use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use zip::{ZipArchive, result::ZipError};
 
@@ -61,8 +60,6 @@ pub struct ResolvedRuntimeSecret {
 pub enum SecretValueSource {
     Env { key: String },
     DevStore { path: PathBuf },
-    SetupAnswers { path: PathBuf },
-    SetupDefault,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -213,11 +210,25 @@ pub fn runtime_secret_env_map_for_cloud(
         team: None,
     };
     let prefix = default_cloud_secret_prefix(&config.environment, &config.tenant, None);
+    let requirements = collect_requirements(&ctx)?;
+
+    // Unify env-map generation with the resolution that the cloud-secret
+    // promotion path uses. `resolve_runtime_secrets` consults env vars AND
+    // every dev secrets store on disk, so optional secrets backed only by
+    // the DevStore are included in the env_map (Codex review F1: previously
+    // the env-only filter silently skipped DevStore-backed optionals while
+    // the AWS/GCP/Azure apply paths still promoted them, producing
+    // runtime auth failures because Terraform was never given the URI).
+    let resolution = block_on_async_resolution(&ctx, &requirements);
+    let resolved_uris: BTreeSet<String> = resolution
+        .resolved
+        .into_iter()
+        .map(|r| r.requirement.uri)
+        .collect();
+
     let mut env_map = BTreeMap::new();
-    for requirement in collect_requirements(&ctx)? {
-        if !requirement.required
-            && !optional_requirement_has_local_value(&ctx.bundle_root, &requirement)
-        {
+    for requirement in requirements {
+        if !requirement.required && !resolved_uris.contains(&requirement.uri) {
             continue;
         }
         let remote_name = match config.provider {
@@ -236,25 +247,38 @@ pub fn runtime_secret_env_map_for_cloud(
     Ok(env_map)
 }
 
-fn optional_requirement_has_local_value(
-    bundle_root: &Path,
-    requirement: &RuntimeSecretRequirement,
-) -> bool {
-    if requirement
-        .default_value
-        .as_ref()
-        .is_some_and(|value| !value.is_empty())
-    {
-        return true;
-    }
-    if let Some(env_key) = canonical_secret_store_key(&requirement.uri)
-        && let Ok(value) = env::var(env_key)
-        && !value.is_empty()
-    {
-        return true;
-    }
-    let mut checked_sources = Vec::new();
-    resolve_from_setup_answers(bundle_root, requirement, &mut checked_sources).is_some()
+/// Run `resolve_runtime_secrets` from a sync context, regardless of the
+/// caller's runtime.
+///
+/// The deployer's production call chain is `run_cloud_backend` →
+/// `run_backend_operation` (which builds a **current-thread** runtime via
+/// `Builder::new_current_thread().block_on(apply::run)`) → several sync
+/// helpers → `runtime_secret_env_map_for_cloud` → here. We therefore CANNOT
+/// use `tokio::task::block_in_place` (it panics on a current-thread runtime)
+/// nor `Handle::current().block_on` (re-entrant block_on on the same
+/// current-thread runtime panics).
+///
+/// Instead, hop to a dedicated OS thread that owns its own current-thread
+/// runtime. `std::thread::scope` lets the closure borrow `ctx`/`requirements`
+/// without a `'static` bound; the inner runtime is fully independent of the
+/// caller's, so this works whether the caller is on a current-thread runtime,
+/// a multi-thread runtime, or no runtime at all.
+fn block_on_async_resolution(
+    ctx: &RuntimeSecretContext,
+    requirements: &[RuntimeSecretRequirement],
+) -> RuntimeSecretResolution {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build runtime for runtime-secret resolution")
+                    .block_on(resolve_runtime_secrets(ctx, requirements))
+            })
+            .join()
+            .expect("runtime-secret resolution thread panicked")
+    })
 }
 
 pub async fn resolve_runtime_secrets(
@@ -293,12 +317,11 @@ pub async fn resolve_runtime_secrets(
                 && !value.is_empty()
             {
                 // `gtc setup --non-interactive` writes raw `${VAR}` placeholders
-                // into the dev secrets store too — not just into setup-answers.
-                // Expand them here against the process env so the promoted
-                // cloud secret carries the actual value, not the placeholder
-                // string. If the env var is unset, treat the dev-store entry
-                // as unresolved and fall back to setup-answers (where the same
-                // expansion runs as a second chance) before marking missing.
+                // into the dev secrets store. Expand them here against the
+                // process env so the promoted cloud secret carries the actual
+                // value, not the placeholder string. If the env var is unset,
+                // treat the dev-store entry as unresolved and mark the
+                // requirement missing.
                 if let Some(env_key) = extract_env_placeholder(&value) {
                     checked_sources.push(format!("env ${{{env_key}}} (from dev store)"));
                     match env::var(&env_key) {
@@ -319,25 +342,6 @@ pub async fn resolve_runtime_secrets(
                 requirement: requirement.clone(),
                 value: SecretValue(value),
                 source: SecretValueSource::DevStore { path },
-            });
-        } else if let Some((path, value)) =
-            resolve_from_setup_answers(&ctx.bundle_root, requirement, &mut checked_sources)
-        {
-            resolved.push(ResolvedRuntimeSecret {
-                requirement: requirement.clone(),
-                value: SecretValue(value),
-                source: SecretValueSource::SetupAnswers { path },
-            });
-        } else if let Some(value) = requirement
-            .default_value
-            .as_ref()
-            .filter(|value| !value.is_empty())
-        {
-            checked_sources.push("assets/setup.yaml default".to_string());
-            resolved.push(ResolvedRuntimeSecret {
-                requirement: requirement.clone(),
-                value: SecretValue(value.clone()),
-                source: SecretValueSource::SetupDefault,
             });
         } else if requirement.required {
             missing.push(MissingRuntimeSecret {
@@ -560,13 +564,6 @@ fn provider_id_from_pack_path(pack_path: &Path) -> String {
         .unwrap_or_else(|| "provider".to_string())
 }
 
-fn config_id_from_pack_path(pack_path: &Path) -> Option<String> {
-    pack_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .map(ToOwned::to_owned)
-}
-
 fn infer_bundle_root_from_pack_path(pack_path: &Path) -> Option<PathBuf> {
     let mut current = if pack_path.is_dir() {
         Some(pack_path)
@@ -768,42 +765,9 @@ fn dedup_requirements(requirements: Vec<PackSecretRequirement>) -> Vec<PackSecre
     by_key.into_values().collect()
 }
 
-fn resolve_from_setup_answers(
-    bundle_root: &Path,
-    requirement: &RuntimeSecretRequirement,
-    checked_sources: &mut Vec<String>,
-) -> Option<(PathBuf, String)> {
-    let config_id = config_id_from_pack_path(&requirement.source)?;
-    let path = bundle_root
-        .join("state/config")
-        .join(config_id)
-        .join("setup-answers.json");
-    checked_sources.push(path.display().to_string());
-    let contents = std::fs::read_to_string(&path).ok()?;
-    let answers = serde_json::from_str::<BTreeMap<String, JsonValue>>(&contents).ok()?;
-    for (key, value) in answers {
-        if canonical_secret_name(&key) != requirement.key {
-            continue;
-        }
-        if let Some(value) = value.as_str()
-            && !value.is_empty()
-        {
-            if let Some(env_key) = extract_env_placeholder(value) {
-                checked_sources.push(format!("env ${{{env_key}}} (from setup-answers)"));
-                return match env::var(&env_key) {
-                    Ok(resolved) if !resolved.is_empty() => Some((path, resolved)),
-                    _ => None,
-                };
-            }
-            return Some((path, value.to_string()));
-        }
-    }
-    None
-}
-
 // Parse a whole-string `${VAR}` placeholder and return `VAR`.
-// `greentic-setup` persists unresolved env-var references in setup-answers.json
-// when a non-interactive run cannot prompt. Without expansion here, those
+// `greentic-setup` persists unresolved env-var references in the dev secrets
+// store when a non-interactive run cannot prompt. Without expansion here those
 // placeholders would propagate to the cloud secrets store verbatim and break
 // providers that try to use the value (e.g. state-redis treating `${REDIS_URL}`
 // as a connection string).
@@ -999,13 +963,16 @@ questions:
     }
 
     #[tokio::test]
-    async fn resolves_secret_values_from_setup_answers() {
+    async fn resolve_runtime_secrets_no_longer_falls_back_to_setup_answers() {
+        // Pre-B12a, `setup-answers.json` was a secondary source when the dev
+        // store missed. After B12a, the dev store is the only source — a stale
+        // plaintext value at the legacy sink must NOT resolve.
         let dir = tempfile::tempdir().unwrap();
         let answers_dir = dir.path().join("state/config/demo-pack");
         std::fs::create_dir_all(&answers_dir).unwrap();
         std::fs::write(
             answers_dir.join("setup-answers.json"),
-            r#"{"api_key":"secret-value"}"#,
+            r#"{"api_key":"STALE-PLAINTEXT-MUST-NOT-LEAK"}"#,
         )
         .unwrap();
         let ctx = RuntimeSecretContext {
@@ -1025,19 +992,23 @@ questions:
         };
 
         let resolution = resolve_runtime_secrets(&ctx, &[requirement]).await;
-        assert!(resolution.missing.is_empty());
-        assert_eq!(resolution.resolved.len(), 1);
-        assert_eq!(resolution.resolved[0].value.expose(), "secret-value");
-        assert!(matches!(
-            resolution.resolved[0].source,
-            SecretValueSource::SetupAnswers { .. }
-        ));
+        assert!(
+            resolution.resolved.is_empty(),
+            "no source means no resolution"
+        );
+        assert_eq!(resolution.missing.len(), 1);
+        assert!(
+            !resolution.missing[0]
+                .checked_sources
+                .iter()
+                .any(|s| s.contains("setup-answers")),
+            "setup-answers must not appear in checked_sources after B12a",
+        );
     }
 
-    #[test]
-    fn runtime_secret_env_map_skips_unresolved_optional_secrets() {
-        let dir = tempfile::tempdir().unwrap();
-        let bundle_root = dir.path();
+    fn build_skips_unresolved_optional_fixture(
+        bundle_root: &Path,
+    ) -> (PathBuf, std::path::PathBuf) {
         let packs_dir = bundle_root.join("packs");
         let config_dir = bundle_root.join("state/config/demo-app");
         std::fs::create_dir_all(packs_dir.join("demo-app/assets")).unwrap();
@@ -1058,19 +1029,24 @@ questions:
 "#,
         )
         .unwrap();
+        // A stale plaintext in setup-answers.json MUST NOT make api_key
+        // appear in env_map — the setup-answers fallback is gone (B12a).
         std::fs::write(
             config_dir.join("setup-answers.json"),
-            r#"{"api_key":"secret-value"}"#,
+            r#"{"api_key":"STALE-PLAINTEXT-MUST-NOT-LEAK"}"#,
         )
         .unwrap();
+        (packs_dir.clone(), packs_dir.join("demo-app"))
+    }
 
-        let config = DeployerConfig {
+    fn deployer_config_for_fixture(bundle_root: &Path, pack_path: PathBuf) -> DeployerConfig {
+        DeployerConfig {
             capability: DeployerCapability::Apply,
             provider: Provider::Aws,
             strategy: "iac-only".into(),
             tenant: "demo".into(),
             environment: "dev".into(),
-            pack_path: packs_dir.join("demo-app"),
+            pack_path,
             bundle_root: Some(bundle_root.to_path_buf()),
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -1096,73 +1072,95 @@ questions:
             ),
             repo_registry_base: None,
             store_registry_base: None,
-        };
+        }
+    }
+
+    #[test]
+    fn runtime_secret_env_map_skips_unresolved_optional_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_root = dir.path();
+        let (_packs_dir, pack_path) = build_skips_unresolved_optional_fixture(bundle_root);
+        let config = deployer_config_for_fixture(bundle_root, pack_path);
 
         let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
-        assert!(env_map.contains_key("secrets://dev/demo/_/demo-app/api_key"));
-        assert!(env_map.contains_key("api_key"));
+        // Required secret is always included.
         assert!(env_map.contains_key("secrets://dev/demo/_/demo-app/jwt_signing_key"));
-        assert!(env_map.contains_key("jwt_signing_key"));
+        // Optionals with no source in env or DevStore are skipped — the
+        // stale plaintext in setup-answers.json must not contribute.
+        assert!(!env_map.contains_key("secrets://dev/demo/_/demo-app/api_key"));
         assert!(!env_map.contains_key("secrets://dev/demo/_/demo-app/oauth_client_secret"));
         assert!(!env_map.contains_key("oauth_client_secret"));
     }
 
+    fn seed_devstore_api_key(bundle_root: &Path) {
+        use greentic_secrets_lib::{DevStore, SecretFormat};
+        let store_path = bundle_root.join(".greentic/state/dev/.dev.secrets.env");
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        let store = DevStore::with_path(&store_path).unwrap();
+        // Seed via an isolated current-thread runtime — no ambient runtime
+        // required, matching how the production sync path reaches the store.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                store
+                    .put(
+                        "secrets://dev/demo/_/demo-app/api_key",
+                        SecretFormat::Text,
+                        b"from-dev-store",
+                    )
+                    .await
+                    .unwrap();
+            });
+    }
+
+    fn assert_devstore_optional_in_env_map(env_map: &BTreeMap<String, String>) {
+        assert!(
+            env_map.contains_key("secrets://dev/demo/_/demo-app/api_key"),
+            "optional secret with DevStore value MUST appear in env_map: {env_map:?}",
+        );
+        assert!(env_map.contains_key("secrets://dev/demo/_/demo-app/jwt_signing_key"));
+        // Other optional with no source stays skipped.
+        assert!(!env_map.contains_key("secrets://dev/demo/_/demo-app/oauth_client_secret"));
+    }
+
     #[test]
-    fn runtime_secret_env_map_includes_optional_setup_secret_with_default() {
+    fn runtime_secret_env_map_includes_optional_secrets_with_devstore_value() {
+        // Codex F1 regression: an optional secret backed only by the dev
+        // secrets store (no env var) MUST appear in the cloud env_map so
+        // Terraform can wire it through to the runtime.
         let dir = tempfile::tempdir().unwrap();
         let bundle_root = dir.path();
-        let packs_dir = bundle_root.join("packs");
-        std::fs::create_dir_all(packs_dir.join("deep-research-demo/assets")).unwrap();
-        std::fs::write(
-            packs_dir.join("deep-research-demo/assets/setup.yaml"),
-            r#"
-questions:
-  - name: api_key_secret
-    secret_key: api_key_secret
-    secret: true
-    required: false
-    default: ollama-placeholder
-"#,
-        )
-        .unwrap();
+        let (_packs_dir, pack_path) = build_skips_unresolved_optional_fixture(bundle_root);
+        seed_devstore_api_key(bundle_root);
 
-        let config = DeployerConfig {
-            capability: DeployerCapability::Apply,
-            provider: Provider::Aws,
-            strategy: "iac-only".into(),
-            tenant: "demo".into(),
-            environment: "dev".into(),
-            pack_path: packs_dir.join("deep-research-demo"),
-            bundle_root: Some(bundle_root.to_path_buf()),
-            providers_dir: PathBuf::from("providers/deployer"),
-            packs_dir: PathBuf::from("packs"),
-            provider_pack: None,
-            pack_ref: None,
-            distributor_url: None,
-            distributor_token: None,
-            preview: false,
-            dry_run: false,
-            execute_local: true,
-            output: crate::config::OutputFormat::Json,
-            greentic: greentic_config::ConfigResolver::new()
-                .load()
-                .unwrap()
-                .config,
-            provenance: greentic_config::ProvenanceMap::new(),
-            config_warnings: Vec::new(),
-            deploy_pack_id_override: None,
-            deploy_flow_id_override: None,
-            bundle_source: Some("file:///tmp/demo.gtbundle".into()),
-            bundle_digest: Some(
-                "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
-            ),
-            repo_registry_base: None,
-            store_registry_base: None,
-        };
-
+        let config = deployer_config_for_fixture(bundle_root, pack_path);
         let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
-        assert!(env_map.contains_key("api_key_secret"));
-        assert!(env_map.contains_key("secrets://dev/demo/_/deep-research-demo/api_key_secret"));
+        assert_devstore_optional_in_env_map(&env_map);
+    }
+
+    // xhigh review C1 regression: the production cloud-deploy path runs
+    // `runtime_secret_env_map_for_cloud` from *inside* a current-thread tokio
+    // runtime (run_backend_operation builds `Builder::new_current_thread()`).
+    // The previous `block_in_place` bridge panicked there. This test
+    // reproduces that exact reentry shape and must not panic.
+    #[test]
+    fn runtime_secret_env_map_callable_from_within_current_thread_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_root = dir.path();
+        let (_packs_dir, pack_path) = build_skips_unresolved_optional_fixture(bundle_root);
+        seed_devstore_api_key(bundle_root);
+        let config = deployer_config_for_fixture(bundle_root, pack_path);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let env_map = rt
+            .block_on(async { runtime_secret_env_map_for_cloud(&config) })
+            .unwrap();
+        assert_devstore_optional_in_env_map(&env_map);
     }
 
     #[test]
