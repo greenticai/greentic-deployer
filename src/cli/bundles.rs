@@ -421,7 +421,10 @@ fn parse_env_id(raw: &str) -> Result<EnvId, OpError> {
 
 /// P6 (B10): resolve the billing principal. `local` defaults to `local-dev`
 /// when none is supplied; every other env must pass one explicitly.
-fn resolve_customer_id(env_id: &EnvId, supplied: Option<String>) -> Result<CustomerId, OpError> {
+pub(super) fn resolve_customer_id(
+    env_id: &EnvId,
+    supplied: Option<String>,
+) -> Result<CustomerId, OpError> {
     match supplied {
         Some(c) if c.trim().is_empty() => Err(OpError::InvalidArgument(
             "customer_id must not be empty".to_string(),

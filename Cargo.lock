@@ -1996,7 +1996,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "greentic-bundle-reader",
- "greentic-deploy-spec 0.1.26557169227",
+ "greentic-deploy-spec 0.1.26577124557",
  "greentic-distributor-client",
  "greentic-qa-lib",
  "hex",
@@ -2080,9 +2080,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deploy-spec"
-version = "0.1.26557169227"
+version = "0.1.26577124557"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4372a6e0f48456289badb81e1b6cc3d7e637b966a83287cfdf7c982f721e0c96"
+checksum = "e18781179c2df58b2a457a292c2af8db63bebb5287a8de42b63b8d51e989c2f0"
 dependencies = [
  "chrono",
  "greentic-config-types",
@@ -3206,9 +3206,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.2.0"
+version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50b7e5b27aa02a74bac8c3f23f448f8d87ff11f92d3aac1a6ed369ee08cc56c1"
+checksum = "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda"
 dependencies = [
  "libc",
  "wasi",
@@ -4709,9 +4709,9 @@ dependencies = [
 
 [[package]]
 name = "socket2"
-version = "0.6.3"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
+checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",

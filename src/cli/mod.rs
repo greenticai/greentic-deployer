@@ -42,6 +42,7 @@ pub mod bundle_stage;
 pub mod bundles;
 pub mod config;
 pub mod credentials;
+pub mod deploy;
 pub mod dispatch;
 pub mod env;
 pub mod env_packs;
