@@ -80,6 +80,11 @@ pub enum OpNoun {
         #[command(subcommand)]
         verb: TrafficVerb,
     },
+    /// One-shot bundle deployment: add (if new) → stage → warm → route 100 %
+    /// traffic, with sensible defaults. Re-deploying an existing bundle stages
+    /// a new revision and blue-green shifts traffic onto it. The
+    /// `bundles`/`revisions`/`traffic` verbs remain for fine-tuning.
+    Deploy(BundleDeployArgs),
     /// Host/setup/runtime config inspection.
     Config {
         #[command(subcommand)]
@@ -282,6 +287,31 @@ pub struct TrafficSetArgs {
     pub authorization_ref: Option<PathBuf>,
 }
 
+/// Args for `op deploy`. All fields are optional at the clap layer so
+/// `--answers` / `--schema` keep working unchanged; the dispatcher builds a
+/// `BundleDeployPayload` only when args are supplied, and requires `--bundle`
+/// on that direct path.
+#[derive(Args, Debug)]
+pub struct BundleDeployArgs {
+    /// Local `.gtbundle` to deploy. Required on the direct CLI path.
+    #[arg(long)]
+    pub bundle: Option<PathBuf>,
+    /// Environment id. Defaults to `local`.
+    #[arg(long)]
+    pub env: Option<String>,
+    /// Bundle id. Defaults to the `.gtbundle` filename stem.
+    #[arg(long = "bundle-id")]
+    pub bundle_id: Option<String>,
+    /// Billing principal (P6). Defaults to `local-dev` on the `local` env;
+    /// required for any other env.
+    #[arg(long = "customer-id")]
+    pub customer_id: Option<String>,
+    /// Idempotency key for the traffic cut-over. Defaults to a value derived
+    /// from the freshly-minted revision id.
+    #[arg(long = "idempotency-key")]
+    pub idempotency_key: Option<String>,
+}
+
 #[derive(Args, Debug)]
 pub struct TrafficTargetArgs {
     /// Environment id, e.g. `local`.
@@ -368,6 +398,7 @@ pub fn dispatch_op(cmd: OpCommand) -> Result<(), OpError> {
         OpNoun::Bundles { verb } => dispatch_bundles(&store, &flags, verb),
         OpNoun::Revisions { verb } => dispatch_revisions(&store, &flags, verb),
         OpNoun::Traffic { verb } => dispatch_traffic(&store, &flags, verb),
+        OpNoun::Deploy(args) => dispatch_deploy(&store, &flags, args),
         OpNoun::Config { verb } => dispatch_config(&store, &flags, verb),
         OpNoun::Credentials { verb } => dispatch_credentials(&store, &flags, verb),
         OpNoun::Secrets { verb } => dispatch_secrets(&store, &flags, verb),
@@ -433,6 +464,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 TrafficVerb::Rollback(_) => "rollback",
             },
         ),
+        OpNoun::Deploy(_) => ("deploy", "run"),
         OpNoun::Config { verb } => (
             "config",
             match verb {
@@ -584,6 +616,16 @@ fn dispatch_traffic(
             super::traffic::rollback(store, flags, payload)?
         }
     };
+    print_outcome(&outcome)
+}
+
+fn dispatch_deploy(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    args: BundleDeployArgs,
+) -> Result<(), OpError> {
+    let payload = super::deploy::payload_from_deploy_args(args)?;
+    let outcome = super::deploy::deploy(store, flags, payload)?;
     print_outcome(&outcome)
 }
 

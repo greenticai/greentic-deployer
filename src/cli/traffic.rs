@@ -57,10 +57,10 @@ pub struct TrafficSetEntryPayload {
     pub weight_percent: Option<u32>,
 }
 
-fn default_updated_by() -> String {
+pub(super) fn default_updated_by() -> String {
     "operator".to_string()
 }
-fn default_authorization_ref() -> PathBuf {
+pub(super) fn default_authorization_ref() -> PathBuf {
     PathBuf::from("auth.json")
 }
 
