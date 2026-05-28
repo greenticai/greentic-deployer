@@ -7,11 +7,27 @@
 //! audit / signing / revenue-policy logic stays single-sourced; this module
 //! only threads the minted ids between them and fills in sensible defaults.
 //!
+//! A real local `.gtbundle` is required on every path — `deploy` refuses to
+//! publish an artifact-less revision (placeholder digests + an empty pack-list
+//! lock would be admissible by traffic yet broken at boot).
+//!
 //! Re-deploying a bundle that is already deployed in the env stages a NEW
 //! revision and shifts 100 % traffic onto it (blue-green): because
 //! `traffic set` replaces the whole split, the previously-live revision
 //! leaves the routing table and drains at runtime. The superseded revision
 //! is retained (not archived) so `gtc op traffic rollback` still works.
+//!
+//! Each invocation is its own rollout: without a caller-supplied
+//! `--idempotency-key`, the cut-over key is derived from the freshly-minted
+//! revision, so a re-run stages another revision rather than deduplicating.
+//! Supply a stable `--idempotency-key` to make retries idempotent — a repeat
+//! with a key that already routed returns the existing outcome without minting
+//! a new revision or disturbing the rollback target.
+//!
+//! The deployer records desired state only; it carries no health-check
+//! producers (B9), so `warm` runs a no-op gate and the result reports
+//! `routed`, not a runtime liveness claim. greentic-start's watcher reloads
+//! and begins serving once the split is written.
 //!
 //! Prerequisites are required, never auto-created: the env must already exist
 //! (`gtc op env init`) and its trust root must carry the operator key
@@ -53,9 +69,10 @@ pub struct BundleDeployPayload {
     /// required for every other env. Forwarded verbatim to `bundles add`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub customer_id: Option<String>,
-    /// Local `.gtbundle` to stage. Required via the CLI. An `--answers`
-    /// payload may omit it to drive the legacy (no-extraction) stage path,
-    /// which is what the unit tests exercise.
+    /// Local `.gtbundle` to stage. Required (on every path): `deploy` refuses
+    /// to publish an artifact-less revision. Optional in the struct only so an
+    /// `--answers` payload that omits it fails with a clear error rather than a
+    /// deserialization error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_path: Option<PathBuf>,
     /// Idempotency key for the traffic cut-over. Defaults to a value derived
@@ -104,6 +121,24 @@ pub fn deploy(
         ));
     }
 
+    // `op deploy` always stages from a real `.gtbundle`: an artifact-less
+    // stage would record placeholder digests and an empty pack-list lock —
+    // warmable by the no-op gate, admissible by traffic, and broken at boot.
+    // Reject it here, before any mutation, so a bad call never creates a
+    // deployment it then can't fill. (The legacy verbatim stage path stays
+    // reachable only through the explicit `revisions stage --answers` verb.)
+    let bundle_path = payload.bundle_path.clone().ok_or_else(|| {
+        OpError::InvalidArgument(
+            "deploy requires a local `.gtbundle`: pass `--bundle <PATH>`".to_string(),
+        )
+    })?;
+    if !bundle_path.is_file() {
+        return Err(OpError::InvalidArgument(format!(
+            "bundle `{}` is not a file",
+            bundle_path.display()
+        )));
+    }
+
     // Preflight: the env must already exist. We never auto-create it, because
     // `env init` is the only path that legitimately seeds the trust root (C2),
     // and a deploy must not grant signing rights as a side effect.
@@ -118,9 +153,47 @@ pub fn deploy(
     // reuse scan keys on the real (env_id, bundle_id, customer_id) anchor.
     let customer_id = super::bundles::resolve_customer_id(&env_id, payload.customer_id.clone())?;
 
+    // Operation-level idempotency: if the caller supplied a key and the bundle
+    // already has a traffic split under that key, this deploy already ran —
+    // return the existing outcome without minting a duplicate revision or
+    // moving the rollback target. (`traffic set` alone keys only the cut-over,
+    // so a keyed retry would otherwise stage a fresh revision and then conflict
+    // at the split, orphaning a Ready revision.)
+    let env = store.load(&env_id)?;
+    if let Some(key) = payload.idempotency_key.as_deref()
+        && let Some(existing) = env
+            .bundles
+            .iter()
+            .find(|b| b.bundle_id.as_str() == bundle_id && b.customer_id == customer_id)
+        && let Some(split) = env
+            .traffic_splits
+            .iter()
+            .find(|s| s.deployment_id == existing.deployment_id && s.idempotency_key == key)
+    {
+        let revision_id = split
+            .entries
+            .first()
+            .map(|e| e.revision_id.to_string())
+            .unwrap_or_default();
+        let summary = DeploySummary {
+            environment_id: env_id.as_str().to_string(),
+            bundle_id,
+            deployment_id: existing.deployment_id.to_string(),
+            revision_id,
+            reused_deployment: true,
+            superseded_revisions: Vec::new(),
+            traffic: "100% (10000 bps)".to_string(),
+            status: "routed".to_string(),
+        };
+        return Ok(OpOutcome::new(
+            NOUN,
+            VERB,
+            serde_json::to_value(summary).expect("DeploySummary is json-safe"),
+        ));
+    }
+
     // Reuse-or-create the deployment, and capture any currently-live revisions
     // so we can report what this deploy supersedes.
-    let env = store.load(&env_id)?;
     let existing = env
         .bundles
         .iter()
@@ -166,11 +239,13 @@ pub fn deploy(
     // Drop the borrow on `env` before the mutating steps below.
     drop(env);
 
-    // Stage a fresh revision from the bundle.
+    // Stage a fresh revision from the bundle. With `bundle_path` set, stage
+    // derives the real digest / pack-list / lock ref from the artifact and
+    // ignores the placeholder field values below.
     let stage_payload = RevisionStagePayload {
         environment_id: payload.environment_id.clone(),
         deployment_id: deployment_id.clone(),
-        bundle_path: payload.bundle_path.clone(),
+        bundle_path: Some(bundle_path),
         bundle_digest: "sha256:00".to_string(),
         pack_list: Vec::new(),
         pack_list_lock_ref: PathBuf::new(),
@@ -194,8 +269,9 @@ pub fn deploy(
 
     // Route 100 % of traffic to the new revision. `traffic set` is a full
     // replacement, so any previously-live revision drops out of the split
-    // (blue-green). A revision-derived idempotency key makes every deploy a
-    // distinct cut-over rather than a replay.
+    // (blue-green). Without a caller-supplied key, each deploy is its own
+    // rollout: the revision-derived key guarantees a distinct cut-over. Supply
+    // `--idempotency-key` to make retries idempotent (handled above).
     let idempotency_key = payload
         .idempotency_key
         .clone()
@@ -225,7 +301,11 @@ pub fn deploy(
         reused_deployment: reused,
         superseded_revisions,
         traffic: "100% (10000 bps)".to_string(),
-        status: "serving".to_string(),
+        // The deployer has written the desired-state split; the runtime begins
+        // serving once greentic-start's watcher reloads. The deployer carries
+        // no health-check producers (B9), so it reports "routed" rather than
+        // asserting the runtime is live.
+        status: "routed".to_string(),
     };
     Ok(OpOutcome::new(
         NOUN,
@@ -320,14 +400,14 @@ fn deploy_schema() -> Value {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "BundleDeployPayload",
         "type": "object",
-        "required": ["bundle_id"],
+        "required": ["bundle_id", "bundle_path"],
         "additionalProperties": false,
         "properties": {
             "environment_id": {"type": "string", "default": "local"},
             "bundle_id": {"type": "string"},
             "customer_id": {"type": "string"},
-            "bundle_path": {"type": "string", "description": "local .gtbundle path"},
-            "idempotency_key": {"type": "string"}
+            "bundle_path": {"type": "string", "description": "local .gtbundle path (required)"},
+            "idempotency_key": {"type": "string", "description": "supply to make retries idempotent"}
         }
     })
 }
@@ -347,15 +427,20 @@ mod tests {
         (dir, store)
     }
 
-    /// A `BundleDeployPayload` with no `bundle_path`, which drives the legacy
-    /// (no-extraction) stage path — enough to exercise the orchestration
-    /// plumbing without building a real squashfs `.gtbundle`.
+    /// The real `.gtbundle` test fixture — extracted (pure-Rust squashfs) and
+    /// pinned into a pack-list lock by the stage step, so the orchestration is
+    /// exercised against an artifact-backed revision, not a placeholder.
+    fn fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/bundles/perf-smoke-bundle.gtbundle")
+    }
+
     fn payload(bundle_id: &str) -> BundleDeployPayload {
         BundleDeployPayload {
             environment_id: "local".to_string(),
             bundle_id: bundle_id.to_string(),
             customer_id: None,
-            bundle_path: None,
+            bundle_path: Some(fixture()),
             idempotency_key: None,
         }
     }
@@ -365,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_deploy_creates_and_serves() {
+    fn fresh_deploy_creates_and_routes() {
         let (_dir, store) = seeded_store();
         let outcome = deploy(&store, &OpFlags::default(), Some(payload("quickstart"))).unwrap();
         let s = deploy_summary(outcome);
@@ -373,9 +458,10 @@ mod tests {
         assert!(!s.deployment_id.is_empty());
         assert!(!s.revision_id.is_empty());
         assert!(s.superseded_revisions.is_empty());
-        assert_eq!(s.status, "serving");
+        assert_eq!(s.status, "routed");
 
-        // One deployment, one live split at 100 % on the new revision.
+        // One deployment, one live split at 100 % on the new revision, and the
+        // revision is artifact-backed (real digest derived from the .gtbundle).
         let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
         assert_eq!(env.bundles.len(), 1);
         assert_eq!(env.traffic_splits.len(), 1);
@@ -383,6 +469,58 @@ mod tests {
         assert_eq!(split.entries.len(), 1);
         assert_eq!(split.entries[0].weight_bps, FULL_TRAFFIC_BPS);
         assert_eq!(split.entries[0].revision_id.to_string(), s.revision_id);
+        let rev = env
+            .revisions
+            .iter()
+            .find(|r| r.revision_id.to_string() == s.revision_id)
+            .expect("revision persisted");
+        assert!(
+            rev.bundle_digest.starts_with("sha256:") && rev.bundle_digest != "sha256:00",
+            "deploy must stage a real artifact digest, got {}",
+            rev.bundle_digest
+        );
+    }
+
+    #[test]
+    fn deploy_without_bundle_path_rejected() {
+        // The artifact is required on every path, including `--answers` payloads
+        // that omit it: deploy must never publish a placeholder-digest revision.
+        let (_dir, store) = seeded_store();
+        let mut p = payload("quickstart");
+        p.bundle_path = None;
+        let err = deploy(&store, &OpFlags::default(), Some(p)).unwrap_err();
+        match err {
+            OpError::InvalidArgument(msg) => assert!(msg.contains("--bundle"), "got {msg}"),
+            other => panic!("expected InvalidArgument requiring --bundle, got {other:?}"),
+        }
+        // No partial state: nothing was added before the rejection.
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert!(env.bundles.is_empty());
+    }
+
+    #[test]
+    fn redeploy_with_same_idempotency_key_is_noop() {
+        let (_dir, store) = seeded_store();
+        let mut p = payload("quickstart");
+        p.idempotency_key = Some("rollout-1".to_string());
+        let first = deploy_summary(deploy(&store, &OpFlags::default(), Some(p.clone())).unwrap());
+        let second = deploy_summary(deploy(&store, &OpFlags::default(), Some(p)).unwrap());
+
+        // The keyed retry returns the existing rollout, mints no new revision,
+        // and leaves the rollback target untouched.
+        assert_eq!(second.revision_id, first.revision_id);
+        assert_eq!(second.deployment_id, first.deployment_id);
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert_eq!(
+            env.revisions.len(),
+            1,
+            "no duplicate revision on keyed retry"
+        );
+        let split = &env.traffic_splits[0];
+        assert!(
+            split.previous_split_ref.is_none(),
+            "rollback target must not be disturbed by an idempotent retry"
+        );
     }
 
     #[test]
