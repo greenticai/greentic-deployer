@@ -151,7 +151,7 @@ pub fn add(
         }),
         idempotency_key: Some(idempotency_key.clone()),
     };
-    audit_and_record(store, ctx, |_committed| {
+    audit_and_record(store, ctx, |committed| {
         let summary = store.transact(&env_id, |locked| -> Result<EndpointSummary, OpError> {
             let mut env = locked.load()?;
             // Idempotent replay: re-running `add` with the same key returns
@@ -166,7 +166,13 @@ pub fn add(
                 .find(|e| carries_idem_key(e, &idempotency_key))
             {
                 if prev.provider_type == provider_type && prev.provider_id == provider_id {
-                    return Ok(EndpointSummary::from(&env_id, prev));
+                    // No env mutation needed, but a prior call may have
+                    // failed AFTER saving env.json and BEFORE the projection
+                    // refresh succeeded — re-run the refresh so retry
+                    // repairs any stale on-disk projection.
+                    let summary = EndpointSummary::from(&env_id, prev);
+                    locked.refresh_messaging_projection(&env)?;
+                    return Ok(summary);
                 }
                 return Err(OpError::Conflict(format!(
                     "idempotency key `{idempotency_key}` already used to add `{}`/`{}` in env `{env_id}`; pass a fresh key",
@@ -203,6 +209,10 @@ pub fn add(
             };
             env.messaging_endpoints.push(endpoint);
             locked.save(&env)?;
+            // env.json is durable from this point — signal so an audit-append
+            // failure on the projection-refresh path goes fail-closed instead
+            // of being demoted to a warning.
+            committed.mark_committed();
             locked.refresh_messaging_projection(&env)?;
             Ok(EndpointSummary::from(
                 &env_id,
@@ -307,7 +317,7 @@ pub fn link_bundle(
         }),
         idempotency_key: Some(idempotency_key.clone()),
     };
-    audit_and_record(store, ctx, |_committed| {
+    audit_and_record(store, ctx, |committed| {
         let summary = store.transact(&env_id, |locked| -> Result<EndpointSummary, OpError> {
             let mut env = locked.load()?;
             let idx = find_endpoint_idx(&env, endpoint_id, &env_id)?;
@@ -323,10 +333,10 @@ pub fn link_bundle(
                 .linked_bundles
                 .contains(&bundle_id)
             {
-                return Ok(EndpointSummary::from(
-                    &env_id,
-                    &env.messaging_endpoints[idx],
-                ));
+                let summary = EndpointSummary::from(&env_id, &env.messaging_endpoints[idx]);
+                // Repair any stale projection from a prior failed call.
+                locked.refresh_messaging_projection(&env)?;
+                return Ok(summary);
             }
             env.messaging_endpoints[idx].linked_bundles.push(bundle_id);
             stamp_mutation(
@@ -335,6 +345,7 @@ pub fn link_bundle(
                 &idempotency_key,
             );
             locked.save(&env)?;
+            committed.mark_committed();
             locked.refresh_messaging_projection(&env)?;
             Ok(EndpointSummary::from(
                 &env_id,
@@ -376,7 +387,7 @@ pub fn unlink_bundle(
         }),
         idempotency_key: Some(idempotency_key.clone()),
     };
-    audit_and_record(store, ctx, |_committed| {
+    audit_and_record(store, ctx, |committed| {
         let summary = store.transact(&env_id, |locked| -> Result<EndpointSummary, OpError> {
             let mut env = locked.load()?;
             let idx = find_endpoint_idx(&env, endpoint_id, &env_id)?;
@@ -386,7 +397,10 @@ pub fn unlink_bundle(
                 .position(|b| b == &bundle_id);
             let Some(bidx) = bundle_idx else {
                 // Idempotent: unlinking a bundle that isn't linked is a no-op.
-                return Ok(EndpointSummary::from(&env_id, &env.messaging_endpoints[idx]));
+                let summary = EndpointSummary::from(&env_id, &env.messaging_endpoints[idx]);
+                // Repair any stale projection from a prior failed call.
+                locked.refresh_messaging_projection(&env)?;
+                return Ok(summary);
             };
             // Removing a bundle that the welcome_flow points at would leave
             // the endpoint in a state validate() rejects; require the user
@@ -401,6 +415,7 @@ pub fn unlink_bundle(
             env.messaging_endpoints[idx].linked_bundles.remove(bidx);
             stamp_mutation(&mut env.messaging_endpoints[idx], &updated_by, &idempotency_key);
             locked.save(&env)?;
+            committed.mark_committed();
             locked.refresh_messaging_projection(&env)?;
             Ok(EndpointSummary::from(&env_id, &env.messaging_endpoints[idx]))
         })?;
@@ -447,7 +462,7 @@ pub fn set_welcome_flow(
         }),
         idempotency_key: Some(idempotency_key.clone()),
     };
-    audit_and_record(store, ctx, |_committed| {
+    audit_and_record(store, ctx, |committed| {
         let summary = store.transact(&env_id, |locked| -> Result<EndpointSummary, OpError> {
             let mut env = locked.load()?;
             let idx = find_endpoint_idx(&env, endpoint_id, &env_id)?;
@@ -459,18 +474,30 @@ pub fn set_welcome_flow(
                     "welcome_flow bundle `{bundle_id}` is not linked to endpoint `{endpoint_id}`; link it first via `link-bundle`"
                 )));
             }
+            // Cheap typo guard: when the linked bundle has at least one
+            // current revision, require `pack_id` to appear in some
+            // revision's `pack_list`. If `current_revisions` is empty the
+            // bundle has not been staged yet, so accept and defer pack/flow
+            // validation to runtime dispatch (M1.5). `flow_id` lives in
+            // pack-manifest metadata that deploy-spec does not see, so
+            // it stays caller-asserted and validated at first contact.
+            validate_welcome_pack_id(&env, &bundle_id, &pack_id)?;
             let new_welcome = WelcomeFlowRef {
                 bundle_id: bundle_id.clone(),
                 pack_id: PackId::new(pack_id.clone()),
                 flow_id: flow_id.clone(),
             };
             if env.messaging_endpoints[idx].welcome_flow.as_ref() == Some(&new_welcome) {
-                // Idempotent replay.
-                return Ok(EndpointSummary::from(&env_id, &env.messaging_endpoints[idx]));
+                // Idempotent replay — repair any stale projection from a
+                // prior failed call before returning.
+                let summary = EndpointSummary::from(&env_id, &env.messaging_endpoints[idx]);
+                locked.refresh_messaging_projection(&env)?;
+                return Ok(summary);
             }
             env.messaging_endpoints[idx].welcome_flow = Some(new_welcome);
             stamp_mutation(&mut env.messaging_endpoints[idx], &updated_by, &idempotency_key);
             locked.save(&env)?;
+            committed.mark_committed();
             locked.refresh_messaging_projection(&env)?;
             Ok(EndpointSummary::from(&env_id, &env.messaging_endpoints[idx]))
         })?;
@@ -506,7 +533,7 @@ pub fn remove(
         target: json!({"endpoint_id": endpoint_id.to_string()}),
         idempotency_key: Some(payload.idempotency_key.clone()),
     };
-    audit_and_record(store, ctx, |_committed| {
+    audit_and_record(store, ctx, |committed| {
         let removed_id =
             store.transact(&env_id, |locked| -> Result<MessagingEndpointId, OpError> {
                 let mut env = locked.load()?;
@@ -515,11 +542,15 @@ pub fn remove(
                     .iter()
                     .position(|e| e.endpoint_id == endpoint_id);
                 let Some(idx) = idx else {
-                    // Idempotent: removing an absent endpoint succeeds.
+                    // Idempotent: removing an absent endpoint succeeds. Repair
+                    // any stale projection from a prior failed call so a
+                    // retry actually cleans up.
+                    locked.refresh_messaging_projection(&env)?;
                     return Ok(endpoint_id);
                 };
                 env.messaging_endpoints.remove(idx);
                 locked.save(&env)?;
+                committed.mark_committed();
                 locked.refresh_messaging_projection(&env)?;
                 Ok(endpoint_id)
             })?;
@@ -621,6 +652,56 @@ fn stamp_mutation(endpoint: &mut MessagingEndpoint, updated_by: &str, idempotenc
     endpoint.generation = endpoint.generation.saturating_add(1);
     endpoint.updated_at = Utc::now();
     endpoint.updated_by = format_idem_writer(updated_by, idempotency_key);
+}
+
+/// Catch obvious typos when setting a welcome flow's `pack_id`: when the
+/// linked bundle has at least one `current_revision` whose pinned `pack_list`
+/// is non-empty, the supplied `pack_id` must match one of those pack ids.
+///
+/// When `current_revisions` is empty (a freshly-deployed bundle that has not
+/// been staged yet), the validator accepts and defers pack/flow resolution
+/// to runtime dispatch (M1.5). Same for the inverse case where every
+/// referenced revision's `pack_list` is empty — there is nothing to compare
+/// against. `flow_id` is never validated here; it lives in pack-manifest
+/// metadata that deploy-spec does not see, so it stays caller-asserted.
+fn validate_welcome_pack_id(
+    env: &greentic_deploy_spec::Environment,
+    bundle_id: &BundleId,
+    pack_id: &str,
+) -> Result<(), OpError> {
+    let bundles: Vec<_> = env
+        .bundles
+        .iter()
+        .filter(|b| b.bundle_id == *bundle_id)
+        .collect();
+    if bundles.is_empty() {
+        return Ok(());
+    }
+    let mut saw_any_pack = false;
+    let mut known_packs: Vec<String> = Vec::new();
+    for bundle in bundles {
+        for rev_id in &bundle.current_revisions {
+            let Some(rev) = env.revisions.iter().find(|r| r.revision_id == *rev_id) else {
+                continue;
+            };
+            for entry in &rev.pack_list {
+                saw_any_pack = true;
+                if entry.pack_id.as_str() == pack_id {
+                    return Ok(());
+                }
+                known_packs.push(entry.pack_id.as_str().to_string());
+            }
+        }
+    }
+    if !saw_any_pack {
+        return Ok(());
+    }
+    known_packs.sort();
+    known_packs.dedup();
+    Err(OpError::InvalidArgument(format!(
+        "welcome_flow.pack_id `{pack_id}` does not appear in any current revision of bundle `{bundle_id}` (known: [{}])",
+        known_packs.join(", ")
+    )))
 }
 
 // --- schema stubs ------------------------------------------------------------
@@ -1080,6 +1161,218 @@ mod tests {
             !index_path.exists(),
             "index.json must be deleted when env has no endpoints"
         );
+    }
+
+    #[test]
+    fn idempotent_replay_repairs_stale_projection() {
+        // Regression for Codex Finding #2: a prior failed call may have
+        // saved env.json but left the projection stale; the idempotent
+        // retry must re-materialize the projection rather than early-return
+        // without touching disk.
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let added = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("teams", "legal", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&added);
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        let endpoint_path = env_dir.join("messaging").join(format!("{id}.json"));
+        let index_path = env_dir.join("messaging").join("index.json");
+        // Simulate a prior failed projection refresh by clobbering the
+        // per-endpoint file out from under the store.
+        std::fs::remove_file(&endpoint_path).unwrap();
+        std::fs::remove_file(&index_path).unwrap();
+        // Replay add with the same key — should re-publish the projection
+        // even though env.json is already correct.
+        add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("teams", "legal", "k1")),
+        )
+        .unwrap();
+        assert!(
+            endpoint_path.exists(),
+            "idempotent add replay must republish the per-endpoint projection"
+        );
+        assert!(
+            index_path.exists(),
+            "idempotent add replay must republish the index"
+        );
+    }
+
+    #[test]
+    fn idempotent_remove_replay_repairs_stale_projection() {
+        // Companion to the add case: remove that succeeded against env.json
+        // but failed to prune the projection must be repaired on retry,
+        // which hits the absent-endpoint idempotent path.
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let added = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("teams", "legal", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&added);
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        let endpoint_path = env_dir.join("messaging").join(format!("{id}.json"));
+        // Manually mutate env.json out from under the store to drop the
+        // endpoint, leaving the projection in the "previous-call-saved-but-
+        // pruning-failed" shape.
+        let env_path = env_dir.join("environment.json");
+        let mut env: greentic_deploy_spec::Environment =
+            serde_json::from_slice(&std::fs::read(&env_path).unwrap()).unwrap();
+        env.messaging_endpoints.clear();
+        std::fs::write(&env_path, serde_json::to_vec_pretty(&env).unwrap()).unwrap();
+        assert!(
+            endpoint_path.exists(),
+            "fixture: per-endpoint file must still be present pre-replay"
+        );
+        // Replay remove — endpoint is absent from env.json, hits the
+        // idempotent path, must still prune the stale per-endpoint file.
+        remove(
+            &store,
+            &OpFlags::default(),
+            Some(EndpointRemovePayload {
+                environment_id: "local".to_string(),
+                endpoint_id: id.to_string(),
+                idempotency_key: "k2".to_string(),
+                updated_by: "tester".to_string(),
+            }),
+        )
+        .unwrap();
+        assert!(
+            !endpoint_path.exists(),
+            "idempotent remove replay must prune the stale per-endpoint file"
+        );
+    }
+
+    #[test]
+    fn set_welcome_flow_rejects_unknown_pack_id_when_revisions_exist() {
+        // Regression for Codex Finding #3: when the linked bundle has at
+        // least one current revision with a non-empty pack_list, a typo'd
+        // pack_id is rejected at write time rather than persisted as a
+        // ticking time-bomb for first-contact dispatch (M1.5).
+        use greentic_deploy_spec::RevisionLifecycle;
+        let (_dir, store, bundle_ids) = seeded_store_with_bundles(&["legal-pack"]);
+        let bundle = &bundle_ids[0];
+        // Seed a revision with a known pack id so the validator has
+        // something to compare against.
+        let env_id_typed = EnvId::try_from("local").unwrap();
+        let mut env = store.load(&env_id_typed).unwrap();
+        let deployment_id = env.bundles[0].deployment_id;
+        let rev = crate::cli::tests_common::make_revision(
+            "local",
+            bundle.as_str(),
+            &deployment_id,
+            1,
+            RevisionLifecycle::Ready,
+        );
+        env.bundles[0].current_revisions.push(rev.revision_id);
+        env.revisions.push(rev);
+        store.save(&env).unwrap();
+        // Wire endpoint + link.
+        let added = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("teams", "legal", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&added);
+        link_bundle(
+            &store,
+            &OpFlags::default(),
+            Some(EndpointLinkBundlePayload {
+                environment_id: "local".to_string(),
+                endpoint_id: id.to_string(),
+                bundle_id: bundle.as_str().to_string(),
+                idempotency_key: "k2".to_string(),
+                updated_by: "tester".to_string(),
+            }),
+        )
+        .unwrap();
+        // Typo'd pack id — must reject.
+        let err = set_welcome_flow(
+            &store,
+            &OpFlags::default(),
+            Some(EndpointSetWelcomeFlowPayload {
+                environment_id: "local".to_string(),
+                endpoint_id: id.to_string(),
+                bundle_id: bundle.as_str().to_string(),
+                pack_id: "typo-pack".to_string(),
+                flow_id: "main".to_string(),
+                idempotency_key: "k3".to_string(),
+                updated_by: "tester".to_string(),
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(_)),
+            "typo'd pack_id must be rejected when bundle has current revisions to compare against, got: {err:?}"
+        );
+        // Real pack id (from make_revision's pack_list[0]) — must succeed.
+        let ok = set_welcome_flow(
+            &store,
+            &OpFlags::default(),
+            Some(EndpointSetWelcomeFlowPayload {
+                environment_id: "local".to_string(),
+                endpoint_id: id.to_string(),
+                bundle_id: bundle.as_str().to_string(),
+                pack_id: "greentic.test.pack".to_string(),
+                flow_id: "main".to_string(),
+                idempotency_key: "k4".to_string(),
+                updated_by: "tester".to_string(),
+            }),
+        );
+        assert!(
+            ok.is_ok(),
+            "pack_id matching the bundle's pack_list must be accepted"
+        );
+    }
+
+    #[test]
+    fn set_welcome_flow_accepts_any_pack_id_when_bundle_has_no_revisions_yet() {
+        // Companion to the above: bundles deployed but not yet staged carry
+        // an empty `current_revisions`; the validator must skip the typo
+        // guard rather than blocking the onboarding flow where set-welcome-
+        // flow is wired before stage.
+        let (_dir, store, bundle_ids) = seeded_store_with_bundles(&["legal-pack"]);
+        let bundle = &bundle_ids[0];
+        let added = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("teams", "legal", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&added);
+        link_bundle(
+            &store,
+            &OpFlags::default(),
+            Some(EndpointLinkBundlePayload {
+                environment_id: "local".to_string(),
+                endpoint_id: id.to_string(),
+                bundle_id: bundle.as_str().to_string(),
+                idempotency_key: "k2".to_string(),
+                updated_by: "tester".to_string(),
+            }),
+        )
+        .unwrap();
+        let outcome = set_welcome_flow(
+            &store,
+            &OpFlags::default(),
+            Some(EndpointSetWelcomeFlowPayload {
+                environment_id: "local".to_string(),
+                endpoint_id: id.to_string(),
+                bundle_id: bundle.as_str().to_string(),
+                pack_id: "future-pack".to_string(),
+                flow_id: "main".to_string(),
+                idempotency_key: "k3".to_string(),
+                updated_by: "tester".to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(outcome.result["welcome_flow"]["pack_id"], "future-pack");
     }
 
     #[test]

@@ -11,6 +11,28 @@
 //! variant for reservation but bindings live in
 //! [`Environment::messaging_endpoints`](crate::Environment), never in
 //! `Environment::packs`.
+//!
+//! ## `linked_bundles` is the admit-gate, not the deployment-selector
+//!
+//! [`MessagingEndpoint::linked_bundles`] is an **ACL** keyed on
+//! [`BundleId`](crate::BundleId), intentionally distinct from deployment
+//! selection. The runtime is expected to resolve the concrete
+//! [`BundleDeployment`](crate::BundleDeployment) via existing routing
+//! (host/path/`tenant_selector` on `BundleDeployment.route_binding`, plus
+//! revision routing from `traffic_splits`), then use the endpoint to
+//! enforce: *"the deployment we just resolved must carry a `bundle_id` in
+//! THIS endpoint's `linked_bundles`."*
+//!
+//! That keeps the data model clean even when an env hosts multiple
+//! deployments of the same bundle for different customers (the
+//! `(env_id, bundle_id, customer_id)` keying on
+//! [`BundleDeployment`](crate::BundleDeployment) supports this) —
+//! customer/billing attribution belongs to the deployment, never to the
+//! endpoint. Authoring an endpoint by `bundle_id` alone is therefore
+//! correct: it scopes which bundles' FLOWS can be reached, not which
+//! customer is charged. See `M1.4` ingress propagation for the runtime
+//! composition and `project-messaging-endpoints-and-scoped-routing` in
+//! the workspace memo for the architecture.
 
 use crate::error::SpecError;
 use crate::ids::{BundleId, MessagingEndpointId, PackId};
