@@ -44,6 +44,7 @@ fn env_with(
         bundles,
         revisions,
         traffic_splits,
+        messaging_endpoints: vec![],
         revocation: Default::default(),
         retention: Default::default(),
         health: Default::default(),
@@ -552,6 +553,208 @@ fn traffic_split_with_wrong_schema_rejected_by_environment() {
             assert_eq!(expected, SchemaVersion::TRAFFIC_SPLIT_V1);
         }
         other => panic!("expected nested-schema SchemaMismatch, got {other:?}"),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Phase M1: MessagingEndpoint cross-references
+// ----------------------------------------------------------------------------
+
+fn endpoint(
+    env: EnvId,
+    endpoint_id: greentic_deploy_spec::MessagingEndpointId,
+    provider_type: &str,
+    provider_id: &str,
+    linked_bundles: Vec<BundleId>,
+) -> greentic_deploy_spec::MessagingEndpoint {
+    greentic_deploy_spec::MessagingEndpoint {
+        schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
+        env_id: env,
+        endpoint_id,
+        provider_id: provider_id.into(),
+        provider_type: provider_type.into(),
+        display_name: format!("{provider_type}: {provider_id}"),
+        secret_refs: vec![],
+        linked_bundles,
+        welcome_flow: None,
+        generation: 1,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        updated_by: "operator://test".into(),
+    }
+}
+
+fn env_with_endpoints(
+    bundles: Vec<BundleDeployment>,
+    endpoints: Vec<greentic_deploy_spec::MessagingEndpoint>,
+) -> Environment {
+    let mut e = env_with(local(), bundles, vec![], vec![]);
+    e.messaging_endpoints = endpoints;
+    e
+}
+
+#[test]
+fn messaging_endpoint_env_id_must_match_environment_id() {
+    let prod = EnvId::from_str("prod").unwrap();
+    let ep = endpoint(
+        prod,
+        greentic_deploy_spec::MessagingEndpointId::new(),
+        "teams",
+        "legal-bot",
+        vec![],
+    );
+    let e = env_with_endpoints(vec![], vec![ep]);
+    let err = e.validate().unwrap_err();
+    assert!(matches!(
+        err,
+        SpecError::EnvIdMismatch {
+            context: "messaging_endpoint",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn duplicate_endpoint_id_rejected() {
+    let id = greentic_deploy_spec::MessagingEndpointId::new();
+    let a = endpoint(local(), id, "teams", "legal", vec![]);
+    let b = endpoint(local(), id, "slack", "accounting", vec![]);
+    let e = env_with_endpoints(vec![], vec![a, b]);
+    let err = e.validate().unwrap_err();
+    assert_eq!(err, SpecError::DuplicateMessagingEndpoint(id));
+}
+
+#[test]
+fn duplicate_provider_instance_rejected() {
+    let a = endpoint(
+        local(),
+        greentic_deploy_spec::MessagingEndpointId::new(),
+        "teams",
+        "legal-bot",
+        vec![],
+    );
+    let b = endpoint(
+        local(),
+        greentic_deploy_spec::MessagingEndpointId::new(),
+        "teams",
+        "legal-bot",
+        vec![],
+    );
+    let e = env_with_endpoints(vec![], vec![a, b]);
+    let err = e.validate().unwrap_err();
+    assert_eq!(
+        err,
+        SpecError::DuplicateProviderInstance {
+            provider_type: "teams".into(),
+            provider_id: "legal-bot".into(),
+        }
+    );
+}
+
+#[test]
+fn distinct_provider_id_under_same_type_is_allowed() {
+    let a = endpoint(
+        local(),
+        greentic_deploy_spec::MessagingEndpointId::new(),
+        "teams",
+        "legal-bot",
+        vec![],
+    );
+    let b = endpoint(
+        local(),
+        greentic_deploy_spec::MessagingEndpointId::new(),
+        "teams",
+        "accounting-bot",
+        vec![],
+    );
+    let e = env_with_endpoints(vec![], vec![a, b]);
+    assert!(e.validate().is_ok());
+}
+
+#[test]
+fn linked_bundle_must_exist_in_environment() {
+    let id = greentic_deploy_spec::MessagingEndpointId::new();
+    let ep = endpoint(
+        local(),
+        id,
+        "teams",
+        "legal-bot",
+        vec![BundleId::new("missing-bundle")],
+    );
+    let e = env_with_endpoints(vec![], vec![ep]);
+    let err = e.validate().unwrap_err();
+    assert_eq!(
+        err,
+        SpecError::MessagingEndpointBundleNotLinked {
+            endpoint: id,
+            bundle: BundleId::new("missing-bundle"),
+        }
+    );
+}
+
+#[test]
+fn welcome_flow_bundle_must_be_linked() {
+    let dep = DeploymentId::new();
+    let bundle_id = BundleId::new("legal-pack");
+    let other_bundle = BundleId::new("accounting-pack");
+    let b = bundle(dep, local(), bundle_id.clone(), vec![]);
+    let id = greentic_deploy_spec::MessagingEndpointId::new();
+    let mut ep = endpoint(local(), id, "teams", "legal-bot", vec![bundle_id.clone()]);
+    ep.welcome_flow = Some(greentic_deploy_spec::WelcomeFlowRef {
+        bundle_id: other_bundle.clone(),
+        pack_id: PackId::new("legal"),
+        flow_id: "main".into(),
+    });
+    let e = env_with_endpoints(vec![b], vec![ep]);
+    let err = e.validate().unwrap_err();
+    assert_eq!(
+        err,
+        SpecError::WelcomeFlowBundleNotLinked {
+            endpoint: id,
+            bundle: other_bundle,
+        }
+    );
+}
+
+#[test]
+fn well_formed_messaging_endpoint_passes() {
+    let dep = DeploymentId::new();
+    let bundle_id = BundleId::new("legal-pack");
+    let b = bundle(dep, local(), bundle_id.clone(), vec![]);
+    let mut ep = endpoint(
+        local(),
+        greentic_deploy_spec::MessagingEndpointId::new(),
+        "teams",
+        "legal-bot",
+        vec![bundle_id.clone()],
+    );
+    ep.welcome_flow = Some(greentic_deploy_spec::WelcomeFlowRef {
+        bundle_id,
+        pack_id: PackId::new("legal"),
+        flow_id: "main".into(),
+    });
+    let e = env_with_endpoints(vec![b], vec![ep]);
+    assert!(e.validate().is_ok());
+}
+
+#[test]
+fn messaging_endpoint_secret_ref_must_be_scoped_to_env() {
+    use greentic_deploy_spec::SecretRef;
+    let id = greentic_deploy_spec::MessagingEndpointId::new();
+    let mut ep = endpoint(local(), id, "teams", "legal-bot", vec![]);
+    ep.secret_refs = vec![SecretRef::try_new("secret://prod/teams/legal-bot/token").unwrap()];
+    let e = env_with_endpoints(vec![], vec![ep]);
+    let err = e.validate().unwrap_err();
+    match err {
+        SpecError::CrossEnvRef {
+            context,
+            ref actual_env,
+            ..
+        } => {
+            assert_eq!(context, "messaging_endpoint.secret_refs");
+            assert_eq!(actual_env, "prod");
+        }
+        other => panic!("expected CrossEnvRef, got {other:?}"),
     }
 }
 

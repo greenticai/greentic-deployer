@@ -19,7 +19,7 @@ schemars = ["dep:schemars"]
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 greentic-config-types = ">=1.1.0-dev, <1.2.0-0"
-greentic-types = ">=1.1.0-dev, <1.2.0-0"
+greentic-types = ">=1.1.0-dev.26561934923, <1.2.0-0"
 hex = "0.4"
 schemars = { version = "0.8", optional = true }
 semver = { version = "1", features = ["serde"] }

@@ -28,7 +28,8 @@
 use std::path::{Path, PathBuf};
 
 use greentic_deploy_spec::{
-    CapabilitySlot, EnvId, Environment, EnvironmentRuntime, RuntimeConfig, SchemaVersion, SpecError,
+    CapabilitySlot, EnvId, Environment, EnvironmentRuntime, MessagingEndpoint, MessagingEndpointId,
+    RuntimeConfig, SchemaVersion, SpecError,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -163,6 +164,33 @@ impl LocalFsStore {
             .join("env-packs")
             .join(slot.as_str())
             .join("answers.json"))
+    }
+
+    /// `<env_dir>/messaging/` — directory holding per-endpoint projections.
+    fn messaging_dir(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
+        Ok(self.env_dir(env_id)?.join("messaging"))
+    }
+
+    /// `<env_dir>/messaging/index.json` — projection enumerating every
+    /// endpoint in source-of-truth order.
+    fn messaging_index_path(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
+        Ok(self.messaging_dir(env_id)?.join("index.json"))
+    }
+
+    /// `<env_dir>/messaging/<endpoint_id>.json` — per-endpoint projection.
+    fn messaging_endpoint_path(
+        &self,
+        env_id: &EnvId,
+        endpoint_id: &MessagingEndpointId,
+    ) -> Result<PathBuf, StoreError> {
+        Ok(self
+            .messaging_dir(env_id)?
+            .join(format!("{endpoint_id}.json")))
+    }
+
+    /// Subdirectory under `backups/` for messaging projection snapshots.
+    fn messaging_backups_dir(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
+        Ok(self.backups_dir(env_id)?.join("messaging"))
     }
 
     fn backups_dir(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
@@ -396,6 +424,93 @@ impl LocalFsStore {
         Ok(())
     }
 
+    /// Reconcile `<env_dir>/messaging/` against the just-saved env's
+    /// `messaging_endpoints`. Writes one `<endpoint_id>.json` per endpoint
+    /// (skipping no-op rewrites) plus an `index.json` enumerator, and removes
+    /// per-endpoint files whose endpoint is no longer in the env.
+    ///
+    /// When the env has zero endpoints, the directory is left empty (after
+    /// removing stale files) and `index.json` is deleted — absence is the
+    /// "no endpoints" signal, mirroring the `runtime-config.json` precedent.
+    fn refresh_messaging_locked(&self, env: &Environment) -> Result<(), StoreError> {
+        let env_id = &env.environment_id;
+        let dir = self.messaging_dir(env_id)?;
+        // Snapshot existing endpoint files so we can prune anything not in
+        // the new endpoint set. Pre-existing non-endpoint files (`index.json`,
+        // unrelated dotfiles) are skipped.
+        let mut existing_files: Vec<(MessagingEndpointId, PathBuf)> = Vec::new();
+        if dir.exists() {
+            for entry in std::fs::read_dir(&dir).map_err(|source| StoreError::Io {
+                path: dir.clone(),
+                source,
+            })? {
+                let entry = entry.map_err(|source| StoreError::Io {
+                    path: dir.clone(),
+                    source,
+                })?;
+                let path = entry.path();
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                if stem == "index" {
+                    continue;
+                }
+                let Ok(ulid) = stem.parse::<ulid::Ulid>() else {
+                    continue;
+                };
+                existing_files.push((MessagingEndpointId(ulid), path));
+            }
+        }
+        // Write each endpoint; track ids written so we can prune the rest.
+        let mut written_ids: std::collections::HashSet<MessagingEndpointId> =
+            std::collections::HashSet::with_capacity(env.messaging_endpoints.len());
+        for endpoint in &env.messaging_endpoints {
+            written_ids.insert(endpoint.endpoint_id);
+            let target = self.messaging_endpoint_path(env_id, &endpoint.endpoint_id)?;
+            if let Ok(existing) = self.read_json::<MessagingEndpoint>(&target)
+                && existing == *endpoint
+            {
+                continue;
+            }
+            copy_to_backup(&target, &self.messaging_backups_dir(env_id)?)?;
+            atomic_write_json(&target, endpoint)?;
+        }
+        for (id, path) in existing_files {
+            if !written_ids.contains(&id) {
+                copy_to_backup(&path, &self.messaging_backups_dir(env_id)?)?;
+                std::fs::remove_file(&path).map_err(|source| StoreError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+            }
+        }
+        // Index file: rewrite when non-empty, delete when empty.
+        let index_path = self.messaging_index_path(env_id)?;
+        let index = super::messaging::materialize_messaging_index(env);
+        if index.is_empty() {
+            if index_path.exists() {
+                copy_to_backup(&index_path, &self.messaging_backups_dir(env_id)?)?;
+                std::fs::remove_file(&index_path).map_err(|source| StoreError::Io {
+                    path: index_path,
+                    source,
+                })?;
+            }
+        } else {
+            if let Ok(existing) =
+                self.read_json::<Vec<super::messaging::MessagingEndpointIndexEntry>>(&index_path)
+                && existing == index
+            {
+                return Ok(());
+            }
+            copy_to_backup(&index_path, &self.messaging_backups_dir(env_id)?)?;
+            atomic_write_json(&index_path, &index)?;
+        }
+        Ok(())
+    }
+
     fn save_pack_answers_locked(
         &self,
         env_id: &EnvId,
@@ -545,6 +660,22 @@ impl<'a> Locked<'a> {
         } else {
             self.store.save_runtime_config_locked(&cfg)
         }
+    }
+
+    /// Reconcile `<env_dir>/messaging/` against the just-saved env. Call
+    /// after any mutation that can change `Environment.messaging_endpoints`
+    /// (M1.2 add/update/remove verbs). Writes one file per endpoint plus an
+    /// `index.json` enumerator; per-endpoint files for ids no longer in the
+    /// env are pruned (with backup) and `index.json` is removed when the env
+    /// has zero endpoints.
+    pub fn refresh_messaging_projection(&self, env: &Environment) -> Result<(), StoreError> {
+        if env.environment_id != self.env_id {
+            return Err(StoreError::EnvIdMismatch {
+                file: self.env_id.clone(),
+                value: env.environment_id.clone(),
+            });
+        }
+        self.store.refresh_messaging_locked(env)
     }
 }
 

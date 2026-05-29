@@ -9,6 +9,7 @@ use crate::bundle_deployment::BundleDeployment;
 use crate::capability_slot::{CapabilitySlot, PackDescriptor};
 use crate::error::SpecError;
 use crate::ids::PackId;
+use crate::messaging_endpoint::MessagingEndpoint;
 use crate::refs::SecretRef;
 use crate::retention::{HealthStatus, RetentionPolicy, RevocationConfig};
 use crate::revision::Revision;
@@ -16,6 +17,7 @@ use crate::traffic_split::TrafficSplit;
 use crate::version::SchemaVersion;
 use greentic_types::EnvId;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
@@ -90,6 +92,10 @@ pub struct Environment {
     pub revisions: Vec<Revision>,
     #[serde(default)]
     pub traffic_splits: Vec<TrafficSplit>,
+    /// Per-environment messaging provider instances (`Phase M1`). N-per-env;
+    /// unique on `endpoint_id` and on `(provider_type, provider_id)`.
+    #[serde(default)]
+    pub messaging_endpoints: Vec<MessagingEndpoint>,
     #[serde(default)]
     pub revocation: RevocationConfig,
     #[serde(default)]
@@ -136,7 +142,9 @@ impl Environment {
             });
         }
 
-        let mut seen = [false; 6];
+        // Sized to the `CapabilitySlot` enum cardinality. Bump in lock-step
+        // when the enum grows.
+        let mut seen = [false; CapabilitySlot::ALL.len()];
         for binding in &self.packs {
             let idx = binding.slot as usize;
             if seen[idx] {
@@ -254,6 +262,51 @@ impl Environment {
                         actual_bundle: referenced.bundle_id.clone(),
                     });
                 }
+            }
+        }
+
+        // Phase M1: messaging endpoint cross-document invariants. Per-document
+        // checks (schema discriminator, non-empty ids, secret-ref env scope)
+        // live on `MessagingEndpoint::validate`.
+        let mut seen_endpoint_ids = HashSet::with_capacity(self.messaging_endpoints.len());
+        let mut seen_provider_instances = HashSet::with_capacity(self.messaging_endpoints.len());
+        for endpoint in &self.messaging_endpoints {
+            endpoint.validate()?;
+            if endpoint.env_id != self.environment_id {
+                return Err(SpecError::EnvIdMismatch {
+                    context: "messaging_endpoint",
+                    expected: self.environment_id.clone(),
+                    actual: endpoint.env_id.clone(),
+                });
+            }
+            if !seen_endpoint_ids.insert(endpoint.endpoint_id) {
+                return Err(SpecError::DuplicateMessagingEndpoint(endpoint.endpoint_id));
+            }
+            let instance_key = (
+                endpoint.provider_type.as_str(),
+                endpoint.provider_id.as_str(),
+            );
+            if !seen_provider_instances.insert(instance_key) {
+                return Err(SpecError::DuplicateProviderInstance {
+                    provider_type: endpoint.provider_type.clone(),
+                    provider_id: endpoint.provider_id.clone(),
+                });
+            }
+            for bundle_id in &endpoint.linked_bundles {
+                if !self.bundles.iter().any(|b| b.bundle_id == *bundle_id) {
+                    return Err(SpecError::MessagingEndpointBundleNotLinked {
+                        endpoint: endpoint.endpoint_id,
+                        bundle: bundle_id.clone(),
+                    });
+                }
+            }
+            if let Some(welcome) = &endpoint.welcome_flow
+                && !endpoint.linked_bundles.contains(&welcome.bundle_id)
+            {
+                return Err(SpecError::WelcomeFlowBundleNotLinked {
+                    endpoint: endpoint.endpoint_id,
+                    bundle: welcome.bundle_id.clone(),
+                });
             }
         }
 
