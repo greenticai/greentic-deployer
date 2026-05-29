@@ -151,6 +151,7 @@ pub fn add(
         }),
         idempotency_key: Some(idempotency_key.clone()),
     };
+    let idem_suffix = idem_suffix(&idempotency_key);
     audit_and_record(store, ctx, |committed| {
         let summary = store.transact(&env_id, |locked| -> Result<EndpointSummary, OpError> {
             let mut env = locked.load()?;
@@ -163,7 +164,7 @@ pub fn add(
             if let Some(prev) = env
                 .messaging_endpoints
                 .iter()
-                .find(|e| carries_idem_key(e, &idempotency_key))
+                .find(|e| carries_idem_key(e, &idem_suffix))
             {
                 if prev.provider_type == provider_type && prev.provider_id == provider_id {
                     // No env mutation needed, but a prior call may have
@@ -523,9 +524,12 @@ pub fn remove(
     let payload = resolve_payload(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let endpoint_id = parse_endpoint_id(&payload.endpoint_id)?;
-    let updated_by = require_nonempty("updated_by", &payload.updated_by)?;
-    let idempotency_key = require_nonempty("idempotency_key", &payload.idempotency_key)?;
-    let _ = (updated_by, idempotency_key);
+    // Validate inputs are non-empty for the audit envelope's sake; the values
+    // themselves are not consumed by the remove path (no endpoint left to
+    // stamp), so the audit ctx below references payload.idempotency_key
+    // directly without binding here.
+    require_nonempty("updated_by", &payload.updated_by)?;
+    require_nonempty("idempotency_key", &payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -642,10 +646,14 @@ fn format_idem_writer(updated_by: &str, idempotency_key: &str) -> String {
     format!("{updated_by}#idem={idempotency_key}")
 }
 
-fn carries_idem_key(endpoint: &MessagingEndpoint, idempotency_key: &str) -> bool {
-    endpoint
-        .updated_by
-        .ends_with(&format!("#idem={idempotency_key}"))
+/// Build the `#idem=<key>` suffix once at the call site so a linear scan
+/// over `messaging_endpoints` does not allocate a fresh `String` per element.
+fn idem_suffix(idempotency_key: &str) -> String {
+    format!("#idem={idempotency_key}")
+}
+
+fn carries_idem_key(endpoint: &MessagingEndpoint, idem_suffix: &str) -> bool {
+    endpoint.updated_by.ends_with(idem_suffix)
 }
 
 fn stamp_mutation(endpoint: &mut MessagingEndpoint, updated_by: &str, idempotency_key: &str) {
@@ -712,42 +720,63 @@ fn validate_welcome_pack_id(
 // would drift from the rest of the cli/ modules. Stubs return a hint string
 // today; the wiring lands when the workspace schemars pass does.
 
+fn verb_schema(verb: &str, fields: &[&str]) -> Value {
+    json!({ "noun": NOUN, "verb": verb, "fields": fields })
+}
+
 fn add_schema() -> Value {
-    json!({
-        "noun": NOUN,
-        "verb": "add",
-        "fields": [
-            "environment_id", "provider_id", "provider_type", "display_name",
-            "secret_refs (array of secret:// URIs)", "idempotency_key", "updated_by"
-        ]
-    })
+    verb_schema(
+        "add",
+        &[
+            "environment_id",
+            "provider_id",
+            "provider_type",
+            "display_name",
+            "secret_refs (array of secret:// URIs)",
+            "idempotency_key",
+            "updated_by",
+        ],
+    )
 }
 
 fn link_bundle_schema() -> Value {
-    json!({
-        "noun": NOUN,
-        "verb": "link-bundle / unlink-bundle",
-        "fields": ["environment_id", "endpoint_id", "bundle_id", "idempotency_key", "updated_by"]
-    })
+    verb_schema(
+        "link-bundle / unlink-bundle",
+        &[
+            "environment_id",
+            "endpoint_id",
+            "bundle_id",
+            "idempotency_key",
+            "updated_by",
+        ],
+    )
 }
 
 fn set_welcome_flow_schema() -> Value {
-    json!({
-        "noun": NOUN,
-        "verb": "set-welcome-flow",
-        "fields": [
-            "environment_id", "endpoint_id", "bundle_id", "pack_id", "flow_id",
-            "idempotency_key", "updated_by"
-        ]
-    })
+    verb_schema(
+        "set-welcome-flow",
+        &[
+            "environment_id",
+            "endpoint_id",
+            "bundle_id",
+            "pack_id",
+            "flow_id",
+            "idempotency_key",
+            "updated_by",
+        ],
+    )
 }
 
 fn remove_schema() -> Value {
-    json!({
-        "noun": NOUN,
-        "verb": "remove",
-        "fields": ["environment_id", "endpoint_id", "idempotency_key", "updated_by"]
-    })
+    verb_schema(
+        "remove",
+        &[
+            "environment_id",
+            "endpoint_id",
+            "idempotency_key",
+            "updated_by",
+        ],
+    )
 }
 
 #[cfg(test)]
