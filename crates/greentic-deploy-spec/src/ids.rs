@@ -55,6 +55,30 @@ impl fmt::Display for DeploymentId {
     }
 }
 
+/// ULID-shaped identifier for a
+/// [`MessagingEndpoint`](crate::MessagingEndpoint) (`Phase M`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MessagingEndpointId(pub Ulid);
+
+impl MessagingEndpointId {
+    pub fn new() -> Self {
+        Self(Ulid::new())
+    }
+}
+
+impl Default for MessagingEndpointId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for MessagingEndpointId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 macro_rules! string_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*

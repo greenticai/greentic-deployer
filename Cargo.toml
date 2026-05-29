@@ -94,7 +94,7 @@ features = [
 ]
 
 [dependencies.greentic-types]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-dev.26561934923, <1.2.0-0"
 
 [dependencies.greentic-distributor-client]
 version = ">=1.1.0-dev, <1.2.0-0"

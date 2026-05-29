@@ -4,7 +4,7 @@ use crate::capability_slot::CapabilitySlot;
 use crate::revision::RevisionLifecycle;
 use thiserror::Error;
 
-use crate::ids::{BundleId, DeploymentId, RevisionId};
+use crate::ids::{BundleId, DeploymentId, MessagingEndpointId, RevisionId};
 use greentic_types::EnvId;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -99,4 +99,40 @@ pub enum SpecError {
         expected_env: EnvId,
         actual_env: String,
     },
+
+    #[error("duplicate messaging endpoint id `{0}` in Environment.messaging_endpoints")]
+    DuplicateMessagingEndpoint(MessagingEndpointId),
+
+    #[error(
+        "duplicate provider instance `{provider_type}` / `{provider_id}` in Environment.messaging_endpoints"
+    )]
+    DuplicateProviderInstance {
+        provider_type: String,
+        provider_id: String,
+    },
+
+    #[error(
+        "messaging endpoint `{endpoint}` links bundle `{bundle}` which is not deployed in this env"
+    )]
+    MessagingEndpointBundleNotLinked {
+        endpoint: MessagingEndpointId,
+        bundle: BundleId,
+    },
+
+    #[error(
+        "messaging endpoint `{endpoint}` welcome_flow references bundle `{bundle}` which is not in linked_bundles"
+    )]
+    WelcomeFlowBundleNotLinked {
+        endpoint: MessagingEndpointId,
+        bundle: BundleId,
+    },
+
+    #[error("messaging endpoint provider_id is empty")]
+    EmptyMessagingProviderId,
+
+    #[error("messaging endpoint provider_type is empty")]
+    EmptyMessagingProviderType,
+
+    #[error("messaging endpoint welcome_flow.flow_id is empty")]
+    EmptyWelcomeFlowId,
 }

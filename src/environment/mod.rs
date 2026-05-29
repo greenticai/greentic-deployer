@@ -14,6 +14,7 @@ pub mod audit;
 pub mod bundle_deployment;
 pub mod file_lock;
 pub mod lifecycle;
+pub mod messaging;
 pub mod runtime_config;
 pub mod store;
 pub mod trust_root;
@@ -32,6 +33,7 @@ pub use lifecycle::{
     HealthCheckId, HealthGateFailure, LifecycleError, apply_revision_transition,
     apply_revision_transition_with_health_gate,
 };
+pub use messaging::{MessagingEndpointIndexEntry, materialize_messaging_index};
 pub use runtime_config::materialize_runtime_config;
 pub use store::{EnvironmentStore, LocalFsStore, Locked, StoreError};
 pub use trust_root::{

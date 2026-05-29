@@ -19,6 +19,7 @@ pub mod environment_runtime;
 pub mod error;
 pub mod ids;
 pub mod integrity;
+pub mod messaging_endpoint;
 pub mod pack_config;
 pub mod pack_list_lock;
 pub mod refs;
@@ -46,8 +47,11 @@ pub use credentials::{
 pub use environment::{DEFAULT_LISTEN_ADDR, EnvPackBinding, Environment, EnvironmentHostConfig};
 pub use environment_runtime::{EnvironmentRuntime, RuntimeDiscoveryValue};
 pub use error::SpecError;
-pub use ids::{BundleId, CustomerId, DeploymentId, PackId, PartyId, RevisionId};
+pub use ids::{
+    BundleId, CustomerId, DeploymentId, MessagingEndpointId, PackId, PartyId, RevisionId,
+};
 pub use integrity::{INTEGRITY_ALGORITHM_SHA256, IntegrityError, StateIntegrity, canonical_json};
+pub use messaging_endpoint::{MessagingEndpoint, WelcomeFlowRef};
 pub use pack_config::PackConfig;
 pub use pack_list_lock::{LockedPack, PackListLock};
 pub use refs::{RuntimeRef, RuntimeRefParseError, SecretRef, SecretRefParseError};

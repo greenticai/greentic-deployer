@@ -108,6 +108,48 @@ pub enum OpNoun {
         #[command(subcommand)]
         verb: TrustRootVerb,
     },
+    /// Per-environment messaging endpoints (`Phase M1`). N-per-env instances
+    /// of messaging providers (e.g. multiple Teams bots), each with its own
+    /// curated bundle set and optional welcome flow.
+    Messaging {
+        #[command(subcommand)]
+        verb: MessagingNoun,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MessagingNoun {
+    /// Manage a per-environment messaging endpoint (`add`/`list`/`show`/
+    /// `link-bundle`/`unlink-bundle`/`set-welcome-flow`/`remove`).
+    Endpoint {
+        #[command(subcommand)]
+        verb: MessagingEndpointVerb,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MessagingEndpointVerb {
+    /// Mint a new endpoint for `<env>` with `<provider_type>` /
+    /// `<provider_id>` instance identity. Bundle linkage and welcome-flow
+    /// follow via dedicated verbs.
+    Add,
+    /// List every endpoint in `<env>`.
+    List { env_id: String },
+    /// Show one endpoint in `<env>` by `<endpoint_id>` (ULID).
+    Show { env_id: String, endpoint_id: String },
+    /// Link a bundle to an endpoint. Bundle must already be deployed in the env.
+    #[command(name = "link-bundle")]
+    LinkBundle,
+    /// Remove a bundle from an endpoint's `linked_bundles`. Fails when the
+    /// bundle owns the endpoint's welcome_flow — clear that first.
+    #[command(name = "unlink-bundle")]
+    UnlinkBundle,
+    /// Set the endpoint's default welcome flow (referenced on first contact
+    /// per M1.5). The flow's bundle must already be linked.
+    #[command(name = "set-welcome-flow")]
+    SetWelcomeFlow,
+    /// Remove an endpoint. Idempotent: removing an absent endpoint succeeds.
+    Remove,
 }
 
 #[derive(Subcommand, Debug)]
@@ -403,6 +445,7 @@ pub fn dispatch_op(cmd: OpCommand) -> Result<(), OpError> {
         OpNoun::Credentials { verb } => dispatch_credentials(&store, &flags, verb),
         OpNoun::Secrets { verb } => dispatch_secrets(&store, &flags, verb),
         OpNoun::TrustRoot { verb } => dispatch_trust_root(&store, &flags, verb),
+        OpNoun::Messaging { verb } => dispatch_messaging(&store, &flags, verb),
     };
     result.inspect_err(|err| print_error(noun, verb, err))
 }
@@ -496,6 +539,20 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 TrustRootVerb::List { .. } => "list",
                 TrustRootVerb::Add(_) => "add",
                 TrustRootVerb::Remove(_) => "remove",
+            },
+        ),
+        OpNoun::Messaging { verb } => (
+            "messaging.endpoint",
+            match verb {
+                MessagingNoun::Endpoint { verb } => match verb {
+                    MessagingEndpointVerb::Add => "add",
+                    MessagingEndpointVerb::List { .. } => "list",
+                    MessagingEndpointVerb::Show { .. } => "show",
+                    MessagingEndpointVerb::LinkBundle => "link-bundle",
+                    MessagingEndpointVerb::UnlinkBundle => "unlink-bundle",
+                    MessagingEndpointVerb::SetWelcomeFlow => "set-welcome-flow",
+                    MessagingEndpointVerb::Remove => "remove",
+                },
             },
         ),
     }
@@ -698,6 +755,34 @@ fn dispatch_trust_root(
             };
             super::trust_root::remove(store, flags, payload)?
         }
+    };
+    print_outcome(&outcome)
+}
+
+fn dispatch_messaging(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    verb: MessagingNoun,
+) -> Result<(), OpError> {
+    let outcome = match verb {
+        MessagingNoun::Endpoint { verb } => match verb {
+            MessagingEndpointVerb::Add => super::messaging::add(store, flags, None)?,
+            MessagingEndpointVerb::List { env_id } => {
+                super::messaging::list(store, flags, &env_id)?
+            }
+            MessagingEndpointVerb::Show {
+                env_id,
+                endpoint_id,
+            } => super::messaging::show(store, flags, &env_id, &endpoint_id)?,
+            MessagingEndpointVerb::LinkBundle => super::messaging::link_bundle(store, flags, None)?,
+            MessagingEndpointVerb::UnlinkBundle => {
+                super::messaging::unlink_bundle(store, flags, None)?
+            }
+            MessagingEndpointVerb::SetWelcomeFlow => {
+                super::messaging::set_welcome_flow(store, flags, None)?
+            }
+            MessagingEndpointVerb::Remove => super::messaging::remove(store, flags, None)?,
+        },
     };
     print_outcome(&outcome)
 }

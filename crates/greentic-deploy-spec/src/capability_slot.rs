@@ -14,6 +14,13 @@ use std::str::FromStr;
 use thiserror::Error;
 
 /// Closed enumeration of capability slots an Environment can bind (`§5.1`).
+///
+/// `Messaging` is reserved for Phase M endpoints but bindings live in
+/// [`Environment::messaging_endpoints`](crate::Environment), not in
+/// [`Environment::packs`](crate::Environment) — messaging endpoints are
+/// N-per-env, so the 1-per-slot constraint enforced on `packs` does not
+/// apply. The variant exists so future per-slot UI/discovery surfaces can
+/// enumerate every capability family from one source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CapabilitySlot {
@@ -23,6 +30,7 @@ pub enum CapabilitySlot {
     Sessions,
     State,
     Revocation,
+    Messaging,
 }
 
 impl CapabilitySlot {
@@ -33,6 +41,7 @@ impl CapabilitySlot {
         CapabilitySlot::Sessions,
         CapabilitySlot::State,
         CapabilitySlot::Revocation,
+        CapabilitySlot::Messaging,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -43,6 +52,7 @@ impl CapabilitySlot {
             CapabilitySlot::Sessions => "sessions",
             CapabilitySlot::State => "state",
             CapabilitySlot::Revocation => "revocation",
+            CapabilitySlot::Messaging => "messaging",
         }
     }
 }
