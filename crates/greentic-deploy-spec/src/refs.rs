@@ -161,10 +161,9 @@ impl ExtensionRef {
         }
         // Own everything borrowed from `raw` before moving `raw` into `Self`.
         let path = path.to_string();
-        let instance_id = match instance {
-            Some(inst) => Some(validate_instance_id(inst)?.to_string()),
-            None => None,
-        };
+        let instance_id = instance
+            .map(|inst| validate_instance_id(inst).map(str::to_string))
+            .transpose()?;
         Ok(Self {
             raw,
             path,

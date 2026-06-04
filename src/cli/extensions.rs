@@ -96,11 +96,7 @@ pub fn add(
     audit_and_record(store, ctx, |_committed| {
         let summary = store.transact(&env_id, |locked| -> Result<ExtensionSummary, OpError> {
             let mut env = locked.load()?;
-            if env
-                .extensions
-                .iter()
-                .any(|b| ExtensionKey::from_binding(b) == key)
-            {
+            if env.extensions.iter().any(|b| key.matches(b)) {
                 return Err(OpError::Conflict(format!(
                     "extension `{}` is already bound on env `{}`; use update",
                     key, env_id
@@ -312,17 +308,23 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
 /// `(descriptor-path, instance_id)` — the uniqueness key for an extension
 /// binding, version-independent by design.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ExtensionKey {
+pub(crate) struct ExtensionKey {
     path: String,
     instance_id: Option<String>,
 }
 
 impl ExtensionKey {
-    fn from_binding(b: &ExtensionBinding) -> Self {
+    pub(crate) fn from_binding(b: &ExtensionBinding) -> Self {
         Self {
             path: b.kind.path().to_string(),
             instance_id: b.instance_id.clone(),
         }
+    }
+
+    /// Whether `b` carries this `(path, instance_id)` key. Borrowed comparison —
+    /// no allocation per element, so it's cheap inside a scan.
+    pub(crate) fn matches(&self, b: &ExtensionBinding) -> bool {
+        b.kind.path() == self.path && b.instance_id.as_deref() == self.instance_id.as_deref()
     }
 }
 
@@ -336,9 +338,7 @@ impl std::fmt::Display for ExtensionKey {
 }
 
 fn find_idx(extensions: &[ExtensionBinding], key: &ExtensionKey) -> Option<usize> {
-    extensions
-        .iter()
-        .position(|b| &ExtensionKey::from_binding(b) == key)
+    extensions.iter().position(|b| key.matches(b))
 }
 
 fn not_found_msg(key: &ExtensionKey, env_id: &EnvId) -> String {

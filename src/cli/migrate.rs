@@ -28,8 +28,9 @@
 //!
 //! [A4 bootstrap]: crate::cli::bootstrap
 
+use crate::cli::extensions::ExtensionKey;
 use chrono::{SecondsFormat, Utc};
-use greentic_deploy_spec::{EnvId, EnvPackBinding, Environment, ExtensionBinding};
+use greentic_deploy_spec::{EnvId, EnvPackBinding, Environment};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -433,13 +434,11 @@ pub fn apply(store: &LocalFsStore, flags: &OpFlags, target: &str) -> Result<OpOu
                 // migrate, so a blind copy would break referential integrity.)
                 let mut added_extensions = Vec::new();
                 for ext in &source.extensions {
-                    let present = target_env.extensions.iter().any(|e| {
-                        e.kind.path() == ext.kind.path() && e.instance_id == ext.instance_id
-                    });
-                    if present {
+                    let key = ExtensionKey::from_binding(ext);
+                    if target_env.extensions.iter().any(|e| key.matches(e)) {
                         continue;
                     }
-                    added_extensions.push(extension_key(ext));
+                    added_extensions.push(key.to_string());
                     target_env.extensions.push(ext.clone());
                 }
                 locked.save(&target_env)?;
@@ -512,15 +511,6 @@ fn cloned_binding(binding: &EnvPackBinding) -> EnvPackBinding {
         answers_ref: binding.answers_ref.clone(),
         generation: binding.generation,
         previous_binding_ref: binding.previous_binding_ref.clone(),
-    }
-}
-
-/// `(path, instance_id)` display key for a migrated extension binding, matching
-/// the `ext://<path>[/<instance>]` shape used everywhere else.
-fn extension_key(ext: &ExtensionBinding) -> String {
-    match &ext.instance_id {
-        Some(inst) => format!("{}/{}", ext.kind.path(), inst),
-        None => ext.kind.path().to_string(),
     }
 }
 
@@ -747,8 +737,11 @@ mod tests {
         assert!(!envs.iter().any(|e| e.as_str() == "dev"));
     }
 
-    fn make_extension(descriptor: &str, instance: Option<&str>) -> ExtensionBinding {
-        ExtensionBinding {
+    fn make_extension(
+        descriptor: &str,
+        instance: Option<&str>,
+    ) -> greentic_deploy_spec::ExtensionBinding {
+        greentic_deploy_spec::ExtensionBinding {
             kind: greentic_deploy_spec::PackDescriptor::try_new(descriptor).unwrap(),
             pack_ref: greentic_deploy_spec::PackId::new("pack-ext"),
             instance_id: instance.map(str::to_string),
