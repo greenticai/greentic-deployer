@@ -610,6 +610,43 @@ mod tests {
     }
 
     #[test]
+    fn rollback_after_remove_errors_not_found() {
+        // Contract (parity with `env-packs`): `rollback` reverts the previous
+        // `update`; `remove` is terminal. After a remove there is no binding to
+        // roll back to — restore by re-adding, not by rollback.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        add(
+            &store,
+            &OpFlags::default(),
+            Some(payload("acme.oauth.auth0@1.0.0", Some("primary"))),
+        )
+        .unwrap();
+        remove(
+            &store,
+            &OpFlags::default(),
+            Some(ExtensionRemovePayload {
+                environment_id: "local".to_string(),
+                kind: "acme.oauth.auth0@1.0.0".to_string(),
+                instance_id: Some("primary".to_string()),
+            }),
+        )
+        .unwrap();
+        let err = rollback(
+            &store,
+            &OpFlags::default(),
+            Some(ExtensionRemovePayload {
+                environment_id: "local".to_string(),
+                kind: "acme.oauth.auth0@1.0.0".to_string(),
+                instance_id: Some("primary".to_string()),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::NotFound(_)), "got {err:?}");
+    }
+
+    #[test]
     fn add_rejects_invalid_instance_id_at_save() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
