@@ -25,7 +25,7 @@ use greentic_secrets_lib::{DevStore, SecretFormat, SecretsStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{EnvironmentStore, LocalFsStore};
+use crate::environment::{EnvFlock, EnvironmentStore, LocalFsStore};
 
 use super::{AuditCtx, AuditGens, OpError, OpFlags, OpOutcome, audit_and_record};
 
@@ -178,6 +178,20 @@ pub fn put(
                  got `{rel_path}`"
             )));
         }
+        // The runtime reader canonicalizes the team segment before lookup
+        // (greentic-start `secrets_manager::canonical_team` maps `default`/
+        // empty — trimmed, case-insensitive — to `_`), so a literal
+        // `default` team would be written under a key no lookup ever uses.
+        // Same policy as the name segment: reject instead of silently
+        // transforming.
+        let team = segments[1];
+        if !is_canonical_team(team) {
+            return Err(OpError::InvalidArgument(format!(
+                "team segment `{team}` is not store-canonical: the runtime \
+                 reads the default team as `_` — pass `_` (or a real team \
+                 name without surrounding whitespace)"
+            )));
+        }
         // The runtime reader canonicalizes the name segment before lookup
         // (greentic-start `secret_name::canonical_secret_name`), so a
         // non-canonical name would be written but never found. Reject
@@ -291,6 +305,14 @@ fn resolve_dev_store_path(env_dir: &Path, override_path: Option<PathBuf>) -> Pat
     primary
 }
 
+/// Fixed-point check against greentic-start's `canonical_team`: the reader
+/// maps a trimmed-empty or case-insensitive `default` team to `_` and trims
+/// surrounding whitespace, so only segments the reader maps to themselves
+/// are writable. `_` itself is a fixed point.
+fn is_canonical_team(team: &str) -> bool {
+    team.trim() == team && !team.eq_ignore_ascii_case("default")
+}
+
 /// Fixed-point check against greentic-start's `canonical_secret_name`: a
 /// name passes iff canonicalizing it would be a no-op, which is exactly when
 /// a put key matches what the runtime reader looks up.
@@ -312,6 +334,17 @@ fn is_canonical_secret_name(name: &str) -> bool {
 /// all, so hop to a dedicated OS thread that owns its own current-thread
 /// runtime.
 ///
+/// The backend is load-snapshot-at-open / persist-full-snapshot-on-write
+/// (its internal flock covers each step, NOT the open→put window), so two
+/// concurrent writers silently lose the slower one's update. Serialize the
+/// whole cycle with a blocking sidecar flock (`<store>.lock`) held from
+/// before `DevStore::with_path` (the snapshot load) until after `put` (the
+/// persist). The sidecar — not the store file itself — because the
+/// backend's own flock on the store file would deadlock against ours.
+/// This serializes `op secrets put` writers; other tools writing the same
+/// store (`greentic-secrets apply`, the runtime's QA persist) don't take
+/// this lock — closing that belongs in the backend (A9 follow-up).
+///
 /// Failures map to `OpError::Io` keyed on the store path — the dev store is
 /// a local file, and adding a dedicated `OpError` variant would break
 /// downstream exhaustive matches (greentic-operator's HTTP status mapping).
@@ -327,6 +360,8 @@ fn dev_store_put(path: &Path, uri: &str, value: &str) -> Result<(), OpError> {
             source,
         })?;
     }
+    let _write_lock = EnvFlock::acquire(&dev_store_lock_path(path))
+        .map_err(|source| OpError::Store(source.into()))?;
     let store = DevStore::with_path(path.to_path_buf())
         .map_err(|e| io_err(format!("open dev store: {e}")))?;
     std::thread::scope(|scope| {
@@ -342,6 +377,17 @@ fn dev_store_put(path: &Path, uri: &str, value: &str) -> Result<(), OpError> {
             .join()
             .expect("dev-store write thread panicked")
     })
+}
+
+/// Sidecar lock path for a dev store file: `<store-file-name>.lock` in the
+/// same directory (`.dev.secrets.env` → `.dev.secrets.env.lock`).
+fn dev_store_lock_path(store_path: &Path) -> PathBuf {
+    let mut name = store_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("dev-store"));
+    name.push(".lock");
+    store_path.with_file_name(name)
 }
 
 fn resolve_payload<T: serde::de::DeserializeOwned>(
@@ -394,7 +440,7 @@ fn put_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "environment_id": {"type": "string"},
-            "path": {"type": "string", "description": "Relative path under secret://<env>/. For the dev-store backend: <tenant>/<team>/<pack>/<name> (e.g. default/_/messaging-telegram/telegram_bot_token)."},
+            "path": {"type": "string", "description": "Relative path under secret://<env>/. For the dev-store backend: <tenant>/<team>/<pack>/<name> (e.g. default/_/messaging-telegram/telegram_bot_token). Use `_` for the default team — a literal `default` team is rejected (the runtime reads the default team as `_`)."},
             "value": {"type": "string"}
         }
     })
@@ -545,6 +591,89 @@ mod tests {
             "secrets://local/default/_/messaging-telegram/telegram_bot_token",
         );
         assert_eq!(bytes, b"tok-dummy-123".to_vec());
+    }
+
+    #[test]
+    fn put_rejects_default_team_segment() {
+        // The runtime reads the default team as `_`; a literal `default`
+        // segment would be written but never looked up.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&env_with_secrets()).unwrap();
+        for team in ["default", "Default", "DEFAULT"] {
+            let err = put(
+                &store,
+                &OpFlags::default(),
+                Some(SecretsPutPayload {
+                    environment_id: "local".to_string(),
+                    path: format!("acme/{team}/messaging-telegram/telegram_bot_token"),
+                    value: "tok-dummy".to_string(),
+                }),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, OpError::InvalidArgument(msg) if msg.contains('_')),
+                "team `{team}` got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_puts_do_not_lose_writes() {
+        // The dev backend is load-snapshot / persist-full-snapshot; without
+        // the sidecar flock spanning open→put, concurrent writers lose
+        // updates silently (each persists a snapshot missing the other's
+        // key). With the lock, every key must survive.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&env_with_secrets()).unwrap();
+        let names: Vec<String> = (0..8).map(|i| format!("concurrent_key_{i}")).collect();
+        let store = &store;
+        std::thread::scope(|scope| {
+            for name in &names {
+                scope.spawn(move || {
+                    let outcome = put(
+                        store,
+                        &OpFlags::default(),
+                        Some(SecretsPutPayload {
+                            environment_id: "local".to_string(),
+                            path: format!("default/_/demo-pack/{name}"),
+                            value: format!("value-{name}"),
+                        }),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        outcome.result.get("written").and_then(|v| v.as_bool()),
+                        Some(true)
+                    );
+                });
+            }
+        });
+        let store_path = dir
+            .path()
+            .join("local")
+            .join(DEV_STORE_RELATIVE)
+            .display()
+            .to_string();
+        for name in &names {
+            let bytes = read_back(
+                &store_path,
+                &format!("secrets://local/default/_/demo-pack/{name}"),
+            );
+            assert_eq!(bytes, format!("value-{name}").into_bytes());
+        }
+    }
+
+    #[test]
+    fn dev_store_lock_path_is_sidecar() {
+        assert_eq!(
+            dev_store_lock_path(Path::new("/x/.greentic/dev/.dev.secrets.env")),
+            Path::new("/x/.greentic/dev/.dev.secrets.env.lock")
+        );
+        assert_eq!(
+            dev_store_lock_path(Path::new("state/dev-store.dat")),
+            Path::new("state/dev-store.dat.lock")
+        );
     }
 
     #[test]
