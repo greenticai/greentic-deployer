@@ -28,6 +28,7 @@
 //!
 //! [A4 bootstrap]: crate::cli::bootstrap
 
+use crate::cli::extensions::ExtensionKey;
 use chrono::{SecondsFormat, Utc};
 use greentic_deploy_spec::{EnvId, EnvPackBinding, Environment};
 use serde::{Deserialize, Serialize};
@@ -93,6 +94,10 @@ pub struct MigrateDevApplyOutcome {
     /// Slots that were added to the target during the merge. Empty if the
     /// target already had everything the source contributed.
     pub merged_slots: Vec<String>,
+    /// Extension bindings (`(path, instance_id)` keys) added to the target
+    /// during the merge. Empty if the source had none or the target already
+    /// carried them all.
+    pub merged_extensions: Vec<String>,
     /// New path the legacy source directory was renamed to (so the user can
     /// verify and remove it manually). `None` if no source directory existed
     /// (apply was a no-op).
@@ -383,6 +388,7 @@ pub fn apply(store: &LocalFsStore, flags: &OpFlags, target: &str) -> Result<OpOu
                 from_env: from.as_str().to_string(),
                 to_env: to.as_str().to_string(),
                 merged_slots: Vec::new(),
+                merged_extensions: Vec::new(),
                 legacy_dir_renamed_to: None,
             };
             return Ok((
@@ -402,28 +408,49 @@ pub fn apply(store: &LocalFsStore, flags: &OpFlags, target: &str) -> Result<OpOu
                 "source env is not eligible for simple migration (see `--check`)".to_string(),
             ));
         }
-        let merged_slots = store.transact(&to, |locked| -> Result<Vec<String>, OpError> {
-            let mut target_env = match locked.load() {
-                Ok(env) => env,
-                Err(StoreError::NotFound(_)) => seed_target_from_source(&source, locked.env_id()),
-                Err(e) => return Err(e.into()),
-            };
-            let mut added = Vec::new();
-            for binding in &source.packs {
-                if target_env.packs.iter().any(|b| b.slot == binding.slot) {
-                    continue;
+        let (merged_slots, merged_extensions) = store.transact(
+            &to,
+            |locked| -> Result<(Vec<String>, Vec<String>), OpError> {
+                let mut target_env = match locked.load() {
+                    Ok(env) => env,
+                    Err(StoreError::NotFound(_)) => {
+                        seed_target_from_source(&source, locked.env_id())
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                let mut added = Vec::new();
+                for binding in &source.packs {
+                    if target_env.packs.iter().any(|b| b.slot == binding.slot) {
+                        continue;
+                    }
+                    added.push(binding.slot.to_string());
+                    target_env.packs.push(cloned_binding(binding));
                 }
-                added.push(binding.slot.to_string());
-                target_env.packs.push(cloned_binding(binding));
-            }
-            locked.save(&target_env)?;
-            Ok(added)
-        })?;
+                // Extension bindings (`Path 3`) are light, referentially
+                // independent state — like `packs`, they migrate. Merge by
+                // `(kind.path(), instance_id)`, preserving any binding the
+                // target already carries. (`messaging_endpoints` are NOT
+                // migrated here: they reference `linked_bundles` that don't
+                // migrate, so a blind copy would break referential integrity.)
+                let mut added_extensions = Vec::new();
+                for ext in &source.extensions {
+                    let key = ExtensionKey::from_binding(ext);
+                    if target_env.extensions.iter().any(|e| key.matches(e)) {
+                        continue;
+                    }
+                    added_extensions.push(key.to_string());
+                    target_env.extensions.push(ext.clone());
+                }
+                locked.save(&target_env)?;
+                Ok((added, added_extensions))
+            },
+        )?;
         let renamed = rename_legacy_dir(store, &from)?;
         let outcome = MigrateDevApplyOutcome {
             from_env: from.as_str().to_string(),
             to_env: to.as_str().to_string(),
             merged_slots,
+            merged_extensions,
             legacy_dir_renamed_to: Some(renamed.display().to_string()),
         };
         Ok((
@@ -708,6 +735,100 @@ mod tests {
         let envs = store.list().unwrap();
         assert!(envs.iter().any(|e| e.as_str() == "local"));
         assert!(!envs.iter().any(|e| e.as_str() == "dev"));
+    }
+
+    fn make_extension(
+        descriptor: &str,
+        instance: Option<&str>,
+    ) -> greentic_deploy_spec::ExtensionBinding {
+        greentic_deploy_spec::ExtensionBinding {
+            kind: greentic_deploy_spec::PackDescriptor::try_new(descriptor).unwrap(),
+            pack_ref: greentic_deploy_spec::PackId::new("pack-ext"),
+            instance_id: instance.map(str::to_string),
+            answers_ref: None,
+            generation: 0,
+            previous_binding_ref: None,
+        }
+    }
+
+    #[test]
+    fn apply_migrates_dev_extensions_into_target() {
+        // Regression: a `dev` env carrying extension bindings (but no heavy
+        // state) was `--check`-clean yet lost its extensions on migrate. They
+        // must now ride along, keyed by `(path, instance_id)`.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("dev");
+        env.extensions
+            .push(make_extension("acme.oauth.auth0@1.0.0", None));
+        env.extensions
+            .push(make_extension("acme.oauth.auth0@1.0.0", Some("primary")));
+        store.save(&env).unwrap();
+
+        // A bare extension-bearing env is still eligible for simple migration.
+        let report = run_check(
+            &store,
+            &EnvId::try_from("dev").unwrap(),
+            &EnvId::try_from("local").unwrap(),
+        )
+        .unwrap();
+        assert!(report.clean, "extension-only dev env should be clean");
+
+        let outcome = apply(&store, &OpFlags::default(), "local").unwrap();
+        let merged: Vec<&str> = outcome.result["merged_extensions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(merged.len(), 2, "got {merged:?}");
+        assert!(merged.contains(&"acme.oauth.auth0"));
+        assert!(merged.contains(&"acme.oauth.auth0/primary"));
+
+        // Target carries both bindings; none were dropped.
+        let local = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert_eq!(local.extensions.len(), 2);
+    }
+
+    #[test]
+    fn apply_preserves_target_extension_on_key_collision() {
+        // A binding already on the target (same path + instance) is preserved;
+        // the source's same-key binding does not overwrite it.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+
+        let mut local = make_env("local");
+        local
+            .extensions
+            .push(make_extension("acme.oauth.auth0@2.0.0", Some("primary")));
+        store.save(&local).unwrap();
+
+        let mut dev = make_env("dev");
+        dev.extensions
+            .push(make_extension("acme.oauth.auth0@1.0.0", Some("primary")));
+        dev.extensions
+            .push(make_extension("acme.other.tool@1.0.0", None));
+        store.save(&dev).unwrap();
+
+        let outcome = apply(&store, &OpFlags::default(), "local").unwrap();
+        let merged: Vec<&str> = outcome.result["merged_extensions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // Only the new key is reported merged; the colliding one is skipped.
+        assert_eq!(merged, vec!["acme.other.tool"]);
+
+        let local = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert_eq!(local.extensions.len(), 2);
+        // The pre-existing target binding kept its @2.0.0 version.
+        let primary = local
+            .extensions
+            .iter()
+            .find(|e| e.instance_id.as_deref() == Some("primary"))
+            .unwrap();
+        assert_eq!(primary.kind.version().to_string(), "2.0.0");
     }
 
     #[test]

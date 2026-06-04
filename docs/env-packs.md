@@ -367,6 +367,12 @@ Identity is `(kind.path(), instance_id)` — version-independent. `update`,
 `remove`/`rollback` payload is ignored). Each mutation bumps `generation` and
 stashes the previous binding for one-step `rollback`, exactly like `env-packs`.
 
+`rollback` reverts the previous `update` only — it is **not** an undo for
+`remove`. A `remove` is terminal: there is no binding left to roll back to, so
+`rollback` after a `remove` returns *not found*. To restore a removed
+extension, `add` it again. (Same contract as `env-packs`; multi-step history is
+out of scope.)
+
 ### 3. Resolve it from a workload
 
 A bundle/flow reaches the binding by name through `ext://<path>[/<instance>]`
