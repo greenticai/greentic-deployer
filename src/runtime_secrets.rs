@@ -491,7 +491,7 @@ fn normalize_store_segment(segment: &str) -> String {
         .collect()
 }
 
-fn canonical_team(team: Option<&str>) -> &str {
+pub(crate) fn canonical_team(team: Option<&str>) -> &str {
     match team
         .map(str::trim)
         .filter(|team| !team.is_empty() && !team.eq_ignore_ascii_case("default"))
