@@ -7,21 +7,46 @@
 //! command surface, enforces the env-must-have-secrets-pack precondition,
 //! and reports the resolved kind in every envelope.
 //!
-//! Get/put/rotate against the live backend return `NotYetImplemented` and
-//! point at the gating PR (A9 — env-pack registry + handler dispatch).
+//! `put` is live for the `greentic.secrets.dev-store` kind (the default
+//! binding `op env init` creates): it writes the value into the env's local
+//! dev store at the same path the runtime reader (greentic-start
+//! `SecretsClient::open(<env_dir>)`) resolves, so a put is immediately
+//! visible to served revisions. All other kinds — and get/rotate against any
+//! live backend — return `NotYetImplemented` and point at the gating PR
+//! (A9 — env-pack registry + handler dispatch).
 //! `list` returns the *namespace* keys the env owns (always `secret://<env>/...`)
 //! — no actual material is fetched.
 
+use std::path::{Path, PathBuf};
+
 use chrono::Utc;
 use greentic_deploy_spec::{CapabilitySlot, EnvId, EnvPackBinding, SecretRef};
+use greentic_secrets_lib::{DevStore, SecretFormat, SecretsStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
-use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
+use super::{AuditCtx, AuditGens, OpError, OpFlags, OpOutcome, audit_and_record};
 
 const NOUN: &str = "secrets";
+
+/// `PackDescriptor::path()` of the local dev-store secrets backend — the
+/// default binding `op env init` creates and the only kind `put` dispatches
+/// to in Phase A.
+const DEV_STORE_KIND_PATH: &str = "greentic.secrets.dev-store";
+
+/// Same override the runtime reader honors (`greentic-start
+/// `dev_store_path::override_path`): when set, both writer and reader use
+/// this path instead of the env-dir defaults below.
+const DEV_SECRETS_PATH_ENV: &str = "GREENTIC_DEV_SECRETS_PATH";
+
+/// Dev-store candidates relative to the env dir. MUST mirror greentic-start's
+/// `dev_store_path.rs` (`STORE_RELATIVE` / `STORE_STATE_RELATIVE`) — the
+/// runtime's `SecretsClient::open(<env_dir>)` resolves the same chain, so a
+/// put here is what a served revision reads back.
+const DEV_STORE_RELATIVE: &str = ".greentic/dev/.dev.secrets.env";
+const DEV_STORE_STATE_RELATIVE: &str = ".greentic/state/dev/.dev.secrets.env";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretsListPayload {
@@ -122,12 +147,9 @@ pub fn put(
     audit_and_record(store, ctx, |_committed| {
         let env = store.load(&env_id)?;
         let secrets = require_secrets_pack(&env, &env_id)?;
+        let rel_path = payload.path.trim_start_matches('/');
         // Build the resolved SecretRef so we can validate the env-scoping.
-        let secret_uri = format!(
-            "secret://{}/{}",
-            env_id.as_str(),
-            payload.path.trim_start_matches('/')
-        );
+        let secret_uri = format!("secret://{}/{rel_path}", env_id.as_str());
         SecretRef::try_new(secret_uri.clone())
             .map_err(|e| OpError::InvalidArgument(format!("secret path: {e}")))?;
         // Make sure the value is non-empty — writing empty strings to a real
@@ -137,9 +159,58 @@ pub fn put(
                 "value must not be empty".to_string(),
             ));
         }
-        let _kind = secrets.kind.to_string();
-        Err(OpError::NotYetImplemented(
-            "secrets backend dispatch lands in A9 (env-pack registry); A3 wires the surface only",
+        if secrets.kind.path() != DEV_STORE_KIND_PATH {
+            return Err(OpError::NotYetImplemented(
+                "secrets backend dispatch beyond the dev-store lands in A9 (env-pack registry)",
+            ));
+        }
+        // The dev store's native key shape is the runtime's `secrets://`
+        // (plural) URI: `secrets://<env>/<tenant>/<team>/<pack>/<name>`.
+        // The backend handler converts the logical `secret://` ref 1:1.
+        // `DevStore::put` itself rejects any other depth, so enforce the
+        // shape upfront with a teachable error instead of surfacing the
+        // backend's "uri is missing category".
+        let segments: Vec<&str> = rel_path.split('/').collect();
+        if segments.len() != 4 || segments.iter().any(|s| s.is_empty()) {
+            return Err(OpError::InvalidArgument(format!(
+                "dev-store secret path must be `<tenant>/<team>/<pack>/<name>` \
+                 (e.g. `default/_/messaging-telegram/telegram_bot_token`); \
+                 got `{rel_path}`"
+            )));
+        }
+        // The runtime reader canonicalizes the name segment before lookup
+        // (greentic-start `secret_name::canonical_secret_name`), so a
+        // non-canonical name would be written but never found. Reject
+        // instead of silently transforming — producer and consumer must
+        // share one derivation, and we share it by only accepting
+        // already-canonical input.
+        let name = segments[3];
+        if !is_canonical_secret_name(name) {
+            return Err(OpError::InvalidArgument(format!(
+                "secret name `{name}` is not store-canonical: use lowercase \
+                 a-z, 0-9 and single `_` separators (no leading/trailing `_`)"
+            )));
+        }
+        let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
+        let dev_path = resolve_dev_store_path(
+            &store.env_dir(&env_id)?,
+            std::env::var_os(DEV_SECRETS_PATH_ENV).map(PathBuf::from),
+        );
+        dev_store_put(&dev_path, &store_uri, &payload.value)?;
+        Ok((
+            OpOutcome::new(
+                NOUN,
+                "put",
+                json!({
+                    "environment_id": env_id.as_str(),
+                    "secret_ref": secret_uri,
+                    "store_uri": store_uri,
+                    "secrets_kind": secrets.kind.to_string(),
+                    "store_path": dev_path.display().to_string(),
+                    "written": true,
+                }),
+            ),
+            AuditGens::NONE,
         ))
     })
 }
@@ -201,6 +272,78 @@ pub fn rotate(
 
 // --- internals -----------------------------------------------------------
 
+/// Where the env's dev store lives, mirroring the runtime reader's chain
+/// (greentic-start `dev_store_path`): explicit override env var, else the
+/// first *existing* default candidate under the env dir, else the primary
+/// default (created on first write).
+fn resolve_dev_store_path(env_dir: &Path, override_path: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = override_path {
+        return path;
+    }
+    let primary = env_dir.join(DEV_STORE_RELATIVE);
+    if primary.exists() {
+        return primary;
+    }
+    let fallback = env_dir.join(DEV_STORE_STATE_RELATIVE);
+    if fallback.exists() {
+        return fallback;
+    }
+    primary
+}
+
+/// Fixed-point check against greentic-start's `canonical_secret_name`: a
+/// name passes iff canonicalizing it would be a no-op, which is exactly when
+/// a put key matches what the runtime reader looks up.
+fn is_canonical_secret_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('_')
+        && !name.ends_with('_')
+        && !name.contains("__")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Write one value into the dev store from this sync context.
+///
+/// `DevStore::put` is async; same constraint as
+/// `runtime_secrets::block_on_async_resolution` — the caller may sit on a
+/// current-thread runtime (where `block_in_place` panics) or no runtime at
+/// all, so hop to a dedicated OS thread that owns its own current-thread
+/// runtime.
+///
+/// Failures map to `OpError::Io` keyed on the store path — the dev store is
+/// a local file, and adding a dedicated `OpError` variant would break
+/// downstream exhaustive matches (greentic-operator's HTTP status mapping).
+/// Error messages carry the backend's text only — never secret material.
+fn dev_store_put(path: &Path, uri: &str, value: &str) -> Result<(), OpError> {
+    let io_err = |message: String| OpError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(message),
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| OpError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let store = DevStore::with_path(path.to_path_buf())
+        .map_err(|e| io_err(format!("open dev store: {e}")))?;
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| io_err(format!("build runtime: {e}")))?
+                    .block_on(store.put(uri, SecretFormat::Text, value.as_bytes()))
+                    .map_err(|e| io_err(format!("dev store write: {e}")))
+            })
+            .join()
+            .expect("dev-store write thread panicked")
+    })
+}
+
 fn resolve_payload<T: serde::de::DeserializeOwned>(
     flags: &OpFlags,
     payload: Option<T>,
@@ -251,7 +394,7 @@ fn put_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "environment_id": {"type": "string"},
-            "path": {"type": "string", "description": "Relative path under secret://<env>/"},
+            "path": {"type": "string", "description": "Relative path under secret://<env>/. For the dev-store backend: <tenant>/<team>/<pack>/<name> (e.g. default/_/messaging-telegram/telegram_bot_token)."},
             "value": {"type": "string"}
         }
     })
@@ -292,12 +435,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn env_with_secrets() -> greentic_deploy_spec::Environment {
-        let mut env = make_env("local");
-        env.packs.push(make_binding(
-            CapabilitySlot::Secrets,
-            "greentic.secrets.dev-store@1.0.0",
-        ));
-        env
+        env_with_secrets_kind("greentic.secrets.dev-store@1.0.0")
     }
 
     #[test]
@@ -339,11 +477,28 @@ mod tests {
         assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
     }
 
+    fn env_with_secrets_kind(kind: &str) -> greentic_deploy_spec::Environment {
+        let mut env = make_env("local");
+        env.packs.push(make_binding(CapabilitySlot::Secrets, kind));
+        env
+    }
+
+    fn read_back(store_path: &str, uri: &str) -> Vec<u8> {
+        let dev = DevStore::with_path(PathBuf::from(store_path)).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { dev.get(uri).await.unwrap() })
+    }
+
     #[test]
-    fn put_validates_path_then_returns_not_yet_implemented() {
+    fn put_non_dev_store_backend_returns_not_yet_implemented() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
-        store.save(&env_with_secrets()).unwrap();
+        store
+            .save(&env_with_secrets_kind("greentic.secrets.aws-sm@1.0.0"))
+            .unwrap();
         let err = put(
             &store,
             &OpFlags::default(),
@@ -355,6 +510,129 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, OpError::NotYetImplemented(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn put_writes_through_to_env_dev_store() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&env_with_secrets()).unwrap();
+        let outcome = put(
+            &store,
+            &OpFlags::default(),
+            Some(SecretsPutPayload {
+                environment_id: "local".to_string(),
+                path: "default/_/messaging-telegram/telegram_bot_token".to_string(),
+                value: "tok-dummy-123".to_string(),
+            }),
+        )
+        .unwrap();
+        let result = &outcome.result;
+        assert_eq!(
+            result.get("store_uri").and_then(|v| v.as_str()),
+            Some("secrets://local/default/_/messaging-telegram/telegram_bot_token")
+        );
+        assert_eq!(result.get("written").and_then(|v| v.as_bool()), Some(true));
+        // The outcome must never echo the value.
+        let envelope = serde_json::to_string(&outcome).unwrap();
+        assert!(!envelope.contains("tok-dummy-123"));
+        let store_path = result
+            .get("store_path")
+            .and_then(|v| v.as_str())
+            .expect("store_path in outcome");
+        let bytes = read_back(
+            store_path,
+            "secrets://local/default/_/messaging-telegram/telegram_bot_token",
+        );
+        assert_eq!(bytes, b"tok-dummy-123".to_vec());
+    }
+
+    #[test]
+    fn put_rejects_non_canonical_name_segment() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&env_with_secrets()).unwrap();
+        let err = put(
+            &store,
+            &OpFlags::default(),
+            Some(SecretsPutPayload {
+                environment_id: "local".to_string(),
+                path: "default/_/messaging-telegram/TELEGRAM-BOT-TOKEN".to_string(),
+                value: "tok-dummy".to_string(),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn put_rejects_wrong_depth_path() {
+        // `DevStore::put` only accepts the 5-segment `secrets://` shape; the
+        // verb rejects other depths upfront with a teachable message.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&env_with_secrets()).unwrap();
+        for path in ["credentials/aws", "default/_/pack/extra/name", "a//b/c"] {
+            let err = put(
+                &store,
+                &OpFlags::default(),
+                Some(SecretsPutPayload {
+                    environment_id: "local".to_string(),
+                    path: path.to_string(),
+                    value: "v".to_string(),
+                }),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, OpError::InvalidArgument(msg) if msg.contains("<tenant>/<team>/<pack>/<name>")),
+                "path `{path}` got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_dev_store_path_override_wins() {
+        let dir = tempdir().unwrap();
+        let override_path = dir.path().join("custom.dat");
+        assert_eq!(
+            resolve_dev_store_path(dir.path(), Some(override_path.clone())),
+            override_path
+        );
+    }
+
+    #[test]
+    fn resolve_dev_store_path_prefers_existing_candidate() {
+        let dir = tempdir().unwrap();
+        let fallback = dir.path().join(DEV_STORE_STATE_RELATIVE);
+        std::fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+        std::fs::write(&fallback, b"").unwrap();
+        assert_eq!(resolve_dev_store_path(dir.path(), None), fallback);
+        // Once the primary exists it wins over the state fallback.
+        let primary = dir.path().join(DEV_STORE_RELATIVE);
+        std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        std::fs::write(&primary, b"").unwrap();
+        assert_eq!(resolve_dev_store_path(dir.path(), None), primary);
+    }
+
+    #[test]
+    fn resolve_dev_store_path_defaults_to_primary() {
+        let dir = tempdir().unwrap();
+        assert_eq!(
+            resolve_dev_store_path(dir.path(), None),
+            dir.path().join(DEV_STORE_RELATIVE)
+        );
+    }
+
+    #[test]
+    fn canonical_name_fixed_points() {
+        assert!(is_canonical_secret_name("telegram_bot_token"));
+        assert!(is_canonical_secret_name("a1"));
+        assert!(!is_canonical_secret_name(""));
+        assert!(!is_canonical_secret_name("TELEGRAM_BOT_TOKEN"));
+        assert!(!is_canonical_secret_name("bot-token"));
+        assert!(!is_canonical_secret_name("_leading"));
+        assert!(!is_canonical_secret_name("trailing_"));
+        assert!(!is_canonical_secret_name("double__underscore"));
     }
 
     #[test]
