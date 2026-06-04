@@ -329,6 +329,21 @@ fn build_binding(
     generation: u64,
     previous_binding_ref: Option<PathBuf>,
 ) -> Result<EnvPackBinding, OpError> {
+    // N-per-env slots (Messaging, Extension) live in their own collections,
+    // never in `packs`. Reject them here with a pointer to the right noun so a
+    // binding can't be wedged into `packs` where its second instance would be
+    // falsely rejected as a duplicate slot.
+    if !payload.slot.binds_in_packs() {
+        let noun = match payload.slot {
+            CapabilitySlot::Messaging => "op messaging endpoint",
+            CapabilitySlot::Extension => "op extensions",
+            _ => unreachable!("binds_in_packs() is false only for Messaging/Extension"),
+        };
+        return Err(OpError::InvalidArgument(format!(
+            "slot `{}` is N-per-env and is not bound via `op env-packs`; use `{noun}` instead",
+            payload.slot
+        )));
+    }
     let kind = PackDescriptor::try_new(payload.kind.clone())
         .map_err(|e| OpError::InvalidArgument(format!("kind: {e}")))?;
     Ok(EnvPackBinding {
@@ -384,14 +399,17 @@ fn remove_schema() -> Value {
 
 const PREV_PREFIX: &str = "inline://";
 
-fn stash_previous(snapshot: Value) -> PathBuf {
+/// Stash a binding snapshot inline so `rollback` can restore it without a
+/// sidecar history file. Reused by sibling N-collection nouns (e.g.
+/// `extensions`) that share the one-step-rollback contract.
+pub(crate) fn stash_previous(snapshot: Value) -> PathBuf {
     let mut encoded = String::from(PREV_PREFIX);
     let raw = serde_json::to_string(&snapshot).expect("Value re-serialises");
     encoded.push_str(&base64_encode(raw.as_bytes()));
     PathBuf::from(encoded)
 }
 
-fn load_previous(prev_ref: &std::path::Path) -> Option<Value> {
+pub(crate) fn load_previous(prev_ref: &std::path::Path) -> Option<Value> {
     let token = prev_ref.to_str()?;
     let encoded = token.strip_prefix(PREV_PREFIX)?;
     let bytes = base64_decode(encoded)?;
@@ -613,6 +631,28 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn add_rejects_n_per_env_slots() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        // Extension and Messaging are N-per-env: they live in their own
+        // collections, not `packs`. `op env-packs` must refuse them with a
+        // pointer to the right noun rather than wedge them into `packs`.
+        for slot in [CapabilitySlot::Extension, CapabilitySlot::Messaging] {
+            let err = add(
+                &store,
+                &OpFlags::default(),
+                Some(local_payload(slot, "acme.oauth.auth0@1.0.0")),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, OpError::InvalidArgument(_)),
+                "slot {slot} should be rejected, got {err:?}"
+            );
+        }
     }
 
     #[test]

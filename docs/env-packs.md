@@ -53,27 +53,46 @@ The seven slots today (`CapabilitySlot::ALL`):
 
 ## Decision: which path are you on?
 
+The first cut is **the dividing rule**: *who consumes the capability?*
+
+- **Core code** (deployer / start / operator / runner) calls `pack_for_slot(X)`
+  and links a **typed host interface** (`dyn SecretsManager`, `dyn StateHost`,
+  …). It's a **core slot** — closed enum, 1-per-env. → **Path 1 or 2.**
+- **A bundle / flow** resolves the capability **dynamically by name**
+  (`ext://<path>[/<instance>]`) and reads config / answers — no typed interface
+  wired. It's an **extension** — open namespace, N-per-env, no schema bump
+  per family. → **Path 3.**
+
 ```
                    ┌─────────────────────────────────────────────┐
-                   │ Does the capability fit one of the          │
-                   │ existing slots in CapabilitySlot::ALL?      │
+                   │ Does CORE code call pack_for_slot(X) and    │
+                   │ link a typed host interface for it?         │
                    └───────────────────┬─────────────────────────┘
-                              yes      │      no
-                       ┌───────────────┴─────────────────┐
-                       ▼                                 ▼
-              ┌─────────────────┐               ┌──────────────────────┐
-              │ Path 1          │               │ Path 2                │
-              │ New descriptor  │               │ Extend the closed     │
-              │ under an        │               │ enum (spec bump)      │
-              │ existing slot   │               │                       │
-              └─────────────────┘               └──────────────────────┘
+                       yes (core slot) │ no (workload resolves by name)
+                       ▼               │               ▼
+        ┌─────────────────────────┐    │     ┌──────────────────────────┐
+        │ Does a slot already      │    │     │ Path 3                    │
+        │ exist in CapabilitySlot? │    │     │ Extension binding         │
+        ├────────────┬─────────────┤    │     │ (open ns, N-per-env,      │
+        │ yes        │ no          │    │     │ no schema bump ever again)│
+        ▼            ▼             │    │     └──────────────────────────┘
+   ┌─────────┐ ┌──────────────┐    │
+   │ Path 1  │ │ Path 2       │    │
+   │ New     │ │ Extend the   │    │
+   │ desc.   │ │ closed enum  │    │
+   └─────────┘ └──────────────┘    │
 ```
 
-Pick **Path 1** unless your capability is genuinely a new family that no
-existing slot can host. The 1-per-slot constraint is intentional — two
-secrets backends in one env would split the truth source — so wanting "a
-second secrets pack" alongside the existing one is almost always a sign you
-want a new descriptor (Path 1), not a new slot (Path 2).
+For a core slot, pick **Path 1** unless your capability is genuinely a new
+family that no existing slot can host. The 1-per-slot constraint is
+intentional — two secrets backends in one env would split the truth source —
+so wanting "a second secrets pack" alongside the existing one is almost always
+a sign you want a new descriptor (Path 1), not a new slot (Path 2).
+
+For config-shaped or naturally N-per-env capabilities a *workload* reaches by
+name, take **Path 3** — it absorbs the long tail that Path 2 overpays for. The
+full rationale lives in the Extension-slot design spec
+(`docs/extension-slot-design.md`).
 
 ## Path 1 — Adding a new pack within an existing slot
 
@@ -305,6 +324,57 @@ the workspace already enforces (see `/home/vampik/greenticai/CLAUDE.md` —
 the canonical chain). Downstream consumers floor-pin to the new spec
 version.
 
+## Path 3 — Adding an extension (open, N-per-env)
+
+Use Path 3 when the capability is consumed by a **workload** (a bundle/flow
+resolving it by name), not by core platform code linking a typed host
+interface. There is **no schema bump** — an extension is a `PackDescriptor`
+value plus a handler registration. The one-time enabling work (the `Extension`
+`CapabilitySlot` variant and `Environment.extensions`) already shipped.
+
+### 1. Author or vendor the pack and (optionally) implement a handler
+
+Pick a descriptor path, e.g. `acme.oauth.auth0@1.0.0`. If the extension runs
+preflight checks (e.g. shells out to a broker CLI) or you want `doctor` to
+recognize it, implement `EnvPackHandler` with `slot() == CapabilitySlot::Extension`
+and register it via `EnvPackRegistry::register` (same Phase D hook as Path 1).
+Until a handler is registered, `doctor` reports the binding under `extensions`
+as an `unknown_kind` — informational, not fatal.
+
+### 2. Operator binds it on an env
+
+```sh
+# Inspect the input schema for `add` (no slot field; instance_id is optional)
+gtc op extensions add --schema
+
+# add.answers.json
+# {
+#   "environment_id": "demo",
+#   "kind": "acme.oauth.auth0@1.0.0",
+#   "pack_ref": "oci://ghcr.io/acme/greentic-oauth-auth0:1.0.0",
+#   "instance_id": "primary",                 # omit for the single default instance
+#   "answers_ref": "extensions/acme.oauth.auth0-primary/answers.json"
+# }
+gtc op extensions add --answers add.answers.json
+
+# N instances of the SAME extension coexist — add a second with a distinct
+# instance_id. A default (no instance_id) and named instances can also coexist.
+gtc op extensions list demo
+```
+
+Identity is `(kind.path(), instance_id)` — version-independent. `update`,
+`remove`, and `rollback` target a binding by that key (the `@<version>` in a
+`remove`/`rollback` payload is ignored). Each mutation bumps `generation` and
+stashes the previous binding for one-step `rollback`, exactly like `env-packs`.
+
+### 3. Resolve it from a workload
+
+A bundle/flow reaches the binding by name through `ext://<path>[/<instance>]`
+(`ext://acme.oauth.auth0/primary`), which the runtime resolves to the binding's
+config/answers blob. No typed host interface is auto-wired — the consuming
+component reads config and does the rest. (Contrast a core slot, where the
+runner links a `dyn Trait` directly.)
+
 ## CLI surface reference
 
 All env-pack management goes through `gtc op env-packs <verb>`:
@@ -316,6 +386,18 @@ All env-pack management goes through `gtc op env-packs <verb>`:
 | `remove`   | Detach a slot. Subsequent reads via the runtime resolver fail closed.                |
 | `rollback` | Restore the previous binding for a slot (one step back).                             |
 | `list`     | Enumerate bindings for an env.                                                       |
+
+Extension (Path 3) bindings are managed through the parallel
+`gtc op extensions <verb>` noun (same verb set), keyed on
+`(kind.path(), instance_id)` instead of a slot:
+
+| Verb       | Purpose                                                                              |
+| ---------- | ------------------------------------------------------------------------------------ |
+| `add`      | Bind an extension. Fails if `(path, instance_id)` is already bound (use `update`).   |
+| `update`   | Replace a binding by `(path, instance_id)`; bumps `generation`; stashes the previous. |
+| `remove`   | Detach a binding by `(path, instance_id)`.                                           |
+| `rollback` | Restore the previous binding for `(path, instance_id)` (one step back).              |
+| `list`     | Enumerate extension bindings for an env.                                             |
 
 Companion verbs on `gtc op env`:
 
@@ -371,7 +453,13 @@ Operator binds it with `gtc op env-packs update --env prod --slot secrets
 `op env doctor` reports the binding healthy; the next deploy reads secrets
 through the Vault handler.
 
-### Adding fast2flow as an env-pack (Path 2)
+### Adding fast2flow as an env service (Path 2 or Path 3)
+
+> **Apply the dividing rule first.** If fast2flow becomes an env-shared service
+> that bundles call **by name** (`ext://...`), it is a **Path 3 extension** — no
+> schema bump. Only if the **runner must wire a fast2flow router as a typed host
+> interface** does it earn a **Path 2 core slot**. The Path 2 walkthrough below
+> applies to the latter case.
 
 **Today fast2flow is not an env-pack.** The workspace explainer
 ([`/home/vampik/greenticai/deploy_explained.md`](../../deploy_explained.md))
@@ -400,7 +488,14 @@ that need it consume it via the existing inter-bundle plumbing. That avoids
 the schema bump entirely and is the lower-risk path if "one fast2flow per
 env" is a convenience, not a hard requirement.
 
-### Adding OAuth as an env-pack (Path 2)
+### Adding OAuth as an env-pack (Path 2 or Path 3)
+
+> **Apply the dividing rule first.** OAuth is borderline. If bundles only need
+> per-env OAuth **config** (client registrations, redirect URIs, scopes) and
+> reach it via `ext://oauth` while keeping their existing host imports, it is a
+> **Path 3 extension**. Only if the **runner must wire an OAuth broker backend**
+> the runtime links does it earn a **Path 2 core slot**. The Path 2 walkthrough
+> below applies to the latter case.
 
 The current `greentic-oauth` crate ships a broker + SDK; today its
 configuration is consumed per-bundle through host imports, not bound as an

@@ -45,6 +45,7 @@ fn env_with(
         revisions,
         traffic_splits,
         messaging_endpoints: vec![],
+        extensions: vec![],
         revocation: Default::default(),
         retention: Default::default(),
         health: Default::default(),

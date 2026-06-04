@@ -46,6 +46,7 @@ pub mod deploy;
 pub mod dispatch;
 pub mod env;
 pub mod env_packs;
+pub mod extensions;
 pub mod messaging;
 pub mod migrate;
 pub mod migrate_state;

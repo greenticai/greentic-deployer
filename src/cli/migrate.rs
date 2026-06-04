@@ -469,6 +469,7 @@ fn seed_target_from_source(source: &Environment, target_env_id: &EnvId) -> Envir
         revisions: Vec::new(),
         traffic_splits: Vec::new(),
         messaging_endpoints: Vec::new(),
+        extensions: Vec::new(),
         revocation: source.revocation.clone(),
         retention: source.retention.clone(),
         health: source.health.clone(),

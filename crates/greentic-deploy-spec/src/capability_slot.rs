@@ -15,11 +15,21 @@ use thiserror::Error;
 
 /// Closed enumeration of capability slots an Environment can bind (`§5.1`).
 ///
-/// `Messaging` is reserved for Phase M endpoints but bindings live in
-/// [`Environment::messaging_endpoints`](crate::Environment), not in
-/// [`Environment::packs`](crate::Environment) — messaging endpoints are
-/// N-per-env, so the 1-per-slot constraint enforced on `packs` does not
-/// apply. The variant exists so future per-slot UI/discovery surfaces can
+/// Most variants are *core slots*: 1-per-env, bound in
+/// [`Environment::packs`](crate::Environment), and demanded by name at compile
+/// time via [`Environment::pack_for_slot`](crate::Environment::pack_for_slot).
+///
+/// `Messaging` and `Extension` are the exceptions — *N-per-env* families whose
+/// bindings live in their own collections, never in `packs`:
+/// - `Messaging` bindings live in
+///   [`Environment::messaging_endpoints`](crate::Environment).
+/// - `Extension` bindings live in
+///   [`Environment::extensions`](crate::Environment) — an open namespace for
+///   config-shaped / N-per-env capabilities resolved by a workload at runtime
+///   (`ext://<path>[/<instance>]`), not linked as a typed host interface.
+///
+/// [`binds_in_packs`](Self::binds_in_packs) is the mechanical test for which
+/// group a slot is in. The variants exist so per-slot UI/discovery surfaces can
 /// enumerate every capability family from one source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -31,6 +41,7 @@ pub enum CapabilitySlot {
     State,
     Revocation,
     Messaging,
+    Extension,
 }
 
 impl CapabilitySlot {
@@ -42,6 +53,7 @@ impl CapabilitySlot {
         CapabilitySlot::State,
         CapabilitySlot::Revocation,
         CapabilitySlot::Messaging,
+        CapabilitySlot::Extension,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -53,7 +65,20 @@ impl CapabilitySlot {
             CapabilitySlot::State => "state",
             CapabilitySlot::Revocation => "revocation",
             CapabilitySlot::Messaging => "messaging",
+            CapabilitySlot::Extension => "extension",
         }
+    }
+
+    /// Whether bindings for this slot live in
+    /// [`Environment::packs`](crate::Environment) under the 1-per-slot rule.
+    ///
+    /// `true` for the core slots (a workload's platform demands exactly one
+    /// binding by name via `pack_for_slot`); `false` for the N-per-env families
+    /// (`Messaging`, `Extension`) whose bindings live in their own collections.
+    /// This is the single predicate distinguishing the two groups — it gates
+    /// `missing_slots` reporting and rejects N-per-env slots from `op env-packs`.
+    pub fn binds_in_packs(self) -> bool {
+        !matches!(self, CapabilitySlot::Messaging | CapabilitySlot::Extension)
     }
 }
 
@@ -98,7 +123,7 @@ impl PackDescriptor {
             return Err(PackDescriptorParseError::PathMissingDot);
         }
         for ch in path.chars() {
-            if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '.') {
+            if !descriptor_path_char_ok(ch) {
                 return Err(PackDescriptorParseError::InvalidPathChar(ch));
             }
         }
@@ -119,6 +144,13 @@ impl PackDescriptor {
     pub fn version(&self) -> &SemVer {
         &self.version
     }
+}
+
+/// Charset permitted in a [`PackDescriptor`] path segment (also the charset an
+/// [`ExtensionRef`](crate::ExtensionRef) path must satisfy): ASCII lowercase,
+/// digits, `-`, `.`.
+pub(crate) fn descriptor_path_char_ok(ch: char) -> bool {
+    ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '.'
 }
 
 impl fmt::Display for PackDescriptor {
@@ -163,4 +195,43 @@ pub enum PackDescriptorParseError {
     InvalidPathChar(char),
     #[error("pack descriptor version is not valid SemVer: {0}")]
     InvalidSemver(String),
+}
+
+#[cfg(test)]
+mod capability_slot_tests {
+    use super::*;
+
+    #[test]
+    fn as_str_round_trips_for_every_variant() {
+        for slot in CapabilitySlot::ALL {
+            let s = slot.as_str();
+            let back: CapabilitySlot =
+                serde_json::from_value(serde_json::Value::String(s.to_string()))
+                    .expect("lowercase as_str deserialises back to the variant");
+            assert_eq!(back, *slot, "round-trip failed for {s}");
+        }
+    }
+
+    #[test]
+    fn extension_is_an_n_per_env_slot() {
+        assert!(!CapabilitySlot::Extension.binds_in_packs());
+        assert!(!CapabilitySlot::Messaging.binds_in_packs());
+        // Every other slot is a core, 1-per-slot family bound in `packs`.
+        for slot in CapabilitySlot::ALL {
+            let expect_in_packs =
+                !matches!(slot, CapabilitySlot::Messaging | CapabilitySlot::Extension);
+            assert_eq!(slot.binds_in_packs(), expect_in_packs, "{slot}");
+        }
+    }
+
+    #[test]
+    fn all_contains_extension_exactly_once() {
+        assert_eq!(
+            CapabilitySlot::ALL
+                .iter()
+                .filter(|s| **s == CapabilitySlot::Extension)
+                .count(),
+            1
+        );
+    }
 }

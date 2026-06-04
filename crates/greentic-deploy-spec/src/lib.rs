@@ -44,7 +44,9 @@ pub use credentials::{
     Credentials, CredentialsBootstrap, CredentialsExpiry, CredentialsMode, CredentialsValidation,
     CredentialsValidationResult,
 };
-pub use environment::{DEFAULT_LISTEN_ADDR, EnvPackBinding, Environment, EnvironmentHostConfig};
+pub use environment::{
+    DEFAULT_LISTEN_ADDR, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding,
+};
 pub use environment_runtime::{EnvironmentRuntime, RuntimeDiscoveryValue};
 pub use error::SpecError;
 pub use ids::{
@@ -54,7 +56,10 @@ pub use integrity::{INTEGRITY_ALGORITHM_SHA256, IntegrityError, StateIntegrity, 
 pub use messaging_endpoint::{MessagingEndpoint, WelcomeFlowRef};
 pub use pack_config::PackConfig;
 pub use pack_list_lock::{LockedPack, PackListLock};
-pub use refs::{RuntimeRef, RuntimeRefParseError, SecretRef, SecretRefParseError};
+pub use refs::{
+    ExtensionRef, ExtensionRefParseError, RuntimeRef, RuntimeRefParseError, SecretRef,
+    SecretRefParseError,
+};
 pub use remote::{
     BackupManifest, ConcurrencyConflict, IdempotencyKey, IdempotencyOutcome, IdempotencyRecord,
     IdempotencyReplay, MutationResponse, Precondition, PreconditionError, RbacRequest,

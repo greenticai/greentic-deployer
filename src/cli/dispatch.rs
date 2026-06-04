@@ -19,7 +19,7 @@ use super::{OpError, OpFlags, OpOutcome, render_error};
 /// through the same `OpCommand` clap tree.
 #[derive(Parser, Debug)]
 #[command(
-    after_help = "Nouns: env, env-packs, bundles, revisions, traffic, config, credentials, secrets.\n\
+    after_help = "Nouns: env, env-packs, extensions, bundles, revisions, traffic, config, credentials, secrets, messaging.\n\
                   Every verb honors:\n\
                     --schema             dump the JSON schema of the payload it would accept, then exit\n\
                     --answers <PATH>     read the payload from a JSON or YAML file\n\n\
@@ -114,6 +114,14 @@ pub enum OpNoun {
     Messaging {
         #[command(subcommand)]
         verb: MessagingNoun,
+    },
+    /// Open-namespace extension bindings (`Path 3`). N-per-env capabilities
+    /// resolved by workloads via `ext://<path>[/<instance>]` — config-shaped,
+    /// no typed host interface, no schema bump per family. Contrast
+    /// `env-packs`, which manages the closed, 1-per-slot core `packs`.
+    Extensions {
+        #[command(subcommand)]
+        verb: ExtensionsVerb,
     },
 }
 
@@ -249,6 +257,15 @@ pub struct TrustRootRemoveArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum EnvPacksVerb {
+    Add,
+    Update,
+    Remove,
+    Rollback,
+    List { env_id: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ExtensionsVerb {
     Add,
     Update,
     Remove,
@@ -446,6 +463,7 @@ pub fn dispatch_op(cmd: OpCommand) -> Result<(), OpError> {
         OpNoun::Secrets { verb } => dispatch_secrets(&store, &flags, verb),
         OpNoun::TrustRoot { verb } => dispatch_trust_root(&store, &flags, verb),
         OpNoun::Messaging { verb } => dispatch_messaging(&store, &flags, verb),
+        OpNoun::Extensions { verb } => dispatch_extensions(&store, &flags, verb),
     };
     result.inspect_err(|err| print_error(noun, verb, err))
 }
@@ -555,6 +573,16 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 },
             },
         ),
+        OpNoun::Extensions { verb } => (
+            "extensions",
+            match verb {
+                ExtensionsVerb::Add => "add",
+                ExtensionsVerb::Update => "update",
+                ExtensionsVerb::Remove => "remove",
+                ExtensionsVerb::Rollback => "rollback",
+                ExtensionsVerb::List { .. } => "list",
+            },
+        ),
     }
 }
 
@@ -618,6 +646,21 @@ fn dispatch_env_packs(
         EnvPacksVerb::Remove => super::env_packs::remove(store, flags, None)?,
         EnvPacksVerb::Rollback => super::env_packs::rollback(store, flags, None)?,
         EnvPacksVerb::List { env_id } => super::env_packs::list(store, flags, &env_id)?,
+    };
+    print_outcome(&outcome)
+}
+
+fn dispatch_extensions(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    verb: ExtensionsVerb,
+) -> Result<(), OpError> {
+    let outcome = match verb {
+        ExtensionsVerb::Add => super::extensions::add(store, flags, None)?,
+        ExtensionsVerb::Update => super::extensions::update(store, flags, None)?,
+        ExtensionsVerb::Remove => super::extensions::remove(store, flags, None)?,
+        ExtensionsVerb::Rollback => super::extensions::rollback(store, flags, None)?,
+        ExtensionsVerb::List { env_id } => super::extensions::list(store, flags, &env_id)?,
     };
     print_outcome(&outcome)
 }
