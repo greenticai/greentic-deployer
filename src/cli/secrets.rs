@@ -169,9 +169,23 @@ pub fn put(
         // The backend handler converts the logical `secret://` ref 1:1.
         // `DevStore::put` itself rejects any other depth, so enforce the
         // shape upfront with a teachable error instead of surfacing the
-        // backend's "uri is missing category".
-        let segments: Vec<&str> = rel_path.split('/').collect();
-        if segments.len() != 4 || segments.iter().any(|s| s.is_empty()) {
+        // backend's "uri is missing category". The `splitn(5)` + None tail
+        // makes "exactly four non-empty segments" structural.
+        let mut segs = rel_path.splitn(5, '/');
+        let (Some(tenant), Some(team), Some(pack), Some(name), None) = (
+            segs.next(),
+            segs.next(),
+            segs.next(),
+            segs.next(),
+            segs.next(),
+        ) else {
+            return Err(OpError::InvalidArgument(format!(
+                "dev-store secret path must be `<tenant>/<team>/<pack>/<name>` \
+                 (e.g. `default/_/messaging-telegram/telegram_bot_token`); \
+                 got `{rel_path}`"
+            )));
+        };
+        if [tenant, team, pack, name].iter().any(|s| s.is_empty()) {
             return Err(OpError::InvalidArgument(format!(
                 "dev-store secret path must be `<tenant>/<team>/<pack>/<name>` \
                  (e.g. `default/_/messaging-telegram/telegram_bot_token`); \
@@ -184,7 +198,6 @@ pub fn put(
         // `default` team would be written under a key no lookup ever uses.
         // Same policy as the name segment: reject instead of silently
         // transforming.
-        let team = segments[1];
         if !is_canonical_team(team) {
             return Err(OpError::InvalidArgument(format!(
                 "team segment `{team}` is not store-canonical: the runtime \
@@ -198,7 +211,6 @@ pub fn put(
         // instead of silently transforming — producer and consumer must
         // share one derivation, and we share it by only accepting
         // already-canonical input.
-        let name = segments[3];
         if !is_canonical_secret_name(name) {
             return Err(OpError::InvalidArgument(format!(
                 "secret name `{name}` is not store-canonical: use lowercase \
@@ -305,25 +317,18 @@ fn resolve_dev_store_path(env_dir: &Path, override_path: Option<PathBuf>) -> Pat
     primary
 }
 
-/// Fixed-point check against greentic-start's `canonical_team`: the reader
-/// maps a trimmed-empty or case-insensitive `default` team to `_` and trims
-/// surrounding whitespace, so only segments the reader maps to themselves
-/// are writable. `_` itself is a fixed point.
+/// A segment is writable iff the runtime reader's canonicalization maps it to
+/// itself — anything else is written under a key no lookup will ever use.
+/// Both checks call the deployer-local copies of the reader's functions
+/// (`runtime_secrets::{canonical_team,canonical_secret_name}`, faithful
+/// mirrors of greentic-start's) so the predicate can't drift from the
+/// transformation it guards.
 fn is_canonical_team(team: &str) -> bool {
-    team.trim() == team && !team.eq_ignore_ascii_case("default")
+    crate::runtime_secrets::canonical_team(Some(team)) == team
 }
 
-/// Fixed-point check against greentic-start's `canonical_secret_name`: a
-/// name passes iff canonicalizing it would be a no-op, which is exactly when
-/// a put key matches what the runtime reader looks up.
 fn is_canonical_secret_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('_')
-        && !name.ends_with('_')
-        && !name.contains("__")
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    crate::runtime_secrets::canonical_secret_name(name) == name
 }
 
 /// Write one value into the dev store from this sync context.
@@ -379,15 +384,14 @@ fn dev_store_put(path: &Path, uri: &str, value: &str) -> Result<(), OpError> {
     })
 }
 
-/// Sidecar lock path for a dev store file: `<store-file-name>.lock` in the
-/// same directory (`.dev.secrets.env` → `.dev.secrets.env.lock`).
+/// Sidecar lock path for a dev store file: the full path with `.lock`
+/// appended (`.dev.secrets.env` → `.dev.secrets.env.lock`). Appending to the
+/// whole path (not just the file name) keeps the directory component intact
+/// without the extract-fallback-reassemble dance.
 fn dev_store_lock_path(store_path: &Path) -> PathBuf {
-    let mut name = store_path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_else(|| std::ffi::OsString::from("dev-store"));
-    name.push(".lock");
-    store_path.with_file_name(name)
+    let mut lock = store_path.as_os_str().to_os_string();
+    lock.push(".lock");
+    PathBuf::from(lock)
 }
 
 fn resolve_payload<T: serde::de::DeserializeOwned>(
