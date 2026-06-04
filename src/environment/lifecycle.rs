@@ -421,6 +421,7 @@ mod tests {
             revisions: Vec::new(),
             traffic_splits: Vec::new(),
             messaging_endpoints: Vec::new(),
+            extensions: Vec::new(),
             revocation: Default::default(),
             retention: Default::default(),
             health: Default::default(),

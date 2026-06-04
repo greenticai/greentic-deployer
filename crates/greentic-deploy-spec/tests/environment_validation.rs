@@ -1,6 +1,6 @@
 use greentic_deploy_spec::{
-    CapabilitySlot, EnvId, EnvPackBinding, Environment, EnvironmentHostConfig, PackDescriptor,
-    PackId, SchemaVersion, SpecError,
+    CapabilitySlot, EnvId, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding,
+    ExtensionRef, PackDescriptor, PackId, SchemaVersion, SpecError,
 };
 use std::str::FromStr;
 
@@ -33,6 +33,7 @@ fn env(packs: Vec<EnvPackBinding>) -> Environment {
         revisions: vec![],
         traffic_splits: vec![],
         messaging_endpoints: vec![],
+        extensions: vec![],
         revocation: Default::default(),
         retention: Default::default(),
         health: Default::default(),
@@ -100,4 +101,92 @@ fn schema_discriminator_required() {
     e.schema = SchemaVersion::new("greentic.environment.v0");
     let err = e.validate().unwrap_err();
     assert!(matches!(err, SpecError::SchemaMismatch { .. }));
+}
+
+// --- extension bindings (Path 3) -----------------------------------------
+
+fn extension(descriptor: &str, instance: Option<&str>) -> ExtensionBinding {
+    ExtensionBinding {
+        kind: PackDescriptor::try_new(descriptor).unwrap(),
+        pack_ref: PackId::new("pack-ext"),
+        instance_id: instance.map(str::to_string),
+        answers_ref: None,
+        generation: 0,
+        previous_binding_ref: None,
+    }
+}
+
+fn env_with_extensions(extensions: Vec<ExtensionBinding>) -> Environment {
+    let mut e = env(vec![]);
+    e.extensions = extensions;
+    e
+}
+
+#[test]
+fn duplicate_extension_same_path_no_instance_rejected() {
+    let e = env_with_extensions(vec![
+        extension("acme.oauth.auth0@1.0.0", None),
+        extension("acme.oauth.auth0@2.0.0", None),
+    ]);
+    let err = e.validate().unwrap_err();
+    assert!(
+        matches!(err, SpecError::DuplicateExtension { ref path, instance_id: None } if path == "acme.oauth.auth0"),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn duplicate_extension_same_path_same_instance_rejected() {
+    let e = env_with_extensions(vec![
+        extension("acme.oauth.auth0@1.0.0", Some("primary")),
+        extension("acme.oauth.auth0@1.0.0", Some("primary")),
+    ]);
+    let err = e.validate().unwrap_err();
+    assert!(
+        matches!(err, SpecError::DuplicateExtension { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn default_and_named_instances_coexist() {
+    // None + two distinct Some(..) on the same path are all unique keys.
+    let e = env_with_extensions(vec![
+        extension("acme.oauth.auth0@1.0.0", None),
+        extension("acme.oauth.auth0@1.0.0", Some("primary")),
+        extension("acme.oauth.auth0@1.0.0", Some("secondary")),
+    ]);
+    e.validate()
+        .expect("distinct (path, instance_id) keys are valid");
+}
+
+#[test]
+fn invalid_instance_id_rejected() {
+    let e = env_with_extensions(vec![extension("acme.oauth.auth0@1.0.0", Some("Bad/Id"))]);
+    let err = e.validate().unwrap_err();
+    assert!(
+        matches!(err, SpecError::InvalidExtensionInstanceId { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn extension_for_ref_selects_by_path_and_instance() {
+    let e = env_with_extensions(vec![
+        extension("acme.oauth.auth0@1.0.0", None),
+        extension("acme.oauth.auth0@1.0.0", Some("primary")),
+    ]);
+    let default = e
+        .extension_for_ref(&ExtensionRef::try_new("ext://acme.oauth.auth0").unwrap())
+        .expect("default instance resolves");
+    assert_eq!(default.instance_id, None);
+    let named = e
+        .extension_for_ref(&ExtensionRef::try_new("ext://acme.oauth.auth0/primary").unwrap())
+        .expect("named instance resolves");
+    assert_eq!(named.instance_id.as_deref(), Some("primary"));
+    // A path/instance with no binding resolves to None.
+    assert!(
+        e.extension_for_ref(&ExtensionRef::try_new("ext://acme.oauth.auth0/missing").unwrap())
+            .is_none()
+    );
 }

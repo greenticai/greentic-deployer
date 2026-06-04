@@ -94,6 +94,7 @@ mod tests {
             revisions: vec![],
             traffic_splits: vec![],
             messaging_endpoints: endpoints,
+            extensions: Vec::new(),
             revocation: Default::default(),
             retention: Default::default(),
             health: Default::default(),

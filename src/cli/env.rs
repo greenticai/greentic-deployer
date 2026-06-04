@@ -127,6 +127,7 @@ pub fn create(
                 revisions: Vec::new(),
                 traffic_splits: Vec::new(),
                 messaging_endpoints: Vec::new(),
+                extensions: Vec::new(),
                 revocation: Default::default(),
                 retention: Default::default(),
                 health: Default::default(),
@@ -266,9 +267,14 @@ pub fn doctor(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpO
     let runtime = store.load_runtime(&env_id)?;
     let validate_result = env.validate();
     let bound_slots: Vec<String> = env.packs.iter().map(|b| b.slot.to_string()).collect();
+    // Only the core, 1-per-slot families (those bound in `packs`) have a
+    // meaningful "missing" state. The N-per-env slots (`Messaging`,
+    // `Extension`) live in their own open collections — absence is not a
+    // misconfiguration — so they never appear here.
     let missing_slots: Vec<String> = greentic_deploy_spec::CapabilitySlot::ALL
         .iter()
         .copied()
+        .filter(|s| s.binds_in_packs())
         .filter(|s| env.pack_for_slot(*s).is_none())
         .map(|s| s.to_string())
         .collect();
@@ -309,6 +315,41 @@ pub fn doctor(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpO
             }
         }
     }
+    // Extension bindings (`Path 3`) resolve against the same registry, but as
+    // an open N-per-env namespace they never contribute to `missing_slots`.
+    // `resolve_for_slot(Extension, ..)` degrades the slot check to "is this a
+    // registered extension"; a handler that serves a different slot (a core
+    // pack mis-bound as an extension) surfaces as a slot mismatch. With no
+    // extension handlers registered, every binding shows as an unknown kind —
+    // the honest answer until Phase D plug-ins register real handlers.
+    let mut extension_report = ExtensionDoctor::default();
+    for ext in &env.extensions {
+        match registry.resolve_for_slot(greentic_deploy_spec::CapabilitySlot::Extension, &ext.kind)
+        {
+            Ok(_) => {}
+            Err(crate::env_packs::RegistryError::Unknown(kind)) => {
+                extension_report.unknown_kinds.push(kind)
+            }
+            Err(crate::env_packs::RegistryError::SlotMismatch { kind, actual, .. }) => {
+                extension_report.slot_mismatches.push(json!({
+                    "kind": kind,
+                    "handler_slot": actual.to_string(),
+                }))
+            }
+            Err(crate::env_packs::RegistryError::VersionUnsupported {
+                kind,
+                requested,
+                supported,
+            }) => extension_report.version_skew.push(json!({
+                "kind": kind,
+                "requested": requested,
+                "supported": supported,
+            })),
+            Err(err @ crate::env_packs::RegistryError::DuplicateRegistration(_)) => {
+                unreachable!("resolve_for_slot never returns {err:?}")
+            }
+        }
+    }
     Ok(OpOutcome::new(
         NOUN,
         "doctor",
@@ -323,10 +364,26 @@ pub fn doctor(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpO
             "unknown_kinds": unknown_kinds,
             "slot_mismatches": slot_mismatches,
             "version_skew": version_skew,
+            "extensions": {
+                "count": env.extensions.len(),
+                "unknown_kinds": extension_report.unknown_kinds,
+                "slot_mismatches": extension_report.slot_mismatches,
+                "version_skew": extension_report.version_skew,
+            },
             "has_runtime": runtime.is_some(),
             "checked_at": Utc::now(),
         }),
     ))
+}
+
+/// Aggregated registry-resolution issues for `Environment.extensions`, reported
+/// under the `extensions` key in `doctor` output. Mirrors the per-`packs`
+/// buckets but omits `missing_slots` (the extension namespace is open).
+#[derive(Default)]
+struct ExtensionDoctor {
+    unknown_kinds: Vec<String>,
+    slot_mismatches: Vec<Value>,
+    version_skew: Vec<Value>,
 }
 
 /// `op env tool-check <env_id>`. Runs each binding's
@@ -381,6 +438,31 @@ pub fn tool_check(
             })),
         }
     }
+    // Extension preflight: an extension handler's `preflight()` runs exactly as
+    // a core handler's. Reported under their own keys so the operator sees core
+    // and extension tool checks distinctly; both feed the totals.
+    let mut extension_bindings: Vec<Value> = Vec::with_capacity(env.extensions.len());
+    let mut extension_unresolved: Vec<Value> = Vec::new();
+    for ext in &env.extensions {
+        match registry.resolve_for_slot(greentic_deploy_spec::CapabilitySlot::Extension, &ext.kind)
+        {
+            Ok(handler) => {
+                let checks = handler.preflight();
+                total_checks += checks.len();
+                failed_checks += checks.iter().filter(|c| !c.outcome.is_ok()).count();
+                extension_bindings.push(json!({
+                    "kind": ext.kind.as_str(),
+                    "instance_id": ext.instance_id,
+                    "checks": checks,
+                }));
+            }
+            Err(e) => extension_unresolved.push(json!({
+                "kind": ext.kind.as_str(),
+                "instance_id": ext.instance_id,
+                "error": e.to_string(),
+            })),
+        }
+    }
     Ok(OpOutcome::new(
         NOUN,
         "tool-check",
@@ -388,6 +470,8 @@ pub fn tool_check(
             "environment_id": env.environment_id.as_str(),
             "bindings": bindings,
             "unresolved_bindings": unresolved_bindings,
+            "extension_bindings": extension_bindings,
+            "extension_unresolved_bindings": extension_unresolved,
             "total_checks": total_checks,
             "failed_checks": failed_checks,
             "checked_at": Utc::now(),
@@ -983,11 +1067,59 @@ mod tests {
             .get("missing_slots")
             .and_then(|v| v.as_array())
             .expect("missing_slots array");
-        // No packs bound → every slot missing.
-        assert_eq!(
-            missing.len(),
-            greentic_deploy_spec::CapabilitySlot::ALL.len()
+        // No packs bound → every CORE slot missing. The N-per-env slots
+        // (Messaging, Extension) live in their own collections and never
+        // appear in missing_slots.
+        let core_slots = greentic_deploy_spec::CapabilitySlot::ALL
+            .iter()
+            .filter(|s| s.binds_in_packs())
+            .count();
+        assert_eq!(missing.len(), core_slots);
+        assert!(
+            missing
+                .iter()
+                .all(|s| s.as_str() != Some("messaging") && s.as_str() != Some("extension")),
+            "N-per-env slots must not appear in missing_slots"
         );
+    }
+
+    #[test]
+    fn doctor_reports_extensions_separately() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        // No extension handler is registered in `with_builtins`, so an
+        // extension binding surfaces under the `extensions` block as an
+        // unknown kind — never in `missing_slots`.
+        env.extensions.push(greentic_deploy_spec::ExtensionBinding {
+            kind: greentic_deploy_spec::PackDescriptor::try_new("acme.oauth.auth0@1.0.0").unwrap(),
+            pack_ref: greentic_deploy_spec::PackId::new("pack-ext"),
+            instance_id: Some("primary".to_string()),
+            answers_ref: None,
+            generation: 0,
+            previous_binding_ref: None,
+        });
+        store.save(&env).unwrap();
+        let outcome = doctor(&store, &OpFlags::default(), "local").unwrap();
+        let ext = outcome
+            .result
+            .get("extensions")
+            .expect("extensions report block");
+        assert_eq!(ext.get("count").and_then(|v| v.as_u64()), Some(1));
+        let unknown = ext
+            .get("unknown_kinds")
+            .and_then(|v| v.as_array())
+            .expect("extension unknown_kinds array");
+        assert_eq!(unknown.len(), 1);
+        assert!(unknown[0].as_str().unwrap().contains("acme.oauth.auth0"));
+        // The extension's path is NOT in missing_slots / unknown_kinds (the
+        // core-`packs` buckets).
+        let core_unknown = outcome
+            .result
+            .get("unknown_kinds")
+            .and_then(|v| v.as_array())
+            .expect("core unknown_kinds array");
+        assert!(core_unknown.is_empty());
     }
 
     #[test]

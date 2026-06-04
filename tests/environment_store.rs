@@ -49,6 +49,7 @@ fn minimal_environment(id: &EnvId) -> Environment {
         revisions: vec![],
         traffic_splits: vec![],
         messaging_endpoints: vec![],
+        extensions: vec![],
         revocation: Default::default(),
         retention: Default::default(),
         health: Default::default(),

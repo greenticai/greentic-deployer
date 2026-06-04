@@ -10,7 +10,7 @@ use crate::capability_slot::{CapabilitySlot, PackDescriptor};
 use crate::error::SpecError;
 use crate::ids::PackId;
 use crate::messaging_endpoint::MessagingEndpoint;
-use crate::refs::SecretRef;
+use crate::refs::{ExtensionRef, SecretRef};
 use crate::retention::{HealthStatus, RetentionPolicy, RevocationConfig};
 use crate::revision::Revision;
 use crate::traffic_split::TrafficSplit;
@@ -74,6 +74,53 @@ pub struct EnvPackBinding {
     pub previous_binding_ref: Option<PathBuf>,
 }
 
+/// An open-namespace capability binding (`§5.1`, Path 3).
+///
+/// Unlike [`EnvPackBinding`] it carries no `slot` field — its slot is always
+/// [`CapabilitySlot::Extension`](crate::CapabilitySlot::Extension). Its identity
+/// is `(kind.path(), instance_id)`: the descriptor path plus an optional
+/// instance selector distinguishing N instances of the same extension type.
+/// Bindings live in [`Environment::extensions`], never in
+/// [`Environment::packs`], so the 1-per-slot rule does not apply; a workload
+/// resolves one by name via `ext://<path>[/<instance>]`
+/// ([`ExtensionRef`](crate::ExtensionRef)) — no typed host interface is wired.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionBinding {
+    pub kind: PackDescriptor,
+    pub pack_ref: PackId,
+    /// Distinguishes N instances of the SAME extension type. `None` ⇒ the
+    /// descriptor path is the whole key (the single default instance). A
+    /// `None` binding and a `Some(..)` binding on the same path coexist; two
+    /// `None` bindings on the same path collide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    /// `extensions/<path>[-<instance>]/answers.json` (env-relative path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers_ref: Option<PathBuf>,
+    /// Bumped on attach/update/remove/rollback.
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_binding_ref: Option<PathBuf>,
+}
+
+impl ExtensionBinding {
+    /// Per-document invariants. The `(path, instance_id)` uniqueness check is a
+    /// cross-document invariant on [`Environment::validate`] where the sibling
+    /// bindings are in scope.
+    pub fn validate(&self) -> Result<(), SpecError> {
+        if let Some(inst) = &self.instance_id {
+            crate::refs::validate_instance_id(inst).map_err(|e| {
+                SpecError::InvalidExtensionInstanceId {
+                    path: self.kind.path().to_string(),
+                    reason: e.to_string(),
+                }
+            })?;
+        }
+        Ok(())
+    }
+}
+
 /// `greentic.environment.v1` compose-view (`§5.1`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Environment {
@@ -96,6 +143,12 @@ pub struct Environment {
     /// unique on `endpoint_id` and on `(provider_type, provider_id)`.
     #[serde(default)]
     pub messaging_endpoints: Vec<MessagingEndpoint>,
+    /// Open-namespace extension bindings (`Path 3`). N-per-env; unique on
+    /// `(kind.path(), instance_id)`. Resolved by workloads via
+    /// `ext://<path>[/<instance>]`, never linked as a typed host interface and
+    /// never reported in `doctor`'s `missing_slots` (the namespace is open).
+    #[serde(default)]
+    pub extensions: Vec<ExtensionBinding>,
     #[serde(default)]
     pub revocation: RevocationConfig,
     #[serde(default)]
@@ -114,9 +167,20 @@ impl Environment {
         self.packs.iter().find(|b| b.slot == slot)
     }
 
+    /// Resolve an [`ExtensionRef`] to its binding by `(path, instance_id)` —
+    /// the same key [`Environment::validate`] enforces uniqueness on. Returns
+    /// `None` when no extension matches both the path and the (absence of an)
+    /// instance selector.
+    pub fn extension_for_ref(&self, r: &ExtensionRef) -> Option<&ExtensionBinding> {
+        self.extensions
+            .iter()
+            .find(|b| b.kind.path() == r.path() && b.instance_id.as_deref() == r.instance_id())
+    }
+
     /// Validates spec-level invariants:
     /// - schema discriminator matches `greentic.environment.v1`,
     /// - slot uniqueness across `packs`,
+    /// - extension binding uniqueness on `(kind.path(), instance_id)`,
     /// - basis-points sums on contained `TrafficSplit` / `BundleDeployment`,
     /// - `env_id` ownership across `host_config`, `revisions`, `bundles`, and
     ///   `traffic_splits` (every nested doc carries the same env identifier),
@@ -306,6 +370,21 @@ impl Environment {
                 return Err(SpecError::WelcomeFlowBundleNotLinked {
                     endpoint: endpoint.endpoint_id,
                     bundle: welcome.bundle_id.clone(),
+                });
+            }
+        }
+
+        // Extension bindings (`Path 3`): open N-per-env namespace, unique on
+        // `(kind.path(), instance_id)`. A `None` instance and a `Some(..)`
+        // instance on the same path coexist; two identical keys collide.
+        let mut seen_extensions = HashSet::with_capacity(self.extensions.len());
+        for ext in &self.extensions {
+            ext.validate()?;
+            let key = (ext.kind.path(), ext.instance_id.as_deref());
+            if !seen_extensions.insert(key) {
+                return Err(SpecError::DuplicateExtension {
+                    path: ext.kind.path().to_string(),
+                    instance_id: ext.instance_id.clone(),
                 });
             }
         }

@@ -238,4 +238,63 @@ mod tests {
         assert!(registry.is_empty());
         assert_eq!(registry.len(), 0);
     }
+
+    /// A Phase-D-style plug-in handler serving the open `Extension` slot.
+    #[derive(Debug)]
+    struct ExtHandler;
+
+    impl EnvPackHandler for ExtHandler {
+        fn slot(&self) -> CapabilitySlot {
+            CapabilitySlot::Extension
+        }
+        fn descriptor_path(&self) -> &str {
+            "acme.oauth.auth0"
+        }
+        fn supported_versions(&self) -> semver::VersionReq {
+            "^1.0.0".parse().unwrap()
+        }
+    }
+
+    #[test]
+    fn resolve_for_slot_accepts_a_registered_extension_handler() {
+        let mut registry = EnvPackRegistry::with_builtins();
+        registry.register(Box::new(ExtHandler)).unwrap();
+        // A registered extension handler resolves under the Extension slot.
+        registry
+            .resolve_for_slot(
+                CapabilitySlot::Extension,
+                &descriptor("acme.oauth.auth0@1.2.0"),
+            )
+            .unwrap();
+        // Binding the same descriptor under a core slot is a slot mismatch.
+        let err = registry
+            .resolve_for_slot(
+                CapabilitySlot::Secrets,
+                &descriptor("acme.oauth.auth0@1.2.0"),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RegistryError::SlotMismatch {
+                expected: CapabilitySlot::Secrets,
+                actual: CapabilitySlot::Extension,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unregistered_extension_is_unknown() {
+        // With no extension handler registered, an extension binding surfaces
+        // as Unknown — exactly what `doctor` reports until Phase D plug-ins
+        // register real handlers.
+        let registry = EnvPackRegistry::with_builtins();
+        let err = registry
+            .resolve_for_slot(
+                CapabilitySlot::Extension,
+                &descriptor("acme.oauth.auth0@1.0.0"),
+            )
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::Unknown(_)));
+    }
 }

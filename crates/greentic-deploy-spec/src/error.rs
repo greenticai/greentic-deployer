@@ -135,4 +135,15 @@ pub enum SpecError {
 
     #[error("messaging endpoint welcome_flow.flow_id is empty")]
     EmptyWelcomeFlowId,
+
+    #[error(
+        "duplicate extension binding for path `{path}` / instance `{instance_id:?}` in Environment.extensions"
+    )]
+    DuplicateExtension {
+        path: String,
+        instance_id: Option<String>,
+    },
+
+    #[error("extension binding `{path}` has an invalid instance id: {reason}")]
+    InvalidExtensionInstanceId { path: String, reason: String },
 }
