@@ -20,6 +20,8 @@ use greentic_deploy_spec::{
     BundleId, EnvId, MessagingEndpoint, MessagingEndpointId, PackId, SchemaVersion, SecretRef,
     WelcomeFlowRef,
 };
+use rand::TryRngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::str::FromStr;
@@ -27,6 +29,7 @@ use std::str::FromStr;
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
 use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
+use std::path::PathBuf;
 
 const NOUN: &str = "messaging.endpoint";
 
@@ -60,6 +63,14 @@ pub struct EndpointSetWelcomeFlowPayload {
     pub bundle_id: String,
     pub pack_id: String,
     pub flow_id: String,
+    pub idempotency_key: String,
+    pub updated_by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndpointRotateWebhookSecretPayload {
+    pub environment_id: String,
+    pub endpoint_id: String,
     pub idempotency_key: String,
     pub updated_by: String,
 }
@@ -193,15 +204,24 @@ pub fn add(
                 )));
             }
             let now = Utc::now();
+            let eid = MessagingEndpointId::new();
+            let webhook_secret_ref = if is_telegram_class(&provider_type) {
+                let secret_value = generate_webhook_secret()?;
+                let secret_ref = build_webhook_secret_ref(&env_id, &eid)?;
+                write_webhook_secret_to_devstore(store, &env_id, &secret_ref, &secret_value)?;
+                Some(secret_ref)
+            } else {
+                None
+            };
             let endpoint = MessagingEndpoint {
                 schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
                 env_id: env_id.clone(),
-                endpoint_id: MessagingEndpointId::new(),
+                endpoint_id: eid,
                 provider_id: provider_id.clone(),
                 provider_type: provider_type.clone(),
                 display_name: display_name.clone(),
                 secret_refs: secret_refs.clone(),
-                webhook_secret: None,
+                webhook_secret_ref,
                 linked_bundles: Vec::new(),
                 welcome_flow: None,
                 generation: 0,
@@ -570,6 +590,76 @@ pub fn remove(
     })
 }
 
+pub fn rotate_webhook_secret(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<EndpointRotateWebhookSecretPayload>,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(
+            NOUN,
+            "rotate-webhook-secret",
+            rotate_webhook_secret_schema(),
+        ));
+    }
+    let payload = resolve_payload(flags, payload)?;
+    let env_id = parse_env_id(&payload.environment_id)?;
+    let endpoint_id = parse_endpoint_id(&payload.endpoint_id)?;
+    let updated_by = require_nonempty("updated_by", &payload.updated_by)?;
+    let idempotency_key = require_nonempty("idempotency_key", &payload.idempotency_key)?;
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "rotate-webhook-secret",
+        target: json!({"endpoint_id": endpoint_id.to_string()}),
+        idempotency_key: Some(idempotency_key.clone()),
+    };
+    let idem_suffix = idem_suffix(&idempotency_key);
+    audit_and_record(store, ctx, |committed| {
+        let summary = store.transact(&env_id, |locked| -> Result<EndpointSummary, OpError> {
+            let mut env = locked.load()?;
+            let idx = find_endpoint_idx(&env, endpoint_id, &env_id)?;
+            // Idempotent replay: if the endpoint already carries this idem key,
+            // the rotation already landed — return the existing endpoint.
+            if carries_idem_key(&env.messaging_endpoints[idx], &idem_suffix) {
+                let summary = EndpointSummary::from(&env_id, &env.messaging_endpoints[idx]);
+                locked.refresh_messaging_projection(&env)?;
+                return Ok(summary);
+            }
+            let new_secret = generate_webhook_secret()?;
+            let secret_ref = match &env.messaging_endpoints[idx].webhook_secret_ref {
+                Some(existing) => existing.clone(),
+                None => {
+                    // First-time setting on a pre-decoupling endpoint.
+                    build_webhook_secret_ref(&env_id, &endpoint_id)?
+                }
+            };
+            write_webhook_secret_to_devstore(store, &env_id, &secret_ref, &new_secret)?;
+            env.messaging_endpoints[idx].webhook_secret_ref = Some(secret_ref);
+            stamp_mutation(
+                &mut env.messaging_endpoints[idx],
+                &updated_by,
+                &idempotency_key,
+            );
+            locked.save(&env)?;
+            committed.mark_committed();
+            locked.refresh_messaging_projection(&env)?;
+            Ok(EndpointSummary::from(
+                &env_id,
+                &env.messaging_endpoints[idx],
+            ))
+        })?;
+        Ok((
+            OpOutcome::new(
+                NOUN,
+                "rotate-webhook-secret",
+                serde_json::to_value(summary).expect("EndpointSummary is json-safe"),
+            ),
+            super::AuditGens::NONE,
+        ))
+    })
+}
+
 // --- internals ---------------------------------------------------------------
 
 fn resolve_payload<T: serde::de::DeserializeOwned>(
@@ -655,6 +745,75 @@ fn idem_suffix(idempotency_key: &str) -> String {
 
 fn carries_idem_key(endpoint: &MessagingEndpoint, idem_suffix: &str) -> bool {
     endpoint.updated_by.ends_with(idem_suffix)
+}
+
+/// Telegram-class providers need a per-endpoint webhook secret generated at
+/// creation time. The prefix check covers `"telegram"`, `"messaging.telegram"`,
+/// and `"messaging.telegram.bot"` — all plausible aliases in current configs.
+fn is_telegram_class(provider_type: &str) -> bool {
+    provider_type == "telegram"
+        || provider_type.starts_with("telegram.")
+        || provider_type == "messaging.telegram"
+        || provider_type.starts_with("messaging.telegram.")
+}
+
+/// Generate a 32-char CSPRNG secret from `[A-Za-z0-9]` (≈190 bits entropy).
+fn generate_webhook_secret() -> Result<String, OpError> {
+    const LEN: usize = 32;
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut bytes = [0u8; LEN];
+    OsRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|e| OpError::InvalidArgument(format!("CSPRNG entropy failure: {e}")))?;
+    let secret: String = bytes
+        .iter()
+        .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
+        .collect();
+    Ok(secret)
+}
+
+/// Construct the deterministic `SecretRef` URI for an endpoint's webhook
+/// secret. The dev-store backend requires the 5-segment shape
+/// `secrets://<env>/<tenant>/<team>/<pack>/<name>`, so the SecretRef mirrors
+/// that: `secret://<env>/default/_/messaging-<eid>/webhook_secret`.
+///
+/// Using `default/_` as tenant/team is the standard convention for
+/// system-generated secrets (see `cli/secrets.rs put` and the runtime's
+/// `canonical_team` which maps `default` → `_`). The endpoint id is folded
+/// to lowercase in the pack segment because `MessagingEndpointId` is a ULID
+/// (uppercase) and the runtime canonicalizes pack segments.
+fn build_webhook_secret_ref(
+    env_id: &EnvId,
+    endpoint_id: &MessagingEndpointId,
+) -> Result<SecretRef, OpError> {
+    let eid_lower = endpoint_id.to_string().to_lowercase();
+    let uri = format!(
+        "secret://{}/default/_/messaging-{}/webhook_secret",
+        env_id.as_str(),
+        eid_lower
+    );
+    SecretRef::try_new(uri)
+        .map_err(|e| OpError::InvalidArgument(format!("webhook secret ref: {e}")))
+}
+
+/// Write the webhook secret VALUE into the env-pack dev-store. Mirrors the
+/// `cli/secrets.rs put` idiom: same `dev_store_put` + `resolve_dev_store_path`
+/// pattern (sidecar flock, dedicated OS thread, own current-thread runtime).
+fn write_webhook_secret_to_devstore(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    secret_ref: &SecretRef,
+    value: &str,
+) -> Result<(), OpError> {
+    let env_dir = store.env_dir(env_id)?;
+    let dev_path = super::secrets::resolve_dev_store_path(
+        &env_dir,
+        std::env::var_os(super::secrets::DEV_SECRETS_PATH_ENV).map(PathBuf::from),
+    );
+    // The dev-store's native URI uses `secrets://` (plural). Convert from
+    // the deploy-spec `secret://` (singular) scheme.
+    let store_uri = secret_ref.as_str().replacen("secret://", "secrets://", 1);
+    super::secrets::dev_store_put(&dev_path, &store_uri, value)
 }
 
 fn stamp_mutation(endpoint: &mut MessagingEndpoint, updated_by: &str, idempotency_key: &str) {
@@ -771,6 +930,18 @@ fn set_welcome_flow_schema() -> Value {
 fn remove_schema() -> Value {
     verb_schema(
         "remove",
+        &[
+            "environment_id",
+            "endpoint_id",
+            "idempotency_key",
+            "updated_by",
+        ],
+    )
+}
+
+fn rotate_webhook_secret_schema() -> Value {
+    verb_schema(
+        "rotate-webhook-secret",
         &[
             "environment_id",
             "endpoint_id",
@@ -1419,5 +1590,254 @@ mod tests {
         };
         let err = add(&store, &OpFlags::default(), Some(bad)).unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    // --- webhook_secret_ref auto-gen + rotate tests -----------------------------
+
+    /// Load the raw `MessagingEndpoint` from the store for a given endpoint id.
+    fn load_raw_endpoint(
+        store: &LocalFsStore,
+        endpoint_id: &MessagingEndpointId,
+    ) -> MessagingEndpoint {
+        let env_id = EnvId::try_from("local").unwrap();
+        let env = store.load(&env_id).unwrap();
+        env.messaging_endpoints
+            .into_iter()
+            .find(|e| e.endpoint_id == *endpoint_id)
+            .expect("endpoint must exist")
+    }
+
+    /// Read back a secret value from the env's dev-store, mirroring the
+    /// runtime's read path (isolated current-thread runtime on a dedicated
+    /// OS thread).
+    fn read_devstore_value(store: &LocalFsStore, secret_ref: &SecretRef) -> String {
+        use greentic_secrets_lib::{DevStore, SecretsStore};
+        let env_id = EnvId::try_from("local").unwrap();
+        let env_dir = store.env_dir(&env_id).unwrap();
+        let dev_path = crate::cli::secrets::resolve_dev_store_path(
+            &env_dir,
+            std::env::var_os(crate::cli::secrets::DEV_SECRETS_PATH_ENV).map(PathBuf::from),
+        );
+        let store_uri = secret_ref.as_str().replacen("secret://", "secrets://", 1);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let dev = DevStore::with_path(dev_path).expect("open dev store");
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async { dev.get(&store_uri).await.unwrap() })
+                })
+                .join()
+                .expect("dev-store read thread panicked")
+        })
+        .into_iter()
+        .map(|b| b as char)
+        .collect()
+    }
+
+    #[test]
+    fn add_telegram_generates_webhook_secret_ref() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let outcome = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("telegram", "legal-bot", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&outcome);
+        let ep = load_raw_endpoint(&store, &id);
+        let secret_ref = ep
+            .webhook_secret_ref
+            .as_ref()
+            .expect("telegram must have webhook_secret_ref");
+        let eid_lower = id.to_string().to_lowercase();
+        let expected_uri = format!("secret://local/default/_/messaging-{eid_lower}/webhook_secret");
+        assert_eq!(secret_ref.as_str(), expected_uri);
+        // Verify the actual value was written to the dev-store.
+        let value = read_devstore_value(&store, secret_ref);
+        assert!(
+            value.len() >= 32,
+            "dev-store secret must be ≥32 chars, got {}",
+            value.len()
+        );
+    }
+
+    #[test]
+    fn add_telegram_dotted_generates_webhook_secret_ref() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let outcome = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("messaging.telegram.bot", "tg-bot", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&outcome);
+        let ep = load_raw_endpoint(&store, &id);
+        assert!(
+            ep.webhook_secret_ref.is_some(),
+            "messaging.telegram.bot must auto-gen webhook_secret_ref"
+        );
+    }
+
+    #[test]
+    fn add_non_telegram_has_no_webhook_secret_ref() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let outcome = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("slack", "ops", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&outcome);
+        let ep = load_raw_endpoint(&store, &id);
+        assert!(
+            ep.webhook_secret_ref.is_none(),
+            "non-telegram provider must not auto-gen webhook_secret_ref"
+        );
+    }
+
+    #[test]
+    fn idempotent_add_preserves_original_webhook_secret_ref() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let first = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("telegram", "legal-bot", "k-replay")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&first);
+        let ref_1 = load_raw_endpoint(&store, &id)
+            .webhook_secret_ref
+            .expect("first call must generate a ref");
+        let value_1 = read_devstore_value(&store, &ref_1);
+        // Replay with same idem key — the idempotent path returns BEFORE
+        // any DevStore write, so the URI and the stored value are unchanged.
+        add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("telegram", "legal-bot", "k-replay")),
+        )
+        .unwrap();
+        let ref_2 = load_raw_endpoint(&store, &id)
+            .webhook_secret_ref
+            .expect("replay must preserve the ref");
+        let value_2 = read_devstore_value(&store, &ref_2);
+        assert_eq!(
+            ref_1, ref_2,
+            "idempotent replay must return the SAME SecretRef"
+        );
+        assert_eq!(
+            value_1, value_2,
+            "idempotent replay must not overwrite the dev-store value"
+        );
+    }
+
+    #[test]
+    fn webhook_secret_ref_passes_deploy_spec_validate() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let outcome = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("telegram", "legal-bot", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&outcome);
+        let ep = load_raw_endpoint(&store, &id);
+        ep.validate()
+            .expect("endpoint with webhook_secret_ref must pass deploy-spec validate");
+    }
+
+    fn rotate_payload(endpoint_id: &str, key: &str) -> EndpointRotateWebhookSecretPayload {
+        EndpointRotateWebhookSecretPayload {
+            environment_id: "local".to_string(),
+            endpoint_id: endpoint_id.to_string(),
+            idempotency_key: key.to_string(),
+            updated_by: "tester".to_string(),
+        }
+    }
+
+    #[test]
+    fn rotate_webhook_secret_changes_devstore_value_and_bumps_generation() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let added = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("telegram", "legal-bot", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&added);
+        let before = load_raw_endpoint(&store, &id);
+        let before_ref = before.webhook_secret_ref.clone().expect("has ref");
+        let before_value = read_devstore_value(&store, &before_ref);
+        let before_gen = before.generation;
+        rotate_webhook_secret(
+            &store,
+            &OpFlags::default(),
+            Some(rotate_payload(&id.to_string(), "k-rotate")),
+        )
+        .unwrap();
+        let after = load_raw_endpoint(&store, &id);
+        let after_ref = after
+            .webhook_secret_ref
+            .as_ref()
+            .expect("rotated endpoint must have ref");
+        let after_value = read_devstore_value(&store, after_ref);
+        assert_eq!(
+            before_ref, *after_ref,
+            "rotate must preserve the same URI ref"
+        );
+        assert_ne!(
+            before_value, after_value,
+            "rotate must produce a different dev-store value"
+        );
+        assert!(after_value.len() >= 32, "rotated secret must be ≥32 chars");
+        assert_eq!(
+            after.generation,
+            before_gen + 1,
+            "rotate must bump generation"
+        );
+    }
+
+    #[test]
+    fn idempotent_rotate_preserves_devstore_value() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let added = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("telegram", "legal-bot", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&added);
+        rotate_webhook_secret(
+            &store,
+            &OpFlags::default(),
+            Some(rotate_payload(&id.to_string(), "k-rotate")),
+        )
+        .unwrap();
+        let ref_1 = load_raw_endpoint(&store, &id)
+            .webhook_secret_ref
+            .expect("has ref");
+        let value_1 = read_devstore_value(&store, &ref_1);
+        let gen_1 = load_raw_endpoint(&store, &id).generation;
+        // Replay with same idem key.
+        rotate_webhook_secret(
+            &store,
+            &OpFlags::default(),
+            Some(rotate_payload(&id.to_string(), "k-rotate")),
+        )
+        .unwrap();
+        let ref_2 = load_raw_endpoint(&store, &id)
+            .webhook_secret_ref
+            .expect("has ref");
+        let value_2 = read_devstore_value(&store, &ref_2);
+        let gen_2 = load_raw_endpoint(&store, &id).generation;
+        assert_eq!(ref_1, ref_2, "idempotent replay must preserve the URI ref");
+        assert_eq!(
+            value_1, value_2,
+            "idempotent rotate replay must preserve the dev-store value"
+        );
+        assert_eq!(gen_1, gen_2, "idempotent replay must not bump generation");
     }
 }
