@@ -41,7 +41,7 @@ use std::path::PathBuf;
 
 use greentic_deploy_spec::EnvId;
 
-/// Per-pack config overrides map: `<pack_id> -> <key> -> <json value>`.
+/// Per-pack config overrides: `<pack_id> -> <key> -> <json value>`.
 type ConfigOverridesMap = BTreeMap<String, BTreeMap<String, Value>>;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -481,22 +481,17 @@ fn parse_config_overrides_cli(
         overrides = parsed;
     }
     for spec in string_specs {
-        let (pack_id, key, value) = parse_one_config_override_string(spec)?;
-        overrides.entry(pack_id).or_default().insert(key, value);
+        let (pack_id, key, value_raw) = split_override_spec(spec, "--config-override")?;
+        overrides
+            .entry(pack_id)
+            .or_default()
+            .insert(key, Value::String(value_raw.to_string()));
     }
     for spec in json_specs {
         let (pack_id, key, value) = parse_one_config_override_json(spec)?;
         overrides.entry(pack_id).or_default().insert(key, value);
     }
     Ok(Some(overrides))
-}
-
-/// Parse one `<pack_id>:<key>=<value>` spec where the value is ALWAYS a
-/// string literal. No JSON coercion — `=true` stays `Value::String("true")`,
-/// `=5` stays `Value::String("5")` (Codex finding 4).
-fn parse_one_config_override_string(spec: &str) -> Result<(String, String, Value), OpError> {
-    let (pack_id, key, value_raw) = split_override_spec(spec, "--config-override")?;
-    Ok((pack_id, key, Value::String(value_raw.to_string())))
 }
 
 /// Parse one `<pack_id>:<key>=<json>` spec where the value is parsed as
@@ -624,6 +619,14 @@ mod tests {
 
     fn deploy_summary(outcome: OpOutcome) -> DeploySummary {
         serde_json::from_value(outcome.result).expect("DeploySummary")
+    }
+
+    /// Build a single-pack override map matching the perf-smoke fixture.
+    fn perf_smoke_override(url: &str) -> BTreeMap<String, BTreeMap<String, Value>> {
+        BTreeMap::from([(
+            "perf-smoke-pack".to_string(),
+            BTreeMap::from([("api_base_url".to_string(), Value::String(url.to_string()))]),
+        )])
     }
 
     #[test]
@@ -1040,13 +1043,7 @@ mod tests {
     fn deploy_persists_config_overrides_via_add_path() {
         let (_dir, store) = seeded_store();
         let mut p = payload("quickstart");
-        p.config_overrides = Some(BTreeMap::from([(
-            "perf-smoke-pack".to_string(), // matches the fixture's pack_list
-            BTreeMap::from([(
-                "api_base_url".to_string(),
-                Value::String("https://staging.example.com".to_string()),
-            )]),
-        )]));
+        p.config_overrides = Some(perf_smoke_override("https://staging.example.com"));
         let outcome = deploy(&store, &OpFlags::default(), Some(p)).unwrap();
         let s = deploy_summary(outcome);
         assert!(!s.reused_deployment, "fresh deploy");
@@ -1066,22 +1063,10 @@ mod tests {
     fn redeploy_with_new_overrides_replaces_them_on_existing_bundle() {
         let (_dir, store) = seeded_store();
         let mut p = payload("quickstart");
-        p.config_overrides = Some(BTreeMap::from([(
-            "perf-smoke-pack".to_string(),
-            BTreeMap::from([(
-                "api_base_url".to_string(),
-                Value::String("https://v1.example.com".to_string()),
-            )]),
-        )]));
+        p.config_overrides = Some(perf_smoke_override("https://v1.example.com"));
         deploy(&store, &OpFlags::default(), Some(p)).unwrap();
         let mut p2 = payload("quickstart");
-        p2.config_overrides = Some(BTreeMap::from([(
-            "perf-smoke-pack".to_string(),
-            BTreeMap::from([(
-                "api_base_url".to_string(),
-                Value::String("https://v2.example.com".to_string()),
-            )]),
-        )]));
+        p2.config_overrides = Some(perf_smoke_override("https://v2.example.com"));
         let s = deploy_summary(deploy(&store, &OpFlags::default(), Some(p2)).unwrap());
         assert!(s.reused_deployment, "blue-green re-deploy");
         let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
@@ -1100,13 +1085,7 @@ mod tests {
     #[test]
     fn redeploy_with_none_overrides_leaves_existing_alone() {
         let (_dir, store) = seeded_store();
-        let initial = BTreeMap::from([(
-            "perf-smoke-pack".to_string(),
-            BTreeMap::from([(
-                "api_base_url".to_string(),
-                Value::String("https://v1.example.com".to_string()),
-            )]),
-        )]);
+        let initial = perf_smoke_override("https://v1.example.com");
         let mut p = payload("quickstart");
         p.config_overrides = Some(initial.clone());
         deploy(&store, &OpFlags::default(), Some(p)).unwrap();
@@ -1128,13 +1107,7 @@ mod tests {
     fn redeploy_with_explicit_empty_overrides_clears_existing() {
         let (_dir, store) = seeded_store();
         let mut p = payload("quickstart");
-        p.config_overrides = Some(BTreeMap::from([(
-            "perf-smoke-pack".to_string(),
-            BTreeMap::from([(
-                "api_base_url".to_string(),
-                Value::String("https://v1.example.com".to_string()),
-            )]),
-        )]));
+        p.config_overrides = Some(perf_smoke_override("https://v1.example.com"));
         deploy(&store, &OpFlags::default(), Some(p)).unwrap();
         // Re-deploy with Some(empty) — explicit clear.
         let mut p2 = payload("quickstart");

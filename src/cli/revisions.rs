@@ -220,18 +220,19 @@ pub fn stage(
                     // check has data to work with (without this, the
                     // `--bundle` path left `pack_list` empty and the
                     // cross-ref was permanently blind — Codex finding 1).
-                    // Version and digest are placeholders: the cross-ref only
-                    // checks `pack_id` membership. Train-3's runtime path
-                    // reads the lock file for the real values.
+                    // Version is a placeholder (0.0.0); digest is the real
+                    // on-disk digest. The cross-ref only checks `pack_id`
+                    // membership. Train-3's runtime path reads the lock file
+                    // for the real version.
                     let lock_derived_pack_list: Vec<PackListEntry> = staged
                         .lock
                         .packs
                         .iter()
-                        .map(|lp| PackListEntry {
-                            pack_id: lp.pack_id.clone(),
-                            version: SemVer::new(0, 0, 0),
-                            digest: lp.digest.clone(),
-                            source_uri: None,
+                        .map(|lp| {
+                            PackListEntry::from_lock_primitives(
+                                lp.pack_id.clone(),
+                                lp.digest.clone(),
+                            )
                         })
                         .collect();
                     (

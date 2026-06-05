@@ -282,27 +282,15 @@ impl Environment {
                 revision_pack_ids.extend(referenced.pack_list.iter().map(|e| e.pack_id.as_str()));
             }
 
-            // D.4: every config_overrides pack_id must appear in at least
-            // one NON-ARCHIVED revision's pack_list for this deployment.
-            // Archived revisions are excluded so a retained historical
-            // revision whose pack set differs from the live candidate cannot
-            // silently legitimize an override that the live revision doesn't
-            // carry (Codex finding 1 sub-finding).
-            //
-            // We scan the env's full revision list filtered by
-            // `deployment_id` (not just `bundle.current_revisions`, which
-            // the CLI's stage/warm/traffic path does not maintain today —
-            // `bundles remove` uses the same env-revisions-filtered-by-
-            // deployment proof of live state).
-            //
-            // The check is enforced only when there is actual pack data to
-            // check against. Forward-looking acceptance triggers when no
-            // non-archived revisions exist for this deployment yet (e.g. the
-            // bundle was just added before its first stage). The override
-            // gets re-validated on the next `env.validate()` call once a
-            // revision lands.
+            // Cross-ref: every config_overrides pack_id must appear in a
+            // non-archived revision's pack_list for this deployment.
+            // Forward-accept when no such revisions yet exist OR when their
+            // pack_list is empty (the in-memory data the validator can see —
+            // disk lock is the source of truth). The override gets
+            // re-validated on the next env.validate() call once a revision
+            // lands with populated pack_list.
             if !bundle.config_overrides.is_empty() {
-                let mut deployment_pack_ids: HashSet<&str> = revision_pack_ids;
+                let mut deployment_pack_ids: HashSet<&str> = HashSet::new();
                 for rev in self.revisions.iter().filter(|r| {
                     r.deployment_id == bundle.deployment_id
                         && r.lifecycle != crate::RevisionLifecycle::Archived

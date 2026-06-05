@@ -76,6 +76,24 @@ pub struct PackListEntry {
     pub source_uri: Option<String>,
 }
 
+impl PackListEntry {
+    /// Build from a bundle-stage lock entry's primitives.
+    ///
+    /// The lock file is the disk source of truth for resolved packs; this
+    /// projection carries `pack_id` and `digest` verbatim but uses a
+    /// sentinel version (`0.0.0`) because the lock doesn't carry semver.
+    /// The `Environment::validate` cross-ref relies only on `pack_id`;
+    /// runtime config materializers re-read the lock for the real version.
+    pub fn from_lock_primitives(pack_id: PackId, digest: String) -> Self {
+        Self {
+            pack_id,
+            version: SemVer::new(0, 0, 0),
+            digest,
+            source_uri: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Revision {
     pub schema: SchemaVersion,
