@@ -42,6 +42,11 @@ use chrono::{DateTime, Utc};
 use greentic_types::EnvId;
 use serde::{Deserialize, Serialize};
 
+/// Minimum length for [`MessagingEndpoint::webhook_secret`] when set.
+/// 32 chars of URL-safe base64 ≈ 192 bits of entropy — comfortably above the
+/// brute-force horizon for an HTTPS-bound shared-secret token.
+pub const MIN_WEBHOOK_SECRET_LEN: usize = 32;
+
 /// Pointer at a flow inside one of the endpoint's `linked_bundles`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WelcomeFlowRef {
@@ -69,6 +74,19 @@ pub struct MessagingEndpoint {
     /// Refs into the env's secrets env-pack (bot token, signing secret, ...).
     #[serde(default)]
     pub secret_refs: Vec<SecretRef>,
+    /// Per-endpoint auth secret presented by the upstream provider on every
+    /// inbound webhook. Today only Telegram (`x-telegram-bot-api-secret-token`
+    /// header on `setWebhook`). Decoupled from [`provider_id`] so the routing
+    /// discriminator and the auth secret can't collapse to one operator-named
+    /// value — see `project_telegram_secret_token_auth_deferred`. Auto-generated
+    /// at endpoint creation (32 URL-safe random chars); `None` preserves the
+    /// pre-decoupling fallback where `provider_id` doubles as the secret-token.
+    ///
+    /// Validation enforces ≥`MIN_WEBHOOK_SECRET_LEN` chars when set — guards
+    /// against operators hand-supplying a short string that wouldn't survive
+    /// brute force.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret: Option<String>,
     /// Bundles whose flows this endpoint can route to.
     #[serde(default)]
     pub linked_bundles: Vec<BundleId>,
@@ -123,6 +141,94 @@ impl MessagingEndpoint {
         {
             return Err(SpecError::EmptyWelcomeFlowId);
         }
+        if let Some(secret) = &self.webhook_secret
+            && secret.len() < MIN_WEBHOOK_SECRET_LEN
+        {
+            return Err(SpecError::MessagingWebhookSecretTooShort {
+                min: MIN_WEBHOOK_SECRET_LEN,
+                got: secret.len(),
+            });
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn fixture(webhook_secret: Option<String>) -> MessagingEndpoint {
+        MessagingEndpoint {
+            schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
+            env_id: EnvId::from_str("prod").unwrap(),
+            endpoint_id: MessagingEndpointId::new(),
+            provider_id: "tg-legal".into(),
+            provider_type: "telegram".into(),
+            display_name: "Legal Bot".into(),
+            secret_refs: vec![],
+            webhook_secret,
+            linked_bundles: vec![],
+            welcome_flow: None,
+            generation: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            updated_by: "operator://test".into(),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_none_webhook_secret() {
+        // None preserves the pre-decoupling fallback where provider_id is the
+        // secret-token. Existing envs must round-trip unchanged.
+        assert!(fixture(None).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_secret_at_min_len() {
+        let secret = "a".repeat(MIN_WEBHOOK_SECRET_LEN);
+        assert!(fixture(Some(secret)).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_short_webhook_secret() {
+        let secret = "a".repeat(MIN_WEBHOOK_SECRET_LEN - 1);
+        let err = fixture(Some(secret)).validate().unwrap_err();
+        assert!(matches!(
+            err,
+            SpecError::MessagingWebhookSecretTooShort { min, got }
+                if min == MIN_WEBHOOK_SECRET_LEN && got == MIN_WEBHOOK_SECRET_LEN - 1
+        ));
+    }
+
+    #[test]
+    fn serde_skips_webhook_secret_when_none() {
+        // Persisted env.json must NOT carry `webhook_secret: null` for endpoints
+        // created before the decoupling — the field is genuinely absent so old
+        // and new clients can both read it. `skip_serializing_if = Option::is_none`
+        // achieves this; the test pins the contract.
+        let json = serde_json::to_string(&fixture(None)).unwrap();
+        assert!(
+            !json.contains("webhook_secret"),
+            "None webhook_secret should be omitted from serialized JSON: {json}",
+        );
+    }
+
+    #[test]
+    fn serde_round_trip_with_some_webhook_secret() {
+        let secret = "x".repeat(MIN_WEBHOOK_SECRET_LEN);
+        let original = fixture(Some(secret.clone()));
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: MessagingEndpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.webhook_secret.as_deref(), Some(secret.as_str()));
+    }
+
+    #[test]
+    fn serde_default_when_field_absent() {
+        // A pre-decoupling env.json (no `webhook_secret` key) must deserialize
+        // as `webhook_secret: None`, not error.
+        let json = serde_json::to_string(&fixture(None)).unwrap();
+        let parsed: MessagingEndpoint = serde_json::from_str(&json).unwrap();
+        assert!(parsed.webhook_secret.is_none());
     }
 }

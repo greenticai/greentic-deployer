@@ -67,6 +67,7 @@ mod tests {
             provider_type: provider_type.into(),
             display_name: format!("{provider_type}: {provider_id}"),
             secret_refs: vec![],
+            webhook_secret: None,
             linked_bundles: vec![],
             welcome_flow: None,
             generation: 1,
