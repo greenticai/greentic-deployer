@@ -13,6 +13,7 @@ use greentic_deploy_spec::{
     RouteBinding, SchemaVersion, SemVer, SpecError, TenantSelector, TrafficSplit,
     TrafficSplitEntry,
 };
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -118,7 +119,7 @@ fn bundle(
         usage: None,
         created_at: Utc::now(),
         authorization_ref: PathBuf::from("audit.json"),
-        config_overrides: std::collections::BTreeMap::new(),
+        config_overrides: BTreeMap::new(),
     }
 }
 
@@ -800,9 +801,9 @@ fn config_overrides_referencing_pack_in_revision_passes() {
         &["messaging-telegram", "messaging-slack"],
     );
     let mut b = bundle(dep, local(), bundle_id, vec![rev_id]);
-    b.config_overrides = std::collections::BTreeMap::from([(
+    b.config_overrides = BTreeMap::from([(
         "messaging-telegram".to_string(),
-        std::collections::BTreeMap::from([(
+        BTreeMap::from([(
             "api_base_url".to_string(),
             serde_json::json!("https://staging.example.com"),
         )]),
@@ -824,9 +825,9 @@ fn config_overrides_referencing_unknown_pack_rejected() {
         &["messaging-telegram"],
     );
     let mut b = bundle(dep, local(), bundle_id, vec![rev_id]);
-    b.config_overrides = std::collections::BTreeMap::from([(
+    b.config_overrides = BTreeMap::from([(
         "messaging-whatsapp".to_string(),
-        std::collections::BTreeMap::from([(
+        BTreeMap::from([(
             "api_base_url".to_string(),
             serde_json::json!("https://wa.example.com"),
         )]),
@@ -859,17 +860,17 @@ fn config_overrides_in_any_current_revision_passes_canary() {
     );
     let r_b = revision_with_packs(rev_b, local(), dep, bundle_id.clone(), &["messaging-slack"]);
     let mut b = bundle(dep, local(), bundle_id, vec![rev_a, rev_b]);
-    b.config_overrides = std::collections::BTreeMap::from([
+    b.config_overrides = BTreeMap::from([
         (
             "messaging-telegram".to_string(),
-            std::collections::BTreeMap::from([(
+            BTreeMap::from([(
                 "api_base_url".to_string(),
                 serde_json::json!("https://tg.example.com"),
             )]),
         ),
         (
             "messaging-slack".to_string(),
-            std::collections::BTreeMap::from([(
+            BTreeMap::from([(
                 "webhook_url".to_string(),
                 serde_json::json!("https://slack.example.com"),
             )]),
@@ -886,9 +887,9 @@ fn config_overrides_on_bundle_with_no_revisions_rejected() {
     let dep = DeploymentId::new();
     let bundle_id = BundleId::new("b");
     let mut b = bundle(dep, local(), bundle_id, vec![]);
-    b.config_overrides = std::collections::BTreeMap::from([(
+    b.config_overrides = BTreeMap::from([(
         "messaging-telegram".to_string(),
-        std::collections::BTreeMap::from([(
+        BTreeMap::from([(
             "api_base_url".to_string(),
             serde_json::json!("https://staging.example.com"),
         )]),

@@ -7,6 +7,7 @@
 //! `revenue_share`, `customer_id`); `revisions` owns the per-version
 //! artifact pointers.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::Utc;
@@ -170,7 +171,7 @@ pub fn add(
                 usage: None,
                 created_at,
                 authorization_ref: payload.authorization_ref.clone(),
-                config_overrides: std::collections::BTreeMap::new(),
+                config_overrides: BTreeMap::new(),
             };
             // C2 Codex follow-up: refuse to AUTO-GENERATE an operator key
             // from this path. A user who runs `bundles add` without ever
