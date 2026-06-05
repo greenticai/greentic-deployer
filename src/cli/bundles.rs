@@ -466,6 +466,11 @@ pub(super) fn resolve_customer_id(
 /// `{"<pack_id>": ["<key>", ...], ...}`. Values are NEVER logged — they
 /// may carry secrets-adjacent material (e.g. an API base URL with a
 /// query-string token), and the audit trail must not be a leak channel.
+///
+/// TODO(d4-followup): config-key schema linter — see Codex review thread on
+/// PR #243. Override key NAMES are user-controlled; a future PR should
+/// validate against a known-safe set OR log counts/hashes by default so a
+/// token/URI accidentally placed in a key name cannot leak through audit.
 pub(super) fn config_overrides_audit_shape(
     overrides: &BTreeMap<String, BTreeMap<String, Value>>,
 ) -> Value {

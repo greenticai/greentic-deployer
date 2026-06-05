@@ -369,15 +369,25 @@ pub struct BundleDeployArgs {
     /// from the freshly-minted revision id.
     #[arg(long = "idempotency-key")]
     pub idempotency_key: Option<String>,
-    /// D.4: per-pack provider config override. Repeating, formatted as
-    /// `<pack_id>:<key>=<value>`. Value is parsed as JSON when possible
-    /// (so `=true`, `=42`, `={"x":1}` work); otherwise it's a literal
-    /// string. Example: `--config-override messaging-telegram:api_base_url=https://staging.example.com`.
+    /// D.4: per-pack provider config override (string values). Repeating,
+    /// formatted as `<pack_id>:<key>=<value>`. The value is ALWAYS stored as
+    /// a JSON string — no type coercion. Use `--config-override-json` for
+    /// typed values (bool, number, object, array).
+    /// Example: `--config-override messaging-telegram:api_base_url=https://staging.example.com`.
     #[arg(long = "config-override", value_name = "PACK_ID:KEY=VALUE")]
     pub config_override: Vec<String>,
+    /// D.4: per-pack provider config override (typed JSON values). Repeating,
+    /// formatted as `<pack_id>:<key>=<json>`. The value is parsed as JSON;
+    /// a parse error is rejected. Both `--config-override` and
+    /// `--config-override-json` merge into the same map (later flags win
+    /// per-(pack,key)).
+    /// Example: `--config-override-json messaging-telegram:retry_max=5`.
+    #[arg(long = "config-override-json", value_name = "PACK_ID:KEY=JSON")]
+    pub config_override_json: Vec<String>,
     /// D.4: bulk-load config overrides from a JSON file shaped
     /// `{"<pack_id>": {"<key>": <value>, ...}, ...}`. Individual
-    /// `--config-override` flags MERGE on top (per-pack, per-key).
+    /// `--config-override` / `--config-override-json` flags MERGE on top
+    /// (per-pack, per-key).
     #[arg(long = "config-overrides-from", value_name = "FILE")]
     pub config_overrides_from: Option<PathBuf>,
 }

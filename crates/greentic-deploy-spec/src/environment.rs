@@ -283,35 +283,30 @@ impl Environment {
             }
 
             // D.4: every config_overrides pack_id must appear in at least
-            // one revision's pack_list for this deployment. We scan the env's
-            // full revision list filtered by `deployment_id` (not just
-            // `bundle.current_revisions`, which the CLI's stage/warm/traffic
-            // path does not maintain today — `bundles remove` uses the same
-            // env-revisions-filtered-by-deployment proof of live state).
+            // one NON-ARCHIVED revision's pack_list for this deployment.
+            // Archived revisions are excluded so a retained historical
+            // revision whose pack set differs from the live candidate cannot
+            // silently legitimize an override that the live revision doesn't
+            // carry (Codex finding 1 sub-finding).
+            //
+            // We scan the env's full revision list filtered by
+            // `deployment_id` (not just `bundle.current_revisions`, which
+            // the CLI's stage/warm/traffic path does not maintain today —
+            // `bundles remove` uses the same env-revisions-filtered-by-
+            // deployment proof of live state).
             //
             // The check is enforced only when there is actual pack data to
-            // check against. Two cases trigger forward-looking acceptance:
-            //
-            // 1. No revisions exist for this deployment yet (e.g. the bundle
-            //    was just added before its first stage). The override gets
-            //    re-validated on the next `env.validate()` call once a
-            //    revision lands.
-            //
-            // 2. Revisions exist but their `Revision.pack_list` is empty —
-            //    this is the canonical state for the CLI's `--bundle` stage
-            //    path, which sets `pack_list = Vec::new()` and persists the
-            //    resolved packs in the on-disk pack-list lock file instead
-            //    (see `cli::revisions::stage`). Pulling the lock file into
-            //    validation would couple `Environment::validate()` to the
-            //    filesystem, so we accept forward-looking and rely on the
-            //    structural validation already done by `bundle.validate()`.
+            // check against. Forward-looking acceptance triggers when no
+            // non-archived revisions exist for this deployment yet (e.g. the
+            // bundle was just added before its first stage). The override
+            // gets re-validated on the next `env.validate()` call once a
+            // revision lands.
             if !bundle.config_overrides.is_empty() {
                 let mut deployment_pack_ids: HashSet<&str> = revision_pack_ids;
-                for rev in self
-                    .revisions
-                    .iter()
-                    .filter(|r| r.deployment_id == bundle.deployment_id)
-                {
+                for rev in self.revisions.iter().filter(|r| {
+                    r.deployment_id == bundle.deployment_id
+                        && r.lifecycle != crate::RevisionLifecycle::Archived
+                }) {
                     deployment_pack_ids.extend(rev.pack_list.iter().map(|e| e.pack_id.as_str()));
                 }
                 if !deployment_pack_ids.is_empty() {
