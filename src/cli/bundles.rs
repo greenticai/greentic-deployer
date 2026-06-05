@@ -37,6 +37,13 @@ pub struct BundleAddPayload {
     pub revenue_share: Vec<RevenueShareEntryPayload>,
     #[serde(default = "default_authorization_ref")]
     pub authorization_ref: PathBuf,
+    /// D.4: per-pack provider config overrides applied at egress time.
+    /// Outer key = `pack_id`, inner key = config key, value = JSON value.
+    /// Structurally validated by `BundleDeployment::validate`; pack ids are
+    /// cross-referenced against the deployment's revisions in
+    /// `Environment::validate`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config_overrides: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
 /// Default `customer_id` for the `local` env when none is supplied. Non-local
@@ -129,6 +136,7 @@ pub fn add(
             basis_points: e.basis_points,
         })
         .collect();
+    let config_overrides = payload.config_overrides.clone();
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -137,6 +145,7 @@ pub fn add(
             "bundle_id": bundle_id.as_str(),
             "customer_id": customer_id.as_str(),
             "revenue_share": revenue_share_json(&revenue_share),
+            "config_overrides": config_overrides_audit_shape(&config_overrides),
         }),
         idempotency_key: None,
     };
@@ -171,7 +180,7 @@ pub fn add(
                 usage: None,
                 created_at,
                 authorization_ref: payload.authorization_ref.clone(),
-                config_overrides: BTreeMap::new(),
+                config_overrides: config_overrides.clone(),
             };
             // C2 Codex follow-up: refuse to AUTO-GENERATE an operator key
             // from this path. A user who runs `bundles add` without ever
@@ -214,6 +223,12 @@ pub struct BundleUpdatePayload {
     pub route_binding: Option<RouteBindingPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revenue_share: Option<Vec<RevenueShareEntryPayload>>,
+    /// D.4: replace the deployment's config_overrides map.
+    ///
+    /// `None` (the default) leaves the existing overrides untouched.
+    /// `Some(map)` replaces them wholesale — pass `Some(empty)` to clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_overrides: Option<BTreeMap<String, BTreeMap<String, Value>>>,
 }
 
 pub fn update(
@@ -243,6 +258,9 @@ pub fn update(
     if let Some(shares) = &new_revenue_share {
         target["revenue_share"] = revenue_share_json(shares);
     }
+    if let Some(overrides) = &payload.config_overrides {
+        target["config_overrides"] = config_overrides_audit_shape(overrides);
+    }
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -268,6 +286,9 @@ pub fn update(
             }
             if let Some(rb) = payload.route_binding.clone() {
                 env.bundles[idx].route_binding = into_route_binding(rb);
+            }
+            if let Some(overrides) = payload.config_overrides.clone() {
+                env.bundles[idx].config_overrides = overrides;
             }
             if let Some(shares) = new_revenue_share.clone() {
                 // A revenue-share mutation creates a new signed/versioned policy
@@ -441,6 +462,21 @@ pub(super) fn resolve_customer_id(
     }
 }
 
+/// Render `config_overrides` as a key-shape only payload for audit logs:
+/// `{"<pack_id>": ["<key>", ...], ...}`. Values are NEVER logged — they
+/// may carry secrets-adjacent material (e.g. an API base URL with a
+/// query-string token), and the audit trail must not be a leak channel.
+pub(super) fn config_overrides_audit_shape(
+    overrides: &BTreeMap<String, BTreeMap<String, Value>>,
+) -> Value {
+    let mut shape = serde_json::Map::with_capacity(overrides.len());
+    for (pack_id, keys) in overrides {
+        let keys: Vec<Value> = keys.keys().map(|k| Value::String(k.clone())).collect();
+        shape.insert(pack_id.clone(), Value::Array(keys));
+    }
+    Value::Object(shape)
+}
+
 /// Render revenue-share entries for the audit `target` payload.
 fn revenue_share_json(shares: &[RevenueShareEntry]) -> Value {
     Value::Array(
@@ -489,7 +525,12 @@ fn add_schema() -> Value {
             "customer_id": {"type": "string", "description": "billing principal; required for non-local envs, defaults to `local-dev` on `local`"},
             "route_binding": {"type": "object"},
             "revenue_share": {"type": "array"},
-            "authorization_ref": {"type": "string"}
+            "authorization_ref": {"type": "string"},
+            "config_overrides": {
+                "type": "object",
+                "description": "D.4: per-pack provider config overrides — object keyed by pack_id, values are objects of {key: json-value}",
+                "additionalProperties": {"type": "object"}
+            }
         }
     })
 }
@@ -506,7 +547,12 @@ fn update_schema() -> Value {
             "deployment_id": {"type": "string", "description": "ULID"},
             "status": {"type": "string", "enum": ["active", "paused", "archived"]},
             "route_binding": {"type": "object"},
-            "revenue_share": {"type": "array"}
+            "revenue_share": {"type": "array"},
+            "config_overrides": {
+                "type": "object",
+                "description": "D.4: replace the deployment's config_overrides map wholesale (omit to leave untouched; pass `{}` to clear)",
+                "additionalProperties": {"type": "object"}
+            }
         }
     })
 }
@@ -543,6 +589,7 @@ mod tests {
             },
             revenue_share: default_revenue_share(),
             authorization_ref: default_authorization_ref(),
+            config_overrides: BTreeMap::new(),
         }
     }
 
@@ -652,6 +699,7 @@ mod tests {
                     tenant_selector: None,
                 }),
                 revenue_share: None,
+                config_overrides: None,
             }),
         )
         .unwrap();
@@ -976,6 +1024,7 @@ mod tests {
                         basis_points: 7_000,
                     },
                 ]),
+                config_overrides: None,
             }),
         )
         .unwrap();
@@ -1023,6 +1072,7 @@ mod tests {
                 status: Some(BundleDeploymentStatus::Paused),
                 route_binding: None,
                 revenue_share: None,
+                config_overrides: None,
             }),
         )
         .unwrap();
@@ -1030,6 +1080,211 @@ mod tests {
         assert_eq!(
             env.bundles[0].revenue_policy_ref,
             PathBuf::from("billing-policies/fast2flow/local-dev/v1.json.sig")
+        );
+    }
+
+    // ---- D.4 train-2 ----------------------------------------------------
+
+    fn payload_with_overrides(
+        bundle_id: &str,
+        overrides: BTreeMap<String, BTreeMap<String, Value>>,
+    ) -> BundleAddPayload {
+        BundleAddPayload {
+            config_overrides: overrides,
+            ..payload(bundle_id)
+        }
+    }
+
+    fn single_override(
+        pack_id: &str,
+        key: &str,
+        value: Value,
+    ) -> BTreeMap<String, BTreeMap<String, Value>> {
+        BTreeMap::from([(
+            pack_id.to_string(),
+            BTreeMap::from([(key.to_string(), value)]),
+        )])
+    }
+
+    #[test]
+    fn add_persists_config_overrides_on_bundle_deployment() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
+        let overrides = single_override(
+            "messaging-telegram",
+            "api_base_url",
+            Value::String("https://staging.example.com".to_string()),
+        );
+        let outcome = add(
+            &store,
+            &OpFlags::default(),
+            Some(payload_with_overrides("fast2flow", overrides.clone())),
+        )
+        .unwrap();
+        assert_eq!(outcome.op, "add");
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert_eq!(env.bundles[0].config_overrides, overrides);
+    }
+
+    #[test]
+    fn add_rejects_structurally_invalid_config_overrides() {
+        // Spec-level validation (`BundleDeployment::validate`) catches empty
+        // pack_id / key / size violations and propagates as `OpError::Spec`.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
+        let overrides = BTreeMap::from([(
+            String::new(), // empty pack_id → rejected by structural validation
+            BTreeMap::from([("k".to_string(), Value::String("v".to_string()))]),
+        )]);
+        let err = add(
+            &store,
+            &OpFlags::default(),
+            Some(payload_with_overrides("fast2flow", overrides)),
+        )
+        .unwrap_err();
+        // Validation fires inside `store.save(&env)`, so the SpecError lands
+        // wrapped in `OpError::Store(StoreError::Spec(_))`.
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("ConfigOverrideEmptyPackId"),
+            "expected ConfigOverrideEmptyPackId, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn update_replaces_config_overrides_when_some() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
+        let initial = single_override(
+            "messaging-telegram",
+            "api_base_url",
+            Value::String("https://v1.example.com".to_string()),
+        );
+        let added = add(
+            &store,
+            &OpFlags::default(),
+            Some(payload_with_overrides("fast2flow", initial)),
+        )
+        .unwrap();
+        let did = added
+            .result
+            .get("deployment_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let replaced = single_override(
+            "messaging-telegram",
+            "api_base_url",
+            Value::String("https://v2.example.com".to_string()),
+        );
+        update(
+            &store,
+            &OpFlags::default(),
+            Some(BundleUpdatePayload {
+                environment_id: "local".to_string(),
+                deployment_id: did,
+                status: None,
+                route_binding: None,
+                revenue_share: None,
+                config_overrides: Some(replaced.clone()),
+            }),
+        )
+        .unwrap();
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert_eq!(env.bundles[0].config_overrides, replaced);
+    }
+
+    #[test]
+    fn update_with_none_leaves_config_overrides_untouched() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
+        let initial = single_override(
+            "messaging-slack",
+            "webhook_url",
+            Value::String("https://hooks.slack/v1".to_string()),
+        );
+        let added = add(
+            &store,
+            &OpFlags::default(),
+            Some(payload_with_overrides("fast2flow", initial.clone())),
+        )
+        .unwrap();
+        let did = added
+            .result
+            .get("deployment_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        // Update status only — `config_overrides: None` must leave them alone.
+        update(
+            &store,
+            &OpFlags::default(),
+            Some(BundleUpdatePayload {
+                environment_id: "local".to_string(),
+                deployment_id: did,
+                status: Some(BundleDeploymentStatus::Paused),
+                route_binding: None,
+                revenue_share: None,
+                config_overrides: None,
+            }),
+        )
+        .unwrap();
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert_eq!(env.bundles[0].config_overrides, initial);
+    }
+
+    #[test]
+    fn config_overrides_audit_shape_lists_keys_not_values() {
+        // Values may carry secrets-adjacent material (URLs with tokens, etc.);
+        // the audit shape must publish key NAMES only — never the values.
+        let overrides = BTreeMap::from([
+            (
+                "messaging-telegram".to_string(),
+                BTreeMap::from([
+                    (
+                        "api_base_url".to_string(),
+                        Value::String("https://api.telegram.org/SECRET-TOKEN".to_string()),
+                    ),
+                    (
+                        "retry_max".to_string(),
+                        Value::Number(serde_json::Number::from(5)),
+                    ),
+                ]),
+            ),
+            (
+                "messaging-slack".to_string(),
+                BTreeMap::from([(
+                    "webhook_url".to_string(),
+                    Value::String("https://hooks.slack/T0123/B0456/SECRET-PATH".to_string()),
+                )]),
+            ),
+        ]);
+        let shape = config_overrides_audit_shape(&overrides);
+        let serialized = serde_json::to_string(&shape).unwrap();
+        assert!(
+            !serialized.contains("SECRET"),
+            "audit shape leaked a value: {serialized}"
+        );
+        assert!(
+            serialized.contains("api_base_url") && serialized.contains("retry_max"),
+            "audit shape missing key names: {serialized}"
+        );
+        // Keys are sorted (BTreeMap ordering), so the shape is deterministic.
+        assert_eq!(
+            serialized,
+            r#"{"messaging-slack":["webhook_url"],"messaging-telegram":["api_base_url","retry_max"]}"#
         );
     }
 }

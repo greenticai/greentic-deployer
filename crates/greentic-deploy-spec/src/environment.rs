@@ -283,16 +283,46 @@ impl Environment {
             }
 
             // D.4: every config_overrides pack_id must appear in at least
-            // one current revision's pack_list.  When current_revisions is
-            // empty, config_overrides is allowed to be empty (no data to
-            // route to anyway) but any non-empty entry is an error because
-            // there are no revisions to validate against.
-            for override_pack_id in bundle.config_overrides.keys() {
-                if !revision_pack_ids.contains(override_pack_id.as_str()) {
-                    return Err(SpecError::ConfigOverridePackNotInRevisions {
-                        deployment: bundle.deployment_id,
-                        pack_id: override_pack_id.clone(),
-                    });
+            // one revision's pack_list for this deployment. We scan the env's
+            // full revision list filtered by `deployment_id` (not just
+            // `bundle.current_revisions`, which the CLI's stage/warm/traffic
+            // path does not maintain today — `bundles remove` uses the same
+            // env-revisions-filtered-by-deployment proof of live state).
+            //
+            // The check is enforced only when there is actual pack data to
+            // check against. Two cases trigger forward-looking acceptance:
+            //
+            // 1. No revisions exist for this deployment yet (e.g. the bundle
+            //    was just added before its first stage). The override gets
+            //    re-validated on the next `env.validate()` call once a
+            //    revision lands.
+            //
+            // 2. Revisions exist but their `Revision.pack_list` is empty —
+            //    this is the canonical state for the CLI's `--bundle` stage
+            //    path, which sets `pack_list = Vec::new()` and persists the
+            //    resolved packs in the on-disk pack-list lock file instead
+            //    (see `cli::revisions::stage`). Pulling the lock file into
+            //    validation would couple `Environment::validate()` to the
+            //    filesystem, so we accept forward-looking and rely on the
+            //    structural validation already done by `bundle.validate()`.
+            if !bundle.config_overrides.is_empty() {
+                let mut deployment_pack_ids: HashSet<&str> = revision_pack_ids;
+                for rev in self
+                    .revisions
+                    .iter()
+                    .filter(|r| r.deployment_id == bundle.deployment_id)
+                {
+                    deployment_pack_ids.extend(rev.pack_list.iter().map(|e| e.pack_id.as_str()));
+                }
+                if !deployment_pack_ids.is_empty() {
+                    for override_pack_id in bundle.config_overrides.keys() {
+                        if !deployment_pack_ids.contains(override_pack_id.as_str()) {
+                            return Err(SpecError::ConfigOverridePackNotInRevisions {
+                                deployment: bundle.deployment_id,
+                                pack_id: override_pack_id.clone(),
+                            });
+                        }
+                    }
                 }
             }
         }

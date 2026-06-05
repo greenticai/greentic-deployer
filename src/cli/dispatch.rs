@@ -369,6 +369,17 @@ pub struct BundleDeployArgs {
     /// from the freshly-minted revision id.
     #[arg(long = "idempotency-key")]
     pub idempotency_key: Option<String>,
+    /// D.4: per-pack provider config override. Repeating, formatted as
+    /// `<pack_id>:<key>=<value>`. Value is parsed as JSON when possible
+    /// (so `=true`, `=42`, `={"x":1}` work); otherwise it's a literal
+    /// string. Example: `--config-override messaging-telegram:api_base_url=https://staging.example.com`.
+    #[arg(long = "config-override", value_name = "PACK_ID:KEY=VALUE")]
+    pub config_override: Vec<String>,
+    /// D.4: bulk-load config overrides from a JSON file shaped
+    /// `{"<pack_id>": {"<key>": <value>, ...}, ...}`. Individual
+    /// `--config-override` flags MERGE on top (per-pack, per-key).
+    #[arg(long = "config-overrides-from", value_name = "FILE")]
+    pub config_overrides_from: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

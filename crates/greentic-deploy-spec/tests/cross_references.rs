@@ -881,9 +881,12 @@ fn config_overrides_in_any_current_revision_passes_canary() {
 }
 
 #[test]
-fn config_overrides_on_bundle_with_no_revisions_rejected() {
-    // No current_revisions → no pack_lists to validate against. Any
-    // non-empty override is an error (the override has nowhere to go).
+fn config_overrides_on_bundle_with_no_revisions_accepted_forward_looking() {
+    // No revisions exist for this deployment yet → forward-looking
+    // acceptance. The CLI flow runs `bundles add` (or `op deploy`'s add
+    // step) BEFORE any `revisions stage` lands a revision, so this is the
+    // normal path. The override gets re-validated on the next
+    // `env.validate()` call once a revision is staged.
     let dep = DeploymentId::new();
     let bundle_id = BundleId::new("b");
     let mut b = bundle(dep, local(), bundle_id, vec![]);
@@ -895,14 +898,7 @@ fn config_overrides_on_bundle_with_no_revisions_rejected() {
         )]),
     )]);
     let e = env_with(local(), vec![b], vec![], vec![]);
-    let err = e.validate().unwrap_err();
-    assert_eq!(
-        err,
-        SpecError::ConfigOverridePackNotInRevisions {
-            deployment: dep,
-            pack_id: "messaging-telegram".to_string(),
-        }
-    );
+    assert!(e.validate().is_ok());
 }
 
 #[test]
@@ -913,6 +909,95 @@ fn empty_config_overrides_on_bundle_with_no_revisions_passes() {
     let b = bundle(dep, local(), bundle_id, vec![]);
     let e = env_with(local(), vec![b], vec![], vec![]);
     assert!(e.validate().is_ok());
+}
+
+#[test]
+fn config_overrides_validated_against_env_revisions_for_deployment() {
+    // The CLI's stage/warm/traffic path doesn't populate
+    // `bundle.current_revisions`, but `env.revisions` does carry the
+    // deployment's revisions. The cross-ref check must include those so
+    // `op deploy --config-override ...` works after the stage step lands.
+    let dep = DeploymentId::new();
+    let bundle_id = BundleId::new("b");
+    let rev_id = RevisionId::new();
+    let r = revision_with_packs(
+        rev_id,
+        local(),
+        dep,
+        bundle_id.clone(),
+        &["messaging-telegram"],
+    );
+    // Note: bundle.current_revisions is intentionally empty — matches the
+    // CLI's actual state.
+    let mut b = bundle(dep, local(), bundle_id, vec![]);
+    b.config_overrides = BTreeMap::from([(
+        "messaging-telegram".to_string(),
+        BTreeMap::from([(
+            "api_base_url".to_string(),
+            serde_json::json!("https://staging.example.com"),
+        )]),
+    )]);
+    let e = env_with(local(), vec![b], vec![r], vec![]);
+    assert!(e.validate().is_ok());
+}
+
+#[test]
+fn config_overrides_accepted_when_revision_pack_list_is_empty() {
+    // CLI `--bundle` stage path persists pack ids in the on-disk pack-list
+    // lock file and leaves `Revision.pack_list = Vec::new()` (see
+    // `cli::revisions::stage`). The cross-ref must not couple to the
+    // filesystem, so any non-empty config_overrides is forward-accepted
+    // when there's no in-memory pack data to validate against.
+    let dep = DeploymentId::new();
+    let bundle_id = BundleId::new("b");
+    let rev_id = RevisionId::new();
+    // Empty pack_list — mirrors the bundle-staged shape.
+    let r = revision_with_packs(rev_id, local(), dep, bundle_id.clone(), &[]);
+    let mut b = bundle(dep, local(), bundle_id, vec![]);
+    b.config_overrides = BTreeMap::from([(
+        "messaging-telegram".to_string(),
+        BTreeMap::from([(
+            "api_base_url".to_string(),
+            serde_json::json!("https://staging.example.com"),
+        )]),
+    )]);
+    let e = env_with(local(), vec![b], vec![r], vec![]);
+    assert!(e.validate().is_ok());
+}
+
+#[test]
+fn config_overrides_unknown_pack_rejected_when_deployment_has_other_revisions() {
+    // Bundle has no current_revisions, but env.revisions has a revision
+    // for this deployment whose pack_list does NOT include the override's
+    // pack_id → still rejects. Forward-looking acceptance only kicks in
+    // when there are zero revisions for this deployment.
+    let dep = DeploymentId::new();
+    let bundle_id = BundleId::new("b");
+    let rev_id = RevisionId::new();
+    let r = revision_with_packs(
+        rev_id,
+        local(),
+        dep,
+        bundle_id.clone(),
+        &["messaging-slack"],
+    );
+    let mut b = bundle(dep, local(), bundle_id, vec![]);
+    b.config_overrides = BTreeMap::from([(
+        "messaging-whatsapp".to_string(),
+        BTreeMap::from([(
+            "api_base_url".to_string(),
+            serde_json::json!("https://wa.example.com"),
+        )]),
+    )]);
+    let e = env_with(local(), vec![b], vec![r], vec![]);
+    let err = e.validate().unwrap_err();
+    assert_eq!(
+        err,
+        SpecError::ConfigOverridePackNotInRevisions {
+            deployment: dep,
+            pack_id: "messaging-whatsapp".to_string(),
+        }
+    );
 }
 
 #[test]
