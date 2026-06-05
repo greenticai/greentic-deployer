@@ -213,9 +213,33 @@ pub fn stage(
                         revision_id,
                         bundle_path,
                     )?;
-                    // The lock file is the source of truth for the resolved
-                    // packs; the inline `pack_list` stays empty on this path.
-                    (staged.bundle_digest, Vec::new(), staged.pack_list_lock_ref)
+                    // The lock file is the on-disk source of truth for the
+                    // resolved packs. We also populate `Revision.pack_list`
+                    // with the pack ids derived from the lock so
+                    // `Environment::validate`'s config_overrides cross-ref
+                    // check has data to work with (without this, the
+                    // `--bundle` path left `pack_list` empty and the
+                    // cross-ref was permanently blind — Codex finding 1).
+                    // Version is a placeholder (0.0.0); digest is the real
+                    // on-disk digest. The cross-ref only checks `pack_id`
+                    // membership. Train-3's runtime path reads the lock file
+                    // for the real version.
+                    let lock_derived_pack_list: Vec<PackListEntry> = staged
+                        .lock
+                        .packs
+                        .iter()
+                        .map(|lp| {
+                            PackListEntry::from_lock_primitives(
+                                lp.pack_id.clone(),
+                                lp.digest.clone(),
+                            )
+                        })
+                        .collect();
+                    (
+                        staged.bundle_digest,
+                        lock_derived_pack_list,
+                        staged.pack_list_lock_ref,
+                    )
                 }
                 None => (
                     payload.bundle_digest.clone(),
@@ -848,8 +872,14 @@ mod tests {
             "bundle_digest should be the real archive hash, got {}",
             revision.bundle_digest
         );
-        // Inline pack_list is empty on the bundle path (lock is source of truth).
-        assert!(revision.pack_list.is_empty());
+        // Inline pack_list is populated from the lock's pack ids so
+        // Environment::validate's config_overrides cross-ref works
+        // (Codex finding 1 fix). The lock file stays the on-disk source
+        // of truth; the inline list carries pack_id membership only.
+        assert!(
+            !revision.pack_list.is_empty(),
+            "pack_list should be populated from the lock"
+        );
 
         let env_dir = store.env_dir(&env_id).unwrap();
         let lock_path = env_dir.join(&revision.pack_list_lock_ref);

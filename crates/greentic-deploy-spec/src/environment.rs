@@ -282,17 +282,30 @@ impl Environment {
                 revision_pack_ids.extend(referenced.pack_list.iter().map(|e| e.pack_id.as_str()));
             }
 
-            // D.4: every config_overrides pack_id must appear in at least
-            // one current revision's pack_list.  When current_revisions is
-            // empty, config_overrides is allowed to be empty (no data to
-            // route to anyway) but any non-empty entry is an error because
-            // there are no revisions to validate against.
-            for override_pack_id in bundle.config_overrides.keys() {
-                if !revision_pack_ids.contains(override_pack_id.as_str()) {
-                    return Err(SpecError::ConfigOverridePackNotInRevisions {
-                        deployment: bundle.deployment_id,
-                        pack_id: override_pack_id.clone(),
-                    });
+            // Cross-ref: every config_overrides pack_id must appear in a
+            // non-archived revision's pack_list for this deployment.
+            // Forward-accept when no such revisions yet exist OR when their
+            // pack_list is empty (the in-memory data the validator can see —
+            // disk lock is the source of truth). The override gets
+            // re-validated on the next env.validate() call once a revision
+            // lands with populated pack_list.
+            if !bundle.config_overrides.is_empty() {
+                let mut deployment_pack_ids: HashSet<&str> = HashSet::new();
+                for rev in self.revisions.iter().filter(|r| {
+                    r.deployment_id == bundle.deployment_id
+                        && r.lifecycle != crate::RevisionLifecycle::Archived
+                }) {
+                    deployment_pack_ids.extend(rev.pack_list.iter().map(|e| e.pack_id.as_str()));
+                }
+                if !deployment_pack_ids.is_empty() {
+                    for override_pack_id in bundle.config_overrides.keys() {
+                        if !deployment_pack_ids.contains(override_pack_id.as_str()) {
+                            return Err(SpecError::ConfigOverridePackNotInRevisions {
+                                deployment: bundle.deployment_id,
+                                pack_id: override_pack_id.clone(),
+                            });
+                        }
+                    }
                 }
             }
         }

@@ -36,15 +36,19 @@
 //!
 //! The four verbs remain the advanced / fine-tune surface, untouched.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use greentic_deploy_spec::EnvId;
+
+/// Per-pack config overrides: `<pack_id> -> <key> -> <json value>`.
+type ConfigOverridesMap = BTreeMap<String, BTreeMap<String, Value>>;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
-use super::bundles::{BundleAddPayload, BundleSummary, RouteBindingPayload};
+use super::bundles::{BundleAddPayload, BundleSummary, BundleUpdatePayload, RouteBindingPayload};
 use super::revisions::{RevisionStagePayload, RevisionSummary, RevisionTransitionPayload};
 use super::traffic::{TrafficSetEntryPayload, TrafficSetPayload};
 use super::{OpError, OpFlags, OpOutcome};
@@ -78,6 +82,18 @@ pub struct BundleDeployPayload {
     /// (non-replay) cut-over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// D.4: per-pack provider config overrides applied at egress time
+    /// (`<pack_id> -> <key> -> <json value>`). Forwarded into the new
+    /// `BundleAddPayload.config_overrides` on a fresh deploy, or applied via
+    /// `bundles update` to the existing deployment on a re-deploy (blue-green
+    /// version bump).
+    ///
+    /// Three-valued semantics (Codex finding 3):
+    /// - `None` (default, no CLI input) = leave existing overrides untouched
+    /// - `Some(empty)` = explicit clear (e.g. `--config-overrides-from` with `{}`)
+    /// - `Some(non-empty)` = replace
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_overrides: Option<BTreeMap<String, BTreeMap<String, Value>>>,
 }
 
 fn default_environment_id() -> String {
@@ -246,6 +262,9 @@ pub fn deploy(
                 },
                 revenue_share: super::bundles::default_revenue_share(),
                 authorization_ref: super::bundles::default_authorization_ref(),
+                // Fresh deploy: BundleAddPayload takes a plain BTreeMap
+                // (no prior state to clear). Unwrap the Option; None → empty.
+                config_overrides: payload.config_overrides.clone().unwrap_or_default(),
             };
             let outcome = super::bundles::add(store, flags, Some(add_payload))?;
             let summary: BundleSummary = parse_summary(outcome, "bundle")?;
@@ -284,6 +303,33 @@ pub fn deploy(
             revision_id: revision_id.clone(),
         }),
     )?;
+
+    // On re-deploy of an existing bundle, replace the deployment's
+    // config_overrides AFTER stage+warm succeed but BEFORE the traffic
+    // cut-over. This ordering ensures that if stage or warm fails (corrupt
+    // bundle, unpack error, health gate rejection), the override map is
+    // NOT replaced — the old deployment keeps its prior overrides intact
+    // (Codex finding 2: override replacement outside the rollout
+    // transaction).
+    //
+    // Note: bundle-level overrides mean rollback (`traffic rollback`)
+    // restores the traffic split only, not the prior override map. This is
+    // an accepted limitation of the bundle-level altitude; revision-scoped
+    // overrides are an explicit non-goal (architectural decision).
+    if reused && let Some(ref overrides) = payload.config_overrides {
+        super::bundles::update(
+            store,
+            flags,
+            Some(BundleUpdatePayload {
+                environment_id: payload.environment_id.clone(),
+                deployment_id: deployment_id.clone(),
+                status: None,
+                route_binding: None,
+                revenue_share: None,
+                config_overrides: Some(overrides.clone()),
+            }),
+        )?;
+    }
 
     // Route 100 % of traffic to the new revision. `traffic set` is a full
     // replacement, so any previously-live revision drops out of the split
@@ -338,12 +384,18 @@ pub fn payload_from_deploy_args(
         bundle_id,
         customer_id,
         idempotency_key,
+        config_override,
+        config_override_json,
+        config_overrides_from,
     } = args;
     if bundle.is_none()
         && env.is_none()
         && bundle_id.is_none()
         && customer_id.is_none()
         && idempotency_key.is_none()
+        && config_override.is_empty()
+        && config_override_json.is_empty()
+        && config_overrides_from.is_none()
     {
         return Ok(None);
     }
@@ -365,13 +417,116 @@ pub fn payload_from_deploy_args(
                 ))
             })?,
     };
+    let config_overrides = parse_config_overrides_cli(
+        &config_override,
+        &config_override_json,
+        config_overrides_from,
+    )?;
     Ok(Some(BundleDeployPayload {
         environment_id: env.unwrap_or_else(default_environment_id),
         bundle_id,
         customer_id,
         bundle_path: Some(bundle_path),
         idempotency_key,
+        config_overrides,
     }))
+}
+
+/// Parse `--config-override` / `--config-override-json` / `--config-overrides-from`
+/// CLI args into the `Option<BTreeMap<pack_id, BTreeMap<key, json>>>` shape
+/// that `BundleDeployPayload.config_overrides` expects.
+///
+/// Returns `None` when no override input was supplied at all (leave existing
+/// alone). Returns `Some(empty)` when the caller explicitly passed `{}`
+/// (clear existing overrides — Codex finding 3).
+///
+/// **String flag** (repeating): `--config-override <pack_id>:<key>=<value>`.
+/// The value is ALWAYS stored as `Value::String` — no JSON coercion
+/// (Codex finding 4). Use `--config-override-json` for typed values.
+///
+/// **JSON flag** (repeating): `--config-override-json <pack_id>:<key>=<json>`.
+/// The value is parsed as JSON; a parse error is an `InvalidArgument`.
+///
+/// **File form**: `--config-overrides-from <FILE>` — the file is read as a
+/// JSON object matching the on-the-wire `config_overrides` shape. Repeating
+/// flag entries are merged ON TOP of the file (per-pack, per-key): the flag
+/// wins on conflict, so a `--config-overrides-from base.json` plus a
+/// `--config-override messaging-telegram:api_base_url=https://staging` lets
+/// staging override the file's default.
+fn parse_config_overrides_cli(
+    string_specs: &[String],
+    json_specs: &[String],
+    from_file: Option<PathBuf>,
+) -> Result<Option<ConfigOverridesMap>, OpError> {
+    // No input at all → None (leave existing untouched).
+    if string_specs.is_empty() && json_specs.is_empty() && from_file.is_none() {
+        return Ok(None);
+    }
+    let mut overrides: BTreeMap<String, BTreeMap<String, Value>> = BTreeMap::new();
+    if let Some(path) = from_file {
+        let bytes = std::fs::read(&path).map_err(|e| {
+            OpError::InvalidArgument(format!(
+                "deploy: cannot read --config-overrides-from `{}`: {e}",
+                path.display()
+            ))
+        })?;
+        let parsed: BTreeMap<String, BTreeMap<String, Value>> = serde_json::from_slice(&bytes)
+            .map_err(|e| {
+                OpError::InvalidArgument(format!(
+                    "deploy: --config-overrides-from `{}` is not a valid \
+                     `{{<pack_id>: {{<key>: <value>}}}}` JSON object: {e}",
+                    path.display()
+                ))
+            })?;
+        overrides = parsed;
+    }
+    for spec in string_specs {
+        let (pack_id, key, value_raw) = split_override_spec(spec, "--config-override")?;
+        overrides
+            .entry(pack_id)
+            .or_default()
+            .insert(key, Value::String(value_raw.to_string()));
+    }
+    for spec in json_specs {
+        let (pack_id, key, value) = parse_one_config_override_json(spec)?;
+        overrides.entry(pack_id).or_default().insert(key, value);
+    }
+    Ok(Some(overrides))
+}
+
+/// Parse one `<pack_id>:<key>=<json>` spec where the value is parsed as
+/// typed JSON. A parse error is `InvalidArgument`.
+fn parse_one_config_override_json(spec: &str) -> Result<(String, String, Value), OpError> {
+    let (pack_id, key, value_raw) = split_override_spec(spec, "--config-override-json")?;
+    let value = serde_json::from_str::<Value>(value_raw).map_err(|e| {
+        OpError::InvalidArgument(format!(
+            "deploy: --config-override-json `{spec}` has invalid JSON value: {e}"
+        ))
+    })?;
+    Ok((pack_id, key, value))
+}
+
+/// Shared `<pack_id>:<key>=<value>` splitting logic for both flag variants.
+fn split_override_spec<'a>(
+    spec: &'a str,
+    flag_name: &str,
+) -> Result<(String, String, &'a str), OpError> {
+    let (pack_id, rest) = spec.split_once(':').ok_or_else(|| {
+        OpError::InvalidArgument(format!(
+            "deploy: {flag_name} `{spec}` is malformed — expected `<pack_id>:<key>=<value>`"
+        ))
+    })?;
+    let (key, value_raw) = rest.split_once('=').ok_or_else(|| {
+        OpError::InvalidArgument(format!(
+            "deploy: {flag_name} `{spec}` is malformed — expected `<pack_id>:<key>=<value>`"
+        ))
+    })?;
+    if pack_id.is_empty() || key.is_empty() {
+        return Err(OpError::InvalidArgument(format!(
+            "deploy: {flag_name} `{spec}` has an empty pack_id or key"
+        )));
+    }
+    Ok((pack_id.to_string(), key.to_string(), value_raw))
 }
 
 /// Deserialize an [`OpOutcome`]'s `result` into a step summary, mapping any
@@ -418,7 +573,12 @@ fn deploy_schema() -> Value {
             "bundle_id": {"type": "string"},
             "customer_id": {"type": "string"},
             "bundle_path": {"type": "string", "description": "local .gtbundle path (required)"},
-            "idempotency_key": {"type": "string", "description": "supply to make retries idempotent"}
+            "idempotency_key": {"type": "string", "description": "supply to make retries idempotent"},
+            "config_overrides": {
+                "type": "object",
+                "description": "D.4: per-pack provider config overrides keyed by pack_id (object of {key: json-value})",
+                "additionalProperties": {"type": "object"}
+            }
         }
     })
 }
@@ -453,11 +613,20 @@ mod tests {
             customer_id: None,
             bundle_path: Some(fixture()),
             idempotency_key: None,
+            config_overrides: None,
         }
     }
 
     fn deploy_summary(outcome: OpOutcome) -> DeploySummary {
         serde_json::from_value(outcome.result).expect("DeploySummary")
+    }
+
+    /// Build a single-pack override map matching the perf-smoke fixture.
+    fn perf_smoke_override(url: &str) -> BTreeMap<String, BTreeMap<String, Value>> {
+        BTreeMap::from([(
+            "perf-smoke-pack".to_string(),
+            BTreeMap::from([("api_base_url".to_string(), Value::String(url.to_string()))]),
+        )])
     }
 
     #[test]
@@ -595,6 +764,9 @@ mod tests {
             bundle_id: None,
             customer_id: None,
             idempotency_key: None,
+            config_override: Vec::new(),
+            config_override_json: Vec::new(),
+            config_overrides_from: None,
         };
         let p = payload_from_deploy_args(args).unwrap().unwrap();
         assert_eq!(p.bundle_id, "quickstart");
@@ -609,6 +781,9 @@ mod tests {
             bundle_id: None,
             customer_id: None,
             idempotency_key: None,
+            config_override: Vec::new(),
+            config_override_json: Vec::new(),
+            config_overrides_from: None,
         };
         assert!(payload_from_deploy_args(args).unwrap().is_none());
     }
@@ -621,8 +796,332 @@ mod tests {
             bundle_id: None,
             customer_id: None,
             idempotency_key: None,
+            config_override: Vec::new(),
+            config_override_json: Vec::new(),
+            config_overrides_from: None,
         };
         let err = payload_from_deploy_args(args).unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    // ---- D.4 train-2 ----------------------------------------------------
+
+    fn empty_args() -> super::super::dispatch::BundleDeployArgs {
+        super::super::dispatch::BundleDeployArgs {
+            bundle: Some(PathBuf::from("/tmp/quickstart.gtbundle")),
+            env: None,
+            bundle_id: None,
+            customer_id: None,
+            idempotency_key: None,
+            config_override: Vec::new(),
+            config_override_json: Vec::new(),
+            config_overrides_from: None,
+        }
+    }
+
+    /// `--config-override` always stores values as strings (Codex finding 4).
+    #[test]
+    fn config_override_flag_always_stores_string() {
+        let args = super::super::dispatch::BundleDeployArgs {
+            config_override: vec![
+                "messaging-telegram:api_base_url=https://staging.example.com".to_string(),
+                "messaging-telegram:retry_max=5".to_string(),
+                "messaging-slack:enabled=true".to_string(),
+            ],
+            ..empty_args()
+        };
+        let p = payload_from_deploy_args(args).unwrap().unwrap();
+        let overrides = p.config_overrides.as_ref().unwrap();
+        assert_eq!(
+            overrides["messaging-telegram"]["api_base_url"],
+            Value::String("https://staging.example.com".to_string())
+        );
+        // Not Number(5) — string flag never coerces.
+        assert_eq!(
+            overrides["messaging-telegram"]["retry_max"],
+            Value::String("5".to_string())
+        );
+        // Not Bool(true) — string flag never coerces.
+        assert_eq!(
+            overrides["messaging-slack"]["enabled"],
+            Value::String("true".to_string())
+        );
+    }
+
+    /// `--config-override-json` parses typed JSON values.
+    #[test]
+    fn config_override_json_flag_parses_typed_values() {
+        let args = super::super::dispatch::BundleDeployArgs {
+            config_override_json: vec![
+                "messaging-telegram:retry_max=5".to_string(),
+                r#"messaging-slack:enabled=true"#.to_string(),
+                r#"messaging-telegram:tags=["a","b"]"#.to_string(),
+            ],
+            ..empty_args()
+        };
+        let p = payload_from_deploy_args(args).unwrap().unwrap();
+        let overrides = p.config_overrides.as_ref().unwrap();
+        assert_eq!(
+            overrides["messaging-telegram"]["retry_max"],
+            Value::Number(serde_json::Number::from(5))
+        );
+        assert_eq!(overrides["messaging-slack"]["enabled"], Value::Bool(true));
+        assert_eq!(
+            overrides["messaging-telegram"]["tags"],
+            serde_json::json!(["a", "b"])
+        );
+    }
+
+    /// `--config-override-json` with invalid JSON is an error.
+    #[test]
+    fn config_override_json_rejects_invalid_json() {
+        let args = super::super::dispatch::BundleDeployArgs {
+            config_override_json: vec!["pack:k=not-valid-json".to_string()],
+            ..empty_args()
+        };
+        let err = payload_from_deploy_args(args).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        let msg = format!("{err}");
+        assert!(msg.contains("config-override-json"), "got {msg}");
+    }
+
+    /// Both flag forms merge into the same map (later flags win per-(pack,key)).
+    #[test]
+    fn config_override_and_json_flags_merge() {
+        let args = super::super::dispatch::BundleDeployArgs {
+            config_override: vec![
+                "messaging-telegram:api_base_url=https://staging.example.com".to_string(),
+            ],
+            config_override_json: vec!["messaging-telegram:retry_max=3".to_string()],
+            ..empty_args()
+        };
+        let p = payload_from_deploy_args(args).unwrap().unwrap();
+        let overrides = p.config_overrides.as_ref().unwrap();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides["messaging-telegram"].len(), 2);
+    }
+
+    #[test]
+    fn config_override_repeating_flags_merge_per_pack() {
+        let args = super::super::dispatch::BundleDeployArgs {
+            config_override: vec![
+                "messaging-telegram:api_base_url=https://staging.example.com".to_string(),
+                "messaging-telegram:retry_max=3".to_string(),
+                "messaging-slack:webhook_url=https://hooks.slack/abc".to_string(),
+            ],
+            ..empty_args()
+        };
+        let p = payload_from_deploy_args(args).unwrap().unwrap();
+        let overrides = p.config_overrides.as_ref().unwrap();
+        assert_eq!(overrides.len(), 2);
+        assert_eq!(overrides["messaging-telegram"].len(), 2);
+        assert_eq!(overrides["messaging-slack"].len(), 1);
+    }
+
+    #[test]
+    fn config_override_rejects_missing_colon() {
+        let args = super::super::dispatch::BundleDeployArgs {
+            config_override: vec!["api_base_url=https://example.com".to_string()],
+            ..empty_args()
+        };
+        let err = payload_from_deploy_args(args).unwrap_err();
+        match err {
+            OpError::InvalidArgument(msg) => {
+                assert!(msg.contains("config-override"), "got {msg}")
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_override_rejects_missing_equals() {
+        let args = super::super::dispatch::BundleDeployArgs {
+            config_override: vec!["pack:no-value".to_string()],
+            ..empty_args()
+        };
+        let err = payload_from_deploy_args(args).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn config_override_rejects_empty_pack_or_key() {
+        let args = super::super::dispatch::BundleDeployArgs {
+            config_override: vec![":key=value".to_string()],
+            ..empty_args()
+        };
+        assert!(matches!(
+            payload_from_deploy_args(args).unwrap_err(),
+            OpError::InvalidArgument(_)
+        ));
+        let args = super::super::dispatch::BundleDeployArgs {
+            config_override: vec!["pack:=value".to_string()],
+            ..empty_args()
+        };
+        assert!(matches!(
+            payload_from_deploy_args(args).unwrap_err(),
+            OpError::InvalidArgument(_)
+        ));
+    }
+
+    #[test]
+    fn config_overrides_from_file_loads_bulk_and_flags_override_per_key() {
+        // File supplies a baseline; a `--config-override` flag wins per (pack, key).
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("overrides.json");
+        std::fs::write(
+            &file,
+            r#"{
+                "messaging-telegram": {
+                    "api_base_url": "https://prod.example.com",
+                    "retry_max": 10
+                }
+            }"#,
+        )
+        .unwrap();
+        let args = super::super::dispatch::BundleDeployArgs {
+            config_override: vec![
+                "messaging-telegram:api_base_url=https://staging.example.com".to_string(),
+            ],
+            config_overrides_from: Some(file),
+            ..empty_args()
+        };
+        let p = payload_from_deploy_args(args).unwrap().unwrap();
+        let overrides = p.config_overrides.as_ref().unwrap();
+        // Flag wins the api_base_url key
+        assert_eq!(
+            overrides["messaging-telegram"]["api_base_url"],
+            Value::String("https://staging.example.com".to_string())
+        );
+        // File's retry_max survives (flag didn't override it)
+        assert_eq!(
+            overrides["messaging-telegram"]["retry_max"],
+            Value::Number(serde_json::Number::from(10))
+        );
+    }
+
+    #[test]
+    fn config_overrides_from_missing_file_errors() {
+        let args = super::super::dispatch::BundleDeployArgs {
+            config_overrides_from: Some(PathBuf::from("/nonexistent/path/overrides.json")),
+            ..empty_args()
+        };
+        assert!(matches!(
+            payload_from_deploy_args(args).unwrap_err(),
+            OpError::InvalidArgument(_)
+        ));
+    }
+
+    /// No override input at all → `config_overrides: None` (Codex finding 3).
+    #[test]
+    fn no_override_input_yields_none() {
+        let args = super::super::dispatch::BundleDeployArgs {
+            config_override: Vec::new(),
+            config_override_json: Vec::new(),
+            config_overrides_from: None,
+            ..empty_args()
+        };
+        let p = payload_from_deploy_args(args).unwrap().unwrap();
+        assert!(p.config_overrides.is_none());
+    }
+
+    /// Explicit empty `{}` file → `config_overrides: Some(empty)` (Codex finding 3).
+    #[test]
+    fn empty_overrides_file_yields_some_empty() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("empty.json");
+        std::fs::write(&file, "{}").unwrap();
+        let args = super::super::dispatch::BundleDeployArgs {
+            config_overrides_from: Some(file),
+            ..empty_args()
+        };
+        let p = payload_from_deploy_args(args).unwrap().unwrap();
+        let overrides = p.config_overrides.as_ref().unwrap();
+        assert!(overrides.is_empty(), "explicit {{}} → Some(empty)");
+    }
+
+    #[test]
+    fn deploy_persists_config_overrides_via_add_path() {
+        let (_dir, store) = seeded_store();
+        let mut p = payload("quickstart");
+        p.config_overrides = Some(perf_smoke_override("https://staging.example.com"));
+        let outcome = deploy(&store, &OpFlags::default(), Some(p)).unwrap();
+        let s = deploy_summary(outcome);
+        assert!(!s.reused_deployment, "fresh deploy");
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        let bundle = env
+            .bundles
+            .iter()
+            .find(|b| b.deployment_id.to_string() == s.deployment_id)
+            .unwrap();
+        assert_eq!(
+            bundle.config_overrides["perf-smoke-pack"]["api_base_url"],
+            Value::String("https://staging.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn redeploy_with_new_overrides_replaces_them_on_existing_bundle() {
+        let (_dir, store) = seeded_store();
+        let mut p = payload("quickstart");
+        p.config_overrides = Some(perf_smoke_override("https://v1.example.com"));
+        deploy(&store, &OpFlags::default(), Some(p)).unwrap();
+        let mut p2 = payload("quickstart");
+        p2.config_overrides = Some(perf_smoke_override("https://v2.example.com"));
+        let s = deploy_summary(deploy(&store, &OpFlags::default(), Some(p2)).unwrap());
+        assert!(s.reused_deployment, "blue-green re-deploy");
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        let bundle = env
+            .bundles
+            .iter()
+            .find(|b| b.deployment_id.to_string() == s.deployment_id)
+            .unwrap();
+        assert_eq!(
+            bundle.config_overrides["perf-smoke-pack"]["api_base_url"],
+            Value::String("https://v2.example.com".to_string())
+        );
+    }
+
+    /// `None` overrides on re-deploy leaves existing alone (Codex finding 3).
+    #[test]
+    fn redeploy_with_none_overrides_leaves_existing_alone() {
+        let (_dir, store) = seeded_store();
+        let initial = perf_smoke_override("https://v1.example.com");
+        let mut p = payload("quickstart");
+        p.config_overrides = Some(initial.clone());
+        deploy(&store, &OpFlags::default(), Some(p)).unwrap();
+        // Re-deploy with None (no override input) — existing must survive.
+        let s = deploy_summary(
+            deploy(&store, &OpFlags::default(), Some(payload("quickstart"))).unwrap(),
+        );
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        let bundle = env
+            .bundles
+            .iter()
+            .find(|b| b.deployment_id.to_string() == s.deployment_id)
+            .unwrap();
+        assert_eq!(bundle.config_overrides, initial);
+    }
+
+    /// `Some(empty)` overrides on re-deploy clears existing (Codex finding 3).
+    #[test]
+    fn redeploy_with_explicit_empty_overrides_clears_existing() {
+        let (_dir, store) = seeded_store();
+        let mut p = payload("quickstart");
+        p.config_overrides = Some(perf_smoke_override("https://v1.example.com"));
+        deploy(&store, &OpFlags::default(), Some(p)).unwrap();
+        // Re-deploy with Some(empty) — explicit clear.
+        let mut p2 = payload("quickstart");
+        p2.config_overrides = Some(BTreeMap::new());
+        let s = deploy_summary(deploy(&store, &OpFlags::default(), Some(p2)).unwrap());
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        let bundle = env
+            .bundles
+            .iter()
+            .find(|b| b.deployment_id.to_string() == s.deployment_id)
+            .unwrap();
+        assert!(
+            bundle.config_overrides.is_empty(),
+            "explicit clear must empty the map"
+        );
     }
 }
