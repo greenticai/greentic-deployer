@@ -136,12 +136,6 @@ pub enum SpecError {
     #[error("messaging endpoint welcome_flow.flow_id is empty")]
     EmptyWelcomeFlowId,
 
-    /// Telegram secret-token decoupling (project_telegram_secret_token_auth_deferred).
-    /// Auto-generated secrets are 32+ chars; rejects manual values that would
-    /// be brute-forceable.
-    #[error("messaging endpoint webhook_secret must be at least {min} chars when set; got {got}")]
-    MessagingWebhookSecretTooShort { min: usize, got: usize },
-
     #[error(
         "duplicate extension binding for path `{path}` / instance `{instance_id:?}` in Environment.extensions"
     )]

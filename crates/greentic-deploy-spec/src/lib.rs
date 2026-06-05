@@ -53,7 +53,7 @@ pub use ids::{
     BundleId, CustomerId, DeploymentId, MessagingEndpointId, PackId, PartyId, RevisionId,
 };
 pub use integrity::{INTEGRITY_ALGORITHM_SHA256, IntegrityError, StateIntegrity, canonical_json};
-pub use messaging_endpoint::{MIN_WEBHOOK_SECRET_LEN, MessagingEndpoint, WelcomeFlowRef};
+pub use messaging_endpoint::{MessagingEndpoint, WelcomeFlowRef};
 pub use pack_config::PackConfig;
 pub use pack_list_lock::{LockedPack, PackListLock};
 pub use refs::{

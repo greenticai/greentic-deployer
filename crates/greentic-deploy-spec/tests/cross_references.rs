@@ -578,7 +578,7 @@ fn endpoint(
         provider_type: provider_type.into(),
         display_name: format!("{provider_type}: {provider_id}"),
         secret_refs: vec![],
-        webhook_secret: None,
+        webhook_secret_ref: None,
         linked_bundles,
         welcome_flow: None,
         generation: 1,

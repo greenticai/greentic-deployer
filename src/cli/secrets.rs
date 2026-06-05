@@ -39,13 +39,13 @@ const DEV_STORE_KIND_PATH: &str = "greentic.secrets.dev-store";
 /// Same override the runtime reader honors (`greentic-start
 /// `dev_store_path::override_path`): when set, both writer and reader use
 /// this path instead of the env-dir defaults below.
-const DEV_SECRETS_PATH_ENV: &str = "GREENTIC_DEV_SECRETS_PATH";
+pub(super) const DEV_SECRETS_PATH_ENV: &str = "GREENTIC_DEV_SECRETS_PATH";
 
 /// Dev-store candidates relative to the env dir. MUST mirror greentic-start's
 /// `dev_store_path.rs` (`STORE_RELATIVE` / `STORE_STATE_RELATIVE`) — the
 /// runtime's `SecretsClient::open(<env_dir>)` resolves the same chain, so a
 /// put here is what a served revision reads back.
-const DEV_STORE_RELATIVE: &str = ".greentic/dev/.dev.secrets.env";
+pub(super) const DEV_STORE_RELATIVE: &str = ".greentic/dev/.dev.secrets.env";
 const DEV_STORE_STATE_RELATIVE: &str = ".greentic/state/dev/.dev.secrets.env";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,7 +302,7 @@ pub fn rotate(
 /// (greentic-start `dev_store_path`): explicit override env var, else the
 /// first *existing* default candidate under the env dir, else the primary
 /// default (created on first write).
-fn resolve_dev_store_path(env_dir: &Path, override_path: Option<PathBuf>) -> PathBuf {
+pub(super) fn resolve_dev_store_path(env_dir: &Path, override_path: Option<PathBuf>) -> PathBuf {
     if let Some(path) = override_path {
         return path;
     }
@@ -354,7 +354,7 @@ fn is_canonical_secret_name(name: &str) -> bool {
 /// a local file, and adding a dedicated `OpError` variant would break
 /// downstream exhaustive matches (greentic-operator's HTTP status mapping).
 /// Error messages carry the backend's text only — never secret material.
-fn dev_store_put(path: &Path, uri: &str, value: &str) -> Result<(), OpError> {
+pub(super) fn dev_store_put(path: &Path, uri: &str, value: &str) -> Result<(), OpError> {
     let io_err = |message: String| OpError::Io {
         path: path.to_path_buf(),
         source: std::io::Error::other(message),
