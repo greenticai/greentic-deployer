@@ -279,6 +279,29 @@ impl Environment {
                     });
                 }
             }
+
+            // D.4: every config_overrides pack_id must appear in at least
+            // one current revision's pack_list.  When current_revisions is
+            // empty, config_overrides is allowed to be empty (no data to
+            // route to anyway) but any non-empty entry is an error because
+            // there are no revisions to validate against.
+            if !bundle.config_overrides.is_empty() {
+                let revision_pack_ids: HashSet<&str> = bundle
+                    .current_revisions
+                    .iter()
+                    .filter_map(|rid| self.revisions.iter().find(|r| r.revision_id == *rid))
+                    .flat_map(|rev| rev.pack_list.iter().map(|e| e.pack_id.as_str()))
+                    .collect();
+
+                for override_pack_id in bundle.config_overrides.keys() {
+                    if !revision_pack_ids.contains(override_pack_id.as_str()) {
+                        return Err(SpecError::ConfigOverridePackNotInRevisions {
+                            deployment: bundle.deployment_id,
+                            pack_id: override_pack_id.clone(),
+                        });
+                    }
+                }
+            }
         }
 
         for split in &self.traffic_splits {

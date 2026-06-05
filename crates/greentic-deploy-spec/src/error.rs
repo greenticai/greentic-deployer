@@ -167,4 +167,12 @@ pub enum SpecError {
 
     #[error("bundle config_overrides for pack `{pack_id}` has an empty config key")]
     ConfigOverrideEmptyKey { pack_id: String },
+
+    #[error(
+        "bundle deployment `{deployment}` config_overrides references pack `{pack_id}` which is not in any current revision's pack_list"
+    )]
+    ConfigOverridePackNotInRevisions {
+        deployment: DeploymentId,
+        pack_id: String,
+    },
 }
