@@ -158,6 +158,10 @@ pub enum MessagingEndpointVerb {
     SetWelcomeFlow,
     /// Remove an endpoint. Idempotent: removing an absent endpoint succeeds.
     Remove,
+    /// Rotate the webhook secret on an existing endpoint. Generates a fresh
+    /// 32-char CSPRNG secret, bumps generation. Idempotent on the same key.
+    #[command(name = "rotate-webhook-secret")]
+    RotateWebhookSecret,
 }
 
 #[derive(Subcommand, Debug)]
@@ -591,6 +595,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                     MessagingEndpointVerb::UnlinkBundle => "unlink-bundle",
                     MessagingEndpointVerb::SetWelcomeFlow => "set-welcome-flow",
                     MessagingEndpointVerb::Remove => "remove",
+                    MessagingEndpointVerb::RotateWebhookSecret => "rotate-webhook-secret",
                 },
             },
         ),
@@ -846,6 +851,9 @@ fn dispatch_messaging(
                 super::messaging::set_welcome_flow(store, flags, None)?
             }
             MessagingEndpointVerb::Remove => super::messaging::remove(store, flags, None)?,
+            MessagingEndpointVerb::RotateWebhookSecret => {
+                super::messaging::rotate_webhook_secret(store, flags, None)?
+            }
         },
     };
     print_outcome(&outcome)

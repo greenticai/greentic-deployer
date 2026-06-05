@@ -20,6 +20,8 @@ use greentic_deploy_spec::{
     BundleId, EnvId, MessagingEndpoint, MessagingEndpointId, PackId, SchemaVersion, SecretRef,
     WelcomeFlowRef,
 };
+use rand::TryRngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::str::FromStr;
@@ -60,6 +62,14 @@ pub struct EndpointSetWelcomeFlowPayload {
     pub bundle_id: String,
     pub pack_id: String,
     pub flow_id: String,
+    pub idempotency_key: String,
+    pub updated_by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndpointRotateWebhookSecretPayload {
+    pub environment_id: String,
+    pub endpoint_id: String,
     pub idempotency_key: String,
     pub updated_by: String,
 }
@@ -193,6 +203,11 @@ pub fn add(
                 )));
             }
             let now = Utc::now();
+            let webhook_secret = if is_telegram_class(&provider_type) {
+                Some(generate_webhook_secret()?)
+            } else {
+                None
+            };
             let endpoint = MessagingEndpoint {
                 schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
                 env_id: env_id.clone(),
@@ -201,7 +216,7 @@ pub fn add(
                 provider_type: provider_type.clone(),
                 display_name: display_name.clone(),
                 secret_refs: secret_refs.clone(),
-                webhook_secret: None,
+                webhook_secret,
                 linked_bundles: Vec::new(),
                 welcome_flow: None,
                 generation: 0,
@@ -570,6 +585,68 @@ pub fn remove(
     })
 }
 
+pub fn rotate_webhook_secret(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<EndpointRotateWebhookSecretPayload>,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(
+            NOUN,
+            "rotate-webhook-secret",
+            rotate_webhook_secret_schema(),
+        ));
+    }
+    let payload = resolve_payload(flags, payload)?;
+    let env_id = parse_env_id(&payload.environment_id)?;
+    let endpoint_id = parse_endpoint_id(&payload.endpoint_id)?;
+    let updated_by = require_nonempty("updated_by", &payload.updated_by)?;
+    let idempotency_key = require_nonempty("idempotency_key", &payload.idempotency_key)?;
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "rotate-webhook-secret",
+        target: json!({"endpoint_id": endpoint_id.to_string()}),
+        idempotency_key: Some(idempotency_key.clone()),
+    };
+    let idem_suffix = idem_suffix(&idempotency_key);
+    audit_and_record(store, ctx, |committed| {
+        let summary = store.transact(&env_id, |locked| -> Result<EndpointSummary, OpError> {
+            let mut env = locked.load()?;
+            let idx = find_endpoint_idx(&env, endpoint_id, &env_id)?;
+            // Idempotent replay: if the endpoint already carries this idem key,
+            // the rotation already landed — return the existing endpoint.
+            if carries_idem_key(&env.messaging_endpoints[idx], &idem_suffix) {
+                let summary = EndpointSummary::from(&env_id, &env.messaging_endpoints[idx]);
+                locked.refresh_messaging_projection(&env)?;
+                return Ok(summary);
+            }
+            let new_secret = generate_webhook_secret()?;
+            env.messaging_endpoints[idx].webhook_secret = Some(new_secret);
+            stamp_mutation(
+                &mut env.messaging_endpoints[idx],
+                &updated_by,
+                &idempotency_key,
+            );
+            locked.save(&env)?;
+            committed.mark_committed();
+            locked.refresh_messaging_projection(&env)?;
+            Ok(EndpointSummary::from(
+                &env_id,
+                &env.messaging_endpoints[idx],
+            ))
+        })?;
+        Ok((
+            OpOutcome::new(
+                NOUN,
+                "rotate-webhook-secret",
+                serde_json::to_value(summary).expect("EndpointSummary is json-safe"),
+            ),
+            super::AuditGens::NONE,
+        ))
+    })
+}
+
 // --- internals ---------------------------------------------------------------
 
 fn resolve_payload<T: serde::de::DeserializeOwned>(
@@ -655,6 +732,32 @@ fn idem_suffix(idempotency_key: &str) -> String {
 
 fn carries_idem_key(endpoint: &MessagingEndpoint, idem_suffix: &str) -> bool {
     endpoint.updated_by.ends_with(idem_suffix)
+}
+
+/// Telegram-class providers need a per-endpoint webhook secret generated at
+/// creation time. The prefix check covers `"telegram"`, `"messaging.telegram"`,
+/// and `"messaging.telegram.bot"` — all plausible aliases in current configs.
+fn is_telegram_class(provider_type: &str) -> bool {
+    provider_type == "telegram"
+        || provider_type.starts_with("telegram.")
+        || provider_type == "messaging.telegram"
+        || provider_type.starts_with("messaging.telegram.")
+}
+
+/// Generate a 32-char CSPRNG secret from `[A-Za-z0-9]` (≈190 bits entropy).
+/// Passes the deploy-spec's `MIN_WEBHOOK_SECRET_LEN` validation.
+fn generate_webhook_secret() -> Result<String, OpError> {
+    const LEN: usize = 32;
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut bytes = [0u8; LEN];
+    OsRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|e| OpError::InvalidArgument(format!("CSPRNG entropy failure: {e}")))?;
+    let secret: String = bytes
+        .iter()
+        .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
+        .collect();
+    Ok(secret)
 }
 
 fn stamp_mutation(endpoint: &mut MessagingEndpoint, updated_by: &str, idempotency_key: &str) {
@@ -771,6 +874,18 @@ fn set_welcome_flow_schema() -> Value {
 fn remove_schema() -> Value {
     verb_schema(
         "remove",
+        &[
+            "environment_id",
+            "endpoint_id",
+            "idempotency_key",
+            "updated_by",
+        ],
+    )
+}
+
+fn rotate_webhook_secret_schema() -> Value {
+    verb_schema(
+        "rotate-webhook-secret",
         &[
             "environment_id",
             "endpoint_id",
@@ -1419,5 +1534,199 @@ mod tests {
         };
         let err = add(&store, &OpFlags::default(), Some(bad)).unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    // --- webhook_secret auto-gen + rotate tests --------------------------------
+
+    /// Load the raw `MessagingEndpoint` from the store for a given endpoint id.
+    fn load_raw_endpoint(
+        store: &LocalFsStore,
+        endpoint_id: &MessagingEndpointId,
+    ) -> MessagingEndpoint {
+        let env_id = EnvId::try_from("local").unwrap();
+        let env = store.load(&env_id).unwrap();
+        env.messaging_endpoints
+            .into_iter()
+            .find(|e| e.endpoint_id == *endpoint_id)
+            .expect("endpoint must exist")
+    }
+
+    #[test]
+    fn add_telegram_generates_webhook_secret() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let outcome = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("telegram", "legal-bot", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&outcome);
+        let ep = load_raw_endpoint(&store, &id);
+        let secret = ep
+            .webhook_secret
+            .expect("telegram must have webhook_secret");
+        assert!(
+            secret.len() >= 32,
+            "secret must be ≥32 chars, got {}",
+            secret.len()
+        );
+    }
+
+    #[test]
+    fn add_telegram_dotted_generates_webhook_secret() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let outcome = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("messaging.telegram.bot", "tg-bot", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&outcome);
+        let ep = load_raw_endpoint(&store, &id);
+        assert!(
+            ep.webhook_secret.is_some(),
+            "messaging.telegram.bot must auto-gen webhook_secret"
+        );
+    }
+
+    #[test]
+    fn add_non_telegram_has_no_webhook_secret() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let outcome = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("slack", "ops", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&outcome);
+        let ep = load_raw_endpoint(&store, &id);
+        assert!(
+            ep.webhook_secret.is_none(),
+            "non-telegram provider must not auto-gen webhook_secret"
+        );
+    }
+
+    #[test]
+    fn idempotent_add_preserves_original_webhook_secret() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let first = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("telegram", "legal-bot", "k-replay")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&first);
+        let secret_1 = load_raw_endpoint(&store, &id)
+            .webhook_secret
+            .expect("first call must generate a secret");
+        // Replay with same idem key.
+        add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("telegram", "legal-bot", "k-replay")),
+        )
+        .unwrap();
+        let secret_2 = load_raw_endpoint(&store, &id)
+            .webhook_secret
+            .expect("replay must preserve the secret");
+        assert_eq!(
+            secret_1, secret_2,
+            "idempotent replay must return the SAME secret, not regenerate"
+        );
+    }
+
+    #[test]
+    fn generated_secret_passes_deploy_spec_validate() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let outcome = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("telegram", "legal-bot", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&outcome);
+        let ep = load_raw_endpoint(&store, &id);
+        ep.validate()
+            .expect("endpoint with auto-gen secret must pass deploy-spec validate");
+    }
+
+    fn rotate_payload(endpoint_id: &str, key: &str) -> EndpointRotateWebhookSecretPayload {
+        EndpointRotateWebhookSecretPayload {
+            environment_id: "local".to_string(),
+            endpoint_id: endpoint_id.to_string(),
+            idempotency_key: key.to_string(),
+            updated_by: "tester".to_string(),
+        }
+    }
+
+    #[test]
+    fn rotate_webhook_secret_changes_secret_and_bumps_generation() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let added = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("telegram", "legal-bot", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&added);
+        let before = load_raw_endpoint(&store, &id);
+        let before_secret = before.webhook_secret.clone().expect("has secret");
+        let before_gen = before.generation;
+        rotate_webhook_secret(
+            &store,
+            &OpFlags::default(),
+            Some(rotate_payload(&id.to_string(), "k-rotate")),
+        )
+        .unwrap();
+        let after = load_raw_endpoint(&store, &id);
+        let after_secret = after.webhook_secret.expect("rotated secret must be Some");
+        assert_ne!(
+            before_secret, after_secret,
+            "rotate must produce a different secret"
+        );
+        assert!(after_secret.len() >= 32, "rotated secret must be ≥32 chars");
+        assert_eq!(
+            after.generation,
+            before_gen + 1,
+            "rotate must bump generation"
+        );
+    }
+
+    #[test]
+    fn idempotent_rotate_returns_same_secret() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let added = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("telegram", "legal-bot", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&added);
+        rotate_webhook_secret(
+            &store,
+            &OpFlags::default(),
+            Some(rotate_payload(&id.to_string(), "k-rotate")),
+        )
+        .unwrap();
+        let secret_1 = load_raw_endpoint(&store, &id)
+            .webhook_secret
+            .expect("has secret");
+        let gen_1 = load_raw_endpoint(&store, &id).generation;
+        // Replay with same idem key.
+        rotate_webhook_secret(
+            &store,
+            &OpFlags::default(),
+            Some(rotate_payload(&id.to_string(), "k-rotate")),
+        )
+        .unwrap();
+        let secret_2 = load_raw_endpoint(&store, &id)
+            .webhook_secret
+            .expect("has secret");
+        let gen_2 = load_raw_endpoint(&store, &id).generation;
+        assert_eq!(
+            secret_1, secret_2,
+            "idempotent rotate replay must preserve the secret"
+        );
+        assert_eq!(gen_1, gen_2, "idempotent replay must not bump generation");
     }
 }
