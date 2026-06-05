@@ -326,6 +326,10 @@ version.
 
 ## Path 3 — Adding an extension (open, N-per-env)
 
+> **In depth:** this is the summary. The full Path 3 walkthrough — the
+> `ext://` grammar, the answers-blob layout, what resolves `ext://` today, and a
+> worked example — lives in [`extensions.md`](extensions.md).
+
 Use Path 3 when the capability is consumed by a **workload** (a bundle/flow
 resolving it by name), not by core platform code linking a typed host
 interface. There is **no schema bump** — an extension is a `PackDescriptor`
