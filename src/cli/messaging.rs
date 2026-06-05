@@ -201,6 +201,7 @@ pub fn add(
                 provider_type: provider_type.clone(),
                 display_name: display_name.clone(),
                 secret_refs: secret_refs.clone(),
+                webhook_secret: None,
                 linked_bundles: Vec::new(),
                 welcome_flow: None,
                 generation: 0,
