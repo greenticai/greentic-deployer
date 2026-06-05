@@ -206,10 +206,7 @@ pub fn add(
             let now = Utc::now();
             let eid = MessagingEndpointId::new();
             let webhook_secret_ref = if is_telegram_class(&provider_type) {
-                let secret_value = generate_webhook_secret()?;
-                let secret_ref = build_webhook_secret_ref(&env_id, &eid)?;
-                write_webhook_secret_to_devstore(store, &env_id, &secret_ref, &secret_value)?;
-                Some(secret_ref)
+                Some(provision_webhook_secret(store, &env_id, &eid, None)?)
             } else {
                 None
             };
@@ -626,15 +623,12 @@ pub fn rotate_webhook_secret(
                 locked.refresh_messaging_projection(&env)?;
                 return Ok(summary);
             }
-            let new_secret = generate_webhook_secret()?;
-            let secret_ref = match &env.messaging_endpoints[idx].webhook_secret_ref {
-                Some(existing) => existing.clone(),
-                None => {
-                    // First-time setting on a pre-decoupling endpoint.
-                    build_webhook_secret_ref(&env_id, &endpoint_id)?
-                }
-            };
-            write_webhook_secret_to_devstore(store, &env_id, &secret_ref, &new_secret)?;
+            let secret_ref = provision_webhook_secret(
+                store,
+                &env_id,
+                &endpoint_id,
+                env.messaging_endpoints[idx].webhook_secret_ref.as_ref(),
+            )?;
             env.messaging_endpoints[idx].webhook_secret_ref = Some(secret_ref);
             stamp_mutation(
                 &mut env.messaging_endpoints[idx],
@@ -748,13 +742,14 @@ fn carries_idem_key(endpoint: &MessagingEndpoint, idem_suffix: &str) -> bool {
 }
 
 /// Telegram-class providers need a per-endpoint webhook secret generated at
-/// creation time. The prefix check covers `"telegram"`, `"messaging.telegram"`,
-/// and `"messaging.telegram.bot"` — all plausible aliases in current configs.
+/// creation time. Covers `"telegram"`, `"telegram.<x>"`,
+/// `"messaging.telegram"`, and `"messaging.telegram.<x>"` — strict on the dot
+/// so `"telegrambot"` and `"messaging.telegrambot"` do NOT match.
 fn is_telegram_class(provider_type: &str) -> bool {
-    provider_type == "telegram"
-        || provider_type.starts_with("telegram.")
-        || provider_type == "messaging.telegram"
-        || provider_type.starts_with("messaging.telegram.")
+    let rest = provider_type
+        .strip_prefix("messaging.")
+        .unwrap_or(provider_type);
+    rest == "telegram" || rest.starts_with("telegram.")
 }
 
 /// Generate a 32-char CSPRNG secret from `[A-Za-z0-9]` (≈190 bits entropy).
@@ -796,6 +791,31 @@ fn build_webhook_secret_ref(
         .map_err(|e| OpError::InvalidArgument(format!("webhook secret ref: {e}")))
 }
 
+/// Provision a webhook secret for an endpoint: generate the value, choose
+/// the ref URI (existing if rotating an endpoint that already has one;
+/// freshly built otherwise), write the value to the dev-store, return the
+/// ref the caller stamps onto `MessagingEndpoint.webhook_secret_ref`.
+///
+/// Shared by `add` (always `existing_ref = None` — fresh endpoint) and
+/// `rotate_webhook_secret` (`existing_ref = Some(_)` for endpoints that
+/// already carry a ref, `None` for first-time setting on a pre-decoupling
+/// endpoint). Keeps the entropy source, URI shape, and write target in one
+/// place so the two verbs cannot drift.
+fn provision_webhook_secret(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    endpoint_id: &MessagingEndpointId,
+    existing_ref: Option<&SecretRef>,
+) -> Result<SecretRef, OpError> {
+    let value = generate_webhook_secret()?;
+    let secret_ref = match existing_ref {
+        Some(r) => r.clone(),
+        None => build_webhook_secret_ref(env_id, endpoint_id)?,
+    };
+    write_webhook_secret_to_devstore(store, env_id, &secret_ref, &value)?;
+    Ok(secret_ref)
+}
+
 /// Write the webhook secret VALUE into the env-pack dev-store. Mirrors the
 /// `cli/secrets.rs put` idiom: same `dev_store_put` + `resolve_dev_store_path`
 /// pattern (sidecar flock, dedicated OS thread, own current-thread runtime).
@@ -810,9 +830,7 @@ fn write_webhook_secret_to_devstore(
         &env_dir,
         std::env::var_os(super::secrets::DEV_SECRETS_PATH_ENV).map(PathBuf::from),
     );
-    // The dev-store's native URI uses `secrets://` (plural). Convert from
-    // the deploy-spec `secret://` (singular) scheme.
-    let store_uri = secret_ref.as_str().replacen("secret://", "secrets://", 1);
+    let store_uri = super::secrets::secret_ref_to_store_uri(secret_ref);
     super::secrets::dev_store_put(&dev_path, &store_uri, value)
 }
 
@@ -1607,9 +1625,10 @@ mod tests {
             .expect("endpoint must exist")
     }
 
-    /// Read back a secret value from the env's dev-store, mirroring the
-    /// runtime's read path (isolated current-thread runtime on a dedicated
-    /// OS thread).
+    /// Read back a secret value from the env's dev-store. Mirrors
+    /// `cli/secrets.rs::read_back` — sync tests build a fresh
+    /// current-thread runtime, no `std::thread::scope` needed (there is no
+    /// outer runtime to nest under).
     fn read_devstore_value(store: &LocalFsStore, secret_ref: &SecretRef) -> String {
         use greentic_secrets_lib::{DevStore, SecretsStore};
         let env_id = EnvId::try_from("local").unwrap();
@@ -1618,23 +1637,14 @@ mod tests {
             &env_dir,
             std::env::var_os(crate::cli::secrets::DEV_SECRETS_PATH_ENV).map(PathBuf::from),
         );
-        let store_uri = secret_ref.as_str().replacen("secret://", "secrets://", 1);
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    let dev = DevStore::with_path(dev_path).expect("open dev store");
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap()
-                        .block_on(async { dev.get(&store_uri).await.unwrap() })
-                })
-                .join()
-                .expect("dev-store read thread panicked")
-        })
-        .into_iter()
-        .map(|b| b as char)
-        .collect()
+        let store_uri = crate::cli::secrets::secret_ref_to_store_uri(secret_ref);
+        let dev = DevStore::with_path(dev_path).expect("open dev store");
+        let bytes = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { dev.get(&store_uri).await.unwrap() });
+        bytes.into_iter().map(|b| b as char).collect()
     }
 
     #[test]
@@ -1816,11 +1826,12 @@ mod tests {
             Some(rotate_payload(&id.to_string(), "k-rotate")),
         )
         .unwrap();
-        let ref_1 = load_raw_endpoint(&store, &id)
-            .webhook_secret_ref
-            .expect("has ref");
+        // One load per snapshot — `ref_N` and `gen_N` come from the SAME
+        // snapshot so they can't theoretically diverge under concurrent writers.
+        let snapshot_1 = load_raw_endpoint(&store, &id);
+        let ref_1 = snapshot_1.webhook_secret_ref.clone().expect("has ref");
+        let gen_1 = snapshot_1.generation;
         let value_1 = read_devstore_value(&store, &ref_1);
-        let gen_1 = load_raw_endpoint(&store, &id).generation;
         // Replay with same idem key.
         rotate_webhook_secret(
             &store,
@@ -1828,11 +1839,10 @@ mod tests {
             Some(rotate_payload(&id.to_string(), "k-rotate")),
         )
         .unwrap();
-        let ref_2 = load_raw_endpoint(&store, &id)
-            .webhook_secret_ref
-            .expect("has ref");
+        let snapshot_2 = load_raw_endpoint(&store, &id);
+        let ref_2 = snapshot_2.webhook_secret_ref.clone().expect("has ref");
+        let gen_2 = snapshot_2.generation;
         let value_2 = read_devstore_value(&store, &ref_2);
-        let gen_2 = load_raw_endpoint(&store, &id).generation;
         assert_eq!(ref_1, ref_2, "idempotent replay must preserve the URI ref");
         assert_eq!(
             value_1, value_2,

@@ -352,6 +352,17 @@ fn is_canonical_secret_name(name: &str) -> bool {
 ///
 /// Failures map to `OpError::Io` keyed on the store path — the dev store is
 /// a local file, and adding a dedicated `OpError` variant would break
+/// Map a deploy-spec `SecretRef` (scheme `secret://`) to the dev-store's
+/// native URI (scheme `secrets://`, plural). The two schemes are deliberately
+/// distinct contracts — deploy-spec refs vs runtime-store keys — and the
+/// mapping is just a scheme rename today. Centralizing it here keeps every
+/// caller doing the same translation and gives one grep target if the
+/// mapping ever grows beyond a rename. See the `secrets://` vs `secret://`
+/// trap noted in workspace memory.
+pub(super) fn secret_ref_to_store_uri(secret_ref: &SecretRef) -> String {
+    secret_ref.as_str().replacen("secret://", "secrets://", 1)
+}
+
 /// downstream exhaustive matches (greentic-operator's HTTP status mapping).
 /// Error messages carry the backend's text only — never secret material.
 pub(super) fn dev_store_put(path: &Path, uri: &str, value: &str) -> Result<(), OpError> {
