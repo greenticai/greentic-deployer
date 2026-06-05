@@ -391,6 +391,7 @@ mod tests {
         Revision, RevisionId, RevisionLifecycle, RouteBinding, SchemaVersion, SemVer,
         TenantSelector, TrafficSplit, TrafficSplitEntry,
     };
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -480,6 +481,7 @@ mod tests {
             usage: None,
             created_at: fixed_now(),
             authorization_ref: PathBuf::from("auth.json"),
+            config_overrides: BTreeMap::new(),
         }
     }
 

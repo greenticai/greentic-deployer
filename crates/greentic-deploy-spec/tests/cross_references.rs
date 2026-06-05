@@ -13,6 +13,7 @@ use greentic_deploy_spec::{
     RouteBinding, SchemaVersion, SemVer, SpecError, TenantSelector, TrafficSplit,
     TrafficSplitEntry,
 };
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -118,6 +119,7 @@ fn bundle(
         usage: None,
         created_at: Utc::now(),
         authorization_ref: PathBuf::from("audit.json"),
+        config_overrides: BTreeMap::new(),
     }
 }
 
@@ -757,6 +759,160 @@ fn messaging_endpoint_secret_ref_must_be_scoped_to_env() {
         }
         other => panic!("expected CrossEnvRef, got {other:?}"),
     }
+}
+
+// ----------------------------------------------------------------------------
+// D.4: config_overrides pack-id cross-reference
+// ----------------------------------------------------------------------------
+
+/// Like [`revision`] but with a custom pack_list so tests can assert that
+/// config_overrides keys are (or aren't) present in the revision's packs.
+fn revision_with_packs(
+    revision_id: RevisionId,
+    env: EnvId,
+    deployment: DeploymentId,
+    bundle: BundleId,
+    pack_ids: &[&str],
+) -> Revision {
+    Revision {
+        pack_list: pack_ids
+            .iter()
+            .map(|id| PackListEntry {
+                pack_id: PackId::new(*id),
+                version: SemVer::new(1, 0, 0),
+                digest: "sha256:0".into(),
+                source_uri: None,
+            })
+            .collect(),
+        ..revision(revision_id, env, deployment, bundle)
+    }
+}
+
+#[test]
+fn config_overrides_referencing_pack_in_revision_passes() {
+    let dep = DeploymentId::new();
+    let bundle_id = BundleId::new("b");
+    let rev_id = RevisionId::new();
+    let r = revision_with_packs(
+        rev_id,
+        local(),
+        dep,
+        bundle_id.clone(),
+        &["messaging-telegram", "messaging-slack"],
+    );
+    let mut b = bundle(dep, local(), bundle_id, vec![rev_id]);
+    b.config_overrides = BTreeMap::from([(
+        "messaging-telegram".to_string(),
+        BTreeMap::from([(
+            "api_base_url".to_string(),
+            serde_json::json!("https://staging.example.com"),
+        )]),
+    )]);
+    let e = env_with(local(), vec![b], vec![r], vec![]);
+    assert!(e.validate().is_ok());
+}
+
+#[test]
+fn config_overrides_referencing_unknown_pack_rejected() {
+    let dep = DeploymentId::new();
+    let bundle_id = BundleId::new("b");
+    let rev_id = RevisionId::new();
+    let r = revision_with_packs(
+        rev_id,
+        local(),
+        dep,
+        bundle_id.clone(),
+        &["messaging-telegram"],
+    );
+    let mut b = bundle(dep, local(), bundle_id, vec![rev_id]);
+    b.config_overrides = BTreeMap::from([(
+        "messaging-whatsapp".to_string(),
+        BTreeMap::from([(
+            "api_base_url".to_string(),
+            serde_json::json!("https://wa.example.com"),
+        )]),
+    )]);
+    let e = env_with(local(), vec![b], vec![r], vec![]);
+    let err = e.validate().unwrap_err();
+    assert_eq!(
+        err,
+        SpecError::ConfigOverridePackNotInRevisions {
+            deployment: dep,
+            pack_id: "messaging-whatsapp".to_string(),
+        }
+    );
+}
+
+#[test]
+fn config_overrides_in_any_current_revision_passes_canary() {
+    // Canary scenario: two current revisions; override pack exists in only
+    // one of them. Loose semantics — the pack exists in at least one.
+    let dep = DeploymentId::new();
+    let bundle_id = BundleId::new("b");
+    let rev_a = RevisionId::new();
+    let rev_b = RevisionId::new();
+    let r_a = revision_with_packs(
+        rev_a,
+        local(),
+        dep,
+        bundle_id.clone(),
+        &["messaging-telegram"],
+    );
+    let r_b = revision_with_packs(rev_b, local(), dep, bundle_id.clone(), &["messaging-slack"]);
+    let mut b = bundle(dep, local(), bundle_id, vec![rev_a, rev_b]);
+    b.config_overrides = BTreeMap::from([
+        (
+            "messaging-telegram".to_string(),
+            BTreeMap::from([(
+                "api_base_url".to_string(),
+                serde_json::json!("https://tg.example.com"),
+            )]),
+        ),
+        (
+            "messaging-slack".to_string(),
+            BTreeMap::from([(
+                "webhook_url".to_string(),
+                serde_json::json!("https://slack.example.com"),
+            )]),
+        ),
+    ]);
+    let e = env_with(local(), vec![b], vec![r_a, r_b], vec![]);
+    assert!(e.validate().is_ok());
+}
+
+#[test]
+fn config_overrides_on_bundle_with_no_revisions_rejected() {
+    // No current_revisions → no pack_lists to validate against. Any
+    // non-empty override is an error (the override has nowhere to go).
+    let dep = DeploymentId::new();
+    let bundle_id = BundleId::new("b");
+    let mut b = bundle(dep, local(), bundle_id, vec![]);
+    b.config_overrides = BTreeMap::from([(
+        "messaging-telegram".to_string(),
+        BTreeMap::from([(
+            "api_base_url".to_string(),
+            serde_json::json!("https://staging.example.com"),
+        )]),
+    )]);
+    let e = env_with(local(), vec![b], vec![], vec![]);
+    let err = e.validate().unwrap_err();
+    assert_eq!(
+        err,
+        SpecError::ConfigOverridePackNotInRevisions {
+            deployment: dep,
+            pack_id: "messaging-telegram".to_string(),
+        }
+    );
+}
+
+#[test]
+fn empty_config_overrides_on_bundle_with_no_revisions_passes() {
+    // No current_revisions + no overrides = fine.
+    let dep = DeploymentId::new();
+    let bundle_id = BundleId::new("b");
+    let b = bundle(dep, local(), bundle_id, vec![]);
+    let e = env_with(local(), vec![b], vec![], vec![]);
+    assert!(e.validate().is_ok());
 }
 
 #[test]

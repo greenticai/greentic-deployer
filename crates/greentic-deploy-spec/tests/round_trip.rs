@@ -105,6 +105,7 @@ fn sample_bundle_deployment() -> BundleDeployment {
         usage: None,
         created_at: Utc::now(),
         authorization_ref: PathBuf::from("audit/x.json"),
+        config_overrides: BTreeMap::new(),
     }
 }
 

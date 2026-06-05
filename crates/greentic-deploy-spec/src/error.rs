@@ -146,4 +146,33 @@ pub enum SpecError {
 
     #[error("extension binding `{path}` has an invalid instance id: {reason}")]
     InvalidExtensionInstanceId { path: String, reason: String },
+
+    #[error("bundle config_overrides carries {count} packs, exceeds cap of {max}")]
+    ConfigOverridesTooManyPacks { count: usize, max: usize },
+
+    #[error(
+        "bundle config_overrides for pack `{pack_id}` carries {count} keys, exceeds cap of {max}"
+    )]
+    ConfigOverridesTooManyKeysForPack {
+        pack_id: String,
+        count: usize,
+        max: usize,
+    },
+
+    #[error("bundle config_overrides serialized size is {bytes} bytes, exceeds cap of {max}")]
+    ConfigOverridesTooLarge { bytes: usize, max: usize },
+
+    #[error("bundle config_overrides has an empty pack id key")]
+    ConfigOverrideEmptyPackId,
+
+    #[error("bundle config_overrides for pack `{pack_id}` has an empty config key")]
+    ConfigOverrideEmptyKey { pack_id: String },
+
+    #[error(
+        "bundle deployment `{deployment}` config_overrides references pack `{pack_id}` which is not in any current revision's pack_list"
+    )]
+    ConfigOverridePackNotInRevisions {
+        deployment: DeploymentId,
+        pack_id: String,
+    },
 }
