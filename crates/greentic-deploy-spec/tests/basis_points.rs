@@ -4,6 +4,7 @@ use greentic_deploy_spec::{
     RevenueShareEntry, RevisionId, RouteBinding, SchemaVersion, SpecError, TenantSelector,
     TrafficSplit, TrafficSplitEntry,
 };
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -102,6 +103,7 @@ fn deployment(shares: &[u32]) -> BundleDeployment {
         usage: None,
         created_at: Utc::now(),
         authorization_ref: PathBuf::from("audit/test.json"),
+        config_overrides: BTreeMap::new(),
     }
 }
 

@@ -136,6 +136,7 @@ pub fn make_bundle_deployment(env_id: &str, bundle_id: &str) -> BundleDeployment
         usage: None,
         created_at: Utc.with_ymd_and_hms(2026, 5, 18, 12, 0, 0).unwrap(),
         authorization_ref: PathBuf::from("auth.json"),
+        config_overrides: std::collections::BTreeMap::new(),
     }
 }
 

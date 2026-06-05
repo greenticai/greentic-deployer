@@ -458,6 +458,7 @@ mod tests {
             usage: None,
             created_at: Utc::now(),
             authorization_ref: PathBuf::from("auth.json"),
+            config_overrides: std::collections::BTreeMap::new(),
         }
     }
 

@@ -118,6 +118,7 @@ fn bundle(
         usage: None,
         created_at: Utc::now(),
         authorization_ref: PathBuf::from("audit.json"),
+        config_overrides: std::collections::BTreeMap::new(),
     }
 }
 
