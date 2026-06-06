@@ -394,6 +394,26 @@ pub struct BundleDeployArgs {
     /// (per-pack, per-key).
     #[arg(long = "config-overrides-from", value_name = "FILE")]
     pub config_overrides_from: Option<PathBuf>,
+    /// Route binding: path prefix to dispatch into this bundle, e.g. `/legal`.
+    /// Repeating. Sets `route_binding.path_prefixes` at deploy time so a
+    /// follow-up `bundles update` isn't needed for the common case.
+    #[arg(long = "path-prefix", value_name = "PREFIX")]
+    pub path_prefix: Vec<String>,
+    /// Route binding: host to dispatch into this bundle. Repeating.
+    /// Sets `route_binding.hosts` at deploy time.
+    #[arg(long = "host", value_name = "HOST")]
+    pub host: Vec<String>,
+    /// Route binding: tenant id for `tenant_selector`. When supplied, the
+    /// resolved deployment carries this tenant through the runtime config so
+    /// per-tenant secret URIs (e.g. `secrets://<env>/<tenant>/…`) resolve
+    /// correctly. Requires no other routing flag — pair with `--path-prefix`
+    /// or `--host` to make the deployment reachable.
+    #[arg(long = "tenant", value_name = "TENANT")]
+    pub tenant: Option<String>,
+    /// Route binding: team id for `tenant_selector`. Defaults to `default`
+    /// when `--tenant` is supplied without `--team`.
+    #[arg(long = "team", value_name = "TEAM")]
+    pub team: Option<String>,
 }
 
 #[derive(Args, Debug)]

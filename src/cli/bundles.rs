@@ -60,7 +60,7 @@ pub(super) fn default_authorization_ref() -> PathBuf {
     PathBuf::from("auth.json")
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteBindingPayload {
     #[serde(default)]
     pub hosts: Vec<String>,
@@ -68,6 +68,24 @@ pub struct RouteBindingPayload {
     pub path_prefixes: Vec<String>,
     #[serde(default)]
     pub tenant_selector: Option<TenantSelectorPayload>,
+}
+
+impl RouteBindingPayload {
+    /// A binding with `tenant_selector` set but no host/path matcher is
+    /// structurally unreachable (no inbound request can match it). Reject at
+    /// payload-construction time so the CLI flag path and the `--answers`
+    /// JSON path share the same validation.
+    pub fn validate(&self) -> Result<(), OpError> {
+        if self.tenant_selector.is_some() && self.hosts.is_empty() && self.path_prefixes.is_empty()
+        {
+            return Err(OpError::InvalidArgument(
+                "route_binding: tenant_selector requires at least one host or path_prefix \
+                 (a binding with no matchers would be unreachable)"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -499,7 +517,7 @@ fn parse_deployment_id(raw: &str) -> Result<DeploymentId, OpError> {
     Ok(DeploymentId(ulid))
 }
 
-fn into_route_binding(payload: RouteBindingPayload) -> RouteBinding {
+pub(super) fn into_route_binding(payload: RouteBindingPayload) -> RouteBinding {
     let tenant_selector = payload
         .tenant_selector
         .map(|t| TenantSelector {
