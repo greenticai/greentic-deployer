@@ -499,7 +499,7 @@ fn parse_deployment_id(raw: &str) -> Result<DeploymentId, OpError> {
     Ok(DeploymentId(ulid))
 }
 
-fn into_route_binding(payload: RouteBindingPayload) -> RouteBinding {
+pub(super) fn into_route_binding(payload: RouteBindingPayload) -> RouteBinding {
     let tenant_selector = payload
         .tenant_selector
         .map(|t| TenantSelector {
