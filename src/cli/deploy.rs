@@ -175,6 +175,11 @@ pub fn deploy(
             "bundle_id must not be empty".to_string(),
         ));
     }
+    // Payload-level routing validation. Catches the `--answers` JSON path
+    // (the CLI flag path also pre-validates via `payload_from_deploy_args`).
+    if let Some(rb) = payload.route_binding.as_ref() {
+        rb.validate()?;
+    }
 
     // `op deploy` always stages from a real `.gtbundle`: an artifact-less
     // stage would record placeholder digests and an empty pack-list lock —
@@ -243,10 +248,32 @@ pub fn deploy(
         .into_outcome());
     }
 
-    let (deployment_id, reused, superseded_revisions, existing_route_binding) = match existing {
+    // On re-deploy with a route_binding in the payload, reject any binding
+    // that differs from the deployment's existing one BEFORE staging a
+    // revision. Routing is bundle-level metadata that `traffic rollback`
+    // does NOT restore (see `traffic::rollback`), so allowing a mutation
+    // here would leave the prior revision mis-routed after a rollback.
+    //
+    // Equal → no-op (preserves the demo flow where the user re-runs the
+    // same deploy command). Different → reject with Conflict pointing to
+    // `gtc op bundles update` as the right verb for routing mutations on
+    // an existing deployment. None → fall through (no change requested).
+    if let (Some(b), Some(rb_payload)) = (existing, payload.route_binding.as_ref()) {
+        let requested: RouteBinding = super::bundles::into_route_binding(rb_payload.clone());
+        if requested != b.route_binding {
+            return Err(OpError::Conflict(format!(
+                "deploy: route_binding differs from the deployed binding for \
+                 `{bundle_id}` — routing is bundle-level metadata and is not \
+                 restored by `traffic rollback`. Run `gtc op bundles update \
+                 --answers ...` to change routing on an existing deployment, \
+                 then re-deploy"
+            )));
+        }
+    }
+
+    let (deployment_id, reused, superseded_revisions) = match existing {
         Some(b) => {
             let dep = b.deployment_id;
-            let existing_rb = b.route_binding.clone();
             let superseded: Vec<String> = env
                 .traffic_splits
                 .iter()
@@ -258,21 +285,14 @@ pub fn deploy(
                         .collect()
                 })
                 .unwrap_or_default();
-            (dep.to_string(), true, superseded, Some(existing_rb))
+            (dep.to_string(), true, superseded)
         }
         None => {
             let add_payload = BundleAddPayload {
                 environment_id: payload.environment_id.clone(),
                 bundle_id: bundle_id.clone(),
                 customer_id: payload.customer_id.clone(),
-                route_binding: payload
-                    .route_binding
-                    .clone()
-                    .unwrap_or(RouteBindingPayload {
-                        hosts: Vec::new(),
-                        path_prefixes: Vec::new(),
-                        tenant_selector: None,
-                    }),
+                route_binding: payload.route_binding.clone().unwrap_or_default(),
                 revenue_share: super::bundles::default_revenue_share(),
                 authorization_ref: super::bundles::default_authorization_ref(),
                 // Fresh deploy: BundleAddPayload takes a plain BTreeMap
@@ -281,7 +301,7 @@ pub fn deploy(
             };
             let outcome = super::bundles::add(store, flags, Some(add_payload))?;
             let summary: BundleSummary = parse_summary(outcome, "bundle")?;
-            (summary.deployment_id, false, Vec::new(), None)
+            (summary.deployment_id, false, Vec::new())
         }
     };
     // Drop the borrow on `env` before the mutating steps below.
@@ -342,34 +362,6 @@ pub fn deploy(
                 config_overrides: Some(overrides.clone()),
             }),
         )?;
-    }
-
-    // On re-deploy, compare the requested route_binding against the existing
-    // one. Routing is bundle-level metadata that `traffic rollback` does NOT
-    // restore, so allowing a mutation here would leave the prior revision
-    // mis-routed after a rollback.
-    //
-    // Equal → skip (no-op, preserves the demo flow where the user re-runs
-    // the same deploy command with the same flags). Different → reject with
-    // a Conflict pointing to `gtc op bundles update` as the right verb.
-    // None → already handled (no route_binding in payload → skip the block).
-    if reused && let Some(ref rb_payload) = payload.route_binding {
-        let requested: RouteBinding = super::bundles::into_route_binding(rb_payload.clone());
-        // `existing_route_binding` is `Some` on the reuse path (captured
-        // from the matched BundleDeployment before `drop(env)`).
-        let current = existing_route_binding
-            .as_ref()
-            .expect("reuse path always captures existing_route_binding");
-        if &requested != current {
-            return Err(OpError::Conflict(format!(
-                "deploy: route_binding differs from the deployed binding for \
-                 `{bundle_id}` — routing is bundle-level metadata and is not \
-                 restored by `traffic rollback`. Run `gtc op bundles update \
-                 --answers ...` to change routing on an existing deployment, \
-                 then re-deploy"
-            )));
-        }
-        // Equal — skip the bundles::update call (no-op).
     }
 
     // Route 100 % of traffic to the new revision. `traffic set` is a full
@@ -476,8 +468,7 @@ pub fn payload_from_deploy_args(
         &config_override_json,
         config_overrides_from,
     )?;
-    let route_binding =
-        route_binding_from_cli(host.clone(), path_prefix.clone(), tenant.clone(), team)?;
+    let route_binding = route_binding_from_cli(host, path_prefix, tenant, team)?;
     Ok(Some(BundleDeployPayload {
         environment_id: env.unwrap_or_else(default_environment_id),
         bundle_id,
@@ -495,7 +486,9 @@ pub fn payload_from_deploy_args(
 /// `team` defaults to `default` when `--tenant` is supplied without `--team`
 /// (matches the bundles-update payload shape the demo emits by hand). The
 /// reverse — `--team` without `--tenant` — is rejected in the caller before
-/// we get here.
+/// we get here. Calls `RouteBindingPayload::validate()` so the same
+/// unreachable-binding check covers both flag-built and `--answers` JSON
+/// payloads.
 fn route_binding_from_cli(
     hosts: Vec<String>,
     path_prefixes: Vec<String>,
@@ -505,24 +498,17 @@ fn route_binding_from_cli(
     if hosts.is_empty() && path_prefixes.is_empty() && tenant.is_none() {
         return Ok(None);
     }
-    // A binding with tenant/team but no matchers is structurally broken: no
-    // host or path prefix can ever match, so the deployment is unreachable.
-    if tenant.is_some() && hosts.is_empty() && path_prefixes.is_empty() {
-        return Err(OpError::InvalidArgument(
-            "deploy: --tenant requires at least one --host or --path-prefix \
-             (a route binding with no matchers would be unreachable)"
-                .to_string(),
-        ));
-    }
     let tenant_selector = tenant.map(|t| super::bundles::TenantSelectorPayload {
         tenant: t,
         team: team.unwrap_or_else(|| "default".to_string()),
     });
-    Ok(Some(RouteBindingPayload {
+    let payload = RouteBindingPayload {
         hosts,
         path_prefixes,
         tenant_selector,
-    }))
+    };
+    payload.validate()?;
+    Ok(Some(payload))
 }
 
 /// Parse `--config-override` / `--config-override-json` / `--config-overrides-from`
@@ -1424,12 +1410,40 @@ mod tests {
         match err {
             OpError::InvalidArgument(msg) => {
                 assert!(
-                    msg.contains("--host") || msg.contains("--path-prefix"),
-                    "expected mention of --host or --path-prefix, got {msg}"
+                    msg.contains("host") && msg.contains("path_prefix"),
+                    "expected validate() message mentioning host and path_prefix, got {msg}"
                 );
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
+    }
+
+    /// `--answers` JSON with the same unreachable shape must be rejected too,
+    /// because validate() runs on the payload at `deploy()` entry — not just
+    /// at the CLI flag layer (altitude fix).
+    #[test]
+    fn answers_payload_with_unreachable_route_binding_rejected() {
+        let (_dir, store) = seeded_store();
+        let mut p = payload("quickstart");
+        p.route_binding = Some(RouteBindingPayload {
+            hosts: Vec::new(),
+            path_prefixes: Vec::new(),
+            tenant_selector: Some(super::super::bundles::TenantSelectorPayload {
+                tenant: "legal".to_string(),
+                team: "default".to_string(),
+            }),
+        });
+        let err = deploy(&store, &OpFlags::default(), Some(p)).unwrap_err();
+        match err {
+            OpError::InvalidArgument(msg) => assert!(
+                msg.contains("host") && msg.contains("path_prefix"),
+                "got {msg}"
+            ),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        // No partial state: validate() ran before any add/stage.
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert!(env.bundles.is_empty(), "no deployment created");
     }
 
     #[test]
