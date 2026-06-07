@@ -203,6 +203,7 @@ mod tests {
                 region: None,
                 tenant_org_id: owner.map(str::to_string),
                 listen_addr: None,
+                public_base_url: None,
             },
             packs: Vec::new(),
             credentials_ref: None,

@@ -46,6 +46,7 @@ pub use credentials::{
 };
 pub use environment::{
     DEFAULT_LISTEN_ADDR, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding,
+    validate_public_base_url,
 };
 pub use environment_runtime::{EnvironmentRuntime, RuntimeDiscoveryValue};
 pub use error::SpecError;

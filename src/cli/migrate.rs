@@ -489,6 +489,7 @@ fn seed_target_from_source(source: &Environment, target_env_id: &EnvId) -> Envir
             region: source.host_config.region.clone(),
             tenant_org_id: source.host_config.tenant_org_id.clone(),
             listen_addr: source.host_config.listen_addr,
+            public_base_url: source.host_config.public_base_url.clone(),
         },
         packs: Vec::new(),
         credentials_ref: None,

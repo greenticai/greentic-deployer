@@ -87,6 +87,13 @@ pub struct ConfigSetPayload {
     /// no clear-to-`None` flow today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<String>,
+    /// Persistent public base URL the runtime exposes (`https://host[:port]`,
+    /// origin only). Validated up front via
+    /// [`validate_public_base_url`](greentic_deploy_spec::validate_public_base_url)
+    /// before any state is touched. `None` leaves the existing value
+    /// unchanged — same semantics as `region`/`tenant_org_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<String>,
 }
 
 /// `op config set`. Mutates `host_config` fields (region, tenant_org_id,
@@ -117,6 +124,8 @@ pub fn set(
             })
         })
         .transpose()?;
+    let parsed_public_base_url =
+        super::env::parse_optional_public_base_url(&payload.public_base_url)?;
     let mut fields = Vec::new();
     if payload.name.is_some() {
         fields.push("name");
@@ -129,6 +138,9 @@ pub fn set(
     }
     if parsed_listen_addr.is_some() {
         fields.push("listen_addr");
+    }
+    if parsed_public_base_url.is_some() {
+        fields.push("public_base_url");
     }
     let ctx = AuditCtx {
         env_id: env_id.clone(),
@@ -151,6 +163,9 @@ pub fn set(
             }
             if let Some(addr) = parsed_listen_addr {
                 env.host_config.listen_addr = Some(addr);
+            }
+            if let Some(url) = parsed_public_base_url.clone() {
+                env.host_config.public_base_url = Some(url);
             }
             locked.save(&env)?;
             Ok((env.host_config.clone(), env.name.clone()))
@@ -224,7 +239,8 @@ fn set_schema() -> Value {
             "listen_addr": {
                 "type": ["string", "null"],
                 "description": "Bind address for the runtime's local HTTP listener (e.g. 127.0.0.1:8080, 0.0.0.0:9090, [::1]:8443). Parsed as SocketAddr; malformed values are rejected."
-            }
+            },
+            "public_base_url": {"type": ["string", "null"], "description": "origin-only URL (https://host[:port])"}
         }
     })
 }
@@ -297,6 +313,7 @@ mod tests {
                 region: Some("eu-west-1".to_string()),
                 tenant_org_id: Some("acme".to_string()),
                 listen_addr: None,
+                public_base_url: None,
             }),
         )
         .unwrap();
@@ -323,6 +340,7 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: Some("127.0.0.1:8080".to_string()),
+                public_base_url: None,
             }),
         )
         .unwrap();
@@ -346,6 +364,7 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: Some("0.0.0.0:9090".to_string()),
+                public_base_url: None,
             }),
         )
         .unwrap();
@@ -368,6 +387,7 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: Some("not-a-socket-addr".to_string()),
+                public_base_url: None,
             }),
         )
         .expect_err("malformed listen_addr must be rejected");
@@ -397,6 +417,7 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: Some(hostile.to_string()),
+                public_base_url: None,
             }),
         )
         .expect_err("hostile listen_addr must still be rejected");
@@ -432,6 +453,7 @@ mod tests {
             "region",
             "tenant_org_id",
             "listen_addr",
+            "public_base_url",
         ]
         .into_iter()
         .collect();
@@ -444,6 +466,20 @@ mod tests {
             Some(&json!(false)),
             "set_schema must keep additionalProperties: false; otherwise the \
              completeness check above is moot",
+        );
+    }
+
+    #[test]
+    fn config_set_schema_includes_public_base_url() {
+        let schema = set_schema();
+        let props = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("schema has properties");
+        assert!(
+            props.contains_key("public_base_url"),
+            "set_schema must advertise public_base_url; got keys: {:?}",
+            props.keys().collect::<Vec<_>>()
         );
     }
 }

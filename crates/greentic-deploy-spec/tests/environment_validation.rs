@@ -26,6 +26,7 @@ fn env(packs: Vec<EnvPackBinding>) -> Environment {
             region: None,
             tenant_org_id: None,
             listen_addr: None,
+            public_base_url: None,
         },
         packs,
         credentials_ref: None,
@@ -166,6 +167,17 @@ fn invalid_instance_id_rejected() {
     let err = e.validate().unwrap_err();
     assert!(
         matches!(err, SpecError::InvalidExtensionInstanceId { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn environment_validate_rejects_invalid_public_base_url() {
+    let mut e = env(vec![]);
+    e.host_config.public_base_url = Some("not-a-url".into());
+    let err = e.validate().unwrap_err();
+    assert!(
+        matches!(err, SpecError::InvalidPublicBaseUrl { .. }),
         "got {err:?}"
     );
 }

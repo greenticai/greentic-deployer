@@ -4,7 +4,9 @@
 //! mutating call validates the payload before touching disk.
 
 use chrono::Utc;
-use greentic_deploy_spec::{EnvId, Environment, EnvironmentHostConfig, SchemaVersion};
+use greentic_deploy_spec::{
+    EnvId, Environment, EnvironmentHostConfig, SchemaVersion, validate_public_base_url,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -36,6 +38,13 @@ pub struct EnvCreatePayload {
     /// to lock the env to a non-default bind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<String>,
+    /// Persistent public base URL the runtime exposes (e.g. via a static
+    /// tunnel or external load balancer). Validated on save: origin only —
+    /// `https://host[:port]`, no path, query, or fragment. `None` leaves
+    /// the env's URL unset, so the runtime falls back to a tunnel-discovered
+    /// or `PUBLIC_BASE_URL` env-var value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<String>,
 }
 
 /// Returned by `op env create` / `op env update`.
@@ -50,6 +59,8 @@ pub struct EnvSummary {
     /// effective resolution via `op config show` (full host_config).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<std::net::SocketAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<String>,
     pub pack_count: usize,
     pub bundle_count: usize,
     pub revision_count: usize,
@@ -63,6 +74,7 @@ impl From<&Environment> for EnvSummary {
             region: env.host_config.region.clone(),
             tenant_org_id: env.host_config.tenant_org_id.clone(),
             listen_addr: env.host_config.listen_addr,
+            public_base_url: env.host_config.public_base_url.clone(),
             pack_count: env.packs.len(),
             bundle_count: env.bundles.len(),
             revision_count: env.revisions.len(),
@@ -96,6 +108,7 @@ pub fn create(
             })
         })
         .transpose()?;
+    let parsed_public_base_url = parse_optional_public_base_url(&payload.public_base_url)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -120,6 +133,7 @@ pub fn create(
                     region: payload.region.clone(),
                     tenant_org_id: payload.tenant_org_id.clone(),
                     listen_addr: parsed_listen_addr,
+                    public_base_url: parsed_public_base_url.clone(),
                 },
                 packs: Vec::new(),
                 credentials_ref: None,
@@ -158,6 +172,7 @@ pub fn update(
     let payload = resolve_payload::<EnvCreatePayload>(flags, payload)?;
     let env_id = EnvId::try_from(payload.environment_id.as_str())
         .map_err(|e| OpError::InvalidArgument(format!("environment_id: {e}")))?;
+    let parsed_public_base_url = parse_optional_public_base_url(&payload.public_base_url)?;
     let mut fields = Vec::new();
     if payload.name != payload.environment_id {
         fields.push("name");
@@ -167,6 +182,9 @@ pub fn update(
     }
     if payload.tenant_org_id.is_some() {
         fields.push("tenant_org_id");
+    }
+    if parsed_public_base_url.is_some() {
+        fields.push("public_base_url");
     }
     let ctx = AuditCtx {
         env_id: env_id.clone(),
@@ -187,6 +205,9 @@ pub fn update(
             env.name = payload.name.clone();
             env.host_config.region = payload.region.clone();
             env.host_config.tenant_org_id = payload.tenant_org_id.clone();
+            if let Some(url) = &parsed_public_base_url {
+                env.host_config.public_base_url = Some(url.clone());
+            }
             locked.save(&env)?;
             Ok(env)
         })?;
@@ -490,12 +511,16 @@ pub fn tool_check(
 /// - `outcome` discriminator: `"created"` | `"healed"` | `"untouched"`.
 /// - `trust_root`: seeded `{operator_key_id, public_pem, trusted_key_count}`
 ///   on first init, `null` thereafter.
-pub fn init(store: &LocalFsStore, flags: &OpFlags) -> Result<OpOutcome, OpError> {
+pub fn init(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: EnvInitPayload,
+) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(
             NOUN,
             "init",
-            json!({ "input_schema": "no input" }),
+            json!({ "input_schema": "optional --public-url" }),
         ));
     }
     let env_id = EnvId::try_from(crate::defaults::LOCAL_ENV_ID).map_err(|e| {
@@ -505,15 +530,24 @@ pub fn init(store: &LocalFsStore, flags: &OpFlags) -> Result<OpOutcome, OpError>
             e
         ))
     })?;
+    // Validate the URL up-front so a malformed value is rejected before any
+    // disk state is touched. The "URL given AND env exists → reject" gate
+    // fires INSIDE `ensure_local_environment`'s per-env flock so it's both
+    // race-free and stat-free here.
+    let validated_public_base_url = parse_optional_public_base_url(&payload.public_base_url)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "init",
-        target: json!({"environment_id": env_id.as_str()}),
+        target: json!({
+            "environment_id": env_id.as_str(),
+            "public_base_url_applied": validated_public_base_url.is_some(),
+        }),
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |committed| {
-        let (env, outcome) = super::bootstrap::ensure_local_environment(store)?;
+        let (env, outcome) =
+            super::bootstrap::ensure_local_environment(store, validated_public_base_url.clone())?;
         // Env is now persisted. Mark committed so a subsequent trust-root
         // seed failure + audit-append failure still fail-closes (otherwise
         // the audit-append failure would demote to `tracing::warn!` and
@@ -528,6 +562,7 @@ pub fn init(store: &LocalFsStore, flags: &OpFlags) -> Result<OpOutcome, OpError>
             "environment_id": env.environment_id.as_str(),
             "bound_slots": bound_slots,
             "pack_count": env.packs.len(),
+            "public_base_url": env.host_config.public_base_url,
             "trust_root": trust_root,
         });
         let payload_obj = payload
@@ -636,8 +671,258 @@ pub fn env_create_payload_schema() -> Value {
             "environment_id": {"type": "string", "description": "EnvId — kebab-friendly env identifier."},
             "name": {"type": "string"},
             "region": {"type": ["string", "null"]},
-            "tenant_org_id": {"type": ["string", "null"]}
+            "tenant_org_id": {"type": ["string", "null"]},
+            "listen_addr": {"type": ["string", "null"]},
+            "public_base_url": {"type": ["string", "null"], "description": "origin-only URL (https://host[:port])"}
         }
+    })
+}
+
+/// Payload accepted by `op env init`. Init is otherwise a fixed-shape
+/// bootstrap of the canonical `local` env; the only optional input is the
+/// public URL persisted on the env's `host_config`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EnvInitPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<String>,
+}
+
+impl super::dispatch::EnvInitArgs {
+    /// Build the typed payload for [`init`]. Init takes no `--answers` /
+    /// `--schema` JSON fallback — the only input is `--public-url`. The
+    /// returned payload is the source of truth (an absent flag is `None`).
+    pub fn into_payload(self, _flags: &OpFlags) -> Result<EnvInitPayload, OpError> {
+        Ok(EnvInitPayload {
+            public_base_url: self.public_url,
+        })
+    }
+}
+
+/// Validate an optional `public_base_url` against the spec validator and wrap
+/// the spec error in `OpError::InvalidArgument` with the canonical
+/// `"public_base_url: …"` field prefix. Centralizes the format string so the
+/// 5 entry points (`env create`, `env update`, `env init`, `env set-public-url`,
+/// `config set`) report identical operator-facing errors.
+pub(super) fn parse_public_base_url(raw: &str) -> Result<String, OpError> {
+    validate_public_base_url(raw)
+        .map_err(|e| OpError::InvalidArgument(format!("public_base_url: {e}")))
+}
+
+/// Validate an `Option<String>` carrying a `public_base_url` payload field.
+/// Returns `Ok(None)` when the field was absent, the canonical form when
+/// present and valid, and `Err(OpError::InvalidArgument)` when present and
+/// invalid. The 5 entry points all share this lift to keep the
+/// `.as_deref().map(parse).transpose()` boilerplate in one place.
+pub(super) fn parse_optional_public_base_url(
+    raw: &Option<String>,
+) -> Result<Option<String>, OpError> {
+    raw.as_deref().map(parse_public_base_url).transpose()
+}
+
+// ---- Inline-args guards (env-local mirror of messaging.rs's pattern) ------
+//
+// Both `EnvCreateArgs::into_payload` and `EnvUpdateArgs::into_payload` need to
+// (a) reject `--answers` mixed with inline flags and (b) report the partial-
+// inline set that's missing required fields. The shape is identical to the
+// `messaging.rs` helpers but those are file-private; promoting them to
+// `cli::mod.rs` for cross-noun reuse is a follow-up cleanup.
+
+fn reject_inline_plus_answers(
+    has_inline: bool,
+    flags: &OpFlags,
+    verb: &'static str,
+) -> Result<(), OpError> {
+    if has_inline && flags.answers.is_some() {
+        return Err(OpError::InvalidArgument(format!(
+            "env {verb}: inline flags and --answers are mutually exclusive; use one or the other"
+        )));
+    }
+    Ok(())
+}
+
+fn partial_inline_error(verb: &'static str, missing: &[&str]) -> OpError {
+    OpError::InvalidArgument(format!(
+        "env {verb}: inline-flag form requires --environment-id and --name; missing: {}",
+        missing.join(", ")
+    ))
+}
+
+/// Helper used by both `EnvCreateArgs` and `EnvUpdateArgs`: enforce the
+/// inline-vs-answers contract and collect required-flag presence. Returns
+/// `Ok(None)` when no inline flags were supplied (caller falls through to
+/// `--answers`), or `Ok(Some((env_id, name)))` when the required pair is
+/// present.
+fn require_inline_env_id_and_name(
+    has_inline: bool,
+    env_id: Option<String>,
+    name: Option<String>,
+    verb: &'static str,
+    flags: &OpFlags,
+) -> Result<Option<(String, String)>, OpError> {
+    reject_inline_plus_answers(has_inline, flags, verb)?;
+    if !has_inline {
+        return Ok(None);
+    }
+    let mut missing: Vec<&'static str> = Vec::new();
+    if env_id.is_none() {
+        missing.push("--environment-id");
+    }
+    if name.is_none() {
+        missing.push("--name");
+    }
+    if !missing.is_empty() {
+        return Err(partial_inline_error(verb, &missing));
+    }
+    Ok(Some((
+        env_id.expect("checked above"),
+        name.expect("checked above"),
+    )))
+}
+
+impl super::dispatch::EnvCreateArgs {
+    fn has_inline_input(&self) -> bool {
+        self.environment_id.is_some()
+            || self.name.is_some()
+            || self.region.is_some()
+            || self.tenant_org_id.is_some()
+            || self.listen_addr.is_some()
+            || self.public_url.is_some()
+    }
+
+    /// Build an [`EnvCreatePayload`] from CLI flags. Returns:
+    /// - `Ok(None)` when no inline flag is set — caller falls through to
+    ///   `--answers`.
+    /// - `Err(OpError::InvalidArgument)` when SOME inline flags are set but
+    ///   required ones (`environment_id`, `name`) are missing, OR when
+    ///   inline flags AND `--answers` are both supplied (mutual exclusion).
+    /// - `Ok(Some(payload))` on the fully-specified inline path.
+    ///
+    /// `verb` is the public verb name (`"create"` / `"update"`) folded into
+    /// the error message.
+    pub fn into_payload(
+        self,
+        verb: &'static str,
+        flags: &OpFlags,
+    ) -> Result<Option<EnvCreatePayload>, OpError> {
+        let has_inline = self.has_inline_input();
+        let Some((environment_id, name)) = require_inline_env_id_and_name(
+            has_inline,
+            self.environment_id,
+            self.name,
+            verb,
+            flags,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(EnvCreatePayload {
+            environment_id,
+            name,
+            region: self.region,
+            tenant_org_id: self.tenant_org_id,
+            listen_addr: self.listen_addr,
+            public_base_url: self.public_url,
+        }))
+    }
+}
+
+impl super::dispatch::EnvUpdateArgs {
+    fn has_inline_input(&self) -> bool {
+        self.environment_id.is_some()
+            || self.name.is_some()
+            || self.region.is_some()
+            || self.tenant_org_id.is_some()
+    }
+
+    /// Build an [`EnvCreatePayload`] from CLI flags for the `update` verb.
+    /// Returns:
+    /// - `Ok(None)` when no inline flag is set — caller falls through to
+    ///   `--answers`.
+    /// - `Err(OpError::InvalidArgument)` when SOME inline flags are set but
+    ///   required ones (`environment_id`, `name`) are missing, OR when
+    ///   inline flags AND `--answers` are both supplied (mutual exclusion).
+    /// - `Ok(Some(payload))` on the fully-specified inline path.
+    ///
+    /// The produced payload always sets `listen_addr: None` and
+    /// `public_base_url: None` — those fields are not exposed on the update
+    /// verb. URL changes go through `op env set-public-url`; listen-addr
+    /// changes through `op config set --listen-addr`.
+    pub fn into_payload(
+        self,
+        verb: &'static str,
+        flags: &OpFlags,
+    ) -> Result<Option<EnvCreatePayload>, OpError> {
+        let has_inline = self.has_inline_input();
+        let Some((environment_id, name)) = require_inline_env_id_and_name(
+            has_inline,
+            self.environment_id,
+            self.name,
+            verb,
+            flags,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(EnvCreatePayload {
+            environment_id,
+            name,
+            region: self.region,
+            tenant_org_id: self.tenant_org_id,
+            listen_addr: None,
+            public_base_url: None,
+        }))
+    }
+}
+
+/// `op env set-public-url <env_id> <URL>`. Dedicated verb that ONLY mutates
+/// `host_config.public_base_url`; safer to expose than `op config set`
+/// (which can update name/region/tenant-org/listen-addr in the same call)
+/// when callers just want to point the env at a different origin.
+pub fn set_public_url(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    env_id: &str,
+    url: &str,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(
+            NOUN,
+            "set-public-url",
+            json!({ "input_schema": "<env_id> <url> positional" }),
+        ));
+    }
+    let env_id =
+        EnvId::try_from(env_id).map_err(|e| OpError::InvalidArgument(format!("env_id: {e}")))?;
+    let validated = parse_public_base_url(url)?;
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "set-public-url",
+        target: json!({"environment_id": env_id.as_str()}),
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, |_committed| {
+        let host_config = store.transact(&env_id, |locked| -> Result<_, OpError> {
+            let mut env = match locked.load() {
+                Ok(env) => env,
+                Err(crate::environment::StoreError::NotFound(id)) => {
+                    return Err(OpError::NotFound(format!("environment `{id}`")));
+                }
+                Err(e) => return Err(e.into()),
+            };
+            env.host_config.public_base_url = Some(validated.clone());
+            locked.save(&env)?;
+            Ok(env.host_config.clone())
+        })?;
+        let outcome = OpOutcome::new(
+            NOUN,
+            "set-public-url",
+            json!({
+                "environment_id": env_id.as_str(),
+                "host_config": host_config,
+            }),
+        );
+        Ok((outcome, super::AuditGens::NONE))
     })
 }
 
@@ -662,6 +947,7 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: None,
+                public_base_url: None,
             }),
         )
         .unwrap();
@@ -691,6 +977,7 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: None,
+                public_base_url: None,
             }),
         )
         .unwrap_err();
@@ -712,6 +999,7 @@ mod tests {
                 region: Some("eu-west-1".to_string()),
                 tenant_org_id: None,
                 listen_addr: None,
+                public_base_url: None,
             }),
         )
         .unwrap();
@@ -738,6 +1026,7 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: Some("0.0.0.0:9090".to_string()),
+                public_base_url: None,
             }),
         )
         .unwrap();
@@ -768,6 +1057,7 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: Some("not-a-socket-addr".to_string()),
+                public_base_url: None,
             }),
         )
         .expect_err("malformed listen_addr must be rejected");
@@ -793,6 +1083,7 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: None,
+                public_base_url: None,
             }),
         )
         .unwrap();
@@ -822,6 +1113,7 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: None,
+                public_base_url: None,
             }),
         )
         .unwrap_err();
@@ -852,7 +1144,7 @@ mod tests {
     fn init_creates_local_env_when_missing() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
-        let outcome = init(&store, &OpFlags::default()).unwrap();
+        let outcome = init(&store, &OpFlags::default(), EnvInitPayload::default()).unwrap();
         assert_eq!(outcome.op, "init");
         assert_eq!(outcome.noun, "env");
         assert_eq!(
@@ -889,7 +1181,7 @@ mod tests {
         }];
         store.save(&env).unwrap();
 
-        let outcome = init(&store, &OpFlags::default()).unwrap();
+        let outcome = init(&store, &OpFlags::default(), EnvInitPayload::default()).unwrap();
         assert_eq!(
             outcome.result.get("outcome").and_then(|v| v.as_str()),
             Some("healed")
@@ -915,8 +1207,8 @@ mod tests {
     fn init_is_idempotent_and_reports_untouched_on_second_call() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
-        init(&store, &OpFlags::default()).unwrap();
-        let outcome = init(&store, &OpFlags::default()).unwrap();
+        init(&store, &OpFlags::default(), EnvInitPayload::default()).unwrap();
+        let outcome = init(&store, &OpFlags::default(), EnvInitPayload::default()).unwrap();
         assert_eq!(
             outcome.result.get("outcome").and_then(|v| v.as_str()),
             Some("untouched")
@@ -932,7 +1224,7 @@ mod tests {
         // a nested `trust_root` key (non-null on FIRST init only).
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
-        let outcome = init(&store, &OpFlags::default()).unwrap();
+        let outcome = init(&store, &OpFlags::default(), EnvInitPayload::default()).unwrap();
         let trust_root = outcome
             .result
             .get("trust_root")
@@ -977,12 +1269,12 @@ mod tests {
         // already-seeded key alone — no duplicate entry, no replace.
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
-        let first = init(&store, &OpFlags::default()).unwrap();
+        let first = init(&store, &OpFlags::default(), EnvInitPayload::default()).unwrap();
         let first_key_id = first.result["trust_root"]["operator_key_id"]
             .as_str()
             .expect("first init seeded a key")
             .to_string();
-        let second = init(&store, &OpFlags::default()).unwrap();
+        let second = init(&store, &OpFlags::default(), EnvInitPayload::default()).unwrap();
         // `is_some_and(is_null)` distinguishes "key present, null value"
         // from "key absent" — bare `.is_null()` on indexed Value returns
         // true for both, masking a future serde change that drops the key.
@@ -1013,7 +1305,7 @@ mod tests {
         let store = LocalFsStore::new(dir.path());
 
         // First init seeds the operator key.
-        let first = init(&store, &OpFlags::default()).unwrap();
+        let first = init(&store, &OpFlags::default(), EnvInitPayload::default()).unwrap();
         let key_id = first.result["trust_root"]["operator_key_id"]
             .as_str()
             .expect("first init seeded a key")
@@ -1038,7 +1330,7 @@ mod tests {
 
         // Second init MUST NOT re-seed. Use the key-present-and-null check
         // so a future serde regression that drops the field is also caught.
-        let second = init(&store, &OpFlags::default()).unwrap();
+        let second = init(&store, &OpFlags::default(), EnvInitPayload::default()).unwrap();
         let tr = second
             .result
             .as_object()
@@ -1369,6 +1661,7 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: None,
+                public_base_url: None,
             }),
         )
         .unwrap_err();
@@ -1414,6 +1707,7 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: None,
+                public_base_url: None,
             }),
         )
         .unwrap();
@@ -1427,5 +1721,356 @@ mod tests {
             crate::environment::AuditDecision::Allow { .. }
         );
         matches!(event.result, crate::environment::AuditResult::Ok);
+    }
+
+    // ---- Change C: env public_url + auto-setWebhook ------------------------
+
+    use super::super::dispatch::{EnvCreateArgs, EnvInitArgs, EnvUpdateArgs};
+
+    fn args_with_url(url: &str) -> EnvCreateArgs {
+        EnvCreateArgs {
+            environment_id: Some("local".into()),
+            name: Some("local".into()),
+            region: None,
+            tenant_org_id: None,
+            listen_addr: None,
+            public_url: Some(url.into()),
+        }
+    }
+
+    #[test]
+    fn env_create_args_into_payload_returns_none_when_no_inline_flags() {
+        // `--answers` path: no inline flag → caller delegates to --answers.
+        let args = EnvCreateArgs {
+            environment_id: None,
+            name: None,
+            region: None,
+            tenant_org_id: None,
+            listen_addr: None,
+            public_url: None,
+        };
+        assert!(
+            args.into_payload("create", &OpFlags::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn env_create_args_into_payload_with_public_url_round_trips() {
+        let p = args_with_url("https://chat.example.com")
+            .into_payload("create", &OpFlags::default())
+            .unwrap()
+            .expect("inline path");
+        assert_eq!(p.environment_id, "local");
+        assert_eq!(
+            p.public_base_url.as_deref(),
+            Some("https://chat.example.com")
+        );
+    }
+
+    #[test]
+    fn env_create_args_partial_inline_is_rejected_not_silent_fall_through() {
+        // Codex-finding regression guard (same shape as the messaging.endpoint
+        // verbs): SOME inline flags + missing required ones MUST error out
+        // explicitly — never silently drop back to `--answers` which could
+        // mutate the wrong env.
+        let args = EnvCreateArgs {
+            environment_id: None, // missing required
+            name: Some("local".into()),
+            region: None,
+            tenant_org_id: None,
+            listen_addr: None,
+            public_url: Some("https://chat.example.com".into()),
+        };
+        let err = args
+            .into_payload("create", &OpFlags::default())
+            .expect_err("should reject");
+        assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn env_create_args_inline_plus_answers_rejected() {
+        // Mutual exclusion: inline flags + --answers together is ambiguous and
+        // rejected at the converter (Change B precedent).
+        let flags = OpFlags {
+            answers: Some(std::path::PathBuf::from("/tmp/x.json")),
+            ..Default::default()
+        };
+        let err = args_with_url("https://chat.example.com")
+            .into_payload("create", &flags)
+            .expect_err("should reject");
+        assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn env_create_with_public_url_persists_and_validates() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        create(
+            &store,
+            &OpFlags::default(),
+            Some(EnvCreatePayload {
+                environment_id: "local".to_string(),
+                name: "local".to_string(),
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+                public_base_url: Some("https://chat.example.com".to_string()),
+            }),
+        )
+        .unwrap();
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert_eq!(
+            env.host_config.public_base_url.as_deref(),
+            Some("https://chat.example.com")
+        );
+    }
+
+    #[test]
+    fn env_create_rejects_invalid_public_url_before_touching_disk() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let err = create(
+            &store,
+            &OpFlags::default(),
+            Some(EnvCreatePayload {
+                environment_id: "local".to_string(),
+                name: "local".to_string(),
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+                public_base_url: Some("https://chat.example.com/path?x=1".to_string()),
+            }),
+        )
+        .expect_err("invalid URL must fail");
+        assert!(matches!(err, OpError::InvalidArgument(_)));
+        // No env was written.
+        assert!(!store.exists(&EnvId::try_from("local").unwrap()).unwrap());
+    }
+
+    #[test]
+    fn env_init_with_public_url_sets_field_on_creation() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let args = EnvInitArgs {
+            public_url: Some("https://demo.greentic.ai".into()),
+        };
+        let payload = args.into_payload(&OpFlags::default()).unwrap();
+        init(&store, &OpFlags::default(), payload).unwrap();
+        let env = store
+            .load(&EnvId::try_from(crate::defaults::LOCAL_ENV_ID).unwrap())
+            .unwrap();
+        assert_eq!(
+            env.host_config.public_base_url.as_deref(),
+            Some("https://demo.greentic.ai")
+        );
+    }
+
+    #[test]
+    fn env_init_rejects_public_url_when_env_already_exists() {
+        // init with --public-url on an existing env must error out. The URL is
+        // only applied on creation; overwriting requires `op env set-public-url`.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        init(
+            &store,
+            &OpFlags::default(),
+            EnvInitPayload {
+                public_base_url: Some("https://first.example.com".into()),
+            },
+        )
+        .unwrap();
+        let err = init(
+            &store,
+            &OpFlags::default(),
+            EnvInitPayload {
+                public_base_url: Some("https://second.example.com".into()),
+            },
+        )
+        .expect_err("second init with --public-url must error");
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        // First env's URL unchanged.
+        let env = store
+            .load(&EnvId::try_from(crate::defaults::LOCAL_ENV_ID).unwrap())
+            .unwrap();
+        assert_eq!(
+            env.host_config.public_base_url.as_deref(),
+            Some("https://first.example.com"),
+            "existing URL must be preserved"
+        );
+    }
+
+    #[test]
+    fn env_init_without_public_url_stays_idempotent_on_existing_env() {
+        // init WITHOUT --public-url on an existing env must remain the silent
+        // no-op/heal bootstrap it always was.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        init(
+            &store,
+            &OpFlags::default(),
+            EnvInitPayload {
+                public_base_url: Some("https://first.example.com".into()),
+            },
+        )
+        .unwrap();
+        let outcome = init(&store, &OpFlags::default(), EnvInitPayload::default()).unwrap();
+        assert_eq!(
+            outcome.result.get("outcome").and_then(|v| v.as_str()),
+            Some("untouched")
+        );
+    }
+
+    #[test]
+    fn env_init_includes_persisted_public_url_in_outcome() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let outcome = init(
+            &store,
+            &OpFlags::default(),
+            EnvInitPayload {
+                public_base_url: Some("https://demo.greentic.ai".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            outcome
+                .result
+                .get("public_base_url")
+                .and_then(|v| v.as_str()),
+            Some("https://demo.greentic.ai"),
+            "outcome must surface the persisted public_base_url"
+        );
+    }
+
+    #[test]
+    fn env_init_rejects_invalid_public_url_up_front() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let err = init(
+            &store,
+            &OpFlags::default(),
+            EnvInitPayload {
+                public_base_url: Some("ftp://nope.example.com".into()),
+            },
+        )
+        .expect_err("non-http scheme must fail");
+        assert!(matches!(err, OpError::InvalidArgument(_)));
+        // No env was written.
+        assert!(
+            !store
+                .exists(&EnvId::try_from(crate::defaults::LOCAL_ENV_ID).unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn set_public_url_updates_existing_env() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        set_public_url(
+            &store,
+            &OpFlags::default(),
+            "local",
+            "https://chat.example.com",
+        )
+        .unwrap();
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert_eq!(
+            env.host_config.public_base_url.as_deref(),
+            Some("https://chat.example.com")
+        );
+    }
+
+    #[test]
+    fn set_public_url_strips_trailing_slash() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        set_public_url(
+            &store,
+            &OpFlags::default(),
+            "local",
+            "https://chat.example.com/",
+        )
+        .unwrap();
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        // Trailing slash normalized away — runtime precedence matching is
+        // origin-equality so the canonical form must drop the `/`.
+        assert_eq!(
+            env.host_config.public_base_url.as_deref(),
+            Some("https://chat.example.com")
+        );
+    }
+
+    #[test]
+    fn set_public_url_rejects_invalid_origin() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let err = set_public_url(
+            &store,
+            &OpFlags::default(),
+            "local",
+            "https://chat.example.com/path",
+        )
+        .expect_err("path-bearing URL must fail");
+        assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn set_public_url_unknown_env_errors_and_no_state_written() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let err = set_public_url(
+            &store,
+            &OpFlags::default(),
+            "missing",
+            "https://chat.example.com",
+        )
+        .expect_err("missing env must fail");
+        // Exact `OpError` variant depends on `audit_and_record` plumbing —
+        // tighten to NotFound once the audit wrapper stops eagerly wrapping
+        // store errors. For now assert no env file was written by the verb.
+        let _ = err;
+        assert!(!store.exists(&EnvId::try_from("missing").unwrap()).unwrap());
+    }
+
+    // ---- Fix 1: EnvUpdateArgs does not expose --public-url or --listen-addr ----
+
+    #[test]
+    fn env_update_args_does_not_expose_public_url_inline() {
+        // Even when reached via --answers JSON (the legacy contract), the
+        // produced payload carries public_base_url: None.
+        let args = EnvUpdateArgs {
+            environment_id: Some("local".into()),
+            name: Some("local".into()),
+            region: Some("eu-west-1".into()),
+            tenant_org_id: None,
+        };
+        let payload = args
+            .into_payload("update", &OpFlags::default())
+            .unwrap()
+            .expect("inline path");
+        assert_eq!(payload.public_base_url, None);
+        assert_eq!(payload.listen_addr, None);
+        assert_eq!(payload.region.as_deref(), Some("eu-west-1"));
+    }
+
+    #[test]
+    fn env_update_args_rejects_partial_inline() {
+        // SOME inline flags + missing required → error, never silent --answers fallthrough.
+        let args = EnvUpdateArgs {
+            environment_id: None, // missing required
+            name: Some("local".into()),
+            region: None,
+            tenant_org_id: None,
+        };
+        let err = args
+            .into_payload("update", &OpFlags::default())
+            .expect_err("should reject");
+        assert!(matches!(err, OpError::InvalidArgument(_)));
     }
 }

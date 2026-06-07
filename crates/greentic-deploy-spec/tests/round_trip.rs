@@ -27,6 +27,7 @@ fn sample_environment() -> Environment {
             region: Some("local".into()),
             tenant_org_id: None,
             listen_addr: None,
+            public_base_url: None,
         },
         packs: vec![EnvPackBinding {
             slot: CapabilitySlot::Deployer,

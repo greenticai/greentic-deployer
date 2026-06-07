@@ -31,6 +31,7 @@ fn audit_log_records_distinct_verbs_in_order() {
             region: None,
             tenant_org_id: None,
             listen_addr: None,
+            public_base_url: None,
         }),
     )
     .unwrap();
@@ -103,6 +104,7 @@ fn non_local_env_create_denies_and_audits() {
             region: None,
             tenant_org_id: None,
             listen_addr: None,
+            public_base_url: None,
         }),
     )
     .unwrap_err();
@@ -146,6 +148,7 @@ fn non_local_env_create_denies_and_audits() {
             region: None,
             tenant_org_id: None,
             listen_addr: None,
+            public_base_url: None,
         }),
     );
     let events = read_events(dir.path(), "prod");
@@ -167,6 +170,7 @@ fn env_packs_update_audit_records_generation_transition() {
             region: None,
             tenant_org_id: None,
             listen_addr: None,
+            public_base_url: None,
         }),
     )
     .unwrap();
@@ -235,6 +239,7 @@ fn committed_mutation_with_unwritable_audit_dir_fails_closed() {
             region: None,
             tenant_org_id: None,
             listen_addr: None,
+            public_base_url: None,
         }),
     )
     .unwrap_err();
@@ -269,6 +274,7 @@ fn denied_mutation_with_unwritable_audit_dir_still_returns_unauthorized() {
             region: None,
             tenant_org_id: None,
             listen_addr: None,
+            public_base_url: None,
         }),
     )
     .unwrap_err();
