@@ -175,4 +175,7 @@ pub enum SpecError {
         deployment: DeploymentId,
         pack_id: String,
     },
+
+    #[error("public_base_url `{value}` is invalid: {reason}")]
+    InvalidPublicBaseUrl { value: String, reason: &'static str },
 }

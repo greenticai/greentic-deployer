@@ -46,6 +46,14 @@ pub struct EnvironmentHostConfig {
     /// concrete name and precedence; this crate stays implementation-agnostic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<SocketAddr>,
+    /// Persistent public base URL the runtime exposes (e.g. via a static
+    /// tunnel or load balancer). Stored as origin only — `https://host[:port]`,
+    /// no path, no query, no fragment. Validated on save via
+    /// [`validate_public_base_url`]. Runtime precedence (env var override vs.
+    /// tunnel-discovered vs. persisted) is `greentic-start`'s concern; this
+    /// crate persists the configured value only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<String>,
 }
 
 impl EnvironmentHostConfig {
@@ -56,6 +64,60 @@ impl EnvironmentHostConfig {
     pub fn resolved_listen_addr(&self) -> SocketAddr {
         self.listen_addr.unwrap_or(DEFAULT_LISTEN_ADDR)
     }
+}
+
+/// Normalize and validate a candidate `public_base_url`. Returns the canonical
+/// form (trimmed, trailing `/` removed) on success. Rules mirror
+/// `greentic-start::startup_contract::normalize_public_base_url` so a value
+/// accepted here passes the runtime's gate without reformatting.
+///
+/// - Scheme MUST be `http://` or `https://`.
+/// - MUST include a host.
+/// - MUST NOT contain whitespace.
+/// - MUST NOT include a query string (`?...`).
+/// - MUST NOT include a fragment (`#...`).
+/// - Path MUST be empty or exactly `/`.
+pub fn validate_public_base_url(value: &str) -> Result<String, crate::error::SpecError> {
+    let trimmed = value.trim();
+    let invalid = |reason: &'static str| crate::error::SpecError::InvalidPublicBaseUrl {
+        value: trimmed.to_string(),
+        reason,
+    };
+    if trimmed.is_empty() {
+        return Err(invalid("must not be empty"));
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(invalid("must not contain whitespace"));
+    }
+    if trimmed.contains('#') {
+        return Err(invalid("must not include a fragment"));
+    }
+    let rest = if let Some(rest) = trimmed.strip_prefix("https://") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        rest
+    } else {
+        return Err(invalid("must start with http:// or https://"));
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, ""),
+    };
+    if authority.is_empty() {
+        return Err(invalid("must include a host"));
+    }
+    if authority.contains('?') {
+        return Err(invalid("must not include a query string"));
+    }
+    if !path.is_empty() {
+        if path.contains('?') {
+            return Err(invalid("must not include a query string"));
+        }
+        if path != "/" {
+            return Err(invalid("must be an origin without a path"));
+        }
+    }
+    Ok(trimmed.trim_end_matches('/').to_string())
 }
 
 /// Binding from a [`CapabilitySlot`] to a concrete pack (`§5.1`).
@@ -419,5 +481,88 @@ impl Environment {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod public_base_url_tests {
+    use super::validate_public_base_url;
+
+    #[test]
+    fn accepts_https_origin() {
+        assert_eq!(
+            validate_public_base_url("https://chat.example.com").unwrap(),
+            "https://chat.example.com"
+        );
+    }
+
+    #[test]
+    fn accepts_http_origin() {
+        assert_eq!(
+            validate_public_base_url("http://localhost:8080").unwrap(),
+            "http://localhost:8080"
+        );
+    }
+
+    #[test]
+    fn trims_trailing_slash() {
+        // Match `greentic-start::startup_contract::normalize_public_base_url`
+        // so a value persisted here passes the runtime's gate unchanged.
+        assert_eq!(
+            validate_public_base_url("https://chat.example.com/").unwrap(),
+            "https://chat.example.com"
+        );
+    }
+
+    #[test]
+    fn rejects_path() {
+        let err = validate_public_base_url("https://chat.example.com/api").unwrap_err();
+        assert!(matches!(err, crate::SpecError::InvalidPublicBaseUrl { .. }));
+    }
+
+    #[test]
+    fn rejects_query() {
+        let err = validate_public_base_url("https://chat.example.com?x=1").unwrap_err();
+        assert!(matches!(err, crate::SpecError::InvalidPublicBaseUrl { .. }));
+    }
+
+    #[test]
+    fn rejects_fragment() {
+        let err = validate_public_base_url("https://chat.example.com#frag").unwrap_err();
+        assert!(matches!(err, crate::SpecError::InvalidPublicBaseUrl { .. }));
+    }
+
+    #[test]
+    fn rejects_non_http_scheme() {
+        let err = validate_public_base_url("ftp://chat.example.com").unwrap_err();
+        assert!(matches!(err, crate::SpecError::InvalidPublicBaseUrl { .. }));
+    }
+
+    #[test]
+    fn rejects_missing_scheme() {
+        let err = validate_public_base_url("chat.example.com").unwrap_err();
+        assert!(matches!(err, crate::SpecError::InvalidPublicBaseUrl { .. }));
+    }
+
+    #[test]
+    fn rejects_empty_host() {
+        let err = validate_public_base_url("https:///path").unwrap_err();
+        assert!(matches!(err, crate::SpecError::InvalidPublicBaseUrl { .. }));
+    }
+
+    #[test]
+    fn rejects_whitespace() {
+        let err = validate_public_base_url("https://chat .example.com").unwrap_err();
+        assert!(matches!(err, crate::SpecError::InvalidPublicBaseUrl { .. }));
+    }
+
+    #[test]
+    fn trims_surrounding_whitespace_before_validation() {
+        // Mirrors `normalize_public_base_url`: trim outer whitespace, reject
+        // inner whitespace.
+        assert_eq!(
+            validate_public_base_url("  https://chat.example.com  ").unwrap(),
+            "https://chat.example.com"
+        );
     }
 }

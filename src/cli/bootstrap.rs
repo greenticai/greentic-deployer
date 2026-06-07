@@ -37,11 +37,20 @@ pub enum LocalEnvOutcome {
 /// without checking first. Returns `(Environment, LocalEnvOutcome)` so
 /// consumers can log a one-line note on creation and stay silent otherwise.
 ///
+/// `public_base_url`: when `Some`, persisted on the env's `host_config` ONLY
+/// during creation (so a `Created` outcome carries it). For `AlreadyExists`
+/// and `Healed` outcomes the existing URL is preserved — use
+/// `op env set-public-url` (or `op config set --public-url`) to overwrite it.
+/// The value is NOT validated here; callers (the `op env init` dispatcher)
+/// must run [`greentic_deploy_spec::validate_public_base_url`] before passing
+/// it in.
+///
 /// The entire read-modify-write runs inside [`LocalFsStore::transact`], so
 /// concurrent first-run invocations on the same host serialize on the per-env
 /// flock and produce a single env.
 pub fn ensure_local_environment(
     store: &LocalFsStore,
+    public_base_url: Option<String>,
 ) -> Result<(Environment, LocalEnvOutcome), OpError> {
     let env_id = EnvId::try_from(LOCAL_ENV_ID).map_err(|e| {
         OpError::InvalidArgument(format!("default env id `{}`: {}", LOCAL_ENV_ID, e))
@@ -69,6 +78,7 @@ pub fn ensure_local_environment(
                     region: None,
                     tenant_org_id: None,
                     listen_addr: Some(DEFAULT_LISTEN_ADDR),
+                    public_base_url: public_base_url.clone(),
                 },
                 packs,
                 credentials_ref: None,
@@ -128,7 +138,7 @@ mod tests {
     #[test]
     fn creates_local_env_when_missing() {
         let (_tmp, store) = store();
-        let (env, outcome) = ensure_local_environment(&store).expect("bootstrap");
+        let (env, outcome) = ensure_local_environment(&store, None).expect("bootstrap");
         assert_eq!(outcome, LocalEnvOutcome::Created);
         assert_eq!(env.environment_id.as_str(), LOCAL_ENV_ID);
         assert_eq!(env.name, LOCAL_ENV_ID);
@@ -139,9 +149,11 @@ mod tests {
     #[test]
     fn returns_existing_env_on_second_call() {
         let (_tmp, store) = store();
-        let (first, first_outcome) = ensure_local_environment(&store).expect("first bootstrap");
+        let (first, first_outcome) =
+            ensure_local_environment(&store, None).expect("first bootstrap");
         assert_eq!(first_outcome, LocalEnvOutcome::Created);
-        let (second, second_outcome) = ensure_local_environment(&store).expect("second bootstrap");
+        let (second, second_outcome) =
+            ensure_local_environment(&store, None).expect("second bootstrap");
         assert_eq!(second_outcome, LocalEnvOutcome::AlreadyExists);
         assert_eq!(first, second);
     }
@@ -149,7 +161,7 @@ mod tests {
     #[test]
     fn default_bindings_cover_expected_slots_and_descriptors() {
         let (_tmp, store) = store();
-        let (env, _) = ensure_local_environment(&store).expect("bootstrap");
+        let (env, _) = ensure_local_environment(&store, None).expect("bootstrap");
         let by_slot: std::collections::BTreeMap<CapabilitySlot, &str> = env
             .packs
             .iter()
@@ -181,7 +193,7 @@ mod tests {
     #[test]
     fn bootstrap_env_has_no_bundles_or_revisions_or_splits() {
         let (_tmp, store) = store();
-        let (env, _) = ensure_local_environment(&store).expect("bootstrap");
+        let (env, _) = ensure_local_environment(&store, None).expect("bootstrap");
         assert!(env.bundles.is_empty());
         assert!(env.revisions.is_empty());
         assert!(env.traffic_splits.is_empty());
@@ -191,7 +203,7 @@ mod tests {
     #[test]
     fn bootstrap_env_host_config_has_no_region_or_org() {
         let (_tmp, store) = store();
-        let (env, _) = ensure_local_environment(&store).expect("bootstrap");
+        let (env, _) = ensure_local_environment(&store, None).expect("bootstrap");
         assert_eq!(env.host_config.env_id, env.environment_id);
         assert!(env.host_config.region.is_none());
         assert!(env.host_config.tenant_org_id.is_none());
@@ -200,7 +212,7 @@ mod tests {
     #[test]
     fn bootstrap_env_writes_default_listen_addr_so_start_can_resolve_it() {
         let (_tmp, store) = store();
-        let (env, outcome) = ensure_local_environment(&store).expect("bootstrap");
+        let (env, outcome) = ensure_local_environment(&store, None).expect("bootstrap");
         assert_eq!(outcome, LocalEnvOutcome::Created);
         assert_eq!(
             env.host_config.listen_addr,
@@ -216,11 +228,11 @@ mod tests {
         use crate::environment::EnvironmentStore;
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let (_tmp, store) = store();
-        let (mut env, _) = ensure_local_environment(&store).expect("bootstrap");
+        let (mut env, _) = ensure_local_environment(&store, None).expect("bootstrap");
         let custom = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 9090);
         env.host_config.listen_addr = Some(custom);
         store.save(&env).expect("user save");
-        let (reloaded, outcome) = ensure_local_environment(&store).expect("second bootstrap");
+        let (reloaded, outcome) = ensure_local_environment(&store, None).expect("second bootstrap");
         assert_eq!(outcome, LocalEnvOutcome::AlreadyExists);
         assert_eq!(
             reloaded.host_config.listen_addr,
@@ -233,11 +245,11 @@ mod tests {
     fn second_call_does_not_overwrite_user_mutations() {
         use crate::environment::EnvironmentStore;
         let (_tmp, store) = store();
-        let (mut env, _) = ensure_local_environment(&store).expect("bootstrap");
+        let (mut env, _) = ensure_local_environment(&store, None).expect("bootstrap");
         env.name = "user-renamed".to_string();
         env.host_config.region = Some("eu-west-1".to_string());
         store.save(&env).expect("user save");
-        let (reloaded, outcome) = ensure_local_environment(&store).expect("second bootstrap");
+        let (reloaded, outcome) = ensure_local_environment(&store, None).expect("second bootstrap");
         assert_eq!(outcome, LocalEnvOutcome::AlreadyExists);
         assert_eq!(reloaded.name, "user-renamed");
         assert_eq!(reloaded.host_config.region.as_deref(), Some("eu-west-1"));
@@ -261,6 +273,7 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: None,
+                public_base_url: None,
             },
             packs: Vec::new(),
             credentials_ref: None,
@@ -292,7 +305,7 @@ mod tests {
     fn heals_existing_env_with_no_packs() {
         let (_tmp, store) = store();
         seed_empty_local_env(&store);
-        let (env, outcome) = ensure_local_environment(&store).expect("bootstrap heal");
+        let (env, outcome) = ensure_local_environment(&store, None).expect("bootstrap heal");
         match outcome {
             LocalEnvOutcome::Healed { added_slots } => {
                 assert_eq!(
@@ -312,7 +325,7 @@ mod tests {
         assert_eq!(env.packs.len(), 5);
         env.validate().expect("env is spec-valid after heal");
         // Persisted: second call sees a fully-bound env and reports AlreadyExists.
-        let (_again, outcome2) = ensure_local_environment(&store).expect("second bootstrap");
+        let (_again, outcome2) = ensure_local_environment(&store, None).expect("second bootstrap");
         assert_eq!(outcome2, LocalEnvOutcome::AlreadyExists);
     }
 
@@ -327,7 +340,7 @@ mod tests {
         ));
         store.save(&env).expect("partial save");
 
-        let (env, outcome) = ensure_local_environment(&store).expect("bootstrap heal");
+        let (env, outcome) = ensure_local_environment(&store, None).expect("bootstrap heal");
         match outcome {
             LocalEnvOutcome::Healed { added_slots } => {
                 assert_eq!(
@@ -358,7 +371,7 @@ mod tests {
             .push(custom_binding(CapabilitySlot::Secrets, custom_secrets));
         store.save(&env).expect("custom-secrets save");
 
-        let (env, outcome) = ensure_local_environment(&store).expect("bootstrap heal");
+        let (env, outcome) = ensure_local_environment(&store, None).expect("bootstrap heal");
         match outcome {
             LocalEnvOutcome::Healed { added_slots } => {
                 assert_eq!(
@@ -392,8 +405,8 @@ mod tests {
         let (_tmp, store) = store();
         // First call creates the env with all 5 defaults; second call must NOT
         // report any healing — env is already in the required shape.
-        ensure_local_environment(&store).expect("first bootstrap");
-        let (_env, outcome) = ensure_local_environment(&store).expect("second bootstrap");
+        ensure_local_environment(&store, None).expect("first bootstrap");
+        let (_env, outcome) = ensure_local_environment(&store, None).expect("second bootstrap");
         assert_eq!(outcome, LocalEnvOutcome::AlreadyExists);
     }
 }

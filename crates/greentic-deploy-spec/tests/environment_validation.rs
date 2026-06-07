@@ -26,6 +26,7 @@ fn env(packs: Vec<EnvPackBinding>) -> Environment {
             region: None,
             tenant_org_id: None,
             listen_addr: None,
+            public_base_url: None,
         },
         packs,
         credentials_ref: None,

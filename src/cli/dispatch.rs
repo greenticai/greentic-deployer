@@ -276,9 +276,14 @@ pub enum EnvVerb {
     /// if missing, fills in any missing default bindings on an existing env,
     /// or reports `untouched` if the env is already complete. User-bound
     /// non-default descriptors are NEVER overwritten.
-    Init,
-    Create,
-    Update,
+    Init(EnvInitArgs),
+    Create(EnvCreateArgs),
+    Update(EnvCreateArgs),
+    /// `op env set-public-url <env_id> <URL>`. Replaces the env's persisted
+    /// `host_config.public_base_url`. Equivalent to
+    /// `op config set --public-url <URL>` but easier to discover for the
+    /// common "I set the URL once and forget it" path.
+    SetPublicUrl(EnvSetPublicUrlArgs),
     List,
     Show {
         env_id: String,
@@ -355,6 +360,66 @@ pub struct TrustRootAddArgs {
     pub public_key_pem: Option<String>,
     #[arg(long = "public-key-file")]
     pub public_key_file: Option<PathBuf>,
+}
+
+/// Args for `op env init`. Only `--public-url` is settable inline;
+/// init is otherwise an idempotent bootstrap of the canonical `local` env.
+/// If the env already exists, an inline `--public-url` is NOT applied —
+/// use `op env set-public-url` (or `op config set --public-url`) to mutate
+/// an existing env's URL.
+#[derive(Args, Debug)]
+pub struct EnvInitArgs {
+    /// Persistent public base URL the runtime exposes
+    /// (`https://host[:port]`, origin only). Stored in
+    /// `Environment.host_config.public_base_url`. Only takes effect when
+    /// `init` actually creates the env; on `untouched` / `healed` outcomes
+    /// the existing URL is preserved.
+    #[arg(long = "public-url")]
+    pub public_url: Option<String>,
+}
+
+/// Args for `op env create` and `op env update`. All fields are optional
+/// at the clap layer so `--answers` / `--schema` keep working unchanged;
+/// the dispatcher builds an `EnvCreatePayload` only when the required
+/// inline flags are supplied, otherwise hands `None` to the library
+/// function (`resolve_payload` then defers to `--answers`).
+#[derive(Args, Debug)]
+pub struct EnvCreateArgs {
+    /// Environment id (e.g. `local`, `prod-eu`).
+    pub environment_id: Option<String>,
+    /// Display name. Defaults to `--environment-id` if omitted on the CLI
+    /// path; required on the JSON path. Pass either positionally below or
+    /// via `--name`.
+    #[arg(long = "name")]
+    pub name: Option<String>,
+    /// Optional region tag (free-form).
+    #[arg(long = "region")]
+    pub region: Option<String>,
+    /// Tenant organization id this env belongs to.
+    #[arg(long = "tenant-org")]
+    pub tenant_org_id: Option<String>,
+    /// Bind address for the runtime's local HTTP listener (e.g.
+    /// `127.0.0.1:8080`). Validated as `SocketAddr` before any state is
+    /// touched.
+    #[arg(long = "listen-addr")]
+    pub listen_addr: Option<String>,
+    /// Persistent public base URL the runtime exposes
+    /// (`https://host[:port]`, origin only).
+    #[arg(long = "public-url")]
+    pub public_url: Option<String>,
+}
+
+/// Args for `op env set-public-url <env_id> <URL>`. Both fields are
+/// required positional — this verb only sets the public URL, no other
+/// host_config fields. `--answers` is rejected: this is a dedicated
+/// single-purpose verb, not an `op config set` alias.
+#[derive(Args, Debug)]
+pub struct EnvSetPublicUrlArgs {
+    /// Environment id (e.g. `local`).
+    pub env_id: String,
+    /// Public base URL the runtime exposes (`https://host[:port]`, origin
+    /// only — no path, query, or fragment).
+    pub url: String,
 }
 
 #[derive(Args, Debug)]
@@ -626,9 +691,10 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
         OpNoun::Env { verb } => (
             "env",
             match verb {
-                EnvVerb::Init => "init",
-                EnvVerb::Create => "create",
-                EnvVerb::Update => "update",
+                EnvVerb::Init(_) => "init",
+                EnvVerb::Create(_) => "create",
+                EnvVerb::Update(_) => "update",
+                EnvVerb::SetPublicUrl(_) => "set-public-url",
                 EnvVerb::List => "list",
                 EnvVerb::Show { .. } => "show",
                 EnvVerb::Doctor { .. } => "doctor",
@@ -739,9 +805,16 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
 
 fn dispatch_env(store: &LocalFsStore, flags: &OpFlags, verb: EnvVerb) -> Result<(), OpError> {
     let outcome = match verb {
-        EnvVerb::Init => super::env::init(store, flags)?,
-        EnvVerb::Create => super::env::create(store, flags, None)?,
-        EnvVerb::Update => super::env::update(store, flags, None)?,
+        EnvVerb::Init(args) => super::env::init(store, flags, args.into_payload(flags)?)?,
+        EnvVerb::Create(args) => {
+            super::env::create(store, flags, args.into_payload("create", flags)?)?
+        }
+        EnvVerb::Update(args) => {
+            super::env::update(store, flags, args.into_payload("update", flags)?)?
+        }
+        EnvVerb::SetPublicUrl(args) => {
+            super::env::set_public_url(store, flags, &args.env_id, &args.url)?
+        }
         EnvVerb::List => super::env::list(store, flags)?,
         EnvVerb::Show { env_id } => super::env::show(store, flags, &env_id)?,
         EnvVerb::Doctor { env_id } => super::env::doctor(store, flags, &env_id)?,
