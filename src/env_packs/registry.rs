@@ -43,6 +43,10 @@ pub enum RegistryError {
     },
     #[error("an env-pack handler is already registered for path `{0}`")]
     DuplicateRegistration(String),
+    #[error(
+        "deployer env-pack `{kind}` does not ship a credentials contract (DeployerCredentials impl)"
+    )]
+    DeployerMissingCredentials { kind: String },
 }
 
 /// Binds [`PackDescriptor`] paths to native [`EnvPackHandler`]s.
@@ -71,12 +75,17 @@ impl EnvPackRegistry {
 
     /// Register a handler under its [`descriptor_path`](EnvPackHandler::descriptor_path).
     ///
-    /// The Phase D plug-in hook. Rejects a path already registered so a
-    /// plug-in cannot silently shadow a built-in handler.
+    /// The Phase D plug-in hook. Rejects:
+    /// - A path already registered (no silent shadowing of built-ins).
+    /// - A `Deployer`-slot handler whose `deployer_credentials()` returns
+    ///   `None` — every deployer env-pack must ship a credentials contract.
     pub fn register(&mut self, handler: Box<dyn EnvPackHandler>) -> Result<(), RegistryError> {
         let path = handler.descriptor_path().to_string();
         if self.handlers.contains_key(&path) {
             return Err(RegistryError::DuplicateRegistration(path));
+        }
+        if handler.slot() == CapabilitySlot::Deployer && handler.deployer_credentials().is_none() {
+            return Err(RegistryError::DeployerMissingCredentials { kind: path });
         }
         self.handlers.insert(path, handler);
         Ok(())
@@ -296,5 +305,48 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, RegistryError::Unknown(_)));
+    }
+
+    /// A deployer handler that returns `deployer_credentials() = None`
+    /// must be rejected at registration time — every deployer env-pack
+    /// must ship a credentials contract.
+    #[derive(Debug)]
+    struct DeployerWithoutCredentials;
+
+    impl EnvPackHandler for DeployerWithoutCredentials {
+        fn slot(&self) -> CapabilitySlot {
+            CapabilitySlot::Deployer
+        }
+        fn descriptor_path(&self) -> &str {
+            "acme.deployer.no-creds"
+        }
+        fn supported_versions(&self) -> semver::VersionReq {
+            "^1.0.0".parse().unwrap()
+        }
+        // deployer_credentials() defaults to None — that's the gap.
+    }
+
+    #[test]
+    fn register_rejects_deployer_without_credentials() {
+        let mut registry = EnvPackRegistry::new();
+        let err = registry
+            .register(Box::new(DeployerWithoutCredentials))
+            .unwrap_err();
+        assert!(
+            matches!(err, RegistryError::DeployerMissingCredentials { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// The built-in local-process deployer ships a credentials contract
+    /// and registers successfully.
+    #[test]
+    fn builtin_deployer_has_credentials_contract() {
+        let registry = EnvPackRegistry::with_builtins();
+        let handler = registry.resolve(&descriptor(LOCAL_DEPLOYER_PACK)).unwrap();
+        assert!(
+            handler.deployer_credentials().is_some(),
+            "built-in deployer must ship a credentials contract"
+        );
     }
 }
