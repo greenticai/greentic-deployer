@@ -961,7 +961,8 @@ fn dispatch_messaging(
     let outcome = match verb {
         MessagingNoun::Endpoint { verb } => match verb {
             MessagingEndpointVerb::Add(args) => {
-                super::messaging::add(store, flags, args.into_payload())?
+                reject_inline_plus_answers(args.has_inline_input(), flags, "add")?;
+                super::messaging::add(store, flags, args.into_payload("add")?)?
             }
             MessagingEndpointVerb::List { env_id } => {
                 super::messaging::list(store, flags, &env_id)?
@@ -971,23 +972,57 @@ fn dispatch_messaging(
                 endpoint_id,
             } => super::messaging::show(store, flags, &env_id, &endpoint_id)?,
             MessagingEndpointVerb::LinkBundle(args) => {
-                super::messaging::link_bundle(store, flags, args.into_payload())?
+                reject_inline_plus_answers(args.has_inline_input(), flags, "link-bundle")?;
+                super::messaging::link_bundle(store, flags, args.into_payload("link-bundle")?)?
             }
             MessagingEndpointVerb::UnlinkBundle(args) => {
-                super::messaging::unlink_bundle(store, flags, args.into_payload())?
+                reject_inline_plus_answers(args.has_inline_input(), flags, "unlink-bundle")?;
+                super::messaging::unlink_bundle(store, flags, args.into_payload("unlink-bundle")?)?
             }
             MessagingEndpointVerb::SetWelcomeFlow(args) => {
-                super::messaging::set_welcome_flow(store, flags, args.into_payload())?
+                reject_inline_plus_answers(args.has_inline_input(), flags, "set-welcome-flow")?;
+                super::messaging::set_welcome_flow(
+                    store,
+                    flags,
+                    args.into_payload("set-welcome-flow")?,
+                )?
             }
             MessagingEndpointVerb::Remove(args) => {
-                super::messaging::remove(store, flags, args.into_remove_payload())?
+                reject_inline_plus_answers(args.has_inline_input(), flags, "remove")?;
+                super::messaging::remove(store, flags, args.into_remove_payload("remove")?)?
             }
             MessagingEndpointVerb::RotateWebhookSecret(args) => {
-                super::messaging::rotate_webhook_secret(store, flags, args.into_rotate_payload())?
+                reject_inline_plus_answers(
+                    args.has_inline_input(),
+                    flags,
+                    "rotate-webhook-secret",
+                )?;
+                super::messaging::rotate_webhook_secret(
+                    store,
+                    flags,
+                    args.into_rotate_payload("rotate-webhook-secret")?,
+                )?
             }
         },
     };
     print_outcome(&outcome)
+}
+
+/// Reject the ambiguity of passing inline CLI flags AND `--answers` at the
+/// same time for messaging endpoint verbs. Either path is fine on its own;
+/// combining them is always a misuse (the inline flags would be silently
+/// ignored if complete, or silently replaced by the answers file if partial).
+pub(super) fn reject_inline_plus_answers(
+    has_inline: bool,
+    flags: &OpFlags,
+    verb: &'static str,
+) -> Result<(), OpError> {
+    if has_inline && flags.answers.is_some() {
+        return Err(OpError::InvalidArgument(format!(
+            "messaging.endpoint {verb}: inline flags and --answers are mutually exclusive; use one or the other"
+        )));
+    }
+    Ok(())
 }
 
 /// Silence the `CapabilitySlot` re-export warning while preserving the symbol
