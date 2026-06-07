@@ -92,16 +92,46 @@ pub struct EndpointRemovePayload {
 // Each verb's args struct yields:
 //   `Ok(None)`                — no inline flag was supplied → defer to `--answers`
 //   `Ok(Some(payload))`       — every required field present → use inline payload
-//   `Err(InvalidArgument(…))` — SOME flags supplied but required ones missing →
-//                                reject with a precise message listing what's absent
+//   `Err(InvalidArgument(…))` — SOME flags supplied but required ones missing,
+//                                OR inline flags were combined with `--answers`,
+//                                which is always misuse
 //
 // This prevents a destructive-misdirection footgun where partial inline flags
 // silently fall through to `--answers`, loading a stale JSON that targets a
 // different resource.
+//
+// The mutual-exclusion check lives inside each converter (not at dispatch) so
+// every call-site gets it automatically — adding a new verb cannot forget the
+// guard.
+
+/// Reject `--answers` when any inline flag is set. Combining them is always a
+/// misuse: inline-only is fine, `--answers` only is fine; the mixed form would
+/// silently honor one and drop the other.
+fn reject_inline_plus_answers(
+    has_inline: bool,
+    flags: &OpFlags,
+    verb: &'static str,
+) -> Result<(), OpError> {
+    if has_inline && flags.answers.is_some() {
+        return Err(OpError::InvalidArgument(format!(
+            "messaging.endpoint {verb}: inline flags and --answers are mutually exclusive; use one or the other"
+        )));
+    }
+    Ok(())
+}
+
+/// Format a partial-flags rejection: which verb, the full required-flag list,
+/// and the subset that was actually missing.
+fn partial_inline_error(verb: &'static str, required: &str, missing: &[&str]) -> OpError {
+    OpError::InvalidArgument(format!(
+        "messaging.endpoint {verb}: inline-flag form requires {required}; missing: {}",
+        missing.join(", ")
+    ))
+}
 
 impl MessagingEndpointAddArgs {
     /// Returns `true` when the caller supplied at least one inline flag.
-    pub(super) fn has_inline_input(&self) -> bool {
+    fn has_inline_input(&self) -> bool {
         self.env.is_some()
             || self.provider_type.is_some()
             || self.provider_id.is_some()
@@ -111,8 +141,14 @@ impl MessagingEndpointAddArgs {
             || self.updated_by.is_some()
     }
 
-    pub fn into_payload(self, verb: &'static str) -> Result<Option<EndpointAddPayload>, OpError> {
-        if !self.has_inline_input() {
+    pub fn into_payload(
+        self,
+        verb: &'static str,
+        flags: &OpFlags,
+    ) -> Result<Option<EndpointAddPayload>, OpError> {
+        let has_inline = self.has_inline_input();
+        reject_inline_plus_answers(has_inline, flags, verb)?;
+        if !has_inline {
             return Ok(None);
         }
         let mut missing = Vec::new();
@@ -135,10 +171,11 @@ impl MessagingEndpointAddArgs {
             missing.push("--updated-by");
         }
         if !missing.is_empty() {
-            return Err(OpError::InvalidArgument(format!(
-                "messaging.endpoint {verb}: inline-flag form requires --env, --provider-type, --provider-id, --display-name, --idempotency-key, --updated-by; missing: {}",
-                missing.join(", ")
-            )));
+            return Err(partial_inline_error(
+                verb,
+                "--env, --provider-type, --provider-id, --display-name, --idempotency-key, --updated-by",
+                &missing,
+            ));
         }
         Ok(Some(EndpointAddPayload {
             environment_id: self.env.unwrap(),
@@ -154,7 +191,7 @@ impl MessagingEndpointAddArgs {
 
 impl MessagingEndpointLinkBundleArgs {
     /// Returns `true` when the caller supplied at least one inline flag.
-    pub(super) fn has_inline_input(&self) -> bool {
+    fn has_inline_input(&self) -> bool {
         self.env.is_some()
             || self.endpoint_id.is_some()
             || self.bundle_id.is_some()
@@ -165,8 +202,11 @@ impl MessagingEndpointLinkBundleArgs {
     pub fn into_payload(
         self,
         verb: &'static str,
+        flags: &OpFlags,
     ) -> Result<Option<EndpointLinkBundlePayload>, OpError> {
-        if !self.has_inline_input() {
+        let has_inline = self.has_inline_input();
+        reject_inline_plus_answers(has_inline, flags, verb)?;
+        if !has_inline {
             return Ok(None);
         }
         let mut missing = Vec::new();
@@ -186,10 +226,11 @@ impl MessagingEndpointLinkBundleArgs {
             missing.push("--updated-by");
         }
         if !missing.is_empty() {
-            return Err(OpError::InvalidArgument(format!(
-                "messaging.endpoint {verb}: inline-flag form requires --env, --endpoint-id, --bundle-id, --idempotency-key, --updated-by; missing: {}",
-                missing.join(", ")
-            )));
+            return Err(partial_inline_error(
+                verb,
+                "--env, --endpoint-id, --bundle-id, --idempotency-key, --updated-by",
+                &missing,
+            ));
         }
         Ok(Some(EndpointLinkBundlePayload {
             environment_id: self.env.unwrap(),
@@ -203,7 +244,7 @@ impl MessagingEndpointLinkBundleArgs {
 
 impl MessagingEndpointSetWelcomeFlowArgs {
     /// Returns `true` when the caller supplied at least one inline flag.
-    pub(super) fn has_inline_input(&self) -> bool {
+    fn has_inline_input(&self) -> bool {
         self.env.is_some()
             || self.endpoint_id.is_some()
             || self.bundle_id.is_some()
@@ -216,8 +257,11 @@ impl MessagingEndpointSetWelcomeFlowArgs {
     pub fn into_payload(
         self,
         verb: &'static str,
+        flags: &OpFlags,
     ) -> Result<Option<EndpointSetWelcomeFlowPayload>, OpError> {
-        if !self.has_inline_input() {
+        let has_inline = self.has_inline_input();
+        reject_inline_plus_answers(has_inline, flags, verb)?;
+        if !has_inline {
             return Ok(None);
         }
         let mut missing = Vec::new();
@@ -243,10 +287,11 @@ impl MessagingEndpointSetWelcomeFlowArgs {
             missing.push("--updated-by");
         }
         if !missing.is_empty() {
-            return Err(OpError::InvalidArgument(format!(
-                "messaging.endpoint {verb}: inline-flag form requires --env, --endpoint-id, --bundle-id, --pack-id, --flow-id, --idempotency-key, --updated-by; missing: {}",
-                missing.join(", ")
-            )));
+            return Err(partial_inline_error(
+                verb,
+                "--env, --endpoint-id, --bundle-id, --pack-id, --flow-id, --idempotency-key, --updated-by",
+                &missing,
+            ));
         }
         Ok(Some(EndpointSetWelcomeFlowPayload {
             environment_id: self.env.unwrap(),
@@ -260,20 +305,30 @@ impl MessagingEndpointSetWelcomeFlowArgs {
     }
 }
 
+/// Validated 4-tuple shared by `remove` and `rotate-webhook-secret`: both verbs
+/// take the same args struct and consume the same field set.
+type ValidatedRemoveFields = (String, String, String, String);
+
 impl MessagingEndpointRemoveArgs {
     /// Returns `true` when the caller supplied at least one inline flag.
-    pub(super) fn has_inline_input(&self) -> bool {
+    fn has_inline_input(&self) -> bool {
         self.env.is_some()
             || self.endpoint_id.is_some()
             || self.idempotency_key.is_some()
             || self.updated_by.is_some()
     }
 
-    pub fn into_remove_payload(
+    /// Single validation pass shared by `remove` and `rotate-webhook-secret`.
+    /// Returns the four fields in canonical order; both verbs then assemble
+    /// their own payload type from this tuple.
+    fn validated_fields(
         self,
         verb: &'static str,
-    ) -> Result<Option<EndpointRemovePayload>, OpError> {
-        if !self.has_inline_input() {
+        flags: &OpFlags,
+    ) -> Result<Option<ValidatedRemoveFields>, OpError> {
+        let has_inline = self.has_inline_input();
+        reject_inline_plus_answers(has_inline, flags, verb)?;
+        if !has_inline {
             return Ok(None);
         }
         let mut missing = Vec::new();
@@ -290,51 +345,48 @@ impl MessagingEndpointRemoveArgs {
             missing.push("--updated-by");
         }
         if !missing.is_empty() {
-            return Err(OpError::InvalidArgument(format!(
-                "messaging.endpoint {verb}: inline-flag form requires --env, --endpoint-id, --idempotency-key, --updated-by; missing: {}",
-                missing.join(", ")
-            )));
+            return Err(partial_inline_error(
+                verb,
+                "--env, --endpoint-id, --idempotency-key, --updated-by",
+                &missing,
+            ));
         }
-        Ok(Some(EndpointRemovePayload {
-            environment_id: self.env.unwrap(),
-            endpoint_id: self.endpoint_id.unwrap(),
-            idempotency_key: self.idempotency_key.unwrap(),
-            updated_by: self.updated_by.unwrap(),
-        }))
+        Ok(Some((
+            self.env.unwrap(),
+            self.endpoint_id.unwrap(),
+            self.idempotency_key.unwrap(),
+            self.updated_by.unwrap(),
+        )))
+    }
+
+    pub fn into_remove_payload(
+        self,
+        verb: &'static str,
+        flags: &OpFlags,
+    ) -> Result<Option<EndpointRemovePayload>, OpError> {
+        Ok(self
+            .validated_fields(verb, flags)?
+            .map(|(env, eid, ikey, by)| EndpointRemovePayload {
+                environment_id: env,
+                endpoint_id: eid,
+                idempotency_key: ikey,
+                updated_by: by,
+            }))
     }
 
     pub fn into_rotate_payload(
         self,
         verb: &'static str,
+        flags: &OpFlags,
     ) -> Result<Option<EndpointRotateWebhookSecretPayload>, OpError> {
-        if !self.has_inline_input() {
-            return Ok(None);
-        }
-        let mut missing = Vec::new();
-        if self.env.is_none() {
-            missing.push("--env");
-        }
-        if self.endpoint_id.is_none() {
-            missing.push("--endpoint-id");
-        }
-        if self.idempotency_key.is_none() {
-            missing.push("--idempotency-key");
-        }
-        if self.updated_by.is_none() {
-            missing.push("--updated-by");
-        }
-        if !missing.is_empty() {
-            return Err(OpError::InvalidArgument(format!(
-                "messaging.endpoint {verb}: inline-flag form requires --env, --endpoint-id, --idempotency-key, --updated-by; missing: {}",
-                missing.join(", ")
-            )));
-        }
-        Ok(Some(EndpointRotateWebhookSecretPayload {
-            environment_id: self.env.unwrap(),
-            endpoint_id: self.endpoint_id.unwrap(),
-            idempotency_key: self.idempotency_key.unwrap(),
-            updated_by: self.updated_by.unwrap(),
-        }))
+        Ok(self
+            .validated_fields(verb, flags)?
+            .map(|(env, eid, ikey, by)| EndpointRotateWebhookSecretPayload {
+                environment_id: env,
+                endpoint_id: eid,
+                idempotency_key: ikey,
+                updated_by: by,
+            }))
     }
 }
 
@@ -2123,7 +2175,7 @@ mod tests {
     #[test]
     fn add_args_with_all_flags_yields_payload() {
         let payload = add_args_full()
-            .into_payload("add")
+            .into_payload("add", &OpFlags::default())
             .expect("ok")
             .expect("some");
         assert_eq!(payload.environment_id, "local");
@@ -2142,7 +2194,10 @@ mod tests {
             "secret://local/global/telegram/bot_token".into(),
             "secret://local/global/telegram/api_key".into(),
         ];
-        let payload = args.into_payload("add").expect("ok").expect("some");
+        let payload = args
+            .into_payload("add", &OpFlags::default())
+            .expect("ok")
+            .expect("some");
         assert_eq!(payload.secret_refs.len(), 2);
         assert_eq!(
             payload.secret_refs[0],
@@ -2154,7 +2209,7 @@ mod tests {
     fn add_args_missing_required_field_is_rejected() {
         let mut args = add_args_full();
         args.display_name = None;
-        let err = args.into_payload("add").unwrap_err();
+        let err = args.into_payload("add", &OpFlags::default()).unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)));
         let msg = format!("{err:?}");
         assert!(
@@ -2167,7 +2222,7 @@ mod tests {
     fn add_args_missing_idem_key_is_rejected() {
         let mut args = add_args_full();
         args.idempotency_key = None;
-        let err = args.into_payload("add").unwrap_err();
+        let err = args.into_payload("add", &OpFlags::default()).unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)));
         let msg = format!("{err:?}");
         assert!(
@@ -2187,7 +2242,11 @@ mod tests {
             idempotency_key: None,
             updated_by: None,
         };
-        assert!(args.into_payload("add").unwrap().is_none());
+        assert!(
+            args.into_payload("add", &OpFlags::default())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2199,7 +2258,10 @@ mod tests {
             idempotency_key: Some("k-link".into()),
             updated_by: Some("alice".into()),
         };
-        let payload = args.into_payload("link-bundle").expect("ok").expect("some");
+        let payload = args
+            .into_payload("link-bundle", &OpFlags::default())
+            .expect("ok")
+            .expect("some");
         assert_eq!(payload.environment_id, "local");
         assert_eq!(payload.endpoint_id, "01HXYZ...");
         assert_eq!(payload.bundle_id, "legal");
@@ -2214,7 +2276,9 @@ mod tests {
             idempotency_key: Some("k".into()),
             updated_by: Some("alice".into()),
         };
-        let err = args.into_payload("link-bundle").unwrap_err();
+        let err = args
+            .into_payload("link-bundle", &OpFlags::default())
+            .unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)));
         let msg = format!("{err:?}");
         assert!(
@@ -2232,7 +2296,11 @@ mod tests {
             idempotency_key: None,
             updated_by: None,
         };
-        assert!(args.into_payload("link-bundle").unwrap().is_none());
+        assert!(
+            args.into_payload("link-bundle", &OpFlags::default())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2247,7 +2315,7 @@ mod tests {
             updated_by: Some("alice".into()),
         };
         let payload = args
-            .into_payload("set-welcome-flow")
+            .into_payload("set-welcome-flow", &OpFlags::default())
             .expect("ok")
             .expect("some");
         assert_eq!(payload.pack_id, "welcome");
@@ -2265,7 +2333,9 @@ mod tests {
             idempotency_key: Some("k".into()),
             updated_by: Some("alice".into()),
         };
-        let err = args.into_payload("set-welcome-flow").unwrap_err();
+        let err = args
+            .into_payload("set-welcome-flow", &OpFlags::default())
+            .unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)));
         let msg = format!("{err:?}");
         assert!(
@@ -2285,7 +2355,11 @@ mod tests {
             idempotency_key: None,
             updated_by: None,
         };
-        assert!(args.into_payload("set-welcome-flow").unwrap().is_none());
+        assert!(
+            args.into_payload("set-welcome-flow", &OpFlags::default())
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn remove_args_full() -> MessagingEndpointRemoveArgs {
@@ -2300,7 +2374,7 @@ mod tests {
     #[test]
     fn remove_args_with_all_flags_yields_remove_payload() {
         let payload = remove_args_full()
-            .into_remove_payload("remove")
+            .into_remove_payload("remove", &OpFlags::default())
             .expect("ok")
             .expect("some");
         assert_eq!(payload.environment_id, "local");
@@ -2311,7 +2385,7 @@ mod tests {
     #[test]
     fn remove_args_with_all_flags_yields_rotate_payload() {
         let payload = remove_args_full()
-            .into_rotate_payload("rotate-webhook-secret")
+            .into_rotate_payload("rotate-webhook-secret", &OpFlags::default())
             .expect("ok")
             .expect("some");
         assert_eq!(payload.environment_id, "local");
@@ -2322,7 +2396,9 @@ mod tests {
     fn remove_args_missing_endpoint_id_is_rejected() {
         let mut args = remove_args_full();
         args.endpoint_id = None;
-        let err = args.into_remove_payload("remove").unwrap_err();
+        let err = args
+            .into_remove_payload("remove", &OpFlags::default())
+            .unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)));
         let msg = format!("{err:?}");
         assert!(
@@ -2334,7 +2410,7 @@ mod tests {
         let mut args = remove_args_full();
         args.endpoint_id = None;
         let err = args
-            .into_rotate_payload("rotate-webhook-secret")
+            .into_rotate_payload("rotate-webhook-secret", &OpFlags::default())
             .unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)));
     }
@@ -2347,7 +2423,11 @@ mod tests {
             idempotency_key: None,
             updated_by: None,
         };
-        assert!(args.into_remove_payload("remove").unwrap().is_none());
+        assert!(
+            args.into_remove_payload("remove", &OpFlags::default())
+                .unwrap()
+                .is_none()
+        );
         let args = MessagingEndpointRemoveArgs {
             env: None,
             endpoint_id: None,
@@ -2355,7 +2435,7 @@ mod tests {
             updated_by: None,
         };
         assert!(
-            args.into_rotate_payload("rotate-webhook-secret")
+            args.into_rotate_payload("rotate-webhook-secret", &OpFlags::default())
                 .unwrap()
                 .is_none()
         );
@@ -2378,7 +2458,7 @@ mod tests {
             idempotency_key: None,
             updated_by: None,
         };
-        let err = args.into_payload("add").unwrap_err();
+        let err = args.into_payload("add", &OpFlags::default()).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("--provider-id"),
@@ -2407,7 +2487,9 @@ mod tests {
             idempotency_key: None,
             updated_by: Some("alice".into()),
         };
-        let err = args.into_payload("link-bundle").unwrap_err();
+        let err = args
+            .into_payload("link-bundle", &OpFlags::default())
+            .unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("--bundle-id"), "must list --bundle-id: {msg}");
         assert!(
@@ -2425,7 +2507,9 @@ mod tests {
             idempotency_key: Some("k".into()),
             updated_by: None,
         };
-        let err = args.into_payload("unlink-bundle").unwrap_err();
+        let err = args
+            .into_payload("unlink-bundle", &OpFlags::default())
+            .unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("--endpoint-id"),
@@ -2448,7 +2532,9 @@ mod tests {
             idempotency_key: Some("k".into()),
             updated_by: Some("alice".into()),
         };
-        let err = args.into_payload("set-welcome-flow").unwrap_err();
+        let err = args
+            .into_payload("set-welcome-flow", &OpFlags::default())
+            .unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("--pack-id"), "must list --pack-id: {msg}");
         assert!(msg.contains("--flow-id"), "must list --flow-id: {msg}");
@@ -2462,7 +2548,9 @@ mod tests {
             idempotency_key: None,
             updated_by: None,
         };
-        let err = args.into_remove_payload("remove").unwrap_err();
+        let err = args
+            .into_remove_payload("remove", &OpFlags::default())
+            .unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("--idempotency-key"),
@@ -2483,7 +2571,7 @@ mod tests {
             updated_by: Some("alice".into()),
         };
         let err = args
-            .into_rotate_payload("rotate-webhook-secret")
+            .into_rotate_payload("rotate-webhook-secret", &OpFlags::default())
             .unwrap_err();
         let msg = format!("{err:?}");
         assert!(
@@ -2494,25 +2582,58 @@ mod tests {
 
     // --- inline flags + --answers mutual exclusion ----------------------------
 
-    #[test]
-    fn inline_plus_answers_is_rejected_at_dispatch() {
-        // This exercises the dispatch-level guard via the shared helper.
-        use crate::cli::dispatch::reject_inline_plus_answers;
-        let flags = OpFlags {
+    fn flags_with_answers() -> OpFlags {
+        OpFlags {
             schema_only: false,
             answers: Some(std::path::PathBuf::from("stale.json")),
-        };
-        let err = reject_inline_plus_answers(true, &flags, "remove").unwrap_err();
+        }
+    }
+
+    #[test]
+    fn add_inline_plus_answers_is_rejected() {
+        // Inline flags + --answers is always misuse: the converter rejects
+        // before any payload work, so a destructive `remove` with both forms
+        // can never proceed against a stale answers file.
+        let err = remove_args_full()
+            .into_remove_payload("remove", &flags_with_answers())
+            .unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("mutually exclusive"),
             "must mention mutual exclusion: {msg}"
         );
-        // No inline flags + --answers is fine (pure --answers path).
-        assert!(reject_inline_plus_answers(false, &flags, "remove").is_ok());
-        // Inline flags + no --answers is fine (pure inline path).
-        let flags_no_answers = OpFlags::default();
-        assert!(reject_inline_plus_answers(true, &flags_no_answers, "remove").is_ok());
+    }
+
+    #[test]
+    fn rotate_inline_plus_answers_is_rejected() {
+        let err = remove_args_full()
+            .into_rotate_payload("rotate-webhook-secret", &flags_with_answers())
+            .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn add_args_inline_plus_answers_is_rejected() {
+        let err = add_args_full()
+            .into_payload("add", &flags_with_answers())
+            .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn no_inline_flags_plus_answers_is_ok() {
+        // Pure --answers path (no inline flags) must NOT be rejected.
+        let args = MessagingEndpointRemoveArgs {
+            env: None,
+            endpoint_id: None,
+            idempotency_key: None,
+            updated_by: None,
+        };
+        assert!(
+            args.into_remove_payload("remove", &flags_with_answers())
+                .unwrap()
+                .is_none()
+        );
     }
 
     // End-to-end: CLI-derived payload feeds the verb the same way `--answers`
@@ -2529,7 +2650,7 @@ mod tests {
             idempotency_key: Some("cli-add-1".into()),
             updated_by: Some("cli".into()),
         }
-        .into_payload("add")
+        .into_payload("add", &OpFlags::default())
         .expect("ok")
         .expect("some");
         let outcome = add(&store, &OpFlags::default(), Some(payload)).unwrap();
