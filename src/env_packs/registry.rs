@@ -61,8 +61,14 @@ impl EnvPackRegistry {
         Self::default()
     }
 
-    /// A registry pre-loaded with the built-in `local` handlers
-    /// ([`BUILTIN_HANDLERS`]).
+    /// A registry pre-loaded with the built-in `local` handlers.
+    ///
+    /// Registers the four metadata-only [`BUILTIN_HANDLERS`] (Secrets,
+    /// Telemetry, Sessions, State) plus the C2 deployer handler that
+    /// ships a real
+    /// [`DeployerCredentials`](crate::credentials::DeployerCredentials)
+    /// impl
+    /// ([`LocalProcessDeployerHandler`](super::local_process::LocalProcessDeployerHandler)).
     pub fn with_builtins() -> Self {
         let mut registry = Self::new();
         for handler in BUILTIN_HANDLERS {
@@ -70,6 +76,11 @@ impl EnvPackRegistry {
                 .register(Box::new(*handler))
                 .expect("built-in handler paths are unique");
         }
+        registry
+            .register(Box::new(
+                super::local_process::LocalProcessDeployerHandler::default(),
+            ))
+            .expect("local-process deployer handler path is unique");
         registry
     }
 

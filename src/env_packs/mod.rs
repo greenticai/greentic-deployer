@@ -6,8 +6,10 @@
 //! - [`registry`] — [`EnvPackRegistry`](registry::EnvPackRegistry): built-in
 //!   registrations plus the Phase D plug-in `register` hook.
 
+pub mod local_process;
 pub mod registry;
 pub mod slot;
 
+pub use local_process::{LocalProcessCredentials, LocalProcessDeployerHandler};
 pub use registry::{EnvPackRegistry, RegistryError};
 pub use slot::{BUILTIN_HANDLERS, BuiltinHandler, EnvPackHandler};

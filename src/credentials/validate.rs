@@ -16,7 +16,7 @@ use std::path::Path;
 use chrono::Utc;
 use greentic_deploy_spec::{
     CapabilitySlot, Credentials, CredentialsMode, CredentialsValidation,
-    CredentialsValidationResult, EnvId, SchemaVersion, SecretRef,
+    CredentialsValidationResult, EnvId, EnvironmentHostConfig, SchemaVersion, SecretRef,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -104,11 +104,14 @@ impl RequirementsReport {
 ///
 /// Probes use `env_root` to test filesystem permissions on the env's own
 /// state dir without depending on `$HOME` being readable. `env_id` is
-/// borrowed for diagnostics only.
+/// borrowed for diagnostics only. `host_config` carries the env's
+/// network bind address so port probes can target the configured
+/// `listen_addr` rather than hardcoding `127.0.0.1`.
 #[derive(Debug)]
 pub struct ValidationContext<'a> {
     pub env_id: &'a EnvId,
     pub env_root: &'a Path,
+    pub host_config: &'a EnvironmentHostConfig,
 }
 
 #[derive(Debug, Error)]
@@ -184,6 +187,7 @@ pub fn validate_requirements(
     let ctx = ValidationContext {
         env_id,
         env_root: &env_root,
+        host_config: &env.host_config,
     };
     let report = creds.validate(&ctx);
 

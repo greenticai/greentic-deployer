@@ -89,63 +89,25 @@ impl EnvPackHandler for BuiltinHandler {
             .parse()
             .expect("built-in version-req is valid (guarded by tests)")
     }
-
-    fn deployer_credentials(&self) -> Option<&dyn crate::credentials::DeployerCredentials> {
-        if self.slot == CapabilitySlot::Deployer {
-            Some(&BuiltinLocalProcessCredentials)
-        } else {
-            None
-        }
-    }
+    // No `deployer_credentials` override — every entry in `BUILTIN_HANDLERS`
+    // serves a non-Deployer slot. The Deployer slot is served by the
+    // dedicated `LocalProcessDeployerHandler` registered separately in
+    // `EnvPackRegistry::with_builtins`. The registry's deployer-credentials
+    // gate ensures any future Deployer-slot handler ships a real contract.
 }
 
-/// Stub credentials for the built-in local-process deployer (C1 contract
-/// registration gate). This is the C1-layer contract; C2's
-/// `LocalProcessCredentials` may override with richer probes. The stub
-/// declares `requires_credentials_material() = false` because the
-/// local-process deployer has no IAM roles or cloud credentials to manage.
-#[derive(Debug)]
-struct BuiltinLocalProcessCredentials;
-
-impl crate::credentials::DeployerCredentials for BuiltinLocalProcessCredentials {
-    fn requires_credentials_material(&self) -> bool {
-        false
-    }
-
-    fn required_capabilities(&self) -> Vec<crate::credentials::Capability> {
-        Vec::new()
-    }
-
-    fn validate(
-        &self,
-        _ctx: &crate::credentials::ValidationContext<'_>,
-    ) -> crate::credentials::RequirementsReport {
-        crate::credentials::RequirementsReport::new(Vec::new())
-    }
-
-    fn bootstrap(
-        &self,
-        _input: &crate::credentials::BootstrapInput<'_>,
-    ) -> Result<crate::credentials::BootstrapOutcome, crate::credentials::BootstrapError> {
-        Err(crate::credentials::BootstrapError::NotApplicable(
-            "local-process deployer has no admin escalation path \
-             — use `op credentials requirements` instead"
-                .to_string(),
-        ))
-    }
-}
-
-/// The five built-in handlers backing the default `local` environment.
+/// Metadata-only built-in handlers backing the default `local` environment.
 ///
-/// The `(slot, descriptor_path)` pairs mirror [`crate::defaults::LOCAL_DEFAULT_BINDINGS`]
-/// (a test asserts they stay in lock-step); the registry registers each one
-/// under its `descriptor_path`.
+/// Four entries (Secrets / Telemetry / Sessions / State) — the Deployer
+/// slot's handler ships behavior (C2's
+/// [`LocalProcessDeployerHandler`](super::local_process::LocalProcessDeployerHandler))
+/// and is registered separately in
+/// [`EnvPackRegistry::with_builtins`](super::registry::EnvPackRegistry::with_builtins).
+///
+/// The combined `(slot, descriptor_path)` set across `BUILTIN_HANDLERS` plus
+/// the local-process deployer mirrors [`crate::defaults::LOCAL_DEFAULT_BINDINGS`]
+/// (a test asserts they stay in lock-step).
 pub const BUILTIN_HANDLERS: &[BuiltinHandler] = &[
-    BuiltinHandler {
-        slot: CapabilitySlot::Deployer,
-        descriptor_path: "greentic.deployer.local-process",
-        version_req: "^0.1.0",
-    },
     BuiltinHandler {
         slot: CapabilitySlot::Secrets,
         descriptor_path: "greentic.secrets.dev-store",
@@ -175,13 +137,20 @@ mod tests {
 
     #[test]
     fn builtin_table_matches_default_bindings() {
-        // The registry's built-in set must stay in lock-step with the
+        // The registry's built-in set across BUILTIN_HANDLERS and the
+        // C2 LocalProcessDeployerHandler must stay in lock-step with the
         // bootstrap `local` bindings: same slots, same descriptor paths.
-        let mut handlers: Vec<(CapabilitySlot, &str)> = BUILTIN_HANDLERS
+        use crate::env_packs::local_process::LocalProcessDeployerHandler;
+        let mut handlers: Vec<(CapabilitySlot, String)> = BUILTIN_HANDLERS
             .iter()
-            .map(|h| (h.slot, h.descriptor_path))
+            .map(|h| (h.slot, h.descriptor_path.to_string()))
             .collect();
-        handlers.sort_by_key(|(_, path)| *path);
+        // Compose the C2 deployer handler — its slot+path participates in
+        // the same lock-step contract even though it lives outside
+        // BUILTIN_HANDLERS (it ships behavior, not just metadata).
+        let lpdh = LocalProcessDeployerHandler::default();
+        handlers.push((lpdh.slot(), lpdh.descriptor_path().to_string()));
+        handlers.sort_by(|a, b| a.1.cmp(&b.1));
 
         let mut defaults: Vec<(CapabilitySlot, String)> = crate::defaults::LOCAL_DEFAULT_BINDINGS
             .iter()
@@ -195,23 +164,32 @@ mod tests {
             .collect();
         defaults.sort_by(|a, b| a.1.cmp(&b.1));
 
-        let defaults_refs: Vec<(CapabilitySlot, &str)> =
-            defaults.iter().map(|(s, p)| (*s, p.as_str())).collect();
-        assert_eq!(handlers, defaults_refs);
+        assert_eq!(handlers, defaults);
     }
 
     #[test]
     fn builtin_version_reqs_accept_their_default_binding_version() {
         // Every built-in's VersionReq must parse and must accept the version
         // the bootstrap `local` binding pins — otherwise `doctor` would flag
-        // the defaults we ship as version-skewed.
+        // the defaults we ship as version-skewed. Composes BUILTIN_HANDLERS
+        // and the C2 LocalProcessDeployerHandler the same way
+        // `with_builtins()` registers them.
+        use crate::env_packs::local_process::LocalProcessDeployerHandler;
+        let lpdh = LocalProcessDeployerHandler::default();
         for (slot, descriptor) in crate::defaults::LOCAL_DEFAULT_BINDINGS {
             let pd = PackDescriptor::try_new(*descriptor).expect("default descriptor parses");
-            let handler = BUILTIN_HANDLERS
+            let req = BUILTIN_HANDLERS
                 .iter()
                 .find(|h| h.descriptor_path() == pd.path())
+                .map(|h| h.supported_versions())
+                .or_else(|| {
+                    if lpdh.descriptor_path() == pd.path() {
+                        Some(lpdh.supported_versions())
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or_else(|| panic!("no built-in handler for {slot}"));
-            let req = handler.supported_versions();
             assert!(
                 req.matches(&pd.version().0),
                 "{descriptor}: req {req} rejects its own default version"

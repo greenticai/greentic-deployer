@@ -610,6 +610,99 @@ mod tests {
         );
     }
 
+    /// C2 end-to-end: a fully-configured `local` env with the C2
+    /// LocalProcessDeployerHandler bound returns a structured pass
+    /// report for both capabilities. Exercises the full chain:
+    /// CLI → registry → DeployerCredentials → probes → OpOutcome.
+    #[test]
+    fn requirements_against_c2_local_process_handler_returns_pass() {
+        use crate::defaults::LOCAL_DEPLOYER_PACK;
+
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs
+            .push(make_binding(CapabilitySlot::Deployer, LOCAL_DEPLOYER_PACK));
+        env.credentials_ref =
+            Some(SecretRef::try_new("secret://local/credentials/local-process").unwrap());
+        store.save(&env).unwrap();
+
+        // Pick a high port range that's almost certainly free on a test
+        // runner — same trick the C2 unit tests use.
+        let registry = {
+            let mut r = EnvPackRegistry::new();
+            for h in crate::env_packs::BUILTIN_HANDLERS {
+                r.register(Box::new(*h)).unwrap();
+            }
+            r.register(Box::new(
+                crate::env_packs::LocalProcessDeployerHandler::with_port_range(49000..=49100),
+            ))
+            .unwrap();
+            r
+        };
+
+        let outcome = requirements(
+            &store,
+            &registry,
+            &OpFlags::default(),
+            Some(CredentialsRequirementsPayload {
+                environment_id: "local".to_string(),
+            }),
+        )
+        .expect("requirements should succeed against c2 local-process");
+        assert_eq!(outcome.op, "requirements");
+        assert_eq!(outcome.noun, NOUN);
+        assert_eq!(outcome.result["result"], "pass");
+        assert!(
+            outcome.result["missing_capabilities"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(false),
+            "no missing caps; got {outcome:?}"
+        );
+        let checks = outcome.result["checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 2);
+    }
+
+    /// C2 end-to-end: bootstrap against local-process refuses with
+    /// `NotApplicable`, surfaced as `OpError::Conflict` and recorded in
+    /// the audit log.
+    #[test]
+    fn bootstrap_against_c2_local_process_handler_refuses_as_not_applicable() {
+        use crate::defaults::LOCAL_DEPLOYER_PACK;
+
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs
+            .push(make_binding(CapabilitySlot::Deployer, LOCAL_DEPLOYER_PACK));
+        store.save(&env).unwrap();
+
+        let err = bootstrap_default(
+            &store,
+            &OpFlags::default(),
+            Some(CredentialsBootstrapPayload {
+                environment_id: "local".to_string(),
+                admin_profile: "admin".to_string(),
+                admin_material_path: None,
+                admin_material_inline: Some("any-admin-token".to_string()),
+            }),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => {
+                assert!(
+                    msg.contains("no admin escalation") || msg.contains("requirements"),
+                    "Conflict message should point user at `requirements`, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict (NotApplicable mapped), got {other:?}"),
+        }
+        // The reload-into-env step never happened: credentials_ref stays None.
+        let reloaded = store.load(&"local".try_into().unwrap()).unwrap();
+        assert!(reloaded.credentials_ref.is_none());
+    }
+
     #[test]
     fn rotate_rejects_env_without_credentials_ref() {
         let dir = tempdir().unwrap();
@@ -740,6 +833,50 @@ mod tests {
                 .unwrap()
                 .contains("no-material-required"),
             "expected sentinel credentials_ref, got {:?}",
+            outcome.result["credentials_ref"]
+        );
+    }
+
+    /// Fix 1 (Codex C2 #1): the stock default registry
+    /// (`EnvPackRegistry::with_builtins()`) must pass requirements for a
+    /// `local` env bound to the default `LOCAL_DEPLOYER_PACK` WITHOUT a
+    /// `credentials_ref` set. This proves the dead-end circular flow
+    /// (requirements → "run bootstrap" → "use requirements instead") is
+    /// closed on the operator-facing path.
+    #[test]
+    fn requirements_default_passes_for_local_deployer_without_credentials_ref() {
+        use crate::defaults::LOCAL_DEPLOYER_PACK;
+
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs
+            .push(make_binding(CapabilitySlot::Deployer, LOCAL_DEPLOYER_PACK));
+        // No credentials_ref set — this is the exact operator-facing scenario.
+        store.save(&env).unwrap();
+
+        let outcome = requirements_default(
+            &store,
+            &OpFlags::default(),
+            Some(CredentialsRequirementsPayload {
+                environment_id: "local".to_string(),
+            }),
+        )
+        .expect("default registry requirements should pass for local-process");
+        assert_eq!(outcome.result["result"], "pass");
+        let checks = outcome.result["checks"].as_array().unwrap();
+        assert_eq!(
+            checks.len(),
+            2,
+            "local-process declares 2 capabilities (fs + port)"
+        );
+        // Sentinel ref used when no material is needed.
+        assert!(
+            outcome.result["credentials_ref"]
+                .as_str()
+                .unwrap()
+                .contains("no-material-required"),
+            "expected sentinel ref, got {:?}",
             outcome.result["credentials_ref"]
         );
     }
