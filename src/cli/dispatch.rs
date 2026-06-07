@@ -140,28 +140,133 @@ pub enum MessagingEndpointVerb {
     /// Mint a new endpoint for `<env>` with `<provider_type>` /
     /// `<provider_id>` instance identity. Bundle linkage and welcome-flow
     /// follow via dedicated verbs.
-    Add,
+    Add(MessagingEndpointAddArgs),
     /// List every endpoint in `<env>`.
     List { env_id: String },
     /// Show one endpoint in `<env>` by `<endpoint_id>` (ULID).
     Show { env_id: String, endpoint_id: String },
     /// Link a bundle to an endpoint. Bundle must already be deployed in the env.
     #[command(name = "link-bundle")]
-    LinkBundle,
+    LinkBundle(MessagingEndpointLinkBundleArgs),
     /// Remove a bundle from an endpoint's `linked_bundles`. Fails when the
     /// bundle owns the endpoint's welcome_flow — clear that first.
     #[command(name = "unlink-bundle")]
-    UnlinkBundle,
+    UnlinkBundle(MessagingEndpointLinkBundleArgs),
     /// Set the endpoint's default welcome flow (referenced on first contact
     /// per M1.5). The flow's bundle must already be linked.
     #[command(name = "set-welcome-flow")]
-    SetWelcomeFlow,
+    SetWelcomeFlow(MessagingEndpointSetWelcomeFlowArgs),
     /// Remove an endpoint. Idempotent: removing an absent endpoint succeeds.
-    Remove,
+    Remove(MessagingEndpointRemoveArgs),
     /// Rotate the webhook secret on an existing endpoint. Generates a fresh
     /// 32-char CSPRNG secret, bumps generation. Idempotent on the same key.
     #[command(name = "rotate-webhook-secret")]
-    RotateWebhookSecret,
+    RotateWebhookSecret(MessagingEndpointRemoveArgs),
+}
+
+/// Inline-flag form of `messaging.endpoint add`. When all required fields
+/// (`--env`, `--provider-type`, `--provider-id`, `--display-name`,
+/// `--idempotency-key`, `--updated-by`) are present, the payload is built
+/// directly from these flags. Otherwise dispatch falls through to
+/// `--answers <PATH>` / `--schema`, matching the `trust-root add` precedent.
+#[derive(Args, Debug)]
+pub struct MessagingEndpointAddArgs {
+    /// Environment id, e.g. `local`.
+    #[arg(long)]
+    pub env: Option<String>,
+    /// Provider type — `telegram`, `teams`, `slack`, `whatsapp`, `webex`,
+    /// `email`, `webchat`.
+    #[arg(long = "provider-type")]
+    pub provider_type: Option<String>,
+    /// Per-environment instance identity for the provider, e.g.
+    /// `telegram-legal-bot`. Together with `--provider-type` it must be
+    /// unique inside the env.
+    #[arg(long = "provider-id")]
+    pub provider_id: Option<String>,
+    /// Human-readable label for the endpoint.
+    #[arg(long = "display-name")]
+    pub display_name: Option<String>,
+    /// Secret reference URI, e.g. `secret://local/global/telegram/bot_token`.
+    /// Repeating.
+    #[arg(long = "secret-ref", value_name = "URI")]
+    pub secret_ref: Vec<String>,
+    /// Idempotency key. Required for safe retries; mutations replay no-op when
+    /// the same key + identity is supplied.
+    #[arg(long = "idempotency-key")]
+    pub idempotency_key: Option<String>,
+    /// Free-form actor label that appears in the env-audit log.
+    #[arg(long = "updated-by")]
+    pub updated_by: Option<String>,
+}
+
+/// Inline-flag form of `messaging.endpoint link-bundle` and `unlink-bundle`.
+/// When all four required fields are present the payload is built directly;
+/// otherwise dispatch falls through to `--answers` / `--schema`.
+#[derive(Args, Debug)]
+pub struct MessagingEndpointLinkBundleArgs {
+    /// Environment id.
+    #[arg(long)]
+    pub env: Option<String>,
+    /// Endpoint id (ULID).
+    #[arg(long = "endpoint-id")]
+    pub endpoint_id: Option<String>,
+    /// Bundle id. Must already be deployed in the env.
+    #[arg(long = "bundle-id")]
+    pub bundle_id: Option<String>,
+    /// Idempotency key.
+    #[arg(long = "idempotency-key")]
+    pub idempotency_key: Option<String>,
+    /// Free-form actor label.
+    #[arg(long = "updated-by")]
+    pub updated_by: Option<String>,
+}
+
+/// Inline-flag form of `messaging.endpoint set-welcome-flow`. When all six
+/// required fields are present the payload is built directly; otherwise
+/// dispatch falls through to `--answers` / `--schema`.
+#[derive(Args, Debug)]
+pub struct MessagingEndpointSetWelcomeFlowArgs {
+    /// Environment id.
+    #[arg(long)]
+    pub env: Option<String>,
+    /// Endpoint id (ULID).
+    #[arg(long = "endpoint-id")]
+    pub endpoint_id: Option<String>,
+    /// Bundle id of the welcome-flow's pack. Must already be linked to the
+    /// endpoint via `link-bundle`.
+    #[arg(long = "bundle-id")]
+    pub bundle_id: Option<String>,
+    /// Pack id that hosts the welcome flow.
+    #[arg(long = "pack-id")]
+    pub pack_id: Option<String>,
+    /// Flow id (the welcome-flow entry point).
+    #[arg(long = "flow-id")]
+    pub flow_id: Option<String>,
+    /// Idempotency key.
+    #[arg(long = "idempotency-key")]
+    pub idempotency_key: Option<String>,
+    /// Free-form actor label.
+    #[arg(long = "updated-by")]
+    pub updated_by: Option<String>,
+}
+
+/// Inline-flag form of `messaging.endpoint remove` and `rotate-webhook-secret`.
+/// When all four required fields are present the payload is built directly;
+/// otherwise dispatch falls through to `--answers` / `--schema`.
+#[derive(Args, Debug)]
+pub struct MessagingEndpointRemoveArgs {
+    /// Environment id.
+    #[arg(long)]
+    pub env: Option<String>,
+    /// Endpoint id (ULID).
+    #[arg(long = "endpoint-id")]
+    pub endpoint_id: Option<String>,
+    /// Idempotency key.
+    #[arg(long = "idempotency-key")]
+    pub idempotency_key: Option<String>,
+    /// Free-form actor label.
+    #[arg(long = "updated-by")]
+    pub updated_by: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -608,14 +713,14 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
             "messaging.endpoint",
             match verb {
                 MessagingNoun::Endpoint { verb } => match verb {
-                    MessagingEndpointVerb::Add => "add",
+                    MessagingEndpointVerb::Add(_) => "add",
                     MessagingEndpointVerb::List { .. } => "list",
                     MessagingEndpointVerb::Show { .. } => "show",
-                    MessagingEndpointVerb::LinkBundle => "link-bundle",
-                    MessagingEndpointVerb::UnlinkBundle => "unlink-bundle",
-                    MessagingEndpointVerb::SetWelcomeFlow => "set-welcome-flow",
-                    MessagingEndpointVerb::Remove => "remove",
-                    MessagingEndpointVerb::RotateWebhookSecret => "rotate-webhook-secret",
+                    MessagingEndpointVerb::LinkBundle(_) => "link-bundle",
+                    MessagingEndpointVerb::UnlinkBundle(_) => "unlink-bundle",
+                    MessagingEndpointVerb::SetWelcomeFlow(_) => "set-welcome-flow",
+                    MessagingEndpointVerb::Remove(_) => "remove",
+                    MessagingEndpointVerb::RotateWebhookSecret(_) => "rotate-webhook-secret",
                 },
             },
         ),
@@ -855,7 +960,9 @@ fn dispatch_messaging(
 ) -> Result<(), OpError> {
     let outcome = match verb {
         MessagingNoun::Endpoint { verb } => match verb {
-            MessagingEndpointVerb::Add => super::messaging::add(store, flags, None)?,
+            MessagingEndpointVerb::Add(args) => {
+                super::messaging::add(store, flags, args.into_payload("add", flags)?)?
+            }
             MessagingEndpointVerb::List { env_id } => {
                 super::messaging::list(store, flags, &env_id)?
             }
@@ -863,16 +970,30 @@ fn dispatch_messaging(
                 env_id,
                 endpoint_id,
             } => super::messaging::show(store, flags, &env_id, &endpoint_id)?,
-            MessagingEndpointVerb::LinkBundle => super::messaging::link_bundle(store, flags, None)?,
-            MessagingEndpointVerb::UnlinkBundle => {
-                super::messaging::unlink_bundle(store, flags, None)?
+            MessagingEndpointVerb::LinkBundle(args) => super::messaging::link_bundle(
+                store,
+                flags,
+                args.into_payload("link-bundle", flags)?,
+            )?,
+            MessagingEndpointVerb::UnlinkBundle(args) => super::messaging::unlink_bundle(
+                store,
+                flags,
+                args.into_payload("unlink-bundle", flags)?,
+            )?,
+            MessagingEndpointVerb::SetWelcomeFlow(args) => super::messaging::set_welcome_flow(
+                store,
+                flags,
+                args.into_payload("set-welcome-flow", flags)?,
+            )?,
+            MessagingEndpointVerb::Remove(args) => {
+                super::messaging::remove(store, flags, args.into_remove_payload("remove", flags)?)?
             }
-            MessagingEndpointVerb::SetWelcomeFlow => {
-                super::messaging::set_welcome_flow(store, flags, None)?
-            }
-            MessagingEndpointVerb::Remove => super::messaging::remove(store, flags, None)?,
-            MessagingEndpointVerb::RotateWebhookSecret => {
-                super::messaging::rotate_webhook_secret(store, flags, None)?
+            MessagingEndpointVerb::RotateWebhookSecret(args) => {
+                super::messaging::rotate_webhook_secret(
+                    store,
+                    flags,
+                    args.into_rotate_payload("rotate-webhook-secret", flags)?,
+                )?
             }
         },
     };
