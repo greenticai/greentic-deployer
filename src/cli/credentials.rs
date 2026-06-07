@@ -1,4 +1,4 @@
-//! `gtc op credentials {requirements,bootstrap,rotate}` (`A3`).
+//! `gtc op credentials {requirements,bootstrap,rotate}` (`C1`).
 //!
 //! Per `plans/next-gen-deployment.md` §P5, credentials are first-class with
 //! two modes:
@@ -9,30 +9,51 @@
 //!   ephemeral admin credentials; produce low-privilege output + a
 //!   reviewable rules pack.
 //! - **rotate**: re-validate; rotate session tokens where the deployer
-//!   supports it.
+//!   supports it (Phase D — today this re-runs requirements and surfaces
+//!   the up-to-date report).
 //!
-//! All three depend on the deployer env-pack registry (A9) and the actual
-//! deployer's `credentials.yaml` contract. A3 ships the command *surface*
-//! only — every call returns a structured envelope describing what was
-//! requested + a `NotYetImplemented` for the action itself, pointing at
-//! the gating PR.
+//! All three resolve the env's bound deployer env-pack through the A9
+//! registry and invoke the
+//! [`DeployerCredentials`](crate::credentials::DeployerCredentials) contract
+//! shipped with that handler (C1). Deployer handlers that have not yet
+//! registered a credentials contract surface as `HandlerNotRegistered`
+//! (a structured CLI conflict, not a silent pass).
 //!
-//! What A3 *does* enforce:
+//! Preconditions enforced at this layer (before audit, before delegating
+//! to the registry):
 //!
 //! - The env must exist.
-//! - The env must have a `Deployer` slot bound (otherwise there's no
-//!   credentials.yaml to consult).
+//! - The env must have a `Deployer` slot bound.
 //! - For `requirements`/`rotate`, the env must already have a
 //!   `credentials_ref` (the user supplied creds somewhere). For
 //!   `bootstrap`, `credentials_ref` MUST be absent (bootstrap creates it).
+//!
+//! ## Admin credentials posture
+//!
+//! `bootstrap` reads the admin material via
+//! [`load_admin_credential`](self::load_admin_credential), wraps it in
+//! [`ZeroizedAdmin`], and never writes it to the env's storage. The
+//! wrapper zeroizes the in-process buffer on drop where the language /
+//! runtime allows it. The CLI does NOT claim process-wide memory erasure
+//! is guaranteed — that's impossible (OS paging, cloud SDK internal
+//! copies, ambient profile chains live outside this process). Operators
+//! needing stronger guarantees should run bootstrap on a short-lived
+//! process (CI runner, dedicated VM).
 
-use greentic_deploy_spec::{CapabilitySlot, EnvId, SecretRef};
+use std::path::PathBuf;
+
+use greentic_deploy_spec::EnvId;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use thiserror::Error;
 
-use crate::environment::{EnvironmentStore, LocalFsStore};
+use crate::credentials::{
+    RunBootstrapError, ValidateError, ZeroizedAdmin, run_bootstrap, validate_requirements,
+};
+use crate::env_packs::EnvPackRegistry;
+use crate::environment::LocalFsStore;
 
-use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
+use super::{AuditCtx, AuditGens, OpError, OpFlags, OpOutcome, audit_and_record};
 
 const NOUN: &str = "credentials";
 
@@ -47,6 +68,17 @@ pub struct CredentialsBootstrapPayload {
     /// Local profile name (e.g. AWS named profile) used for the one-time
     /// admin run. Never written to the env's storage.
     pub admin_profile: String,
+    /// Path to a file holding the admin credential material. The
+    /// contents are loaded into a [`ZeroizedAdmin`] wrapper and dropped
+    /// (zeroized) before this call returns. Mutually exclusive with
+    /// `admin_material_inline`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_material_path: Option<PathBuf>,
+    /// Inline admin credential material — convenient for piping (e.g.
+    /// `gtc op credentials bootstrap … --answers <(...)`). Never
+    /// persisted by the CLI. Mutually exclusive with `admin_material_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_material_inline: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,11 +86,28 @@ pub struct CredentialsRotatePayload {
     pub environment_id: String,
 }
 
-/// `op credentials requirements`. Returns a structured report describing
-/// what *would* be checked and yields `NotYetImplemented` for the actual
-/// validation. A5/Phase D wires the deployer env-pack `credentials.yaml`.
+#[derive(Debug, Error)]
+enum AdminLoadError {
+    #[error("no admin material supplied: provide `admin_material_path` or `admin_material_inline`")]
+    Missing,
+    #[error("cannot supply both `admin_material_path` and `admin_material_inline`")]
+    Both,
+    #[error("read admin material from `{path}`: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("admin material is empty")]
+    Empty,
+}
+
+/// `op credentials requirements`. Resolves the env's deployer handler
+/// through the registry, runs the C1 contract's probes, returns the
+/// per-check report.
 pub fn requirements(
     store: &LocalFsStore,
+    registry: &EnvPackRegistry,
     flags: &OpFlags,
     payload: Option<CredentialsRequirementsPayload>,
 ) -> Result<OpOutcome, OpError> {
@@ -67,25 +116,29 @@ pub fn requirements(
     }
     let payload = resolve_payload::<CredentialsRequirementsPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let env = store.load(&env_id)?;
-    let deployer = env.pack_for_slot(CapabilitySlot::Deployer).ok_or_else(|| {
-        OpError::Conflict(format!(
-            "env `{env_id}` has no deployer env-pack bound; bind one with `op env-packs add` first"
-        ))
-    })?;
-    let creds_ref: &SecretRef = env.credentials_ref.as_ref().ok_or_else(|| {
-        OpError::Conflict(format!(
-            "env `{env_id}` has no credentials_ref; run `op credentials bootstrap` first"
-        ))
-    })?;
-    let _ = describe_intent("requirements", &env_id, deployer, Some(creds_ref));
-    Err(OpError::NotYetImplemented(
-        "credential validation depends on deployer env-pack `credentials.yaml`; lands in A5+Phase D",
+
+    let (doc, report) =
+        validate_requirements(store, registry, &env_id).map_err(map_validate_err)?;
+
+    Ok(OpOutcome::new(
+        NOUN,
+        "requirements",
+        json!({
+            "environment_id": env_id.as_str(),
+            "deployer_kind": doc.deployer_kind.as_str(),
+            "credentials_ref": doc.provided_credentials_ref.as_str(),
+            "mode": "requirements",
+            "result": result_label(&doc.validation.result),
+            "missing_capabilities": doc.validation.missing_capabilities,
+            "checks": report.checks,
+            "last_run_at": doc.validation.last_run_at,
+        }),
     ))
 }
 
 pub fn bootstrap(
     store: &LocalFsStore,
+    registry: &EnvPackRegistry,
     flags: &OpFlags,
     payload: Option<CredentialsBootstrapPayload>,
 ) -> Result<OpOutcome, OpError> {
@@ -94,34 +147,63 @@ pub fn bootstrap(
     }
     let payload = resolve_payload::<CredentialsBootstrapPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
+
+    let admin = load_admin_credential(&payload).map_err(|e| {
+        // Keep the admin-loader's specific error visible to the operator
+        // — `Conflict` is the right kind for "you supplied the wrong
+        // combination of options" / "the file you pointed at is empty".
+        OpError::Conflict(e.to_string())
+    })?;
+
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "bootstrap",
+        // admin material is NEVER recorded — only the user-supplied
+        // profile handle (which is not a secret).
         target: json!({"admin_profile": payload.admin_profile}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, |_committed| {
-        let env = store.load(&env_id)?;
-        let deployer = env.pack_for_slot(CapabilitySlot::Deployer).ok_or_else(|| {
-            OpError::Conflict(format!(
-                "env `{env_id}` has no deployer env-pack bound; bind one with `op env-packs add` first"
-            ))
+    audit_and_record(store, ctx, |committed| {
+        let doc = match run_bootstrap(store, registry, &env_id, &admin) {
+            Ok(d) => d,
+            Err(e) => return Err(map_bootstrap_err(e)),
+        };
+
+        // Persist the new credentials_ref onto the env so subsequent
+        // `requirements`/`rotate` calls find it. `transact` is generic
+        // over the closure's error type with `E: From<StoreError>`, so
+        // `OpError` (which carries `#[from] StoreError`) flows through
+        // without any outer remap.
+        store.transact(&env_id, |locked| {
+            let mut env = locked.load()?;
+            env.credentials_ref = Some(doc.provided_credentials_ref.clone());
+            locked.save(&env)?;
+            Ok::<(), OpError>(())
         })?;
-        if env.credentials_ref.is_some() {
-            return Err(OpError::Conflict(format!(
-                "env `{env_id}` already has credentials_ref; use `rotate` instead of `bootstrap`"
-            )));
-        }
-        let _ = describe_intent("bootstrap", &env_id, deployer, None);
-        Err(OpError::NotYetImplemented(
-            "bootstrap runs the deployer env-pack's bootstrap module against ephemeral admin credentials; lands in A5+Phase D",
+        committed.mark_committed();
+
+        Ok((
+            OpOutcome::new(
+                NOUN,
+                "bootstrap",
+                json!({
+                    "environment_id": env_id.as_str(),
+                    "deployer_kind": doc.deployer_kind.as_str(),
+                    "mode": "bootstrap",
+                    "credentials_ref": doc.provided_credentials_ref.as_str(),
+                    "rules_pack_ref": doc.bootstrap.as_ref().map(|b| b.rules_pack_ref.display().to_string()),
+                    "admin_credential_consumed_at": doc.bootstrap.as_ref().map(|b| b.admin_credential_consumed_at),
+                }),
+            ),
+            AuditGens::NONE,
         ))
     })
 }
 
 pub fn rotate(
     store: &LocalFsStore,
+    registry: &EnvPackRegistry,
     flags: &OpFlags,
     payload: Option<CredentialsRotatePayload>,
 ) -> Result<OpOutcome, OpError> {
@@ -138,21 +220,110 @@ pub fn rotate(
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |_committed| {
-        let env = store.load(&env_id)?;
-        let deployer = env.pack_for_slot(CapabilitySlot::Deployer).ok_or_else(|| {
-            OpError::Conflict(format!("env `{env_id}` has no deployer env-pack bound"))
-        })?;
-        let creds_ref: &SecretRef = env.credentials_ref.as_ref().ok_or_else(|| {
-            OpError::Conflict(format!("env `{env_id}` has no credentials_ref to rotate"))
-        })?;
-        let _ = describe_intent("rotate", &env_id, deployer, Some(creds_ref));
-        Err(OpError::NotYetImplemented(
-            "credential rotation depends on deployer-specific session/token rotation hooks; lands in A5+Phase D",
+        // C1's rotate is "re-validate against the bound handler" —
+        // session-token rotation hooks (AWS STS, GCP impersonation) are
+        // deployer-specific behavior that lands in Phase D. Surfacing
+        // the up-to-date requirements report is the honest local
+        // behavior: it tells the operator whether the existing creds
+        // still satisfy the requirements.
+        let (doc, report) =
+            validate_requirements(store, registry, &env_id).map_err(map_validate_err)?;
+        Ok((
+            OpOutcome::new(
+                NOUN,
+                "rotate",
+                json!({
+                    "environment_id": env_id.as_str(),
+                    "deployer_kind": doc.deployer_kind.as_str(),
+                    "credentials_ref": doc.provided_credentials_ref.as_str(),
+                    "mode": "requirements",
+                    "result": result_label(&doc.validation.result),
+                    "missing_capabilities": doc.validation.missing_capabilities,
+                    "checks": report.checks,
+                    "last_run_at": doc.validation.last_run_at,
+                    "note": "session-token rotation is Phase D — today this re-validates the bound credentials",
+                }),
+            ),
+            AuditGens::NONE,
         ))
     })
 }
 
 // --- internals -----------------------------------------------------------
+
+fn result_label(r: &greentic_deploy_spec::CredentialsValidationResult) -> &'static str {
+    match r {
+        greentic_deploy_spec::CredentialsValidationResult::Pass => "pass",
+        greentic_deploy_spec::CredentialsValidationResult::Fail => "fail",
+    }
+}
+
+fn load_admin_credential(
+    payload: &CredentialsBootstrapPayload,
+) -> Result<ZeroizedAdmin, AdminLoadError> {
+    match (&payload.admin_material_path, &payload.admin_material_inline) {
+        (None, None) => Err(AdminLoadError::Missing),
+        (Some(_), Some(_)) => Err(AdminLoadError::Both),
+        (Some(path), None) => {
+            let bytes = std::fs::read(path).map_err(|source| AdminLoadError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            let material = String::from_utf8_lossy(&bytes).into_owned();
+            if material.trim().is_empty() {
+                return Err(AdminLoadError::Empty);
+            }
+            Ok(ZeroizedAdmin::new(&payload.admin_profile, material))
+        }
+        (None, Some(inline)) => {
+            if inline.trim().is_empty() {
+                return Err(AdminLoadError::Empty);
+            }
+            Ok(ZeroizedAdmin::new(&payload.admin_profile, inline.clone()))
+        }
+    }
+}
+
+fn map_validate_err(e: ValidateError) -> OpError {
+    match e {
+        ValidateError::NoDeployerBound(env_id) => OpError::Conflict(format!(
+            "env `{env_id}` has no deployer env-pack bound; bind one with `op env-packs add` first"
+        )),
+        ValidateError::NoCredentialsRef(env_id) => OpError::Conflict(format!(
+            "env `{env_id}` has no credentials_ref; run `op credentials bootstrap` first"
+        )),
+        ValidateError::HandlerNotRegistered { kind } => OpError::Conflict(format!(
+            "deployer env-pack `{kind}` has no native credentials handler registered (Phase D plug-in)"
+        )),
+        ValidateError::Store(s) => OpError::Store(s),
+        ValidateError::Registry(r) => OpError::Conflict(r.to_string()),
+    }
+}
+
+fn map_bootstrap_err(e: RunBootstrapError) -> OpError {
+    use crate::credentials::BootstrapError;
+    match e {
+        RunBootstrapError::NoDeployerBound(env_id) => OpError::Conflict(format!(
+            "env `{env_id}` has no deployer env-pack bound; bind one with `op env-packs add` first"
+        )),
+        RunBootstrapError::AlreadyBootstrapped(env_id) => OpError::Conflict(format!(
+            "env `{env_id}` already has credentials_ref; use `rotate` instead of `bootstrap`"
+        )),
+        RunBootstrapError::HandlerNotRegistered { kind } => OpError::Conflict(format!(
+            "deployer env-pack `{kind}` has no native credentials handler registered (Phase D plug-in)"
+        )),
+        RunBootstrapError::Store(s) => OpError::Store(s),
+        RunBootstrapError::Registry(r) => OpError::Conflict(r.to_string()),
+        RunBootstrapError::Bootstrap(BootstrapError::NotApplicable(msg)) => OpError::Conflict(msg),
+        RunBootstrapError::Bootstrap(BootstrapError::AdminRejected(msg)) => {
+            OpError::Conflict(format!("admin credential rejected: {msg}"))
+        }
+        RunBootstrapError::Bootstrap(BootstrapError::ProvisioningFailed { step, message }) => {
+            OpError::Conflict(format!("bootstrap failed during {step}: {message}"))
+        }
+        RunBootstrapError::RulesExport(r) => OpError::Conflict(format!("rules export: {r}")),
+    }
+}
 
 fn resolve_payload<T: serde::de::DeserializeOwned>(
     flags: &OpFlags,
@@ -171,21 +342,6 @@ fn resolve_payload<T: serde::de::DeserializeOwned>(
 
 fn parse_env_id(raw: &str) -> Result<EnvId, OpError> {
     EnvId::try_from(raw).map_err(|e| OpError::InvalidArgument(format!("environment_id: {e}")))
-}
-
-fn describe_intent(
-    op: &'static str,
-    env_id: &EnvId,
-    deployer: &greentic_deploy_spec::EnvPackBinding,
-    creds_ref: Option<&SecretRef>,
-) -> Value {
-    json!({
-        "op": op,
-        "environment_id": env_id.as_str(),
-        "deployer_kind": deployer.kind.to_string(),
-        "deployer_pack_ref": deployer.pack_ref.as_str(),
-        "credentials_ref": creds_ref.map(|c| c.as_str()),
-    })
 }
 
 fn req_schema() -> Value {
@@ -208,7 +364,9 @@ fn bootstrap_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "environment_id": {"type": "string"},
-            "admin_profile": {"type": "string"}
+            "admin_profile": {"type": "string"},
+            "admin_material_path": {"type": "string", "description": "path to a file holding the admin credential material (zeroized on drop)"},
+            "admin_material_inline": {"type": "string", "description": "inline admin credential material (zeroized on drop); mutually exclusive with admin_material_path"}
         }
     })
 }
@@ -224,10 +382,46 @@ fn rotate_schema() -> Value {
     })
 }
 
+// Backwards-compat shim so existing dispatch sites that call into the
+// 3-arg form (without an explicit registry) still build. Callers that
+// don't yet pass a registry get the built-in set (5 default `local`
+// handlers); Phase D registers more through `EnvPackRegistry::register`.
+//
+// Kept private — `dispatch::dispatch_credentials` is updated to pass a
+// registry explicitly. Tests use this shim for convenience.
+#[cfg(test)]
+pub(crate) fn requirements_default(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<CredentialsRequirementsPayload>,
+) -> Result<OpOutcome, OpError> {
+    requirements(store, &EnvPackRegistry::with_builtins(), flags, payload)
+}
+
+#[cfg(test)]
+pub(crate) fn bootstrap_default(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<CredentialsBootstrapPayload>,
+) -> Result<OpOutcome, OpError> {
+    bootstrap(store, &EnvPackRegistry::with_builtins(), flags, payload)
+}
+
+#[cfg(test)]
+pub(crate) fn rotate_default(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<CredentialsRotatePayload>,
+) -> Result<OpOutcome, OpError> {
+    rotate(store, &EnvPackRegistry::with_builtins(), flags, payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::tests_common::{make_binding, make_env};
+    use crate::environment::EnvironmentStore;
+    use greentic_deploy_spec::{CapabilitySlot, SecretRef};
     use tempfile::tempdir;
 
     #[test]
@@ -235,7 +429,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
-        let err = requirements(
+        let err = requirements_default(
             &store,
             &OpFlags::default(),
             Some(CredentialsRequirementsPayload {
@@ -243,6 +437,59 @@ mod tests {
             }),
         )
         .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn requirements_rejects_env_without_credentials_ref() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.local-process@0.1.0",
+        ));
+        store.save(&env).unwrap();
+        let err = requirements_default(
+            &store,
+            &OpFlags::default(),
+            Some(CredentialsRequirementsPayload {
+                environment_id: "local".to_string(),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+    }
+
+    /// With no native credentials handler registered for the bound
+    /// deployer, the CLI surfaces a structured `Conflict` (not a silent
+    /// pass-through). C2 wires the local-process handler so this case
+    /// passes; here we exercise an arbitrary deployer kind to confirm
+    /// the "no handler" path.
+    #[test]
+    fn requirements_with_unregistered_deployer_kind_yields_conflict() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            // No handler is registered for an arbitrary aws-ecs path
+            // in the C1 PR — Phase D registers it.
+            "greentic.deployer.aws-ecs@1.0.0",
+        ));
+        env.credentials_ref = Some(SecretRef::try_new("secret://local/credentials/aws").unwrap());
+        store.save(&env).unwrap();
+        let err = requirements_default(
+            &store,
+            &OpFlags::default(),
+            Some(CredentialsRequirementsPayload {
+                environment_id: "local".to_string(),
+            }),
+        )
+        .unwrap_err();
+        // The deployer kind isn't registered → registry resolve fails
+        // with `Unknown(kind)`; map_validate_err converts that to a
+        // Conflict carrying the registry message.
         assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
     }
 
@@ -257,12 +504,14 @@ mod tests {
         ));
         env.credentials_ref = Some(SecretRef::try_new("secret://local/credentials/aws").unwrap());
         store.save(&env).unwrap();
-        let err = bootstrap(
+        let err = bootstrap_default(
             &store,
             &OpFlags::default(),
             Some(CredentialsBootstrapPayload {
                 environment_id: "local".to_string(),
                 admin_profile: "admin".to_string(),
+                admin_material_path: None,
+                admin_material_inline: Some("ADMIN_TOKEN".to_string()),
             }),
         )
         .unwrap_err();
@@ -270,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_with_deployer_no_creds_yields_not_yet_implemented() {
+    fn bootstrap_requires_admin_material() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let mut env = make_env("local");
@@ -279,16 +528,48 @@ mod tests {
             "greentic.deployer.aws-ecs@1.0.0",
         ));
         store.save(&env).unwrap();
-        let err = bootstrap(
+        let err = bootstrap_default(
             &store,
             &OpFlags::default(),
             Some(CredentialsBootstrapPayload {
                 environment_id: "local".to_string(),
                 admin_profile: "admin".to_string(),
+                admin_material_path: None,
+                admin_material_inline: None,
             }),
         )
         .unwrap_err();
-        assert!(matches!(err, OpError::NotYetImplemented(_)), "got {err:?}");
+        assert!(
+            matches!(err, OpError::Conflict(ref m) if m.contains("no admin material")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_rejects_both_path_and_inline() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.aws-ecs@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let err = bootstrap_default(
+            &store,
+            &OpFlags::default(),
+            Some(CredentialsBootstrapPayload {
+                environment_id: "local".to_string(),
+                admin_profile: "admin".to_string(),
+                admin_material_path: Some("/tmp/x".into()),
+                admin_material_inline: Some("y".into()),
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, OpError::Conflict(ref m) if m.contains("cannot supply both")),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -301,7 +582,7 @@ mod tests {
             "greentic.deployer.aws-ecs@1.0.0",
         ));
         store.save(&env).unwrap();
-        let err = rotate(
+        let err = rotate_default(
             &store,
             &OpFlags::default(),
             Some(CredentialsRotatePayload {
@@ -310,60 +591,5 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn requirements_with_complete_setup_yields_not_yet_implemented() {
-        let dir = tempdir().unwrap();
-        let store = LocalFsStore::new(dir.path());
-        let mut env = make_env("local");
-        env.packs.push(make_binding(
-            CapabilitySlot::Deployer,
-            "greentic.deployer.aws-ecs@1.0.0",
-        ));
-        env.credentials_ref = Some(SecretRef::try_new("secret://local/credentials/aws").unwrap());
-        store.save(&env).unwrap();
-        let err = requirements(
-            &store,
-            &OpFlags::default(),
-            Some(CredentialsRequirementsPayload {
-                environment_id: "local".to_string(),
-            }),
-        )
-        .unwrap_err();
-        assert!(matches!(err, OpError::NotYetImplemented(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn bootstrap_stub_records_not_yet_implemented_audit_result() {
-        let dir = tempdir().unwrap();
-        let store = LocalFsStore::new(dir.path());
-        let mut env = make_env("local");
-        env.packs.push(make_binding(
-            CapabilitySlot::Deployer,
-            "greentic.deployer.aws-ecs@1.0.0",
-        ));
-        store.save(&env).unwrap();
-        let err = bootstrap(
-            &store,
-            &OpFlags::default(),
-            Some(CredentialsBootstrapPayload {
-                environment_id: "local".to_string(),
-                admin_profile: "admin".to_string(),
-            }),
-        )
-        .unwrap_err();
-        assert!(matches!(err, OpError::NotYetImplemented(_)));
-        let log = dir.path().join("local").join("audit").join("events.jsonl");
-        let raw = std::fs::read_to_string(&log).unwrap();
-        let event: crate::environment::AuditEvent = serde_json::from_str(raw.trim_end()).unwrap();
-        // Stub verbs MUST record `NotYetImplemented` (distinct from `Error`) so
-        // post-A7 readers can filter stub attempts from real errors.
-        match event.result {
-            crate::environment::AuditResult::NotYetImplemented { detail } => {
-                assert!(detail.contains("bootstrap"), "detail: {detail}");
-            }
-            other => panic!("expected NotYetImplemented, got {other:?}"),
-        }
     }
 }

@@ -51,6 +51,20 @@ pub trait EnvPackHandler: std::fmt::Debug + Send + Sync {
     fn preflight(&self) -> Vec<ToolCheck> {
         Vec::new()
     }
+
+    /// Deployer-only: credentials contract (C1).
+    ///
+    /// Returns `Some(_)` only on `Deployer`-slot handlers that ship a
+    /// [`DeployerCredentials`](crate::credentials::DeployerCredentials)
+    /// impl (C2 reference: local-process; Phase D adds AWS / K8s / etc.).
+    /// `None` for non-deployer handlers AND for deployer handlers that
+    /// haven't registered a credentials contract yet — the latter surface
+    /// as `HandlerNotRegistered` through the requirements/bootstrap CLI
+    /// flows, so deployer authors are nudged to ship one rather than
+    /// silently producing pass-through credential operations.
+    fn deployer_credentials(&self) -> Option<&dyn crate::credentials::DeployerCredentials> {
+        None
+    }
 }
 
 /// A built-in, metadata-only handler. One value per default `local` binding.

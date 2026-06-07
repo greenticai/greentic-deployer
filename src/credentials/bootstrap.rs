@@ -1,0 +1,273 @@
+//! Bootstrap-flow driver for [`super::DeployerCredentials`].
+//!
+//! `run_bootstrap` consumes a one-shot admin credential via
+//! [`ZeroizedAdmin`], delegates to the bound deployer handler, and
+//! persists:
+//!
+//! 1. The generated low-privilege secret material into the env's secrets
+//!    backend (returned via [`BootstrapOutcome::generated_credentials_ref`]).
+//! 2. A reviewable rules-pack under `rules/<env_id>/` so the customer's
+//!    admin can apply the equivalent IaC offline (see
+//!    [`rules_export`](super::rules_export)).
+//! 3. A [`Credentials`] doc with `mode = Bootstrap`,
+//!    `admin_credential_consumed_at` stamped to the call time, and a
+//!    pointer to the generated secret.
+//!
+//! ## Admin credentials posture
+//!
+//! Admin credentials are received in a [`ZeroizedAdmin`] wrapper whose
+//! `Drop` zeroizes the in-process buffer. This is best-effort: the OS
+//! may have paged the buffer, the cloud SDK may hold its own copy, and
+//! ambient profile chains (e.g. `~/.aws/credentials`) live outside this
+//! process. The contract is honest about that and does NOT claim
+//! process-wide memory erasure. Operators that need strong guarantees
+//! should run bootstrap on a short-lived process (CI runner, dedicated
+//! VM).
+//!
+//! ## Phase A constraint
+//!
+//! Same constraint as [`validate`](super::validate): Phase A's secrets
+//! handler is metadata-only, so the runner cannot actually *write* the
+//! generated secret material to a real backend yet. The
+//! [`BootstrapOutcome`] returned by the handler is honored and stamped
+//! into the persisted `Credentials` doc; the secret-backend write is a
+//! Phase D follow-on. Today, deployers that have no admin escalation
+//! (local-process, C2) cleanly return
+//! [`BootstrapError::NotApplicable`].
+
+use std::path::Path;
+
+use chrono::Utc;
+use greentic_deploy_spec::{
+    CapabilitySlot, Credentials, CredentialsBootstrap, CredentialsMode, CredentialsValidation,
+    CredentialsValidationResult, EnvId, SchemaVersion, SecretRef,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use zeroize::Zeroizing;
+
+use crate::env_packs::{EnvPackRegistry, RegistryError};
+use crate::environment::{EnvironmentStore, LocalFsStore, StoreError};
+
+use super::rules_export::{RulesExportError, RulesPack, write_rules_pack};
+
+/// One-shot admin credential material. `Drop` zeroizes the in-process
+/// buffer; see the module docstring for the limits of that guarantee.
+///
+/// Wrap the credential at the boundary closest to where it was supplied
+/// (e.g. read from an interactive prompt or a one-time ENV var) and pass
+/// the wrapper through to [`run_bootstrap`]. Do NOT clone the inner
+/// string out — `as_str()` borrows for the duration of the call.
+#[derive(Clone)]
+pub struct ZeroizedAdmin {
+    inner: Zeroizing<String>,
+    /// Profile / handle the user named (e.g. an AWS named profile or a
+    /// kubeconfig context). Not sensitive itself, but kept alongside the
+    /// material for diagnostics.
+    profile: String,
+}
+
+impl std::fmt::Debug for ZeroizedAdmin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZeroizedAdmin")
+            .field("profile", &self.profile)
+            .field("inner", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ZeroizedAdmin {
+    /// Wrap admin credential material. The caller is responsible for
+    /// ensuring `material` was not copied through an intermediate
+    /// allocation that survives this call.
+    pub fn new(profile: impl Into<String>, material: String) -> Self {
+        Self {
+            inner: Zeroizing::new(material),
+            profile: profile.into(),
+        }
+    }
+
+    /// Sentinel "I have no real admin material" wrapper for deployers
+    /// whose [`super::DeployerCredentials::bootstrap`] does not need any
+    /// (currently none — every real deployer needs *something* — but C2
+    /// uses this to test the rejection path).
+    pub fn sentinel(profile: impl Into<String>) -> Self {
+        Self {
+            inner: Zeroizing::new(String::new()),
+            profile: profile.into(),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.inner.as_str()
+    }
+
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+}
+
+/// Input passed to [`super::DeployerCredentials::bootstrap`].
+///
+/// Borrows the admin credential and the env context. Handlers MUST NOT
+/// store the `admin` reference past the call return — by the time
+/// `run_bootstrap` returns to the operator, the `ZeroizedAdmin` has
+/// dropped and its buffer is zeroized.
+#[derive(Debug)]
+pub struct BootstrapInput<'a> {
+    pub env_id: &'a EnvId,
+    pub env_root: &'a Path,
+    pub admin: &'a ZeroizedAdmin,
+}
+
+/// Successful bootstrap output.
+///
+/// The handler returns this; the runner persists the rules pack and
+/// stamps the env's [`Credentials`] doc. The handler does NOT touch the
+/// store directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootstrapOutcome {
+    /// `secret://<env>/credentials/<deployer-handle>` URI where the
+    /// generated low-privilege material was (or will be) written.
+    pub generated_credentials_ref: SecretRef,
+    /// Rules-pack content the customer's admin can review and apply.
+    /// Empty for deployers that need no offline IaC step (e.g.
+    /// local-process — though those should use
+    /// [`BootstrapError::NotApplicable`] rather than reach here).
+    pub rules_pack: RulesPack,
+}
+
+#[derive(Debug, Error)]
+pub enum BootstrapError {
+    /// The deployer has no admin escalation path — the user should run
+    /// `requirements` instead. Returned by local-process (C2).
+    #[error("{0}")]
+    NotApplicable(String),
+    /// Admin credential rejected by the cloud provider (wrong account,
+    /// expired session, insufficient privileges).
+    #[error("admin credential rejected: {0}")]
+    AdminRejected(String),
+    /// Bootstrap ran but a downstream provisioning step failed.
+    #[error("bootstrap failed during {step}: {message}")]
+    ProvisioningFailed { step: String, message: String },
+}
+
+#[derive(Debug, Error)]
+pub enum RunBootstrapError {
+    #[error("env `{0}` has no deployer slot bound; bind one with `op env-packs add` first")]
+    NoDeployerBound(EnvId),
+    #[error("env `{0}` already has credentials_ref; use `rotate` instead of `bootstrap`")]
+    AlreadyBootstrapped(EnvId),
+    #[error(
+        "deployer env-pack `{kind}` has no native credentials handler registered (Phase D plug-in)"
+    )]
+    HandlerNotRegistered { kind: String },
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
+    #[error(transparent)]
+    Bootstrap(#[from] BootstrapError),
+    #[error(transparent)]
+    RulesExport(#[from] RulesExportError),
+}
+
+/// Drive a `bootstrap` flow against the env's bound deployer env-pack.
+///
+/// Steps:
+/// 1. Load the env; require a deployer slot AND require
+///    `credentials_ref` to be absent (bootstrap creates it).
+/// 2. Resolve the deployer's handler via the registry.
+/// 3. Read the handler's [`super::DeployerCredentials`] (None ⇒ Phase D
+///    handler that hasn't registered a credentials contract).
+/// 4. Build a [`BootstrapInput`] borrowing the admin credential; call
+///    `handler.bootstrap(&input)`.
+/// 5. On `Ok(outcome)`: write the rules pack under `rules/<env_id>/`
+///    and build a [`Credentials`] doc stamped with
+///    `admin_credential_consumed_at = now()`.
+///
+/// Returns the [`Credentials`] doc; the caller decides whether to
+/// persist it onto the env (`env.credentials_ref = …`). This keeps the
+/// runner pure and lets tests assert the doc shape without observing
+/// store mutation.
+pub fn run_bootstrap(
+    store: &LocalFsStore,
+    registry: &EnvPackRegistry,
+    env_id: &EnvId,
+    admin: &ZeroizedAdmin,
+) -> Result<Credentials, RunBootstrapError> {
+    let env = store.load(env_id)?;
+    let deployer = env
+        .pack_for_slot(CapabilitySlot::Deployer)
+        .ok_or_else(|| RunBootstrapError::NoDeployerBound(env_id.clone()))?;
+    if env.credentials_ref.is_some() {
+        return Err(RunBootstrapError::AlreadyBootstrapped(env_id.clone()));
+    }
+
+    let handler = registry.resolve_for_slot(CapabilitySlot::Deployer, &deployer.kind)?;
+    let creds =
+        handler
+            .deployer_credentials()
+            .ok_or_else(|| RunBootstrapError::HandlerNotRegistered {
+                kind: deployer.kind.as_str().to_string(),
+            })?;
+
+    let env_root = store.env_dir(env_id)?;
+    let input = BootstrapInput {
+        env_id,
+        env_root: &env_root,
+        admin,
+    };
+    let outcome = creds.bootstrap(&input)?;
+
+    let consumed_at = Utc::now();
+    let rules_pack_ref = write_rules_pack(&env_root, &deployer.kind, &outcome.rules_pack)?;
+
+    let doc = Credentials {
+        schema: SchemaVersion::new(SchemaVersion::CREDENTIALS_V1),
+        env_id: env_id.clone(),
+        deployer_kind: deployer.kind.clone(),
+        mode: CredentialsMode::Bootstrap,
+        provided_credentials_ref: outcome.generated_credentials_ref.clone(),
+        validation: CredentialsValidation {
+            last_run_at: consumed_at,
+            // Bootstrap output is trusted at write-time; first
+            // requirements run after this stamps the real result.
+            result: CredentialsValidationResult::Pass,
+            missing_capabilities: Vec::new(),
+        },
+        bootstrap: Some(CredentialsBootstrap {
+            admin_credential_consumed_at: consumed_at,
+            rules_pack_ref,
+            generated_credentials_ref: outcome.generated_credentials_ref,
+        }),
+        expiry: None,
+    };
+    Ok(doc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zeroized_admin_redacts_in_debug_output() {
+        let admin = ZeroizedAdmin::new("p1", "AKIASUPERSECRET".to_string());
+        let dbg = format!("{admin:?}");
+        assert!(dbg.contains("<redacted>"));
+        assert!(!dbg.contains("AKIASUPERSECRET"));
+    }
+
+    #[test]
+    fn zeroized_admin_as_str_returns_material() {
+        let admin = ZeroizedAdmin::new("p1", "x".to_string());
+        assert_eq!(admin.as_str(), "x");
+        assert_eq!(admin.profile(), "p1");
+    }
+
+    #[test]
+    fn sentinel_has_empty_material() {
+        let admin = ZeroizedAdmin::sentinel("p1");
+        assert!(admin.as_str().is_empty());
+    }
+}

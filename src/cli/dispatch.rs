@@ -988,10 +988,19 @@ fn dispatch_credentials(
     flags: &OpFlags,
     verb: CredentialsVerb,
 ) -> Result<(), OpError> {
+    // Phase A built-in registry covers the five default `local`
+    // handlers. Phase D plug-ins register additional deployer
+    // credentials handlers (AWS / K8s / ...) via
+    // `EnvPackRegistry::register`. When that plug-in surface lands,
+    // wire the operator's persistent registry through here instead of
+    // constructing one per call.
+    let registry = crate::env_packs::EnvPackRegistry::with_builtins();
     let outcome = match verb {
-        CredentialsVerb::Requirements => super::credentials::requirements(store, flags, None)?,
-        CredentialsVerb::Bootstrap => super::credentials::bootstrap(store, flags, None)?,
-        CredentialsVerb::Rotate => super::credentials::rotate(store, flags, None)?,
+        CredentialsVerb::Requirements => {
+            super::credentials::requirements(store, &registry, flags, None)?
+        }
+        CredentialsVerb::Bootstrap => super::credentials::bootstrap(store, &registry, flags, None)?,
+        CredentialsVerb::Rotate => super::credentials::rotate(store, &registry, flags, None)?,
     };
     print_outcome(&outcome)
 }
