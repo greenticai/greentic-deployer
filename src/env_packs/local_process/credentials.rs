@@ -133,15 +133,17 @@ impl DeployerCredentials for LocalProcessCredentials {
     }
 }
 
-/// Probe whether the env's state dir is writable using the same
-/// atomic-write sequence the store uses at runtime (NamedTempFile →
-/// flush → sync_all → persist/rename → fsync parent). This catches
-/// read-only mounts and filesystems that accept buffered writes but fail
-/// on sync or rename — the original tempfile-only probe missed those.
+/// Probe whether the env's state dir is writable by exercising the
+/// canonical `crate::environment::atomic_write::atomic_write_bytes`
+/// helper (NamedTempFile → flush → sync_all → persist → fsync parent).
+/// Catches read-only mounts and filesystems that accept buffered writes
+/// but fail on sync or rename — the original tempfile-only probe missed
+/// those. Sharing the helper guarantees the probe stays in lock-step
+/// with what the store actually does at runtime.
 ///
-/// The probe writes a file named `.local-process-creds-probe` under
-/// `env_root`, then deletes it on success. On any failure the file is
-/// cleaned up by `NamedTempFile`'s Drop.
+/// The probe writes `.local-process-creds-probe` under `env_root`, then
+/// deletes it on success. On atomic-write failure the partial file is
+/// cleaned up by the helper's NamedTempFile Drop.
 ///
 /// **Limitation:** probes only `env_root` itself. The deployer writes
 /// under several subdirs (`runtime-config.json`, `revisions/`,
@@ -159,55 +161,24 @@ fn probe_fs_writable(env_root: &Path) -> CapabilityStatus {
         };
     }
     let probe_target = env_root.join(".local-process-creds-probe");
-    let tmp = match tempfile::NamedTempFile::new_in(env_root) {
-        Ok(t) => t,
-        Err(e) => {
-            return CapabilityStatus::Fail {
-                reason: format!(
-                    "could not create probe file under `{}`: {}",
-                    env_root.display(),
-                    e
-                ),
-            };
+    match crate::environment::atomic_write::atomic_write_bytes(
+        &probe_target,
+        b"local-process-creds-probe",
+    ) {
+        Ok(()) => {
+            // Clean up the probe file. A failure to remove is non-fatal —
+            // the deployer would tolerate a stray probe file on a
+            // writable mount, and the probe has already proven its point.
+            let _ = std::fs::remove_file(&probe_target);
+            CapabilityStatus::Pass
         }
-    };
-    use std::io::Write;
-    if let Err(e) = (&tmp).write_all(b"local-process-creds-probe") {
-        return CapabilityStatus::Fail {
-            reason: format!("write probe at `{}` failed: {}", tmp.path().display(), e),
-        };
-    }
-    if let Err(e) = tmp.as_file().flush() {
-        return CapabilityStatus::Fail {
-            reason: format!("flush probe at `{}` failed: {}", tmp.path().display(), e),
-        };
-    }
-    if let Err(e) = tmp.as_file().sync_all() {
-        return CapabilityStatus::Fail {
-            reason: format!("sync probe at `{}` failed: {}", tmp.path().display(), e),
-        };
-    }
-    // Atomic rename — exercises the same persist path as `atomic_write_bytes`.
-    if let Err(e) = tmp.persist(&probe_target) {
-        return CapabilityStatus::Fail {
+        Err(e) => CapabilityStatus::Fail {
             reason: format!(
-                "persist (rename) probe to `{}` failed: {}",
-                probe_target.display(),
-                e
+                "atomic write probe at `{}` failed: {e}",
+                probe_target.display()
             ),
-        };
+        },
     }
-    // fsync the parent directory so the rename is durable (matches the
-    // store's `fsync_parent` on Unix, no-op elsewhere).
-    #[cfg(unix)]
-    {
-        if let Ok(dir) = std::fs::File::open(env_root) {
-            let _ = dir.sync_all();
-        }
-    }
-    // Clean up the probe file.
-    let _ = std::fs::remove_file(&probe_target);
-    CapabilityStatus::Pass
 }
 
 /// Probe whether the deployer can bind a network listener.

@@ -89,50 +89,11 @@ impl EnvPackHandler for BuiltinHandler {
             .parse()
             .expect("built-in version-req is valid (guarded by tests)")
     }
-
-    fn deployer_credentials(&self) -> Option<&dyn crate::credentials::DeployerCredentials> {
-        if self.slot == CapabilitySlot::Deployer {
-            Some(&BuiltinLocalProcessCredentials)
-        } else {
-            None
-        }
-    }
-}
-
-/// Stub credentials for the built-in local-process deployer (C1 contract
-/// registration gate). This is the C1-layer contract; C2's
-/// `LocalProcessCredentials` may override with richer probes. The stub
-/// declares `requires_credentials_material() = false` because the
-/// local-process deployer has no IAM roles or cloud credentials to manage.
-#[derive(Debug)]
-struct BuiltinLocalProcessCredentials;
-
-impl crate::credentials::DeployerCredentials for BuiltinLocalProcessCredentials {
-    fn requires_credentials_material(&self) -> bool {
-        false
-    }
-
-    fn required_capabilities(&self) -> Vec<crate::credentials::Capability> {
-        Vec::new()
-    }
-
-    fn validate(
-        &self,
-        _ctx: &crate::credentials::ValidationContext<'_>,
-    ) -> crate::credentials::RequirementsReport {
-        crate::credentials::RequirementsReport::new(Vec::new())
-    }
-
-    fn bootstrap(
-        &self,
-        _input: &crate::credentials::BootstrapInput<'_>,
-    ) -> Result<crate::credentials::BootstrapOutcome, crate::credentials::BootstrapError> {
-        Err(crate::credentials::BootstrapError::NotApplicable(
-            "local-process deployer has no admin escalation path \
-             — use `op credentials requirements` instead"
-                .to_string(),
-        ))
-    }
+    // No `deployer_credentials` override — every entry in `BUILTIN_HANDLERS`
+    // serves a non-Deployer slot. The Deployer slot is served by the
+    // dedicated `LocalProcessDeployerHandler` registered separately in
+    // `EnvPackRegistry::with_builtins`. The registry's deployer-credentials
+    // gate ensures any future Deployer-slot handler ships a real contract.
 }
 
 /// Metadata-only built-in handlers backing the default `local` environment.
