@@ -836,4 +836,48 @@ mod tests {
             outcome.result["credentials_ref"]
         );
     }
+
+    /// Fix 1 (Codex C2 #1): the stock default registry
+    /// (`EnvPackRegistry::with_builtins()`) must pass requirements for a
+    /// `local` env bound to the default `LOCAL_DEPLOYER_PACK` WITHOUT a
+    /// `credentials_ref` set. This proves the dead-end circular flow
+    /// (requirements → "run bootstrap" → "use requirements instead") is
+    /// closed on the operator-facing path.
+    #[test]
+    fn requirements_default_passes_for_local_deployer_without_credentials_ref() {
+        use crate::defaults::LOCAL_DEPLOYER_PACK;
+
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs
+            .push(make_binding(CapabilitySlot::Deployer, LOCAL_DEPLOYER_PACK));
+        // No credentials_ref set — this is the exact operator-facing scenario.
+        store.save(&env).unwrap();
+
+        let outcome = requirements_default(
+            &store,
+            &OpFlags::default(),
+            Some(CredentialsRequirementsPayload {
+                environment_id: "local".to_string(),
+            }),
+        )
+        .expect("default registry requirements should pass for local-process");
+        assert_eq!(outcome.result["result"], "pass");
+        let checks = outcome.result["checks"].as_array().unwrap();
+        assert_eq!(
+            checks.len(),
+            2,
+            "local-process declares 2 capabilities (fs + port)"
+        );
+        // Sentinel ref used when no material is needed.
+        assert!(
+            outcome.result["credentials_ref"]
+                .as_str()
+                .unwrap()
+                .contains("no-material-required"),
+            "expected sentinel ref, got {:?}",
+            outcome.result["credentials_ref"]
+        );
+    }
 }
