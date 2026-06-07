@@ -306,17 +306,30 @@ fn load_admin_credential(
     }
 }
 
+// Shared message helpers — both mappers below enrich the library-level
+// error with operator-action guidance (e.g. "bind one with `op env-packs
+// add` first"). The source `#[error(...)]` strings on `ValidateError` /
+// `RunBootstrapError` are deliberately library-shaped (no CLI verb hints),
+// so the CLI mapper layer owns the operator-facing wording.
+fn no_deployer_bound_msg(env_id: &EnvId) -> String {
+    format!("env `{env_id}` has no deployer env-pack bound; bind one with `op env-packs add` first")
+}
+
+fn handler_not_registered_msg(kind: &str) -> String {
+    format!(
+        "deployer env-pack `{kind}` has no native credentials handler registered (Phase D plug-in)"
+    )
+}
+
 fn map_validate_err(e: ValidateError) -> OpError {
     match e {
-        ValidateError::NoDeployerBound(env_id) => OpError::Conflict(format!(
-            "env `{env_id}` has no deployer env-pack bound; bind one with `op env-packs add` first"
-        )),
+        ValidateError::NoDeployerBound(env_id) => OpError::Conflict(no_deployer_bound_msg(&env_id)),
         ValidateError::NoCredentialsRef(env_id) => OpError::Conflict(format!(
             "env `{env_id}` has no credentials_ref; run `op credentials bootstrap` first"
         )),
-        ValidateError::HandlerNotRegistered { kind } => OpError::Conflict(format!(
-            "deployer env-pack `{kind}` has no native credentials handler registered (Phase D plug-in)"
-        )),
+        ValidateError::HandlerNotRegistered { kind } => {
+            OpError::Conflict(handler_not_registered_msg(&kind))
+        }
         ValidateError::Store(s) => OpError::Store(s),
         ValidateError::Registry(r) => OpError::Conflict(r.to_string()),
     }
@@ -325,15 +338,15 @@ fn map_validate_err(e: ValidateError) -> OpError {
 fn map_bootstrap_err(e: RunBootstrapError) -> OpError {
     use crate::credentials::BootstrapError;
     match e {
-        RunBootstrapError::NoDeployerBound(env_id) => OpError::Conflict(format!(
-            "env `{env_id}` has no deployer env-pack bound; bind one with `op env-packs add` first"
-        )),
+        RunBootstrapError::NoDeployerBound(env_id) => {
+            OpError::Conflict(no_deployer_bound_msg(&env_id))
+        }
         RunBootstrapError::AlreadyBootstrapped(env_id) => OpError::Conflict(format!(
             "env `{env_id}` already has credentials_ref; use `rotate` instead of `bootstrap`"
         )),
-        RunBootstrapError::HandlerNotRegistered { kind } => OpError::Conflict(format!(
-            "deployer env-pack `{kind}` has no native credentials handler registered (Phase D plug-in)"
-        )),
+        RunBootstrapError::HandlerNotRegistered { kind } => {
+            OpError::Conflict(handler_not_registered_msg(&kind))
+        }
         RunBootstrapError::Store(s) => OpError::Store(s),
         RunBootstrapError::Registry(r) => OpError::Conflict(r.to_string()),
         RunBootstrapError::Bootstrap(BootstrapError::NotApplicable(msg)) => OpError::Conflict(msg),

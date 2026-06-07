@@ -94,7 +94,8 @@ pub fn write_rules_pack(
     // `env_root/rules/<deployer-path>` would cause `create_dir_all` to
     // succeed (following the symlink) and writes would land outside the
     // per-pack rules directory.
-    assert_no_symlink_ancestors(env_root, &pack_dir)?;
+    crate::path_safety::assert_no_symlink_ancestors(env_root, &pack_dir)
+        .map_err(map_path_safety)?;
 
     create_dir_all(&pack_dir)?;
 
@@ -138,75 +139,41 @@ fn create_dir_all(path: &Path) -> Result<(), RulesExportError> {
     })
 }
 
-/// Walk every existing ancestor of `target` that is a proper descendant of
-/// `root` (inclusive of `target` itself) and reject if any is a symlink.
-///
-/// Only existing ancestors are checked — non-existent path segments are
-/// fine (they will be created by `create_dir_all`). This mirrors the
-/// P0.4 symlink-TOCTOU posture from the bundle extractors: the check runs
-/// immediately before the write, under the env flock, so the race window
-/// is bounded to the same flock scope as other env mutations.
-fn assert_no_symlink_ancestors(root: &Path, target: &Path) -> Result<(), RulesExportError> {
-    // Build the list of segments between root and target.
-    let suffix = match target.strip_prefix(root) {
-        Ok(s) => s,
-        Err(_) => return Ok(()), // target is not under root — caller error, but not our gate
-    };
-    let mut current = root.to_path_buf();
-    for component in suffix.components() {
-        current.push(component);
-        // Only check segments that already exist on disk. Non-existent
-        // segments will be freshly created by `create_dir_all`.
-        match std::fs::symlink_metadata(&current) {
-            Ok(meta) if meta.is_symlink() => {
-                return Err(RulesExportError::SymlinkAncestor { path: current });
-            }
-            Ok(_) => {} // exists, not a symlink — fine
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-            Err(e) => {
-                return Err(RulesExportError::Io {
-                    path: current,
-                    source: e,
-                });
-            }
-        }
+// `assert_no_symlink_ancestors` lives in `crate::path_safety` — the shared
+// home for P0.4-style symlink-TOCTOU defenses so future extractors and
+// writers consult the same gate. Local mapping of its typed error into
+// `RulesExportError` is in `map_path_safety` below.
+
+fn map_path_safety(e: crate::path_safety::PathSafetyError) -> RulesExportError {
+    use crate::path_safety::PathSafetyError;
+    match e {
+        PathSafetyError::SymlinkAncestor { path } => RulesExportError::SymlinkAncestor { path },
+        PathSafetyError::Io { path, source } => RulesExportError::Io { path, source },
     }
-    Ok(())
 }
 
+/// Delegate to the canonical atomic-write helper in
+/// `crate::environment::atomic_write` (the same NamedTempFile → flush →
+/// sync_all → persist → fsync(parent) pipeline the store uses for env
+/// state). Map the typed error into [`RulesExportError`] so callers get
+/// the rules-pack error envelope.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), RulesExportError> {
-    use std::io::Write;
-    let parent = path.parent().ok_or_else(|| RulesExportError::Io {
-        path: path.to_path_buf(),
-        source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent dir"),
-    })?;
-    let mut tmp =
-        tempfile::NamedTempFile::new_in(parent).map_err(|source| RulesExportError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    tmp.write_all(bytes)
-        .map_err(|source| RulesExportError::Io {
-            path: tmp.path().to_path_buf(),
-            source,
-        })?;
-    tmp.as_file_mut()
-        .sync_all()
-        .map_err(|source| RulesExportError::Io {
-            path: tmp.path().to_path_buf(),
-            source,
-        })?;
-    tmp.persist(path).map_err(|e| RulesExportError::Io {
-        path: path.to_path_buf(),
-        source: e.error,
-    })?;
-    #[cfg(unix)]
-    {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
-    Ok(())
+    use crate::environment::atomic_write::{AtomicWriteError, atomic_write_bytes};
+    atomic_write_bytes(path, bytes).map_err(|e| match e {
+        AtomicWriteError::Io { path, source } => RulesExportError::Io { path, source },
+        AtomicWriteError::NoParent(path) => RulesExportError::Io {
+            path,
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent dir"),
+        },
+        AtomicWriteError::Persist { target, source } => RulesExportError::Io {
+            path: target,
+            source: source.error,
+        },
+        other => RulesExportError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(other.to_string()),
+        },
+    })
 }
 
 #[derive(Serialize)]

@@ -193,7 +193,7 @@ pub fn run_bootstrap(
     admin: &ZeroizedAdmin,
 ) -> Result<Credentials, RunBootstrapError> {
     store.transact(env_id, |locked| {
-        let env = locked.load()?;
+        let mut env = locked.load()?;
         let deployer = env
             .pack_for_slot(CapabilitySlot::Deployer)
             .ok_or_else(|| RunBootstrapError::NoDeployerBound(env_id.clone()))?;
@@ -218,11 +218,13 @@ pub fn run_bootstrap(
 
         let consumed_at = Utc::now();
         let rules_pack_ref = write_rules_pack(&env_root, &deployer.kind, &outcome.rules_pack)?;
+        // Snapshot the deployer kind before the &env borrow ends below.
+        let deployer_kind = deployer.kind.clone();
 
         let doc = Credentials {
             schema: SchemaVersion::new(SchemaVersion::CREDENTIALS_V1),
             env_id: env_id.clone(),
-            deployer_kind: deployer.kind.clone(),
+            deployer_kind,
             mode: CredentialsMode::Bootstrap,
             provided_credentials_ref: outcome.generated_credentials_ref.clone(),
             validation: CredentialsValidation {
@@ -240,9 +242,10 @@ pub fn run_bootstrap(
             expiry: None,
         };
 
-        // Persist credentials_ref inside the transaction so the
-        // absence-check → write is atomic w.r.t. the flock.
-        let mut env = locked.load()?;
+        // Persist credentials_ref inside the same transaction so the
+        // absence-check → write is atomic w.r.t. the flock. Reuses
+        // `env` from the initial load — no external writer can have
+        // mutated it while the flock is held.
         env.credentials_ref = Some(doc.provided_credentials_ref.clone());
         locked.save(&env)?;
 
