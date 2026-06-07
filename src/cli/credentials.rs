@@ -46,12 +46,13 @@ use greentic_deploy_spec::EnvId;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::credentials::{
     RunBootstrapError, ValidateError, ZeroizedAdmin, run_bootstrap, validate_requirements,
 };
 use crate::env_packs::EnvPackRegistry;
-use crate::environment::LocalFsStore;
+use crate::environment::{EnvironmentStore, LocalFsStore};
 
 use super::{AuditCtx, AuditGens, OpError, OpFlags, OpOutcome, audit_and_record};
 
@@ -98,6 +99,8 @@ enum AdminLoadError {
         #[source]
         source: std::io::Error,
     },
+    #[error("admin material at `{path}` is not valid UTF-8")]
+    NonUtf8 { path: PathBuf },
     #[error("admin material is empty")]
     Empty,
 }
@@ -145,10 +148,10 @@ pub fn bootstrap(
     if flags.schema_only {
         return Ok(OpOutcome::new(NOUN, "bootstrap", bootstrap_schema()));
     }
-    let payload = resolve_payload::<CredentialsBootstrapPayload>(flags, payload)?;
+    let mut payload = resolve_payload::<CredentialsBootstrapPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
 
-    let admin = load_admin_credential(&payload).map_err(|e| {
+    let admin = load_admin_credential(&mut payload).map_err(|e| {
         // Keep the admin-loader's specific error visible to the operator
         // — `Conflict` is the right kind for "you supplied the wrong
         // combination of options" / "the file you pointed at is empty".
@@ -165,22 +168,13 @@ pub fn bootstrap(
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |committed| {
+        // `run_bootstrap` holds the env flock for the entire flow:
+        // load → absence check → handler.bootstrap → rules-pack write →
+        // credentials_ref persist. No separate `transact` needed here.
         let doc = match run_bootstrap(store, registry, &env_id, &admin) {
             Ok(d) => d,
             Err(e) => return Err(map_bootstrap_err(e)),
         };
-
-        // Persist the new credentials_ref onto the env so subsequent
-        // `requirements`/`rotate` calls find it. `transact` is generic
-        // over the closure's error type with `E: From<StoreError>`, so
-        // `OpError` (which carries `#[from] StoreError`) flows through
-        // without any outer remap.
-        store.transact(&env_id, |locked| {
-            let mut env = locked.load()?;
-            env.credentials_ref = Some(doc.provided_credentials_ref.clone());
-            locked.save(&env)?;
-            Ok::<(), OpError>(())
-        })?;
         committed.mark_committed();
 
         Ok((
@@ -203,7 +197,7 @@ pub fn bootstrap(
 
 pub fn rotate(
     store: &LocalFsStore,
-    registry: &EnvPackRegistry,
+    _registry: &EnvPackRegistry,
     flags: &OpFlags,
     payload: Option<CredentialsRotatePayload>,
 ) -> Result<OpOutcome, OpError> {
@@ -212,6 +206,29 @@ pub fn rotate(
     }
     let payload = resolve_payload::<CredentialsRotatePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
+
+    // Pre-flight: reject envs that have no credentials_ref at all
+    // (same precondition as the old validate_requirements path).
+    let env = store.load(&env_id).map_err(|e| match e {
+        crate::environment::StoreError::NotFound(_) => {
+            OpError::NotFound(format!("environment `{env_id}`"))
+        }
+        other => OpError::Store(other),
+    })?;
+    if env
+        .pack_for_slot(greentic_deploy_spec::CapabilitySlot::Deployer)
+        .is_none()
+    {
+        return Err(OpError::Conflict(format!(
+            "env `{env_id}` has no deployer env-pack bound; bind one with `op env-packs add` first"
+        )));
+    }
+    if env.credentials_ref.is_none() {
+        return Err(OpError::Conflict(format!(
+            "env `{env_id}` has no credentials_ref; run `op credentials bootstrap` first"
+        )));
+    }
+
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -220,31 +237,15 @@ pub fn rotate(
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |_committed| {
-        // C1's rotate is "re-validate against the bound handler" —
-        // session-token rotation hooks (AWS STS, GCP impersonation) are
-        // deployer-specific behavior that lands in Phase D. Surfacing
-        // the up-to-date requirements report is the honest local
-        // behavior: it tells the operator whether the existing creds
-        // still satisfy the requirements.
-        let (doc, report) =
-            validate_requirements(store, registry, &env_id).map_err(map_validate_err)?;
-        Ok((
-            OpOutcome::new(
-                NOUN,
-                "rotate",
-                json!({
-                    "environment_id": env_id.as_str(),
-                    "deployer_kind": doc.deployer_kind.as_str(),
-                    "credentials_ref": doc.provided_credentials_ref.as_str(),
-                    "mode": "requirements",
-                    "result": result_label(&doc.validation.result),
-                    "missing_capabilities": doc.validation.missing_capabilities,
-                    "checks": report.checks,
-                    "last_run_at": doc.validation.last_run_at,
-                    "note": "session-token rotation is Phase D — today this re-validates the bound credentials",
-                }),
-            ),
-            AuditGens::NONE,
+        // Session-token rotation hooks (AWS STS, GCP impersonation) are
+        // deployer-specific behavior that lands in Phase D. Returning
+        // NotYetImplemented ensures the audit log does NOT record a
+        // successful rotation when no material actually changed —
+        // operators watching for leaked-credential remediation won't
+        // get a false "rotated" signal.
+        Err(OpError::NotYetImplemented(
+            "session-token rotation hooks are Phase D \
+             — use `op credentials requirements` for re-validation today",
         ))
     })
 }
@@ -258,28 +259,49 @@ fn result_label(r: &greentic_deploy_spec::CredentialsValidationResult) -> &'stat
     }
 }
 
+/// Load admin credential material into a [`ZeroizedAdmin`] wrapper.
+///
+/// Takes `&mut` so the inline path can `std::mem::take` the material out
+/// of the payload, leaving `None` behind — explicit single-use semantics
+/// that prevents the caller from accidentally retaining the cleartext.
+///
+/// File path: reads into `Zeroizing<Vec<u8>>`, then converts via strict
+/// `String::from_utf8` (not lossy — lossy substitution silently corrupts
+/// credentials). The intermediate `Vec<u8>` is zeroized on drop.
 fn load_admin_credential(
-    payload: &CredentialsBootstrapPayload,
+    payload: &mut CredentialsBootstrapPayload,
 ) -> Result<ZeroizedAdmin, AdminLoadError> {
     match (&payload.admin_material_path, &payload.admin_material_inline) {
         (None, None) => Err(AdminLoadError::Missing),
         (Some(_), Some(_)) => Err(AdminLoadError::Both),
         (Some(path), None) => {
-            let bytes = std::fs::read(path).map_err(|source| AdminLoadError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            let material = String::from_utf8_lossy(&bytes).into_owned();
+            let mut bytes =
+                Zeroizing::new(std::fs::read(path).map_err(|source| AdminLoadError::Io {
+                    path: path.clone(),
+                    source,
+                })?);
+            // Take the raw bytes out of the Zeroizing wrapper. The
+            // wrapper drops with an empty Vec (no-op zeroize); the
+            // bytes move into String::from_utf8. On UTF-8 success the
+            // String takes ownership of the same allocation; on failure
+            // the bytes are returned inside the error and dropped here.
+            let raw = std::mem::take(&mut *bytes);
+            let material = String::from_utf8(raw)
+                .map_err(|_| AdminLoadError::NonUtf8 { path: path.clone() })?;
             if material.trim().is_empty() {
                 return Err(AdminLoadError::Empty);
             }
             Ok(ZeroizedAdmin::new(&payload.admin_profile, material))
         }
-        (None, Some(inline)) => {
-            if inline.trim().is_empty() {
+        (None, Some(_)) => {
+            // Take the inline material out of the payload — the field
+            // becomes `None` after extraction, enforcing single-use.
+            let taken = std::mem::take(&mut payload.admin_material_inline)
+                .expect("matched Some branch; take cannot be None");
+            if taken.trim().is_empty() {
                 return Err(AdminLoadError::Empty);
             }
-            Ok(ZeroizedAdmin::new(&payload.admin_profile, inline.clone()))
+            Ok(ZeroizedAdmin::new(&payload.admin_profile, taken))
         }
     }
 }
@@ -440,8 +462,10 @@ mod tests {
         assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
     }
 
+    /// A no-material deployer (like local-process) passes requirements
+    /// even without a `credentials_ref` on the env.
     #[test]
-    fn requirements_rejects_env_without_credentials_ref() {
+    fn requirements_passes_for_no_material_deployer_without_credentials_ref() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let mut env = make_env("local");
@@ -450,15 +474,16 @@ mod tests {
             "greentic.deployer.local-process@0.1.0",
         ));
         store.save(&env).unwrap();
-        let err = requirements_default(
+        let outcome = requirements_default(
             &store,
             &OpFlags::default(),
             Some(CredentialsRequirementsPayload {
                 environment_id: "local".to_string(),
             }),
         )
-        .unwrap_err();
-        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+        .unwrap();
+        assert_eq!(outcome.result["mode"], "requirements");
+        assert_eq!(outcome.result["result"], "pass");
     }
 
     /// With no native credentials handler registered for the bound
@@ -591,5 +616,118 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+    }
+
+    /// Rotate returns `NotYetImplemented` (not a misleading success).
+    #[test]
+    fn rotate_returns_not_yet_implemented() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.local-process@0.1.0",
+        ));
+        env.credentials_ref = Some(SecretRef::try_new("secret://local/credentials/test").unwrap());
+        store.save(&env).unwrap();
+        let err = rotate_default(
+            &store,
+            &OpFlags::default(),
+            Some(CredentialsRotatePayload {
+                environment_id: "local".to_string(),
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, OpError::NotYetImplemented(_)),
+            "rotate should return NotYetImplemented, got {err:?}"
+        );
+    }
+
+    /// A no-material deployer handler works against an env with no
+    /// `credentials_ref` — the validate_requirements runner uses a
+    /// sentinel ref instead of rejecting with NoCredentialsRef.
+    #[test]
+    fn no_material_deployer_requirements_without_credentials_ref() {
+        use crate::credentials::{
+            BootstrapError, BootstrapInput, BootstrapOutcome, Capability, DeployerCredentials,
+            RequirementsReport, ValidationContext,
+        };
+        use crate::env_packs::EnvPackHandler;
+
+        #[derive(Debug)]
+        struct NoMaterialHandler;
+
+        impl EnvPackHandler for NoMaterialHandler {
+            fn slot(&self) -> CapabilitySlot {
+                CapabilitySlot::Deployer
+            }
+            fn descriptor_path(&self) -> &str {
+                "test.deployer.no-material"
+            }
+            fn supported_versions(&self) -> semver::VersionReq {
+                "^0.1.0".parse().unwrap()
+            }
+            fn deployer_credentials(&self) -> Option<&dyn DeployerCredentials> {
+                Some(&NoMaterialCreds)
+            }
+        }
+
+        #[derive(Debug)]
+        struct NoMaterialCreds;
+
+        impl DeployerCredentials for NoMaterialCreds {
+            fn requires_credentials_material(&self) -> bool {
+                false
+            }
+            fn required_capabilities(&self) -> Vec<Capability> {
+                Vec::new()
+            }
+            fn validate(&self, _ctx: &ValidationContext<'_>) -> RequirementsReport {
+                RequirementsReport::new(Vec::new())
+            }
+            fn bootstrap(
+                &self,
+                _input: &BootstrapInput<'_>,
+            ) -> Result<BootstrapOutcome, BootstrapError> {
+                Err(BootstrapError::NotApplicable(
+                    "no admin escalation".to_string(),
+                ))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "test.deployer.no-material@0.1.0",
+        ));
+        // No credentials_ref set.
+        store.save(&env).unwrap();
+
+        let mut registry = EnvPackRegistry::new();
+        registry.register(Box::new(NoMaterialHandler)).unwrap();
+
+        let outcome = requirements(
+            &store,
+            &registry,
+            &OpFlags::default(),
+            Some(CredentialsRequirementsPayload {
+                environment_id: "local".to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(outcome.result["mode"], "requirements");
+        assert_eq!(outcome.result["result"], "pass");
+        // The sentinel ref is used when no real ref is present.
+        assert!(
+            outcome.result["credentials_ref"]
+                .as_str()
+                .unwrap()
+                .contains("no-material-required"),
+            "expected sentinel credentials_ref, got {:?}",
+            outcome.result["credentials_ref"]
+        );
     }
 }

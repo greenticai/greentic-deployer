@@ -47,7 +47,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::env_packs::{EnvPackRegistry, RegistryError};
-use crate::environment::{EnvironmentStore, LocalFsStore, StoreError};
+use crate::environment::{LocalFsStore, StoreError};
 
 use super::rules_export::{RulesExportError, RulesPack, write_rules_pack};
 
@@ -58,7 +58,6 @@ use super::rules_export::{RulesExportError, RulesPack, write_rules_pack};
 /// (e.g. read from an interactive prompt or a one-time ENV var) and pass
 /// the wrapper through to [`run_bootstrap`]. Do NOT clone the inner
 /// string out — `as_str()` borrows for the duration of the call.
-#[derive(Clone)]
 pub struct ZeroizedAdmin {
     inner: Zeroizing<String>,
     /// Profile / handle the user named (e.g. an AWS named profile or a
@@ -172,78 +171,83 @@ pub enum RunBootstrapError {
     RulesExport(#[from] RulesExportError),
 }
 
-/// Drive a `bootstrap` flow against the env's bound deployer env-pack.
+/// Drive a `bootstrap` flow against the env's bound deployer env-pack,
+/// inside a single transactional scope.
 ///
-/// Steps:
-/// 1. Load the env; require a deployer slot AND require
-///    `credentials_ref` to be absent (bootstrap creates it).
-/// 2. Resolve the deployer's handler via the registry.
-/// 3. Read the handler's [`super::DeployerCredentials`] (None ⇒ Phase D
-///    handler that hasn't registered a credentials contract).
-/// 4. Build a [`BootstrapInput`] borrowing the admin credential; call
-///    `handler.bootstrap(&input)`.
-/// 5. On `Ok(outcome)`: write the rules pack under `rules/<env_id>/`
-///    and build a [`Credentials`] doc stamped with
-///    `admin_credential_consumed_at = now()`.
+/// The entire flow — load env, assert `credentials_ref` absent, invoke the
+/// handler's bootstrap path, write the rules pack, persist the new
+/// `credentials_ref` — runs while holding the env's exclusive flock. This
+/// prevents two concurrent invocations from both passing the absence check,
+/// consuming admin credentials, and racing on the final write.
 ///
-/// Returns the [`Credentials`] doc; the caller decides whether to
-/// persist it onto the env (`env.credentials_ref = …`). This keeps the
-/// runner pure and lets tests assert the doc shape without observing
-/// store mutation.
+/// **Trade-off:** Bootstrap may be long-running (handler calls out to a
+/// cloud provider), so the env flock is held for the full duration of the
+/// call. This is acceptable because (a) bootstrap is a one-shot admin
+/// operation, not a hot path, and (b) other verbs that need the flock
+/// (requirements, rotate, traffic mutations) will simply block until
+/// bootstrap completes, which is the correct serialization.
 pub fn run_bootstrap(
     store: &LocalFsStore,
     registry: &EnvPackRegistry,
     env_id: &EnvId,
     admin: &ZeroizedAdmin,
 ) -> Result<Credentials, RunBootstrapError> {
-    let env = store.load(env_id)?;
-    let deployer = env
-        .pack_for_slot(CapabilitySlot::Deployer)
-        .ok_or_else(|| RunBootstrapError::NoDeployerBound(env_id.clone()))?;
-    if env.credentials_ref.is_some() {
-        return Err(RunBootstrapError::AlreadyBootstrapped(env_id.clone()));
-    }
+    store.transact(env_id, |locked| {
+        let env = locked.load()?;
+        let deployer = env
+            .pack_for_slot(CapabilitySlot::Deployer)
+            .ok_or_else(|| RunBootstrapError::NoDeployerBound(env_id.clone()))?;
+        if env.credentials_ref.is_some() {
+            return Err(RunBootstrapError::AlreadyBootstrapped(env_id.clone()));
+        }
 
-    let handler = registry.resolve_for_slot(CapabilitySlot::Deployer, &deployer.kind)?;
-    let creds =
-        handler
-            .deployer_credentials()
-            .ok_or_else(|| RunBootstrapError::HandlerNotRegistered {
+        let handler = registry.resolve_for_slot(CapabilitySlot::Deployer, &deployer.kind)?;
+        let creds = handler.deployer_credentials().ok_or_else(|| {
+            RunBootstrapError::HandlerNotRegistered {
                 kind: deployer.kind.as_str().to_string(),
-            })?;
+            }
+        })?;
 
-    let env_root = store.env_dir(env_id)?;
-    let input = BootstrapInput {
-        env_id,
-        env_root: &env_root,
-        admin,
-    };
-    let outcome = creds.bootstrap(&input)?;
+        let env_root = store.env_dir(env_id)?;
+        let input = BootstrapInput {
+            env_id,
+            env_root: &env_root,
+            admin,
+        };
+        let outcome = creds.bootstrap(&input)?;
 
-    let consumed_at = Utc::now();
-    let rules_pack_ref = write_rules_pack(&env_root, &deployer.kind, &outcome.rules_pack)?;
+        let consumed_at = Utc::now();
+        let rules_pack_ref = write_rules_pack(&env_root, &deployer.kind, &outcome.rules_pack)?;
 
-    let doc = Credentials {
-        schema: SchemaVersion::new(SchemaVersion::CREDENTIALS_V1),
-        env_id: env_id.clone(),
-        deployer_kind: deployer.kind.clone(),
-        mode: CredentialsMode::Bootstrap,
-        provided_credentials_ref: outcome.generated_credentials_ref.clone(),
-        validation: CredentialsValidation {
-            last_run_at: consumed_at,
-            // Bootstrap output is trusted at write-time; first
-            // requirements run after this stamps the real result.
-            result: CredentialsValidationResult::Pass,
-            missing_capabilities: Vec::new(),
-        },
-        bootstrap: Some(CredentialsBootstrap {
-            admin_credential_consumed_at: consumed_at,
-            rules_pack_ref,
-            generated_credentials_ref: outcome.generated_credentials_ref,
-        }),
-        expiry: None,
-    };
-    Ok(doc)
+        let doc = Credentials {
+            schema: SchemaVersion::new(SchemaVersion::CREDENTIALS_V1),
+            env_id: env_id.clone(),
+            deployer_kind: deployer.kind.clone(),
+            mode: CredentialsMode::Bootstrap,
+            provided_credentials_ref: outcome.generated_credentials_ref.clone(),
+            validation: CredentialsValidation {
+                last_run_at: consumed_at,
+                // Bootstrap output is trusted at write-time; first
+                // requirements run after this stamps the real result.
+                result: CredentialsValidationResult::Pass,
+                missing_capabilities: Vec::new(),
+            },
+            bootstrap: Some(CredentialsBootstrap {
+                admin_credential_consumed_at: consumed_at,
+                rules_pack_ref,
+                generated_credentials_ref: outcome.generated_credentials_ref,
+            }),
+            expiry: None,
+        };
+
+        // Persist credentials_ref inside the transaction so the
+        // absence-check → write is atomic w.r.t. the flock.
+        let mut env = locked.load()?;
+        env.credentials_ref = Some(doc.provided_credentials_ref.clone());
+        locked.save(&env)?;
+
+        Ok(doc)
+    })
 }
 
 #[cfg(test)]

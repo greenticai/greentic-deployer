@@ -16,7 +16,7 @@ use std::path::Path;
 use chrono::Utc;
 use greentic_deploy_spec::{
     CapabilitySlot, Credentials, CredentialsMode, CredentialsValidation,
-    CredentialsValidationResult, EnvId, SchemaVersion,
+    CredentialsValidationResult, EnvId, SchemaVersion, SecretRef,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -149,10 +149,6 @@ pub fn validate_requirements(
     let deployer = env
         .pack_for_slot(CapabilitySlot::Deployer)
         .ok_or_else(|| ValidateError::NoDeployerBound(env_id.clone()))?;
-    let creds_ref = env
-        .credentials_ref
-        .clone()
-        .ok_or_else(|| ValidateError::NoCredentialsRef(env_id.clone()))?;
 
     let handler = registry.resolve_for_slot(CapabilitySlot::Deployer, &deployer.kind)?;
     let creds =
@@ -161,6 +157,28 @@ pub fn validate_requirements(
             .ok_or_else(|| ValidateError::HandlerNotRegistered {
                 kind: deployer.kind.as_str().to_string(),
             })?;
+
+    // No-material deployers (e.g. local-process) can pass validation
+    // without a credentials_ref. For deployers that require material,
+    // the env must already have one (the user ran `op credentials
+    // bootstrap` or supplied one out-of-band).
+    let creds_ref = if creds.requires_credentials_material() {
+        env.credentials_ref
+            .clone()
+            .ok_or_else(|| ValidateError::NoCredentialsRef(env_id.clone()))?
+    } else {
+        // Use the env's ref if present; otherwise a sentinel that
+        // signals "no material required". The deploy-spec's
+        // `provided_credentials_ref` field is required, so we use a
+        // well-known sentinel rather than making it optional.
+        env.credentials_ref.clone().unwrap_or_else(|| {
+            SecretRef::try_new(format!(
+                "secret://{}/local-process/no-material-required",
+                env_id.as_str()
+            ))
+            .expect("sentinel SecretRef is well-formed")
+        })
+    };
 
     let env_root = store.env_dir(env_id)?;
     let ctx = ValidationContext {

@@ -330,8 +330,12 @@ pub fn doctor(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpO
                 "supported": supported,
             })),
             // `resolve_for_slot` only produces the three variants above;
-            // `DuplicateRegistration` comes solely from `register`.
-            Err(err @ crate::env_packs::RegistryError::DuplicateRegistration(_)) => {
+            // `DuplicateRegistration` and `DeployerMissingCredentials`
+            // come solely from `register`.
+            Err(
+                err @ (crate::env_packs::RegistryError::DuplicateRegistration(_)
+                | crate::env_packs::RegistryError::DeployerMissingCredentials { .. }),
+            ) => {
                 unreachable!("resolve_for_slot never returns {err:?}")
             }
         }
@@ -366,7 +370,10 @@ pub fn doctor(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpO
                 "requested": requested,
                 "supported": supported,
             })),
-            Err(err @ crate::env_packs::RegistryError::DuplicateRegistration(_)) => {
+            Err(
+                err @ (crate::env_packs::RegistryError::DuplicateRegistration(_)
+                | crate::env_packs::RegistryError::DeployerMissingCredentials { .. }),
+            ) => {
                 unreachable!("resolve_for_slot never returns {err:?}")
             }
         }

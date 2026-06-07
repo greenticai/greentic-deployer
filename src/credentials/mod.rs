@@ -46,6 +46,20 @@ pub use validate::{
 /// must be `Send + Sync` because the registry is shared across the
 /// operator's request handlers.
 pub trait DeployerCredentials: std::fmt::Debug + Send + Sync {
+    /// Whether this deployer requires real credential material at all.
+    ///
+    /// Deployers that run purely locally (e.g. local-process — no IAM
+    /// roles, no cluster RBAC, no cloud credentials) return `false`.
+    /// When `false`:
+    /// - `validate_requirements` skips the `NoCredentialsRef` rejection
+    ///   for envs that have no `credentials_ref`.
+    /// - `bootstrap` should return [`BootstrapError::NotApplicable`].
+    ///
+    /// Default is `true`, preserving Phase D AWS/K8s/GCP/Azure behavior.
+    fn requires_credentials_material(&self) -> bool {
+        true
+    }
+
     /// The set of capabilities the deployer's credentials must satisfy.
     /// Order is stable — the CLI renders this as the column order in
     /// `gtc op credentials requirements` output. Used both as the

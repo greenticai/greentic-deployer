@@ -675,12 +675,29 @@ pub fn print_error(noun: &'static str, op: &'static str, err: &OpError) {
 /// `--answers` or `--payload-json`; this function only routes argv into
 /// the right library call.
 ///
+/// Uses the built-in env-pack registry (five default `local` handlers).
+/// Phase D plug-ins that register additional handlers should call
+/// [`dispatch_op_with_registry`] instead, passing a registry populated
+/// with both built-ins and their plug-in handlers.
+///
 /// On success, the per-verb result is written to stdout as the documented
 /// `{op, noun, result}` envelope. On error, the documented
 /// `{op, noun, error: {kind, message}}` envelope is written to stderr and
 /// the same `OpError` is returned so callers can map it to a process exit
 /// code without re-rendering. Stdout and stderr never cross-contaminate.
 pub fn dispatch_op(cmd: OpCommand) -> Result<(), OpError> {
+    let registry = crate::env_packs::EnvPackRegistry::with_builtins();
+    dispatch_op_with_registry(cmd, &registry)
+}
+
+/// Phase D plug-in entry point — register handlers on the registry, then
+/// call this. The `credentials` noun (and any future noun that resolves
+/// handlers through the registry) will see every handler the caller
+/// registered.
+pub fn dispatch_op_with_registry(
+    cmd: OpCommand,
+    registry: &crate::env_packs::EnvPackRegistry,
+) -> Result<(), OpError> {
     let flags = OpFlags {
         schema_only: cmd.schema,
         answers: cmd.answers.clone(),
@@ -695,7 +712,7 @@ pub fn dispatch_op(cmd: OpCommand) -> Result<(), OpError> {
         OpNoun::Traffic { verb } => dispatch_traffic(&store, &flags, verb),
         OpNoun::Deploy(args) => dispatch_deploy(&store, &flags, args),
         OpNoun::Config { verb } => dispatch_config(&store, &flags, verb),
-        OpNoun::Credentials { verb } => dispatch_credentials(&store, &flags, verb),
+        OpNoun::Credentials { verb } => dispatch_credentials(&store, registry, &flags, verb),
         OpNoun::Secrets { verb } => dispatch_secrets(&store, &flags, verb),
         OpNoun::TrustRoot { verb } => dispatch_trust_root(&store, &flags, verb),
         OpNoun::Messaging { verb } => dispatch_messaging(&store, &flags, verb),
@@ -985,22 +1002,16 @@ fn dispatch_config(store: &LocalFsStore, flags: &OpFlags, verb: ConfigVerb) -> R
 
 fn dispatch_credentials(
     store: &LocalFsStore,
+    registry: &crate::env_packs::EnvPackRegistry,
     flags: &OpFlags,
     verb: CredentialsVerb,
 ) -> Result<(), OpError> {
-    // Phase A built-in registry covers the five default `local`
-    // handlers. Phase D plug-ins register additional deployer
-    // credentials handlers (AWS / K8s / ...) via
-    // `EnvPackRegistry::register`. When that plug-in surface lands,
-    // wire the operator's persistent registry through here instead of
-    // constructing one per call.
-    let registry = crate::env_packs::EnvPackRegistry::with_builtins();
     let outcome = match verb {
         CredentialsVerb::Requirements => {
-            super::credentials::requirements(store, &registry, flags, None)?
+            super::credentials::requirements(store, registry, flags, None)?
         }
-        CredentialsVerb::Bootstrap => super::credentials::bootstrap(store, &registry, flags, None)?,
-        CredentialsVerb::Rotate => super::credentials::rotate(store, &registry, flags, None)?,
+        CredentialsVerb::Bootstrap => super::credentials::bootstrap(store, registry, flags, None)?,
+        CredentialsVerb::Rotate => super::credentials::rotate(store, registry, flags, None)?,
     };
     print_outcome(&outcome)
 }

@@ -59,6 +59,8 @@ pub enum RulesExportError {
     EmptyFilename(String),
     #[error("rules entry filename `{0}` escapes the per-pack subdir")]
     UnsafeFilename(String),
+    #[error("symlink detected at `{path}` under env root — refusing to write through it")]
+    SymlinkAncestor { path: PathBuf },
     #[error("io error on {path}: {source}")]
     Io {
         path: PathBuf,
@@ -85,6 +87,15 @@ pub fn write_rules_pack(
 ) -> Result<PathBuf, RulesExportError> {
     let pack_subdir = PathBuf::from("rules").join(deployer.path());
     let pack_dir = env_root.join(&pack_subdir);
+
+    // P0.4-equivalent posture: reject any existing symlink component under
+    // env_root before creating directories or writing files. Without this
+    // check, a pre-existing symlink at `env_root/rules/` or
+    // `env_root/rules/<deployer-path>` would cause `create_dir_all` to
+    // succeed (following the symlink) and writes would land outside the
+    // per-pack rules directory.
+    assert_no_symlink_ancestors(env_root, &pack_dir)?;
+
     create_dir_all(&pack_dir)?;
 
     for entry in &pack.entries {
@@ -125,6 +136,42 @@ fn create_dir_all(path: &Path) -> Result<(), RulesExportError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// Walk every existing ancestor of `target` that is a proper descendant of
+/// `root` (inclusive of `target` itself) and reject if any is a symlink.
+///
+/// Only existing ancestors are checked — non-existent path segments are
+/// fine (they will be created by `create_dir_all`). This mirrors the
+/// P0.4 symlink-TOCTOU posture from the bundle extractors: the check runs
+/// immediately before the write, under the env flock, so the race window
+/// is bounded to the same flock scope as other env mutations.
+fn assert_no_symlink_ancestors(root: &Path, target: &Path) -> Result<(), RulesExportError> {
+    // Build the list of segments between root and target.
+    let suffix = match target.strip_prefix(root) {
+        Ok(s) => s,
+        Err(_) => return Ok(()), // target is not under root — caller error, but not our gate
+    };
+    let mut current = root.to_path_buf();
+    for component in suffix.components() {
+        current.push(component);
+        // Only check segments that already exist on disk. Non-existent
+        // segments will be freshly created by `create_dir_all`.
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.is_symlink() => {
+                return Err(RulesExportError::SymlinkAncestor { path: current });
+            }
+            Ok(_) => {} // exists, not a symlink — fine
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => {
+                return Err(RulesExportError::Io {
+                    path: current,
+                    source: e,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), RulesExportError> {
@@ -313,5 +360,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, RulesExportError::EmptyFilename(_)));
+    }
+
+    /// Regression: if `<env_root>/rules` already exists as a symlink
+    /// pointing outside the env root, `write_rules_pack` must reject
+    /// instead of following the symlink and writing outside the env.
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_rules_dir() {
+        let env_root = tempdir().unwrap();
+        let escape_target = tempdir().unwrap();
+        let rules_link = env_root.path().join("rules");
+        std::os::unix::fs::symlink(escape_target.path(), &rules_link).unwrap();
+
+        let pack = RulesPack {
+            entries: vec![RulesPackEntry {
+                filename: "policy.json".into(),
+                content: "{}".into(),
+                description: None,
+            }],
+        };
+        let err = write_rules_pack(
+            env_root.path(),
+            &descriptor("greentic.deployer.aws-ecs@1.0.0"),
+            &pack,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RulesExportError::SymlinkAncestor { .. }),
+            "got {err:?}"
+        );
+        // Verify nothing was written to the escape target.
+        assert!(
+            std::fs::read_dir(escape_target.path())
+                .unwrap()
+                .next()
+                .is_none(),
+            "escape target should be empty"
+        );
     }
 }
