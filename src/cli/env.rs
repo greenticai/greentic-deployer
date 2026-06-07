@@ -108,14 +108,7 @@ pub fn create(
             })
         })
         .transpose()?;
-    let parsed_public_base_url = payload
-        .public_base_url
-        .as_deref()
-        .map(|raw| {
-            validate_public_base_url(raw)
-                .map_err(|e| OpError::InvalidArgument(format!("public_base_url: {e}")))
-        })
-        .transpose()?;
+    let parsed_public_base_url = parse_optional_public_base_url(&payload.public_base_url)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -179,14 +172,7 @@ pub fn update(
     let payload = resolve_payload::<EnvCreatePayload>(flags, payload)?;
     let env_id = EnvId::try_from(payload.environment_id.as_str())
         .map_err(|e| OpError::InvalidArgument(format!("environment_id: {e}")))?;
-    let parsed_public_base_url = payload
-        .public_base_url
-        .as_deref()
-        .map(|raw| {
-            validate_public_base_url(raw)
-                .map_err(|e| OpError::InvalidArgument(format!("public_base_url: {e}")))
-        })
-        .transpose()?;
+    let parsed_public_base_url = parse_optional_public_base_url(&payload.public_base_url)?;
     let mut fields = Vec::new();
     if payload.name != payload.environment_id {
         fields.push("name");
@@ -545,23 +531,10 @@ pub fn init(
         ))
     })?;
     // Validate the URL up-front so a malformed value is rejected before any
-    // disk state is touched.
-    let validated_public_base_url = payload
-        .public_base_url
-        .as_deref()
-        .map(|raw| {
-            validate_public_base_url(raw)
-                .map_err(|e| OpError::InvalidArgument(format!("public_base_url: {e}")))
-        })
-        .transpose()?;
-    // Reject --public-url when the env already exists. The URL is only applied
-    // on creation; overwriting an existing env's URL requires the explicit
-    // `op env set-public-url` verb.
-    if validated_public_base_url.is_some() && store.exists(&env_id)? {
-        return Err(OpError::InvalidArgument(
-            "env `local` already exists; use `op env set-public-url <env_id> <URL>` to overwrite the persisted public URL".to_string(),
-        ));
-    }
+    // disk state is touched. The "URL given AND env exists → reject" gate
+    // fires INSIDE `ensure_local_environment`'s per-env flock so it's both
+    // race-free and stat-free here.
+    let validated_public_base_url = parse_optional_public_base_url(&payload.public_base_url)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -725,6 +698,87 @@ impl super::dispatch::EnvInitArgs {
     }
 }
 
+/// Validate an optional `public_base_url` against the spec validator and wrap
+/// the spec error in `OpError::InvalidArgument` with the canonical
+/// `"public_base_url: …"` field prefix. Centralizes the format string so the
+/// 5 entry points (`env create`, `env update`, `env init`, `env set-public-url`,
+/// `config set`) report identical operator-facing errors.
+pub(super) fn parse_public_base_url(raw: &str) -> Result<String, OpError> {
+    validate_public_base_url(raw)
+        .map_err(|e| OpError::InvalidArgument(format!("public_base_url: {e}")))
+}
+
+/// Validate an `Option<String>` carrying a `public_base_url` payload field.
+/// Returns `Ok(None)` when the field was absent, the canonical form when
+/// present and valid, and `Err(OpError::InvalidArgument)` when present and
+/// invalid. The 5 entry points all share this lift to keep the
+/// `.as_deref().map(parse).transpose()` boilerplate in one place.
+pub(super) fn parse_optional_public_base_url(
+    raw: &Option<String>,
+) -> Result<Option<String>, OpError> {
+    raw.as_deref().map(parse_public_base_url).transpose()
+}
+
+// ---- Inline-args guards (env-local mirror of messaging.rs's pattern) ------
+//
+// Both `EnvCreateArgs::into_payload` and `EnvUpdateArgs::into_payload` need to
+// (a) reject `--answers` mixed with inline flags and (b) report the partial-
+// inline set that's missing required fields. The shape is identical to the
+// `messaging.rs` helpers but those are file-private; promoting them to
+// `cli::mod.rs` for cross-noun reuse is a follow-up cleanup.
+
+fn reject_inline_plus_answers(
+    has_inline: bool,
+    flags: &OpFlags,
+    verb: &'static str,
+) -> Result<(), OpError> {
+    if has_inline && flags.answers.is_some() {
+        return Err(OpError::InvalidArgument(format!(
+            "env {verb}: inline flags and --answers are mutually exclusive; use one or the other"
+        )));
+    }
+    Ok(())
+}
+
+fn partial_inline_error(verb: &'static str, missing: &[&str]) -> OpError {
+    OpError::InvalidArgument(format!(
+        "env {verb}: inline-flag form requires --environment-id and --name; missing: {}",
+        missing.join(", ")
+    ))
+}
+
+/// Helper used by both `EnvCreateArgs` and `EnvUpdateArgs`: enforce the
+/// inline-vs-answers contract and collect required-flag presence. Returns
+/// `Ok(None)` when no inline flags were supplied (caller falls through to
+/// `--answers`), or `Ok(Some((env_id, name)))` when the required pair is
+/// present.
+fn require_inline_env_id_and_name(
+    has_inline: bool,
+    env_id: Option<String>,
+    name: Option<String>,
+    verb: &'static str,
+    flags: &OpFlags,
+) -> Result<Option<(String, String)>, OpError> {
+    reject_inline_plus_answers(has_inline, flags, verb)?;
+    if !has_inline {
+        return Ok(None);
+    }
+    let mut missing: Vec<&'static str> = Vec::new();
+    if env_id.is_none() {
+        missing.push("--environment-id");
+    }
+    if name.is_none() {
+        missing.push("--name");
+    }
+    if !missing.is_empty() {
+        return Err(partial_inline_error(verb, &missing));
+    }
+    Ok(Some((
+        env_id.expect("checked above"),
+        name.expect("checked above"),
+    )))
+}
+
 impl super::dispatch::EnvCreateArgs {
     fn has_inline_input(&self) -> bool {
         self.environment_id.is_some()
@@ -751,30 +805,19 @@ impl super::dispatch::EnvCreateArgs {
         flags: &OpFlags,
     ) -> Result<Option<EnvCreatePayload>, OpError> {
         let has_inline = self.has_inline_input();
-        if has_inline && flags.answers.is_some() {
-            return Err(OpError::InvalidArgument(format!(
-                "env {verb}: inline flags and --answers are mutually exclusive; use one or the other"
-            )));
-        }
-        if !has_inline {
+        let Some((environment_id, name)) = require_inline_env_id_and_name(
+            has_inline,
+            self.environment_id,
+            self.name,
+            verb,
+            flags,
+        )?
+        else {
             return Ok(None);
-        }
-        let mut missing: Vec<&'static str> = Vec::new();
-        if self.environment_id.is_none() {
-            missing.push("--environment-id");
-        }
-        if self.name.is_none() {
-            missing.push("--name");
-        }
-        if !missing.is_empty() {
-            return Err(OpError::InvalidArgument(format!(
-                "env {verb}: inline-flag form requires --environment-id and --name; missing: {}",
-                missing.join(", ")
-            )));
-        }
+        };
         Ok(Some(EnvCreatePayload {
-            environment_id: self.environment_id.expect("checked above"),
-            name: self.name.expect("checked above"),
+            environment_id,
+            name,
             region: self.region,
             tenant_org_id: self.tenant_org_id,
             listen_addr: self.listen_addr,
@@ -807,33 +850,22 @@ impl super::dispatch::EnvUpdateArgs {
     pub fn into_payload(
         self,
         verb: &'static str,
-        flags: &super::OpFlags,
-    ) -> Result<Option<EnvCreatePayload>, super::OpError> {
+        flags: &OpFlags,
+    ) -> Result<Option<EnvCreatePayload>, OpError> {
         let has_inline = self.has_inline_input();
-        if has_inline && flags.answers.is_some() {
-            return Err(super::OpError::InvalidArgument(format!(
-                "env {verb}: inline flags and --answers are mutually exclusive; use one or the other"
-            )));
-        }
-        if !has_inline {
+        let Some((environment_id, name)) = require_inline_env_id_and_name(
+            has_inline,
+            self.environment_id,
+            self.name,
+            verb,
+            flags,
+        )?
+        else {
             return Ok(None);
-        }
-        let mut missing: Vec<&'static str> = Vec::new();
-        if self.environment_id.is_none() {
-            missing.push("--environment-id");
-        }
-        if self.name.is_none() {
-            missing.push("--name");
-        }
-        if !missing.is_empty() {
-            return Err(super::OpError::InvalidArgument(format!(
-                "env {verb}: inline-flag form requires --environment-id and --name; missing: {}",
-                missing.join(", ")
-            )));
-        }
+        };
         Ok(Some(EnvCreatePayload {
-            environment_id: self.environment_id.expect("checked above"),
-            name: self.name.expect("checked above"),
+            environment_id,
+            name,
             region: self.region,
             tenant_org_id: self.tenant_org_id,
             listen_addr: None,
@@ -861,8 +893,7 @@ pub fn set_public_url(
     }
     let env_id =
         EnvId::try_from(env_id).map_err(|e| OpError::InvalidArgument(format!("env_id: {e}")))?;
-    let validated = validate_public_base_url(url)
-        .map_err(|e| OpError::InvalidArgument(format!("public_base_url: {e}")))?;
+    let validated = parse_public_base_url(url)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,

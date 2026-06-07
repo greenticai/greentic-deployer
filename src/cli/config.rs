@@ -7,7 +7,7 @@
 //! `plans/next-gen-deployment.md` §P1b.
 
 use chrono::Utc;
-use greentic_deploy_spec::{CapabilitySlot, EnvId, validate_public_base_url};
+use greentic_deploy_spec::{CapabilitySlot, EnvId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -124,14 +124,8 @@ pub fn set(
             })
         })
         .transpose()?;
-    let parsed_public_base_url = payload
-        .public_base_url
-        .as_deref()
-        .map(|raw| {
-            validate_public_base_url(raw)
-                .map_err(|e| OpError::InvalidArgument(format!("public_base_url: {e}")))
-        })
-        .transpose()?;
+    let parsed_public_base_url =
+        super::env::parse_optional_public_base_url(&payload.public_base_url)?;
     let mut fields = Vec::new();
     if payload.name.is_some() {
         fields.push("name");

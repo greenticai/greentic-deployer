@@ -59,6 +59,16 @@ pub fn ensure_local_environment(
         &env_id,
         |locked| -> Result<(Environment, LocalEnvOutcome), OpError> {
             if let Ok(mut existing) = locked.load() {
+                // Inside the per-env flock so the check is race-free against
+                // a concurrent `op env init` minting the env. The URL is only
+                // applied on creation; overwriting an existing env's URL goes
+                // through `op env set-public-url`.
+                if public_base_url.is_some() {
+                    return Err(OpError::InvalidArgument(format!(
+                        "env `{}` already exists; use `op env set-public-url <env_id> <URL>` to overwrite the persisted public URL",
+                        locked.env_id()
+                    )));
+                }
                 let added = fill_missing_default_bindings(&mut existing)?;
                 if added.is_empty() {
                     return Ok((existing, LocalEnvOutcome::AlreadyExists));
