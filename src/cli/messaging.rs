@@ -28,6 +28,10 @@ use std::str::FromStr;
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
+use super::dispatch::{
+    MessagingEndpointAddArgs, MessagingEndpointLinkBundleArgs, MessagingEndpointRemoveArgs,
+    MessagingEndpointSetWelcomeFlowArgs,
+};
 use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
 use std::path::PathBuf;
 
@@ -81,6 +85,80 @@ pub struct EndpointRemovePayload {
     pub endpoint_id: String,
     pub idempotency_key: String,
     pub updated_by: String,
+}
+
+// --- inline-flag → payload conversions ---------------------------------------
+//
+// Each verb's args struct either yields a fully-populated payload (CLI mode)
+// or `None` (caller dropped flags — `resolve_payload` then consumes
+// `--answers <PATH>` or returns an "no payload" error). This mirrors the
+// `trust-root add` precedent: build the payload only when the discriminator
+// fields are present, otherwise fall through.
+
+impl MessagingEndpointAddArgs {
+    pub fn into_payload(self) -> Option<EndpointAddPayload> {
+        let env = self.env?;
+        let provider_type = self.provider_type?;
+        let provider_id = self.provider_id?;
+        let display_name = self.display_name?;
+        let idempotency_key = self.idempotency_key?;
+        let updated_by = self.updated_by?;
+        Some(EndpointAddPayload {
+            environment_id: env,
+            provider_id,
+            provider_type,
+            display_name,
+            secret_refs: self.secret_ref,
+            idempotency_key,
+            updated_by,
+        })
+    }
+}
+
+impl MessagingEndpointLinkBundleArgs {
+    pub fn into_payload(self) -> Option<EndpointLinkBundlePayload> {
+        Some(EndpointLinkBundlePayload {
+            environment_id: self.env?,
+            endpoint_id: self.endpoint_id?,
+            bundle_id: self.bundle_id?,
+            idempotency_key: self.idempotency_key?,
+            updated_by: self.updated_by?,
+        })
+    }
+}
+
+impl MessagingEndpointSetWelcomeFlowArgs {
+    pub fn into_payload(self) -> Option<EndpointSetWelcomeFlowPayload> {
+        Some(EndpointSetWelcomeFlowPayload {
+            environment_id: self.env?,
+            endpoint_id: self.endpoint_id?,
+            bundle_id: self.bundle_id?,
+            pack_id: self.pack_id?,
+            flow_id: self.flow_id?,
+            idempotency_key: self.idempotency_key?,
+            updated_by: self.updated_by?,
+        })
+    }
+}
+
+impl MessagingEndpointRemoveArgs {
+    pub fn into_remove_payload(self) -> Option<EndpointRemovePayload> {
+        Some(EndpointRemovePayload {
+            environment_id: self.env?,
+            endpoint_id: self.endpoint_id?,
+            idempotency_key: self.idempotency_key?,
+            updated_by: self.updated_by?,
+        })
+    }
+
+    pub fn into_rotate_payload(self) -> Option<EndpointRotateWebhookSecretPayload> {
+        Some(EndpointRotateWebhookSecretPayload {
+            environment_id: self.env?,
+            endpoint_id: self.endpoint_id?,
+            idempotency_key: self.idempotency_key?,
+            updated_by: self.updated_by?,
+        })
+    }
 }
 
 // --- summary -----------------------------------------------------------------
@@ -1849,5 +1927,175 @@ mod tests {
             "idempotent rotate replay must preserve the dev-store value"
         );
         assert_eq!(gen_1, gen_2, "idempotent replay must not bump generation");
+    }
+
+    // ---- inline-flag → payload conversion ---------------------------------
+
+    fn add_args_full() -> MessagingEndpointAddArgs {
+        MessagingEndpointAddArgs {
+            env: Some("local".into()),
+            provider_type: Some("telegram".into()),
+            provider_id: Some("legal-bot".into()),
+            display_name: Some("Legal Bot".into()),
+            secret_ref: vec![],
+            idempotency_key: Some("k1".into()),
+            updated_by: Some("alice".into()),
+        }
+    }
+
+    #[test]
+    fn add_args_with_all_flags_yields_payload() {
+        let payload = add_args_full().into_payload().expect("payload");
+        assert_eq!(payload.environment_id, "local");
+        assert_eq!(payload.provider_type, "telegram");
+        assert_eq!(payload.provider_id, "legal-bot");
+        assert_eq!(payload.display_name, "Legal Bot");
+        assert_eq!(payload.idempotency_key, "k1");
+        assert_eq!(payload.updated_by, "alice");
+        assert!(payload.secret_refs.is_empty());
+    }
+
+    #[test]
+    fn add_args_propagates_secret_refs() {
+        let mut args = add_args_full();
+        args.secret_ref = vec![
+            "secret://local/global/telegram/bot_token".into(),
+            "secret://local/global/telegram/api_key".into(),
+        ];
+        let payload = args.into_payload().expect("payload");
+        assert_eq!(payload.secret_refs.len(), 2);
+        assert_eq!(
+            payload.secret_refs[0],
+            "secret://local/global/telegram/bot_token"
+        );
+    }
+
+    #[test]
+    fn add_args_missing_required_field_falls_through() {
+        let mut args = add_args_full();
+        args.display_name = None;
+        assert!(args.into_payload().is_none());
+    }
+
+    #[test]
+    fn add_args_missing_idem_key_falls_through() {
+        let mut args = add_args_full();
+        args.idempotency_key = None;
+        assert!(args.into_payload().is_none());
+    }
+
+    #[test]
+    fn link_bundle_args_with_all_flags_yields_payload() {
+        let args = MessagingEndpointLinkBundleArgs {
+            env: Some("local".into()),
+            endpoint_id: Some("01HXYZ...".into()),
+            bundle_id: Some("legal".into()),
+            idempotency_key: Some("k-link".into()),
+            updated_by: Some("alice".into()),
+        };
+        let payload = args.into_payload().expect("payload");
+        assert_eq!(payload.environment_id, "local");
+        assert_eq!(payload.endpoint_id, "01HXYZ...");
+        assert_eq!(payload.bundle_id, "legal");
+    }
+
+    #[test]
+    fn link_bundle_args_missing_bundle_falls_through() {
+        let args = MessagingEndpointLinkBundleArgs {
+            env: Some("local".into()),
+            endpoint_id: Some("01HXYZ".into()),
+            bundle_id: None,
+            idempotency_key: Some("k".into()),
+            updated_by: Some("alice".into()),
+        };
+        assert!(args.into_payload().is_none());
+    }
+
+    #[test]
+    fn set_welcome_flow_args_with_all_flags_yields_payload() {
+        let args = MessagingEndpointSetWelcomeFlowArgs {
+            env: Some("local".into()),
+            endpoint_id: Some("01HXYZ".into()),
+            bundle_id: Some("legal".into()),
+            pack_id: Some("welcome".into()),
+            flow_id: Some("hello".into()),
+            idempotency_key: Some("k-set".into()),
+            updated_by: Some("alice".into()),
+        };
+        let payload = args.into_payload().expect("payload");
+        assert_eq!(payload.pack_id, "welcome");
+        assert_eq!(payload.flow_id, "hello");
+    }
+
+    #[test]
+    fn set_welcome_flow_args_missing_flow_id_falls_through() {
+        let args = MessagingEndpointSetWelcomeFlowArgs {
+            env: Some("local".into()),
+            endpoint_id: Some("01HXYZ".into()),
+            bundle_id: Some("legal".into()),
+            pack_id: Some("welcome".into()),
+            flow_id: None,
+            idempotency_key: Some("k".into()),
+            updated_by: Some("alice".into()),
+        };
+        assert!(args.into_payload().is_none());
+    }
+
+    fn remove_args_full() -> MessagingEndpointRemoveArgs {
+        MessagingEndpointRemoveArgs {
+            env: Some("local".into()),
+            endpoint_id: Some("01HXYZ".into()),
+            idempotency_key: Some("k-rm".into()),
+            updated_by: Some("alice".into()),
+        }
+    }
+
+    #[test]
+    fn remove_args_with_all_flags_yields_remove_payload() {
+        let payload = remove_args_full().into_remove_payload().expect("payload");
+        assert_eq!(payload.environment_id, "local");
+        assert_eq!(payload.endpoint_id, "01HXYZ");
+        assert_eq!(payload.idempotency_key, "k-rm");
+    }
+
+    #[test]
+    fn remove_args_with_all_flags_yields_rotate_payload() {
+        let payload = remove_args_full().into_rotate_payload().expect("payload");
+        assert_eq!(payload.environment_id, "local");
+        assert_eq!(payload.endpoint_id, "01HXYZ");
+    }
+
+    #[test]
+    fn remove_args_missing_endpoint_id_falls_through() {
+        let mut args = remove_args_full();
+        args.endpoint_id = None;
+        assert!(args.into_remove_payload().is_none());
+        // The rotate path takes the same args struct — same fall-through
+        // semantics on the same field set.
+        let mut args = remove_args_full();
+        args.endpoint_id = None;
+        assert!(args.into_rotate_payload().is_none());
+    }
+
+    // End-to-end: CLI-derived payload feeds the verb the same way `--answers`
+    // does, and the resulting endpoint is materialized correctly.
+    #[test]
+    fn cli_derived_add_payload_drives_verb_e2e() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let payload = MessagingEndpointAddArgs {
+            env: Some("local".into()),
+            provider_type: Some("teams".into()),
+            provider_id: Some("cli-bot".into()),
+            display_name: Some("CLI Bot".into()),
+            secret_ref: vec![],
+            idempotency_key: Some("cli-add-1".into()),
+            updated_by: Some("cli".into()),
+        }
+        .into_payload()
+        .expect("payload");
+        let outcome = add(&store, &OpFlags::default(), Some(payload)).unwrap();
+        assert_eq!(outcome.result["provider_type"], "teams");
+        assert_eq!(outcome.result["provider_id"], "cli-bot");
+        assert_eq!(outcome.result["display_name"], "CLI Bot");
     }
 }
