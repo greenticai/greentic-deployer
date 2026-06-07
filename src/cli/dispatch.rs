@@ -278,7 +278,7 @@ pub enum EnvVerb {
     /// non-default descriptors are NEVER overwritten.
     Init(EnvInitArgs),
     Create(EnvCreateArgs),
-    Update(EnvCreateArgs),
+    Update(EnvUpdateArgs),
     /// `op env set-public-url <env_id> <URL>`. Replaces the env's persisted
     /// `host_config.public_base_url`. Equivalent to
     /// `op config set --public-url <URL>` but easier to discover for the
@@ -407,6 +407,27 @@ pub struct EnvCreateArgs {
     /// (`https://host[:port]`, origin only).
     #[arg(long = "public-url")]
     pub public_url: Option<String>,
+}
+
+/// Args for `op env update`. Update accepts the metadata fields only.
+/// URL changes go through `op env set-public-url` (single-field verb)
+/// or `op config set --public-url` (URL inside a multi-field host_config
+/// update); listen-addr changes through `op config set --listen-addr`.
+#[derive(Args, Debug)]
+pub struct EnvUpdateArgs {
+    /// Environment id (e.g. `local`, `prod-eu`).
+    pub environment_id: Option<String>,
+    /// Display name. Defaults to `--environment-id` if omitted on the CLI
+    /// path; required on the JSON path. Pass either positionally below or
+    /// via `--name`.
+    #[arg(long = "name")]
+    pub name: Option<String>,
+    /// Optional region tag (free-form).
+    #[arg(long = "region")]
+    pub region: Option<String>,
+    /// Tenant organization id this env belongs to.
+    #[arg(long = "tenant-org")]
+    pub tenant_org_id: Option<String>,
 }
 
 /// Args for `op env set-public-url <env_id> <URL>`. Both fields are
@@ -812,6 +833,7 @@ fn dispatch_env(store: &LocalFsStore, flags: &OpFlags, verb: EnvVerb) -> Result<
         EnvVerb::Update(args) => {
             super::env::update(store, flags, args.into_payload("update", flags)?)?
         }
+
         EnvVerb::SetPublicUrl(args) => {
             super::env::set_public_url(store, flags, &args.env_id, &args.url)?
         }

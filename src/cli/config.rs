@@ -245,7 +245,8 @@ fn set_schema() -> Value {
             "listen_addr": {
                 "type": ["string", "null"],
                 "description": "Bind address for the runtime's local HTTP listener (e.g. 127.0.0.1:8080, 0.0.0.0:9090, [::1]:8443). Parsed as SocketAddr; malformed values are rejected."
-            }
+            },
+            "public_base_url": {"type": ["string", "null"], "description": "origin-only URL (https://host[:port])"}
         }
     })
 }
@@ -458,6 +459,7 @@ mod tests {
             "region",
             "tenant_org_id",
             "listen_addr",
+            "public_base_url",
         ]
         .into_iter()
         .collect();
@@ -470,6 +472,20 @@ mod tests {
             Some(&json!(false)),
             "set_schema must keep additionalProperties: false; otherwise the \
              completeness check above is moot",
+        );
+    }
+
+    #[test]
+    fn config_set_schema_includes_public_base_url() {
+        let schema = set_schema();
+        let props = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("schema has properties");
+        assert!(
+            props.contains_key("public_base_url"),
+            "set_schema must advertise public_base_url; got keys: {:?}",
+            props.keys().collect::<Vec<_>>()
         );
     }
 }

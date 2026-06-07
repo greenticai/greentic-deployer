@@ -172,6 +172,17 @@ fn invalid_instance_id_rejected() {
 }
 
 #[test]
+fn environment_validate_rejects_invalid_public_base_url() {
+    let mut e = env(vec![]);
+    e.host_config.public_base_url = Some("not-a-url".into());
+    let err = e.validate().unwrap_err();
+    assert!(
+        matches!(err, SpecError::InvalidPublicBaseUrl { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
 fn extension_for_ref_selects_by_path_and_instance() {
     let e = env_with_extensions(vec![
         extension("acme.oauth.auth0@1.0.0", None),

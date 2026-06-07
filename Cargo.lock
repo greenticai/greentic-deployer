@@ -2081,6 +2081,7 @@ dependencies = [
  "greentic-config-types",
  "greentic-types",
  "hex",
+ "http 1.4.1",
  "schemars 0.8.22",
  "semver",
  "serde",

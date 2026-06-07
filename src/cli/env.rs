@@ -554,13 +554,21 @@ pub fn init(
                 .map_err(|e| OpError::InvalidArgument(format!("public_base_url: {e}")))
         })
         .transpose()?;
+    // Reject --public-url when the env already exists. The URL is only applied
+    // on creation; overwriting an existing env's URL requires the explicit
+    // `op env set-public-url` verb.
+    if validated_public_base_url.is_some() && store.exists(&env_id)? {
+        return Err(OpError::InvalidArgument(
+            "env `local` already exists; use `op env set-public-url <env_id> <URL>` to overwrite the persisted public URL".to_string(),
+        ));
+    }
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "init",
         target: json!({
             "environment_id": env_id.as_str(),
-            "public_base_url_set": validated_public_base_url.is_some(),
+            "public_base_url_applied": validated_public_base_url.is_some(),
         }),
         idempotency_key: None,
     };
@@ -581,6 +589,7 @@ pub fn init(
             "environment_id": env.environment_id.as_str(),
             "bound_slots": bound_slots,
             "pack_count": env.packs.len(),
+            "public_base_url": env.host_config.public_base_url,
             "trust_root": trust_root,
         });
         let payload_obj = payload
@@ -770,6 +779,65 @@ impl super::dispatch::EnvCreateArgs {
             tenant_org_id: self.tenant_org_id,
             listen_addr: self.listen_addr,
             public_base_url: self.public_url,
+        }))
+    }
+}
+
+impl super::dispatch::EnvUpdateArgs {
+    fn has_inline_input(&self) -> bool {
+        self.environment_id.is_some()
+            || self.name.is_some()
+            || self.region.is_some()
+            || self.tenant_org_id.is_some()
+    }
+
+    /// Build an [`EnvCreatePayload`] from CLI flags for the `update` verb.
+    /// Returns:
+    /// - `Ok(None)` when no inline flag is set — caller falls through to
+    ///   `--answers`.
+    /// - `Err(OpError::InvalidArgument)` when SOME inline flags are set but
+    ///   required ones (`environment_id`, `name`) are missing, OR when
+    ///   inline flags AND `--answers` are both supplied (mutual exclusion).
+    /// - `Ok(Some(payload))` on the fully-specified inline path.
+    ///
+    /// The produced payload always sets `listen_addr: None` and
+    /// `public_base_url: None` — those fields are not exposed on the update
+    /// verb. URL changes go through `op env set-public-url`; listen-addr
+    /// changes through `op config set --listen-addr`.
+    pub fn into_payload(
+        self,
+        verb: &'static str,
+        flags: &super::OpFlags,
+    ) -> Result<Option<EnvCreatePayload>, super::OpError> {
+        let has_inline = self.has_inline_input();
+        if has_inline && flags.answers.is_some() {
+            return Err(super::OpError::InvalidArgument(format!(
+                "env {verb}: inline flags and --answers are mutually exclusive; use one or the other"
+            )));
+        }
+        if !has_inline {
+            return Ok(None);
+        }
+        let mut missing: Vec<&'static str> = Vec::new();
+        if self.environment_id.is_none() {
+            missing.push("--environment-id");
+        }
+        if self.name.is_none() {
+            missing.push("--name");
+        }
+        if !missing.is_empty() {
+            return Err(super::OpError::InvalidArgument(format!(
+                "env {verb}: inline-flag form requires --environment-id and --name; missing: {}",
+                missing.join(", ")
+            )));
+        }
+        Ok(Some(EnvCreatePayload {
+            environment_id: self.environment_id.expect("checked above"),
+            name: self.name.expect("checked above"),
+            region: self.region,
+            tenant_org_id: self.tenant_org_id,
+            listen_addr: None,
+            public_base_url: None,
         }))
     }
 }
@@ -1626,7 +1694,7 @@ mod tests {
 
     // ---- Change C: env public_url + auto-setWebhook ------------------------
 
-    use super::super::dispatch::{EnvCreateArgs, EnvInitArgs};
+    use super::super::dispatch::{EnvCreateArgs, EnvInitArgs, EnvUpdateArgs};
 
     fn args_with_url(url: &str) -> EnvCreateArgs {
         EnvCreateArgs {
@@ -1769,10 +1837,9 @@ mod tests {
     }
 
     #[test]
-    fn env_init_with_public_url_does_not_overwrite_existing_env() {
-        // init is idempotent + heal-only: a second init with a different URL
-        // must NOT overwrite the existing env's URL. Operators get a sharp
-        // `set-public-url` tool for that.
+    fn env_init_rejects_public_url_when_env_already_exists() {
+        // init with --public-url on an existing env must error out. The URL is
+        // only applied on creation; overwriting requires `op env set-public-url`.
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         init(
@@ -1783,21 +1850,66 @@ mod tests {
             },
         )
         .unwrap();
-        init(
+        let err = init(
             &store,
             &OpFlags::default(),
             EnvInitPayload {
                 public_base_url: Some("https://second.example.com".into()),
             },
         )
-        .unwrap();
+        .expect_err("second init with --public-url must error");
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        // First env's URL unchanged.
         let env = store
             .load(&EnvId::try_from(crate::defaults::LOCAL_ENV_ID).unwrap())
             .unwrap();
         assert_eq!(
             env.host_config.public_base_url.as_deref(),
             Some("https://first.example.com"),
-            "second init must not overwrite existing URL"
+            "existing URL must be preserved"
+        );
+    }
+
+    #[test]
+    fn env_init_without_public_url_stays_idempotent_on_existing_env() {
+        // init WITHOUT --public-url on an existing env must remain the silent
+        // no-op/heal bootstrap it always was.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        init(
+            &store,
+            &OpFlags::default(),
+            EnvInitPayload {
+                public_base_url: Some("https://first.example.com".into()),
+            },
+        )
+        .unwrap();
+        let outcome = init(&store, &OpFlags::default(), EnvInitPayload::default()).unwrap();
+        assert_eq!(
+            outcome.result.get("outcome").and_then(|v| v.as_str()),
+            Some("untouched")
+        );
+    }
+
+    #[test]
+    fn env_init_includes_persisted_public_url_in_outcome() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let outcome = init(
+            &store,
+            &OpFlags::default(),
+            EnvInitPayload {
+                public_base_url: Some("https://demo.greentic.ai".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            outcome
+                .result
+                .get("public_base_url")
+                .and_then(|v| v.as_str()),
+            Some("https://demo.greentic.ai"),
+            "outcome must surface the persisted public_base_url"
         );
     }
 
@@ -1893,5 +2005,41 @@ mod tests {
         // store errors. For now assert no env file was written by the verb.
         let _ = err;
         assert!(!store.exists(&EnvId::try_from("missing").unwrap()).unwrap());
+    }
+
+    // ---- Fix 1: EnvUpdateArgs does not expose --public-url or --listen-addr ----
+
+    #[test]
+    fn env_update_args_does_not_expose_public_url_inline() {
+        // Even when reached via --answers JSON (the legacy contract), the
+        // produced payload carries public_base_url: None.
+        let args = EnvUpdateArgs {
+            environment_id: Some("local".into()),
+            name: Some("local".into()),
+            region: Some("eu-west-1".into()),
+            tenant_org_id: None,
+        };
+        let payload = args
+            .into_payload("update", &OpFlags::default())
+            .unwrap()
+            .expect("inline path");
+        assert_eq!(payload.public_base_url, None);
+        assert_eq!(payload.listen_addr, None);
+        assert_eq!(payload.region.as_deref(), Some("eu-west-1"));
+    }
+
+    #[test]
+    fn env_update_args_rejects_partial_inline() {
+        // SOME inline flags + missing required → error, never silent --answers fallthrough.
+        let args = EnvUpdateArgs {
+            environment_id: None, // missing required
+            name: Some("local".into()),
+            region: None,
+            tenant_org_id: None,
+        };
+        let err = args
+            .into_payload("update", &OpFlags::default())
+            .expect_err("should reject");
+        assert!(matches!(err, OpError::InvalidArgument(_)));
     }
 }
