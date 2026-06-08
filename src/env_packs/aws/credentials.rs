@@ -6,8 +6,9 @@
 //! - **`aws.sts.caller-identity`** — `STS::GetCallerIdentity`. Proves the
 //!   ambient AWS credential chain resolves to a usable principal.
 //! - **One capability per validated IAM verb**, evaluated via
-//!   `IAM::SimulatePrincipalPolicy` against the resolved caller ARN. Six
-//!   verbs cover the minimum ECS-rollout surface: `sts:GetCallerIdentity`,
+//!   `IAM::SimulatePrincipalPolicy` against the resolved caller ARN. Eight
+//!   verbs cover the minimum ECS-rollout + self-validation surface:
+//!   `sts:GetCallerIdentity`, `iam:SimulatePrincipalPolicy`,
 //!   `ecs:CreateService`, `ecs:UpdateService`, `ecs:CreateTaskSet`,
 //!   `ecr:PutImage`, `elasticloadbalancing:ModifyListener`, `iam:PassRole`.
 //!   Phase D D-AWS-1 may extend the verb list as ECR/ALB/IAM Terraform lands.
@@ -37,16 +38,14 @@
 //!
 //! [`bootstrap`](DeployerCredentials::bootstrap) emits a minimum-privilege
 //! IAM role + inline policy Terraform module via [`super::bootstrap`].
-//! Returns a [`BootstrapOutcome`] whose `generated_credentials_ref` is a
-//! sentinel `secret://<env>/aws-ecs/bootstrap-pending` until Phase D wires
-//! a live secret backend (per the Phase A `mod.rs` constraint). The rules
-//! pack lands under `rules/<env>/greentic.deployer.aws-ecs/aws-min-iam.tf`
-//! and the customer's admin applies it via `tofu apply` / `terraform apply`
+//! Returns a [`BootstrapOutcome`] with `bound_credentials_ref: None` —
+//! the admin applies the rules pack offline and binds the resulting role
+//! ARN via `op credentials rotate`. The rules pack lands under
+//! `rules/<env>/greentic.deployer.aws-ecs/aws-min-iam.tf` and the
+//! customer's admin applies it via `tofu apply` / `terraform apply`
 //! against their own state backend.
 
 use std::sync::{Arc, Mutex};
-
-use greentic_deploy_spec::SecretRef;
 
 use crate::credentials::{
     BootstrapError, BootstrapInput, BootstrapOutcome, Capability, CapabilityCheck,
@@ -65,6 +64,7 @@ pub const AWS_STS_CALLER_IDENTITY_CAP: &str = "aws.sts.caller-identity";
 /// pipeline. Each verb maps to a capability ID `aws.iam.allow:<verb>`.
 pub const VALIDATED_IAM_VERBS: &[&str] = &[
     "sts:GetCallerIdentity",
+    "iam:SimulatePrincipalPolicy",
     "ecs:CreateService",
     "ecs:UpdateService",
     "ecs:CreateTaskSet",
@@ -326,10 +326,12 @@ impl DeployerCredentials for AwsDeployerCredentials {
         let client = match self.resolve_client() {
             Ok(c) => c,
             Err(AwsClientError::NoCredentialChain(reason)) => {
-                // No credentials at all — skip every probe with the chain
-                // diagnostic so the operator sees one actionable line per
-                // capability instead of repeating the same auth failure.
-                return all_skipped(&self.required_capabilities(), &reason);
+                // No credentials at all — for a deployer that requires
+                // credential material, missing chain is an auth failure,
+                // not a "we couldn't check" skip. Fail every cap so
+                // `report.passed()` is false and the downstream doc
+                // stamps `result: Fail`.
+                return all_failed(&self.required_capabilities(), &reason);
             }
             Err(e) => {
                 return all_failed(&self.required_capabilities(), &e.to_string());
@@ -416,40 +418,23 @@ impl DeployerCredentials for AwsDeployerCredentials {
             allowed_actions: VALIDATED_IAM_VERBS,
         });
 
-        // Sentinel SecretRef — Phase D wires the real secret backend.
-        // The CLI surface treats this as a placeholder and a follow-up
-        // `op credentials rotate` will overwrite once the backend is live.
-        let sentinel = SecretRef::try_new(format!(
-            "secret://{}/aws-ecs/bootstrap-pending",
-            input.env_id.as_str()
-        ))
-        .expect("sentinel SecretRef is well-formed");
-
+        // C3 stub: the admin applies the rules pack offline (Terraform),
+        // then binds the resulting role ARN via `op credentials rotate`.
+        // No credentials are minted here — `bound_credentials_ref: None`
+        // tells the runner NOT to mark the env as credentialed. Phase D
+        // AWS will return `Some` once the deployer can mint a session
+        // token directly.
         Ok(BootstrapOutcome {
-            generated_credentials_ref: sentinel,
             rules_pack,
+            bound_credentials_ref: None,
         })
     }
 }
 
-/// Build every-capability-skipped report with the same reason. Used when
-/// the credential chain doesn't resolve at all.
-fn all_skipped(caps: &[Capability], reason: &str) -> RequirementsReport {
-    RequirementsReport::new(
-        caps.iter()
-            .map(|c| CapabilityCheck {
-                capability: c.clone(),
-                status: CapabilityStatus::Skipped {
-                    reason: reason.to_string(),
-                },
-            })
-            .collect(),
-    )
-}
-
 /// Build every-capability-failed report with the same reason. Used when
-/// the SDK errors in a way that's neither no-chain nor a verb-specific
-/// denial.
+/// the credential chain doesn't resolve or the SDK errors in a way that
+/// is neither verb-specific denial nor a transport issue the operator can
+/// distinguish from auth failure.
 fn all_failed(caps: &[Capability], reason: &str) -> RequirementsReport {
     RequirementsReport::new(
         caps.iter()
@@ -684,33 +669,41 @@ mod tests {
         }
     }
 
+    /// `NoCredentialChain` must produce `Fail` for every capability —
+    /// missing credentials is an auth failure for a deployer that requires
+    /// material, not a "we couldn't check" skip. This test exercises the
+    /// validate path end-to-end via a mock client that surfaces
+    /// `NoCredentialChain` at the STS call (the closest we can get to
+    /// triggering the `resolve_client` chain-error path through the mock).
     #[test]
-    fn validate_skips_every_cap_when_no_credential_chain() {
-        // Mock STS to return NoCredentialChain via the resolve path: in
-        // practice this happens at `resolve_client()`, not at the SDK call.
-        // We can't trigger `resolve_client()` via the public mock surface
-        // (the mock is already constructed), so simulate the equivalent
-        // outcome: STS itself returns NoCredentialChain — every cap is
-        // Skipped instead of Fail, mirroring `all_skipped`'s posture.
-        //
-        // We re-route through all_skipped indirectly: passing a chain-error
-        // from the mock STS results in Fail (the trait can't tell
-        // intermediate construction errors from STS errors). The genuine
-        // "no chain" path is exercised by an integration test against an
-        // unconfigured environment; here we just verify the SKIPPED branch
-        // when we directly invoke the helper.
-        let creds = AwsDeployerCredentials::default();
-        let caps = creds.required_capabilities();
-        let report = all_skipped(&caps, "no AWS chain in test env");
-        assert!(report.passed(), "Skipped does not block overall pass");
+    fn validate_fails_every_cap_when_no_credential_chain() {
+        let mock = Arc::new(MockAwsClient::default().with_sts(Err(
+            AwsClientError::NoCredentialChain("no AWS chain configured".into()),
+        )));
+        let creds = AwsDeployerCredentials::with_client(mock);
+        let env_id = EnvId::try_from("prod-eu").unwrap();
+        let hc = default_host_config(&env_id);
+        let dir = tempdir().unwrap();
+        let report = creds.validate(&ctx(dir.path(), &env_id, &hc));
+        assert!(
+            !report.passed(),
+            "NoCredentialChain must block overall pass"
+        );
         let missing = report.missing();
-        assert_eq!(missing.len(), caps.len());
+        assert_eq!(
+            missing.len(),
+            creds.required_capabilities().len(),
+            "every cap must be missing; got {missing:?}"
+        );
         for check in &report.checks {
             match &check.status {
-                CapabilityStatus::Skipped { reason } => {
-                    assert_eq!(reason, "no AWS chain in test env");
+                CapabilityStatus::Fail { reason } => {
+                    assert!(
+                        reason.contains("no AWS chain configured"),
+                        "reason: {reason}"
+                    );
                 }
-                other => panic!("expected Skipped, got {other:?}"),
+                other => panic!("expected Fail, got {other:?}"),
             }
         }
     }
@@ -794,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_returns_rules_pack_with_iam_terraform_and_sentinel_ref() {
+    fn bootstrap_returns_rules_pack_without_binding_credentials() {
         let creds = AwsDeployerCredentials::default();
         let env_id = EnvId::try_from("prod-eu").unwrap();
         let dir = tempdir().unwrap();
@@ -808,9 +801,11 @@ mod tests {
             admin: &admin,
         };
         let outcome = creds.bootstrap(&input).expect("bootstrap renders");
-        assert_eq!(
-            outcome.generated_credentials_ref.as_str(),
-            "secret://prod-eu/aws-ecs/bootstrap-pending"
+        // C3 stub returns None — the admin applies Terraform offline,
+        // then binds via `op credentials rotate`.
+        assert!(
+            outcome.bound_credentials_ref.is_none(),
+            "AWS C3 bootstrap must not bind credentials directly"
         );
         assert!(
             !outcome.rules_pack.is_empty(),

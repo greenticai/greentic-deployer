@@ -78,16 +78,148 @@ pub fn render_min_iam_rules_pack(input: &IamRulesPackInput<'_>) -> RulesPack {
     }
 }
 
+/// Sensitivity bucket for IAM action scoping in the rendered policy.
+enum ActionBucket {
+    /// `sts:*` and `iam:Simulate*` — read-only, safe at `Resource = "*"`.
+    ReadOnly,
+    /// `ecs:*` — ECS rollout, scoped to cluster/service ARN.
+    Ecs,
+    /// `ecr:*` — image push, scoped to repo ARN.
+    Ecr,
+    /// `elasticloadbalancing:*` — ALB mutation, scoped to listener ARN.
+    Alb,
+    /// `iam:PassRole` — privilege-sensitive, scoped + conditioned.
+    PassRole,
+    /// Unrecognized action — falls to a review bucket.
+    Unrecognized,
+}
+
+fn classify_action(action: &str) -> ActionBucket {
+    if action == "iam:PassRole" {
+        return ActionBucket::PassRole;
+    }
+    if action.starts_with("sts:") || action.starts_with("iam:Simulate") {
+        return ActionBucket::ReadOnly;
+    }
+    if action.starts_with("ecs:") {
+        return ActionBucket::Ecs;
+    }
+    if action.starts_with("ecr:") {
+        return ActionBucket::Ecr;
+    }
+    if action.starts_with("elasticloadbalancing:") {
+        return ActionBucket::Alb;
+    }
+    ActionBucket::Unrecognized
+}
+
+/// Render one HCL policy statement block. `extra_fields` carries optional
+/// Condition blocks or comments appended after `Resource`.
+fn render_statement(
+    comment: &str,
+    actions: &[&str],
+    resource: &str,
+    extra_fields: Option<&str>,
+) -> String {
+    let indent = "        ";
+    let mut s = format!("{indent}# {comment}\n{indent}{{\n");
+    s.push_str(&format!("{indent}  Effect = \"Allow\"\n"));
+    if actions.len() == 1 {
+        s.push_str(&format!("{indent}  Action = \"{}\"\n", actions[0]));
+    } else {
+        s.push_str(&format!("{indent}  Action = [\n"));
+        for a in actions {
+            s.push_str(&format!("{indent}    \"{a}\",\n"));
+        }
+        s.push_str(&format!("{indent}  ]\n"));
+    }
+    s.push_str(&format!("{indent}  Resource = \"{resource}\"\n"));
+    if let Some(extra) = extra_fields {
+        s.push_str(extra);
+    }
+    s.push_str(&format!("{indent}}}"));
+    s
+}
+
 fn render_terraform(input: &IamRulesPackInput<'_>) -> String {
-    // The HCL Action list is rendered as a JSON-style list inside the
-    // inline policy document. Order mirrors `allowed_actions` for
-    // reviewer-friendly diffs.
-    let actions_json = input
-        .allowed_actions
-        .iter()
-        .map(|a| format!("            \"{a}\""))
-        .collect::<Vec<_>>()
-        .join(",\n");
+    // Bucket actions by sensitivity.
+    let mut read_only: Vec<&str> = Vec::new();
+    let mut ecs: Vec<&str> = Vec::new();
+    let mut ecr: Vec<&str> = Vec::new();
+    let mut alb: Vec<&str> = Vec::new();
+    let mut pass_role: Vec<&str> = Vec::new();
+    let mut unrecognized: Vec<&str> = Vec::new();
+
+    for action in input.allowed_actions {
+        match classify_action(action) {
+            ActionBucket::ReadOnly => read_only.push(action),
+            ActionBucket::Ecs => ecs.push(action),
+            ActionBucket::Ecr => ecr.push(action),
+            ActionBucket::Alb => alb.push(action),
+            ActionBucket::PassRole => pass_role.push(action),
+            ActionBucket::Unrecognized => unrecognized.push(action),
+        }
+    }
+
+    // Build statements in order: read-only, ECS, ECR, ALB, PassRole, unrecognized.
+    let mut statements: Vec<String> = Vec::new();
+
+    if !read_only.is_empty() {
+        statements.push(render_statement(
+            "Read-only validation surface — safe at Resource = \"*\".",
+            &read_only,
+            "*",
+            None,
+        ));
+    }
+    if !ecs.is_empty() {
+        statements.push(render_statement(
+            "ECS rollout — admin scopes to cluster/service ARN at apply.",
+            &ecs,
+            "<REPLACE_WITH_ECS_RESOURCE_ARNS>",
+            None,
+        ));
+    }
+    if !ecr.is_empty() {
+        statements.push(render_statement(
+            "ECR image push — admin scopes to repo ARN.",
+            &ecr,
+            "<REPLACE_WITH_ECR_REPO_ARNS>",
+            None,
+        ));
+    }
+    if !alb.is_empty() {
+        statements.push(render_statement(
+            "ALB listener mutation — admin scopes to listener ARN.",
+            &alb,
+            "<REPLACE_WITH_ALB_LISTENER_ARNS>",
+            None,
+        ));
+    }
+    if !pass_role.is_empty() {
+        let condition = "\
+        \n          Condition = {\
+        \n            StringEquals = {\
+        \n              \"iam:PassedToService\" = \"ecs-tasks.amazonaws.com\"\
+        \n            }\
+        \n          }\n";
+        statements.push(render_statement(
+            "iam:PassRole — only for the ECS task-execution role, scoped + conditioned.",
+            &pass_role,
+            "<REPLACE_WITH_ECS_TASK_ROLE_ARN>",
+            Some(condition),
+        ));
+    }
+    if !unrecognized.is_empty() {
+        statements.push(render_statement(
+            "UNRECOGNIZED ACTION — review before applying.",
+            &unrecognized,
+            "*",
+            None,
+        ));
+    }
+
+    let statements_hcl = statements.join(",\n");
 
     // Trust principal rendering: if the hint already looks like an ARN we
     // inline it; otherwise we drop a placeholder the admin substitutes.
@@ -112,6 +244,14 @@ fn render_terraform(input: &IamRulesPackInput<'_>) -> String {
 # policy is the minimum set of actions exercised by the ECS rollout
 # surface (validated against this exact list by `gtc op credentials
 # requirements {env_id}`).
+#
+# IMPORTANT: Resource placeholders (`<REPLACE_WITH_*>`) must be replaced
+# with the actual ARNs from your AWS account before applying:
+#
+#   <REPLACE_WITH_ECS_RESOURCE_ARNS>  — e.g. arn:aws:ecs:<region>:<account>:service/<cluster>/greentic-*
+#   <REPLACE_WITH_ECR_REPO_ARNS>      — e.g. arn:aws:ecr:<region>:<account>:repository/greentic-*
+#   <REPLACE_WITH_ALB_LISTENER_ARNS>  — e.g. arn:aws:elasticloadbalancing:<region>:<account>:listener/app/<lb>/<id>/<id>
+#   <REPLACE_WITH_ECS_TASK_ROLE_ARN>  — e.g. arn:aws:iam::<account>:role/greentic-{env_id}-task-execution
 #
 # Trust principal is rendered from the operator-supplied admin hint:
 #   `{admin_hint}`
@@ -149,13 +289,7 @@ resource "aws_iam_role_policy" "greentic_{env_id_safe}_min" {{
   policy = jsonencode({{
     Version = "2012-10-17"
     Statement = [
-      {{
-        Effect = "Allow"
-        Action = [
-{actions_json}
-        ]
-        Resource = "*"
-      }}
+{statements_hcl}
     ]
   }})
 }}
@@ -172,7 +306,7 @@ output "role_arn" {{
         env_id_safe = input.env_id.replace('-', "_"),
         admin_hint = input.admin_identity_hint,
         trust_principal = trust_principal,
-        actions_json = actions_json,
+        statements_hcl = statements_hcl,
     )
 }
 
@@ -192,9 +326,28 @@ exercises:
 
 {action_bullets}
 
+The policy is split into multiple statements by sensitivity:
+
+- **Read-only** (`sts:GetCallerIdentity`, `iam:SimulatePrincipalPolicy`)
+  — `Resource = "*"` is safe; these are validation-only.
+- **ECS** (`ecs:*`) — replace `<REPLACE_WITH_ECS_RESOURCE_ARNS>` with
+  your cluster/service ARNs, e.g.
+  `arn:aws:ecs:<region>:<account>:service/<cluster>/greentic-*`.
+- **ECR** (`ecr:PutImage`) — replace `<REPLACE_WITH_ECR_REPO_ARNS>` with
+  your repository ARN, e.g.
+  `arn:aws:ecr:<region>:<account>:repository/greentic-*`.
+- **ALB** (`elasticloadbalancing:ModifyListener`) — replace
+  `<REPLACE_WITH_ALB_LISTENER_ARNS>` with your listener ARN.
+- **iam:PassRole** — replace `<REPLACE_WITH_ECS_TASK_ROLE_ARN>` with the
+  ARN of the ECS task-execution role, e.g.
+  `arn:aws:iam::<account>:role/greentic-{env_id}-task-execution`.
+  Conditioned on `iam:PassedToService = ecs-tasks.amazonaws.com`.
+
 ## How to apply
 
-1. Review `aws-min-iam.tf`. The trust principal is currently:
+1. Review `aws-min-iam.tf`. Replace every `<REPLACE_WITH_*>` placeholder
+   with the actual ARNs from your AWS account. The trust principal is
+   currently:
 
    ```
    {admin_hint}
@@ -237,8 +390,8 @@ exercises:
    gtc op credentials requirements {env_id}
    ```
 
-   All seven capabilities (`{sts_cap}` + the six IAM verbs above) must
-   pass before `gtc op deploy {env_id}` is honored.
+   All capabilities (`{sts_cap}` + the IAM verbs above) must pass
+   before `gtc op deploy {env_id}` is honored.
 
 ## What this does NOT do
 
@@ -343,6 +496,7 @@ mod tests {
             admin_identity_hint: "arn:aws:iam::111122223333:role/x",
             allowed_actions: &[
                 "sts:GetCallerIdentity",
+                "iam:SimulatePrincipalPolicy",
                 "ecs:CreateService",
                 "ecs:UpdateService",
                 "ecs:CreateTaskSet",
@@ -415,6 +569,129 @@ mod tests {
         assert!(readme.content.contains("gtc op credentials rotate prod-eu"));
         // env_id is templated through.
         assert!(readme.content.contains("env `prod-eu`"));
+    }
+
+    /// The full verb list produces at least 5 statements: read-only, ECS,
+    /// ECR, ALB, and PassRole.
+    #[test]
+    fn tf_emits_one_statement_per_bucket() {
+        let input = IamRulesPackInput {
+            env_id: "prod-eu",
+            admin_identity_hint: "arn:aws:iam::111122223333:role/x",
+            allowed_actions: &[
+                "sts:GetCallerIdentity",
+                "iam:SimulatePrincipalPolicy",
+                "ecs:CreateService",
+                "ecs:UpdateService",
+                "ecs:CreateTaskSet",
+                "ecr:PutImage",
+                "elasticloadbalancing:ModifyListener",
+                "iam:PassRole",
+            ],
+        };
+        let pack = render_min_iam_rules_pack(&input);
+        let tf = &pack
+            .entries
+            .iter()
+            .find(|e| e.filename == "aws-min-iam.tf")
+            .unwrap()
+            .content;
+        // Count statement comment markers.
+        let statement_comments: Vec<&str> = tf
+            .lines()
+            .filter(|l| {
+                let trimmed = l.trim();
+                trimmed.starts_with("# Read-only")
+                    || trimmed.starts_with("# ECS rollout")
+                    || trimmed.starts_with("# ECR image")
+                    || trimmed.starts_with("# ALB listener")
+                    || trimmed.starts_with("# iam:PassRole")
+            })
+            .collect();
+        assert!(
+            statement_comments.len() >= 5,
+            "expected at least 5 statement buckets; got {} in:\n{tf}",
+            statement_comments.len()
+        );
+    }
+
+    /// `iam:PassRole` must be scoped to a placeholder resource (not `*`)
+    /// and conditioned on `iam:PassedToService`.
+    #[test]
+    fn tf_passrole_is_scoped_and_conditioned() {
+        let input = IamRulesPackInput {
+            env_id: "prod-eu",
+            admin_identity_hint: "arn:aws:iam::111122223333:role/x",
+            allowed_actions: &[
+                "sts:GetCallerIdentity",
+                "iam:SimulatePrincipalPolicy",
+                "ecs:CreateService",
+                "ecr:PutImage",
+                "elasticloadbalancing:ModifyListener",
+                "iam:PassRole",
+            ],
+        };
+        let pack = render_min_iam_rules_pack(&input);
+        let tf = &pack
+            .entries
+            .iter()
+            .find(|e| e.filename == "aws-min-iam.tf")
+            .unwrap()
+            .content;
+        // Find the PassRole statement block (from its comment to the next
+        // statement comment or end of statements).
+        let passrole_start = tf
+            .find("# iam:PassRole")
+            .expect("PassRole comment must exist");
+        let passrole_block = &tf[passrole_start..];
+        assert!(
+            passrole_block.contains("iam:PassedToService"),
+            "PassRole statement must have iam:PassedToService condition; block:\n{passrole_block}"
+        );
+        assert!(
+            passrole_block.contains("ecs-tasks.amazonaws.com"),
+            "PassRole condition must reference ecs-tasks; block:\n{passrole_block}"
+        );
+        assert!(
+            passrole_block.contains("<REPLACE_WITH_ECS_TASK_ROLE_ARN>"),
+            "PassRole Resource must be a scoped placeholder, not *; block:\n{passrole_block}"
+        );
+        // Ensure the PassRole block does NOT use Resource = "*".
+        // Find the Resource line within the passrole block.
+        for line in passrole_block.lines() {
+            if line.contains("Resource") && line.contains('"') {
+                assert!(
+                    !line.contains("\"*\""),
+                    "PassRole Resource must not be \"*\"; line: {line}"
+                );
+            }
+        }
+    }
+
+    /// An unrecognized action (not matching any known bucket) must land in
+    /// an UNRECOGNIZED review bucket rather than being silently dropped.
+    #[test]
+    fn tf_unknown_action_falls_to_review_bucket() {
+        let input = IamRulesPackInput {
+            env_id: "prod-eu",
+            admin_identity_hint: "arn:aws:iam::111122223333:role/x",
+            allowed_actions: &["sts:GetCallerIdentity", "s3:GetObject"],
+        };
+        let pack = render_min_iam_rules_pack(&input);
+        let tf = &pack
+            .entries
+            .iter()
+            .find(|e| e.filename == "aws-min-iam.tf")
+            .unwrap()
+            .content;
+        assert!(
+            tf.contains("UNRECOGNIZED"),
+            "unrecognized action must land in UNRECOGNIZED bucket; content:\n{tf}"
+        );
+        assert!(
+            tf.contains("\"s3:GetObject\""),
+            "unrecognized action must appear in the HCL; content:\n{tf}"
+        );
     }
 
     #[test]
