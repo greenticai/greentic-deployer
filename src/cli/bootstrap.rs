@@ -17,6 +17,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::defaults::{LOCAL_DEPLOYER_PACK, LOCAL_ENV_ID, local_pack_bindings};
+use crate::env_packs::LocalProcessDeployerHandler;
 use crate::environment::{LocalFsStore, Locked};
 
 use super::OpError;
@@ -75,11 +76,11 @@ pub fn ensure_local_environment(
                 }
                 let added = fill_missing_default_bindings(&mut existing)?;
                 if added.is_empty() {
-                    write_local_runtime_stub_if_absent(locked, &existing)?;
+                    refresh_local_runtime_stub(locked, &existing, false)?;
                     return Ok((existing, LocalEnvOutcome::AlreadyExists));
                 }
                 locked.save(&existing)?;
-                write_local_runtime_stub(locked, &existing)?;
+                refresh_local_runtime_stub(locked, &existing, true)?;
                 return Ok((existing, LocalEnvOutcome::Healed { added_slots: added }));
             }
             let packs = local_pack_bindings().map_err(|e| {
@@ -108,54 +109,79 @@ pub fn ensure_local_environment(
                 health: Default::default(),
             };
             locked.save(&env)?;
-            write_local_runtime_stub(locked, &env)?;
+            refresh_local_runtime_stub(locked, &env, true)?;
             Ok((env, LocalEnvOutcome::Created))
         },
     )
 }
 
-/// Write the local-process deployer's `runtime.json` stub for `env`, bumping
-/// `generation` against the previous `runtime.json` (or starting at 1 when
-/// absent). Called from the Create and Heal arms so the C5 `runtime://`
-/// resolver in `greentic-start` has a live snapshot the moment the env is
-/// committed.
+/// Refresh (or create) the local-process deployer's `runtime.json` stub.
 ///
-/// The stub seeds `discovered` with the env's resolved bind address so a
-/// reference component can resolve `runtime://<env>/discovered/listen_addr`
-/// against the local env without a Phase-D deployer. Phase-D deployers
-/// (AWS-ECS, K8s, …) own `report_runtime_config` for their providers — this
-/// helper only covers the local-process slot.
-fn write_local_runtime_stub(locked: &Locked<'_>, env: &Environment) -> Result<(), OpError> {
-    let prev_generation = locked.load_runtime()?.map(|r| r.generation).unwrap_or(0);
-    locked
-        .save_runtime(&build_local_runtime_stub(env, prev_generation + 1)?)
-        .map_err(Into::into)
-}
-
-/// Write the runtime stub only when `runtime.json` is absent. Used by the
-/// `AlreadyExists` path so re-running `gtc start` does not churn backups for
-/// an unchanged env.
-fn write_local_runtime_stub_if_absent(
+/// Gates:
+/// 1. The env's Deployer binding must be the local-process handler. If absent
+///    or bound to a different deployer (e.g. `greentic.deployer.aws-ecs`), the
+///    helper no-ops — we do not own that file.
+/// 2. If `runtime.json` already exists AND its `generated_by` path is not the
+///    local-process handler, the helper no-ops — a foreign producer owns it.
+///
+/// When `force_bump` is `true` (Create / Heal arms), the stub is always
+/// written with a bumped generation. When `false` (AlreadyExists arm), the
+/// stub is only written when the `listen_addr` discovered key is stale or the
+/// file is absent — avoiding backup churn on every `gtc start`.
+///
+/// Existing `discovered` keys from a prior stub are preserved; only
+/// `listen_addr` is upserted.
+fn refresh_local_runtime_stub(
     locked: &Locked<'_>,
     env: &Environment,
+    force_bump: bool,
 ) -> Result<(), OpError> {
-    if locked.load_runtime()?.is_some() {
+    // Gate 1: env Deployer binding must be local-process.
+    let is_local = env
+        .pack_for_slot(CapabilitySlot::Deployer)
+        .is_some_and(|b| b.kind.path() == LocalProcessDeployerHandler::DESCRIPTOR_PATH);
+    if !is_local {
         return Ok(());
     }
+
+    let existing = locked.load_runtime()?;
+
+    // Gate 2: existing stub's producer must be local-process (or absent).
+    if let Some(ref rt) = existing
+        && rt.generated_by.path() != LocalProcessDeployerHandler::DESCRIPTOR_PATH
+    {
+        return Ok(());
+    }
+
+    let prev_generation = existing.as_ref().map(|r| r.generation).unwrap_or(0);
+    let mut desired_discovered = existing
+        .as_ref()
+        .map(|r| r.discovered.clone())
+        .unwrap_or_default();
+    let new_addr = Value::String(env.host_config.resolved_listen_addr().to_string());
+    desired_discovered.insert("listen_addr".to_string(), new_addr);
+
+    if !force_bump
+        && let Some(ref rt) = existing
+        && rt.discovered == desired_discovered
+    {
+        return Ok(());
+    }
+
     locked
-        .save_runtime(&build_local_runtime_stub(env, 1)?)
+        .save_runtime(&build_local_runtime_stub(
+            env,
+            prev_generation + 1,
+            desired_discovered,
+        )?)
         .map_err(Into::into)
 }
 
 fn build_local_runtime_stub(
     env: &Environment,
     generation: u64,
+    discovered: BTreeMap<String, Value>,
 ) -> Result<EnvironmentRuntime, OpError> {
-    let mut discovered = BTreeMap::new();
-    discovered.insert(
-        "listen_addr".to_string(),
-        Value::String(env.host_config.resolved_listen_addr().to_string()),
-    );
     let generated_by = PackDescriptor::try_new(LOCAL_DEPLOYER_PACK).map_err(|e| {
         OpError::InvalidArgument(format!(
             "local-process descriptor `{}`: {}",
@@ -605,6 +631,154 @@ mod tests {
         assert_eq!(
             runtime.generation, 2,
             "Heal arm must bump generation against the previous stub",
+        );
+    }
+
+    #[test]
+    fn heal_preserves_existing_discovered_keys() {
+        let (_tmp, store) = store();
+        // First bootstrap to create env + runtime stub (generation=1).
+        ensure_local_environment(&store, None).expect("first bootstrap");
+        let env_id = EnvId::try_from(LOCAL_ENV_ID).unwrap();
+
+        // Inject extra discovered keys into the existing runtime.json,
+        // simulating a Phase-D deployer that added `alb_dns`.
+        let mut runtime = store.load_runtime(&env_id).expect("load").expect("exists");
+        runtime
+            .discovered
+            .insert("alb_dns".to_string(), Value::String("ALB".to_string()));
+        store.save_runtime(&runtime).expect("save patched runtime");
+
+        // Strip one default binding so the next bootstrap falls into Heal.
+        let mut env = store.load(&env_id).expect("load env");
+        env.packs.retain(|b| b.slot != CapabilitySlot::Telemetry);
+        store.save(&env).expect("user save");
+
+        let (healed_env, outcome) = ensure_local_environment(&store, None).expect("heal bootstrap");
+        assert!(matches!(outcome, LocalEnvOutcome::Healed { .. }));
+
+        let refreshed = store.load_runtime(&env_id).expect("load").expect("exists");
+        assert_eq!(
+            refreshed.discovered.get("alb_dns").and_then(Value::as_str),
+            Some("ALB"),
+            "pre-existing discovered keys must survive Heal",
+        );
+        assert_eq!(
+            refreshed
+                .discovered
+                .get("listen_addr")
+                .and_then(Value::as_str),
+            Some(
+                healed_env
+                    .host_config
+                    .resolved_listen_addr()
+                    .to_string()
+                    .as_str()
+            ),
+        );
+        assert!(
+            refreshed.generation > runtime.generation,
+            "generation must bump on Heal",
+        );
+    }
+
+    #[test]
+    fn heal_skips_runtime_stub_when_deployer_binding_is_not_local_process() {
+        let (_tmp, store) = store();
+        let mut env = seed_empty_local_env(&store);
+        // Bind the Deployer slot to a non-local-process descriptor.
+        env.packs.push(custom_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.aws-ecs@1.0.0",
+        ));
+        store.save(&env).expect("save env with aws deployer");
+
+        // Pre-seed runtime.json with the AWS deployer as generated_by.
+        let aws_descriptor = PackDescriptor::try_new("greentic.deployer.aws-ecs@1.0.0").unwrap();
+        let mut aws_discovered = BTreeMap::new();
+        aws_discovered.insert("alb_dns".to_string(), Value::String("ALB".to_string()));
+        let aws_runtime = EnvironmentRuntime {
+            schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_RUNTIME_V1),
+            environment_id: env.environment_id.clone(),
+            discovered: aws_discovered,
+            generated_at: Utc::now(),
+            generated_by: aws_descriptor,
+            generation: 5,
+        };
+        store.save_runtime(&aws_runtime).expect("save aws runtime");
+
+        // Bootstrap — should heal missing slots but NOT touch runtime.json.
+        let (_env, outcome) = ensure_local_environment(&store, None).expect("heal");
+        assert!(matches!(outcome, LocalEnvOutcome::Healed { .. }));
+
+        let after = store
+            .load_runtime(&env.environment_id)
+            .expect("load")
+            .expect("exists");
+        assert_eq!(
+            after.generation, aws_runtime.generation,
+            "generation must not change — foreign producer owns the file",
+        );
+        assert_eq!(
+            after.generated_at, aws_runtime.generated_at,
+            "generated_at must not change",
+        );
+        assert_eq!(
+            after.discovered, aws_runtime.discovered,
+            "discovered must be untouched",
+        );
+    }
+
+    #[test]
+    fn already_exists_refreshes_stale_listen_addr() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let (_tmp, store) = store();
+        // First bootstrap writes env + runtime stub with default listen_addr.
+        ensure_local_environment(&store, None).expect("first bootstrap");
+        let env_id = EnvId::try_from(LOCAL_ENV_ID).unwrap();
+        let before = store.load_runtime(&env_id).expect("load").expect("exists");
+
+        // Mutate listen_addr on the persisted env (simulates `op config set`).
+        let mut env = store.load(&env_id).expect("load env");
+        let custom = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 9090);
+        env.host_config.listen_addr = Some(custom);
+        store.save(&env).expect("user save");
+
+        // Second bootstrap → AlreadyExists, but listen_addr is now stale.
+        let (_env, outcome) = ensure_local_environment(&store, None).expect("second bootstrap");
+        assert_eq!(outcome, LocalEnvOutcome::AlreadyExists);
+
+        let after = store.load_runtime(&env_id).expect("load").expect("exists");
+        assert_eq!(
+            after.discovered.get("listen_addr").and_then(Value::as_str),
+            Some(custom.to_string().as_str()),
+            "listen_addr must be refreshed to the new address",
+        );
+        assert_eq!(
+            after.generation,
+            before.generation + 1,
+            "generation must bump by exactly 1",
+        );
+    }
+
+    #[test]
+    fn already_exists_does_not_churn_when_listen_addr_unchanged() {
+        let (_tmp, store) = store();
+        ensure_local_environment(&store, None).expect("first bootstrap");
+        let env_id = EnvId::try_from(LOCAL_ENV_ID).unwrap();
+        let before = store.load_runtime(&env_id).expect("load").expect("exists");
+
+        // Second bootstrap — same env, same listen_addr.
+        ensure_local_environment(&store, None).expect("second bootstrap");
+        let after = store.load_runtime(&env_id).expect("load").expect("exists");
+
+        assert_eq!(
+            before.generation, after.generation,
+            "generation must not bump when listen_addr unchanged",
+        );
+        assert_eq!(
+            before.generated_at, after.generated_at,
+            "generated_at must not change when no write occurs",
         );
     }
 }
