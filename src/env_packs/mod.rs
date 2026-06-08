@@ -6,10 +6,14 @@
 //! - [`registry`] — [`EnvPackRegistry`](registry::EnvPackRegistry): built-in
 //!   registrations plus the Phase D plug-in `register` hook.
 
+#[cfg(feature = "creds-aws")]
+pub mod aws;
 pub mod local_process;
 pub mod registry;
 pub mod slot;
 
+#[cfg(feature = "creds-aws")]
+pub use aws::{AwsDeployerCredentials, AwsEcsDeployerHandler, AwsValidatorClient};
 pub use local_process::{LocalProcessCredentials, LocalProcessDeployerHandler};
 pub use registry::{EnvPackRegistry, RegistryError};
 pub use slot::{BUILTIN_HANDLERS, BuiltinHandler, EnvPackHandler};

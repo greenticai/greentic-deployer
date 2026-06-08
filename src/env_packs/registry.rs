@@ -69,6 +69,16 @@ impl EnvPackRegistry {
     /// [`DeployerCredentials`](crate::credentials::DeployerCredentials)
     /// impl
     /// ([`LocalProcessDeployerHandler`](super::local_process::LocalProcessDeployerHandler)).
+    ///
+    /// When the `creds-aws` feature is on (default), also registers the
+    /// C3 AWS-ECS deployer handler
+    /// ([`AwsEcsDeployerHandler`](super::aws::AwsEcsDeployerHandler))
+    /// under `greentic.deployer.aws-ecs`. The handler is NOT part of the
+    /// `local` env's default bindings — it must be bound explicitly via
+    /// `gtc op env-packs add <env> --slot deployer --kind
+    /// greentic.deployer.aws-ecs@1.0.0` — but the registry resolves the
+    /// descriptor so `gtc op credentials requirements` can probe a real
+    /// AWS account today.
     pub fn with_builtins() -> Self {
         let mut registry = Self::new();
         for handler in BUILTIN_HANDLERS {
@@ -81,6 +91,10 @@ impl EnvPackRegistry {
                 super::local_process::LocalProcessDeployerHandler::default(),
             ))
             .expect("local-process deployer handler path is unique");
+        #[cfg(feature = "creds-aws")]
+        registry
+            .register(Box::new(super::aws::AwsEcsDeployerHandler::default()))
+            .expect("aws-ecs deployer handler path is unique");
         registry
     }
 
@@ -167,9 +181,19 @@ mod tests {
     }
 
     #[test]
-    fn with_builtins_registers_five_handlers() {
+    fn with_builtins_registers_baseline_handlers() {
+        // Five `local` handlers (Secrets / Telemetry / Sessions / State +
+        // local-process Deployer). With the `creds-aws` feature on, the
+        // C3 AWS-ECS Deployer handler is also registered — it's not part
+        // of the `local` env's default bindings but the registry exposes
+        // it so `gtc op env-packs add … --kind greentic.deployer.aws-ecs`
+        // resolves.
         let registry = EnvPackRegistry::with_builtins();
-        assert_eq!(registry.len(), 5);
+        #[cfg(feature = "creds-aws")]
+        let expected = 6;
+        #[cfg(not(feature = "creds-aws"))]
+        let expected = 5;
+        assert_eq!(registry.len(), expected);
     }
 
     #[test]
