@@ -24,11 +24,16 @@ categories = [
 ]
 
 [features]
-default = ["bundle-upload-aws", "runtime-secrets-aws"]
+default = ["bundle-upload-aws", "runtime-secrets-aws", "creds-aws"]
 internal-tools = []
 test-utils = []
 bundle-upload-aws = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime-api"]
 runtime-secrets-aws = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "dep:aws-smithy-runtime-api"]
+# C3 (Phase C): AWS deployer env-pack credentials (typed STS + IAM
+# SimulatePrincipalPolicy validation, IAM rules-pack bootstrap). Default-on
+# alongside the other AWS deps; the env-pack registers only when this is
+# enabled.
+creds-aws = ["dep:aws-sdk-sts", "dep:aws-sdk-iam", "dep:aws-config", "dep:aws-smithy-runtime-api"]
 bundle-upload-gcp = []
 bundle-upload-azure = []
 
@@ -178,6 +183,24 @@ features = [
 [dependencies.aws-smithy-runtime-api]
 version = "1"
 optional = true
+
+[dependencies.aws-sdk-sts]
+version = "1"
+optional = true
+default-features = false
+features = [
+    "default-https-client",
+    "rt-tokio",
+]
+
+[dependencies.aws-sdk-iam]
+version = "1"
+optional = true
+default-features = false
+features = [
+    "default-https-client",
+    "rt-tokio",
+]
 
 [dependencies.tempfile]
 version = "3"

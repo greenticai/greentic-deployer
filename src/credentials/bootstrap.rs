@@ -4,14 +4,20 @@
 //! [`ZeroizedAdmin`], delegates to the bound deployer handler, and
 //! persists:
 //!
-//! 1. The generated low-privilege secret material into the env's secrets
-//!    backend (returned via [`BootstrapOutcome::generated_credentials_ref`]).
-//! 2. A reviewable rules-pack under `rules/<env_id>/` so the customer's
+//! 1. A reviewable rules-pack under `rules/<env_id>/` so the customer's
 //!    admin can apply the equivalent IaC offline (see
 //!    [`rules_export`](super::rules_export)).
-//! 3. A [`Credentials`] doc with `mode = Bootstrap`,
-//!    `admin_credential_consumed_at` stamped to the call time, and a
-//!    pointer to the generated secret.
+//! 2. A [`Credentials`] doc with `mode = Bootstrap`,
+//!    `admin_credential_consumed_at` stamped to the call time, and — when
+//!    the handler bound material directly — the env's `credentials_ref`.
+//!
+//! When the handler returns `bound_credentials_ref = None` (e.g. AWS C3
+//! where the admin runs Terraform offline), the env stays uncredentialed:
+//! `credentials_ref` is NOT written, so a follow-up `op credentials
+//! bootstrap` is not locked out by `AlreadyBootstrapped`, and downstream
+//! `op credentials requirements` will correctly reject with
+//! `NoCredentialsRef` until the admin binds the real value via `op
+//! credentials rotate`.
 //!
 //! ## Admin credentials posture
 //!
@@ -126,14 +132,24 @@ pub struct BootstrapInput<'a> {
 /// store directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapOutcome {
-    /// `secret://<env>/credentials/<deployer-handle>` URI where the
-    /// generated low-privilege material was (or will be) written.
-    pub generated_credentials_ref: SecretRef,
     /// Rules-pack content the customer's admin can review and apply.
     /// Empty for deployers that need no offline IaC step (e.g.
     /// local-process — though those should use
     /// [`BootstrapError::NotApplicable`] rather than reach here).
     pub rules_pack: RulesPack,
+    /// When `Some`, the runner sets `env.credentials_ref` to this value
+    /// — the env is now credentialed and downstream validates will run
+    /// the deployer's real probes against it. When `None`, the bootstrap
+    /// emitted only an IaC rules pack; the env stays uncredentialed
+    /// until `op credentials rotate <env> --provided-credentials-ref
+    /// <uri>` binds the real value the customer's admin produces by
+    /// applying the rules pack offline.
+    ///
+    /// AWS C3 stub returns `None` (admin runs Terraform); Phase D AWS
+    /// will return `Some` once the deployer can mint a session token
+    /// directly. Local-process never reaches here (returns
+    /// `BootstrapError::NotApplicable`).
+    pub bound_credentials_ref: Option<SecretRef>,
 }
 
 #[derive(Debug, Error)]
@@ -221,33 +237,56 @@ pub fn run_bootstrap(
         // Snapshot the deployer kind before the &env borrow ends below.
         let deployer_kind = deployer.kind.clone();
 
+        // When the handler bound credentials directly (e.g. Phase D AWS
+        // mints a session token), the env is immediately credentialed.
+        // When `None` (e.g. C3 AWS where the admin runs Terraform
+        // offline), use a doc-only sentinel so the returned Credentials
+        // doc is honest about the incomplete state — but do NOT write it
+        // to env.credentials_ref.
+        let (doc_ref, validation_result, missing_caps) =
+            if let Some(ref bound) = outcome.bound_credentials_ref {
+                (bound.clone(), CredentialsValidationResult::Pass, Vec::new())
+            } else {
+                let sentinel = SecretRef::try_new(format!(
+                    "secret://{}/{}/bootstrap-incomplete",
+                    env_id.as_str(),
+                    deployer_kind.as_str()
+                ))
+                .expect("sentinel SecretRef is well-formed");
+                (
+                    sentinel,
+                    CredentialsValidationResult::Fail,
+                    vec!["credentials.bind-pending".to_string()],
+                )
+            };
+
         let doc = Credentials {
             schema: SchemaVersion::new(SchemaVersion::CREDENTIALS_V1),
             env_id: env_id.clone(),
             deployer_kind,
             mode: CredentialsMode::Bootstrap,
-            provided_credentials_ref: outcome.generated_credentials_ref.clone(),
+            provided_credentials_ref: doc_ref.clone(),
             validation: CredentialsValidation {
                 last_run_at: consumed_at,
-                // Bootstrap output is trusted at write-time; first
-                // requirements run after this stamps the real result.
-                result: CredentialsValidationResult::Pass,
-                missing_capabilities: Vec::new(),
+                result: validation_result,
+                missing_capabilities: missing_caps,
             },
             bootstrap: Some(CredentialsBootstrap {
                 admin_credential_consumed_at: consumed_at,
                 rules_pack_ref,
-                generated_credentials_ref: outcome.generated_credentials_ref,
+                generated_credentials_ref: doc_ref,
             }),
             expiry: None,
         };
 
-        // Persist credentials_ref inside the same transaction so the
-        // absence-check → write is atomic w.r.t. the flock. Reuses
-        // `env` from the initial load — no external writer can have
-        // mutated it while the flock is held.
-        env.credentials_ref = Some(doc.provided_credentials_ref.clone());
-        locked.save(&env)?;
+        // Only persist credentials_ref when the handler actually bound
+        // material. When `None`, the env stays uncredentialed — bootstrap
+        // can be re-run after the admin applies the rules pack and binds
+        // credentials via `op credentials rotate`.
+        if outcome.bound_credentials_ref.is_some() {
+            env.credentials_ref = Some(doc.provided_credentials_ref.clone());
+            locked.save(&env)?;
+        }
 
         Ok(doc)
     })

@@ -511,9 +511,12 @@ mod tests {
         let mut env = make_env("local");
         env.packs.push(make_binding(
             CapabilitySlot::Deployer,
-            // No handler is registered for an arbitrary aws-ecs path
-            // in the C1 PR — Phase D registers it.
-            "greentic.deployer.aws-ecs@1.0.0",
+            // No handler is registered for this fictional kind — the
+            // registry's built-in set covers local-process (C2) and (when
+            // `creds-aws` is on) aws-ecs (C3). A bare fictional kind
+            // exercises the resolve-failure path without depending on
+            // which env-packs are or aren't registered today.
+            "acme.deployer.fictional@1.0.0",
         ));
         env.credentials_ref = Some(SecretRef::try_new("secret://local/credentials/aws").unwrap());
         store.save(&env).unwrap();
