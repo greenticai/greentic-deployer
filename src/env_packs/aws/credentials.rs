@@ -134,10 +134,16 @@ pub trait AwsValidatorClient: std::fmt::Debug + Send + Sync {
     /// same order as the input slice; missing-from-response is the
     /// client's responsibility to detect and surface as
     /// [`AwsClientError::IamRejected`].
-    async fn simulate_principal_policy(
-        &self,
-        principal_arn: &str,
-        actions: &[String],
+    ///
+    /// Borrowed `&[&str]` (not `&[String]`) so the call site can pass
+    /// `VALIDATED_IAM_VERBS` directly. Real impls that need owned
+    /// `Vec<String>` for the SDK do the conversion locally. The shared
+    /// `'a` lifetime is required by `async_trait` to unify the nested
+    /// references in the returned future.
+    async fn simulate_principal_policy<'a>(
+        &'a self,
+        principal_arn: &'a str,
+        actions: &'a [&'a str],
     ) -> Result<Vec<ActionDecision>, AwsClientError>;
 }
 
@@ -206,16 +212,18 @@ impl AwsValidatorClient for RealAwsClient {
         })
     }
 
-    async fn simulate_principal_policy(
-        &self,
-        principal_arn: &str,
-        actions: &[String],
+    async fn simulate_principal_policy<'a>(
+        &'a self,
+        principal_arn: &'a str,
+        actions: &'a [&'a str],
     ) -> Result<Vec<ActionDecision>, AwsClientError> {
+        // SDK wants owned `Vec<String>`; convert at the edge.
+        let action_names: Vec<String> = actions.iter().map(|a| (*a).to_string()).collect();
         let out = self
             .iam
             .simulate_principal_policy()
             .policy_source_arn(principal_arn)
-            .set_action_names(Some(actions.to_vec()))
+            .set_action_names(Some(action_names))
             .send()
             .await
             .map_err(|e| AwsClientError::IamRejected(format!("{e}")))?;
@@ -223,9 +231,11 @@ impl AwsValidatorClient for RealAwsClient {
         // The API returns one EvaluationResult per (action, resource) pair.
         // We didn't pass resource ARNs, so resource is implicit-* — one
         // entry per action. Build a lookup map and emit decisions in the
-        // requested order so callers can zip results to requests.
-        let mut by_action: std::collections::BTreeMap<String, IamDecision> =
-            std::collections::BTreeMap::new();
+        // requested order so callers can zip results to requests. HashMap
+        // because lookup order isn't observed (the output is built by
+        // re-iterating the request slice).
+        let mut by_action: std::collections::HashMap<&str, IamDecision> =
+            std::collections::HashMap::with_capacity(out.evaluation_results().len());
         for r in out.evaluation_results() {
             let decision = r.eval_decision().as_str();
             let interp = if decision.eq_ignore_ascii_case("allowed") {
@@ -233,17 +243,17 @@ impl AwsValidatorClient for RealAwsClient {
             } else {
                 IamDecision::Denied(decision.to_string())
             };
-            by_action.insert(r.eval_action_name().to_string(), interp);
+            by_action.insert(r.eval_action_name(), interp);
         }
         let mut out = Vec::with_capacity(actions.len());
         for action in actions {
-            let decision = by_action.get(action).cloned().ok_or_else(|| {
+            let decision = by_action.get(*action).cloned().ok_or_else(|| {
                 AwsClientError::IamRejected(format!(
                     "IAM SimulatePrincipalPolicy returned no decision for `{action}`"
                 ))
             })?;
             out.push(ActionDecision {
-                action: action.clone(),
+                action: (*action).to_string(),
                 decision,
             });
         }
@@ -306,6 +316,30 @@ impl AwsDeployerCredentials {
             format!("IAM principal is allowed to perform `{verb}`"),
         )
     }
+
+    /// Mixed-status report for the case where STS succeeded but the
+    /// downstream IAM SimulatePrincipalPolicy call errored. STS cap
+    /// passes (we have a usable caller identity); every verb cap fails
+    /// with the same Simulate-error reason. Mirrors `all_failed` for
+    /// the STS-already-passed case so the validate path stays a
+    /// straight-line sequence of helper calls instead of carrying an
+    /// inline 14-line CapabilityCheck construction.
+    fn sts_pass_verbs_failed(&self, reason: &str) -> RequirementsReport {
+        let mut checks = Vec::with_capacity(1 + VALIDATED_IAM_VERBS.len());
+        checks.push(CapabilityCheck {
+            capability: self.caller_identity_capability(),
+            status: CapabilityStatus::Pass,
+        });
+        for verb in VALIDATED_IAM_VERBS {
+            checks.push(CapabilityCheck {
+                capability: self.iam_verb_capability(verb),
+                status: CapabilityStatus::Fail {
+                    reason: reason.to_string(),
+                },
+            });
+        }
+        RequirementsReport::new(checks)
+    }
 }
 
 impl DeployerCredentials for AwsDeployerCredentials {
@@ -323,6 +357,9 @@ impl DeployerCredentials for AwsDeployerCredentials {
     }
 
     fn validate(&self, _ctx: &ValidationContext<'_>) -> RequirementsReport {
+        // Hoist caps once — every early-return arm reuses it.
+        let caps = self.required_capabilities();
+
         let client = match self.resolve_client() {
             Ok(c) => c,
             Err(AwsClientError::NoCredentialChain(reason)) => {
@@ -331,50 +368,35 @@ impl DeployerCredentials for AwsDeployerCredentials {
                 // not a "we couldn't check" skip. Fail every cap so
                 // `report.passed()` is false and the downstream doc
                 // stamps `result: Fail`.
-                return all_failed(&self.required_capabilities(), &reason);
+                return all_failed(&caps, &reason);
             }
             Err(e) => {
-                return all_failed(&self.required_capabilities(), &e.to_string());
+                return all_failed(&caps, &e.to_string());
             }
         };
 
-        let arn_result = run_aws_async(client.get_caller_identity());
-        let arn = match arn_result {
+        let arn = match run_aws_async(client.get_caller_identity()) {
             Ok(id) => id.arn,
             Err(e) => {
                 // STS rejected the chain — fail every cap with the same
                 // diagnostic; downstream IAM simulate can't run without
                 // a principal ARN.
-                return all_failed(
-                    &self.required_capabilities(),
-                    &format!("STS GetCallerIdentity failed: {e}"),
-                );
+                return all_failed(&caps, &format!("STS GetCallerIdentity failed: {e}"));
             }
         };
 
         // STS passed; now SimulatePrincipalPolicy for the verb list.
-        let actions: Vec<String> = VALIDATED_IAM_VERBS.iter().map(|s| s.to_string()).collect();
-        let sim = run_aws_async(client.simulate_principal_policy(&arn, &actions));
-        let decisions: Vec<ActionDecision> = match sim {
-            Ok(v) => v,
-            Err(e) => {
-                // STS passed but IAM Simulate failed — STS cap passes,
-                // every verb cap fails with the simulate error.
-                let mut checks = vec![CapabilityCheck {
-                    capability: self.caller_identity_capability(),
-                    status: CapabilityStatus::Pass,
-                }];
-                for verb in VALIDATED_IAM_VERBS {
-                    checks.push(CapabilityCheck {
-                        capability: self.iam_verb_capability(verb),
-                        status: CapabilityStatus::Fail {
-                            reason: format!("IAM SimulatePrincipalPolicy failed: {e}"),
-                        },
-                    });
+        let decisions =
+            match run_aws_async(client.simulate_principal_policy(&arn, VALIDATED_IAM_VERBS)) {
+                Ok(v) => v,
+                Err(e) => {
+                    // STS passed but IAM Simulate failed — STS cap passes,
+                    // every verb cap fails with the simulate error.
+                    return self.sts_pass_verbs_failed(&format!(
+                        "IAM SimulatePrincipalPolicy failed: {e}"
+                    ));
                 }
-                return RequirementsReport::new(checks);
-            }
-        };
+            };
 
         let mut checks = Vec::with_capacity(1 + decisions.len());
         checks.push(CapabilityCheck {
@@ -541,15 +563,19 @@ mod tests {
                 .take()
                 .expect("test must wire sts_response")
         }
-        async fn simulate_principal_policy(
-            &self,
-            principal_arn: &str,
-            actions: &[String],
+        async fn simulate_principal_policy<'a>(
+            &'a self,
+            principal_arn: &'a str,
+            actions: &'a [&'a str],
         ) -> Result<Vec<ActionDecision>, AwsClientError> {
+            // Snapshot the borrowed slice into owned Strings for the call
+            // recorder — tests need a stable record even after `actions`
+            // goes out of scope.
+            let snapshot: Vec<String> = actions.iter().map(|a| (*a).to_string()).collect();
             self.simulate_calls
                 .lock()
                 .unwrap()
-                .push((principal_arn.to_string(), actions.to_vec()));
+                .push((principal_arn.to_string(), snapshot));
             self.simulate_response
                 .lock()
                 .unwrap()

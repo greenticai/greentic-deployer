@@ -79,6 +79,7 @@ pub fn render_min_iam_rules_pack(input: &IamRulesPackInput<'_>) -> RulesPack {
 }
 
 /// Sensitivity bucket for IAM action scoping in the rendered policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ActionBucket {
     /// `sts:*` and `iam:Simulate*` — read-only, safe at `Resource = "*"`.
     ReadOnly,
@@ -113,111 +114,125 @@ fn classify_action(action: &str) -> ActionBucket {
     ActionBucket::Unrecognized
 }
 
+/// HCL Condition block appended to the `iam:PassRole` statement so the
+/// generated role can only pass roles to ECS tasks. Hoisted to a `const`
+/// so `BUCKET_SPECS` can carry a `Some(&'static str)` reference.
+const PASS_ROLE_CONDITION: &str = "\
+\n          Condition = {\
+\n            StringEquals = {\
+\n              \"iam:PassedToService\" = \"ecs-tasks.amazonaws.com\"\
+\n            }\
+\n          }\n";
+
+/// Static descriptor for one rendered policy statement.
+///
+/// The table order is the emission order — readers see the same shape in
+/// `BUCKET_SPECS` that they see in the rendered HCL, and adding a future
+/// bucket is a single table entry rather than copy-pasting an if-block.
+struct BucketSpec {
+    bucket: ActionBucket,
+    comment: &'static str,
+    resource: &'static str,
+    extra: Option<&'static str>,
+}
+
+/// Statement-emission order. Mirrors the audit narrative in the rendered
+/// HCL: read-only verbs first (least sensitive), then service-scoped
+/// verbs, then `iam:PassRole` (conditioned), then unrecognized (flagged).
+const BUCKET_SPECS: &[BucketSpec] = &[
+    BucketSpec {
+        bucket: ActionBucket::ReadOnly,
+        comment: "Read-only validation surface — safe at Resource = \"*\".",
+        resource: "*",
+        extra: None,
+    },
+    BucketSpec {
+        bucket: ActionBucket::Ecs,
+        comment: "ECS rollout — admin scopes to cluster/service ARN at apply.",
+        resource: "<REPLACE_WITH_ECS_RESOURCE_ARNS>",
+        extra: None,
+    },
+    BucketSpec {
+        bucket: ActionBucket::Ecr,
+        comment: "ECR image push — admin scopes to repo ARN.",
+        resource: "<REPLACE_WITH_ECR_REPO_ARNS>",
+        extra: None,
+    },
+    BucketSpec {
+        bucket: ActionBucket::Alb,
+        comment: "ALB listener mutation — admin scopes to listener ARN.",
+        resource: "<REPLACE_WITH_ALB_LISTENER_ARNS>",
+        extra: None,
+    },
+    BucketSpec {
+        bucket: ActionBucket::PassRole,
+        comment: "iam:PassRole — only for the ECS task-execution role, scoped + conditioned.",
+        resource: "<REPLACE_WITH_ECS_TASK_ROLE_ARN>",
+        extra: Some(PASS_ROLE_CONDITION),
+    },
+    BucketSpec {
+        bucket: ActionBucket::Unrecognized,
+        comment: "UNRECOGNIZED ACTION — review before applying.",
+        resource: "*",
+        extra: None,
+    },
+];
+
 /// Render one HCL policy statement block. `extra_fields` carries optional
-/// Condition blocks or comments appended after `Resource`.
+/// Condition blocks or comments appended after `Resource`. Pre-sizes the
+/// buffer + uses `write!` so the per-statement render is zero-extra-alloc
+/// (the only heap touch is the returned `String` itself).
 fn render_statement(
     comment: &str,
     actions: &[&str],
     resource: &str,
     extra_fields: Option<&str>,
 ) -> String {
+    use std::fmt::Write as _;
     let indent = "        ";
-    let mut s = format!("{indent}# {comment}\n{indent}{{\n");
-    s.push_str(&format!("{indent}  Effect = \"Allow\"\n"));
-    if actions.len() == 1 {
-        s.push_str(&format!("{indent}  Action = \"{}\"\n", actions[0]));
+    let mut s = String::with_capacity(256);
+    let _ = writeln!(s, "{indent}# {comment}");
+    let _ = writeln!(s, "{indent}{{");
+    let _ = writeln!(s, "{indent}  Effect = \"Allow\"");
+    if let [single] = actions {
+        let _ = writeln!(s, "{indent}  Action = \"{single}\"");
     } else {
-        s.push_str(&format!("{indent}  Action = [\n"));
+        let _ = writeln!(s, "{indent}  Action = [");
         for a in actions {
-            s.push_str(&format!("{indent}    \"{a}\",\n"));
+            let _ = writeln!(s, "{indent}    \"{a}\",");
         }
-        s.push_str(&format!("{indent}  ]\n"));
+        let _ = writeln!(s, "{indent}  ]");
     }
-    s.push_str(&format!("{indent}  Resource = \"{resource}\"\n"));
+    let _ = writeln!(s, "{indent}  Resource = \"{resource}\"");
     if let Some(extra) = extra_fields {
         s.push_str(extra);
     }
-    s.push_str(&format!("{indent}}}"));
+    let _ = write!(s, "{indent}}}");
     s
 }
 
 fn render_terraform(input: &IamRulesPackInput<'_>) -> String {
-    // Bucket actions by sensitivity.
-    let mut read_only: Vec<&str> = Vec::new();
-    let mut ecs: Vec<&str> = Vec::new();
-    let mut ecr: Vec<&str> = Vec::new();
-    let mut alb: Vec<&str> = Vec::new();
-    let mut pass_role: Vec<&str> = Vec::new();
-    let mut unrecognized: Vec<&str> = Vec::new();
-
+    // Bucket actions by sensitivity in one pass; emit statements in
+    // BUCKET_SPECS order (an empty bucket emits nothing). HashMap because
+    // iteration order is governed by the static table, not the map.
+    let mut buckets: std::collections::HashMap<ActionBucket, Vec<&str>> =
+        std::collections::HashMap::with_capacity(BUCKET_SPECS.len());
     for action in input.allowed_actions {
-        match classify_action(action) {
-            ActionBucket::ReadOnly => read_only.push(action),
-            ActionBucket::Ecs => ecs.push(action),
-            ActionBucket::Ecr => ecr.push(action),
-            ActionBucket::Alb => alb.push(action),
-            ActionBucket::PassRole => pass_role.push(action),
-            ActionBucket::Unrecognized => unrecognized.push(action),
-        }
+        buckets
+            .entry(classify_action(action))
+            .or_default()
+            .push(action);
     }
 
-    // Build statements in order: read-only, ECS, ECR, ALB, PassRole, unrecognized.
-    let mut statements: Vec<String> = Vec::new();
-
-    if !read_only.is_empty() {
-        statements.push(render_statement(
-            "Read-only validation surface — safe at Resource = \"*\".",
-            &read_only,
-            "*",
-            None,
-        ));
-    }
-    if !ecs.is_empty() {
-        statements.push(render_statement(
-            "ECS rollout — admin scopes to cluster/service ARN at apply.",
-            &ecs,
-            "<REPLACE_WITH_ECS_RESOURCE_ARNS>",
-            None,
-        ));
-    }
-    if !ecr.is_empty() {
-        statements.push(render_statement(
-            "ECR image push — admin scopes to repo ARN.",
-            &ecr,
-            "<REPLACE_WITH_ECR_REPO_ARNS>",
-            None,
-        ));
-    }
-    if !alb.is_empty() {
-        statements.push(render_statement(
-            "ALB listener mutation — admin scopes to listener ARN.",
-            &alb,
-            "<REPLACE_WITH_ALB_LISTENER_ARNS>",
-            None,
-        ));
-    }
-    if !pass_role.is_empty() {
-        let condition = "\
-        \n          Condition = {\
-        \n            StringEquals = {\
-        \n              \"iam:PassedToService\" = \"ecs-tasks.amazonaws.com\"\
-        \n            }\
-        \n          }\n";
-        statements.push(render_statement(
-            "iam:PassRole — only for the ECS task-execution role, scoped + conditioned.",
-            &pass_role,
-            "<REPLACE_WITH_ECS_TASK_ROLE_ARN>",
-            Some(condition),
-        ));
-    }
-    if !unrecognized.is_empty() {
-        statements.push(render_statement(
-            "UNRECOGNIZED ACTION — review before applying.",
-            &unrecognized,
-            "*",
-            None,
-        ));
-    }
+    let statements: Vec<String> = BUCKET_SPECS
+        .iter()
+        .filter_map(|spec| {
+            buckets
+                .get(&spec.bucket)
+                .filter(|actions| !actions.is_empty())
+                .map(|actions| render_statement(spec.comment, actions, spec.resource, spec.extra))
+        })
+        .collect();
 
     let statements_hcl = statements.join(",\n");
 

@@ -52,10 +52,6 @@ impl AwsEcsDeployerHandler {
     /// pre-releases that may ship before Phase D lands.
     pub const VERSION_REQ: &'static str = ">=1.0.0-dev, <2.0.0";
 
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Construct with a pluggable AWS client. Tests pass a mock; production
     /// uses [`AwsDeployerCredentials::default`] which builds the real SDK
     /// client lazily on first validate.
