@@ -15,13 +15,104 @@ use std::path::Path;
 
 use greentic_distributor_client::signing::TrustedKey;
 
-use greentic_deploy_spec::{EnvId, IdempotencyKey};
+use greentic_deploy_spec::{
+    EnvId, Environment, EnvironmentHostConfig, IdempotencyKey, SchemaVersion,
+};
 
-use super::mutations::{TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed};
+use super::mutations::{
+    TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload,
+};
 use super::store::{LocalFsStore, StoreError};
 use super::trust_root::{self as store_trust_root, trust_root_path};
 
 impl LocalFsStore {
+    // -------------------------------------------------------------
+    // Environment lifecycle  (PR-3a.3)
+    //   `op env create | update | set-public-url`
+    //   `op config set`
+    // -------------------------------------------------------------
+
+    /// Create a fresh environment with empty bundles/revisions/packs.
+    /// Rejects (via [`StoreError::Conflict`]) if the env already exists —
+    /// callers wanting upsert semantics should call
+    /// [`Self::update_environment`].
+    ///
+    /// The caller's [`EnvironmentHostConfig::env_id`] is overwritten with
+    /// `env_id` so the on-disk row's host-config envelope cannot disagree
+    /// with the directory it lands in.
+    pub fn create_environment(
+        &self,
+        env_id: &EnvId,
+        name: String,
+        host_config: EnvironmentHostConfig,
+    ) -> Result<Environment, StoreError> {
+        self.transact(env_id, |locked| {
+            if locked.load().is_ok() {
+                return Err(StoreError::Conflict(format!(
+                    "environment `{}` already exists",
+                    locked.env_id()
+                )));
+            }
+            let env = Environment {
+                schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
+                environment_id: locked.env_id().clone(),
+                name,
+                host_config: EnvironmentHostConfig {
+                    env_id: locked.env_id().clone(),
+                    ..host_config
+                },
+                packs: Vec::new(),
+                credentials_ref: None,
+                bundles: Vec::new(),
+                revisions: Vec::new(),
+                traffic_splits: Vec::new(),
+                messaging_endpoints: Vec::new(),
+                extensions: Vec::new(),
+                revocation: Default::default(),
+                retention: Default::default(),
+                health: Default::default(),
+            };
+            locked.save(&env)?;
+            Ok(env)
+        })
+    }
+
+    /// Patch the named scalar fields on an existing env. `None` fields are
+    /// skipped (no clear-to-`None` flow today). Returns the fully-updated
+    /// [`Environment`]. Collapses what was previously split across the
+    /// `op env update`, `op env set-public-url`, and `op config set` verbs
+    /// — see [`UpdateEnvironmentPayload`] for the rationale.
+    ///
+    /// `StoreError::NotFound` passes through unchanged; the CLI mapper
+    /// downcasts it to `OpError::NotFound` via
+    /// [`crate::cli::map_store_err_preserving_noun`].
+    pub fn update_environment(
+        &self,
+        env_id: &EnvId,
+        patch: UpdateEnvironmentPayload,
+    ) -> Result<Environment, StoreError> {
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            if let Some(name) = patch.name {
+                env.name = name;
+            }
+            if let Some(region) = patch.region {
+                env.host_config.region = Some(region);
+            }
+            if let Some(org) = patch.tenant_org_id {
+                env.host_config.tenant_org_id = Some(org);
+            }
+            if let Some(addr) = patch.listen_addr {
+                env.host_config.listen_addr = Some(addr);
+            }
+            if let Some(url) = patch.public_base_url {
+                env.host_config.public_base_url = Some(url);
+            }
+            locked.save(&env)?;
+            Ok(env)
+        })
+    }
+
     // -------------------------------------------------------------
     // Trust root  (PR-3a.2)
     //   `op env trust-root bootstrap | add | remove`

@@ -11,9 +11,11 @@ use greentic_deploy_spec::{CapabilitySlot, EnvId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{EnvironmentStore, LocalFsStore};
+use crate::environment::{EnvironmentStore, LocalFsStore, UpdateEnvironmentPayload};
 
-use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
+use super::{
+    AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
+};
 
 const NOUN: &str = "config";
 
@@ -150,33 +152,25 @@ pub fn set(
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |_committed| {
-        let (host_config, name) = store.transact(&env_id, |locked| -> Result<_, OpError> {
-            let mut env = locked.load()?;
-            if let Some(name) = payload.name.clone() {
-                env.name = name;
-            }
-            if let Some(region) = payload.region.clone() {
-                env.host_config.region = Some(region);
-            }
-            if let Some(org) = payload.tenant_org_id.clone() {
-                env.host_config.tenant_org_id = Some(org);
-            }
-            if let Some(addr) = parsed_listen_addr {
-                env.host_config.listen_addr = Some(addr);
-            }
-            if let Some(url) = parsed_public_base_url.clone() {
-                env.host_config.public_base_url = Some(url);
-            }
-            locked.save(&env)?;
-            Ok((env.host_config.clone(), env.name.clone()))
-        })?;
+        let env = store
+            .update_environment(
+                &env_id,
+                UpdateEnvironmentPayload {
+                    name: payload.name.clone(),
+                    region: payload.region.clone(),
+                    tenant_org_id: payload.tenant_org_id.clone(),
+                    listen_addr: parsed_listen_addr,
+                    public_base_url: parsed_public_base_url.clone(),
+                },
+            )
+            .map_err(map_store_err_preserving_noun)?;
         let outcome = OpOutcome::new(
             NOUN,
             "set",
             json!({
                 "environment_id": env_id.as_str(),
-                "host_config": host_config,
-                "name": name,
+                "host_config": env.host_config,
+                "name": env.name,
             }),
         );
         Ok((outcome, super::AuditGens::NONE))
