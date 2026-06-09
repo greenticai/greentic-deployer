@@ -389,10 +389,20 @@ pub trait EnvironmentMutations: Send + Sync {
         config_overrides: Option<BTreeMap<String, BTreeMap<String, Value>>>,
     ) -> Result<BundleDeployment, StoreError>;
 
+    /// Remove a bundle deployment from the env. Refuses if the deployment
+    /// still has live traffic splits or non-archived revisions —
+    /// callers must `op traffic clear` and archive revisions first.
+    /// Also drops archived revisions for the same `deployment_id` so the
+    /// env stays compact (no tombstones).
+    ///
+    /// `idempotency_key` is required for A8 §2 mutation replay; the local
+    /// impl accepts and ignores, the HTTP backend caches the original
+    /// outcome.
     fn remove_bundle(
         &self,
         env_id: &EnvId,
         deployment_id: DeploymentId,
+        idempotency_key: IdempotencyKey,
     ) -> Result<BundleDeployment, StoreError>;
 
     // -------------------------------------------------------------

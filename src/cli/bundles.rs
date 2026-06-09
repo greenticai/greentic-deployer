@@ -20,7 +20,10 @@ use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
-use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
+use super::{
+    AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
+    mint_idempotency_key,
+};
 
 const NOUN: &str = "bundles";
 
@@ -339,6 +342,12 @@ pub fn update(
 pub struct BundleRemovePayload {
     pub environment_id: String,
     pub deployment_id: String,
+    /// Caller-supplied A8 §2 idempotency key. Optional on the CLI
+    /// surface; when absent, `remove` mints one per invocation. Operators
+    /// wanting safe lost-response retries (HTTP backend, PR-3b) supply a
+    /// stable key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 pub fn remove(
@@ -352,59 +361,23 @@ pub fn remove(
     let payload = resolve_payload::<BundleRemovePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
+    let idempotency_key = match payload.idempotency_key {
+        Some(raw) => greentic_deploy_spec::IdempotencyKey::new(raw)
+            .map_err(|e| OpError::InvalidArgument(format!("idempotency_key: {e}")))?,
+        None => mint_idempotency_key(),
+    };
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "remove",
         target: json!({"deployment_id": deployment_id.to_string()}),
-        idempotency_key: None,
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let summary = store.transact(&env_id, |locked| -> Result<BundleSummary, OpError> {
-            let mut env = locked.load()?;
-            let idx = env
-                .bundles
-                .iter()
-                .position(|b| b.deployment_id == deployment_id)
-                .ok_or_else(|| {
-                    OpError::NotFound(format!(
-                        "deployment `{deployment_id}` not found in env `{env_id}`"
-                    ))
-                })?;
-            // Live-state guard. `current_revisions` is plan-level future signal
-            // that A3's stage/warm path does not yet maintain, so it can't be
-            // the gate. The actual live-state proof is: any traffic split
-            // pointing at this deployment, or any non-archived Revision for it.
-            let active_splits = env
-                .traffic_splits
-                .iter()
-                .filter(|s| s.deployment_id == deployment_id)
-                .count();
-            let active_revisions = env
-                .revisions
-                .iter()
-                .filter(|r| {
-                    r.deployment_id == deployment_id
-                        && !matches!(
-                            r.lifecycle,
-                            greentic_deploy_spec::RevisionLifecycle::Archived
-                        )
-                })
-                .count();
-            if active_splits > 0 || active_revisions > 0 {
-                return Err(OpError::Conflict(format!(
-                    "deployment `{deployment_id}` is still live: {active_splits} traffic split(s), \
-                     {active_revisions} non-archived revision(s). Archive revisions and clear the \
-                     split first."
-                )));
-            }
-            let removed = env.bundles.remove(idx);
-            // No live state to nuke at this point; drop the archived revisions
-            // for this deployment so the env stays compact.
-            env.revisions.retain(|r| r.deployment_id != deployment_id);
-            locked.save(&env)?;
-            Ok(BundleSummary::from(&env_id, &removed))
-        })?;
+        let removed = store
+            .remove_bundle(&env_id, deployment_id, idempotency_key)
+            .map_err(map_store_err_preserving_noun)?;
+        let summary = BundleSummary::from(&env_id, &removed);
         let outcome = OpOutcome::new(
             NOUN,
             "remove",
@@ -765,6 +738,7 @@ mod tests {
             Some(BundleRemovePayload {
                 environment_id: "local".to_string(),
                 deployment_id: did.to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap_err();
@@ -791,6 +765,7 @@ mod tests {
             Some(BundleRemovePayload {
                 environment_id: "local".to_string(),
                 deployment_id: did,
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -836,6 +811,7 @@ mod tests {
             Some(BundleRemovePayload {
                 environment_id: "local".to_string(),
                 deployment_id: did.to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap_err();
@@ -868,6 +844,7 @@ mod tests {
             Some(BundleRemovePayload {
                 environment_id: "local".to_string(),
                 deployment_id: did.to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap_err();

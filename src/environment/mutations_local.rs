@@ -17,8 +17,9 @@ use chrono::Utc;
 use greentic_distributor_client::signing::TrustedKey;
 
 use greentic_deploy_spec::{
-    EnvId, Environment, EnvironmentHostConfig, HealthStatus, IdempotencyKey, RetentionPolicy,
-    Revision, RevisionId, RevisionLifecycle, RevocationConfig, SchemaVersion,
+    BundleDeployment, DeploymentId, EnvId, Environment, EnvironmentHostConfig, HealthStatus,
+    IdempotencyKey, RetentionPolicy, Revision, RevisionId, RevisionLifecycle, RevocationConfig,
+    SchemaVersion,
 };
 
 use super::lifecycle::{
@@ -452,6 +453,78 @@ impl LocalFsStore {
                 environment,
                 starting_lifecycle,
             })
+        })
+    }
+
+    // -------------------------------------------------------------
+    // Bundle deployment CRUD  (PR-3a.7)
+    //   `op bundles remove`
+    //   `op bundles add | update` move in PR-3a.7b (revenue-policy
+    //   sidecar + operator-key signing across the HTTP wire is a
+    //   distinct design pass).
+    // -------------------------------------------------------------
+
+    /// Remove a [`BundleDeployment`] from the env. Refuses with
+    /// [`StoreError::Conflict`] if the deployment still carries live state
+    /// (any [`greentic_deploy_spec::TrafficSplit`] pointing at it, or any
+    /// non-`Archived` revision under it) — callers run `op traffic clear`
+    /// and archive revisions first. Drops archived revisions for the same
+    /// `deployment_id` so the env stays compact.
+    ///
+    /// Returns [`StoreError::DependentNotFound`] when the deployment is
+    /// absent under the env at lock-acquisition time (matches the
+    /// `DependentNotFound` precedent set by `stage_revision`).
+    ///
+    /// `_idempotency_key` is accepted for trait conformance and ignored
+    /// locally; the HTTP backend caches it for A8 §2 replay.
+    pub fn remove_bundle(
+        &self,
+        env_id: &EnvId,
+        deployment_id: DeploymentId,
+        _idempotency_key: IdempotencyKey,
+    ) -> Result<BundleDeployment, StoreError> {
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx = env
+                .bundles
+                .iter()
+                .position(|b| b.deployment_id == deployment_id)
+                .ok_or_else(|| {
+                    StoreError::DependentNotFound(format!(
+                        "deployment `{deployment_id}` not found in env `{env_id}`"
+                    ))
+                })?;
+            // Live-state guard. `current_revisions` is plan-level future
+            // signal that A3's stage/warm path does not yet maintain, so
+            // it can't be the gate. The actual live-state proof is: any
+            // traffic split pointing at this deployment, or any
+            // non-archived revision for it.
+            let active_splits = env
+                .traffic_splits
+                .iter()
+                .filter(|s| s.deployment_id == deployment_id)
+                .count();
+            let active_revisions = env
+                .revisions
+                .iter()
+                .filter(|r| {
+                    r.deployment_id == deployment_id
+                        && !matches!(r.lifecycle, RevisionLifecycle::Archived)
+                })
+                .count();
+            if active_splits > 0 || active_revisions > 0 {
+                return Err(StoreError::Conflict(format!(
+                    "deployment `{deployment_id}` is still live: {active_splits} traffic split(s), \
+                     {active_revisions} non-archived revision(s). Archive revisions and clear the \
+                     split first."
+                )));
+            }
+            let removed = env.bundles.remove(idx);
+            // No live state to nuke at this point; drop the archived
+            // revisions for this deployment so the env stays compact.
+            env.revisions.retain(|r| r.deployment_id != deployment_id);
+            locked.save(&env)?;
+            Ok(removed)
         })
     }
 
