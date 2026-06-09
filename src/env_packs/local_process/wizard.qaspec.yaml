@@ -16,15 +16,33 @@
 # A second question would be over-specifying for v1; the listen address
 # is sourced from `host_config.listen_addr` (a different layer) and the
 # runtime stub C5 already handles it.
+#
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Trust-boundary disclosure (C2 ↔ C6 scope split):
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# The deployer has no reader for `EnvPackBinding.answers_ref` today: the
+# field is recorded on the binding and never loaded. C2's
+# `LocalProcessCredentials::validate` probes the in-code default port
+# range (or whatever `with_port_range` was passed at handler construction
+# time) — NOT the captured `port_range` answer below. Phase D wires
+# `answers_ref` into `ValidationContext` and the per-capability probes;
+# until then, treat this wizard as DECLARATIVE INTENT recorded on the
+# binding for Phase D consumption, not as an input to today's probes.
+# Local-process's risk surface here is tiny (a stray port-range answer
+# can't widen a trust boundary the way an AWS region/role answer can),
+# but the same C6→Phase-D split applies.
 
 id: greentic.deployer.local-process.wizard
 title: Local-process deployer
 version: "0.1.0"
 description: >-
-  Configuration for the local-process deployer env-pack. Local-process runs
-  workers as child processes on the operator host; the only environment-
-  scoped knob today is the port range it searches for an available port
-  at probe time.
+  Configuration for the local-process deployer env-pack. Local-process
+  runs workers as child processes on the operator host; the only
+  environment-scoped knob today is the port range it searches for an
+  available port at probe time. Phase C: answers are captured on the
+  binding (`answers_ref`) but NOT yet honored by `credentials validate`
+  — the C2 probe uses the in-code default. Phase D wires the captured
+  answer into the probe.
 questions:
   - id: port_range
     type: string

@@ -10,6 +10,30 @@
 # repo, which optional ALB listener. Secrets stay on the secret backend
 # (B12a / `secret://` URI refs).
 #
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Trust-boundary disclosure (C3 ↔ C6 scope split):
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# C3's `AwsDeployerCredentials::validate(&self, _ctx: &ValidationContext)`
+# IGNORES `_ctx` and builds the STS + IAM SDK clients from
+# `aws_config::load_defaults` — the ambient AWS chain (env vars →
+# `~/.aws/credentials` → IMDS → IRSA). The deployer ALSO has no reader
+# for `EnvPackBinding.answers_ref` today: the field is recorded and
+# carried through, never loaded.
+#
+# Net effect for an operator filling this wizard: the captured answers
+# below are PERSISTED on the binding via `answers_ref`, but the C3
+# credentials probe runs against whatever ambient AWS identity is present
+# in the process environment — NOT against `region` / `aws_profile` /
+# `assume_role_arn` from this form. Validation can therefore pass or
+# fail for a different principal than the one this wizard scopes.
+#
+# Phase D wires `answers_ref → ValidationContext.answers` and feeds
+# `region`/`aws_profile`/`assume_role_arn` into the SDK client builder,
+# at which point probes scope correctly to the captured identity. Until
+# that lands, treat this wizard as DECLARATIVE INTENT for the env's
+# scoping (recorded on the binding for Phase D consumption) — NOT as
+# the authoritative input to today's credential probes.
+#
 # Versioning: this spec rides the env-pack handler's
 # `AwsEcsDeployerHandler::VERSION_REQ` (`>=1.0.0-dev, <2.0.0`). A breaking
 # change to the question set means a Major bump on the env-pack descriptor
@@ -19,17 +43,22 @@ id: greentic.deployer.aws-ecs.wizard
 title: AWS-ECS deployer
 version: "0.1.0"
 description: >-
-  Identifies the AWS account scope the AWS-ECS deployer env-pack operates
-  against. Credential MATERIAL is resolved from the ambient AWS chain at
-  validate time and never collected here; the wizard captures the
-  non-secret scoping knobs the deployer needs to plan ECS rollouts.
+  Records the AWS account scope the AWS-ECS deployer env-pack will
+  operate against. Phase C: answers are captured on the binding
+  (`answers_ref`) but NOT yet honored by `credentials validate` — the
+  C3 probe uses the ambient AWS chain. Phase D wires these answers into
+  the SDK client builder so probes scope to the captured identity.
+  Credential MATERIAL is never collected here.
 presentation:
   intro: >-
-    Bind an AWS-ECS environment. The deployer will resolve credentials
-    from the ambient AWS chain (`AWS_PROFILE`, `~/.aws/credentials`,
-    IRSA, IMDS, …) and validate them via typed STS + IAM probes. You
-    only need to provide the region + cluster + ECR repo + optional ALB
-    listener here.
+    Bind an AWS-ECS environment. Phase-C disclosure: today's `gtc op
+    credentials requirements` probes the AMBIENT AWS chain
+    (`AWS_PROFILE`, `~/.aws/credentials`, IRSA, IMDS, …) — the answers
+    below are recorded on the binding but DO NOT scope today's
+    validation. Make sure the host's ambient AWS identity points at the
+    same account/region you fill in here, or validation will pass/fail
+    for the wrong principal. Phase D removes this gap by feeding the
+    answers into the SDK client builder.
 
 questions:
   - id: region
