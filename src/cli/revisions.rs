@@ -383,15 +383,9 @@ pub fn drain(
     if flags.schema_only {
         return Ok(OpOutcome::new(NOUN, "drain", transition_schema()));
     }
-    transition(
-        store,
-        flags,
-        payload,
-        "drain",
-        &[(RevisionLifecycle::Ready, RevisionLifecycle::Draining)],
-        |_| {},
-        false,
-    )
+    typed_transition(store, flags, payload, "drain", |env_id, revision_id| {
+        store.drain_revision(env_id, revision_id, mint_idempotency_key())
+    })
 }
 
 /// `op revisions archive`. Transitions the lifecycle to `archived` and
@@ -411,22 +405,9 @@ pub fn archive(
     if flags.schema_only {
         return Ok(OpOutcome::new(NOUN, "archive", transition_schema()));
     }
-    transition(
-        store,
-        flags,
-        payload,
-        "archive",
-        &[
-            (RevisionLifecycle::Staged, RevisionLifecycle::Archived),
-            (RevisionLifecycle::Warming, RevisionLifecycle::Archived),
-            (RevisionLifecycle::Ready, RevisionLifecycle::Archived),
-            (RevisionLifecycle::Failed, RevisionLifecycle::Archived),
-            (RevisionLifecycle::Draining, RevisionLifecycle::Inactive),
-            (RevisionLifecycle::Inactive, RevisionLifecycle::Archived),
-        ],
-        |_| {},
-        true,
-    )
+    typed_transition(store, flags, payload, "archive", |env_id, revision_id| {
+        store.archive_revision(env_id, revision_id, mint_idempotency_key())
+    })
 }
 
 /// `op revisions list <env>` (filterable by `--deployment <id>` later).
@@ -453,31 +434,70 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
 
 // --- internals -----------------------------------------------------------
 
-/// CLI-side adapter over [`crate::environment::apply_revision_transition`].
-/// Resolves the payload, drives the env transact, and renders the outcome
-/// envelope. The lifecycle matrix walk lives in
-/// [`crate::environment::lifecycle`] so future B-phase consumers (gtc start
-/// orchestration #221, A7 audit emission) can call it without going through
-/// the CLI shell.
-fn transition<F: FnOnce(&mut Revision)>(
+/// CLI-side adapter over a typed
+/// [`EnvironmentMutations`](crate::environment::EnvironmentMutations) revision
+/// verb. PR-3a.6 replaces the closure-based
+/// `apply_revision_transition` driver for the no-gate path (drain + archive)
+/// — the typed verb method owns the `transact` flock and the
+/// `refresh_runtime_config` refresh; the CLI handles authz, audit, payload
+/// resolution, error noun preservation, and lifecycle-event emission.
+///
+/// The warm/ready gate path stays on the closure-based
+/// [`transition_with_health_gate`] until PR-3a.6b: pre-evaluating the gate
+/// against a synthesized post-chain view is a behavior shift worth its own PR.
+fn typed_transition<F>(
     store: &LocalFsStore,
     flags: &OpFlags,
     payload: Option<RevisionTransitionPayload>,
     op: &'static str,
-    accepted_chain: &[(RevisionLifecycle, RevisionLifecycle)],
-    on_final: F,
-    prune_from_splits: bool,
-) -> Result<OpOutcome, OpError> {
-    transition_with_health_gate(
-        store,
-        flags,
-        payload,
-        op,
-        accepted_chain,
-        on_final,
-        prune_from_splits,
-        |_env, _revision| Ok(()),
-    )
+    call_verb: F,
+) -> Result<OpOutcome, OpError>
+where
+    F: FnOnce(
+        &greentic_deploy_spec::EnvId,
+        greentic_deploy_spec::RevisionId,
+    ) -> Result<
+        crate::environment::RevisionTransitionOutcome,
+        crate::environment::StoreError,
+    >,
+{
+    let payload = resolve_payload::<RevisionTransitionPayload>(flags, payload)?;
+    let env_id = parse_env_id(&payload.environment_id)?;
+    let revision_id = parse_revision_id(&payload.revision_id)?;
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: op,
+        target: json!({
+            "revision_id": revision_id.to_string(),
+            // `archive`'s chain can land on `Archived` OR `Inactive`
+            // (Draining → Inactive hop); the typed-verb caller doesn't see
+            // the final state until after the call, so the audit target
+            // omits `lifecycle_to` here (the audit log still records the
+            // outcome verb).
+        }),
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, |committed| {
+        let outcome = call_verb(&env_id, revision_id).map_err(map_store_err_preserving_noun)?;
+        // Typed-verb Ok = saved + runtime-config refreshed before return,
+        // so mark committed before any best-effort emit unwinds.
+        committed.mark_committed();
+        emit_for_op(
+            op,
+            false,
+            Some(outcome.starting_lifecycle),
+            &outcome.environment,
+            &outcome.revision,
+        );
+        let summary = RevisionSummary::from(&outcome.revision);
+        let op_outcome = OpOutcome::new(
+            NOUN,
+            op,
+            serde_json::to_value(summary).expect("RevisionSummary is json-safe"),
+        );
+        Ok((op_outcome, super::AuditGens::NONE))
+    })
 }
 
 /// Gate-aware variant of [`transition`] for the B9 warm/ready gate. Routes

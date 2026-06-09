@@ -230,6 +230,14 @@ pub(crate) fn map_store_err_preserving_noun(e: crate::environment::StoreError) -
             OpError::NotFound(format!("environment `{id}`"))
         }
         crate::environment::StoreError::DependentNotFound(msg) => OpError::NotFound(msg),
+        // PR-3a.6: the typed revision-lifecycle verbs (`warm_revision` /
+        // `drain_revision` / `archive_revision`) wrap their inner
+        // `LifecycleError` in this variant so the structured detail
+        // (`HealthGateFailed::failed_checks`, `Conflict::expected_starts`,
+        // `ActiveTrafficReference::splits`) survives the trip back to the
+        // CLI verb. Unwrap to the existing `LifecycleError → OpError`
+        // mapping rather than flattening to `OpError::Store`.
+        crate::environment::StoreError::Lifecycle(inner) => OpError::from(*inner),
         other => OpError::Store(other),
     }
 }

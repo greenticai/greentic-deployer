@@ -90,6 +90,19 @@ pub enum StoreError {
     /// found in env `<env>`", etc.) so backend impls don't have to reconstruct it.
     #[error("not found: {0}")]
     DependentNotFound(String),
+    /// Revision-lifecycle failure surfaced by the typed
+    /// `warm_revision` / `drain_revision` / `archive_revision` verbs
+    /// (PR-3a.6). The inner [`super::LifecycleError`] preserves the
+    /// structured detail (`HealthGateFailed::failed_checks`,
+    /// `Conflict::expected_starts`, `ActiveTrafficReference::splits`)
+    /// the CLI renders to the operator. No `#[from]` impl: the cycle
+    /// between `LifecycleError::Store(StoreError)` and this variant is
+    /// broken in [`super::mutations_local`] by unwrapping
+    /// `LifecycleError::Store` back into the inner `StoreError` at the
+    /// boundary. CLI callers re-extract via
+    /// [`crate::cli::map_store_err_preserving_noun`].
+    #[error(transparent)]
+    Lifecycle(Box<super::LifecycleError>),
 }
 
 /// Reject env ids that, while valid per the upstream `EnvId` validator

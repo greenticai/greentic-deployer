@@ -18,15 +18,29 @@ use greentic_distributor_client::signing::TrustedKey;
 
 use greentic_deploy_spec::{
     EnvId, Environment, EnvironmentHostConfig, HealthStatus, IdempotencyKey, RetentionPolicy,
-    Revision, RevisionLifecycle, RevocationConfig, SchemaVersion,
+    Revision, RevisionId, RevisionLifecycle, RevocationConfig, SchemaVersion,
 };
 
+use super::lifecycle::{
+    LifecycleError, apply_revision_transition, apply_revision_transition_with_health_gate,
+};
 use super::mutations::{
-    ExtensionKey, MigrateMergePayload, StageRevisionPayload, TrustRootAddOutcome,
-    TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload,
+    ExtensionKey, MigrateMergePayload, RevisionTransitionOutcome, StageRevisionPayload,
+    TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload,
+    WarmRevisionPayload,
 };
 use super::store::{LocalFsStore, StoreError};
 use super::trust_root::{self as store_trust_root, trust_root_path};
+
+/// Fold a [`LifecycleError`] back into the `StoreError` shape the typed verbs
+/// promise. Unwraps `LifecycleError::Store` to preserve the original store
+/// error rather than boxing it inside `Lifecycle(Store(...))` round-trips.
+fn fold_lifecycle_err(err: LifecycleError) -> StoreError {
+    match err {
+        LifecycleError::Store(inner) => inner,
+        other => StoreError::Lifecycle(Box::new(other)),
+    }
+}
 
 impl LocalFsStore {
     // -------------------------------------------------------------
@@ -268,6 +282,154 @@ impl LocalFsStore {
         })
     }
 
+    /// Drive a revision through the `Staged → Warming → Ready` chain and
+    /// apply the client-evaluated warm/ready health-gate outcome. The
+    /// chain advance, the `warmed_at` stamp, the gate-result application
+    /// (Ready on `Ok(())`; Failed on `Err(failure)`, persisted), and the
+    /// `runtime-config.json` refresh all happen inside one
+    /// [`super::store::LocalFsStore::transact`] flock so the on-disk env
+    /// is durable when the call returns.
+    ///
+    /// `payload.health_gate` is `Result<(), HealthGateFailure>`, not a
+    /// closure — closures don't cross the A8 HTTP wire (PR-3b). The
+    /// deployer CLI evaluates the gate locally against the post-chain
+    /// `(env, revision)` view and ships the outcome here.
+    ///
+    /// `payload.idempotency_key` is accepted for trait conformance and
+    /// ignored locally; the HTTP backend caches it for A8 §2 replay.
+    pub fn warm_revision(
+        &self,
+        env_id: &EnvId,
+        payload: WarmRevisionPayload,
+    ) -> Result<RevisionTransitionOutcome, StoreError> {
+        let WarmRevisionPayload {
+            revision_id,
+            health_gate,
+            idempotency_key: _,
+        } = payload;
+        self.run_revision_transition(env_id, revision_id, |locked| {
+            apply_revision_transition_with_health_gate(
+                locked,
+                revision_id,
+                &[
+                    (RevisionLifecycle::Staged, RevisionLifecycle::Warming),
+                    (RevisionLifecycle::Warming, RevisionLifecycle::Ready),
+                ],
+                |r| {
+                    r.warmed_at = Some(Utc::now());
+                },
+                false,
+                // FnOnce closure consumes the pre-evaluated outcome — the
+                // lifecycle helper only fires the gate when the chain
+                // actually advanced, so an idempotent retry against an
+                // already-`Ready` revision skips the gate.
+                |_env, _rev| health_gate,
+            )
+        })
+    }
+
+    /// Transition a `Ready` revision to `Draining`. Pure lifecycle stamp —
+    /// the in-flight drain dance (sessions, WebSocket cleanup) is owned by
+    /// `greentic-start`.
+    ///
+    /// `_idempotency_key` is accepted for trait conformance and ignored
+    /// locally; the HTTP backend caches it for A8 §2 replay.
+    pub fn drain_revision(
+        &self,
+        env_id: &EnvId,
+        revision_id: RevisionId,
+        _idempotency_key: IdempotencyKey,
+    ) -> Result<RevisionTransitionOutcome, StoreError> {
+        self.run_revision_transition(env_id, revision_id, |locked| {
+            apply_revision_transition(
+                locked,
+                revision_id,
+                &[(RevisionLifecycle::Ready, RevisionLifecycle::Draining)],
+                |_| {},
+                false,
+            )
+        })
+    }
+
+    /// Archive a revision, walking any of `Staged | Warming | Ready | Failed`
+    /// to `Archived` in one hop and the post-drain `Draining → Inactive →
+    /// Archived` walk end-to-end. Refuses if the revision still routes live
+    /// traffic — callers rebalance via `gtc op traffic set` first.
+    ///
+    /// `_idempotency_key` is accepted for trait conformance and ignored
+    /// locally; the HTTP backend caches it for A8 §2 replay.
+    pub fn archive_revision(
+        &self,
+        env_id: &EnvId,
+        revision_id: RevisionId,
+        _idempotency_key: IdempotencyKey,
+    ) -> Result<RevisionTransitionOutcome, StoreError> {
+        self.run_revision_transition(env_id, revision_id, |locked| {
+            apply_revision_transition(
+                locked,
+                revision_id,
+                &[
+                    (RevisionLifecycle::Staged, RevisionLifecycle::Archived),
+                    (RevisionLifecycle::Warming, RevisionLifecycle::Archived),
+                    (RevisionLifecycle::Ready, RevisionLifecycle::Archived),
+                    (RevisionLifecycle::Failed, RevisionLifecycle::Archived),
+                    (RevisionLifecycle::Draining, RevisionLifecycle::Inactive),
+                    (RevisionLifecycle::Inactive, RevisionLifecycle::Archived),
+                ],
+                |_| {},
+                true,
+            )
+        })
+    }
+
+    /// Shared transact body for warm/drain/archive: capture the starting
+    /// lifecycle (for the archive eviction-vs-retirement discriminator in
+    /// `cli::revisions::emit_for_op`), drive the lifecycle helper, refresh
+    /// the materialized runtime config, return the typed outcome.
+    ///
+    /// `archive`'s chain can traverse `Draining → Inactive → Archived`
+    /// end-to-end in one call, so the final lifecycle alone can't tell us
+    /// whether the eviction hop fired — capture the starting state here so
+    /// the CLI emit can branch on it.
+    fn run_revision_transition<F>(
+        &self,
+        env_id: &EnvId,
+        revision_id: RevisionId,
+        apply: F,
+    ) -> Result<RevisionTransitionOutcome, StoreError>
+    where
+        F: FnOnce(&super::store::Locked<'_>) -> Result<Revision, LifecycleError>,
+    {
+        self.transact(env_id, |locked| {
+            // C5.3: capture the revision's pre-chain lifecycle before the
+            // helper walks the chain. A load failure leaves the value at
+            // `Inactive` — the CLI eviction emit (the only consumer) will
+            // skip silently, which matches the prior fail-safe behavior.
+            let starting_lifecycle = locked
+                .load()
+                .ok()
+                .and_then(|e| {
+                    e.revisions
+                        .iter()
+                        .find(|r| r.revision_id == revision_id)
+                        .map(|r| r.lifecycle)
+                })
+                .unwrap_or(RevisionLifecycle::Inactive);
+            let revision = apply(locked).map_err(fold_lifecycle_err)?;
+            // Lifecycle transitions don't change traffic splits today, so
+            // this is a no-op refresh (guarded by change-detection); it
+            // keeps the runtime-config contract uniform across every
+            // mutating verb.
+            let environment = locked.load()?;
+            locked.refresh_runtime_config(&environment)?;
+            Ok(RevisionTransitionOutcome {
+                revision,
+                environment,
+                starting_lifecycle,
+            })
+        })
+    }
+
     // -------------------------------------------------------------
     // Trust root  (PR-3a.2)
     //   `op env trust-root bootstrap | add | remove`
@@ -437,4 +599,209 @@ fn seed_op_key(
         public_key_pem: op_key.public_pem,
         trusted_key_count: trust.keys.len(),
     })
+}
+
+#[cfg(test)]
+mod warm_revision_tests {
+    //! Direct tests for the typed `warm_revision` verb (PR-3a.6). `drain` and
+    //! `archive` are covered through the CLI integration tests in
+    //! `cli::revisions`; `warm` is not CLI-wired yet (the closure-shaped
+    //! `warm_with_health_gate` path still owns the gate consumer) so its
+    //! typed-verb behavior is locked in here.
+    use super::*;
+    use crate::environment::lifecycle::{HealthCheckId, HealthGateFailure, LifecycleError};
+    use crate::environment::store::EnvironmentStore;
+    use chrono::{TimeZone, Utc};
+    use greentic_deploy_spec::{
+        BundleDeployment, BundleDeploymentStatus, BundleId, CustomerId, DeploymentId, EnvId,
+        Environment, EnvironmentHostConfig, PartyId, RevenueShareEntry, Revision, RevisionId,
+        RevisionLifecycle, RouteBinding, SchemaVersion, TenantSelector,
+    };
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    const ENV_ID: &str = "local";
+
+    fn env_id() -> EnvId {
+        EnvId::try_from(ENV_ID).unwrap()
+    }
+
+    fn seed_one_staged() -> (LocalFsStore, EnvId, RevisionId) {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path().to_path_buf());
+        let did = DeploymentId::new();
+        let rid = RevisionId::new();
+        let env = Environment {
+            schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
+            environment_id: env_id(),
+            name: ENV_ID.to_string(),
+            host_config: EnvironmentHostConfig {
+                env_id: env_id(),
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+                public_base_url: None,
+            },
+            packs: Vec::new(),
+            credentials_ref: None,
+            bundles: vec![BundleDeployment {
+                schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
+                deployment_id: did,
+                env_id: env_id(),
+                bundle_id: BundleId::new("fast2flow"),
+                customer_id: CustomerId::new("local-dev"),
+                status: BundleDeploymentStatus::Active,
+                current_revisions: vec![rid],
+                route_binding: RouteBinding {
+                    hosts: vec!["fast2flow.local".to_string()],
+                    path_prefixes: Vec::new(),
+                    tenant_selector: TenantSelector {
+                        tenant: "default".to_string(),
+                        team: "default".to_string(),
+                    },
+                },
+                revenue_share: vec![RevenueShareEntry {
+                    party_id: PartyId::new("greentic"),
+                    basis_points: 10_000,
+                }],
+                revenue_policy_ref: PathBuf::from("revenue.json"),
+                usage: None,
+                created_at: Utc.with_ymd_and_hms(2026, 6, 9, 12, 0, 0).unwrap(),
+                authorization_ref: PathBuf::from("auth.json"),
+                config_overrides: BTreeMap::new(),
+            }],
+            revisions: vec![Revision {
+                schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
+                revision_id: rid,
+                env_id: env_id(),
+                bundle_id: BundleId::new("fast2flow"),
+                deployment_id: did,
+                sequence: 1,
+                created_at: Utc.with_ymd_and_hms(2026, 6, 9, 12, 0, 0).unwrap(),
+                bundle_digest: "sha256:00".to_string(),
+                pack_list: Vec::new(),
+                pack_list_lock_ref: PathBuf::new(),
+                pack_config_refs: Vec::new(),
+                config_digest: "sha256:00".to_string(),
+                signature_sidecar_ref: PathBuf::from("rev.sig"),
+                lifecycle: RevisionLifecycle::Staged,
+                staged_at: Some(Utc.with_ymd_and_hms(2026, 6, 9, 12, 0, 0).unwrap()),
+                warmed_at: None,
+                drain_seconds: 30,
+                abort_metrics: Vec::new(),
+            }],
+            traffic_splits: Vec::new(),
+            messaging_endpoints: Vec::new(),
+            extensions: Vec::new(),
+            revocation: Default::default(),
+            retention: Default::default(),
+            health: Default::default(),
+        };
+        store.save(&env).unwrap();
+        std::mem::forget(dir);
+        (store, env_id(), rid)
+    }
+
+    fn idem() -> IdempotencyKey {
+        IdempotencyKey::new(ulid::Ulid::new().to_string()).unwrap()
+    }
+
+    #[test]
+    fn warm_revision_with_passing_gate_lands_ready_and_stamps_warmed_at() {
+        let (store, env_id, rid) = seed_one_staged();
+        let outcome = store
+            .warm_revision(
+                &env_id,
+                WarmRevisionPayload {
+                    revision_id: rid,
+                    health_gate: Ok(()),
+                    idempotency_key: idem(),
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome.revision.lifecycle, RevisionLifecycle::Ready);
+        assert!(outcome.revision.warmed_at.is_some());
+        assert_eq!(outcome.starting_lifecycle, RevisionLifecycle::Staged);
+        // Persisted.
+        let env = store.load(&env_id).unwrap();
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Ready);
+    }
+
+    #[test]
+    fn warm_revision_with_failing_gate_persists_failed_and_surfaces_health_gate_error() {
+        let (store, env_id, rid) = seed_one_staged();
+        let err = store
+            .warm_revision(
+                &env_id,
+                WarmRevisionPayload {
+                    revision_id: rid,
+                    health_gate: Err(HealthGateFailure {
+                        failed_checks: vec![HealthCheckId::RouteTable],
+                        message: "missing routes".to_string(),
+                    }),
+                    idempotency_key: idem(),
+                },
+            )
+            .unwrap_err();
+        match err {
+            StoreError::Lifecycle(inner) => match *inner {
+                LifecycleError::HealthGateFailed {
+                    revision_id,
+                    failed_checks,
+                    ..
+                } => {
+                    assert_eq!(revision_id, rid);
+                    assert_eq!(failed_checks, vec![HealthCheckId::RouteTable]);
+                }
+                other => panic!("expected HealthGateFailed, got {other:?}"),
+            },
+            other => panic!("expected StoreError::Lifecycle, got {other:?}"),
+        }
+        // Failed state is durable per the B9 contract.
+        let env = store.load(&env_id).unwrap();
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Failed);
+    }
+
+    #[test]
+    fn drain_revision_advances_ready_to_draining() {
+        let (store, env_id, rid) = seed_one_staged();
+        // First warm the revision to Ready (drain only accepts Ready as a start).
+        store
+            .warm_revision(
+                &env_id,
+                WarmRevisionPayload {
+                    revision_id: rid,
+                    health_gate: Ok(()),
+                    idempotency_key: idem(),
+                },
+            )
+            .unwrap();
+        let outcome = store.drain_revision(&env_id, rid, idem()).unwrap();
+        assert_eq!(outcome.revision.lifecycle, RevisionLifecycle::Draining);
+        assert_eq!(outcome.starting_lifecycle, RevisionLifecycle::Ready);
+    }
+
+    #[test]
+    fn archive_revision_walks_draining_through_inactive_to_archived() {
+        let (store, env_id, rid) = seed_one_staged();
+        store
+            .warm_revision(
+                &env_id,
+                WarmRevisionPayload {
+                    revision_id: rid,
+                    health_gate: Ok(()),
+                    idempotency_key: idem(),
+                },
+            )
+            .unwrap();
+        store.drain_revision(&env_id, rid, idem()).unwrap();
+        let outcome = store.archive_revision(&env_id, rid, idem()).unwrap();
+        assert_eq!(outcome.revision.lifecycle, RevisionLifecycle::Archived);
+        // Starting lifecycle must surface `Draining` so the CLI eviction-emit
+        // discriminator can branch correctly (archive's chain walks
+        // Draining→Inactive→Archived in one hop, so the final lifecycle alone
+        // can't tell us we crossed the eviction boundary).
+        assert_eq!(outcome.starting_lifecycle, RevisionLifecycle::Draining);
+    }
 }
