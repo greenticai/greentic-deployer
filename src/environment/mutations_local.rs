@@ -18,8 +18,8 @@ use greentic_distributor_client::signing::TrustedKey;
 
 use greentic_deploy_spec::{
     CapabilitySlot, DeploymentId, EnvId, EnvPackBinding, Environment, EnvironmentHostConfig,
-    HealthStatus, IdempotencyKey, RetentionPolicy, Revision, RevisionId, RevisionLifecycle,
-    RevocationConfig, SchemaVersion,
+    ExtensionBinding, HealthStatus, IdempotencyKey, RetentionPolicy, Revision, RevisionId,
+    RevisionLifecycle, RevocationConfig, SchemaVersion,
 };
 
 use super::lifecycle::{
@@ -827,6 +827,172 @@ impl LocalFsStore {
                 removed_public_key_pem,
                 trusted_key_count: trust.keys.len(),
             })
+        })
+    }
+
+    // -------------------------------------------------------------
+    // Extension binding CRUD  (PR-3a.9)
+    //   `op extensions add | update | remove | rollback`
+    // -------------------------------------------------------------
+
+    /// Add a new extension binding to the env. Rejects with
+    /// [`StoreError::Conflict`] if a binding with the same
+    /// `(kind.path(), instance_id)` key already exists — callers wanting
+    /// to replace use [`Self::update_extension_binding`].
+    ///
+    /// `_idempotency_key` is accepted for trait conformance and ignored
+    /// locally; the HTTP backend caches it for A8 §2 replay.
+    pub fn add_extension_binding(
+        &self,
+        env_id: &EnvId,
+        binding: ExtensionBinding,
+        _idempotency_key: IdempotencyKey,
+    ) -> Result<ExtensionBinding, StoreError> {
+        let key = ExtensionKey::from_binding(&binding);
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            if env.extensions.iter().any(|b| key.matches(b)) {
+                return Err(StoreError::Conflict(format!(
+                    "extension `{}` is already bound on env `{}`; use update",
+                    key, env_id
+                )));
+            }
+            env.extensions.push(binding.clone());
+            locked.save(&env)?;
+            Ok(env.extensions.last().expect("just pushed").clone())
+        })
+    }
+
+    /// Replace an existing extension binding identified by `key`. Bumps
+    /// `generation` to `previous + 1` and stashes the prior binding inline
+    /// so [`Self::rollback_extension_binding`] can restore it.
+    ///
+    /// Returns `(new_binding, new_generation)`.
+    ///
+    /// `_idempotency_key` is accepted for trait conformance and ignored
+    /// locally; the HTTP backend caches it for A8 §2 replay.
+    pub fn update_extension_binding(
+        &self,
+        env_id: &EnvId,
+        key: ExtensionKey,
+        binding: ExtensionBinding,
+        _idempotency_key: IdempotencyKey,
+    ) -> Result<(ExtensionBinding, u64), StoreError> {
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx = env
+                .extensions
+                .iter()
+                .position(|b| key.matches(b))
+                .ok_or_else(|| {
+                    StoreError::DependentNotFound(format!(
+                        "extension `{}` not bound on env `{}`",
+                        key, env_id
+                    ))
+                })?;
+            let prev_generation = env.extensions[idx].generation;
+            let new_generation = prev_generation.checked_add(1).ok_or_else(|| {
+                StoreError::Conflict(format!(
+                    "extension `{}` on env `{}`: generation overflow ({})",
+                    key, env_id, prev_generation
+                ))
+            })?;
+            let prev_snapshot = serde_json::to_value(&env.extensions[idx])
+                .map_err(|e| StoreError::Conflict(format!("snapshot prior binding: {e}")))?;
+            let mut new_binding = binding;
+            new_binding.generation = new_generation;
+            new_binding.previous_binding_ref =
+                Some(crate::cli::env_packs::stash_previous(prev_snapshot));
+            env.extensions[idx] = new_binding;
+            locked.save(&env)?;
+            Ok((env.extensions[idx].clone(), new_generation))
+        })
+    }
+
+    /// Remove an extension binding identified by `key`. Returns the removed
+    /// binding and its generation at the time of removal.
+    ///
+    /// `_idempotency_key` is accepted for trait conformance and ignored
+    /// locally; the HTTP backend caches it for A8 §2 replay.
+    pub fn remove_extension_binding(
+        &self,
+        env_id: &EnvId,
+        key: ExtensionKey,
+        _idempotency_key: IdempotencyKey,
+    ) -> Result<(ExtensionBinding, u64), StoreError> {
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx = env
+                .extensions
+                .iter()
+                .position(|b| key.matches(b))
+                .ok_or_else(|| {
+                    StoreError::DependentNotFound(format!(
+                        "extension `{}` not bound on env `{}`",
+                        key, env_id
+                    ))
+                })?;
+            let removed = env.extensions.remove(idx);
+            let generation = removed.generation;
+            locked.save(&env)?;
+            Ok((removed, generation))
+        })
+    }
+
+    /// Rollback an extension binding to its previous version. Requires the
+    /// binding to have a stashed `previous_binding_ref`. Bumps generation
+    /// and clears the stash so a second rollback fails (single-step only).
+    ///
+    /// `_idempotency_key` is accepted for trait conformance and ignored
+    /// locally; the HTTP backend caches it for A8 §2 replay.
+    pub fn rollback_extension_binding(
+        &self,
+        env_id: &EnvId,
+        key: ExtensionKey,
+        _idempotency_key: IdempotencyKey,
+    ) -> Result<(ExtensionBinding, u64), StoreError> {
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx = env
+                .extensions
+                .iter()
+                .position(|b| key.matches(b))
+                .ok_or_else(|| {
+                    StoreError::DependentNotFound(format!(
+                        "extension `{}` not bound on env `{}`",
+                        key, env_id
+                    ))
+                })?;
+            let prev_generation = env.extensions[idx].generation;
+            let new_generation = prev_generation.checked_add(1).ok_or_else(|| {
+                StoreError::Conflict(format!(
+                    "extension `{}` on env `{}`: generation overflow ({})",
+                    key, env_id, prev_generation
+                ))
+            })?;
+            let prev_ref = env.extensions[idx]
+                .previous_binding_ref
+                .clone()
+                .ok_or_else(|| {
+                    StoreError::Conflict(format!(
+                        "extension `{}` on env `{}` has no previous binding to roll back to",
+                        key, env_id
+                    ))
+                })?;
+            let prev_value = crate::cli::env_packs::load_previous(&prev_ref).ok_or_else(|| {
+                StoreError::DependentNotFound(format!(
+                    "previous binding payload `{}` missing for extension `{}`",
+                    prev_ref.display(),
+                    key
+                ))
+            })?;
+            let mut restored: ExtensionBinding = serde_json::from_value(prev_value)
+                .map_err(|e| StoreError::Conflict(format!("deserialise previous binding: {e}")))?;
+            restored.generation = new_generation;
+            restored.previous_binding_ref = None;
+            env.extensions[idx] = restored;
+            locked.save(&env)?;
+            Ok((env.extensions[idx].clone(), new_generation))
         })
     }
 }
