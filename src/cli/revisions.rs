@@ -241,12 +241,36 @@ pub fn stage(
                         // An empty bundle (no inputs) returns an empty list,
                         // so legacy bundles still stage. The rev_dir naming
                         // mirrors `bundle_stage::stage_local_bundle`.
+                        //
+                        // Scope arguments enforce env/bundle/pack-list bindings:
+                        // a bundle authored for env A or pack X is refused when
+                        // staged into env B or under a pack list missing X.
+                        //
+                        // Cleanup guard (Codex review finding 4): if pack-config
+                        // materialization fails AFTER `stage_local_bundle`
+                        // succeeded, we leave behind a freshly-extracted
+                        // bundle + `pack-list.lock` under an `rev_dir` that no
+                        // env.json will ever reference (the transact below
+                        // hasn't run yet). Drop the whole rev_dir on error so
+                        // a re-stage starts from a clean slate.
                         let rev_dir = env_dir.join("revisions").join(revision_id.to_string());
+                        let pinned_pack_ids: std::collections::HashSet<String> = staged
+                            .lock
+                            .packs
+                            .iter()
+                            .map(|lp| lp.pack_id.as_str().to_string())
+                            .collect();
                         let pack_config_refs = super::pack_config_stage::materialize_pack_configs(
                             &env_dir,
                             &rev_dir,
                             revision_id,
-                        )?;
+                            &env_id,
+                            &bundle_id,
+                            &pinned_pack_ids,
+                        )
+                        .inspect_err(|_| {
+                            let _ = std::fs::remove_dir_all(&rev_dir);
+                        })?;
                         (
                             staged.bundle_digest,
                             lock_derived_pack_list,
