@@ -110,6 +110,12 @@ pub enum StoreError {
     /// [`crate::cli::map_store_err_preserving_noun`].
     #[error(transparent)]
     Lifecycle(Box<super::LifecycleError>),
+    /// Revenue-policy sidecar write failure (PR-3a.7b). Surfaces the
+    /// inner [`super::BundleDeploymentError`] so CLI callers can
+    /// downcast to `OpError::RevenuePolicy` via
+    /// [`crate::cli::map_store_err_preserving_noun`].
+    #[error("revenue policy: {0}")]
+    RevenuePolicy(#[from] super::BundleDeploymentError),
     /// A typed-verb body persisted state to disk via the lifecycle
     /// helper's internal `locked.save(...)` and *then* failed on a
     /// post-save step (env reload, materialized-runtime-config refresh,

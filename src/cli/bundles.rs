@@ -10,15 +10,17 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use chrono::Utc;
 use greentic_deploy_spec::{
     BundleDeployment, BundleDeploymentStatus, BundleId, CustomerId, DeploymentId, EnvId,
-    RevenueShareEntry, RouteBinding, SchemaVersion, TenantSelector,
+    RevenueShareEntry, RouteBinding, TenantSelector,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{EnvironmentStore, LocalFsStore, RemoveBundleOutcome};
+use crate::environment::mutations::UpdateBundlePayload as StoreUpdateBundlePayload;
+use crate::environment::{
+    AddBundlePayload as StoreAddBundlePayload, EnvironmentStore, LocalFsStore, RemoveBundleOutcome,
+};
 
 use super::{
     AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
@@ -47,6 +49,12 @@ pub struct BundleAddPayload {
     /// `Environment::validate`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub config_overrides: BTreeMap<String, BTreeMap<String, Value>>,
+    /// Caller-supplied A8 §2 idempotency key. Optional on the CLI
+    /// surface; when absent, `add` mints one per invocation. Operators
+    /// wanting safe lost-response retries (HTTP backend, PR-3b) supply a
+    /// stable key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 /// Default `customer_id` for the `local` env when none is supplied. Non-local
@@ -158,6 +166,8 @@ pub fn add(
         })
         .collect();
     let config_overrides = payload.config_overrides.clone();
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
+    let route_binding_payload = payload.route_binding.clone();
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -168,63 +178,26 @@ pub fn add(
             "revenue_share": revenue_share_json(&revenue_share),
             "config_overrides": config_overrides_audit_shape(&config_overrides),
         }),
-        idempotency_key: None,
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let env_dir = store.env_dir(&env_id)?;
-        let summary = store.transact(&env_id, |locked| -> Result<BundleSummary, OpError> {
-            let mut env = locked.load()?;
-            // P6 anchor (§5.4): one BundleDeployment per (env_id, bundle_id, customer_id).
-            if env
-                .bundles
-                .iter()
-                .any(|b| b.bundle_id == bundle_id && b.customer_id == customer_id)
-            {
-                return Err(OpError::Conflict(format!(
-                    "bundle `{}` for customer `{}` already deployed in env `{}`",
-                    bundle_id, customer_id, env_id
-                )));
-            }
-            let created_at = Utc::now();
-            let mut deployment = BundleDeployment {
-                schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
-                deployment_id: crate::environment::mint_deployment_id(),
-                env_id: env_id.clone(),
-                bundle_id: bundle_id.clone(),
-                customer_id: customer_id.clone(),
-                status: BundleDeploymentStatus::Active,
-                current_revisions: Vec::new(),
-                route_binding: into_route_binding(payload.route_binding.clone()),
-                revenue_share: revenue_share.clone(),
-                // Replaced with the v1 policy sidecar path below.
-                revenue_policy_ref: PathBuf::new(),
-                usage: None,
-                created_at,
-                authorization_ref: payload.authorization_ref.clone(),
-                config_overrides: config_overrides.clone(),
-            };
-            // C2 Codex follow-up: refuse to AUTO-GENERATE an operator key
-            // from this path. A user who runs `bundles add` without ever
-            // running `gtc op env init` (N1.4) or `gtc op trust-root bootstrap`
-            // would otherwise create an unexpected `~/.greentic/operator/key.pem`
-            // as a side effect of a command that then aborts with
-            // `OperatorKeyNotTrusted`.
-            let operator_key = crate::operator_key::load_existing_only()?;
-            let version = crate::environment::write_revenue_policy_version(
-                &env_dir,
-                &deployment,
-                &deployment.revenue_share,
-                created_at,
-                &operator_key,
-            )?;
-            deployment.revenue_policy_ref = version.policy_ref;
-            env.bundles.push(deployment);
-            locked.save(&env)?;
-            Ok(BundleSummary::from(
+        let deployment = store
+            .add_bundle(
                 &env_id,
-                env.bundles.last().expect("just pushed"),
-            ))
-        })?;
+                StoreAddBundlePayload {
+                    bundle_id,
+                    customer_id,
+                    revenue_share,
+                    route_binding: Some(into_route_binding(route_binding_payload)),
+                    authorization_ref: Some(
+                        payload.authorization_ref.to_string_lossy().into_owned(),
+                    ),
+                    config_overrides,
+                    idempotency_key,
+                },
+            )
+            .map_err(map_store_err_preserving_noun)?;
+        let summary = BundleSummary::from(&env_id, &deployment);
         let outcome = OpOutcome::new(
             NOUN,
             "add",
@@ -250,6 +223,12 @@ pub struct BundleUpdatePayload {
     /// `Some(map)` replaces them wholesale — pass `Some(empty)` to clear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_overrides: Option<BTreeMap<String, BTreeMap<String, Value>>>,
+    /// Caller-supplied A8 §2 idempotency key. Optional on the CLI
+    /// surface; when absent, `update` mints one per invocation. Operators
+    /// wanting safe lost-response retries (HTTP backend, PR-3b) supply a
+    /// stable key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 pub fn update(
@@ -275,6 +254,8 @@ pub fn update(
                 })
                 .collect()
         });
+    let new_route_binding = payload.route_binding.clone().map(into_route_binding);
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let mut target = json!({"deployment_id": deployment_id.to_string()});
     if let Some(shares) = &new_revenue_share {
         target["revenue_share"] = revenue_share_json(shares);
@@ -287,48 +268,23 @@ pub fn update(
         noun: NOUN,
         verb: "update",
         target,
-        idempotency_key: None,
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let env_dir = store.env_dir(&env_id)?;
-        let summary = store.transact(&env_id, |locked| -> Result<BundleSummary, OpError> {
-            let mut env = locked.load()?;
-            let idx = env
-                .bundles
-                .iter()
-                .position(|b| b.deployment_id == deployment_id)
-                .ok_or_else(|| {
-                    OpError::NotFound(format!(
-                        "deployment `{deployment_id}` not found in env `{env_id}`"
-                    ))
-                })?;
-            if let Some(status) = payload.status {
-                env.bundles[idx].status = status;
-            }
-            if let Some(rb) = payload.route_binding.clone() {
-                env.bundles[idx].route_binding = into_route_binding(rb);
-            }
-            if let Some(overrides) = payload.config_overrides.clone() {
-                env.bundles[idx].config_overrides = overrides;
-            }
-            if let Some(shares) = new_revenue_share.clone() {
-                // A revenue-share mutation creates a new signed/versioned policy
-                // (B10): set the shares, write v{N+1}, and pin the new ref.
-                env.bundles[idx].revenue_share = shares;
-                let created_at = Utc::now();
-                let operator_key = crate::operator_key::load_existing_only()?;
-                let version = crate::environment::write_revenue_policy_version(
-                    &env_dir,
-                    &env.bundles[idx],
-                    &env.bundles[idx].revenue_share,
-                    created_at,
-                    &operator_key,
-                )?;
-                env.bundles[idx].revenue_policy_ref = version.policy_ref;
-            }
-            locked.save(&env)?;
-            Ok(BundleSummary::from(&env_id, &env.bundles[idx]))
-        })?;
+        let deployment = store
+            .update_bundle(
+                &env_id,
+                StoreUpdateBundlePayload {
+                    deployment_id,
+                    status: payload.status,
+                    route_binding: new_route_binding,
+                    revenue_share: new_revenue_share,
+                    config_overrides: payload.config_overrides,
+                    idempotency_key,
+                },
+            )
+            .map_err(map_store_err_preserving_noun)?;
+        let summary = BundleSummary::from(&env_id, &deployment);
         let outcome = OpOutcome::new(
             NOUN,
             "update",
@@ -534,6 +490,10 @@ fn add_schema() -> Value {
                 "type": "object",
                 "description": "D.4: per-pack provider config overrides — object keyed by pack_id, values are objects of {key: json-value}",
                 "additionalProperties": {"type": "object"}
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Optional A8 §2 caller-supplied key for safe retry replay; minted per-invocation when omitted."
             }
         }
     })
@@ -556,6 +516,10 @@ fn update_schema() -> Value {
                 "type": "object",
                 "description": "D.4: replace the deployment's config_overrides map wholesale (omit to leave untouched; pass `{}` to clear)",
                 "additionalProperties": {"type": "object"}
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Optional A8 §2 caller-supplied key for safe retry replay; minted per-invocation when omitted."
             }
         }
     })
@@ -596,6 +560,32 @@ mod tests {
         assert!(
             schema.pointer("/properties/idempotency_key").is_some(),
             "remove_schema must list `idempotency_key` so --schema-driven \
+             callers can supply the A8 retry key (schema: {schema:#})"
+        );
+    }
+
+    /// PR-3a.7b: `BundleAddPayload` accepts an `idempotency_key` field;
+    /// the schema published via `--schema` MUST list it under `properties`,
+    /// otherwise schema-driven callers reject the field.
+    #[test]
+    fn add_schema_lists_idempotency_key() {
+        let schema = add_schema();
+        assert!(
+            schema.pointer("/properties/idempotency_key").is_some(),
+            "add_schema must list `idempotency_key` so --schema-driven \
+             callers can supply the A8 retry key (schema: {schema:#})"
+        );
+    }
+
+    /// PR-3a.7b: `BundleUpdatePayload` accepts an `idempotency_key` field;
+    /// the schema published via `--schema` MUST list it under `properties`,
+    /// otherwise schema-driven callers reject the field.
+    #[test]
+    fn update_schema_lists_idempotency_key() {
+        let schema = update_schema();
+        assert!(
+            schema.pointer("/properties/idempotency_key").is_some(),
+            "update_schema must list `idempotency_key` so --schema-driven \
              callers can supply the A8 retry key (schema: {schema:#})"
         );
     }
@@ -673,6 +663,7 @@ mod tests {
             revenue_share: default_revenue_share(),
             authorization_ref: default_authorization_ref(),
             config_overrides: BTreeMap::new(),
+            idempotency_key: None,
         }
     }
 
@@ -783,6 +774,7 @@ mod tests {
                 }),
                 revenue_share: None,
                 config_overrides: None,
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -1112,6 +1104,7 @@ mod tests {
                     },
                 ]),
                 config_overrides: None,
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -1160,6 +1153,7 @@ mod tests {
                 route_binding: None,
                 revenue_share: None,
                 config_overrides: None,
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -1283,6 +1277,7 @@ mod tests {
                 route_binding: None,
                 revenue_share: None,
                 config_overrides: Some(replaced.clone()),
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -1325,6 +1320,7 @@ mod tests {
                 route_binding: None,
                 revenue_share: None,
                 config_overrides: None,
+                idempotency_key: None,
             }),
         )
         .unwrap();
