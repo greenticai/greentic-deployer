@@ -539,7 +539,7 @@ impl LocalFsStore {
                 status: BundleDeploymentStatus::Active,
                 current_revisions: Vec::new(),
                 route_binding,
-                revenue_share: payload.revenue_share.clone(),
+                revenue_share: payload.revenue_share,
                 // Replaced with the v1 policy sidecar path below.
                 revenue_policy_ref: std::path::PathBuf::new(),
                 usage: None,
@@ -551,7 +551,7 @@ impl LocalFsStore {
             let version = crate::environment::write_revenue_policy_version(
                 &env_dir,
                 &deployment,
-                &payload.revenue_share,
+                &deployment.revenue_share,
                 created_at,
                 &operator_key,
             )?;
