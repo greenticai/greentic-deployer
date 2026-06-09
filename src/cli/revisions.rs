@@ -28,17 +28,20 @@ use std::path::PathBuf;
 use chrono::Utc;
 use greentic_deploy_spec::{
     BundleId, DeploymentId, EnvId, PackId, PackListEntry, Revision, RevisionId, RevisionLifecycle,
-    SchemaVersion, SemVer, is_valid_transition,
+    SemVer, is_valid_transition,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{EnvironmentStore, LocalFsStore};
+use crate::environment::{EnvironmentStore, LocalFsStore, StageRevisionPayload};
 use crate::rollout_telemetry::emit_lifecycle_event;
 use greentic_deploy_spec::Environment;
 use greentic_telemetry::RolloutEvent;
 
-use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
+use super::{
+    AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
+    mint_idempotency_key,
+};
 
 const NOUN: &str = "revisions";
 
@@ -174,151 +177,109 @@ pub fn stage(
         }),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, |_committed| {
-        let summary = store.transact(&env_id, |locked| -> Result<RevisionSummary, OpError> {
-            let mut env = locked.load()?;
-            let deployment = env
-                .bundles
-                .iter()
-                .find(|b| b.deployment_id == deployment_id)
-                .ok_or_else(|| {
-                    OpError::NotFound(format!(
-                        "deployment `{deployment_id}` not found in env `{env_id}`"
-                    ))
-                })?
-                .clone();
-            let bundle_id = deployment.bundle_id.clone();
-            let next_sequence = env
-                .revisions
-                .iter()
-                .filter(|r| r.deployment_id == deployment_id)
-                .map(|r| r.sequence)
-                .max()
-                .unwrap_or(0)
-                + 1;
-            let now = Utc::now();
-            // Mint the id first: when resolving a local bundle, it names the
-            // per-revision extract dir the pack-list lock is written under.
-            let revision_id = crate::environment::mint_revision_id();
-
-            // Resolve a local `.gtbundle` (extract + pin packs) when one was
-            // supplied, deriving the artifact pointers; otherwise record the
-            // caller-supplied pointers verbatim (legacy Phase-A behavior).
-            let (bundle_digest, revision_pack_list, pack_list_lock_ref, pack_config_refs) =
-                match &payload.bundle_path {
-                    Some(bundle_path) => {
-                        let env_dir = store.env_dir(&env_id)?;
-                        let staged = super::bundle_stage::stage_local_bundle(
-                            &env_dir,
-                            revision_id,
-                            bundle_path,
-                        )?;
-                        // The lock file is the on-disk source of truth for the
-                        // resolved packs. We also populate `Revision.pack_list`
-                        // with the pack ids derived from the lock so
-                        // `Environment::validate`'s config_overrides cross-ref
-                        // check has data to work with (without this, the
-                        // `--bundle` path left `pack_list` empty and the
-                        // cross-ref was permanently blind — Codex finding 1).
-                        // Version is a placeholder (0.0.0); digest is the real
-                        // on-disk digest. The cross-ref only checks `pack_id`
-                        // membership. Train-3's runtime path reads the lock file
-                        // for the real version.
-                        let lock_derived_pack_list: Vec<PackListEntry> = staged
-                            .lock
-                            .packs
-                            .iter()
-                            .map(|lp| {
-                                PackListEntry::from_lock_primitives(
-                                    lp.pack_id.clone(),
-                                    lp.digest.clone(),
-                                )
-                            })
-                            .collect();
-                        // C7: read any `pack-config-input.v1` files the wizard
-                        // emitted into the bundle and write the per-pack
-                        // `pack-config.v1` documents stamped with revision_id.
-                        // An empty bundle (no inputs) returns an empty list,
-                        // so legacy bundles still stage. The rev_dir naming
-                        // mirrors `bundle_stage::stage_local_bundle`.
-                        //
-                        // Scope arguments enforce env/bundle/pack-list bindings:
-                        // a bundle authored for env A or pack X is refused when
-                        // staged into env B or under a pack list missing X.
-                        //
-                        // Cleanup guard (Codex review finding 4): if pack-config
-                        // materialization fails AFTER `stage_local_bundle`
-                        // succeeded, we leave behind a freshly-extracted
-                        // bundle + `pack-list.lock` under an `rev_dir` that no
-                        // env.json will ever reference (the transact below
-                        // hasn't run yet). Drop the whole rev_dir on error so
-                        // a re-stage starts from a clean slate.
-                        let rev_dir = env_dir.join("revisions").join(revision_id.to_string());
-                        let pinned_pack_ids: std::collections::HashSet<String> = staged
-                            .lock
-                            .packs
-                            .iter()
-                            .map(|lp| lp.pack_id.as_str().to_string())
-                            .collect();
-                        let pack_config_refs = super::pack_config_stage::materialize_pack_configs(
-                            &env_dir,
-                            &rev_dir,
-                            revision_id,
-                            &env_id,
-                            &bundle_id,
-                            &pinned_pack_ids,
-                        )
-                        .inspect_err(|_| {
-                            let _ = std::fs::remove_dir_all(&rev_dir);
-                        })?;
-                        (
-                            staged.bundle_digest,
-                            lock_derived_pack_list,
-                            staged.pack_list_lock_ref,
-                            pack_config_refs,
-                        )
-                    }
-                    None => (
-                        payload.bundle_digest.clone(),
-                        pack_list.clone(),
-                        payload.pack_list_lock_ref.clone(),
-                        Vec::new(),
-                    ),
-                };
-
-            let staged = Revision {
-                schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
-                revision_id,
-                env_id: env_id.clone(),
-                bundle_id,
-                deployment_id,
-                sequence: next_sequence,
-                created_at: now,
-                bundle_digest,
-                pack_list: revision_pack_list,
-                pack_list_lock_ref,
-                pack_config_refs,
-                config_digest: payload.config_digest.clone(),
-                signature_sidecar_ref: payload.signature_sidecar_ref.clone(),
-                lifecycle: RevisionLifecycle::Staged,
-                staged_at: Some(now),
-                warmed_at: None,
-                drain_seconds: payload.drain_seconds,
-                abort_metrics: Vec::new(),
-            };
-            env.revisions.push(staged);
-            locked.save(&env)?;
-            Ok(RevisionSummary::from(
-                env.revisions
-                    .iter()
-                    .find(|r| r.revision_id == revision_id)
-                    .expect("just pushed"),
+    // Pre-look-up the deployment to surface a typed `not-found` error
+    // before we mint a revision_id or extract a bundle. The typed store
+    // verb re-validates under the lock (closes the TOCTOU window).
+    let pre_env = store.load(&env_id).map_err(map_store_err_preserving_noun)?;
+    let bundle_id = pre_env
+        .bundles
+        .iter()
+        .find(|b| b.deployment_id == deployment_id)
+        .map(|b| b.bundle_id.clone())
+        .ok_or_else(|| {
+            OpError::NotFound(format!(
+                "deployment `{deployment_id}` not found in env `{env_id}`"
             ))
         })?;
+    drop(pre_env);
+
+    // Mint the revision id now: the `--bundle` path names the per-revision
+    // extract dir after this ULID, and the pack-list lock + per-pack
+    // pack-config docs are written under that dir before the typed verb
+    // ever sees them.
+    let revision_id = crate::environment::mint_revision_id();
+
+    // Resolve a local `.gtbundle` (extract + pin packs) when one was
+    // supplied, deriving the artifact pointers; otherwise record the
+    // caller-supplied pointers verbatim (legacy Phase-A behavior).
+    let (bundle_digest, revision_pack_list, pack_list_lock_ref, pack_config_refs) =
+        match &payload.bundle_path {
+            Some(bundle_path) => {
+                let env_dir = store.env_dir(&env_id)?;
+                let staged =
+                    super::bundle_stage::stage_local_bundle(&env_dir, revision_id, bundle_path)?;
+                // The lock file is the on-disk source of truth for the
+                // resolved packs. We also populate `Revision.pack_list`
+                // with the pack ids derived from the lock so
+                // `Environment::validate`'s config_overrides cross-ref
+                // check has data to work with.
+                let lock_derived_pack_list: Vec<PackListEntry> = staged
+                    .lock
+                    .packs
+                    .iter()
+                    .map(|lp| {
+                        PackListEntry::from_lock_primitives(lp.pack_id.clone(), lp.digest.clone())
+                    })
+                    .collect();
+                // Cleanup guard: if pack-config materialization fails
+                // AFTER `stage_local_bundle` succeeded, we'd otherwise
+                // leak the freshly-extracted bundle + lock under an
+                // `rev_dir` that no env.json will ever reference. Drop
+                // the whole rev_dir on error so a re-stage starts clean.
+                let rev_dir = env_dir.join("revisions").join(revision_id.to_string());
+                let pinned_pack_ids: std::collections::HashSet<String> = staged
+                    .lock
+                    .packs
+                    .iter()
+                    .map(|lp| lp.pack_id.as_str().to_string())
+                    .collect();
+                let pack_config_refs = super::pack_config_stage::materialize_pack_configs(
+                    &env_dir,
+                    &rev_dir,
+                    revision_id,
+                    &env_id,
+                    &bundle_id,
+                    &pinned_pack_ids,
+                )
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_dir_all(&rev_dir);
+                })?;
+                (
+                    staged.bundle_digest,
+                    lock_derived_pack_list,
+                    staged.pack_list_lock_ref,
+                    pack_config_refs,
+                )
+            }
+            None => (
+                payload.bundle_digest.clone(),
+                pack_list,
+                payload.pack_list_lock_ref.clone(),
+                Vec::new(),
+            ),
+        };
+
+    audit_and_record(store, ctx, |_committed| {
+        let store_payload = StageRevisionPayload {
+            revision_id,
+            deployment_id,
+            bundle_digest,
+            pack_list: revision_pack_list,
+            pack_list_lock_ref,
+            pack_config_refs,
+            config_digest: payload.config_digest.clone(),
+            signature_sidecar_ref: payload.signature_sidecar_ref.clone(),
+            drain_seconds: payload.drain_seconds,
+            idempotency_key: mint_idempotency_key(),
+        };
+        let revision = store
+            .stage_revision(&env_id, store_payload)
+            .map_err(map_store_err_preserving_noun)?;
         let outcome = OpOutcome::new(
             NOUN,
             "stage",
-            serde_json::to_value(summary).expect("RevisionSummary is json-safe"),
+            serde_json::to_value(RevisionSummary::from(&revision))
+                .expect("RevisionSummary is json-safe"),
         );
         Ok((outcome, super::AuditGens::NONE))
     })

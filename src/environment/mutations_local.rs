@@ -13,16 +13,17 @@
 
 use std::path::Path;
 
+use chrono::Utc;
 use greentic_distributor_client::signing::TrustedKey;
 
 use greentic_deploy_spec::{
     EnvId, Environment, EnvironmentHostConfig, HealthStatus, IdempotencyKey, RetentionPolicy,
-    RevocationConfig, SchemaVersion,
+    Revision, RevisionLifecycle, RevocationConfig, SchemaVersion,
 };
 
 use super::mutations::{
-    ExtensionKey, MigrateMergePayload, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
-    UpdateEnvironmentPayload,
+    ExtensionKey, MigrateMergePayload, StageRevisionPayload, TrustRootAddOutcome,
+    TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload,
 };
 use super::store::{LocalFsStore, StoreError};
 use super::trust_root::{self as store_trust_root, trust_root_path};
@@ -183,6 +184,84 @@ impl LocalFsStore {
             }
             locked.save(&target_env)?;
             Ok((added_slots, added_extensions))
+        })
+    }
+
+    // -------------------------------------------------------------
+    // Revision lifecycle — stage  (PR-3a.5)
+    //   `op revisions stage`
+    //   warm/drain/archive land in PR-3a.6
+    // -------------------------------------------------------------
+
+    /// Stage a fresh revision under `payload.deployment_id`. The caller
+    /// supplies the pre-resolved artifact pointers (`bundle_digest`,
+    /// `pack_list`, `pack_list_lock_ref`, `pack_config_refs`) and a
+    /// pre-minted [`RevisionId`] — bundle staging (extract + lock-pin +
+    /// pack-config materialization) runs OUTSIDE the env flock because
+    /// the `rev_dir` is named after the ULID and the extraction cost
+    /// shouldn't hold the lock.
+    ///
+    /// Inside the flock: load → re-validate deployment exists →
+    /// compute `next_sequence = max(existing[deployment]) + 1` → build
+    /// `Revision` (Staged) → push → save.
+    ///
+    /// Returns [`StoreError::DependentNotFound`] when the deployment is
+    /// missing under the env at lock-acquisition time (closes the
+    /// TOCTOU window over any pre-call lookup the caller may have done
+    /// for input validation).
+    ///
+    /// `payload.idempotency_key` is accepted for trait conformance and
+    /// ignored locally; the HTTP backend caches it for A8 §2 replay.
+    pub fn stage_revision(
+        &self,
+        env_id: &EnvId,
+        payload: StageRevisionPayload,
+    ) -> Result<Revision, StoreError> {
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            let deployment = env
+                .bundles
+                .iter()
+                .find(|b| b.deployment_id == payload.deployment_id)
+                .ok_or_else(|| {
+                    StoreError::DependentNotFound(format!(
+                        "deployment `{}` not found in env `{}`",
+                        payload.deployment_id, env_id
+                    ))
+                })?
+                .clone();
+            let next_sequence = env
+                .revisions
+                .iter()
+                .filter(|r| r.deployment_id == payload.deployment_id)
+                .map(|r| r.sequence)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let now = Utc::now();
+            let revision = Revision {
+                schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
+                revision_id: payload.revision_id,
+                env_id: env_id.clone(),
+                bundle_id: deployment.bundle_id,
+                deployment_id: payload.deployment_id,
+                sequence: next_sequence,
+                created_at: now,
+                bundle_digest: payload.bundle_digest,
+                pack_list: payload.pack_list,
+                pack_list_lock_ref: payload.pack_list_lock_ref,
+                pack_config_refs: payload.pack_config_refs,
+                config_digest: payload.config_digest,
+                signature_sidecar_ref: payload.signature_sidecar_ref,
+                lifecycle: RevisionLifecycle::Staged,
+                staged_at: Some(now),
+                warmed_at: None,
+                drain_seconds: payload.drain_seconds,
+                abort_metrics: Vec::new(),
+            };
+            env.revisions.push(revision.clone());
+            locked.save(&env)?;
+            Ok(revision)
         })
     }
 

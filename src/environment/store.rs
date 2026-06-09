@@ -82,6 +82,14 @@ pub enum StoreError {
     /// [`crate::cli::map_store_err_preserving_noun`].
     #[error("conflict: {0}")]
     Conflict(String),
+    /// Sub-entity (e.g. a `BundleDeployment`, `EnvPackBinding`,
+    /// `MessagingEndpoint`) is missing under an existing env. Distinct from
+    /// [`StoreError::NotFound`] which is reserved for missing envs. The CLI
+    /// mapper preserves the `not-found` noun by downcasting; the string
+    /// carries the verbatim caller-facing message ("deployment `<id>` not
+    /// found in env `<env>`", etc.) so backend impls don't have to reconstruct it.
+    #[error("not found: {0}")]
+    DependentNotFound(String),
 }
 
 /// Reject env ids that, while valid per the upstream `EnvId` validator
