@@ -1,18 +1,16 @@
 //! `gtc op env trust-root {list,add,remove}` (C2 of `plans/next-gen-deployment.md`).
 //!
-//! Wraps [`crate::environment::trust_root`] in the operator-CLI shape so
-//! external callers can manage the per-env trust root without writing JSON
-//! by hand. All mutations run under the env flock via
-//! [`LocalFsStore::transact`].
+//! Wraps the typed trust-root verbs on [`LocalFsStore`] (Phase D PR-3a.2)
+//! in the operator-CLI shape so external callers can manage the per-env
+//! trust root without writing JSON by hand.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use greentic_deploy_spec::EnvId;
-use greentic_distributor_client::signing::TrustedKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{LocalFsStore, trust_root as store_trust_root};
+use crate::environment::{LocalFsStore, TrustRootSeed, trust_root as store_trust_root};
 
 use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
 
@@ -71,86 +69,49 @@ pub fn bootstrap(
     };
     audit_and_record(store, ctx, |_committed| {
         // Authz passed: now safe to load-or-generate the operator key.
-        let seeded = seed_operator_key_into_trust_root(store, &env_id)?;
+        let seed = store
+            .bootstrap_trust_root(&env_id)
+            .map_err(map_store_err_preserving_noun)?;
         Ok((
-            OpOutcome::new(NOUN, "bootstrap", json!(seeded)),
+            OpOutcome::new(NOUN, "bootstrap", trust_root_seed_to_wire(&env_id, &seed)),
             super::AuditGens::NONE,
         ))
     })
 }
 
-/// Result of seeding the operator key into the env trust root. Serialized
-/// shape matches the legacy `trust-root bootstrap` outcome and is embedded
-/// under the `trust_root` key on `env.init` outcomes (N1.4).
-#[derive(Debug, Clone, Serialize)]
-pub(super) struct TrustRootSeedResult {
-    pub environment_id: String,
-    pub operator_key_id: String,
-    pub operator_public_key_pem: String,
-    pub trusted_key_count: usize,
-}
-
-/// Unconditional variant: used by `trust-root bootstrap`, the documented
-/// explicit re-grant verb. Caller wraps in [`super::audit_and_record`] so
-/// authz fires BEFORE `load_or_generate` writes `~/.greentic/operator/key.pem`.
-/// `op env init` uses the gated [`seed_operator_key_if_trust_root_absent`]
-/// instead, so it cannot re-grant a key the operator revoked via
-/// `trust-root remove`.
-pub(super) fn seed_operator_key_into_trust_root(
-    store: &LocalFsStore,
-    env_id: &EnvId,
-) -> Result<TrustRootSeedResult, OpError> {
-    let op_key = crate::operator_key::load_or_generate()?;
-    let env_dir = store.env_dir(env_id)?;
-    store.transact(env_id, |_locked| {
-        add_op_key_and_summarize(&env_dir, env_id, &op_key)
+/// Wire shape the CLI emits for a [`TrustRootSeed`] — preserves the
+/// pre-PR-3a.2 envelope (`environment_id`/`operator_key_id`/`operator_public_key_pem`/`trusted_key_count`).
+/// Used by `bootstrap` here and `op env init` (via [`trust_root_seed_to_wire_opt`]).
+pub(super) fn trust_root_seed_to_wire(env_id: &EnvId, seed: &TrustRootSeed) -> Value {
+    json!({
+        "environment_id": env_id.as_str(),
+        "operator_key_id": seed.key_id,
+        "operator_public_key_pem": seed.public_key_pem,
+        "trusted_key_count": seed.trusted_key_count,
     })
 }
 
-/// First-init-only variant: returns `None` when `<env_dir>/trust-root.json`
-/// already exists (bootstrapped/added/removed — the operator has touched
-/// the trust root). Existence check + `load_or_generate` + write all sit
-/// under the env flock so a concurrent `trust-root remove` cannot race
-/// the gate, and `~/.greentic/operator/key.pem` is not auto-generated when
-/// the gate would skip.
-pub(super) fn seed_operator_key_if_trust_root_absent(
-    store: &LocalFsStore,
-    env_id: &EnvId,
-) -> Result<Option<TrustRootSeedResult>, OpError> {
-    let env_dir = store.env_dir(env_id)?;
-    let tr_path = crate::environment::trust_root::trust_root_path(&env_dir);
-    store.transact(env_id, |_locked| -> Result<_, OpError> {
-        if tr_path.exists() {
-            return Ok(None);
-        }
-        let op_key = crate::operator_key::load_or_generate()?;
-        add_op_key_and_summarize(&env_dir, env_id, &op_key).map(Some)
-    })
+/// `Option` variant: returns JSON `null` when the trust root was already
+/// present (op no-op), preserving the pre-PR-3a.2 `Option<TrustRootSeedResult>`
+/// serialization the `env init` payload depended on.
+pub(super) fn trust_root_seed_to_wire_opt(env_id: &EnvId, seed: Option<&TrustRootSeed>) -> Value {
+    match seed {
+        Some(s) => trust_root_seed_to_wire(env_id, s),
+        None => Value::Null,
+    }
 }
 
-/// Shared body of the two seed variants: add the operator key to the env
-/// trust root and return the wire-shaped summary. Caller owns the
-/// `load_or_generate` placement (the unconditional variant calls it
-/// outside the flock; the gated variant calls it inside) — this helper
-/// is only the post-key work and assumes the env flock is held.
-fn add_op_key_and_summarize(
-    env_dir: &Path,
-    env_id: &EnvId,
-    op_key: &crate::operator_key::OperatorKey,
-) -> Result<TrustRootSeedResult, OpError> {
-    let trust = store_trust_root::add_trusted_key(
-        env_dir,
-        TrustedKey {
-            key_id: op_key.key_id.clone(),
-            public_key_pem: op_key.public_pem.clone(),
-        },
-    )?;
-    Ok(TrustRootSeedResult {
-        environment_id: env_id.as_str().to_string(),
-        operator_key_id: op_key.key_id.clone(),
-        operator_public_key_pem: op_key.public_pem.clone(),
-        trusted_key_count: trust.keys.len(),
-    })
+/// Downcast a [`crate::environment::StoreError`] so trust-root and
+/// operator-key failures surface under their own `OpError` noun instead of
+/// being flattened into `OpError::Store`. Without this, the error envelope
+/// would regress from `kind="trust-root"` (pre-PR-3a.2 via direct
+/// `TrustRootError` propagation) to `kind="store"`.
+pub(super) fn map_store_err_preserving_noun(e: crate::environment::StoreError) -> OpError {
+    match e {
+        crate::environment::StoreError::TrustRoot(inner) => OpError::TrustRoot(inner),
+        crate::environment::StoreError::OperatorKey(inner) => OpError::OperatorKey(inner),
+        other => OpError::Store(other),
+    }
 }
 
 /// `op env trust-root list <env_id>` — return all trusted keys for the env.
@@ -202,21 +163,9 @@ pub fn add(
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |_committed| {
-        let env_dir = store.env_dir(&env_id)?;
-        let summary = store.transact(&env_id, |_locked| -> Result<Value, OpError> {
-            let trust = store_trust_root::add_trusted_key(
-                &env_dir,
-                TrustedKey {
-                    key_id: payload.key_id.clone(),
-                    public_key_pem: public_key_pem.clone(),
-                },
-            )?;
-            Ok(json!({
-                "environment_id": env_id.as_str(),
-                "added_key_id": payload.key_id,
-                "trusted_key_count": trust.keys.len(),
-            }))
-        })?;
+        let summary = store
+            .add_trusted_key(&env_id, payload.key_id.clone(), public_key_pem.clone())
+            .map_err(map_store_err_preserving_noun)?;
         Ok((OpOutcome::new(NOUN, "add", summary), super::AuditGens::NONE))
     })
 }
@@ -246,24 +195,9 @@ pub fn remove(
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |_committed| {
-        let env_dir = store.env_dir(&env_id)?;
-        let summary = store.transact(&env_id, |_locked| -> Result<Value, OpError> {
-            // Capture the PEM under the flock — no race with concurrent
-            // add/remove can change what we report as "actually removed".
-            let pre = store_trust_root::load(&env_dir)?;
-            let removed_pem = pre
-                .keys
-                .iter()
-                .find(|k| k.key_id.eq_ignore_ascii_case(&payload.key_id))
-                .map(|k| k.public_key_pem.clone());
-            let trust = store_trust_root::remove_trusted_key(&env_dir, &payload.key_id)?;
-            Ok(json!({
-                "environment_id": env_id.as_str(),
-                "removed_key_id": payload.key_id,
-                "removed_public_key_pem": removed_pem,
-                "trusted_key_count": trust.keys.len(),
-            }))
-        })?;
+        let summary = store
+            .remove_trusted_key(&env_id, payload.key_id.clone())
+            .map_err(map_store_err_preserving_noun)?;
         Ok((
             OpOutcome::new(NOUN, "remove", summary),
             super::AuditGens::NONE,

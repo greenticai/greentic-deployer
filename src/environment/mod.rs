@@ -16,6 +16,7 @@ pub mod file_lock;
 pub mod lifecycle;
 pub mod messaging;
 pub mod mutations;
+pub mod mutations_local;
 pub mod runtime_config;
 pub mod store;
 pub mod trust_root;

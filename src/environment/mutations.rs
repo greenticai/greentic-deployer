@@ -80,13 +80,13 @@ pub struct RevisionTransitionOutcome {
 /// Outcome of seeding the bootstrap trust root for an env (the operator
 /// signing key for revenue policies and other env-scoped DSSE artifacts).
 ///
-/// Distinct from `cli::trust_root::TrustRootSeedResult` (the CLI-shaped
-/// envelope with `environment_id` + `trusted_key_count` for the JSON
-/// response); this is the minimal store-layer return.
+/// `trusted_key_count` is the post-add total — the CLI surfaces it on the
+/// wire so operators can see at a glance whether they added a duplicate.
 #[derive(Debug, Clone)]
 pub struct TrustRootSeed {
     pub key_id: String,
     pub public_key_pem: String,
+    pub trusted_key_count: usize,
 }
 
 /// Optional-field patch for [`EnvironmentMutations::update_environment`].
