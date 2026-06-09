@@ -334,6 +334,7 @@ pub fn deploy(
         Some(RevisionTransitionPayload {
             environment_id: payload.environment_id.clone(),
             revision_id: revision_id.clone(),
+            idempotency_key: None,
         }),
     )?;
 

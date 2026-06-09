@@ -90,6 +90,46 @@ pub enum StoreError {
     /// found in env `<env>`", etc.) so backend impls don't have to reconstruct it.
     #[error("not found: {0}")]
     DependentNotFound(String),
+    /// Revision-lifecycle failure surfaced by the typed
+    /// `warm_revision` / `drain_revision` / `archive_revision` verbs
+    /// (PR-3a.6). The inner [`super::LifecycleError`] preserves the
+    /// structured detail (`HealthGateFailed::failed_checks`,
+    /// `Conflict::expected_starts`, `ActiveTrafficReference::splits`)
+    /// the CLI renders to the operator. No `#[from]` impl: the cycle
+    /// between `LifecycleError::Store(StoreError)` and this variant is
+    /// broken in [`super::mutations_local`] by unwrapping
+    /// `LifecycleError::Store` back into the inner `StoreError` at the
+    /// boundary. CLI callers re-extract via
+    /// [`crate::cli::map_store_err_preserving_noun`].
+    #[error(transparent)]
+    Lifecycle(Box<super::LifecycleError>),
+    /// A typed-verb body persisted state to disk via the lifecycle
+    /// helper's internal `locked.save(...)` and *then* failed on a
+    /// post-save step (env reload, materialized-runtime-config refresh,
+    /// etc.). The wrapped `StoreError` is the original failure; CLI
+    /// callers MUST treat the verb as `committed` (so the audit
+    /// boundary fails-closed on an audit-append failure rather than
+    /// demoting it to `tracing::warn!`) AND forward the inner error.
+    /// The closure-based revision-transition path already had this
+    /// invariant — surfacing it across the typed-verb boundary keeps
+    /// the committed-on-error contract intact (`warm` test
+    /// `warm_ok_with_refresh_failure_and_audit_failure_returns_audit_error`).
+    /// HTTP backends (PR-3b) wrap any "we wrote, then the response
+    /// pipeline failed" error in this variant for the same reason.
+    #[error(transparent)]
+    CommittedAfterSave(Box<StoreError>),
+}
+
+impl StoreError {
+    /// `true` iff `self` is the [`StoreError::CommittedAfterSave`] wrapper.
+    /// Typed-verb callers (`cli::revisions::typed_transition`) query this
+    /// BEFORE mapping the error to an `OpError` so they can call
+    /// [`crate::cli::CommitMarker::mark_committed`] on the boundary — the
+    /// wrapper itself is unwrapped one layer at a time by
+    /// [`crate::cli::map_store_err_preserving_noun`].
+    pub fn is_committed_after_save(&self) -> bool {
+        matches!(self, StoreError::CommittedAfterSave(_))
+    }
 }
 
 /// Reject env ids that, while valid per the upstream `EnvId` validator
