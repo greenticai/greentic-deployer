@@ -17,8 +17,9 @@ use chrono::Utc;
 use greentic_distributor_client::signing::TrustedKey;
 
 use greentic_deploy_spec::{
-    DeploymentId, EnvId, Environment, EnvironmentHostConfig, HealthStatus, IdempotencyKey,
-    RetentionPolicy, Revision, RevisionId, RevisionLifecycle, RevocationConfig, SchemaVersion,
+    CapabilitySlot, DeploymentId, EnvId, EnvPackBinding, Environment, EnvironmentHostConfig,
+    HealthStatus, IdempotencyKey, RetentionPolicy, Revision, RevisionId, RevisionLifecycle,
+    RevocationConfig, SchemaVersion,
 };
 
 use super::lifecycle::{
@@ -530,6 +531,166 @@ impl LocalFsStore {
                 deployment,
                 pruned_revision_ids,
             })
+        })
+    }
+
+    // -------------------------------------------------------------
+    // Env-pack binding CRUD  (PR-3a.8)
+    //   `op env-packs add | update | remove | rollback`
+    // -------------------------------------------------------------
+
+    /// Bind a new env-pack slot. Rejects with [`StoreError::Conflict`]
+    /// when the slot is already bound (callers should `update` instead).
+    ///
+    /// `_idempotency_key` is accepted for trait conformance and ignored
+    /// locally; the HTTP backend caches it for A8 §2 replay.
+    pub fn add_pack_binding(
+        &self,
+        env_id: &EnvId,
+        binding: EnvPackBinding,
+        _idempotency_key: IdempotencyKey,
+    ) -> Result<EnvPackBinding, StoreError> {
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            if env.pack_for_slot(binding.slot).is_some() {
+                return Err(StoreError::Conflict(format!(
+                    "slot `{}` already bound on env `{}`; use update",
+                    binding.slot, env_id
+                )));
+            }
+            env.packs.push(binding.clone());
+            locked.save(&env)?;
+            Ok(env.packs.last().expect("just pushed").clone())
+        })
+    }
+
+    /// Replace the binding on an existing slot. Snapshots the prior binding
+    /// inline via [`crate::cli::env_packs::stash_previous`] so one-step
+    /// `rollback` works without a sidecar history file.
+    ///
+    /// Returns `(new_binding, new_generation)`.
+    ///
+    /// `_idempotency_key` is accepted for trait conformance and ignored
+    /// locally; the HTTP backend caches it for A8 §2 replay.
+    pub fn update_pack_binding(
+        &self,
+        env_id: &EnvId,
+        slot: CapabilitySlot,
+        binding: EnvPackBinding,
+        _idempotency_key: IdempotencyKey,
+    ) -> Result<(EnvPackBinding, u64), StoreError> {
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx = env
+                .packs
+                .iter()
+                .position(|b| b.slot == slot)
+                .ok_or_else(|| {
+                    StoreError::DependentNotFound(format!(
+                        "slot `{}` not bound on env `{}`",
+                        slot, env_id
+                    ))
+                })?;
+            if binding.slot != slot {
+                return Err(StoreError::Conflict(format!(
+                    "binding slot `{}` does not match target slot `{}`",
+                    binding.slot, slot
+                )));
+            }
+            let prev_generation = env.packs[idx].generation;
+            let prev_snapshot = serde_json::to_value(&env.packs[idx])
+                .map_err(|e| StoreError::Conflict(format!("snapshot prior binding: {e}")))?;
+            let new_generation = prev_generation + 1;
+            let mut new_binding = EnvPackBinding {
+                generation: new_generation,
+                ..binding
+            };
+            new_binding.previous_binding_ref =
+                Some(crate::cli::env_packs::stash_previous(prev_snapshot));
+            env.packs[idx] = new_binding;
+            locked.save(&env)?;
+            Ok((env.packs[idx].clone(), new_generation))
+        })
+    }
+
+    /// Remove a pack-binding slot. Returns `(removed_binding,
+    /// removed_generation)`.
+    ///
+    /// `_idempotency_key` is accepted for trait conformance and ignored
+    /// locally; the HTTP backend caches it for A8 §2 replay.
+    pub fn remove_pack_binding(
+        &self,
+        env_id: &EnvId,
+        slot: CapabilitySlot,
+        _idempotency_key: IdempotencyKey,
+    ) -> Result<(EnvPackBinding, u64), StoreError> {
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx = env
+                .packs
+                .iter()
+                .position(|b| b.slot == slot)
+                .ok_or_else(|| {
+                    StoreError::DependentNotFound(format!(
+                        "slot `{}` not bound on env `{}`",
+                        slot, env_id
+                    ))
+                })?;
+            let removed = env.packs.remove(idx);
+            let generation = removed.generation;
+            locked.save(&env)?;
+            Ok((removed, generation))
+        })
+    }
+
+    /// Rollback a pack-binding slot to its one-step-previous snapshot.
+    /// Returns `(restored_binding, new_generation)`. Fails with
+    /// [`StoreError::DependentNotFound`] when the slot doesn't exist
+    /// and [`StoreError::Conflict`] when there is no previous snapshot
+    /// to restore.
+    ///
+    /// `_idempotency_key` is accepted for trait conformance and ignored
+    /// locally; the HTTP backend caches it for A8 §2 replay.
+    pub fn rollback_pack_binding(
+        &self,
+        env_id: &EnvId,
+        slot: CapabilitySlot,
+        _idempotency_key: IdempotencyKey,
+    ) -> Result<(EnvPackBinding, u64), StoreError> {
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx = env
+                .packs
+                .iter()
+                .position(|b| b.slot == slot)
+                .ok_or_else(|| {
+                    StoreError::DependentNotFound(format!(
+                        "slot `{}` not bound on env `{}`",
+                        slot, env_id
+                    ))
+                })?;
+            let prev_generation = env.packs[idx].generation;
+            let prev_ref = env.packs[idx].previous_binding_ref.clone().ok_or_else(|| {
+                StoreError::Conflict(format!(
+                    "slot `{}` on env `{}` has no previous binding to roll back to",
+                    slot, env_id
+                ))
+            })?;
+            let prev_value = crate::cli::env_packs::load_previous(&prev_ref).ok_or_else(|| {
+                StoreError::DependentNotFound(format!(
+                    "previous binding payload `{}` missing for slot `{}`",
+                    prev_ref.display(),
+                    slot
+                ))
+            })?;
+            let mut restored: EnvPackBinding = serde_json::from_value(prev_value)
+                .map_err(|e| StoreError::Conflict(format!("deserialise previous binding: {e}")))?;
+            restored.generation = prev_generation + 1;
+            restored.previous_binding_ref = None;
+            let new_generation = restored.generation;
+            env.packs[idx] = restored;
+            locked.save(&env)?;
+            Ok((env.packs[idx].clone(), new_generation))
         })
     }
 

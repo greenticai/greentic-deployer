@@ -45,6 +45,7 @@ fn audit_log_records_distinct_verbs_in_order() {
             kind: "greentic.secrets.dev-store@1.0.0".to_string(),
             pack_ref: "greentic.secrets.dev-store".to_string(),
             answers_ref: None,
+            idempotency_key: None,
         }),
     )
     .unwrap();
@@ -58,6 +59,7 @@ fn audit_log_records_distinct_verbs_in_order() {
             kind: "greentic.telemetry.stdout@1.0.0".to_string(),
             pack_ref: "greentic.telemetry.stdout".to_string(),
             answers_ref: None,
+            idempotency_key: None,
         }),
     )
     .unwrap();
@@ -183,6 +185,7 @@ fn env_packs_update_audit_records_generation_transition() {
             kind: "greentic.secrets.dev-store@1.0.0".to_string(),
             pack_ref: "greentic.secrets.dev-store".to_string(),
             answers_ref: None,
+            idempotency_key: None,
         }),
     )
     .unwrap();
@@ -195,6 +198,7 @@ fn env_packs_update_audit_records_generation_transition() {
             kind: "greentic.secrets.aws-sm@1.0.0".to_string(),
             pack_ref: "greentic.secrets.aws-sm".to_string(),
             answers_ref: None,
+            idempotency_key: None,
         }),
     )
     .unwrap();
