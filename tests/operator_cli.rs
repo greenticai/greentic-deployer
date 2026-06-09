@@ -7,11 +7,11 @@ mod provider_pack;
 
 use provider_pack::{build_operator_provider_gtpack, example_pack_path, write_fake_command_bin};
 
-fn copied_test_binary(dir: &tempfile::TempDir) -> std::path::PathBuf {
-    let source = std::path::Path::new(env!("CARGO_BIN_EXE_greentic-deployer"));
-    let target = dir.path().join("greentic-deployer");
-    std::fs::copy(source, &target).expect("copy greentic-deployer test binary");
-    target
+fn copied_test_binary(_dir: &tempfile::TempDir) -> std::path::PathBuf {
+    // See tests/support/cli_binary.rs::copied_test_binary for the rationale —
+    // the global cli_test_lock serializes binary execution, so the per-test
+    // 345 MB copy is unnecessary and was tipping CI runners into StorageFull.
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_greentic-deployer"))
 }
 
 fn cli_test_lock() -> &'static Mutex<()> {
