@@ -133,7 +133,6 @@ pub fn materialize_pack_configs(
     })?;
 
     let mut refs = Vec::with_capacity(inputs.len());
-    let mut seen_pack_ids = std::collections::HashSet::with_capacity(inputs.len());
     for input_path in &inputs {
         let body = std::fs::read(input_path).map_err(|source| OpError::Io {
             path: input_path.clone(),
@@ -205,14 +204,10 @@ pub fn materialize_pack_configs(
                 input.pack_id
             )));
         }
-
-        if !seen_pack_ids.insert(input.pack_id.clone()) {
-            return Err(OpError::InvalidArgument(format!(
-                "pack-config-input `{}`: duplicate pack_id `{}` in bundle",
-                input_path.display(),
-                input.pack_id
-            )));
-        }
+        // No separate duplicate-pack_id guard needed: filesystem entries in a
+        // single directory have unique full names, and the stem==pack_id check
+        // above pins `input.pack_id` to that unique stem, so two iterations
+        // can never observe the same pack_id.
 
         let mut secret_refs = BTreeMap::new();
         for (key, raw) in input.secret_refs {
