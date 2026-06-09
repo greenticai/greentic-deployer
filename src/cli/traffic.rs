@@ -149,7 +149,7 @@ pub fn set(
         target: json!({"deployment_id": deployment_id.to_string()}),
         idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
-    audit_and_record(store, ctx, |_committed| {
+    audit_and_record(store, ctx, |committed| {
         let outcome = store
             .set_traffic_split(
                 &env_id,
@@ -159,6 +159,11 @@ pub fn set(
                 payload.updated_by,
                 Some(payload.authorization_ref.to_string_lossy().into_owned()),
             )
+            .inspect_err(|err| {
+                if err.is_committed_after_save() {
+                    committed.mark_committed();
+                }
+            })
             .map_err(map_traffic_store_err)?;
         let gens = super::AuditGens {
             previous: outcome.previous_generation,
@@ -384,9 +389,14 @@ pub fn rollback(
         target: json!({"deployment_id": deployment_id.to_string()}),
         idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
-    audit_and_record(store, ctx, |_committed| {
+    audit_and_record(store, ctx, |committed| {
         let outcome = store
             .rollback_traffic_split(&env_id, deployment_id, idempotency_key)
+            .inspect_err(|err| {
+                if err.is_committed_after_save() {
+                    committed.mark_committed();
+                }
+            })
             .map_err(map_traffic_store_err)?;
         let gens = super::AuditGens {
             previous: Some(outcome.previous_generation),
