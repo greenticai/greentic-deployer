@@ -409,14 +409,26 @@ pub fn apply(store: &LocalFsStore, flags: &OpFlags, target: &str) -> Result<OpOu
                 "source env is not eligible for simple migration (see `--check`)".to_string(),
             ));
         }
+        // Destructure once: `source` is an owned `Environment` not read
+        // after this point, so the migrate payload moves its fields in
+        // rather than cloning each one.
+        let Environment {
+            packs,
+            extensions,
+            host_config,
+            revocation,
+            retention,
+            health,
+            ..
+        } = source;
         let payload = MigrateMergePayload {
-            packs: source.packs.clone(),
-            extensions: source.extensions.clone(),
+            packs,
+            extensions,
             seed_if_missing: Some(MigrateSeedPayload {
-                host_config: source.host_config.clone(),
-                revocation: source.revocation.clone(),
-                retention: source.retention.clone(),
-                health: source.health.clone(),
+                host_config,
+                revocation,
+                retention,
+                health,
             }),
         };
         let (merged_slots, merged_extensions) = store

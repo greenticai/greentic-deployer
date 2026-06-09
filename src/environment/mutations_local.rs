@@ -16,7 +16,8 @@ use std::path::Path;
 use greentic_distributor_client::signing::TrustedKey;
 
 use greentic_deploy_spec::{
-    EnvId, Environment, EnvironmentHostConfig, IdempotencyKey, SchemaVersion,
+    EnvId, Environment, EnvironmentHostConfig, HealthStatus, IdempotencyKey, RetentionPolicy,
+    RevocationConfig, SchemaVersion,
 };
 
 use super::mutations::{
@@ -64,25 +65,14 @@ impl LocalFsStore {
                 Err(StoreError::NotFound(_)) => {}
                 Err(e) => return Err(e),
             }
-            let env = Environment {
-                schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
-                environment_id: locked.env_id().clone(),
+            let env = fresh_environment(
+                locked.env_id(),
                 name,
-                host_config: EnvironmentHostConfig {
-                    env_id: locked.env_id().clone(),
-                    ..host_config
-                },
-                packs: Vec::new(),
-                credentials_ref: None,
-                bundles: Vec::new(),
-                revisions: Vec::new(),
-                traffic_splits: Vec::new(),
-                messaging_endpoints: Vec::new(),
-                extensions: Vec::new(),
-                revocation: Default::default(),
-                retention: Default::default(),
-                health: Default::default(),
-            };
+                host_config,
+                RevocationConfig::default(),
+                RetentionPolicy::default(),
+                HealthStatus::default(),
+            );
             locked.save(&env)?;
             Ok(env)
         })
@@ -156,25 +146,14 @@ impl LocalFsStore {
             let mut target_env = match locked.load() {
                 Ok(env) => env,
                 Err(StoreError::NotFound(id)) => match seed_if_missing {
-                    Some(seed) => Environment {
-                        schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
-                        environment_id: locked.env_id().clone(),
-                        name: locked.env_id().as_str().to_string(),
-                        host_config: EnvironmentHostConfig {
-                            env_id: locked.env_id().clone(),
-                            ..seed.host_config
-                        },
-                        packs: Vec::new(),
-                        credentials_ref: None,
-                        bundles: Vec::new(),
-                        revisions: Vec::new(),
-                        traffic_splits: Vec::new(),
-                        messaging_endpoints: Vec::new(),
-                        extensions: Vec::new(),
-                        revocation: seed.revocation,
-                        retention: seed.retention,
-                        health: seed.health,
-                    },
+                    Some(seed) => fresh_environment(
+                        locked.env_id(),
+                        locked.env_id().as_str().to_string(),
+                        seed.host_config,
+                        seed.revocation,
+                        seed.retention,
+                        seed.health,
+                    ),
                     None => return Err(StoreError::NotFound(id)),
                 },
                 Err(e) => return Err(e),
@@ -313,6 +292,46 @@ impl LocalFsStore {
                 trusted_key_count: trust.keys.len(),
             })
         })
+    }
+}
+
+/// Build an empty [`Environment`] at the current `ENVIRONMENT_V1` schema
+/// with the supplied `host_config` + policy state. All collection fields
+/// start empty and `credentials_ref` is `None` — populated downstream by
+/// the binding verbs. Shared by `create_environment` (which passes
+/// `Default::default()` for revocation/retention/health) and
+/// `migrate_merge_bindings`' seed branch (which threads the source's
+/// existing policy state through).
+///
+/// Centralizing this prevents the two seed sites from drifting when a new
+/// `Environment` field lands — both currently must zero/default it, and
+/// missing one site is the silent-zero-value footgun.
+fn fresh_environment(
+    env_id: &EnvId,
+    name: String,
+    host_config: EnvironmentHostConfig,
+    revocation: RevocationConfig,
+    retention: RetentionPolicy,
+    health: HealthStatus,
+) -> Environment {
+    Environment {
+        schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
+        environment_id: env_id.clone(),
+        name,
+        host_config: EnvironmentHostConfig {
+            env_id: env_id.clone(),
+            ..host_config
+        },
+        packs: Vec::new(),
+        credentials_ref: None,
+        bundles: Vec::new(),
+        revisions: Vec::new(),
+        traffic_splits: Vec::new(),
+        messaging_endpoints: Vec::new(),
+        extensions: Vec::new(),
+        revocation,
+        retention,
+        health,
     }
 }
 
