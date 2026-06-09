@@ -264,6 +264,21 @@ pub(crate) fn mint_idempotency_key() -> greentic_deploy_spec::IdempotencyKey {
         .expect("freshly minted ULID is non-empty")
 }
 
+/// Resolve a caller-supplied idempotency key from an optional CLI payload
+/// field, falling back to a fresh-minted ULID. Cross-cutting helper for
+/// every typed-verb CLI site that accepts an optional caller-supplied key
+/// — `cli::bundles::remove`, `cli::revisions::typed_transition`, and the
+/// remaining PR-3a.* migrations.
+pub(crate) fn resolve_idempotency_key(
+    supplied: Option<String>,
+) -> Result<greentic_deploy_spec::IdempotencyKey, OpError> {
+    match supplied {
+        Some(raw) => greentic_deploy_spec::IdempotencyKey::new(raw)
+            .map_err(|e| OpError::InvalidArgument(format!("idempotency_key: {e}"))),
+        None => Ok(mint_idempotency_key()),
+    }
+}
+
 /// Closure-callable handle for signalling "this mutation persisted state to
 /// disk even though it's returning Err."
 ///

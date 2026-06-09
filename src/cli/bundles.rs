@@ -18,9 +18,12 @@ use greentic_deploy_spec::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{EnvironmentStore, LocalFsStore};
+use crate::environment::{EnvironmentStore, LocalFsStore, RemoveBundleOutcome};
 
-use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
+use super::{
+    AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
+    resolve_idempotency_key,
+};
 
 const NOUN: &str = "bundles";
 
@@ -339,6 +342,12 @@ pub fn update(
 pub struct BundleRemovePayload {
     pub environment_id: String,
     pub deployment_id: String,
+    /// Caller-supplied A8 §2 idempotency key. Optional on the CLI
+    /// surface; when absent, `remove` mints one per invocation. Operators
+    /// wanting safe lost-response retries (HTTP backend, PR-3b) supply a
+    /// stable key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 pub fn remove(
@@ -352,64 +361,36 @@ pub fn remove(
     let payload = resolve_payload::<BundleRemovePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "remove",
+        // `pruned_revision_ids` is added inside the closure once the typed
+        // verb returns the prune set — the destructive side effect is
+        // explicit in the audit event.
         target: json!({"deployment_id": deployment_id.to_string()}),
-        idempotency_key: None,
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let summary = store.transact(&env_id, |locked| -> Result<BundleSummary, OpError> {
-            let mut env = locked.load()?;
-            let idx = env
-                .bundles
+        let RemoveBundleOutcome {
+            deployment,
+            pruned_revision_ids,
+        } = store
+            .remove_bundle(&env_id, deployment_id, idempotency_key)
+            .map_err(map_store_err_preserving_noun)?;
+        let summary = BundleSummary::from(&env_id, &deployment);
+        let mut result = serde_json::to_value(summary).expect("BundleSummary is json-safe");
+        // Surface pruned IDs on the wire response so HTTP callers see
+        // exactly what was destroyed (matches what the audit event now
+        // captures via the explicit-side-effect contract).
+        result["pruned_revision_ids"] = json!(
+            pruned_revision_ids
                 .iter()
-                .position(|b| b.deployment_id == deployment_id)
-                .ok_or_else(|| {
-                    OpError::NotFound(format!(
-                        "deployment `{deployment_id}` not found in env `{env_id}`"
-                    ))
-                })?;
-            // Live-state guard. `current_revisions` is plan-level future signal
-            // that A3's stage/warm path does not yet maintain, so it can't be
-            // the gate. The actual live-state proof is: any traffic split
-            // pointing at this deployment, or any non-archived Revision for it.
-            let active_splits = env
-                .traffic_splits
-                .iter()
-                .filter(|s| s.deployment_id == deployment_id)
-                .count();
-            let active_revisions = env
-                .revisions
-                .iter()
-                .filter(|r| {
-                    r.deployment_id == deployment_id
-                        && !matches!(
-                            r.lifecycle,
-                            greentic_deploy_spec::RevisionLifecycle::Archived
-                        )
-                })
-                .count();
-            if active_splits > 0 || active_revisions > 0 {
-                return Err(OpError::Conflict(format!(
-                    "deployment `{deployment_id}` is still live: {active_splits} traffic split(s), \
-                     {active_revisions} non-archived revision(s). Archive revisions and clear the \
-                     split first."
-                )));
-            }
-            let removed = env.bundles.remove(idx);
-            // No live state to nuke at this point; drop the archived revisions
-            // for this deployment so the env stays compact.
-            env.revisions.retain(|r| r.deployment_id != deployment_id);
-            locked.save(&env)?;
-            Ok(BundleSummary::from(&env_id, &removed))
-        })?;
-        let outcome = OpOutcome::new(
-            NOUN,
-            "remove",
-            serde_json::to_value(summary).expect("BundleSummary is json-safe"),
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>()
         );
+        let outcome = OpOutcome::new(NOUN, "remove", result);
         Ok((outcome, super::AuditGens::NONE))
     })
 }
@@ -589,7 +570,11 @@ fn remove_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "environment_id": {"type": "string"},
-            "deployment_id": {"type": "string", "description": "ULID"}
+            "deployment_id": {"type": "string", "description": "ULID"},
+            "idempotency_key": {
+                "type": "string",
+                "description": "Optional A8 §2 caller-supplied key for safe retry replay; minted per-invocation when omitted."
+            }
         }
     })
 }
@@ -599,6 +584,81 @@ mod tests {
     use super::*;
     use crate::cli::tests_common::make_env;
     use tempfile::tempdir;
+
+    /// PR-3a.7 Codex regression: `BundleRemovePayload` accepts an
+    /// `idempotency_key` field; the schema published via `--schema` MUST
+    /// list it under `properties`, otherwise schema-driven callers
+    /// (`gtc op bundles remove --schema | jsonschema-validator …`)
+    /// reject the exact field needed for stable A8 §2 retry keys.
+    #[test]
+    fn remove_schema_lists_idempotency_key() {
+        let schema = remove_schema();
+        assert!(
+            schema.pointer("/properties/idempotency_key").is_some(),
+            "remove_schema must list `idempotency_key` so --schema-driven \
+             callers can supply the A8 retry key (schema: {schema:#})"
+        );
+    }
+
+    /// PR-3a.7 Codex regression: removing a bundle prunes its archived
+    /// revisions, but the destructive side effect must be explicit on the
+    /// wire response (and the audit event) — HTTP backends will apply a
+    /// separate authz check against the prune set.
+    #[test]
+    fn remove_response_surfaces_pruned_revision_ids() {
+        use greentic_deploy_spec::RevisionLifecycle;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env_id = EnvId::try_from("local").unwrap();
+        store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&env_id).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
+
+        let added = add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
+        let did_str = added
+            .result
+            .get("deployment_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let deployment_id = parse_deployment_id(&did_str).unwrap();
+
+        // Seed two archived revisions under that deployment (the live-
+        // state guard demands archived; otherwise remove refuses).
+        let mut env = store.load(&env_id).unwrap();
+        for _ in 0..2 {
+            env.revisions.push(crate::cli::tests_common::make_revision(
+                "local",
+                "fast2flow",
+                &deployment_id,
+                1,
+                RevisionLifecycle::Archived,
+            ));
+        }
+        store.save(&env).unwrap();
+
+        let removed = remove(
+            &store,
+            &OpFlags::default(),
+            Some(BundleRemovePayload {
+                environment_id: "local".to_string(),
+                deployment_id: did_str,
+                idempotency_key: None,
+            }),
+        )
+        .unwrap();
+
+        let pruned = removed
+            .result
+            .get("pruned_revision_ids")
+            .and_then(|v| v.as_array())
+            .expect("pruned_revision_ids on response");
+        assert_eq!(
+            pruned.len(),
+            2,
+            "both archived revisions surface in the response: {removed:#?}"
+        );
+    }
 
     fn payload(bundle_id: &str) -> BundleAddPayload {
         BundleAddPayload {
@@ -765,6 +825,7 @@ mod tests {
             Some(BundleRemovePayload {
                 environment_id: "local".to_string(),
                 deployment_id: did.to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap_err();
@@ -791,6 +852,7 @@ mod tests {
             Some(BundleRemovePayload {
                 environment_id: "local".to_string(),
                 deployment_id: did,
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -836,6 +898,7 @@ mod tests {
             Some(BundleRemovePayload {
                 environment_id: "local".to_string(),
                 deployment_id: did.to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap_err();
@@ -868,6 +931,7 @@ mod tests {
             Some(BundleRemovePayload {
                 environment_id: "local".to_string(),
                 deployment_id: did.to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap_err();

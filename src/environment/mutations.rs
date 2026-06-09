@@ -97,6 +97,21 @@ pub struct RevisionTransitionOutcome {
     pub starting_lifecycle: RevisionLifecycle,
 }
 
+/// Outcome of [`EnvironmentMutations::remove_bundle`]. Surfaces the
+/// archived revisions that were pruned alongside the deployment so the
+/// destructive side effect is explicit on the contract — the CLI records
+/// the IDs in the audit target, and HTTP backends can apply a separate
+/// authorization check against the prune set before committing.
+#[derive(Debug, Clone)]
+pub struct RemoveBundleOutcome {
+    pub deployment: BundleDeployment,
+    /// IDs of revisions removed from `Environment.revisions` as part of the
+    /// post-removal compaction (always in `Archived` state because the
+    /// live-state guard refuses any non-archived revision under the
+    /// deployment).
+    pub pruned_revision_ids: Vec<RevisionId>,
+}
+
 /// Outcome of seeding the bootstrap trust root for an env (the operator
 /// signing key for revenue policies and other env-scoped DSSE artifacts).
 ///
@@ -389,11 +404,25 @@ pub trait EnvironmentMutations: Send + Sync {
         config_overrides: Option<BTreeMap<String, BTreeMap<String, Value>>>,
     ) -> Result<BundleDeployment, StoreError>;
 
+    /// Remove a bundle deployment from the env. Refuses if the deployment
+    /// still has live traffic splits or non-archived revisions —
+    /// callers must `op traffic clear` and archive revisions first.
+    ///
+    /// Also drops archived revisions for the same `deployment_id` so the
+    /// env stays compact. The pruned IDs are surfaced on the outcome so
+    /// the destructive side effect is explicit on the contract —
+    /// HTTP backends can apply a separate authorization check against
+    /// the prune set, the CLI logs the IDs in the audit target.
+    ///
+    /// `idempotency_key` is required for A8 §2 mutation replay; the local
+    /// impl accepts and ignores, the HTTP backend caches the original
+    /// outcome.
     fn remove_bundle(
         &self,
         env_id: &EnvId,
         deployment_id: DeploymentId,
-    ) -> Result<BundleDeployment, StoreError>;
+        idempotency_key: IdempotencyKey,
+    ) -> Result<RemoveBundleOutcome, StoreError>;
 
     // -------------------------------------------------------------
     // Env-pack binding CRUD

@@ -17,17 +17,17 @@ use chrono::Utc;
 use greentic_distributor_client::signing::TrustedKey;
 
 use greentic_deploy_spec::{
-    EnvId, Environment, EnvironmentHostConfig, HealthStatus, IdempotencyKey, RetentionPolicy,
-    Revision, RevisionId, RevisionLifecycle, RevocationConfig, SchemaVersion,
+    DeploymentId, EnvId, Environment, EnvironmentHostConfig, HealthStatus, IdempotencyKey,
+    RetentionPolicy, Revision, RevisionId, RevisionLifecycle, RevocationConfig, SchemaVersion,
 };
 
 use super::lifecycle::{
     LifecycleError, apply_revision_transition, apply_revision_transition_with_health_gate,
 };
 use super::mutations::{
-    ExtensionKey, MigrateMergePayload, RevisionTransitionOutcome, StageRevisionPayload,
-    TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload,
-    WarmRevisionPayload,
+    ExtensionKey, MigrateMergePayload, RemoveBundleOutcome, RevisionTransitionOutcome,
+    StageRevisionPayload, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
+    UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 use super::store::{LocalFsStore, StoreError};
 use super::trust_root::{self as store_trust_root, trust_root_path};
@@ -451,6 +451,84 @@ impl LocalFsStore {
                 revision,
                 environment,
                 starting_lifecycle,
+            })
+        })
+    }
+
+    // -------------------------------------------------------------
+    // Bundle deployment CRUD  (PR-3a.7)
+    //   `op bundles remove`
+    //   `op bundles add | update` move in PR-3a.7b (revenue-policy
+    //   sidecar + operator-key signing across the HTTP wire is a
+    //   distinct design pass).
+    // -------------------------------------------------------------
+
+    /// Remove a [`BundleDeployment`] from the env. Refuses with
+    /// [`StoreError::Conflict`] if the deployment still carries live state
+    /// (any [`greentic_deploy_spec::TrafficSplit`] pointing at it, or any
+    /// non-`Archived` revision under it) — callers run `op traffic clear`
+    /// and archive revisions first. Drops archived revisions for the same
+    /// `deployment_id` so the env stays compact.
+    ///
+    /// Returns [`StoreError::DependentNotFound`] when the deployment is
+    /// absent under the env at lock-acquisition time (matches the
+    /// `DependentNotFound` precedent set by `stage_revision`).
+    ///
+    /// `_idempotency_key` is accepted for trait conformance and ignored
+    /// locally; the HTTP backend caches it for A8 §2 replay.
+    pub fn remove_bundle(
+        &self,
+        env_id: &EnvId,
+        deployment_id: DeploymentId,
+        _idempotency_key: IdempotencyKey,
+    ) -> Result<RemoveBundleOutcome, StoreError> {
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx = env
+                .bundles
+                .iter()
+                .position(|b| b.deployment_id == deployment_id)
+                .ok_or_else(|| {
+                    StoreError::DependentNotFound(format!(
+                        "deployment `{deployment_id}` not found in env `{env_id}`"
+                    ))
+                })?;
+            // Live-state guard + prune set computed in one pass over
+            // `env.revisions`. `current_revisions` is plan-level future
+            // signal that A3's stage/warm path does not yet maintain, so
+            // it can't be the gate; the live-state proof is: any traffic
+            // split pointing at this deployment, or any non-`Archived`
+            // revision for it.
+            let active_splits = env
+                .traffic_splits
+                .iter()
+                .filter(|s| s.deployment_id == deployment_id)
+                .count();
+            let mut active_revisions = 0usize;
+            let mut pruned_revision_ids: Vec<RevisionId> = Vec::new();
+            for r in env.revisions.iter() {
+                if r.deployment_id != deployment_id {
+                    continue;
+                }
+                if matches!(r.lifecycle, RevisionLifecycle::Archived) {
+                    pruned_revision_ids.push(r.revision_id);
+                } else {
+                    active_revisions += 1;
+                }
+            }
+            if active_splits > 0 || active_revisions > 0 {
+                return Err(StoreError::Conflict(format!(
+                    "deployment `{deployment_id}` is still live: {active_splits} traffic split(s), \
+                     {active_revisions} non-archived revision(s). Archive revisions and clear the \
+                     split first."
+                )));
+            }
+            let deployment = env.bundles.remove(idx);
+            env.revisions.retain(|r| r.deployment_id != deployment_id);
+            locked.save(&env)?;
+            Ok(RemoveBundleOutcome {
+                deployment,
+                pruned_revision_ids,
             })
         })
     }

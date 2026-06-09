@@ -488,11 +488,7 @@ where
     // event and in the typed verb call so an HTTP backend (PR-3b) can
     // replay the original outcome on a lost-response retry. Falling back
     // to a fresh ULID keeps existing CLI usage working unchanged.
-    let idempotency_key = match payload.idempotency_key {
-        Some(raw) => greentic_deploy_spec::IdempotencyKey::new(raw)
-            .map_err(|e| OpError::InvalidArgument(format!("idempotency_key: {e}")))?,
-        None => mint_idempotency_key(),
-    };
+    let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -860,7 +856,11 @@ fn transition_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "environment_id": {"type": "string"},
-            "revision_id": {"type": "string", "description": "ULID"}
+            "revision_id": {"type": "string", "description": "ULID"},
+            "idempotency_key": {
+                "type": "string",
+                "description": "Optional A8 §2 caller-supplied key for safe retry replay; minted per-invocation when omitted."
+            }
         }
     })
 }
@@ -870,6 +870,22 @@ mod tests {
     use super::*;
     use crate::cli::tests_common::{make_bundle_deployment, make_env};
     use tempfile::tempdir;
+
+    /// PR-3a.7 schema-drift regression (carries the same fix as
+    /// `cli::bundles::tests::remove_schema_lists_idempotency_key`):
+    /// `RevisionTransitionPayload` accepts an `idempotency_key` field, so
+    /// `--schema` output MUST list it under `properties` — otherwise
+    /// schema-driven callers reject the exact field needed for A8 §2
+    /// retry replay.
+    #[test]
+    fn transition_schema_lists_idempotency_key() {
+        let schema = transition_schema();
+        assert!(
+            schema.pointer("/properties/idempotency_key").is_some(),
+            "transition_schema must list `idempotency_key` so --schema-driven \
+             callers can supply the A8 retry key (schema: {schema:#})"
+        );
+    }
 
     fn seed_env_with_deployment(store: &LocalFsStore) -> DeploymentId {
         let mut env = make_env("local");
