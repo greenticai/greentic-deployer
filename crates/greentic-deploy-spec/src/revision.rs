@@ -109,6 +109,13 @@ pub struct Revision {
     pub pack_list: Vec<PackListEntry>,
     /// Env-relative path to the pinned pack-list lockfile.
     pub pack_list_lock_ref: PathBuf,
+    /// Env-relative paths to per-pack `pack-config.v1` documents written at
+    /// stage time (one per pack id that carried a `pack-config-input.v1` in
+    /// the bundle). Empty when the bundle had no inputs or when staging used
+    /// the legacy non-bundle path. Surfaces through the runtime-config
+    /// projection's `pack_config_refs` for `greentic-start` to load.
+    #[serde(default)]
+    pub pack_config_refs: Vec<PathBuf>,
     /// Hash of (setup-answers + pack_list).
     pub config_digest: String,
     /// Env-relative path to the revision DSSE sidecar.

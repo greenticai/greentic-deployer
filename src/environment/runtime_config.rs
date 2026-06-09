@@ -27,11 +27,15 @@
 //! revision_id)`) and emitting that revision's `pack_list_lock_ref` — the
 //! `pack-list.lock` written at stage time. An entry with no matching revision
 //! (or a revision with an empty lock ref) emits no ref: B0 only file-checks
-//! non-empty refs, so the boot/route seam stays fail-safe. `pack_config_refs`
-//! remains empty pending `pack-config.v1` (Phase C).
+//! non-empty refs, so the boot/route seam stays fail-safe.
+//!
+//! `pack_config_refs` are sourced from the same revision's
+//! `pack_config_refs` field — one env-relative path per pack id that carried
+//! a `pack-config-input.v1` at stage time (C7). Bundles with no wizard inputs
+//! contribute no refs; B0 file-checks only non-empty refs, so the seam stays
+//! fail-safe through the legacy path.
 
 use greentic_deploy_spec::{Environment, RevisionRuntimeBlock, RuntimeConfig, SchemaVersion};
-use std::path::PathBuf;
 
 /// Materialize the `runtime-config.v1` projection of an environment's traffic
 /// splits. Pure and total: one [`RevisionRuntimeBlock`] per split entry, in
@@ -45,24 +49,27 @@ pub fn materialize_runtime_config(env: &Environment) -> RuntimeConfig {
         .iter()
         .flat_map(|split| {
             split.entries.iter().map(move |entry| {
-                // Join to the revision to surface its pinned pack-list lockfile.
-                // A missing match or empty ref yields no pack_list_refs, which
-                // B0 treats as "nothing to file-check" rather than an error.
-                let pack_list_refs = env
-                    .revisions
-                    .iter()
-                    .find(|r| {
-                        r.revision_id == entry.revision_id && r.deployment_id == split.deployment_id
-                    })
+                // Join to the revision once to surface BOTH its pinned
+                // pack-list lockfile AND its per-pack pack-config.v1 refs.
+                // A missing match (or an empty lock ref) yields no
+                // pack_list_refs / pack_config_refs, which B0 treats as
+                // "nothing to file-check" rather than an error.
+                let revision = env.revisions.iter().find(|r| {
+                    r.revision_id == entry.revision_id && r.deployment_id == split.deployment_id
+                });
+                let pack_list_refs = revision
                     .filter(|r| !r.pack_list_lock_ref.as_os_str().is_empty())
                     .map(|r| vec![r.pack_list_lock_ref.clone()])
+                    .unwrap_or_default();
+                let pack_config_refs = revision
+                    .map(|r| r.pack_config_refs.clone())
                     .unwrap_or_default();
                 RevisionRuntimeBlock {
                     deployment_id: split.deployment_id,
                     revision_id: entry.revision_id,
                     bundle_id: split.bundle_id.clone(),
                     pack_list_refs,
-                    pack_config_refs: Vec::<PathBuf>::new(),
+                    pack_config_refs,
                     weight_bps: entry.weight_bps,
                 }
             })
@@ -158,6 +165,7 @@ mod tests {
             bundle_digest: "sha256:00".to_string(),
             pack_list: Vec::new(),
             pack_list_lock_ref,
+            pack_config_refs: Vec::new(),
             config_digest: "sha256:00".to_string(),
             signature_sidecar_ref: PathBuf::from("rev.sig"),
             lifecycle: RevisionLifecycle::Ready,
@@ -265,8 +273,35 @@ mod tests {
         let cfg = materialize_runtime_config(&env);
         assert_eq!(cfg.revisions.len(), 1);
         assert_eq!(cfg.revisions[0].pack_list_refs, vec![lock_ref]);
-        // pack-config refs stay empty (Phase C).
+        // pack-config refs stay empty when the revision carried no inputs.
         assert!(cfg.revisions[0].pack_config_refs.is_empty());
+    }
+
+    #[test]
+    fn split_entry_surfaces_revision_pack_config_refs() {
+        // A revision staged from a bundle that carried `pack-config-input.v1`
+        // files (C7) records env-relative paths on `pack_config_refs`. The
+        // materializer must surface them in the runtime-config block so
+        // `greentic-start` can resolve them through the C4 channel.
+        let did = DeploymentId::new();
+        let rid = RevisionId::new();
+        let lock_ref = PathBuf::from(format!("revisions/{rid}/pack-list.lock"));
+        let cfg_refs = vec![
+            PathBuf::from(format!("revisions/{rid}/pack-configs/alpha.pack.json")),
+            PathBuf::from(format!("revisions/{rid}/pack-configs/beta.pack.json")),
+        ];
+        let mut env = env(
+            "local",
+            vec![split("local", "fast2flow", did, vec![(rid, 10_000)])],
+        );
+        let mut rev = revision("local", "fast2flow", did, rid, lock_ref.clone());
+        rev.pack_config_refs = cfg_refs.clone();
+        env.revisions.push(rev);
+
+        let cfg = materialize_runtime_config(&env);
+        assert_eq!(cfg.revisions.len(), 1);
+        assert_eq!(cfg.revisions[0].pack_list_refs, vec![lock_ref]);
+        assert_eq!(cfg.revisions[0].pack_config_refs, cfg_refs);
     }
 
     #[test]
