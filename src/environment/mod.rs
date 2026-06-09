@@ -38,7 +38,7 @@ pub use lifecycle::{
 pub use messaging::{MessagingEndpointIndexEntry, materialize_messaging_index};
 pub use mutations::{
     AddBundlePayload, AddMessagingEndpointPayload, EnvironmentMutations, ExtensionKey,
-    MigrateMergePayload, MigrateSeedPayload, RevisionTransitionOutcome,
+    MigrateMergePayload, MigrateSeedPayload, RemoveBundleOutcome, RevisionTransitionOutcome,
     SetMessagingWelcomeFlowPayload, StageRevisionPayload, TrustRootAddOutcome,
     TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload, WarmRevisionPayload,
 };

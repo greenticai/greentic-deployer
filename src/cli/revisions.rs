@@ -860,7 +860,11 @@ fn transition_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "environment_id": {"type": "string"},
-            "revision_id": {"type": "string", "description": "ULID"}
+            "revision_id": {"type": "string", "description": "ULID"},
+            "idempotency_key": {
+                "type": "string",
+                "description": "Optional A8 §2 caller-supplied key for safe retry replay; minted per-invocation when omitted."
+            }
         }
     })
 }
@@ -870,6 +874,26 @@ mod tests {
     use super::*;
     use crate::cli::tests_common::{make_bundle_deployment, make_env};
     use tempfile::tempdir;
+
+    /// PR-3a.7 schema-drift regression (carries the same fix as
+    /// `cli::bundles::tests::remove_schema_lists_idempotency_key`):
+    /// `RevisionTransitionPayload` accepts an `idempotency_key` field, so
+    /// `--schema` output MUST list it under `properties` — otherwise
+    /// schema-driven callers reject the exact field needed for A8 §2
+    /// retry replay.
+    #[test]
+    fn transition_schema_lists_idempotency_key() {
+        let schema = transition_schema();
+        let props = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("properties block");
+        assert!(
+            props.contains_key("idempotency_key"),
+            "transition_schema must list `idempotency_key` so --schema-driven \
+             callers can supply the A8 retry key (schema: {schema:#})"
+        );
+    }
 
     fn seed_env_with_deployment(store: &LocalFsStore) -> DeploymentId {
         let mut env = make_env("local");

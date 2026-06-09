@@ -370,19 +370,29 @@ pub fn remove(
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "remove",
+        // `pruned_revision_ids` is added inside the closure once the typed
+        // verb returns the prune set — the destructive side effect is
+        // explicit in the audit event.
         target: json!({"deployment_id": deployment_id.to_string()}),
         idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let removed = store
+        let outcome_struct = store
             .remove_bundle(&env_id, deployment_id, idempotency_key)
             .map_err(map_store_err_preserving_noun)?;
-        let summary = BundleSummary::from(&env_id, &removed);
-        let outcome = OpOutcome::new(
-            NOUN,
-            "remove",
-            serde_json::to_value(summary).expect("BundleSummary is json-safe"),
+        let summary = BundleSummary::from(&env_id, &outcome_struct.deployment);
+        let mut result = serde_json::to_value(summary).expect("BundleSummary is json-safe");
+        // Surface pruned IDs on the wire response so HTTP callers see
+        // exactly what was destroyed (matches what the audit event now
+        // captures via the explicit-side-effect contract).
+        result["pruned_revision_ids"] = json!(
+            outcome_struct
+                .pruned_revision_ids
+                .iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>()
         );
+        let outcome = OpOutcome::new(NOUN, "remove", result);
         Ok((outcome, super::AuditGens::NONE))
     })
 }
@@ -562,7 +572,11 @@ fn remove_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "environment_id": {"type": "string"},
-            "deployment_id": {"type": "string", "description": "ULID"}
+            "deployment_id": {"type": "string", "description": "ULID"},
+            "idempotency_key": {
+                "type": "string",
+                "description": "Optional A8 §2 caller-supplied key for safe retry replay; minted per-invocation when omitted."
+            }
         }
     })
 }
@@ -572,6 +586,101 @@ mod tests {
     use super::*;
     use crate::cli::tests_common::make_env;
     use tempfile::tempdir;
+
+    /// PR-3a.7 Codex regression: `BundleRemovePayload` accepts an
+    /// `idempotency_key` field; the schema published via `--schema` MUST
+    /// list it under `properties`, otherwise schema-driven callers
+    /// (`gtc op bundles remove --schema | jsonschema-validator …`)
+    /// reject the exact field needed for stable A8 §2 retry keys.
+    #[test]
+    fn remove_schema_lists_idempotency_key() {
+        let schema = remove_schema();
+        let props = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("properties block");
+        assert!(
+            props.contains_key("idempotency_key"),
+            "remove_schema must list `idempotency_key` so --schema-driven \
+             callers can supply the A8 retry key (schema: {schema:#})"
+        );
+    }
+
+    /// PR-3a.7 Codex regression: removing a bundle prunes its archived
+    /// revisions, but the destructive side effect must be explicit on the
+    /// wire response (and the audit event) — HTTP backends will apply a
+    /// separate authz check against the prune set.
+    #[test]
+    fn remove_response_surfaces_pruned_revision_ids() {
+        use greentic_deploy_spec::{Revision, RevisionLifecycle, SchemaVersion};
+        use std::path::PathBuf;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env_id = EnvId::try_from("local").unwrap();
+        store.save(&make_env("local")).unwrap();
+        let env_dir = store.env_dir(&env_id).unwrap();
+        crate::cli::tests_common::bootstrap_env_trust_root(&env_dir);
+
+        let added = add(&store, &OpFlags::default(), Some(payload("fast2flow"))).unwrap();
+        let did_str = added
+            .result
+            .get("deployment_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let deployment_id = parse_deployment_id(&did_str).unwrap();
+
+        // Seed two archived revisions under that deployment (the live-
+        // state guard demands archived; otherwise remove refuses).
+        let bundle_id = BundleId::new("fast2flow");
+        let mut env = store.load(&env_id).unwrap();
+        let now = Utc::now();
+        for _ in 0..2 {
+            env.revisions.push(Revision {
+                schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
+                revision_id: crate::environment::mint_revision_id(),
+                env_id: env_id.clone(),
+                bundle_id: bundle_id.clone(),
+                deployment_id,
+                sequence: 1,
+                created_at: now,
+                bundle_digest: "sha256:00".to_string(),
+                pack_list: Vec::new(),
+                pack_list_lock_ref: PathBuf::new(),
+                pack_config_refs: Vec::new(),
+                config_digest: "sha256:00".to_string(),
+                signature_sidecar_ref: PathBuf::from("rev.sig"),
+                lifecycle: RevisionLifecycle::Archived,
+                staged_at: Some(now),
+                warmed_at: None,
+                drain_seconds: 30,
+                abort_metrics: Vec::new(),
+            });
+        }
+        store.save(&env).unwrap();
+
+        let removed = remove(
+            &store,
+            &OpFlags::default(),
+            Some(BundleRemovePayload {
+                environment_id: "local".to_string(),
+                deployment_id: did_str,
+                idempotency_key: None,
+            }),
+        )
+        .unwrap();
+
+        let pruned = removed
+            .result
+            .get("pruned_revision_ids")
+            .and_then(|v| v.as_array())
+            .expect("pruned_revision_ids on response");
+        assert_eq!(
+            pruned.len(),
+            2,
+            "both archived revisions surface in the response: {removed:#?}"
+        );
+    }
 
     fn payload(bundle_id: &str) -> BundleAddPayload {
         BundleAddPayload {

@@ -17,18 +17,17 @@ use chrono::Utc;
 use greentic_distributor_client::signing::TrustedKey;
 
 use greentic_deploy_spec::{
-    BundleDeployment, DeploymentId, EnvId, Environment, EnvironmentHostConfig, HealthStatus,
-    IdempotencyKey, RetentionPolicy, Revision, RevisionId, RevisionLifecycle, RevocationConfig,
-    SchemaVersion,
+    DeploymentId, EnvId, Environment, EnvironmentHostConfig, HealthStatus, IdempotencyKey,
+    RetentionPolicy, Revision, RevisionId, RevisionLifecycle, RevocationConfig, SchemaVersion,
 };
 
 use super::lifecycle::{
     LifecycleError, apply_revision_transition, apply_revision_transition_with_health_gate,
 };
 use super::mutations::{
-    ExtensionKey, MigrateMergePayload, RevisionTransitionOutcome, StageRevisionPayload,
-    TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload,
-    WarmRevisionPayload,
+    ExtensionKey, MigrateMergePayload, RemoveBundleOutcome, RevisionTransitionOutcome,
+    StageRevisionPayload, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
+    UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 use super::store::{LocalFsStore, StoreError};
 use super::trust_root::{self as store_trust_root, trust_root_path};
@@ -482,7 +481,7 @@ impl LocalFsStore {
         env_id: &EnvId,
         deployment_id: DeploymentId,
         _idempotency_key: IdempotencyKey,
-    ) -> Result<BundleDeployment, StoreError> {
+    ) -> Result<RemoveBundleOutcome, StoreError> {
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
             let idx = env
@@ -519,12 +518,22 @@ impl LocalFsStore {
                      split first."
                 )));
             }
-            let removed = env.bundles.remove(idx);
-            // No live state to nuke at this point; drop the archived
-            // revisions for this deployment so the env stays compact.
+            let deployment = env.bundles.remove(idx);
+            // Capture the archived revisions BEFORE retaining the rest so
+            // the prune set is explicit on the outcome (HTTP backends can
+            // apply a separate authz check; audit logs the IDs).
+            let pruned_revision_ids: Vec<RevisionId> = env
+                .revisions
+                .iter()
+                .filter(|r| r.deployment_id == deployment_id)
+                .map(|r| r.revision_id)
+                .collect();
             env.revisions.retain(|r| r.deployment_id != deployment_id);
             locked.save(&env)?;
-            Ok(removed)
+            Ok(RemoveBundleOutcome {
+                deployment,
+                pruned_revision_ids,
+            })
         })
     }
 
