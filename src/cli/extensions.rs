@@ -21,8 +21,10 @@ use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, ExtensionKey, LocalFsStore};
 
-use super::env_packs::{load_previous, stash_previous};
-use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
+use super::{
+    AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
+    resolve_idempotency_key,
+};
 
 const NOUN: &str = "extensions";
 
@@ -36,6 +38,12 @@ pub struct ExtensionBindingPayload {
     pub instance_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answers_ref: Option<PathBuf>,
+    /// Caller-supplied A8 §2 idempotency key. Optional on the CLI
+    /// surface; when absent, the verb mints one per invocation. Operators
+    /// wanting safe lost-response retries (HTTP backend, PR-3b) supply a
+    /// stable key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 /// Payload for `op extensions remove` / `op extensions rollback`. Identifies a
@@ -47,6 +55,10 @@ pub struct ExtensionRemovePayload {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
+    /// Caller-supplied A8 §2 idempotency key. Optional on the CLI
+    /// surface; when absent, the verb mints one per invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 /// Returned by every mutating call.
@@ -85,30 +97,19 @@ pub fn add(
     let payload = resolve_payload(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let binding = build_binding(&payload, 0, None)?;
-    let key = ExtensionKey::from_binding(&binding);
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "add",
         target: json!({"kind": payload.kind, "instance_id": payload.instance_id}),
-        idempotency_key: None,
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let summary = store.transact(&env_id, |locked| -> Result<ExtensionSummary, OpError> {
-            let mut env = locked.load()?;
-            if env.extensions.iter().any(|b| key.matches(b)) {
-                return Err(OpError::Conflict(format!(
-                    "extension `{}` is already bound on env `{}`; use update",
-                    key, env_id
-                )));
-            }
-            env.extensions.push(binding.clone());
-            locked.save(&env)?;
-            Ok(ExtensionSummary::from_binding(
-                &env_id,
-                env.extensions.last().expect("just pushed"),
-            ))
-        })?;
+        let added = store
+            .add_extension_binding(&env_id, binding, idempotency_key)
+            .map_err(map_store_err_preserving_noun)?;
+        let summary = ExtensionSummary::from_binding(&env_id, &added);
         let outcome = OpOutcome::new(
             NOUN,
             "add",
@@ -135,34 +136,24 @@ pub fn update(
     let payload = resolve_payload(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let key = build_key(&payload.kind, &payload.instance_id)?;
+    let binding = build_binding(&payload, 0, None)?;
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "update",
         target: json!({"kind": payload.kind, "instance_id": payload.instance_id}),
-        idempotency_key: None,
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let (summary, gens) = store.transact(&env_id, |locked| {
-            let mut env = locked.load()?;
-            let idx = find_idx(&env.extensions, &key)
-                .ok_or_else(|| OpError::NotFound(not_found_msg(&key, &env_id)))?;
-            let prev_generation = env.extensions[idx].generation;
-            let prev_snapshot = serde_json::to_value(&env.extensions[idx])
-                .map_err(|e| OpError::InvalidArgument(format!("snapshot prior binding: {e}")))?;
-            let mut new_binding = build_binding(&payload, prev_generation + 1, None)?;
-            new_binding.previous_binding_ref = Some(stash_previous(prev_snapshot));
-            env.extensions[idx] = new_binding;
-            locked.save(&env)?;
-            let gens = super::AuditGens {
-                previous: Some(prev_generation),
-                new: Some(prev_generation + 1),
-            };
-            Ok::<_, OpError>((
-                ExtensionSummary::from_binding(&env_id, &env.extensions[idx]),
-                gens,
-            ))
-        })?;
+        let (updated, new_generation) = store
+            .update_extension_binding(&env_id, key, binding, idempotency_key)
+            .map_err(map_store_err_preserving_noun)?;
+        let summary = ExtensionSummary::from_binding(&env_id, &updated);
+        let gens = super::AuditGens {
+            previous: new_generation.checked_sub(1),
+            new: Some(new_generation),
+        };
         let outcome = OpOutcome::new(
             NOUN,
             "update",
@@ -183,26 +174,23 @@ pub fn remove(
     let payload = resolve_payload::<ExtensionRemovePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let key = build_key(&payload.kind, &payload.instance_id)?;
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "remove",
         target: json!({"kind": payload.kind, "instance_id": payload.instance_id}),
-        idempotency_key: None,
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let (summary, gens) = store.transact(&env_id, |locked| {
-            let mut env = locked.load()?;
-            let idx = find_idx(&env.extensions, &key)
-                .ok_or_else(|| OpError::NotFound(not_found_msg(&key, &env_id)))?;
-            let removed = env.extensions.remove(idx);
-            locked.save(&env)?;
-            let gens = super::AuditGens {
-                previous: Some(removed.generation),
-                new: None,
-            };
-            Ok::<_, OpError>((ExtensionSummary::from_binding(&env_id, &removed), gens))
-        })?;
+        let (removed, generation) = store
+            .remove_extension_binding(&env_id, key, idempotency_key)
+            .map_err(map_store_err_preserving_noun)?;
+        let summary = ExtensionSummary::from_binding(&env_id, &removed);
+        let gens = super::AuditGens {
+            previous: Some(generation),
+            new: None,
+        };
         let outcome = OpOutcome::new(
             NOUN,
             "remove",
@@ -223,52 +211,23 @@ pub fn rollback(
     let payload = resolve_payload::<ExtensionRemovePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let key = build_key(&payload.kind, &payload.instance_id)?;
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "rollback",
         target: json!({"kind": payload.kind, "instance_id": payload.instance_id}),
-        idempotency_key: None,
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let (summary, gens) = store.transact(&env_id, |locked| {
-            let mut env = locked.load()?;
-            let idx = find_idx(&env.extensions, &key)
-                .ok_or_else(|| OpError::NotFound(not_found_msg(&key, &env_id)))?;
-            let prev_generation = env.extensions[idx].generation;
-            let prev_ref = env.extensions[idx]
-                .previous_binding_ref
-                .clone()
-                .ok_or_else(|| {
-                    OpError::Conflict(format!(
-                        "extension `{}` on env `{}` has no previous binding to roll back to",
-                        key, env_id
-                    ))
-                })?;
-            let prev_value = load_previous(&prev_ref).ok_or_else(|| {
-                OpError::NotFound(format!(
-                    "previous binding payload `{}` missing for extension `{}`",
-                    prev_ref.display(),
-                    key
-                ))
-            })?;
-            let mut restored: ExtensionBinding =
-                serde_json::from_value(prev_value).map_err(|e| {
-                    OpError::InvalidArgument(format!("deserialise previous binding: {e}"))
-                })?;
-            restored.generation = prev_generation + 1;
-            restored.previous_binding_ref = None;
-            env.extensions[idx] = restored;
-            locked.save(&env)?;
-            let gens = super::AuditGens {
-                previous: Some(prev_generation),
-                new: Some(prev_generation + 1),
-            };
-            Ok::<_, OpError>((
-                ExtensionSummary::from_binding(&env_id, &env.extensions[idx]),
-                gens,
-            ))
-        })?;
+        let (restored, new_generation) = store
+            .rollback_extension_binding(&env_id, key, idempotency_key)
+            .map_err(map_store_err_preserving_noun)?;
+        let summary = ExtensionSummary::from_binding(&env_id, &restored);
+        let gens = super::AuditGens {
+            previous: new_generation.checked_sub(1),
+            new: Some(new_generation),
+        };
         let outcome = OpOutcome::new(
             NOUN,
             "rollback",
@@ -304,14 +263,6 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
 }
 
 // --- internals -----------------------------------------------------------
-
-fn find_idx(extensions: &[ExtensionBinding], key: &ExtensionKey) -> Option<usize> {
-    extensions.iter().position(|b| key.matches(b))
-}
-
-fn not_found_msg(key: &ExtensionKey, env_id: &EnvId) -> String {
-    format!("extension `{key}` not bound on env `{env_id}`")
-}
 
 /// Build the lookup key from a remove/rollback payload's `kind` (path is the
 /// version-independent key) and `instance_id`.
@@ -369,7 +320,11 @@ fn payload_schema() -> Value {
             "kind": {"type": "string", "description": "PackDescriptor — `<namespace>.<id>@<semver>`."},
             "pack_ref": {"type": "string"},
             "instance_id": {"type": ["string", "null"], "description": "Distinguishes N instances of the same extension; omit for the single default instance."},
-            "answers_ref": {"type": ["string", "null"]}
+            "answers_ref": {"type": ["string", "null"]},
+            "idempotency_key": {
+                "type": "string",
+                "description": "Optional A8 §2 caller-supplied key for safe retry replay; minted per-invocation when omitted."
+            }
         }
     })
 }
@@ -384,7 +339,11 @@ fn remove_schema() -> Value {
         "properties": {
             "environment_id": {"type": "string"},
             "kind": {"type": "string", "description": "PackDescriptor — `@<version>` is ignored; the path is the key."},
-            "instance_id": {"type": ["string", "null"]}
+            "instance_id": {"type": ["string", "null"]},
+            "idempotency_key": {
+                "type": "string",
+                "description": "Optional A8 §2 caller-supplied key for safe retry replay; minted per-invocation when omitted."
+            }
         }
     })
 }
@@ -403,6 +362,7 @@ mod tests {
             pack_ref: kind.split('@').next().unwrap_or(kind).to_string(),
             instance_id: instance.map(str::to_string),
             answers_ref: None,
+            idempotency_key: None,
         }
     }
 
@@ -506,6 +466,7 @@ mod tests {
                 environment_id: "local".to_string(),
                 kind: "acme.oauth.auth0@2.0.0".to_string(),
                 instance_id: Some("primary".to_string()),
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -544,6 +505,7 @@ mod tests {
                 environment_id: "local".to_string(),
                 kind: "acme.oauth.auth0@9.9.9".to_string(), // version ignored
                 instance_id: Some("primary".to_string()),
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -568,6 +530,7 @@ mod tests {
                 environment_id: "local".to_string(),
                 kind: "acme.oauth.auth0@1.0.0".to_string(),
                 instance_id: None,
+                idempotency_key: None,
             }),
         )
         .unwrap_err();
@@ -595,6 +558,7 @@ mod tests {
                 environment_id: "local".to_string(),
                 kind: "acme.oauth.auth0@1.0.0".to_string(),
                 instance_id: Some("primary".to_string()),
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -605,6 +569,7 @@ mod tests {
                 environment_id: "local".to_string(),
                 kind: "acme.oauth.auth0@1.0.0".to_string(),
                 instance_id: Some("primary".to_string()),
+                idempotency_key: None,
             }),
         )
         .unwrap_err();
@@ -627,6 +592,70 @@ mod tests {
         assert!(
             !matches!(err, OpError::Conflict(_)),
             "expected a validation error, got {err:?}"
+        );
+    }
+
+    // --- PR-3a.9 schema regression tests ---
+
+    #[test]
+    fn add_schema_lists_idempotency_key() {
+        let schema = payload_schema();
+        assert!(
+            schema.pointer("/properties/idempotency_key").is_some(),
+            "payload_schema must list `idempotency_key` so --schema-driven \
+             callers can supply the A8 retry key (schema: {schema:#})"
+        );
+    }
+
+    #[test]
+    fn update_schema_lists_idempotency_key() {
+        // `update` reuses `payload_schema`, but verify via the public path.
+        let outcome = add(
+            &LocalFsStore::new(tempdir().unwrap().path()),
+            &OpFlags {
+                schema_only: true,
+                ..OpFlags::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            outcome
+                .result
+                .pointer("/properties/idempotency_key")
+                .is_some(),
+            "add --schema must list `idempotency_key`"
+        );
+    }
+
+    #[test]
+    fn remove_schema_lists_idempotency_key() {
+        let schema = remove_schema();
+        assert!(
+            schema.pointer("/properties/idempotency_key").is_some(),
+            "remove_schema must list `idempotency_key` so --schema-driven \
+             callers can supply the A8 retry key (schema: {schema:#})"
+        );
+    }
+
+    #[test]
+    fn rollback_schema_lists_idempotency_key() {
+        // `rollback` reuses `remove_schema`, but verify via the public path.
+        let outcome = rollback(
+            &LocalFsStore::new(tempdir().unwrap().path()),
+            &OpFlags {
+                schema_only: true,
+                ..OpFlags::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            outcome
+                .result
+                .pointer("/properties/idempotency_key")
+                .is_some(),
+            "rollback --schema must list `idempotency_key`"
         );
     }
 }
