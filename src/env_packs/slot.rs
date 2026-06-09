@@ -89,6 +89,27 @@ pub trait EnvPackHandler: std::fmt::Debug + Send + Sync {
     fn wizard_qaspec_yaml(&self) -> Option<&'static str> {
         None
     }
+
+    /// Deployer-only: the [`Deployer`](super::deployer::Deployer) trait
+    /// impl this handler ships.
+    ///
+    /// Returns `Some(_)` only on `Deployer`-slot handlers that have a
+    /// real impl wired up (the local-process reference and Phase D
+    /// K8s / AWS / GCP / Azure). Returns `None` for every non-deployer
+    /// slot AND for deployer handlers that haven't been migrated yet —
+    /// consumers MUST treat the `None` arm as "no provider-side
+    /// behavior available, the CLI's storage-layer path remains in
+    /// charge" rather than as an error.
+    ///
+    /// Pairs with [`deployer_credentials`](Self::deployer_credentials):
+    /// every deployer env-pack ships a credentials contract (enforced
+    /// at registration); shipping a [`Deployer`](super::deployer::Deployer)
+    /// impl is the second half of the Phase D pluggability contract
+    /// and is verified end-to-end by
+    /// [`run_conformance`](super::deployer::run_conformance).
+    fn as_deployer(&self) -> Option<&dyn super::deployer::Deployer> {
+        None
+    }
 }
 
 /// A built-in, metadata-only handler. One value per default `local` binding.

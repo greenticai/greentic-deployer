@@ -18,6 +18,7 @@
 //!   ([`LocalProcessCredentials`]) with the per-capability probes.
 
 pub mod credentials;
+pub mod deployer;
 
 use greentic_deploy_spec::CapabilitySlot;
 use semver::VersionReq;
@@ -88,6 +89,10 @@ impl EnvPackHandler for LocalProcessDeployerHandler {
 
     fn wizard_qaspec_yaml(&self) -> Option<&'static str> {
         Some(include_str!("wizard.qaspec.yaml"))
+    }
+
+    fn as_deployer(&self) -> Option<&dyn crate::env_packs::deployer::Deployer> {
+        Some(self)
     }
 }
 
