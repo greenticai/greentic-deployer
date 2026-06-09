@@ -38,14 +38,14 @@ serde_json = "1"
 version = "1"
 features = ["full"]
 
-[dev-dependencies.sqlx]
-version = "0.8"
-default-features = false
-features = ["runtime-tokio", "postgres"]
-
 [dev-dependencies.testcontainers]
 version = "0.23"
 
 [dev-dependencies.testcontainers-modules]
 version = "0.11"
 features = ["postgres"]
+
+# Note: `sqlx` itself is intentionally NOT in [dev-dependencies] —
+# Cargo unifies features within a build, and the lib-level sqlx already
+# carries every feature dev needs (runtime-tokio, tls-rustls, postgres,
+# json, macros, migrate). A subset entry here would be dead.

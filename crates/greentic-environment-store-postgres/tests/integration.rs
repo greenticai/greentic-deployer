@@ -105,7 +105,7 @@ async fn create_then_load_round_trip() {
     assert!(store.exists(&id).await.expect("exists"));
 
     let loaded = store.load_env(&id).await.expect("load");
-    assert_eq!(loaded.environment, env);
+    assert_eq!(loaded.value, env);
     assert_eq!(loaded.revision, rev);
 }
 
@@ -147,7 +147,7 @@ async fn update_with_matching_precondition_bumps_generation() {
     assert_ne!(rev2.etag, rev1.etag);
 
     let loaded = store.load_env(&id).await.expect("load");
-    assert_eq!(loaded.environment.name, "renamed");
+    assert_eq!(loaded.value.name, "renamed");
     assert_eq!(loaded.revision.generation, 2);
 }
 
@@ -291,7 +291,7 @@ async fn pack_answers_round_trip_with_cas() {
         .await
         .expect("load")
         .expect("present");
-    assert_eq!(loaded.answers, answers2);
+    assert_eq!(loaded.value, answers2);
 
     // Stale pc → conflict.
     let stale = Precondition::matching(rev1.etag.clone(), rev1.generation);

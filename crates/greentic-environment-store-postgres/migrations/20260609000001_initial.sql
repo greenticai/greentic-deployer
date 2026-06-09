@@ -1,6 +1,11 @@
 -- Greentic EnvironmentStore (Postgres prototype) initial schema.
 -- Phase D §13.5 prereq #2 — see ../../../plans/next-gen-deployment.md.
 --
+-- IMMUTABLE AFTER FIRST MERGE: sqlx tracks applied migrations by
+-- checksum in `_sqlx_migrations`. Editing this file after the PR
+-- merges will desync deployed databases. All subsequent schema
+-- changes must land as new `*.sql` files with later timestamps.
+--
 -- Shared schema with env_id columns (NOT per-env Postgres schemas) so a
 -- migration is one DDL, not O(envs) DDL. Optimistic CAS rides on the
 -- generation column; every UPDATE checks the prior generation explicitly.

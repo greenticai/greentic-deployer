@@ -64,32 +64,23 @@ pub struct EnvRevision {
     pub etag: StateEtag,
 }
 
-/// `load_env` payload: the decoded `Environment` plus its revision.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoadedEnv {
-    pub environment: Environment,
+/// A loaded resource paired with its server-observed revision.
+///
+/// `Eq` is intentionally not derived: the runtime + answers payload types
+/// contain non-`Eq` fields (`serde_json::Value`, `BTreeMap` values), and
+/// one consistent shape across all `T` beats a per-resource struct.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Loaded<T> {
+    pub value: T,
     pub revision: EnvRevision,
 }
 
-/// `load_runtime` payload: the decoded `EnvironmentRuntime` plus its revision.
-///
-/// `EnvironmentRuntime` does not implement [`Eq`] (carries non-`Eq` fields),
-/// so this type intentionally derives only [`PartialEq`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct LoadedRuntime {
-    pub runtime: EnvironmentRuntime,
-    pub revision: EnvRevision,
-}
-
-/// `load_pack_answers` payload: opaque JSON answers plus their revision.
-///
-/// `serde_json::Value` does not implement [`Eq`], so this type intentionally
-/// derives only [`PartialEq`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct LoadedAnswers {
-    pub answers: Value,
-    pub revision: EnvRevision,
-}
+/// `load_env` return type.
+pub type LoadedEnv = Loaded<Environment>;
+/// `load_runtime` return type.
+pub type LoadedRuntime = Loaded<EnvironmentRuntime>;
+/// `load_pack_answers` return type.
+pub type LoadedAnswers = Loaded<Value>;
 
 /// Errors surfaced by the Postgres store.
 ///
@@ -242,8 +233,8 @@ impl PostgresEnvironmentStore {
                 recomputed: recomputed.digest,
             });
         }
-        Ok(LoadedEnv {
-            environment: env,
+        Ok(Loaded {
+            value: env,
             revision,
         })
     }
@@ -349,9 +340,7 @@ impl PostgresEnvironmentStore {
         let Some(row) = row else {
             return Ok(None);
         };
-        let revision = decode_revision(&row)?;
-        let data: Value = row.try_get("data")?;
-        let stored_digest: String = row.try_get("integrity_digest")?;
+        let (revision, data, stored_digest) = decode_revision_with_data(&row)?;
         let runtime: EnvironmentRuntime = serde_json::from_value(data)?;
         if runtime.environment_id != *env_id {
             return Err(PgStoreError::EnvIdMismatch {
@@ -373,7 +362,10 @@ impl PostgresEnvironmentStore {
                 recomputed: recomputed.digest,
             });
         }
-        Ok(Some(LoadedRuntime { runtime, revision }))
+        Ok(Some(Loaded {
+            value: runtime,
+            revision,
+        }))
     }
 
     /// Upsert the runtime. On first write (no existing row) `precondition`
@@ -401,7 +393,7 @@ impl PostgresEnvironmentStore {
         .fetch_optional(&mut *tx)
         .await?;
 
-        let new_revision = match current {
+        let new_gen = match current {
             None => {
                 // Row absent: only allow the create-if-absent path
                 // (no precondition). A conditional precondition here
@@ -422,10 +414,7 @@ impl PostgresEnvironmentStore {
                 .bind(&integrity.digest)
                 .execute(&mut *tx)
                 .await?;
-                EnvRevision {
-                    generation: 1,
-                    etag,
-                }
+                1
             }
             Some(current) => {
                 let Some(pc) = precondition else {
@@ -450,14 +439,14 @@ impl PostgresEnvironmentStore {
                 .bind(runtime.environment_id.as_str())
                 .execute(&mut *tx)
                 .await?;
-                EnvRevision {
-                    generation: new_gen,
-                    etag,
-                }
+                new_gen
             }
         };
         tx.commit().await?;
-        Ok(new_revision)
+        Ok(EnvRevision {
+            generation: new_gen,
+            etag,
+        })
     }
 
     // --- pack answers ---------------------------------------------------
@@ -478,10 +467,9 @@ impl PostgresEnvironmentStore {
         let Some(row) = row else {
             return Ok(None);
         };
-        let revision = decode_revision(&row)?;
-        let data: Value = row.try_get("data")?;
-        let stored_digest: String = row.try_get("integrity_digest")?;
-        let answers: Value = serde_json::from_value(data)?;
+        // `data` is `Value` on both sides of the row boundary — no
+        // additional `from_value` round-trip is needed.
+        let (revision, answers, stored_digest) = decode_revision_with_data(&row)?;
         let recomputed = StateIntegrity::sha256_of(&answers)?;
         if recomputed.digest != stored_digest {
             return Err(PgStoreError::IntegrityMismatch {
@@ -490,7 +478,10 @@ impl PostgresEnvironmentStore {
                 recomputed: recomputed.digest,
             });
         }
-        Ok(Some(LoadedAnswers { answers, revision }))
+        Ok(Some(Loaded {
+            value: answers,
+            revision,
+        }))
     }
 
     /// Upsert pack answers under `(env_id, slot)`. Same semantics as
@@ -515,7 +506,7 @@ impl PostgresEnvironmentStore {
         .fetch_optional(&mut *tx)
         .await?;
 
-        let new_revision = match current {
+        let new_gen = match current {
             None => {
                 // Row absent: only allow the create-if-absent path
                 // (no precondition). A conditional precondition means
@@ -536,10 +527,7 @@ impl PostgresEnvironmentStore {
                 .bind(&integrity.digest)
                 .execute(&mut *tx)
                 .await?;
-                EnvRevision {
-                    generation: 1,
-                    etag,
-                }
+                1
             }
             Some(current) => {
                 let Some(pc) = precondition else {
@@ -563,14 +551,14 @@ impl PostgresEnvironmentStore {
                 .bind(slot.as_str())
                 .execute(&mut *tx)
                 .await?;
-                EnvRevision {
-                    generation: new_gen,
-                    etag,
-                }
+                new_gen
             }
         };
         tx.commit().await?;
-        Ok(new_revision)
+        Ok(EnvRevision {
+            generation: new_gen,
+            etag,
+        })
     }
 
     /// Delete pack answers under `(env_id, slot)` with a guarded
