@@ -16,6 +16,7 @@ pub mod file_lock;
 pub mod lifecycle;
 pub mod messaging;
 pub mod mutations;
+pub mod mutations_local;
 pub mod runtime_config;
 pub mod store;
 pub mod trust_root;
@@ -37,8 +38,9 @@ pub use lifecycle::{
 pub use messaging::{MessagingEndpointIndexEntry, materialize_messaging_index};
 pub use mutations::{
     AddBundlePayload, AddMessagingEndpointPayload, EnvironmentMutations, ExtensionKey,
-    RevisionTransitionOutcome, SetMessagingWelcomeFlowPayload, StageRevisionPayload, TrustRootSeed,
-    UpdateEnvironmentPayload, WarmRevisionPayload,
+    RevisionTransitionOutcome, SetMessagingWelcomeFlowPayload, StageRevisionPayload,
+    TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload,
+    WarmRevisionPayload,
 };
 pub use runtime_config::materialize_runtime_config;
 pub use store::{EnvironmentStore, LocalFsStore, Locked, StoreError};

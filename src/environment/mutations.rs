@@ -80,13 +80,33 @@ pub struct RevisionTransitionOutcome {
 /// Outcome of seeding the bootstrap trust root for an env (the operator
 /// signing key for revenue policies and other env-scoped DSSE artifacts).
 ///
-/// Distinct from `cli::trust_root::TrustRootSeedResult` (the CLI-shaped
-/// envelope with `environment_id` + `trusted_key_count` for the JSON
-/// response); this is the minimal store-layer return.
+/// `trusted_key_count` is the post-add total — the CLI surfaces it on the
+/// wire so operators can see at a glance whether they added a duplicate.
 #[derive(Debug, Clone)]
 pub struct TrustRootSeed {
     pub key_id: String,
     pub public_key_pem: String,
+    pub trusted_key_count: usize,
+}
+
+/// Outcome of [`EnvironmentMutations::add_trusted_key`]. The store returns
+/// typed data so every backend stays uniform; the CLI shapes the wire JSON
+/// (adding `environment_id` from the caller's request context).
+#[derive(Debug, Clone)]
+pub struct TrustRootAddOutcome {
+    pub added_key_id: String,
+    pub trusted_key_count: usize,
+}
+
+/// Outcome of [`EnvironmentMutations::remove_trusted_key`]. `removed_public_key_pem`
+/// is `None` when the key was already absent (silent no-op); the HTTP backend
+/// MUST cache the original `Some(pem)` against the idempotency key so a retry
+/// returns the original PEM rather than `None`.
+#[derive(Debug, Clone)]
+pub struct TrustRootRemoveOutcome {
+    pub removed_key_id: String,
+    pub removed_public_key_pem: Option<String>,
+    pub trusted_key_count: usize,
 }
 
 /// Optional-field patch for [`EnvironmentMutations::update_environment`].
@@ -469,14 +489,30 @@ pub trait EnvironmentMutations: Send + Sync {
         env_id: &EnvId,
     ) -> Result<Option<TrustRootSeed>, StoreError>;
 
+    /// `idempotency_key` is required for A8 mutation consistency even though
+    /// `add_trusted_key` is intrinsically idempotent on `key_id` collision —
+    /// the key enables HTTP-backend audit-event replay. Local-FS impls accept
+    /// and ignore it; HTTP impls cache it for replay.
     fn add_trusted_key(
         &self,
         env_id: &EnvId,
         key_id: String,
         public_key_pem: String,
-    ) -> Result<Value, StoreError>;
+        idempotency_key: IdempotencyKey,
+    ) -> Result<TrustRootAddOutcome, StoreError>;
 
-    fn remove_trusted_key(&self, env_id: &EnvId, key_id: String) -> Result<Value, StoreError>;
+    /// `idempotency_key` is required for A8 mutation consistency. `remove`
+    /// is logically idempotent on the trust-root state, but the wire-shape
+    /// `removed_public_key_pem` field would be `null` on retry (the original
+    /// PEM is gone) — so a retry without replay loses recovery material AND
+    /// audit fidelity. The key enables HTTP-backend replay of the original
+    /// response/audit; local-FS impls accept and ignore it.
+    fn remove_trusted_key(
+        &self,
+        env_id: &EnvId,
+        key_id: String,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<TrustRootRemoveOutcome, StoreError>;
 }
 
 #[cfg(test)]

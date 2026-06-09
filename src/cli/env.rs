@@ -561,9 +561,14 @@ pub fn init(
         // hide the missing audit record for the env we just wrote).
         committed.mark_committed();
         // N1.4: seed operator key on first init only — see
-        // [`super::trust_root::seed_operator_key_if_trust_root_absent`].
-        let trust_root =
-            super::trust_root::seed_operator_key_if_trust_root_absent(store, &env.environment_id)?;
+        // `LocalFsStore::seed_trust_root_if_absent` (Phase D PR-3a.2).
+        let trust_root_seed = store
+            .seed_trust_root_if_absent(&env.environment_id)
+            .map_err(super::map_store_err_preserving_noun)?;
+        let trust_root = super::trust_root::trust_root_seed_to_wire_opt(
+            &env.environment_id,
+            trust_root_seed.as_ref(),
+        );
         let bound_slots: Vec<String> = env.packs.iter().map(|b| b.slot.to_string()).collect();
         let mut payload = json!({
             "environment_id": env.environment_id.as_str(),

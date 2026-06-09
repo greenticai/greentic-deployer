@@ -65,6 +65,17 @@ pub enum StoreError {
         #[source]
         source: serde_json::Error,
     },
+    /// Surfaces from trust-root verbs on [`crate::environment::mutations`] —
+    /// the typed-verb shape returns `StoreError` so the HTTP backend can map
+    /// transport errors into the same enum. CLI callers preserve the
+    /// trust-root noun by downcasting this variant back to `OpError::TrustRoot`.
+    #[error("trust root: {0}")]
+    TrustRoot(#[from] super::trust_root::TrustRootError),
+    /// Surfaces from `bootstrap_trust_root` / `seed_trust_root_if_absent` when
+    /// loading or generating `~/.greentic/operator/key.pem` fails. Distinct
+    /// from `TrustRoot` so CLI callers can surface the right error noun.
+    #[error("operator key: {0}")]
+    OperatorKey(#[from] crate::operator_key::OperatorKeyError),
 }
 
 /// Reject env ids that, while valid per the upstream `EnvId` validator
