@@ -33,21 +33,44 @@ use greentic_deploy_spec::{
 use serde_json::Value;
 
 use super::StoreError;
+use super::lifecycle::HealthGateFailure;
 
 /// `(kind_path, instance_id)` composite key identifying one extension binding
 /// in `Environment::extensions`. `kind_path` is the canonical
 /// `ExtensionKind::path()` form (e.g. `"capability/memory/long-term"`).
+///
+/// `instance_id` is `Option<String>`: a `None` binding (the unnamed default)
+/// and a `Some("default")` binding on the same `kind_path` are **distinct**
+/// and may coexist — two `None` bindings on the same path collide.
+/// This mirrors `ExtensionBinding::instance_id` in `greentic-deploy-spec`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExtensionKey {
     pub kind_path: String,
-    pub instance_id: String,
+    pub instance_id: Option<String>,
 }
 
 impl ExtensionKey {
-    pub fn new(kind_path: impl Into<String>, instance_id: impl Into<String>) -> Self {
+    pub fn new(kind_path: impl Into<String>, instance_id: Option<String>) -> Self {
         Self {
             kind_path: kind_path.into(),
-            instance_id: instance_id.into(),
+            instance_id,
+        }
+    }
+
+    /// Build a key for the unnamed default instance (`instance_id = None`).
+    pub fn unnamed(kind_path: impl Into<String>) -> Self {
+        Self {
+            kind_path: kind_path.into(),
+            instance_id: None,
+        }
+    }
+
+    /// Derive the key from an existing [`ExtensionBinding`], mirroring the
+    /// `(descriptor-path, instance_id)` convention in `cli/extensions.rs`.
+    pub fn from_binding(b: &ExtensionBinding) -> Self {
+        Self {
+            kind_path: b.kind.path().to_string(),
+            instance_id: b.instance_id.clone(),
         }
     }
 }
@@ -93,6 +116,25 @@ pub struct StageRevisionPayload {
     pub config_digest: Option<String>,
     pub signature_sidecar_ref: Option<PathBuf>,
     pub drain_seconds: Option<u32>,
+    /// A8 idempotency: same-key replay returns the originally staged
+    /// `Revision` without re-minting the ULID or advancing
+    /// `deployment.next_sequence`.
+    pub idempotency_key: IdempotencyKey,
+}
+
+/// Inputs to [`EnvironmentMutations::warm_revision`]. The closure-based gate
+/// from [`apply_revision_transition_with_health_gate`](super::apply_revision_transition_with_health_gate)
+/// can't cross the HTTP wire, so the deployer CLI evaluates runner health
+/// locally and ships the typed outcome. The impl applies `Ok(())` → `Ready`
+/// or `Err(failure)` → `Failed` atomically.
+#[derive(Debug, Clone)]
+pub struct WarmRevisionPayload {
+    pub revision_id: RevisionId,
+    /// The client-evaluated health-gate outcome. `Ok(())` advances the
+    /// revision to `Ready`; `Err(failure)` flips it to `Failed`
+    /// atomically inside the impl.
+    pub health_gate: Result<(), HealthGateFailure>,
+    pub idempotency_key: IdempotencyKey,
 }
 
 /// Inputs to [`EnvironmentMutations::add_bundle`].
@@ -230,30 +272,37 @@ pub trait EnvironmentMutations: Send + Sync {
         payload: StageRevisionPayload,
     ) -> Result<Revision, StoreError>;
 
-    /// Transition a revision through its `warm` lifecycle chain after the
-    /// runner-side health gate passes. The `LocalFsStore` impl runs the
-    /// health check inline; the `HttpEnvironmentStore` impl passes a
-    /// pre-computed [`HealthState`](greentic_deploy_spec::HealthState)-shaped
-    /// result so the server-side handler can apply the same gate logic
-    /// without crossing the wire as a closure.
+    /// Transition a revision through its `warm` lifecycle chain, applying the
+    /// client-evaluated health-gate outcome. The deployer CLI runs the
+    /// runner-side health checks locally and ships the result in
+    /// [`WarmRevisionPayload::health_gate`]: `Ok(())` advances the revision
+    /// to `Ready`; `Err(failure)` flips it to `Failed` atomically. This
+    /// replaces the closure-based gate so the operation can cross the A8
+    /// HTTP wire contract.
     fn warm_revision(
         &self,
         env_id: &EnvId,
-        revision_id: RevisionId,
+        payload: WarmRevisionPayload,
     ) -> Result<RevisionTransitionOutcome, StoreError>;
 
     /// Drain a `Ready` revision (graceful step-down → `Drained`).
+    /// `idempotency_key` is required for A8 mutation consistency even though
+    /// drain is logically idempotent — the key enables audit-event replay.
     fn drain_revision(
         &self,
         env_id: &EnvId,
         revision_id: RevisionId,
+        idempotency_key: IdempotencyKey,
     ) -> Result<RevisionTransitionOutcome, StoreError>;
 
     /// Archive a `Drained` / `Failed` revision (terminal).
+    /// `idempotency_key` is required for A8 mutation consistency even though
+    /// archive is logically idempotent — the key enables audit-event replay.
     fn archive_revision(
         &self,
         env_id: &EnvId,
         revision_id: RevisionId,
+        idempotency_key: IdempotencyKey,
     ) -> Result<RevisionTransitionOutcome, StoreError>;
 
     // -------------------------------------------------------------
@@ -455,14 +504,27 @@ mod tests {
 
     #[test]
     fn extension_key_roundtrips() {
-        let key = ExtensionKey::new("capability/memory/long-term", "default");
+        let key = ExtensionKey::new("capability/memory/long-term", Some("default".to_string()));
         assert_eq!(key.kind_path, "capability/memory/long-term");
-        assert_eq!(key.instance_id, "default");
+        assert_eq!(key.instance_id, Some("default".to_string()));
+
         // Hashable + Eq for use in `HashMap` / `HashSet` (the existing
         // `extensions.rs` uses `(kind.path(), instance_id)` as a lookup
         // key).
         let mut set = std::collections::HashSet::new();
         set.insert(key.clone());
         assert!(set.contains(&key));
+
+        // `unnamed` (None) and named ("default") on the SAME kind_path
+        // are distinct: a None binding is the unnamed default instance,
+        // a Some("default") binding is a named instance — they coexist.
+        let unnamed = ExtensionKey::unnamed("capability/memory/long-term");
+        assert_ne!(unnamed, key, "unnamed (None) and named (Some) must differ");
+        assert!(
+            !set.contains(&unnamed),
+            "unnamed key must not hash-collide with named key"
+        );
+        set.insert(unnamed.clone());
+        assert_eq!(set.len(), 2);
     }
 }
