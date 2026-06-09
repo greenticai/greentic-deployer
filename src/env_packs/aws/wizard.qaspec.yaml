@@ -1,0 +1,113 @@
+# wizard.qaspec.yaml — AWS-ECS deployer env-pack (C6).
+#
+# Collects the operator-facing knobs the AWS-ECS deployer needs at
+# bind time. AWS credential MATERIAL is not captured here — the credential
+# chain (`~/.aws/credentials`, IRSA, ambient role, …) is resolved by
+# `RealAwsClient::resolve` in `credentials.rs` and validated via the
+# typed STS + IAM SimulatePrincipalPolicy probes from `VALIDATED_IAM_VERBS`.
+# The wizard's job is to capture the *non-secret* identifiers the deployer
+# needs to scope its operations: which region, which cluster, which ECR
+# repo, which optional ALB listener. Secrets stay on the secret backend
+# (B12a / `secret://` URI refs).
+#
+# Versioning: this spec rides the env-pack handler's
+# `AwsEcsDeployerHandler::VERSION_REQ` (`>=1.0.0-dev, <2.0.0`). A breaking
+# change to the question set means a Major bump on the env-pack descriptor
+# and a fresh `wizard.qaspec.yaml`.
+
+id: greentic.deployer.aws-ecs.wizard
+title: AWS-ECS deployer
+version: "0.1.0"
+description: >-
+  Identifies the AWS account scope the AWS-ECS deployer env-pack operates
+  against. Credential MATERIAL is resolved from the ambient AWS chain at
+  validate time and never collected here; the wizard captures the
+  non-secret scoping knobs the deployer needs to plan ECS rollouts.
+presentation:
+  intro: >-
+    Bind an AWS-ECS environment. The deployer will resolve credentials
+    from the ambient AWS chain (`AWS_PROFILE`, `~/.aws/credentials`,
+    IRSA, IMDS, …) and validate them via typed STS + IAM probes. You
+    only need to provide the region + cluster + ECR repo + optional ALB
+    listener here.
+
+questions:
+  - id: region
+    type: string
+    title: AWS region
+    description: >-
+      AWS region the ECS cluster lives in (e.g. `us-east-1`,
+      `eu-west-1`). Used as the `region` field on the resolved AWS SDK
+      config when the deployer's typed clients are built.
+    required: true
+    constraint:
+      pattern: '^[a-z]{2}-[a-z]+-[0-9]$'
+
+  - id: aws_profile
+    type: string
+    title: AWS profile (optional)
+    description: >-
+      Named profile from `~/.aws/credentials` / `~/.aws/config`. Leave
+      blank to let the SDK walk the default credential chain
+      (env vars → shared config → IMDS → IRSA).
+    required: false
+
+  - id: assume_role_arn
+    type: string
+    title: Assume-role ARN (optional)
+    description: >-
+      IAM role ARN to assume after the base credential chain resolves
+      (typical for cross-account ECS deploys). Leave blank to use the
+      base credentials directly.
+    required: false
+    constraint:
+      pattern: '^arn:aws:iam::[0-9]{12}:role/.+$'
+
+  - id: ecs_cluster_name
+    type: string
+    title: ECS cluster name
+    description: >-
+      Name of the ECS cluster the deployer manages services in.
+      Must already exist; this wizard does not provision it. The Phase-D
+      D-AWS-1 train will optionally render Terraform to provision it.
+    required: true
+    constraint:
+      min_len: 1
+      max_len: 255
+      pattern: '^[a-zA-Z0-9_-]+$'
+
+  - id: ecr_repository_prefix
+    type: string
+    title: ECR repository prefix
+    description: >-
+      Prefix appended to every revision's container image (e.g.
+      `<account>.dkr.ecr.<region>.amazonaws.com/greentic/`). The
+      deployer's `ecr:PutImage` IAM probe is scoped to this prefix.
+    required: true
+    constraint:
+      min_len: 1
+      pattern: '^[a-zA-Z0-9._/-]+$'
+
+  - id: alb_listener_arn
+    type: string
+    title: ALB listener ARN (optional)
+    description: >-
+      Listener ARN for the ALB the deployer will write weighted target-
+      group rules to (mirrors `TrafficSplit`). Leave blank when the
+      runtime dispatcher is authoritative for traffic splitting and no
+      ALB mirror is configured.
+    required: false
+    constraint:
+      pattern: '^arn:aws:elasticloadbalancing:[a-z0-9-]+:[0-9]{12}:listener/.+$'
+
+  - id: container_image_tag_prefix
+    type: string
+    title: Container image tag prefix
+    description: >-
+      Prefix every revision's image tag is built from (e.g. `rev-`).
+      Combined with the revision ULID at deploy time. Leave blank to
+      tag with the raw revision ULID.
+    required: false
+    default_value: "rev-"
+    constraint:
+      pattern: '^[a-zA-Z0-9_.-]*$'

@@ -1,0 +1,39 @@
+# wizard.qaspec.yaml — local-process deployer env-pack (C6).
+#
+# This QASpec is intentionally minimal. The local-process deployer runs
+# everything in-process against the developer's machine; there is no
+# cloud account, no cluster, no IAM, no remote credentials to collect.
+# The only operator-tunable surface today is the port range the handler
+# searches for an available port at probe time (defaults to 8080..=8090
+# in code; tests override via `LocalProcessDeployerHandler::with_port_range`).
+#
+# Shipping a one-question spec lets the operator's wizard driver:
+#   1. prove the C6 seam end-to-end against a real env-pack;
+#   2. surface a knob the operator MAY override per env without code changes;
+#   3. give downstream env-packs (AWS-ECS, K8s, …) a reference shape to
+#      mirror.
+#
+# A second question would be over-specifying for v1; the listen address
+# is sourced from `host_config.listen_addr` (a different layer) and the
+# runtime stub C5 already handles it.
+
+id: greentic.deployer.local-process.wizard
+title: Local-process deployer
+version: "0.1.0"
+description: >-
+  Configuration for the local-process deployer env-pack. Local-process runs
+  workers as child processes on the operator host; the only environment-
+  scoped knob today is the port range it searches for an available port
+  at probe time.
+questions:
+  - id: port_range
+    type: string
+    title: Worker port range
+    description: >-
+      Inclusive port range the local-process deployer searches for an
+      available port. Format `<start>..=<end>`. Leave blank to use the
+      built-in default (`8080..=8090`).
+    required: false
+    default_value: "8080..=8090"
+    constraint:
+      pattern: '^[0-9]+\.\.=[0-9]+$'

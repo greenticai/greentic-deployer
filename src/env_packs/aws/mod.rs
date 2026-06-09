@@ -90,6 +90,10 @@ impl EnvPackHandler for AwsEcsDeployerHandler {
     fn deployer_credentials(&self) -> Option<&dyn crate::credentials::DeployerCredentials> {
         Some(&self.creds)
     }
+
+    fn wizard_qaspec_yaml(&self) -> Option<&'static str> {
+        Some(include_str!("wizard.qaspec.yaml"))
+    }
 }
 
 #[cfg(test)]
@@ -138,5 +142,25 @@ mod tests {
         // makes this dishonest only when the env supplies its own AWS
         // creds via the env's secret backend, which C3 doesn't wire).
         assert!(creds.requires_credentials_material());
+    }
+
+    /// C6: the shipped `wizard.qaspec.yaml` deserializes into a
+    /// `qa_spec::FormSpec`. Guards against a typo / drift between the
+    /// YAML and the qa-spec schema landing at build time instead of at
+    /// the operator's wizard-driver call site. Also asserts the spec
+    /// declares a `region` question — the only field with no sensible
+    /// default and the one the credential probes can't run without.
+    #[test]
+    fn wizard_qaspec_yaml_deserializes_into_form_spec() {
+        let yaml = AwsEcsDeployerHandler::default()
+            .wizard_qaspec_yaml()
+            .expect("aws-ecs handler ships a wizard QASpec");
+        let spec: qa_spec::FormSpec =
+            serde_yaml_bw::from_str(yaml).expect("wizard.qaspec.yaml parses as FormSpec");
+        assert_eq!(spec.id, "greentic.deployer.aws-ecs.wizard");
+        assert!(
+            spec.questions.iter().any(|q| q.id == "region"),
+            "aws-ecs wizard must collect the AWS region (no sensible default)",
+        );
     }
 }

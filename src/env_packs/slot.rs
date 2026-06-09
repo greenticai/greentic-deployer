@@ -65,6 +65,22 @@ pub trait EnvPackHandler: std::fmt::Debug + Send + Sync {
     fn deployer_credentials(&self) -> Option<&dyn crate::credentials::DeployerCredentials> {
         None
     }
+
+    /// Env-pack wizard QASpec (`C6`).
+    ///
+    /// Returns the YAML source of the env-pack's `wizard.qaspec.yaml` —
+    /// the spec the operator's wizard driver runs to collect a binding's
+    /// `answers_ref` payload. The trait returns raw YAML (not a typed
+    /// `qa_spec::FormSpec`) so this crate stays qa-spec-free; the operator
+    /// already depends on `qa-spec` and parses at the call site.
+    ///
+    /// Default `None`: metadata-only built-ins (Secrets/Telemetry/Sessions/
+    /// State today) ship no wizard. Env-packs that ship a QASpec override
+    /// with `Some(include_str!("wizard.qaspec.yaml"))` so the YAML is
+    /// embedded at build time and version-pinned with the handler.
+    fn wizard_qaspec_yaml(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// A built-in, metadata-only handler. One value per default `local` binding.
@@ -165,6 +181,23 @@ mod tests {
         defaults.sort_by(|a, b| a.1.cmp(&b.1));
 
         assert_eq!(handlers, defaults);
+    }
+
+    /// C6: the trait's `wizard_qaspec_yaml` default returns `None` so the
+    /// four metadata-only built-ins (Secrets/Telemetry/Sessions/State) ship
+    /// no wizard. Asserting on the trait method itself (not the handlers')
+    /// catches an override slipping into `BuiltinHandler` by accident.
+    #[test]
+    fn builtin_metadata_handlers_ship_no_wizard_qaspec() {
+        for h in BUILTIN_HANDLERS {
+            assert!(
+                h.wizard_qaspec_yaml().is_none(),
+                "metadata-only built-in `{}` must not ship a wizard QASpec — \
+                 override `wizard_qaspec_yaml` only on handlers that surface \
+                 operator-tunable knobs",
+                h.descriptor_path(),
+            );
+        }
     }
 
     #[test]
