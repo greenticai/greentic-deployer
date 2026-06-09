@@ -76,6 +76,12 @@ pub enum StoreError {
     /// from `TrustRoot` so CLI callers can surface the right error noun.
     #[error("operator key: {0}")]
     OperatorKey(#[from] crate::operator_key::OperatorKeyError),
+    /// Mutator-precondition violation surfaced by [`super::mutations`] verbs
+    /// (e.g. [`super::LocalFsStore::create_environment`] when the env already
+    /// exists). CLI callers preserve the `conflict` noun by downcasting in
+    /// [`crate::cli::map_store_err_preserving_noun`].
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 /// Reject env ids that, while valid per the upstream `EnvId` validator

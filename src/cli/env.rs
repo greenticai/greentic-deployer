@@ -4,15 +4,15 @@
 //! mutating call validates the payload before touching disk.
 
 use chrono::Utc;
-use greentic_deploy_spec::{
-    EnvId, Environment, EnvironmentHostConfig, SchemaVersion, validate_public_base_url,
-};
+use greentic_deploy_spec::{EnvId, Environment, EnvironmentHostConfig, validate_public_base_url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{EnvironmentStore, LocalFsStore};
+use crate::environment::{EnvironmentStore, LocalFsStore, UpdateEnvironmentPayload};
 
-use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
+use super::{
+    AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
+};
 
 const NOUN: &str = "env";
 
@@ -117,38 +117,19 @@ pub fn create(
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |_committed| {
-        let env = store.transact(&env_id, |locked| -> Result<Environment, OpError> {
-            if locked.load().is_ok() {
-                return Err(OpError::Conflict(format!(
-                    "environment `{}` already exists",
-                    locked.env_id()
-                )));
-            }
-            let env = Environment {
-                schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
-                environment_id: locked.env_id().clone(),
-                name: payload.name.clone(),
-                host_config: EnvironmentHostConfig {
-                    env_id: locked.env_id().clone(),
-                    region: payload.region.clone(),
-                    tenant_org_id: payload.tenant_org_id.clone(),
+        let env = store
+            .create_environment(
+                &env_id,
+                payload.name,
+                EnvironmentHostConfig {
+                    env_id: env_id.clone(),
+                    region: payload.region,
+                    tenant_org_id: payload.tenant_org_id,
                     listen_addr: parsed_listen_addr,
-                    public_base_url: parsed_public_base_url.clone(),
+                    public_base_url: parsed_public_base_url,
                 },
-                packs: Vec::new(),
-                credentials_ref: None,
-                bundles: Vec::new(),
-                revisions: Vec::new(),
-                traffic_splits: Vec::new(),
-                messaging_endpoints: Vec::new(),
-                extensions: Vec::new(),
-                revocation: Default::default(),
-                retention: Default::default(),
-                health: Default::default(),
-            };
-            locked.save(&env)?;
-            Ok(env)
-        })?;
+            )
+            .map_err(map_store_err_preserving_noun)?;
         let outcome = OpOutcome::new(
             NOUN,
             "create",
@@ -194,23 +175,18 @@ pub fn update(
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |_committed| {
-        let env = store.transact(&env_id, |locked| -> Result<Environment, OpError> {
-            let mut env = match locked.load() {
-                Ok(env) => env,
-                Err(crate::environment::StoreError::NotFound(id)) => {
-                    return Err(OpError::NotFound(format!("environment `{id}`")));
-                }
-                Err(e) => return Err(e.into()),
-            };
-            env.name = payload.name.clone();
-            env.host_config.region = payload.region.clone();
-            env.host_config.tenant_org_id = payload.tenant_org_id.clone();
-            if let Some(url) = &parsed_public_base_url {
-                env.host_config.public_base_url = Some(url.clone());
-            }
-            locked.save(&env)?;
-            Ok(env)
-        })?;
+        let env = store
+            .update_environment(
+                &env_id,
+                UpdateEnvironmentPayload {
+                    name: Some(payload.name),
+                    region: payload.region,
+                    tenant_org_id: payload.tenant_org_id,
+                    listen_addr: None,
+                    public_base_url: parsed_public_base_url,
+                },
+            )
+            .map_err(map_store_err_preserving_noun)?;
         let outcome = OpOutcome::new(
             NOUN,
             "update",
@@ -914,24 +890,21 @@ pub fn set_public_url(
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |_committed| {
-        let host_config = store.transact(&env_id, |locked| -> Result<_, OpError> {
-            let mut env = match locked.load() {
-                Ok(env) => env,
-                Err(crate::environment::StoreError::NotFound(id)) => {
-                    return Err(OpError::NotFound(format!("environment `{id}`")));
-                }
-                Err(e) => return Err(e.into()),
-            };
-            env.host_config.public_base_url = Some(validated.clone());
-            locked.save(&env)?;
-            Ok(env.host_config.clone())
-        })?;
+        let env = store
+            .update_environment(
+                &env_id,
+                UpdateEnvironmentPayload {
+                    public_base_url: Some(validated),
+                    ..Default::default()
+                },
+            )
+            .map_err(map_store_err_preserving_noun)?;
         let outcome = OpOutcome::new(
             NOUN,
             "set-public-url",
             json!({
                 "environment_id": env_id.as_str(),
-                "host_config": host_config,
+                "host_config": env.host_config,
             }),
         );
         Ok((outcome, super::AuditGens::NONE))
@@ -1083,6 +1056,46 @@ mod tests {
     }
 
     #[test]
+    fn create_preserves_corrupt_environment_json_instead_of_overwriting() {
+        // Regression for the `is_ok()`-existence-check footgun in
+        // `LocalFsStore::create_environment`. A corrupt `environment.json`
+        // must NOT be treated as "env doesn't exist" — otherwise create
+        // would silently overwrite a recoverable file with an empty env.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env_dir = dir.path().join("local");
+        std::fs::create_dir_all(&env_dir).unwrap();
+        let corrupt_path = env_dir.join("environment.json");
+        let corrupt_bytes = b"{ this is not valid json";
+        std::fs::write(&corrupt_path, corrupt_bytes).unwrap();
+        let err = create(
+            &store,
+            &OpFlags::default(),
+            Some(EnvCreatePayload {
+                environment_id: "local".to_string(),
+                name: "local".to_string(),
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+                public_base_url: None,
+            }),
+        )
+        .expect_err("create over a corrupt environment.json must fail");
+        // Anything but Conflict — the env "appears to exist but is unreadable",
+        // which is a Store error, not a duplicate.
+        assert!(
+            !matches!(err, OpError::Conflict(_)),
+            "expected store/json error, got Conflict (overwrote the file?): {err:?}"
+        );
+        // Crucially: the corrupt file is byte-for-byte preserved.
+        let on_disk = std::fs::read(&corrupt_path).unwrap();
+        assert_eq!(
+            on_disk, corrupt_bytes,
+            "create must not have rewritten environment.json"
+        );
+    }
+
+    #[test]
     fn create_with_no_listen_addr_persists_none_so_runtime_falls_back_to_default() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
@@ -1107,6 +1120,52 @@ mod tests {
         assert_eq!(
             env.host_config.resolved_listen_addr(),
             greentic_deploy_spec::DEFAULT_LISTEN_ADDR,
+        );
+    }
+
+    #[test]
+    fn update_preserves_existing_fields_when_payload_omits_them() {
+        // PR-3a.3: `op env update` now skips `None` fields instead of wiping
+        // them. Matches the trait-shell rule from PR-3a.1 ("None values are
+        // skipped") and aligns env update with `op config set` semantics so
+        // one HTTP endpoint covers both verbs. Pins the behavior so future
+        // refactors can't regress to wholesale-overwrite.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.host_config.region = Some("eu-west-1".to_string());
+        env.host_config.tenant_org_id = Some("acme".to_string());
+        env.host_config.public_base_url = Some("https://existing.example.com".to_string());
+        store.save(&env).unwrap();
+        update(
+            &store,
+            &OpFlags::default(),
+            Some(EnvCreatePayload {
+                environment_id: "local".to_string(),
+                name: "renamed".to_string(),
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+                public_base_url: None,
+            }),
+        )
+        .unwrap();
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert_eq!(env.name, "renamed");
+        assert_eq!(
+            env.host_config.region.as_deref(),
+            Some("eu-west-1"),
+            "region must NOT be wiped when payload omits it"
+        );
+        assert_eq!(
+            env.host_config.tenant_org_id.as_deref(),
+            Some("acme"),
+            "tenant_org_id must NOT be wiped when payload omits it"
+        );
+        assert_eq!(
+            env.host_config.public_base_url.as_deref(),
+            Some("https://existing.example.com"),
+            "public_base_url must NOT be wiped when payload omits it"
         );
     }
 

@@ -7,11 +7,15 @@ fn cli_test_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-pub fn copied_test_binary(dir: &tempfile::TempDir) -> std::path::PathBuf {
-    let source = std::path::Path::new(env!("CARGO_BIN_EXE_greentic-deployer"));
-    let target = dir.path().join("greentic-deployer");
-    std::fs::copy(source, &target).expect("copy greentic-deployer test binary");
-    target
+pub fn copied_test_binary(_dir: &tempfile::TempDir) -> std::path::PathBuf {
+    // Returns the cargo-built binary path directly. The historical per-test
+    // copy was added to dodge `ExecutableFileBusy` when parallel tests hit
+    // the same binary; once `cli_test_lock` started serializing CLI process
+    // execution the copy became redundant — but it kept ~345 MB × 60 test
+    // sites of disk pressure on CI runners, which now occasionally fail
+    // with `StorageFull`. The TempDir argument is retained so the 60+ call
+    // sites stay unchanged.
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_greentic-deployer"))
 }
 
 pub fn command_output_with_busy_retry(command: &mut Command) -> std::process::Output {
