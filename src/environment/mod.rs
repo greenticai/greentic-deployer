@@ -38,9 +38,9 @@ pub use lifecycle::{
 pub use messaging::{MessagingEndpointIndexEntry, materialize_messaging_index};
 pub use mutations::{
     AddBundlePayload, AddMessagingEndpointPayload, EnvironmentMutations, ExtensionKey,
-    RevisionTransitionOutcome, SetMessagingWelcomeFlowPayload, StageRevisionPayload,
-    TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload,
-    WarmRevisionPayload,
+    MigrateMergePayload, MigrateSeedPayload, RevisionTransitionOutcome,
+    SetMessagingWelcomeFlowPayload, StageRevisionPayload, TrustRootAddOutcome,
+    TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 pub use runtime_config::materialize_runtime_config;
 pub use store::{EnvironmentStore, LocalFsStore, Locked, StoreError};

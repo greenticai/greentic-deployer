@@ -28,15 +28,16 @@
 //!
 //! [A4 bootstrap]: crate::cli::bootstrap
 
-use crate::cli::extensions::ExtensionKey;
 use chrono::{SecondsFormat, Utc};
-use greentic_deploy_spec::{EnvId, EnvPackBinding, Environment};
+use greentic_deploy_spec::{EnvId, Environment};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
+use super::{
+    AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
+};
 use crate::defaults::LOCAL_ENV_ID;
-use crate::environment::{EnvironmentStore, LocalFsStore, StoreError};
+use crate::environment::{EnvironmentStore, LocalFsStore, MigrateMergePayload, MigrateSeedPayload};
 
 const NOUN: &str = "env";
 const OP: &str = "migrate-dev";
@@ -408,43 +409,19 @@ pub fn apply(store: &LocalFsStore, flags: &OpFlags, target: &str) -> Result<OpOu
                 "source env is not eligible for simple migration (see `--check`)".to_string(),
             ));
         }
-        let (merged_slots, merged_extensions) = store.transact(
-            &to,
-            |locked| -> Result<(Vec<String>, Vec<String>), OpError> {
-                let mut target_env = match locked.load() {
-                    Ok(env) => env,
-                    Err(StoreError::NotFound(_)) => {
-                        seed_target_from_source(&source, locked.env_id())
-                    }
-                    Err(e) => return Err(e.into()),
-                };
-                let mut added = Vec::new();
-                for binding in &source.packs {
-                    if target_env.packs.iter().any(|b| b.slot == binding.slot) {
-                        continue;
-                    }
-                    added.push(binding.slot.to_string());
-                    target_env.packs.push(cloned_binding(binding));
-                }
-                // Extension bindings (`Path 3`) are light, referentially
-                // independent state — like `packs`, they migrate. Merge by
-                // `(kind.path(), instance_id)`, preserving any binding the
-                // target already carries. (`messaging_endpoints` are NOT
-                // migrated here: they reference `linked_bundles` that don't
-                // migrate, so a blind copy would break referential integrity.)
-                let mut added_extensions = Vec::new();
-                for ext in &source.extensions {
-                    let key = ExtensionKey::from_binding(ext);
-                    if target_env.extensions.iter().any(|e| key.matches(e)) {
-                        continue;
-                    }
-                    added_extensions.push(key.to_string());
-                    target_env.extensions.push(ext.clone());
-                }
-                locked.save(&target_env)?;
-                Ok((added, added_extensions))
-            },
-        )?;
+        let payload = MigrateMergePayload {
+            packs: source.packs.clone(),
+            extensions: source.extensions.clone(),
+            seed_if_missing: Some(MigrateSeedPayload {
+                host_config: source.host_config.clone(),
+                revocation: source.revocation.clone(),
+                retention: source.retention.clone(),
+                health: source.health.clone(),
+            }),
+        };
+        let (merged_slots, merged_extensions) = store
+            .migrate_merge_bindings(&to, payload)
+            .map_err(map_store_err_preserving_noun)?;
         let renamed = rename_legacy_dir(store, &from)?;
         let outcome = MigrateDevApplyOutcome {
             from_env: from.as_str().to_string(),
@@ -475,44 +452,6 @@ fn resolve_endpoints(target: &str) -> Result<(EnvId, EnvId), OpError> {
         )));
     }
     Ok((from, to))
-}
-
-/// Construct a fresh target env seeded from the source's `host_config`
-/// + the source's pack bindings. Used when the target doesn't exist yet.
-fn seed_target_from_source(source: &Environment, target_env_id: &EnvId) -> Environment {
-    Environment {
-        schema: source.schema.clone(),
-        environment_id: target_env_id.clone(),
-        name: target_env_id.as_str().to_string(),
-        host_config: greentic_deploy_spec::EnvironmentHostConfig {
-            env_id: target_env_id.clone(),
-            region: source.host_config.region.clone(),
-            tenant_org_id: source.host_config.tenant_org_id.clone(),
-            listen_addr: source.host_config.listen_addr,
-            public_base_url: source.host_config.public_base_url.clone(),
-        },
-        packs: Vec::new(),
-        credentials_ref: None,
-        bundles: Vec::new(),
-        revisions: Vec::new(),
-        traffic_splits: Vec::new(),
-        messaging_endpoints: Vec::new(),
-        extensions: Vec::new(),
-        revocation: source.revocation.clone(),
-        retention: source.retention.clone(),
-        health: source.health.clone(),
-    }
-}
-
-fn cloned_binding(binding: &EnvPackBinding) -> EnvPackBinding {
-    EnvPackBinding {
-        slot: binding.slot,
-        kind: binding.kind.clone(),
-        pack_ref: binding.pack_ref.clone(),
-        answers_ref: binding.answers_ref.clone(),
-        generation: binding.generation,
-        previous_binding_ref: binding.previous_binding_ref.clone(),
-    }
 }
 
 /// Rename `<root>/<from>/` to `<root>/.dev-migrated-<ts>/`. The leading dot
