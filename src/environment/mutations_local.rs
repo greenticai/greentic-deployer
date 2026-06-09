@@ -591,6 +591,12 @@ impl LocalFsStore {
                         slot, env_id
                     ))
                 })?;
+            if binding.slot != slot {
+                return Err(StoreError::Conflict(format!(
+                    "binding slot `{}` does not match target slot `{}`",
+                    binding.slot, slot
+                )));
+            }
             let prev_generation = env.packs[idx].generation;
             let prev_snapshot = serde_json::to_value(&env.packs[idx])
                 .map_err(|e| StoreError::Conflict(format!("snapshot prior binding: {e}")))?;
