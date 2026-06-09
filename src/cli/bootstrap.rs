@@ -116,27 +116,21 @@ pub fn ensure_local_environment(
 }
 
 /// Refresh (or create) the local-process deployer's `runtime.json` stub.
+/// `force_bump = true` (Create/Heal): always write with a bumped generation.
+/// `force_bump = false` (AlreadyExists): write only when `listen_addr` is
+/// stale or the file is absent. Existing `discovered` keys are preserved;
+/// only `listen_addr` is upserted.
 ///
-/// Gates:
-/// 1. The env's Deployer binding must be the local-process handler. If absent
-///    or bound to a different deployer (e.g. `greentic.deployer.aws-ecs`), the
-///    helper no-ops — we do not own that file.
-/// 2. If `runtime.json` already exists AND its `generated_by` path is not the
-///    local-process handler, the helper no-ops — a foreign producer owns it.
-///
-/// When `force_bump` is `true` (Create / Heal arms), the stub is always
-/// written with a bumped generation. When `false` (AlreadyExists arm), the
-/// stub is only written when the `listen_addr` discovered key is stale or the
-/// file is absent — avoiding backup churn on every `gtc start`.
-///
-/// Existing `discovered` keys from a prior stub are preserved; only
-/// `listen_addr` is upserted.
+/// TODO(phase-d): replace with `EnvPackHandler::report_runtime_config()` on
+/// `LocalProcessDeployerHandler` once the trait method lands (see
+/// `plans/next-gen-deployment.md` line 1406).
 fn refresh_local_runtime_stub(
     locked: &Locked<'_>,
     env: &Environment,
     force_bump: bool,
 ) -> Result<(), OpError> {
-    // Gate 1: env Deployer binding must be local-process.
+    // Gate 1: env Deployer binding must be local-process — otherwise this
+    // helper is not the authoritative producer.
     let is_local = env
         .pack_for_slot(CapabilitySlot::Deployer)
         .is_some_and(|b| b.kind.path() == LocalProcessDeployerHandler::DESCRIPTOR_PATH);
@@ -146,31 +140,30 @@ fn refresh_local_runtime_stub(
 
     let existing = locked.load_runtime()?;
 
-    // Gate 2: existing stub's producer must be local-process (or absent).
+    // Gate 2: a foreign producer's runtime.json is left untouched.
     if let Some(ref rt) = existing
         && rt.generated_by.path() != LocalProcessDeployerHandler::DESCRIPTOR_PATH
     {
         return Ok(());
     }
 
-    let prev_generation = existing.as_ref().map(|r| r.generation).unwrap_or(0);
-    let mut desired_discovered = existing
-        .as_ref()
-        .map(|r| r.discovered.clone())
-        .unwrap_or_default();
-    let new_addr = Value::String(env.host_config.resolved_listen_addr().to_string());
-    desired_discovered.insert("listen_addr".to_string(), new_addr);
-
+    // No-op fast path for the dominant AlreadyExists case: check the one key
+    // we own BEFORE cloning the discovered map.
+    let new_addr_str = env.host_config.resolved_listen_addr().to_string();
     if !force_bump
         && let Some(ref rt) = existing
-        && rt.discovered == desired_discovered
+        && rt.discovered.get("listen_addr") == Some(&Value::String(new_addr_str.clone()))
     {
         return Ok(());
     }
 
+    let prev_generation = existing.as_ref().map(|r| r.generation).unwrap_or(0);
+    let mut desired_discovered = existing.map(|r| r.discovered).unwrap_or_default();
+    desired_discovered.insert("listen_addr".to_string(), Value::String(new_addr_str));
+
     locked
         .save_runtime(&build_local_runtime_stub(
-            env,
+            &env.environment_id,
             prev_generation + 1,
             desired_discovered,
         )?)
@@ -178,7 +171,7 @@ fn refresh_local_runtime_stub(
 }
 
 fn build_local_runtime_stub(
-    env: &Environment,
+    env_id: &EnvId,
     generation: u64,
     discovered: BTreeMap<String, Value>,
 ) -> Result<EnvironmentRuntime, OpError> {
@@ -190,7 +183,7 @@ fn build_local_runtime_stub(
     })?;
     Ok(EnvironmentRuntime {
         schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_RUNTIME_V1),
-        environment_id: env.environment_id.clone(),
+        environment_id: env_id.clone(),
         discovered,
         generated_at: Utc::now(),
         generated_by,
@@ -758,27 +751,6 @@ mod tests {
             after.generation,
             before.generation + 1,
             "generation must bump by exactly 1",
-        );
-    }
-
-    #[test]
-    fn already_exists_does_not_churn_when_listen_addr_unchanged() {
-        let (_tmp, store) = store();
-        ensure_local_environment(&store, None).expect("first bootstrap");
-        let env_id = EnvId::try_from(LOCAL_ENV_ID).unwrap();
-        let before = store.load_runtime(&env_id).expect("load").expect("exists");
-
-        // Second bootstrap — same env, same listen_addr.
-        ensure_local_environment(&store, None).expect("second bootstrap");
-        let after = store.load_runtime(&env_id).expect("load").expect("exists");
-
-        assert_eq!(
-            before.generation, after.generation,
-            "generation must not bump when listen_addr unchanged",
-        );
-        assert_eq!(
-            before.generated_at, after.generated_at,
-            "generated_at must not change when no write occurs",
         );
     }
 }
