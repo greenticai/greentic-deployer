@@ -17,20 +17,22 @@ use chrono::Utc;
 use greentic_distributor_client::signing::TrustedKey;
 
 use greentic_deploy_spec::{
-    BundleId, CapabilitySlot, DeploymentId, EnvId, EnvPackBinding, Environment,
-    EnvironmentHostConfig, ExtensionBinding, HealthStatus, IdempotencyKey, RetentionPolicy,
-    Revision, RevisionId, RevisionLifecycle, RevocationConfig, SchemaVersion, TrafficSplit,
-    TrafficSplitEntry,
+    BundleDeployment, BundleDeploymentStatus, BundleId, CapabilitySlot, DeploymentId, EnvId,
+    EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding, HealthStatus,
+    IdempotencyKey, MessagingEndpoint, MessagingEndpointId, RetentionPolicy, Revision, RevisionId,
+    RevisionLifecycle, RevocationConfig, RouteBinding, SchemaVersion, SecretRef, TrafficSplit,
+    TrafficSplitEntry, WelcomeFlowRef,
 };
 
 use super::lifecycle::{
     LifecycleError, apply_revision_transition, apply_revision_transition_with_health_gate,
 };
 use super::mutations::{
-    ApplyTrafficSplitOutcome, ExtensionKey, MigrateMergePayload, RemoveBundleOutcome,
-    RevisionTransitionOutcome, RollbackTrafficSplitOutcome, StageRevisionPayload,
-    TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload,
-    WarmRevisionPayload,
+    AddBundlePayload, AddMessagingEndpointPayload, ApplyTrafficSplitOutcome, ExtensionKey,
+    MigrateMergePayload, RemoveBundleOutcome, RevisionTransitionOutcome,
+    RollbackTrafficSplitOutcome, SetMessagingWelcomeFlowPayload, StageRevisionPayload,
+    TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed, UpdateBundlePayload,
+    UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 use super::store::{LocalFsStore, StoreError};
 use super::trust_root::{self as store_trust_root, trust_root_path};
@@ -487,12 +489,143 @@ impl LocalFsStore {
     }
 
     // -------------------------------------------------------------
-    // Bundle deployment CRUD  (PR-3a.7)
-    //   `op bundles remove`
-    //   `op bundles add | update` move in PR-3a.7b (revenue-policy
-    //   sidecar + operator-key signing across the HTTP wire is a
-    //   distinct design pass).
+    // Bundle deployment CRUD  (PR-3a.7 + PR-3a.7b)
+    //   `op bundles add | update | remove`
     // -------------------------------------------------------------
+
+    /// Add a [`BundleDeployment`] to the env. Rejects with
+    /// [`StoreError::Conflict`] when `(bundle_id, customer_id)` is already
+    /// deployed. Writes the v1 revenue-policy sidecar via
+    /// [`super::write_revenue_policy_version`] and pins the resulting ref
+    /// on the deployment.
+    ///
+    /// `payload.idempotency_key` is accepted for trait conformance and
+    /// ignored locally; the HTTP backend caches it for A8 §2 replay.
+    pub fn add_bundle(
+        &self,
+        env_id: &EnvId,
+        payload: AddBundlePayload,
+    ) -> Result<BundleDeployment, StoreError> {
+        let env_dir = self.env_dir(env_id)?;
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            // P6 anchor (§5.4): one BundleDeployment per (env_id, bundle_id, customer_id).
+            if env
+                .bundles
+                .iter()
+                .any(|b| b.bundle_id == payload.bundle_id && b.customer_id == payload.customer_id)
+            {
+                return Err(StoreError::Conflict(format!(
+                    "bundle `{}` for customer `{}` already deployed in env `{}`",
+                    payload.bundle_id, payload.customer_id, env_id
+                )));
+            }
+            let created_at = Utc::now();
+            let route_binding = payload.route_binding.unwrap_or_else(|| RouteBinding {
+                hosts: Vec::new(),
+                path_prefixes: Vec::new(),
+                tenant_selector: greentic_deploy_spec::TenantSelector {
+                    tenant: "default".to_string(),
+                    team: "default".to_string(),
+                },
+            });
+            let authorization_ref = payload
+                .authorization_ref
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("auth.json"));
+            let mut deployment = BundleDeployment {
+                schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
+                deployment_id: crate::environment::mint_deployment_id(),
+                env_id: env_id.clone(),
+                bundle_id: payload.bundle_id,
+                customer_id: payload.customer_id,
+                status: BundleDeploymentStatus::Active,
+                current_revisions: Vec::new(),
+                route_binding,
+                revenue_share: payload.revenue_share,
+                // Replaced with the v1 policy sidecar path below.
+                revenue_policy_ref: std::path::PathBuf::new(),
+                usage: None,
+                created_at,
+                authorization_ref,
+                config_overrides: payload.config_overrides,
+            };
+            let operator_key = crate::operator_key::load_existing_only()?;
+            let version = crate::environment::write_revenue_policy_version(
+                &env_dir,
+                &deployment,
+                &deployment.revenue_share,
+                created_at,
+                &operator_key,
+            )?;
+            deployment.revenue_policy_ref = version.policy_ref;
+            env.bundles.push(deployment.clone());
+            locked.save(&env)?;
+            Ok(deployment)
+        })
+    }
+
+    /// Patch a [`BundleDeployment`]'s scalar fields. `None` fields are
+    /// skipped. When `revenue_share` is `Some`, writes a new signed/versioned
+    /// revenue-policy sidecar (chain-linked to the prior version) and pins
+    /// the new ref on the deployment.
+    ///
+    /// Returns [`StoreError::DependentNotFound`] when `deployment_id` is
+    /// absent under the env at lock-acquisition time.
+    ///
+    /// `payload.idempotency_key` is accepted for trait conformance and
+    /// ignored locally; the HTTP backend caches it for A8 §2 replay.
+    pub fn update_bundle(
+        &self,
+        env_id: &EnvId,
+        payload: UpdateBundlePayload,
+    ) -> Result<BundleDeployment, StoreError> {
+        let UpdateBundlePayload {
+            deployment_id,
+            status,
+            route_binding,
+            revenue_share,
+            config_overrides,
+            idempotency_key: _,
+        } = payload;
+        let env_dir = self.env_dir(env_id)?;
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx = env
+                .bundles
+                .iter()
+                .position(|b| b.deployment_id == deployment_id)
+                .ok_or_else(|| {
+                    StoreError::DependentNotFound(format!(
+                        "deployment `{deployment_id}` not found in env `{env_id}`"
+                    ))
+                })?;
+            if let Some(s) = status {
+                env.bundles[idx].status = s;
+            }
+            if let Some(rb) = route_binding {
+                env.bundles[idx].route_binding = rb;
+            }
+            if let Some(overrides) = config_overrides {
+                env.bundles[idx].config_overrides = overrides;
+            }
+            if let Some(shares) = revenue_share {
+                env.bundles[idx].revenue_share = shares;
+                let created_at = Utc::now();
+                let operator_key = crate::operator_key::load_existing_only()?;
+                let version = crate::environment::write_revenue_policy_version(
+                    &env_dir,
+                    &env.bundles[idx],
+                    &env.bundles[idx].revenue_share,
+                    created_at,
+                    &operator_key,
+                )?;
+                env.bundles[idx].revenue_policy_ref = version.policy_ref;
+            }
+            locked.save(&env)?;
+            Ok(env.bundles[idx].clone())
+        })
+    }
 
     /// Remove a [`BundleDeployment`] from the env. Refuses with
     /// [`StoreError::Conflict`] if the deployment still carries live state
@@ -1229,6 +1362,351 @@ impl LocalFsStore {
             })
         })
     }
+
+    // -------------------------------------------------------------
+    // Messaging endpoint CRUD  (PR-3a.10)
+    //   `op messaging endpoint add | link-bundle | unlink-bundle
+    //                  | set-welcome-flow | remove | rotate-webhook-secret`
+    // -------------------------------------------------------------
+
+    /// Add a messaging endpoint. Rejects with [`StoreError::Conflict`] when
+    /// the `(provider_type, provider_id)` pair is already present or when the
+    /// idempotency key was already used for a different endpoint identity.
+    /// Idempotent on same-key same-identity replay (repairs a stale
+    /// projection from a prior failed call).
+    ///
+    /// Telegram-class providers auto-generate a webhook secret at creation
+    /// time via [`crate::cli::messaging::provision_webhook_secret`].
+    pub fn add_messaging_endpoint(
+        &self,
+        env_id: &EnvId,
+        payload: AddMessagingEndpointPayload,
+    ) -> Result<MessagingEndpoint, StoreError> {
+        use crate::cli::messaging::{
+            carries_idem_key, format_idem_writer, idem_suffix, is_telegram_class,
+            provision_webhook_secret,
+        };
+        let idem_suffix_str = idem_suffix(payload.idempotency_key.as_str());
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            // Idempotent replay: re-running with the same key returns the
+            // previously-created endpoint iff the payload's instance
+            // identity matches what was stored.
+            if let Some(prev) = env
+                .messaging_endpoints
+                .iter()
+                .find(|e| carries_idem_key(e, &idem_suffix_str))
+            {
+                if prev.provider_type == payload.provider_type
+                    && prev.provider_id == payload.provider_id
+                {
+                    let ep = prev.clone();
+                    locked
+                        .refresh_messaging_projection(&env)
+                        .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
+                    return Ok(ep);
+                }
+                return Err(StoreError::Conflict(format!(
+                    "idempotency key `{}` already used to add `{}`/`{}` in env `{env_id}`; pass a fresh key",
+                    payload.idempotency_key.as_str(),
+                    prev.provider_type,
+                    prev.provider_id
+                )));
+            }
+            if env
+                .messaging_endpoints
+                .iter()
+                .any(|e| {
+                    e.provider_type == payload.provider_type
+                        && e.provider_id == payload.provider_id
+                })
+            {
+                return Err(StoreError::Conflict(format!(
+                    "messaging endpoint with provider_type=`{}` provider_id=`{}` already exists in env `{env_id}`",
+                    payload.provider_type, payload.provider_id
+                )));
+            }
+            // Validate secret_refs BEFORE provisioning the webhook secret so
+            // a malformed ref does not leave an orphan secret in the dev-store.
+            let secret_refs: Vec<SecretRef> = payload
+                .secret_refs
+                .iter()
+                .map(|r| {
+                    SecretRef::try_new(r)
+                        .map_err(|e| StoreError::InvalidArgument(format!("secret_ref `{r}`: {e}")))
+                })
+                .collect::<Result<_, _>>()?;
+            let now = Utc::now();
+            let eid = MessagingEndpointId::new();
+            let webhook_secret_ref = if is_telegram_class(&payload.provider_type) {
+                Some(
+                    provision_webhook_secret(self, env_id, &eid, None)
+                        .map_err(|e| StoreError::Conflict(e.to_string()))?,
+                )
+            } else {
+                None
+            };
+            let endpoint = MessagingEndpoint {
+                schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
+                env_id: env_id.clone(),
+                endpoint_id: eid,
+                provider_id: payload.provider_id.clone(),
+                provider_type: payload.provider_type.clone(),
+                display_name: payload.display_name.clone(),
+                secret_refs,
+                webhook_secret_ref,
+                linked_bundles: Vec::new(),
+                welcome_flow: None,
+                generation: 0,
+                created_at: now,
+                updated_at: now,
+                updated_by: format_idem_writer(
+                    &payload.updated_by,
+                    payload.idempotency_key.as_str(),
+                ),
+            };
+            env.messaging_endpoints.push(endpoint);
+            locked.save(&env)?;
+            let ep = env
+                .messaging_endpoints
+                .last()
+                .expect("just pushed endpoint")
+                .clone();
+            locked
+                .refresh_messaging_projection(&env)
+                .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
+            Ok(ep)
+        })
+    }
+
+    /// Link a bundle to an existing messaging endpoint. Idempotent when the
+    /// bundle is already linked (repairs a stale projection). Rejects with
+    /// [`StoreError::DependentNotFound`] when the endpoint or bundle is
+    /// missing.
+    pub fn link_messaging_bundle(
+        &self,
+        env_id: &EnvId,
+        endpoint_id: MessagingEndpointId,
+        bundle_id: BundleId,
+        updated_by: String,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<MessagingEndpoint, StoreError> {
+        use crate::cli::messaging::stamp_mutation;
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx = find_messaging_endpoint_idx(&env, endpoint_id, env_id)?;
+            if !env.bundles.iter().any(|b| b.bundle_id == bundle_id) {
+                return Err(StoreError::DependentNotFound(format!(
+                    "bundle `{bundle_id}` is not deployed in env `{env_id}`"
+                )));
+            }
+            if env.messaging_endpoints[idx]
+                .linked_bundles
+                .contains(&bundle_id)
+            {
+                let ep = env.messaging_endpoints[idx].clone();
+                locked
+                    .refresh_messaging_projection(&env)
+                    .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
+                return Ok(ep);
+            }
+            env.messaging_endpoints[idx].linked_bundles.push(bundle_id);
+            stamp_mutation(
+                &mut env.messaging_endpoints[idx],
+                &updated_by,
+                idempotency_key.as_str(),
+            );
+            locked.save(&env)?;
+            let ep = env.messaging_endpoints[idx].clone();
+            locked
+                .refresh_messaging_projection(&env)
+                .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
+            Ok(ep)
+        })
+    }
+
+    /// Unlink a bundle from an existing messaging endpoint. Idempotent when
+    /// the bundle is not linked (repairs a stale projection). Rejects with
+    /// [`StoreError::Conflict`] if the bundle owns the endpoint's
+    /// `welcome_flow`.
+    pub fn unlink_messaging_bundle(
+        &self,
+        env_id: &EnvId,
+        endpoint_id: MessagingEndpointId,
+        bundle_id: BundleId,
+        updated_by: String,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<MessagingEndpoint, StoreError> {
+        use crate::cli::messaging::stamp_mutation;
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx = find_messaging_endpoint_idx(&env, endpoint_id, env_id)?;
+            let bundle_idx = env.messaging_endpoints[idx]
+                .linked_bundles
+                .iter()
+                .position(|b| b == &bundle_id);
+            let Some(bidx) = bundle_idx else {
+                // Idempotent: unlinking a bundle that isn't linked is a no-op.
+                let ep = env.messaging_endpoints[idx].clone();
+                locked
+                    .refresh_messaging_projection(&env)
+                    .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
+                return Ok(ep);
+            };
+            if let Some(welcome) = &env.messaging_endpoints[idx].welcome_flow
+                && welcome.bundle_id == bundle_id
+            {
+                return Err(StoreError::Conflict(format!(
+                    "cannot unlink bundle `{bundle_id}` from endpoint `{endpoint_id}` while it owns the welcome_flow; clear the welcome_flow first via `set-welcome-flow` to a different linked bundle, or `remove` the endpoint"
+                )));
+            }
+            env.messaging_endpoints[idx].linked_bundles.remove(bidx);
+            stamp_mutation(
+                &mut env.messaging_endpoints[idx],
+                &updated_by,
+                idempotency_key.as_str(),
+            );
+            locked.save(&env)?;
+            let ep = env.messaging_endpoints[idx].clone();
+            locked
+                .refresh_messaging_projection(&env)
+                .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
+            Ok(ep)
+        })
+    }
+
+    /// Set the welcome flow on a messaging endpoint. Rejects with
+    /// [`StoreError::Conflict`] when the bundle is not linked, or when
+    /// `pack_id` does not appear in any current revision's pack_list.
+    /// Idempotent when the same welcome flow ref is already set (repairs a
+    /// stale projection).
+    pub fn set_messaging_welcome_flow(
+        &self,
+        env_id: &EnvId,
+        payload: SetMessagingWelcomeFlowPayload,
+    ) -> Result<MessagingEndpoint, StoreError> {
+        use crate::cli::messaging::stamp_mutation;
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx =
+                find_messaging_endpoint_idx(&env, payload.endpoint_id, env_id)?;
+            if !env.messaging_endpoints[idx]
+                .linked_bundles
+                .contains(&payload.bundle_id)
+            {
+                return Err(StoreError::InvalidArgument(format!(
+                    "welcome_flow bundle `{}` is not linked to endpoint `{}`; link it first via `link-bundle`",
+                    payload.bundle_id, payload.endpoint_id
+                )));
+            }
+            validate_welcome_pack_id_store(&env, &payload.bundle_id, payload.pack_id.as_str())?;
+            let new_welcome = WelcomeFlowRef {
+                bundle_id: payload.bundle_id.clone(),
+                pack_id: payload.pack_id.clone(),
+                flow_id: payload.flow_id.clone(),
+            };
+            if env.messaging_endpoints[idx].welcome_flow.as_ref() == Some(&new_welcome) {
+                let ep = env.messaging_endpoints[idx].clone();
+                locked
+                    .refresh_messaging_projection(&env)
+                    .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
+                return Ok(ep);
+            }
+            env.messaging_endpoints[idx].welcome_flow = Some(new_welcome);
+            stamp_mutation(
+                &mut env.messaging_endpoints[idx],
+                &payload.updated_by,
+                payload.idempotency_key.as_str(),
+            );
+            locked.save(&env)?;
+            let ep = env.messaging_endpoints[idx].clone();
+            locked
+                .refresh_messaging_projection(&env)
+                .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
+            Ok(ep)
+        })
+    }
+
+    /// Remove a messaging endpoint by id. Idempotent when the endpoint is
+    /// already absent (repairs a stale projection). Returns the id of the
+    /// removed endpoint.
+    pub fn remove_messaging_endpoint(
+        &self,
+        env_id: &EnvId,
+        endpoint_id: MessagingEndpointId,
+    ) -> Result<MessagingEndpointId, StoreError> {
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx = env
+                .messaging_endpoints
+                .iter()
+                .position(|e| e.endpoint_id == endpoint_id);
+            let Some(idx) = idx else {
+                // Idempotent: removing an absent endpoint succeeds. Repair
+                // any stale projection from a prior failed call.
+                locked
+                    .refresh_messaging_projection(&env)
+                    .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
+                return Ok(endpoint_id);
+            };
+            env.messaging_endpoints.remove(idx);
+            locked.save(&env)?;
+            locked
+                .refresh_messaging_projection(&env)
+                .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
+            Ok(endpoint_id)
+        })
+    }
+
+    /// Rotate the webhook secret for a messaging endpoint. Generates a new
+    /// CSPRNG secret value, writes it to the dev-store under the existing
+    /// (or freshly-built) secret ref URI, and bumps generation.
+    /// Idempotent on same-idem-key replay (returns the existing endpoint
+    /// without re-generating).
+    pub fn rotate_messaging_webhook_secret(
+        &self,
+        env_id: &EnvId,
+        endpoint_id: MessagingEndpointId,
+        updated_by: String,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<MessagingEndpoint, StoreError> {
+        use crate::cli::messaging::{
+            carries_idem_key, idem_suffix, provision_webhook_secret, stamp_mutation,
+        };
+        let idem_suffix_str = idem_suffix(idempotency_key.as_str());
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx = find_messaging_endpoint_idx(&env, endpoint_id, env_id)?;
+            // Idempotent replay: if the endpoint already carries this idem key,
+            // the rotation already landed — return the existing endpoint.
+            if carries_idem_key(&env.messaging_endpoints[idx], &idem_suffix_str) {
+                let ep = env.messaging_endpoints[idx].clone();
+                locked
+                    .refresh_messaging_projection(&env)
+                    .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
+                return Ok(ep);
+            }
+            let secret_ref = provision_webhook_secret(
+                self,
+                env_id,
+                &endpoint_id,
+                env.messaging_endpoints[idx].webhook_secret_ref.as_ref(),
+            )
+            .map_err(|e| StoreError::Conflict(e.to_string()))?;
+            env.messaging_endpoints[idx].webhook_secret_ref = Some(secret_ref);
+            stamp_mutation(
+                &mut env.messaging_endpoints[idx],
+                &updated_by,
+                idempotency_key.as_str(),
+            );
+            locked.save(&env)?;
+            let ep = env.messaging_endpoints[idx].clone();
+            locked
+                .refresh_messaging_projection(&env)
+                .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
+            Ok(ep)
+        })
+    }
 }
 
 /// §5.3 admission: every entry's revision must exist and be `Ready` before its
@@ -1274,6 +1752,66 @@ fn entries_match(a: &[TrafficSplitEntry], b: &[TrafficSplitEntry]) -> bool {
     a_sorted.sort_by_key(|(r, _)| r.to_string());
     b_sorted.sort_by_key(|(r, _)| r.to_string());
     a_sorted == b_sorted
+}
+
+/// Locate a messaging endpoint by id inside an environment, returning
+/// [`StoreError::DependentNotFound`] when absent.
+fn find_messaging_endpoint_idx(
+    env: &Environment,
+    endpoint_id: MessagingEndpointId,
+    env_id: &EnvId,
+) -> Result<usize, StoreError> {
+    env.messaging_endpoints
+        .iter()
+        .position(|e| e.endpoint_id == endpoint_id)
+        .ok_or_else(|| {
+            StoreError::DependentNotFound(format!(
+                "messaging endpoint `{endpoint_id}` not found in env `{env_id}`"
+            ))
+        })
+}
+
+/// Store-level welcome-flow pack_id validation mirroring
+/// [`crate::cli::messaging::validate_welcome_pack_id`] but returning
+/// [`StoreError::Conflict`] instead of `OpError`.
+fn validate_welcome_pack_id_store(
+    env: &Environment,
+    bundle_id: &BundleId,
+    pack_id: &str,
+) -> Result<(), StoreError> {
+    let bundles: Vec<_> = env
+        .bundles
+        .iter()
+        .filter(|b| b.bundle_id == *bundle_id)
+        .collect();
+    if bundles.is_empty() {
+        return Ok(());
+    }
+    let mut saw_any_pack = false;
+    let mut known_packs: Vec<String> = Vec::new();
+    for bundle in bundles {
+        for rev_id in &bundle.current_revisions {
+            let Some(rev) = env.revisions.iter().find(|r| r.revision_id == *rev_id) else {
+                continue;
+            };
+            for entry in &rev.pack_list {
+                saw_any_pack = true;
+                if entry.pack_id.as_str() == pack_id {
+                    return Ok(());
+                }
+                known_packs.push(entry.pack_id.as_str().to_string());
+            }
+        }
+    }
+    if !saw_any_pack {
+        return Ok(());
+    }
+    known_packs.sort();
+    known_packs.dedup();
+    Err(StoreError::InvalidArgument(format!(
+        "welcome_flow.pack_id `{pack_id}` does not appear in any current revision of bundle `{bundle_id}` (known: [{}])",
+        known_packs.join(", ")
+    )))
 }
 
 /// Build an empty [`Environment`] at the current `ENVIRONMENT_V1` schema

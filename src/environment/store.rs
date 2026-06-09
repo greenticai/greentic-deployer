@@ -82,6 +82,13 @@ pub enum StoreError {
     /// [`crate::cli::map_store_err_preserving_noun`].
     #[error("conflict: {0}")]
     Conflict(String),
+    /// Caller-supplied argument is structurally valid but semantically wrong
+    /// (e.g. a `pack_id` that does not appear in any current revision, or a
+    /// welcome-flow bundle that is not linked). CLI callers preserve the
+    /// `invalid-argument` noun via
+    /// [`crate::cli::map_store_err_preserving_noun`].
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     /// Sub-entity (e.g. a `BundleDeployment`, `EnvPackBinding`,
     /// `MessagingEndpoint`) is missing under an existing env. Distinct from
     /// [`StoreError::NotFound`] which is reserved for missing envs. The CLI
@@ -103,6 +110,12 @@ pub enum StoreError {
     /// [`crate::cli::map_store_err_preserving_noun`].
     #[error(transparent)]
     Lifecycle(Box<super::LifecycleError>),
+    /// Revenue-policy sidecar write failure (PR-3a.7b). Surfaces the
+    /// inner [`super::BundleDeploymentError`] so CLI callers can
+    /// downcast to `OpError::RevenuePolicy` via
+    /// [`crate::cli::map_store_err_preserving_noun`].
+    #[error("revenue policy: {0}")]
+    RevenuePolicy(#[from] super::BundleDeploymentError),
     /// A typed-verb body persisted state to disk via the lifecycle
     /// helper's internal `locked.save(...)` and *then* failed on a
     /// post-save step (env reload, materialized-runtime-config refresh,
