@@ -219,17 +219,20 @@ impl LocalFsStore {
     ) -> Result<Revision, StoreError> {
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            let deployment = env
+            // Resolve `bundle_id` from the deployment row. Cloning only the
+            // ID — not the whole `BundleDeployment` — drops the
+            // route_binding/revenue_share/config_overrides clone churn.
+            let bundle_id = env
                 .bundles
                 .iter()
                 .find(|b| b.deployment_id == payload.deployment_id)
+                .map(|b| b.bundle_id.clone())
                 .ok_or_else(|| {
                     StoreError::DependentNotFound(format!(
                         "deployment `{}` not found in env `{}`",
                         payload.deployment_id, env_id
                     ))
-                })?
-                .clone();
+                })?;
             let next_sequence = env
                 .revisions
                 .iter()
@@ -243,7 +246,7 @@ impl LocalFsStore {
                 schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
                 revision_id: payload.revision_id,
                 env_id: env_id.clone(),
-                bundle_id: deployment.bundle_id,
+                bundle_id,
                 deployment_id: payload.deployment_id,
                 sequence: next_sequence,
                 created_at: now,
