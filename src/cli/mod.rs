@@ -227,6 +227,7 @@ pub(crate) fn map_store_err_preserving_noun(e: crate::environment::StoreError) -
         crate::environment::StoreError::OperatorKey(inner) => OpError::OperatorKey(inner),
         crate::environment::StoreError::RevenuePolicy(inner) => OpError::RevenuePolicy(inner),
         crate::environment::StoreError::Conflict(msg) => OpError::Conflict(msg),
+        crate::environment::StoreError::InvalidArgument(msg) => OpError::InvalidArgument(msg),
         crate::environment::StoreError::NotFound(id) => {
             OpError::NotFound(format!("environment `{id}`"))
         }
