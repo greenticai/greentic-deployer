@@ -229,6 +229,7 @@ pub(crate) fn map_store_err_preserving_noun(e: crate::environment::StoreError) -
         crate::environment::StoreError::NotFound(id) => {
             OpError::NotFound(format!("environment `{id}`"))
         }
+        crate::environment::StoreError::DependentNotFound(msg) => OpError::NotFound(msg),
         other => OpError::Store(other),
     }
 }

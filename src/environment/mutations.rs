@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use greentic_deploy_spec::{
     BundleDeployment, BundleDeploymentStatus, BundleId, CapabilitySlot, CustomerId, DeploymentId,
     EnvId, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding, HealthStatus,
-    IdempotencyKey, MessagingEndpoint, MessagingEndpointId, PackId, RetentionPolicy,
+    IdempotencyKey, MessagingEndpoint, MessagingEndpointId, PackId, PackListEntry, RetentionPolicy,
     RevenueShareEntry, Revision, RevisionId, RevisionLifecycle, RevocationConfig, RouteBinding,
     TrafficSplit, TrafficSplitEntry,
 };
@@ -176,18 +176,32 @@ pub struct MigrateMergePayload {
 /// method signature stays under clippy's `too_many_arguments` threshold;
 /// the existing `cli::revisions::RevisionStagePayload` is the CLI-shaped
 /// counterpart and maps to this at the call site.
+///
+/// `revision_id` is supplied by the caller because the bundle staging
+/// step (extract + lock-pin + pack-config materialization) runs OUTSIDE
+/// the env flock and names its on-disk `rev_dir` after the ULID. Local
+/// callers mint it via [`crate::environment::mint_revision_id`]; an
+/// HTTP-backed server resolves it from the idempotency cache (PR-3b).
+///
+/// `pack_list` is the resolved pack list the local impl writes verbatim
+/// into `Revision.pack_list`. PR-3a.1 omitted it — without it the
+/// resulting Revision was missing data
+/// `Environment::validate`'s config-overrides cross-ref needs.
 #[derive(Debug, Clone)]
 pub struct StageRevisionPayload {
+    pub revision_id: RevisionId,
     pub deployment_id: DeploymentId,
     pub bundle_digest: String,
-    pub pack_list_lock_ref: String,
-    pub pack_config_refs: BTreeMap<String, String>,
-    pub config_digest: Option<String>,
-    pub signature_sidecar_ref: Option<PathBuf>,
-    pub drain_seconds: Option<u32>,
+    pub pack_list: Vec<PackListEntry>,
+    pub pack_list_lock_ref: PathBuf,
+    pub pack_config_refs: Vec<PathBuf>,
+    pub config_digest: String,
+    pub signature_sidecar_ref: PathBuf,
+    pub drain_seconds: u32,
     /// A8 idempotency: same-key replay returns the originally staged
     /// `Revision` without re-minting the ULID or advancing
-    /// `deployment.next_sequence`.
+    /// `deployment.next_sequence`. Local impl accepts and ignores;
+    /// HTTP impl caches it for replay.
     pub idempotency_key: IdempotencyKey,
 }
 
