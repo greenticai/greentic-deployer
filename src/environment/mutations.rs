@@ -57,14 +57,6 @@ impl ExtensionKey {
         }
     }
 
-    /// Build a key for the unnamed default instance (`instance_id = None`).
-    pub fn unnamed(kind_path: impl Into<String>) -> Self {
-        Self {
-            kind_path: kind_path.into(),
-            instance_id: None,
-        }
-    }
-
     /// Derive the key from an existing [`ExtensionBinding`], mirroring the
     /// `(descriptor-path, instance_id)` convention in `cli/extensions.rs`.
     pub fn from_binding(b: &ExtensionBinding) -> Self {
@@ -87,20 +79,27 @@ pub struct RevisionTransitionOutcome {
 
 /// Outcome of seeding the bootstrap trust root for an env (the operator
 /// signing key for revenue policies and other env-scoped DSSE artifacts).
+///
+/// Distinct from `cli::trust_root::TrustRootSeedResult` (the CLI-shaped
+/// envelope with `environment_id` + `trusted_key_count` for the JSON
+/// response); this is the minimal store-layer return.
 #[derive(Debug, Clone)]
-pub struct TrustRootSeedResult {
+pub struct TrustRootSeed {
     pub key_id: String,
     pub public_key_pem: String,
 }
 
-/// Outcome of `ensure_local_environment`. Surfaces whether the env was
-/// created, healed (missing-default-bindings backfilled), or already
-/// consistent — so the caller can render the right CLI message.
-#[derive(Debug, Clone)]
-pub enum LocalEnvOutcome {
-    Created,
-    HealedDefaults { added_slots: Vec<String> },
-    AlreadyConsistent,
+/// Optional-field patch for [`EnvironmentMutations::update_environment`].
+/// Replaces the earlier `set_public_url` and `set_config` verbs — both were
+/// strict subsets of this patch shape, so collapsing them removes two
+/// HTTP endpoints and two impl bodies that would drift over time.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateEnvironmentPayload {
+    pub name: Option<String>,
+    pub region: Option<String>,
+    pub tenant_org_id: Option<String>,
+    pub listen_addr: Option<SocketAddr>,
+    pub public_base_url: Option<String>,
 }
 
 /// Inputs to [`EnvironmentMutations::stage_revision`]. Bundled so the
@@ -190,7 +189,10 @@ pub trait EnvironmentMutations: Send + Sync {
     // Environment lifecycle
     //   `op env create | update | set-public-url`
     //   `op config set`
-    //   `op env init` / `gtc setup`
+    //
+    // `op env init` / `gtc setup` is NOT on this trait — it's local-FS
+    // only (default-binding heal + runtime stub), so it stays inherent
+    // on `LocalFsStore`. The HTTP backend has its own bootstrap path.
     // -------------------------------------------------------------
 
     /// Create a fresh environment with empty bundles/revisions/packs.
@@ -204,57 +206,34 @@ pub trait EnvironmentMutations: Send + Sync {
 
     /// Patch the named scalar fields on an existing environment. `None`
     /// values are skipped. The full updated `Environment` is returned.
+    /// Covers what was previously split across `update_environment` (no
+    /// `listen_addr`), `set_public_url` (single field), and `set_config`
+    /// (host-level fields including `listen_addr`). One verb, one HTTP
+    /// endpoint, one impl body per backend.
     fn update_environment(
         &self,
         env_id: &EnvId,
-        name: Option<String>,
-        region: Option<String>,
-        tenant_org_id: Option<String>,
-        public_base_url: Option<String>,
+        patch: UpdateEnvironmentPayload,
     ) -> Result<Environment, StoreError>;
-
-    /// Set the env's `public_base_url`. `validated_url` MUST have passed
-    /// [`greentic_deploy_spec::validate_public_base_url`] at the call site.
-    fn set_public_url(
-        &self,
-        env_id: &EnvId,
-        validated_url: String,
-    ) -> Result<Environment, StoreError>;
-
-    /// `op config set` — same shape as [`update_environment`] but also
-    /// accepts `listen_addr` (host bind address).
-    fn set_config(
-        &self,
-        env_id: &EnvId,
-        name: Option<String>,
-        region: Option<String>,
-        tenant_org_id: Option<String>,
-        listen_addr: Option<SocketAddr>,
-        public_base_url: Option<String>,
-    ) -> Result<Environment, StoreError>;
-
-    /// Idempotent local-env bootstrap used by `op env init` and `gtc
-    /// setup`. Creates the env if missing; heals missing default bindings
-    /// if present. `public_base_url` is rejected if the env already exists.
-    fn ensure_local_environment(
-        &self,
-        env_id: &EnvId,
-        public_base_url: Option<String>,
-    ) -> Result<(Environment, LocalEnvOutcome), StoreError>;
 
     // -------------------------------------------------------------
     // Migration
     //   `op env migrate-dev --apply`
     // -------------------------------------------------------------
 
-    /// Merge pack bindings and extension bindings from `source` into
-    /// `target_env_id`. Skips slots / extension keys already bound in the
-    /// target. Returns the list of newly-merged slots + extension key
-    /// strings (in the form `"<kind_path>::<instance_id>"`).
+    /// Merge pack bindings and extension bindings into `target_env_id`.
+    /// Skips slots / extension keys already bound in the target. Returns
+    /// the list of newly-merged slots + extension key strings (in the
+    /// form `"<kind_path>::<instance_id>"`).
+    ///
+    /// Takes the bindings directly rather than a full source `Environment`
+    /// so the HTTP impl doesn't have to ship an entire env aggregate when
+    /// the operation reads only these two vectors.
     fn migrate_merge_bindings(
         &self,
         target_env_id: &EnvId,
-        source: &Environment,
+        packs: &[EnvPackBinding],
+        extensions: &[ExtensionBinding],
     ) -> Result<(Vec<String>, Vec<String>), StoreError>;
 
     // -------------------------------------------------------------
@@ -341,6 +320,7 @@ pub trait EnvironmentMutations: Send + Sync {
         &self,
         env_id: &EnvId,
         binding: EnvPackBinding,
+        idempotency_key: IdempotencyKey,
     ) -> Result<EnvPackBinding, StoreError>;
 
     /// Returns `(new_binding, new_generation)` — the bumped audit generation
@@ -350,18 +330,21 @@ pub trait EnvironmentMutations: Send + Sync {
         env_id: &EnvId,
         slot: CapabilitySlot,
         binding: EnvPackBinding,
+        idempotency_key: IdempotencyKey,
     ) -> Result<(EnvPackBinding, u64), StoreError>;
 
     fn remove_pack_binding(
         &self,
         env_id: &EnvId,
         slot: CapabilitySlot,
+        idempotency_key: IdempotencyKey,
     ) -> Result<(EnvPackBinding, u64), StoreError>;
 
     fn rollback_pack_binding(
         &self,
         env_id: &EnvId,
         slot: CapabilitySlot,
+        idempotency_key: IdempotencyKey,
     ) -> Result<(EnvPackBinding, u64), StoreError>;
 
     // -------------------------------------------------------------
@@ -373,6 +356,7 @@ pub trait EnvironmentMutations: Send + Sync {
         &self,
         env_id: &EnvId,
         binding: ExtensionBinding,
+        idempotency_key: IdempotencyKey,
     ) -> Result<ExtensionBinding, StoreError>;
 
     fn update_extension_binding(
@@ -380,18 +364,21 @@ pub trait EnvironmentMutations: Send + Sync {
         env_id: &EnvId,
         key: ExtensionKey,
         binding: ExtensionBinding,
+        idempotency_key: IdempotencyKey,
     ) -> Result<(ExtensionBinding, u64), StoreError>;
 
     fn remove_extension_binding(
         &self,
         env_id: &EnvId,
         key: ExtensionKey,
+        idempotency_key: IdempotencyKey,
     ) -> Result<(ExtensionBinding, u64), StoreError>;
 
     fn rollback_extension_binding(
         &self,
         env_id: &EnvId,
         key: ExtensionKey,
+        idempotency_key: IdempotencyKey,
     ) -> Result<(ExtensionBinding, u64), StoreError>;
 
     // -------------------------------------------------------------
@@ -473,14 +460,14 @@ pub trait EnvironmentMutations: Send + Sync {
 
     /// Generate and persist a fresh operator signing key for the env.
     /// Rejects if a trust root already exists.
-    fn bootstrap_trust_root(&self, env_id: &EnvId) -> Result<TrustRootSeedResult, StoreError>;
+    fn bootstrap_trust_root(&self, env_id: &EnvId) -> Result<TrustRootSeed, StoreError>;
 
     /// Idempotent variant called from `op env init`: returns `Some(seed)`
     /// when a key was minted, `None` when a trust root already existed.
     fn seed_trust_root_if_absent(
         &self,
         env_id: &EnvId,
-    ) -> Result<Option<TrustRootSeedResult>, StoreError>;
+    ) -> Result<Option<TrustRootSeed>, StoreError>;
 
     fn add_trusted_key(
         &self,
@@ -497,10 +484,11 @@ mod tests {
     use super::*;
 
     /// Compile-time guard: the trait stays object-safe so future code can
-    /// hold `Box<dyn EnvironmentMutations>` (e.g. for runtime selection
-    /// between `LocalFsStore` and `HttpEnvironmentStore` in PR-3c).
+    /// hold `&dyn EnvironmentMutations` / `Box<dyn EnvironmentMutations>`
+    /// (e.g. for runtime selection between `LocalFsStore` and
+    /// `HttpEnvironmentStore` in PR-3c).
     #[allow(dead_code)]
-    fn _is_object_safe(_: Box<dyn EnvironmentMutations>) {}
+    fn _is_object_safe(_: &dyn EnvironmentMutations) {}
 
     #[test]
     fn extension_key_roundtrips() {
@@ -515,14 +503,15 @@ mod tests {
         set.insert(key.clone());
         assert!(set.contains(&key));
 
-        // `unnamed` (None) and named ("default") on the SAME kind_path
-        // are distinct: a None binding is the unnamed default instance,
-        // a Some("default") binding is a named instance — they coexist.
-        let unnamed = ExtensionKey::unnamed("capability/memory/long-term");
-        assert_ne!(unnamed, key, "unnamed (None) and named (Some) must differ");
+        // `None` and `Some("default")` on the SAME kind_path are distinct
+        // identities: an unnamed binding (None) is the default instance,
+        // a named "default" binding is a separate instance — both coexist
+        // per `ExtensionBinding`'s doc comment in `greentic-deploy-spec`.
+        let unnamed = ExtensionKey::new("capability/memory/long-term", None);
+        assert_ne!(unnamed, key, "None and Some(_) must differ");
         assert!(
             !set.contains(&unnamed),
-            "unnamed key must not hash-collide with named key"
+            "None key must not hash-collide with Some(_) key"
         );
         set.insert(unnamed.clone());
         assert_eq!(set.len(), 2);
