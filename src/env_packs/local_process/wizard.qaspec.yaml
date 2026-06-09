@@ -17,20 +17,10 @@
 # is sourced from `host_config.listen_addr` (a different layer) and the
 # runtime stub C5 already handles it.
 #
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Trust-boundary disclosure (C2 ↔ C6 scope split):
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# The deployer has no reader for `EnvPackBinding.answers_ref` today: the
-# field is recorded on the binding and never loaded. C2's
-# `LocalProcessCredentials::validate` probes the in-code default port
-# range (or whatever `with_port_range` was passed at handler construction
-# time) — NOT the captured `port_range` answer below. Phase D wires
-# `answers_ref` into `ValidationContext` and the per-capability probes;
-# until then, treat this wizard as DECLARATIVE INTENT recorded on the
-# binding for Phase D consumption, not as an input to today's probes.
-# Local-process's risk surface here is tiny (a stray port-range answer
-# can't widen a trust boundary the way an AWS region/role answer can),
-# but the same C6→Phase-D split applies.
+# C6 ↔ Phase D split applies (answers recorded on the binding, not yet
+# honored by today's `LocalProcessCredentials::validate` probe). See the
+# AWS-ECS YAML's "Trust-boundary disclosure" header for the full
+# reference write-up. Local-process's risk surface here is tiny.
 
 id: greentic.deployer.local-process.wizard
 title: Local-process deployer

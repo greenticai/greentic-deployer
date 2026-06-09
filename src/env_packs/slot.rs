@@ -68,44 +68,24 @@ pub trait EnvPackHandler: std::fmt::Debug + Send + Sync {
 
     /// Env-pack wizard QASpec (`C6`).
     ///
-    /// Returns the YAML source of the env-pack's `wizard.qaspec.yaml` —
+    /// Returns the YAML source of the env-pack's `wizard.qaspec.yaml`,
     /// the spec the operator's wizard driver runs to collect a binding's
-    /// `answers_ref` payload. The trait returns raw YAML (not a typed
-    /// `qa_spec::FormSpec`) so this crate stays qa-spec-free; the operator
-    /// already depends on `qa-spec` and parses at the call site.
+    /// `answers_ref` payload. Raw YAML (not a typed `qa_spec::FormSpec`)
+    /// so this crate stays qa-spec-free; the operator already depends on
+    /// `qa-spec` and parses at the call site. Default `None`: metadata-
+    /// only built-ins ship no wizard. Env-packs that ship a QASpec
+    /// override with `Some(include_str!("wizard.qaspec.yaml"))`.
     ///
-    /// Default `None`: metadata-only built-ins (Secrets/Telemetry/Sessions/
-    /// State today) ship no wizard. Env-packs that ship a QASpec override
-    /// with `Some(include_str!("wizard.qaspec.yaml"))` so the YAML is
-    /// embedded at build time and version-pinned with the handler.
-    ///
-    /// ## C6 ↔ Phase D scope split (read before authoring a YAML)
-    ///
-    /// C6 attaches a wizard spec to env-packs. **It does NOT plumb the
-    /// captured answers into [`validate`](crate::credentials::DeployerCredentials::validate)
-    /// or any other handler operation.** The deployer has no reader for
+    /// **C6 ↔ Phase D scope split**: C6 attaches the spec. It does NOT
+    /// plumb the captured answers into
+    /// [`DeployerCredentials::validate`](crate::credentials::DeployerCredentials::validate)
+    /// or any other handler op — there is no reader for
     /// [`EnvPackBinding.answers_ref`](greentic_deploy_spec::EnvPackBinding)
-    /// today: the field is recorded and pass-through-copied on
-    /// `update`/`migrate`, never loaded.
-    ///
-    /// In particular, every `DeployerCredentials::validate` impl
-    /// receives [`ValidationContext`](crate::credentials::ValidationContext)
-    /// that carries only `env_root` (no answers). Probes that look like
-    /// they should scope to a wizard answer — `region` on an AWS handler,
-    /// `cluster` on a K8s handler — run against the AMBIENT environment
-    /// (the SDK's default credential chain, the kubeconfig's
-    /// current-context, etc.).
-    ///
-    /// What this means for a wizard YAML you ship today:
-    ///
-    /// - **Do** capture the operator's declarative scoping intent so
-    ///   Phase D can read it from the binding.
-    /// - **Don't** word the questions as if they steer validation — they
-    ///   don't until Phase D wires them through.
-    /// - **Do** disclose the gap in the YAML's `presentation.intro` or a
-    ///   top-level comment when a wrong answer could mask a cross-account
-    ///   / cross-cluster validation failure (see the AWS-ECS YAML's
-    ///   "Trust-boundary disclosure" header for the reference pattern).
+    /// today. Probes that look like they should scope to a wizard
+    /// answer (`region` on an AWS handler, `cluster` on a K8s handler)
+    /// run against the ambient environment. See the AWS-ECS YAML's
+    /// "Trust-boundary disclosure" header for the reference authoring
+    /// pattern when this gap matters for an env-pack.
     fn wizard_qaspec_yaml(&self) -> Option<&'static str> {
         None
     }

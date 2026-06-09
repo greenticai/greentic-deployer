@@ -144,14 +144,13 @@ mod tests {
         assert!(creds.requires_credentials_material());
     }
 
-    /// C6: the shipped `wizard.qaspec.yaml` deserializes into a
-    /// `qa_spec::FormSpec`. Guards against a typo / drift between the
-    /// YAML and the qa-spec schema landing at build time instead of at
-    /// the operator's wizard-driver call site. Also asserts the spec
-    /// declares a `region` question — the only field with no sensible
-    /// default and the one the credential probes can't run without.
+    /// C6: pins this handler's wizard YAML to its canonical `id` and
+    /// asserts a `region` question is present (the only field with no
+    /// sensible default and the one Phase D's IAM/STS probes can't scope
+    /// without). Round-trip `qa_spec::FormSpec` deserialization is
+    /// covered by the registry-level parametrized test in `registry.rs`.
     #[test]
-    fn wizard_qaspec_yaml_deserializes_into_form_spec() {
+    fn wizard_qaspec_yaml_pins_id_and_requires_region() {
         let yaml = AwsEcsDeployerHandler::default()
             .wizard_qaspec_yaml()
             .expect("aws-ecs handler ships a wizard QASpec");

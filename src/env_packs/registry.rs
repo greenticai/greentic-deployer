@@ -389,6 +389,33 @@ mod tests {
         );
     }
 
+    /// C6 (parametrized): every handler that ships a wizard YAML must
+    /// deserialize cleanly as a `qa_spec::FormSpec` with at least one
+    /// question. Centralized here so a new handler shipping a wizard
+    /// automatically inherits the contract — no per-handler boilerplate.
+    #[test]
+    fn every_handler_with_a_wizard_ships_a_well_formed_qaspec() {
+        let registry = EnvPackRegistry::with_builtins();
+        let mut checked = 0;
+        for (path, handler) in &registry.handlers {
+            let Some(yaml) = handler.wizard_qaspec_yaml() else {
+                continue;
+            };
+            let spec: qa_spec::FormSpec = serde_yaml_bw::from_str(yaml)
+                .unwrap_or_else(|e| panic!("`{path}` wizard.qaspec.yaml parses: {e}"));
+            assert!(
+                !spec.questions.is_empty(),
+                "`{path}` wizard QASpec declares zero questions — the operator's wizard \
+                 driver has nothing to ask",
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 1,
+            "no built-in handler ships a wizard QASpec — the C6 seam is unexercised",
+        );
+    }
+
     /// C6: the registry helper returns the deployer's wizard YAML when
     /// the descriptor resolves, `None` for descriptors whose handler
     /// ships no wizard (metadata-only built-ins), and `VersionUnsupported`

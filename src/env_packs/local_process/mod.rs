@@ -129,21 +129,17 @@ mod tests {
         assert_eq!(caps.len(), 2);
     }
 
-    /// C6: the shipped `wizard.qaspec.yaml` deserializes into a
-    /// `qa_spec::FormSpec`. Guards against a typo / drift between the
-    /// YAML and the qa-spec schema landing at build time instead of at
-    /// the operator's wizard-driver call site.
+    /// C6: pins this handler's wizard YAML to its canonical `id` so a
+    /// renamed YAML or a wrong `include_str!` path surfaces here.
+    /// (Round-trip `qa_spec::FormSpec` deserialization is covered by
+    /// the registry-level parametrized test in `registry.rs`.)
     #[test]
-    fn wizard_qaspec_yaml_deserializes_into_form_spec() {
+    fn wizard_qaspec_yaml_id_matches_canonical() {
         let yaml = LocalProcessDeployerHandler::default()
             .wizard_qaspec_yaml()
             .expect("local-process handler ships a wizard QASpec");
         let spec: qa_spec::FormSpec =
             serde_yaml_bw::from_str(yaml).expect("wizard.qaspec.yaml parses as FormSpec");
         assert_eq!(spec.id, "greentic.deployer.local-process.wizard");
-        assert!(
-            !spec.questions.is_empty(),
-            "wizard QASpec must declare at least one question to drive the operator's wizard",
-        );
     }
 }
