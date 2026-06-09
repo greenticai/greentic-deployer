@@ -177,89 +177,94 @@ pub fn stage(
         }),
         idempotency_key: None,
     };
-    // Pre-look-up the deployment to surface a typed `not-found` error
-    // before we mint a revision_id or extract a bundle. The typed store
-    // verb re-validates under the lock (closes the TOCTOU window).
-    let pre_env = store.load(&env_id).map_err(map_store_err_preserving_noun)?;
-    let bundle_id = pre_env
-        .bundles
-        .iter()
-        .find(|b| b.deployment_id == deployment_id)
-        .map(|b| b.bundle_id.clone())
-        .ok_or_else(|| {
-            OpError::NotFound(format!(
-                "deployment `{deployment_id}` not found in env `{env_id}`"
-            ))
-        })?;
-    drop(pre_env);
-
-    // Mint the revision id now: the `--bundle` path names the per-revision
-    // extract dir after this ULID, and the pack-list lock + per-pack
-    // pack-config docs are written under that dir before the typed verb
-    // ever sees them.
-    let revision_id = crate::environment::mint_revision_id();
-
-    // Resolve a local `.gtbundle` (extract + pin packs) when one was
-    // supplied, deriving the artifact pointers; otherwise record the
-    // caller-supplied pointers verbatim (legacy Phase-A behavior).
-    let (bundle_digest, revision_pack_list, pack_list_lock_ref, pack_config_refs) =
-        match &payload.bundle_path {
-            Some(bundle_path) => {
-                let env_dir = store.env_dir(&env_id)?;
-                let staged =
-                    super::bundle_stage::stage_local_bundle(&env_dir, revision_id, bundle_path)?;
-                // The lock file is the on-disk source of truth for the
-                // resolved packs. We also populate `Revision.pack_list`
-                // with the pack ids derived from the lock so
-                // `Environment::validate`'s config_overrides cross-ref
-                // check has data to work with.
-                let lock_derived_pack_list: Vec<PackListEntry> = staged
-                    .lock
-                    .packs
-                    .iter()
-                    .map(|lp| {
-                        PackListEntry::from_lock_primitives(lp.pack_id.clone(), lp.digest.clone())
-                    })
-                    .collect();
-                // Cleanup guard: if pack-config materialization fails
-                // AFTER `stage_local_bundle` succeeded, we'd otherwise
-                // leak the freshly-extracted bundle + lock under an
-                // `rev_dir` that no env.json will ever reference. Drop
-                // the whole rev_dir on error so a re-stage starts clean.
-                let rev_dir = env_dir.join("revisions").join(revision_id.to_string());
-                let pinned_pack_ids: std::collections::HashSet<String> = staged
-                    .lock
-                    .packs
-                    .iter()
-                    .map(|lp| lp.pack_id.as_str().to_string())
-                    .collect();
-                let pack_config_refs = super::pack_config_stage::materialize_pack_configs(
-                    &env_dir,
-                    &rev_dir,
-                    revision_id,
-                    &env_id,
-                    &bundle_id,
-                    &pinned_pack_ids,
-                )
-                .inspect_err(|_| {
-                    let _ = std::fs::remove_dir_all(&rev_dir);
-                })?;
-                (
-                    staged.bundle_digest,
-                    lock_derived_pack_list,
-                    staged.pack_list_lock_ref,
-                    pack_config_refs,
-                )
-            }
-            None => (
-                payload.bundle_digest.clone(),
-                pack_list,
-                payload.pack_list_lock_ref.clone(),
-                Vec::new(),
-            ),
-        };
-
     audit_and_record(store, ctx, |_committed| {
+        // Look up the deployment INSIDE the authz gate. Touching the
+        // filesystem (bundle extraction, pack-config materialization)
+        // before `audit_and_record` enters its closure would let a
+        // denied caller write under `<env>/revisions/...` before being
+        // rejected — Codex review on PR-3a.5 flagged that authz bypass.
+        let env = store.load(&env_id).map_err(map_store_err_preserving_noun)?;
+        let bundle_id = env
+            .bundles
+            .iter()
+            .find(|b| b.deployment_id == deployment_id)
+            .map(|b| b.bundle_id.clone())
+            .ok_or_else(|| {
+                OpError::NotFound(format!(
+                    "deployment `{deployment_id}` not found in env `{env_id}`"
+                ))
+            })?;
+        drop(env);
+
+        // Mint the revision id now: the `--bundle` path names the
+        // per-revision extract dir after this ULID, and the pack-list
+        // lock + per-pack pack-config docs are written under that dir
+        // before the typed verb sees them.
+        let revision_id = crate::environment::mint_revision_id();
+        let env_dir = store.env_dir(&env_id)?;
+
+        // Resolve a local `.gtbundle` (extract + pin packs) when one
+        // was supplied, deriving the artifact pointers; otherwise
+        // record the caller-supplied pointers verbatim (legacy
+        // Phase-A behavior).
+        let (bundle_digest, revision_pack_list, pack_list_lock_ref, pack_config_refs) =
+            match &payload.bundle_path {
+                Some(bundle_path) => {
+                    let staged = super::bundle_stage::stage_local_bundle(
+                        &env_dir,
+                        revision_id,
+                        bundle_path,
+                    )?;
+                    // Populate `Revision.pack_list` from the lock so
+                    // `Environment::validate`'s config-overrides
+                    // cross-ref has data to work with.
+                    let lock_derived_pack_list: Vec<PackListEntry> = staged
+                        .lock
+                        .packs
+                        .iter()
+                        .map(|lp| {
+                            PackListEntry::from_lock_primitives(
+                                lp.pack_id.clone(),
+                                lp.digest.clone(),
+                            )
+                        })
+                        .collect();
+                    // If pack-config materialization fails AFTER
+                    // `stage_local_bundle` succeeded, drop the rev_dir
+                    // so a re-stage starts clean.
+                    let rev_dir = env_dir.join("revisions").join(revision_id.to_string());
+                    let pinned_pack_ids: std::collections::HashSet<String> = staged
+                        .lock
+                        .packs
+                        .iter()
+                        .map(|lp| lp.pack_id.as_str().to_string())
+                        .collect();
+                    let pack_config_refs = super::pack_config_stage::materialize_pack_configs(
+                        &env_dir,
+                        &rev_dir,
+                        revision_id,
+                        &env_id,
+                        &bundle_id,
+                        &pinned_pack_ids,
+                    )
+                    .inspect_err(|_| {
+                        let _ = std::fs::remove_dir_all(&rev_dir);
+                    })?;
+                    (
+                        staged.bundle_digest,
+                        lock_derived_pack_list,
+                        staged.pack_list_lock_ref,
+                        pack_config_refs,
+                    )
+                }
+                None => (
+                    payload.bundle_digest.clone(),
+                    pack_list.clone(),
+                    payload.pack_list_lock_ref.clone(),
+                    Vec::new(),
+                ),
+            };
+
         let store_payload = StageRevisionPayload {
             revision_id,
             deployment_id,
@@ -272,8 +277,19 @@ pub fn stage(
             drain_seconds: payload.drain_seconds,
             idempotency_key: mint_idempotency_key(),
         };
+        // Post-staging cleanup: if the typed verb fails after the
+        // `--bundle` path already wrote files under `rev_dir`, drop
+        // the rev_dir so a re-stage starts clean. Closes a window
+        // that existed pre-PR too: the old closure could return Err
+        // from `locked.save(&env)` with the rev_dir already populated.
         let revision = store
             .stage_revision(&env_id, store_payload)
+            .inspect_err(|_| {
+                if payload.bundle_path.is_some() {
+                    let rev_dir = env_dir.join("revisions").join(revision_id.to_string());
+                    let _ = std::fs::remove_dir_all(&rev_dir);
+                }
+            })
             .map_err(map_store_err_preserving_noun)?;
         let outcome = OpOutcome::new(
             NOUN,
@@ -826,6 +842,45 @@ mod tests {
     /// revision. The lock's per-pack digest must equal the sha256 of the
     /// extracted `.gtpack` on disk — the exact invariant greentic-start's
     /// `load_revision` re-checks at boot.
+    /// Regression for PR-3a.5 Codex finding: bundle staging must NOT touch
+    /// the filesystem before `audit_and_record`'s authz gate. A `stage
+    /// --bundle` against a non-local env must return `Unauthorized` AND
+    /// leave the env's `revisions/` dir untouched.
+    #[test]
+    fn stage_with_bundle_on_non_local_env_rejects_before_writing_files() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        // Seed a non-local env so `authorize_local_only` denies.
+        let mut env = make_env("prod");
+        let deployment = make_bundle_deployment("prod", "fast2flow");
+        let did = deployment.deployment_id;
+        env.bundles.push(deployment);
+        store.save(&env).unwrap();
+
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/bundles/perf-smoke-bundle.gtbundle");
+        let mut payload = stage_payload(&did);
+        payload.environment_id = "prod".to_string();
+        payload.bundle_path = Some(fixture);
+
+        let err = stage(&store, &OpFlags::default(), Some(payload)).unwrap_err();
+        assert!(
+            matches!(err, OpError::Unauthorized { .. }),
+            "non-local env stage must be denied, got: {err:?}"
+        );
+        // No revisions dir should have been created — bundle staging
+        // must run INSIDE the audit_and_record closure, not before.
+        let rev_root = dir.path().join("prod").join("revisions");
+        assert!(
+            !rev_root.exists()
+                || std::fs::read_dir(&rev_root)
+                    .map(|d| d.count() == 0)
+                    .unwrap_or(true),
+            "denied stage must not write under `{}`",
+            rev_root.display()
+        );
+    }
+
     #[test]
     fn stage_with_local_bundle_pins_packs_into_lockfile() {
         use greentic_deploy_spec::PackListLock;
