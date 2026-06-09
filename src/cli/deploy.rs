@@ -298,6 +298,7 @@ pub fn deploy(
                 // Fresh deploy: BundleAddPayload takes a plain BTreeMap
                 // (no prior state to clear). Unwrap the Option; None → empty.
                 config_overrides: payload.config_overrides.clone().unwrap_or_default(),
+                idempotency_key: None,
             };
             let outcome = super::bundles::add(store, flags, Some(add_payload))?;
             let summary: BundleSummary = parse_summary(outcome, "bundle")?;
@@ -361,6 +362,7 @@ pub fn deploy(
                 route_binding: None,
                 revenue_share: None,
                 config_overrides: Some(overrides.clone()),
+                idempotency_key: None,
             }),
         )?;
     }

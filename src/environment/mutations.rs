@@ -257,6 +257,22 @@ pub struct AddBundlePayload {
     pub route_binding: Option<RouteBinding>,
     pub authorization_ref: Option<String>,
     pub config_overrides: BTreeMap<String, BTreeMap<String, Value>>,
+    /// A8 §2 idempotency key. The local-FS impl accepts and ignores;
+    /// the HTTP backend caches it for safe-retry replay.
+    pub idempotency_key: IdempotencyKey,
+}
+
+/// Inputs to [`EnvironmentMutations::update_bundle`].
+#[derive(Debug, Clone)]
+pub struct UpdateBundlePayload {
+    pub deployment_id: DeploymentId,
+    pub status: Option<BundleDeploymentStatus>,
+    pub route_binding: Option<RouteBinding>,
+    pub revenue_share: Option<Vec<RevenueShareEntry>>,
+    pub config_overrides: Option<BTreeMap<String, BTreeMap<String, Value>>>,
+    /// A8 §2 idempotency key. The local-FS impl accepts and ignores;
+    /// the HTTP backend caches it for safe-retry replay.
+    pub idempotency_key: IdempotencyKey,
 }
 
 /// Inputs to [`EnvironmentMutations::add_messaging_endpoint`].
@@ -410,11 +426,7 @@ pub trait EnvironmentMutations: Send + Sync {
     fn update_bundle(
         &self,
         env_id: &EnvId,
-        deployment_id: DeploymentId,
-        status: Option<BundleDeploymentStatus>,
-        route_binding: Option<RouteBinding>,
-        revenue_share: Option<Vec<RevenueShareEntry>>,
-        config_overrides: Option<BTreeMap<String, BTreeMap<String, Value>>>,
+        payload: UpdateBundlePayload,
     ) -> Result<BundleDeployment, StoreError>;
 
     /// Remove a bundle deployment from the env. Refuses if the deployment

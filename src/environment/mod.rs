@@ -40,7 +40,8 @@ pub use mutations::{
     AddBundlePayload, AddMessagingEndpointPayload, EnvironmentMutations, ExtensionKey,
     MigrateMergePayload, MigrateSeedPayload, RemoveBundleOutcome, RevisionTransitionOutcome,
     SetMessagingWelcomeFlowPayload, StageRevisionPayload, TrustRootAddOutcome,
-    TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload, WarmRevisionPayload,
+    TrustRootRemoveOutcome, TrustRootSeed, UpdateBundlePayload, UpdateEnvironmentPayload,
+    WarmRevisionPayload,
 };
 pub use runtime_config::materialize_runtime_config;
 pub use store::{EnvironmentStore, LocalFsStore, Locked, StoreError};
