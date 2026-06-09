@@ -614,9 +614,8 @@ where
         // saved the env mutation but a post-save step (load /
         // refresh_runtime_config) failed, mark committed BEFORE the
         // error escapes so the audit boundary fails-closed on an
-        // audit-append failure (matches the closure-based
-        // `transition_with_health_gate` Ok-arm post-save contract —
-        // see `warm_ok_with_refresh_failure_and_audit_failure_returns_audit_error`).
+        // audit-append failure (see
+        // `warm_ok_with_refresh_failure_and_audit_failure_returns_audit_error`).
         let outcome = call_verb(&env_id, revision_id, idempotency_key)
             .inspect_err(|err| {
                 if err.is_committed_after_save() {
