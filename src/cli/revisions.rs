@@ -204,49 +204,63 @@ pub fn stage(
             // Resolve a local `.gtbundle` (extract + pin packs) when one was
             // supplied, deriving the artifact pointers; otherwise record the
             // caller-supplied pointers verbatim (legacy Phase-A behavior).
-            let (bundle_digest, revision_pack_list, pack_list_lock_ref) = match &payload.bundle_path
-            {
-                Some(bundle_path) => {
-                    let env_dir = store.env_dir(&env_id)?;
-                    let staged = super::bundle_stage::stage_local_bundle(
-                        &env_dir,
-                        revision_id,
-                        bundle_path,
-                    )?;
-                    // The lock file is the on-disk source of truth for the
-                    // resolved packs. We also populate `Revision.pack_list`
-                    // with the pack ids derived from the lock so
-                    // `Environment::validate`'s config_overrides cross-ref
-                    // check has data to work with (without this, the
-                    // `--bundle` path left `pack_list` empty and the
-                    // cross-ref was permanently blind — Codex finding 1).
-                    // Version is a placeholder (0.0.0); digest is the real
-                    // on-disk digest. The cross-ref only checks `pack_id`
-                    // membership. Train-3's runtime path reads the lock file
-                    // for the real version.
-                    let lock_derived_pack_list: Vec<PackListEntry> = staged
-                        .lock
-                        .packs
-                        .iter()
-                        .map(|lp| {
-                            PackListEntry::from_lock_primitives(
-                                lp.pack_id.clone(),
-                                lp.digest.clone(),
-                            )
-                        })
-                        .collect();
-                    (
-                        staged.bundle_digest,
-                        lock_derived_pack_list,
-                        staged.pack_list_lock_ref,
-                    )
-                }
-                None => (
-                    payload.bundle_digest.clone(),
-                    pack_list.clone(),
-                    payload.pack_list_lock_ref.clone(),
-                ),
-            };
+            let (bundle_digest, revision_pack_list, pack_list_lock_ref, pack_config_refs) =
+                match &payload.bundle_path {
+                    Some(bundle_path) => {
+                        let env_dir = store.env_dir(&env_id)?;
+                        let staged = super::bundle_stage::stage_local_bundle(
+                            &env_dir,
+                            revision_id,
+                            bundle_path,
+                        )?;
+                        // The lock file is the on-disk source of truth for the
+                        // resolved packs. We also populate `Revision.pack_list`
+                        // with the pack ids derived from the lock so
+                        // `Environment::validate`'s config_overrides cross-ref
+                        // check has data to work with (without this, the
+                        // `--bundle` path left `pack_list` empty and the
+                        // cross-ref was permanently blind — Codex finding 1).
+                        // Version is a placeholder (0.0.0); digest is the real
+                        // on-disk digest. The cross-ref only checks `pack_id`
+                        // membership. Train-3's runtime path reads the lock file
+                        // for the real version.
+                        let lock_derived_pack_list: Vec<PackListEntry> = staged
+                            .lock
+                            .packs
+                            .iter()
+                            .map(|lp| {
+                                PackListEntry::from_lock_primitives(
+                                    lp.pack_id.clone(),
+                                    lp.digest.clone(),
+                                )
+                            })
+                            .collect();
+                        // C7: read any `pack-config-input.v1` files the wizard
+                        // emitted into the bundle and write the per-pack
+                        // `pack-config.v1` documents stamped with revision_id.
+                        // An empty bundle (no inputs) returns an empty list,
+                        // so legacy bundles still stage. The rev_dir naming
+                        // mirrors `bundle_stage::stage_local_bundle`.
+                        let rev_dir = env_dir.join("revisions").join(revision_id.to_string());
+                        let pack_config_refs = super::pack_config_stage::materialize_pack_configs(
+                            &env_dir,
+                            &rev_dir,
+                            revision_id,
+                        )?;
+                        (
+                            staged.bundle_digest,
+                            lock_derived_pack_list,
+                            staged.pack_list_lock_ref,
+                            pack_config_refs,
+                        )
+                    }
+                    None => (
+                        payload.bundle_digest.clone(),
+                        pack_list.clone(),
+                        payload.pack_list_lock_ref.clone(),
+                        Vec::new(),
+                    ),
+                };
 
             let staged = Revision {
                 schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
@@ -259,6 +273,7 @@ pub fn stage(
                 bundle_digest,
                 pack_list: revision_pack_list,
                 pack_list_lock_ref,
+                pack_config_refs,
                 config_digest: payload.config_digest.clone(),
                 signature_sidecar_ref: payload.signature_sidecar_ref.clone(),
                 lifecycle: RevisionLifecycle::Staged,

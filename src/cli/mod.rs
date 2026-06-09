@@ -50,6 +50,7 @@ pub mod extensions;
 pub mod messaging;
 pub mod migrate;
 pub mod migrate_state;
+pub mod pack_config_stage;
 pub mod revisions;
 pub mod secrets;
 pub mod traffic;

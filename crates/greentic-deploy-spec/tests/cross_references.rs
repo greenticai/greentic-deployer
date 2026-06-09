@@ -80,6 +80,7 @@ fn revision(
             source_uri: None,
         }],
         pack_list_lock_ref: PathBuf::from("revisions/lock"),
+        pack_config_refs: Vec::new(),
         config_digest: "sha256:0".into(),
         signature_sidecar_ref: PathBuf::from("revisions/sig"),
         lifecycle: RevisionLifecycle::Ready,
