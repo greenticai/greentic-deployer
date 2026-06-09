@@ -1,5 +1,9 @@
 [workspace]
-members = [".", "crates/greentic-deploy-spec"]
+members = [
+    ".",
+    "crates/greentic-deploy-spec",
+    "crates/greentic-environment-store-postgres",
+]
 resolver = "2"
 
 [package]
