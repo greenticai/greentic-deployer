@@ -233,6 +233,19 @@ pub struct WarmRevisionPayload {
     /// atomically inside the impl.
     pub health_gate: Result<(), HealthGateFailure>,
     pub idempotency_key: IdempotencyKey,
+    /// The revision lifecycle the caller observed at gate-evaluation time.
+    /// The typed verb checks under the env flock that the revision still
+    /// carries this lifecycle before applying the pre-evaluated gate result.
+    /// On mismatch (a concurrent mutation landed between gate-eval and
+    /// verb acquisition), the verb rejects with
+    /// [`super::lifecycle::LifecycleError::Conflict`] so a stale gate
+    /// outcome is never applied to env state it didn't observe.
+    ///
+    /// Idempotent-retry (revision already at the chain's final state) skips
+    /// the precondition check — the gate fires only when the chain actually
+    /// advanced, and a retry against an already-`Ready` revision is a
+    /// no-op regardless of the snapshot.
+    pub expected_lifecycle: RevisionLifecycle,
 }
 
 /// Inputs to [`EnvironmentMutations::add_bundle`].

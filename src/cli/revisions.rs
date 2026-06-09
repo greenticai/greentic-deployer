@@ -25,7 +25,6 @@
 
 use std::path::PathBuf;
 
-use chrono::Utc;
 use greentic_deploy_spec::{
     BundleId, DeploymentId, EnvId, PackId, PackListEntry, Revision, RevisionId, RevisionLifecycle,
     SemVer, is_valid_transition,
@@ -33,7 +32,9 @@ use greentic_deploy_spec::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{EnvironmentStore, LocalFsStore, StageRevisionPayload};
+use crate::environment::{
+    EnvironmentStore, LocalFsStore, StageRevisionPayload, WarmRevisionPayload,
+};
 use crate::rollout_telemetry::emit_lifecycle_event;
 use greentic_deploy_spec::Environment;
 use greentic_telemetry::RolloutEvent;
@@ -338,16 +339,33 @@ pub fn warm(
 /// Gate-aware variant of [`warm`] (B9 of `plans/next-gen-deployment.md`).
 ///
 /// Drives the same `staged → warming → ready` chain but runs `health_gate`
-/// against the post-chain `(env, revision)` view before `warmed_at` is
-/// stamped and the env is saved. On gate rejection, the revision is
-/// persisted in `Failed` and a `Conflict` (warm/ready health gate) is
-/// surfaced — see
+/// against a synthesized post-chain `(env, revision)` view. On gate
+/// rejection, the revision is persisted in `Failed` and a `Conflict`
+/// (warm/ready health gate) is surfaced — see
 /// [`crate::environment::apply_revision_transition_with_health_gate`].
+///
+/// **Closure→typed-verb bridge (PR-3a.6b).** The public signature stays
+/// closure-based so external consumers (`greentic-start`) keep their
+/// current contract. Internally the closure is evaluated OUTSIDE the typed
+/// verb's flock:
+///
+/// 1. Load env, find the revision, capture its current lifecycle.
+/// 2. Build a synthesized post-chain `Revision` view (clone with
+///    `lifecycle = Ready`, `warmed_at = None`).
+/// 3. Run the closure against `(env, synthesized_revision)`.
+/// 4. Call `store.warm_revision(env_id, WarmRevisionPayload {
+///    expected_lifecycle: current_lifecycle, health_gate, … })`.
+///
+/// `expected_lifecycle` is the precondition that guards against a
+/// concurrent mutation landing between gate-eval (step 3) and the typed
+/// verb's flock acquisition (step 4) — the verb rejects with `Conflict`
+/// if the revision's lifecycle drifted.
 ///
 /// Higher-tier consumers construct the gate from concrete validators
 /// (route-table validate, runtime-config load, signature verify, provider
-/// probes); this function only forwards the closure into the lifecycle
-/// helper, keeping `greentic-deployer` free of any health-check producers.
+/// probes); this function only evaluates the closure and ships the
+/// pre-evaluated outcome, keeping `greentic-deployer` free of any
+/// health-check producers.
 pub fn warm_with_health_gate<G>(
     store: &LocalFsStore,
     flags: &OpFlags,
@@ -363,21 +381,110 @@ where
     if flags.schema_only {
         return Ok(OpOutcome::new(NOUN, "warm", transition_schema()));
     }
-    transition_with_health_gate(
-        store,
-        flags,
-        payload,
-        "warm",
-        &[
-            (RevisionLifecycle::Staged, RevisionLifecycle::Warming),
-            (RevisionLifecycle::Warming, RevisionLifecycle::Ready),
-        ],
-        |r| {
-            r.warmed_at = Some(Utc::now());
-        },
-        false,
-        health_gate,
-    )
+    let payload = resolve_payload::<RevisionTransitionPayload>(flags, payload)?;
+    let env_id = parse_env_id(&payload.environment_id)?;
+    let revision_id = parse_revision_id(&payload.revision_id)?;
+    let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
+
+    // --- Pre-evaluate the health gate outside the typed verb's flock. ---
+    //
+    // Load env + find revision to capture the current lifecycle (the
+    // precondition) and build a synthesized post-chain view for the gate.
+    // A load/find failure here is a pre-flight error that does NOT hold
+    // the env flock — it simply surfaces as NotFound before the audit
+    // boundary.
+    let env = store.load(&env_id)?;
+    let current_revision = env
+        .revisions
+        .iter()
+        .find(|r| r.revision_id == revision_id)
+        .ok_or_else(|| {
+            OpError::NotFound(format!(
+                "revision `{revision_id}` not found in env `{env_id}`"
+            ))
+        })?;
+    let current_lifecycle = current_revision.lifecycle;
+
+    // Synthesize the post-chain revision view the gate will inspect: the
+    // lifecycle helper would walk `Staged → Warming → Ready` and stamp
+    // `warmed_at`, so the gate sees `Ready` with no warmed_at (the real
+    // stamp lands inside the typed verb AFTER the gate passes).
+    let mut synthesized = current_revision.clone();
+    synthesized.lifecycle = RevisionLifecycle::Ready;
+    // `warmed_at` is left as-is (None for a first warm; re-stamped on
+    // idempotent retry by the typed verb).
+
+    let gate_result = health_gate(&env, &synthesized);
+
+    // --- Dispatch to the typed verb through the standard adapter. ---
+    let op = "warm";
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: op,
+        target: json!({
+            "revision_id": revision_id.to_string(),
+            "lifecycle_to": RevisionLifecycle::Ready,
+        }),
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
+    };
+    audit_and_record(store, ctx, |committed| {
+        let store_result = store
+            .warm_revision(
+                &env_id,
+                WarmRevisionPayload {
+                    revision_id,
+                    health_gate: gate_result,
+                    idempotency_key,
+                    expected_lifecycle: current_lifecycle,
+                },
+            )
+            .inspect_err(|err| {
+                if err.is_committed_after_save() {
+                    committed.mark_committed();
+                }
+            });
+        // The warm typed verb's HealthGateFailed path persists Failed
+        // state, so mirror the closure-based committed-on-error contract.
+        match &store_result {
+            Err(crate::environment::StoreError::Lifecycle(inner))
+                if matches!(
+                    inner.as_ref(),
+                    crate::environment::LifecycleError::HealthGateFailed { .. }
+                ) =>
+            {
+                committed.mark_committed();
+                // Best-effort gate-failed emit: load the post-save env
+                // so the emit sees the Failed lifecycle.
+                if let Ok(env_for_emit) = store.load(&env_id)
+                    && let Some(rev_for_emit) = env_for_emit
+                        .revisions
+                        .iter()
+                        .find(|r| r.revision_id == revision_id)
+                {
+                    emit_for_op(op, true, None, &env_for_emit, rev_for_emit);
+                }
+                return Err(map_store_err_preserving_noun(store_result.unwrap_err()));
+            }
+            _ => {}
+        }
+        let outcome = store_result.map_err(map_store_err_preserving_noun)?;
+        committed.mark_committed();
+        emit_for_op(
+            op,
+            false,
+            Some(outcome.starting_lifecycle),
+            &outcome.environment,
+            &outcome.revision,
+        );
+        let summary = RevisionSummary::from(&outcome.revision);
+        let op_outcome = OpOutcome::new(
+            NOUN,
+            op,
+            serde_json::to_value(summary).expect("RevisionSummary is json-safe"),
+        );
+        Ok((op_outcome, super::AuditGens::NONE))
+    })
 }
 
 /// `op revisions drain`. `ready → draining`. The full in-flight drain dance
@@ -460,9 +567,8 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
 /// `refresh_runtime_config` refresh; the CLI handles authz, audit, payload
 /// resolution, error noun preservation, and lifecycle-event emission.
 ///
-/// The warm/ready gate path stays on the closure-based
-/// [`transition_with_health_gate`] until PR-3a.6b: pre-evaluating the gate
-/// against a synthesized post-chain view is a behavior shift worth its own PR.
+/// PR-3a.6b migrated `warm` to its own typed-verb adapter in
+/// [`warm_with_health_gate`]; this function now serves drain + archive only.
 fn typed_transition<F>(
     store: &LocalFsStore,
     flags: &OpFlags,
@@ -535,163 +641,6 @@ where
             serde_json::to_value(summary).expect("RevisionSummary is json-safe"),
         );
         Ok((op_outcome, super::AuditGens::NONE))
-    })
-}
-
-/// Gate-aware variant of [`typed_transition`] for the B9 warm/ready gate.
-/// Routes `on_final` and the `health_gate` closure through
-/// [`crate::environment::apply_revision_transition_with_health_gate`] inside
-/// the same `store.transact` lock so the gate sees the same snapshot the
-/// chain advance saw and the env is saved once (Failed on rejection, post-
-/// transition otherwise).
-///
-/// **TODO(PR-3a.6b):** delete this in favor of [`typed_transition`] once warm
-/// migrates to the typed `LocalFsStore::warm_revision` verb. Today the
-/// closure shape stays so the in-lock B9 gate consumer in `greentic-start`
-/// keeps its current contract; PR-3a.6b adds env-generation precondition
-/// support to `WarmRevisionPayload` so the pre-evaluated outcome can be
-/// safely shipped across the HTTP wire.
-// One extra arg over the 7-arg sibling typed_transition to thread the gate
-// closure; bundling into a struct would touch every existing warm caller for
-// no readability win.
-#[allow(clippy::too_many_arguments)]
-fn transition_with_health_gate<F, G>(
-    store: &LocalFsStore,
-    flags: &OpFlags,
-    payload: Option<RevisionTransitionPayload>,
-    op: &'static str,
-    accepted_chain: &[(RevisionLifecycle, RevisionLifecycle)],
-    on_final: F,
-    prune_from_splits: bool,
-    health_gate: G,
-) -> Result<OpOutcome, OpError>
-where
-    F: FnOnce(&mut Revision),
-    G: FnOnce(
-        &greentic_deploy_spec::Environment,
-        &Revision,
-    ) -> Result<(), crate::environment::HealthGateFailure>,
-{
-    let payload = resolve_payload::<RevisionTransitionPayload>(flags, payload)?;
-    let env_id = parse_env_id(&payload.environment_id)?;
-    let revision_id = parse_revision_id(&payload.revision_id)?;
-    // The chain's final `to` state is the lifecycle this verb lands on. Serde
-    // emits the canonical lowercase wire form, matching how lifecycle appears
-    // everywhere else.
-    let lifecycle_to = accepted_chain.last().map(|(_, to)| *to);
-    let ctx = AuditCtx {
-        env_id: env_id.clone(),
-        noun: NOUN,
-        verb: op,
-        target: json!({
-            "revision_id": revision_id.to_string(),
-            "lifecycle_to": lifecycle_to,
-        }),
-        idempotency_key: None,
-    };
-    audit_and_record(store, ctx, |committed| {
-        let (revision, env, starting_lifecycle) = store.transact(
-            &env_id,
-            |locked| -> Result<(Revision, Environment, Option<RevisionLifecycle>), OpError> {
-                // C5.3: capture the revision's lifecycle BEFORE the helper
-                // walks the chain. The `archive` matrix can traverse
-                // `Draining → Inactive → Archived` end-to-end in one call,
-                // so the final lifecycle alone can't tell us whether we
-                // crossed the `Draining → Inactive` eviction hop. Reading
-                // the env here is the same disk read the helper does
-                // internally, so the extra cost is one in-memory lookup.
-                //
-                // A load failure leaves `starting_lifecycle = None`, which
-                // makes the eviction emit skip silently — emit a
-                // `tracing::warn!` so the gap is observable rather than
-                // invisible. The lifecycle helper below will likely fail
-                // too, but if it transiently recovers (rare), at least the
-                // missing telemetry has a breadcrumb.
-                let starting_lifecycle = match locked.load() {
-                    Ok(e) => e
-                        .revisions
-                        .iter()
-                        .find(|r| r.revision_id == revision_id)
-                        .map(|r| r.lifecycle),
-                    Err(err) => {
-                        tracing::warn!(
-                            op = op,
-                            env_id = %env_id,
-                            revision_id = %revision_id,
-                            error = %err,
-                            "C5.3: failed to capture starting lifecycle; an `archive` \
-                             eviction emit may be skipped"
-                        );
-                        None
-                    }
-                };
-                let revision = match crate::environment::apply_revision_transition_with_health_gate(
-                    locked,
-                    revision_id,
-                    accepted_chain,
-                    on_final,
-                    prune_from_splits,
-                    health_gate,
-                ) {
-                    Ok(r) => {
-                        // The lifecycle helper called `locked.save(&env)` before
-                        // returning Ok — env is durable on disk. From this point
-                        // forward, every error path inside the transact (load,
-                        // refresh_runtime_config, …) is *committed-on-error*:
-                        // mark the audit boundary so a follow-up audit-append
-                        // failure fails-closed instead of silently demoting to
-                        // `tracing::warn!`.
-                        committed.mark_committed();
-                        r
-                    }
-                    Err(e @ crate::environment::LifecycleError::HealthGateFailed { .. }) => {
-                        // Gate-fail path: the lifecycle helper flipped the
-                        // revision to `Failed` and saved before returning this
-                        // error. The Failed state is durable, so mark the
-                        // audit boundary BEFORE the best-effort telemetry
-                        // emit — matches the Ok-arm convention
-                        // (commit-then-emit) and keeps the audit failure
-                        // path robust to any unwind from the emit. Telemetry
-                        // is best-effort: a load failure here must NOT mask
-                        // the original `HealthGateFailed` error, hence
-                        // `.ok()`.
-                        committed.mark_committed();
-                        if let Ok(env_for_emit) = locked.load()
-                            && let Some(rev_for_emit) = env_for_emit
-                                .revisions
-                                .iter()
-                                .find(|r| r.revision_id == revision_id)
-                        {
-                            // `starting_lifecycle` is not used by the
-                            // `gate_failed = true` arm of `emit_for_op`, so
-                            // passing `None` is fine here.
-                            emit_for_op(op, true, None, &env_for_emit, rev_for_emit);
-                        }
-                        return Err(OpError::from(e));
-                    }
-                    Err(other) => return Err(OpError::from(other)),
-                };
-                // Lifecycle transitions don't change traffic splits today, so this
-                // is a no-op refresh (guarded by change-detection); it keeps the
-                // runtime-config contract uniform across every mutating verb.
-                let env = locked.load()?;
-                locked.refresh_runtime_config(&env)?;
-                Ok((revision, env, starting_lifecycle))
-            },
-        )?;
-        // C5.3: emit the lifecycle event for this verb. Centralized in
-        // `emit_for_op` so the verb→event mapping lives in one place. Best-
-        // effort observability — `emit_rollout_event` is panic-safe with no
-        // subscriber installed, so no fallible path here can affect outcome.
-        emit_for_op(op, false, starting_lifecycle, &env, &revision);
-
-        let summary = RevisionSummary::from(&revision);
-        let outcome = OpOutcome::new(
-            NOUN,
-            op,
-            serde_json::to_value(summary).expect("RevisionSummary is json-safe"),
-        );
-        Ok((outcome, super::AuditGens::NONE))
     })
 }
 
