@@ -1061,6 +1061,16 @@ impl LocalFsStore {
                     payload.provider_type, payload.provider_id
                 )));
             }
+            // Validate secret_refs BEFORE provisioning the webhook secret so
+            // a malformed ref does not leave an orphan secret in the dev-store.
+            let secret_refs: Vec<SecretRef> = payload
+                .secret_refs
+                .iter()
+                .map(|r| {
+                    SecretRef::try_new(r)
+                        .map_err(|e| StoreError::InvalidArgument(format!("secret_ref `{r}`: {e}")))
+                })
+                .collect::<Result<_, _>>()?;
             let now = Utc::now();
             let eid = MessagingEndpointId::new();
             let webhook_secret_ref = if is_telegram_class(&payload.provider_type) {
@@ -1071,14 +1081,6 @@ impl LocalFsStore {
             } else {
                 None
             };
-            let secret_refs: Vec<SecretRef> = payload
-                .secret_refs
-                .iter()
-                .map(|r| {
-                    SecretRef::try_new(r)
-                        .map_err(|e| StoreError::InvalidArgument(format!("secret_ref `{r}`: {e}")))
-                })
-                .collect::<Result<_, _>>()?;
             let endpoint = MessagingEndpoint {
                 schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
                 env_id: env_id.clone(),
