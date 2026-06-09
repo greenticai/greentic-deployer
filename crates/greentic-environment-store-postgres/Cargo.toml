@@ -1,0 +1,46 @@
+[package]
+name = "greentic-environment-store-postgres"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Postgres-backed EnvironmentStore prototype for the Greentic next-gen deployer (Phase D §13.5)"
+license = "MIT"
+publish = false
+
+[dependencies]
+greentic-deploy-spec = { path = "../greentic-deploy-spec", version = "0.1" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[dependencies.sqlx]
+version = "0.8"
+default-features = false
+features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "json",
+    "macros",
+    "migrate",
+]
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread", "macros"]
+
+[dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde_json = "1"
+
+[dev-dependencies.tokio]
+version = "1"
+features = ["full"]
+
+[dev-dependencies.testcontainers]
+version = "0.23"
+
+[dev-dependencies.testcontainers-modules]
+version = "0.11"
+features = ["postgres"]
