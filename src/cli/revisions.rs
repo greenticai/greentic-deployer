@@ -488,11 +488,7 @@ where
     // event and in the typed verb call so an HTTP backend (PR-3b) can
     // replay the original outcome on a lost-response retry. Falling back
     // to a fresh ULID keeps existing CLI usage working unchanged.
-    let idempotency_key = match payload.idempotency_key {
-        Some(raw) => greentic_deploy_spec::IdempotencyKey::new(raw)
-            .map_err(|e| OpError::InvalidArgument(format!("idempotency_key: {e}")))?,
-        None => mint_idempotency_key(),
-    };
+    let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -884,12 +880,8 @@ mod tests {
     #[test]
     fn transition_schema_lists_idempotency_key() {
         let schema = transition_schema();
-        let props = schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .expect("properties block");
         assert!(
-            props.contains_key("idempotency_key"),
+            schema.pointer("/properties/idempotency_key").is_some(),
             "transition_schema must list `idempotency_key` so --schema-driven \
              callers can supply the A8 retry key (schema: {schema:#})"
         );

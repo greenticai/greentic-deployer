@@ -18,11 +18,11 @@ use greentic_deploy_spec::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{EnvironmentStore, LocalFsStore};
+use crate::environment::{EnvironmentStore, LocalFsStore, RemoveBundleOutcome};
 
 use super::{
     AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
-    mint_idempotency_key,
+    resolve_idempotency_key,
 };
 
 const NOUN: &str = "bundles";
@@ -361,11 +361,7 @@ pub fn remove(
     let payload = resolve_payload::<BundleRemovePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
-    let idempotency_key = match payload.idempotency_key {
-        Some(raw) => greentic_deploy_spec::IdempotencyKey::new(raw)
-            .map_err(|e| OpError::InvalidArgument(format!("idempotency_key: {e}")))?,
-        None => mint_idempotency_key(),
-    };
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -377,17 +373,19 @@ pub fn remove(
         idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let outcome_struct = store
+        let RemoveBundleOutcome {
+            deployment,
+            pruned_revision_ids,
+        } = store
             .remove_bundle(&env_id, deployment_id, idempotency_key)
             .map_err(map_store_err_preserving_noun)?;
-        let summary = BundleSummary::from(&env_id, &outcome_struct.deployment);
+        let summary = BundleSummary::from(&env_id, &deployment);
         let mut result = serde_json::to_value(summary).expect("BundleSummary is json-safe");
         // Surface pruned IDs on the wire response so HTTP callers see
         // exactly what was destroyed (matches what the audit event now
         // captures via the explicit-side-effect contract).
         result["pruned_revision_ids"] = json!(
-            outcome_struct
-                .pruned_revision_ids
+            pruned_revision_ids
                 .iter()
                 .map(|r| r.to_string())
                 .collect::<Vec<_>>()
@@ -595,12 +593,8 @@ mod tests {
     #[test]
     fn remove_schema_lists_idempotency_key() {
         let schema = remove_schema();
-        let props = schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .expect("properties block");
         assert!(
-            props.contains_key("idempotency_key"),
+            schema.pointer("/properties/idempotency_key").is_some(),
             "remove_schema must list `idempotency_key` so --schema-driven \
              callers can supply the A8 retry key (schema: {schema:#})"
         );
@@ -612,8 +606,7 @@ mod tests {
     /// separate authz check against the prune set.
     #[test]
     fn remove_response_surfaces_pruned_revision_ids() {
-        use greentic_deploy_spec::{Revision, RevisionLifecycle, SchemaVersion};
-        use std::path::PathBuf;
+        use greentic_deploy_spec::RevisionLifecycle;
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let env_id = EnvId::try_from("local").unwrap();
@@ -632,30 +625,15 @@ mod tests {
 
         // Seed two archived revisions under that deployment (the live-
         // state guard demands archived; otherwise remove refuses).
-        let bundle_id = BundleId::new("fast2flow");
         let mut env = store.load(&env_id).unwrap();
-        let now = Utc::now();
         for _ in 0..2 {
-            env.revisions.push(Revision {
-                schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
-                revision_id: crate::environment::mint_revision_id(),
-                env_id: env_id.clone(),
-                bundle_id: bundle_id.clone(),
-                deployment_id,
-                sequence: 1,
-                created_at: now,
-                bundle_digest: "sha256:00".to_string(),
-                pack_list: Vec::new(),
-                pack_list_lock_ref: PathBuf::new(),
-                pack_config_refs: Vec::new(),
-                config_digest: "sha256:00".to_string(),
-                signature_sidecar_ref: PathBuf::from("rev.sig"),
-                lifecycle: RevisionLifecycle::Archived,
-                staged_at: Some(now),
-                warmed_at: None,
-                drain_seconds: 30,
-                abort_metrics: Vec::new(),
-            });
+            env.revisions.push(crate::cli::tests_common::make_revision(
+                "local",
+                "fast2flow",
+                &deployment_id,
+                1,
+                RevisionLifecycle::Archived,
+            ));
         }
         store.save(&env).unwrap();
 

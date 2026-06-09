@@ -493,24 +493,29 @@ impl LocalFsStore {
                         "deployment `{deployment_id}` not found in env `{env_id}`"
                     ))
                 })?;
-            // Live-state guard. `current_revisions` is plan-level future
+            // Live-state guard + prune set computed in one pass over
+            // `env.revisions`. `current_revisions` is plan-level future
             // signal that A3's stage/warm path does not yet maintain, so
-            // it can't be the gate. The actual live-state proof is: any
-            // traffic split pointing at this deployment, or any
-            // non-archived revision for it.
+            // it can't be the gate; the live-state proof is: any traffic
+            // split pointing at this deployment, or any non-`Archived`
+            // revision for it.
             let active_splits = env
                 .traffic_splits
                 .iter()
                 .filter(|s| s.deployment_id == deployment_id)
                 .count();
-            let active_revisions = env
-                .revisions
-                .iter()
-                .filter(|r| {
-                    r.deployment_id == deployment_id
-                        && !matches!(r.lifecycle, RevisionLifecycle::Archived)
-                })
-                .count();
+            let mut active_revisions = 0usize;
+            let mut pruned_revision_ids: Vec<RevisionId> = Vec::new();
+            for r in env.revisions.iter() {
+                if r.deployment_id != deployment_id {
+                    continue;
+                }
+                if matches!(r.lifecycle, RevisionLifecycle::Archived) {
+                    pruned_revision_ids.push(r.revision_id);
+                } else {
+                    active_revisions += 1;
+                }
+            }
             if active_splits > 0 || active_revisions > 0 {
                 return Err(StoreError::Conflict(format!(
                     "deployment `{deployment_id}` is still live: {active_splits} traffic split(s), \
@@ -519,15 +524,6 @@ impl LocalFsStore {
                 )));
             }
             let deployment = env.bundles.remove(idx);
-            // Capture the archived revisions BEFORE retaining the rest so
-            // the prune set is explicit on the outcome (HTTP backends can
-            // apply a separate authz check; audit logs the IDs).
-            let pruned_revision_ids: Vec<RevisionId> = env
-                .revisions
-                .iter()
-                .filter(|r| r.deployment_id == deployment_id)
-                .map(|r| r.revision_id)
-                .collect();
             env.revisions.retain(|r| r.deployment_id != deployment_id);
             locked.save(&env)?;
             Ok(RemoveBundleOutcome {
