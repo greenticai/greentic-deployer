@@ -65,6 +65,30 @@ pub trait EnvPackHandler: std::fmt::Debug + Send + Sync {
     fn deployer_credentials(&self) -> Option<&dyn crate::credentials::DeployerCredentials> {
         None
     }
+
+    /// Env-pack wizard QASpec (`C6`).
+    ///
+    /// Returns the YAML source of the env-pack's `wizard.qaspec.yaml`,
+    /// the spec the operator's wizard driver runs to collect a binding's
+    /// `answers_ref` payload. Raw YAML (not a typed `qa_spec::FormSpec`)
+    /// so this crate stays qa-spec-free; the operator already depends on
+    /// `qa-spec` and parses at the call site. Default `None`: metadata-
+    /// only built-ins ship no wizard. Env-packs that ship a QASpec
+    /// override with `Some(include_str!("wizard.qaspec.yaml"))`.
+    ///
+    /// **C6 ↔ Phase D scope split**: C6 attaches the spec. It does NOT
+    /// plumb the captured answers into
+    /// [`DeployerCredentials::validate`](crate::credentials::DeployerCredentials::validate)
+    /// or any other handler op — there is no reader for
+    /// [`EnvPackBinding.answers_ref`](greentic_deploy_spec::EnvPackBinding)
+    /// today. Probes that look like they should scope to a wizard
+    /// answer (`region` on an AWS handler, `cluster` on a K8s handler)
+    /// run against the ambient environment. See the AWS-ECS YAML's
+    /// "Trust-boundary disclosure" header for the reference authoring
+    /// pattern when this gap matters for an env-pack.
+    fn wizard_qaspec_yaml(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// A built-in, metadata-only handler. One value per default `local` binding.
@@ -165,6 +189,23 @@ mod tests {
         defaults.sort_by(|a, b| a.1.cmp(&b.1));
 
         assert_eq!(handlers, defaults);
+    }
+
+    /// C6: the trait's `wizard_qaspec_yaml` default returns `None` so the
+    /// four metadata-only built-ins (Secrets/Telemetry/Sessions/State) ship
+    /// no wizard. Asserting on the trait method itself (not the handlers')
+    /// catches an override slipping into `BuiltinHandler` by accident.
+    #[test]
+    fn builtin_metadata_handlers_ship_no_wizard_qaspec() {
+        for h in BUILTIN_HANDLERS {
+            assert!(
+                h.wizard_qaspec_yaml().is_none(),
+                "metadata-only built-in `{}` must not ship a wizard QASpec — \
+                 override `wizard_qaspec_yaml` only on handlers that surface \
+                 operator-tunable knobs",
+                h.descriptor_path(),
+            );
+        }
     }
 
     #[test]

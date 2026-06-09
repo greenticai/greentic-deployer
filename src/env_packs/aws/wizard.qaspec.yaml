@@ -1,0 +1,142 @@
+# wizard.qaspec.yaml — AWS-ECS deployer env-pack (C6).
+#
+# Collects the operator-facing knobs the AWS-ECS deployer needs at
+# bind time. AWS credential MATERIAL is not captured here — the credential
+# chain (`~/.aws/credentials`, IRSA, ambient role, …) is resolved by
+# `RealAwsClient::resolve` in `credentials.rs` and validated via the
+# typed STS + IAM SimulatePrincipalPolicy probes from `VALIDATED_IAM_VERBS`.
+# The wizard's job is to capture the *non-secret* identifiers the deployer
+# needs to scope its operations: which region, which cluster, which ECR
+# repo, which optional ALB listener. Secrets stay on the secret backend
+# (B12a / `secret://` URI refs).
+#
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Trust-boundary disclosure (C3 ↔ C6 scope split):
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# C3's `AwsDeployerCredentials::validate(&self, _ctx: &ValidationContext)`
+# IGNORES `_ctx` and builds the STS + IAM SDK clients from
+# `aws_config::load_defaults` — the ambient AWS chain (env vars →
+# `~/.aws/credentials` → IMDS → IRSA). The deployer ALSO has no reader
+# for `EnvPackBinding.answers_ref` today: the field is recorded and
+# carried through, never loaded.
+#
+# Net effect for an operator filling this wizard: the captured answers
+# below are PERSISTED on the binding via `answers_ref`, but the C3
+# credentials probe runs against whatever ambient AWS identity is present
+# in the process environment — NOT against `region` / `aws_profile` /
+# `assume_role_arn` from this form. Validation can therefore pass or
+# fail for a different principal than the one this wizard scopes.
+#
+# Phase D wires `answers_ref → ValidationContext.answers` and feeds
+# `region`/`aws_profile`/`assume_role_arn` into the SDK client builder,
+# at which point probes scope correctly to the captured identity. Until
+# that lands, treat this wizard as DECLARATIVE INTENT for the env's
+# scoping (recorded on the binding for Phase D consumption) — NOT as
+# the authoritative input to today's credential probes.
+#
+# Versioning: this spec rides the env-pack handler's
+# `AwsEcsDeployerHandler::VERSION_REQ` (`>=1.0.0-dev, <2.0.0`). A breaking
+# change to the question set means a Major bump on the env-pack descriptor
+# and a fresh `wizard.qaspec.yaml`.
+
+id: greentic.deployer.aws-ecs.wizard
+title: AWS-ECS deployer
+version: "0.1.0"
+description: >-
+  Records the AWS account scope the AWS-ECS deployer env-pack will
+  operate against. Phase C: answers are captured on the binding
+  (`answers_ref`) but NOT yet honored by `credentials validate` — the
+  C3 probe uses the ambient AWS chain. Phase D wires these answers into
+  the SDK client builder so probes scope to the captured identity.
+  Credential MATERIAL is never collected here.
+presentation:
+  intro: >-
+    Bind an AWS-ECS environment. Phase-C disclosure: today's `gtc op
+    credentials requirements` probes the AMBIENT AWS chain
+    (`AWS_PROFILE`, `~/.aws/credentials`, IRSA, IMDS, …) — the answers
+    below are recorded on the binding but DO NOT scope today's
+    validation. Make sure the host's ambient AWS identity points at the
+    same account/region you fill in here, or validation will pass/fail
+    for the wrong principal. Phase D removes this gap by feeding the
+    answers into the SDK client builder.
+
+questions:
+  - id: region
+    type: string
+    title: AWS region
+    description: >-
+      AWS region the ECS cluster lives in (e.g. `us-east-1`,
+      `eu-west-1`). Used as the `region` field on the resolved AWS SDK
+      config when the deployer's typed clients are built.
+    required: true
+    constraint:
+      pattern: '^[a-z]{2}-[a-z]+-[0-9]$'
+
+  - id: aws_profile
+    type: string
+    title: AWS profile (optional)
+    description: >-
+      Named profile from `~/.aws/credentials` / `~/.aws/config`. Leave
+      blank to let the SDK walk the default credential chain
+      (env vars → shared config → IMDS → IRSA).
+    required: false
+
+  - id: assume_role_arn
+    type: string
+    title: Assume-role ARN (optional)
+    description: >-
+      IAM role ARN to assume after the base credential chain resolves
+      (typical for cross-account ECS deploys). Leave blank to use the
+      base credentials directly.
+    required: false
+    constraint:
+      pattern: '^arn:aws:iam::[0-9]{12}:role/.+$'
+
+  - id: ecs_cluster_name
+    type: string
+    title: ECS cluster name
+    description: >-
+      Name of the ECS cluster the deployer manages services in.
+      Must already exist; this wizard does not provision it. The Phase-D
+      D-AWS-1 train will optionally render Terraform to provision it.
+    required: true
+    constraint:
+      min_len: 1
+      max_len: 255
+      pattern: '^[a-zA-Z0-9_-]+$'
+
+  - id: ecr_repository_prefix
+    type: string
+    title: ECR repository prefix
+    description: >-
+      Prefix appended to every revision's container image (e.g.
+      `<account>.dkr.ecr.<region>.amazonaws.com/greentic/`). The
+      deployer's `ecr:PutImage` IAM probe is scoped to this prefix.
+    required: true
+    constraint:
+      min_len: 1
+      pattern: '^[a-zA-Z0-9._/-]+$'
+
+  - id: alb_listener_arn
+    type: string
+    title: ALB listener ARN (optional)
+    description: >-
+      Listener ARN for the ALB the deployer will write weighted target-
+      group rules to (mirrors `TrafficSplit`). Leave blank when the
+      runtime dispatcher is authoritative for traffic splitting and no
+      ALB mirror is configured.
+    required: false
+    constraint:
+      pattern: '^arn:aws:elasticloadbalancing:[a-z0-9-]+:[0-9]{12}:listener/.+$'
+
+  - id: container_image_tag_prefix
+    type: string
+    title: Container image tag prefix
+    description: >-
+      Prefix every revision's image tag is built from (e.g. `rev-`).
+      Combined with the revision ULID at deploy time. Leave blank to
+      tag with the raw revision ULID.
+    required: false
+    default_value: "rev-"
+    constraint:
+      pattern: '^[a-zA-Z0-9_.-]*$'

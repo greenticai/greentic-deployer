@@ -160,6 +160,22 @@ impl EnvPackRegistry {
         Ok(handler)
     }
 
+    /// Resolve a descriptor and return the handler's
+    /// [`wizard_qaspec_yaml`](EnvPackHandler::wizard_qaspec_yaml) (C6).
+    ///
+    /// Reuses [`resolve`](Self::resolve)'s version-supported check, so a
+    /// caller asking for an env-pack's wizard at a version the handler
+    /// does not implement gets [`RegistryError::VersionUnsupported`]
+    /// before any YAML is returned. The outer `Result` distinguishes
+    /// "no handler / wrong version" from the inner `Option` ("handler
+    /// resolves but ships no wizard" — the metadata-only built-ins).
+    pub fn wizard_qaspec_yaml_for_descriptor(
+        &self,
+        kind: &PackDescriptor,
+    ) -> Result<Option<&'static str>, RegistryError> {
+        Ok(self.resolve(kind)?.wizard_qaspec_yaml())
+    }
+
     /// Number of registered handlers.
     pub fn len(&self) -> usize {
         self.handlers.len()
@@ -371,6 +387,72 @@ mod tests {
             matches!(err, RegistryError::DeployerMissingCredentials { .. }),
             "got {err:?}"
         );
+    }
+
+    /// C6 (parametrized): every handler that ships a wizard YAML must
+    /// deserialize cleanly as a `qa_spec::FormSpec` with at least one
+    /// question. Centralized here so a new handler shipping a wizard
+    /// automatically inherits the contract — no per-handler boilerplate.
+    #[test]
+    fn every_handler_with_a_wizard_ships_a_well_formed_qaspec() {
+        let registry = EnvPackRegistry::with_builtins();
+        let mut checked = 0;
+        for (path, handler) in &registry.handlers {
+            let Some(yaml) = handler.wizard_qaspec_yaml() else {
+                continue;
+            };
+            let spec: qa_spec::FormSpec = serde_yaml_bw::from_str(yaml)
+                .unwrap_or_else(|e| panic!("`{path}` wizard.qaspec.yaml parses: {e}"));
+            assert!(
+                !spec.questions.is_empty(),
+                "`{path}` wizard QASpec declares zero questions — the operator's wizard \
+                 driver has nothing to ask",
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 1,
+            "no built-in handler ships a wizard QASpec — the C6 seam is unexercised",
+        );
+    }
+
+    /// C6: the registry helper returns the deployer's wizard YAML when
+    /// the descriptor resolves, `None` for descriptors whose handler
+    /// ships no wizard (metadata-only built-ins), and `VersionUnsupported`
+    /// when the pinned version exceeds what the handler implements.
+    #[test]
+    fn wizard_qaspec_yaml_for_descriptor_resolves_local_process() {
+        let registry = EnvPackRegistry::with_builtins();
+        let yaml = registry
+            .wizard_qaspec_yaml_for_descriptor(&descriptor(LOCAL_DEPLOYER_PACK))
+            .expect("local-process deployer descriptor resolves")
+            .expect("local-process deployer ships a wizard QASpec");
+        assert!(yaml.contains("greentic.deployer.local-process.wizard"));
+    }
+
+    #[test]
+    fn wizard_qaspec_yaml_for_descriptor_none_for_metadata_only_handler() {
+        let registry = EnvPackRegistry::with_builtins();
+        // The dev-store secrets handler is metadata-only — no wizard.
+        let yaml = registry
+            .wizard_qaspec_yaml_for_descriptor(&descriptor(LOCAL_SECRETS_PACK))
+            .expect("dev-store secrets descriptor resolves");
+        assert!(
+            yaml.is_none(),
+            "metadata-only handler must not surface a wizard QASpec",
+        );
+    }
+
+    #[test]
+    fn wizard_qaspec_yaml_for_descriptor_propagates_version_skew() {
+        let registry = EnvPackRegistry::with_builtins();
+        // Path resolves but version is past what the handler implements —
+        // wizard lookup MUST inherit `resolve`'s version check, not silently
+        // return YAML for an unsupported version.
+        let err = registry
+            .wizard_qaspec_yaml_for_descriptor(&descriptor("greentic.secrets.dev-store@9.9.9"))
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::VersionUnsupported { .. }));
     }
 
     /// The built-in local-process deployer ships a credentials contract

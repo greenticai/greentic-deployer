@@ -85,6 +85,10 @@ impl EnvPackHandler for LocalProcessDeployerHandler {
     fn deployer_credentials(&self) -> Option<&dyn crate::credentials::DeployerCredentials> {
         Some(&self.creds)
     }
+
+    fn wizard_qaspec_yaml(&self) -> Option<&'static str> {
+        Some(include_str!("wizard.qaspec.yaml"))
+    }
 }
 
 #[cfg(test)]
@@ -123,5 +127,19 @@ mod tests {
         // Sanity: contract returns the two C2 capabilities.
         let caps = creds.required_capabilities();
         assert_eq!(caps.len(), 2);
+    }
+
+    /// C6: pins this handler's wizard YAML to its canonical `id` so a
+    /// renamed YAML or a wrong `include_str!` path surfaces here.
+    /// (Round-trip `qa_spec::FormSpec` deserialization is covered by
+    /// the registry-level parametrized test in `registry.rs`.)
+    #[test]
+    fn wizard_qaspec_yaml_id_matches_canonical() {
+        let yaml = LocalProcessDeployerHandler::default()
+            .wizard_qaspec_yaml()
+            .expect("local-process handler ships a wizard QASpec");
+        let spec: qa_spec::FormSpec =
+            serde_yaml_bw::from_str(yaml).expect("wizard.qaspec.yaml parses as FormSpec");
+        assert_eq!(spec.id, "greentic.deployer.local-process.wizard");
     }
 }

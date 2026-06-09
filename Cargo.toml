@@ -208,3 +208,8 @@ version = "3"
 [dev-dependencies]
 wat = "1"
 base64 = "0.22"
+# C6: parse the env-pack `wizard.qaspec.yaml` files at test time to prove
+# the shipped YAML deserializes into `qa_spec::FormSpec`. NOT a runtime
+# dep — the trait carries raw YAML (`&'static str`), so the lib stays
+# qa-spec-free; the operator parses at the call site.
+qa-spec = ">=1.1.0-dev, <1.2.0-0"
