@@ -222,12 +222,24 @@ pub fn materialize_pack_configs(
                     input_path.display()
                 ))
             })?;
-            if parsed.env_segment() != env_id.as_str() {
+            // Codex review (post-hardening) finding: the wizard documents
+            // `secret://<env>/<bundle>/<pack>/<question>` (PR2 §472). Checking
+            // only the env segment leaves same-env cross-bundle / cross-pack /
+            // cross-key URIs accepted — a hand-edited or stale bundle could
+            // route one pack's `pack-config.v1` at another pack's secrets at
+            // boot. Pin every segment to the target env/bundle/pack and the
+            // map key.
+            let expected = format!(
+                "secret://{}/{}/{}/{}",
+                env_id.as_str(),
+                bundle_id.as_str(),
+                input.pack_id,
+                key
+            );
+            if parsed.as_str() != expected {
                 return Err(OpError::InvalidArgument(format!(
-                    "pack-config-input `{}`: secret_refs.{key} = `{raw}` is scoped to env `{}`, not target env `{}`",
-                    input_path.display(),
-                    parsed.env_segment(),
-                    env_id.as_str()
+                    "pack-config-input `{}`: secret_refs.{key} = `{raw}` is not scoped to `{expected}`",
+                    input_path.display()
                 )));
             }
             secret_refs.insert(key, parsed);
@@ -642,40 +654,84 @@ mod tests {
         assert!(msg.contains("bundle_id `customer.support`"), "msg = {msg}");
     }
 
-    /// Codex review finding 1 (secret-URI env scope): a `secret_refs` value
-    /// like `secret://prod/...` is refused even when input.env_id agreed —
-    /// stale URIs in a bundle copy must not point at another env's secrets.
-    #[test]
-    fn secret_ref_env_segment_drift_rejects() {
-        let env = tempdir().unwrap();
-        let rev_dir = env.path().join("revisions/r1");
+    /// Codex review (post-hardening) — full secret-URI scope.
+    ///
+    /// Wizard contract is `secret://<env>/<bundle>/<pack>/<question>` (PR2 §472).
+    /// Each segment must match the staging target: env mismatch fails fast,
+    /// and the same gate refuses same-env cross-bundle / cross-pack /
+    /// cross-key URIs (subsequent regression tests). Without these checks a
+    /// hand-edited or stale bundle could route one pack's `pack-config.v1`
+    /// at another pack's secrets at boot.
+    fn run_with_secret_ref(env: &str, bundle: &str, pack: &str, key: &str, raw: &str) -> OpError {
+        let dir = tempdir().unwrap();
+        let rev_dir = dir.path().join("revisions/r1");
         let ext = extract_dir(&rev_dir);
         write_input(
             &ext,
             &json!({
                 "schema": "greentic.pack-config-input.v1",
-                "pack_id": "p",
-                "env_id": "local",
-                "bundle_id": "b",
-                "secret_refs": {"k": "secret://prod/b/p/k"},
+                "pack_id": pack,
+                "env_id": env,
+                "bundle_id": bundle,
+                "secret_refs": {key: raw},
             }),
-            "p.json",
+            &format!("{pack}.json"),
         );
-
-        let err = run(
-            env.path(),
+        run(
+            dir.path(),
             &rev_dir,
             RevisionId::new(),
-            "local",
-            "b",
-            &pinned(&["p"]),
+            env,
+            bundle,
+            &pinned(&[pack]),
         )
-        .unwrap_err();
+        .unwrap_err()
+    }
+
+    #[test]
+    fn secret_ref_wrong_env_rejects() {
+        let err = run_with_secret_ref("local", "b", "p", "k", "secret://prod/b/p/k");
         let OpError::InvalidArgument(msg) = err else {
             panic!("expected InvalidArgument, got {err:?}");
         };
         assert!(
-            msg.contains("scoped to env `prod`, not target env `local`"),
+            msg.contains("not scoped to `secret://local/b/p/k`"),
+            "msg = {msg}"
+        );
+    }
+
+    #[test]
+    fn secret_ref_wrong_bundle_rejects() {
+        let err = run_with_secret_ref("local", "b", "p", "k", "secret://local/other-bundle/p/k");
+        let OpError::InvalidArgument(msg) = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert!(
+            msg.contains("not scoped to `secret://local/b/p/k`"),
+            "msg = {msg}"
+        );
+    }
+
+    #[test]
+    fn secret_ref_wrong_pack_rejects() {
+        let err = run_with_secret_ref("local", "b", "p", "k", "secret://local/b/other-pack/k");
+        let OpError::InvalidArgument(msg) = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert!(
+            msg.contains("not scoped to `secret://local/b/p/k`"),
+            "msg = {msg}"
+        );
+    }
+
+    #[test]
+    fn secret_ref_wrong_key_rejects() {
+        let err = run_with_secret_ref("local", "b", "p", "k", "secret://local/b/p/other-key");
+        let OpError::InvalidArgument(msg) = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert!(
+            msg.contains("not scoped to `secret://local/b/p/k`"),
             "msg = {msg}"
         );
     }
