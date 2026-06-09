@@ -17,18 +17,20 @@ use chrono::Utc;
 use greentic_distributor_client::signing::TrustedKey;
 
 use greentic_deploy_spec::{
-    CapabilitySlot, DeploymentId, EnvId, EnvPackBinding, Environment, EnvironmentHostConfig,
-    ExtensionBinding, HealthStatus, IdempotencyKey, RetentionPolicy, Revision, RevisionId,
-    RevisionLifecycle, RevocationConfig, SchemaVersion,
+    BundleId, CapabilitySlot, DeploymentId, EnvId, EnvPackBinding, Environment,
+    EnvironmentHostConfig, ExtensionBinding, HealthStatus, IdempotencyKey, RetentionPolicy,
+    Revision, RevisionId, RevisionLifecycle, RevocationConfig, SchemaVersion, TrafficSplit,
+    TrafficSplitEntry,
 };
 
 use super::lifecycle::{
     LifecycleError, apply_revision_transition, apply_revision_transition_with_health_gate,
 };
 use super::mutations::{
-    ExtensionKey, MigrateMergePayload, RemoveBundleOutcome, RevisionTransitionOutcome,
-    StageRevisionPayload, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
-    UpdateEnvironmentPayload, WarmRevisionPayload,
+    ApplyTrafficSplitOutcome, ExtensionKey, MigrateMergePayload, RemoveBundleOutcome,
+    RevisionTransitionOutcome, RollbackTrafficSplitOutcome, StageRevisionPayload,
+    TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload,
+    WarmRevisionPayload,
 };
 use super::store::{LocalFsStore, StoreError};
 use super::trust_root::{self as store_trust_root, trust_root_path};
@@ -995,6 +997,283 @@ impl LocalFsStore {
             Ok((env.extensions[idx].clone(), new_generation))
         })
     }
+
+    // -------------------------------------------------------------
+    // Traffic split  (PR-3a.11)
+    //   `op traffic set | rollback`
+    // -------------------------------------------------------------
+
+    /// Replace the entire traffic-split entry list for one deployment.
+    /// Validates the 10,000 bps sum invariant via [`TrafficSplit::validate`],
+    /// checks §5.3 admission (entries must route to `Ready` revisions), and
+    /// stashes the prior split for one-step rollback.
+    ///
+    /// Idempotency: a same-key-same-entries replay is a no-op success that
+    /// reconciles the materialized `runtime-config.json` (repairs a prior
+    /// publish failure). Same-key-different-entries is a conflict. A new
+    /// key advances the generation.
+    ///
+    /// The `authorization_ref` is stored on the split for audit provenance;
+    /// the `updated_by` field records the operator identity.
+    ///
+    /// Post-save, the materialized `runtime-config.json` is refreshed. A
+    /// failure there wraps as [`StoreError::CommittedAfterSave`] so the CLI
+    /// audit fires for the already-persisted mutation.
+    pub fn set_traffic_split(
+        &self,
+        env_id: &EnvId,
+        deployment_id: DeploymentId,
+        entries: Vec<TrafficSplitEntry>,
+        idempotency_key: IdempotencyKey,
+        updated_by: String,
+        authorization_ref: Option<String>,
+    ) -> Result<ApplyTrafficSplitOutcome, StoreError> {
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            let deployment = env
+                .bundles
+                .iter()
+                .find(|b| b.deployment_id == deployment_id)
+                .ok_or_else(|| {
+                    StoreError::DependentNotFound(format!(
+                        "deployment `{deployment_id}` not found in env `{env_id}`"
+                    ))
+                })?;
+            let bundle_id: BundleId = deployment.bundle_id.clone();
+            // Revision-belongs-to-deployment check.
+            for entry in &entries {
+                let rev = env
+                    .revisions
+                    .iter()
+                    .find(|r| r.revision_id == entry.revision_id)
+                    .ok_or_else(|| {
+                        StoreError::DependentNotFound(format!(
+                            "revision `{}` not found in env `{env_id}`",
+                            entry.revision_id
+                        ))
+                    })?;
+                if rev.deployment_id != deployment_id {
+                    return Err(StoreError::Conflict(format!(
+                        "revision `{}` belongs to deployment `{}`, not `{}`",
+                        entry.revision_id, rev.deployment_id, deployment_id,
+                    )));
+                }
+            }
+            // Idempotency check: a retry with the same key against the same
+            // (deployment, entries) is a no-op success; same key + different
+            // payload is a conflict; new key advances generation.
+            let prev_split_idx = env
+                .traffic_splits
+                .iter()
+                .position(|s| s.deployment_id == deployment_id);
+            if let Some(idx) = prev_split_idx {
+                let prev = &env.traffic_splits[idx];
+                if prev.idempotency_key == idempotency_key.as_str() {
+                    if entries_match(&prev.entries, &entries) {
+                        // No-op replay. Reconcile the derived runtime-config
+                        // before returning so a retry repairs a publish that
+                        // failed after environment.json was already durable.
+                        locked.refresh_runtime_config(&env)?;
+                        return Ok(ApplyTrafficSplitOutcome {
+                            split: prev.clone(),
+                            previous_generation: None,
+                            new_generation: None,
+                        });
+                    }
+                    return Err(StoreError::Conflict(format!(
+                        "idempotency key `{}` already used for deployment `{}` with different entries",
+                        idempotency_key.as_str(), deployment_id
+                    )));
+                }
+            }
+            // §5.3 admission, on the apply path only: the idempotent no-op
+            // replay above must stay a success even if a routed revision later
+            // drains, so a stale split is never rejected on retry.
+            assert_entries_all_ready(&env, &entries, env_id)?;
+            let (generation, previous_split_ref, prev_gen) = match prev_split_idx {
+                Some(idx) => {
+                    let prev = &env.traffic_splits[idx];
+                    let snapshot = serde_json::to_value(prev).map_err(|e| {
+                        StoreError::Conflict(format!("snapshot prior split: {e}"))
+                    })?;
+                    (
+                        prev.generation + 1,
+                        Some(crate::cli::traffic::stash_inline(snapshot)),
+                        Some(prev.generation),
+                    )
+                }
+                None => (0, None, None),
+            };
+            let split = TrafficSplit {
+                schema: SchemaVersion::new(SchemaVersion::TRAFFIC_SPLIT_V1),
+                env_id: env_id.clone(),
+                deployment_id,
+                bundle_id,
+                generation,
+                entries: entries.clone(),
+                updated_at: Utc::now(),
+                updated_by,
+                idempotency_key: idempotency_key.as_str().to_string(),
+                authorization_ref: authorization_ref
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("auth.json")),
+                previous_split_ref,
+            };
+            split.validate().map_err(StoreError::Spec)?;
+            match prev_split_idx {
+                Some(idx) => env.traffic_splits[idx] = split.clone(),
+                None => env.traffic_splits.push(split.clone()),
+            }
+            locked.save(&env)?;
+            // From here on the env mutation is durable on disk. Any
+            // subsequent failure (runtime-config refresh) wraps as
+            // `CommittedAfterSave` so the CLI audit fires for the
+            // already-persisted mutation.
+            locked
+                .refresh_runtime_config(&env)
+                .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
+            // C5.3: emit `TrafficSplitApplied` from INSIDE the transact so the
+            // tenant attribution reads the same env snapshot that was just
+            // saved (no TOCTOU window with a concurrent writer). The idempotent
+            // no-op replay returns earlier with `NONE` generations, so reaching
+            // this point implies a genuine mutation.
+            crate::rollout_telemetry::emit_traffic_split_applied(
+                &env,
+                split.deployment_id,
+                &split.bundle_id,
+                split.generation,
+            );
+            Ok(ApplyTrafficSplitOutcome {
+                split,
+                previous_generation: prev_gen,
+                new_generation: Some(generation),
+            })
+        })
+    }
+
+    /// Rollback the traffic split for a deployment to its one-step-previous
+    /// snapshot. Bumps the generation, validates §5.3 admission on the
+    /// restored entries, refreshes `runtime-config.json`, and emits the
+    /// C5.3 telemetry event.
+    ///
+    /// Returns [`StoreError::DependentNotFound`] when no split exists for
+    /// the deployment, and [`StoreError::Conflict`] when there is no
+    /// previous snapshot to restore.
+    ///
+    /// `_idempotency_key` is accepted for trait conformance and ignored
+    /// locally; the HTTP backend caches it for A8 §2 replay.
+    pub fn rollback_traffic_split(
+        &self,
+        env_id: &EnvId,
+        deployment_id: DeploymentId,
+        _idempotency_key: IdempotencyKey,
+    ) -> Result<RollbackTrafficSplitOutcome, StoreError> {
+        self.transact(env_id, |locked| {
+            let mut env = locked.load()?;
+            let idx = env
+                .traffic_splits
+                .iter()
+                .position(|s| s.deployment_id == deployment_id)
+                .ok_or_else(|| {
+                    StoreError::DependentNotFound(format!(
+                        "no traffic split for deployment `{deployment_id}` in env `{env_id}`"
+                    ))
+                })?;
+            let prev_split_generation = env.traffic_splits[idx].generation;
+            let prev_ref = env.traffic_splits[idx]
+                .previous_split_ref
+                .clone()
+                .ok_or_else(|| {
+                    StoreError::Conflict(format!(
+                        "traffic split for `{deployment_id}` has no prior version to roll back to"
+                    ))
+                })?;
+            let prev_value = crate::cli::traffic::load_inline(&prev_ref).ok_or_else(|| {
+                StoreError::DependentNotFound(format!(
+                    "previous split payload `{}` missing",
+                    prev_ref.display()
+                ))
+            })?;
+            let mut restored: TrafficSplit = serde_json::from_value(prev_value)
+                .map_err(|e| StoreError::Conflict(format!("deserialise previous split: {e}")))?;
+            let new_generation = prev_split_generation + 1;
+            restored.generation = new_generation;
+            restored.previous_split_ref = None;
+            restored.updated_at = Utc::now();
+            restored.idempotency_key =
+                format!("rollback-{}", env.traffic_splits[idx].idempotency_key);
+            restored.validate().map_err(StoreError::Spec)?;
+            // §5.3 admission on the restore path: a historical split may route
+            // to revisions that have since been archived, failed, or removed.
+            assert_entries_all_ready(&env, &restored.entries, env_id)?;
+            env.traffic_splits[idx] = restored.clone();
+            locked.save(&env)?;
+            // From here on the env mutation is durable on disk.
+            locked
+                .refresh_runtime_config(&env)
+                .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
+            // C5.3: emit `TrafficSplitApplied` for the rollback path too —
+            // a rollback advances generation and materializes into runtime-
+            // config exactly like a forward `set`, so monitoring pipelines
+            // need the same lifecycle event.
+            crate::rollout_telemetry::emit_traffic_split_applied(
+                &env,
+                restored.deployment_id,
+                &restored.bundle_id,
+                restored.generation,
+            );
+            Ok(RollbackTrafficSplitOutcome {
+                restored,
+                previous_generation: prev_split_generation,
+                new_generation,
+            })
+        })
+    }
+}
+
+/// §5.3 admission: every entry's revision must exist and be `Ready` before its
+/// split goes live. Used by both `set_traffic_split` and
+/// `rollback_traffic_split`.
+fn assert_entries_all_ready(
+    env: &Environment,
+    entries: &[TrafficSplitEntry],
+    env_id: &EnvId,
+) -> Result<(), StoreError> {
+    for entry in entries {
+        let rev = env
+            .revisions
+            .iter()
+            .find(|r| r.revision_id == entry.revision_id)
+            .ok_or_else(|| {
+                StoreError::Conflict(format!(
+                    "revision `{}` not found in env `{env_id}`",
+                    entry.revision_id
+                ))
+            })?;
+        if rev.lifecycle != RevisionLifecycle::Ready {
+            return Err(StoreError::Conflict(format!(
+                "revision `{}` is `{:?}`; only `Ready` revisions may receive traffic",
+                entry.revision_id, rev.lifecycle
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Order-insensitive equality on basis-points-per-revision_id. Two payloads
+/// that route the same percentage to the same revision_id (in any
+/// permutation) collapse to "same" for idempotency purposes.
+fn entries_match(a: &[TrafficSplitEntry], b: &[TrafficSplitEntry]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a_sorted: Vec<(&RevisionId, u32)> =
+        a.iter().map(|e| (&e.revision_id, e.weight_bps)).collect();
+    let mut b_sorted: Vec<(&RevisionId, u32)> =
+        b.iter().map(|e| (&e.revision_id, e.weight_bps)).collect();
+    a_sorted.sort_by_key(|(r, _)| r.to_string());
+    b_sorted.sort_by_key(|(r, _)| r.to_string());
+    a_sorted == b_sorted
 }
 
 /// Build an empty [`Environment`] at the current `ENVIRONMENT_V1` schema

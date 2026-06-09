@@ -144,6 +144,26 @@ pub struct TrustRootRemoveOutcome {
     pub trusted_key_count: usize,
 }
 
+/// Outcome of [`EnvironmentMutations::set_traffic_split`]. Carries the
+/// post-apply split and the generation transition for audit/observability.
+/// On an idempotent same-key-same-entries replay, `previous_generation`
+/// and `new_generation` are both `None` (no state change).
+#[derive(Debug, Clone)]
+pub struct ApplyTrafficSplitOutcome {
+    pub split: TrafficSplit,
+    pub previous_generation: Option<u64>,
+    pub new_generation: Option<u64>,
+}
+
+/// Outcome of [`EnvironmentMutations::rollback_traffic_split`]. Carries
+/// the restored split and the generation transition for audit/observability.
+#[derive(Debug, Clone)]
+pub struct RollbackTrafficSplitOutcome {
+    pub restored: TrafficSplit,
+    pub previous_generation: u64,
+    pub new_generation: u64,
+}
+
 /// Optional-field patch for [`EnvironmentMutations::update_environment`].
 /// Replaces the earlier `set_public_url` and `set_config` verbs — both were
 /// strict subsets of this patch shape, so collapsing them removes two
@@ -520,13 +540,14 @@ pub trait EnvironmentMutations: Send + Sync {
         idempotency_key: IdempotencyKey,
         updated_by: String,
         authorization_ref: Option<String>,
-    ) -> Result<TrafficSplit, StoreError>;
+    ) -> Result<ApplyTrafficSplitOutcome, StoreError>;
 
     fn rollback_traffic_split(
         &self,
         env_id: &EnvId,
         deployment_id: DeploymentId,
-    ) -> Result<TrafficSplit, StoreError>;
+        idempotency_key: IdempotencyKey,
+    ) -> Result<RollbackTrafficSplitOutcome, StoreError>;
 
     // -------------------------------------------------------------
     // Messaging endpoints

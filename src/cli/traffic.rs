@@ -16,22 +16,20 @@
 
 use std::path::PathBuf;
 
-use chrono::Utc;
-use greentic_deploy_spec::{
-    BundleId, DeploymentId, EnvId, Environment, RevisionId, RevisionLifecycle, SchemaVersion,
-    TrafficSplit, TrafficSplitEntry,
-};
+use greentic_deploy_spec::{DeploymentId, EnvId, RevisionId, TrafficSplit, TrafficSplitEntry};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
-use crate::rollout_telemetry::emit_traffic_split_applied;
 
 use super::dispatch::{TrafficSetArgs, TrafficTargetArgs};
-use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
+use super::{
+    AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
+    resolve_idempotency_key,
+};
 
 const NOUN: &str = "traffic";
-const PREV_PREFIX: &str = "inline://";
+pub(crate) const PREV_PREFIX: &str = "inline://";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrafficSetPayload {
@@ -118,132 +116,61 @@ pub fn set(
     // here is malformed the caller hears about it without contending for
     // the env's flock.
     let parsed_entries = parse_entries(&payload.entries)?;
+    // Revision-belongs-to-deployment check (operator-friendly error
+    // instead of waiting for the store's defense-in-depth guard to fire
+    // with a less specific error variant).
+    {
+        let env = store.load(&env_id)?;
+        for entry in &parsed_entries {
+            let rev = env
+                .revisions
+                .iter()
+                .find(|r| r.revision_id == entry.revision_id)
+                .ok_or_else(|| {
+                    OpError::NotFound(format!(
+                        "revision `{}` not found in env `{env_id}`",
+                        entry.revision_id
+                    ))
+                })?;
+            if rev.deployment_id != deployment_id {
+                return Err(OpError::InvalidArgument(format!(
+                    "revision `{}` belongs to deployment `{}`, not `{}`",
+                    entry.revision_id, rev.deployment_id, deployment_id,
+                )));
+            }
+        }
+    }
+    let idempotency_key = greentic_deploy_spec::IdempotencyKey::new(payload.idempotency_key)
+        .map_err(|e| OpError::InvalidArgument(format!("idempotency_key: {e}")))?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "set",
         target: json!({"deployment_id": deployment_id.to_string()}),
-        idempotency_key: Some(payload.idempotency_key.clone()),
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let (split, gens) = store.transact(&env_id, |locked| {
-            let mut env = locked.load()?;
-            let deployment = env
-                .bundles
-                .iter()
-                .find(|b| b.deployment_id == deployment_id)
-                .ok_or_else(|| {
-                    OpError::NotFound(format!(
-                        "deployment `{deployment_id}` not found in env `{env_id}`"
-                    ))
-                })?;
-            let bundle_id: BundleId = deployment.bundle_id.clone();
-            // Revision-belongs-to-deployment check (operator-friendly error
-            // instead of waiting for Environment::validate to fire).
-            for entry in &parsed_entries {
-                let rev = env
-                    .revisions
-                    .iter()
-                    .find(|r| r.revision_id == entry.revision_id)
-                    .ok_or_else(|| {
-                        OpError::NotFound(format!(
-                            "revision `{}` not found in env `{env_id}`",
-                            entry.revision_id
-                        ))
-                    })?;
-                if rev.deployment_id != deployment_id {
-                    return Err(OpError::InvalidArgument(format!(
-                        "revision `{}` belongs to deployment `{}`, not `{}`",
-                        entry.revision_id, rev.deployment_id, deployment_id,
-                    )));
-                }
-            }
-            // Idempotency check: a retry with the same key against the same
-            // (deployment, entries) is a no-op success; same key + different
-            // payload is a conflict; new key advances generation.
-            let prev_split_idx = env
-                .traffic_splits
-                .iter()
-                .position(|s| s.deployment_id == deployment_id);
-            if let Some(idx) = prev_split_idx {
-                let prev = &env.traffic_splits[idx];
-                if prev.idempotency_key == payload.idempotency_key {
-                    if entries_match(&prev.entries, &parsed_entries) {
-                        // No-op replay. Reconcile the derived runtime-config
-                        // before returning so a retry repairs a publish that
-                        // failed after environment.json was already durable.
-                        locked.refresh_runtime_config(&env)?;
-                        return Ok((prev.clone(), super::AuditGens::NONE));
-                    }
-                    return Err(OpError::Conflict(format!(
-                        "idempotency key `{}` already used for deployment `{}` with different entries",
-                        payload.idempotency_key, deployment_id
-                    )));
-                }
-            }
-            // §5.3 admission, on the apply path only: the idempotent no-op
-            // replay above must stay a success even if a routed revision later
-            // drains, so a stale split is never rejected on retry.
-            assert_entries_all_ready(&env, &parsed_entries, &env_id)?;
-            let (generation, previous_split_ref, prev_gen) = match prev_split_idx {
-                Some(idx) => {
-                    let prev = &env.traffic_splits[idx];
-                    let snapshot = serde_json::to_value(prev).map_err(|e| {
-                        OpError::InvalidArgument(format!("snapshot prior split: {e}"))
-                    })?;
-                    (
-                        prev.generation + 1,
-                        Some(stash_inline(snapshot)),
-                        Some(prev.generation),
-                    )
-                }
-                None => (0, None, None),
-            };
-            let split = TrafficSplit {
-                schema: SchemaVersion::new(SchemaVersion::TRAFFIC_SPLIT_V1),
-                env_id: env_id.clone(),
+        let outcome = store
+            .set_traffic_split(
+                &env_id,
                 deployment_id,
-                bundle_id,
-                generation,
-                entries: parsed_entries.clone(),
-                updated_at: Utc::now(),
-                updated_by: payload.updated_by.clone(),
-                idempotency_key: payload.idempotency_key.clone(),
-                authorization_ref: payload.authorization_ref.clone(),
-                previous_split_ref,
-            };
-            split.validate().map_err(OpError::Spec)?;
-            match prev_split_idx {
-                Some(idx) => env.traffic_splits[idx] = split.clone(),
-                None => env.traffic_splits.push(split.clone()),
-            }
-            locked.save(&env)?;
-            locked.refresh_runtime_config(&env)?;
-            // C5.3: emit `TrafficSplitApplied` from INSIDE the transact so the
-            // tenant attribution reads the same env snapshot that was just
-            // saved (no TOCTOU window with a concurrent writer). The idempotent
-            // no-op replay returns earlier with `AuditGens::NONE`, so reaching
-            // this point implies a genuine mutation.
-            emit_traffic_split_applied(
-                &env,
-                split.deployment_id,
-                &split.bundle_id,
-                split.generation,
-            );
-            let gens = super::AuditGens {
-                previous: prev_gen,
-                new: Some(generation),
-            };
-            Ok::<_, OpError>((split, gens))
-        })?;
-
-        let outcome = OpOutcome::new(
+                parsed_entries,
+                idempotency_key,
+                payload.updated_by,
+                Some(payload.authorization_ref.to_string_lossy().into_owned()),
+            )
+            .map_err(map_traffic_store_err)?;
+        let gens = super::AuditGens {
+            previous: outcome.previous_generation,
+            new: outcome.new_generation,
+        };
+        let op_outcome = OpOutcome::new(
             NOUN,
             "set",
-            serde_json::to_value(TrafficSummary::from(&env_id, &split))
+            serde_json::to_value(TrafficSummary::from(&env_id, &outcome.split))
                 .expect("TrafficSummary is json-safe"),
         );
-        Ok((outcome, gens))
+        Ok((op_outcome, gens))
     })
 }
 
@@ -326,6 +253,7 @@ pub fn payload_from_target_args(
     Ok(Some(TrafficShowPayload {
         environment_id,
         deployment_id,
+        idempotency_key: None,
     }))
 }
 
@@ -398,56 +326,14 @@ fn parse_entries(entries: &[TrafficSetEntryPayload]) -> Result<Vec<TrafficSplitE
     Ok(out)
 }
 
-/// §5.3 admission: every entry's revision must exist and be `Ready` before its
-/// split goes live, since the split materializes into runtime routing. Shared
-/// by the `set` apply path and the `rollback` restore path so the rule lives in
-/// one place.
-fn assert_entries_all_ready(
-    env: &Environment,
-    entries: &[TrafficSplitEntry],
-    env_id: &EnvId,
-) -> Result<(), OpError> {
-    for entry in entries {
-        let rev = env
-            .revisions
-            .iter()
-            .find(|r| r.revision_id == entry.revision_id)
-            .ok_or_else(|| {
-                OpError::Conflict(format!(
-                    "revision `{}` not found in env `{env_id}`",
-                    entry.revision_id
-                ))
-            })?;
-        if rev.lifecycle != RevisionLifecycle::Ready {
-            return Err(OpError::Conflict(format!(
-                "revision `{}` is `{:?}`; only `Ready` revisions may receive traffic",
-                entry.revision_id, rev.lifecycle
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Order-insensitive equality on basis-points-per-revision_id. Two payloads
-/// that route the same percentage to the same revision_id (in any
-/// permutation) collapse to "same" for idempotency purposes.
-fn entries_match(a: &[TrafficSplitEntry], b: &[TrafficSplitEntry]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut a_sorted: Vec<(&RevisionId, u32)> =
-        a.iter().map(|e| (&e.revision_id, e.weight_bps)).collect();
-    let mut b_sorted: Vec<(&RevisionId, u32)> =
-        b.iter().map(|e| (&e.revision_id, e.weight_bps)).collect();
-    a_sorted.sort_by_key(|(r, _)| r.to_string());
-    b_sorted.sort_by_key(|(r, _)| r.to_string());
-    a_sorted == b_sorted
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrafficShowPayload {
     pub environment_id: String,
     pub deployment_id: String,
+    /// Caller-supplied A8 §2 idempotency key. Optional on the CLI
+    /// surface; when absent, the verb mints one per invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 pub fn show(
@@ -490,83 +376,45 @@ pub fn rollback(
     let payload = resolve_payload::<TrafficShowPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "rollback",
         target: json!({"deployment_id": deployment_id.to_string()}),
-        idempotency_key: None,
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let (restored, gens) = store.transact(&env_id, |locked| {
-            let mut env = locked.load()?;
-            let idx = env
-                .traffic_splits
-                .iter()
-                .position(|s| s.deployment_id == deployment_id)
-                .ok_or_else(|| {
-                    OpError::NotFound(format!(
-                        "no traffic split for deployment `{deployment_id}` in env `{env_id}`"
-                    ))
-                })?;
-            let prev_split_generation = env.traffic_splits[idx].generation;
-            let prev_ref = env.traffic_splits[idx]
-                .previous_split_ref
-                .clone()
-                .ok_or_else(|| {
-                    OpError::Conflict(format!(
-                        "traffic split for `{deployment_id}` has no prior version to roll back to"
-                    ))
-                })?;
-            let prev_value = load_inline(&prev_ref).ok_or_else(|| {
-                OpError::NotFound(format!(
-                    "previous split payload `{}` missing",
-                    prev_ref.display()
-                ))
-            })?;
-            let mut restored: TrafficSplit = serde_json::from_value(prev_value).map_err(|e| {
-                OpError::InvalidArgument(format!("deserialise previous split: {e}"))
-            })?;
-            restored.generation = prev_split_generation + 1;
-            restored.previous_split_ref = None;
-            restored.updated_at = Utc::now();
-            restored.idempotency_key =
-                format!("rollback-{}", env.traffic_splits[idx].idempotency_key);
-            restored.validate().map_err(OpError::Spec)?;
-            // §5.3 admission on the restore path: a historical split may route
-            // to revisions that have since been archived, failed, or removed.
-            assert_entries_all_ready(&env, &restored.entries, &env_id)?;
-            env.traffic_splits[idx] = restored.clone();
-            locked.save(&env)?;
-            locked.refresh_runtime_config(&env)?;
-            // C5.3: emit `TrafficSplitApplied` for the rollback path too —
-            // a rollback advances generation and materializes into runtime-
-            // config exactly like a forward `set`, so monitoring pipelines
-            // need the same lifecycle event. Emit from inside the lock so
-            // tenant attribution rides the saved env snapshot.
-            emit_traffic_split_applied(
-                &env,
-                restored.deployment_id,
-                &restored.bundle_id,
-                restored.generation,
-            );
-            let gens = super::AuditGens {
-                previous: Some(prev_split_generation),
-                new: Some(prev_split_generation + 1),
-            };
-            Ok::<_, OpError>((restored, gens))
-        })?;
-        let outcome = OpOutcome::new(
+        let outcome = store
+            .rollback_traffic_split(&env_id, deployment_id, idempotency_key)
+            .map_err(map_traffic_store_err)?;
+        let gens = super::AuditGens {
+            previous: Some(outcome.previous_generation),
+            new: Some(outcome.new_generation),
+        };
+        let op_outcome = OpOutcome::new(
             NOUN,
             "rollback",
-            serde_json::to_value(TrafficSummary::from(&env_id, &restored))
+            serde_json::to_value(TrafficSummary::from(&env_id, &outcome.restored))
                 .expect("TrafficSummary is json-safe"),
         );
-        Ok((outcome, gens))
+        Ok((op_outcome, gens))
     })
 }
 
 // --- internals -----------------------------------------------------------
+
+/// Traffic-specific `StoreError → OpError` mapper that peels
+/// [`crate::environment::StoreError::Spec`] into [`OpError::Spec`] before
+/// falling through to [`map_store_err_preserving_noun`]. The Spec variant
+/// is unique to traffic (validate sum == 10,000 bps) and the shared
+/// mapper doesn't cover it.
+fn map_traffic_store_err(e: crate::environment::StoreError) -> OpError {
+    match e {
+        crate::environment::StoreError::Spec(s) => OpError::Spec(s),
+        other => map_store_err_preserving_noun(other),
+    }
+}
 
 fn resolve_payload<T: serde::de::DeserializeOwned>(
     flags: &OpFlags,
@@ -639,7 +487,8 @@ fn show_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "environment_id": {"type": "string"},
-            "deployment_id": {"type": "string", "description": "ULID"}
+            "deployment_id": {"type": "string", "description": "ULID"},
+            "idempotency_key": {"type": "string"}
         }
     })
 }
@@ -648,14 +497,14 @@ fn show_schema() -> Value {
 // to a shared module to keep the surface area small while we figure out
 // whether multi-step history (A8) really wants this scheme at all.
 
-fn stash_inline(snapshot: Value) -> PathBuf {
+pub(crate) fn stash_inline(snapshot: Value) -> PathBuf {
     let mut encoded = String::from(PREV_PREFIX);
     let raw = serde_json::to_string(&snapshot).expect("Value re-serialises");
     encoded.push_str(&crate::cli::env_packs::base64_encode_public(raw.as_bytes()));
     PathBuf::from(encoded)
 }
 
-fn load_inline(prev_ref: &std::path::Path) -> Option<Value> {
+pub(crate) fn load_inline(prev_ref: &std::path::Path) -> Option<Value> {
     let token = prev_ref.to_str()?;
     let encoded = token.strip_prefix(PREV_PREFIX)?;
     let bytes = crate::cli::env_packs::base64_decode_public(encoded)?;
@@ -667,7 +516,7 @@ fn load_inline(prev_ref: &std::path::Path) -> Option<Value> {
 mod tests {
     use super::*;
     use crate::cli::tests_common::{make_bundle_deployment, make_env, make_revision};
-    use greentic_deploy_spec::RevisionLifecycle;
+    use greentic_deploy_spec::{RevisionLifecycle, SchemaVersion};
     use tempfile::tempdir;
 
     fn seed_env(store: &LocalFsStore) -> (DeploymentId, RevisionId, RevisionId) {
@@ -717,6 +566,7 @@ mod tests {
             Some(TrafficShowPayload {
                 environment_id: "local".to_string(),
                 deployment_id: did.to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -815,6 +665,7 @@ mod tests {
             Some(TrafficShowPayload {
                 environment_id: "local".to_string(),
                 deployment_id: did.to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -1011,6 +862,7 @@ mod tests {
             Some(TrafficShowPayload {
                 environment_id: "local".to_string(),
                 deployment_id: did.to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -1283,6 +1135,7 @@ mod tests {
             Some(TrafficShowPayload {
                 environment_id: "local".to_string(),
                 deployment_id: did.to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap_err();
@@ -1614,6 +1467,7 @@ mod tests {
             Some(TrafficShowPayload {
                 environment_id: "local".to_string(),
                 deployment_id: did.to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -1774,6 +1628,7 @@ mod tests {
                 Some(TrafficShowPayload {
                     environment_id: "local".to_string(),
                     deployment_id: did.to_string(),
+                    idempotency_key: None,
                 }),
             )
         });
@@ -1784,6 +1639,33 @@ mod tests {
             "rollback must emit exactly one TrafficSplitApplied; \
              captured: {:?}",
             observed(&events)
+        );
+    }
+
+    // --- PR-3a.11: schema regression tests for idempotency_key ---------------
+
+    /// `TrafficSetPayload` accepts `idempotency_key`; the schema published
+    /// via `--schema` MUST list it so schema-driven callers can supply the
+    /// A8 retry key.
+    #[test]
+    fn set_schema_lists_idempotency_key() {
+        let schema = set_schema();
+        assert!(
+            schema.pointer("/properties/idempotency_key").is_some(),
+            "set_schema must list `idempotency_key` (schema: {schema:#})"
+        );
+    }
+
+    /// Same gate for the show/rollback schema: `TrafficShowPayload` now
+    /// accepts `idempotency_key`, so the schema must list it under
+    /// `properties` (especially because `additionalProperties: false`
+    /// would reject it otherwise).
+    #[test]
+    fn show_schema_lists_idempotency_key() {
+        let schema = show_schema();
+        assert!(
+            schema.pointer("/properties/idempotency_key").is_some(),
+            "show_schema must list `idempotency_key` (schema: {schema:#})"
         );
     }
 }
