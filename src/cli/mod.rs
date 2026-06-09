@@ -238,8 +238,25 @@ pub(crate) fn map_store_err_preserving_noun(e: crate::environment::StoreError) -
         // CLI verb. Unwrap to the existing `LifecycleError → OpError`
         // mapping rather than flattening to `OpError::Store`.
         crate::environment::StoreError::Lifecycle(inner) => OpError::from(*inner),
+        // Committed-on-error: forward the inner error's noun by
+        // recursing. Callers (see `cli::revisions::typed_transition`)
+        // are responsible for inspecting the outer variant FIRST and
+        // calling `CommitMarker::mark_committed` before mapping —
+        // otherwise the audit boundary won't fail-closed.
+        crate::environment::StoreError::CommittedAfterSave(inner) => {
+            map_store_err_preserving_noun(*inner)
+        }
         other => OpError::Store(other),
     }
+}
+
+/// Detect the [`crate::environment::StoreError::CommittedAfterSave`] wrapper
+/// regardless of nesting depth. Typed-verb callers query this BEFORE mapping
+/// the error to an `OpError` so they can call
+/// [`CommitMarker::mark_committed`] on the boundary — the wrapper itself is
+/// unwrapped by [`map_store_err_preserving_noun`] one layer at a time.
+pub(crate) fn is_store_err_committed_after_save(e: &crate::environment::StoreError) -> bool {
+    matches!(e, crate::environment::StoreError::CommittedAfterSave(_))
 }
 
 /// Mint a fresh [`greentic_deploy_spec::IdempotencyKey`] (ULID) for a

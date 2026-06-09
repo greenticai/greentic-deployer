@@ -297,6 +297,19 @@ impl LocalFsStore {
     ///
     /// `payload.idempotency_key` is accepted for trait conformance and
     /// ignored locally; the HTTP backend caches it for A8 §2 replay.
+    ///
+    /// **Stale-snapshot caution.** The gate is evaluated OUTSIDE the env
+    /// flock (by definition — closures don't cross the wire). A
+    /// concurrent mutation that lands BETWEEN gate evaluation and this
+    /// verb's flock acquisition can produce a Ready/Failed outcome that
+    /// doesn't match the env state the gate actually observed. The
+    /// current consumer (closure-based CLI `warm_with_health_gate`) is
+    /// not affected — it stays in-lock. Future typed consumers (PR-3b
+    /// HTTP backend, Phase D `greentic-start` warm gate) MUST add an
+    /// env-generation / lifecycle-hash precondition to
+    /// [`super::mutations::WarmRevisionPayload`] and revalidate under
+    /// the lock before applying the gate result. Tracked for PR-3a.6b /
+    /// PR-3b before any caller wires the typed verb live.
     pub fn warm_revision(
         &self,
         env_id: &EnvId,
@@ -416,12 +429,25 @@ impl LocalFsStore {
                 })
                 .unwrap_or(RevisionLifecycle::Inactive);
             let revision = apply(locked).map_err(fold_lifecycle_err)?;
+            // From here on the lifecycle helper has already called
+            // `locked.save(...)` — the env mutation is durable on disk.
+            // Any subsequent failure (env reload, materialized
+            // runtime-config refresh) is committed-on-error and MUST be
+            // surfaced as `StoreError::CommittedAfterSave` so the CLI
+            // audit boundary fails-closed on an audit-append failure
+            // (matches the closure-based path's `mark_committed` +
+            // post-save fall-through contract).
+            //
             // Lifecycle transitions don't change traffic splits today, so
-            // this is a no-op refresh (guarded by change-detection); it
+            // the refresh is a no-op-guarded by change-detection; it
             // keeps the runtime-config contract uniform across every
             // mutating verb.
-            let environment = locked.load()?;
-            locked.refresh_runtime_config(&environment)?;
+            let environment = locked
+                .load()
+                .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
+            locked
+                .refresh_runtime_config(&environment)
+                .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
             Ok(RevisionTransitionOutcome {
                 revision,
                 environment,

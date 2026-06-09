@@ -103,6 +103,21 @@ pub enum StoreError {
     /// [`crate::cli::map_store_err_preserving_noun`].
     #[error(transparent)]
     Lifecycle(Box<super::LifecycleError>),
+    /// A typed-verb body persisted state to disk via the lifecycle
+    /// helper's internal `locked.save(...)` and *then* failed on a
+    /// post-save step (env reload, materialized-runtime-config refresh,
+    /// etc.). The wrapped `StoreError` is the original failure; CLI
+    /// callers MUST treat the verb as `committed` (so the audit
+    /// boundary fails-closed on an audit-append failure rather than
+    /// demoting it to `tracing::warn!`) AND forward the inner error.
+    /// The closure-based revision-transition path already had this
+    /// invariant — surfacing it across the typed-verb boundary keeps
+    /// the committed-on-error contract intact (`warm` test
+    /// `warm_ok_with_refresh_failure_and_audit_failure_returns_audit_error`).
+    /// HTTP backends (PR-3b) wrap any "we wrote, then the response
+    /// pipeline failed" error in this variant for the same reason.
+    #[error(transparent)]
+    CommittedAfterSave(Box<StoreError>),
 }
 
 /// Reject env ids that, while valid per the upstream `EnvId` validator

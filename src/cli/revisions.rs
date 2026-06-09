@@ -98,10 +98,18 @@ pub struct PackListEntryPayload {
     pub source_uri: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RevisionTransitionPayload {
     pub environment_id: String,
     pub revision_id: String,
+    /// Caller-supplied A8 §2 idempotency key. Optional on the CLI surface
+    /// for back-compat; when absent, [`typed_transition`] mints one per
+    /// CLI invocation. Operators wanting safe lost-response retries
+    /// (HTTP backend, PR-3b) supply a stable key in their payload so the
+    /// server can replay the original outcome instead of applying a
+    /// second mutation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,9 +391,14 @@ pub fn drain(
     if flags.schema_only {
         return Ok(OpOutcome::new(NOUN, "drain", transition_schema()));
     }
-    typed_transition(store, flags, payload, "drain", |env_id, revision_id| {
-        store.drain_revision(env_id, revision_id, mint_idempotency_key())
-    })
+    typed_transition(
+        store,
+        flags,
+        payload,
+        "drain",
+        RevisionLifecycle::Draining,
+        |env_id, revision_id, key| store.drain_revision(env_id, revision_id, key),
+    )
 }
 
 /// `op revisions archive`. Transitions the lifecycle to `archived` and
@@ -405,9 +418,14 @@ pub fn archive(
     if flags.schema_only {
         return Ok(OpOutcome::new(NOUN, "archive", transition_schema()));
     }
-    typed_transition(store, flags, payload, "archive", |env_id, revision_id| {
-        store.archive_revision(env_id, revision_id, mint_idempotency_key())
-    })
+    typed_transition(
+        store,
+        flags,
+        payload,
+        "archive",
+        RevisionLifecycle::Archived,
+        |env_id, revision_id, key| store.archive_revision(env_id, revision_id, key),
+    )
 }
 
 /// `op revisions list <env>` (filterable by `--deployment <id>` later).
@@ -450,12 +468,14 @@ fn typed_transition<F>(
     flags: &OpFlags,
     payload: Option<RevisionTransitionPayload>,
     op: &'static str,
+    lifecycle_to: RevisionLifecycle,
     call_verb: F,
 ) -> Result<OpOutcome, OpError>
 where
     F: FnOnce(
         &greentic_deploy_spec::EnvId,
         greentic_deploy_spec::RevisionId,
+        greentic_deploy_spec::IdempotencyKey,
     ) -> Result<
         crate::environment::RevisionTransitionOutcome,
         crate::environment::StoreError,
@@ -464,22 +484,47 @@ where
     let payload = resolve_payload::<RevisionTransitionPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let revision_id = parse_revision_id(&payload.revision_id)?;
+    // Resolve the idempotency key once — same value lands in the audit
+    // event and in the typed verb call so an HTTP backend (PR-3b) can
+    // replay the original outcome on a lost-response retry. Falling back
+    // to a fresh ULID keeps existing CLI usage working unchanged.
+    let idempotency_key = match payload.idempotency_key {
+        Some(raw) => greentic_deploy_spec::IdempotencyKey::new(raw)
+            .map_err(|e| OpError::InvalidArgument(format!("idempotency_key: {e}")))?,
+        None => mint_idempotency_key(),
+    };
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: op,
+        // Both drain (always `Draining`) and archive (always `Archived`
+        // — the `Draining → Inactive → Archived` chain walks end-to-end
+        // in one call so a successful archive start always lands on
+        // `Archived`) are deterministic, so record the verb-target state.
         target: json!({
             "revision_id": revision_id.to_string(),
-            // `archive`'s chain can land on `Archived` OR `Inactive`
-            // (Draining → Inactive hop); the typed-verb caller doesn't see
-            // the final state until after the call, so the audit target
-            // omits `lifecycle_to` here (the audit log still records the
-            // outcome verb).
+            "lifecycle_to": lifecycle_to,
         }),
-        idempotency_key: None,
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |committed| {
-        let outcome = call_verb(&env_id, revision_id).map_err(map_store_err_preserving_noun)?;
+        let outcome = match call_verb(&env_id, revision_id, idempotency_key) {
+            Ok(o) => o,
+            Err(err) => {
+                // Committed-on-error: the typed verb's lifecycle helper
+                // saved the env mutation but a post-save step (load /
+                // refresh_runtime_config) failed. Mark committed BEFORE
+                // mapping so the audit boundary fails-closed on an
+                // audit-append failure (matches the closure-based
+                // `transition_with_health_gate` Ok-arm post-save
+                // contract — see
+                // `warm_ok_with_refresh_failure_and_audit_failure_returns_audit_error`).
+                if super::is_store_err_committed_after_save(&err) {
+                    committed.mark_committed();
+                }
+                return Err(map_store_err_preserving_noun(err));
+            }
+        };
         // Typed-verb Ok = saved + runtime-config refreshed before return,
         // so mark committed before any best-effort emit unwinds.
         committed.mark_committed();
@@ -1099,6 +1144,7 @@ mod tests {
             Some(RevisionTransitionPayload {
                 environment_id: "local".to_string(),
                 revision_id: rid,
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -1126,6 +1172,7 @@ mod tests {
             Some(RevisionTransitionPayload {
                 environment_id: "local".to_string(),
                 revision_id: rid.clone(),
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -1135,6 +1182,7 @@ mod tests {
             Some(RevisionTransitionPayload {
                 environment_id: "local".to_string(),
                 revision_id: rid,
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -1162,6 +1210,7 @@ mod tests {
             Some(RevisionTransitionPayload {
                 environment_id: "local".to_string(),
                 revision_id: rid,
+                idempotency_key: None,
             }),
         )
         .unwrap_err();
@@ -1199,6 +1248,7 @@ mod tests {
             Some(RevisionTransitionPayload {
                 environment_id: "local".to_string(),
                 revision_id: rid.to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -1252,6 +1302,7 @@ mod tests {
             Some(RevisionTransitionPayload {
                 environment_id: "local".to_string(),
                 revision_id: rid.to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap_err();
@@ -1301,6 +1352,7 @@ mod tests {
             Some(RevisionTransitionPayload {
                 environment_id: "local".to_string(),
                 revision_id: rid.to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -1355,6 +1407,7 @@ mod tests {
             Some(RevisionTransitionPayload {
                 environment_id: "local".to_string(),
                 revision_id: rid,
+                idempotency_key: None,
             }),
             |_env, _revision| Ok(()),
         )
@@ -1388,6 +1441,7 @@ mod tests {
             Some(RevisionTransitionPayload {
                 environment_id: "local".to_string(),
                 revision_id: rid_str.clone(),
+                idempotency_key: None,
             }),
             |_env, _revision| {
                 Err(crate::environment::HealthGateFailure {
@@ -1444,6 +1498,7 @@ mod tests {
             Some(RevisionTransitionPayload {
                 environment_id: "local".to_string(),
                 revision_id: rid_str.clone(),
+                idempotency_key: None,
             }),
             |_env, _revision| {
                 Err(crate::environment::HealthGateFailure {
@@ -1491,6 +1546,7 @@ mod tests {
             Some(RevisionTransitionPayload {
                 environment_id: "local".to_string(),
                 revision_id: phantom_rid,
+                idempotency_key: None,
             }),
         )
         .unwrap_err();
@@ -1548,6 +1604,7 @@ mod tests {
             Some(RevisionTransitionPayload {
                 environment_id: "local".to_string(),
                 revision_id: rid_str,
+                idempotency_key: None,
             }),
             |_env, _revision| Ok(()),
         )
@@ -1566,6 +1623,71 @@ mod tests {
         // is Ready on disk.
         let env = store.load(&env_id).unwrap();
         assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Ready);
+    }
+
+    /// PR-3a.6 Codex regression: the typed drain verb's lifecycle helper
+    /// `locked.save`s before `run_revision_transition`'s post-save
+    /// reload / runtime-config refresh runs. If refresh fails AND the
+    /// audit append fails, the typed-verb-shaped caller (`typed_transition`)
+    /// must still fail-closed — same contract as
+    /// `warm_ok_with_refresh_failure_and_audit_failure_returns_audit_error`,
+    /// just via the `StoreError::CommittedAfterSave` wrapper instead of
+    /// the closure-based path's direct mark_committed.
+    #[test]
+    fn drain_ok_with_refresh_failure_and_audit_failure_returns_audit_error() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let did = seed_env_with_deployment(&store);
+        let staged = stage(&store, &OpFlags::default(), Some(stage_payload(&did))).unwrap();
+        let rid_str = staged
+            .result
+            .get("revision_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        // Warm to Ready first — drain only accepts Ready as a start.
+        warm(
+            &store,
+            &OpFlags::default(),
+            Some(RevisionTransitionPayload {
+                environment_id: "local".to_string(),
+                revision_id: rid_str.clone(),
+                idempotency_key: None,
+            }),
+        )
+        .unwrap();
+
+        let env_id = EnvId::try_from("local").unwrap();
+        let env_dir = store.env_dir(&env_id).unwrap();
+
+        // Block `refresh_runtime_config` AND `audit append` — same
+        // directory-as-file trick used by the warm regression.
+        let _ = std::fs::remove_file(env_dir.join("runtime-config.json"));
+        std::fs::create_dir(env_dir.join("runtime-config.json")).unwrap();
+        let events_path = env_dir.join("audit").join("events.jsonl");
+        let _ = std::fs::remove_file(&events_path);
+        std::fs::create_dir(&events_path).unwrap();
+
+        let err = drain(
+            &store,
+            &OpFlags::default(),
+            Some(RevisionTransitionPayload {
+                environment_id: "local".to_string(),
+                revision_id: rid_str,
+                idempotency_key: None,
+            }),
+        )
+        .unwrap_err();
+
+        match &err {
+            OpError::Audit(_) => {}
+            other => panic!("expected OpError::Audit (fail-closed); got `{other:?}`"),
+        }
+
+        // The lifecycle save committed before refresh failed.
+        let env = store.load(&env_id).unwrap();
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Draining);
     }
 
     // -------------------------------------------------------------------
@@ -1617,6 +1739,7 @@ mod tests {
                 Some(RevisionTransitionPayload {
                     environment_id: "local".to_string(),
                     revision_id: rid,
+                    idempotency_key: None,
                 }),
             )
         });
@@ -1657,6 +1780,7 @@ mod tests {
                 Some(RevisionTransitionPayload {
                     environment_id: "local".to_string(),
                     revision_id: rid,
+                    idempotency_key: None,
                 }),
                 |_env, _revision| {
                     Err(crate::environment::HealthGateFailure {
@@ -1699,6 +1823,7 @@ mod tests {
             Some(RevisionTransitionPayload {
                 environment_id: "local".to_string(),
                 revision_id: rid.clone(),
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -1710,6 +1835,7 @@ mod tests {
                 Some(RevisionTransitionPayload {
                     environment_id: "local".to_string(),
                     revision_id: rid,
+                    idempotency_key: None,
                 }),
             )
         });
@@ -1745,6 +1871,7 @@ mod tests {
             Some(RevisionTransitionPayload {
                 environment_id: "local".to_string(),
                 revision_id: rid.clone(),
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -1754,6 +1881,7 @@ mod tests {
             Some(RevisionTransitionPayload {
                 environment_id: "local".to_string(),
                 revision_id: rid.clone(),
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -1765,6 +1893,7 @@ mod tests {
                 Some(RevisionTransitionPayload {
                     environment_id: "local".to_string(),
                     revision_id: rid,
+                    idempotency_key: None,
                 }),
             )
         });
