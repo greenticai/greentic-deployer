@@ -610,7 +610,7 @@ mod tests {
     #[test]
     fn update_schema_lists_idempotency_key() {
         // `update` reuses `payload_schema`, but verify via the public path.
-        let outcome = add(
+        let outcome = update(
             &LocalFsStore::new(tempdir().unwrap().path()),
             &OpFlags {
                 schema_only: true,
@@ -624,7 +624,7 @@ mod tests {
                 .result
                 .pointer("/properties/idempotency_key")
                 .is_some(),
-            "add --schema must list `idempotency_key`"
+            "update --schema must list `idempotency_key`"
         );
     }
 

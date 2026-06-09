@@ -703,7 +703,12 @@ impl LocalFsStore {
                     ))
                 })?;
             let prev_generation = env.extensions[idx].generation;
-            let new_generation = prev_generation + 1;
+            let new_generation = prev_generation.checked_add(1).ok_or_else(|| {
+                StoreError::Conflict(format!(
+                    "extension `{}` on env `{}`: generation overflow ({})",
+                    key, env_id, prev_generation
+                ))
+            })?;
             let prev_snapshot = serde_json::to_value(&env.extensions[idx])
                 .map_err(|e| StoreError::Conflict(format!("snapshot prior binding: {e}")))?;
             let mut new_binding = binding;
@@ -771,7 +776,12 @@ impl LocalFsStore {
                     ))
                 })?;
             let prev_generation = env.extensions[idx].generation;
-            let new_generation = prev_generation + 1;
+            let new_generation = prev_generation.checked_add(1).ok_or_else(|| {
+                StoreError::Conflict(format!(
+                    "extension `{}` on env `{}`: generation overflow ({})",
+                    key, env_id, prev_generation
+                ))
+            })?;
             let prev_ref = env.extensions[idx]
                 .previous_binding_ref
                 .clone()
