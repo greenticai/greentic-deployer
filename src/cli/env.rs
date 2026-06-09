@@ -120,13 +120,13 @@ pub fn create(
         let env = store
             .create_environment(
                 &env_id,
-                payload.name.clone(),
+                payload.name,
                 EnvironmentHostConfig {
                     env_id: env_id.clone(),
-                    region: payload.region.clone(),
-                    tenant_org_id: payload.tenant_org_id.clone(),
+                    region: payload.region,
+                    tenant_org_id: payload.tenant_org_id,
                     listen_addr: parsed_listen_addr,
-                    public_base_url: parsed_public_base_url.clone(),
+                    public_base_url: parsed_public_base_url,
                 },
             )
             .map_err(map_store_err_preserving_noun)?;
@@ -179,11 +179,11 @@ pub fn update(
             .update_environment(
                 &env_id,
                 UpdateEnvironmentPayload {
-                    name: Some(payload.name.clone()),
-                    region: payload.region.clone(),
-                    tenant_org_id: payload.tenant_org_id.clone(),
+                    name: Some(payload.name),
+                    region: payload.region,
+                    tenant_org_id: payload.tenant_org_id,
                     listen_addr: None,
-                    public_base_url: parsed_public_base_url.clone(),
+                    public_base_url: parsed_public_base_url,
                 },
             )
             .map_err(map_store_err_preserving_noun)?;
@@ -894,7 +894,7 @@ pub fn set_public_url(
             .update_environment(
                 &env_id,
                 UpdateEnvironmentPayload {
-                    public_base_url: Some(validated.clone()),
+                    public_base_url: Some(validated),
                     ..Default::default()
                 },
             )

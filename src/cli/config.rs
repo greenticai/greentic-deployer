@@ -156,11 +156,11 @@ pub fn set(
             .update_environment(
                 &env_id,
                 UpdateEnvironmentPayload {
-                    name: payload.name.clone(),
-                    region: payload.region.clone(),
-                    tenant_org_id: payload.tenant_org_id.clone(),
+                    name: payload.name,
+                    region: payload.region,
+                    tenant_org_id: payload.tenant_org_id,
                     listen_addr: parsed_listen_addr,
-                    public_base_url: parsed_public_base_url.clone(),
+                    public_base_url: parsed_public_base_url,
                 },
             )
             .map_err(map_store_err_preserving_noun)?;
