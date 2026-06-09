@@ -179,28 +179,34 @@ async fn check_unknown_revision_rejected<D: Deployer + ?Sized>(
     // 0xFFFF is distinct from every fixture ULID (those use small
     // single-digit u128 seeds — see `build_fixture_env`).
     let unknown = RevisionId(Ulid::from(0xFFFF_u128));
-    for verb in [
+    classify_unknown_revision(
         "stage_revision",
+        deployer.stage_revision(&env, unknown).await.map(|_| ()),
+    )?;
+    classify_unknown_revision(
         "warm_revision",
+        deployer.warm_revision(&env, unknown).await.map(|_| ()),
+    )?;
+    classify_unknown_revision(
         "drain_revision",
+        deployer.drain_revision(&env, unknown).await.map(|_| ()),
+    )?;
+    classify_unknown_revision(
         "archive_revision",
-    ] {
-        let result = match verb {
-            "stage_revision" => deployer.stage_revision(&env, unknown).await.map(|_| ()),
-            "warm_revision" => deployer.warm_revision(&env, unknown).await.map(|_| ()),
-            "drain_revision" => deployer.drain_revision(&env, unknown).await.map(|_| ()),
-            "archive_revision" => deployer.archive_revision(&env, unknown).await.map(|_| ()),
-            _ => unreachable!(),
-        };
-        match result {
-            Ok(()) => return Err(ConformanceFailure::UnknownRevisionAccepted { verb }),
-            Err(DeployerError::RevisionNotFound { .. }) => {}
-            Err(source) => {
-                return Err(ConformanceFailure::UnknownRevisionWrongError { verb, source });
-            }
-        }
-    }
+        deployer.archive_revision(&env, unknown).await.map(|_| ()),
+    )?;
     Ok(())
+}
+
+fn classify_unknown_revision(
+    verb: &'static str,
+    result: Result<(), DeployerError>,
+) -> Result<(), ConformanceFailure> {
+    match result {
+        Ok(()) => Err(ConformanceFailure::UnknownRevisionAccepted { verb }),
+        Err(DeployerError::RevisionNotFound { .. }) => Ok(()),
+        Err(source) => Err(ConformanceFailure::UnknownRevisionWrongError { verb, source }),
+    }
 }
 
 async fn check_invalid_split_rejected<D: Deployer + ?Sized>(
@@ -525,41 +531,17 @@ mod tests {
             env: &Environment,
             deployment_id: DeploymentId,
         ) -> Result<TrafficSplitOutcome, DeployerError> {
-            let split = env
-                .traffic_splits
-                .iter()
-                .find(|s| s.deployment_id == deployment_id)
-                .ok_or(DeployerError::SplitNotFound {
-                    env_id: env.environment_id.clone(),
-                    deployment_id,
-                })?;
-            let sum: u64 = split.entries.iter().map(|e| u64::from(e.weight_bps)).sum();
-            if sum != 10_000 {
-                return Err(DeployerError::InvalidSplit { deployment_id, sum });
-            }
-            Ok(TrafficSplitOutcome {
-                applied_deployment_id: deployment_id,
-                applied_entries: split.entries.clone(),
-            })
+            enforce_split_invariants(env, deployment_id)
         }
     }
 
-    /// Imports `Deployer`'s associated outcome types into scope so the
-    /// `Result<…, DeployerError>` returns line up.
+    /// Imports `Deployer`'s associated outcome types + shared precondition
+    /// helpers into scope so the test stubs line up with the canonical
+    /// shape every Phase D impl uses.
     use super::super::trait_def::{
         ArchiveOutcome, DrainOutcome, StageOutcome, TrafficSplitOutcome, WarmOutcome,
+        enforce_split_invariants, require_revision,
     };
-
-    fn require_revision(env: &Environment, revision_id: RevisionId) -> Result<(), DeployerError> {
-        if env.revisions.iter().any(|r| r.revision_id == revision_id) {
-            Ok(())
-        } else {
-            Err(DeployerError::RevisionNotFound {
-                env_id: env.environment_id.clone(),
-                revision_id,
-            })
-        }
-    }
 
     #[tokio::test]
     async fn noop_deployer_passes() {
@@ -622,22 +604,7 @@ mod tests {
             env: &Environment,
             deployment_id: DeploymentId,
         ) -> Result<TrafficSplitOutcome, DeployerError> {
-            let split = env
-                .traffic_splits
-                .iter()
-                .find(|s| s.deployment_id == deployment_id)
-                .ok_or(DeployerError::SplitNotFound {
-                    env_id: env.environment_id.clone(),
-                    deployment_id,
-                })?;
-            let sum: u64 = split.entries.iter().map(|e| u64::from(e.weight_bps)).sum();
-            if sum != 10_000 {
-                return Err(DeployerError::InvalidSplit { deployment_id, sum });
-            }
-            Ok(TrafficSplitOutcome {
-                applied_deployment_id: deployment_id,
-                applied_entries: split.entries.clone(),
-            })
+            enforce_split_invariants(env, deployment_id)
         }
     }
 
@@ -768,24 +735,11 @@ mod tests {
             env: &Environment,
             deployment_id: DeploymentId,
         ) -> Result<TrafficSplitOutcome, DeployerError> {
-            let split = env
-                .traffic_splits
-                .iter()
-                .find(|s| s.deployment_id == deployment_id)
-                .ok_or(DeployerError::SplitNotFound {
-                    env_id: env.environment_id.clone(),
-                    deployment_id,
-                })?;
-            let sum: u64 = split.entries.iter().map(|e| u64::from(e.weight_bps)).sum();
-            if sum != 10_000 {
-                return Err(DeployerError::InvalidSplit { deployment_id, sum });
-            }
-            // Always report a fixed wrong deployment id.
-            let wrong_id = DeploymentId(Ulid::from(0xDEAD_u128));
-            Ok(TrafficSplitOutcome {
-                applied_deployment_id: wrong_id,
-                applied_entries: split.entries.clone(),
-            })
+            // Borrow the shared precondition path, then corrupt the
+            // self-report so the bench's cross-deployment check fires.
+            let mut outcome = enforce_split_invariants(env, deployment_id)?;
+            outcome.applied_deployment_id = DeploymentId(Ulid::from(0xDEAD_u128));
+            Ok(outcome)
         }
     }
 

@@ -19,7 +19,7 @@ use greentic_deploy_spec::{DeploymentId, Environment, RevisionId};
 use super::LocalProcessDeployerHandler;
 use crate::env_packs::deployer::{
     ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome, TrafficSplitOutcome,
-    WarmOutcome,
+    WarmOutcome, enforce_split_invariants, require_revision,
 };
 
 #[async_trait]
@@ -65,35 +65,10 @@ impl Deployer for LocalProcessDeployerHandler {
         env: &Environment,
         deployment_id: DeploymentId,
     ) -> Result<TrafficSplitOutcome, DeployerError> {
-        let split = env
-            .traffic_splits
-            .iter()
-            .find(|s| s.deployment_id == deployment_id)
-            .ok_or_else(|| DeployerError::SplitNotFound {
-                env_id: env.environment_id.clone(),
-                deployment_id,
-            })?;
-        let sum: u64 = split.entries.iter().map(|e| u64::from(e.weight_bps)).sum();
-        if sum != 10_000 {
-            return Err(DeployerError::InvalidSplit { deployment_id, sum });
-        }
         // No provider side — the in-process dispatcher reads the
-        // runtime-config materialization on its own.
-        Ok(TrafficSplitOutcome {
-            applied_deployment_id: deployment_id,
-            applied_entries: split.entries.clone(),
-        })
-    }
-}
-
-fn require_revision(env: &Environment, revision_id: RevisionId) -> Result<(), DeployerError> {
-    if env.revisions.iter().any(|r| r.revision_id == revision_id) {
-        Ok(())
-    } else {
-        Err(DeployerError::RevisionNotFound {
-            env_id: env.environment_id.clone(),
-            revision_id,
-        })
+        // runtime-config materialization on its own. The shared helper
+        // enforces the sum-invariant and constructs the outcome.
+        enforce_split_invariants(env, deployment_id)
     }
 }
 

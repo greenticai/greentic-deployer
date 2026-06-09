@@ -87,6 +87,54 @@ pub enum DeployerError {
     Provider(String),
 }
 
+/// Shared precondition helper: rejects a revision_id that isn't in the env.
+///
+/// Every [`Deployer`] verb starts with this check. Lives here (not on each
+/// impl) so a future Phase D handler can't accidentally drop it; the
+/// conformance bench exercises it via
+/// [`super::conformance::ConformanceFailure::UnknownRevisionAccepted`].
+pub fn require_revision(env: &Environment, revision_id: RevisionId) -> Result<(), DeployerError> {
+    if env.revisions.iter().any(|r| r.revision_id == revision_id) {
+        Ok(())
+    } else {
+        Err(DeployerError::RevisionNotFound {
+            env_id: env.environment_id.clone(),
+            revision_id,
+        })
+    }
+}
+
+/// Shared precondition helper: locates the recorded `TrafficSplit` for
+/// `deployment_id`, enforces the `sum == 10000bps` invariant, and returns a
+/// [`TrafficSplitOutcome`] populated against the env's recorded entries.
+///
+/// Every [`Deployer::apply_traffic_split`] impl wraps this with its own
+/// provider work (kubectl apply, ALB rule update, ...). Pulling the
+/// precondition + outcome construction here keeps the 4-stub conformance
+/// bench and every Phase D impl on one source of truth — and is what the
+/// conformance bench's `CrossDeploymentInterference` check trusts.
+pub fn enforce_split_invariants(
+    env: &Environment,
+    deployment_id: DeploymentId,
+) -> Result<TrafficSplitOutcome, DeployerError> {
+    let split = env
+        .traffic_splits
+        .iter()
+        .find(|s| s.deployment_id == deployment_id)
+        .ok_or_else(|| DeployerError::SplitNotFound {
+            env_id: env.environment_id.clone(),
+            deployment_id,
+        })?;
+    let sum: u64 = split.entries.iter().map(|e| u64::from(e.weight_bps)).sum();
+    if sum != 10_000 {
+        return Err(DeployerError::InvalidSplit { deployment_id, sum });
+    }
+    Ok(TrafficSplitOutcome {
+        applied_deployment_id: deployment_id,
+        applied_entries: split.entries.clone(),
+    })
+}
+
 /// Contract every deployer env-pack implements.
 ///
 /// Trait methods model **provider-side effects** — the work that brings

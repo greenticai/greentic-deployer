@@ -31,5 +31,5 @@ pub mod trait_def;
 pub use conformance::{ConformanceFailure, run_conformance};
 pub use trait_def::{
     ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome, TrafficSplitOutcome,
-    WarmOutcome,
+    WarmOutcome, enforce_split_invariants, require_revision,
 };
