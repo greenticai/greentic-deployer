@@ -47,11 +47,21 @@ impl LocalFsStore {
         host_config: EnvironmentHostConfig,
     ) -> Result<Environment, StoreError> {
         self.transact(env_id, |locked| {
-            if locked.load().is_ok() {
-                return Err(StoreError::Conflict(format!(
-                    "environment `{}` already exists",
-                    locked.env_id()
-                )));
+            // Existence check must reject non-NotFound errors instead of
+            // treating "load failed" as "env doesn't exist". A corrupt
+            // `environment.json`, an env-id mismatch, or any I/O error
+            // would otherwise fall through to fresh `Environment`
+            // construction and overwrite the existing (recoverable) file
+            // — silent data loss while reporting create success.
+            match locked.load() {
+                Ok(_) => {
+                    return Err(StoreError::Conflict(format!(
+                        "environment `{}` already exists",
+                        locked.env_id()
+                    )));
+                }
+                Err(StoreError::NotFound(_)) => {}
+                Err(e) => return Err(e),
             }
             let env = Environment {
                 schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),

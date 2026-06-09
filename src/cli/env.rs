@@ -1056,6 +1056,46 @@ mod tests {
     }
 
     #[test]
+    fn create_preserves_corrupt_environment_json_instead_of_overwriting() {
+        // Regression for the `is_ok()`-existence-check footgun in
+        // `LocalFsStore::create_environment`. A corrupt `environment.json`
+        // must NOT be treated as "env doesn't exist" — otherwise create
+        // would silently overwrite a recoverable file with an empty env.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env_dir = dir.path().join("local");
+        std::fs::create_dir_all(&env_dir).unwrap();
+        let corrupt_path = env_dir.join("environment.json");
+        let corrupt_bytes = b"{ this is not valid json";
+        std::fs::write(&corrupt_path, corrupt_bytes).unwrap();
+        let err = create(
+            &store,
+            &OpFlags::default(),
+            Some(EnvCreatePayload {
+                environment_id: "local".to_string(),
+                name: "local".to_string(),
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+                public_base_url: None,
+            }),
+        )
+        .expect_err("create over a corrupt environment.json must fail");
+        // Anything but Conflict — the env "appears to exist but is unreadable",
+        // which is a Store error, not a duplicate.
+        assert!(
+            !matches!(err, OpError::Conflict(_)),
+            "expected store/json error, got Conflict (overwrote the file?): {err:?}"
+        );
+        // Crucially: the corrupt file is byte-for-byte preserved.
+        let on_disk = std::fs::read(&corrupt_path).unwrap();
+        assert_eq!(
+            on_disk, corrupt_bytes,
+            "create must not have rewritten environment.json"
+        );
+    }
+
+    #[test]
     fn create_with_no_listen_addr_persists_none_so_runtime_falls_back_to_default() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
