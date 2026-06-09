@@ -298,18 +298,18 @@ impl LocalFsStore {
     /// `payload.idempotency_key` is accepted for trait conformance and
     /// ignored locally; the HTTP backend caches it for A8 §2 replay.
     ///
-    /// **Stale-snapshot caution.** The gate is evaluated OUTSIDE the env
-    /// flock (by definition — closures don't cross the wire). A
-    /// concurrent mutation that lands BETWEEN gate evaluation and this
-    /// verb's flock acquisition can produce a Ready/Failed outcome that
-    /// doesn't match the env state the gate actually observed. The
-    /// current consumer (closure-based CLI `warm_with_health_gate`) is
-    /// not affected — it stays in-lock. Future typed consumers (PR-3b
-    /// HTTP backend, Phase D `greentic-start` warm gate) MUST add an
-    /// env-generation / lifecycle-hash precondition to
-    /// [`super::mutations::WarmRevisionPayload`] and revalidate under
-    /// the lock before applying the gate result. Tracked for PR-3a.6b /
-    /// PR-3b before any caller wires the typed verb live.
+    /// **Lifecycle precondition (PR-3a.6b).** The gate is evaluated
+    /// OUTSIDE the env flock (by definition — closures don't cross the
+    /// wire). `payload.expected_lifecycle` records the revision's
+    /// lifecycle at gate-evaluation time; the impl re-checks under the
+    /// flock that the revision still carries that lifecycle before
+    /// applying the gate result. On mismatch, the verb rejects with
+    /// `LifecycleError::Conflict` so a stale gate outcome (evaluated
+    /// against env state that has since changed) is never applied.
+    ///
+    /// The precondition is skipped on the idempotent-retry path (revision
+    /// already at the chain's final state, chain walk is a no-op) because
+    /// the gate fires only when the chain actually advanced.
     pub fn warm_revision(
         &self,
         env_id: &EnvId,
@@ -319,8 +319,36 @@ impl LocalFsStore {
             revision_id,
             health_gate,
             idempotency_key: _,
+            expected_lifecycle,
         } = payload;
         self.run_revision_transition(env_id, revision_id, |locked| {
+            // Lifecycle precondition (PR-3a.6b): verify under the flock that
+            // the revision still carries the lifecycle the caller observed at
+            // gate-evaluation time. Skipped on the idempotent-retry path
+            // (revision already at the chain's final `Ready` state) because
+            // the gate fires only when the chain actually advanced — a retry
+            // that doesn't advance the chain never applies the gate result,
+            // so the precondition is moot.
+            let env_snapshot = locked.load()?;
+            let current_lifecycle = env_snapshot
+                .revisions
+                .iter()
+                .find(|r| r.revision_id == revision_id)
+                .map(|r| r.lifecycle);
+            let chain_final = RevisionLifecycle::Ready;
+            if let Some(actual) = current_lifecycle {
+                let is_idempotent_retry = actual == chain_final;
+                if !is_idempotent_retry && actual != expected_lifecycle {
+                    return Err(LifecycleError::Conflict {
+                        revision_id,
+                        actual,
+                        expected_starts: vec![expected_lifecycle],
+                    });
+                }
+            }
+            // Precondition passed (or skipped for idempotent retry).
+            // Drop env_snapshot; the lifecycle helper does its own load.
+            drop(env_snapshot);
             apply_revision_transition_with_health_gate(
                 locked,
                 revision_id,
@@ -983,6 +1011,7 @@ mod warm_revision_tests {
                     revision_id: rid,
                     health_gate: Ok(()),
                     idempotency_key: idem(),
+                    expected_lifecycle: RevisionLifecycle::Staged,
                 },
             )
             .unwrap();
@@ -1007,6 +1036,7 @@ mod warm_revision_tests {
                         message: "missing routes".to_string(),
                     }),
                     idempotency_key: idem(),
+                    expected_lifecycle: RevisionLifecycle::Staged,
                 },
             )
             .unwrap_err();
@@ -1040,6 +1070,7 @@ mod warm_revision_tests {
                     revision_id: rid,
                     health_gate: Ok(()),
                     idempotency_key: idem(),
+                    expected_lifecycle: RevisionLifecycle::Staged,
                 },
             )
             .unwrap();
@@ -1058,6 +1089,7 @@ mod warm_revision_tests {
                     revision_id: rid,
                     health_gate: Ok(()),
                     idempotency_key: idem(),
+                    expected_lifecycle: RevisionLifecycle::Staged,
                 },
             )
             .unwrap();
@@ -1069,5 +1101,82 @@ mod warm_revision_tests {
         // Draining→Inactive→Archived in one hop, so the final lifecycle alone
         // can't tell us we crossed the eviction boundary).
         assert_eq!(outcome.starting_lifecycle, RevisionLifecycle::Draining);
+    }
+
+    /// PR-3a.6b regression: a concurrent mutation that changes the revision's
+    /// lifecycle AFTER gate evaluation but BEFORE the typed verb acquires the
+    /// flock must be rejected. Simulated here by supplying an
+    /// `expected_lifecycle` that doesn't match the revision's on-disk state.
+    #[test]
+    fn warm_with_concurrent_lifecycle_change_rejects() {
+        let (store, env_id, rid) = seed_one_staged();
+        // The revision is `Staged` on disk, but the caller claims it observed
+        // `Ready` (simulating a concurrent drain that landed between gate-eval
+        // and verb dispatch). The precondition must reject.
+        let err = store
+            .warm_revision(
+                &env_id,
+                WarmRevisionPayload {
+                    revision_id: rid,
+                    health_gate: Ok(()),
+                    idempotency_key: idem(),
+                    expected_lifecycle: RevisionLifecycle::Ready,
+                },
+            )
+            .unwrap_err();
+        match err {
+            StoreError::Lifecycle(inner) => match *inner {
+                LifecycleError::Conflict {
+                    revision_id: conflict_rid,
+                    actual,
+                    expected_starts,
+                } => {
+                    assert_eq!(conflict_rid, rid);
+                    assert_eq!(actual, RevisionLifecycle::Staged);
+                    assert_eq!(expected_starts, vec![RevisionLifecycle::Ready]);
+                }
+                other => panic!("expected LifecycleError::Conflict, got {other:?}"),
+            },
+            other => panic!("expected StoreError::Lifecycle, got {other:?}"),
+        }
+        // Env untouched — revision stays Staged.
+        let env = store.load(&env_id).unwrap();
+        assert_eq!(env.revisions[0].lifecycle, RevisionLifecycle::Staged);
+    }
+
+    /// Complement of `warm_with_concurrent_lifecycle_change_rejects`:
+    /// an idempotent retry against an already-Ready revision must
+    /// succeed regardless of the `expected_lifecycle` value, because
+    /// the chain walk is a no-op and the gate is never fired.
+    #[test]
+    fn warm_idempotent_retry_skips_precondition() {
+        let (store, env_id, rid) = seed_one_staged();
+        // Warm once (Staged → Ready).
+        store
+            .warm_revision(
+                &env_id,
+                WarmRevisionPayload {
+                    revision_id: rid,
+                    health_gate: Ok(()),
+                    idempotency_key: idem(),
+                    expected_lifecycle: RevisionLifecycle::Staged,
+                },
+            )
+            .unwrap();
+        // Retry with a stale `expected_lifecycle` (Staged, not Ready).
+        // Must succeed because the revision is already at the chain's
+        // final state.
+        let outcome = store
+            .warm_revision(
+                &env_id,
+                WarmRevisionPayload {
+                    revision_id: rid,
+                    health_gate: Ok(()),
+                    idempotency_key: idem(),
+                    expected_lifecycle: RevisionLifecycle::Staged,
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome.revision.lifecycle, RevisionLifecycle::Ready);
     }
 }
