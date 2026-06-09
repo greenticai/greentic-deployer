@@ -79,7 +79,10 @@ impl Deployer for LocalProcessDeployerHandler {
         }
         // No provider side — the in-process dispatcher reads the
         // runtime-config materialization on its own.
-        Ok(TrafficSplitOutcome::default())
+        Ok(TrafficSplitOutcome {
+            applied_deployment_id: deployment_id,
+            applied_entries: split.entries.clone(),
+        })
     }
 }
 

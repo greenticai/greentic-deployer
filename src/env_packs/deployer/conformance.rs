@@ -84,8 +84,9 @@ pub enum ConformanceFailure {
     RuntimeConfigDrift,
 
     #[error(
-        "apply_traffic_split: applying the split for deployment A perturbed the recorded split \
-         for deployment B (cross-deployment independence violated)"
+        "apply_traffic_split: the impl's self-reported TrafficSplitOutcome does not match the \
+         targeted deployment_id or the env's recorded entries (cross-deployment independence \
+         violated or wrong deployment applied)"
     )]
     CrossDeploymentInterference,
 }
@@ -106,24 +107,28 @@ pub async fn run_conformance<D: Deployer + ?Sized>(deployer: &D) -> Result<(), C
 
     check_idempotent(
         "stage_revision",
-        deployer.stage_revision(&env, r_warm).await,
-        deployer.stage_revision(&env, r_warm).await,
-    )?;
+        || deployer.stage_revision(&env, r_warm),
+        || deployer.stage_revision(&env, r_warm),
+    )
+    .await?;
     check_idempotent(
         "warm_revision",
-        deployer.warm_revision(&env, r_warm).await,
-        deployer.warm_revision(&env, r_warm).await,
-    )?;
+        || deployer.warm_revision(&env, r_warm),
+        || deployer.warm_revision(&env, r_warm),
+    )
+    .await?;
     check_idempotent(
         "drain_revision",
-        deployer.drain_revision(&env, r_drain).await,
-        deployer.drain_revision(&env, r_drain).await,
-    )?;
+        || deployer.drain_revision(&env, r_drain),
+        || deployer.drain_revision(&env, r_drain),
+    )
+    .await?;
     check_idempotent(
         "archive_revision",
-        deployer.archive_revision(&env, r_archive).await,
-        deployer.archive_revision(&env, r_archive).await,
-    )?;
+        || deployer.archive_revision(&env, r_archive),
+        || deployer.archive_revision(&env, r_archive),
+    )
+    .await?;
 
     check_unknown_revision_rejected(deployer).await?;
     check_invalid_split_rejected(deployer).await?;
@@ -131,14 +136,16 @@ pub async fn run_conformance<D: Deployer + ?Sized>(deployer: &D) -> Result<(), C
 
     check_idempotent(
         "apply_traffic_split",
-        deployer.apply_traffic_split(&env, dep_a).await,
-        deployer.apply_traffic_split(&env, dep_a).await,
-    )?;
+        || deployer.apply_traffic_split(&env, dep_a),
+        || deployer.apply_traffic_split(&env, dep_a),
+    )
+    .await?;
     check_idempotent(
         "apply_traffic_split[dep_b]",
-        deployer.apply_traffic_split(&env, dep_b).await,
-        deployer.apply_traffic_split(&env, dep_b).await,
-    )?;
+        || deployer.apply_traffic_split(&env, dep_b),
+        || deployer.apply_traffic_split(&env, dep_b),
+    )
+    .await?;
     check_cross_deployment_independence(deployer, &env, dep_a, dep_b).await?;
 
     check_runtime_config_projection(deployer, &env)?;
@@ -146,16 +153,20 @@ pub async fn run_conformance<D: Deployer + ?Sized>(deployer: &D) -> Result<(), C
     Ok(())
 }
 
-fn check_idempotent<T>(
+async fn check_idempotent<T, Fut, F1, F2>(
     verb: &'static str,
-    first: Result<T, DeployerError>,
-    second: Result<T, DeployerError>,
-) -> Result<(), ConformanceFailure> {
-    match first {
-        Ok(_) => {}
-        Err(source) => return Err(ConformanceFailure::HappyPathFailed { verb, source }),
+    first: F1,
+    second: F2,
+) -> Result<(), ConformanceFailure>
+where
+    Fut: std::future::Future<Output = Result<T, DeployerError>>,
+    F1: FnOnce() -> Fut,
+    F2: FnOnce() -> Fut,
+{
+    if let Err(source) = first().await {
+        return Err(ConformanceFailure::HappyPathFailed { verb, source });
     }
-    match second {
+    match second().await {
         Ok(_) => Ok(()),
         Err(source) => Err(ConformanceFailure::NotIdempotent { verb, source }),
     }
@@ -227,27 +238,38 @@ async fn check_cross_deployment_independence<D: Deployer + ?Sized>(
     dep_a: DeploymentId,
     dep_b: DeploymentId,
 ) -> Result<(), ConformanceFailure> {
-    let projection_before = deployer.report_runtime_config(env);
-    deployer
+    let expected_a = env
+        .traffic_splits
+        .iter()
+        .find(|s| s.deployment_id == dep_a)
+        .map(|s| s.entries.clone())
+        .unwrap_or_default();
+    let expected_b = env
+        .traffic_splits
+        .iter()
+        .find(|s| s.deployment_id == dep_b)
+        .map(|s| s.entries.clone())
+        .unwrap_or_default();
+
+    let outcome_a = deployer
         .apply_traffic_split(env, dep_a)
         .await
         .map_err(|source| ConformanceFailure::HappyPathFailed {
-            verb: "apply_traffic_split[cross-dep]",
+            verb: "apply_traffic_split[cross-dep:a]",
             source,
         })?;
-    let projection_after = deployer.report_runtime_config(env);
+    if outcome_a.applied_deployment_id != dep_a || outcome_a.applied_entries != expected_a {
+        return Err(ConformanceFailure::CrossDeploymentInterference);
+    }
 
-    let blocks_b_before: Vec<_> = projection_before
-        .revisions
-        .iter()
-        .filter(|b| b.deployment_id == dep_b)
-        .collect();
-    let blocks_b_after: Vec<_> = projection_after
-        .revisions
-        .iter()
-        .filter(|b| b.deployment_id == dep_b)
-        .collect();
-    if blocks_b_before != blocks_b_after {
+    let outcome_b = deployer
+        .apply_traffic_split(env, dep_b)
+        .await
+        .map_err(|source| ConformanceFailure::HappyPathFailed {
+            verb: "apply_traffic_split[cross-dep:b]",
+            source,
+        })?;
+    if outcome_b.applied_deployment_id != dep_b || outcome_b.applied_entries != expected_b {
         return Err(ConformanceFailure::CrossDeploymentInterference);
     }
     Ok(())
@@ -515,7 +537,10 @@ mod tests {
             if sum != 10_000 {
                 return Err(DeployerError::InvalidSplit { deployment_id, sum });
             }
-            Ok(TrafficSplitOutcome::default())
+            Ok(TrafficSplitOutcome {
+                applied_deployment_id: deployment_id,
+                applied_entries: split.entries.clone(),
+            })
         }
     }
 
@@ -609,7 +634,10 @@ mod tests {
             if sum != 10_000 {
                 return Err(DeployerError::InvalidSplit { deployment_id, sum });
             }
-            Ok(TrafficSplitOutcome::default())
+            Ok(TrafficSplitOutcome {
+                applied_deployment_id: deployment_id,
+                applied_entries: split.entries.clone(),
+            })
         }
     }
 
@@ -673,10 +701,13 @@ mod tests {
         async fn apply_traffic_split(
             &self,
             _env: &Environment,
-            _deployment_id: DeploymentId,
+            deployment_id: DeploymentId,
         ) -> Result<TrafficSplitOutcome, DeployerError> {
             // Doesn't check the sum — should fail the bench.
-            Ok(TrafficSplitOutcome::default())
+            Ok(TrafficSplitOutcome {
+                applied_deployment_id: deployment_id,
+                applied_entries: Vec::new(),
+            })
         }
     }
 
@@ -689,6 +720,84 @@ mod tests {
         assert!(
             matches!(err, ConformanceFailure::InvalidSplitAccepted { .. }),
             "expected InvalidSplitAccepted, got {err:?}"
+        );
+    }
+
+    /// Deployer that always reports a fixed wrong `applied_deployment_id`
+    /// in its `TrafficSplitOutcome`, regardless of the actual input.
+    /// The bench must surface `CrossDeploymentInterference`.
+    #[derive(Debug, Default)]
+    struct WrongDeploymentReporter;
+
+    #[async_trait]
+    impl Deployer for WrongDeploymentReporter {
+        async fn stage_revision(
+            &self,
+            env: &Environment,
+            revision_id: RevisionId,
+        ) -> Result<StageOutcome, DeployerError> {
+            require_revision(env, revision_id)?;
+            Ok(StageOutcome::default())
+        }
+        async fn warm_revision(
+            &self,
+            env: &Environment,
+            revision_id: RevisionId,
+        ) -> Result<WarmOutcome, DeployerError> {
+            require_revision(env, revision_id)?;
+            Ok(WarmOutcome::default())
+        }
+        async fn drain_revision(
+            &self,
+            env: &Environment,
+            revision_id: RevisionId,
+        ) -> Result<DrainOutcome, DeployerError> {
+            require_revision(env, revision_id)?;
+            Ok(DrainOutcome::default())
+        }
+        async fn archive_revision(
+            &self,
+            env: &Environment,
+            revision_id: RevisionId,
+        ) -> Result<ArchiveOutcome, DeployerError> {
+            require_revision(env, revision_id)?;
+            Ok(ArchiveOutcome::default())
+        }
+        async fn apply_traffic_split(
+            &self,
+            env: &Environment,
+            deployment_id: DeploymentId,
+        ) -> Result<TrafficSplitOutcome, DeployerError> {
+            let split = env
+                .traffic_splits
+                .iter()
+                .find(|s| s.deployment_id == deployment_id)
+                .ok_or(DeployerError::SplitNotFound {
+                    env_id: env.environment_id.clone(),
+                    deployment_id,
+                })?;
+            let sum: u64 = split.entries.iter().map(|e| u64::from(e.weight_bps)).sum();
+            if sum != 10_000 {
+                return Err(DeployerError::InvalidSplit { deployment_id, sum });
+            }
+            // Always report a fixed wrong deployment id.
+            let wrong_id = DeploymentId(Ulid::from(0xDEAD_u128));
+            Ok(TrafficSplitOutcome {
+                applied_deployment_id: wrong_id,
+                applied_entries: split.entries.clone(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn bench_detects_wrong_deployment_id_in_outcome() {
+        let d = WrongDeploymentReporter;
+        let err = run_conformance(&d)
+            .await
+            .expect_err("wrong deployment id in outcome must be caught");
+        assert!(
+            matches!(err, ConformanceFailure::CrossDeploymentInterference),
+            "expected CrossDeploymentInterference, got {err:?}"
         );
     }
 }

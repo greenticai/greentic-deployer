@@ -31,8 +31,19 @@ pub struct DrainOutcome {}
 pub struct ArchiveOutcome {}
 
 /// Side-effect outcome of [`Deployer::apply_traffic_split`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TrafficSplitOutcome {}
+///
+/// The conformance bench asserts both fields so a deployer that
+/// quietly applies the wrong deployment or silently mutates a
+/// sibling deployment's split cannot pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrafficSplitOutcome {
+    /// The deployment whose split this call enforced. MUST equal the
+    /// `deployment_id` argument to [`Deployer::apply_traffic_split`].
+    pub applied_deployment_id: DeploymentId,
+    /// The exact entries the impl applied. MUST equal
+    /// `env.traffic_splits.iter().find(|s| s.deployment_id == deployment_id).unwrap().entries`.
+    pub applied_entries: Vec<greentic_deploy_spec::TrafficSplitEntry>,
+}
 
 /// Errors a [`Deployer`] impl may return.
 ///
