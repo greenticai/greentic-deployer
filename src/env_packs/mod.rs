@@ -8,6 +8,7 @@
 
 #[cfg(feature = "creds-aws")]
 pub mod aws;
+pub mod deployer;
 pub mod local_process;
 pub mod registry;
 pub mod slot;
