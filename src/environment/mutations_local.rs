@@ -32,9 +32,8 @@ use super::mutations::{
 use super::store::{LocalFsStore, StoreError};
 use super::trust_root::{self as store_trust_root, trust_root_path};
 
-/// Fold a [`LifecycleError`] back into the `StoreError` shape the typed verbs
-/// promise. Unwraps `LifecycleError::Store` to preserve the original store
-/// error rather than boxing it inside `Lifecycle(Store(...))` round-trips.
+/// Map a [`LifecycleError`] into `StoreError`, peeling `LifecycleError::Store`
+/// so the original [`StoreError`] reaches callers unboxed.
 fn fold_lifecycle_err(err: LifecycleError) -> StoreError {
     match err {
         LifecycleError::Store(inner) => inner,
@@ -725,7 +724,9 @@ mod warm_revision_tests {
             health: Default::default(),
         };
         store.save(&env).unwrap();
-        std::mem::forget(dir);
+        // `keep()` consumes the tempdir's `Drop` guard so the dir survives the
+        // test scope without leaking via `mem::forget`.
+        let _ = dir.keep();
         (store, env_id(), rid)
     }
 

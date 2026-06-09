@@ -98,7 +98,7 @@ pub struct PackListEntryPayload {
     pub source_uri: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevisionTransitionPayload {
     pub environment_id: String,
     pub revision_id: String,
@@ -508,23 +508,20 @@ where
         idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |committed| {
-        let outcome = match call_verb(&env_id, revision_id, idempotency_key) {
-            Ok(o) => o,
-            Err(err) => {
-                // Committed-on-error: the typed verb's lifecycle helper
-                // saved the env mutation but a post-save step (load /
-                // refresh_runtime_config) failed. Mark committed BEFORE
-                // mapping so the audit boundary fails-closed on an
-                // audit-append failure (matches the closure-based
-                // `transition_with_health_gate` Ok-arm post-save
-                // contract — see
-                // `warm_ok_with_refresh_failure_and_audit_failure_returns_audit_error`).
-                if super::is_store_err_committed_after_save(&err) {
+        // Committed-on-error: when the typed verb's lifecycle helper
+        // saved the env mutation but a post-save step (load /
+        // refresh_runtime_config) failed, mark committed BEFORE the
+        // error escapes so the audit boundary fails-closed on an
+        // audit-append failure (matches the closure-based
+        // `transition_with_health_gate` Ok-arm post-save contract —
+        // see `warm_ok_with_refresh_failure_and_audit_failure_returns_audit_error`).
+        let outcome = call_verb(&env_id, revision_id, idempotency_key)
+            .inspect_err(|err| {
+                if err.is_committed_after_save() {
                     committed.mark_committed();
                 }
-                return Err(map_store_err_preserving_noun(err));
-            }
-        };
+            })
+            .map_err(map_store_err_preserving_noun)?;
         // Typed-verb Ok = saved + runtime-config refreshed before return,
         // so mark committed before any best-effort emit unwinds.
         committed.mark_committed();
@@ -545,15 +542,22 @@ where
     })
 }
 
-/// Gate-aware variant of [`transition`] for the B9 warm/ready gate. Routes
-/// `on_final` and the `health_gate` closure through
+/// Gate-aware variant of [`typed_transition`] for the B9 warm/ready gate.
+/// Routes `on_final` and the `health_gate` closure through
 /// [`crate::environment::apply_revision_transition_with_health_gate`] inside
 /// the same `store.transact` lock so the gate sees the same snapshot the
 /// chain advance saw and the env is saved once (Failed on rejection, post-
 /// transition otherwise).
-// One extra arg over the 7-arg sibling `transition` to thread the gate
-// closure; bundling into a struct would touch every existing warm/drain/
-// archive caller for no readability win.
+///
+/// **TODO(PR-3a.6b):** delete this in favor of [`typed_transition`] once warm
+/// migrates to the typed `LocalFsStore::warm_revision` verb. Today the
+/// closure shape stays so the in-lock B9 gate consumer in `greentic-start`
+/// keeps its current contract; PR-3a.6b adds env-generation precondition
+/// support to `WarmRevisionPayload` so the pre-evaluated outcome can be
+/// safely shipped across the HTTP wire.
+// One extra arg over the 7-arg sibling typed_transition to thread the gate
+// closure; bundling into a struct would touch every existing warm caller for
+// no readability win.
 #[allow(clippy::too_many_arguments)]
 fn transition_with_health_gate<F, G>(
     store: &LocalFsStore,
@@ -1646,19 +1650,14 @@ mod tests {
             .unwrap()
             .to_string();
 
-        // Warm to Ready first — drain only accepts Ready as a start.
-        warm(
-            &store,
-            &OpFlags::default(),
-            Some(RevisionTransitionPayload {
-                environment_id: "local".to_string(),
-                revision_id: rid_str.clone(),
-                idempotency_key: None,
-            }),
-        )
-        .unwrap();
-
+        // Drain accepts only `Ready` as a start — flip the staged revision
+        // directly instead of running the full warm dance (which isn't the
+        // verb under test here).
         let env_id = EnvId::try_from("local").unwrap();
+        let mut env = store.load(&env_id).unwrap();
+        env.revisions[0].lifecycle = RevisionLifecycle::Ready;
+        store.save(&env).unwrap();
+
         let env_dir = store.env_dir(&env_id).unwrap();
 
         // Block `refresh_runtime_config` AND `audit append` — same

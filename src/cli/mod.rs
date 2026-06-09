@@ -250,15 +250,6 @@ pub(crate) fn map_store_err_preserving_noun(e: crate::environment::StoreError) -
     }
 }
 
-/// Detect the [`crate::environment::StoreError::CommittedAfterSave`] wrapper
-/// regardless of nesting depth. Typed-verb callers query this BEFORE mapping
-/// the error to an `OpError` so they can call
-/// [`CommitMarker::mark_committed`] on the boundary — the wrapper itself is
-/// unwrapped by [`map_store_err_preserving_noun`] one layer at a time.
-pub(crate) fn is_store_err_committed_after_save(e: &crate::environment::StoreError) -> bool {
-    matches!(e, crate::environment::StoreError::CommittedAfterSave(_))
-}
-
 /// Mint a fresh [`greentic_deploy_spec::IdempotencyKey`] (ULID) for a
 /// CLI-initiated mutation that doesn't carry a caller-supplied key in its
 /// payload. Cross-cutting helper: every verb-group migration that didn't

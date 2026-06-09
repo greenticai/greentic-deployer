@@ -120,6 +120,18 @@ pub enum StoreError {
     CommittedAfterSave(Box<StoreError>),
 }
 
+impl StoreError {
+    /// `true` iff `self` is the [`StoreError::CommittedAfterSave`] wrapper.
+    /// Typed-verb callers (`cli::revisions::typed_transition`) query this
+    /// BEFORE mapping the error to an `OpError` so they can call
+    /// [`crate::cli::CommitMarker::mark_committed`] on the boundary — the
+    /// wrapper itself is unwrapped one layer at a time by
+    /// [`crate::cli::map_store_err_preserving_noun`].
+    pub fn is_committed_after_save(&self) -> bool {
+        matches!(self, StoreError::CommittedAfterSave(_))
+    }
+}
+
 /// Reject env ids that, while valid per the upstream `EnvId` validator
 /// (which allows `.` and `..` as full strings), would escape the store
 /// root when used as a path segment. The upstream validator already
