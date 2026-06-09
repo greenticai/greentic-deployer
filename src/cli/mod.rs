@@ -212,6 +212,37 @@ pub(crate) struct AuditCtx {
     pub idempotency_key: Option<String>,
 }
 
+/// Downcast a [`crate::environment::StoreError`] so domain-specific failures
+/// surface under their own [`OpError`] noun instead of being flattened into
+/// `OpError::Store`. Without this, the error envelope's `error.kind` regresses
+/// from `"trust-root"` / `"operator-key"` (the typed CLI noun) to the generic
+/// `"store"` for every CLI verb that calls through to typed
+/// [`crate::environment::mutations::EnvironmentMutations`] verbs.
+///
+/// Cross-cutting concern shared by every verb-group migration in the PR-3a.*
+/// train — lives here so 14 future migrations don't each invent a copy.
+pub(crate) fn map_store_err_preserving_noun(e: crate::environment::StoreError) -> OpError {
+    match e {
+        crate::environment::StoreError::TrustRoot(inner) => OpError::TrustRoot(inner),
+        crate::environment::StoreError::OperatorKey(inner) => OpError::OperatorKey(inner),
+        other => OpError::Store(other),
+    }
+}
+
+/// Mint a fresh [`greentic_deploy_spec::IdempotencyKey`] (ULID) for a
+/// CLI-initiated mutation that doesn't carry a caller-supplied key in its
+/// payload. Cross-cutting helper: every verb-group migration that didn't
+/// already require an idempotency key in its payload (e.g. trust-root) uses
+/// this so audit ctx + store call share the same key.
+///
+/// Caller-supplied keys via the payload remain the right shape for verbs
+/// whose mutation cost is high enough to warrant operator-level dedup
+/// control (see `cli/traffic.rs` precedent).
+pub(crate) fn mint_idempotency_key() -> greentic_deploy_spec::IdempotencyKey {
+    greentic_deploy_spec::IdempotencyKey::new(ulid::Ulid::new().to_string())
+        .expect("freshly minted ULID is non-empty")
+}
+
 /// Closure-callable handle for signalling "this mutation persisted state to
 /// disk even though it's returning Err."
 ///

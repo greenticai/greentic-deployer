@@ -564,7 +564,7 @@ pub fn init(
         // `LocalFsStore::seed_trust_root_if_absent` (Phase D PR-3a.2).
         let trust_root_seed = store
             .seed_trust_root_if_absent(&env.environment_id)
-            .map_err(super::trust_root::map_store_err_preserving_noun)?;
+            .map_err(super::map_store_err_preserving_noun)?;
         let trust_root = super::trust_root::trust_root_seed_to_wire_opt(
             &env.environment_id,
             trust_root_seed.as_ref(),

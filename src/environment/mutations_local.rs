@@ -11,12 +11,13 @@
 //! verb group has migrated (PR-3a.16), a trailing PR wires the trait impl as
 //! thin forwarders.
 
+use std::path::Path;
+
 use greentic_distributor_client::signing::TrustedKey;
-use serde_json::{Value, json};
 
 use greentic_deploy_spec::{EnvId, IdempotencyKey};
 
-use super::mutations::TrustRootSeed;
+use super::mutations::{TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed};
 use super::store::{LocalFsStore, StoreError};
 use super::trust_root::{self as store_trust_root, trust_root_path};
 
@@ -42,20 +43,7 @@ impl LocalFsStore {
     pub fn bootstrap_trust_root(&self, env_id: &EnvId) -> Result<TrustRootSeed, StoreError> {
         let op_key = crate::operator_key::load_or_generate()?;
         let env_dir = self.env_dir(env_id)?;
-        self.transact(env_id, |_locked| -> Result<TrustRootSeed, StoreError> {
-            let trust = store_trust_root::add_trusted_key(
-                &env_dir,
-                TrustedKey {
-                    key_id: op_key.key_id.clone(),
-                    public_key_pem: op_key.public_pem.clone(),
-                },
-            )?;
-            Ok(TrustRootSeed {
-                key_id: op_key.key_id.clone(),
-                public_key_pem: op_key.public_pem.clone(),
-                trusted_key_count: trust.keys.len(),
-            })
-        })
+        self.transact(env_id, |_locked| seed_op_key(&env_dir, op_key))
     }
 
     /// First-init-only variant: returns `None` when `<env_dir>/trust-root.json`
@@ -70,33 +58,19 @@ impl LocalFsStore {
     ) -> Result<Option<TrustRootSeed>, StoreError> {
         let env_dir = self.env_dir(env_id)?;
         let tr_path = trust_root_path(&env_dir);
-        self.transact(
-            env_id,
-            |_locked| -> Result<Option<TrustRootSeed>, StoreError> {
-                if tr_path.exists() {
-                    return Ok(None);
-                }
-                let op_key = crate::operator_key::load_or_generate()?;
-                let trust = store_trust_root::add_trusted_key(
-                    &env_dir,
-                    TrustedKey {
-                        key_id: op_key.key_id.clone(),
-                        public_key_pem: op_key.public_pem.clone(),
-                    },
-                )?;
-                Ok(Some(TrustRootSeed {
-                    key_id: op_key.key_id,
-                    public_key_pem: op_key.public_pem,
-                    trusted_key_count: trust.keys.len(),
-                }))
-            },
-        )
+        self.transact(env_id, |_locked| {
+            if tr_path.exists() {
+                return Ok(None);
+            }
+            let op_key = crate::operator_key::load_or_generate()?;
+            seed_op_key(&env_dir, op_key).map(Some)
+        })
     }
 
     /// Add a trusted (key_id, public_key_pem) entry to the env trust root.
     /// Validates `key_id` matches the canonical derivation from `pem` and
     /// rejects empty/whitespace key ids. Idempotent on case-insensitive
-    /// `key_id` collision. Returns the wire-shape JSON the CLI surfaces.
+    /// `key_id` collision.
     ///
     /// `_idempotency_key` is accepted for trait-conformance with
     /// [`super::mutations::EnvironmentMutations::add_trusted_key`] and
@@ -107,9 +81,9 @@ impl LocalFsStore {
         key_id: String,
         public_key_pem: String,
         _idempotency_key: IdempotencyKey,
-    ) -> Result<Value, StoreError> {
+    ) -> Result<TrustRootAddOutcome, StoreError> {
         let env_dir = self.env_dir(env_id)?;
-        self.transact(env_id, |_locked| -> Result<Value, StoreError> {
+        self.transact(env_id, |_locked| {
             let trust = store_trust_root::add_trusted_key(
                 &env_dir,
                 TrustedKey {
@@ -117,45 +91,64 @@ impl LocalFsStore {
                     public_key_pem,
                 },
             )?;
-            Ok(json!({
-                "environment_id": env_id.as_str(),
-                "added_key_id": key_id,
-                "trusted_key_count": trust.keys.len(),
-            }))
+            Ok(TrustRootAddOutcome {
+                added_key_id: key_id,
+                trusted_key_count: trust.keys.len(),
+            })
         })
     }
 
     /// Remove a trusted key by case-insensitive `key_id`. Silent no-op when
-    /// the id is absent. Returns the wire-shape JSON: the PEM that was
-    /// actually removed (captured under the flock for race-safety) and the
-    /// post-removal trusted-key count.
+    /// the id is absent. Captures the pre-state PEM under the flock for
+    /// race-safe recovery reporting.
     ///
     /// `_idempotency_key` is accepted for trait-conformance with
     /// [`super::mutations::EnvironmentMutations::remove_trusted_key`] and
     /// ignored locally. The HTTP backend MUST cache and replay the original
-    /// response so retries don't surface `removed_public_key_pem: null` (the
+    /// outcome so retries don't surface `removed_public_key_pem: None` (the
     /// failure mode that motivated requiring the key).
     pub fn remove_trusted_key(
         &self,
         env_id: &EnvId,
         key_id: String,
         _idempotency_key: IdempotencyKey,
-    ) -> Result<Value, StoreError> {
+    ) -> Result<TrustRootRemoveOutcome, StoreError> {
         let env_dir = self.env_dir(env_id)?;
-        self.transact(env_id, |_locked| -> Result<Value, StoreError> {
+        self.transact(env_id, |_locked| {
             let pre = store_trust_root::load(&env_dir)?;
-            let removed_pem = pre
+            let removed_public_key_pem = pre
                 .keys
                 .iter()
                 .find(|k| k.key_id.eq_ignore_ascii_case(&key_id))
                 .map(|k| k.public_key_pem.clone());
             let trust = store_trust_root::remove_trusted_key(&env_dir, &key_id)?;
-            Ok(json!({
-                "environment_id": env_id.as_str(),
-                "removed_key_id": key_id,
-                "removed_public_key_pem": removed_pem,
-                "trusted_key_count": trust.keys.len(),
-            }))
+            Ok(TrustRootRemoveOutcome {
+                removed_key_id: key_id,
+                removed_public_key_pem,
+                trusted_key_count: trust.keys.len(),
+            })
         })
     }
+}
+
+/// Persist `op_key` as a trusted entry on `env_dir`'s trust root and shape
+/// the typed [`TrustRootSeed`] outcome. Shared body of `bootstrap_trust_root`
+/// and `seed_trust_root_if_absent` — invariant is that the env flock is held
+/// at the call site (both callers wrap in `self.transact`).
+fn seed_op_key(
+    env_dir: &Path,
+    op_key: crate::operator_key::OperatorKey,
+) -> Result<TrustRootSeed, StoreError> {
+    let trust = store_trust_root::add_trusted_key(
+        env_dir,
+        TrustedKey {
+            key_id: op_key.key_id.clone(),
+            public_key_pem: op_key.public_pem.clone(),
+        },
+    )?;
+    Ok(TrustRootSeed {
+        key_id: op_key.key_id,
+        public_key_pem: op_key.public_pem,
+        trusted_key_count: trust.keys.len(),
+    })
 }

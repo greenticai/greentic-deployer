@@ -6,13 +6,19 @@
 
 use std::path::PathBuf;
 
-use greentic_deploy_spec::{EnvId, IdempotencyKey};
+use greentic_deploy_spec::EnvId;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{LocalFsStore, TrustRootSeed, trust_root as store_trust_root};
+use crate::environment::{
+    LocalFsStore, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
+    trust_root as store_trust_root,
+};
 
-use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
+use super::{
+    AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
+    mint_idempotency_key,
+};
 
 const NOUN: &str = "trust-root";
 
@@ -101,17 +107,21 @@ pub(super) fn trust_root_seed_to_wire_opt(env_id: &EnvId, seed: Option<&TrustRoo
     }
 }
 
-/// Downcast a [`crate::environment::StoreError`] so trust-root and
-/// operator-key failures surface under their own `OpError` noun instead of
-/// being flattened into `OpError::Store`. Without this, the error envelope
-/// would regress from `kind="trust-root"` (pre-PR-3a.2 via direct
-/// `TrustRootError` propagation) to `kind="store"`.
-pub(super) fn map_store_err_preserving_noun(e: crate::environment::StoreError) -> OpError {
-    match e {
-        crate::environment::StoreError::TrustRoot(inner) => OpError::TrustRoot(inner),
-        crate::environment::StoreError::OperatorKey(inner) => OpError::OperatorKey(inner),
-        other => OpError::Store(other),
-    }
+fn trust_root_add_outcome_to_wire(env_id: &EnvId, out: &TrustRootAddOutcome) -> Value {
+    json!({
+        "environment_id": env_id.as_str(),
+        "added_key_id": out.added_key_id,
+        "trusted_key_count": out.trusted_key_count,
+    })
+}
+
+fn trust_root_remove_outcome_to_wire(env_id: &EnvId, out: &TrustRootRemoveOutcome) -> Value {
+    json!({
+        "environment_id": env_id.as_str(),
+        "removed_key_id": out.removed_key_id,
+        "removed_public_key_pem": out.removed_public_key_pem,
+        "trusted_key_count": out.trusted_key_count,
+    })
 }
 
 /// `op env trust-root list <env_id>` — return all trusted keys for the env.
@@ -169,15 +179,17 @@ pub fn add(
         idempotency_key: Some(idem.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let summary = store
-            .add_trusted_key(
-                &env_id,
-                payload.key_id.clone(),
-                public_key_pem.clone(),
-                idem.clone(),
-            )
+        let outcome = store
+            .add_trusted_key(&env_id, payload.key_id, public_key_pem, idem)
             .map_err(map_store_err_preserving_noun)?;
-        Ok((OpOutcome::new(NOUN, "add", summary), super::AuditGens::NONE))
+        Ok((
+            OpOutcome::new(
+                NOUN,
+                "add",
+                trust_root_add_outcome_to_wire(&env_id, &outcome),
+            ),
+            super::AuditGens::NONE,
+        ))
     })
 }
 
@@ -207,22 +219,18 @@ pub fn remove(
         idempotency_key: Some(idem.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let summary = store
-            .remove_trusted_key(&env_id, payload.key_id.clone(), idem.clone())
+        let outcome = store
+            .remove_trusted_key(&env_id, payload.key_id, idem)
             .map_err(map_store_err_preserving_noun)?;
         Ok((
-            OpOutcome::new(NOUN, "remove", summary),
+            OpOutcome::new(
+                NOUN,
+                "remove",
+                trust_root_remove_outcome_to_wire(&env_id, &outcome),
+            ),
             super::AuditGens::NONE,
         ))
     })
-}
-
-/// Mint a fresh idempotency key (ULID) for a CLI-initiated trust-root
-/// mutation. Caller-supplied keys via the payload are a future
-/// extension — see the `cli/traffic.rs` precedent for the required-string
-/// shape we'd graduate to.
-fn mint_idempotency_key() -> IdempotencyKey {
-    IdempotencyKey::new(ulid::Ulid::new().to_string()).expect("freshly minted ULID is non-empty")
 }
 
 fn resolve_pem(payload: &TrustRootAddPayload) -> Result<String, OpError> {

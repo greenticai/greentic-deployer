@@ -89,6 +89,26 @@ pub struct TrustRootSeed {
     pub trusted_key_count: usize,
 }
 
+/// Outcome of [`EnvironmentMutations::add_trusted_key`]. The store returns
+/// typed data so every backend stays uniform; the CLI shapes the wire JSON
+/// (adding `environment_id` from the caller's request context).
+#[derive(Debug, Clone)]
+pub struct TrustRootAddOutcome {
+    pub added_key_id: String,
+    pub trusted_key_count: usize,
+}
+
+/// Outcome of [`EnvironmentMutations::remove_trusted_key`]. `removed_public_key_pem`
+/// is `None` when the key was already absent (silent no-op); the HTTP backend
+/// MUST cache the original `Some(pem)` against the idempotency key so a retry
+/// returns the original PEM rather than `None`.
+#[derive(Debug, Clone)]
+pub struct TrustRootRemoveOutcome {
+    pub removed_key_id: String,
+    pub removed_public_key_pem: Option<String>,
+    pub trusted_key_count: usize,
+}
+
 /// Optional-field patch for [`EnvironmentMutations::update_environment`].
 /// Replaces the earlier `set_public_url` and `set_config` verbs — both were
 /// strict subsets of this patch shape, so collapsing them removes two
@@ -479,7 +499,7 @@ pub trait EnvironmentMutations: Send + Sync {
         key_id: String,
         public_key_pem: String,
         idempotency_key: IdempotencyKey,
-    ) -> Result<Value, StoreError>;
+    ) -> Result<TrustRootAddOutcome, StoreError>;
 
     /// `idempotency_key` is required for A8 mutation consistency. `remove`
     /// is logically idempotent on the trust-root state, but the wire-shape
@@ -492,7 +512,7 @@ pub trait EnvironmentMutations: Send + Sync {
         env_id: &EnvId,
         key_id: String,
         idempotency_key: IdempotencyKey,
-    ) -> Result<Value, StoreError>;
+    ) -> Result<TrustRootRemoveOutcome, StoreError>;
 }
 
 #[cfg(test)]
