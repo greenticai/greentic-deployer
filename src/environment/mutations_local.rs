@@ -14,7 +14,7 @@
 use greentic_distributor_client::signing::TrustedKey;
 use serde_json::{Value, json};
 
-use greentic_deploy_spec::EnvId;
+use greentic_deploy_spec::{EnvId, IdempotencyKey};
 
 use super::mutations::TrustRootSeed;
 use super::store::{LocalFsStore, StoreError};
@@ -97,11 +97,16 @@ impl LocalFsStore {
     /// Validates `key_id` matches the canonical derivation from `pem` and
     /// rejects empty/whitespace key ids. Idempotent on case-insensitive
     /// `key_id` collision. Returns the wire-shape JSON the CLI surfaces.
+    ///
+    /// `_idempotency_key` is accepted for trait-conformance with
+    /// [`super::mutations::EnvironmentMutations::add_trusted_key`] and
+    /// ignored locally — the HTTP backend caches it for A8 §2 replay.
     pub fn add_trusted_key(
         &self,
         env_id: &EnvId,
         key_id: String,
         public_key_pem: String,
+        _idempotency_key: IdempotencyKey,
     ) -> Result<Value, StoreError> {
         let env_dir = self.env_dir(env_id)?;
         self.transact(env_id, |_locked| -> Result<Value, StoreError> {
@@ -124,7 +129,18 @@ impl LocalFsStore {
     /// the id is absent. Returns the wire-shape JSON: the PEM that was
     /// actually removed (captured under the flock for race-safety) and the
     /// post-removal trusted-key count.
-    pub fn remove_trusted_key(&self, env_id: &EnvId, key_id: String) -> Result<Value, StoreError> {
+    ///
+    /// `_idempotency_key` is accepted for trait-conformance with
+    /// [`super::mutations::EnvironmentMutations::remove_trusted_key`] and
+    /// ignored locally. The HTTP backend MUST cache and replay the original
+    /// response so retries don't surface `removed_public_key_pem: null` (the
+    /// failure mode that motivated requiring the key).
+    pub fn remove_trusted_key(
+        &self,
+        env_id: &EnvId,
+        key_id: String,
+        _idempotency_key: IdempotencyKey,
+    ) -> Result<Value, StoreError> {
         let env_dir = self.env_dir(env_id)?;
         self.transact(env_id, |_locked| -> Result<Value, StoreError> {
             let pre = store_trust_root::load(&env_dir)?;

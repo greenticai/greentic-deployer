@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use greentic_deploy_spec::EnvId;
+use greentic_deploy_spec::{EnvId, IdempotencyKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -152,6 +152,12 @@ pub fn add(
     // Codex #3: audit `target` carries the full PEM, so a removed key can be
     // reconstructed from the audit log alone if the on-disk backup is also
     // lost. `key_id` alone is not sufficient for recovery.
+    // PR-3a.2 follow-up (Codex review of PR #260): every trust-root mutation
+    // gets an idempotency key so the HTTP backend can replay the original
+    // response (Phase D §A8 #2). The CLI auto-generates a ULID per call
+    // today; future direct-args support can plumb a caller-supplied value
+    // through the payload (matches the `cli/traffic.rs` precedent).
+    let idem = mint_idempotency_key();
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -160,11 +166,16 @@ pub fn add(
             "key_id": payload.key_id,
             "public_key_pem": public_key_pem,
         }),
-        idempotency_key: None,
+        idempotency_key: Some(idem.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
         let summary = store
-            .add_trusted_key(&env_id, payload.key_id.clone(), public_key_pem.clone())
+            .add_trusted_key(
+                &env_id,
+                payload.key_id.clone(),
+                public_key_pem.clone(),
+                idem.clone(),
+            )
             .map_err(map_store_err_preserving_noun)?;
         Ok((OpOutcome::new(NOUN, "add", summary), super::AuditGens::NONE))
     })
@@ -181,6 +192,7 @@ pub fn remove(
     }
     let payload = resolve_payload::<TrustRootRemovePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
+    let idem = mint_idempotency_key();
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -192,17 +204,25 @@ pub fn remove(
         // recovery artifact; the outcome value below carries the PEM that
         // was actually removed under the flock.
         target: json!({"key_id": payload.key_id}),
-        idempotency_key: None,
+        idempotency_key: Some(idem.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
         let summary = store
-            .remove_trusted_key(&env_id, payload.key_id.clone())
+            .remove_trusted_key(&env_id, payload.key_id.clone(), idem.clone())
             .map_err(map_store_err_preserving_noun)?;
         Ok((
             OpOutcome::new(NOUN, "remove", summary),
             super::AuditGens::NONE,
         ))
     })
+}
+
+/// Mint a fresh idempotency key (ULID) for a CLI-initiated trust-root
+/// mutation. Caller-supplied keys via the payload are a future
+/// extension — see the `cli/traffic.rs` precedent for the required-string
+/// shape we'd graduate to.
+fn mint_idempotency_key() -> IdempotencyKey {
+    IdempotencyKey::new(ulid::Ulid::new().to_string()).expect("freshly minted ULID is non-empty")
 }
 
 fn resolve_pem(payload: &TrustRootAddPayload) -> Result<String, OpError> {

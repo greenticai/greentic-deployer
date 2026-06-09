@@ -469,14 +469,30 @@ pub trait EnvironmentMutations: Send + Sync {
         env_id: &EnvId,
     ) -> Result<Option<TrustRootSeed>, StoreError>;
 
+    /// `idempotency_key` is required for A8 mutation consistency even though
+    /// `add_trusted_key` is intrinsically idempotent on `key_id` collision —
+    /// the key enables HTTP-backend audit-event replay. Local-FS impls accept
+    /// and ignore it; HTTP impls cache it for replay.
     fn add_trusted_key(
         &self,
         env_id: &EnvId,
         key_id: String,
         public_key_pem: String,
+        idempotency_key: IdempotencyKey,
     ) -> Result<Value, StoreError>;
 
-    fn remove_trusted_key(&self, env_id: &EnvId, key_id: String) -> Result<Value, StoreError>;
+    /// `idempotency_key` is required for A8 mutation consistency. `remove`
+    /// is logically idempotent on the trust-root state, but the wire-shape
+    /// `removed_public_key_pem` field would be `null` on retry (the original
+    /// PEM is gone) — so a retry without replay loses recovery material AND
+    /// audit fidelity. The key enables HTTP-backend replay of the original
+    /// response/audit; local-FS impls accept and ignore it.
+    fn remove_trusted_key(
+        &self,
+        env_id: &EnvId,
+        key_id: String,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<Value, StoreError>;
 }
 
 #[cfg(test)]
