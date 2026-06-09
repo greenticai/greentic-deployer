@@ -19,7 +19,10 @@ use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
-use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
+use super::{
+    AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
+    resolve_idempotency_key,
+};
 
 const NOUN: &str = "env-packs";
 
@@ -32,6 +35,12 @@ pub struct EnvPackBindingPayload {
     pub pack_ref: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answers_ref: Option<PathBuf>,
+    /// Caller-supplied A8 §2 idempotency key. Optional on the CLI
+    /// surface; when absent, the verb mints one per invocation. Operators
+    /// wanting safe lost-response retries (HTTP backend, PR-3b) supply a
+    /// stable key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 /// Returned by every mutating call.
@@ -69,29 +78,20 @@ pub fn add(
     let payload = resolve_payload(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let binding = build_binding(&payload, 0, None)?;
+    let target = json!({"slot": payload.slot, "kind": payload.kind});
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "add",
-        target: json!({"slot": payload.slot, "kind": payload.kind}),
-        idempotency_key: None,
+        target,
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let summary = store.transact(&env_id, |locked| -> Result<BindingSummary, OpError> {
-            let mut env = locked.load()?;
-            if env.pack_for_slot(binding.slot).is_some() {
-                return Err(OpError::Conflict(format!(
-                    "slot `{}` already bound on env `{}`; use update",
-                    binding.slot, env_id
-                )));
-            }
-            env.packs.push(binding.clone());
-            locked.save(&env)?;
-            Ok(BindingSummary::from_binding(
-                &env_id,
-                env.packs.last().expect("just pushed"),
-            ))
-        })?;
+        let added = store
+            .add_pack_binding(&env_id, binding, idempotency_key)
+            .map_err(map_store_err_preserving_noun)?;
+        let summary = BindingSummary::from_binding(&env_id, &added);
         let outcome = OpOutcome::new(
             NOUN,
             "add",
@@ -117,39 +117,26 @@ pub fn update(
     }
     let payload = resolve_payload(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
+    let slot = payload.slot;
+    let binding = build_binding(&payload, 0, None)?;
+    let target = json!({"slot": payload.slot, "kind": payload.kind});
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "update",
-        target: json!({"slot": payload.slot, "kind": payload.kind}),
-        idempotency_key: None,
+        target,
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let (summary, gens) = store.transact(&env_id, |locked| {
-            let mut env = locked.load()?;
-            let idx = env
-                .packs
-                .iter()
-                .position(|b| b.slot == payload.slot)
-                .ok_or_else(|| {
-                    OpError::NotFound(format!(
-                        "slot `{}` not bound on env `{}`",
-                        payload.slot, env_id
-                    ))
-                })?;
-            let prev_generation = env.packs[idx].generation;
-            let prev_snapshot = serde_json::to_value(&env.packs[idx])
-                .map_err(|e| OpError::InvalidArgument(format!("snapshot prior binding: {e}")))?;
-            let mut new_binding = build_binding(&payload, prev_generation + 1, None)?;
-            new_binding.previous_binding_ref = Some(stash_previous(prev_snapshot));
-            env.packs[idx] = new_binding;
-            locked.save(&env)?;
-            let gens = super::AuditGens {
-                previous: Some(prev_generation),
-                new: Some(prev_generation + 1),
-            };
-            Ok::<_, OpError>((BindingSummary::from_binding(&env_id, &env.packs[idx]), gens))
-        })?;
+        let (new_binding, new_generation) = store
+            .update_pack_binding(&env_id, slot, binding, idempotency_key)
+            .map_err(map_store_err_preserving_noun)?;
+        let summary = BindingSummary::from_binding(&env_id, &new_binding);
+        let gens = super::AuditGens {
+            previous: Some(new_generation.saturating_sub(1)),
+            new: Some(new_generation),
+        };
         let outcome = OpOutcome::new(
             NOUN,
             "update",
@@ -163,6 +150,10 @@ pub fn update(
 pub struct EnvPackRemovePayload {
     pub environment_id: String,
     pub slot: CapabilitySlot,
+    /// Caller-supplied A8 §2 idempotency key. Optional on the CLI
+    /// surface; when absent, the verb mints one per invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 pub fn remove(
@@ -175,34 +166,24 @@ pub fn remove(
     }
     let payload = resolve_payload::<EnvPackRemovePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
+    let slot = payload.slot;
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "remove",
-        target: json!({"slot": payload.slot}),
-        idempotency_key: None,
+        target: json!({"slot": slot}),
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let (summary, gens) = store.transact(&env_id, |locked| {
-            let mut env = locked.load()?;
-            let idx = env
-                .packs
-                .iter()
-                .position(|b| b.slot == payload.slot)
-                .ok_or_else(|| {
-                    OpError::NotFound(format!(
-                        "slot `{}` not bound on env `{}`",
-                        payload.slot, env_id
-                    ))
-                })?;
-            let removed = env.packs.remove(idx);
-            locked.save(&env)?;
-            let gens = super::AuditGens {
-                previous: Some(removed.generation),
-                new: None,
-            };
-            Ok::<_, OpError>((BindingSummary::from_binding(&env_id, &removed), gens))
-        })?;
+        let (removed, removed_generation) = store
+            .remove_pack_binding(&env_id, slot, idempotency_key)
+            .map_err(map_store_err_preserving_noun)?;
+        let summary = BindingSummary::from_binding(&env_id, &removed);
+        let gens = super::AuditGens {
+            previous: Some(removed_generation),
+            new: None,
+        };
         let outcome = OpOutcome::new(
             NOUN,
             "remove",
@@ -222,53 +203,24 @@ pub fn rollback(
     }
     let payload = resolve_payload::<EnvPackRemovePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
+    let slot = payload.slot;
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "rollback",
-        target: json!({"slot": payload.slot}),
-        idempotency_key: None,
+        target: json!({"slot": slot}),
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
-        let (summary, gens) = store.transact(&env_id, |locked| {
-            let mut env = locked.load()?;
-            let idx = env
-                .packs
-                .iter()
-                .position(|b| b.slot == payload.slot)
-                .ok_or_else(|| {
-                    OpError::NotFound(format!(
-                        "slot `{}` not bound on env `{}`",
-                        payload.slot, env_id
-                    ))
-                })?;
-            let prev_generation = env.packs[idx].generation;
-            let prev_ref = env.packs[idx].previous_binding_ref.clone().ok_or_else(|| {
-                OpError::Conflict(format!(
-                    "slot `{}` on env `{}` has no previous binding to roll back to",
-                    payload.slot, env_id
-                ))
-            })?;
-            let prev_value = load_previous(&prev_ref).ok_or_else(|| {
-                OpError::NotFound(format!(
-                    "previous binding payload `{}` missing for slot `{}`",
-                    prev_ref.display(),
-                    payload.slot
-                ))
-            })?;
-            let mut restored: EnvPackBinding = serde_json::from_value(prev_value).map_err(|e| {
-                OpError::InvalidArgument(format!("deserialise previous binding: {e}"))
-            })?;
-            restored.generation = prev_generation + 1;
-            restored.previous_binding_ref = None;
-            env.packs[idx] = restored;
-            locked.save(&env)?;
-            let gens = super::AuditGens {
-                previous: Some(prev_generation),
-                new: Some(prev_generation + 1),
-            };
-            Ok::<_, OpError>((BindingSummary::from_binding(&env_id, &env.packs[idx]), gens))
-        })?;
+        let (restored, new_generation) = store
+            .rollback_pack_binding(&env_id, slot, idempotency_key)
+            .map_err(map_store_err_preserving_noun)?;
+        let summary = BindingSummary::from_binding(&env_id, &restored);
+        let gens = super::AuditGens {
+            previous: Some(new_generation.saturating_sub(1)),
+            new: Some(new_generation),
+        };
         let outcome = OpOutcome::new(
             NOUN,
             "rollback",
@@ -368,7 +320,11 @@ fn payload_schema() -> Value {
             "slot": {"type": "string", "enum": ["deployer", "secrets", "telemetry", "sessions", "state", "revocation"]},
             "kind": {"type": "string", "description": "PackDescriptor — `<namespace>.<id>@<semver>`."},
             "pack_ref": {"type": "string"},
-            "answers_ref": {"type": ["string", "null"]}
+            "answers_ref": {"type": ["string", "null"]},
+            "idempotency_key": {
+                "type": "string",
+                "description": "Optional A8 §2 caller-supplied key for safe retry replay; minted per-invocation when omitted."
+            }
         }
     })
 }
@@ -382,7 +338,11 @@ fn remove_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "environment_id": {"type": "string"},
-            "slot": {"type": "string", "enum": ["deployer", "secrets", "telemetry", "sessions", "state", "revocation"]}
+            "slot": {"type": "string", "enum": ["deployer", "secrets", "telemetry", "sessions", "state", "revocation"]},
+            "idempotency_key": {
+                "type": "string",
+                "description": "Optional A8 §2 caller-supplied key for safe retry replay; minted per-invocation when omitted."
+            }
         }
     })
 }
@@ -504,6 +464,7 @@ mod tests {
             kind: kind.to_string(),
             pack_ref: kind.split('@').next().unwrap_or(kind).to_string(),
             answers_ref: None,
+            idempotency_key: None,
         }
     }
 
@@ -575,6 +536,7 @@ mod tests {
             Some(EnvPackRemovePayload {
                 environment_id: "local".to_string(),
                 slot: CapabilitySlot::Secrets,
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -602,6 +564,7 @@ mod tests {
             Some(EnvPackRemovePayload {
                 environment_id: "local".to_string(),
                 slot: CapabilitySlot::Telemetry,
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -627,6 +590,7 @@ mod tests {
             Some(EnvPackRemovePayload {
                 environment_id: "local".to_string(),
                 slot: CapabilitySlot::State,
+                idempotency_key: None,
             }),
         )
         .unwrap_err();
@@ -741,5 +705,88 @@ mod tests {
         assert_eq!(update_event.verb, "update");
         assert_eq!(update_event.previous_generation, Some(0));
         assert_eq!(update_event.new_generation, Some(1));
+    }
+
+    // --- PR-3a.8: schema regression tests for idempotency_key ---------------
+
+    /// `EnvPackBindingPayload` accepts `idempotency_key`; the schema
+    /// published via `--schema` MUST list it so schema-driven callers can
+    /// supply the A8 retry key.
+    #[test]
+    fn add_schema_lists_idempotency_key() {
+        let schema = payload_schema();
+        assert!(
+            schema.pointer("/properties/idempotency_key").is_some(),
+            "payload_schema must list `idempotency_key` (schema: {schema:#})"
+        );
+    }
+
+    /// Same gate for the remove/rollback schema.
+    #[test]
+    fn remove_schema_lists_idempotency_key() {
+        let schema = remove_schema();
+        assert!(
+            schema.pointer("/properties/idempotency_key").is_some(),
+            "remove_schema must list `idempotency_key` (schema: {schema:#})"
+        );
+    }
+
+    /// Audit events emitted by the typed-verb path carry the resolved
+    /// idempotency key (either caller-supplied or freshly minted).
+    #[test]
+    fn add_audit_event_carries_idempotency_key() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let p = local_payload(CapabilitySlot::Secrets, "greentic.secrets.dev-store@1.0.0");
+        add(&store, &OpFlags::default(), Some(p)).unwrap();
+        let log = dir.path().join("local").join("audit").join("events.jsonl");
+        let raw = std::fs::read_to_string(&log).unwrap();
+        let event: crate::environment::AuditEvent =
+            serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert!(
+            event.idempotency_key.is_some(),
+            "add audit event must carry an idempotency_key"
+        );
+    }
+
+    /// Typed `remove_pack_binding` via the CLI correctly maps
+    /// `StoreError::DependentNotFound` to `OpError::NotFound`.
+    #[test]
+    fn remove_missing_slot_returns_not_found() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let err = remove(
+            &store,
+            &OpFlags::default(),
+            Some(EnvPackRemovePayload {
+                environment_id: "local".to_string(),
+                slot: CapabilitySlot::Secrets,
+                idempotency_key: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::NotFound(_)), "got {err:?}");
+    }
+
+    /// Typed `rollback_pack_binding` via the CLI correctly maps
+    /// `StoreError::DependentNotFound` to `OpError::NotFound`.
+    #[test]
+    fn rollback_missing_slot_returns_not_found() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let err = rollback(
+            &store,
+            &OpFlags::default(),
+            Some(EnvPackRemovePayload {
+                environment_id: "local".to_string(),
+                slot: CapabilitySlot::Secrets,
+                idempotency_key: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::NotFound(_)), "got {err:?}");
     }
 }
