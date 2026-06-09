@@ -17,8 +17,7 @@
 
 use chrono::Utc;
 use greentic_deploy_spec::{
-    BundleId, EnvId, MessagingEndpoint, MessagingEndpointId, PackId, SchemaVersion, SecretRef,
-    WelcomeFlowRef,
+    BundleId, EnvId, MessagingEndpoint, MessagingEndpointId, PackId, SecretRef,
 };
 use rand::TryRngCore;
 use rand::rngs::OsRng;
@@ -26,13 +25,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::str::FromStr;
 
-use crate::environment::{EnvironmentStore, LocalFsStore};
+use crate::environment::{
+    AddMessagingEndpointPayload, EnvironmentStore, LocalFsStore, SetMessagingWelcomeFlowPayload,
+};
 
 use super::dispatch::{
     MessagingEndpointAddArgs, MessagingEndpointLinkBundleArgs, MessagingEndpointRemoveArgs,
     MessagingEndpointSetWelcomeFlowArgs,
 };
-use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
+use super::{
+    AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
+    resolve_idempotency_key,
+};
 use std::path::PathBuf;
 
 const NOUN: &str = "messaging.endpoint";
@@ -47,7 +51,10 @@ pub struct EndpointAddPayload {
     pub display_name: String,
     #[serde(default)]
     pub secret_refs: Vec<String>,
-    pub idempotency_key: String,
+    /// Caller-supplied A8 §2 idempotency key. Optional on the CLI
+    /// surface; when absent, the verb mints one per invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     pub updated_by: String,
 }
 
@@ -56,7 +63,10 @@ pub struct EndpointLinkBundlePayload {
     pub environment_id: String,
     pub endpoint_id: String,
     pub bundle_id: String,
-    pub idempotency_key: String,
+    /// Caller-supplied A8 §2 idempotency key. Optional on the CLI
+    /// surface; when absent, the verb mints one per invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     pub updated_by: String,
 }
 
@@ -67,7 +77,10 @@ pub struct EndpointSetWelcomeFlowPayload {
     pub bundle_id: String,
     pub pack_id: String,
     pub flow_id: String,
-    pub idempotency_key: String,
+    /// Caller-supplied A8 §2 idempotency key. Optional on the CLI
+    /// surface; when absent, the verb mints one per invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     pub updated_by: String,
 }
 
@@ -75,7 +88,10 @@ pub struct EndpointSetWelcomeFlowPayload {
 pub struct EndpointRotateWebhookSecretPayload {
     pub environment_id: String,
     pub endpoint_id: String,
-    pub idempotency_key: String,
+    /// Caller-supplied A8 §2 idempotency key. Optional on the CLI
+    /// surface; when absent, the verb mints one per invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     pub updated_by: String,
 }
 
@@ -83,7 +99,10 @@ pub struct EndpointRotateWebhookSecretPayload {
 pub struct EndpointRemovePayload {
     pub environment_id: String,
     pub endpoint_id: String,
-    pub idempotency_key: String,
+    /// Caller-supplied A8 §2 idempotency key. Optional on the CLI
+    /// surface; when absent, the verb mints one per invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     pub updated_by: String,
 }
 
@@ -183,7 +202,7 @@ impl MessagingEndpointAddArgs {
             provider_type: self.provider_type.unwrap(),
             display_name: self.display_name.unwrap(),
             secret_refs: self.secret_ref,
-            idempotency_key: self.idempotency_key.unwrap(),
+            idempotency_key: self.idempotency_key,
             updated_by: self.updated_by.unwrap(),
         }))
     }
@@ -236,7 +255,7 @@ impl MessagingEndpointLinkBundleArgs {
             environment_id: self.env.unwrap(),
             endpoint_id: self.endpoint_id.unwrap(),
             bundle_id: self.bundle_id.unwrap(),
-            idempotency_key: self.idempotency_key.unwrap(),
+            idempotency_key: self.idempotency_key,
             updated_by: self.updated_by.unwrap(),
         }))
     }
@@ -299,7 +318,7 @@ impl MessagingEndpointSetWelcomeFlowArgs {
             bundle_id: self.bundle_id.unwrap(),
             pack_id: self.pack_id.unwrap(),
             flow_id: self.flow_id.unwrap(),
-            idempotency_key: self.idempotency_key.unwrap(),
+            idempotency_key: self.idempotency_key,
             updated_by: self.updated_by.unwrap(),
         }))
     }
@@ -307,7 +326,9 @@ impl MessagingEndpointSetWelcomeFlowArgs {
 
 /// Validated 4-tuple shared by `remove` and `rotate-webhook-secret`: both verbs
 /// take the same args struct and consume the same field set.
-type ValidatedRemoveFields = (String, String, String, String);
+/// The third element is an optional idempotency key (minted by the CLI verb
+/// when absent).
+type ValidatedRemoveFields = (String, String, Option<String>, String);
 
 impl MessagingEndpointRemoveArgs {
     /// Returns `true` when the caller supplied at least one inline flag.
@@ -354,7 +375,7 @@ impl MessagingEndpointRemoveArgs {
         Ok(Some((
             self.env.unwrap(),
             self.endpoint_id.unwrap(),
-            self.idempotency_key.unwrap(),
+            self.idempotency_key,
             self.updated_by.unwrap(),
         )))
     }
@@ -457,8 +478,7 @@ pub fn add(
     let provider_type = require_nonempty("provider_type", &payload.provider_type)?;
     let display_name = require_nonempty("display_name", &payload.display_name)?;
     let updated_by = require_nonempty("updated_by", &payload.updated_by)?;
-    let idempotency_key = require_nonempty("idempotency_key", &payload.idempotency_key)?;
-    let secret_refs = parse_secret_refs(&payload.secret_refs)?;
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -467,86 +487,29 @@ pub fn add(
             "provider_id": provider_id,
             "provider_type": provider_type,
         }),
-        idempotency_key: Some(idempotency_key.clone()),
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
-    let idem_suffix = idem_suffix(&idempotency_key);
     audit_and_record(store, ctx, |committed| {
-        let summary = store.transact(&env_id, |locked| -> Result<EndpointSummary, OpError> {
-            let mut env = locked.load()?;
-            // Idempotent replay: re-running `add` with the same key returns
-            // the previously-created endpoint iff the payload's instance
-            // identity matches what was stored; otherwise the key has been
-            // reused for a different request and we refuse (traffic.rs
-            // precedent). Drives off the key alone — `updated_by` is a
-            // free-form actor label that retries may carry differently.
-            if let Some(prev) = env
-                .messaging_endpoints
-                .iter()
-                .find(|e| carries_idem_key(e, &idem_suffix))
-            {
-                if prev.provider_type == provider_type && prev.provider_id == provider_id {
-                    // No env mutation needed, but a prior call may have
-                    // failed AFTER saving env.json and BEFORE the projection
-                    // refresh succeeded — re-run the refresh so retry
-                    // repairs any stale on-disk projection.
-                    let summary = EndpointSummary::from(&env_id, prev);
-                    locked.refresh_messaging_projection(&env)?;
-                    return Ok(summary);
-                }
-                return Err(OpError::Conflict(format!(
-                    "idempotency key `{idempotency_key}` already used to add `{}`/`{}` in env `{env_id}`; pass a fresh key",
-                    prev.provider_type, prev.provider_id
-                )));
-            }
-            // `(provider_type, provider_id)` must be unique per env (M1
-            // hard-cutover) — caught later by validate(), but surface a
-            // precise error here so callers see the right message.
-            if env
-                .messaging_endpoints
-                .iter()
-                .any(|e| e.provider_type == provider_type && e.provider_id == provider_id)
-            {
-                return Err(OpError::Conflict(format!(
-                    "messaging endpoint with provider_type=`{provider_type}` provider_id=`{provider_id}` already exists in env `{env_id}`"
-                )));
-            }
-            let now = Utc::now();
-            let eid = MessagingEndpointId::new();
-            let webhook_secret_ref = if is_telegram_class(&provider_type) {
-                Some(provision_webhook_secret(store, &env_id, &eid, None)?)
-            } else {
-                None
-            };
-            let endpoint = MessagingEndpoint {
-                schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
-                env_id: env_id.clone(),
-                endpoint_id: eid,
-                provider_id: provider_id.clone(),
-                provider_type: provider_type.clone(),
-                display_name: display_name.clone(),
-                secret_refs: secret_refs.clone(),
-                webhook_secret_ref,
-                linked_bundles: Vec::new(),
-                welcome_flow: None,
-                generation: 0,
-                created_at: now,
-                updated_at: now,
-                updated_by: format_idem_writer(&updated_by, &idempotency_key),
-            };
-            env.messaging_endpoints.push(endpoint);
-            locked.save(&env)?;
-            // env.json is durable from this point — signal so an audit-append
-            // failure on the projection-refresh path goes fail-closed instead
-            // of being demoted to a warning.
-            committed.mark_committed();
-            locked.refresh_messaging_projection(&env)?;
-            Ok(EndpointSummary::from(
+        let ep = store
+            .add_messaging_endpoint(
                 &env_id,
-                env.messaging_endpoints
-                    .last()
-                    .expect("just pushed endpoint"),
-            ))
-        })?;
+                AddMessagingEndpointPayload {
+                    provider_id,
+                    provider_type,
+                    display_name,
+                    secret_refs: payload.secret_refs,
+                    updated_by,
+                    idempotency_key,
+                },
+            )
+            .inspect_err(|err| {
+                if err.is_committed_after_save() {
+                    committed.mark_committed();
+                }
+            })
+            .map_err(map_store_err_preserving_noun)?;
+        committed.mark_committed();
+        let summary = EndpointSummary::from(&env_id, &ep);
         Ok((
             OpOutcome::new(
                 NOUN,
@@ -632,7 +595,7 @@ pub fn link_bundle(
     let endpoint_id = parse_endpoint_id(&payload.endpoint_id)?;
     let bundle_id = parse_bundle_id(&payload.bundle_id)?;
     let updated_by = require_nonempty("updated_by", &payload.updated_by)?;
-    let idempotency_key = require_nonempty("idempotency_key", &payload.idempotency_key)?;
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -641,43 +604,19 @@ pub fn link_bundle(
             "endpoint_id": endpoint_id.to_string(),
             "bundle_id": bundle_id.as_str(),
         }),
-        idempotency_key: Some(idempotency_key.clone()),
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |committed| {
-        let summary = store.transact(&env_id, |locked| -> Result<EndpointSummary, OpError> {
-            let mut env = locked.load()?;
-            let idx = find_endpoint_idx(&env, endpoint_id, &env_id)?;
-            // Idempotent replay on the (endpoint, bundle, key) triple is a
-            // no-op success. Validate() rejects unknown bundle ids; we surface
-            // a precise error first.
-            if !env.bundles.iter().any(|b| b.bundle_id == bundle_id) {
-                return Err(OpError::NotFound(format!(
-                    "bundle `{bundle_id}` is not deployed in env `{env_id}`"
-                )));
-            }
-            if env.messaging_endpoints[idx]
-                .linked_bundles
-                .contains(&bundle_id)
-            {
-                let summary = EndpointSummary::from(&env_id, &env.messaging_endpoints[idx]);
-                // Repair any stale projection from a prior failed call.
-                locked.refresh_messaging_projection(&env)?;
-                return Ok(summary);
-            }
-            env.messaging_endpoints[idx].linked_bundles.push(bundle_id);
-            stamp_mutation(
-                &mut env.messaging_endpoints[idx],
-                &updated_by,
-                &idempotency_key,
-            );
-            locked.save(&env)?;
-            committed.mark_committed();
-            locked.refresh_messaging_projection(&env)?;
-            Ok(EndpointSummary::from(
-                &env_id,
-                &env.messaging_endpoints[idx],
-            ))
-        })?;
+        let ep = store
+            .link_messaging_bundle(&env_id, endpoint_id, bundle_id, updated_by, idempotency_key)
+            .inspect_err(|err| {
+                if err.is_committed_after_save() {
+                    committed.mark_committed();
+                }
+            })
+            .map_err(map_store_err_preserving_noun)?;
+        committed.mark_committed();
+        let summary = EndpointSummary::from(&env_id, &ep);
         Ok((
             OpOutcome::new(
                 NOUN,
@@ -702,7 +641,7 @@ pub fn unlink_bundle(
     let endpoint_id = parse_endpoint_id(&payload.endpoint_id)?;
     let bundle_id = parse_bundle_id(&payload.bundle_id)?;
     let updated_by = require_nonempty("updated_by", &payload.updated_by)?;
-    let idempotency_key = require_nonempty("idempotency_key", &payload.idempotency_key)?;
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -711,40 +650,19 @@ pub fn unlink_bundle(
             "endpoint_id": endpoint_id.to_string(),
             "bundle_id": bundle_id.as_str(),
         }),
-        idempotency_key: Some(idempotency_key.clone()),
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |committed| {
-        let summary = store.transact(&env_id, |locked| -> Result<EndpointSummary, OpError> {
-            let mut env = locked.load()?;
-            let idx = find_endpoint_idx(&env, endpoint_id, &env_id)?;
-            let bundle_idx = env.messaging_endpoints[idx]
-                .linked_bundles
-                .iter()
-                .position(|b| b == &bundle_id);
-            let Some(bidx) = bundle_idx else {
-                // Idempotent: unlinking a bundle that isn't linked is a no-op.
-                let summary = EndpointSummary::from(&env_id, &env.messaging_endpoints[idx]);
-                // Repair any stale projection from a prior failed call.
-                locked.refresh_messaging_projection(&env)?;
-                return Ok(summary);
-            };
-            // Removing a bundle that the welcome_flow points at would leave
-            // the endpoint in a state validate() rejects; require the user
-            // to clear the welcome flow first rather than silently dropping it.
-            if let Some(welcome) = &env.messaging_endpoints[idx].welcome_flow
-                && welcome.bundle_id == bundle_id
-            {
-                return Err(OpError::Conflict(format!(
-                    "cannot unlink bundle `{bundle_id}` from endpoint `{endpoint_id}` while it owns the welcome_flow; clear the welcome_flow first via `set-welcome-flow` to a different linked bundle, or `remove` the endpoint"
-                )));
-            }
-            env.messaging_endpoints[idx].linked_bundles.remove(bidx);
-            stamp_mutation(&mut env.messaging_endpoints[idx], &updated_by, &idempotency_key);
-            locked.save(&env)?;
-            committed.mark_committed();
-            locked.refresh_messaging_projection(&env)?;
-            Ok(EndpointSummary::from(&env_id, &env.messaging_endpoints[idx]))
-        })?;
+        let ep = store
+            .unlink_messaging_bundle(&env_id, endpoint_id, bundle_id, updated_by, idempotency_key)
+            .inspect_err(|err| {
+                if err.is_committed_after_save() {
+                    committed.mark_committed();
+                }
+            })
+            .map_err(map_store_err_preserving_noun)?;
+        committed.mark_committed();
+        let summary = EndpointSummary::from(&env_id, &ep);
         Ok((
             OpOutcome::new(
                 NOUN,
@@ -775,7 +693,7 @@ pub fn set_welcome_flow(
     let pack_id = require_nonempty("pack_id", &payload.pack_id)?;
     let flow_id = require_nonempty("flow_id", &payload.flow_id)?;
     let updated_by = require_nonempty("updated_by", &payload.updated_by)?;
-    let idempotency_key = require_nonempty("idempotency_key", &payload.idempotency_key)?;
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -786,47 +704,29 @@ pub fn set_welcome_flow(
             "pack_id": pack_id,
             "flow_id": flow_id,
         }),
-        idempotency_key: Some(idempotency_key.clone()),
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |committed| {
-        let summary = store.transact(&env_id, |locked| -> Result<EndpointSummary, OpError> {
-            let mut env = locked.load()?;
-            let idx = find_endpoint_idx(&env, endpoint_id, &env_id)?;
-            if !env.messaging_endpoints[idx]
-                .linked_bundles
-                .contains(&bundle_id)
-            {
-                return Err(OpError::InvalidArgument(format!(
-                    "welcome_flow bundle `{bundle_id}` is not linked to endpoint `{endpoint_id}`; link it first via `link-bundle`"
-                )));
-            }
-            // Cheap typo guard: when the linked bundle has at least one
-            // current revision, require `pack_id` to appear in some
-            // revision's `pack_list`. If `current_revisions` is empty the
-            // bundle has not been staged yet, so accept and defer pack/flow
-            // validation to runtime dispatch (M1.5). `flow_id` lives in
-            // pack-manifest metadata that deploy-spec does not see, so
-            // it stays caller-asserted and validated at first contact.
-            validate_welcome_pack_id(&env, &bundle_id, &pack_id)?;
-            let new_welcome = WelcomeFlowRef {
-                bundle_id: bundle_id.clone(),
-                pack_id: PackId::new(pack_id.clone()),
-                flow_id: flow_id.clone(),
-            };
-            if env.messaging_endpoints[idx].welcome_flow.as_ref() == Some(&new_welcome) {
-                // Idempotent replay — repair any stale projection from a
-                // prior failed call before returning.
-                let summary = EndpointSummary::from(&env_id, &env.messaging_endpoints[idx]);
-                locked.refresh_messaging_projection(&env)?;
-                return Ok(summary);
-            }
-            env.messaging_endpoints[idx].welcome_flow = Some(new_welcome);
-            stamp_mutation(&mut env.messaging_endpoints[idx], &updated_by, &idempotency_key);
-            locked.save(&env)?;
-            committed.mark_committed();
-            locked.refresh_messaging_projection(&env)?;
-            Ok(EndpointSummary::from(&env_id, &env.messaging_endpoints[idx]))
-        })?;
+        let ep = store
+            .set_messaging_welcome_flow(
+                &env_id,
+                SetMessagingWelcomeFlowPayload {
+                    endpoint_id,
+                    bundle_id,
+                    pack_id: PackId::new(pack_id),
+                    flow_id,
+                    updated_by,
+                    idempotency_key,
+                },
+            )
+            .inspect_err(|err| {
+                if err.is_committed_after_save() {
+                    committed.mark_committed();
+                }
+            })
+            .map_err(map_store_err_preserving_noun)?;
+        committed.mark_committed();
+        let summary = EndpointSummary::from(&env_id, &ep);
         Ok((
             OpOutcome::new(
                 NOUN,
@@ -849,40 +749,25 @@ pub fn remove(
     let payload = resolve_payload(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let endpoint_id = parse_endpoint_id(&payload.endpoint_id)?;
-    // Validate inputs are non-empty for the audit envelope's sake; the values
-    // themselves are not consumed by the remove path (no endpoint left to
-    // stamp), so the audit ctx below references payload.idempotency_key
-    // directly without binding here.
     require_nonempty("updated_by", &payload.updated_by)?;
-    require_nonempty("idempotency_key", &payload.idempotency_key)?;
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "remove",
         target: json!({"endpoint_id": endpoint_id.to_string()}),
-        idempotency_key: Some(payload.idempotency_key.clone()),
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |committed| {
-        let removed_id =
-            store.transact(&env_id, |locked| -> Result<MessagingEndpointId, OpError> {
-                let mut env = locked.load()?;
-                let idx = env
-                    .messaging_endpoints
-                    .iter()
-                    .position(|e| e.endpoint_id == endpoint_id);
-                let Some(idx) = idx else {
-                    // Idempotent: removing an absent endpoint succeeds. Repair
-                    // any stale projection from a prior failed call so a
-                    // retry actually cleans up.
-                    locked.refresh_messaging_projection(&env)?;
-                    return Ok(endpoint_id);
-                };
-                env.messaging_endpoints.remove(idx);
-                locked.save(&env)?;
-                committed.mark_committed();
-                locked.refresh_messaging_projection(&env)?;
-                Ok(endpoint_id)
-            })?;
+        let removed_id = store
+            .remove_messaging_endpoint(&env_id, endpoint_id)
+            .inspect_err(|err| {
+                if err.is_committed_after_save() {
+                    committed.mark_committed();
+                }
+            })
+            .map_err(map_store_err_preserving_noun)?;
+        committed.mark_committed();
         Ok((
             OpOutcome::new(
                 NOUN,
@@ -910,46 +795,25 @@ pub fn rotate_webhook_secret(
     let env_id = parse_env_id(&payload.environment_id)?;
     let endpoint_id = parse_endpoint_id(&payload.endpoint_id)?;
     let updated_by = require_nonempty("updated_by", &payload.updated_by)?;
-    let idempotency_key = require_nonempty("idempotency_key", &payload.idempotency_key)?;
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "rotate-webhook-secret",
         target: json!({"endpoint_id": endpoint_id.to_string()}),
-        idempotency_key: Some(idempotency_key.clone()),
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
-    let idem_suffix = idem_suffix(&idempotency_key);
     audit_and_record(store, ctx, |committed| {
-        let summary = store.transact(&env_id, |locked| -> Result<EndpointSummary, OpError> {
-            let mut env = locked.load()?;
-            let idx = find_endpoint_idx(&env, endpoint_id, &env_id)?;
-            // Idempotent replay: if the endpoint already carries this idem key,
-            // the rotation already landed — return the existing endpoint.
-            if carries_idem_key(&env.messaging_endpoints[idx], &idem_suffix) {
-                let summary = EndpointSummary::from(&env_id, &env.messaging_endpoints[idx]);
-                locked.refresh_messaging_projection(&env)?;
-                return Ok(summary);
-            }
-            let secret_ref = provision_webhook_secret(
-                store,
-                &env_id,
-                &endpoint_id,
-                env.messaging_endpoints[idx].webhook_secret_ref.as_ref(),
-            )?;
-            env.messaging_endpoints[idx].webhook_secret_ref = Some(secret_ref);
-            stamp_mutation(
-                &mut env.messaging_endpoints[idx],
-                &updated_by,
-                &idempotency_key,
-            );
-            locked.save(&env)?;
-            committed.mark_committed();
-            locked.refresh_messaging_projection(&env)?;
-            Ok(EndpointSummary::from(
-                &env_id,
-                &env.messaging_endpoints[idx],
-            ))
-        })?;
+        let ep = store
+            .rotate_messaging_webhook_secret(&env_id, endpoint_id, updated_by, idempotency_key)
+            .inspect_err(|err| {
+                if err.is_committed_after_save() {
+                    committed.mark_committed();
+                }
+            })
+            .map_err(map_store_err_preserving_noun)?;
+        committed.mark_committed();
+        let summary = EndpointSummary::from(&env_id, &ep);
         Ok((
             OpOutcome::new(
                 NOUN,
@@ -997,15 +861,6 @@ fn parse_bundle_id(raw: &str) -> Result<BundleId, OpError> {
     Ok(BundleId::new(raw))
 }
 
-fn parse_secret_refs(raws: &[String]) -> Result<Vec<SecretRef>, OpError> {
-    raws.iter()
-        .map(|r| {
-            SecretRef::try_new(r)
-                .map_err(|e| OpError::InvalidArgument(format!("secret_ref `{r}`: {e}")))
-        })
-        .collect()
-}
-
 fn require_nonempty(field: &str, value: &str) -> Result<String, OpError> {
     if value.trim().is_empty() {
         return Err(OpError::InvalidArgument(format!(
@@ -1015,36 +870,21 @@ fn require_nonempty(field: &str, value: &str) -> Result<String, OpError> {
     Ok(value.to_string())
 }
 
-fn find_endpoint_idx(
-    env: &greentic_deploy_spec::Environment,
-    endpoint_id: MessagingEndpointId,
-    env_id: &EnvId,
-) -> Result<usize, OpError> {
-    env.messaging_endpoints
-        .iter()
-        .position(|e| e.endpoint_id == endpoint_id)
-        .ok_or_else(|| {
-            OpError::NotFound(format!(
-                "messaging endpoint `{endpoint_id}` not found in env `{env_id}`"
-            ))
-        })
-}
-
 /// Embed the idempotency key in `updated_by` so a same-key retry surfaces as
 /// the original mutation. `MessagingEndpoint` has no separate
 /// `idempotency_key` field today; the encoding here keeps the contract
 /// without bloating the spec type for one CLI-side concern.
-fn format_idem_writer(updated_by: &str, idempotency_key: &str) -> String {
+pub(crate) fn format_idem_writer(updated_by: &str, idempotency_key: &str) -> String {
     format!("{updated_by}#idem={idempotency_key}")
 }
 
 /// Build the `#idem=<key>` suffix once at the call site so a linear scan
 /// over `messaging_endpoints` does not allocate a fresh `String` per element.
-fn idem_suffix(idempotency_key: &str) -> String {
+pub(crate) fn idem_suffix(idempotency_key: &str) -> String {
     format!("#idem={idempotency_key}")
 }
 
-fn carries_idem_key(endpoint: &MessagingEndpoint, idem_suffix: &str) -> bool {
+pub(crate) fn carries_idem_key(endpoint: &MessagingEndpoint, idem_suffix: &str) -> bool {
     endpoint.updated_by.ends_with(idem_suffix)
 }
 
@@ -1052,7 +892,7 @@ fn carries_idem_key(endpoint: &MessagingEndpoint, idem_suffix: &str) -> bool {
 /// creation time. Covers `"telegram"`, `"telegram.<x>"`,
 /// `"messaging.telegram"`, and `"messaging.telegram.<x>"` — strict on the dot
 /// so `"telegrambot"` and `"messaging.telegrambot"` do NOT match.
-fn is_telegram_class(provider_type: &str) -> bool {
+pub(crate) fn is_telegram_class(provider_type: &str) -> bool {
     let rest = provider_type
         .strip_prefix("messaging.")
         .unwrap_or(provider_type);
@@ -1108,7 +948,7 @@ fn build_webhook_secret_ref(
 /// already carry a ref, `None` for first-time setting on a pre-decoupling
 /// endpoint). Keeps the entropy source, URI shape, and write target in one
 /// place so the two verbs cannot drift.
-fn provision_webhook_secret(
+pub(crate) fn provision_webhook_secret(
     store: &LocalFsStore,
     env_id: &EnvId,
     endpoint_id: &MessagingEndpointId,
@@ -1141,60 +981,14 @@ fn write_webhook_secret_to_devstore(
     super::secrets::dev_store_put(&dev_path, &store_uri, value)
 }
 
-fn stamp_mutation(endpoint: &mut MessagingEndpoint, updated_by: &str, idempotency_key: &str) {
+pub(crate) fn stamp_mutation(
+    endpoint: &mut MessagingEndpoint,
+    updated_by: &str,
+    idempotency_key: &str,
+) {
     endpoint.generation = endpoint.generation.saturating_add(1);
     endpoint.updated_at = Utc::now();
     endpoint.updated_by = format_idem_writer(updated_by, idempotency_key);
-}
-
-/// Catch obvious typos when setting a welcome flow's `pack_id`: when the
-/// linked bundle has at least one `current_revision` whose pinned `pack_list`
-/// is non-empty, the supplied `pack_id` must match one of those pack ids.
-///
-/// When `current_revisions` is empty (a freshly-deployed bundle that has not
-/// been staged yet), the validator accepts and defers pack/flow resolution
-/// to runtime dispatch (M1.5). Same for the inverse case where every
-/// referenced revision's `pack_list` is empty — there is nothing to compare
-/// against. `flow_id` is never validated here; it lives in pack-manifest
-/// metadata that deploy-spec does not see, so it stays caller-asserted.
-fn validate_welcome_pack_id(
-    env: &greentic_deploy_spec::Environment,
-    bundle_id: &BundleId,
-    pack_id: &str,
-) -> Result<(), OpError> {
-    let bundles: Vec<_> = env
-        .bundles
-        .iter()
-        .filter(|b| b.bundle_id == *bundle_id)
-        .collect();
-    if bundles.is_empty() {
-        return Ok(());
-    }
-    let mut saw_any_pack = false;
-    let mut known_packs: Vec<String> = Vec::new();
-    for bundle in bundles {
-        for rev_id in &bundle.current_revisions {
-            let Some(rev) = env.revisions.iter().find(|r| r.revision_id == *rev_id) else {
-                continue;
-            };
-            for entry in &rev.pack_list {
-                saw_any_pack = true;
-                if entry.pack_id.as_str() == pack_id {
-                    return Ok(());
-                }
-                known_packs.push(entry.pack_id.as_str().to_string());
-            }
-        }
-    }
-    if !saw_any_pack {
-        return Ok(());
-    }
-    known_packs.sort();
-    known_packs.dedup();
-    Err(OpError::InvalidArgument(format!(
-        "welcome_flow.pack_id `{pack_id}` does not appear in any current revision of bundle `{bundle_id}` (known: [{}])",
-        known_packs.join(", ")
-    )))
 }
 
 // --- schema stubs ------------------------------------------------------------
@@ -1306,7 +1100,7 @@ mod tests {
             provider_type: provider_type.to_string(),
             display_name: format!("{provider_type} {provider_id}"),
             secret_refs: vec![],
-            idempotency_key: key.to_string(),
+            idempotency_key: Some(key.to_string()),
             updated_by: "tester".to_string(),
         }
     }
@@ -1427,7 +1221,7 @@ mod tests {
                 environment_id: "local".to_string(),
                 endpoint_id: id.to_string(),
                 bundle_id: bundle.as_str().to_string(),
-                idempotency_key: "k2".to_string(),
+                idempotency_key: Some("k2".to_string()),
                 updated_by: "tester".to_string(),
             }),
         )
@@ -1441,7 +1235,7 @@ mod tests {
                 environment_id: "local".to_string(),
                 endpoint_id: id.to_string(),
                 bundle_id: bundle.as_str().to_string(),
-                idempotency_key: "k3".to_string(),
+                idempotency_key: Some("k3".to_string()),
                 updated_by: "tester".to_string(),
             }),
         )
@@ -1471,7 +1265,7 @@ mod tests {
                 environment_id: "local".to_string(),
                 endpoint_id: id.to_string(),
                 bundle_id: "ghost-bundle".to_string(),
-                idempotency_key: "k2".to_string(),
+                idempotency_key: Some("k2".to_string()),
                 updated_by: "tester".to_string(),
             }),
         )
@@ -1500,7 +1294,7 @@ mod tests {
                 bundle_id: bundle.as_str().to_string(),
                 pack_id: "legal".to_string(),
                 flow_id: "main".to_string(),
-                idempotency_key: "k2".to_string(),
+                idempotency_key: Some("k2".to_string()),
                 updated_by: "tester".to_string(),
             }),
         )
@@ -1514,7 +1308,7 @@ mod tests {
                 environment_id: "local".to_string(),
                 endpoint_id: id.to_string(),
                 bundle_id: bundle.as_str().to_string(),
-                idempotency_key: "k3".to_string(),
+                idempotency_key: Some("k3".to_string()),
                 updated_by: "tester".to_string(),
             }),
         )
@@ -1528,7 +1322,7 @@ mod tests {
                 bundle_id: bundle.as_str().to_string(),
                 pack_id: "legal".to_string(),
                 flow_id: "main".to_string(),
-                idempotency_key: "k4".to_string(),
+                idempotency_key: Some("k4".to_string()),
                 updated_by: "tester".to_string(),
             }),
         )
@@ -1554,7 +1348,7 @@ mod tests {
                 environment_id: "local".to_string(),
                 endpoint_id: id.to_string(),
                 bundle_id: bundle.as_str().to_string(),
-                idempotency_key: "k2".to_string(),
+                idempotency_key: Some("k2".to_string()),
                 updated_by: "tester".to_string(),
             }),
         )
@@ -1568,7 +1362,7 @@ mod tests {
                 bundle_id: bundle.as_str().to_string(),
                 pack_id: "legal".to_string(),
                 flow_id: "main".to_string(),
-                idempotency_key: "k3".to_string(),
+                idempotency_key: Some("k3".to_string()),
                 updated_by: "tester".to_string(),
             }),
         )
@@ -1580,7 +1374,7 @@ mod tests {
                 environment_id: "local".to_string(),
                 endpoint_id: id.to_string(),
                 bundle_id: bundle.as_str().to_string(),
-                idempotency_key: "k4".to_string(),
+                idempotency_key: Some("k4".to_string()),
                 updated_by: "tester".to_string(),
             }),
         )
@@ -1604,7 +1398,7 @@ mod tests {
             Some(EndpointRemovePayload {
                 environment_id: "local".to_string(),
                 endpoint_id: id.to_string(),
-                idempotency_key: "k2".to_string(),
+                idempotency_key: Some("k2".to_string()),
                 updated_by: "tester".to_string(),
             }),
         )
@@ -1622,7 +1416,7 @@ mod tests {
             Some(EndpointRemovePayload {
                 environment_id: "local".to_string(),
                 endpoint_id: MessagingEndpointId::new().to_string(),
-                idempotency_key: "k1".to_string(),
+                idempotency_key: Some("k1".to_string()),
                 updated_by: "tester".to_string(),
             }),
         )
@@ -1674,7 +1468,7 @@ mod tests {
             Some(EndpointRemovePayload {
                 environment_id: "local".to_string(),
                 endpoint_id: id.to_string(),
-                idempotency_key: "k2".to_string(),
+                idempotency_key: Some("k2".to_string()),
                 updated_by: "tester".to_string(),
             }),
         )
@@ -1763,7 +1557,7 @@ mod tests {
             Some(EndpointRemovePayload {
                 environment_id: "local".to_string(),
                 endpoint_id: id.to_string(),
-                idempotency_key: "k2".to_string(),
+                idempotency_key: Some("k2".to_string()),
                 updated_by: "tester".to_string(),
             }),
         )
@@ -1813,7 +1607,7 @@ mod tests {
                 environment_id: "local".to_string(),
                 endpoint_id: id.to_string(),
                 bundle_id: bundle.as_str().to_string(),
-                idempotency_key: "k2".to_string(),
+                idempotency_key: Some("k2".to_string()),
                 updated_by: "tester".to_string(),
             }),
         )
@@ -1828,7 +1622,7 @@ mod tests {
                 bundle_id: bundle.as_str().to_string(),
                 pack_id: "typo-pack".to_string(),
                 flow_id: "main".to_string(),
-                idempotency_key: "k3".to_string(),
+                idempotency_key: Some("k3".to_string()),
                 updated_by: "tester".to_string(),
             }),
         )
@@ -1847,7 +1641,7 @@ mod tests {
                 bundle_id: bundle.as_str().to_string(),
                 pack_id: "greentic.test.pack".to_string(),
                 flow_id: "main".to_string(),
-                idempotency_key: "k4".to_string(),
+                idempotency_key: Some("k4".to_string()),
                 updated_by: "tester".to_string(),
             }),
         );
@@ -1879,7 +1673,7 @@ mod tests {
                 environment_id: "local".to_string(),
                 endpoint_id: id.to_string(),
                 bundle_id: bundle.as_str().to_string(),
-                idempotency_key: "k2".to_string(),
+                idempotency_key: Some("k2".to_string()),
                 updated_by: "tester".to_string(),
             }),
         )
@@ -1893,7 +1687,7 @@ mod tests {
                 bundle_id: bundle.as_str().to_string(),
                 pack_id: "future-pack".to_string(),
                 flow_id: "main".to_string(),
-                idempotency_key: "k3".to_string(),
+                idempotency_key: Some("k3".to_string()),
                 updated_by: "tester".to_string(),
             }),
         )
@@ -1910,7 +1704,7 @@ mod tests {
             provider_type: "teams".to_string(),
             display_name: "x".to_string(),
             secret_refs: vec![],
-            idempotency_key: "k1".to_string(),
+            idempotency_key: Some("k1".to_string()),
             updated_by: "tester".to_string(),
         };
         let err = add(&store, &OpFlags::default(), Some(bad)).unwrap_err();
@@ -2070,7 +1864,7 @@ mod tests {
         EndpointRotateWebhookSecretPayload {
             environment_id: "local".to_string(),
             endpoint_id: endpoint_id.to_string(),
-            idempotency_key: key.to_string(),
+            idempotency_key: Some(key.to_string()),
             updated_by: "tester".to_string(),
         }
     }
@@ -2182,7 +1976,7 @@ mod tests {
         assert_eq!(payload.provider_type, "telegram");
         assert_eq!(payload.provider_id, "legal-bot");
         assert_eq!(payload.display_name, "Legal Bot");
-        assert_eq!(payload.idempotency_key, "k1");
+        assert_eq!(payload.idempotency_key, Some("k1".to_string()));
         assert_eq!(payload.updated_by, "alice");
         assert!(payload.secret_refs.is_empty());
     }
@@ -2379,7 +2173,7 @@ mod tests {
             .expect("some");
         assert_eq!(payload.environment_id, "local");
         assert_eq!(payload.endpoint_id, "01HXYZ");
-        assert_eq!(payload.idempotency_key, "k-rm");
+        assert_eq!(payload.idempotency_key, Some("k-rm".to_string()));
     }
 
     #[test]
