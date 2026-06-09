@@ -340,7 +340,7 @@ impl PostgresEnvironmentStore {
         env_id: &EnvId,
     ) -> Result<Option<LoadedRuntime>, PgStoreError> {
         let row = sqlx::query(
-            "SELECT generation, etag, data \
+            "SELECT generation, etag, data, integrity_digest \
              FROM environment_runtimes WHERE env_id = $1",
         )
         .bind(env_id.as_str())
@@ -351,6 +351,7 @@ impl PostgresEnvironmentStore {
         };
         let revision = decode_revision(&row)?;
         let data: Value = row.try_get("data")?;
+        let stored_digest: String = row.try_get("integrity_digest")?;
         let runtime: EnvironmentRuntime = serde_json::from_value(data)?;
         if runtime.environment_id != *env_id {
             return Err(PgStoreError::EnvIdMismatch {
@@ -363,6 +364,14 @@ impl PostgresEnvironmentStore {
                 expected: SchemaVersion::ENVIRONMENT_RUNTIME_V1,
                 actual: runtime.schema.as_str().to_string(),
             }));
+        }
+        let recomputed = StateIntegrity::sha256_of(&runtime)?;
+        if recomputed.digest != stored_digest {
+            return Err(PgStoreError::IntegrityMismatch {
+                env_id: env_id.clone(),
+                stored: stored_digest,
+                recomputed: recomputed.digest,
+            });
         }
         Ok(Some(LoadedRuntime { runtime, revision }))
     }
@@ -381,7 +390,7 @@ impl PostgresEnvironmentStore {
                 actual: runtime.schema.as_str().to_string(),
             }));
         }
-        let (etag, _integrity, data) = serialize_for_write(runtime)?;
+        let (etag, integrity, data) = serialize_for_write(runtime)?;
 
         let mut tx = self.pool.begin().await?;
         let current = sqlx::query(
@@ -394,13 +403,23 @@ impl PostgresEnvironmentStore {
 
         let new_revision = match current {
             None => {
+                // Row absent: only allow the create-if-absent path
+                // (no precondition). A conditional precondition here
+                // means the caller expected an existing row — another
+                // actor deleted it in the meantime. Resurrecting with
+                // stale data would break CAS.
+                if precondition.is_some_and(|pc| pc.is_conditional()) {
+                    return Err(PgStoreError::NotFound(runtime.environment_id.clone()));
+                }
                 sqlx::query(
-                    "INSERT INTO environment_runtimes (env_id, generation, etag, data) \
-                     VALUES ($1, 1, $2, $3)",
+                    "INSERT INTO environment_runtimes \
+                     (env_id, generation, etag, data, integrity_digest) \
+                     VALUES ($1, 1, $2, $3, $4)",
                 )
                 .bind(runtime.environment_id.as_str())
                 .bind(&etag.0)
                 .bind(&data)
+                .bind(&integrity.digest)
                 .execute(&mut *tx)
                 .await?;
                 EnvRevision {
@@ -420,12 +439,14 @@ impl PostgresEnvironmentStore {
                 let new_gen = current_rev.generation + 1;
                 sqlx::query(
                     "UPDATE environment_runtimes \
-                     SET data = $1, generation = $2, etag = $3, updated_at = NOW() \
-                     WHERE env_id = $4",
+                     SET data = $1, generation = $2, etag = $3, \
+                         integrity_digest = $4, updated_at = NOW() \
+                     WHERE env_id = $5",
                 )
                 .bind(&data)
                 .bind(new_gen as i64)
                 .bind(&etag.0)
+                .bind(&integrity.digest)
                 .bind(runtime.environment_id.as_str())
                 .execute(&mut *tx)
                 .await?;
@@ -447,7 +468,7 @@ impl PostgresEnvironmentStore {
         slot: CapabilitySlot,
     ) -> Result<Option<LoadedAnswers>, PgStoreError> {
         let row = sqlx::query(
-            "SELECT generation, etag, data \
+            "SELECT generation, etag, data, integrity_digest \
              FROM pack_answers WHERE env_id = $1 AND slot = $2",
         )
         .bind(env_id.as_str())
@@ -458,7 +479,17 @@ impl PostgresEnvironmentStore {
             return Ok(None);
         };
         let revision = decode_revision(&row)?;
-        let answers: Value = row.try_get("data")?;
+        let data: Value = row.try_get("data")?;
+        let stored_digest: String = row.try_get("integrity_digest")?;
+        let answers: Value = serde_json::from_value(data)?;
+        let recomputed = StateIntegrity::sha256_of(&answers)?;
+        if recomputed.digest != stored_digest {
+            return Err(PgStoreError::IntegrityMismatch {
+                env_id: env_id.clone(),
+                stored: stored_digest,
+                recomputed: recomputed.digest,
+            });
+        }
         Ok(Some(LoadedAnswers { answers, revision }))
     }
 
@@ -472,7 +503,7 @@ impl PostgresEnvironmentStore {
         answers: &Value,
         precondition: Option<&Precondition>,
     ) -> Result<EnvRevision, PgStoreError> {
-        let (etag, _integrity, _data) = serialize_for_write(answers)?;
+        let (etag, integrity, data) = serialize_for_write(answers)?;
 
         let mut tx = self.pool.begin().await?;
         let current = sqlx::query(
@@ -486,14 +517,23 @@ impl PostgresEnvironmentStore {
 
         let new_revision = match current {
             None => {
+                // Row absent: only allow the create-if-absent path
+                // (no precondition). A conditional precondition means
+                // the caller expected an existing row — another actor
+                // deleted it. Resurrecting would break CAS.
+                if precondition.is_some_and(|pc| pc.is_conditional()) {
+                    return Err(PgStoreError::NotFound(env_id.clone()));
+                }
                 sqlx::query(
-                    "INSERT INTO pack_answers (env_id, slot, generation, etag, data) \
-                     VALUES ($1, $2, 1, $3, $4)",
+                    "INSERT INTO pack_answers \
+                     (env_id, slot, generation, etag, data, integrity_digest) \
+                     VALUES ($1, $2, 1, $3, $4, $5)",
                 )
                 .bind(env_id.as_str())
                 .bind(slot.as_str())
                 .bind(&etag.0)
-                .bind(answers)
+                .bind(&data)
+                .bind(&integrity.digest)
                 .execute(&mut *tx)
                 .await?;
                 EnvRevision {
@@ -511,12 +551,14 @@ impl PostgresEnvironmentStore {
                 let new_gen = current_rev.generation + 1;
                 sqlx::query(
                     "UPDATE pack_answers \
-                     SET data = $1, generation = $2, etag = $3, updated_at = NOW() \
-                     WHERE env_id = $4 AND slot = $5",
+                     SET data = $1, generation = $2, etag = $3, \
+                         integrity_digest = $4, updated_at = NOW() \
+                     WHERE env_id = $5 AND slot = $6",
                 )
-                .bind(answers)
+                .bind(&data)
                 .bind(new_gen as i64)
                 .bind(&etag.0)
+                .bind(&integrity.digest)
                 .bind(env_id.as_str())
                 .bind(slot.as_str())
                 .execute(&mut *tx)

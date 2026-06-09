@@ -25,21 +25,23 @@ CREATE TABLE environments (
 CREATE INDEX environments_updated_at_idx ON environments (updated_at);
 
 CREATE TABLE environment_runtimes (
-    env_id     TEXT        PRIMARY KEY REFERENCES environments(env_id) ON DELETE CASCADE,
-    generation BIGINT      NOT NULL,
-    etag       TEXT        NOT NULL,
-    data       JSONB       NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    env_id           TEXT        PRIMARY KEY REFERENCES environments(env_id) ON DELETE CASCADE,
+    generation       BIGINT      NOT NULL,
+    etag             TEXT        NOT NULL,
+    data             JSONB       NOT NULL,
+    integrity_digest TEXT        NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT environment_runtimes_generation_positive CHECK (generation > 0)
 );
 
 CREATE TABLE pack_answers (
-    env_id     TEXT        NOT NULL REFERENCES environments(env_id) ON DELETE CASCADE,
-    slot       TEXT        NOT NULL,
-    generation BIGINT      NOT NULL,
-    etag       TEXT        NOT NULL,
-    data       JSONB       NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    env_id           TEXT        NOT NULL REFERENCES environments(env_id) ON DELETE CASCADE,
+    slot             TEXT        NOT NULL,
+    generation       BIGINT      NOT NULL,
+    etag             TEXT        NOT NULL,
+    data             JSONB       NOT NULL,
+    integrity_digest TEXT        NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (env_id, slot),
     CONSTRAINT pack_answers_generation_positive CHECK (generation > 0)
 );

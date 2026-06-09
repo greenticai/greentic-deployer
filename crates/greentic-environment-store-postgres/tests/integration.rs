@@ -337,3 +337,124 @@ async fn list_envs_returns_sorted_ids() {
     let names: Vec<&str> = ids.iter().map(|i| i.as_str()).collect();
     assert_eq!(names, vec!["a", "b", "c"]);
 }
+
+// --- Finding 1: stale-after-delete CAS bypass ---
+
+#[tokio::test]
+#[ignore = "requires Docker for testcontainers Postgres"]
+async fn upsert_pack_answers_after_delete_with_stale_precondition_returns_not_found() {
+    let (_c, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    // Create answers, then delete them.
+    let answers = json!({"region": "eu-west-1"});
+    let rev1 = store
+        .upsert_pack_answers(&id, CapabilitySlot::Deployer, &answers, None)
+        .await
+        .expect("create answers");
+    let pc_delete = Precondition::matching(rev1.etag.clone(), rev1.generation);
+    store
+        .delete_pack_answers(&id, CapabilitySlot::Deployer, &pc_delete)
+        .await
+        .expect("delete answers");
+
+    // Attempt to upsert with the OLD (pre-delete) precondition.
+    // This must NOT silently resurrect the row — it should return NotFound.
+    let stale = Precondition::matching(rev1.etag.clone(), rev1.generation);
+    let err = store
+        .upsert_pack_answers(&id, CapabilitySlot::Deployer, &answers, Some(&stale))
+        .await
+        .expect_err("conditional upsert on deleted row must fail");
+    let PgStoreError::NotFound(missing) = err else {
+        panic!("expected NotFound, got: {err:?}");
+    };
+    assert_eq!(missing, id);
+
+    // Verify no row was resurrected.
+    assert!(
+        store
+            .load_pack_answers(&id, CapabilitySlot::Deployer)
+            .await
+            .expect("load")
+            .is_none()
+    );
+}
+
+// --- Finding 2: integrity digest tamper detection ---
+
+#[tokio::test]
+#[ignore = "requires Docker for testcontainers Postgres"]
+async fn load_runtime_detects_tampered_data() {
+    let (_c, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    let runtime = minimal_runtime(&id);
+    store
+        .upsert_runtime(&runtime, None)
+        .await
+        .expect("upsert runtime");
+
+    // Tamper: write a valid-but-different runtime so deserialization
+    // succeeds but the integrity digest no longer matches.
+    let mut tampered = minimal_runtime(&id);
+    tampered.generation = 999;
+    let tampered_json = serde_json::to_value(&tampered).unwrap();
+    sqlx::query("UPDATE environment_runtimes SET data = $1 WHERE env_id = $2")
+        .bind(&tampered_json)
+        .bind(id.as_str())
+        .execute(store.pool())
+        .await
+        .expect("tamper");
+
+    let err = store
+        .load_runtime(&id)
+        .await
+        .expect_err("tampered runtime must fail integrity check");
+    assert!(
+        matches!(err, PgStoreError::IntegrityMismatch { .. }),
+        "expected IntegrityMismatch, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker for testcontainers Postgres"]
+async fn load_pack_answers_detects_tampered_data() {
+    let (_c, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    let answers = json!({"region": "eu-west-1"});
+    store
+        .upsert_pack_answers(&id, CapabilitySlot::Deployer, &answers, None)
+        .await
+        .expect("upsert answers");
+
+    // Tamper with the stored JSON without updating integrity_digest.
+    sqlx::query("UPDATE pack_answers SET data = $1 WHERE env_id = $2 AND slot = $3")
+        .bind(serde_json::to_value(json!({"tampered": true})).unwrap())
+        .bind(id.as_str())
+        .bind(CapabilitySlot::Deployer.as_str())
+        .execute(store.pool())
+        .await
+        .expect("tamper");
+
+    let err = store
+        .load_pack_answers(&id, CapabilitySlot::Deployer)
+        .await
+        .expect_err("tampered answers must fail integrity check");
+    assert!(
+        matches!(err, PgStoreError::IntegrityMismatch { .. }),
+        "expected IntegrityMismatch, got: {err:?}"
+    );
+}
