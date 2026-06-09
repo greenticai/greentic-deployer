@@ -16,11 +16,13 @@ use std::path::Path;
 use greentic_distributor_client::signing::TrustedKey;
 
 use greentic_deploy_spec::{
-    EnvId, Environment, EnvironmentHostConfig, IdempotencyKey, SchemaVersion,
+    EnvId, Environment, EnvironmentHostConfig, HealthStatus, IdempotencyKey, RetentionPolicy,
+    RevocationConfig, SchemaVersion,
 };
 
 use super::mutations::{
-    TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload,
+    ExtensionKey, MigrateMergePayload, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
+    UpdateEnvironmentPayload,
 };
 use super::store::{LocalFsStore, StoreError};
 use super::trust_root::{self as store_trust_root, trust_root_path};
@@ -63,25 +65,14 @@ impl LocalFsStore {
                 Err(StoreError::NotFound(_)) => {}
                 Err(e) => return Err(e),
             }
-            let env = Environment {
-                schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
-                environment_id: locked.env_id().clone(),
+            let env = fresh_environment(
+                locked.env_id(),
                 name,
-                host_config: EnvironmentHostConfig {
-                    env_id: locked.env_id().clone(),
-                    ..host_config
-                },
-                packs: Vec::new(),
-                credentials_ref: None,
-                bundles: Vec::new(),
-                revisions: Vec::new(),
-                traffic_splits: Vec::new(),
-                messaging_endpoints: Vec::new(),
-                extensions: Vec::new(),
-                revocation: Default::default(),
-                retention: Default::default(),
-                health: Default::default(),
-            };
+                host_config,
+                RevocationConfig::default(),
+                RetentionPolicy::default(),
+                HealthStatus::default(),
+            );
             locked.save(&env)?;
             Ok(env)
         })
@@ -120,6 +111,78 @@ impl LocalFsStore {
             }
             locked.save(&env)?;
             Ok(env)
+        })
+    }
+
+    // -------------------------------------------------------------
+    // Migration  (PR-3a.4)
+    //   `op env migrate-dev --apply`
+    // -------------------------------------------------------------
+
+    /// Merge pack bindings and extension bindings into `target_env_id`,
+    /// optionally seeding a fresh target env from a source when the target
+    /// doesn't exist yet. All work runs under the target's flock so the
+    /// existence check + optional seed + merge + save are atomic.
+    ///
+    /// Skips slots already in the target's `packs` and extension keys
+    /// already in the target's `extensions` (uniqueness on
+    /// `(kind.path(), instance_id)`). Returns `(merged_slot_names,
+    /// merged_extension_key_strings)`.
+    ///
+    /// Returns `StoreError::NotFound` if target is missing AND
+    /// `payload.seed_if_missing` is `None` (the caller asserted target
+    /// presence).
+    pub fn migrate_merge_bindings(
+        &self,
+        target_env_id: &EnvId,
+        payload: MigrateMergePayload,
+    ) -> Result<(Vec<String>, Vec<String>), StoreError> {
+        let MigrateMergePayload {
+            packs,
+            extensions,
+            seed_if_missing,
+        } = payload;
+        self.transact(target_env_id, |locked| {
+            let mut target_env = match locked.load() {
+                Ok(env) => env,
+                Err(StoreError::NotFound(id)) => match seed_if_missing {
+                    Some(seed) => fresh_environment(
+                        locked.env_id(),
+                        locked.env_id().as_str().to_string(),
+                        seed.host_config,
+                        seed.revocation,
+                        seed.retention,
+                        seed.health,
+                    ),
+                    None => return Err(StoreError::NotFound(id)),
+                },
+                Err(e) => return Err(e),
+            };
+            let mut added_slots = Vec::new();
+            for binding in packs {
+                if target_env.packs.iter().any(|b| b.slot == binding.slot) {
+                    continue;
+                }
+                added_slots.push(binding.slot.to_string());
+                target_env.packs.push(binding);
+            }
+            // Extension bindings (`Path 3`) are light, referentially
+            // independent state — like `packs`, they migrate. Merge by
+            // `(kind.path(), instance_id)`, preserving any binding the
+            // target already carries. (`messaging_endpoints` are NOT
+            // migrated here: they reference `linked_bundles` that don't
+            // migrate, so a blind copy would break referential integrity.)
+            let mut added_extensions = Vec::new();
+            for ext in extensions {
+                let key = ExtensionKey::from_binding(&ext);
+                if target_env.extensions.iter().any(|e| key.matches(e)) {
+                    continue;
+                }
+                added_extensions.push(key.to_string());
+                target_env.extensions.push(ext);
+            }
+            locked.save(&target_env)?;
+            Ok((added_slots, added_extensions))
         })
     }
 
@@ -229,6 +292,46 @@ impl LocalFsStore {
                 trusted_key_count: trust.keys.len(),
             })
         })
+    }
+}
+
+/// Build an empty [`Environment`] at the current `ENVIRONMENT_V1` schema
+/// with the supplied `host_config` + policy state. All collection fields
+/// start empty and `credentials_ref` is `None` — populated downstream by
+/// the binding verbs. Shared by `create_environment` (which passes
+/// `Default::default()` for revocation/retention/health) and
+/// `migrate_merge_bindings`' seed branch (which threads the source's
+/// existing policy state through).
+///
+/// Centralizing this prevents the two seed sites from drifting when a new
+/// `Environment` field lands — both currently must zero/default it, and
+/// missing one site is the silent-zero-value footgun.
+fn fresh_environment(
+    env_id: &EnvId,
+    name: String,
+    host_config: EnvironmentHostConfig,
+    revocation: RevocationConfig,
+    retention: RetentionPolicy,
+    health: HealthStatus,
+) -> Environment {
+    Environment {
+        schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
+        environment_id: env_id.clone(),
+        name,
+        host_config: EnvironmentHostConfig {
+            env_id: env_id.clone(),
+            ..host_config
+        },
+        packs: Vec::new(),
+        credentials_ref: None,
+        bundles: Vec::new(),
+        revisions: Vec::new(),
+        traffic_splits: Vec::new(),
+        messaging_endpoints: Vec::new(),
+        extensions: Vec::new(),
+        revocation,
+        retention,
+        health,
     }
 }
 

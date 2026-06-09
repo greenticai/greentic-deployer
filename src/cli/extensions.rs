@@ -19,7 +19,7 @@ use greentic_deploy_spec::{EnvId, ExtensionBinding, PackDescriptor, PackId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{EnvironmentStore, LocalFsStore};
+use crate::environment::{EnvironmentStore, ExtensionKey, LocalFsStore};
 
 use super::env_packs::{load_previous, stash_previous};
 use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
@@ -305,38 +305,6 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
 
 // --- internals -----------------------------------------------------------
 
-/// `(descriptor-path, instance_id)` — the uniqueness key for an extension
-/// binding, version-independent by design.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExtensionKey {
-    path: String,
-    instance_id: Option<String>,
-}
-
-impl ExtensionKey {
-    pub(crate) fn from_binding(b: &ExtensionBinding) -> Self {
-        Self {
-            path: b.kind.path().to_string(),
-            instance_id: b.instance_id.clone(),
-        }
-    }
-
-    /// Whether `b` carries this `(path, instance_id)` key. Borrowed comparison —
-    /// no allocation per element, so it's cheap inside a scan.
-    pub(crate) fn matches(&self, b: &ExtensionBinding) -> bool {
-        b.kind.path() == self.path && b.instance_id.as_deref() == self.instance_id.as_deref()
-    }
-}
-
-impl std::fmt::Display for ExtensionKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.instance_id {
-            Some(inst) => write!(f, "{}/{}", self.path, inst),
-            None => f.write_str(&self.path),
-        }
-    }
-}
-
 fn find_idx(extensions: &[ExtensionBinding], key: &ExtensionKey) -> Option<usize> {
     extensions.iter().position(|b| key.matches(b))
 }
@@ -350,10 +318,7 @@ fn not_found_msg(key: &ExtensionKey, env_id: &EnvId) -> String {
 fn build_key(kind: &str, instance_id: &Option<String>) -> Result<ExtensionKey, OpError> {
     let descriptor = PackDescriptor::try_new(kind)
         .map_err(|e| OpError::InvalidArgument(format!("kind: {e}")))?;
-    Ok(ExtensionKey {
-        path: descriptor.path().to_string(),
-        instance_id: instance_id.clone(),
-    })
+    Ok(ExtensionKey::new(descriptor.path(), instance_id.clone()))
 }
 
 fn resolve_payload<T: serde::de::DeserializeOwned>(

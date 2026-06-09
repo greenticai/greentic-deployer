@@ -26,9 +26,10 @@ use std::path::PathBuf;
 
 use greentic_deploy_spec::{
     BundleDeployment, BundleDeploymentStatus, BundleId, CapabilitySlot, CustomerId, DeploymentId,
-    EnvId, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding, IdempotencyKey,
-    MessagingEndpoint, MessagingEndpointId, PackId, RevenueShareEntry, Revision, RevisionId,
-    RevisionLifecycle, RouteBinding, TrafficSplit, TrafficSplitEntry,
+    EnvId, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding, HealthStatus,
+    IdempotencyKey, MessagingEndpoint, MessagingEndpointId, PackId, RetentionPolicy,
+    RevenueShareEntry, Revision, RevisionId, RevisionLifecycle, RevocationConfig, RouteBinding,
+    TrafficSplit, TrafficSplitEntry,
 };
 use serde_json::Value;
 
@@ -63,6 +64,25 @@ impl ExtensionKey {
         Self {
             kind_path: b.kind.path().to_string(),
             instance_id: b.instance_id.clone(),
+        }
+    }
+
+    /// Whether `b` carries this `(kind_path, instance_id)` key. Borrowed
+    /// comparison — no allocation per element, so it's cheap inside a scan.
+    pub fn matches(&self, b: &ExtensionBinding) -> bool {
+        b.kind.path() == self.kind_path && b.instance_id.as_deref() == self.instance_id.as_deref()
+    }
+}
+
+/// Wire-stable rendering used by audit-event targets and CLI outcome JSON.
+/// `<kind_path>/<instance_id>` when an instance is present, otherwise just
+/// `<kind_path>`. Mirrors the CLI's `cli::extensions::ExtensionKey` Display
+/// so existing operator-facing strings stay byte-identical.
+impl std::fmt::Display for ExtensionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.instance_id {
+            Some(inst) => write!(f, "{}/{}", self.kind_path, inst),
+            None => f.write_str(&self.kind_path),
         }
     }
 }
@@ -120,6 +140,36 @@ pub struct UpdateEnvironmentPayload {
     pub tenant_org_id: Option<String>,
     pub listen_addr: Option<SocketAddr>,
     pub public_base_url: Option<String>,
+}
+
+/// Optional seed payload for [`EnvironmentMutations::migrate_merge_bindings`].
+/// Supplied when the caller wants the impl to atomically create the target
+/// env (using these fields) if it doesn't exist yet, then merge the bindings
+/// into it. Mirrors the seed-from-source behavior of `op env migrate-dev`
+/// where the source's host config + policy state ride along onto the freshly
+/// created target.
+///
+/// `name` is intentionally omitted: the impl derives it from
+/// `target_env_id`. `schema` is set to the current `ENVIRONMENT_V1` constant
+/// by the impl, not threaded through the wire.
+#[derive(Debug, Clone)]
+pub struct MigrateSeedPayload {
+    pub host_config: EnvironmentHostConfig,
+    pub revocation: RevocationConfig,
+    pub retention: RetentionPolicy,
+    pub health: HealthStatus,
+}
+
+/// Inputs to [`EnvironmentMutations::migrate_merge_bindings`].
+#[derive(Debug, Clone)]
+pub struct MigrateMergePayload {
+    pub packs: Vec<EnvPackBinding>,
+    pub extensions: Vec<ExtensionBinding>,
+    /// When `Some`, the impl atomically creates the target env (using
+    /// these fields) if it doesn't exist yet, then merges the bindings
+    /// into it. When `None`, the impl returns `StoreError::NotFound` if
+    /// the target doesn't exist — the caller is asserting target presence.
+    pub seed_if_missing: Option<MigrateSeedPayload>,
 }
 
 /// Inputs to [`EnvironmentMutations::stage_revision`]. Bundled so the
@@ -246,14 +296,14 @@ pub trait EnvironmentMutations: Send + Sync {
     /// the list of newly-merged slots + extension key strings (in the
     /// form `"<kind_path>::<instance_id>"`).
     ///
-    /// Takes the bindings directly rather than a full source `Environment`
-    /// so the HTTP impl doesn't have to ship an entire env aggregate when
-    /// the operation reads only these two vectors.
+    /// `payload.seed_if_missing` is the optional seed-on-create-target
+    /// branch used by `op env migrate-dev` to migrate a legacy `dev` env
+    /// into a fresh `local` target atomically — load, fallback-to-seed,
+    /// merge, save all happen under one lock.
     fn migrate_merge_bindings(
         &self,
         target_env_id: &EnvId,
-        packs: &[EnvPackBinding],
-        extensions: &[ExtensionBinding],
+        payload: MigrateMergePayload,
     ) -> Result<(Vec<String>, Vec<String>), StoreError>;
 
     // -------------------------------------------------------------
