@@ -11,6 +11,7 @@
 
 pub mod atomic_write;
 pub mod audit;
+pub mod bootstrap;
 pub mod bundle_deployment;
 pub mod file_lock;
 pub mod lifecycle;
@@ -26,6 +27,7 @@ pub use audit::{
     AUDIT_EVENT_SCHEMA_V1, Actor, AuditDecision, AuditError, AuditEvent, AuditLog, AuditResult,
     POLICY_LOCAL_ONLY, authorize_local_only, current_local_actor,
 };
+pub use bootstrap::{EnsureLocalEnvironmentPayload, LocalEnvOutcome};
 pub use bundle_deployment::{
     BundleDeploymentError, REVENUE_POLICY_PREDICATE_TYPE_V1, RevenuePolicyPredicate,
     RevenuePolicyVersion, write_revenue_policy_version,

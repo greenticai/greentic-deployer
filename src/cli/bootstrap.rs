@@ -10,31 +10,19 @@
 
 use chrono::Utc;
 use greentic_deploy_spec::{
-    CapabilitySlot, DEFAULT_LISTEN_ADDR, EnvId, Environment, EnvironmentHostConfig,
-    EnvironmentRuntime, PackDescriptor, SchemaVersion,
+    CapabilitySlot, EnvId, Environment, EnvironmentRuntime, PackDescriptor, SchemaVersion,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-use crate::defaults::{LOCAL_DEPLOYER_PACK, LOCAL_ENV_ID, local_pack_bindings};
+use crate::defaults::{LOCAL_DEPLOYER_PACK, LOCAL_ENV_ID};
 use crate::env_packs::LocalProcessDeployerHandler;
-use crate::environment::{LocalFsStore, Locked};
+// Re-export so `cli::env` can reference `super::bootstrap::LocalEnvOutcome`
+// as before (the enum moved from this module to `environment::bootstrap`).
+pub use crate::environment::LocalEnvOutcome;
+use crate::environment::{EnsureLocalEnvironmentPayload, LocalFsStore, Locked};
 
-use super::OpError;
-
-/// Whether [`ensure_local_environment`] created the env, found it intact, or
-/// repaired missing default bindings on an existing env.
-///
-/// `Healed` carries the slots that were missing and got the default binding
-/// inserted. Slots already bound to a non-default descriptor are NOT
-/// overwritten — bootstrap only fills *missing* slots, never replaces user
-/// intent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LocalEnvOutcome {
-    Created,
-    AlreadyExists,
-    Healed { added_slots: Vec<CapabilitySlot> },
-}
+use super::{OpError, map_store_err_preserving_noun};
 
 /// Creates the `local` Environment with default env-pack bindings if absent.
 ///
@@ -50,9 +38,9 @@ pub enum LocalEnvOutcome {
 /// must run [`greentic_deploy_spec::validate_public_base_url`] before passing
 /// it in.
 ///
-/// The entire read-modify-write runs inside [`LocalFsStore::transact`], so
-/// concurrent first-run invocations on the same host serialize on the per-env
-/// flock and produce a single env.
+/// Delegates to [`LocalFsStore::ensure_local_environment`] for the atomic
+/// read-modify-write, then runs `refresh_local_runtime_stub` at the CLI
+/// layer.
 pub fn ensure_local_environment(
     store: &LocalFsStore,
     public_base_url: Option<String>,
@@ -60,59 +48,19 @@ pub fn ensure_local_environment(
     let env_id = EnvId::try_from(LOCAL_ENV_ID).map_err(|e| {
         OpError::InvalidArgument(format!("default env id `{}`: {}", LOCAL_ENV_ID, e))
     })?;
-    store.transact(
-        &env_id,
-        |locked| -> Result<(Environment, LocalEnvOutcome), OpError> {
-            if let Ok(mut existing) = locked.load() {
-                // Inside the per-env flock so the check is race-free against
-                // a concurrent `op env init` minting the env. The URL is only
-                // applied on creation; overwriting an existing env's URL goes
-                // through `op env set-public-url`.
-                if public_base_url.is_some() {
-                    return Err(OpError::InvalidArgument(format!(
-                        "env `{}` already exists; use `op env set-public-url <env_id> <URL>` to overwrite the persisted public URL",
-                        locked.env_id()
-                    )));
-                }
-                let added = fill_missing_default_bindings(&mut existing)?;
-                if added.is_empty() {
-                    refresh_local_runtime_stub(locked, &existing, false)?;
-                    return Ok((existing, LocalEnvOutcome::AlreadyExists));
-                }
-                locked.save(&existing)?;
-                refresh_local_runtime_stub(locked, &existing, true)?;
-                return Ok((existing, LocalEnvOutcome::Healed { added_slots: added }));
-            }
-            let packs = local_pack_bindings().map_err(|e| {
-                OpError::InvalidArgument(format!("default pack binding parse: {e}"))
-            })?;
-            let env = Environment {
-                schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
-                environment_id: locked.env_id().clone(),
-                name: LOCAL_ENV_ID.to_string(),
-                host_config: EnvironmentHostConfig {
-                    env_id: locked.env_id().clone(),
-                    region: None,
-                    tenant_org_id: None,
-                    listen_addr: Some(DEFAULT_LISTEN_ADDR),
-                    public_base_url: public_base_url.clone(),
-                },
-                packs,
-                credentials_ref: None,
-                bundles: Vec::new(),
-                revisions: Vec::new(),
-                traffic_splits: Vec::new(),
-                messaging_endpoints: Vec::new(),
-                extensions: Vec::new(),
-                revocation: Default::default(),
-                retention: Default::default(),
-                health: Default::default(),
-            };
-            locked.save(&env)?;
-            refresh_local_runtime_stub(locked, &env, true)?;
-            Ok((env, LocalEnvOutcome::Created))
-        },
-    )
+    let payload = EnsureLocalEnvironmentPayload { public_base_url };
+    let (env, outcome) = store
+        .ensure_local_environment(&env_id, payload)
+        .map_err(map_store_err_preserving_noun)?;
+    // Runtime stub refresh runs outside the typed verb's flock. The tiny
+    // race window is acceptable — the stub is a derived projection that
+    // self-heals on every bootstrap call.
+    let force_bump = !matches!(outcome, LocalEnvOutcome::AlreadyExists);
+    store.transact(&env_id, |locked| -> Result<(), OpError> {
+        refresh_local_runtime_stub(locked, &env, force_bump)?;
+        Ok(())
+    })?;
+    Ok((env, outcome))
 }
 
 /// Refresh (or create) the local-process deployer's `runtime.json` stub.
@@ -191,28 +139,6 @@ fn build_local_runtime_stub(
     })
 }
 
-/// Walks the five default capability slots and appends a default
-/// [`greentic_deploy_spec::EnvPackBinding`] for any slot not already bound on
-/// `env`. Slots already bound — regardless of descriptor — are left untouched
-/// so user-customized bindings (e.g. an externally-provisioned secrets backend)
-/// survive.
-///
-/// Returns the slots that were appended, in the canonical default order.
-/// Empty return means the env already satisfied the A4 invariant.
-fn fill_missing_default_bindings(env: &mut Environment) -> Result<Vec<CapabilitySlot>, OpError> {
-    let defaults = local_pack_bindings()
-        .map_err(|e| OpError::InvalidArgument(format!("default pack binding parse: {e}")))?;
-    let mut added = Vec::new();
-    for binding in defaults {
-        if env.packs.iter().any(|b| b.slot == binding.slot) {
-            continue;
-        }
-        added.push(binding.slot);
-        env.packs.push(binding);
-    }
-    Ok(added)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,7 +146,7 @@ mod tests {
         LOCAL_DEPLOYER_PACK, LOCAL_SECRETS_PACK, LOCAL_SESSIONS_PACK, LOCAL_STATE_PACK,
         LOCAL_TELEMETRY_PACK,
     };
-    use greentic_deploy_spec::CapabilitySlot;
+    use greentic_deploy_spec::{CapabilitySlot, DEFAULT_LISTEN_ADDR, EnvironmentHostConfig};
     use tempfile::TempDir;
 
     fn store() -> (TempDir, LocalFsStore) {
