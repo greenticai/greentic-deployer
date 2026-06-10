@@ -292,6 +292,8 @@ pub enum EnvVerb {
     /// `greentic.env-manifest.v1` document via `--answers <PATH>` and
     /// reconciles the env toward it: validate → diff → plan → execute →
     /// verify. Re-running an unchanged manifest is a visible no-op.
+    /// `--dry-run` previews the plan; `--check` is the CI gate (exit 1 on
+    /// pending diff).
     Apply(EnvApplyArgs),
     Create(EnvCreateArgs),
     Update(EnvUpdateArgs),
@@ -403,6 +405,13 @@ pub struct EnvApplyArgs {
     /// anything (exit 0 even when changes are pending — it's a preview).
     #[arg(long = "dry-run")]
     pub dry_run: bool,
+    /// CI convergence gate: validate + diff + print the plan, then exit
+    /// non-zero when the plan contains pending diffable changes, 0 when the
+    /// env is converged. Always-put secret steps don't count as drift
+    /// (values cannot be diffed until A9); they're reported separately.
+    /// Never mutates anything.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub check: bool,
     /// Audit principal forwarded to every composed mutation. Defaults to
     /// `env-apply`.
     #[arg(long = "updated-by")]
@@ -903,9 +912,14 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
 fn dispatch_env(store: &LocalFsStore, flags: &OpFlags, verb: EnvVerb) -> Result<(), OpError> {
     let outcome = match verb {
         EnvVerb::Init(args) => super::env::init(store, flags, args.into_payload(flags)?)?,
-        EnvVerb::Apply(args) => {
-            super::env_apply::apply(store, flags, args.dry_run, args.updated_by, args.yes)?
-        }
+        EnvVerb::Apply(args) => super::env_apply::apply(
+            store,
+            flags,
+            args.dry_run,
+            args.check,
+            args.updated_by,
+            args.yes,
+        )?,
         EnvVerb::Create(args) => {
             super::env::create(store, flags, args.into_payload("create", flags)?)?
         }

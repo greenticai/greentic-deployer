@@ -28,6 +28,10 @@
 //! - Store-level verify only: *runtime* readiness (secrets resolvable by
 //!   the reader, routes served) is `gtc doctor`'s job — apply must work
 //!   without a running runtime.
+//! - `--check` (CI convergence gate): validate + diff + plan, never
+//!   mutate; exit non-zero when diffable changes are pending. Always-put
+//!   secret rows are excluded from the verdict (values cannot be diffed
+//!   until A9) and reported under `undiffable` instead.
 //!
 //! - Secrets are always-put: `op secrets get` is not-yet-implemented, so
 //!   values cannot be diffed — the plan says `put (cannot diff)` instead of
@@ -250,15 +254,17 @@ struct ApplyContext {
 
 // --- entry point ----------------------------------------------------------------
 
-/// `gtc op env apply --answers <manifest.json> [--dry-run] [--updated-by <who>] [--yes]`.
+/// `gtc op env apply --answers <manifest.json> [--dry-run | --check]
+/// [--updated-by <who>] [--yes]`.
 pub fn apply(
     store: &LocalFsStore,
     flags: &OpFlags,
     dry_run: bool,
+    check: bool,
     updated_by: Option<String>,
     yes: bool,
 ) -> Result<OpOutcome, OpError> {
-    apply_with_env_lookup(store, flags, dry_run, updated_by, yes, &|name| {
+    apply_with_env_lookup(store, flags, dry_run, check, updated_by, yes, &|name| {
         std::env::var(name).ok()
     })
 }
@@ -270,6 +276,7 @@ fn apply_with_env_lookup(
     store: &LocalFsStore,
     flags: &OpFlags,
     dry_run: bool,
+    check: bool,
     updated_by: Option<String>,
     yes: bool,
     env_lookup: &dyn Fn(&str) -> Option<String>,
@@ -307,6 +314,31 @@ fn apply_with_env_lookup(
             VERB,
             report_json(&ctx, &steps, "dry-run", None),
         ));
+    }
+    if check {
+        // Always-put secret steps (`ApplyAction::Put`) are excluded from the
+        // convergence verdict: values cannot be diffed until A9 lands a real
+        // `secrets get`, so a `put` step is "unknowable", not evidence of
+        // drift — counting it would make `--check` permanently red for any
+        // manifest with a `secrets[]` section. The report carries the count
+        // under `undiffable` (and every secret row still says `put`), so the
+        // output never claims more convergence than it can prove.
+        let undiffable = steps
+            .iter()
+            .filter(|s| s.action == ApplyAction::Put)
+            .count();
+        let diffable_pending = pending - undiffable;
+        if diffable_pending > 0 {
+            return Err(OpError::Conflict(format!(
+                "env `{}` is not converged: {diffable_pending} pending change(s) — \
+                 run `gtc op env apply --answers <manifest>` to reconcile (see the \
+                 plan above for the step list)",
+                ctx.env_id.as_str()
+            )));
+        }
+        let mut report = report_json(&ctx, &steps, "check", None);
+        report["undiffable"] = json!(undiffable);
+        return Ok(OpOutcome::new(NOUN, VERB, report));
     }
     if pending > 0 && !yes && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         eprint!(
@@ -1531,7 +1563,7 @@ mod tests {
             schema_only: false,
             answers: Some(manifest_path.to_path_buf()),
         };
-        apply(store, &flags, false, None, false)
+        apply(store, &flags, false, false, None, false)
     }
 
     fn run_dry(store: &LocalFsStore, manifest_path: &Path) -> Result<OpOutcome, OpError> {
@@ -1539,7 +1571,15 @@ mod tests {
             schema_only: false,
             answers: Some(manifest_path.to_path_buf()),
         };
-        apply(store, &flags, true, None, false)
+        apply(store, &flags, true, false, None, false)
+    }
+
+    fn run_check(store: &LocalFsStore, manifest_path: &Path) -> Result<OpOutcome, OpError> {
+        let flags = OpFlags {
+            schema_only: false,
+            answers: Some(manifest_path.to_path_buf()),
+        };
+        apply(store, &flags, false, true, None, false)
     }
 
     fn load_local(store: &LocalFsStore) -> Environment {
@@ -1662,6 +1702,43 @@ mod tests {
         assert!(
             env.messaging_endpoints.is_empty(),
             "dry-run must not add endpoints"
+        );
+    }
+
+    // --- §9 follow-up: --check (CI convergence gate) ----------------------------
+
+    #[test]
+    fn check_fails_on_pending_diff_and_mutates_nothing() {
+        let (dir, store) = seeded_store();
+        let manifest_path = write_manifest(dir.path(), &full_manifest(&fixture()));
+
+        let err = run_check(&store, &manifest_path).unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("not converged"), "{msg}");
+        assert!(msg.contains("4 pending change(s)"), "{msg}");
+
+        let env = load_local(&store);
+        assert!(env.bundles.is_empty(), "--check must not deploy");
+        assert!(
+            env.messaging_endpoints.is_empty(),
+            "--check must not add endpoints"
+        );
+    }
+
+    #[test]
+    fn check_passes_on_converged_env() {
+        let (dir, store) = seeded_store();
+        let manifest_path = write_manifest(dir.path(), &full_manifest(&fixture()));
+        run_apply(&store, &manifest_path).expect("apply succeeds");
+
+        let outcome = run_check(&store, &manifest_path).expect("check passes on converged env");
+        assert_eq!(outcome.result["mode"], "check");
+        assert_eq!(outcome.result["changed"], 0, "result: {}", outcome.result);
+        assert_eq!(outcome.result["undiffable"], 0);
+        assert!(
+            outcome.result.get("verify").is_none(),
+            "check must not verify (nothing executed)"
         );
     }
 
@@ -2144,7 +2221,19 @@ mod tests {
             schema_only: false,
             answers: Some(manifest_path.to_path_buf()),
         };
-        apply_with_env_lookup(store, &flags, dry_run, None, false, lookup)
+        apply_with_env_lookup(store, &flags, dry_run, false, None, false, lookup)
+    }
+
+    fn run_check_with_lookup(
+        store: &LocalFsStore,
+        manifest_path: &Path,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<OpOutcome, OpError> {
+        let flags = OpFlags {
+            schema_only: false,
+            answers: Some(manifest_path.to_path_buf()),
+        };
+        apply_with_env_lookup(store, &flags, false, true, None, false, lookup)
     }
 
     use crate::cli::tests_common::dev_store_read;
@@ -2308,6 +2397,45 @@ mod tests {
 
     // `SecretValue`'s redacting-Debug property is pinned by its owning
     // module's test (`runtime_secrets::tests::secret_value_debug_is_redacted`).
+
+    #[test]
+    fn check_excludes_undiffable_secret_puts_but_counts_real_drift() {
+        let (dir, store) = seeded_store_with_dev_secrets();
+        let lookup =
+            |name: &str| (name == "APPLY_LEGAL_BOT_TOKEN").then(|| "tok-secret-9000".to_string());
+
+        // Converged env + a manifest whose only non-no-op row is the
+        // always-put secret: excluded from the verdict — check passes,
+        // reports the row as undiffable, and writes nothing.
+        let manifest_path = write_manifest(dir.path(), &secrets_manifest("APPLY_LEGAL_BOT_TOKEN"));
+        let outcome = run_check_with_lookup(&store, &manifest_path, &lookup).expect("check passes");
+        assert_eq!(outcome.result["mode"], "check");
+        assert_eq!(outcome.result["undiffable"], 1, "{}", outcome.result);
+        assert_eq!(
+            outcome.result["changed"], 1,
+            "the put row stays visible in the report: {}",
+            outcome.result
+        );
+        assert!(
+            !dir.path()
+                .join("local")
+                .join(super::super::secrets::DEV_STORE_RELATIVE)
+                .exists(),
+            "--check must not write the dev store"
+        );
+
+        // Mixed manifest: a pending bundle deploy is real drift — check
+        // fails, and the count excludes the undiffable put row.
+        let mut mixed = full_manifest(&fixture());
+        mixed["secrets"] = json!([{"path": SECRET_PATH, "from_env": "APPLY_LEGAL_BOT_TOKEN"}]);
+        let mixed_path = write_manifest(dir.path(), &mixed);
+        let err = run_check_with_lookup(&store, &mixed_path, &lookup).unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("4 pending change(s)"),
+            "put row must not count toward drift: {err}"
+        );
+    }
 
     // --- Adversarial-review fix 1: pre-mutation artifact re-hash gate ---
 
