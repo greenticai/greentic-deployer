@@ -1,5 +1,5 @@
 //! `gtc op env apply` — declarative, upsert-only environment apply
-//! (PR-1 of `plans/env-manifest-apply.md`).
+//! (PR-1 + PR-2 of `plans/env-manifest-apply.md`).
 //!
 //! Consumes a `greentic.env-manifest.v1` document (via the standard
 //! `--answers <PATH>` payload convention) and reconciles the environment
@@ -26,11 +26,18 @@
 //!   the reader, routes served) is `gtc doctor`'s job — apply must work
 //!   without a running runtime.
 //!
+//! - Secrets are always-put: `op secrets get` is not-yet-implemented, so
+//!   values cannot be diffed — the plan says `put (cannot diff)` instead of
+//!   ever claiming a false no-op. Values resolve from `from_env` process
+//!   variables at validation time and never appear in the manifest, plan,
+//!   report, or audit records.
+//!
 //! Every mutation is executed through the existing single-purpose verb
 //! functions (`deploy::deploy`, `bundles::update`, `messaging::add`/…,
-//! `trust_root::bootstrap`, `env::init`/`set_public_url`), so audit,
-//! authorization, signing, and revenue-policy logic stay single-sourced —
-//! each step lands its own audit event under the composed verb's noun.
+//! `secrets::put`, `trust_root::bootstrap`, `env::init`/`set_public_url`),
+//! so audit, authorization, signing, and revenue-policy logic stay
+//! single-sourced — each step lands its own audit event under the composed
+//! verb's noun.
 //!
 //! Human-readable plan/progress lines go to **stderr**; stdout carries only
 //! the standard `{op, noun, result}` JSON envelope (so the output is
@@ -58,6 +65,7 @@ use super::env_manifest::{
 use super::messaging::{
     EndpointAddPayload, EndpointLinkBundlePayload, EndpointSetWelcomeFlowPayload, EndpointSummary,
 };
+use super::secrets::SecretsPutPayload;
 use super::trust_root::TrustRootBootstrapPayload;
 use super::{OpError, OpFlags, OpOutcome};
 
@@ -70,13 +78,16 @@ const DEFAULT_UPDATED_BY: &str = "env-apply";
 
 // --- plan model ---------------------------------------------------------------
 
-/// What the diff decided for one step. `Put` (secrets, cannot-diff) arrives
-/// with PR-2; warning-carrying no-ops surface through the plan's `warnings`
-/// list instead of a dedicated `Skip` action.
+/// What the diff decided for one step. `Put` is the secrets-only
+/// "cannot diff, write unconditionally" action (`op secrets get` is
+/// not-yet-implemented for every backend, so a no-op can never be claimed);
+/// warning-carrying no-ops surface through the plan's `warnings` list
+/// instead of a dedicated `Skip` action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplyAction {
     Create,
     Update,
+    Put,
     NoOp,
 }
 
@@ -85,6 +96,7 @@ impl ApplyAction {
         match self {
             ApplyAction::Create => "create",
             ApplyAction::Update => "update",
+            ApplyAction::Put => "put",
             ApplyAction::NoOp => "no-op",
         }
     }
@@ -94,6 +106,7 @@ impl ApplyAction {
 enum ApplyStepKind {
     EnsureEnvironment,
     BootstrapTrustRoot,
+    PutSecret,
     DeployBundle,
     UpdateBundle,
     AddEndpoint,
@@ -106,6 +119,7 @@ impl ApplyStepKind {
         match self {
             ApplyStepKind::EnsureEnvironment => "ensure-environment",
             ApplyStepKind::BootstrapTrustRoot => "bootstrap-trust-root",
+            ApplyStepKind::PutSecret => "put-secret",
             ApplyStepKind::DeployBundle => "deploy-bundle",
             ApplyStepKind::UpdateBundle => "update-bundle",
             ApplyStepKind::AddEndpoint => "add-endpoint",
@@ -134,6 +148,12 @@ enum StepOp {
         url: String,
     },
     TrustRootBootstrap,
+    /// The resolved VALUE deliberately does not live in the step (steps
+    /// derive `Debug` and serialize into the plan/report) — execute looks it
+    /// up in [`ApplyContext::secret_values`] by this path.
+    PutSecret {
+        path: String,
+    },
     Deploy {
         payload: Box<BundleDeployPayload>,
         /// Digest recorded at plan time; re-verified just before the deploy
@@ -205,10 +225,25 @@ struct ResolvedEndpoint {
     matched: Option<MessagingEndpoint>,
 }
 
+/// A secret value resolved from the process environment at validation time.
+/// `Debug` renders a fixed placeholder so no derived-`Debug` surface can
+/// ever echo the material; the value reaches exactly one place — the
+/// `secrets::put` payload at execute time.
+struct SecretValue(String);
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 /// Everything validation established, handed to diff/execute/verify.
 struct ApplyContext {
     env_id: EnvId,
     manifest: EnvManifest,
+    /// Secret values keyed by the manifest's verbatim `path`, resolved from
+    /// `from_env` during validation. Never serialized; see [`SecretValue`].
+    secret_values: BTreeMap<String, SecretValue>,
     bundles: Vec<ResolvedBundle>,
     endpoints: Vec<ResolvedEndpoint>,
     env: Option<Environment>,
@@ -227,6 +262,22 @@ pub fn apply(
     dry_run: bool,
     updated_by: Option<String>,
     yes: bool,
+) -> Result<OpOutcome, OpError> {
+    apply_with_env_lookup(store, flags, dry_run, updated_by, yes, &|name| {
+        std::env::var(name).ok()
+    })
+}
+
+/// [`apply`] with the `from_env` secret-value lookup injected. Tests pass a
+/// fake lookup so they never mutate the process environment (`set_var` is
+/// unsafe under a multithreaded test harness).
+fn apply_with_env_lookup(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    dry_run: bool,
+    updated_by: Option<String>,
+    yes: bool,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(NOUN, VERB, manifest_schema()));
@@ -247,7 +298,7 @@ pub fn apply(
         .to_path_buf();
     let updated_by = updated_by.unwrap_or_else(|| DEFAULT_UPDATED_BY.to_string());
 
-    let ctx = resolve_and_validate(store, manifest, &manifest_dir, updated_by)?;
+    let ctx = resolve_and_validate(store, manifest, &manifest_dir, updated_by, env_lookup)?;
     let steps = diff(store, &ctx)?;
     render_plan(&steps, &ctx.warnings);
 
@@ -298,6 +349,7 @@ fn resolve_and_validate(
     manifest: EnvManifest,
     manifest_dir: &Path,
     updated_by: String,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ApplyContext, OpError> {
     let env_id = EnvId::try_from(manifest.environment.id.as_str())
         .map_err(|e| OpError::InvalidArgument(format!("environment.id: {e}")))?;
@@ -315,6 +367,42 @@ fn resolve_and_validate(
         }
         None
     };
+
+    // Secrets: resolve every `from_env` (set + non-empty) and pre-check the
+    // bound secrets backend, all before any mutation — a missing variable or
+    // a non-dev-store backend must fail the whole apply at validation time,
+    // not mid-run. Values land ONLY in `secret_values` (never in steps,
+    // plan, report, or audit targets). Path canonicality was already
+    // checked by `validate_shape`.
+    let mut secret_values = BTreeMap::new();
+    if !manifest.secrets.is_empty() {
+        // A fresh env is exempt: the `env init` step creates the default
+        // dev-store binding before any put-secret step runs.
+        if let Some(env) = &env {
+            let secrets_pack = super::secrets::require_secrets_pack(env, &env_id)?;
+            if secrets_pack.kind.path() != super::secrets::DEV_STORE_KIND_PATH {
+                return Err(OpError::NotYetImplemented(format!(
+                    "manifest secrets[] write through the dev-store only; env `{env_id}` \
+                     binds `{}` — backend dispatch beyond the dev-store lands in A9 \
+                     (env-pack registry)",
+                    secrets_pack.kind
+                )));
+            }
+        }
+        for s in &manifest.secrets {
+            let value = env_lookup(&s.from_env)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    OpError::InvalidArgument(format!(
+                        "secret `{}`: environment variable `{}` is not set (or empty) — \
+                         secret values never appear in the manifest, so the variable must \
+                         be exported before running apply",
+                        s.path, s.from_env
+                    ))
+                })?;
+            secret_values.insert(s.path.clone(), SecretValue(value));
+        }
+    }
 
     // Bundle artifacts: existence + digest, plus the B10 billing-principal
     // rule, all before any mutation.
@@ -456,6 +544,7 @@ fn resolve_and_validate(
     Ok(ApplyContext {
         env_id,
         manifest,
+        secret_values,
         bundles: resolved_bundles,
         endpoints: resolved_endpoints,
         env,
@@ -549,7 +638,38 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
         steps.push(trust_root_step(store, ctx)?);
     }
 
-    // 3. Bundles (keyed on `(bundle_id, customer_id)` — the same natural key
+    // 3. Secrets — always-put: `op secrets get` is not-yet-implemented for
+    //    every backend, so values cannot be diffed. The plan says so
+    //    explicitly rather than ever claiming a false no-op; when A9 lands a
+    //    real `get`, this tightens to write-if-changed with no schema
+    //    change. Secrets land before bundles so a just-deployed revision
+    //    never serves a request that resolves a missing secret.
+    for s in &ctx.manifest.secrets {
+        // The desired-state hash covers only manifest-visible state (the
+        // env-var NAME, deliberately not the value): the derived key lands
+        // in audit records, and value-derived material there would be
+        // offline-brute-forceable for low-entropy secrets. Nothing dedupes
+        // secret puts on this key today (the dev-store put is
+        // always-write), so value-insensitivity loses nothing.
+        let ikey = derive_idempotency_key(
+            &ctx.env_id,
+            ApplyStepKind::PutSecret.label(),
+            &s.path,
+            &hash_json(&json!({"from_env": s.from_env})),
+        );
+        steps.push(ApplyStep {
+            kind: ApplyStepKind::PutSecret,
+            key: s.path.clone(),
+            action: ApplyAction::Put,
+            detail: format!("from ${} (cannot diff until A9)", s.from_env),
+            idempotency_key: Some(ikey),
+            op: StepOp::PutSecret {
+                path: s.path.clone(),
+            },
+        });
+    }
+
+    // 4. Bundles (keyed on `(bundle_id, customer_id)` — the same natural key
     //    that `op deploy` uses).
     for rb in &ctx.bundles {
         let existing = ctx.env.as_ref().and_then(|e| {
@@ -688,7 +808,7 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
         }
     }
 
-    // 4. Endpoints (add → link → welcome-flow, per endpoint in manifest order).
+    // 5. Endpoints (add → link → welcome-flow, per endpoint in manifest order).
     //    Reuses the match computed during validation (Fix 6); verify() re-matches
     //    the freshly reloaded env on purpose.
     for re in &ctx.endpoints {
@@ -907,6 +1027,23 @@ fn execute(store: &LocalFsStore, ctx: &ApplyContext, steps: &[ApplyStep]) -> Res
                 }),
             )
             .map(|_| ()),
+            StepOp::PutSecret { path } => {
+                let value = ctx
+                    .secret_values
+                    .get(path)
+                    .expect("validated: every put-secret step has a resolved value");
+                super::secrets::put(
+                    store,
+                    &exec_flags,
+                    Some(SecretsPutPayload {
+                        environment_id: ctx.env_id.as_str().to_string(),
+                        path: path.clone(),
+                        value: value.0.clone(),
+                        idempotency_key: step.idempotency_key.clone(),
+                    }),
+                )
+                .map(|_| ())
+            }
             StepOp::Deploy {
                 payload,
                 expected_digest,
@@ -1006,7 +1143,10 @@ fn resolve_endpoint_id(
 
 /// Store-level post-conditions: re-read the environment and assert the
 /// manifest's desired state is visible. Runtime readiness is the doctor's
-/// job (PR-3), not apply's.
+/// job (PR-3), not apply's. Secrets are deliberately NOT verified: there is
+/// no `get` until A9, and reader-side resolvability is exactly the doctor's
+/// check — `put`'s own write-through already failed the step if the store
+/// rejected it.
 fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
     let env = store.load(&ctx.env_id)?;
     let mut failures: Vec<String> = Vec::new();
@@ -1356,10 +1496,10 @@ mod tests {
     // --- LocalFsStore integration ---------------------------------------------
 
     use crate::cli::tests_common::{
-        bootstrap_env_trust_root, make_bundle_deployment, make_env, make_revision,
+        bootstrap_env_trust_root, make_binding, make_bundle_deployment, make_env, make_revision,
         make_traffic_split,
     };
-    use greentic_deploy_spec::RevisionLifecycle;
+    use greentic_deploy_spec::{CapabilitySlot, RevisionLifecycle};
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -1974,6 +2114,199 @@ mod tests {
             "deploy-bundle (idx {deploy_idx}) must precede update-bundle (idx {update_idx}): \
              {steps:?}"
         );
+    }
+
+    // --- PR-2: secrets[] -------------------------------------------------------
+
+    /// [`seeded_store`] plus the default dev-store secrets binding `env init`
+    /// would create (`make_env` binds no env-packs).
+    fn seeded_store_with_dev_secrets() -> (tempfile::TempDir, LocalFsStore) {
+        let (dir, store) = seeded_store();
+        let mut env = load_local(&store);
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            "greentic.secrets.dev-store@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        (dir, store)
+    }
+
+    fn run_apply_with_lookup(
+        store: &LocalFsStore,
+        manifest_path: &Path,
+        dry_run: bool,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<OpOutcome, OpError> {
+        let flags = OpFlags {
+            schema_only: false,
+            answers: Some(manifest_path.to_path_buf()),
+        };
+        apply_with_env_lookup(store, &flags, dry_run, None, false, lookup)
+    }
+
+    /// Read one value back from the dev store, mirroring the runtime
+    /// reader's access path.
+    fn dev_store_read(path: &Path, uri: &str) -> Vec<u8> {
+        use greentic_secrets_lib::{DevStore, SecretsStore};
+        let dev = DevStore::with_path(path.to_path_buf()).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { dev.get(uri).await.unwrap() })
+    }
+
+    const SECRET_PATH: &str = "legal/_/messaging-telegram/telegram_bot_token";
+
+    fn secrets_manifest(var: &str) -> Value {
+        json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "secrets": [{"path": SECRET_PATH, "from_env": var}]
+        })
+    }
+
+    #[test]
+    fn secrets_e2e_put_writes_value_and_redacts() {
+        let (dir, store) = seeded_store_with_dev_secrets();
+        let manifest_path = write_manifest(dir.path(), &secrets_manifest("APPLY_LEGAL_BOT_TOKEN"));
+        let lookup =
+            |name: &str| (name == "APPLY_LEGAL_BOT_TOKEN").then(|| "tok-secret-9000".to_string());
+
+        let outcome =
+            run_apply_with_lookup(&store, &manifest_path, false, &lookup).expect("apply succeeds");
+
+        // The report names the env VAR and says `put` — never the value.
+        let envelope = serde_json::to_string(&outcome).unwrap();
+        assert!(
+            !envelope.contains("tok-secret-9000"),
+            "envelope must not leak the value: {envelope}"
+        );
+        assert!(envelope.contains("APPLY_LEGAL_BOT_TOKEN"), "{envelope}");
+        let actions = step_actions(&outcome.result);
+        assert!(
+            actions.contains(&("put-secret".to_string(), "put".to_string())),
+            "{actions:?}"
+        );
+
+        // Written through to the dev store the runtime reader resolves.
+        let store_path = dir
+            .path()
+            .join("local")
+            .join(super::super::secrets::DEV_STORE_RELATIVE);
+        let bytes = dev_store_read(&store_path, &format!("secrets://local/{SECRET_PATH}"));
+        assert_eq!(bytes, b"tok-secret-9000".to_vec());
+
+        // The audit event carries the deterministic derived key and no value.
+        let audit = std::fs::read_to_string(dir.path().join("local/audit/events.jsonl")).unwrap();
+        assert!(
+            !audit.contains("tok-secret-9000"),
+            "audit log must not leak the value"
+        );
+        let expected_ikey = derive_idempotency_key(
+            &EnvId::try_from("local").unwrap(),
+            ApplyStepKind::PutSecret.label(),
+            SECRET_PATH,
+            &hash_json(&json!({"from_env": "APPLY_LEGAL_BOT_TOKEN"})),
+        );
+        assert!(audit.contains(&expected_ikey), "audit: {audit}");
+
+        // Always-put: a re-apply is NOT a no-op for the secret (cannot diff).
+        let second =
+            run_apply_with_lookup(&store, &manifest_path, false, &lookup).expect("re-apply");
+        assert_eq!(second.result["changed"], 1, "{}", second.result);
+    }
+
+    #[test]
+    fn missing_or_empty_secret_env_var_fails_validation() {
+        let (dir, store) = seeded_store_with_dev_secrets();
+        let manifest_path = write_manifest(dir.path(), &secrets_manifest("APPLY_MISSING_VAR"));
+        for value in [None, Some(String::new())] {
+            let lookup = |_: &str| value.clone();
+            let err = run_apply_with_lookup(&store, &manifest_path, false, &lookup).unwrap_err();
+            match err {
+                OpError::InvalidArgument(msg) => {
+                    assert!(msg.contains("APPLY_MISSING_VAR"), "got: {msg}")
+                }
+                other => panic!("expected InvalidArgument, got {other:?}"),
+            }
+        }
+        // Failed at validation: nothing executed, nothing written.
+        assert!(
+            !dir.path()
+                .join("local")
+                .join(super::super::secrets::DEV_STORE_RELATIVE)
+                .exists()
+        );
+        assert!(!dir.path().join("local/audit/events.jsonl").exists());
+    }
+
+    #[test]
+    fn non_dev_store_backend_fails_at_validation() {
+        let (dir, store) = seeded_store();
+        let manifest_path = write_manifest(dir.path(), &secrets_manifest("APPLY_VAR"));
+        let lookup = |_: &str| Some("v".to_string());
+
+        // Existing env with NO secrets pack bound → the shared precondition
+        // fires at validation time.
+        let err = run_apply_with_lookup(&store, &manifest_path, false, &lookup).unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+
+        // Non-dev-store backend → not-yet-implemented at validation time.
+        let mut env = load_local(&store);
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            "greentic.secrets.aws-sm@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let err = run_apply_with_lookup(&store, &manifest_path, false, &lookup).unwrap_err();
+        assert!(matches!(err, OpError::NotYetImplemented(_)), "got {err:?}");
+
+        // Both failures pre-date execution: no audit events were appended.
+        assert!(!dir.path().join("local/audit/events.jsonl").exists());
+    }
+
+    #[test]
+    fn secrets_plan_orders_before_bundles_and_dry_run_writes_nothing() {
+        let (dir, store) = seeded_store_with_dev_secrets();
+        let mut manifest = full_manifest(&fixture());
+        manifest["secrets"] = json!([{"path": SECRET_PATH, "from_env": "APPLY_ORDER_TOKEN"}]);
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let lookup = |_: &str| Some("tok-order".to_string());
+
+        let plan = run_apply_with_lookup(&store, &manifest_path, true, &lookup).expect("dry-run");
+        let steps = plan.result["steps"].as_array().expect("steps");
+        let pos = |kind: &str| {
+            steps
+                .iter()
+                .position(|s| s["kind"] == kind)
+                .unwrap_or_else(|| panic!("no `{kind}` step in {steps:?}"))
+        };
+        assert!(pos("ensure-environment") < pos("put-secret"));
+        assert!(
+            pos("put-secret") < pos("deploy-bundle"),
+            "secrets must land before bundles so a fresh revision never \
+             resolves a missing secret"
+        );
+
+        // Dry-run resolved the value but wrote nothing.
+        assert!(
+            !dir.path()
+                .join("local")
+                .join(super::super::secrets::DEV_STORE_RELATIVE)
+                .exists(),
+            "dry-run must not write the dev store"
+        );
+    }
+
+    #[test]
+    fn secret_value_debug_is_redacted() {
+        let v = SecretValue("tok-secret".to_string());
+        assert_eq!(format!("{v:?}"), "<redacted>");
+        // The containment surface that matters: a derived-Debug render of the
+        // map ApplyContext holds.
+        let map = BTreeMap::from([("p".to_string(), v)]);
+        assert!(!format!("{map:?}").contains("tok-secret"));
     }
 
     // --- Fix 8: welcome-flow reachability lives in env-side validation only ---

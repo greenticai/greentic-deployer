@@ -2,7 +2,7 @@
 //! consumed by `gtc op env apply` (PR-1 of `plans/env-manifest-apply.md`).
 //!
 //! The manifest declares the desired *wiring* of one environment: env
-//! identity, trust root, secrets (PR-2), bundle deployments with route
+//! identity, trust root, secrets, bundle deployments with route
 //! bindings, and messaging endpoints with their bundle links. It is a
 //! durable document keyed by resource natural keys, designed to live in
 //! version control and be re-applied — NOT a recorded wizard-answers file
@@ -38,8 +38,8 @@ pub struct EnvManifest {
     /// (idempotent). Absent = skip the step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_root: Option<TrustRootDirective>,
-    /// Dev-store secret entries. Parsed in PR-1 so the schema is stable, but
-    /// rejected at validation until PR-2 wires the `secrets[]` execution.
+    /// Dev-store secret entries — always-put (`op secrets get` is
+    /// not-yet-implemented, so values cannot be diffed until A9).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<ManifestSecret>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -146,12 +146,26 @@ impl EnvManifest {
                 "environment.id must not be empty".to_string(),
             ));
         }
-        if !self.secrets.is_empty() {
-            return Err(OpError::NotYetImplemented(
-                "manifest `secrets[]` lands in PR-2 of plans/env-manifest-apply.md; \
-                 seed secrets with `greentic-secrets apply` or `gtc op secrets put` for now"
-                    .to_string(),
-            ));
+        // Secrets: path shape + canonicality via the same checks
+        // `secrets.rs::put` applies (shared helper — the two surfaces cannot
+        // drift), so a bad path fails the whole apply here instead of
+        // mid-run. `from_env` *resolution* (var set + non-empty) needs
+        // process context and lives in `env_apply`'s validation.
+        let mut secret_paths = BTreeSet::new();
+        for s in &self.secrets {
+            let rel_path = s.path.trim_start_matches('/');
+            super::secrets::validate_dev_store_secret_path(rel_path)?;
+            if !secret_paths.insert(rel_path) {
+                return Err(OpError::InvalidArgument(format!(
+                    "duplicate secret path `{rel_path}` in manifest secrets[] \
+                     (order-dependent last-write-wins is never what you want)"
+                )));
+            }
+            if s.from_env.trim().is_empty() {
+                return Err(OpError::InvalidArgument(format!(
+                    "secret `{rel_path}`: from_env must name an environment variable"
+                )));
+            }
         }
 
         let mut bundle_ids = BTreeSet::new();
@@ -238,7 +252,7 @@ pub fn manifest_schema() -> Value {
             "trust_root": {"enum": ["bootstrap", null], "description": "`bootstrap` seeds the operator key (idempotent)"},
             "secrets": {
                 "type": "array",
-                "description": "PR-2 — rejected with not-yet-implemented in PR-1",
+                "description": "dev-store secret entries; always-put (values cannot be diffed until A9)",
                 "items": {
                     "type": "object",
                     "required": ["path", "from_env"],
@@ -335,15 +349,69 @@ mod tests {
     }
 
     #[test]
-    fn secrets_rejected_until_pr2() {
+    fn valid_secrets_pass_shape_validation() {
         let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
             "schema": ENV_MANIFEST_SCHEMA_V1,
             "environment": {"id": "local"},
-            "secrets": [{"path": "legal/_/p/n", "from_env": "X"}]
+            "secrets": [
+                {"path": "legal/_/messaging-telegram/telegram_bot_token", "from_env": "A"},
+                {"path": "accounting/_/messaging-telegram/telegram_bot_token", "from_env": "B"}
+            ]
+        }))
+        .unwrap();
+        manifest.validate_shape().expect("valid");
+    }
+
+    #[test]
+    fn non_canonical_secret_path_rejected_at_shape() {
+        // Same checks as `op secrets put` (shared helper): wrong depth,
+        // non-canonical team, non-canonical name.
+        for path in [
+            "credentials/aws",
+            "legal/default/messaging-telegram/telegram_bot_token",
+            "legal/_/messaging-telegram/BOT-TOKEN",
+        ] {
+            let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+                "schema": ENV_MANIFEST_SCHEMA_V1,
+                "environment": {"id": "local"},
+                "secrets": [{"path": path, "from_env": "X"}]
+            }))
+            .unwrap();
+            let err = manifest.validate_shape().unwrap_err();
+            assert!(
+                matches!(err, OpError::InvalidArgument(_)),
+                "path `{path}` got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_secret_path_rejected() {
+        // The dup check runs on the trimmed path, so a leading `/` cannot
+        // smuggle in a duplicate.
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "secrets": [
+                {"path": "legal/_/p/tok", "from_env": "A"},
+                {"path": "/legal/_/p/tok", "from_env": "B"}
+            ]
         }))
         .unwrap();
         let err = manifest.validate_shape().unwrap_err();
-        assert!(matches!(err, OpError::NotYetImplemented(_)), "{err}");
+        assert!(err.to_string().contains("duplicate secret path"), "{err}");
+    }
+
+    #[test]
+    fn empty_from_env_rejected() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "secrets": [{"path": "legal/_/p/tok", "from_env": "  "}]
+        }))
+        .unwrap();
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("from_env"), "{err}");
     }
 
     #[test]
@@ -439,11 +507,21 @@ mod tests {
 
     #[test]
     fn two_dept_worked_example_parses() {
-        // The §3 worked example from the design doc, minus secrets (PR-2).
+        // The full §3 worked example from the design doc.
         let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
             "schema": ENV_MANIFEST_SCHEMA_V1,
             "environment": {"id": "local", "public_base_url": null},
             "trust_root": "bootstrap",
+            "secrets": [
+                {
+                    "path": "legal/_/messaging-telegram/telegram_bot_token",
+                    "from_env": "TELEGRAM_LEGAL_BOT_TOKEN"
+                },
+                {
+                    "path": "accounting/_/messaging-telegram/telegram_bot_token",
+                    "from_env": "TELEGRAM_ACCOUNTING_BOT_TOKEN"
+                }
+            ],
             "bundles": [
                 {
                     "bundle_id": "realbot-legal",
@@ -479,6 +557,7 @@ mod tests {
         }))
         .unwrap();
         manifest.validate_shape().expect("worked example is valid");
+        assert_eq!(manifest.secrets.len(), 2);
         assert_eq!(manifest.bundles.len(), 2);
         assert_eq!(manifest.messaging_endpoints.len(), 2);
     }
