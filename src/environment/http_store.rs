@@ -168,7 +168,20 @@ pub enum ConstructionError {
 pub struct HttpEnvironmentStore {
     client: Client,
     base_url: Url,
-    auth: AuthMethod,
+    /// Pre-rendered `Authorization: Bearer <token>` value, built once at
+    /// construction. `None` when [`AuthMethod::None`].
+    auth_header_value: Option<String>,
+}
+
+/// Ensure `base_url`'s path ends with `/` so [`Url::join`] treats relative
+/// paths as siblings of the base, not replacements of the last segment.
+/// Idempotent — called once at construction.
+fn normalize_base_url(mut base_url: Url) -> Url {
+    if !base_url.path().ends_with('/') {
+        let normalized = format!("{}/", base_url.path());
+        base_url.set_path(&normalized);
+    }
+    base_url
 }
 
 /// Whether `url` points at a loopback address (`127.0.0.0/8`, `::1`, or
@@ -211,12 +224,7 @@ impl HttpEnvironmentStore {
     /// [`AuthMethod::Bearer`] and `base_url` is `http://` to a non-loopback
     /// host.
     pub fn new(base_url: Url, auth: AuthMethod) -> Result<Self, ConstructionError> {
-        validate_transport(&base_url, &auth)?;
-        Ok(Self {
-            client: Client::new(),
-            base_url,
-            auth,
-        })
+        Self::with_client(Client::new(), base_url, auth)
     }
 
     /// Build with a caller-supplied client (custom timeouts, TLS config, etc.).
@@ -230,10 +238,14 @@ impl HttpEnvironmentStore {
         auth: AuthMethod,
     ) -> Result<Self, ConstructionError> {
         validate_transport(&base_url, &auth)?;
+        let auth_header_value = match auth {
+            AuthMethod::Bearer(token) => Some(format!("Bearer {token}")),
+            AuthMethod::None => None,
+        };
         Ok(Self {
             client,
-            base_url,
-            auth,
+            base_url: normalize_base_url(base_url),
+            auth_header_value,
         })
     }
 
@@ -241,15 +253,24 @@ impl HttpEnvironmentStore {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Build a full URL by joining `path` onto `base_url`.
+    /// Build a full URL by joining `path` onto `base_url`. The base is
+    /// trailing-slash-normalized in the constructor so [`Url::join`] resolves
+    /// `path` relative to the API root, not by replacing the last segment.
     fn url(&self, path: &str) -> Result<Url, StoreError> {
-        // Ensure base URL ends with "/" so join works correctly.
-        let mut base = self.base_url.clone();
-        if !base.path().ends_with('/') {
-            base.set_path(&format!("{}/", base.path()));
-        }
-        base.join(path)
+        self.base_url
+            .join(path)
             .map_err(|e| StoreError::Conflict(format!("transport: invalid URL path `{path}`: {e}")))
+    }
+
+    /// Build the env-scoped request path: `environments/{env}{suffix}`. The
+    /// returned string is suitable for [`Self::send_mutation`] et al; pass
+    /// `""` for the env itself or `"/revisions"` (already-encoded) for
+    /// sub-resources. For multi-segment paths (e.g. `/revisions/{rid}/warm`),
+    /// callers still encode each dynamic segment themselves and inline the
+    /// `format!` — the helper is only a win for the env-only and
+    /// env+constant-suffix shapes.
+    fn env_path(&self, env_id: &EnvId, suffix: &str) -> String {
+        format!("environments/{}{suffix}", encode_segment(env_id.as_str()))
     }
 
     /// Send an HTTP request and parse the JSON response.
@@ -273,8 +294,8 @@ impl HttpEnvironmentStore {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json");
 
-        if let AuthMethod::Bearer(ref token) = self.auth {
-            builder = builder.header("Authorization", format!("Bearer {token}"));
+        if let Some(value) = &self.auth_header_value {
+            builder = builder.header("Authorization", value);
         }
         if let Some(key) = idempotency_key {
             builder = builder.header("Idempotency-Key", key);
@@ -361,11 +382,13 @@ struct MutationEnvelope<T> {
     audit: Option<AuditEvent>,
 }
 
-/// Mint a one-shot [`IdempotencyKey`] for methods whose trait signature does
-/// not carry one. Each call produces a unique ULID so retries by the caller
-/// are safe (the key changes on every invocation).
+/// Mint a one-shot idempotency key for methods whose trait signature does
+/// not carry one. Delegates to [`crate::cli::mint_idempotency_key`] so the
+/// ULID-generation strategy stays in one place. Returns the inner string for
+/// header-value use; each call produces a unique ULID so retries by the
+/// caller are safe.
 fn mint_idempotency_key() -> String {
-    ulid::Ulid::new().to_string()
+    crate::cli::mint_idempotency_key().as_str().to_string()
 }
 
 /// Map an error HTTP response to [`StoreError`].
@@ -559,14 +582,14 @@ struct RevisionTransitionResponse {
     starting_lifecycle: RevisionLifecycle,
 }
 
-#[derive(Serialize)]
-struct DrainRevisionRequest {
-    // Body intentionally minimal — the revision_id is in the URL path.
-}
-
-#[derive(Serialize)]
-struct ArchiveRevisionRequest {
-    // Body intentionally minimal — the revision_id is in the URL path.
+impl From<RevisionTransitionResponse> for RevisionTransitionOutcome {
+    fn from(resp: RevisionTransitionResponse) -> Self {
+        Self {
+            revision: resp.revision,
+            environment: resp.environment,
+            starting_lifecycle: resp.starting_lifecycle,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -676,14 +699,10 @@ struct AddMessagingEndpointRequest {
     updated_by: String,
 }
 
+/// Body for both `link-bundle` and `unlink-bundle` messaging-endpoint verbs.
+/// The two routes diverge by URL suffix only.
 #[derive(Serialize)]
-struct LinkMessagingBundleRequest {
-    bundle_id: BundleId,
-    updated_by: String,
-}
-
-#[derive(Serialize)]
-struct UnlinkMessagingBundleRequest {
+struct MessagingBundleLinkRequest {
     bundle_id: BundleId,
     updated_by: String,
 }
@@ -762,7 +781,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         let req: UpdateEnvironmentRequest = patch.into();
         self.send_mutation(
             reqwest::Method::PATCH,
-            &format!("environments/{}", encode_segment(env_id.as_str())),
+            &self.env_path(env_id, ""),
             Some(&idem_key),
             Some(&req),
         )
@@ -806,7 +825,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         };
         self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{}/revisions", encode_segment(env_id.as_str())),
+            &self.env_path(env_id, "/revisions"),
             Some(&idem_key),
             Some(&req),
         )
@@ -837,11 +856,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             Some(&idem_key),
             Some(&req),
         )?;
-        Ok(RevisionTransitionOutcome {
-            revision: resp.revision,
-            environment: resp.environment,
-            starting_lifecycle: resp.starting_lifecycle,
-        })
+        Ok(resp.into())
     }
 
     fn drain_revision(
@@ -851,8 +866,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<RevisionTransitionOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let req = DrainRevisionRequest {};
-        let resp: RevisionTransitionResponse = self.send_mutation(
+        let resp: RevisionTransitionResponse = self.send_mutation_no_body(
             reqwest::Method::POST,
             &format!(
                 "environments/{}/revisions/{}/drain",
@@ -860,13 +874,8 @@ impl EnvironmentMutations for HttpEnvironmentStore {
                 encode_segment(&revision_id.to_string()),
             ),
             Some(&idem_key),
-            Some(&req),
         )?;
-        Ok(RevisionTransitionOutcome {
-            revision: resp.revision,
-            environment: resp.environment,
-            starting_lifecycle: resp.starting_lifecycle,
-        })
+        Ok(resp.into())
     }
 
     fn archive_revision(
@@ -876,8 +885,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<RevisionTransitionOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let req = ArchiveRevisionRequest {};
-        let resp: RevisionTransitionResponse = self.send_mutation(
+        let resp: RevisionTransitionResponse = self.send_mutation_no_body(
             reqwest::Method::POST,
             &format!(
                 "environments/{}/revisions/{}/archive",
@@ -885,13 +893,8 @@ impl EnvironmentMutations for HttpEnvironmentStore {
                 encode_segment(&revision_id.to_string()),
             ),
             Some(&idem_key),
-            Some(&req),
         )?;
-        Ok(RevisionTransitionOutcome {
-            revision: resp.revision,
-            environment: resp.environment,
-            starting_lifecycle: resp.starting_lifecycle,
-        })
+        Ok(resp.into())
     }
 
     fn add_bundle(
@@ -910,7 +913,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         };
         self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{}/bundles", encode_segment(env_id.as_str())),
+            &self.env_path(env_id, "/bundles"),
             Some(&idem_key),
             Some(&req),
         )
@@ -974,7 +977,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         let req = PackBindingRequest { binding };
         self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{}/packs", encode_segment(env_id.as_str())),
+            &self.env_path(env_id, "/packs"),
             Some(&idem_key),
             Some(&req),
         )
@@ -1147,7 +1150,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         };
         let resp: ApplyTrafficSplitResponse = self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{}/traffic", encode_segment(env_id.as_str())),
+            &self.env_path(env_id, "/traffic"),
             Some(&idem_key),
             Some(&req),
         )?;
@@ -1197,7 +1200,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         };
         self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{}/messaging", encode_segment(env_id.as_str())),
+            &self.env_path(env_id, "/messaging"),
             Some(&idem_key),
             Some(&req),
         )
@@ -1212,7 +1215,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let req = LinkMessagingBundleRequest {
+        let req = MessagingBundleLinkRequest {
             bundle_id,
             updated_by,
         };
@@ -1237,7 +1240,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let req = UnlinkMessagingBundleRequest {
+        let req = MessagingBundleLinkRequest {
             bundle_id,
             updated_by,
         };
@@ -1493,6 +1496,16 @@ mod tests {
         HttpEnvironmentStore::new(Url::parse(&format!("http://{addr}")).unwrap(), auth).unwrap()
     }
 
+    /// One-shot helper for the common no-auth single-response test shape:
+    /// start a mock that returns `(status, body)` once and build a store
+    /// pointed at it. Callers must hold the returned `MockServer` alive
+    /// (binding it; dropping closes the listener mid-test).
+    fn happy_store(status: u16, body: &str) -> (MockServer, HttpEnvironmentStore) {
+        let mock = start_mock(vec![(status, body)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        (mock, store)
+    }
+
     /// Wrap a domain-type JSON value in the A8 `MutationEnvelope` shape.
     fn wrap_mutation(domain: serde_json::Value) -> String {
         serde_json::json!({
@@ -1547,8 +1560,7 @@ mod tests {
             "health": {}
         });
         let body = wrap_mutation(domain);
-        let mock = start_mock(vec![(201, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(201, &body);
         let result = store.create_environment(
             &env_id(),
             "test".to_string(),
@@ -1570,8 +1582,7 @@ mod tests {
             "kind": "idempotency-conflict",
             "reason": "environment already exists"
         });
-        let mock = start_mock(vec![(409, &err_body.to_string())], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(409, &err_body.to_string());
         let result = store.create_environment(
             &env_id(),
             "test".to_string(),
@@ -1604,8 +1615,7 @@ mod tests {
             "health": {}
         });
         let body = wrap_mutation(domain);
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.update_environment(
             &env_id(),
             UpdateEnvironmentPayload {
@@ -1620,8 +1630,7 @@ mod tests {
     #[test]
     fn update_environment_not_found() {
         let err_body = serde_json::json!({"kind": "not-found"});
-        let mock = start_mock(vec![(404, &err_body.to_string())], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(404, &err_body.to_string());
         let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
         assert!(matches!(result, Err(StoreError::NotFound(_))));
     }
@@ -1637,8 +1646,7 @@ mod tests {
             "merged_extensions": ["capability/memory/long-term"]
         });
         let body = wrap_mutation(domain);
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.migrate_merge_bindings(
             &env_id(),
             MigrateMergePayload {
@@ -1682,8 +1690,7 @@ mod tests {
     #[test]
     fn stage_revision_happy_path() {
         let body = sample_revision_response();
-        let mock = start_mock(vec![(201, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(201, &body);
         let result = store.stage_revision(
             &env_id(),
             StageRevisionPayload {
@@ -1709,8 +1716,7 @@ mod tests {
             "expected": "abc",
             "actual": "def"
         });
-        let mock = start_mock(vec![(422, &err_body.to_string())], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(422, &err_body.to_string());
         let result = store.stage_revision(
             &env_id(),
             StageRevisionPayload {
@@ -1772,8 +1778,7 @@ mod tests {
     #[test]
     fn warm_revision_happy_path() {
         let body = sample_transition_response("ready");
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.warm_revision(
             &env_id(),
             WarmRevisionPayload {
@@ -1792,8 +1797,7 @@ mod tests {
     #[test]
     fn drain_revision_happy_path() {
         let body = sample_transition_response("draining");
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.drain_revision(&env_id(), RevisionId::new(), idem());
         assert!(result.is_ok());
     }
@@ -1801,8 +1805,7 @@ mod tests {
     #[test]
     fn archive_revision_happy_path() {
         let body = sample_transition_response("archived");
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.archive_revision(&env_id(), RevisionId::new(), idem());
         assert!(result.is_ok());
     }
@@ -1836,8 +1839,7 @@ mod tests {
     #[test]
     fn add_bundle_happy_path() {
         let body = sample_bundle_deployment();
-        let mock = start_mock(vec![(201, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(201, &body);
         let result = store.add_bundle(
             &env_id(),
             AddBundlePayload {
@@ -1856,8 +1858,7 @@ mod tests {
     #[test]
     fn update_bundle_happy_path() {
         let body = sample_bundle_deployment();
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.update_bundle(
             &env_id(),
             UpdateBundlePayload {
@@ -1897,8 +1898,7 @@ mod tests {
             "pruned_revision_ids": []
         });
         let body = wrap_mutation(domain);
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.remove_bundle(&env_id(), DeploymentId::new(), idem());
         assert!(result.is_ok());
         assert!(result.unwrap().pruned_revision_ids.is_empty());
@@ -1933,8 +1933,7 @@ mod tests {
     #[test]
     fn add_pack_binding_happy_path() {
         let body = sample_pack_binding();
-        let mock = start_mock(vec![(201, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(201, &body);
         let binding: EnvPackBinding = serde_json::from_str(&sample_pack_binding_json()).unwrap();
         let result = store.add_pack_binding(&env_id(), binding, idem());
         assert!(result.is_ok());
@@ -1944,8 +1943,7 @@ mod tests {
     fn update_pack_binding_happy_path() {
         let binding_json = sample_pack_binding_json();
         let body = sample_binding_generation_response(&binding_json, 2);
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let binding: EnvPackBinding = serde_json::from_str(&binding_json).unwrap();
         let result =
             store.update_pack_binding(&env_id(), CapabilitySlot::Messaging, binding, idem());
@@ -1958,8 +1956,7 @@ mod tests {
     fn remove_pack_binding_happy_path() {
         let binding_json = sample_pack_binding_json();
         let body = sample_binding_generation_response(&binding_json, 3);
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.remove_pack_binding(&env_id(), CapabilitySlot::Messaging, idem());
         assert!(result.is_ok());
     }
@@ -1968,8 +1965,7 @@ mod tests {
     fn rollback_pack_binding_happy_path() {
         let binding_json = sample_pack_binding_json();
         let body = sample_binding_generation_response(&binding_json, 4);
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.rollback_pack_binding(&env_id(), CapabilitySlot::Messaging, idem());
         assert!(result.is_ok());
     }
@@ -1994,8 +1990,7 @@ mod tests {
     #[test]
     fn add_extension_binding_happy_path() {
         let body = sample_extension_binding();
-        let mock = start_mock(vec![(201, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(201, &body);
         let binding: ExtensionBinding =
             serde_json::from_str(&sample_extension_binding_json()).unwrap();
         let result = store.add_extension_binding(&env_id(), binding, idem());
@@ -2006,8 +2001,7 @@ mod tests {
     fn update_extension_binding_happy_path() {
         let ext_json = sample_extension_binding_json();
         let body = sample_binding_generation_response(&ext_json, 2);
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let binding: ExtensionBinding = serde_json::from_str(&ext_json).unwrap();
         let key = ExtensionKey::new("capability/memory/long-term", None);
         let result = store.update_extension_binding(&env_id(), key, binding, idem());
@@ -2020,8 +2014,7 @@ mod tests {
     fn remove_extension_binding_happy_path() {
         let ext_json = sample_extension_binding_json();
         let body = sample_binding_generation_response(&ext_json, 3);
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let key = ExtensionKey::new("capability/memory/long-term", None);
         let result = store.remove_extension_binding(&env_id(), key, idem());
         assert!(result.is_ok());
@@ -2031,8 +2024,7 @@ mod tests {
     fn rollback_extension_binding_happy_path() {
         let ext_json = sample_extension_binding_json();
         let body = sample_binding_generation_response(&ext_json, 4);
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let key = ExtensionKey::new("capability/memory/long-term", None);
         let result = store.rollback_extension_binding(&env_id(), key, idem());
         assert!(result.is_ok());
@@ -2065,8 +2057,7 @@ mod tests {
             "new_generation": 2
         });
         let body = wrap_mutation(domain);
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.set_traffic_split(
             &env_id(),
             DeploymentId::new(),
@@ -2089,8 +2080,7 @@ mod tests {
             "new_generation": 3
         });
         let body = wrap_mutation(domain);
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.rollback_traffic_split(&env_id(), DeploymentId::new(), idem());
         assert!(result.is_ok());
     }
@@ -2119,8 +2109,7 @@ mod tests {
     #[test]
     fn add_messaging_endpoint_happy_path() {
         let body = sample_messaging_endpoint();
-        let mock = start_mock(vec![(201, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(201, &body);
         let result = store.add_messaging_endpoint(
             &env_id(),
             AddMessagingEndpointPayload {
@@ -2138,8 +2127,7 @@ mod tests {
     #[test]
     fn link_messaging_bundle_happy_path() {
         let body = sample_messaging_endpoint();
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.link_messaging_bundle(
             &env_id(),
             MessagingEndpointId::new(),
@@ -2153,8 +2141,7 @@ mod tests {
     #[test]
     fn unlink_messaging_bundle_happy_path() {
         let body = sample_messaging_endpoint();
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.unlink_messaging_bundle(
             &env_id(),
             MessagingEndpointId::new(),
@@ -2168,8 +2155,7 @@ mod tests {
     #[test]
     fn set_messaging_welcome_flow_happy_path() {
         let body = sample_messaging_endpoint();
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.set_messaging_welcome_flow(
             &env_id(),
             SetMessagingWelcomeFlowPayload {
@@ -2188,8 +2174,7 @@ mod tests {
     fn remove_messaging_endpoint_happy_path() {
         let eid = MessagingEndpointId::new();
         let body = wrap_mutation(serde_json::json!(eid.to_string()));
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.remove_messaging_endpoint(&env_id(), eid);
         assert!(result.is_ok());
     }
@@ -2197,8 +2182,7 @@ mod tests {
     #[test]
     fn rotate_messaging_webhook_secret_happy_path() {
         let body = sample_messaging_endpoint();
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.rotate_messaging_webhook_secret(
             &env_id(),
             MessagingEndpointId::new(),
@@ -2223,8 +2207,7 @@ mod tests {
     #[test]
     fn bootstrap_trust_root_happy_path() {
         let body = sample_trust_root_seed();
-        let mock = start_mock(vec![(201, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(201, &body);
         let result = store.bootstrap_trust_root(&env_id());
         assert!(result.is_ok());
         let seed = result.unwrap();
@@ -2235,8 +2218,7 @@ mod tests {
     #[test]
     fn seed_trust_root_if_absent_when_seeded() {
         let body = sample_trust_root_seed();
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.seed_trust_root_if_absent(&env_id());
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
@@ -2245,8 +2227,7 @@ mod tests {
     #[test]
     fn seed_trust_root_if_absent_when_already_exists() {
         let body = wrap_mutation(serde_json::Value::Null);
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.seed_trust_root_if_absent(&env_id());
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
@@ -2259,8 +2240,7 @@ mod tests {
             "trusted_key_count": 2
         });
         let body = wrap_mutation(domain);
-        let mock = start_mock(vec![(201, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(201, &body);
         let result = store.add_trusted_key(
             &env_id(),
             "external-key-1".to_string(),
@@ -2281,8 +2261,7 @@ mod tests {
             "trusted_key_count": 1
         });
         let body = wrap_mutation(domain);
-        let mock = start_mock(vec![(200, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(200, &body);
         let result = store.remove_trusted_key(&env_id(), "external-key-1".to_string(), idem());
         assert!(result.is_ok());
         let outcome = result.unwrap();
@@ -2343,8 +2322,7 @@ mod tests {
     #[test]
     fn error_404_maps_to_not_found() {
         let err_body = serde_json::json!({"kind": "not-found"});
-        let mock = start_mock(vec![(404, &err_body.to_string())], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(404, &err_body.to_string());
         let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
         assert!(matches!(result, Err(StoreError::NotFound(_))));
     }
@@ -2355,8 +2333,7 @@ mod tests {
             "kind": "idempotency-conflict",
             "reason": "key reused"
         });
-        let mock = start_mock(vec![(409, &err_body.to_string())], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(409, &err_body.to_string());
         let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
         assert!(matches!(result, Err(StoreError::Conflict(_))));
     }
@@ -2367,8 +2344,7 @@ mod tests {
             "kind": "internal",
             "message": "disk full"
         });
-        let mock = start_mock(vec![(500, &err_body.to_string())], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(500, &err_body.to_string());
         let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
         match result {
             Err(StoreError::Conflict(msg)) => {
@@ -2388,8 +2364,7 @@ mod tests {
             "policy": "rbac-v1",
             "reason": "insufficient permissions"
         });
-        let mock = start_mock(vec![(403, &err_body.to_string())], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(403, &err_body.to_string());
         let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
         match result {
             Err(StoreError::Conflict(msg)) => {
@@ -2513,8 +2488,7 @@ mod tests {
             "health": {}
         });
         let body = wrap_mutation(domain);
-        let mock = start_mock(vec![(201, &body)], None);
-        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_mock, store) = happy_store(201, &body);
         let result = store.create_environment(
             &env_id(),
             "test-envelope".to_string(),
