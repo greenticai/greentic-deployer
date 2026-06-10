@@ -46,6 +46,8 @@ pub mod deploy;
 pub mod dispatch;
 pub(crate) mod dispatch_remote;
 pub mod env;
+pub mod env_apply;
+pub mod env_manifest;
 pub mod env_packs;
 pub mod extensions;
 pub mod messaging;

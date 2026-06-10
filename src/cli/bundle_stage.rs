@@ -198,8 +198,9 @@ fn stage_into(
 
 /// Streaming SHA-256 of a file, returned as `sha256:<lowercase-hex>`. Streams
 /// through a fixed buffer rather than loading the whole artifact into memory,
-/// so a large bundle or pack can't blow up peak RSS.
-fn sha256_file(path: &Path) -> std::io::Result<String> {
+/// so a large bundle or pack can't blow up peak RSS. Shared with
+/// `cli::env_apply` (manifest-vs-live digest diffing).
+pub(crate) fn sha256_file(path: &Path) -> std::io::Result<String> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();

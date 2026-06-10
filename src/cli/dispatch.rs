@@ -288,6 +288,11 @@ pub enum EnvVerb {
     /// or reports `untouched` if the env is already complete. User-bound
     /// non-default descriptors are NEVER overwritten.
     Init(EnvInitArgs),
+    /// Declarative, upsert-only environment apply. Reads a
+    /// `greentic.env-manifest.v1` document via `--answers <PATH>` and
+    /// reconciles the env toward it: validate → diff → plan → execute →
+    /// verify. Re-running an unchanged manifest is a visible no-op.
+    Apply(EnvApplyArgs),
     Create(EnvCreateArgs),
     Update(EnvUpdateArgs),
     /// `op env set-public-url <env_id> <URL>`. Replaces the env's persisted
@@ -387,6 +392,25 @@ pub struct EnvInitArgs {
     /// the existing URL is preserved.
     #[arg(long = "public-url")]
     pub public_url: Option<String>,
+}
+
+/// Args for `op env apply`. The manifest itself arrives via the global
+/// `--answers <PATH>` flag (it IS the verb's payload); these flags only
+/// shape how the plan is executed.
+#[derive(Args, Debug)]
+pub struct EnvApplyArgs {
+    /// Validate + diff + print the plan, then exit without mutating
+    /// anything (exit 0 even when changes are pending — it's a preview).
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
+    /// Audit principal forwarded to every composed mutation. Defaults to
+    /// `env-apply`.
+    #[arg(long = "updated-by")]
+    pub updated_by: Option<String>,
+    /// Skip the interactive confirmation shown when the plan contains
+    /// mutations and stdin/stdout are a TTY. Non-TTY implies `--yes`.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 /// Args for `op env create` and `op env update`. All fields are optional
@@ -764,6 +788,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
             "env",
             match verb {
                 EnvVerb::Init(_) => "init",
+                EnvVerb::Apply(_) => "apply",
                 EnvVerb::Create(_) => "create",
                 EnvVerb::Update(_) => "update",
                 EnvVerb::SetPublicUrl(_) => "set-public-url",
@@ -878,6 +903,9 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
 fn dispatch_env(store: &LocalFsStore, flags: &OpFlags, verb: EnvVerb) -> Result<(), OpError> {
     let outcome = match verb {
         EnvVerb::Init(args) => super::env::init(store, flags, args.into_payload(flags)?)?,
+        EnvVerb::Apply(args) => {
+            super::env_apply::apply(store, flags, args.dry_run, args.updated_by, args.yes)?
+        }
         EnvVerb::Create(args) => {
             super::env::create(store, flags, args.into_payload("create", flags)?)?
         }

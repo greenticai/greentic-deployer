@@ -1042,6 +1042,7 @@ mod tests {
         ];
 
         PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::from_str("dev.greentic.sample").unwrap(),
             name: None,
