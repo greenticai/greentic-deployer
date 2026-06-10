@@ -37,6 +37,7 @@ pub mod runtime_secrets;
 pub mod serverless;
 pub mod single_vm;
 pub mod snap;
+pub mod sorx_routing;
 pub mod spec;
 pub mod surface;
 pub mod telemetry;
