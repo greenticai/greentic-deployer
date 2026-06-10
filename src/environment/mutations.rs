@@ -164,17 +164,72 @@ pub struct RollbackTrafficSplitOutcome {
     pub new_generation: u64,
 }
 
+/// Tri-state field for [`UpdateEnvironmentPayload`]: callers can keep the
+/// existing value, set a new one, or clear an optional field back to `None`.
+///
+/// `Keep` maps to the prior `None` behavior (no change). `Set(v)` maps to
+/// the prior `Some(v)`. `Clear` is new — it writes `None` into the
+/// persisted field, which the prior `Option<T>` shape could not express.
+///
+/// Only fields that are `Option<T>` on [`Environment`] /
+/// [`EnvironmentHostConfig`] may be `Clear`-ed. Required fields (e.g.
+/// `name`) use plain `Option<T>` and remain Keep/Set only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum FieldUpdate<T> {
+    /// Leave the existing value unchanged (the prior `None` behavior).
+    #[default]
+    Keep,
+    /// Write a new value.
+    Set(T),
+    /// Clear an optional field back to `None`. Only valid for fields that
+    /// are `Option<T>` on the persisted struct. The store impl rejects
+    /// `Clear` on required fields with [`StoreError::Spec`].
+    Clear,
+}
+
+impl<T> FieldUpdate<T> {
+    /// Convert from `Option<T>` (backward-compat): `None` → `Keep`,
+    /// `Some(v)` → `Set(v)`. Existing callers that pass bare `None` keep
+    /// the prior semantics with no code change beyond wrapping.
+    pub fn from_option(opt: Option<T>) -> Self {
+        match opt {
+            Some(v) => Self::Set(v),
+            None => Self::Keep,
+        }
+    }
+
+    /// Convert from `Option<Option<T>>` (JSON tri-state): outer `None` →
+    /// `Keep`, `Some(None)` → `Clear`, `Some(Some(v))` → `Set(v)`.
+    pub fn from_double_option(opt: Option<Option<T>>) -> Self {
+        match opt {
+            None => Self::Keep,
+            Some(None) => Self::Clear,
+            Some(Some(v)) => Self::Set(v),
+        }
+    }
+
+    /// Whether this update is a no-op.
+    pub fn is_keep(&self) -> bool {
+        matches!(self, Self::Keep)
+    }
+}
+
 /// Optional-field patch for [`EnvironmentMutations::update_environment`].
 /// Replaces the earlier `set_public_url` and `set_config` verbs — both were
 /// strict subsets of this patch shape, so collapsing them removes two
 /// HTTP endpoints and two impl bodies that would drift over time.
+///
+/// Required fields (`name`) stay `Option<T>` — `None` = keep, `Some(v)` = set.
+/// Optional fields (`region`, `tenant_org_id`, `listen_addr`,
+/// `public_base_url`) use [`FieldUpdate<T>`] so callers can distinguish
+/// Keep / Set / Clear.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateEnvironmentPayload {
     pub name: Option<String>,
-    pub region: Option<String>,
-    pub tenant_org_id: Option<String>,
-    pub listen_addr: Option<SocketAddr>,
-    pub public_base_url: Option<String>,
+    pub region: FieldUpdate<String>,
+    pub tenant_org_id: FieldUpdate<String>,
+    pub listen_addr: FieldUpdate<SocketAddr>,
+    pub public_base_url: FieldUpdate<String>,
 }
 
 /// Optional seed payload for [`EnvironmentMutations::migrate_merge_bindings`].
@@ -352,8 +407,10 @@ pub trait EnvironmentMutations: Send + Sync {
         host_config: EnvironmentHostConfig,
     ) -> Result<Environment, StoreError>;
 
-    /// Patch the named scalar fields on an existing environment. `None`
-    /// values are skipped. The full updated `Environment` is returned.
+    /// Patch the named scalar fields on an existing environment.
+    /// [`FieldUpdate::Keep`] fields are skipped, [`FieldUpdate::Set`]
+    /// writes the new value, [`FieldUpdate::Clear`] resets optional
+    /// fields to `None`. The full updated `Environment` is returned.
     /// Covers what was previously split across `update_environment` (no
     /// `listen_addr`), `set_public_url` (single field), and `set_config`
     /// (host-level fields including `listen_addr`). One verb, one HTTP
@@ -664,6 +721,47 @@ mod tests {
     /// `HttpEnvironmentStore` in PR-3c).
     #[allow(dead_code)]
     fn _is_object_safe(_: &dyn EnvironmentMutations) {}
+
+    #[test]
+    fn field_update_default_is_keep() {
+        let fu: FieldUpdate<String> = FieldUpdate::default();
+        assert!(fu.is_keep());
+        assert_eq!(fu, FieldUpdate::Keep);
+    }
+
+    #[test]
+    fn field_update_from_option_maps_none_to_keep_and_some_to_set() {
+        let keep: FieldUpdate<String> = FieldUpdate::from_option(None);
+        assert!(keep.is_keep());
+
+        let set = FieldUpdate::from_option(Some("value".to_string()));
+        assert_eq!(set, FieldUpdate::Set("value".to_string()));
+        assert!(!set.is_keep());
+    }
+
+    #[test]
+    fn field_update_from_double_option_tri_state() {
+        let keep: FieldUpdate<String> = FieldUpdate::from_double_option(None);
+        assert_eq!(keep, FieldUpdate::Keep);
+
+        let clear: FieldUpdate<String> = FieldUpdate::from_double_option(Some(None));
+        assert_eq!(clear, FieldUpdate::Clear);
+        assert!(!clear.is_keep());
+
+        let set: FieldUpdate<String> =
+            FieldUpdate::from_double_option(Some(Some("value".to_string())));
+        assert_eq!(set, FieldUpdate::Set("value".to_string()));
+    }
+
+    #[test]
+    fn update_environment_payload_defaults_to_all_keep() {
+        let payload = UpdateEnvironmentPayload::default();
+        assert!(payload.name.is_none());
+        assert!(payload.region.is_keep());
+        assert!(payload.tenant_org_id.is_keep());
+        assert!(payload.listen_addr.is_keep());
+        assert!(payload.public_base_url.is_keep());
+    }
 
     #[test]
     fn extension_key_roundtrips() {

@@ -8,7 +8,7 @@ use greentic_deploy_spec::{EnvId, Environment, EnvironmentHostConfig, validate_p
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{EnvironmentStore, LocalFsStore, UpdateEnvironmentPayload};
+use crate::environment::{EnvironmentStore, FieldUpdate, LocalFsStore, UpdateEnvironmentPayload};
 
 use super::{
     AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
@@ -180,10 +180,10 @@ pub fn update(
                 &env_id,
                 UpdateEnvironmentPayload {
                     name: Some(payload.name),
-                    region: payload.region,
-                    tenant_org_id: payload.tenant_org_id,
-                    listen_addr: None,
-                    public_base_url: parsed_public_base_url,
+                    region: FieldUpdate::from_option(payload.region),
+                    tenant_org_id: FieldUpdate::from_option(payload.tenant_org_id),
+                    listen_addr: FieldUpdate::Keep,
+                    public_base_url: FieldUpdate::from_option(parsed_public_base_url),
                 },
             )
             .map_err(map_store_err_preserving_noun)?;
@@ -894,7 +894,7 @@ pub fn set_public_url(
             .update_environment(
                 &env_id,
                 UpdateEnvironmentPayload {
-                    public_base_url: Some(validated),
+                    public_base_url: FieldUpdate::Set(validated),
                     ..Default::default()
                 },
             )
@@ -1166,6 +1166,161 @@ mod tests {
             env.host_config.public_base_url.as_deref(),
             Some("https://existing.example.com"),
             "public_base_url must NOT be wiped when payload omits it"
+        );
+    }
+
+    #[test]
+    fn update_environment_clear_resets_optional_fields_to_none() {
+        // PR-3a.3 follow-up: `FieldUpdate::Clear` writes `None` into
+        // optional host_config fields so callers can un-set a region,
+        // tenant_org_id, listen_addr, or public_base_url.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.host_config.region = Some("eu-west-1".to_string());
+        env.host_config.tenant_org_id = Some("acme".to_string());
+        env.host_config.listen_addr = Some("0.0.0.0:9090".parse().unwrap());
+        env.host_config.public_base_url = Some("https://example.com".to_string());
+        store.save(&env).unwrap();
+
+        let env_id = EnvId::try_from("local").unwrap();
+        let env = store
+            .update_environment(
+                &env_id,
+                UpdateEnvironmentPayload {
+                    name: None,
+                    region: FieldUpdate::Clear,
+                    tenant_org_id: FieldUpdate::Clear,
+                    listen_addr: FieldUpdate::Clear,
+                    public_base_url: FieldUpdate::Clear,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(env.host_config.region, None, "region must be cleared");
+        assert_eq!(
+            env.host_config.tenant_org_id, None,
+            "tenant_org_id must be cleared"
+        );
+        assert_eq!(
+            env.host_config.listen_addr, None,
+            "listen_addr must be cleared"
+        );
+        assert_eq!(
+            env.host_config.public_base_url, None,
+            "public_base_url must be cleared"
+        );
+        // Name stays unchanged (Clear is not available for required fields).
+        assert_eq!(env.name, "local");
+    }
+
+    #[test]
+    fn update_environment_keep_preserves_set_does_not_collide_with_clear() {
+        // Tri-state regression: a mix of Keep, Set, and Clear on different
+        // fields in the same payload must each apply independently.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.host_config.region = Some("us-east-1".to_string());
+        env.host_config.tenant_org_id = Some("old-org".to_string());
+        env.host_config.listen_addr = Some("127.0.0.1:8080".parse().unwrap());
+        env.host_config.public_base_url = Some("https://old.example.com".to_string());
+        store.save(&env).unwrap();
+
+        let env_id = EnvId::try_from("local").unwrap();
+        let env = store
+            .update_environment(
+                &env_id,
+                UpdateEnvironmentPayload {
+                    name: Some("renamed".to_string()),
+                    region: FieldUpdate::Keep, // preserve
+                    tenant_org_id: FieldUpdate::Set("new-org".to_string()), // overwrite
+                    listen_addr: FieldUpdate::Clear, // clear
+                    public_base_url: FieldUpdate::Set("https://new.example.com".to_string()),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(env.name, "renamed");
+        assert_eq!(
+            env.host_config.region.as_deref(),
+            Some("us-east-1"),
+            "Keep must preserve existing value"
+        );
+        assert_eq!(
+            env.host_config.tenant_org_id.as_deref(),
+            Some("new-org"),
+            "Set must overwrite"
+        );
+        assert_eq!(
+            env.host_config.listen_addr, None,
+            "Clear must reset to None"
+        );
+        assert_eq!(
+            env.host_config.public_base_url.as_deref(),
+            Some("https://new.example.com"),
+            "Set must overwrite"
+        );
+    }
+
+    #[test]
+    fn update_environment_clear_on_already_none_is_idempotent() {
+        // Clear on a field that is already None is a no-op — must not panic
+        // or error.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = make_env("local");
+        // make_env creates host_config with all optional fields as None.
+        assert!(env.host_config.region.is_none());
+        store.save(&env).unwrap();
+
+        let env_id = EnvId::try_from("local").unwrap();
+        let env = store
+            .update_environment(
+                &env_id,
+                UpdateEnvironmentPayload {
+                    name: None,
+                    region: FieldUpdate::Clear,
+                    tenant_org_id: FieldUpdate::Clear,
+                    listen_addr: FieldUpdate::Clear,
+                    public_base_url: FieldUpdate::Clear,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(env.host_config.region, None);
+        assert_eq!(env.host_config.tenant_org_id, None);
+        assert_eq!(env.host_config.listen_addr, None);
+        assert_eq!(env.host_config.public_base_url, None);
+    }
+
+    #[test]
+    fn update_environment_default_payload_is_all_keep_noop() {
+        // `UpdateEnvironmentPayload::default()` must be a no-op patch —
+        // backward compat with code that relied on `..Default::default()`.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.host_config.region = Some("eu-west-1".to_string());
+        env.host_config.tenant_org_id = Some("acme".to_string());
+        env.host_config.listen_addr = Some("0.0.0.0:9090".parse().unwrap());
+        env.host_config.public_base_url = Some("https://example.com".to_string());
+        store.save(&env).unwrap();
+
+        let env_id = EnvId::try_from("local").unwrap();
+        let env = store
+            .update_environment(&env_id, UpdateEnvironmentPayload::default())
+            .unwrap();
+
+        assert_eq!(env.host_config.region.as_deref(), Some("eu-west-1"));
+        assert_eq!(env.host_config.tenant_org_id.as_deref(), Some("acme"));
+        assert_eq!(
+            env.host_config.listen_addr,
+            Some("0.0.0.0:9090".parse().unwrap())
+        );
+        assert_eq!(
+            env.host_config.public_base_url.as_deref(),
+            Some("https://example.com")
         );
     }
 
