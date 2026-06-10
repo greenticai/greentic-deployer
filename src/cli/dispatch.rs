@@ -422,6 +422,21 @@ pub struct EnvApplyArgs {
     pub yes: bool,
 }
 
+impl EnvApplyArgs {
+    /// clap's `conflicts_with` guarantees at most one of `--dry-run` /
+    /// `--check` is set.
+    fn mode(&self) -> super::env_apply::ApplyMode {
+        use super::env_apply::ApplyMode;
+        if self.check {
+            ApplyMode::Check
+        } else if self.dry_run {
+            ApplyMode::DryRun
+        } else {
+            ApplyMode::Apply
+        }
+    }
+}
+
 /// Args for `op env create` and `op env update`. All fields are optional
 /// at the clap layer so `--answers` / `--schema` keep working unchanged;
 /// the dispatcher builds an `EnvCreatePayload` only when the required
@@ -912,14 +927,9 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
 fn dispatch_env(store: &LocalFsStore, flags: &OpFlags, verb: EnvVerb) -> Result<(), OpError> {
     let outcome = match verb {
         EnvVerb::Init(args) => super::env::init(store, flags, args.into_payload(flags)?)?,
-        EnvVerb::Apply(args) => super::env_apply::apply(
-            store,
-            flags,
-            args.dry_run,
-            args.check,
-            args.updated_by,
-            args.yes,
-        )?,
+        EnvVerb::Apply(args) => {
+            super::env_apply::apply(store, flags, args.mode(), args.updated_by, args.yes)?
+        }
         EnvVerb::Create(args) => {
             super::env::create(store, flags, args.into_payload("create", flags)?)?
         }

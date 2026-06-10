@@ -108,6 +108,16 @@ impl ApplyAction {
             ApplyAction::NoOp => "no-op",
         }
     }
+
+    /// Does this action represent *diffable* drift for the `--check`
+    /// convergence verdict? `Put` is excluded: always-put secret rows are
+    /// unknowable until A9 lands a real `secrets get`, so counting them
+    /// would make `--check` permanently red for any manifest with a
+    /// `secrets[]` section. They stay visible in the report (`put` rows
+    /// plus the `undiffable` count) instead of failing the gate.
+    fn counts_as_drift(self) -> bool {
+        matches!(self, ApplyAction::Create | ApplyAction::Update)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,17 +264,40 @@ struct ApplyContext {
 
 // --- entry point ----------------------------------------------------------------
 
+/// How `apply` terminates once the plan is computed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ApplyMode {
+    /// Execute the plan and verify (the default).
+    Apply,
+    /// Print the plan and exit 0 without mutating — a preview, even when
+    /// changes are pending.
+    DryRun,
+    /// CI convergence gate: print the plan, never mutate, and fail
+    /// (non-zero exit) when diffable changes are pending. Always-put
+    /// secret rows don't count as drift ([`ApplyAction::counts_as_drift`]).
+    Check,
+}
+
+impl ApplyMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            ApplyMode::Apply => "apply",
+            ApplyMode::DryRun => "dry-run",
+            ApplyMode::Check => "check",
+        }
+    }
+}
+
 /// `gtc op env apply --answers <manifest.json> [--dry-run | --check]
 /// [--updated-by <who>] [--yes]`.
 pub fn apply(
     store: &LocalFsStore,
     flags: &OpFlags,
-    dry_run: bool,
-    check: bool,
+    mode: ApplyMode,
     updated_by: Option<String>,
     yes: bool,
 ) -> Result<OpOutcome, OpError> {
-    apply_with_env_lookup(store, flags, dry_run, check, updated_by, yes, &|name| {
+    apply_with_env_lookup(store, flags, mode, updated_by, yes, &|name| {
         std::env::var(name).ok()
     })
 }
@@ -275,8 +308,7 @@ pub fn apply(
 fn apply_with_env_lookup(
     store: &LocalFsStore,
     flags: &OpFlags,
-    dry_run: bool,
-    check: bool,
+    mode: ApplyMode,
     updated_by: Option<String>,
     yes: bool,
     env_lookup: &dyn Fn(&str) -> Option<String>,
@@ -304,42 +336,37 @@ fn apply_with_env_lookup(
     let steps = diff(store, &ctx)?;
     render_plan(&steps, &ctx.warnings);
 
+    match mode {
+        ApplyMode::DryRun => {
+            return Ok(OpOutcome::new(
+                NOUN,
+                VERB,
+                report_json(&ctx, &steps, mode.as_str(), None),
+            ));
+        }
+        ApplyMode::Check => {
+            let diffable_pending = steps.iter().filter(|s| s.action.counts_as_drift()).count();
+            if diffable_pending > 0 {
+                return Err(OpError::Conflict(format!(
+                    "env `{}` is not converged: {diffable_pending} pending change(s) — \
+                     run `gtc op env apply --answers <manifest>` to reconcile (see the \
+                     plan above for the step list)",
+                    ctx.env_id.as_str()
+                )));
+            }
+            return Ok(OpOutcome::new(
+                NOUN,
+                VERB,
+                report_json(&ctx, &steps, mode.as_str(), None),
+            ));
+        }
+        ApplyMode::Apply => {}
+    }
+
     let pending = steps
         .iter()
         .filter(|s| s.action != ApplyAction::NoOp)
         .count();
-    if dry_run {
-        return Ok(OpOutcome::new(
-            NOUN,
-            VERB,
-            report_json(&ctx, &steps, "dry-run", None),
-        ));
-    }
-    if check {
-        // Always-put secret steps (`ApplyAction::Put`) are excluded from the
-        // convergence verdict: values cannot be diffed until A9 lands a real
-        // `secrets get`, so a `put` step is "unknowable", not evidence of
-        // drift — counting it would make `--check` permanently red for any
-        // manifest with a `secrets[]` section. The report carries the count
-        // under `undiffable` (and every secret row still says `put`), so the
-        // output never claims more convergence than it can prove.
-        let undiffable = steps
-            .iter()
-            .filter(|s| s.action == ApplyAction::Put)
-            .count();
-        let diffable_pending = pending - undiffable;
-        if diffable_pending > 0 {
-            return Err(OpError::Conflict(format!(
-                "env `{}` is not converged: {diffable_pending} pending change(s) — \
-                 run `gtc op env apply --answers <manifest>` to reconcile (see the \
-                 plan above for the step list)",
-                ctx.env_id.as_str()
-            )));
-        }
-        let mut report = report_json(&ctx, &steps, "check", None);
-        report["undiffable"] = json!(undiffable);
-        return Ok(OpOutcome::new(NOUN, VERB, report));
-    }
     if pending > 0 && !yes && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         eprint!(
             "apply {pending} change(s) to env `{}`? [y/N] ",
@@ -1471,6 +1498,13 @@ fn report_json(
         .iter()
         .filter(|s| s.action != ApplyAction::NoOp)
         .count();
+    // Always-put rows: counted in `changed`, but not drift for `--check`
+    // (see `ApplyAction::counts_as_drift`). Emitted in every mode so the
+    // report schema doesn't vary by mode.
+    let undiffable = steps
+        .iter()
+        .filter(|s| s.action == ApplyAction::Put)
+        .count();
     let mut report = json!({
         "manifest_schema": ENV_MANIFEST_SCHEMA_V1,
         "environment_id": ctx.env_id.as_str(),
@@ -1478,6 +1512,7 @@ fn report_json(
         "steps": steps.iter().map(ApplyStep::to_json).collect::<Vec<_>>(),
         "changed": changed,
         "no_op": steps.len() - changed,
+        "undiffable": undiffable,
         "warnings": ctx.warnings,
     });
     if let Some(v) = verify {
@@ -1558,28 +1593,28 @@ mod tests {
         path
     }
 
-    fn run_apply(store: &LocalFsStore, manifest_path: &Path) -> Result<OpOutcome, OpError> {
+    fn run_mode(
+        store: &LocalFsStore,
+        manifest_path: &Path,
+        mode: ApplyMode,
+    ) -> Result<OpOutcome, OpError> {
         let flags = OpFlags {
             schema_only: false,
             answers: Some(manifest_path.to_path_buf()),
         };
-        apply(store, &flags, false, false, None, false)
+        apply(store, &flags, mode, None, false)
+    }
+
+    fn run_apply(store: &LocalFsStore, manifest_path: &Path) -> Result<OpOutcome, OpError> {
+        run_mode(store, manifest_path, ApplyMode::Apply)
     }
 
     fn run_dry(store: &LocalFsStore, manifest_path: &Path) -> Result<OpOutcome, OpError> {
-        let flags = OpFlags {
-            schema_only: false,
-            answers: Some(manifest_path.to_path_buf()),
-        };
-        apply(store, &flags, true, false, None, false)
+        run_mode(store, manifest_path, ApplyMode::DryRun)
     }
 
     fn run_check(store: &LocalFsStore, manifest_path: &Path) -> Result<OpOutcome, OpError> {
-        let flags = OpFlags {
-            schema_only: false,
-            answers: Some(manifest_path.to_path_buf()),
-        };
-        apply(store, &flags, false, true, None, false)
+        run_mode(store, manifest_path, ApplyMode::Check)
     }
 
     fn load_local(store: &LocalFsStore) -> Environment {
@@ -2211,29 +2246,17 @@ mod tests {
         (dir, store)
     }
 
-    fn run_apply_with_lookup(
+    fn run_with_lookup(
         store: &LocalFsStore,
         manifest_path: &Path,
-        dry_run: bool,
+        mode: ApplyMode,
         lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Result<OpOutcome, OpError> {
         let flags = OpFlags {
             schema_only: false,
             answers: Some(manifest_path.to_path_buf()),
         };
-        apply_with_env_lookup(store, &flags, dry_run, false, None, false, lookup)
-    }
-
-    fn run_check_with_lookup(
-        store: &LocalFsStore,
-        manifest_path: &Path,
-        lookup: &dyn Fn(&str) -> Option<String>,
-    ) -> Result<OpOutcome, OpError> {
-        let flags = OpFlags {
-            schema_only: false,
-            answers: Some(manifest_path.to_path_buf()),
-        };
-        apply_with_env_lookup(store, &flags, false, true, None, false, lookup)
+        apply_with_env_lookup(store, &flags, mode, None, false, lookup)
     }
 
     use crate::cli::tests_common::dev_store_read;
@@ -2255,8 +2278,8 @@ mod tests {
         let lookup =
             |name: &str| (name == "APPLY_LEGAL_BOT_TOKEN").then(|| "tok-secret-9000".to_string());
 
-        let outcome =
-            run_apply_with_lookup(&store, &manifest_path, false, &lookup).expect("apply succeeds");
+        let outcome = run_with_lookup(&store, &manifest_path, ApplyMode::Apply, &lookup)
+            .expect("apply succeeds");
 
         // The report names the env VAR and says `put` — never the value.
         let envelope = serde_json::to_string(&outcome).unwrap();
@@ -2299,7 +2322,7 @@ mod tests {
 
         // Always-put: a re-apply is NOT a no-op for the secret (cannot diff).
         let second =
-            run_apply_with_lookup(&store, &manifest_path, false, &lookup).expect("re-apply");
+            run_with_lookup(&store, &manifest_path, ApplyMode::Apply, &lookup).expect("re-apply");
         assert_eq!(second.result["changed"], 1, "{}", second.result);
 
         // Two invocations must mint DIFFERENT idempotency keys (fresh per
@@ -2319,7 +2342,8 @@ mod tests {
         let manifest_path = write_manifest(dir.path(), &secrets_manifest("APPLY_MISSING_VAR"));
         for value in [None, Some(String::new())] {
             let lookup = |_: &str| value.clone();
-            let err = run_apply_with_lookup(&store, &manifest_path, false, &lookup).unwrap_err();
+            let err =
+                run_with_lookup(&store, &manifest_path, ApplyMode::Apply, &lookup).unwrap_err();
             match err {
                 OpError::InvalidArgument(msg) => {
                     assert!(msg.contains("APPLY_MISSING_VAR"), "got: {msg}")
@@ -2345,7 +2369,7 @@ mod tests {
 
         // Existing env with NO secrets pack bound → the shared precondition
         // fires at validation time.
-        let err = run_apply_with_lookup(&store, &manifest_path, false, &lookup).unwrap_err();
+        let err = run_with_lookup(&store, &manifest_path, ApplyMode::Apply, &lookup).unwrap_err();
         assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
 
         // Non-dev-store backend → not-yet-implemented at validation time.
@@ -2355,7 +2379,7 @@ mod tests {
             "greentic.secrets.aws-sm@1.0.0",
         ));
         store.save(&env).unwrap();
-        let err = run_apply_with_lookup(&store, &manifest_path, false, &lookup).unwrap_err();
+        let err = run_with_lookup(&store, &manifest_path, ApplyMode::Apply, &lookup).unwrap_err();
         assert!(matches!(err, OpError::NotYetImplemented(_)), "got {err:?}");
 
         // Both failures pre-date execution: no audit events were appended.
@@ -2370,7 +2394,8 @@ mod tests {
         let manifest_path = write_manifest(dir.path(), &manifest);
         let lookup = |_: &str| Some("tok-order".to_string());
 
-        let plan = run_apply_with_lookup(&store, &manifest_path, true, &lookup).expect("dry-run");
+        let plan =
+            run_with_lookup(&store, &manifest_path, ApplyMode::DryRun, &lookup).expect("dry-run");
         let steps = plan.result["steps"].as_array().expect("steps");
         let pos = |kind: &str| {
             steps
@@ -2408,7 +2433,8 @@ mod tests {
         // always-put secret: excluded from the verdict — check passes,
         // reports the row as undiffable, and writes nothing.
         let manifest_path = write_manifest(dir.path(), &secrets_manifest("APPLY_LEGAL_BOT_TOKEN"));
-        let outcome = run_check_with_lookup(&store, &manifest_path, &lookup).expect("check passes");
+        let outcome = run_with_lookup(&store, &manifest_path, ApplyMode::Check, &lookup)
+            .expect("check passes");
         assert_eq!(outcome.result["mode"], "check");
         assert_eq!(outcome.result["undiffable"], 1, "{}", outcome.result);
         assert_eq!(
@@ -2429,7 +2455,7 @@ mod tests {
         let mut mixed = full_manifest(&fixture());
         mixed["secrets"] = json!([{"path": SECRET_PATH, "from_env": "APPLY_LEGAL_BOT_TOKEN"}]);
         let mixed_path = write_manifest(dir.path(), &mixed);
-        let err = run_check_with_lookup(&store, &mixed_path, &lookup).unwrap_err();
+        let err = run_with_lookup(&store, &mixed_path, ApplyMode::Check, &lookup).unwrap_err();
         assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
         assert!(
             err.to_string().contains("4 pending change(s)"),
