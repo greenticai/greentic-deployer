@@ -112,32 +112,19 @@ impl LocalFsStore {
         env_id: &EnvId,
         patch: UpdateEnvironmentPayload,
     ) -> Result<Environment, StoreError> {
-        use super::mutations::FieldUpdate;
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
             if let Some(name) = patch.name {
                 env.name = name;
             }
-            match patch.region {
-                FieldUpdate::Keep => {}
-                FieldUpdate::Set(region) => env.host_config.region = Some(region),
-                FieldUpdate::Clear => env.host_config.region = None,
-            }
-            match patch.tenant_org_id {
-                FieldUpdate::Keep => {}
-                FieldUpdate::Set(org) => env.host_config.tenant_org_id = Some(org),
-                FieldUpdate::Clear => env.host_config.tenant_org_id = None,
-            }
-            match patch.listen_addr {
-                FieldUpdate::Keep => {}
-                FieldUpdate::Set(addr) => env.host_config.listen_addr = Some(addr),
-                FieldUpdate::Clear => env.host_config.listen_addr = None,
-            }
-            match patch.public_base_url {
-                FieldUpdate::Keep => {}
-                FieldUpdate::Set(url) => env.host_config.public_base_url = Some(url),
-                FieldUpdate::Clear => env.host_config.public_base_url = None,
-            }
+            patch.region.apply_to(&mut env.host_config.region);
+            patch
+                .tenant_org_id
+                .apply_to(&mut env.host_config.tenant_org_id);
+            patch.listen_addr.apply_to(&mut env.host_config.listen_addr);
+            patch
+                .public_base_url
+                .apply_to(&mut env.host_config.public_base_url);
             locked.save(&env)?;
             Ok(env)
         })

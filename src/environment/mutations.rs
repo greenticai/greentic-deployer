@@ -212,6 +212,16 @@ impl<T> FieldUpdate<T> {
     pub fn is_keep(&self) -> bool {
         matches!(self, Self::Keep)
     }
+
+    /// Apply this update to an `Option<T>` target field: `Keep` is a no-op,
+    /// `Set(v)` writes `Some(v)`, `Clear` writes `None`.
+    pub fn apply_to(self, target: &mut Option<T>) {
+        match self {
+            Self::Keep => {}
+            Self::Set(v) => *target = Some(v),
+            Self::Clear => *target = None,
+        }
+    }
 }
 
 /// Optional-field patch for [`EnvironmentMutations::update_environment`].
@@ -737,6 +747,24 @@ mod tests {
         let set = FieldUpdate::from_option(Some("value".to_string()));
         assert_eq!(set, FieldUpdate::Set("value".to_string()));
         assert!(!set.is_keep());
+    }
+
+    #[test]
+    fn field_update_apply_to_writes_target() {
+        let mut target: Option<String> = Some("old".to_string());
+
+        FieldUpdate::<String>::Keep.apply_to(&mut target);
+        assert_eq!(target.as_deref(), Some("old"), "Keep must not touch target");
+
+        FieldUpdate::Set("new".to_string()).apply_to(&mut target);
+        assert_eq!(target.as_deref(), Some("new"), "Set must overwrite");
+
+        FieldUpdate::<String>::Clear.apply_to(&mut target);
+        assert_eq!(target, None, "Clear must write None");
+
+        // Clear on already-None is a no-op.
+        FieldUpdate::<String>::Clear.apply_to(&mut target);
+        assert_eq!(target, None);
     }
 
     #[test]
