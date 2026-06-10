@@ -621,7 +621,7 @@ pub fn destroy(
         // ships with the bundle-deployment retention path (B-phase); A7 wires
         // the audit + authorize surface so the destroy intent is logged today.
         Err(OpError::NotYetImplemented(
-            "`op env destroy` requires the retention path (B-phase); use the LocalFsStore root path returned by `op env show` for manual cleanup",
+            "`op env destroy` requires the retention path (B-phase); use the LocalFsStore root path returned by `op env show` for manual cleanup".to_string(),
         ))
     })
 }

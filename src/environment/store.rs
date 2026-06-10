@@ -116,6 +116,20 @@ pub enum StoreError {
     /// [`crate::cli::map_store_err_preserving_noun`].
     #[error("revenue policy: {0}")]
     RevenuePolicy(#[from] super::BundleDeploymentError),
+    /// RBAC denial surfaced by a remote store backend (`403` on the A8
+    /// wire, [`greentic_deploy_spec::RemoteStoreError::Unauthorized`]).
+    /// Local-FS verbs never construct it — local RBAC runs in the CLI's
+    /// audit boundary before the verb fires. CLI callers preserve the
+    /// `unauthorized` noun via [`crate::cli::map_store_err_preserving_noun`]
+    /// (PR-4.0; previously flattened into [`StoreError::Conflict`]).
+    #[error("unauthorized: {reason} (policy `{policy}`)")]
+    Unauthorized { policy: String, reason: String },
+    /// Verb recognized but not implemented by the backend (`501` on the A8
+    /// wire, [`greentic_deploy_spec::RemoteStoreError::NotYetImplemented`]).
+    /// CLI callers preserve the `not-yet-implemented` noun via
+    /// [`crate::cli::map_store_err_preserving_noun`] (PR-4.0).
+    #[error("not yet implemented: {0}")]
+    NotYetImplemented(String),
     /// A typed-verb body persisted state to disk via the lifecycle
     /// helper's internal `locked.save(...)` and *then* failed on a
     /// post-save step (env reload, materialized-runtime-config refresh,
