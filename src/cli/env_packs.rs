@@ -55,7 +55,7 @@ pub struct BindingSummary {
 }
 
 impl BindingSummary {
-    fn from_binding(env_id: &EnvId, b: &EnvPackBinding) -> Self {
+    pub(crate) fn from_binding(env_id: &EnvId, b: &EnvPackBinding) -> Self {
         Self {
             environment_id: env_id.as_str().to_string(),
             slot: b.slot,
@@ -276,7 +276,7 @@ fn parse_env_id(raw: &str) -> Result<EnvId, OpError> {
     EnvId::try_from(raw).map_err(|e| OpError::InvalidArgument(format!("environment_id: {e}")))
 }
 
-fn build_binding(
+pub(crate) fn build_binding(
     payload: &EnvPackBindingPayload,
     generation: u64,
     previous_binding_ref: Option<PathBuf>,

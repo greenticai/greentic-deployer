@@ -38,6 +38,17 @@ pub struct OpCommand {
     #[arg(long, global = true)]
     pub store_root: Option<PathBuf>,
 
+    /// Target a remote operator store over HTTP instead of the local FS
+    /// store. Overrides `GREENTIC_STORE_URL`. When set (and not `--schema`),
+    /// mutation verbs run against the remote A8 HTTP store.
+    #[arg(long, global = true)]
+    pub store_url: Option<String>,
+
+    /// Bearer token for the remote `--store-url` store. Overrides
+    /// `GREENTIC_STORE_TOKEN`.
+    #[arg(long, global = true)]
+    pub store_token: Option<String>,
+
     /// Dump the JSON Schema of the input payload this verb accepts, then
     /// exit. The library is free to return a hand-written stub until A1's
     /// `schemars` derive wiring lands.
@@ -703,6 +714,29 @@ pub fn dispatch_op_with_registry(
         answers: cmd.answers.clone(),
     };
     let (noun, verb) = noun_verb_labels(&cmd.noun);
+
+    // Remote store selection (PR-3c). --store-url / GREENTIC_STORE_URL picks
+    // the A8 HTTP backend. Schema-only requests stay local (schema is
+    // store-independent and never touches the FS), so the operator can
+    // inspect payloads without a running server.
+    //
+    // URL and token are paired by ORIGIN: an env-configured
+    // GREENTIC_STORE_TOKEN must not leak to an ad-hoc `--store-url` flag
+    // endpoint. A flag URL only accepts a flag token; an env URL accepts a
+    // flag token or the env token.
+    let (store_url, store_token) = crate::cli::dispatch_remote::resolve_remote_target(
+        cmd.store_url.clone(),
+        cmd.store_token.clone(),
+        std::env::var("GREENTIC_STORE_URL").ok(),
+        std::env::var("GREENTIC_STORE_TOKEN").ok(),
+    );
+    if let Some(raw_url) = store_url
+        && !cmd.schema
+    {
+        return crate::cli::dispatch_remote::dispatch_op_remote(&raw_url, store_token, cmd, &flags)
+            .inspect_err(|err| print_error(noun, verb, err));
+    }
+
     let store = build_store(&cmd).inspect_err(|err| print_error(noun, verb, err))?;
     let result = match cmd.noun {
         OpNoun::Env { verb } => dispatch_env(&store, &flags, verb),

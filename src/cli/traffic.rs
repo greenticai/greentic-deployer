@@ -79,7 +79,7 @@ pub struct TrafficSummaryEntry {
 }
 
 impl TrafficSummary {
-    fn from(env_id: &EnvId, split: &TrafficSplit) -> Self {
+    pub(crate) fn from(env_id: &EnvId, split: &TrafficSplit) -> Self {
         Self {
             environment_id: env_id.as_str().to_string(),
             deployment_id: split.deployment_id.to_string(),
@@ -303,7 +303,9 @@ fn parse_entry_arg(raw: &str) -> Result<TrafficSetEntryPayload, OpError> {
     })
 }
 
-fn parse_entries(entries: &[TrafficSetEntryPayload]) -> Result<Vec<TrafficSplitEntry>, OpError> {
+pub(crate) fn parse_entries(
+    entries: &[TrafficSetEntryPayload],
+) -> Result<Vec<TrafficSplitEntry>, OpError> {
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
         let bps = match (entry.weight_bps, entry.weight_percent) {
@@ -419,7 +421,7 @@ pub fn rollback(
 /// falling through to [`map_store_err_preserving_noun`]. The Spec variant
 /// is unique to traffic (validate sum == 10,000 bps) and the shared
 /// mapper doesn't cover it.
-fn map_traffic_store_err(e: crate::environment::StoreError) -> OpError {
+pub(crate) fn map_traffic_store_err(e: crate::environment::StoreError) -> OpError {
     match e {
         crate::environment::StoreError::Spec(s) => OpError::Spec(s),
         other => map_store_err_preserving_noun(other),

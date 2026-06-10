@@ -61,14 +61,30 @@ pub struct BundleAddPayload {
 /// envs must pass one explicitly (B10).
 const LOCAL_DEV_CUSTOMER_ID: &str = "local-dev";
 
-pub(super) fn default_revenue_share() -> Vec<RevenueShareEntryPayload> {
+pub(crate) fn default_revenue_share() -> Vec<RevenueShareEntryPayload> {
     vec![RevenueShareEntryPayload {
         party_id: "greentic".to_string(),
         basis_points: 10_000,
     }]
 }
-pub(super) fn default_authorization_ref() -> PathBuf {
+pub(crate) fn default_authorization_ref() -> PathBuf {
     PathBuf::from("auth.json")
+}
+
+/// Convert the CLI `RevenueShareEntryPayload` list into the spec
+/// [`RevenueShareEntry`] list. Shared by the remote dispatch's `bundles
+/// add`/`update` so the two HTTP call sites don't re-roll the mapping.
+pub(crate) fn convert_revenue_share(
+    entries: &[RevenueShareEntryPayload],
+) -> Vec<RevenueShareEntry> {
+    entries
+        .iter()
+        .cloned()
+        .map(|e| RevenueShareEntry {
+            party_id: greentic_deploy_spec::PartyId::new(e.party_id),
+            basis_points: e.basis_points,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -123,7 +139,7 @@ pub struct BundleSummary {
 }
 
 impl BundleSummary {
-    fn from(env_id: &EnvId, b: &BundleDeployment) -> Self {
+    pub(crate) fn from(env_id: &EnvId, b: &BundleDeployment) -> Self {
         Self {
             environment_id: env_id.as_str().to_string(),
             bundle_id: b.bundle_id.as_str().to_string(),
@@ -399,7 +415,7 @@ fn parse_env_id(raw: &str) -> Result<EnvId, OpError> {
 
 /// P6 (B10): resolve the billing principal. `local` defaults to `local-dev`
 /// when none is supplied; every other env must pass one explicitly.
-pub(super) fn resolve_customer_id(
+pub(crate) fn resolve_customer_id(
     env_id: &EnvId,
     supplied: Option<String>,
 ) -> Result<CustomerId, OpError> {
@@ -454,7 +470,7 @@ fn parse_deployment_id(raw: &str) -> Result<DeploymentId, OpError> {
     Ok(DeploymentId(ulid))
 }
 
-pub(super) fn into_route_binding(payload: RouteBindingPayload) -> RouteBinding {
+pub(crate) fn into_route_binding(payload: RouteBindingPayload) -> RouteBinding {
     let tenant_selector = payload
         .tenant_selector
         .map(|t| TenantSelector {
