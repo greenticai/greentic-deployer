@@ -78,12 +78,14 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use greentic_deploy_spec::{
-    BundleDeployment, BundleDeploymentStatus, BundleId, CapabilitySlot, CustomerId, DeploymentId,
-    EnvId, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding, HealthStatus,
-    IdempotencyKey, MessagingEndpoint, MessagingEndpointId, PackId, PackListEntry,
-    RemoteStoreError, RetentionPolicy, RevenueShareEntry, Revision, RevisionId, RevisionLifecycle,
-    RevocationConfig, RouteBinding, TrafficSplit, TrafficSplitEntry,
+    AuditEvent, BundleDeployment, BundleDeploymentStatus, BundleId, CapabilitySlot, CustomerId,
+    DeploymentId, EnvId, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding,
+    HealthStatus, IdempotencyKey, IdempotencyOutcome, MessagingEndpoint, MessagingEndpointId,
+    PackId, PackListEntry, RemoteStoreError, RetentionPolicy, RevenueShareEntry, Revision,
+    RevisionId, RevisionLifecycle, RevocationConfig, RouteBinding, StateEtag, TrafficSplit,
+    TrafficSplitEntry,
 };
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -113,6 +115,49 @@ pub enum AuthMethod {
 }
 
 // ---------------------------------------------------------------------------
+// URL path-segment encoding (Fix 1: prevent path-traversal via dynamic IDs)
+// ---------------------------------------------------------------------------
+
+/// Characters that MUST be percent-encoded when interpolated into a URL path
+/// segment. Covers RFC 3986 reserved + unsafe characters that `Url::join`
+/// would otherwise interpret structurally (`/`, `?`, `#`, `..` via `.`).
+const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b'%')
+    .add(b'.');
+
+/// Percent-encode a dynamic identifier for safe interpolation into a URL path
+/// segment. Normal alphanumeric identifiers pass through unchanged; characters
+/// like `/`, `..`, `?`, `#` are escaped so they cannot alter the request path.
+fn encode_segment(s: &str) -> String {
+    utf8_percent_encode(s, PATH_SEGMENT_ENCODE_SET).to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Construction errors
+// ---------------------------------------------------------------------------
+
+/// Errors that can occur when constructing an [`HttpEnvironmentStore`].
+#[derive(Debug, thiserror::Error)]
+pub enum ConstructionError {
+    /// Bearer auth over plaintext HTTP to a non-loopback host exposes the token.
+    #[error(
+        "bearer auth over http:// is only allowed to loopback hosts; \
+         got `{0}` — use https:// or AuthMethod::None"
+    )]
+    InsecureTransport(String),
+}
+
+// ---------------------------------------------------------------------------
 // HttpEnvironmentStore
 // ---------------------------------------------------------------------------
 
@@ -126,23 +171,70 @@ pub struct HttpEnvironmentStore {
     auth: AuthMethod,
 }
 
+/// Whether `url` points at a loopback address (`127.0.0.0/8`, `::1`, or
+/// `localhost`). Used by the insecure-transport guard.
+fn is_loopback(url: &Url) -> bool {
+    match url.host_str() {
+        Some("localhost") => true,
+        Some(host) => host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+/// Validate that bearer auth is not used over plaintext HTTP to non-loopback.
+fn validate_transport(url: &Url, auth: &AuthMethod) -> Result<(), ConstructionError> {
+    if let AuthMethod::Bearer(_) = auth
+        && url.scheme() == "http"
+    {
+        if is_loopback(url) {
+            tracing::warn!(
+                url = %url,
+                "bearer auth over http:// to loopback — acceptable for dev, \
+                 not for production"
+            );
+        } else {
+            return Err(ConstructionError::InsecureTransport(
+                url.host_str().unwrap_or("<none>").to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl HttpEnvironmentStore {
     /// Build with the default `reqwest::blocking::Client`.
-    pub fn new(base_url: Url, auth: AuthMethod) -> Self {
-        Self {
+    ///
+    /// Returns [`ConstructionError::InsecureTransport`] if `auth` is
+    /// [`AuthMethod::Bearer`] and `base_url` is `http://` to a non-loopback
+    /// host.
+    pub fn new(base_url: Url, auth: AuthMethod) -> Result<Self, ConstructionError> {
+        validate_transport(&base_url, &auth)?;
+        Ok(Self {
             client: Client::new(),
             base_url,
             auth,
-        }
+        })
     }
 
     /// Build with a caller-supplied client (custom timeouts, TLS config, etc.).
-    pub fn with_client(client: Client, base_url: Url, auth: AuthMethod) -> Self {
-        Self {
+    ///
+    /// Returns [`ConstructionError::InsecureTransport`] if `auth` is
+    /// [`AuthMethod::Bearer`] and `base_url` is `http://` to a non-loopback
+    /// host.
+    pub fn with_client(
+        client: Client,
+        base_url: Url,
+        auth: AuthMethod,
+    ) -> Result<Self, ConstructionError> {
+        validate_transport(&base_url, &auth)?;
+        Ok(Self {
             client,
             base_url,
             auth,
-        }
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -213,16 +305,67 @@ impl HttpEnvironmentStore {
         }
     }
 
-    /// Variant of [`send`](Self::send) that takes no body (GET/DELETE with no
-    /// body).
-    fn send_no_body<R: serde::de::DeserializeOwned>(
+    /// Send a mutating request whose A8 response is a [`MutationEnvelope`]
+    /// wrapping the domain result alongside ETag/generation/idempotency
+    /// metadata. Extracts and returns only the domain `result` for now;
+    /// PR-3b-fu will surface the envelope metadata via a return-type
+    /// extension.
+    fn send_mutation<P: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        idempotency_key: Option<&str>,
+        body: Option<&P>,
+    ) -> Result<R, StoreError> {
+        let envelope: MutationEnvelope<R> = self.send(method, path, idempotency_key, body)?;
+        Ok(envelope.result)
+    }
+
+    /// [`send_mutation`](Self::send_mutation) variant with no request body.
+    fn send_mutation_no_body<R: serde::de::DeserializeOwned>(
         &self,
         method: reqwest::Method,
         path: &str,
         idempotency_key: Option<&str>,
     ) -> Result<R, StoreError> {
-        self.send::<(), R>(method, path, idempotency_key, None)
+        self.send_mutation::<(), R>(method, path, idempotency_key, None)
     }
+}
+
+// ---------------------------------------------------------------------------
+// A8 mutation-response envelope
+// ---------------------------------------------------------------------------
+
+/// The A8 success envelope for mutating calls. The server returns the domain
+/// `result` alongside CAS/idempotency/audit metadata defined in
+/// [`greentic_deploy_spec::remote::MutationResponse`].
+///
+/// PR-3b parses the full envelope so that a future return-type extension
+/// (PR-3b-fu) can surface ETag/generation without re-parsing. Today the
+/// trait methods return bare domain types, so callers see only `result`.
+#[derive(Debug, Deserialize)]
+struct MutationEnvelope<T> {
+    result: T,
+    // Fields present per A8 but not yet surfaced to callers (PR-3b-fu).
+    #[serde(default)]
+    #[allow(dead_code)]
+    etag: Option<StateEtag>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    generation: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    idempotency: Option<IdempotencyOutcome>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    audit: Option<AuditEvent>,
+}
+
+/// Mint a one-shot [`IdempotencyKey`] for methods whose trait signature does
+/// not carry one. Each call produces a unique ULID so retries by the caller
+/// are safe (the key changes on every invocation).
+fn mint_idempotency_key() -> String {
+    ulid::Ulid::new().to_string()
 }
 
 /// Map an error HTTP response to [`StoreError`].
@@ -596,12 +739,18 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         name: String,
         host_config: EnvironmentHostConfig,
     ) -> Result<Environment, StoreError> {
+        let idem_key = mint_idempotency_key();
         let req = CreateEnvironmentRequest {
             env_id: env_id.clone(),
             name,
             host_config,
         };
-        self.send(reqwest::Method::POST, "environments", None, Some(&req))
+        self.send_mutation(
+            reqwest::Method::POST,
+            "environments",
+            Some(&idem_key),
+            Some(&req),
+        )
     }
 
     fn update_environment(
@@ -609,11 +758,12 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         env_id: &EnvId,
         patch: UpdateEnvironmentPayload,
     ) -> Result<Environment, StoreError> {
+        let idem_key = mint_idempotency_key();
         let req: UpdateEnvironmentRequest = patch.into();
-        self.send(
+        self.send_mutation(
             reqwest::Method::PATCH,
-            &format!("environments/{env_id}"),
-            None,
+            &format!("environments/{}", encode_segment(env_id.as_str())),
+            Some(&idem_key),
             Some(&req),
         )
     }
@@ -623,11 +773,15 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         target_env_id: &EnvId,
         payload: MigrateMergePayload,
     ) -> Result<(Vec<String>, Vec<String>), StoreError> {
+        let idem_key = mint_idempotency_key();
         let req: MigrateMergeRequest = payload.into();
-        let resp: MigrateMergeResponse = self.send(
+        let resp: MigrateMergeResponse = self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{target_env_id}/migrate-bindings"),
-            None,
+            &format!(
+                "environments/{}/migrate-bindings",
+                encode_segment(target_env_id.as_str())
+            ),
+            Some(&idem_key),
             Some(&req),
         )?;
         Ok((resp.merged_slots, resp.merged_extensions))
@@ -650,9 +804,9 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             signature_sidecar_ref: payload.signature_sidecar_ref,
             drain_seconds: payload.drain_seconds,
         };
-        self.send(
+        self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/revisions"),
+            &format!("environments/{}/revisions", encode_segment(env_id.as_str())),
             Some(&idem_key),
             Some(&req),
         )
@@ -673,9 +827,13 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             }),
             expected_lifecycle: payload.expected_lifecycle,
         };
-        let resp: RevisionTransitionResponse = self.send(
+        let resp: RevisionTransitionResponse = self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/revisions/{rid}/warm"),
+            &format!(
+                "environments/{}/revisions/{}/warm",
+                encode_segment(env_id.as_str()),
+                encode_segment(&rid.to_string()),
+            ),
             Some(&idem_key),
             Some(&req),
         )?;
@@ -694,9 +852,13 @@ impl EnvironmentMutations for HttpEnvironmentStore {
     ) -> Result<RevisionTransitionOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
         let req = DrainRevisionRequest {};
-        let resp: RevisionTransitionResponse = self.send(
+        let resp: RevisionTransitionResponse = self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/revisions/{revision_id}/drain"),
+            &format!(
+                "environments/{}/revisions/{}/drain",
+                encode_segment(env_id.as_str()),
+                encode_segment(&revision_id.to_string()),
+            ),
             Some(&idem_key),
             Some(&req),
         )?;
@@ -715,9 +877,13 @@ impl EnvironmentMutations for HttpEnvironmentStore {
     ) -> Result<RevisionTransitionOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
         let req = ArchiveRevisionRequest {};
-        let resp: RevisionTransitionResponse = self.send(
+        let resp: RevisionTransitionResponse = self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/revisions/{revision_id}/archive"),
+            &format!(
+                "environments/{}/revisions/{}/archive",
+                encode_segment(env_id.as_str()),
+                encode_segment(&revision_id.to_string()),
+            ),
             Some(&idem_key),
             Some(&req),
         )?;
@@ -742,9 +908,9 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             authorization_ref: payload.authorization_ref,
             config_overrides: payload.config_overrides,
         };
-        self.send(
+        self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/bundles"),
+            &format!("environments/{}/bundles", encode_segment(env_id.as_str())),
             Some(&idem_key),
             Some(&req),
         )
@@ -756,7 +922,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         payload: UpdateBundlePayload,
     ) -> Result<BundleDeployment, StoreError> {
         let idem_key = payload.idempotency_key.as_str().to_string();
-        let did = &payload.deployment_id;
+        let did = payload.deployment_id.to_string();
         let req = UpdateBundleRequest {
             deployment_id: payload.deployment_id,
             status: payload.status,
@@ -764,9 +930,13 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             revenue_share: payload.revenue_share,
             config_overrides: payload.config_overrides,
         };
-        self.send(
+        self.send_mutation(
             reqwest::Method::PATCH,
-            &format!("environments/{env_id}/bundles/{did}"),
+            &format!(
+                "environments/{}/bundles/{}",
+                encode_segment(env_id.as_str()),
+                encode_segment(&did),
+            ),
             Some(&idem_key),
             Some(&req),
         )
@@ -779,9 +949,13 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<RemoveBundleOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let resp: RemoveBundleResponse = self.send_no_body(
+        let resp: RemoveBundleResponse = self.send_mutation_no_body(
             reqwest::Method::DELETE,
-            &format!("environments/{env_id}/bundles/{deployment_id}"),
+            &format!(
+                "environments/{}/bundles/{}",
+                encode_segment(env_id.as_str()),
+                encode_segment(&deployment_id.to_string()),
+            ),
             Some(&idem_key),
         )?;
         Ok(RemoveBundleOutcome {
@@ -798,9 +972,9 @@ impl EnvironmentMutations for HttpEnvironmentStore {
     ) -> Result<EnvPackBinding, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
         let req = PackBindingRequest { binding };
-        self.send(
+        self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/packs"),
+            &format!("environments/{}/packs", encode_segment(env_id.as_str())),
             Some(&idem_key),
             Some(&req),
         )
@@ -815,9 +989,13 @@ impl EnvironmentMutations for HttpEnvironmentStore {
     ) -> Result<(EnvPackBinding, u64), StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
         let req = PackBindingRequest { binding };
-        let resp: BindingGenerationResponse<EnvPackBinding> = self.send(
+        let resp: BindingGenerationResponse<EnvPackBinding> = self.send_mutation(
             reqwest::Method::PATCH,
-            &format!("environments/{env_id}/packs/{slot}"),
+            &format!(
+                "environments/{}/packs/{}",
+                encode_segment(env_id.as_str()),
+                encode_segment(&slot.to_string()),
+            ),
             Some(&idem_key),
             Some(&req),
         )?;
@@ -831,9 +1009,13 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<(EnvPackBinding, u64), StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let resp: BindingGenerationResponse<EnvPackBinding> = self.send_no_body(
+        let resp: BindingGenerationResponse<EnvPackBinding> = self.send_mutation_no_body(
             reqwest::Method::DELETE,
-            &format!("environments/{env_id}/packs/{slot}"),
+            &format!(
+                "environments/{}/packs/{}",
+                encode_segment(env_id.as_str()),
+                encode_segment(&slot.to_string()),
+            ),
             Some(&idem_key),
         )?;
         Ok((resp.binding, resp.generation))
@@ -846,9 +1028,13 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<(EnvPackBinding, u64), StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let resp: BindingGenerationResponse<EnvPackBinding> = self.send_no_body(
+        let resp: BindingGenerationResponse<EnvPackBinding> = self.send_mutation_no_body(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/packs/{slot}/rollback"),
+            &format!(
+                "environments/{}/packs/{}/rollback",
+                encode_segment(env_id.as_str()),
+                encode_segment(&slot.to_string()),
+            ),
             Some(&idem_key),
         )?;
         Ok((resp.binding, resp.generation))
@@ -862,9 +1048,12 @@ impl EnvironmentMutations for HttpEnvironmentStore {
     ) -> Result<ExtensionBinding, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
         let req = ExtensionBindingRequest { binding };
-        self.send(
+        self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/extensions"),
+            &format!(
+                "environments/{}/extensions",
+                encode_segment(env_id.as_str())
+            ),
             Some(&idem_key),
             Some(&req),
         )
@@ -882,9 +1071,12 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             key: WireExtensionKey::from(&key),
             binding: Some(binding),
         };
-        let resp: BindingGenerationResponse<ExtensionBinding> = self.send(
+        let resp: BindingGenerationResponse<ExtensionBinding> = self.send_mutation(
             reqwest::Method::PATCH,
-            &format!("environments/{env_id}/extensions"),
+            &format!(
+                "environments/{}/extensions",
+                encode_segment(env_id.as_str())
+            ),
             Some(&idem_key),
             Some(&req),
         )?;
@@ -902,9 +1094,12 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             key: WireExtensionKey::from(&key),
             binding: None,
         };
-        let resp: BindingGenerationResponse<ExtensionBinding> = self.send(
+        let resp: BindingGenerationResponse<ExtensionBinding> = self.send_mutation(
             reqwest::Method::DELETE,
-            &format!("environments/{env_id}/extensions"),
+            &format!(
+                "environments/{}/extensions",
+                encode_segment(env_id.as_str())
+            ),
             Some(&idem_key),
             Some(&req),
         )?;
@@ -922,9 +1117,12 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             key: WireExtensionKey::from(&key),
             binding: None,
         };
-        let resp: BindingGenerationResponse<ExtensionBinding> = self.send(
+        let resp: BindingGenerationResponse<ExtensionBinding> = self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/extensions/rollback"),
+            &format!(
+                "environments/{}/extensions/rollback",
+                encode_segment(env_id.as_str())
+            ),
             Some(&idem_key),
             Some(&req),
         )?;
@@ -947,9 +1145,9 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             updated_by,
             authorization_ref,
         };
-        let resp: ApplyTrafficSplitResponse = self.send(
+        let resp: ApplyTrafficSplitResponse = self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/traffic"),
+            &format!("environments/{}/traffic", encode_segment(env_id.as_str())),
             Some(&idem_key),
             Some(&req),
         )?;
@@ -968,9 +1166,12 @@ impl EnvironmentMutations for HttpEnvironmentStore {
     ) -> Result<RollbackTrafficSplitOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
         let req = RollbackTrafficSplitRequest { deployment_id };
-        let resp: RollbackTrafficSplitResponse = self.send(
+        let resp: RollbackTrafficSplitResponse = self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/traffic/rollback"),
+            &format!(
+                "environments/{}/traffic/rollback",
+                encode_segment(env_id.as_str())
+            ),
             Some(&idem_key),
             Some(&req),
         )?;
@@ -994,9 +1195,9 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             secret_refs: payload.secret_refs,
             updated_by: payload.updated_by,
         };
-        self.send(
+        self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/messaging"),
+            &format!("environments/{}/messaging", encode_segment(env_id.as_str())),
             Some(&idem_key),
             Some(&req),
         )
@@ -1015,9 +1216,13 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             bundle_id,
             updated_by,
         };
-        self.send(
+        self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/messaging/{endpoint_id}/link"),
+            &format!(
+                "environments/{}/messaging/{}/link",
+                encode_segment(env_id.as_str()),
+                encode_segment(&endpoint_id.to_string()),
+            ),
             Some(&idem_key),
             Some(&req),
         )
@@ -1036,9 +1241,13 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             bundle_id,
             updated_by,
         };
-        self.send(
+        self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/messaging/{endpoint_id}/unlink"),
+            &format!(
+                "environments/{}/messaging/{}/unlink",
+                encode_segment(env_id.as_str()),
+                encode_segment(&endpoint_id.to_string()),
+            ),
             Some(&idem_key),
             Some(&req),
         )
@@ -1050,7 +1259,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         payload: SetMessagingWelcomeFlowPayload,
     ) -> Result<MessagingEndpoint, StoreError> {
         let idem_key = payload.idempotency_key.as_str().to_string();
-        let eid = &payload.endpoint_id;
+        let eid = payload.endpoint_id.to_string();
         let req = SetMessagingWelcomeFlowRequest {
             endpoint_id: payload.endpoint_id,
             bundle_id: payload.bundle_id,
@@ -1058,9 +1267,13 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             flow_id: payload.flow_id,
             updated_by: payload.updated_by,
         };
-        self.send(
+        self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/messaging/{eid}/welcome-flow"),
+            &format!(
+                "environments/{}/messaging/{}/welcome-flow",
+                encode_segment(env_id.as_str()),
+                encode_segment(&eid),
+            ),
             Some(&idem_key),
             Some(&req),
         )
@@ -1071,10 +1284,15 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         env_id: &EnvId,
         endpoint_id: MessagingEndpointId,
     ) -> Result<MessagingEndpointId, StoreError> {
-        self.send_no_body(
+        let idem_key = mint_idempotency_key();
+        self.send_mutation_no_body(
             reqwest::Method::DELETE,
-            &format!("environments/{env_id}/messaging/{endpoint_id}"),
-            None,
+            &format!(
+                "environments/{}/messaging/{}",
+                encode_segment(env_id.as_str()),
+                encode_segment(&endpoint_id.to_string()),
+            ),
+            Some(&idem_key),
         )
     }
 
@@ -1087,19 +1305,27 @@ impl EnvironmentMutations for HttpEnvironmentStore {
     ) -> Result<MessagingEndpoint, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
         let req = RotateWebhookSecretRequest { updated_by };
-        self.send(
+        self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/messaging/{endpoint_id}/rotate-secret"),
+            &format!(
+                "environments/{}/messaging/{}/rotate-secret",
+                encode_segment(env_id.as_str()),
+                encode_segment(&endpoint_id.to_string()),
+            ),
             Some(&idem_key),
             Some(&req),
         )
     }
 
     fn bootstrap_trust_root(&self, env_id: &EnvId) -> Result<TrustRootSeed, StoreError> {
-        let resp: TrustRootSeedResponse = self.send_no_body(
+        let idem_key = mint_idempotency_key();
+        let resp: TrustRootSeedResponse = self.send_mutation_no_body(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/trust-root/bootstrap"),
-            None,
+            &format!(
+                "environments/{}/trust-root/bootstrap",
+                encode_segment(env_id.as_str())
+            ),
+            Some(&idem_key),
         )?;
         Ok(TrustRootSeed {
             key_id: resp.key_id,
@@ -1112,10 +1338,14 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         &self,
         env_id: &EnvId,
     ) -> Result<Option<TrustRootSeed>, StoreError> {
-        let resp: Option<TrustRootSeedResponse> = self.send_no_body(
+        let idem_key = mint_idempotency_key();
+        let resp: Option<TrustRootSeedResponse> = self.send_mutation_no_body(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/trust-root/seed"),
-            None,
+            &format!(
+                "environments/{}/trust-root/seed",
+                encode_segment(env_id.as_str())
+            ),
+            Some(&idem_key),
         )?;
         Ok(resp.map(|r| TrustRootSeed {
             key_id: r.key_id,
@@ -1136,9 +1366,12 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             key_id,
             public_key_pem,
         };
-        let resp: TrustRootAddResponse = self.send(
+        let resp: TrustRootAddResponse = self.send_mutation(
             reqwest::Method::POST,
-            &format!("environments/{env_id}/trust-root/keys"),
+            &format!(
+                "environments/{}/trust-root/keys",
+                encode_segment(env_id.as_str())
+            ),
             Some(&idem_key),
             Some(&req),
         )?;
@@ -1155,9 +1388,13 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<TrustRootRemoveOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let resp: TrustRootRemoveResponse = self.send_no_body(
+        let resp: TrustRootRemoveResponse = self.send_mutation_no_body(
             reqwest::Method::DELETE,
-            &format!("environments/{env_id}/trust-root/keys/{key_id}"),
+            &format!(
+                "environments/{}/trust-root/keys/{}",
+                encode_segment(env_id.as_str()),
+                encode_segment(&key_id),
+            ),
             Some(&idem_key),
         )?;
         Ok(TrustRootRemoveOutcome {
@@ -1253,7 +1490,31 @@ mod tests {
     }
 
     fn mock_store(addr: SocketAddr, auth: AuthMethod) -> HttpEnvironmentStore {
-        HttpEnvironmentStore::new(Url::parse(&format!("http://{addr}")).unwrap(), auth)
+        HttpEnvironmentStore::new(Url::parse(&format!("http://{addr}")).unwrap(), auth).unwrap()
+    }
+
+    /// Wrap a domain-type JSON value in the A8 `MutationEnvelope` shape.
+    fn wrap_mutation(domain: serde_json::Value) -> String {
+        serde_json::json!({
+            "result": domain,
+            "etag": "sha256:test",
+            "generation": 1,
+            "idempotency": {"idempotency": "applied"},
+            "audit": {
+                "schema": "greentic.audit-event.v1",
+                "event_id": "01TEST000000000000000000AA",
+                "ts": "2026-06-09T12:00:00Z",
+                "actor": {"kind": "operator"},
+                "env_id": "local",
+                "noun": "test",
+                "verb": "test",
+                "target": null,
+                "authorization": {"decision": "allow", "policy": "local-only", "reason": "test"},
+                "result": {"outcome": "ok"},
+                "idempotency_key": "01TEST000000000000000000BB"
+            }
+        })
+        .to_string()
     }
 
     fn env_id() -> EnvId {
@@ -1270,7 +1531,7 @@ mod tests {
 
     #[test]
     fn create_environment_happy_path() {
-        let body = serde_json::json!({
+        let domain = serde_json::json!({
             "schema": "greentic.environment.v1",
             "environment_id": "local",
             "name": "test",
@@ -1285,7 +1546,8 @@ mod tests {
             "retention": {},
             "health": {}
         });
-        let mock = start_mock(vec![(201, &body.to_string())], None);
+        let body = wrap_mutation(domain);
+        let mock = start_mock(vec![(201, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
         let result = store.create_environment(
             &env_id(),
@@ -1326,7 +1588,7 @@ mod tests {
 
     #[test]
     fn update_environment_happy_path() {
-        let body = serde_json::json!({
+        let domain = serde_json::json!({
             "schema": "greentic.environment.v1",
             "environment_id": "local",
             "name": "updated",
@@ -1341,7 +1603,8 @@ mod tests {
             "retention": {},
             "health": {}
         });
-        let mock = start_mock(vec![(200, &body.to_string())], None);
+        let body = wrap_mutation(domain);
+        let mock = start_mock(vec![(200, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
         let result = store.update_environment(
             &env_id(),
@@ -1369,11 +1632,12 @@ mod tests {
 
     #[test]
     fn migrate_merge_bindings_happy_path() {
-        let body = serde_json::json!({
+        let domain = serde_json::json!({
             "merged_slots": ["messaging"],
             "merged_extensions": ["capability/memory/long-term"]
         });
-        let mock = start_mock(vec![(200, &body.to_string())], None);
+        let body = wrap_mutation(domain);
+        let mock = start_mock(vec![(200, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
         let result = store.migrate_merge_bindings(
             &env_id(),
@@ -1394,7 +1658,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn sample_revision_response() -> String {
-        serde_json::json!({
+        wrap_mutation(serde_json::json!({
             "schema": "greentic.revision.v1",
             "revision_id": "01JTKW5B4W4Q5Y1CQW93F7S5VH",
             "env_id": "local",
@@ -1412,8 +1676,7 @@ mod tests {
             "staged_at": "2026-06-09T12:00:00Z",
             "drain_seconds": 30,
             "abort_metrics": []
-        })
-        .to_string()
+        }))
     }
 
     #[test]
@@ -1467,7 +1730,7 @@ mod tests {
     }
 
     fn sample_transition_response(lifecycle: &str) -> String {
-        serde_json::json!({
+        wrap_mutation(serde_json::json!({
             "revision": {
                 "schema": "greentic.revision.v1",
                 "revision_id": "01JTKW5B4W4Q5Y1CQW93F7S5VH",
@@ -1503,8 +1766,7 @@ mod tests {
                 "health": {}
             },
             "starting_lifecycle": "staged"
-        })
-        .to_string()
+        }))
     }
 
     #[test]
@@ -1550,7 +1812,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn sample_bundle_deployment() -> String {
-        serde_json::json!({
+        wrap_mutation(serde_json::json!({
             "schema": "greentic.bundle-deployment.v1",
             "deployment_id": "01JTKW5B4W4Q5Y1CQW93F7S5VH",
             "env_id": "local",
@@ -1568,8 +1830,7 @@ mod tests {
             "created_at": "2026-06-09T12:00:00Z",
             "authorization_ref": "auth.json",
             "config_overrides": {}
-        })
-        .to_string()
+        }))
     }
 
     #[test]
@@ -1613,7 +1874,7 @@ mod tests {
 
     #[test]
     fn remove_bundle_happy_path() {
-        let body = serde_json::json!({
+        let domain = serde_json::json!({
             "deployment": {
                 "schema": "greentic.bundle-deployment.v1",
                 "deployment_id": "01JTKW5B4W4Q5Y1CQW93F7S5VH",
@@ -1635,7 +1896,8 @@ mod tests {
             },
             "pruned_revision_ids": []
         });
-        let mock = start_mock(vec![(200, &body.to_string())], None);
+        let body = wrap_mutation(domain);
+        let mock = start_mock(vec![(200, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
         let result = store.remove_bundle(&env_id(), DeploymentId::new(), idem());
         assert!(result.is_ok());
@@ -1646,7 +1908,7 @@ mod tests {
     // Pack binding CRUD
     // -----------------------------------------------------------------------
 
-    fn sample_pack_binding() -> String {
+    fn sample_pack_binding_json() -> String {
         serde_json::json!({
             "slot": "messaging",
             "kind": "greentic.messaging@0.5.0",
@@ -1656,8 +1918,16 @@ mod tests {
         .to_string()
     }
 
+    fn sample_pack_binding() -> String {
+        wrap_mutation(serde_json::from_str(&sample_pack_binding_json()).unwrap())
+    }
+
     fn sample_binding_generation_response(binding_json: &str, generation: u64) -> String {
-        format!(r#"{{"binding": {binding_json}, "generation": {generation}}}"#)
+        let domain: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"binding": {binding_json}, "generation": {generation}}}"#
+        ))
+        .unwrap();
+        wrap_mutation(domain)
     }
 
     #[test]
@@ -1665,14 +1935,14 @@ mod tests {
         let body = sample_pack_binding();
         let mock = start_mock(vec![(201, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
-        let binding: EnvPackBinding = serde_json::from_str(&body).unwrap();
+        let binding: EnvPackBinding = serde_json::from_str(&sample_pack_binding_json()).unwrap();
         let result = store.add_pack_binding(&env_id(), binding, idem());
         assert!(result.is_ok());
     }
 
     #[test]
     fn update_pack_binding_happy_path() {
-        let binding_json = sample_pack_binding();
+        let binding_json = sample_pack_binding_json();
         let body = sample_binding_generation_response(&binding_json, 2);
         let mock = start_mock(vec![(200, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
@@ -1686,7 +1956,7 @@ mod tests {
 
     #[test]
     fn remove_pack_binding_happy_path() {
-        let binding_json = sample_pack_binding();
+        let binding_json = sample_pack_binding_json();
         let body = sample_binding_generation_response(&binding_json, 3);
         let mock = start_mock(vec![(200, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
@@ -1696,7 +1966,7 @@ mod tests {
 
     #[test]
     fn rollback_pack_binding_happy_path() {
-        let binding_json = sample_pack_binding();
+        let binding_json = sample_pack_binding_json();
         let body = sample_binding_generation_response(&binding_json, 4);
         let mock = start_mock(vec![(200, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
@@ -1708,7 +1978,7 @@ mod tests {
     // Extension binding CRUD
     // -----------------------------------------------------------------------
 
-    fn sample_extension_binding() -> String {
+    fn sample_extension_binding_json() -> String {
         serde_json::json!({
             "kind": "greentic.memory-chronicle@0.1.0",
             "pack_ref": "greentic-chronicle",
@@ -1717,19 +1987,24 @@ mod tests {
         .to_string()
     }
 
+    fn sample_extension_binding() -> String {
+        wrap_mutation(serde_json::from_str(&sample_extension_binding_json()).unwrap())
+    }
+
     #[test]
     fn add_extension_binding_happy_path() {
         let body = sample_extension_binding();
         let mock = start_mock(vec![(201, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
-        let binding: ExtensionBinding = serde_json::from_str(&body).unwrap();
+        let binding: ExtensionBinding =
+            serde_json::from_str(&sample_extension_binding_json()).unwrap();
         let result = store.add_extension_binding(&env_id(), binding, idem());
         assert!(result.is_ok());
     }
 
     #[test]
     fn update_extension_binding_happy_path() {
-        let ext_json = sample_extension_binding();
+        let ext_json = sample_extension_binding_json();
         let body = sample_binding_generation_response(&ext_json, 2);
         let mock = start_mock(vec![(200, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
@@ -1743,7 +2018,7 @@ mod tests {
 
     #[test]
     fn remove_extension_binding_happy_path() {
-        let ext_json = sample_extension_binding();
+        let ext_json = sample_extension_binding_json();
         let body = sample_binding_generation_response(&ext_json, 3);
         let mock = start_mock(vec![(200, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
@@ -1754,7 +2029,7 @@ mod tests {
 
     #[test]
     fn rollback_extension_binding_happy_path() {
-        let ext_json = sample_extension_binding();
+        let ext_json = sample_extension_binding_json();
         let body = sample_binding_generation_response(&ext_json, 4);
         let mock = start_mock(vec![(200, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
@@ -1784,12 +2059,13 @@ mod tests {
 
     #[test]
     fn set_traffic_split_happy_path() {
-        let body = serde_json::json!({
+        let domain = serde_json::json!({
             "split": sample_traffic_split(),
             "previous_generation": 1,
             "new_generation": 2
         });
-        let mock = start_mock(vec![(200, &body.to_string())], None);
+        let body = wrap_mutation(domain);
+        let mock = start_mock(vec![(200, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
         let result = store.set_traffic_split(
             &env_id(),
@@ -1807,12 +2083,13 @@ mod tests {
 
     #[test]
     fn rollback_traffic_split_happy_path() {
-        let body = serde_json::json!({
+        let domain = serde_json::json!({
             "restored": sample_traffic_split(),
             "previous_generation": 2,
             "new_generation": 3
         });
-        let mock = start_mock(vec![(200, &body.to_string())], None);
+        let body = wrap_mutation(domain);
+        let mock = start_mock(vec![(200, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
         let result = store.rollback_traffic_split(&env_id(), DeploymentId::new(), idem());
         assert!(result.is_ok());
@@ -1823,7 +2100,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn sample_messaging_endpoint() -> String {
-        serde_json::json!({
+        wrap_mutation(serde_json::json!({
             "schema": "greentic.messaging-endpoint.v1",
             "env_id": "local",
             "endpoint_id": "01JTKW5B4W4Q5Y1CQW93F7S5VH",
@@ -1836,8 +2113,7 @@ mod tests {
             "created_at": "2026-06-09T12:00:00Z",
             "updated_at": "2026-06-09T12:00:00Z",
             "updated_by": "tester"
-        })
-        .to_string()
+        }))
     }
 
     #[test]
@@ -1911,8 +2187,8 @@ mod tests {
     #[test]
     fn remove_messaging_endpoint_happy_path() {
         let eid = MessagingEndpointId::new();
-        let body = serde_json::json!(eid.to_string());
-        let mock = start_mock(vec![(200, &body.to_string())], None);
+        let body = wrap_mutation(serde_json::json!(eid.to_string()));
+        let mock = start_mock(vec![(200, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
         let result = store.remove_messaging_endpoint(&env_id(), eid);
         assert!(result.is_ok());
@@ -1937,12 +2213,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn sample_trust_root_seed() -> String {
-        serde_json::json!({
+        wrap_mutation(serde_json::json!({
             "key_id": "op-key-1",
             "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMFkw...\n-----END PUBLIC KEY-----",
             "trusted_key_count": 1
-        })
-        .to_string()
+        }))
     }
 
     #[test]
@@ -1969,7 +2244,8 @@ mod tests {
 
     #[test]
     fn seed_trust_root_if_absent_when_already_exists() {
-        let mock = start_mock(vec![(200, "null")], None);
+        let body = wrap_mutation(serde_json::Value::Null);
+        let mock = start_mock(vec![(200, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
         let result = store.seed_trust_root_if_absent(&env_id());
         assert!(result.is_ok());
@@ -1978,11 +2254,12 @@ mod tests {
 
     #[test]
     fn add_trusted_key_happy_path() {
-        let body = serde_json::json!({
+        let domain = serde_json::json!({
             "added_key_id": "external-key-1",
             "trusted_key_count": 2
         });
-        let mock = start_mock(vec![(201, &body.to_string())], None);
+        let body = wrap_mutation(domain);
+        let mock = start_mock(vec![(201, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
         let result = store.add_trusted_key(
             &env_id(),
@@ -1998,12 +2275,13 @@ mod tests {
 
     #[test]
     fn remove_trusted_key_happy_path() {
-        let body = serde_json::json!({
+        let domain = serde_json::json!({
             "removed_key_id": "external-key-1",
             "removed_public_key_pem": "PEM-DATA",
             "trusted_key_count": 1
         });
-        let mock = start_mock(vec![(200, &body.to_string())], None);
+        let body = wrap_mutation(domain);
+        let mock = start_mock(vec![(200, &body)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
         let result = store.remove_trusted_key(&env_id(), "external-key-1".to_string(), idem());
         assert!(result.is_ok());
@@ -2128,7 +2406,8 @@ mod tests {
     fn transport_error_maps_to_conflict() {
         // Connect to a port that is definitely not listening.
         let store =
-            HttpEnvironmentStore::new(Url::parse("http://127.0.0.1:1").unwrap(), AuthMethod::None);
+            HttpEnvironmentStore::new(Url::parse("http://127.0.0.1:1").unwrap(), AuthMethod::None)
+                .unwrap();
         let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
         match result {
             Err(StoreError::Conflict(msg)) => {
@@ -2139,6 +2418,233 @@ mod tests {
             }
             other => panic!("expected Conflict(transport:...), got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 1: percent-encoding of dynamic path segments
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn encode_segment_passes_through_alphanumeric() {
+        assert_eq!(encode_segment("local"), "local");
+        assert_eq!(
+            encode_segment("01JTKW5B4W4Q5Y1CQW93F7S5VH"),
+            "01JTKW5B4W4Q5Y1CQW93F7S5VH"
+        );
+    }
+
+    #[test]
+    fn encode_segment_escapes_slash() {
+        let encoded = encode_segment("foo/bar");
+        assert!(
+            !encoded.contains('/'),
+            "slash must be escaped, got: {encoded}"
+        );
+        assert!(encoded.contains("%2F"));
+    }
+
+    #[test]
+    fn encode_segment_escapes_dot_dot() {
+        let encoded = encode_segment("..");
+        assert!(
+            !encoded.contains(".."),
+            "dots must be escaped, got: {encoded}"
+        );
+        assert!(encoded.contains("%2E"));
+    }
+
+    #[test]
+    fn encode_segment_escapes_query() {
+        let encoded = encode_segment("id?foo=bar");
+        assert!(
+            !encoded.contains('?'),
+            "query marker must be escaped, got: {encoded}"
+        );
+    }
+
+    #[test]
+    fn encode_segment_escapes_fragment() {
+        let encoded = encode_segment("id#frag");
+        assert!(
+            !encoded.contains('#'),
+            "fragment marker must be escaped, got: {encoded}"
+        );
+    }
+
+    #[test]
+    fn key_id_with_slash_reaches_escaped_path() {
+        let body = wrap_mutation(serde_json::json!({
+            "removed_key_id": "a/b",
+            "removed_public_key_pem": "PEM",
+            "trusted_key_count": 0
+        }));
+        let check = Arc::new(|req_line: &str, _headers: &str, _body: &[u8]| {
+            assert!(
+                req_line.contains("a%2Fb"),
+                "expected escaped slash in path, got: {req_line}"
+            );
+        });
+        let mock = start_mock(vec![(200, &body)], Some(check));
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let _ = store.remove_trusted_key(&env_id(), "a/b".to_string(), idem());
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 2: MutationEnvelope parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mutation_envelope_with_extra_metadata_is_accepted() {
+        // The envelope carries etag/generation/audit alongside the result.
+        // Verify that the client parses the envelope correctly.
+        let domain = serde_json::json!({
+            "schema": "greentic.environment.v1",
+            "environment_id": "local",
+            "name": "test-envelope",
+            "host_config": {"env_id": "local"},
+            "packs": [],
+            "bundles": [],
+            "revisions": [],
+            "traffic_splits": [],
+            "messaging_endpoints": [],
+            "extensions": [],
+            "revocation": {},
+            "retention": {},
+            "health": {}
+        });
+        let body = wrap_mutation(domain);
+        let mock = start_mock(vec![(201, &body)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let result = store.create_environment(
+            &env_id(),
+            "test-envelope".to_string(),
+            EnvironmentHostConfig {
+                env_id: env_id(),
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+                public_base_url: None,
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().name, "test-envelope");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 4: idempotency-key minting for methods without payload key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bootstrap_trust_root_sends_idempotency_key() {
+        let body = sample_trust_root_seed();
+        let check = Arc::new(|_req_line: &str, headers: &str, _body: &[u8]| {
+            assert!(
+                headers.contains("Idempotency-Key:"),
+                "expected Idempotency-Key header in: {headers}"
+            );
+            // Extract the key value and verify it's non-empty.
+            let key = headers
+                .lines()
+                .find(|l| l.starts_with("Idempotency-Key:"))
+                .and_then(|l| l.split(':').nth(1))
+                .map(|v| v.trim())
+                .unwrap_or("");
+            assert!(!key.is_empty(), "Idempotency-Key must be non-empty");
+        });
+        let mock = start_mock(vec![(201, &body)], Some(check));
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let _ = store.bootstrap_trust_root(&env_id());
+    }
+
+    #[test]
+    fn create_environment_sends_idempotency_key() {
+        let domain = serde_json::json!({
+            "schema": "greentic.environment.v1",
+            "environment_id": "local",
+            "name": "test",
+            "host_config": {"env_id": "local"},
+            "packs": [],
+            "bundles": [],
+            "revisions": [],
+            "traffic_splits": [],
+            "messaging_endpoints": [],
+            "extensions": [],
+            "revocation": {},
+            "retention": {},
+            "health": {}
+        });
+        let body = wrap_mutation(domain);
+        let check = Arc::new(|_req_line: &str, headers: &str, _body: &[u8]| {
+            assert!(
+                headers.contains("Idempotency-Key:"),
+                "expected Idempotency-Key header for create_environment: {headers}"
+            );
+        });
+        let mock = start_mock(vec![(201, &body)], Some(check));
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let _ = store.create_environment(
+            &env_id(),
+            "test".to_string(),
+            EnvironmentHostConfig {
+                env_id: env_id(),
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+                public_base_url: None,
+            },
+        );
+    }
+
+    #[test]
+    fn minted_keys_are_unique_per_call() {
+        let key1 = mint_idempotency_key();
+        let key2 = mint_idempotency_key();
+        assert_ne!(key1, key2, "minted keys must differ per call");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 5: insecure-transport guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bearer_over_http_non_loopback_is_rejected() {
+        let result = HttpEnvironmentStore::new(
+            Url::parse("http://192.0.2.1:8080").unwrap(),
+            AuthMethod::Bearer("token".to_string()),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ConstructionError::InsecureTransport(_)),
+            "expected InsecureTransport, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn bearer_over_http_loopback_is_allowed() {
+        let result = HttpEnvironmentStore::new(
+            Url::parse("http://127.0.0.1:8080").unwrap(),
+            AuthMethod::Bearer("token".to_string()),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn bearer_over_https_is_allowed() {
+        let result = HttpEnvironmentStore::new(
+            Url::parse("https://example.com").unwrap(),
+            AuthMethod::Bearer("token".to_string()),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn no_auth_over_http_is_allowed() {
+        let result = HttpEnvironmentStore::new(
+            Url::parse("http://192.0.2.1:8080").unwrap(),
+            AuthMethod::None,
+        );
+        assert!(result.is_ok());
     }
 
     // -----------------------------------------------------------------------
