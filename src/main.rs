@@ -53,6 +53,46 @@ enum TopLevelCommand {
     /// `EnvironmentStore` rooted at `~/.greentic/environments` (or
     /// `--store-root <path>`).
     Op(greentic_deployer::cli::dispatch::OpCommand),
+    /// SoRX alias-aware routing (S3-deployer, decision B1 / Option A).
+    Sorx(SorxCommand),
+}
+
+#[derive(Parser)]
+struct SorxCommand {
+    #[command(subcommand)]
+    command: SorxSubcommand,
+}
+
+#[derive(Subcommand)]
+enum SorxSubcommand {
+    /// Resolve a sample request against the SoRX routing-table and an injected
+    /// upstream map, printing the routing decision as JSON (dry-run).
+    ///
+    /// This is the verifiable core of the deployer-owned thin router. The live
+    /// listener (bind a socket, copy bytes) and live process orchestration
+    /// (spawn one SoRX per deployment, populate the upstream registry) are the
+    /// documented infra-coupled follow-ups — see `src/sorx_routing.rs`.
+    Route(SorxRouteArgs),
+}
+
+#[derive(Parser)]
+struct SorxRouteArgs {
+    /// SoRX base URL, e.g. `http://127.0.0.1:9080`.
+    #[arg(long = "sorx-url")]
+    sorx_url: String,
+    /// Injected `deployment_id -> host:port` upstream map as JSON, e.g.
+    /// `{"dep-1":"127.0.0.1:8088"}`. Supplied by the orchestrator; v1 is static.
+    #[arg(long = "upstreams")]
+    upstreams: String,
+    /// HTTP method of the sample request (dry-run only).
+    #[arg(long = "method", default_value = "GET")]
+    method: String,
+    /// Sample inbound request path `/{tenant}/{sor}/{alias}/{rest}`.
+    #[arg(long = "path")]
+    path: String,
+    /// Routing-table cache TTL in seconds.
+    #[arg(long = "ttl-secs", default_value_t = 5)]
+    ttl_secs: u64,
 }
 
 enum BuiltinBackendCommand {
@@ -1273,6 +1313,40 @@ fn main() -> Result<()> {
                 Ok(()) => Ok(()),
                 Err(_) => std::process::exit(1),
             }
+        }
+        TopLevelCommand::Sorx(command) => run_sorx(command),
+    }
+}
+
+fn run_sorx(command: SorxCommand) -> Result<()> {
+    use greentic_deployer::sorx_routing::{
+        AliasResolver, HttpRoutingTableSource, StaticUpstreamRegistry, describe_request,
+    };
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    match command.command {
+        SorxSubcommand::Route(args) => {
+            let upstreams: HashMap<String, String> = serde_json::from_str(&args.upstreams)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "--upstreams must be a JSON object of deployment_id -> host:port: {e}"
+                    )
+                })?;
+            let registry = StaticUpstreamRegistry::new(upstreams);
+
+            let source = HttpRoutingTableSource::new().map_err(|e| anyhow::anyhow!(e))?;
+            let resolver = AliasResolver::new(Box::new(source), Duration::from_secs(args.ttl_secs));
+
+            let decision = describe_request(
+                &resolver,
+                &registry,
+                &args.sorx_url,
+                &args.method,
+                &args.path,
+            );
+            println!("{}", serde_json::to_string_pretty(&decision)?);
+            Ok(())
         }
     }
 }
