@@ -43,6 +43,12 @@ impl SecretValue {
     }
 }
 
+impl From<String> for SecretValue {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
 impl fmt::Debug for SecretValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("<redacted>")

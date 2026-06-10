@@ -27,14 +27,18 @@ use serde_json::{Value, json};
 
 use crate::environment::{EnvFlock, EnvironmentStore, LocalFsStore};
 
-use super::{AuditCtx, AuditGens, OpError, OpFlags, OpOutcome, audit_and_record};
+use super::{
+    AuditCtx, AuditGens, OpError, OpFlags, OpOutcome, audit_and_record, resolve_idempotency_key,
+};
 
 const NOUN: &str = "secrets";
 
 /// `PackDescriptor::path()` of the local dev-store secrets backend — the
 /// default binding `op env init` creates and the only kind `put` dispatches
-/// to in Phase A.
-const DEV_STORE_KIND_PATH: &str = "greentic.secrets.dev-store";
+/// to in Phase A. Shared with `env apply` (PR-2), which pre-checks the bound
+/// backend at validation time so a non-dev-store env fails before any
+/// mutation instead of mid-run.
+pub(super) const DEV_STORE_KIND_PATH: &str = "greentic.secrets.dev-store";
 
 /// Same override the runtime reader honors (`greentic-start
 /// `dev_store_path::override_path`): when set, both writer and reader use
@@ -63,6 +67,10 @@ pub struct SecretsPutPayload {
     /// transport stays uniform; the live backend handler (A9) is what reads
     /// this and converts to the backend-native shape.
     pub value: String,
+    /// Caller-supplied A8 §2 idempotency key. Optional on the CLI
+    /// surface; when absent, the verb mints one per invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,12 +145,13 @@ pub fn put(
     }
     let payload = resolve_payload::<SecretsPutPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key.clone())?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "put",
         target: json!({"path": payload.path}),
-        idempotency_key: None,
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
     };
     audit_and_record(store, ctx, |_committed| {
         let env = store.load(&env_id)?;
@@ -165,59 +174,7 @@ pub fn put(
                     .to_string(),
             ));
         }
-        // The dev store's native key shape is the runtime's `secrets://`
-        // (plural) URI: `secrets://<env>/<tenant>/<team>/<pack>/<name>`.
-        // The backend handler converts the logical `secret://` ref 1:1.
-        // `DevStore::put` itself rejects any other depth, so enforce the
-        // shape upfront with a teachable error instead of surfacing the
-        // backend's "uri is missing category". The `splitn(5)` + None tail
-        // makes "exactly four non-empty segments" structural.
-        let mut segs = rel_path.splitn(5, '/');
-        let (Some(tenant), Some(team), Some(pack), Some(name), None) = (
-            segs.next(),
-            segs.next(),
-            segs.next(),
-            segs.next(),
-            segs.next(),
-        ) else {
-            return Err(OpError::InvalidArgument(format!(
-                "dev-store secret path must be `<tenant>/<team>/<pack>/<name>` \
-                 (e.g. `default/_/messaging-telegram/telegram_bot_token`); \
-                 got `{rel_path}`"
-            )));
-        };
-        if [tenant, team, pack, name].iter().any(|s| s.is_empty()) {
-            return Err(OpError::InvalidArgument(format!(
-                "dev-store secret path must be `<tenant>/<team>/<pack>/<name>` \
-                 (e.g. `default/_/messaging-telegram/telegram_bot_token`); \
-                 got `{rel_path}`"
-            )));
-        }
-        // The runtime reader canonicalizes the team segment before lookup
-        // (greentic-start `secrets_manager::canonical_team` maps `default`/
-        // empty — trimmed, case-insensitive — to `_`), so a literal
-        // `default` team would be written under a key no lookup ever uses.
-        // Same policy as the name segment: reject instead of silently
-        // transforming.
-        if !is_canonical_team(team) {
-            return Err(OpError::InvalidArgument(format!(
-                "team segment `{team}` is not store-canonical: the runtime \
-                 reads the default team as `_` — pass `_` (or a real team \
-                 name without surrounding whitespace)"
-            )));
-        }
-        // The runtime reader canonicalizes the name segment before lookup
-        // (greentic-start `secret_name::canonical_secret_name`), so a
-        // non-canonical name would be written but never found. Reject
-        // instead of silently transforming — producer and consumer must
-        // share one derivation, and we share it by only accepting
-        // already-canonical input.
-        if !is_canonical_secret_name(name) {
-            return Err(OpError::InvalidArgument(format!(
-                "secret name `{name}` is not store-canonical: use lowercase \
-                 a-z, 0-9 and single `_` separators (no leading/trailing `_`)"
-            )));
-        }
+        validate_dev_store_secret_path(rel_path)?;
         let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
         let dev_path = resolve_dev_store_path(
             &store.env_dir(&env_id)?,
@@ -317,6 +274,62 @@ pub(super) fn resolve_dev_store_path(env_dir: &Path, override_path: Option<PathB
         return fallback;
     }
     primary
+}
+
+/// Validate that `rel_path` (leading `/` already trimmed) is a writable
+/// dev-store secret path: exactly `<tenant>/<team>/<pack>/<name>` with
+/// store-canonical team and name segments.
+///
+/// The dev store's native key shape is the runtime's `secrets://` (plural)
+/// URI: `secrets://<env>/<tenant>/<team>/<pack>/<name>`; the backend handler
+/// converts the logical `secret://` ref 1:1. `DevStore::put` itself rejects
+/// any other depth, so enforce the shape upfront with a teachable error
+/// instead of surfacing the backend's "uri is missing category" — exactly
+/// four non-empty segments.
+///
+/// Shared between `put` (pre-write) and `env apply`'s pre-mutation manifest
+/// validation (PR-2) so the two surfaces cannot drift.
+pub(super) fn validate_dev_store_secret_path(rel_path: &str) -> Result<(), OpError> {
+    let shape_err = || {
+        OpError::InvalidArgument(format!(
+            "dev-store secret path must be `<tenant>/<team>/<pack>/<name>` \
+             (e.g. `default/_/messaging-telegram/telegram_bot_token`); \
+             got `{rel_path}`"
+        ))
+    };
+    let segs: Vec<&str> = rel_path.split('/').collect();
+    let [_tenant, team, _pack, name] = segs[..] else {
+        return Err(shape_err());
+    };
+    if segs.iter().any(|s| s.is_empty()) {
+        return Err(shape_err());
+    }
+    // The runtime reader canonicalizes the team segment before lookup
+    // (greentic-start `secrets_manager::canonical_team` maps `default`/
+    // empty — trimmed, case-insensitive — to `_`), so a literal
+    // `default` team would be written under a key no lookup ever uses.
+    // Same policy as the name segment: reject instead of silently
+    // transforming.
+    if !is_canonical_team(team) {
+        return Err(OpError::InvalidArgument(format!(
+            "team segment `{team}` is not store-canonical: the runtime \
+             reads the default team as `_` — pass `_` (or a real team \
+             name without surrounding whitespace)"
+        )));
+    }
+    // The runtime reader canonicalizes the name segment before lookup
+    // (greentic-start `secret_name::canonical_secret_name`), so a
+    // non-canonical name would be written but never found. Reject
+    // instead of silently transforming — producer and consumer must
+    // share one derivation, and we share it by only accepting
+    // already-canonical input.
+    if !is_canonical_secret_name(name) {
+        return Err(OpError::InvalidArgument(format!(
+            "secret name `{name}` is not store-canonical: use lowercase \
+             a-z, 0-9 and single `_` separators (no leading/trailing `_`)"
+        )));
+    }
+    Ok(())
 }
 
 /// A segment is writable iff the runtime reader's canonicalization maps it to
@@ -426,7 +439,9 @@ fn parse_env_id(raw: &str) -> Result<EnvId, OpError> {
     EnvId::try_from(raw).map_err(|e| OpError::InvalidArgument(format!("environment_id: {e}")))
 }
 
-fn require_secrets_pack<'a>(
+/// The env-must-have-secrets-pack precondition every secrets verb enforces.
+/// Shared with `env apply`'s validation (PR-2).
+pub(super) fn require_secrets_pack<'a>(
     env: &'a greentic_deploy_spec::Environment,
     env_id: &EnvId,
 ) -> Result<&'a EnvPackBinding, OpError> {
@@ -458,7 +473,8 @@ fn put_schema() -> Value {
         "properties": {
             "environment_id": {"type": "string"},
             "path": {"type": "string", "description": "Relative path under secret://<env>/. For the dev-store backend: <tenant>/<team>/<pack>/<name> (e.g. default/_/messaging-telegram/telegram_bot_token). Use `_` for the default team — a literal `default` team is rejected (the runtime reads the default team as `_`)."},
-            "value": {"type": "string"}
+            "value": {"type": "string"},
+            "idempotency_key": {"type": ["string", "null"], "description": "Caller-supplied idempotency key; minted per invocation when absent."}
         }
     })
 }
@@ -547,12 +563,7 @@ mod tests {
     }
 
     fn read_back(store_path: &str, uri: &str) -> Vec<u8> {
-        let dev = DevStore::with_path(PathBuf::from(store_path)).unwrap();
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async { dev.get(uri).await.unwrap() })
+        crate::cli::tests_common::dev_store_read(Path::new(store_path), uri)
     }
 
     #[test]
@@ -569,6 +580,7 @@ mod tests {
                 environment_id: "local".to_string(),
                 path: "credentials/aws".to_string(),
                 value: "secret-material".to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap_err();
@@ -587,6 +599,7 @@ mod tests {
                 environment_id: "local".to_string(),
                 path: "default/_/messaging-telegram/telegram_bot_token".to_string(),
                 value: "tok-dummy-123".to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap();
@@ -625,6 +638,7 @@ mod tests {
                     environment_id: "local".to_string(),
                     path: format!("acme/{team}/messaging-telegram/telegram_bot_token"),
                     value: "tok-dummy".to_string(),
+                    idempotency_key: None,
                 }),
             )
             .unwrap_err();
@@ -656,6 +670,7 @@ mod tests {
                             environment_id: "local".to_string(),
                             path: format!("default/_/demo-pack/{name}"),
                             value: format!("value-{name}"),
+                            idempotency_key: None,
                         }),
                     )
                     .unwrap();
@@ -705,6 +720,7 @@ mod tests {
                 environment_id: "local".to_string(),
                 path: "default/_/messaging-telegram/TELEGRAM-BOT-TOKEN".to_string(),
                 value: "tok-dummy".to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap_err();
@@ -726,6 +742,7 @@ mod tests {
                     environment_id: "local".to_string(),
                     path: path.to_string(),
                     value: "v".to_string(),
+                    idempotency_key: None,
                 }),
             )
             .unwrap_err();
@@ -793,6 +810,7 @@ mod tests {
                 environment_id: "local".to_string(),
                 path: "x".to_string(),
                 value: "".to_string(),
+                idempotency_key: None,
             }),
         )
         .unwrap_err();

@@ -39,6 +39,20 @@ pub fn bootstrap_env_trust_root(env_dir: &Path) {
     .expect("seed operator key into env trust root");
 }
 
+/// Read one value back from a dev store file, mirroring the runtime
+/// reader's access path (`DevStore::get` over the `secrets://` URI).
+/// Shared by the secrets / env-apply test suites — one async-bridge copy
+/// instead of one per `mod tests`.
+pub fn dev_store_read(path: &Path, uri: &str) -> Vec<u8> {
+    use greentic_secrets_lib::{DevStore, SecretsStore};
+    let dev = DevStore::with_path(path.to_path_buf()).unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async { dev.get(uri).await.unwrap() })
+}
+
 /// Minimal valid `Environment` for unit/integration tests.
 pub fn make_env(env_id: &str) -> Environment {
     let env_id = EnvId::try_from(env_id).expect("test env_id");
