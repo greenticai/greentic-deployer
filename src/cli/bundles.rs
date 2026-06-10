@@ -71,6 +71,22 @@ pub(crate) fn default_authorization_ref() -> PathBuf {
     PathBuf::from("auth.json")
 }
 
+/// Convert the CLI `RevenueShareEntryPayload` list into the spec
+/// [`RevenueShareEntry`] list. Shared by the remote dispatch's `bundles
+/// add`/`update` so the two HTTP call sites don't re-roll the mapping.
+pub(crate) fn convert_revenue_share(
+    entries: &[RevenueShareEntryPayload],
+) -> Vec<RevenueShareEntry> {
+    entries
+        .iter()
+        .cloned()
+        .map(|e| RevenueShareEntry {
+            party_id: greentic_deploy_spec::PartyId::new(e.party_id),
+            basis_points: e.basis_points,
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteBindingPayload {
     #[serde(default)]

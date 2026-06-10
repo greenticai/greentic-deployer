@@ -266,7 +266,7 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
 
 /// Build the lookup key from a remove/rollback payload's `kind` (path is the
 /// version-independent key) and `instance_id`.
-fn build_key(kind: &str, instance_id: &Option<String>) -> Result<ExtensionKey, OpError> {
+pub(crate) fn build_key(kind: &str, instance_id: &Option<String>) -> Result<ExtensionKey, OpError> {
     let descriptor = PackDescriptor::try_new(kind)
         .map_err(|e| OpError::InvalidArgument(format!("kind: {e}")))?;
     Ok(ExtensionKey::new(descriptor.path(), instance_id.clone()))
@@ -291,7 +291,7 @@ fn parse_env_id(raw: &str) -> Result<EnvId, OpError> {
     EnvId::try_from(raw).map_err(|e| OpError::InvalidArgument(format!("environment_id: {e}")))
 }
 
-fn build_binding(
+pub(crate) fn build_binding(
     payload: &ExtensionBindingPayload,
     generation: u64,
     previous_binding_ref: Option<PathBuf>,

@@ -11,16 +11,15 @@
 //! a clear message.
 
 use greentic_deploy_spec::{
-    BundleId, CapabilitySlot, DeploymentId, EnvId, EnvPackBinding, EnvironmentHostConfig,
-    ExtensionBinding, IdempotencyKey, MessagingEndpointId, PackDescriptor, PackId,
-    RevenueShareEntry, RevisionId, TrafficSplitEntry,
+    BundleId, DeploymentId, EnvId, EnvironmentHostConfig, IdempotencyKey, MessagingEndpointId,
+    PackId, RevenueShareEntry, RevisionId,
 };
 use serde_json::json;
 
 use crate::environment::{
-    AddBundlePayload, AddMessagingEndpointPayload, AuthMethod, EnvironmentMutations, ExtensionKey,
-    FieldUpdate, HttpEnvironmentStore, RemoveBundleOutcome, SetMessagingWelcomeFlowPayload,
-    UpdateBundlePayload, UpdateEnvironmentPayload,
+    AddBundlePayload, AddMessagingEndpointPayload, AuthMethod, EnvironmentMutations, FieldUpdate,
+    HttpEnvironmentStore, RemoveBundleOutcome, SetMessagingWelcomeFlowPayload, UpdateBundlePayload,
+    UpdateEnvironmentPayload,
 };
 
 use super::dispatch::{
@@ -156,8 +155,16 @@ fn route_remote(
 
         // -- revisions ---------------------------------------------------------
         OpNoun::Revisions { verb } => match verb {
-            RevisionsVerb::Drain => remote_revisions_drain(store, flags),
-            RevisionsVerb::Archive => remote_revisions_archive(store, flags),
+            RevisionsVerb::Drain => {
+                remote_revision_transition(store, flags, "drain", |s, e, r, k| {
+                    s.drain_revision(e, r, k)
+                })
+            }
+            RevisionsVerb::Archive => {
+                remote_revision_transition(store, flags, "archive", |s, e, r, k| {
+                    s.archive_revision(e, r, k)
+                })
+            }
             RevisionsVerb::Stage(_) => Err(OpError::NotYetImplemented(
                 "`revisions stage` against a remote --store-url store is not supported yet \
                  (needs server-side bundle staging / a GET-env read endpoint; \
@@ -417,7 +424,7 @@ fn remote_env_packs_add(
 ) -> Result<OpOutcome, OpError> {
     let payload = resolve_payload::<super::env_packs::EnvPackBindingPayload>(flags, None)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let binding = build_env_pack_binding(&payload)?;
+    let binding = super::env_packs::build_binding(&payload, 0, None)?;
     let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
     let added = store
         .add_pack_binding(&env_id, binding, idempotency_key)
@@ -439,7 +446,7 @@ fn remote_env_packs_update(
     let payload = resolve_payload::<super::env_packs::EnvPackBindingPayload>(flags, None)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let slot = payload.slot;
-    let binding = build_env_pack_binding(&payload)?;
+    let binding = super::env_packs::build_binding(&payload, 0, None)?;
     let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
     let (new_binding, _new_generation) = store
         .update_pack_binding(&env_id, slot, binding, idempotency_key)
@@ -497,34 +504,6 @@ fn remote_env_packs_rollback(
     ))
 }
 
-/// Build an `EnvPackBinding` from the CLI payload for add/update.
-fn build_env_pack_binding(
-    payload: &super::env_packs::EnvPackBindingPayload,
-) -> Result<EnvPackBinding, OpError> {
-    if !payload.slot.binds_in_packs() {
-        let noun = match payload.slot {
-            CapabilitySlot::Messaging => "op messaging endpoint",
-            CapabilitySlot::Extension => "op extensions",
-            _ => unreachable!("binds_in_packs() is false only for Messaging/Extension"),
-        };
-        return Err(OpError::InvalidArgument(format!(
-            "slot `{}` is N-per-env and is not bound via `op env-packs`; use `{noun}` instead",
-            payload.slot
-        )));
-    }
-    let kind = PackDescriptor::try_new(payload.kind.clone())
-        .map_err(|e| OpError::InvalidArgument(format!("kind: {e}")))?;
-    let pack_ref = greentic_deploy_spec::PackId::new(&payload.pack_ref);
-    Ok(EnvPackBinding {
-        slot: payload.slot,
-        kind,
-        pack_ref,
-        generation: 0,
-        answers_ref: payload.answers_ref.clone(),
-        previous_binding_ref: None,
-    })
-}
-
 // ---------------------------------------------------------------------------
 // extensions: add, update, remove, rollback
 // ---------------------------------------------------------------------------
@@ -535,7 +514,7 @@ fn remote_extensions_add(
 ) -> Result<OpOutcome, OpError> {
     let payload = resolve_payload::<super::extensions::ExtensionBindingPayload>(flags, None)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let binding = build_extension_binding(&payload)?;
+    let binding = super::extensions::build_binding(&payload, 0, None)?;
     let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
     let added = store
         .add_extension_binding(&env_id, binding, idempotency_key)
@@ -556,8 +535,8 @@ fn remote_extensions_update(
 ) -> Result<OpOutcome, OpError> {
     let payload = resolve_payload::<super::extensions::ExtensionBindingPayload>(flags, None)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let key = build_extension_key(&payload.kind, &payload.instance_id)?;
-    let binding = build_extension_binding(&payload)?;
+    let key = super::extensions::build_key(&payload.kind, &payload.instance_id)?;
+    let binding = super::extensions::build_binding(&payload, 0, None)?;
     let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
     let (updated, _new_generation) = store
         .update_extension_binding(&env_id, key, binding, idempotency_key)
@@ -578,7 +557,7 @@ fn remote_extensions_remove(
 ) -> Result<OpOutcome, OpError> {
     let payload = resolve_payload::<super::extensions::ExtensionRemovePayload>(flags, None)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let key = build_extension_key(&payload.kind, &payload.instance_id)?;
+    let key = super::extensions::build_key(&payload.kind, &payload.instance_id)?;
     let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
     let (removed, _generation) = store
         .remove_extension_binding(&env_id, key, idempotency_key)
@@ -599,7 +578,7 @@ fn remote_extensions_rollback(
 ) -> Result<OpOutcome, OpError> {
     let payload = resolve_payload::<super::extensions::ExtensionRemovePayload>(flags, None)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let key = build_extension_key(&payload.kind, &payload.instance_id)?;
+    let key = super::extensions::build_key(&payload.kind, &payload.instance_id)?;
     let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
     let (restored, _new_generation) = store
         .rollback_extension_binding(&env_id, key, idempotency_key)
@@ -612,28 +591,6 @@ fn remote_extensions_rollback(
         ))
         .expect("ExtensionSummary is json-safe"),
     ))
-}
-
-fn build_extension_key(kind: &str, instance_id: &Option<String>) -> Result<ExtensionKey, OpError> {
-    let descriptor = PackDescriptor::try_new(kind)
-        .map_err(|e| OpError::InvalidArgument(format!("kind: {e}")))?;
-    Ok(ExtensionKey::new(descriptor.path(), instance_id.clone()))
-}
-
-fn build_extension_binding(
-    payload: &super::extensions::ExtensionBindingPayload,
-) -> Result<ExtensionBinding, OpError> {
-    let kind = PackDescriptor::try_new(payload.kind.clone())
-        .map_err(|e| OpError::InvalidArgument(format!("kind: {e}")))?;
-    let pack_ref = PackId::new(&payload.pack_ref);
-    Ok(ExtensionBinding {
-        kind,
-        pack_ref,
-        instance_id: payload.instance_id.clone(),
-        generation: 0,
-        answers_ref: payload.answers_ref.clone(),
-        previous_binding_ref: None,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -653,15 +610,7 @@ fn remote_bundles_add(
     }
     let bundle_id = BundleId::new(payload.bundle_id);
     let customer_id = super::bundles::resolve_customer_id(&env_id, payload.customer_id)?;
-    let revenue_share: Vec<RevenueShareEntry> = payload
-        .revenue_share
-        .iter()
-        .cloned()
-        .map(|e| RevenueShareEntry {
-            party_id: greentic_deploy_spec::PartyId::new(e.party_id),
-            basis_points: e.basis_points,
-        })
-        .collect();
+    let revenue_share = super::bundles::convert_revenue_share(&payload.revenue_share);
     let route_binding_payload = payload.route_binding.clone();
     let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
     let deployment = store
@@ -693,16 +642,10 @@ fn remote_bundles_update(
     let payload = resolve_payload::<super::bundles::BundleUpdatePayload>(flags, None)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
-    let new_revenue_share: Option<Vec<RevenueShareEntry>> =
-        payload.revenue_share.as_ref().map(|s| {
-            s.iter()
-                .cloned()
-                .map(|e| RevenueShareEntry {
-                    party_id: greentic_deploy_spec::PartyId::new(e.party_id),
-                    basis_points: e.basis_points,
-                })
-                .collect()
-        });
+    let new_revenue_share: Option<Vec<RevenueShareEntry>> = payload
+        .revenue_share
+        .as_ref()
+        .map(|s| super::bundles::convert_revenue_share(s));
     let new_route_binding = payload
         .route_binding
         .clone()
@@ -767,7 +710,7 @@ fn remote_traffic_set(
     let payload = resolve_payload(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
-    let parsed_entries = parse_traffic_entries(&payload.entries)?;
+    let parsed_entries = super::traffic::parse_entries(&payload.entries)?;
     // Skip the local store.load "revision-belongs-to-deployment" pre-check —
     // the typed verb `set_traffic_split` enforces it server-side.
     let idempotency_key = IdempotencyKey::new(payload.idempotency_key)
@@ -781,7 +724,7 @@ fn remote_traffic_set(
             payload.updated_by,
             Some(payload.authorization_ref.to_string_lossy().into_owned()),
         )
-        .map_err(map_traffic_store_err)?;
+        .map_err(super::traffic::map_traffic_store_err)?;
     Ok(OpOutcome::new(
         "traffic",
         "set",
@@ -804,7 +747,7 @@ fn remote_traffic_rollback(
     let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
     let outcome = store
         .rollback_traffic_split(&env_id, deployment_id, idempotency_key)
-        .map_err(map_traffic_store_err)?;
+        .map_err(super::traffic::map_traffic_store_err)?;
     Ok(OpOutcome::new(
         "traffic",
         "rollback",
@@ -816,63 +759,41 @@ fn remote_traffic_rollback(
     ))
 }
 
-fn parse_traffic_entries(
-    entries: &[super::traffic::TrafficSetEntryPayload],
-) -> Result<Vec<TrafficSplitEntry>, OpError> {
-    let mut out = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let bps = match (entry.weight_bps, entry.weight_percent) {
-            (Some(bps), _) => bps,
-            (None, Some(pct)) => {
-                if pct > 100 {
-                    return Err(OpError::InvalidArgument(format!(
-                        "weight_percent {pct} > 100"
-                    )));
-                }
-                pct.saturating_mul(100)
-            }
-            (None, None) => {
-                return Err(OpError::InvalidArgument(
-                    "each entry must set weight_bps or weight_percent".to_string(),
-                ));
-            }
-        };
-        let revision_id = parse_revision_id(&entry.revision_id)?;
-        out.push(TrafficSplitEntry {
-            revision_id,
-            weight_bps: bps,
-        });
-    }
-    Ok(out)
-}
-
-fn map_traffic_store_err(e: crate::environment::StoreError) -> OpError {
-    match e {
-        crate::environment::StoreError::Spec(s) => OpError::Spec(s),
-        other => map_store_err_preserving_noun(other),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // revisions: drain, archive
 // ---------------------------------------------------------------------------
 
-fn remote_revisions_drain(
+/// Shared remote driver for the revision lifecycle transitions
+/// (`drain` / `archive`). Both resolve the same payload, call their typed
+/// verb, emit the matching rollout event from the returned outcome, and
+/// render a `RevisionSummary` — they differ only by verb label and store
+/// method. `emit_for_op` keys on the starting lifecycle, so `archive` emits
+/// `RevisionEvicted` only for the post-drain (`Inactive → Archived`)
+/// eviction hop. Telemetry parity with the local helper: the typed verb's
+/// outcome carries the post-mutation env + revision, so no local read is
+/// needed over HTTP.
+fn remote_revision_transition(
     store: &dyn EnvironmentMutations,
     flags: &OpFlags,
+    verb: &'static str,
+    transition: impl Fn(
+        &dyn EnvironmentMutations,
+        &EnvId,
+        RevisionId,
+        IdempotencyKey,
+    ) -> Result<
+        crate::environment::RevisionTransitionOutcome,
+        crate::environment::StoreError,
+    >,
 ) -> Result<OpOutcome, OpError> {
     let payload = resolve_payload::<super::revisions::RevisionTransitionPayload>(flags, None)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let revision_id = parse_revision_id(&payload.revision_id)?;
     let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
-    let outcome = store
-        .drain_revision(&env_id, revision_id, idempotency_key)
+    let outcome = transition(store, &env_id, revision_id, idempotency_key)
         .map_err(map_store_err_preserving_noun)?;
-    // Rollout-telemetry parity with the local helper: the typed verb returns
-    // the post-mutation env + revision, so emit `RevisionDraining` here too —
-    // no local read needed.
     super::revisions::emit_for_op(
-        "drain",
+        verb,
         false,
         Some(outcome.starting_lifecycle),
         &outcome.environment,
@@ -880,36 +801,7 @@ fn remote_revisions_drain(
     );
     Ok(OpOutcome::new(
         "revisions",
-        "drain",
-        serde_json::to_value(super::revisions::RevisionSummary::from(&outcome.revision))
-            .expect("RevisionSummary is json-safe"),
-    ))
-}
-
-fn remote_revisions_archive(
-    store: &dyn EnvironmentMutations,
-    flags: &OpFlags,
-) -> Result<OpOutcome, OpError> {
-    let payload = resolve_payload::<super::revisions::RevisionTransitionPayload>(flags, None)?;
-    let env_id = parse_env_id(&payload.environment_id)?;
-    let revision_id = parse_revision_id(&payload.revision_id)?;
-    let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
-    let outcome = store
-        .archive_revision(&env_id, revision_id, idempotency_key)
-        .map_err(map_store_err_preserving_noun)?;
-    // Rollout-telemetry parity with the local helper: `emit_for_op` keys on
-    // the starting lifecycle, so it emits `RevisionEvicted` only for the
-    // post-drain (`Inactive → Archived`) eviction hop, not a plain retirement.
-    super::revisions::emit_for_op(
-        "archive",
-        false,
-        Some(outcome.starting_lifecycle),
-        &outcome.environment,
-        &outcome.revision,
-    );
-    Ok(OpOutcome::new(
-        "revisions",
-        "archive",
+        verb,
         serde_json::to_value(super::revisions::RevisionSummary::from(&outcome.revision))
             .expect("RevisionSummary is json-safe"),
     ))
@@ -1088,7 +980,7 @@ fn remote_trust_root_add(
     };
     let payload = resolve_payload::<super::trust_root::TrustRootAddPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let public_key_pem = resolve_pem(&payload)?;
+    let public_key_pem = super::trust_root::resolve_pem(&payload)?;
     let idem = super::mint_idempotency_key();
     let outcome = store
         .add_trusted_key(&env_id, payload.key_id, public_key_pem, idem)
@@ -1123,22 +1015,6 @@ fn remote_trust_root_remove(
         "remove",
         super::trust_root::trust_root_remove_outcome_to_wire(&env_id, &outcome),
     ))
-}
-
-fn resolve_pem(payload: &super::trust_root::TrustRootAddPayload) -> Result<String, OpError> {
-    match (&payload.public_key_pem, &payload.public_key_file) {
-        (Some(pem), None) => Ok(pem.clone()),
-        (None, Some(path)) => std::fs::read_to_string(path).map_err(|source| OpError::Io {
-            path: path.clone(),
-            source,
-        }),
-        (Some(_), Some(_)) => Err(OpError::InvalidArgument(
-            "trust-root add: pass exactly one of `public_key_pem` or `public_key_file`".to_string(),
-        )),
-        (None, None) => Err(OpError::InvalidArgument(
-            "trust-root add: one of `public_key_pem` or `public_key_file` is required".to_string(),
-        )),
-    }
 }
 
 // ===========================================================================
@@ -1615,7 +1491,10 @@ mod tests {
             schema_only: false,
             answers: Some(tmp.path().to_path_buf()),
         };
-        let outcome = remote_revisions_drain(&store, &flags).unwrap();
+        let outcome = remote_revision_transition(&store, &flags, "drain", |s, e, r, k| {
+            s.drain_revision(e, r, k)
+        })
+        .unwrap();
         assert_eq!(outcome.noun, "revisions");
         assert_eq!(outcome.op, "drain");
     }

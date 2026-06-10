@@ -236,7 +236,7 @@ pub fn remove(
     })
 }
 
-fn resolve_pem(payload: &TrustRootAddPayload) -> Result<String, OpError> {
+pub(crate) fn resolve_pem(payload: &TrustRootAddPayload) -> Result<String, OpError> {
     match (&payload.public_key_pem, &payload.public_key_file) {
         (Some(pem), None) => Ok(pem.clone()),
         (None, Some(path)) => std::fs::read_to_string(path).map_err(|source| OpError::Io {
