@@ -43,10 +43,10 @@ pub type LoadedAnswers = Loaded<Value>;
 
 /// Errors surfaced by a storage backend.
 ///
-/// Variants map cleanly onto the [`greentic_deploy_spec::RemoteStoreError`]
-/// HTTP status table for the HTTP fronting layer:
+/// The HTTP statuses the operator store server will emit for each variant
+/// (these are A8 contract statuses, not `RemoteStoreError` variants):
 ///
-/// | Variant | HTTP equivalent |
+/// | Variant | HTTP status |
 /// |---|---|
 /// | `NotFound` | `404` |
 /// | `AlreadyExists` | `409` |
@@ -55,6 +55,12 @@ pub type LoadedAnswers = Loaded<Value>;
 /// | `IntegrityMismatch` | `422` |
 /// | `Spec` / `EnvIdMismatch` | `400` |
 /// | `Json` / `Integrity` / `Backend` | `500` |
+///
+/// Note: [`greentic_deploy_spec::RemoteStoreError`] currently lacks
+/// `already-exists` (409) and invalid-request (400) kinds — its only 409
+/// is `IdempotencyConflict`. PR-4.2 must extend the shared wire enum
+/// (deploy-spec + client + server together) before routes can emit typed
+/// bodies for `AlreadyExists` / `Spec` / `EnvIdMismatch`.
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("environment `{0}` not found")]

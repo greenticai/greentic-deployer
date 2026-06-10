@@ -3,6 +3,9 @@
 -- of the parked Postgres prototype schema
 -- (crates/greentic-environment-store-postgres/migrations/20260609000001_initial.sql).
 --
+-- pack_answers carries a `deleted` tombstone column so the generation
+-- sequence survives delete/recreate cycles (ABA protection).
+--
 -- IMMUTABLE AFTER FIRST MERGE: sqlx tracks applied migrations by
 -- checksum in `_sqlx_migrations`. Editing this file after the PR
 -- merges will desync deployed databases. All subsequent schema
@@ -47,6 +50,7 @@ CREATE TABLE pack_answers (
     etag             TEXT    NOT NULL,
     data             TEXT    NOT NULL,
     integrity_digest TEXT    NOT NULL,
+    deleted          INTEGER NOT NULL DEFAULT 0,
     updated_at       TEXT    NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (env_id, slot)
 );

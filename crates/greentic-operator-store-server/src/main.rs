@@ -51,8 +51,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn shutdown_signal() {
-    if let Err(err) = tokio::signal::ctrl_c().await {
-        tracing::warn!(%err, "failed to install ctrl-c handler; running until killed");
-        std::future::pending::<()>().await;
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let ctrl_c = async {
+            if let Err(err) = tokio::signal::ctrl_c().await {
+                tracing::warn!(%err, "failed to install ctrl-c handler; running until killed");
+                std::future::pending::<()>().await;
+            }
+        };
+        let sigterm = async {
+            match signal(SignalKind::terminate()) {
+                Ok(mut s) => {
+                    s.recv().await;
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "failed to install SIGTERM handler; running until killed");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        tokio::select! {
+            () = ctrl_c => {}
+            () = sigterm => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%err, "failed to install ctrl-c handler; running until killed");
+            std::future::pending::<()>().await;
+        }
     }
 }

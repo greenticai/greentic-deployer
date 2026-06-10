@@ -2514,6 +2514,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "fs4",
  "greentic-deploy-spec 0.1.0",
  "http-body-util",
  "serde",

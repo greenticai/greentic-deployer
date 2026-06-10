@@ -20,6 +20,7 @@ use greentic_deploy_spec::{
 use greentic_operator_store_server::sqlite::SqliteEnvironmentStore;
 use greentic_operator_store_server::storage::{EnvironmentStorage, StorageError};
 use serde_json::json;
+use sqlx::Row;
 
 async fn fresh_store() -> (tempfile::TempDir, SqliteEnvironmentStore) {
     let dir = tempfile::tempdir().expect("create temp dir");
@@ -361,6 +362,134 @@ async fn upsert_pack_answers_after_delete_with_stale_precondition_returns_not_fo
     );
 }
 
+// --- ABA: delete/recreate generation continuity (tombstone) ---
+
+#[tokio::test]
+async fn recreate_after_delete_continues_generation_sequence() {
+    let (_d, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    let answers = json!({"region": "eu-west-1"});
+    let rev1 = store
+        .upsert_pack_answers(&id, CapabilitySlot::Deployer, &answers, None)
+        .await
+        .expect("create answers (gen 1)");
+    assert_eq!(rev1.generation, 1);
+
+    // Delete (tombstone internally at gen 2).
+    let pc_del = Precondition::matching(rev1.etag.clone(), rev1.generation);
+    store
+        .delete_pack_answers(&id, CapabilitySlot::Deployer, &pc_del)
+        .await
+        .expect("delete");
+
+    // Unconditional re-upsert must continue from the tombstone generation.
+    let answers2 = json!({"region": "us-east-1"});
+    let rev3 = store
+        .upsert_pack_answers(&id, CapabilitySlot::Deployer, &answers2, None)
+        .await
+        .expect("recreate answers");
+    assert_eq!(
+        rev3.generation, 3,
+        "generation must continue past tombstone"
+    );
+
+    let loaded = store
+        .load_pack_answers(&id, CapabilitySlot::Deployer)
+        .await
+        .expect("load")
+        .expect("present after recreate");
+    assert_eq!(loaded.value, answers2);
+    assert_eq!(loaded.revision.generation, 3);
+}
+
+#[tokio::test]
+async fn stale_first_incarnation_precondition_rejected_after_recreate() {
+    let (_d, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    // Create content A at gen 1.
+    let content_a = json!({"region": "eu-west-1"});
+    let rev1 = store
+        .upsert_pack_answers(&id, CapabilitySlot::Deployer, &content_a, None)
+        .await
+        .expect("create answers");
+    assert_eq!(rev1.generation, 1);
+
+    // Delete with rev1.
+    let pc_del = Precondition::matching(rev1.etag.clone(), rev1.generation);
+    store
+        .delete_pack_answers(&id, CapabilitySlot::Deployer, &pc_del)
+        .await
+        .expect("delete");
+
+    // Unconditional re-upsert with the SAME content A.
+    let rev3 = store
+        .upsert_pack_answers(&id, CapabilitySlot::Deployer, &content_a, None)
+        .await
+        .expect("recreate with same content");
+    assert_eq!(rev3.generation, 3);
+
+    // Attempt CAS with stale rev1 precondition — etag matches (same
+    // content!) but generation 1 != 3. This was the ABA hole.
+    let stale = Precondition::matching(rev1.etag.clone(), rev1.generation);
+    let err = store
+        .upsert_pack_answers(&id, CapabilitySlot::Deployer, &content_a, Some(&stale))
+        .await
+        .expect_err("stale first-incarnation precondition must reject");
+    assert!(
+        matches!(err, StorageError::PreconditionFailed { .. }),
+        "expected PreconditionFailed, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_of_deleted_row_is_idempotent_without_generation_bump() {
+    let (_d, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    let answers = json!({"region": "eu-west-1"});
+    let rev1 = store
+        .upsert_pack_answers(&id, CapabilitySlot::Deployer, &answers, None)
+        .await
+        .expect("create answers");
+
+    let pc = Precondition::matching(rev1.etag.clone(), rev1.generation);
+    store
+        .delete_pack_answers(&id, CapabilitySlot::Deployer, &pc)
+        .await
+        .expect("first delete");
+
+    // Second delete of the already-tombstoned row — idempotent, no gen bump.
+    store
+        .delete_pack_answers(&id, CapabilitySlot::Deployer, &pc)
+        .await
+        .expect("second delete (idempotent)");
+
+    // Re-upsert must land at gen 3 (tombstone was gen 2; second delete
+    // did NOT bump to gen 3).
+    let rev3 = store
+        .upsert_pack_answers(&id, CapabilitySlot::Deployer, &answers, None)
+        .await
+        .expect("recreate");
+    assert_eq!(
+        rev3.generation, 3,
+        "second delete must not have bumped generation"
+    );
+}
+
 // --- integrity digest tamper detection (Postgres-suite Finding 2) ---
 
 #[tokio::test]
@@ -432,4 +561,75 @@ async fn load_pack_answers_detects_tampered_data() {
         matches!(err, StorageError::IntegrityMismatch { .. }),
         "expected IntegrityMismatch, got: {err:?}"
     );
+}
+
+// --- unknown-field injection (raw-first integrity check) ---
+
+#[tokio::test]
+async fn load_env_detects_unknown_field_injection() {
+    let (_d, store) = fresh_store().await;
+    let id = env_id("local");
+    let env = minimal_environment(&id);
+    store.create_env(&env).await.expect("create env");
+
+    // Inject an extra top-level key into the stored JSON without touching
+    // integrity_digest. serde would silently drop the unknown field on
+    // deserialization, so a post-typed hash check would miss this — only
+    // the raw-first check catches it.
+    let mut data: serde_json::Value =
+        sqlx::query("SELECT data FROM environments WHERE env_id = $1")
+            .bind(id.as_str())
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch")
+            .try_get("data")
+            .expect("data column");
+    data.as_object_mut()
+        .expect("object")
+        .insert("__injected".to_string(), json!(true));
+    sqlx::query("UPDATE environments SET data = $1 WHERE env_id = $2")
+        .bind(&data)
+        .bind(id.as_str())
+        .execute(store.pool())
+        .await
+        .expect("inject");
+
+    let err = store
+        .load_env(&id)
+        .await
+        .expect_err("unknown-field injection must fail integrity check");
+    assert!(
+        matches!(err, StorageError::IntegrityMismatch { .. }),
+        "expected IntegrityMismatch, got: {err:?}"
+    );
+}
+
+// --- single-process ownership (sidecar flock) ---
+
+#[tokio::test]
+async fn second_open_of_same_file_is_rejected_while_lock_held() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let db_path = dir.path().join("store.sqlite");
+
+    let store_a = SqliteEnvironmentStore::open(&db_path)
+        .await
+        .expect("first open");
+
+    // A second open of the same path must fail while A holds the lock.
+    let err = SqliteEnvironmentStore::open(&db_path)
+        .await
+        .expect_err("second open must fail while lock is held");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("already locked"),
+        "expected 'already locked' in error, got: {msg}"
+    );
+
+    // Drop store A (releases the flock via Arc<File> drop).
+    drop(store_a);
+
+    // Re-open should now succeed.
+    let _store_b = SqliteEnvironmentStore::open(&db_path)
+        .await
+        .expect("re-open after drop must succeed");
 }

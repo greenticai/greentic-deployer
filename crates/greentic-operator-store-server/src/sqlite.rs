@@ -8,10 +8,18 @@
 //! **one connection**, so every transaction is fully serialized
 //! in-process and the CAS read-check-write windows are trivially
 //! race-free (SQLite has no `FOR UPDATE`; it doesn't need one here).
+//!
+//! The single-writer assumption is **enforced** via an exclusive sidecar
+//! flock (`<db>.lock`), acquired non-blocking during [`SqliteEnvironmentStore::open`].
+//! A second process opening the same file is rejected before a connection
+//! is established.
 
+use std::fs::{File, OpenOptions};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
+use fs4::fs_std::FileExt;
 use greentic_deploy_spec::{
     CapabilitySlot, EnvId, Environment, EnvironmentRuntime, Precondition, SchemaVersion, SpecError,
     StateEtag, StateIntegrity,
@@ -42,16 +50,67 @@ impl From<sqlx::migrate::MigrateError> for StorageError {
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// SQLite-backed environment store. Cheap to clone — wraps `sqlx::SqlitePool`.
+///
+/// The `_owner_lock` field holds an exclusive advisory flock on a sidecar
+/// `.lock` file next to the database. It survives clones (via `Arc`) and
+/// is released when the last clone is dropped.
 #[derive(Debug, Clone)]
 pub struct SqliteEnvironmentStore {
     pool: SqlitePool,
+    _owner_lock: Arc<File>,
 }
 
 impl SqliteEnvironmentStore {
     /// Open (creating if missing) the SQLite database at `path` and apply
     /// the bundled migrations. Migration is idempotent — sqlx tracks
     /// applied files in `_sqlx_migrations`.
+    ///
+    /// An exclusive advisory flock on `<path>.lock` is acquired first
+    /// (non-blocking). If another process already holds the lock, this
+    /// returns [`StorageError::Backend`] immediately.
     pub async fn open(path: &Path) -> Result<Self, StorageError> {
+        // --- sidecar flock (single-writer enforcement) ---
+        let lock_path_string = format!("{}.lock", path.display());
+        let lock_path = Path::new(&lock_path_string);
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                StorageError::backend(std::io::Error::new(
+                    e.kind(),
+                    format!("create lock-file parent {}: {e}", parent.display()),
+                ))
+            })?;
+        }
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(|e| {
+                StorageError::backend(std::io::Error::new(
+                    e.kind(),
+                    format!("open lock file {}: {e}", lock_path.display()),
+                ))
+            })?;
+        match lock_file.try_lock_exclusive() {
+            Ok(true) => {} // acquired
+            Ok(false) => {
+                return Err(StorageError::backend(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "database {} is already locked by another operator-store-server process",
+                        path.display()
+                    ),
+                )));
+            }
+            Err(e) => {
+                return Err(StorageError::backend(std::io::Error::new(
+                    e.kind(),
+                    format!("flock {}: {e}", lock_path.display()),
+                )));
+            }
+        }
+
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
@@ -65,7 +124,10 @@ impl SqliteEnvironmentStore {
             .connect_with(options)
             .await?;
         MIGRATOR.run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            _owner_lock: Arc::new(lock_file),
+        })
     }
 
     pub fn pool(&self) -> &SqlitePool {
@@ -114,6 +176,17 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
             return Err(StorageError::NotFound(env_id.clone()));
         };
         let (revision, data, stored_digest) = decode_revision_with_data(&row)?;
+        // Verify integrity against the RAW Value BEFORE typed deserialization —
+        // serde silently drops unknown fields, so a post-typed check would miss
+        // injected top-level keys.
+        let recomputed = StateIntegrity::sha256_of(&data)?;
+        if recomputed.digest != stored_digest {
+            return Err(StorageError::IntegrityMismatch {
+                env_id: env_id.clone(),
+                stored: stored_digest,
+                recomputed: recomputed.digest,
+            });
+        }
         let env: Environment = serde_json::from_value(data)?;
         if env.environment_id != *env_id {
             return Err(StorageError::EnvIdMismatch {
@@ -122,14 +195,6 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
             });
         }
         env.validate()?;
-        let recomputed = StateIntegrity::sha256_of(&env)?;
-        if recomputed.digest != stored_digest {
-            return Err(StorageError::IntegrityMismatch {
-                env_id: env_id.clone(),
-                stored: stored_digest,
-                recomputed: recomputed.digest,
-            });
-        }
         Ok(Loaded {
             value: env,
             revision,
@@ -229,6 +294,17 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
             return Ok(None);
         };
         let (revision, data, stored_digest) = decode_revision_with_data(&row)?;
+        // Verify integrity against the RAW Value BEFORE typed deserialization —
+        // serde silently drops unknown fields, so a post-typed check would miss
+        // injected top-level keys.
+        let recomputed = StateIntegrity::sha256_of(&data)?;
+        if recomputed.digest != stored_digest {
+            return Err(StorageError::IntegrityMismatch {
+                env_id: env_id.clone(),
+                stored: stored_digest,
+                recomputed: recomputed.digest,
+            });
+        }
         let runtime: EnvironmentRuntime = serde_json::from_value(data)?;
         if runtime.environment_id != *env_id {
             return Err(StorageError::EnvIdMismatch {
@@ -241,14 +317,6 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
                 expected: SchemaVersion::ENVIRONMENT_RUNTIME_V1,
                 actual: runtime.schema.as_str().to_string(),
             }));
-        }
-        let recomputed = StateIntegrity::sha256_of(&runtime)?;
-        if recomputed.digest != stored_digest {
-            return Err(StorageError::IntegrityMismatch {
-                env_id: env_id.clone(),
-                stored: stored_digest,
-                recomputed: recomputed.digest,
-            });
         }
         Ok(Some(Loaded {
             value: runtime,
@@ -342,7 +410,7 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         slot: CapabilitySlot,
     ) -> Result<Option<LoadedAnswers>, StorageError> {
         let row = sqlx::query(
-            "SELECT generation, etag, data, integrity_digest \
+            "SELECT generation, etag, data, integrity_digest, deleted \
              FROM pack_answers WHERE env_id = $1 AND slot = $2",
         )
         .bind(env_id.as_str())
@@ -352,6 +420,11 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         let Some(row) = row else {
             return Ok(None);
         };
+        // Tombstoned rows are logically absent.
+        let deleted: i32 = row.try_get("deleted")?;
+        if deleted != 0 {
+            return Ok(None);
+        }
         // `data` is `Value` on both sides of the row boundary — no
         // additional `from_value` round-trip is needed.
         let (revision, answers, stored_digest) = decode_revision_with_data(&row)?;
@@ -380,7 +453,7 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
 
         let mut tx = self.pool.begin().await?;
         let current = sqlx::query(
-            "SELECT generation, etag FROM pack_answers \
+            "SELECT generation, etag, deleted FROM pack_answers \
              WHERE env_id = $1 AND slot = $2",
         )
         .bind(env_id.as_str())
@@ -390,10 +463,9 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
 
         let new_gen = match current {
             None => {
-                // Row absent: only allow the create-if-absent path
+                // No row at all: only allow the create-if-absent path
                 // (no precondition). A conditional precondition means
-                // the caller expected an existing row — another actor
-                // deleted it. Resurrecting would break CAS.
+                // the caller expected an existing row.
                 if precondition.is_some_and(|pc| pc.is_conditional()) {
                     return Err(StorageError::NotFound(env_id.clone()));
                 }
@@ -412,28 +484,60 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
                 1
             }
             Some(current) => {
-                let Some(pc) = precondition else {
-                    return Err(StorageError::PreconditionRequired);
-                };
+                let deleted: i32 = current.try_get("deleted")?;
                 let current_rev = decode_revision(&current)?;
-                pc.check(&current_rev.etag, current_rev.generation)
-                    .map_err(|e| StorageError::from_precondition(env_id.clone(), e))?;
-                let new_gen = current_rev.generation + 1;
-                sqlx::query(
-                    "UPDATE pack_answers \
-                     SET data = $1, generation = $2, etag = $3, \
-                         integrity_digest = $4, updated_at = datetime('now') \
-                     WHERE env_id = $5 AND slot = $6",
-                )
-                .bind(&data)
-                .bind(new_gen as i64)
-                .bind(&etag.0)
-                .bind(&integrity.digest)
-                .bind(env_id.as_str())
-                .bind(slot.as_str())
-                .execute(&mut *tx)
-                .await?;
-                new_gen
+
+                if deleted != 0 {
+                    // Tombstoned row: a conditional precondition expects
+                    // a LIVE row — fail with NotFound so stale
+                    // preconditions from a previous incarnation can't
+                    // ABA-match the new one.
+                    if precondition.is_some_and(|pc| pc.is_conditional()) {
+                        return Err(StorageError::NotFound(env_id.clone()));
+                    }
+                    // Unconditional resurrect: continue the generation
+                    // sequence from the tombstone.
+                    let new_gen = current_rev.generation + 1;
+                    sqlx::query(
+                        "UPDATE pack_answers \
+                         SET data = $1, generation = $2, etag = $3, \
+                             integrity_digest = $4, deleted = 0, \
+                             updated_at = datetime('now') \
+                         WHERE env_id = $5 AND slot = $6",
+                    )
+                    .bind(&data)
+                    .bind(new_gen as i64)
+                    .bind(&etag.0)
+                    .bind(&integrity.digest)
+                    .bind(env_id.as_str())
+                    .bind(slot.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+                    new_gen
+                } else {
+                    // Live row: require a conditional precondition.
+                    let Some(pc) = precondition else {
+                        return Err(StorageError::PreconditionRequired);
+                    };
+                    pc.check(&current_rev.etag, current_rev.generation)
+                        .map_err(|e| StorageError::from_precondition(env_id.clone(), e))?;
+                    let new_gen = current_rev.generation + 1;
+                    sqlx::query(
+                        "UPDATE pack_answers \
+                         SET data = $1, generation = $2, etag = $3, \
+                             integrity_digest = $4, updated_at = datetime('now') \
+                         WHERE env_id = $5 AND slot = $6",
+                    )
+                    .bind(&data)
+                    .bind(new_gen as i64)
+                    .bind(&etag.0)
+                    .bind(&integrity.digest)
+                    .bind(env_id.as_str())
+                    .bind(slot.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+                    new_gen
+                }
             }
         };
         tx.commit().await?;
@@ -454,7 +558,7 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         }
         let mut tx = self.pool.begin().await?;
         let current = sqlx::query(
-            "SELECT generation, etag FROM pack_answers \
+            "SELECT generation, etag, deleted FROM pack_answers \
              WHERE env_id = $1 AND slot = $2",
         )
         .bind(env_id.as_str())
@@ -465,14 +569,22 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
             // Idempotent delete: nothing to remove.
             return Ok(());
         };
+        let deleted: i32 = current.try_get("deleted")?;
+        if deleted != 0 {
+            // Already tombstoned — idempotent no-op (no generation bump).
+            return Ok(());
+        }
         let current_rev = decode_revision(&current)?;
         precondition
             .check(&current_rev.etag, current_rev.generation)
             .map_err(|e| StorageError::from_precondition(env_id.clone(), e))?;
+        let new_gen = current_rev.generation + 1;
         sqlx::query(
-            "DELETE FROM pack_answers \
-             WHERE env_id = $1 AND slot = $2",
+            "UPDATE pack_answers \
+             SET deleted = 1, generation = $1, updated_at = datetime('now') \
+             WHERE env_id = $2 AND slot = $3",
         )
+        .bind(new_gen as i64)
         .bind(env_id.as_str())
         .bind(slot.as_str())
         .execute(&mut *tx)
@@ -496,13 +608,14 @@ fn validate_environment(env: &Environment) -> Result<(), StorageError> {
 }
 
 /// Compute `(etag, integrity, data_value)` once for a payload that's about
-/// to be written. Keeps the call sites from re-deriving the same things.
+/// to be written. Serializes to `Value` first, then hashes the raw `Value`
+/// so that the write-side digest matches the load-side raw-first check.
 fn serialize_for_write<T: serde::Serialize>(
     value: &T,
 ) -> Result<(StateEtag, StateIntegrity, Value), StorageError> {
-    let integrity = StateIntegrity::sha256_of(value)?;
-    let etag = StateEtag::from_integrity(&integrity);
     let data = serde_json::to_value(value)?;
+    let integrity = StateIntegrity::sha256_of(&data)?;
+    let etag = StateEtag::from_integrity(&integrity);
     Ok((etag, integrity, data))
 }
 
