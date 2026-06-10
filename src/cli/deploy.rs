@@ -57,7 +57,7 @@ const NOUN: &str = "deploy";
 const VERB: &str = "run";
 
 /// 100 % of traffic, in basis points.
-const FULL_TRAFFIC_BPS: u32 = 10_000;
+pub(crate) const FULL_TRAFFIC_BPS: u32 = 10_000;
 
 /// Input to [`deploy`]. Everything but `bundle_id` and `bundle_path` has a
 /// sensible default; the CLI requires `--bundle` and derives `bundle_id` from

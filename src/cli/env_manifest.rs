@@ -200,18 +200,12 @@ impl EnvManifest {
                     ep.name
                 )));
             }
-            if let Some(wf) = &ep.welcome_flow
-                && !ep.links.contains(&wf.bundle_id)
-            {
-                // The bundle may already be linked on an existing endpoint;
-                // that case is validated env-side in env_apply. Manifest-side
-                // we require the welcome-flow bundle to at least be a link
-                // target somewhere the manifest can see.
-                if !bundle_ids.contains(wf.bundle_id.as_str()) {
+            let mut link_set = BTreeSet::new();
+            for link in &ep.links {
+                if !link_set.insert(link.as_str()) {
                     return Err(OpError::InvalidArgument(format!(
-                        "endpoint `{}`: welcome_flow.bundle_id `{}` is neither in this \
-                         endpoint's links[] nor declared in bundles[]",
-                        ep.name, wf.bundle_id
+                        "endpoint `{}`: duplicate link `{link}` in links[]",
+                        ep.name
                     )));
                 }
             }
@@ -415,19 +409,20 @@ mod tests {
     }
 
     #[test]
-    fn welcome_flow_bundle_must_be_visible() {
+    fn duplicate_link_in_endpoint_rejected() {
         let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
             "schema": ENV_MANIFEST_SCHEMA_V1,
             "environment": {"id": "local"},
             "messaging_endpoints": [{
                 "name": "n",
                 "provider_type": "messaging.telegram.bot",
-                "welcome_flow": {"bundle_id": "ghost", "pack_id": "p", "flow_id": "f"}
+                "links": ["bundle-a", "bundle-a"]
             }]
         }))
         .unwrap();
         let err = manifest.validate_shape().unwrap_err();
-        assert!(err.to_string().contains("welcome_flow.bundle_id"), "{err}");
+        assert!(err.to_string().contains("duplicate link"), "{err}");
+        assert!(err.to_string().contains("bundle-a"), "{err}");
     }
 
     #[test]
