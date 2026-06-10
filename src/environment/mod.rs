@@ -14,6 +14,7 @@ pub mod audit;
 pub mod bootstrap;
 pub mod bundle_deployment;
 pub mod file_lock;
+pub mod http_store;
 pub mod lifecycle;
 pub mod messaging;
 pub mod mutations;
@@ -33,6 +34,7 @@ pub use bundle_deployment::{
     RevenuePolicyVersion, write_revenue_policy_version,
 };
 pub use file_lock::{EnvFlock, LockError};
+pub use http_store::{AuthMethod, ConstructionError, HttpEnvironmentStore};
 pub use lifecycle::{
     HealthCheckId, HealthGateFailure, LifecycleError, apply_revision_transition,
     apply_revision_transition_with_health_gate,
