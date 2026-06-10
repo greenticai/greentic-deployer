@@ -28,8 +28,8 @@ use super::lifecycle::{
     LifecycleError, apply_revision_transition, apply_revision_transition_with_health_gate,
 };
 use super::mutations::{
-    AddBundlePayload, AddMessagingEndpointPayload, ApplyTrafficSplitOutcome, ExtensionKey,
-    MigrateMergePayload, RemoveBundleOutcome, RevisionTransitionOutcome,
+    AddBundlePayload, AddMessagingEndpointPayload, ApplyTrafficSplitOutcome, EnvironmentMutations,
+    ExtensionKey, MigrateMergePayload, RemoveBundleOutcome, RevisionTransitionOutcome,
     RollbackTrafficSplitOutcome, SetMessagingWelcomeFlowPayload, StageRevisionPayload,
     TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed, UpdateBundlePayload,
     UpdateEnvironmentPayload, WarmRevisionPayload,
@@ -1874,6 +1874,318 @@ fn seed_op_key(
         public_key_pem: op_key.public_pem,
         trusted_key_count: trust.keys.len(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Trait impl — thin forwarders to the inherent methods above.
+//
+// PR-3a.16: every inherent method landed independently (PR-3a.2..3a.15);
+// now that all 30 exist, this block wires the `EnvironmentMutations` trait
+// so callers can use `dyn EnvironmentMutations` / generic `T: EnvironmentMutations`.
+// ---------------------------------------------------------------------------
+
+impl EnvironmentMutations for LocalFsStore {
+    /// See [`LocalFsStore::create_environment`].
+    fn create_environment(
+        &self,
+        env_id: &EnvId,
+        name: String,
+        host_config: EnvironmentHostConfig,
+    ) -> Result<Environment, StoreError> {
+        self.create_environment(env_id, name, host_config)
+    }
+
+    /// See [`LocalFsStore::update_environment`].
+    fn update_environment(
+        &self,
+        env_id: &EnvId,
+        patch: UpdateEnvironmentPayload,
+    ) -> Result<Environment, StoreError> {
+        self.update_environment(env_id, patch)
+    }
+
+    /// See [`LocalFsStore::migrate_merge_bindings`].
+    fn migrate_merge_bindings(
+        &self,
+        target_env_id: &EnvId,
+        payload: MigrateMergePayload,
+    ) -> Result<(Vec<String>, Vec<String>), StoreError> {
+        self.migrate_merge_bindings(target_env_id, payload)
+    }
+
+    /// See [`LocalFsStore::stage_revision`].
+    fn stage_revision(
+        &self,
+        env_id: &EnvId,
+        payload: StageRevisionPayload,
+    ) -> Result<Revision, StoreError> {
+        self.stage_revision(env_id, payload)
+    }
+
+    /// See [`LocalFsStore::warm_revision`].
+    fn warm_revision(
+        &self,
+        env_id: &EnvId,
+        payload: WarmRevisionPayload,
+    ) -> Result<RevisionTransitionOutcome, StoreError> {
+        self.warm_revision(env_id, payload)
+    }
+
+    /// See [`LocalFsStore::drain_revision`].
+    fn drain_revision(
+        &self,
+        env_id: &EnvId,
+        revision_id: RevisionId,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<RevisionTransitionOutcome, StoreError> {
+        self.drain_revision(env_id, revision_id, idempotency_key)
+    }
+
+    /// See [`LocalFsStore::archive_revision`].
+    fn archive_revision(
+        &self,
+        env_id: &EnvId,
+        revision_id: RevisionId,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<RevisionTransitionOutcome, StoreError> {
+        self.archive_revision(env_id, revision_id, idempotency_key)
+    }
+
+    /// See [`LocalFsStore::add_bundle`].
+    fn add_bundle(
+        &self,
+        env_id: &EnvId,
+        payload: AddBundlePayload,
+    ) -> Result<BundleDeployment, StoreError> {
+        self.add_bundle(env_id, payload)
+    }
+
+    /// See [`LocalFsStore::update_bundle`].
+    fn update_bundle(
+        &self,
+        env_id: &EnvId,
+        payload: UpdateBundlePayload,
+    ) -> Result<BundleDeployment, StoreError> {
+        self.update_bundle(env_id, payload)
+    }
+
+    /// See [`LocalFsStore::remove_bundle`].
+    fn remove_bundle(
+        &self,
+        env_id: &EnvId,
+        deployment_id: DeploymentId,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<RemoveBundleOutcome, StoreError> {
+        self.remove_bundle(env_id, deployment_id, idempotency_key)
+    }
+
+    /// See [`LocalFsStore::add_pack_binding`].
+    fn add_pack_binding(
+        &self,
+        env_id: &EnvId,
+        binding: EnvPackBinding,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<EnvPackBinding, StoreError> {
+        self.add_pack_binding(env_id, binding, idempotency_key)
+    }
+
+    /// See [`LocalFsStore::update_pack_binding`].
+    fn update_pack_binding(
+        &self,
+        env_id: &EnvId,
+        slot: CapabilitySlot,
+        binding: EnvPackBinding,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<(EnvPackBinding, u64), StoreError> {
+        self.update_pack_binding(env_id, slot, binding, idempotency_key)
+    }
+
+    /// See [`LocalFsStore::remove_pack_binding`].
+    fn remove_pack_binding(
+        &self,
+        env_id: &EnvId,
+        slot: CapabilitySlot,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<(EnvPackBinding, u64), StoreError> {
+        self.remove_pack_binding(env_id, slot, idempotency_key)
+    }
+
+    /// See [`LocalFsStore::rollback_pack_binding`].
+    fn rollback_pack_binding(
+        &self,
+        env_id: &EnvId,
+        slot: CapabilitySlot,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<(EnvPackBinding, u64), StoreError> {
+        self.rollback_pack_binding(env_id, slot, idempotency_key)
+    }
+
+    /// See [`LocalFsStore::add_extension_binding`].
+    fn add_extension_binding(
+        &self,
+        env_id: &EnvId,
+        binding: ExtensionBinding,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<ExtensionBinding, StoreError> {
+        self.add_extension_binding(env_id, binding, idempotency_key)
+    }
+
+    /// See [`LocalFsStore::update_extension_binding`].
+    fn update_extension_binding(
+        &self,
+        env_id: &EnvId,
+        key: ExtensionKey,
+        binding: ExtensionBinding,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<(ExtensionBinding, u64), StoreError> {
+        self.update_extension_binding(env_id, key, binding, idempotency_key)
+    }
+
+    /// See [`LocalFsStore::remove_extension_binding`].
+    fn remove_extension_binding(
+        &self,
+        env_id: &EnvId,
+        key: ExtensionKey,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<(ExtensionBinding, u64), StoreError> {
+        self.remove_extension_binding(env_id, key, idempotency_key)
+    }
+
+    /// See [`LocalFsStore::rollback_extension_binding`].
+    fn rollback_extension_binding(
+        &self,
+        env_id: &EnvId,
+        key: ExtensionKey,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<(ExtensionBinding, u64), StoreError> {
+        self.rollback_extension_binding(env_id, key, idempotency_key)
+    }
+
+    /// See [`LocalFsStore::set_traffic_split`].
+    fn set_traffic_split(
+        &self,
+        env_id: &EnvId,
+        deployment_id: DeploymentId,
+        entries: Vec<TrafficSplitEntry>,
+        idempotency_key: IdempotencyKey,
+        updated_by: String,
+        authorization_ref: Option<String>,
+    ) -> Result<ApplyTrafficSplitOutcome, StoreError> {
+        self.set_traffic_split(
+            env_id,
+            deployment_id,
+            entries,
+            idempotency_key,
+            updated_by,
+            authorization_ref,
+        )
+    }
+
+    /// See [`LocalFsStore::rollback_traffic_split`].
+    fn rollback_traffic_split(
+        &self,
+        env_id: &EnvId,
+        deployment_id: DeploymentId,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<RollbackTrafficSplitOutcome, StoreError> {
+        self.rollback_traffic_split(env_id, deployment_id, idempotency_key)
+    }
+
+    /// See [`LocalFsStore::add_messaging_endpoint`].
+    fn add_messaging_endpoint(
+        &self,
+        env_id: &EnvId,
+        payload: AddMessagingEndpointPayload,
+    ) -> Result<MessagingEndpoint, StoreError> {
+        self.add_messaging_endpoint(env_id, payload)
+    }
+
+    /// See [`LocalFsStore::link_messaging_bundle`].
+    fn link_messaging_bundle(
+        &self,
+        env_id: &EnvId,
+        endpoint_id: MessagingEndpointId,
+        bundle_id: BundleId,
+        updated_by: String,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<MessagingEndpoint, StoreError> {
+        self.link_messaging_bundle(env_id, endpoint_id, bundle_id, updated_by, idempotency_key)
+    }
+
+    /// See [`LocalFsStore::unlink_messaging_bundle`].
+    fn unlink_messaging_bundle(
+        &self,
+        env_id: &EnvId,
+        endpoint_id: MessagingEndpointId,
+        bundle_id: BundleId,
+        updated_by: String,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<MessagingEndpoint, StoreError> {
+        self.unlink_messaging_bundle(env_id, endpoint_id, bundle_id, updated_by, idempotency_key)
+    }
+
+    /// See [`LocalFsStore::set_messaging_welcome_flow`].
+    fn set_messaging_welcome_flow(
+        &self,
+        env_id: &EnvId,
+        payload: SetMessagingWelcomeFlowPayload,
+    ) -> Result<MessagingEndpoint, StoreError> {
+        self.set_messaging_welcome_flow(env_id, payload)
+    }
+
+    /// See [`LocalFsStore::remove_messaging_endpoint`].
+    fn remove_messaging_endpoint(
+        &self,
+        env_id: &EnvId,
+        endpoint_id: MessagingEndpointId,
+    ) -> Result<MessagingEndpointId, StoreError> {
+        self.remove_messaging_endpoint(env_id, endpoint_id)
+    }
+
+    /// See [`LocalFsStore::rotate_messaging_webhook_secret`].
+    fn rotate_messaging_webhook_secret(
+        &self,
+        env_id: &EnvId,
+        endpoint_id: MessagingEndpointId,
+        updated_by: String,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<MessagingEndpoint, StoreError> {
+        self.rotate_messaging_webhook_secret(env_id, endpoint_id, updated_by, idempotency_key)
+    }
+
+    /// See [`LocalFsStore::bootstrap_trust_root`].
+    fn bootstrap_trust_root(&self, env_id: &EnvId) -> Result<TrustRootSeed, StoreError> {
+        self.bootstrap_trust_root(env_id)
+    }
+
+    /// See [`LocalFsStore::seed_trust_root_if_absent`].
+    fn seed_trust_root_if_absent(
+        &self,
+        env_id: &EnvId,
+    ) -> Result<Option<TrustRootSeed>, StoreError> {
+        self.seed_trust_root_if_absent(env_id)
+    }
+
+    /// See [`LocalFsStore::add_trusted_key`].
+    fn add_trusted_key(
+        &self,
+        env_id: &EnvId,
+        key_id: String,
+        public_key_pem: String,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<TrustRootAddOutcome, StoreError> {
+        self.add_trusted_key(env_id, key_id, public_key_pem, idempotency_key)
+    }
+
+    /// See [`LocalFsStore::remove_trusted_key`].
+    fn remove_trusted_key(
+        &self,
+        env_id: &EnvId,
+        key_id: String,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<TrustRootRemoveOutcome, StoreError> {
+        self.remove_trusted_key(env_id, key_id, idempotency_key)
+    }
 }
 
 #[cfg(test)]
