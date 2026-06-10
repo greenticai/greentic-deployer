@@ -55,7 +55,7 @@ pub struct BindingSummary {
 }
 
 impl BindingSummary {
-    fn from_binding(env_id: &EnvId, b: &EnvPackBinding) -> Self {
+    pub(crate) fn from_binding(env_id: &EnvId, b: &EnvPackBinding) -> Self {
         Self {
             environment_id: env_id.as_str().to_string(),
             slot: b.slot,

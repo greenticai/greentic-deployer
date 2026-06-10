@@ -88,7 +88,7 @@ pub fn bootstrap(
 /// Wire shape the CLI emits for a [`TrustRootSeed`] — preserves the
 /// pre-PR-3a.2 envelope (`environment_id`/`operator_key_id`/`operator_public_key_pem`/`trusted_key_count`).
 /// Used by `bootstrap` here and `op env init` (via [`trust_root_seed_to_wire_opt`]).
-pub(super) fn trust_root_seed_to_wire(env_id: &EnvId, seed: &TrustRootSeed) -> Value {
+pub(crate) fn trust_root_seed_to_wire(env_id: &EnvId, seed: &TrustRootSeed) -> Value {
     json!({
         "environment_id": env_id.as_str(),
         "operator_key_id": seed.key_id,
@@ -107,7 +107,7 @@ pub(super) fn trust_root_seed_to_wire_opt(env_id: &EnvId, seed: Option<&TrustRoo
     }
 }
 
-fn trust_root_add_outcome_to_wire(env_id: &EnvId, out: &TrustRootAddOutcome) -> Value {
+pub(crate) fn trust_root_add_outcome_to_wire(env_id: &EnvId, out: &TrustRootAddOutcome) -> Value {
     json!({
         "environment_id": env_id.as_str(),
         "added_key_id": out.added_key_id,
@@ -115,7 +115,10 @@ fn trust_root_add_outcome_to_wire(env_id: &EnvId, out: &TrustRootAddOutcome) -> 
     })
 }
 
-fn trust_root_remove_outcome_to_wire(env_id: &EnvId, out: &TrustRootRemoveOutcome) -> Value {
+pub(crate) fn trust_root_remove_outcome_to_wire(
+    env_id: &EnvId,
+    out: &TrustRootRemoveOutcome,
+) -> Value {
     json!({
         "environment_id": env_id.as_str(),
         "removed_key_id": out.removed_key_id,

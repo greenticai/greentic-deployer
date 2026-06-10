@@ -691,7 +691,7 @@ impl super::dispatch::EnvInitArgs {
 /// `"public_base_url: …"` field prefix. Centralizes the format string so the
 /// 5 entry points (`env create`, `env update`, `env init`, `env set-public-url`,
 /// `config set`) report identical operator-facing errors.
-pub(super) fn parse_public_base_url(raw: &str) -> Result<String, OpError> {
+pub(crate) fn parse_public_base_url(raw: &str) -> Result<String, OpError> {
     validate_public_base_url(raw)
         .map_err(|e| OpError::InvalidArgument(format!("public_base_url: {e}")))
 }
@@ -701,7 +701,7 @@ pub(super) fn parse_public_base_url(raw: &str) -> Result<String, OpError> {
 /// present and valid, and `Err(OpError::InvalidArgument)` when present and
 /// invalid. The 5 entry points all share this lift to keep the
 /// `.as_deref().map(parse).transpose()` boilerplate in one place.
-pub(super) fn parse_optional_public_base_url(
+pub(crate) fn parse_optional_public_base_url(
     raw: &Option<String>,
 ) -> Result<Option<String>, OpError> {
     raw.as_deref().map(parse_public_base_url).transpose()

@@ -435,7 +435,7 @@ pub struct WelcomeFlowSummary {
 }
 
 impl EndpointSummary {
-    fn from(env_id: &EnvId, ep: &MessagingEndpoint) -> Self {
+    pub(crate) fn from(env_id: &EnvId, ep: &MessagingEndpoint) -> Self {
         Self {
             environment_id: env_id.as_str().to_string(),
             endpoint_id: ep.endpoint_id.to_string(),

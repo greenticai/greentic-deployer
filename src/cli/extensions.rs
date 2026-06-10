@@ -74,7 +74,7 @@ pub struct ExtensionSummary {
 }
 
 impl ExtensionSummary {
-    fn from_binding(env_id: &EnvId, b: &ExtensionBinding) -> Self {
+    pub(crate) fn from_binding(env_id: &EnvId, b: &ExtensionBinding) -> Self {
         Self {
             environment_id: env_id.as_str().to_string(),
             kind: b.kind.to_string(),

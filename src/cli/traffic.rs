@@ -79,7 +79,7 @@ pub struct TrafficSummaryEntry {
 }
 
 impl TrafficSummary {
-    fn from(env_id: &EnvId, split: &TrafficSplit) -> Self {
+    pub(crate) fn from(env_id: &EnvId, split: &TrafficSplit) -> Self {
         Self {
             environment_id: env_id.as_str().to_string(),
             deployment_id: split.deployment_id.to_string(),
