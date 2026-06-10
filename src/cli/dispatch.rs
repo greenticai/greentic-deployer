@@ -719,18 +719,21 @@ pub fn dispatch_op_with_registry(
     // the A8 HTTP backend. Schema-only requests stay local (schema is
     // store-independent and never touches the FS), so the operator can
     // inspect payloads without a running server.
-    let store_url = cmd
-        .store_url
-        .clone()
-        .or_else(|| std::env::var("GREENTIC_STORE_URL").ok());
+    //
+    // URL and token are paired by ORIGIN: an env-configured
+    // GREENTIC_STORE_TOKEN must not leak to an ad-hoc `--store-url` flag
+    // endpoint. A flag URL only accepts a flag token; an env URL accepts a
+    // flag token or the env token.
+    let (store_url, store_token) = crate::cli::dispatch_remote::resolve_remote_target(
+        cmd.store_url.clone(),
+        cmd.store_token.clone(),
+        std::env::var("GREENTIC_STORE_URL").ok(),
+        std::env::var("GREENTIC_STORE_TOKEN").ok(),
+    );
     if let Some(raw_url) = store_url
         && !cmd.schema
     {
-        let token = cmd
-            .store_token
-            .clone()
-            .or_else(|| std::env::var("GREENTIC_STORE_TOKEN").ok());
-        return crate::cli::dispatch_remote::dispatch_op_remote(&raw_url, token, cmd, &flags)
+        return crate::cli::dispatch_remote::dispatch_op_remote(&raw_url, store_token, cmd, &flags)
             .inspect_err(|err| print_error(noun, verb, err));
     }
 

@@ -662,7 +662,7 @@ where
 ///   the starting lifecycle so a `Ready → Archived` archive (lifecycle
 ///   retirement, NOT a rollout eviction) correctly emits nothing.
 /// - Other verbs and chains: no emit (no live rollout-event match).
-fn emit_for_op(
+pub(crate) fn emit_for_op(
     op: &'static str,
     gate_failed: bool,
     starting_lifecycle: Option<RevisionLifecycle>,

@@ -34,6 +34,32 @@ use super::{OpError, OpFlags, OpOutcome, map_store_err_preserving_noun};
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Resolve the remote store target `(url, token)`, pairing them by ORIGIN so
+/// an env-configured token can never leak to an ad-hoc `--store-url` flag
+/// endpoint.
+///
+/// - URL from `--store-url` (flag) → token must also be explicit
+///   (`--store-token`); the env token is NOT inherited, because its origin
+///   doesn't match the flag URL.
+/// - URL from `GREENTIC_STORE_URL` (env) → token may come from `--store-token`
+///   (flag wins) or `GREENTIC_STORE_TOKEN` (env) — both are "configured", so
+///   the origins are consistent.
+/// - No URL from either source → no remote target.
+pub(crate) fn resolve_remote_target(
+    flag_url: Option<String>,
+    flag_token: Option<String>,
+    env_url: Option<String>,
+    env_token: Option<String>,
+) -> (Option<String>, Option<String>) {
+    match flag_url {
+        Some(url) => (Some(url), flag_token),
+        None => match env_url {
+            Some(url) => (Some(url), flag_token.or(env_token)),
+            None => (None, None),
+        },
+    }
+}
+
 /// Dispatch an `OpCommand` against a remote HTTP store.
 ///
 /// Called from [`super::dispatch::dispatch_op_with_registry`] when
@@ -842,6 +868,16 @@ fn remote_revisions_drain(
     let outcome = store
         .drain_revision(&env_id, revision_id, idempotency_key)
         .map_err(map_store_err_preserving_noun)?;
+    // Rollout-telemetry parity with the local helper: the typed verb returns
+    // the post-mutation env + revision, so emit `RevisionDraining` here too —
+    // no local read needed.
+    super::revisions::emit_for_op(
+        "drain",
+        false,
+        Some(outcome.starting_lifecycle),
+        &outcome.environment,
+        &outcome.revision,
+    );
     Ok(OpOutcome::new(
         "revisions",
         "drain",
@@ -861,6 +897,16 @@ fn remote_revisions_archive(
     let outcome = store
         .archive_revision(&env_id, revision_id, idempotency_key)
         .map_err(map_store_err_preserving_noun)?;
+    // Rollout-telemetry parity with the local helper: `emit_for_op` keys on
+    // the starting lifecycle, so it emits `RevisionEvicted` only for the
+    // post-drain (`Inactive → Archived`) eviction hop, not a plain retirement.
+    super::revisions::emit_for_op(
+        "archive",
+        false,
+        Some(outcome.starting_lifecycle),
+        &outcome.environment,
+        &outcome.revision,
+    );
     Ok(OpOutcome::new(
         "revisions",
         "archive",
@@ -1108,6 +1154,64 @@ mod tests {
     use std::net::{SocketAddr, TcpListener};
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    // -----------------------------------------------------------------------
+    // resolve_remote_target: URL/token origin pairing (anti-credential-leak)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn flag_url_never_inherits_env_token() {
+        // A flag URL with NO flag token must NOT pick up the env token —
+        // otherwise a prod GREENTIC_STORE_TOKEN leaks to an ad-hoc endpoint.
+        let (url, token) = resolve_remote_target(
+            Some("https://flag.example".to_string()),
+            None,
+            Some("https://env.example".to_string()),
+            Some("env-secret".to_string()),
+        );
+        assert_eq!(url.as_deref(), Some("https://flag.example"));
+        assert_eq!(token, None, "env token must not pair with a flag URL");
+    }
+
+    #[test]
+    fn flag_url_keeps_explicit_flag_token() {
+        let (url, token) = resolve_remote_target(
+            Some("https://flag.example".to_string()),
+            Some("flag-secret".to_string()),
+            None,
+            Some("env-secret".to_string()),
+        );
+        assert_eq!(url.as_deref(), Some("https://flag.example"));
+        assert_eq!(token.as_deref(), Some("flag-secret"));
+    }
+
+    #[test]
+    fn env_url_inherits_env_token_but_flag_token_wins() {
+        let (url, token) = resolve_remote_target(
+            None,
+            None,
+            Some("https://env.example".to_string()),
+            Some("env-secret".to_string()),
+        );
+        assert_eq!(url.as_deref(), Some("https://env.example"));
+        assert_eq!(token.as_deref(), Some("env-secret"));
+
+        let (_, token) = resolve_remote_target(
+            None,
+            Some("flag-secret".to_string()),
+            Some("https://env.example".to_string()),
+            Some("env-secret".to_string()),
+        );
+        assert_eq!(token.as_deref(), Some("flag-secret"), "flag token wins");
+    }
+
+    #[test]
+    fn no_url_means_no_remote_target() {
+        let (url, token) =
+            resolve_remote_target(None, Some("x".to_string()), None, Some("y".to_string()));
+        assert_eq!(url, None);
+        assert_eq!(token, None);
+    }
 
     // -----------------------------------------------------------------------
     // Minimal mock (same idiom as http_store.rs tests)
