@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/greentic-deploy-spec",
     "crates/greentic-environment-store-postgres",
+    "crates/greentic-operator-store-server",
 ]
 resolver = "2"
 
