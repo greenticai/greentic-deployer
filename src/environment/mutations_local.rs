@@ -1707,6 +1707,90 @@ impl LocalFsStore {
             Ok(ep)
         })
     }
+
+    // -------------------------------------------------------------
+    // Bootstrap  (PR-3a.12)
+    //   `op env init` — idempotent first-run bootstrap
+    // -------------------------------------------------------------
+
+    /// Get-or-create-with-heal: idempotent first-run bootstrap of the `local`
+    /// [`Environment`] with default env-pack bindings. Returns the env + an
+    /// outcome variant indicating whether it was Created, Healed (default
+    /// bindings added), or AlreadyExists (no change needed).
+    ///
+    /// The entire read-modify-write runs inside [`LocalFsStore::transact`], so
+    /// concurrent first-run invocations on the same host serialize on the
+    /// per-env flock and produce a single env.
+    ///
+    /// `refresh_local_runtime_stub` is NOT called here — the CLI layer runs
+    /// it after the verb returns, outside the flock. The tiny race window
+    /// (another writer could modify the env between verb-return and
+    /// stub-refresh) is acceptable because the runtime stub is a derived
+    /// projection that self-heals on every bootstrap call.
+    ///
+    /// This verb is **not** part of the [`super::mutations::EnvironmentMutations`]
+    /// trait — bootstrap is `LocalFsStore`-specific. Remote stores don't run
+    /// first-run local bootstrap.
+    pub fn ensure_local_environment(
+        &self,
+        env_id: &EnvId,
+        payload: super::bootstrap::EnsureLocalEnvironmentPayload,
+    ) -> Result<(Environment, super::bootstrap::LocalEnvOutcome), StoreError> {
+        self.transact(env_id, |locked| {
+            match locked.load() {
+                Ok(mut existing) => {
+                    // The URL is only applied on creation; overwriting an
+                    // existing env's URL goes through `op env set-public-url`.
+                    if payload.public_base_url.is_some() {
+                        return Err(StoreError::InvalidArgument(format!(
+                            "env `{}` already exists; use `op env set-public-url <env_id> <URL>` \
+                             to overwrite the persisted public URL",
+                            locked.env_id()
+                        )));
+                    }
+                    let added = super::bootstrap::fill_missing_default_bindings(&mut existing)?;
+                    if added.is_empty() {
+                        return Ok((existing, super::bootstrap::LocalEnvOutcome::AlreadyExists));
+                    }
+                    locked.save(&existing)?;
+                    Ok((
+                        existing,
+                        super::bootstrap::LocalEnvOutcome::Healed { added_slots: added },
+                    ))
+                }
+                Err(StoreError::NotFound(_)) => {
+                    let packs = crate::defaults::local_pack_bindings().map_err(|e| {
+                        StoreError::InvalidArgument(format!("default pack binding parse: {e}"))
+                    })?;
+                    let env = Environment {
+                        schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
+                        environment_id: locked.env_id().clone(),
+                        name: env_id.as_str().to_string(),
+                        host_config: EnvironmentHostConfig {
+                            env_id: locked.env_id().clone(),
+                            region: None,
+                            tenant_org_id: None,
+                            listen_addr: Some(greentic_deploy_spec::DEFAULT_LISTEN_ADDR),
+                            public_base_url: payload.public_base_url.clone(),
+                        },
+                        packs,
+                        credentials_ref: None,
+                        bundles: Vec::new(),
+                        revisions: Vec::new(),
+                        traffic_splits: Vec::new(),
+                        messaging_endpoints: Vec::new(),
+                        extensions: Vec::new(),
+                        revocation: Default::default(),
+                        retention: Default::default(),
+                        health: Default::default(),
+                    };
+                    locked.save(&env)?;
+                    Ok((env, super::bootstrap::LocalEnvOutcome::Created))
+                }
+                Err(e) => Err(e),
+            }
+        })
+    }
 }
 
 /// §5.3 admission: every entry's revision must exist and be `Ready` before its
@@ -2161,5 +2245,249 @@ mod warm_revision_tests {
             )
             .unwrap();
         assert_eq!(outcome.revision.lifecycle, RevisionLifecycle::Ready);
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_typed_verb_tests {
+    //! Direct tests for the typed `ensure_local_environment` verb (PR-3a.12).
+    //! The CLI-layer tests in `cli::bootstrap` exercise the full wrapper
+    //! including `refresh_local_runtime_stub`; these lock in the store-level
+    //! typed-verb behavior: Created, AlreadyExists, Healed, and
+    //! public_base_url overwrite rejection.
+    use super::*;
+    use crate::defaults::{
+        LOCAL_DEPLOYER_PACK, LOCAL_ENV_ID, LOCAL_SECRETS_PACK, LOCAL_SESSIONS_PACK,
+        LOCAL_STATE_PACK, LOCAL_TELEMETRY_PACK,
+    };
+    use crate::environment::bootstrap::{EnsureLocalEnvironmentPayload, LocalEnvOutcome};
+    use crate::environment::store::EnvironmentStore;
+    use greentic_deploy_spec::{CapabilitySlot, EnvId, EnvPackBinding, PackDescriptor, PackId};
+    use tempfile::TempDir;
+
+    fn store() -> (TempDir, LocalFsStore) {
+        let tmp = TempDir::new().expect("tempdir");
+        let s = LocalFsStore::new(tmp.path().to_path_buf());
+        (tmp, s)
+    }
+
+    fn env_id() -> EnvId {
+        EnvId::try_from(LOCAL_ENV_ID).unwrap()
+    }
+
+    fn payload(public_base_url: Option<&str>) -> EnsureLocalEnvironmentPayload {
+        EnsureLocalEnvironmentPayload {
+            public_base_url: public_base_url.map(ToString::to_string),
+        }
+    }
+
+    #[test]
+    fn creates_env_when_missing() {
+        let (_tmp, store) = store();
+        let (env, outcome) = store
+            .ensure_local_environment(&env_id(), payload(None))
+            .expect("create");
+        assert_eq!(outcome, LocalEnvOutcome::Created);
+        assert_eq!(env.environment_id.as_str(), LOCAL_ENV_ID);
+        assert_eq!(env.name, LOCAL_ENV_ID);
+        assert_eq!(env.packs.len(), 5);
+        env.validate().expect("spec-valid");
+    }
+
+    #[test]
+    fn creates_env_with_public_base_url() {
+        let (_tmp, store) = store();
+        let (env, outcome) = store
+            .ensure_local_environment(&env_id(), payload(Some("https://example.com")))
+            .expect("create with url");
+        assert_eq!(outcome, LocalEnvOutcome::Created);
+        assert_eq!(
+            env.host_config.public_base_url.as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn returns_already_exists_on_second_call() {
+        let (_tmp, store) = store();
+        let (first, _) = store
+            .ensure_local_environment(&env_id(), payload(None))
+            .expect("first");
+        let (second, outcome) = store
+            .ensure_local_environment(&env_id(), payload(None))
+            .expect("second");
+        assert_eq!(outcome, LocalEnvOutcome::AlreadyExists);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn rejects_public_base_url_when_env_exists() {
+        let (_tmp, store) = store();
+        store
+            .ensure_local_environment(&env_id(), payload(None))
+            .expect("first");
+        let err = store
+            .ensure_local_environment(&env_id(), payload(Some("https://example.com")))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidArgument(ref msg) if msg.contains("already exists")),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    /// Seed an empty `local` env (all 5 slots missing) — mimics `op env create local`.
+    fn seed_empty_local_env(store: &LocalFsStore) -> greentic_deploy_spec::Environment {
+        let eid = env_id();
+        let env = greentic_deploy_spec::Environment {
+            schema: greentic_deploy_spec::SchemaVersion::new(
+                greentic_deploy_spec::SchemaVersion::ENVIRONMENT_V1,
+            ),
+            environment_id: eid.clone(),
+            name: LOCAL_ENV_ID.to_string(),
+            host_config: greentic_deploy_spec::EnvironmentHostConfig {
+                env_id: eid,
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+                public_base_url: None,
+            },
+            packs: Vec::new(),
+            credentials_ref: None,
+            bundles: Vec::new(),
+            revisions: Vec::new(),
+            traffic_splits: Vec::new(),
+            messaging_endpoints: Vec::new(),
+            extensions: Vec::new(),
+            revocation: Default::default(),
+            retention: Default::default(),
+            health: Default::default(),
+        };
+        store.save(&env).expect("seed");
+        env
+    }
+
+    fn custom_binding(slot: CapabilitySlot, descriptor: &str) -> EnvPackBinding {
+        EnvPackBinding {
+            slot,
+            kind: PackDescriptor::try_new(descriptor).expect("valid"),
+            pack_ref: PackId::new(descriptor),
+            answers_ref: None,
+            generation: 0,
+            previous_binding_ref: None,
+        }
+    }
+
+    #[test]
+    fn heals_env_with_no_packs() {
+        let (_tmp, store) = store();
+        seed_empty_local_env(&store);
+        let (env, outcome) = store
+            .ensure_local_environment(&env_id(), payload(None))
+            .expect("heal");
+        match outcome {
+            LocalEnvOutcome::Healed { added_slots } => {
+                assert_eq!(
+                    added_slots,
+                    vec![
+                        CapabilitySlot::Deployer,
+                        CapabilitySlot::Secrets,
+                        CapabilitySlot::Telemetry,
+                        CapabilitySlot::Sessions,
+                        CapabilitySlot::State,
+                    ]
+                );
+            }
+            other => panic!("expected Healed, got {other:?}"),
+        }
+        assert_eq!(env.packs.len(), 5);
+        env.validate().expect("spec-valid after heal");
+        // Re-run: now fully bound, should be AlreadyExists.
+        let (_, outcome2) = store
+            .ensure_local_environment(&env_id(), payload(None))
+            .expect("second");
+        assert_eq!(outcome2, LocalEnvOutcome::AlreadyExists);
+    }
+
+    #[test]
+    fn heals_env_with_partial_packs() {
+        let (_tmp, store) = store();
+        let mut env = seed_empty_local_env(&store);
+        env.packs.push(custom_binding(
+            CapabilitySlot::Deployer,
+            LOCAL_DEPLOYER_PACK,
+        ));
+        store.save(&env).expect("partial save");
+
+        let (env, outcome) = store
+            .ensure_local_environment(&env_id(), payload(None))
+            .expect("heal");
+        match outcome {
+            LocalEnvOutcome::Healed { added_slots } => {
+                assert_eq!(
+                    added_slots,
+                    vec![
+                        CapabilitySlot::Secrets,
+                        CapabilitySlot::Telemetry,
+                        CapabilitySlot::Sessions,
+                        CapabilitySlot::State,
+                    ]
+                );
+            }
+            other => panic!("expected Healed, got {other:?}"),
+        }
+        assert_eq!(env.packs.len(), 5);
+    }
+
+    #[test]
+    fn heal_preserves_user_bound_non_default_descriptor() {
+        let (_tmp, store) = store();
+        let mut env = seed_empty_local_env(&store);
+        let custom_secrets = "greentic.secrets.aws-secrets-manager@1.0.0";
+        env.packs
+            .push(custom_binding(CapabilitySlot::Secrets, custom_secrets));
+        store.save(&env).expect("custom-secrets save");
+
+        let (env, outcome) = store
+            .ensure_local_environment(&env_id(), payload(None))
+            .expect("heal");
+        match outcome {
+            LocalEnvOutcome::Healed { added_slots } => {
+                assert_eq!(
+                    added_slots,
+                    vec![
+                        CapabilitySlot::Deployer,
+                        CapabilitySlot::Telemetry,
+                        CapabilitySlot::Sessions,
+                        CapabilitySlot::State,
+                    ]
+                );
+            }
+            other => panic!("expected Healed, got {other:?}"),
+        }
+        let secrets_desc = env
+            .packs
+            .iter()
+            .find(|b| b.slot == CapabilitySlot::Secrets)
+            .map(|b| b.kind.as_str())
+            .expect("secrets slot");
+        assert_eq!(secrets_desc, custom_secrets);
+    }
+
+    #[test]
+    fn default_bindings_cover_expected_descriptors() {
+        let (_tmp, store) = store();
+        let (env, _) = store
+            .ensure_local_environment(&env_id(), payload(None))
+            .expect("create");
+        let by_slot: std::collections::BTreeMap<CapabilitySlot, &str> = env
+            .packs
+            .iter()
+            .map(|b| (b.slot, b.kind.as_str()))
+            .collect();
+        assert_eq!(by_slot[&CapabilitySlot::Deployer], LOCAL_DEPLOYER_PACK);
+        assert_eq!(by_slot[&CapabilitySlot::Secrets], LOCAL_SECRETS_PACK);
+        assert_eq!(by_slot[&CapabilitySlot::Telemetry], LOCAL_TELEMETRY_PACK);
+        assert_eq!(by_slot[&CapabilitySlot::Sessions], LOCAL_SESSIONS_PACK);
+        assert_eq!(by_slot[&CapabilitySlot::State], LOCAL_STATE_PACK);
     }
 }
