@@ -24,6 +24,9 @@ use greentic_deploy_spec::{
     TrafficSplitEntry, WelcomeFlowRef,
 };
 
+use super::bootstrap::{
+    EnsureLocalEnvironmentPayload, LocalEnvOutcome, fill_missing_default_bindings,
+};
 use super::lifecycle::{
     LifecycleError, apply_revision_transition, apply_revision_transition_with_health_gate,
 };
@@ -1734,8 +1737,8 @@ impl LocalFsStore {
     pub fn ensure_local_environment(
         &self,
         env_id: &EnvId,
-        payload: super::bootstrap::EnsureLocalEnvironmentPayload,
-    ) -> Result<(Environment, super::bootstrap::LocalEnvOutcome), StoreError> {
+        payload: EnsureLocalEnvironmentPayload,
+    ) -> Result<(Environment, LocalEnvOutcome), StoreError> {
         self.transact(env_id, |locked| {
             match locked.load() {
                 Ok(mut existing) => {
@@ -1748,15 +1751,12 @@ impl LocalFsStore {
                             locked.env_id()
                         )));
                     }
-                    let added = super::bootstrap::fill_missing_default_bindings(&mut existing)?;
+                    let added = fill_missing_default_bindings(&mut existing)?;
                     if added.is_empty() {
-                        return Ok((existing, super::bootstrap::LocalEnvOutcome::AlreadyExists));
+                        return Ok((existing, LocalEnvOutcome::AlreadyExists));
                     }
                     locked.save(&existing)?;
-                    Ok((
-                        existing,
-                        super::bootstrap::LocalEnvOutcome::Healed { added_slots: added },
-                    ))
+                    Ok((existing, LocalEnvOutcome::Healed { added_slots: added }))
                 }
                 Err(StoreError::NotFound(_)) => {
                     let packs = crate::defaults::local_pack_bindings().map_err(|e| {
@@ -1785,7 +1785,7 @@ impl LocalFsStore {
                         health: Default::default(),
                     };
                     locked.save(&env)?;
-                    Ok((env, super::bootstrap::LocalEnvOutcome::Created))
+                    Ok((env, LocalEnvOutcome::Created))
                 }
                 Err(e) => Err(e),
             }
