@@ -61,23 +61,22 @@ pub struct SqliteEnvironmentStore {
 }
 
 impl SqliteEnvironmentStore {
-    /// Open (creating if missing) the SQLite database at `path` and apply
-    /// the bundled migrations. Migration is idempotent — sqlx tracks
-    /// applied files in `_sqlx_migrations`.
+    /// Open the SQLite database at `path` (creating file and parent
+    /// directories if missing) and apply the bundled migrations.
     ///
     /// An exclusive advisory flock on `<path>.lock` is acquired first
     /// (non-blocking). If another process already holds the lock, this
     /// returns [`StorageError::Backend`] immediately.
     pub async fn open(path: &Path) -> Result<Self, StorageError> {
         // --- sidecar flock (single-writer enforcement) ---
+        // The lock sidecar shares the database's parent directory, so this
+        // create_dir_all also guarantees the parent `create_if_missing`
+        // needs below.
         let lock_path_string = format!("{}.lock", path.display());
         let lock_path = Path::new(&lock_path_string);
         if let Some(parent) = lock_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                StorageError::backend(std::io::Error::new(
-                    e.kind(),
-                    format!("create lock-file parent {}: {e}", parent.display()),
-                ))
+                io_backend(format!("create lock-file parent {}", parent.display()), e)
             })?;
         }
         let lock_file = OpenOptions::new()
@@ -86,12 +85,7 @@ impl SqliteEnvironmentStore {
             .create(true)
             .truncate(false)
             .open(lock_path)
-            .map_err(|e| {
-                StorageError::backend(std::io::Error::new(
-                    e.kind(),
-                    format!("open lock file {}: {e}", lock_path.display()),
-                ))
-            })?;
+            .map_err(|e| io_backend(format!("open lock file {}", lock_path.display()), e))?;
         match lock_file.try_lock_exclusive() {
             Ok(true) => {} // acquired
             Ok(false) => {
@@ -104,10 +98,7 @@ impl SqliteEnvironmentStore {
                 )));
             }
             Err(e) => {
-                return Err(StorageError::backend(std::io::Error::new(
-                    e.kind(),
-                    format!("flock {}: {e}", lock_path.display()),
-                )));
+                return Err(io_backend(format!("flock {}", lock_path.display()), e));
             }
         }
 
@@ -176,17 +167,7 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
             return Err(StorageError::NotFound(env_id.clone()));
         };
         let (revision, data, stored_digest) = decode_revision_with_data(&row)?;
-        // Verify integrity against the RAW Value BEFORE typed deserialization —
-        // serde silently drops unknown fields, so a post-typed check would miss
-        // injected top-level keys.
-        let recomputed = StateIntegrity::sha256_of(&data)?;
-        if recomputed.digest != stored_digest {
-            return Err(StorageError::IntegrityMismatch {
-                env_id: env_id.clone(),
-                stored: stored_digest,
-                recomputed: recomputed.digest,
-            });
-        }
+        verify_integrity(env_id, &data, stored_digest)?;
         let env: Environment = serde_json::from_value(data)?;
         if env.environment_id != *env_id {
             return Err(StorageError::EnvIdMismatch {
@@ -294,17 +275,7 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
             return Ok(None);
         };
         let (revision, data, stored_digest) = decode_revision_with_data(&row)?;
-        // Verify integrity against the RAW Value BEFORE typed deserialization —
-        // serde silently drops unknown fields, so a post-typed check would miss
-        // injected top-level keys.
-        let recomputed = StateIntegrity::sha256_of(&data)?;
-        if recomputed.digest != stored_digest {
-            return Err(StorageError::IntegrityMismatch {
-                env_id: env_id.clone(),
-                stored: stored_digest,
-                recomputed: recomputed.digest,
-            });
-        }
+        verify_integrity(env_id, &data, stored_digest)?;
         let runtime: EnvironmentRuntime = serde_json::from_value(data)?;
         if runtime.environment_id != *env_id {
             return Err(StorageError::EnvIdMismatch {
@@ -409,9 +380,10 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         env_id: &EnvId,
         slot: CapabilitySlot,
     ) -> Result<Option<LoadedAnswers>, StorageError> {
+        // `deleted = 0`: tombstoned rows are logically absent.
         let row = sqlx::query(
-            "SELECT generation, etag, data, integrity_digest, deleted \
-             FROM pack_answers WHERE env_id = $1 AND slot = $2",
+            "SELECT generation, etag, data, integrity_digest \
+             FROM pack_answers WHERE env_id = $1 AND slot = $2 AND deleted = 0",
         )
         .bind(env_id.as_str())
         .bind(slot.as_str())
@@ -420,22 +392,10 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         let Some(row) = row else {
             return Ok(None);
         };
-        // Tombstoned rows are logically absent.
-        let deleted: i32 = row.try_get("deleted")?;
-        if deleted != 0 {
-            return Ok(None);
-        }
         // `data` is `Value` on both sides of the row boundary — no
         // additional `from_value` round-trip is needed.
         let (revision, answers, stored_digest) = decode_revision_with_data(&row)?;
-        let recomputed = StateIntegrity::sha256_of(&answers)?;
-        if recomputed.digest != stored_digest {
-            return Err(StorageError::IntegrityMismatch {
-                env_id: env_id.clone(),
-                stored: stored_digest,
-                recomputed: recomputed.digest,
-            });
-        }
+        verify_integrity(env_id, &answers, stored_digest)?;
         Ok(Some(Loaded {
             value: answers,
             revision,
@@ -491,29 +451,11 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
                     // Tombstoned row: a conditional precondition expects
                     // a LIVE row — fail with NotFound so stale
                     // preconditions from a previous incarnation can't
-                    // ABA-match the new one.
+                    // ABA-match the new one. Unconditional writes
+                    // resurrect, continuing the generation sequence.
                     if precondition.is_some_and(|pc| pc.is_conditional()) {
                         return Err(StorageError::NotFound(env_id.clone()));
                     }
-                    // Unconditional resurrect: continue the generation
-                    // sequence from the tombstone.
-                    let new_gen = current_rev.generation + 1;
-                    sqlx::query(
-                        "UPDATE pack_answers \
-                         SET data = $1, generation = $2, etag = $3, \
-                             integrity_digest = $4, deleted = 0, \
-                             updated_at = datetime('now') \
-                         WHERE env_id = $5 AND slot = $6",
-                    )
-                    .bind(&data)
-                    .bind(new_gen as i64)
-                    .bind(&etag.0)
-                    .bind(&integrity.digest)
-                    .bind(env_id.as_str())
-                    .bind(slot.as_str())
-                    .execute(&mut *tx)
-                    .await?;
-                    new_gen
                 } else {
                     // Live row: require a conditional precondition.
                     let Some(pc) = precondition else {
@@ -521,23 +463,26 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
                     };
                     pc.check(&current_rev.etag, current_rev.generation)
                         .map_err(|e| StorageError::from_precondition(env_id.clone(), e))?;
-                    let new_gen = current_rev.generation + 1;
-                    sqlx::query(
-                        "UPDATE pack_answers \
-                         SET data = $1, generation = $2, etag = $3, \
-                             integrity_digest = $4, updated_at = datetime('now') \
-                         WHERE env_id = $5 AND slot = $6",
-                    )
-                    .bind(&data)
-                    .bind(new_gen as i64)
-                    .bind(&etag.0)
-                    .bind(&integrity.digest)
-                    .bind(env_id.as_str())
-                    .bind(slot.as_str())
-                    .execute(&mut *tx)
-                    .await?;
-                    new_gen
                 }
+                // One write for both cases: `deleted = 0` is a no-op on a
+                // live row and resurrects a tombstone.
+                let new_gen = current_rev.generation + 1;
+                sqlx::query(
+                    "UPDATE pack_answers \
+                     SET data = $1, generation = $2, etag = $3, \
+                         integrity_digest = $4, deleted = 0, \
+                         updated_at = datetime('now') \
+                     WHERE env_id = $5 AND slot = $6",
+                )
+                .bind(&data)
+                .bind(new_gen as i64)
+                .bind(&etag.0)
+                .bind(&integrity.digest)
+                .bind(env_id.as_str())
+                .bind(slot.as_str())
+                .execute(&mut *tx)
+                .await?;
+                new_gen
             }
         };
         tx.commit().await?;
@@ -617,6 +562,30 @@ fn serialize_for_write<T: serde::Serialize>(
     let integrity = StateIntegrity::sha256_of(&data)?;
     let etag = StateEtag::from_integrity(&integrity);
     Ok((etag, integrity, data))
+}
+
+/// Wrap an `io::Error` with call-site context as a [`StorageError::Backend`].
+fn io_backend(context: String, err: std::io::Error) -> StorageError {
+    StorageError::backend(std::io::Error::new(err.kind(), format!("{context}: {err}")))
+}
+
+/// Verify the stored digest against the RAW `Value` BEFORE typed
+/// deserialization — serde silently drops unknown fields, so a post-typed
+/// check would miss injected top-level keys.
+fn verify_integrity(
+    env_id: &EnvId,
+    data: &Value,
+    stored_digest: String,
+) -> Result<(), StorageError> {
+    let recomputed = StateIntegrity::sha256_of(data)?;
+    if recomputed.digest != stored_digest {
+        return Err(StorageError::IntegrityMismatch {
+            env_id: env_id.clone(),
+            stored: stored_digest,
+            recomputed: recomputed.digest,
+        });
+    }
+    Ok(())
 }
 
 fn decode_revision(row: &SqliteRow) -> Result<EnvRevision, StorageError> {

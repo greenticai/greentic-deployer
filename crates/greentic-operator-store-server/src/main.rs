@@ -30,11 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     let args = Args::parse();
 
-    if let Some(parent) = args.db.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
+    // `open` creates the parent directory and the database file if missing.
     let store = SqliteEnvironmentStore::open(&args.db).await?;
     let app = router(Arc::new(store));
 

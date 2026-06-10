@@ -22,13 +22,8 @@ use greentic_operator_store_server::storage::{EnvironmentStorage, StorageError};
 use serde_json::json;
 use sqlx::Row;
 
-async fn fresh_store() -> (tempfile::TempDir, SqliteEnvironmentStore) {
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let store = SqliteEnvironmentStore::open(&dir.path().join("store.sqlite"))
-        .await
-        .expect("open sqlite store");
-    (dir, store)
-}
+mod common;
+use common::fresh_store;
 
 fn env_id(s: &str) -> EnvId {
     EnvId::try_from(s).expect("valid env id")

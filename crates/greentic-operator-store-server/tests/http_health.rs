@@ -5,17 +5,11 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use greentic_operator_store_server::http::router;
-use greentic_operator_store_server::sqlite::SqliteEnvironmentStore;
 use http_body_util::BodyExt;
 use tower::util::ServiceExt;
 
-async fn fresh_store() -> (tempfile::TempDir, SqliteEnvironmentStore) {
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let store = SqliteEnvironmentStore::open(&dir.path().join("store.sqlite"))
-        .await
-        .expect("open sqlite store");
-    (dir, store)
-}
+mod common;
+use common::fresh_store;
 
 async fn get_json(app: axum::Router, path: &str) -> (StatusCode, serde_json::Value) {
     let response = app
