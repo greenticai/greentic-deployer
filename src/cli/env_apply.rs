@@ -40,7 +40,9 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use greentic_deploy_spec::{DeploymentId, EnvId, Environment, MessagingEndpoint, RouteBinding};
+use greentic_deploy_spec::{
+    CustomerId, DeploymentId, EnvId, Environment, MessagingEndpoint, RouteBinding,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -125,7 +127,12 @@ enum StepOp {
         url: String,
     },
     TrustRootBootstrap,
-    Deploy(Box<BundleDeployPayload>),
+    Deploy {
+        payload: Box<BundleDeployPayload>,
+        /// Digest recorded at plan time; re-verified just before the deploy
+        /// step executes to shrink the validate→execute TOCTOU window.
+        expected_digest: String,
+    },
     BundleUpdate(Box<BundleUpdatePayload>),
     EndpointAdd(Box<EndpointAddPayload>),
     EndpointLink {
@@ -179,6 +186,10 @@ impl ApplyStep {
 struct BundleArtifact {
     resolved_path: PathBuf,
     digest: String,
+    /// Billing principal resolved during validation (from
+    /// `resolve_customer_id`). Used to match deployments by the same
+    /// `(bundle_id, customer_id)` pair that `op deploy` keys on.
+    customer_id: CustomerId,
 }
 
 /// Everything validation established, handed to diff/execute/verify.
@@ -313,28 +324,51 @@ fn resolve_and_validate(
                 path: resolved_path.clone(),
                 source,
             })?;
-        super::bundles::resolve_customer_id(&env_id, b.customer_id.clone())?;
+        let customer_id = super::bundles::resolve_customer_id(&env_id, b.customer_id.clone())?;
         artifacts.push(BundleArtifact {
             resolved_path,
             digest,
+            customer_id,
         });
     }
 
-    // Deployment natural-key sanity: apply keys bundles by `bundle_id` alone;
-    // an env where one bundle_id maps to several deployments (multi-customer)
-    // is ambiguous for a declarative upsert.
+    // Deployment natural-key sanity: `op deploy` keys on
+    // `(bundle_id, customer_id)`. Refuse to adopt a deployment owned by a
+    // different billing principal, and reject same-pair ambiguity.
     if let Some(env) = &env {
-        for b in &manifest.bundles {
-            let count = env
+        for (b, artifact) in manifest.bundles.iter().zip(&artifacts) {
+            let same_customer: Vec<_> = env
                 .bundles
                 .iter()
-                .filter(|d| d.bundle_id.as_str() == b.bundle_id)
-                .count();
-            if count > 1 {
+                .filter(|d| {
+                    d.bundle_id.as_str() == b.bundle_id && d.customer_id == artifact.customer_id
+                })
+                .collect();
+            let other_customer: Vec<_> = env
+                .bundles
+                .iter()
+                .filter(|d| {
+                    d.bundle_id.as_str() == b.bundle_id && d.customer_id != artifact.customer_id
+                })
+                .collect();
+            if !other_customer.is_empty() {
                 return Err(OpError::Conflict(format!(
-                    "bundle `{}` matches {count} deployments in env `{env_id}` — apply \
-                     refuses to guess; reconcile with `gtc op bundles list {env_id}` first",
-                    b.bundle_id
+                    "bundle `{}`: deployment owned by customer `{}` exists but manifest \
+                     resolves to `{}` — apply refuses to adopt a deployment owned by a \
+                     different customer",
+                    b.bundle_id,
+                    other_customer[0].customer_id.as_str(),
+                    artifact.customer_id.as_str(),
+                )));
+            }
+            if same_customer.len() > 1 {
+                return Err(OpError::Conflict(format!(
+                    "bundle `{}` matches {} deployments for customer `{}` in env `{env_id}` \
+                     — apply refuses to guess; reconcile with `gtc op bundles list {env_id}` \
+                     first",
+                    b.bundle_id,
+                    same_customer.len(),
+                    artifact.customer_id.as_str(),
                 )));
             }
         }
@@ -494,12 +528,13 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
         steps.push(trust_root_step(store, ctx)?);
     }
 
-    // 3. Bundles.
+    // 3. Bundles (keyed on `(bundle_id, customer_id)` — the same natural key
+    //    that `op deploy` uses).
     for (b, artifact) in ctx.manifest.bundles.iter().zip(&ctx.artifacts) {
         let existing = ctx.env.as_ref().and_then(|e| {
-            e.bundles
-                .iter()
-                .find(|d| d.bundle_id.as_str() == b.bundle_id)
+            e.bundles.iter().find(|d| {
+                d.bundle_id.as_str() == b.bundle_id && d.customer_id == artifact.customer_id
+            })
         });
         match existing {
             None => {
@@ -514,15 +549,18 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     action: ApplyAction::Create,
                     detail,
                     idempotency_key: None, // deploy derives its cut-over key per revision
-                    op: StepOp::Deploy(Box::new(BundleDeployPayload {
-                        environment_id: env_id_str.clone(),
-                        bundle_id: b.bundle_id.clone(),
-                        customer_id: b.customer_id.clone(),
-                        bundle_path: Some(artifact.resolved_path.clone()),
-                        idempotency_key: None,
-                        config_overrides: b.config_overrides.clone(),
-                        route_binding: b.route_binding.clone(),
-                    })),
+                    op: StepOp::Deploy {
+                        payload: Box::new(BundleDeployPayload {
+                            environment_id: env_id_str.clone(),
+                            bundle_id: b.bundle_id.clone(),
+                            customer_id: b.customer_id.clone(),
+                            bundle_path: Some(artifact.resolved_path.clone()),
+                            idempotency_key: None,
+                            config_overrides: b.config_overrides.clone(),
+                            route_binding: b.route_binding.clone(),
+                        }),
+                        expected_digest: artifact.digest.clone(),
+                    },
                 });
             }
             Some(dep) => {
@@ -536,13 +574,61 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     .as_ref()
                     .is_some_and(|o| *o != dep.config_overrides);
                 let env = ctx.env.as_ref().expect("existing deployment implies env");
+                let converged = deployment_converged(env, dep.deployment_id, &artifact.digest);
+                let needs_deploy = !converged;
                 let live = live_revision_digest(env, dep.deployment_id);
-                let needs_deploy = match live {
-                    Some(d) if digest_is_real(d) => d != artifact.digest,
-                    // Degenerate/unknown digest: fail toward re-deploy, not
-                    // toward silently keeping a possibly-stale artifact.
-                    _ => true,
-                };
+
+                // Deploy FIRST when re-staging is needed (routing-metadata-
+                // last: a stage failure leaves the OLD revision serving under
+                // the OLD binding, keeping published paths alive). The
+                // binding/overrides update runs AFTER the deploy lands.
+                if needs_deploy {
+                    let detail = if converged {
+                        // Unreachable (needs_deploy == !converged), but kept
+                        // for defensive completeness.
+                        format!(
+                            "digest {} → {} (blue-green re-stage)",
+                            live.map(short_digest).unwrap_or("none"),
+                            short_digest(&artifact.digest)
+                        )
+                    } else if live.is_some_and(digest_is_real) {
+                        format!(
+                            "digest {} → {} (blue-green re-stage)",
+                            live.map(short_digest).unwrap_or("none"),
+                            short_digest(&artifact.digest)
+                        )
+                    } else {
+                        format!(
+                            "traffic split is not a single 100% entry \
+                             → re-deploy reconverges ({})",
+                            short_digest(&artifact.digest)
+                        )
+                    };
+                    steps.push(ApplyStep {
+                        kind: ApplyStepKind::DeployBundle,
+                        key: b.bundle_id.clone(),
+                        action: ApplyAction::Update,
+                        detail,
+                        idempotency_key: None,
+                        op: StepOp::Deploy {
+                            payload: Box::new(BundleDeployPayload {
+                                environment_id: env_id_str.clone(),
+                                bundle_id: b.bundle_id.clone(),
+                                customer_id: b.customer_id.clone(),
+                                bundle_path: Some(artifact.resolved_path.clone()),
+                                idempotency_key: None,
+                                // Overrides ride the deploy (applied after
+                                // stage+warm, before the cut-over). The
+                                // binding is reconciled by the update step
+                                // AFTER the deploy lands, so None here —
+                                // deploy rejects a differing binding.
+                                config_overrides: b.config_overrides.clone(),
+                                route_binding: None,
+                            }),
+                            expected_digest: artifact.digest.clone(),
+                        },
+                    });
+                }
 
                 if binding_differs || (overrides_differ && !needs_deploy) {
                     let route_binding = binding_differs.then(|| {
@@ -586,32 +672,8 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                         })),
                     });
                 }
-                if needs_deploy {
-                    steps.push(ApplyStep {
-                        kind: ApplyStepKind::DeployBundle,
-                        key: b.bundle_id.clone(),
-                        action: ApplyAction::Update,
-                        detail: format!(
-                            "digest {} → {} (blue-green re-stage)",
-                            live.map(short_digest).unwrap_or("none"),
-                            short_digest(&artifact.digest)
-                        ),
-                        idempotency_key: None,
-                        op: StepOp::Deploy(Box::new(BundleDeployPayload {
-                            environment_id: env_id_str.clone(),
-                            bundle_id: b.bundle_id.clone(),
-                            customer_id: b.customer_id.clone(),
-                            bundle_path: Some(artifact.resolved_path.clone()),
-                            idempotency_key: None,
-                            // Overrides ride the deploy (applied after
-                            // stage+warm, before the cut-over). The binding
-                            // was reconciled by the update step above, so
-                            // None here — deploy rejects a differing binding.
-                            config_overrides: b.config_overrides.clone(),
-                            route_binding: None,
-                        })),
-                    });
-                } else if !binding_differs && !overrides_differ {
+
+                if !needs_deploy && !binding_differs && !overrides_differ {
                     steps.push(ApplyStep::no_op(
                         ApplyStepKind::DeployBundle,
                         b.bundle_id.clone(),
@@ -847,7 +909,17 @@ fn execute(store: &LocalFsStore, ctx: &ApplyContext, steps: &[ApplyStep]) -> Res
                 }),
             )
             .map(|_| ()),
-            StepOp::Deploy(payload) => {
+            StepOp::Deploy {
+                payload,
+                expected_digest,
+            } => {
+                ensure_artifact_unchanged(
+                    payload
+                        .bundle_path
+                        .as_deref()
+                        .expect("apply-built Deploy always has bundle_path"),
+                    expected_digest,
+                )?;
                 super::deploy::deploy(store, &exec_flags, Some((**payload).clone())).map(|_| ())
             }
             StepOp::BundleUpdate(payload) => {
@@ -978,19 +1050,18 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
         let Some(dep) = env
             .bundles
             .iter()
-            .find(|d| d.bundle_id.as_str() == b.bundle_id)
+            .find(|d| d.bundle_id.as_str() == b.bundle_id && d.customer_id == artifact.customer_id)
         else {
             failures.push(format!("bundle `{}` is not deployed", b.bundle_id));
             continue;
         };
-        match live_revision_digest(&env, dep.deployment_id) {
-            Some(d) if d == artifact.digest => {}
-            other => failures.push(format!(
+        if !deployment_converged(&env, dep.deployment_id, &artifact.digest) {
+            failures.push(format!(
                 "bundle `{}`: live revision digest is `{}`, expected `{}`",
                 b.bundle_id,
-                other.unwrap_or("none"),
+                live_revision_digest(&env, dep.deployment_id).unwrap_or("none"),
                 artifact.digest
-            )),
+            ));
         }
         if let Some(rb) = &b.route_binding {
             let desired = into_route_binding(rb.clone());
@@ -1103,6 +1174,53 @@ fn live_revision_digest(env: &Environment, deployment_id: DeploymentId) -> Optio
 /// `sha256:00` placeholder pre-digest revisions carry.
 fn digest_is_real(digest: &str) -> bool {
     digest.starts_with("sha256:") && digest.len() > "sha256:".len() && digest != "sha256:00"
+}
+
+/// Strict convergence: the deployment's traffic split has EXACTLY ONE entry
+/// at full weight (10,000 bps), that entry's revision exists, carries a real
+/// digest, and the digest matches `expected_digest`. A mixed split (e.g.
+/// 60/40 blue-green) or a degenerate placeholder digest is NOT converged.
+fn deployment_converged(
+    env: &Environment,
+    deployment_id: DeploymentId,
+    expected_digest: &str,
+) -> bool {
+    let Some(split) = env
+        .traffic_splits
+        .iter()
+        .find(|s| s.deployment_id == deployment_id)
+    else {
+        return false;
+    };
+    if split.entries.len() != 1 || split.entries[0].weight_bps != 10_000 {
+        return false;
+    }
+    let entry = &split.entries[0];
+    env.revisions
+        .iter()
+        .find(|r| r.revision_id == entry.revision_id)
+        .is_some_and(|r| digest_is_real(&r.bundle_digest) && r.bundle_digest == expected_digest)
+}
+
+/// Re-hash the artifact at `path` and verify it still matches the digest
+/// recorded at plan time. Returns `Err(Conflict)` if the bytes changed
+/// between planning and execution (shrinks the TOCTOU window to what
+/// `op deploy` itself has).
+fn ensure_artifact_unchanged(path: &Path, expected: &str) -> Result<(), OpError> {
+    let actual = super::bundle_stage::sha256_file(path).map_err(|source| OpError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if actual != expected {
+        return Err(OpError::Conflict(format!(
+            "artifact `{}` changed since the plan was computed (expected {}, found {}); \
+             re-run apply",
+            path.display(),
+            short_digest(expected),
+            short_digest(&actual),
+        )));
+    }
+    Ok(())
 }
 
 fn short_digest(digest: &str) -> &str {
@@ -1675,5 +1793,173 @@ mod tests {
         );
         let env = load_local(&store);
         assert_eq!(env.messaging_endpoints[0].linked_bundles.len(), 1);
+    }
+
+    // --- Fix 1: customer-aware bundle matching ---
+
+    #[test]
+    fn cross_customer_deployment_is_rejected() {
+        let (dir, store) = seeded_store();
+        // Seed a deployment owned by "other-customer".
+        let mut env = make_env("local");
+        let mut dep = make_bundle_deployment("local", "quickstart");
+        dep.customer_id = CustomerId::new("other-customer");
+        env.bundles.push(dep);
+        store.save(&env).unwrap();
+
+        // Manifest declares the same bundle_id but resolves to the default
+        // customer "local-dev" → Conflict.
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "quickstart", "bundle_path": fixture()}]
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let err = run_apply(&store, &manifest_path).unwrap_err();
+        match err {
+            OpError::Conflict(msg) => {
+                assert!(msg.contains("other-customer"), "got: {msg}");
+                assert!(msg.contains("local-dev"), "got: {msg}");
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+        // No mutation.
+        let env = load_local(&store);
+        assert!(env.revisions.is_empty());
+    }
+
+    // --- Fix 2: pre-deploy artifact re-hash ---
+
+    #[test]
+    fn ensure_artifact_unchanged_catches_modification() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        std::fs::write(&path, b"original content").unwrap();
+        let digest = super::super::bundle_stage::sha256_file(&path).unwrap();
+
+        // Same bytes → Ok.
+        ensure_artifact_unchanged(&path, &digest).expect("unchanged file must pass");
+
+        // Mutate → Err(Conflict).
+        std::fs::write(&path, b"tampered content").unwrap();
+        let err = ensure_artifact_unchanged(&path, &digest).unwrap_err();
+        match err {
+            OpError::Conflict(msg) => {
+                assert!(msg.contains("changed since the plan"), "got: {msg}")
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    // --- Fix 3: strict convergence check ---
+
+    #[test]
+    fn mixed_split_is_not_converged_plans_redeploy() {
+        use greentic_deploy_spec::TrafficSplitEntry;
+
+        let (dir, store) = seeded_store();
+        let real_digest = super::super::bundle_stage::sha256_file(&fixture()).unwrap();
+
+        let mut env = make_env("local");
+        let dep = make_bundle_deployment("local", "quickstart");
+        let mut rev1 = make_revision(
+            "local",
+            "quickstart",
+            &dep.deployment_id,
+            1,
+            RevisionLifecycle::Ready,
+        );
+        rev1.bundle_digest = real_digest;
+        let rev2 = make_revision(
+            "local",
+            "quickstart",
+            &dep.deployment_id,
+            2,
+            RevisionLifecycle::Ready,
+        );
+        // Two-entry split: 6000/4000 — sum = 10_000 (valid).
+        let mut split = make_traffic_split(
+            "local",
+            "quickstart",
+            &dep.deployment_id,
+            &rev1.revision_id,
+            "seed",
+        );
+        split.entries[0].weight_bps = 6_000;
+        split.entries.push(TrafficSplitEntry {
+            revision_id: rev2.revision_id,
+            weight_bps: 4_000,
+        });
+        env.bundles.push(dep);
+        env.revisions.push(rev1);
+        env.revisions.push(rev2);
+        env.traffic_splits.push(split);
+        store.save(&env).unwrap();
+
+        // Manifest: same bundle, same artifact (top entry digest matches) —
+        // but the split is mixed, so it MUST plan a re-deploy, not a no-op.
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "quickstart", "bundle_path": fixture()}]
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let plan = run_dry(&store, &manifest_path).expect("dry-run");
+        let actions = step_actions(&plan.result);
+        assert!(
+            actions.contains(&("deploy-bundle".to_string(), "update".to_string())),
+            "mixed split must plan a re-deploy: {actions:?}"
+        );
+        assert!(plan.result["changed"].as_u64().unwrap() >= 1);
+    }
+
+    // --- Fix 4: deploy BEFORE binding update ---
+
+    #[test]
+    fn deploy_precedes_binding_update_when_both_differ() {
+        let (dir, store) = seeded_store();
+        // Seed: deployment with degenerate digest (needs deploy) + binding
+        // that differs from the manifest's.
+        let mut env = make_env("local");
+        let dep = make_bundle_deployment("local", "quickstart");
+        let rev = make_revision(
+            "local",
+            "quickstart",
+            &dep.deployment_id,
+            1,
+            RevisionLifecycle::Ready,
+        );
+        env.traffic_splits.push(make_traffic_split(
+            "local",
+            "quickstart",
+            &dep.deployment_id,
+            &rev.revision_id,
+            "seed",
+        ));
+        env.bundles.push(dep);
+        env.revisions.push(rev);
+        store.save(&env).unwrap();
+
+        // Manifest with the fixture path AND a different binding (/legal).
+        let manifest = full_manifest(&fixture());
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let plan = run_dry(&store, &manifest_path).expect("dry-run");
+        let steps = plan.result["steps"].as_array().expect("steps");
+
+        // Find indices of deploy-bundle (update) and update-bundle (update).
+        let deploy_idx = steps
+            .iter()
+            .position(|s| s["kind"] == "deploy-bundle" && s["action"] == "update")
+            .expect("deploy-bundle update step");
+        let update_idx = steps
+            .iter()
+            .position(|s| s["kind"] == "update-bundle" && s["action"] == "update")
+            .expect("update-bundle update step");
+
+        assert!(
+            deploy_idx < update_idx,
+            "deploy-bundle (idx {deploy_idx}) must precede update-bundle (idx {update_idx}): \
+             {steps:?}"
+        );
     }
 }
