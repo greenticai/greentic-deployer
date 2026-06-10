@@ -316,19 +316,17 @@ impl HttpEnvironmentStore {
             // `send`'s only caller, so the 2xx path is exclusively mutations.
             if status == reqwest::StatusCode::NO_CONTENT {
                 return serde_json::from_str("null").map_err(|e| {
-                    StoreError::CommittedAfterSave(Box::new(StoreError::Conflict(format!(
-                        "transport: cannot deserialize 204 body: {e} — the server reported \
-                         success (2xx), so the mutation may already be committed — re-running \
-                         with the SAME Idempotency-Key replays instead of re-applying"
-                    ))))
+                    committed_after_save(
+                        format!("transport: cannot deserialize 204 body: {e}"),
+                        idempotency_key,
+                    )
                 });
             }
             response.json::<R>().map_err(|e| {
-                StoreError::CommittedAfterSave(Box::new(StoreError::Conflict(format!(
-                    "transport: invalid response body: {e} — the server reported \
-                     success (2xx), so the mutation may already be committed — re-running \
-                     with the SAME Idempotency-Key replays instead of re-applying"
-                ))))
+                committed_after_save(
+                    format!("transport: invalid response body: {e}"),
+                    idempotency_key,
+                )
             })
         } else {
             Err(map_error_response(status, response))
@@ -338,10 +336,10 @@ impl HttpEnvironmentStore {
     /// Send a mutating request whose A8 response is a [`MutationEnvelope`]
     /// wrapping the domain result alongside ETag/generation/idempotency
     /// metadata. Enforces the A8 §4 audit invariant on the success envelope
-    /// (see [`validate_success_audit`]) against `expected_env` — the env the
-    /// request targeted — then returns only the domain `result`; PR-3b-fu
-    /// will surface the remaining envelope metadata via a return-type
-    /// extension.
+    /// (see [`MutationEnvelope::validated`]) against `expected_env` — the
+    /// env the request targeted — then returns only the domain `result`;
+    /// PR-3b-fu will surface the remaining envelope metadata via a
+    /// return-type extension.
     fn send_mutation<P: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         expected_env: &EnvId,
@@ -350,28 +348,8 @@ impl HttpEnvironmentStore {
         idempotency_key: Option<&str>,
         body: Option<&P>,
     ) -> Result<R, StoreError> {
-        // `send` returns only after a 2xx — the mutation may already be
-        // committed server-side. Wrap post-2xx failures (from `send` itself
-        // or from `validate_success_audit`) in `CommittedAfterSave` so the
-        // caller knows retrying with a fresh key would double-apply.
         let envelope: MutationEnvelope<R> = self.send(method, path, idempotency_key, body)?;
-        if let Err(inner) =
-            validate_success_audit(envelope.audit.as_ref(), expected_env, idempotency_key)
-        {
-            let guidance = match idempotency_key {
-                Some(key) => format!(
-                    " — the server reported success (2xx), so the mutation may already be \
-                     committed — replay with Idempotency-Key `{key}`"
-                ),
-                None => " — the server reported success (2xx), so the mutation may already be \
-                         committed"
-                    .to_string(),
-            };
-            return Err(StoreError::CommittedAfterSave(Box::new(
-                StoreError::Conflict(format!("{inner}{guidance}")),
-            )));
-        }
-        Ok(envelope.result)
+        envelope.validated(expected_env, idempotency_key)
     }
 
     /// [`send_mutation`](Self::send_mutation) variant with no request body.
@@ -436,26 +414,34 @@ fn validate_success_audit(
     // Bind the audit record to the request via the idempotency key: a
     // stale same-env record cannot carry the request's fresh ULID.
     if let Some(sent) = sent_idempotency_key {
-        match audit.idempotency_key.as_deref() {
-            Some(audit_key) if audit_key == sent => { /* match — record belongs to this request */
-            }
-            Some(audit_key) => {
-                return Err(StoreError::Conflict(format!(
-                    "A8 contract violation: audit record idempotency key `{audit_key}` \
-                     does not match the request's key `{sent}` — the record does not \
-                     belong to this mutation"
-                )));
-            }
-            None => {
-                return Err(StoreError::Conflict(format!(
-                    "A8 contract violation: audit record idempotency key missing \
-                     does not match the request's key `{sent}` — the record does not \
-                     belong to this mutation"
-                )));
-            }
+        let audit_key = audit.idempotency_key.as_deref();
+        if audit_key != Some(sent) {
+            return Err(StoreError::Conflict(format!(
+                "A8 contract violation: audit record idempotency key `{}` does not match \
+                 the request's key `{sent}` — the record does not belong to this mutation",
+                audit_key.unwrap_or("<missing>")
+            )));
         }
     }
     Ok(())
+}
+
+/// Wrap a post-2xx failure in [`StoreError::CommittedAfterSave`] with the
+/// shared replay guidance. After a 2xx status the mutation may already be
+/// committed server-side, so the error must not look retriable — re-running
+/// with a freshly minted idempotency key would double-apply, while the SAME
+/// key replays (A8 §2).
+fn committed_after_save(message: String, idempotency_key: Option<&str>) -> StoreError {
+    let replay = match idempotency_key {
+        Some(key) => format!(" — replay with Idempotency-Key `{key}` instead of re-applying"),
+        None => {
+            " — re-running with the SAME Idempotency-Key replays instead of re-applying".to_string()
+        }
+    };
+    StoreError::CommittedAfterSave(Box::new(StoreError::Conflict(format!(
+        "{message} — the server reported success (2xx), so the mutation may already be \
+         committed{replay}"
+    ))))
 }
 
 // ---------------------------------------------------------------------------
@@ -490,6 +476,25 @@ struct MutationEnvelope<T> {
     audit: Option<AuditEvent>,
 }
 
+impl<T> MutationEnvelope<T> {
+    /// Enforce the A8 §4 audit invariant (see [`validate_success_audit`])
+    /// and return the domain `result`. Consuming the envelope here couples
+    /// the invariant to the type: any future path that deserializes a
+    /// `MutationEnvelope` must go through `validated` to reach the result,
+    /// so the check cannot be silently skipped. Violations are wrapped in
+    /// [`StoreError::CommittedAfterSave`] — the envelope only exists after
+    /// a 2xx, so the mutation may already be committed server-side.
+    fn validated(
+        self,
+        expected_env: &EnvId,
+        sent_idempotency_key: Option<&str>,
+    ) -> Result<T, StoreError> {
+        validate_success_audit(self.audit.as_ref(), expected_env, sent_idempotency_key)
+            .map_err(|inner| committed_after_save(inner.to_string(), sent_idempotency_key))?;
+        Ok(self.result)
+    }
+}
+
 /// Mint a one-shot idempotency key for methods whose trait signature does
 /// not carry one. Delegates to [`crate::cli::mint_idempotency_key`] so the
 /// ULID-generation strategy stays in one place. Returns the inner string for
@@ -519,7 +524,7 @@ fn map_error_response(
         let consistent = actual == expected
             || (actual == 401 && matches!(remote_err, RemoteStoreError::Unauthorized { .. }));
         if consistent {
-            return map_remote_error(&remote_err);
+            return map_remote_error(remote_err);
         }
         return StoreError::Conflict(format!(
             "A8 contract violation: HTTP status {actual} contradicts the A8 error body \
@@ -539,7 +544,7 @@ fn map_error_response(
         // from a proxy/LB in front of the store) is still a denial — keep
         // the `unauthorized` noun rather than degrading to `conflict`.
         401 | 403 => StoreError::Unauthorized {
-            policy: "remote".to_string(),
+            policy: GATEWAY_DENIAL_POLICY.to_string(),
             reason: body_text,
         },
         501 => StoreError::NotYetImplemented(body_text),
@@ -547,8 +552,14 @@ fn map_error_response(
     }
 }
 
-/// Map a parsed [`RemoteStoreError`] to [`StoreError`].
-fn map_remote_error(err: &RemoteStoreError) -> StoreError {
+/// `policy` value for denials that did not come through the A8 error shape
+/// (non-A8 401/403 bodies, e.g. a proxy/LB in front of the store). Named so
+/// downstream consumers matching on `policy` have one stable value.
+const GATEWAY_DENIAL_POLICY: &str = "remote";
+
+/// Map a parsed [`RemoteStoreError`] to [`StoreError`]. Takes the error by
+/// value so the owned `String` fields move instead of cloning.
+fn map_remote_error(err: RemoteStoreError) -> StoreError {
     match err {
         RemoteStoreError::NotFound => StoreError::NotFound(
             EnvId::try_from("unknown")
@@ -563,16 +574,13 @@ fn map_remote_error(err: &RemoteStoreError) -> StoreError {
         RemoteStoreError::IdempotencyConflict { reason } => {
             StoreError::Conflict(format!("idempotency conflict: {reason}"))
         }
-        RemoteStoreError::Unauthorized { policy, reason } => StoreError::Unauthorized {
-            policy: policy.clone(),
-            reason: reason.clone(),
-        },
+        RemoteStoreError::Unauthorized { policy, reason } => {
+            StoreError::Unauthorized { policy, reason }
+        }
         RemoteStoreError::IntegrityMismatch { expected, actual } => StoreError::InvalidArgument(
             format!("integrity mismatch: expected {expected}, computed {actual}"),
         ),
-        RemoteStoreError::NotYetImplemented { detail } => {
-            StoreError::NotYetImplemented(detail.clone())
-        }
+        RemoteStoreError::NotYetImplemented { detail } => StoreError::NotYetImplemented(detail),
         RemoteStoreError::Internal { message } => {
             StoreError::Conflict(format!("server: {message}"))
         }
@@ -1761,63 +1769,62 @@ mod tests {
         }
     }
 
-    #[test]
-    fn success_without_audit_is_rejected() {
-        let body = wrap_mutation_tweaked(sample_env_domain(), |env| {
-            env.as_object_mut().unwrap().remove("audit");
-        });
+    /// Shared skeleton for the audit-invariant negative tests: serve a 200
+    /// envelope mutated by `tweak`, run a mutation, and assert the
+    /// `CommittedAfterSave`-wrapped violation message contains
+    /// `expected_substr`.
+    fn assert_audit_violation(tweak: impl FnOnce(&mut serde_json::Value), expected_substr: &str) {
+        let body = wrap_mutation_tweaked(sample_env_domain(), tweak);
         let (_mock, store) = happy_store(200, &body);
         let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
         let msg = unwrap_committed_conflict(result);
         assert!(
-            msg.contains("missing the audit record"),
-            "expected missing-audit violation, got: {msg}"
+            msg.contains(expected_substr),
+            "expected `{expected_substr}` violation, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn success_without_audit_is_rejected() {
+        assert_audit_violation(
+            |env| {
+                env.as_object_mut().unwrap().remove("audit");
+            },
+            "missing the audit record",
         );
     }
 
     #[test]
     fn success_with_deny_audit_is_rejected() {
-        let body = wrap_mutation_tweaked(sample_env_domain(), |env| {
-            env["audit"]["authorization"] = serde_json::json!({
-                "decision": "deny", "policy": "rbac-v1", "reason": "nope"
-            });
-        });
-        let (_mock, store) = happy_store(200, &body);
-        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
-        let msg = unwrap_committed_conflict(result);
-        assert!(
-            msg.contains("deny audit decision"),
-            "expected deny-decision violation, got: {msg}"
+        assert_audit_violation(
+            |env| {
+                env["audit"]["authorization"] = serde_json::json!({
+                    "decision": "deny", "policy": "rbac-v1", "reason": "nope"
+                });
+            },
+            "deny audit decision",
         );
     }
 
     #[test]
     fn success_with_non_ok_audit_result_is_rejected() {
-        let body = wrap_mutation_tweaked(sample_env_domain(), |env| {
-            env["audit"]["result"] = serde_json::json!({
-                "outcome": "error", "kind": "store", "message": "boom"
-            });
-        });
-        let (_mock, store) = happy_store(200, &body);
-        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
-        let msg = unwrap_committed_conflict(result);
-        assert!(
-            msg.contains("non-ok audit result"),
-            "expected non-ok-result violation, got: {msg}"
+        assert_audit_violation(
+            |env| {
+                env["audit"]["result"] = serde_json::json!({
+                    "outcome": "error", "kind": "store", "message": "boom"
+                });
+            },
+            "non-ok audit result",
         );
     }
 
     #[test]
     fn success_with_mismatched_audit_env_is_rejected() {
-        let body = wrap_mutation_tweaked(sample_env_domain(), |env| {
-            env["audit"]["env_id"] = serde_json::json!("other-env");
-        });
-        let (_mock, store) = happy_store(200, &body);
-        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
-        let msg = unwrap_committed_conflict(result);
-        assert!(
-            msg.contains("names env `other-env`"),
-            "expected env-mismatch violation, got: {msg}"
+        assert_audit_violation(
+            |env| {
+                env["audit"]["env_id"] = serde_json::json!("other-env");
+            },
+            "names env `other-env`",
         );
     }
 
@@ -1825,33 +1832,25 @@ mod tests {
 
     #[test]
     fn success_with_wrong_audit_idempotency_key_is_rejected() {
-        let body = wrap_mutation_tweaked(sample_env_domain(), |env| {
-            // Set audit key to a fixed wrong value (not the placeholder).
-            env["audit"]["idempotency_key"] = serde_json::json!("01WRONG00000000000000000XX");
-        });
-        let (_mock, store) = happy_store(200, &body);
-        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
-        let msg = unwrap_committed_conflict(result);
-        assert!(
-            msg.contains("does not belong"),
-            "expected idempotency key mismatch violation, got: {msg}"
+        assert_audit_violation(
+            |env| {
+                // Set audit key to a fixed wrong value (not the placeholder).
+                env["audit"]["idempotency_key"] = serde_json::json!("01WRONG00000000000000000XX");
+            },
+            "does not belong",
         );
     }
 
     #[test]
     fn success_with_missing_audit_idempotency_key_is_rejected() {
-        let body = wrap_mutation_tweaked(sample_env_domain(), |env| {
-            env["audit"]
-                .as_object_mut()
-                .unwrap()
-                .remove("idempotency_key");
-        });
-        let (_mock, store) = happy_store(200, &body);
-        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
-        let msg = unwrap_committed_conflict(result);
-        assert!(
-            msg.contains("does not belong"),
-            "expected missing audit key violation, got: {msg}"
+        assert_audit_violation(
+            |env| {
+                env["audit"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("idempotency_key");
+            },
+            "does not belong",
         );
     }
 
@@ -1863,18 +1862,11 @@ mod tests {
         // committed, so the error must be CommittedAfterSave.
         let (_mock, store) = happy_store(200, "this is not json");
         let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
-        match result {
-            Err(StoreError::CommittedAfterSave(inner)) => match *inner {
-                StoreError::Conflict(msg) => {
-                    assert!(
-                        msg.contains("already be committed"),
-                        "expected committed guidance, got: {msg}"
-                    );
-                }
-                other => panic!("expected inner Conflict, got {other:?}"),
-            },
-            other => panic!("expected CommittedAfterSave, got {other:?}"),
-        }
+        let msg = unwrap_committed_conflict(result);
+        assert!(
+            msg.contains("already be committed"),
+            "expected committed guidance, got: {msg}"
+        );
     }
 
     // FIX 3: A8 status/kind agreement tests
