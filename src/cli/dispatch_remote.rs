@@ -1135,6 +1135,18 @@ mod tests {
                     let headers = lines[1..].join("\r\n");
                     check_fn(request_line, &headers, &req_body);
                 }
+                // Substitute {{IDEMPOTENCY_KEY}} placeholder with the real
+                // request header value so audit key correlation passes.
+                let body = if body.contains("{{IDEMPOTENCY_KEY}}") {
+                    let idem_val = lines
+                        .iter()
+                        .find(|l| l.to_lowercase().starts_with("idempotency-key:"))
+                        .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()))
+                        .unwrap_or_default();
+                    body.replace("{{IDEMPOTENCY_KEY}}", &idem_val)
+                } else {
+                    body
+                };
                 let status_text = match status {
                     200 => "OK",
                     201 => "Created",
@@ -1180,7 +1192,7 @@ mod tests {
                 "target": null,
                 "authorization": {"decision": "allow", "policy": "local-only", "reason": "test"},
                 "result": {"outcome": "ok"},
-                "idempotency_key": "01TEST000000000000000000BB"
+                "idempotency_key": "{{IDEMPOTENCY_KEY}}"
             }
         })
         .to_string()

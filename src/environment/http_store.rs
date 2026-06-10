@@ -310,17 +310,26 @@ impl HttpEnvironmentStore {
 
         let status = response.status();
         if status.is_success() {
-            // 204 No Content: return the unit-ish default. The caller should
-            // use `()` or a type that deserializes from `null`/empty.
+            // After a 2xx the mutation may already be committed server-side.
+            // Decode failures must not look retriable-with-a-fresh-key — wrap
+            // them in `CommittedAfterSave`. Safe because `send_mutation` is
+            // `send`'s only caller, so the 2xx path is exclusively mutations.
             if status == reqwest::StatusCode::NO_CONTENT {
-                // Try deserializing from "null" for types that accept it.
                 return serde_json::from_str("null").map_err(|e| {
-                    StoreError::Conflict(format!("transport: cannot deserialize 204 body: {e}"))
+                    StoreError::CommittedAfterSave(Box::new(StoreError::Conflict(format!(
+                        "transport: cannot deserialize 204 body: {e} — the server reported \
+                         success (2xx), so the mutation may already be committed — re-running \
+                         with the SAME Idempotency-Key replays instead of re-applying"
+                    ))))
                 });
             }
-            response
-                .json::<R>()
-                .map_err(|e| StoreError::Conflict(format!("transport: invalid response body: {e}")))
+            response.json::<R>().map_err(|e| {
+                StoreError::CommittedAfterSave(Box::new(StoreError::Conflict(format!(
+                    "transport: invalid response body: {e} — the server reported \
+                     success (2xx), so the mutation may already be committed — re-running \
+                     with the SAME Idempotency-Key replays instead of re-applying"
+                ))))
+            })
         } else {
             Err(map_error_response(status, response))
         }
@@ -341,8 +350,27 @@ impl HttpEnvironmentStore {
         idempotency_key: Option<&str>,
         body: Option<&P>,
     ) -> Result<R, StoreError> {
+        // `send` returns only after a 2xx — the mutation may already be
+        // committed server-side. Wrap post-2xx failures (from `send` itself
+        // or from `validate_success_audit`) in `CommittedAfterSave` so the
+        // caller knows retrying with a fresh key would double-apply.
         let envelope: MutationEnvelope<R> = self.send(method, path, idempotency_key, body)?;
-        validate_success_audit(envelope.audit.as_ref(), expected_env)?;
+        if let Err(inner) =
+            validate_success_audit(envelope.audit.as_ref(), expected_env, idempotency_key)
+        {
+            let guidance = match idempotency_key {
+                Some(key) => format!(
+                    " — the server reported success (2xx), so the mutation may already be \
+                     committed — replay with Idempotency-Key `{key}`"
+                ),
+                None => " — the server reported success (2xx), so the mutation may already be \
+                         committed"
+                    .to_string(),
+            };
+            return Err(StoreError::CommittedAfterSave(Box::new(
+                StoreError::Conflict(format!("{inner}{guidance}")),
+            )));
+        }
         Ok(envelope.result)
     }
 
@@ -367,9 +395,16 @@ impl HttpEnvironmentStore {
 /// the success (a `deny` decision, a non-`ok` result) or names a different
 /// environment than the request targeted, is a contract violation the client
 /// must reject rather than report as success.
+///
+/// `sent_idempotency_key`: when `Some(key)`, the audit record's
+/// `idempotency_key` must match — otherwise a stale record from a
+/// different request could satisfy the check. A8 §2 replays carry the
+/// SAME key by definition, so replays pass. When `None` (no current
+/// caller supplies one), the equality check is skipped.
 fn validate_success_audit(
     audit: Option<&AuditEvent>,
     expected_env: &EnvId,
+    sent_idempotency_key: Option<&str>,
 ) -> Result<(), StoreError> {
     let Some(audit) = audit else {
         return Err(StoreError::Conflict(
@@ -397,6 +432,28 @@ fn validate_success_audit(
              env `{expected_env}`",
             audit.env_id
         )));
+    }
+    // Bind the audit record to the request via the idempotency key: a
+    // stale same-env record cannot carry the request's fresh ULID.
+    if let Some(sent) = sent_idempotency_key {
+        match audit.idempotency_key.as_deref() {
+            Some(audit_key) if audit_key == sent => { /* match — record belongs to this request */
+            }
+            Some(audit_key) => {
+                return Err(StoreError::Conflict(format!(
+                    "A8 contract violation: audit record idempotency key `{audit_key}` \
+                     does not match the request's key `{sent}` — the record does not \
+                     belong to this mutation"
+                )));
+            }
+            None => {
+                return Err(StoreError::Conflict(format!(
+                    "A8 contract violation: audit record idempotency key missing \
+                     does not match the request's key `{sent}` — the record does not \
+                     belong to this mutation"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -455,7 +512,19 @@ fn map_error_response(
 
     // Try to parse as the A8 contract error shape.
     if let Ok(remote_err) = serde_json::from_str::<RemoteStoreError>(&body_text) {
-        return map_remote_error(&remote_err);
+        let actual = status.as_u16();
+        let expected = remote_err.http_status();
+        // A8 defines `Unauthorized` as 403; accept 401 (unauthenticated) as
+        // well since both express a denial. All other kinds must match exactly.
+        let consistent = actual == expected
+            || (actual == 401 && matches!(remote_err, RemoteStoreError::Unauthorized { .. }));
+        if consistent {
+            return map_remote_error(&remote_err);
+        }
+        return StoreError::Conflict(format!(
+            "A8 contract violation: HTTP status {actual} contradicts the A8 error body \
+             (kind expects {expected}): {remote_err}"
+        ));
     }
 
     // Fallback: map by status code with raw body.
@@ -1555,17 +1624,36 @@ mod tests {
                     check_fn(request_line, &headers, &req_body);
                 }
 
+                // Extract the Idempotency-Key header value from the request
+                // and substitute `{{IDEMPOTENCY_KEY}}` in the response body
+                // so happy-path tests echo the real sent key back in the
+                // audit record (FIX 1 correlation).
+                let body = if body.contains("{{IDEMPOTENCY_KEY}}") {
+                    let idem_val = lines
+                        .iter()
+                        .find(|l| l.to_lowercase().starts_with("idempotency-key:"))
+                        .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()))
+                        .unwrap_or_default();
+                    body.replace("{{IDEMPOTENCY_KEY}}", &idem_val)
+                } else {
+                    body
+                };
+
                 let status_text = match status {
                     200 => "OK",
                     201 => "Created",
                     204 => "No Content",
                     400 => "Bad Request",
+                    401 => "Unauthorized",
+                    403 => "Forbidden",
                     404 => "Not Found",
                     409 => "Conflict",
                     422 => "Unprocessable Entity",
                     500 => "Internal Server Error",
+                    501 => "Not Implemented",
                     _ => "Unknown",
                 };
+                // Recompute Content-Length after substitution.
                 let response = format!(
                     "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -1613,7 +1701,7 @@ mod tests {
                 "target": null,
                 "authorization": {"decision": "allow", "policy": "local-only", "reason": "test"},
                 "result": {"outcome": "ok"},
-                "idempotency_key": "01TEST000000000000000000BB"
+                "idempotency_key": "{{IDEMPOTENCY_KEY}}"
             }
         })
         .to_string()
@@ -1661,6 +1749,18 @@ mod tests {
     // PR-4.0 (F2): A8 §4 audit invariant on success envelopes
     // -----------------------------------------------------------------------
 
+    /// Helper: unwrap a `CommittedAfterSave` wrapper and return the inner
+    /// `Conflict` message string. Panics if the shape doesn't match.
+    fn unwrap_committed_conflict(result: Result<Environment, StoreError>) -> String {
+        match result {
+            Err(StoreError::CommittedAfterSave(inner)) => match *inner {
+                StoreError::Conflict(msg) => msg,
+                other => panic!("expected inner Conflict, got {other:?}"),
+            },
+            other => panic!("expected CommittedAfterSave, got {other:?}"),
+        }
+    }
+
     #[test]
     fn success_without_audit_is_rejected() {
         let body = wrap_mutation_tweaked(sample_env_domain(), |env| {
@@ -1668,15 +1768,11 @@ mod tests {
         });
         let (_mock, store) = happy_store(200, &body);
         let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
-        match result {
-            Err(StoreError::Conflict(msg)) => {
-                assert!(
-                    msg.contains("missing the audit record"),
-                    "expected missing-audit violation, got: {msg}"
-                );
-            }
-            other => panic!("expected Conflict, got {other:?}"),
-        }
+        let msg = unwrap_committed_conflict(result);
+        assert!(
+            msg.contains("missing the audit record"),
+            "expected missing-audit violation, got: {msg}"
+        );
     }
 
     #[test]
@@ -1688,15 +1784,11 @@ mod tests {
         });
         let (_mock, store) = happy_store(200, &body);
         let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
-        match result {
-            Err(StoreError::Conflict(msg)) => {
-                assert!(
-                    msg.contains("deny audit decision"),
-                    "expected deny-decision violation, got: {msg}"
-                );
-            }
-            other => panic!("expected Conflict, got {other:?}"),
-        }
+        let msg = unwrap_committed_conflict(result);
+        assert!(
+            msg.contains("deny audit decision"),
+            "expected deny-decision violation, got: {msg}"
+        );
     }
 
     #[test]
@@ -1708,15 +1800,11 @@ mod tests {
         });
         let (_mock, store) = happy_store(200, &body);
         let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
-        match result {
-            Err(StoreError::Conflict(msg)) => {
-                assert!(
-                    msg.contains("non-ok audit result"),
-                    "expected non-ok-result violation, got: {msg}"
-                );
-            }
-            other => panic!("expected Conflict, got {other:?}"),
-        }
+        let msg = unwrap_committed_conflict(result);
+        assert!(
+            msg.contains("non-ok audit result"),
+            "expected non-ok-result violation, got: {msg}"
+        );
     }
 
     #[test]
@@ -1726,14 +1814,110 @@ mod tests {
         });
         let (_mock, store) = happy_store(200, &body);
         let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
+        let msg = unwrap_committed_conflict(result);
+        assert!(
+            msg.contains("names env `other-env`"),
+            "expected env-mismatch violation, got: {msg}"
+        );
+    }
+
+    // FIX 1: audit idempotency key correlation tests
+
+    #[test]
+    fn success_with_wrong_audit_idempotency_key_is_rejected() {
+        let body = wrap_mutation_tweaked(sample_env_domain(), |env| {
+            // Set audit key to a fixed wrong value (not the placeholder).
+            env["audit"]["idempotency_key"] = serde_json::json!("01WRONG00000000000000000XX");
+        });
+        let (_mock, store) = happy_store(200, &body);
+        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
+        let msg = unwrap_committed_conflict(result);
+        assert!(
+            msg.contains("does not belong"),
+            "expected idempotency key mismatch violation, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn success_with_missing_audit_idempotency_key_is_rejected() {
+        let body = wrap_mutation_tweaked(sample_env_domain(), |env| {
+            env["audit"]
+                .as_object_mut()
+                .unwrap()
+                .remove("idempotency_key");
+        });
+        let (_mock, store) = happy_store(200, &body);
+        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
+        let msg = unwrap_committed_conflict(result);
+        assert!(
+            msg.contains("does not belong"),
+            "expected missing audit key violation, got: {msg}"
+        );
+    }
+
+    // FIX 2: post-2xx failures wrapped in CommittedAfterSave
+
+    #[test]
+    fn success_2xx_with_garbage_body_maps_to_committed_after_save() {
+        // A 200 response with a non-JSON body: the mutation may already be
+        // committed, so the error must be CommittedAfterSave.
+        let (_mock, store) = happy_store(200, "this is not json");
+        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
+        match result {
+            Err(StoreError::CommittedAfterSave(inner)) => match *inner {
+                StoreError::Conflict(msg) => {
+                    assert!(
+                        msg.contains("already be committed"),
+                        "expected committed guidance, got: {msg}"
+                    );
+                }
+                other => panic!("expected inner Conflict, got {other:?}"),
+            },
+            other => panic!("expected CommittedAfterSave, got {other:?}"),
+        }
+    }
+
+    // FIX 3: A8 status/kind agreement tests
+
+    #[test]
+    fn error_500_with_unauthorized_body_is_contract_violation() {
+        // HTTP 500 but the A8 body claims `unauthorized` (expects 403) — don't
+        // trust either side.
+        let err_body = serde_json::json!({
+            "kind": "unauthorized",
+            "policy": "rbac-v1",
+            "reason": "nope"
+        });
+        let (_mock, store) = happy_store(500, &err_body.to_string());
+        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
         match result {
             Err(StoreError::Conflict(msg)) => {
                 assert!(
-                    msg.contains("names env `other-env`"),
-                    "expected env-mismatch violation, got: {msg}"
+                    msg.contains("contradicts"),
+                    "expected contract violation, got: {msg}"
                 );
             }
-            other => panic!("expected Conflict, got {other:?}"),
+            other => panic!("expected Conflict(contradicts...), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_401_with_unauthorized_body_maps_to_unauthorized() {
+        // HTTP 401 with an A8 `unauthorized`-kind body: the 401 allowance
+        // means we trust the body.
+        let err_body = serde_json::json!({
+            "kind": "unauthorized",
+            "policy": "rbac-v1",
+            "reason": "expired token"
+        });
+        let (_mock, store) = happy_store(401, &err_body.to_string());
+        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
+        match result {
+            Err(StoreError::Unauthorized { policy, reason }) => {
+                assert_eq!(policy, "rbac-v1");
+                assert_eq!(reason, "expired token");
+            }
+            other => panic!("expected Unauthorized, got {other:?}"),
         }
     }
 
