@@ -97,8 +97,8 @@ pub enum OpError {
     InvalidArgument(String),
     #[error("not found: {0}")]
     NotFound(String),
-    #[error("not yet implemented in Phase A: {0}")]
-    NotYetImplemented(&'static str),
+    #[error("not yet implemented: {0}")]
+    NotYetImplemented(String),
     #[error("conflict: {0}")]
     Conflict(String),
     #[error("unauthorized: {policy} — {reason}")]
@@ -233,6 +233,16 @@ pub(crate) fn map_store_err_preserving_noun(e: crate::environment::StoreError) -
             OpError::NotFound(format!("environment `{id}`"))
         }
         crate::environment::StoreError::DependentNotFound(msg) => OpError::NotFound(msg),
+        // PR-4.0 (F4): remote-backend RBAC denials (`403`) and 501s keep
+        // their typed nouns — the HTTP store surfaces them as dedicated
+        // variants so the error envelope renders `error.kind:
+        // "unauthorized"` / `"not-yet-implemented"` instead of `"conflict"`.
+        crate::environment::StoreError::Unauthorized { policy, reason } => {
+            OpError::Unauthorized { policy, reason }
+        }
+        crate::environment::StoreError::NotYetImplemented(detail) => {
+            OpError::NotYetImplemented(detail)
+        }
         // PR-3a.6: the typed revision-lifecycle verbs (`warm_revision` /
         // `drain_revision` / `archive_revision`) wrap their inner
         // `LifecycleError` in this variant so the structured detail
@@ -400,7 +410,7 @@ where
     let audit_result = match &result {
         Ok(_) => AuditResult::Ok,
         Err(OpError::NotYetImplemented(detail)) => AuditResult::NotYetImplemented {
-            detail: (*detail).to_string(),
+            detail: detail.clone(),
         },
         Err(err) => AuditResult::Error {
             kind: err.kind().to_string(),

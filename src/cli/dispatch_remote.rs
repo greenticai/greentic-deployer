@@ -168,12 +168,14 @@ fn route_remote(
             RevisionsVerb::Stage(_) => Err(OpError::NotYetImplemented(
                 "`revisions stage` against a remote --store-url store is not supported yet \
                  (needs server-side bundle staging / a GET-env read endpoint; \
-                 tracked as PR-3c follow-up)",
+                 tracked as PR-3c follow-up)"
+                    .to_string(),
             )),
             RevisionsVerb::Warm => Err(OpError::NotYetImplemented(
                 "`revisions warm` against a remote --store-url store is not supported yet \
                  (needs a GET-env read endpoint for the health-gate precondition; \
-                 tracked as PR-3c follow-up)",
+                 tracked as PR-3c follow-up)"
+                    .to_string(),
             )),
             RevisionsVerb::List { .. } => Err(not_supported("revisions list")),
         },
@@ -204,7 +206,8 @@ fn route_remote(
                 MessagingEndpointVerb::RotateWebhookSecret(_) => Err(OpError::NotYetImplemented(
                     "`messaging rotate-webhook-secret` against a remote --store-url store \
                          is not supported yet (writes the secret to the local dev-store; needs \
-                         server-side secret handling; tracked as PR-3c follow-up)",
+                         server-side secret handling; tracked as PR-3c follow-up)"
+                        .to_string(),
                 )),
                 MessagingEndpointVerb::List { .. } => Err(not_supported("messaging.endpoint list")),
                 MessagingEndpointVerb::Show { .. } => Err(not_supported("messaging.endpoint show")),
@@ -242,16 +245,12 @@ fn route_remote(
 }
 
 /// Build the `NotYetImplemented` error for a local-only verb.
-fn not_supported(noun_verb: &'static str) -> OpError {
-    OpError::NotYetImplemented(
-        // The static str borrow is safe because we control every call site.
-        // Can't use `format!` (returns String, not &'static str), so the
-        // message is generic. The noun_verb label is already in the error
-        // envelope via the print_error call at the dispatch fork site.
-        //
-        // Revisit when OpError::NotYetImplemented carries a String.
-        noun_verb,
-    )
+fn not_supported(noun_verb: &str) -> OpError {
+    OpError::NotYetImplemented(format!(
+        "`{noun_verb}` is a read/local-only verb not supported against a \
+         remote --store-url store; run it without --store-url / \
+         GREENTIC_STORE_URL against the local store"
+    ))
 }
 
 // ---------------------------------------------------------------------------

@@ -161,7 +161,8 @@ pub fn put(
         }
         if secrets.kind.path() != DEV_STORE_KIND_PATH {
             return Err(OpError::NotYetImplemented(
-                "secrets backend dispatch beyond the dev-store lands in A9 (env-pack registry)",
+                "secrets backend dispatch beyond the dev-store lands in A9 (env-pack registry)"
+                    .to_string(),
             ));
         }
         // The dev store's native key shape is the runtime's `secrets://`
@@ -260,7 +261,8 @@ pub fn get(
     ))
     .map_err(|e| OpError::InvalidArgument(format!("secret path: {e}")))?;
     Err(OpError::NotYetImplemented(
-        "secrets backend dispatch lands in A9 (env-pack registry); A3 wires the surface only",
+        "secrets backend dispatch lands in A9 (env-pack registry); A3 wires the surface only"
+            .to_string(),
     ))
 }
 
@@ -291,7 +293,7 @@ pub fn rotate(
         ))
         .map_err(|e| OpError::InvalidArgument(format!("secret path: {e}")))?;
         Err(OpError::NotYetImplemented(
-            "secret rotation depends on backend-specific rotate hooks; lands in A9",
+            "secret rotation depends on backend-specific rotate hooks; lands in A9".to_string(),
         ))
     })
 }

@@ -245,7 +245,8 @@ pub fn rotate(
         // get a false "rotated" signal.
         Err(OpError::NotYetImplemented(
             "session-token rotation hooks are Phase D \
-             — use `op credentials requirements` for re-validation today",
+             — use `op credentials requirements` for re-validation today"
+                .to_string(),
         ))
     })
 }

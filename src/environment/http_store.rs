@@ -78,12 +78,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use greentic_deploy_spec::{
-    AuditEvent, BundleDeployment, BundleDeploymentStatus, BundleId, CapabilitySlot, CustomerId,
-    DeploymentId, EnvId, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding,
-    HealthStatus, IdempotencyKey, IdempotencyOutcome, MessagingEndpoint, MessagingEndpointId,
-    PackId, PackListEntry, RemoteStoreError, RetentionPolicy, RevenueShareEntry, Revision,
-    RevisionId, RevisionLifecycle, RevocationConfig, RouteBinding, StateEtag, TrafficSplit,
-    TrafficSplitEntry,
+    AuditDecision, AuditEvent, AuditResult, BundleDeployment, BundleDeploymentStatus, BundleId,
+    CapabilitySlot, CustomerId, DeploymentId, EnvId, EnvPackBinding, Environment,
+    EnvironmentHostConfig, ExtensionBinding, HealthStatus, IdempotencyKey, IdempotencyOutcome,
+    MessagingEndpoint, MessagingEndpointId, PackId, PackListEntry, RemoteStoreError,
+    RetentionPolicy, RevenueShareEntry, Revision, RevisionId, RevisionLifecycle, RevocationConfig,
+    RouteBinding, StateEtag, TrafficSplit, TrafficSplitEntry,
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::Client;
@@ -328,29 +328,77 @@ impl HttpEnvironmentStore {
 
     /// Send a mutating request whose A8 response is a [`MutationEnvelope`]
     /// wrapping the domain result alongside ETag/generation/idempotency
-    /// metadata. Extracts and returns only the domain `result` for now;
-    /// PR-3b-fu will surface the envelope metadata via a return-type
+    /// metadata. Enforces the A8 §4 audit invariant on the success envelope
+    /// (see [`validate_success_audit`]) against `expected_env` — the env the
+    /// request targeted — then returns only the domain `result`; PR-3b-fu
+    /// will surface the remaining envelope metadata via a return-type
     /// extension.
     fn send_mutation<P: Serialize, R: serde::de::DeserializeOwned>(
         &self,
+        expected_env: &EnvId,
         method: reqwest::Method,
         path: &str,
         idempotency_key: Option<&str>,
         body: Option<&P>,
     ) -> Result<R, StoreError> {
         let envelope: MutationEnvelope<R> = self.send(method, path, idempotency_key, body)?;
+        validate_success_audit(envelope.audit.as_ref(), expected_env)?;
         Ok(envelope.result)
     }
 
     /// [`send_mutation`](Self::send_mutation) variant with no request body.
     fn send_mutation_no_body<R: serde::de::DeserializeOwned>(
         &self,
+        expected_env: &EnvId,
         method: reqwest::Method,
         path: &str,
         idempotency_key: Option<&str>,
     ) -> Result<R, StoreError> {
-        self.send_mutation::<(), R>(method, path, idempotency_key, None)
+        self.send_mutation::<(), R>(expected_env, method, path, idempotency_key, None)
     }
+}
+
+/// PR-4.0 (F2): enforce the A8 §4 audit invariant on a success envelope.
+///
+/// The local path fails closed on audit via `cli::audit_and_record`; the
+/// remote path skips local audit because the server owns the durable record
+/// (A8 §4). That hand-off is only sound if the server actually returned the
+/// record — so a 2xx envelope missing it, or carrying one that contradicts
+/// the success (a `deny` decision, a non-`ok` result) or names a different
+/// environment than the request targeted, is a contract violation the client
+/// must reject rather than report as success.
+fn validate_success_audit(
+    audit: Option<&AuditEvent>,
+    expected_env: &EnvId,
+) -> Result<(), StoreError> {
+    let Some(audit) = audit else {
+        return Err(StoreError::Conflict(
+            "A8 contract violation: success response is missing the audit record (§4)".to_string(),
+        ));
+    };
+    if let AuditDecision::Deny { policy, reason } = &audit.authorization {
+        return Err(StoreError::Conflict(format!(
+            "A8 contract violation: success response carries a deny audit decision \
+             (policy `{policy}`: {reason}); a denial must be a 403"
+        )));
+    }
+    match &audit.result {
+        AuditResult::Ok => {}
+        other => {
+            return Err(StoreError::Conflict(format!(
+                "A8 contract violation: success response carries a non-ok audit result \
+                 ({other:?})"
+            )));
+        }
+    }
+    if audit.env_id != expected_env.as_str() {
+        return Err(StoreError::Conflict(format!(
+            "A8 contract violation: audit record names env `{}` but the request targeted \
+             env `{expected_env}`",
+            audit.env_id
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -363,7 +411,11 @@ impl HttpEnvironmentStore {
 ///
 /// PR-3b parses the full envelope so that a future return-type extension
 /// (PR-3b-fu) can surface ETag/generation without re-parsing. Today the
-/// trait methods return bare domain types, so callers see only `result`.
+/// trait methods return bare domain types, so callers see only `result` —
+/// except `audit`, which [`validate_success_audit`] enforces on every
+/// success (PR-4.0/F2). It stays `Option` so a missing record is rejected
+/// with a precise contract-violation message instead of a generic serde
+/// deserialize error.
 #[derive(Debug, Deserialize)]
 struct MutationEnvelope<T> {
     result: T,
@@ -378,7 +430,6 @@ struct MutationEnvelope<T> {
     #[allow(dead_code)]
     idempotency: Option<IdempotencyOutcome>,
     #[serde(default)]
-    #[allow(dead_code)]
     audit: Option<AuditEvent>,
 }
 
@@ -415,7 +466,14 @@ fn map_error_response(
         })),
         409 => StoreError::Conflict(body_text),
         400 | 422 => StoreError::InvalidArgument(body_text),
-        401 | 403 => StoreError::Conflict(format!("authorization: {body_text}")),
+        // PR-4.0 (F4): a 401/403 whose body is not the A8 error shape (e.g.
+        // from a proxy/LB in front of the store) is still a denial — keep
+        // the `unauthorized` noun rather than degrading to `conflict`.
+        401 | 403 => StoreError::Unauthorized {
+            policy: "remote".to_string(),
+            reason: body_text,
+        },
+        501 => StoreError::NotYetImplemented(body_text),
         _ => StoreError::Conflict(format!("server ({status}): {body_text}")),
     }
 }
@@ -436,14 +494,15 @@ fn map_remote_error(err: &RemoteStoreError) -> StoreError {
         RemoteStoreError::IdempotencyConflict { reason } => {
             StoreError::Conflict(format!("idempotency conflict: {reason}"))
         }
-        RemoteStoreError::Unauthorized { policy, reason } => {
-            StoreError::Conflict(format!("authorization: {reason} (policy `{policy}`)"))
-        }
+        RemoteStoreError::Unauthorized { policy, reason } => StoreError::Unauthorized {
+            policy: policy.clone(),
+            reason: reason.clone(),
+        },
         RemoteStoreError::IntegrityMismatch { expected, actual } => StoreError::InvalidArgument(
             format!("integrity mismatch: expected {expected}, computed {actual}"),
         ),
         RemoteStoreError::NotYetImplemented { detail } => {
-            StoreError::Conflict(format!("not yet implemented: {detail}"))
+            StoreError::NotYetImplemented(detail.clone())
         }
         RemoteStoreError::Internal { message } => {
             StoreError::Conflict(format!("server: {message}"))
@@ -765,6 +824,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             host_config,
         };
         self.send_mutation(
+            env_id,
             reqwest::Method::POST,
             "environments",
             Some(&idem_key),
@@ -780,6 +840,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         let idem_key = mint_idempotency_key();
         let req: UpdateEnvironmentRequest = patch.into();
         self.send_mutation(
+            env_id,
             reqwest::Method::PATCH,
             &self.env_path(env_id, ""),
             Some(&idem_key),
@@ -795,6 +856,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         let idem_key = mint_idempotency_key();
         let req: MigrateMergeRequest = payload.into();
         let resp: MigrateMergeResponse = self.send_mutation(
+            target_env_id,
             reqwest::Method::POST,
             &format!(
                 "environments/{}/migrate-bindings",
@@ -824,6 +886,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             drain_seconds: payload.drain_seconds,
         };
         self.send_mutation(
+            env_id,
             reqwest::Method::POST,
             &self.env_path(env_id, "/revisions"),
             Some(&idem_key),
@@ -847,6 +910,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             expected_lifecycle: payload.expected_lifecycle,
         };
         let resp: RevisionTransitionResponse = self.send_mutation(
+            env_id,
             reqwest::Method::POST,
             &format!(
                 "environments/{}/revisions/{}/warm",
@@ -867,6 +931,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
     ) -> Result<RevisionTransitionOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
         let resp: RevisionTransitionResponse = self.send_mutation_no_body(
+            env_id,
             reqwest::Method::POST,
             &format!(
                 "environments/{}/revisions/{}/drain",
@@ -886,6 +951,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
     ) -> Result<RevisionTransitionOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
         let resp: RevisionTransitionResponse = self.send_mutation_no_body(
+            env_id,
             reqwest::Method::POST,
             &format!(
                 "environments/{}/revisions/{}/archive",
@@ -912,6 +978,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             config_overrides: payload.config_overrides,
         };
         self.send_mutation(
+            env_id,
             reqwest::Method::POST,
             &self.env_path(env_id, "/bundles"),
             Some(&idem_key),
@@ -934,6 +1001,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             config_overrides: payload.config_overrides,
         };
         self.send_mutation(
+            env_id,
             reqwest::Method::PATCH,
             &format!(
                 "environments/{}/bundles/{}",
@@ -953,6 +1021,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
     ) -> Result<RemoveBundleOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
         let resp: RemoveBundleResponse = self.send_mutation_no_body(
+            env_id,
             reqwest::Method::DELETE,
             &format!(
                 "environments/{}/bundles/{}",
@@ -976,6 +1045,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         let idem_key = idempotency_key.as_str().to_string();
         let req = PackBindingRequest { binding };
         self.send_mutation(
+            env_id,
             reqwest::Method::POST,
             &self.env_path(env_id, "/packs"),
             Some(&idem_key),
@@ -993,6 +1063,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         let idem_key = idempotency_key.as_str().to_string();
         let req = PackBindingRequest { binding };
         let resp: BindingGenerationResponse<EnvPackBinding> = self.send_mutation(
+            env_id,
             reqwest::Method::PATCH,
             &format!(
                 "environments/{}/packs/{}",
@@ -1013,6 +1084,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
     ) -> Result<(EnvPackBinding, u64), StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
         let resp: BindingGenerationResponse<EnvPackBinding> = self.send_mutation_no_body(
+            env_id,
             reqwest::Method::DELETE,
             &format!(
                 "environments/{}/packs/{}",
@@ -1032,6 +1104,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
     ) -> Result<(EnvPackBinding, u64), StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
         let resp: BindingGenerationResponse<EnvPackBinding> = self.send_mutation_no_body(
+            env_id,
             reqwest::Method::POST,
             &format!(
                 "environments/{}/packs/{}/rollback",
@@ -1052,6 +1125,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         let idem_key = idempotency_key.as_str().to_string();
         let req = ExtensionBindingRequest { binding };
         self.send_mutation(
+            env_id,
             reqwest::Method::POST,
             &format!(
                 "environments/{}/extensions",
@@ -1075,6 +1149,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             binding: Some(binding),
         };
         let resp: BindingGenerationResponse<ExtensionBinding> = self.send_mutation(
+            env_id,
             reqwest::Method::PATCH,
             &format!(
                 "environments/{}/extensions",
@@ -1098,6 +1173,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             binding: None,
         };
         let resp: BindingGenerationResponse<ExtensionBinding> = self.send_mutation(
+            env_id,
             reqwest::Method::DELETE,
             &format!(
                 "environments/{}/extensions",
@@ -1121,6 +1197,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             binding: None,
         };
         let resp: BindingGenerationResponse<ExtensionBinding> = self.send_mutation(
+            env_id,
             reqwest::Method::POST,
             &format!(
                 "environments/{}/extensions/rollback",
@@ -1149,6 +1226,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             authorization_ref,
         };
         let resp: ApplyTrafficSplitResponse = self.send_mutation(
+            env_id,
             reqwest::Method::POST,
             &self.env_path(env_id, "/traffic"),
             Some(&idem_key),
@@ -1170,6 +1248,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         let idem_key = idempotency_key.as_str().to_string();
         let req = RollbackTrafficSplitRequest { deployment_id };
         let resp: RollbackTrafficSplitResponse = self.send_mutation(
+            env_id,
             reqwest::Method::POST,
             &format!(
                 "environments/{}/traffic/rollback",
@@ -1199,6 +1278,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             updated_by: payload.updated_by,
         };
         self.send_mutation(
+            env_id,
             reqwest::Method::POST,
             &self.env_path(env_id, "/messaging"),
             Some(&idem_key),
@@ -1220,6 +1300,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             updated_by,
         };
         self.send_mutation(
+            env_id,
             reqwest::Method::POST,
             &format!(
                 "environments/{}/messaging/{}/link",
@@ -1245,6 +1326,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             updated_by,
         };
         self.send_mutation(
+            env_id,
             reqwest::Method::POST,
             &format!(
                 "environments/{}/messaging/{}/unlink",
@@ -1271,6 +1353,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             updated_by: payload.updated_by,
         };
         self.send_mutation(
+            env_id,
             reqwest::Method::POST,
             &format!(
                 "environments/{}/messaging/{}/welcome-flow",
@@ -1289,6 +1372,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
     ) -> Result<MessagingEndpointId, StoreError> {
         let idem_key = mint_idempotency_key();
         self.send_mutation_no_body(
+            env_id,
             reqwest::Method::DELETE,
             &format!(
                 "environments/{}/messaging/{}",
@@ -1309,6 +1393,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         let idem_key = idempotency_key.as_str().to_string();
         let req = RotateWebhookSecretRequest { updated_by };
         self.send_mutation(
+            env_id,
             reqwest::Method::POST,
             &format!(
                 "environments/{}/messaging/{}/rotate-secret",
@@ -1323,6 +1408,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
     fn bootstrap_trust_root(&self, env_id: &EnvId) -> Result<TrustRootSeed, StoreError> {
         let idem_key = mint_idempotency_key();
         let resp: TrustRootSeedResponse = self.send_mutation_no_body(
+            env_id,
             reqwest::Method::POST,
             &format!(
                 "environments/{}/trust-root/bootstrap",
@@ -1343,6 +1429,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
     ) -> Result<Option<TrustRootSeed>, StoreError> {
         let idem_key = mint_idempotency_key();
         let resp: Option<TrustRootSeedResponse> = self.send_mutation_no_body(
+            env_id,
             reqwest::Method::POST,
             &format!(
                 "environments/{}/trust-root/seed",
@@ -1370,6 +1457,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             public_key_pem,
         };
         let resp: TrustRootAddResponse = self.send_mutation(
+            env_id,
             reqwest::Method::POST,
             &format!(
                 "environments/{}/trust-root/keys",
@@ -1392,6 +1480,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
     ) -> Result<TrustRootRemoveOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
         let resp: TrustRootRemoveResponse = self.send_mutation_no_body(
+            env_id,
             reqwest::Method::DELETE,
             &format!(
                 "environments/{}/trust-root/keys/{}",
@@ -1536,6 +1625,116 @@ mod tests {
 
     fn idem() -> IdempotencyKey {
         IdempotencyKey::new("01JABC000000000000000000ZZ").unwrap()
+    }
+
+    /// A minimal valid `Environment` domain body for envelope-shape tests.
+    fn sample_env_domain() -> serde_json::Value {
+        serde_json::json!({
+            "schema": "greentic.environment.v1",
+            "environment_id": "local",
+            "name": "test",
+            "host_config": {"env_id": "local"},
+            "packs": [],
+            "bundles": [],
+            "revisions": [],
+            "traffic_splits": [],
+            "messaging_endpoints": [],
+            "extensions": [],
+            "revocation": {},
+            "retention": {},
+            "health": {}
+        })
+    }
+
+    /// [`wrap_mutation`] variant with the envelope mutated by `tweak` after
+    /// assembly — for the PR-4.0/F2 audit-invariant negative tests.
+    fn wrap_mutation_tweaked(
+        domain: serde_json::Value,
+        tweak: impl FnOnce(&mut serde_json::Value),
+    ) -> String {
+        let mut envelope: serde_json::Value = serde_json::from_str(&wrap_mutation(domain)).unwrap();
+        tweak(&mut envelope);
+        envelope.to_string()
+    }
+
+    // -----------------------------------------------------------------------
+    // PR-4.0 (F2): A8 §4 audit invariant on success envelopes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn success_without_audit_is_rejected() {
+        let body = wrap_mutation_tweaked(sample_env_domain(), |env| {
+            env.as_object_mut().unwrap().remove("audit");
+        });
+        let (_mock, store) = happy_store(200, &body);
+        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
+        match result {
+            Err(StoreError::Conflict(msg)) => {
+                assert!(
+                    msg.contains("missing the audit record"),
+                    "expected missing-audit violation, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn success_with_deny_audit_is_rejected() {
+        let body = wrap_mutation_tweaked(sample_env_domain(), |env| {
+            env["audit"]["authorization"] = serde_json::json!({
+                "decision": "deny", "policy": "rbac-v1", "reason": "nope"
+            });
+        });
+        let (_mock, store) = happy_store(200, &body);
+        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
+        match result {
+            Err(StoreError::Conflict(msg)) => {
+                assert!(
+                    msg.contains("deny audit decision"),
+                    "expected deny-decision violation, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn success_with_non_ok_audit_result_is_rejected() {
+        let body = wrap_mutation_tweaked(sample_env_domain(), |env| {
+            env["audit"]["result"] = serde_json::json!({
+                "outcome": "error", "kind": "store", "message": "boom"
+            });
+        });
+        let (_mock, store) = happy_store(200, &body);
+        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
+        match result {
+            Err(StoreError::Conflict(msg)) => {
+                assert!(
+                    msg.contains("non-ok audit result"),
+                    "expected non-ok-result violation, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn success_with_mismatched_audit_env_is_rejected() {
+        let body = wrap_mutation_tweaked(sample_env_domain(), |env| {
+            env["audit"]["env_id"] = serde_json::json!("other-env");
+        });
+        let (_mock, store) = happy_store(200, &body);
+        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
+        match result {
+            Err(StoreError::Conflict(msg)) => {
+                assert!(
+                    msg.contains("names env `other-env`"),
+                    "expected env-mismatch violation, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2358,7 +2557,10 @@ mod tests {
     }
 
     #[test]
-    fn error_403_maps_to_conflict_authorization() {
+    fn error_403_maps_to_unauthorized() {
+        // PR-4.0 (F4): an A8 `unauthorized` body keeps its typed noun —
+        // previously it was flattened into `StoreError::Conflict`, so RBAC
+        // denials rendered as `error.kind: conflict` in the CLI envelope.
         let err_body = serde_json::json!({
             "kind": "unauthorized",
             "policy": "rbac-v1",
@@ -2367,13 +2569,42 @@ mod tests {
         let (_mock, store) = happy_store(403, &err_body.to_string());
         let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
         match result {
-            Err(StoreError::Conflict(msg)) => {
-                assert!(
-                    msg.contains("authorization:"),
-                    "expected 'authorization:' prefix, got: {msg}"
-                );
+            Err(StoreError::Unauthorized { policy, reason }) => {
+                assert_eq!(policy, "rbac-v1");
+                assert_eq!(reason, "insufficient permissions");
             }
-            other => panic!("expected Conflict, got {other:?}"),
+            other => panic!("expected Unauthorized, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_403_without_a8_body_maps_to_unauthorized() {
+        // A denial from a proxy/LB in front of the store (non-A8 body) is
+        // still a denial — the fallback status mapping keeps the noun.
+        let (_mock, store) = happy_store(403, "access denied by gateway");
+        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
+        match result {
+            Err(StoreError::Unauthorized { policy, reason }) => {
+                assert_eq!(policy, "remote");
+                assert_eq!(reason, "access denied by gateway");
+            }
+            other => panic!("expected Unauthorized, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_501_maps_to_not_yet_implemented() {
+        let err_body = serde_json::json!({
+            "kind": "not-yet-implemented",
+            "detail": "backup/restore lands in PR-4"
+        });
+        let (_mock, store) = happy_store(501, &err_body.to_string());
+        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
+        match result {
+            Err(StoreError::NotYetImplemented(detail)) => {
+                assert_eq!(detail, "backup/restore lands in PR-4");
+            }
+            other => panic!("expected NotYetImplemented, got {other:?}"),
         }
     }
 
