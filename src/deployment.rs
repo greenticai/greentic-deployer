@@ -811,6 +811,7 @@ mod tests {
         std::fs::create_dir_all(&base).expect("create tmp base");
         let dir = tempfile::tempdir_in(base).expect("temp dir");
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::try_from(pack_id).unwrap(),
             name: None,
@@ -1032,6 +1033,7 @@ mod tests {
     #[test]
     fn contract_owned_capability_flow_overrides_default_flow() {
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::try_from("greentic.deploy.aws").unwrap(),
             name: None,
@@ -1107,6 +1109,7 @@ mod tests {
     #[test]
     fn missing_contract_capability_errors() {
         let mut manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::try_from("greentic.deploy.aws").unwrap(),
             name: None,

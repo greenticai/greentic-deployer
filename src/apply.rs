@@ -4184,6 +4184,7 @@ mod tests {
         std::fs::create_dir_all(&base).expect("create tmp base");
         let dir = tempfile::tempdir_in(base).expect("temp dir");
         let mut manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::from_str("greentic.deploy.aws").unwrap(),
             name: None,
@@ -4995,6 +4996,7 @@ kind: Deployment
             },
             pack_path,
             manifest: PackManifest {
+                agents: Default::default(),
                 schema_version: "pack-v1".to_string(),
                 pack_id: PackId::from_str("greentic.deploy.terraform").unwrap(),
                 name: None,
@@ -5344,6 +5346,7 @@ data "aws_region" "current" {}
             },
             pack_path,
             manifest: PackManifest {
+                agents: Default::default(),
                 schema_version: "pack-v1".to_string(),
                 pack_id: PackId::from_str("greentic.deploy.terraform").unwrap(),
                 name: None,
@@ -5454,6 +5457,7 @@ data "aws_region" "current" {}
             },
             pack_path,
             manifest: PackManifest {
+                agents: Default::default(),
                 schema_version: "pack-v1".to_string(),
                 pack_id: PackId::from_str("greentic.deploy.terraform").unwrap(),
                 name: None,
@@ -5823,6 +5827,7 @@ data "aws_region" "current" {}
             },
             pack_path,
             manifest: PackManifest {
+                agents: Default::default(),
                 schema_version: "pack-v1".to_string(),
                 pack_id: PackId::from_str("greentic.deploy.k8s").unwrap(),
                 name: None,
@@ -5915,6 +5920,7 @@ data "aws_region" "current" {}
             },
             pack_path,
             manifest: PackManifest {
+                agents: Default::default(),
                 schema_version: "pack-v1".to_string(),
                 pack_id: PackId::from_str("greentic.deploy.helm").unwrap(),
                 name: None,
