@@ -284,33 +284,25 @@ pub(super) fn resolve_dev_store_path(env_dir: &Path, override_path: Option<PathB
 /// URI: `secrets://<env>/<tenant>/<team>/<pack>/<name>`; the backend handler
 /// converts the logical `secret://` ref 1:1. `DevStore::put` itself rejects
 /// any other depth, so enforce the shape upfront with a teachable error
-/// instead of surfacing the backend's "uri is missing category". The
-/// `splitn(5)` + None tail makes "exactly four non-empty segments"
-/// structural.
+/// instead of surfacing the backend's "uri is missing category" — exactly
+/// four non-empty segments.
 ///
 /// Shared between `put` (pre-write) and `env apply`'s pre-mutation manifest
 /// validation (PR-2) so the two surfaces cannot drift.
 pub(super) fn validate_dev_store_secret_path(rel_path: &str) -> Result<(), OpError> {
-    let mut segs = rel_path.splitn(5, '/');
-    let (Some(tenant), Some(team), Some(pack), Some(name), None) = (
-        segs.next(),
-        segs.next(),
-        segs.next(),
-        segs.next(),
-        segs.next(),
-    ) else {
-        return Err(OpError::InvalidArgument(format!(
+    let shape_err = || {
+        OpError::InvalidArgument(format!(
             "dev-store secret path must be `<tenant>/<team>/<pack>/<name>` \
              (e.g. `default/_/messaging-telegram/telegram_bot_token`); \
              got `{rel_path}`"
-        )));
+        ))
     };
-    if [tenant, team, pack, name].iter().any(|s| s.is_empty()) {
-        return Err(OpError::InvalidArgument(format!(
-            "dev-store secret path must be `<tenant>/<team>/<pack>/<name>` \
-             (e.g. `default/_/messaging-telegram/telegram_bot_token`); \
-             got `{rel_path}`"
-        )));
+    let segs: Vec<&str> = rel_path.split('/').collect();
+    let [_tenant, team, _pack, name] = segs[..] else {
+        return Err(shape_err());
+    };
+    if segs.iter().any(|s| s.is_empty()) {
+        return Err(shape_err());
     }
     // The runtime reader canonicalizes the team segment before lookup
     // (greentic-start `secrets_manager::canonical_team` maps `default`/
@@ -571,12 +563,7 @@ mod tests {
     }
 
     fn read_back(store_path: &str, uri: &str) -> Vec<u8> {
-        let dev = DevStore::with_path(PathBuf::from(store_path)).unwrap();
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async { dev.get(uri).await.unwrap() })
+        crate::cli::tests_common::dev_store_read(Path::new(store_path), uri)
     }
 
     #[test]

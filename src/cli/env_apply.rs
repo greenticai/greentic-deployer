@@ -57,6 +57,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::environment::{EnvironmentStore, LocalFsStore, trust_root as store_trust_root};
+use crate::runtime_secrets::SecretValue;
 
 use super::bundles::{BundleUpdatePayload, RouteBindingPayload, into_route_binding};
 use super::deploy::BundleDeployPayload;
@@ -228,24 +229,15 @@ struct ResolvedEndpoint {
     matched: Option<MessagingEndpoint>,
 }
 
-/// A secret value resolved from the process environment at validation time.
-/// `Debug` renders a fixed placeholder so no derived-`Debug` surface can
-/// ever echo the material; the value reaches exactly one place — the
-/// `secrets::put` payload at execute time.
-struct SecretValue(String);
-
-impl std::fmt::Debug for SecretValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("<redacted>")
-    }
-}
-
 /// Everything validation established, handed to diff/execute/verify.
 struct ApplyContext {
     env_id: EnvId,
     manifest: EnvManifest,
     /// Secret values keyed by the manifest's verbatim `path`, resolved from
-    /// `from_env` during validation. Never serialized; see [`SecretValue`].
+    /// `from_env` during validation. Never serialized; [`SecretValue`]'s
+    /// `Debug` renders a fixed placeholder, so no derived-`Debug` surface
+    /// can echo the material — the value reaches exactly one place, the
+    /// `secrets::put` payload at execute time.
     secret_values: BTreeMap<String, SecretValue>,
     bundles: Vec<ResolvedBundle>,
     endpoints: Vec<ResolvedEndpoint>,
@@ -377,34 +369,35 @@ fn resolve_and_validate(
     // not mid-run. Values land ONLY in `secret_values` (never in steps,
     // plan, report, or audit targets). Path canonicality was already
     // checked by `validate_shape`.
+    // Backend pre-check applies only when the env already exists — a fresh
+    // env is exempt because the `env init` step creates the default
+    // dev-store binding before any put-secret step runs.
+    if !manifest.secrets.is_empty()
+        && let Some(env) = &env
+    {
+        let secrets_pack = super::secrets::require_secrets_pack(env, &env_id)?;
+        if secrets_pack.kind.path() != super::secrets::DEV_STORE_KIND_PATH {
+            return Err(OpError::NotYetImplemented(format!(
+                "manifest secrets[] write through the dev-store only; env `{env_id}` \
+                 binds `{}` — backend dispatch beyond the dev-store lands in A9 \
+                 (env-pack registry)",
+                secrets_pack.kind
+            )));
+        }
+    }
     let mut secret_values = BTreeMap::new();
-    if !manifest.secrets.is_empty() {
-        // A fresh env is exempt: the `env init` step creates the default
-        // dev-store binding before any put-secret step runs.
-        if let Some(env) = &env {
-            let secrets_pack = super::secrets::require_secrets_pack(env, &env_id)?;
-            if secrets_pack.kind.path() != super::secrets::DEV_STORE_KIND_PATH {
-                return Err(OpError::NotYetImplemented(format!(
-                    "manifest secrets[] write through the dev-store only; env `{env_id}` \
-                     binds `{}` — backend dispatch beyond the dev-store lands in A9 \
-                     (env-pack registry)",
-                    secrets_pack.kind
-                )));
-            }
-        }
-        for s in &manifest.secrets {
-            let value = env_lookup(&s.from_env)
-                .filter(|v| !v.is_empty())
-                .ok_or_else(|| {
-                    OpError::InvalidArgument(format!(
-                        "secret `{}`: environment variable `{}` is not set (or empty) — \
-                         secret values never appear in the manifest, so the variable must \
-                         be exported before running apply",
-                        s.path, s.from_env
-                    ))
-                })?;
-            secret_values.insert(s.path.clone(), SecretValue(value));
-        }
+    for s in &manifest.secrets {
+        let value = env_lookup(&s.from_env)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                OpError::InvalidArgument(format!(
+                    "secret `{}`: environment variable `{}` is not set (or empty) — \
+                     secret values never appear in the manifest, so the variable must \
+                     be exported before running apply",
+                    s.path, s.from_env
+                ))
+            })?;
+        secret_values.insert(s.path.clone(), SecretValue::from(value));
     }
 
     // Bundle artifacts: existence + digest, plus the B10 billing-principal
@@ -1048,7 +1041,7 @@ fn execute(store: &LocalFsStore, ctx: &ApplyContext, steps: &[ApplyStep]) -> Res
                     Some(SecretsPutPayload {
                         environment_id: ctx.env_id.as_str().to_string(),
                         path: path.clone(),
-                        value: value.0.clone(),
+                        value: value.expose().to_string(),
                         idempotency_key: step.idempotency_key.clone(),
                     }),
                 )
@@ -2154,17 +2147,7 @@ mod tests {
         apply_with_env_lookup(store, &flags, dry_run, None, false, lookup)
     }
 
-    /// Read one value back from the dev store, mirroring the runtime
-    /// reader's access path.
-    fn dev_store_read(path: &Path, uri: &str) -> Vec<u8> {
-        use greentic_secrets_lib::{DevStore, SecretsStore};
-        let dev = DevStore::with_path(path.to_path_buf()).unwrap();
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async { dev.get(uri).await.unwrap() })
-    }
+    use crate::cli::tests_common::dev_store_read;
 
     const SECRET_PATH: &str = "legal/_/messaging-telegram/telegram_bot_token";
 
@@ -2208,47 +2191,36 @@ mod tests {
         assert_eq!(bytes, b"tok-secret-9000".to_vec());
 
         // The audit event carries a fresh (not deterministic) key and no value.
-        let audit = std::fs::read_to_string(dir.path().join("local/audit/events.jsonl")).unwrap();
+        let audit_path = dir.path().join("local/audit/events.jsonl");
+        let put_ikeys = || -> Vec<String> {
+            std::fs::read_to_string(&audit_path)
+                .unwrap()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|e| e["noun"] == "secrets" && e["verb"] == "put")
+                .map(|e| e["idempotency_key"].as_str().expect("ikey").to_string())
+                .collect()
+        };
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
         assert!(
             !audit.contains("tok-secret-9000"),
             "audit log must not leak the value"
         );
-        // Parse audit JSONL: find put events, verify fresh mint.
-        let put_events_1: Vec<serde_json::Value> = audit
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .filter(|e| e["noun"] == "secrets" && e["verb"] == "put")
-            .collect();
-        assert!(!put_events_1.is_empty(), "no put audit events: {audit}");
-        for ev in &put_events_1 {
-            let ikey = ev["idempotency_key"].as_str().expect("ikey is a string");
-            assert_eq!(ikey.len(), 26, "ULID is 26 chars, got: {ikey}");
-        }
+        assert_eq!(put_ikeys().len(), 1, "one put audit event: {audit}");
 
         // Always-put: a re-apply is NOT a no-op for the secret (cannot diff).
         let second =
             run_apply_with_lookup(&store, &manifest_path, false, &lookup).expect("re-apply");
         assert_eq!(second.result["changed"], 1, "{}", second.result);
 
-        // Two invocations must produce DIFFERENT idempotency keys (fresh
-        // mint per invocation — the new contract after removing
-        // deterministic keys from put-secret steps).
-        let audit2 = std::fs::read_to_string(dir.path().join("local/audit/events.jsonl")).unwrap();
-        let put_events_all: Vec<serde_json::Value> = audit2
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .filter(|e| e["noun"] == "secrets" && e["verb"] == "put")
-            .collect();
-        assert!(
-            put_events_all.len() >= 2,
-            "expected >= 2 put events, got {}",
-            put_events_all.len()
-        );
-        let ikey_1 = put_events_all[0]["idempotency_key"].as_str().expect("ikey");
-        let ikey_2 = put_events_all[1]["idempotency_key"].as_str().expect("ikey");
+        // Two invocations must mint DIFFERENT idempotency keys (fresh per
+        // invocation — the contract after removing deterministic keys from
+        // put-secret steps).
+        let ikeys = put_ikeys();
+        assert_eq!(ikeys.len(), 2, "two put events after re-apply: {ikeys:?}");
         assert_ne!(
-            ikey_1, ikey_2,
-            "two invocations must mint different keys: {ikey_1} vs {ikey_2}"
+            ikeys[0], ikeys[1],
+            "two invocations must mint different keys"
         );
     }
 
@@ -2334,15 +2306,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn secret_value_debug_is_redacted() {
-        let v = SecretValue("tok-secret".to_string());
-        assert_eq!(format!("{v:?}"), "<redacted>");
-        // The containment surface that matters: a derived-Debug render of the
-        // map ApplyContext holds.
-        let map = BTreeMap::from([("p".to_string(), v)]);
-        assert!(!format!("{map:?}").contains("tok-secret"));
-    }
+    // `SecretValue`'s redacting-Debug property is pinned by its owning
+    // module's test (`runtime_secrets::tests::secret_value_debug_is_redacted`).
 
     // --- Adversarial-review fix 1: pre-mutation artifact re-hash gate ---
 
@@ -2359,15 +2324,12 @@ mod tests {
         let tamper_bundle = dir.path().join("tamper.gtbundle");
         std::fs::copy(fixture(), &tamper_bundle).unwrap();
 
-        let mut manifest = json!({
+        let manifest = json!({
             "schema": ENV_MANIFEST_SCHEMA_V1,
             "environment": {"id": "local"},
             "bundles": [{"bundle_id": "quickstart", "bundle_path": &tamper_bundle}],
             "secrets": [{"path": SECRET_PATH, "from_env": "APPLY_TAMPER_TOKEN"}]
         });
-        // Resolve the path to the bundle to make it absolute for the manifest.
-        manifest["bundles"][0]["bundle_path"] =
-            serde_json::Value::String(tamper_bundle.display().to_string());
         let manifest_path = write_manifest(dir.path(), &manifest);
         let lookup = |name: &str| (name == "APPLY_TAMPER_TOKEN").then(|| "tok-tamper".to_string());
 
