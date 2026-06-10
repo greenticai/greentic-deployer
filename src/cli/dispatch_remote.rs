@@ -105,6 +105,9 @@ fn route_remote(
                 remote_env_set_public_url(store, &args.env_id, &args.url)
             }
             EnvVerb::Init(_) => Err(not_supported("env init")),
+            // Remote apply is blocked on remote artifact staging (A8), not
+            // on the manifest design — see plans/env-manifest-apply.md §9.
+            EnvVerb::Apply(_) => Err(not_supported("env apply")),
             EnvVerb::List => Err(not_supported("env list")),
             EnvVerb::Show { .. } => Err(not_supported("env show")),
             EnvVerb::Doctor { .. } => Err(not_supported("env doctor")),
