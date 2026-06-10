@@ -97,11 +97,12 @@ impl LocalFsStore {
         })
     }
 
-    /// Patch the named scalar fields on an existing env. `None` fields are
-    /// skipped (no clear-to-`None` flow today). Returns the fully-updated
-    /// [`Environment`]. Collapses what was previously split across the
-    /// `op env update`, `op env set-public-url`, and `op config set` verbs
-    /// — see [`UpdateEnvironmentPayload`] for the rationale.
+    /// Patch the named scalar fields on an existing env. [`FieldUpdate::Keep`]
+    /// fields are skipped, [`FieldUpdate::Set`] writes the new value, and
+    /// [`FieldUpdate::Clear`] resets an optional field to `None`. Returns the
+    /// fully-updated [`Environment`]. Collapses what was previously split
+    /// across the `op env update`, `op env set-public-url`, and `op config
+    /// set` verbs — see [`UpdateEnvironmentPayload`] for the rationale.
     ///
     /// `StoreError::NotFound` passes through unchanged; the CLI mapper
     /// downcasts it to `OpError::NotFound` via
@@ -116,18 +117,14 @@ impl LocalFsStore {
             if let Some(name) = patch.name {
                 env.name = name;
             }
-            if let Some(region) = patch.region {
-                env.host_config.region = Some(region);
-            }
-            if let Some(org) = patch.tenant_org_id {
-                env.host_config.tenant_org_id = Some(org);
-            }
-            if let Some(addr) = patch.listen_addr {
-                env.host_config.listen_addr = Some(addr);
-            }
-            if let Some(url) = patch.public_base_url {
-                env.host_config.public_base_url = Some(url);
-            }
+            patch.region.apply_to(&mut env.host_config.region);
+            patch
+                .tenant_org_id
+                .apply_to(&mut env.host_config.tenant_org_id);
+            patch.listen_addr.apply_to(&mut env.host_config.listen_addr);
+            patch
+                .public_base_url
+                .apply_to(&mut env.host_config.public_base_url);
             locked.save(&env)?;
             Ok(env)
         })

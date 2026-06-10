@@ -11,7 +11,7 @@ use greentic_deploy_spec::{CapabilitySlot, EnvId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{EnvironmentStore, LocalFsStore, UpdateEnvironmentPayload};
+use crate::environment::{EnvironmentStore, FieldUpdate, LocalFsStore, UpdateEnvironmentPayload};
 
 use super::{
     AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
@@ -157,10 +157,10 @@ pub fn set(
                 &env_id,
                 UpdateEnvironmentPayload {
                     name: payload.name,
-                    region: payload.region,
-                    tenant_org_id: payload.tenant_org_id,
-                    listen_addr: parsed_listen_addr,
-                    public_base_url: parsed_public_base_url,
+                    region: FieldUpdate::from_option(payload.region),
+                    tenant_org_id: FieldUpdate::from_option(payload.tenant_org_id),
+                    listen_addr: FieldUpdate::from_option(parsed_listen_addr),
+                    public_base_url: FieldUpdate::from_option(parsed_public_base_url),
                 },
             )
             .map_err(map_store_err_preserving_noun)?;
