@@ -19,9 +19,12 @@
 //! - Deterministic idempotency keys: derived from
 //!   `(schema, env, step kind, natural key, desired-state hash)` so a
 //!   re-run replays instead of double-mutating (HTTP-store dedupe
-//!   compatible). Exception: `deploy`'s traffic cut-over key intentionally
-//!   stays per-revision-derived — a re-stage is by definition a new
-//!   cut-over.
+//!   compatible). Exceptions: `deploy`'s traffic cut-over key intentionally
+//!   stays per-revision-derived (a re-stage is by definition a new
+//!   cut-over); `put-secret` carries no deterministic key (an always-put is
+//!   by definition a new write — a value-insensitive key would conflate
+//!   rotations in audit and break A8 same-key-different-body semantics;
+//!   `secrets::put` mints a fresh per-invocation key).
 //! - Store-level verify only: *runtime* readiness (secrets resolvable by
 //!   the reader, routes served) is `gtc doctor`'s job — apply must work
 //!   without a running runtime.
@@ -645,24 +648,21 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
     //    change. Secrets land before bundles so a just-deployed revision
     //    never serves a request that resolves a missing secret.
     for s in &ctx.manifest.secrets {
-        // The desired-state hash covers only manifest-visible state (the
-        // env-var NAME, deliberately not the value): the derived key lands
-        // in audit records, and value-derived material there would be
-        // offline-brute-forceable for low-entropy secrets. Nothing dedupes
-        // secret puts on this key today (the dev-store put is
-        // always-write), so value-insensitivity loses nothing.
-        let ikey = derive_idempotency_key(
-            &ctx.env_id,
-            ApplyStepKind::PutSecret.label(),
-            &s.path,
-            &hash_json(&json!({"from_env": s.from_env})),
-        );
+        // Deliberately NO deterministic idempotency key: an always-put is
+        // by definition a NEW write (values cannot be diffed until A9), so
+        // a value-insensitive key would stamp two semantically different
+        // writes (e.g. a secret rotation under the same env var) with the
+        // same key — conflating audit records and wrongly replaying under
+        // any future same-key dedupe layer (A8 same-key-different-body
+        // conflict rule). `secrets::put` mints a fresh per-invocation key
+        // instead (second exception alongside deploy's per-revision
+        // cut-over key).
         steps.push(ApplyStep {
             kind: ApplyStepKind::PutSecret,
             key: s.path.clone(),
             action: ApplyAction::Put,
             detail: format!("from ${} (cannot diff until A9)", s.from_env),
-            idempotency_key: Some(ikey),
+            idempotency_key: None,
             op: StepOp::PutSecret {
                 path: s.path.clone(),
             },
@@ -984,6 +984,16 @@ fn trust_root_step(store: &LocalFsStore, ctx: &ApplyContext) -> Result<ApplyStep
 // --- execute --------------------------------------------------------------------
 
 fn execute(store: &LocalFsStore, ctx: &ApplyContext, steps: &[ApplyStep]) -> Result<(), OpError> {
+    // Post-confirmation, pre-first-mutation artifact gate: re-hash every
+    // bundle artifact to detect changes that occurred during the
+    // (potentially unbounded) TTY confirmation pause. A changed artifact
+    // aborts the whole apply before ANY step (including put-secret)
+    // mutates the store. The per-Deploy-step re-check stays because later
+    // steps in the same run can still race with external writes.
+    for rb in &ctx.bundles {
+        ensure_artifact_unchanged(&rb.resolved_path, &rb.digest)?;
+    }
+
     // Sub-verbs get clean flags: payloads are passed directly, never re-read
     // from the manifest path.
     let exec_flags = OpFlags::default();
@@ -2197,24 +2207,49 @@ mod tests {
         let bytes = dev_store_read(&store_path, &format!("secrets://local/{SECRET_PATH}"));
         assert_eq!(bytes, b"tok-secret-9000".to_vec());
 
-        // The audit event carries the deterministic derived key and no value.
+        // The audit event carries a fresh (not deterministic) key and no value.
         let audit = std::fs::read_to_string(dir.path().join("local/audit/events.jsonl")).unwrap();
         assert!(
             !audit.contains("tok-secret-9000"),
             "audit log must not leak the value"
         );
-        let expected_ikey = derive_idempotency_key(
-            &EnvId::try_from("local").unwrap(),
-            ApplyStepKind::PutSecret.label(),
-            SECRET_PATH,
-            &hash_json(&json!({"from_env": "APPLY_LEGAL_BOT_TOKEN"})),
-        );
-        assert!(audit.contains(&expected_ikey), "audit: {audit}");
+        // Parse audit JSONL: find put events, verify fresh mint.
+        let put_events_1: Vec<serde_json::Value> = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["noun"] == "secrets" && e["verb"] == "put")
+            .collect();
+        assert!(!put_events_1.is_empty(), "no put audit events: {audit}");
+        for ev in &put_events_1 {
+            let ikey = ev["idempotency_key"].as_str().expect("ikey is a string");
+            assert_eq!(ikey.len(), 26, "ULID is 26 chars, got: {ikey}");
+        }
 
         // Always-put: a re-apply is NOT a no-op for the secret (cannot diff).
         let second =
             run_apply_with_lookup(&store, &manifest_path, false, &lookup).expect("re-apply");
         assert_eq!(second.result["changed"], 1, "{}", second.result);
+
+        // Two invocations must produce DIFFERENT idempotency keys (fresh
+        // mint per invocation — the new contract after removing
+        // deterministic keys from put-secret steps).
+        let audit2 = std::fs::read_to_string(dir.path().join("local/audit/events.jsonl")).unwrap();
+        let put_events_all: Vec<serde_json::Value> = audit2
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["noun"] == "secrets" && e["verb"] == "put")
+            .collect();
+        assert!(
+            put_events_all.len() >= 2,
+            "expected >= 2 put events, got {}",
+            put_events_all.len()
+        );
+        let ikey_1 = put_events_all[0]["idempotency_key"].as_str().expect("ikey");
+        let ikey_2 = put_events_all[1]["idempotency_key"].as_str().expect("ikey");
+        assert_ne!(
+            ikey_1, ikey_2,
+            "two invocations must mint different keys: {ikey_1} vs {ikey_2}"
+        );
     }
 
     #[test]
@@ -2307,6 +2342,62 @@ mod tests {
         // map ApplyContext holds.
         let map = BTreeMap::from([("p".to_string(), v)]);
         assert!(!format!("{map:?}").contains("tok-secret"));
+    }
+
+    // --- Adversarial-review fix 1: pre-mutation artifact re-hash gate ---
+
+    #[test]
+    fn tampered_artifact_aborts_before_any_secret_write() {
+        // Between validation (digests computed) and execute, the
+        // confirmation pause is unbounded. If an artifact changes during
+        // the pause, the pre-mutation gate at the top of execute() must
+        // abort the whole apply before ANY step (including put-secret)
+        // mutates the store.
+        let (dir, store) = seeded_store_with_dev_secrets();
+
+        // Copy the real bundle to a temp file we can tamper.
+        let tamper_bundle = dir.path().join("tamper.gtbundle");
+        std::fs::copy(fixture(), &tamper_bundle).unwrap();
+
+        let mut manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "quickstart", "bundle_path": &tamper_bundle}],
+            "secrets": [{"path": SECRET_PATH, "from_env": "APPLY_TAMPER_TOKEN"}]
+        });
+        // Resolve the path to the bundle to make it absolute for the manifest.
+        manifest["bundles"][0]["bundle_path"] =
+            serde_json::Value::String(tamper_bundle.display().to_string());
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let lookup = |name: &str| (name == "APPLY_TAMPER_TOKEN").then(|| "tok-tamper".to_string());
+
+        // Run the validation + diff pipeline directly (mirroring apply's
+        // flow), then tamper the artifact, then call execute.
+        let loaded: EnvManifest = super::super::load_answers(&manifest_path).unwrap();
+        loaded.validate_shape().unwrap();
+        let manifest_dir = manifest_path.parent().unwrap().to_path_buf();
+        let ctx = resolve_and_validate(&store, loaded, &manifest_dir, "test".to_string(), &lookup)
+            .unwrap();
+        let steps = diff(&store, &ctx).unwrap();
+
+        // Tamper the bundle AFTER diff (simulating a change during the
+        // confirmation pause).
+        std::fs::write(&tamper_bundle, b"tampered bytes").unwrap();
+
+        let err = execute(&store, &ctx, &steps).expect_err("tampered artifact must abort");
+        assert!(
+            matches!(&err, OpError::Conflict(msg) if msg.contains("changed since the plan")),
+            "expected Conflict about artifact change, got: {err:?}"
+        );
+
+        // The dev-store file must NOT exist — no secret was written.
+        assert!(
+            !dir.path()
+                .join("local")
+                .join(super::super::secrets::DEV_STORE_RELATIVE)
+                .exists(),
+            "tampered artifact must abort before any secret write"
+        );
     }
 
     // --- Fix 8: welcome-flow reachability lives in env-side validation only ---
