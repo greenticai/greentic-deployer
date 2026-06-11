@@ -83,6 +83,7 @@ hex = "0.4"
 ulid = "1"
 url = "2"
 percent-encoding = "2"
+rpassword = "7"
 rustix = { version = "1", features = ["process"], default-features = false }
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "zeroize"] }
 zeroize = "1"

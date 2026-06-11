@@ -32,6 +32,20 @@
 //!   mutate; exit non-zero when diffable changes are pending. Always-put
 //!   secret rows are excluded from the verdict (values cannot be diffed
 //!   until A9) and reported under `undiffable` instead.
+//! - Missing-inputs contract: an unset `from_env` variable or an absent
+//!   `bundle_path` artifact is *collected* (not fail-fast) and reported
+//!   under `missing` in the JSON report, so one run surfaces every gap.
+//!   Mutating apply refuses to execute while any remain; on a TTY, missing
+//!   secret values are prompted for (masked, in-memory only).
+//!   `--non-interactive` never prompts and implies `--yes`; `--dry-run` and
+//!   `--check` report missing inputs without failing on them (`--check`
+//!   excludes them from the convergence verdict — CI gates must be runnable
+//!   without holding credentials).
+//!
+//! The `--emit-answers-template <path>` shortcut writes a skeleton manifest
+//! to start from — it is dispatched as a peer verb mode
+//! ([`emit_answers_template`]) before the apply engine is entered, because
+//! it needs no store, no manifest, and no flags.
 //!
 //! - Secrets are always-put: `op secrets get` is not-yet-implemented, so
 //!   values cannot be diffed — the plan says `put (cannot diff)` instead of
@@ -50,7 +64,7 @@
 //! the standard `{op, noun, result}` JSON envelope (so the output is
 //! already machine-readable — no separate `--json` flag).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
@@ -253,21 +267,70 @@ struct ApplyContext {
     /// can echo the material — the value reaches exactly one place, the
     /// `secrets::put` payload at execute time.
     secret_values: BTreeMap<String, SecretValue>,
+    /// Secret paths whose value came from the TTY prompter rather than the
+    /// named env var — the plan row says `prompted` instead of `from $VAR`.
+    prompted_paths: BTreeSet<String>,
     bundles: Vec<ResolvedBundle>,
     endpoints: Vec<ResolvedEndpoint>,
     env: Option<Environment>,
     /// Canonicalized `environment.public_base_url` (validated form).
     canonical_public_base_url: Option<String>,
+    /// Accumulated input gaps (see [`MissingItem`]): secrets in manifest
+    /// order, then bundles in manifest order.
+    missing: Vec<MissingItem>,
     warnings: Vec<String>,
     updated_by: String,
 }
 
 // --- entry point ----------------------------------------------------------------
 
+/// An input the manifest names but the process cannot supply: an unset
+/// (or empty) `from_env` variable, or a `bundle_path` that is not a file.
+/// Missing inputs are *accumulated* during validation (unlike structural
+/// manifest errors, which stay fail-fast) so headless callers see the
+/// complete list in one run, and reported under `missing` in the JSON
+/// report. Apply mode refuses to execute while any remain; preview modes
+/// (`--dry-run`, `--check`) report them without failing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MissingItem {
+    kind: MissingKind,
+    /// Natural key: the secret's manifest `path`, or the bundle's
+    /// `bundle_id`.
+    key: String,
+    /// Where the input was expected: `env:<VAR>` or `path:<resolved path>`.
+    source: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingKind {
+    SecretValue,
+    BundleArtifact,
+}
+
+impl MissingKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            MissingKind::SecretValue => "secret_value",
+            MissingKind::BundleArtifact => "bundle_artifact",
+        }
+    }
+}
+
+impl MissingItem {
+    fn to_json(&self) -> Value {
+        json!({
+            "kind": self.kind.as_str(),
+            "key": self.key,
+            "source": self.source,
+        })
+    }
+}
+
 /// How `apply` terminates once the plan is computed.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ApplyMode {
     /// Execute the plan and verify (the default).
+    #[default]
     Apply,
     /// Print the plan and exit 0 without mutating — a preview, even when
     /// changes are pending.
@@ -288,34 +351,118 @@ impl ApplyMode {
     }
 }
 
-/// `gtc op env apply --answers <manifest.json> [--dry-run | --check]
-/// [--updated-by <who>] [--yes]`.
+/// Knobs for [`apply`] beyond the global `OpFlags`. Built from
+/// `EnvApplyArgs` on the CLI path; library callers (greentic-setup's env
+/// mode) construct it directly — `Default` is a plain mutating apply.
+///
+/// The `--emit-answers-template` shortcut is dispatched as a peer verb
+/// mode ([`emit_answers_template`]) before `ApplyOptions` is constructed,
+/// so it does not appear here.
+#[derive(Debug, Clone, Default)]
+pub struct ApplyOptions {
+    pub mode: ApplyMode,
+    /// Audit principal forwarded to every composed mutation. Defaults to
+    /// `env-apply`.
+    pub updated_by: Option<String>,
+    /// Skip the interactive plan confirmation.
+    pub yes: bool,
+    /// Never prompt — neither for missing secret values nor the plan
+    /// confirmation (implies `yes`). Missing inputs are collected and
+    /// reported instead of asked for.
+    pub non_interactive: bool,
+}
+
+/// Write the skeleton `greentic.env-manifest.v1` template to `path`.
+///
+/// This is the peer verb mode for `--emit-answers-template`: it needs no
+/// store, no manifest, and no flags — dispatched before `apply` is
+/// entered so the template write is decoupled from the apply engine's
+/// precondition stack.
+pub fn emit_answers_template(path: &Path) -> Result<OpOutcome, OpError> {
+    std::fs::write(path, super::env_manifest::MANIFEST_TEMPLATE_JSON).map_err(|source| {
+        OpError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    Ok(OpOutcome::new(
+        NOUN,
+        VERB,
+        json!({
+            "manifest_schema": ENV_MANIFEST_SCHEMA_V1,
+            "mode": "emit-answers-template",
+            "path": path,
+        }),
+    ))
+}
+
+/// `gtc op env apply --answers <manifest.json> [--dry-run | --check |
+/// --non-interactive] [--updated-by <who>] [--yes]`.
 pub fn apply(
     store: &LocalFsStore,
     flags: &OpFlags,
-    mode: ApplyMode,
-    updated_by: Option<String>,
-    yes: bool,
+    opts: ApplyOptions,
 ) -> Result<OpOutcome, OpError> {
-    apply_with_env_lookup(store, flags, mode, updated_by, yes, &|name| {
-        std::env::var(name).ok()
-    })
+    // TTY fill-in is offered only when the run could actually mutate
+    // (prompting during a preview is noise) and the operator can answer.
+    // rpassword prompts and reads on /dev/tty directly, so a redirected
+    // stdout never sees the prompt and the JSON envelope stays clean.
+    let interactive = opts.mode == ApplyMode::Apply
+        && !opts.non_interactive
+        && std::io::stdin().is_terminal()
+        && std::io::stderr().is_terminal();
+    let prompter: Option<&SecretPrompter> = if interactive {
+        Some(&prompt_secret_value)
+    } else {
+        None
+    };
+    apply_with_lookups(
+        store,
+        flags,
+        opts,
+        &|name| std::env::var(name).ok(),
+        prompter,
+    )
 }
 
-/// [`apply`] with the `from_env` secret-value lookup injected. Tests pass a
-/// fake lookup so they never mutate the process environment (`set_var` is
-/// unsafe under a multithreaded test harness).
-fn apply_with_env_lookup(
+/// Fallback asked for a secret value when the manifest's `from_env`
+/// variable is unset: `(manifest path, from_env name) -> value`. `None`
+/// means "still missing" — the path lands in the missing-inputs report.
+type SecretPrompter = dyn Fn(&str, &str) -> Option<String>;
+
+/// Masked TTY prompt for one missing secret value. Empty input declines —
+/// the path stays missing and apply aborts with the full report. The value
+/// lives only in the in-memory [`SecretValue`] map, exactly like an
+/// env-resolved one; it never reaches the manifest, plan, report, or audit.
+fn prompt_secret_value(path: &str, from_env: &str) -> Option<String> {
+    let value = rpassword::prompt_password(format!(
+        "secret `{path}`: ${from_env} is unset — enter value (hidden; empty to abort): "
+    ))
+    .ok()?;
+    (!value.is_empty()).then_some(value)
+}
+
+/// [`apply`] with the `from_env` secret-value lookup and the TTY prompter
+/// injected. Tests pass fakes so they never mutate the process environment
+/// (`set_var` is unsafe under a multithreaded test harness) and never need
+/// a TTY.
+fn apply_with_lookups(
     store: &LocalFsStore,
     flags: &OpFlags,
-    mode: ApplyMode,
-    updated_by: Option<String>,
-    yes: bool,
+    opts: ApplyOptions,
     env_lookup: &dyn Fn(&str) -> Option<String>,
+    prompter: Option<&SecretPrompter>,
 ) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(NOUN, VERB, manifest_schema()));
     }
+    let ApplyOptions {
+        mode,
+        updated_by,
+        yes,
+        non_interactive,
+    } = opts;
+    let yes = yes || non_interactive;
     let manifest_path = flags.answers.clone().ok_or_else(|| {
         OpError::InvalidArgument(
             "env apply requires `--answers <manifest.json>` (a greentic.env-manifest.v1 \
@@ -332,9 +479,16 @@ fn apply_with_env_lookup(
         .to_path_buf();
     let updated_by = updated_by.unwrap_or_else(|| DEFAULT_UPDATED_BY.to_string());
 
-    let ctx = resolve_and_validate(store, manifest, &manifest_dir, updated_by, env_lookup)?;
+    let ctx = resolve_and_validate(
+        store,
+        manifest,
+        &manifest_dir,
+        updated_by,
+        env_lookup,
+        prompter,
+    )?;
     let steps = diff(store, &ctx)?;
-    render_plan(&steps, &ctx.warnings);
+    render_plan(&steps, &ctx.warnings, &ctx.missing);
 
     match mode {
         ApplyMode::DryRun => {
@@ -345,6 +499,10 @@ fn apply_with_env_lookup(
             ));
         }
         ApplyMode::Check => {
+            // Missing inputs are reported but deliberately NOT drift: a CI
+            // convergence gate must be runnable without holding the secret
+            // values themselves (they're excluded from the verdict as
+            // undiffable anyway). Mutating apply still requires them below.
             let diffable_pending = steps.iter().filter(|s| s.action.counts_as_drift()).count();
             if diffable_pending > 0 {
                 return Err(OpError::Conflict(format!(
@@ -361,6 +519,23 @@ fn apply_with_env_lookup(
             ));
         }
         ApplyMode::Apply => {}
+    }
+
+    // Mutating apply refuses to run while any input is missing — the plan
+    // above already lists every gap (the whole point of accumulating them),
+    // so the operator fixes all of them in one round trip.
+    if !ctx.missing.is_empty() {
+        return Err(OpError::InvalidArgument(format!(
+            "cannot apply: {} missing input(s): {} — export the named variable(s) / \
+             provide the artifact(s) and re-run (on a TTY, missing secret values are \
+             prompted for)",
+            ctx.missing.len(),
+            ctx.missing
+                .iter()
+                .map(|m| format!("{} `{}` ({})", m.kind.as_str(), m.key, m.source))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )));
     }
 
     let pending = steps
@@ -404,6 +579,7 @@ fn resolve_and_validate(
     manifest_dir: &Path,
     updated_by: String,
     env_lookup: &dyn Fn(&str) -> Option<String>,
+    prompter: Option<&SecretPrompter>,
 ) -> Result<ApplyContext, OpError> {
     let env_id = EnvId::try_from(manifest.environment.id.as_str())
         .map_err(|e| OpError::InvalidArgument(format!("environment.id: {e}")))?;
@@ -423,11 +599,9 @@ fn resolve_and_validate(
     };
 
     // Secrets: resolve every `from_env` (set + non-empty) and pre-check the
-    // bound secrets backend, all before any mutation — a missing variable or
-    // a non-dev-store backend must fail the whole apply at validation time,
-    // not mid-run. Values land ONLY in `secret_values` (never in steps,
-    // plan, report, or audit targets). Path canonicality was already
-    // checked by `validate_shape`.
+    // bound secrets backend, all before any mutation. Values land ONLY in
+    // `secret_values` (never in steps, plan, report, or audit targets).
+    // Path canonicality was already checked by `validate_shape`.
     // Backend pre-check applies only when the env already exists — a fresh
     // env is exempt because the `env init` step creates the default
     // dev-store binding before any put-secret step runs.
@@ -444,44 +618,61 @@ fn resolve_and_validate(
             )));
         }
     }
+    // An unresolvable value is a MISSING INPUT, not a structural error:
+    // collect every gap (offering the TTY prompter as a fallback) instead
+    // of failing on the first, so one run reports the complete list.
+    let mut missing = Vec::new();
     let mut secret_values = BTreeMap::new();
+    let mut prompted_paths = BTreeSet::new();
     for s in &manifest.secrets {
-        let value = env_lookup(&s.from_env)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-                OpError::InvalidArgument(format!(
-                    "secret `{}`: environment variable `{}` is not set (or empty) — \
-                     secret values never appear in the manifest, so the variable must \
-                     be exported before running apply",
-                    s.path, s.from_env
-                ))
-            })?;
-        secret_values.insert(s.path.clone(), SecretValue::from(value));
+        let env_value = env_lookup(&s.from_env).filter(|v| !v.is_empty());
+        let value = match env_value {
+            Some(v) => Some(v),
+            None => prompter.and_then(|p| {
+                let v = p(&s.path, &s.from_env).filter(|v| !v.is_empty());
+                if v.is_some() {
+                    prompted_paths.insert(s.path.clone());
+                }
+                v
+            }),
+        };
+        match value {
+            Some(v) => {
+                secret_values.insert(s.path.clone(), SecretValue::from(v));
+            }
+            None => missing.push(MissingItem {
+                kind: MissingKind::SecretValue,
+                key: s.path.clone(),
+                source: format!("env:{}", s.from_env),
+            }),
+        }
     }
 
     // Bundle artifacts: existence + digest, plus the B10 billing-principal
-    // rule, all before any mutation.
+    // rule, all before any mutation. The principal rule stays fail-fast
+    // (a manifest bug); an absent artifact is a missing input — the bundle
+    // is reported and skipped (no digest means nothing to diff against).
     let mut resolved_bundles = Vec::with_capacity(manifest.bundles.len());
     for b in &manifest.bundles {
+        let customer_id = super::bundles::resolve_customer_id(&env_id, b.customer_id.clone())?;
         let resolved_path = if b.bundle_path.is_absolute() {
             b.bundle_path.clone()
         } else {
             manifest_dir.join(&b.bundle_path)
         };
         if !resolved_path.is_file() {
-            return Err(OpError::InvalidArgument(format!(
-                "bundle `{}`: `{}` is not a file (relative paths resolve against the \
-                 manifest's directory)",
-                b.bundle_id,
-                resolved_path.display()
-            )));
+            missing.push(MissingItem {
+                kind: MissingKind::BundleArtifact,
+                key: b.bundle_id.clone(),
+                source: format!("path:{}", resolved_path.display()),
+            });
+            continue;
         }
         let digest =
             super::bundle_stage::sha256_file(&resolved_path).map_err(|source| OpError::Io {
                 path: resolved_path.clone(),
                 source,
             })?;
-        let customer_id = super::bundles::resolve_customer_id(&env_id, b.customer_id.clone())?;
         resolved_bundles.push(ResolvedBundle {
             spec: b.clone(),
             resolved_path,
@@ -600,10 +791,12 @@ fn resolve_and_validate(
         env_id,
         manifest,
         secret_values,
+        prompted_paths,
         bundles: resolved_bundles,
         endpoints: resolved_endpoints,
         env,
         canonical_public_base_url,
+        missing,
         warnings,
         updated_by,
     })
@@ -709,11 +902,16 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
         // conflict rule). `secrets::put` mints a fresh per-invocation key
         // instead (second exception alongside deploy's per-revision
         // cut-over key).
+        let detail = if ctx.prompted_paths.contains(&s.path) {
+            "prompted (cannot diff until A9)".to_string()
+        } else {
+            format!("from ${} (cannot diff until A9)", s.from_env)
+        };
         steps.push(ApplyStep {
             kind: ApplyStepKind::PutSecret,
             key: s.path.clone(),
             action: ApplyAction::Put,
-            detail: format!("from ${} (cannot diff until A9)", s.from_env),
+            detail,
             idempotency_key: None,
             op: StepOp::PutSecret {
                 path: s.path.clone(),
@@ -1472,7 +1670,7 @@ fn binding_summary(binding: &Option<RouteBinding>) -> String {
     }
 }
 
-fn render_plan(steps: &[ApplyStep], warnings: &[String]) {
+fn render_plan(steps: &[ApplyStep], warnings: &[String], missing: &[MissingItem]) {
     eprintln!("plan ({} step(s)):", steps.len());
     for step in steps {
         eprintln!(
@@ -1481,6 +1679,14 @@ fn render_plan(steps: &[ApplyStep], warnings: &[String]) {
             step.key,
             step.action.as_str(),
             step.detail
+        );
+    }
+    for m in missing {
+        eprintln!(
+            "  missing: {:<14} {:<40} {}",
+            m.kind.as_str(),
+            m.key,
+            m.source
         );
     }
     for w in warnings {
@@ -1513,6 +1719,7 @@ fn report_json(
         "changed": changed,
         "no_op": steps.len() - changed,
         "undiffable": undiffable,
+        "missing": ctx.missing.iter().map(MissingItem::to_json).collect::<Vec<_>>(),
         "warnings": ctx.warnings,
     });
     if let Some(v) = verify {
@@ -1602,7 +1809,14 @@ mod tests {
             schema_only: false,
             answers: Some(manifest_path.to_path_buf()),
         };
-        apply(store, &flags, mode, None, false)
+        apply(
+            store,
+            &flags,
+            ApplyOptions {
+                mode,
+                ..ApplyOptions::default()
+            },
+        )
     }
 
     fn run_apply(store: &LocalFsStore, manifest_path: &Path) -> Result<OpOutcome, OpError> {
@@ -2252,11 +2466,30 @@ mod tests {
         mode: ApplyMode,
         lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Result<OpOutcome, OpError> {
+        run_with_lookup_and_prompter(store, manifest_path, mode, lookup, None)
+    }
+
+    fn run_with_lookup_and_prompter(
+        store: &LocalFsStore,
+        manifest_path: &Path,
+        mode: ApplyMode,
+        lookup: &dyn Fn(&str) -> Option<String>,
+        prompter: Option<&SecretPrompter>,
+    ) -> Result<OpOutcome, OpError> {
         let flags = OpFlags {
             schema_only: false,
             answers: Some(manifest_path.to_path_buf()),
         };
-        apply_with_env_lookup(store, &flags, mode, None, false, lookup)
+        apply_with_lookups(
+            store,
+            &flags,
+            ApplyOptions {
+                mode,
+                ..ApplyOptions::default()
+            },
+            lookup,
+            prompter,
+        )
     }
 
     use crate::cli::tests_common::dev_store_read;
@@ -2337,7 +2570,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_empty_secret_env_var_fails_validation() {
+    fn missing_or_empty_secret_env_var_fails_apply_before_mutation() {
         let (dir, store) = seeded_store_with_dev_secrets();
         let manifest_path = write_manifest(dir.path(), &secrets_manifest("APPLY_MISSING_VAR"));
         for value in [None, Some(String::new())] {
@@ -2346,12 +2579,14 @@ mod tests {
                 run_with_lookup(&store, &manifest_path, ApplyMode::Apply, &lookup).unwrap_err();
             match err {
                 OpError::InvalidArgument(msg) => {
-                    assert!(msg.contains("APPLY_MISSING_VAR"), "got: {msg}")
+                    assert!(msg.contains("1 missing input(s)"), "got: {msg}");
+                    assert!(msg.contains("APPLY_MISSING_VAR"), "got: {msg}");
+                    assert!(msg.contains(SECRET_PATH), "got: {msg}");
                 }
                 other => panic!("expected InvalidArgument, got {other:?}"),
             }
         }
-        // Failed at validation: nothing executed, nothing written.
+        // The missing gate fires before execute: nothing written.
         assert!(
             !dir.path()
                 .join("local")
@@ -2492,8 +2727,15 @@ mod tests {
         let loaded: EnvManifest = super::super::load_answers(&manifest_path).unwrap();
         loaded.validate_shape().unwrap();
         let manifest_dir = manifest_path.parent().unwrap().to_path_buf();
-        let ctx = resolve_and_validate(&store, loaded, &manifest_dir, "test".to_string(), &lookup)
-            .unwrap();
+        let ctx = resolve_and_validate(
+            &store,
+            loaded,
+            &manifest_dir,
+            "test".to_string(),
+            &lookup,
+            None,
+        )
+        .unwrap();
         let steps = diff(&store, &ctx).unwrap();
 
         // Tamper the bundle AFTER diff (simulating a change during the
@@ -2514,6 +2756,173 @@ mod tests {
                 .exists(),
             "tampered artifact must abort before any secret write"
         );
+    }
+
+    // --- operator-surface PR-1: missing-inputs contract -------------------------
+
+    #[test]
+    fn missing_inputs_accumulate_across_secrets_and_bundles() {
+        let (dir, store) = seeded_store_with_dev_secrets();
+        let absent = dir.path().join("ghost.gtbundle");
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "secrets": [
+                {"path": "legal/_/messaging-telegram/telegram_bot_token",
+                 "from_env": "APPLY_VAR_A"},
+                {"path": "accounting/_/messaging-telegram/telegram_bot_token",
+                 "from_env": "APPLY_VAR_B"}
+            ],
+            "bundles": [{"bundle_id": "ghost", "bundle_path": absent}]
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let lookup = |_: &str| None;
+
+        // Dry-run: ALL THREE gaps in one report, stable order (secrets in
+        // manifest order, then bundles), exit 0.
+        let plan = run_with_lookup(&store, &manifest_path, ApplyMode::DryRun, &lookup)
+            .expect("dry-run never fails on missing inputs");
+        let rows: Vec<(String, String, String)> = plan.result["missing"]
+            .as_array()
+            .expect("missing array")
+            .iter()
+            .map(|m| {
+                (
+                    m["kind"].as_str().unwrap().to_string(),
+                    m["key"].as_str().unwrap().to_string(),
+                    m["source"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(
+            (rows[0].0.as_str(), rows[0].2.as_str()),
+            ("secret_value", "env:APPLY_VAR_A")
+        );
+        assert_eq!(rows[0].1, "legal/_/messaging-telegram/telegram_bot_token");
+        assert_eq!(
+            (rows[1].0.as_str(), rows[1].2.as_str()),
+            ("secret_value", "env:APPLY_VAR_B")
+        );
+        assert_eq!(rows[2].0, "bundle_artifact");
+        assert_eq!(rows[2].1, "ghost");
+        assert!(rows[2].2.starts_with("path:"), "{rows:?}");
+
+        // Apply: the gate names all three gaps in ONE error, pre-mutation.
+        let err = run_with_lookup(&store, &manifest_path, ApplyMode::Apply, &lookup).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("3 missing input(s)"), "{msg}");
+        assert!(msg.contains("APPLY_VAR_A"), "{msg}");
+        assert!(msg.contains("APPLY_VAR_B"), "{msg}");
+        assert!(msg.contains("ghost"), "{msg}");
+        assert!(!dir.path().join("local/audit/events.jsonl").exists());
+    }
+
+    #[test]
+    fn check_reports_missing_but_excludes_it_from_the_verdict() {
+        let (dir, store) = seeded_store_with_dev_secrets();
+        // Converged env + one unset var: check exits 0 — a CI convergence
+        // gate must be runnable without holding credentials — and reports
+        // the gap.
+        let manifest_path = write_manifest(dir.path(), &secrets_manifest("APPLY_UNSET_CI_VAR"));
+        let lookup = |_: &str| None;
+        let outcome = run_with_lookup(&store, &manifest_path, ApplyMode::Check, &lookup)
+            .expect("check passes without the secret value");
+        assert_eq!(outcome.result["mode"], "check");
+        assert_eq!(
+            outcome.result["missing"].as_array().unwrap().len(),
+            1,
+            "{}",
+            outcome.result
+        );
+        assert_eq!(outcome.result["undiffable"], 1);
+
+        // Real drift still fails check, with or without the values.
+        let mut mixed = full_manifest(&fixture());
+        mixed["secrets"] = json!([{"path": SECRET_PATH, "from_env": "APPLY_UNSET_CI_VAR"}]);
+        let mixed_path = write_manifest(dir.path(), &mixed);
+        let err = run_with_lookup(&store, &mixed_path, ApplyMode::Check, &lookup).unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn prompter_fills_missing_secret_and_plan_says_prompted() {
+        let (dir, store) = seeded_store_with_dev_secrets();
+        let manifest_path = write_manifest(dir.path(), &secrets_manifest("APPLY_PROMPT_VAR"));
+        let lookup = |_: &str| None;
+        let prompter = |path: &str, from_env: &str| {
+            assert_eq!(path, SECRET_PATH);
+            assert_eq!(from_env, "APPLY_PROMPT_VAR");
+            Some("tok-prompted-1".to_string())
+        };
+
+        let outcome = run_with_lookup_and_prompter(
+            &store,
+            &manifest_path,
+            ApplyMode::Apply,
+            &lookup,
+            Some(&prompter),
+        )
+        .expect("prompted apply succeeds");
+
+        // The plan row says `prompted` (not `from $VAR`), the report's
+        // missing list is empty, and the value never leaks anywhere.
+        let envelope = serde_json::to_string(&outcome).unwrap();
+        assert!(!envelope.contains("tok-prompted-1"), "{envelope}");
+        let steps = outcome.result["steps"].as_array().unwrap();
+        let put = steps.iter().find(|s| s["kind"] == "put-secret").unwrap();
+        assert_eq!(put["detail"], "prompted (cannot diff until A9)");
+        assert!(outcome.result["missing"].as_array().unwrap().is_empty());
+
+        // The prompted value reached the dev store the runtime reads.
+        let store_path = dir
+            .path()
+            .join("local")
+            .join(super::super::secrets::DEV_STORE_RELATIVE);
+        let bytes = dev_store_read(&store_path, &format!("secrets://local/{SECRET_PATH}"));
+        assert_eq!(bytes, b"tok-prompted-1".to_vec());
+
+        // Audit must not leak it either.
+        let audit = std::fs::read_to_string(dir.path().join("local/audit/events.jsonl")).unwrap();
+        assert!(!audit.contains("tok-prompted-1"));
+    }
+
+    #[test]
+    fn prompter_decline_leaves_input_missing() {
+        let (dir, store) = seeded_store_with_dev_secrets();
+        let manifest_path = write_manifest(dir.path(), &secrets_manifest("APPLY_DECLINE_VAR"));
+        let lookup = |_: &str| None;
+        let prompter = |_: &str, _: &str| None;
+        let err = run_with_lookup_and_prompter(
+            &store,
+            &manifest_path,
+            ApplyMode::Apply,
+            &lookup,
+            Some(&prompter),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("1 missing input(s)"), "{err}");
+        assert!(!dir.path().join("local/audit/events.jsonl").exists());
+    }
+
+    #[test]
+    fn emit_answers_template_writes_valid_manifest_and_touches_nothing() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let out = dir.path().join("template.env.json");
+        let outcome = emit_answers_template(&out).expect("template emit succeeds");
+        assert_eq!(outcome.result["mode"], "emit-answers-template");
+
+        // What lands on disk parses under deny_unknown_fields and is
+        // shape-valid as-is (the env_manifest guard test pins the source;
+        // this pins the written artifact).
+        let written: EnvManifest = serde_json::from_slice(&std::fs::read(&out).unwrap())
+            .expect("written template parses as EnvManifest");
+        written
+            .validate_shape()
+            .expect("written template is shape-valid");
+        // No env/store state was created.
+        assert!(!store.exists(&EnvId::try_from("local").unwrap()).unwrap());
     }
 
     // --- Fix 8: welcome-flow reachability lives in env-side validation only ---

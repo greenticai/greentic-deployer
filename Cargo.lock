@@ -2420,6 +2420,7 @@ dependencies = [
  "qa-spec",
  "rand 0.9.4",
  "reqwest 0.13.4",
+ "rpassword",
  "rustix",
  "semver",
  "serde",
