@@ -394,8 +394,11 @@ pub const ENV_MANIFEST_FORM_VERSION: &str = "1";
 ///   wizard filter: fields the manifest allows to be absent
 ///   (`public_base_url`, `customer_id`, `config_overrides`, route binding,
 ///   welcome flow, …) are `required: false` and surface in advanced mode.
-///   The three `List` sections and `trust_root_bootstrap` are `required`
-///   so the wizard walks them; an empty array / `false` answer is valid.
+///   The three `List` sections are `required: false` — an empty section is
+///   a valid manifest, so absence must pass [`qa_spec::validate()`], and the
+///   qa prompt loop walks `List` questions regardless of `required` (its
+///   normal-mode filter exempts tables). `trust_root_bootstrap` stays
+///   `required` (a `false` answer is valid; the prompt fills the default).
 /// - Nested string arrays (`links`, `route_path_prefixes`, …) are
 ///   comma-separated `String` questions — qa-spec `List` rows cannot nest
 ///   lists. [`answers_to_manifest`] owns the split.
@@ -435,7 +438,7 @@ pub fn manifest_form_spec() -> FormSpec {
         "Secrets",
         "Dev-store secret entries. Each names the environment VARIABLE \
          holding the value — values never go into a manifest.",
-        true,
+        false,
     );
     secrets.list = Some(ListSpec {
         min_items: None,
@@ -465,7 +468,7 @@ pub fn manifest_form_spec() -> FormSpec {
         QuestionType::List,
         "Bundles",
         "Bundle deployments for this environment.",
-        true,
+        false,
     );
     bundles.list = Some(ListSpec {
         min_items: None,
@@ -541,7 +544,7 @@ pub fn manifest_form_spec() -> FormSpec {
         QuestionType::List,
         "Messaging endpoints",
         "Messaging endpoints and their bundle links.",
-        true,
+        false,
     );
     messaging_endpoints.list = Some(ListSpec {
         min_items: None,
@@ -1237,13 +1240,10 @@ mod tests {
         let expected: BTreeSet<String> = [
             "environment_id",
             "trust_root_bootstrap",
-            "secrets",
             "secrets.path",
             "secrets.from_env",
-            "bundles",
             "bundles.bundle_id",
             "bundles.bundle_path",
-            "messaging_endpoints",
             "messaging_endpoints.name",
             "messaging_endpoints.provider_type",
         ]
@@ -1454,6 +1454,26 @@ mod tests {
         assert!(manifest.secrets.is_empty());
         assert!(manifest.bundles.is_empty());
         assert!(manifest.messaging_endpoints.is_empty());
+    }
+
+    #[test]
+    fn minimal_answers_pass_form_validation() {
+        // An empty section is a valid manifest, so the `List` sections must
+        // be `required: false`: minimal answers (no lists at all) pass
+        // qa_spec::validate — the wizard's declined tables don't trip a
+        // bogus required nag, and headless validation stays honest.
+        let result = qa_spec::validate(
+            &manifest_form_spec(),
+            &serde_json::json!({
+                "environment_id": "local",
+                "trust_root_bootstrap": true
+            }),
+        );
+        assert!(
+            result.valid,
+            "errors: {:?}, missing: {:?}, unknown: {:?}",
+            result.errors, result.missing_required, result.unknown_fields
+        );
     }
 
     #[test]
