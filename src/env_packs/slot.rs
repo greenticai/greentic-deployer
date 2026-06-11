@@ -71,8 +71,10 @@ pub trait EnvPackHandler: std::fmt::Debug + Send + Sync {
     /// Returns the YAML source of the env-pack's `wizard.qaspec.yaml`,
     /// the spec the operator's wizard driver runs to collect a binding's
     /// `answers_ref` payload. Raw YAML (not a typed `qa_spec::FormSpec`)
-    /// so this crate stays qa-spec-free; the operator already depends on
-    /// `qa-spec` and parses at the call site. Default `None`: metadata-
+    /// so the env-pack TRAIT carries no qa-spec types (the crate itself
+    /// depends on qa-spec since the env-manifest authoring form,
+    /// `cli::env_manifest::manifest_form_spec`); the operator already
+    /// depends on `qa-spec` and parses at the call site. Default `None`: metadata-
     /// only built-ins ship no wizard. Env-packs that ship a QASpec
     /// override with `Some(include_str!("wizard.qaspec.yaml"))`.
     ///
