@@ -625,7 +625,10 @@ pub fn manifest_form_spec() -> FormSpec {
     }
 }
 
-/// All-defaults [`QuestionSpec`] except the five fields every question sets.
+/// [`QuestionSpec`] constructor. Spells out every field (no
+/// `..Default::default()`) on purpose: a field added to qa-spec's
+/// `QuestionSpec` becomes a compile error here, forcing a deliberate
+/// default instead of silently inheriting one.
 fn question(
     id: &str,
     kind: QuestionType,
@@ -662,6 +665,12 @@ fn question(
 /// [`EnvManifest::validate_shape`] on the result — this function does not
 /// duplicate either. Lenient on absence (missing sections → empty) so a
 /// minimal hand-written answers file converts.
+///
+/// Convention reminder for new fields: every `Vec<String>` manifest field
+/// (`links`, `route_hosts`, `route_path_prefixes`, `secret_refs`) is a
+/// comma-separated `String` question and MUST come through
+/// [`split_csv`] — a plain `req_row_string` would smuggle the commas into
+/// a single entry.
 pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> {
     if answers.form_id != ENV_MANIFEST_FORM_ID {
         return Err(OpError::InvalidArgument(format!(
@@ -831,6 +840,16 @@ fn row_object<'a>(
 
 /// Optional string answer: absent/null/blank → `None`; non-string → error.
 fn opt_string(map: &serde_json::Map<String, Value>, key: &str) -> Result<Option<String>, OpError> {
+    opt_string_at(map, key, key)
+}
+
+/// [`opt_string`] with a caller-supplied error label (`section[idx].key`
+/// for row fields), so every type error keeps the offending value.
+fn opt_string_at(
+    map: &serde_json::Map<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<Option<String>, OpError> {
     match map.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => {
@@ -838,7 +857,7 @@ fn opt_string(map: &serde_json::Map<String, Value>, key: &str) -> Result<Option<
             Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
         }
         Some(other) => Err(OpError::InvalidArgument(format!(
-            "answers: {key} must be a string, got {other}"
+            "answers: {label} must be a string, got {other}"
         ))),
     }
 }
@@ -849,9 +868,7 @@ fn opt_row_string(
     row: &serde_json::Map<String, Value>,
     key: &str,
 ) -> Result<Option<String>, OpError> {
-    opt_string(row, key).map_err(|_| {
-        OpError::InvalidArgument(format!("answers: {section}[{idx}].{key} must be a string"))
-    })
+    opt_string_at(row, key, &format!("{section}[{idx}].{key}"))
 }
 
 fn req_row_string(
@@ -1368,7 +1385,7 @@ mod tests {
                 {
                     "name": "realbot-legal",
                     "provider_type": "messaging.telegram.bot",
-                    "links": "realbot-legal",
+                    "links": "realbot-legal, realbot-audit",
                     "welcome_bundle_id": "realbot-legal",
                     "welcome_pack_id": "realbot",
                     "welcome_flow_id": "main"
@@ -1408,7 +1425,7 @@ mod tests {
             ("legal", "default")
         );
         let ep = &manifest.messaging_endpoints[0];
-        assert_eq!(ep.links, ["realbot-legal"]);
+        assert_eq!(ep.links, ["realbot-legal", "realbot-audit"]);
         assert_eq!(
             ep.welcome_flow,
             Some(ManifestWelcomeFlow {
