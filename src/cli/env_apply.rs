@@ -40,8 +40,12 @@
 //!   `--non-interactive` never prompts and implies `--yes`; `--dry-run` and
 //!   `--check` report missing inputs without failing on them (`--check`
 //!   excludes them from the convergence verdict — CI gates must be runnable
-//!   without holding credentials). `--emit-answers-template <path>` writes
-//!   a skeleton manifest to start from.
+//!   without holding credentials).
+//!
+//! The `--emit-answers-template <path>` shortcut writes a skeleton manifest
+//! to start from — it is dispatched as a peer verb mode
+//! ([`emit_answers_template`]) before the apply engine is entered, because
+//! it needs no store, no manifest, and no flags.
 //!
 //! - Secrets are always-put: `op secrets get` is not-yet-implemented, so
 //!   values cannot be diffed — the plan says `put (cannot diff)` instead of
@@ -350,6 +354,10 @@ impl ApplyMode {
 /// Knobs for [`apply`] beyond the global `OpFlags`. Built from
 /// `EnvApplyArgs` on the CLI path; library callers (greentic-setup's env
 /// mode) construct it directly — `Default` is a plain mutating apply.
+///
+/// The `--emit-answers-template` shortcut is dispatched as a peer verb
+/// mode ([`emit_answers_template`]) before `ApplyOptions` is constructed,
+/// so it does not appear here.
 #[derive(Debug, Clone, Default)]
 pub struct ApplyOptions {
     pub mode: ApplyMode,
@@ -362,14 +370,34 @@ pub struct ApplyOptions {
     /// confirmation (implies `yes`). Missing inputs are collected and
     /// reported instead of asked for.
     pub non_interactive: bool,
-    /// Write a skeleton manifest to this path and exit — no `--answers`,
-    /// no store access.
-    pub emit_answers_template: Option<PathBuf>,
+}
+
+/// Write the skeleton `greentic.env-manifest.v1` template to `path`.
+///
+/// This is the peer verb mode for `--emit-answers-template`: it needs no
+/// store, no manifest, and no flags — dispatched before `apply` is
+/// entered so the template write is decoupled from the apply engine's
+/// precondition stack.
+pub fn emit_answers_template(path: &Path) -> Result<OpOutcome, OpError> {
+    std::fs::write(path, super::env_manifest::MANIFEST_TEMPLATE_JSON).map_err(|source| {
+        OpError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    Ok(OpOutcome::new(
+        NOUN,
+        VERB,
+        json!({
+            "manifest_schema": ENV_MANIFEST_SCHEMA_V1,
+            "mode": "emit-answers-template",
+            "path": path,
+        }),
+    ))
 }
 
 /// `gtc op env apply --answers <manifest.json> [--dry-run | --check |
-/// --non-interactive] [--emit-answers-template <path>] [--updated-by <who>]
-/// [--yes]`.
+/// --non-interactive] [--updated-by <who>] [--yes]`.
 pub fn apply(
     store: &LocalFsStore,
     flags: &OpFlags,
@@ -428,29 +456,11 @@ fn apply_with_lookups(
     if flags.schema_only {
         return Ok(OpOutcome::new(NOUN, VERB, manifest_schema()));
     }
-    if let Some(path) = &opts.emit_answers_template {
-        std::fs::write(path, super::env_manifest::MANIFEST_TEMPLATE_JSON).map_err(|source| {
-            OpError::Io {
-                path: path.clone(),
-                source,
-            }
-        })?;
-        return Ok(OpOutcome::new(
-            NOUN,
-            VERB,
-            json!({
-                "manifest_schema": ENV_MANIFEST_SCHEMA_V1,
-                "mode": "emit-answers-template",
-                "path": path,
-            }),
-        ));
-    }
     let ApplyOptions {
         mode,
         updated_by,
         yes,
         non_interactive,
-        emit_answers_template: _,
     } = opts;
     let yes = yes || non_interactive;
     let manifest_path = flags.answers.clone().ok_or_else(|| {
@@ -2900,15 +2910,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let out = dir.path().join("template.env.json");
-        let outcome = apply(
-            &store,
-            &OpFlags::default(), // template needs no --answers
-            ApplyOptions {
-                emit_answers_template: Some(out.clone()),
-                ..ApplyOptions::default()
-            },
-        )
-        .expect("template emit succeeds");
+        let outcome = emit_answers_template(&out).expect("template emit succeeds");
         assert_eq!(outcome.result["mode"], "emit-answers-template");
 
         // What lands on disk parses under deny_unknown_fields and is

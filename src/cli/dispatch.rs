@@ -454,7 +454,6 @@ impl EnvApplyArgs {
             updated_by: self.updated_by,
             yes: self.yes,
             non_interactive: self.non_interactive,
-            emit_answers_template: self.emit_answers_template,
         }
     }
 }
@@ -949,7 +948,13 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
 fn dispatch_env(store: &LocalFsStore, flags: &OpFlags, verb: EnvVerb) -> Result<(), OpError> {
     let outcome = match verb {
         EnvVerb::Init(args) => super::env::init(store, flags, args.into_payload(flags)?)?,
-        EnvVerb::Apply(args) => super::env_apply::apply(store, flags, args.into_options())?,
+        EnvVerb::Apply(mut args) => {
+            if let Some(path) = args.emit_answers_template.take() {
+                super::env_apply::emit_answers_template(&path)?
+            } else {
+                super::env_apply::apply(store, flags, args.into_options())?
+            }
+        }
         EnvVerb::Create(args) => {
             super::env::create(store, flags, args.into_payload("create", flags)?)?
         }
