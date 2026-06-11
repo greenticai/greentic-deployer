@@ -56,11 +56,9 @@ pub type LoadedAnswers = Loaded<Value>;
 /// | `Spec` / `EnvIdMismatch` | `400` |
 /// | `Json` / `Integrity` / `Backend` | `500` |
 ///
-/// Note: [`greentic_deploy_spec::RemoteStoreError`] currently lacks
-/// `already-exists` (409) and invalid-request (400) kinds — its only 409
-/// is `IdempotencyConflict`. PR-4.2 must extend the shared wire enum
-/// (deploy-spec + client + server together) before routes can emit typed
-/// bodies for `AlreadyExists` / `Spec` / `EnvIdMismatch`.
+/// The mapping is implemented by `crate::api::map_storage_error`, emitting
+/// the [`greentic_deploy_spec::RemoteStoreError`] kinds `already-exists`
+/// (409) and `invalid-request` (400) added in PR-4.2a.
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("environment `{0}` not found")]

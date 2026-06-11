@@ -1,14 +1,18 @@
 //! Axum surface for the operator store server.
 //!
-//! PR-4.1 scaffold: liveness (`/healthz`) + readiness (`/readyz`, pings
-//! the storage backend). The 28 A8 mutation/read routes (pinned in the
-//! deployer's `environment::http_store` module doc) land in PR-4.2+.
+//! Health endpoints (`/healthz` liveness, `/readyz` storage-probing
+//! readiness) plus the A8 verb routes from [`crate::api`]. PR-4.2a serves
+//! the environment-lifecycle group; the remaining verb groups from the
+//! route table pinned in the deployer's `environment::http_store` module
+//! doc land group-by-group in PR-4.2b+.
 
 use std::sync::Arc;
 
-use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use axum::routing::{get, post};
+use axum::{Json, Router, extract::State, http::StatusCode};
 use serde_json::{Value, json};
 
+use crate::api;
 use crate::storage::EnvironmentStorage;
 
 /// Shared handler state. Manual `Clone` so `S` itself doesn't need to be
@@ -33,6 +37,18 @@ where
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz::<S>))
+        .route(
+            "/environments",
+            get(api::list_environments::<S>).post(api::create_environment::<S>),
+        )
+        .route(
+            "/environments/{env_id}",
+            get(api::get_environment::<S>).patch(api::update_environment::<S>),
+        )
+        .route(
+            "/environments/{env_id}/migrate-bindings",
+            post(api::migrate_bindings::<S>),
+        )
         .with_state(AppState { storage })
 }
 

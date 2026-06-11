@@ -221,3 +221,9 @@ version = "3"
 [dev-dependencies]
 wat = "1"
 base64 = "0.22"
+# Path-only (no version) on purpose: the server crate is `publish = false`,
+# and cargo strips versionless path dev-deps at publish time. Used by the
+# `store_server_e2e` test to drive the real `HttpEnvironmentStore` client
+# against a real operator-store-server listener.
+greentic-operator-store-server = { path = "crates/greentic-operator-store-server" }
+axum = "0.8"

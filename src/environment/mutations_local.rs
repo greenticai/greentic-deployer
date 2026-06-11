@@ -16,6 +16,7 @@ use std::path::Path;
 use chrono::Utc;
 use greentic_distributor_client::signing::TrustedKey;
 
+use greentic_deploy_spec::engine::{self, EngineError};
 use greentic_deploy_spec::{
     BundleDeployment, BundleDeploymentStatus, BundleId, CapabilitySlot, DeploymentId, EnvId,
     EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding, HealthStatus,
@@ -46,6 +47,16 @@ fn fold_lifecycle_err(err: LifecycleError) -> StoreError {
     match err {
         LifecycleError::Store(inner) => inner,
         other => StoreError::Lifecycle(Box::new(other)),
+    }
+}
+
+/// Map a pure-engine failure onto the local store's error surface. The
+/// operator-store-server maps the same [`EngineError`]s onto
+/// `RemoteStoreError` — both sides share the transform, each owns its
+/// error vocabulary.
+fn map_engine_err(err: EngineError) -> StoreError {
+    match err {
+        EngineError::NotFound(id) => StoreError::NotFound(id),
     }
 }
 
@@ -87,7 +98,7 @@ impl LocalFsStore {
                 Err(StoreError::NotFound(_)) => {}
                 Err(e) => return Err(e),
             }
-            let env = fresh_environment(
+            let env = engine::fresh_environment(
                 locked.env_id(),
                 name,
                 host_config,
@@ -117,17 +128,7 @@ impl LocalFsStore {
     ) -> Result<Environment, StoreError> {
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            if let Some(name) = patch.name {
-                env.name = name;
-            }
-            patch.region.apply_to(&mut env.host_config.region);
-            patch
-                .tenant_org_id
-                .apply_to(&mut env.host_config.tenant_org_id);
-            patch.listen_addr.apply_to(&mut env.host_config.listen_addr);
-            patch
-                .public_base_url
-                .apply_to(&mut env.host_config.public_base_url);
+            engine::apply_environment_update(&mut env, patch);
             locked.save(&env)?;
             Ok(env)
         })
@@ -162,46 +163,22 @@ impl LocalFsStore {
             seed_if_missing,
         } = payload;
         self.transact(target_env_id, |locked| {
-            let mut target_env = match locked.load() {
-                Ok(env) => env,
-                Err(StoreError::NotFound(id)) => match seed_if_missing {
-                    Some(seed) => fresh_environment(
-                        locked.env_id(),
-                        locked.env_id().as_str().to_string(),
-                        seed.host_config,
-                        seed.revocation,
-                        seed.retention,
-                        seed.health,
-                    ),
-                    None => return Err(StoreError::NotFound(id)),
-                },
+            let existing = match locked.load() {
+                Ok(env) => Some(env),
+                Err(StoreError::NotFound(_)) => None,
                 Err(e) => return Err(e),
             };
-            let mut added_slots = Vec::new();
-            for binding in packs {
-                if target_env.packs.iter().any(|b| b.slot == binding.slot) {
-                    continue;
-                }
-                added_slots.push(binding.slot.to_string());
-                target_env.packs.push(binding);
-            }
+            let mut target_env =
+                engine::seed_or_existing(existing, locked.env_id(), seed_if_missing)
+                    .map_err(map_engine_err)?;
             // Extension bindings (`Path 3`) are light, referentially
-            // independent state — like `packs`, they migrate. Merge by
-            // `(kind.path(), instance_id)`, preserving any binding the
-            // target already carries. (`messaging_endpoints` are NOT
-            // migrated here: they reference `linked_bundles` that don't
-            // migrate, so a blind copy would break referential integrity.)
-            let mut added_extensions = Vec::new();
-            for ext in extensions {
-                let key = ExtensionKey::from_binding(&ext);
-                if target_env.extensions.iter().any(|e| key.matches(e)) {
-                    continue;
-                }
-                added_extensions.push(key.to_string());
-                target_env.extensions.push(ext);
-            }
+            // independent state — like `packs`, they migrate.
+            // (`messaging_endpoints` are NOT migrated: they reference
+            // `linked_bundles` that don't migrate, so a blind copy would
+            // break referential integrity.)
+            let report = engine::merge_bindings(&mut target_env, packs, extensions);
             locked.save(&target_env)?;
-            Ok((added_slots, added_extensions))
+            Ok((report.merged_slots, report.merged_extensions))
         })
     }
 
@@ -1895,45 +1872,8 @@ fn validate_welcome_pack_id_store(
     )))
 }
 
-/// Build an empty [`Environment`] at the current `ENVIRONMENT_V1` schema
-/// with the supplied `host_config` + policy state. All collection fields
-/// start empty and `credentials_ref` is `None` — populated downstream by
-/// the binding verbs. Shared by `create_environment` (which passes
-/// `Default::default()` for revocation/retention/health) and
-/// `migrate_merge_bindings`' seed branch (which threads the source's
-/// existing policy state through).
-///
-/// Centralizing this prevents the two seed sites from drifting when a new
-/// `Environment` field lands — both currently must zero/default it, and
-/// missing one site is the silent-zero-value footgun.
-fn fresh_environment(
-    env_id: &EnvId,
-    name: String,
-    host_config: EnvironmentHostConfig,
-    revocation: RevocationConfig,
-    retention: RetentionPolicy,
-    health: HealthStatus,
-) -> Environment {
-    Environment {
-        schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
-        environment_id: env_id.clone(),
-        name,
-        host_config: EnvironmentHostConfig {
-            env_id: env_id.clone(),
-            ..host_config
-        },
-        packs: Vec::new(),
-        credentials_ref: None,
-        bundles: Vec::new(),
-        revisions: Vec::new(),
-        traffic_splits: Vec::new(),
-        messaging_endpoints: Vec::new(),
-        extensions: Vec::new(),
-        revocation,
-        retention,
-        health,
-    }
-}
+// `fresh_environment` moved to `greentic_deploy_spec::engine` (PR-4.2a) so
+// the operator-store-server seeds envs identically.
 
 /// Persist `op_key` as a trusted entry on `env_dir`'s trust root and shape
 /// the typed [`TrustRootSeed`] outcome. Shared body of `bootstrap_trust_root`

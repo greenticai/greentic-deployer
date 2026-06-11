@@ -74,16 +74,14 @@
 //! - PR-3c wires dispatch between `LocalFsStore` and `HttpEnvironmentStore`
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use greentic_deploy_spec::{
     AuditDecision, AuditEvent, AuditResult, BundleDeployment, BundleDeploymentStatus, BundleId,
     CapabilitySlot, CustomerId, DeploymentId, EnvId, EnvPackBinding, Environment,
-    EnvironmentHostConfig, ExtensionBinding, HealthStatus, IdempotencyKey, IdempotencyOutcome,
-    MessagingEndpoint, MessagingEndpointId, PackId, PackListEntry, RemoteStoreError,
-    RetentionPolicy, RevenueShareEntry, Revision, RevisionId, RevisionLifecycle, RevocationConfig,
-    RouteBinding, StateEtag, TrafficSplit, TrafficSplitEntry,
+    EnvironmentHostConfig, ExtensionBinding, IdempotencyKey, IdempotencyOutcome, MessagingEndpoint,
+    MessagingEndpointId, PackId, PackListEntry, RemoteStoreError, RevenueShareEntry, Revision,
+    RevisionId, RevisionLifecycle, RouteBinding, StateEtag, TrafficSplit, TrafficSplitEntry,
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::Client;
@@ -93,7 +91,7 @@ use url::Url;
 
 use super::mutations::{
     AddBundlePayload, AddMessagingEndpointPayload, ApplyTrafficSplitOutcome, EnvironmentMutations,
-    ExtensionKey, FieldUpdate, MigrateMergePayload, RemoveBundleOutcome, RevisionTransitionOutcome,
+    ExtensionKey, MigrateMergePayload, RemoveBundleOutcome, RevisionTransitionOutcome,
     RollbackTrafficSplitOutcome, SetMessagingWelcomeFlowPayload, StageRevisionPayload,
     TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed, UpdateBundlePayload,
     UpdateEnvironmentPayload, WarmRevisionPayload,
@@ -577,6 +575,10 @@ fn map_remote_error(err: RemoteStoreError) -> StoreError {
         RemoteStoreError::Unauthorized { policy, reason } => {
             StoreError::Unauthorized { policy, reason }
         }
+        // Same noun the local impl uses for create-on-existing — the CLI
+        // mapper downcasts `Conflict` uniformly across backends.
+        RemoteStoreError::AlreadyExists { detail } => StoreError::Conflict(detail),
+        RemoteStoreError::InvalidRequest { detail } => StoreError::InvalidArgument(detail),
         RemoteStoreError::IntegrityMismatch { expected, actual } => StoreError::InvalidArgument(
             format!("integrity mismatch: expected {expected}, computed {actual}"),
         ),
@@ -595,93 +597,12 @@ fn map_remote_error(err: RemoteStoreError) -> StoreError {
 // that do, and convert at the call boundary.
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
-struct CreateEnvironmentRequest {
-    env_id: EnvId,
-    name: String,
-    host_config: EnvironmentHostConfig,
-}
-
-/// JSON tri-state for [`FieldUpdate<T>`]: `null` = keep, `{"clear": true}` =
-/// clear, `{"value": T}` = set. Using tagged-enum serde so the server can
-/// distinguish keep (field absent / null) from clear.
-#[derive(Serialize)]
-#[serde(untagged)]
-enum WireFieldUpdate<T: Serialize> {
-    Set { value: T },
-    Clear { clear: bool },
-}
-
-#[derive(Serialize)]
-struct UpdateEnvironmentRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    region: Option<WireFieldUpdate<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tenant_org_id: Option<WireFieldUpdate<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    listen_addr: Option<WireFieldUpdate<SocketAddr>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    public_base_url: Option<WireFieldUpdate<String>>,
-}
-
-impl From<UpdateEnvironmentPayload> for UpdateEnvironmentRequest {
-    fn from(p: UpdateEnvironmentPayload) -> Self {
-        fn wire<T: Serialize>(fu: FieldUpdate<T>) -> Option<WireFieldUpdate<T>> {
-            match fu {
-                FieldUpdate::Keep => None,
-                FieldUpdate::Set(v) => Some(WireFieldUpdate::Set { value: v }),
-                FieldUpdate::Clear => Some(WireFieldUpdate::Clear { clear: true }),
-            }
-        }
-        Self {
-            name: p.name,
-            region: wire(p.region),
-            tenant_org_id: wire(p.tenant_org_id),
-            listen_addr: wire(p.listen_addr),
-            public_base_url: wire(p.public_base_url),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct MigrateSeedWire {
-    host_config: EnvironmentHostConfig,
-    revocation: RevocationConfig,
-    retention: RetentionPolicy,
-    health: HealthStatus,
-}
-
-#[derive(Serialize)]
-struct MigrateMergeRequest {
-    packs: Vec<EnvPackBinding>,
-    extensions: Vec<ExtensionBinding>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    seed_if_missing: Option<MigrateSeedWire>,
-}
-
-impl From<MigrateMergePayload> for MigrateMergeRequest {
-    fn from(p: MigrateMergePayload) -> Self {
-        Self {
-            packs: p.packs,
-            extensions: p.extensions,
-            seed_if_missing: p.seed_if_missing.map(|s| MigrateSeedWire {
-                host_config: s.host_config,
-                revocation: s.revocation,
-                retention: s.retention,
-                health: s.health,
-            }),
-        }
-    }
-}
-
-/// Server returns the two merge-result lists.
-#[derive(Deserialize)]
-struct MigrateMergeResponse {
-    merged_slots: Vec<String>,
-    merged_extensions: Vec<String>,
-}
+// Env-lifecycle wire shapes (`CreateEnvironmentPayload`,
+// `UpdateEnvironmentPayload`, `MigrateMergePayload`, `MergeReport`) moved to
+// `greentic_deploy_spec::engine` in PR-4.2a — the payload structs now carry
+// serde derives in the exact wire encoding this module established, so the
+// client serializes them directly and the operator-store-server deserializes
+// the same types. Remaining verb groups migrate as their routes land.
 
 #[derive(Serialize)]
 struct StageRevisionRequest {
@@ -895,7 +816,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         host_config: EnvironmentHostConfig,
     ) -> Result<Environment, StoreError> {
         let idem_key = mint_idempotency_key();
-        let req = CreateEnvironmentRequest {
+        let req = greentic_deploy_spec::CreateEnvironmentPayload {
             env_id: env_id.clone(),
             name,
             host_config,
@@ -915,13 +836,12 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         patch: UpdateEnvironmentPayload,
     ) -> Result<Environment, StoreError> {
         let idem_key = mint_idempotency_key();
-        let req: UpdateEnvironmentRequest = patch.into();
         self.send_mutation(
             env_id,
             reqwest::Method::PATCH,
             &self.env_path(env_id, ""),
             Some(&idem_key),
-            Some(&req),
+            Some(&patch),
         )
     }
 
@@ -931,8 +851,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         payload: MigrateMergePayload,
     ) -> Result<(Vec<String>, Vec<String>), StoreError> {
         let idem_key = mint_idempotency_key();
-        let req: MigrateMergeRequest = payload.into();
-        let resp: MigrateMergeResponse = self.send_mutation(
+        let resp: greentic_deploy_spec::MergeReport = self.send_mutation(
             target_env_id,
             reqwest::Method::POST,
             &format!(
@@ -940,7 +859,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
                 encode_segment(target_env_id.as_str())
             ),
             Some(&idem_key),
-            Some(&req),
+            Some(&payload),
         )?;
         Ok((resp.merged_slots, resp.merged_extensions))
     }
@@ -1578,7 +1497,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpListener;
+    use std::net::{SocketAddr, TcpListener};
     use std::sync::Arc;
 
     /// Minimal mock server: binds an ephemeral port, accepts one request,
