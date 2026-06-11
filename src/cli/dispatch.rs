@@ -412,6 +412,21 @@ pub struct EnvApplyArgs {
     /// Never mutates anything.
     #[arg(long, conflicts_with = "dry_run")]
     pub check: bool,
+    /// Never prompt — neither for missing secret values nor the plan
+    /// confirmation (implies `--yes`). Missing inputs are collected and
+    /// reported (JSON `missing` section) instead of asked for; any missing
+    /// input fails the apply before it mutates.
+    #[arg(long = "non-interactive")]
+    pub non_interactive: bool,
+    /// Write a skeleton `greentic.env-manifest.v1` document to PATH and
+    /// exit — a starting point for `--answers`. Needs no manifest and
+    /// touches no store state.
+    #[arg(
+        long = "emit-answers-template",
+        value_name = "PATH",
+        conflicts_with_all = ["dry_run", "check"]
+    )]
+    pub emit_answers_template: Option<PathBuf>,
     /// Audit principal forwarded to every composed mutation. Defaults to
     /// `env-apply`.
     #[arg(long = "updated-by")]
@@ -423,16 +438,23 @@ pub struct EnvApplyArgs {
 }
 
 impl EnvApplyArgs {
-    /// clap's `conflicts_with` guarantees at most one of `--dry-run` /
-    /// `--check` is set.
-    fn mode(&self) -> super::env_apply::ApplyMode {
+    fn into_options(self) -> super::env_apply::ApplyOptions {
         use super::env_apply::ApplyMode;
-        if self.check {
+        // clap's `conflicts_with` guarantees at most one of `--dry-run` /
+        // `--check` is set.
+        let mode = if self.check {
             ApplyMode::Check
         } else if self.dry_run {
             ApplyMode::DryRun
         } else {
             ApplyMode::Apply
+        };
+        super::env_apply::ApplyOptions {
+            mode,
+            updated_by: self.updated_by,
+            yes: self.yes,
+            non_interactive: self.non_interactive,
+            emit_answers_template: self.emit_answers_template,
         }
     }
 }
@@ -927,9 +949,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
 fn dispatch_env(store: &LocalFsStore, flags: &OpFlags, verb: EnvVerb) -> Result<(), OpError> {
     let outcome = match verb {
         EnvVerb::Init(args) => super::env::init(store, flags, args.into_payload(flags)?)?,
-        EnvVerb::Apply(args) => {
-            super::env_apply::apply(store, flags, args.mode(), args.updated_by, args.yes)?
-        }
+        EnvVerb::Apply(args) => super::env_apply::apply(store, flags, args.into_options())?,
         EnvVerb::Create(args) => {
             super::env::create(store, flags, args.into_payload("create", flags)?)?
         }

@@ -228,6 +228,53 @@ impl EnvManifest {
     }
 }
 
+/// Skeleton manifest for `op env apply --emit-answers-template`: one worked
+/// example entry per section, ready to edit. Secret entries name an
+/// environment VARIABLE (`from_env`) — values never appear in a manifest.
+///
+/// A verbatim literal (not a serialized [`EnvManifest`]) so the emitted
+/// file keeps the authoring order (`schema` first) instead of serde_json's
+/// alphabetical keys. Guarded by a round-trip test: the template must
+/// deserialize through [`EnvManifest`] (`deny_unknown_fields`) and pass
+/// [`EnvManifest::validate_shape`], so template and types cannot drift.
+pub const MANIFEST_TEMPLATE_JSON: &str = r#"{
+  "schema": "greentic.env-manifest.v1",
+  "environment": {
+    "id": "local",
+    "public_base_url": null
+  },
+  "trust_root": "bootstrap",
+  "secrets": [
+    {
+      "path": "default/_/messaging-telegram/telegram_bot_token",
+      "from_env": "TELEGRAM_BOT_TOKEN"
+    }
+  ],
+  "bundles": [
+    {
+      "bundle_id": "example-bundle",
+      "bundle_path": "example-bundle.gtbundle",
+      "route_binding": {
+        "path_prefixes": ["/example"],
+        "tenant_selector": { "tenant": "default", "team": "default" }
+      }
+    }
+  ],
+  "messaging_endpoints": [
+    {
+      "name": "example-endpoint",
+      "provider_type": "messaging.telegram.bot",
+      "links": ["example-bundle"],
+      "welcome_flow": {
+        "bundle_id": "example-bundle",
+        "pack_id": "example-pack",
+        "flow_id": "main"
+      }
+    }
+  ]
+}
+"#;
+
 /// Hand-written JSON Schema for the manifest (`op env apply --schema`),
 /// following the existing convention (A1 schemars wiring is still deferred).
 pub fn manifest_schema() -> Value {
@@ -503,6 +550,25 @@ mod tests {
         .unwrap();
         assert_eq!(manifest.trust_root, Some(TrustRootDirective::Bootstrap));
         manifest.validate_shape().expect("valid");
+    }
+
+    #[test]
+    fn template_round_trips_through_manifest_and_shape_validation() {
+        // The `--emit-answers-template` skeleton and the serde types must
+        // never drift: the template parses under `deny_unknown_fields` AND
+        // passes shape validation (canonical secret path, route binding
+        // rules, ...) as-is.
+        let manifest: EnvManifest =
+            serde_json::from_str(MANIFEST_TEMPLATE_JSON).expect("template parses as EnvManifest");
+        manifest
+            .validate_shape()
+            .expect("template passes validate_shape");
+        assert_eq!(manifest.schema, ENV_MANIFEST_SCHEMA_V1);
+        // Every section carries a worked example.
+        assert_eq!(manifest.trust_root, Some(TrustRootDirective::Bootstrap));
+        assert!(!manifest.secrets.is_empty());
+        assert!(!manifest.bundles.is_empty());
+        assert!(!manifest.messaging_endpoints.is_empty());
     }
 
     #[test]
