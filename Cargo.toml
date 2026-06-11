@@ -89,6 +89,12 @@ ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "zeroize"] }
 zeroize = "1"
 rand = "0.9"
 libc = "0.2"
+# Env-manifest authoring form (PR-5, `plans/operator-surface-unification.md`):
+# `manifest_form_spec()` / `answers_to_manifest()` are typed lib API, so this
+# is a runtime dep now (it was dev-only for the C6 env-pack YAML round-trip
+# tests; the env-pack trait still carries raw YAML). Already in the runtime
+# graph via greentic-bundle -> greentic-qa-lib, so this adds no new crates.
+qa-spec = ">=1.1.0-dev, <1.2.0-0"
 
 [dependencies.clap]
 version = "4.5"
@@ -215,8 +221,3 @@ version = "3"
 [dev-dependencies]
 wat = "1"
 base64 = "0.22"
-# C6: parse the env-pack `wizard.qaspec.yaml` files at test time to prove
-# the shipped YAML deserializes into `qa_spec::FormSpec`. NOT a runtime
-# dep — the trait carries raw YAML (`&'static str`), so the lib stays
-# qa-spec-free; the operator parses at the call site.
-qa-spec = ">=1.1.0-dev, <1.2.0-0"

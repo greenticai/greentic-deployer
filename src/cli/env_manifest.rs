@@ -17,11 +17,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use qa_spec::spec::ListSpec;
+use qa_spec::spec::question::QuestionPolicy;
+use qa_spec::{AnswerSet, FormSpec, QuestionSpec, QuestionType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::OpError;
-use super::bundles::RouteBindingPayload;
+use super::bundles::{RouteBindingPayload, TenantSelectorPayload};
 
 /// Exact `schema` discriminator the manifest must carry.
 pub const ENV_MANIFEST_SCHEMA_V1: &str = "greentic.env-manifest.v1";
@@ -364,6 +367,519 @@ pub fn manifest_schema() -> Value {
     })
 }
 
+/// Form id of the env-manifest authoring form ([`manifest_form_spec`]).
+pub const ENV_MANIFEST_FORM_ID: &str = "greentic.env-manifest";
+
+/// Version paired with [`ENV_MANIFEST_FORM_ID`]. Answer sets carry it and
+/// [`answers_to_manifest`] rejects a mismatch — bump it whenever the
+/// question set changes shape, so stale answer files fail loudly instead of
+/// converting wrong.
+pub const ENV_MANIFEST_FORM_VERSION: &str = "1";
+
+/// The one `qa_spec::FormSpec` for authoring a manifest. The greentic-setup
+/// terminal wizard, the future web UI, and Adaptive-Card front-ends all
+/// render these same questions; [`answers_to_manifest`] converts the
+/// resulting [`AnswerSet`] into a typed [`EnvManifest`] — the manifest stays
+/// the durable artifact, answers are an input mechanism.
+///
+/// Conventions (each pinned by a test):
+/// - Repeating manifest sections (`secrets[]`, `bundles[]`,
+///   `messaging_endpoints[]`) are `List` questions; an answer is an array of
+///   objects keyed by the row field ids.
+/// - Secret-adjacent questions ask for the env-var NAME (`from_env`), never
+///   a value — no question carries `secret: true`. Unset variables are the
+///   apply engine's concern (missing-inputs contract + TTY fill-in).
+/// - `required` is the manifest's validation truth, and doubles as the
+///   normal-mode marker under greentic-setup's `advanced || required`
+///   wizard filter: fields the manifest allows to be absent
+///   (`public_base_url`, `customer_id`, `config_overrides`, route binding,
+///   welcome flow, …) are `required: false` and surface in advanced mode.
+///   The three `List` sections and `trust_root_bootstrap` are `required`
+///   so the wizard walks them; an empty array / `false` answer is valid.
+/// - Nested string arrays (`links`, `route_path_prefixes`, …) are
+///   comma-separated `String` questions — qa-spec `List` rows cannot nest
+///   lists. [`answers_to_manifest`] owns the split.
+pub fn manifest_form_spec() -> FormSpec {
+    let mut environment_id = question(
+        "environment_id",
+        QuestionType::String,
+        "Environment id",
+        "Environment to apply to. v1 apply can bootstrap only `local`; any \
+         other id must already exist.",
+        true,
+    );
+    environment_id.default_value = Some("local".to_string());
+
+    let public_base_url = question(
+        "public_base_url",
+        QuestionType::String,
+        "Public base URL",
+        "Origin-only URL persisted on the environment (e.g. \
+         https://bots.example.com). Leave empty to keep the current value.",
+        false,
+    );
+
+    let mut trust_root_bootstrap = question(
+        "trust_root_bootstrap",
+        QuestionType::Boolean,
+        "Bootstrap the trust root?",
+        "Seed the environment trust root with the local operator key \
+         (idempotent; required once before bundles can be staged).",
+        true,
+    );
+    trust_root_bootstrap.default_value = Some("true".to_string());
+
+    let mut secrets = question(
+        "secrets",
+        QuestionType::List,
+        "Secrets",
+        "Dev-store secret entries. Each names the environment VARIABLE \
+         holding the value — values never go into a manifest.",
+        true,
+    );
+    secrets.list = Some(ListSpec {
+        min_items: None,
+        max_items: None,
+        fields: vec![
+            question(
+                "path",
+                QuestionType::String,
+                "Secret path",
+                "`<tenant>/<team>/<pack>/<name>`, e.g. \
+                 default/_/messaging-telegram/telegram_bot_token",
+                true,
+            ),
+            question(
+                "from_env",
+                QuestionType::String,
+                "Environment variable name",
+                "Name of the variable holding the secret value (e.g. \
+                 TELEGRAM_BOT_TOKEN) — the name, never the value.",
+                true,
+            ),
+        ],
+    });
+
+    let mut bundles = question(
+        "bundles",
+        QuestionType::List,
+        "Bundles",
+        "Bundle deployments for this environment.",
+        true,
+    );
+    bundles.list = Some(ListSpec {
+        min_items: None,
+        max_items: None,
+        fields: vec![
+            question(
+                "bundle_id",
+                QuestionType::String,
+                "Bundle id",
+                "Natural key — unique within the manifest.",
+                true,
+            ),
+            question(
+                "bundle_path",
+                QuestionType::String,
+                "Bundle path",
+                "Local `.gtbundle`. Relative paths resolve against the \
+                 manifest file's directory.",
+                true,
+            ),
+            question(
+                "customer_id",
+                QuestionType::String,
+                "Customer id",
+                "Billing principal — required by apply for non-`local` \
+                 environments.",
+                false,
+            ),
+            question(
+                "config_overrides",
+                QuestionType::String,
+                "Config overrides (JSON)",
+                "JSON object `{\"<pack_id>\": {\"<key>\": <value>}}`. Empty \
+                 = leave untouched; `{}` = explicit clear.",
+                false,
+            ),
+            question(
+                "route_hosts",
+                QuestionType::String,
+                "Route hosts",
+                "Comma-separated host names for the route binding.",
+                false,
+            ),
+            question(
+                "route_path_prefixes",
+                QuestionType::String,
+                "Route path prefixes",
+                "Comma-separated HTTP path prefixes, each starting with `/` \
+                 (e.g. /legal).",
+                false,
+            ),
+            question(
+                "route_tenant",
+                QuestionType::String,
+                "Route tenant",
+                "Tenant for the route binding's tenant selector — set \
+                 together with `route_team`.",
+                false,
+            ),
+            question(
+                "route_team",
+                QuestionType::String,
+                "Route team",
+                "Team for the route binding's tenant selector — set \
+                 together with `route_tenant`.",
+                false,
+            ),
+        ],
+    });
+
+    let mut messaging_endpoints = question(
+        "messaging_endpoints",
+        QuestionType::List,
+        "Messaging endpoints",
+        "Messaging endpoints and their bundle links.",
+        true,
+    );
+    messaging_endpoints.list = Some(ListSpec {
+        min_items: None,
+        max_items: None,
+        fields: vec![
+            question(
+                "name",
+                QuestionType::String,
+                "Endpoint name",
+                "Manifest-local handle and display name. Upsert key \
+                 together with the provider type.",
+                true,
+            ),
+            question(
+                "provider_type",
+                QuestionType::String,
+                "Provider type",
+                "Provider class, e.g. messaging.telegram.bot.",
+                true,
+            ),
+            question(
+                "links",
+                QuestionType::String,
+                "Linked bundle ids",
+                "Comma-separated `bundle_id`s this endpoint admits.",
+                false,
+            ),
+            question(
+                "welcome_bundle_id",
+                QuestionType::String,
+                "Welcome flow: bundle id",
+                "Set the three welcome_* fields together (or none).",
+                false,
+            ),
+            question(
+                "welcome_pack_id",
+                QuestionType::String,
+                "Welcome flow: pack id",
+                "Set the three welcome_* fields together (or none).",
+                false,
+            ),
+            question(
+                "welcome_flow_id",
+                QuestionType::String,
+                "Welcome flow: flow id",
+                "Set the three welcome_* fields together (or none).",
+                false,
+            ),
+            question(
+                "secret_refs",
+                QuestionType::String,
+                "Secret refs",
+                "Comma-separated secret refs forwarded on endpoint create.",
+                false,
+            ),
+        ],
+    });
+
+    FormSpec {
+        id: ENV_MANIFEST_FORM_ID.to_string(),
+        title: "Environment setup".to_string(),
+        version: ENV_MANIFEST_FORM_VERSION.to_string(),
+        description: Some(format!(
+            "Authors a `{ENV_MANIFEST_SCHEMA_V1}` manifest — the durable, \
+             re-appliable desired-state document for one environment."
+        )),
+        presentation: None,
+        progress_policy: None,
+        secrets_policy: None,
+        store: Vec::new(),
+        validations: Vec::new(),
+        includes: Vec::new(),
+        questions: vec![
+            environment_id,
+            public_base_url,
+            trust_root_bootstrap,
+            secrets,
+            bundles,
+            messaging_endpoints,
+        ],
+    }
+}
+
+/// All-defaults [`QuestionSpec`] except the five fields every question sets.
+fn question(
+    id: &str,
+    kind: QuestionType,
+    title: &str,
+    description: &str,
+    required: bool,
+) -> QuestionSpec {
+    QuestionSpec {
+        id: id.to_string(),
+        kind,
+        title: title.to_string(),
+        title_i18n: None,
+        description: Some(description.to_string()),
+        description_i18n: None,
+        required,
+        choices: None,
+        default_value: None,
+        secret: false,
+        visible_if: None,
+        constraint: None,
+        list: None,
+        computed: None,
+        policy: QuestionPolicy::default(),
+        computed_overridable: false,
+    }
+}
+
+/// Convert a [`manifest_form_spec`] answer set into a typed [`EnvManifest`].
+///
+/// Pure conversion: errors only on values that cannot map onto the manifest
+/// types (wrong JSON type, half-set field pairs, unparseable
+/// `config_overrides`). Callers run `qa_spec::validate` on the answers
+/// first for required/constraint enforcement, and the apply engine runs
+/// [`EnvManifest::validate_shape`] on the result — this function does not
+/// duplicate either. Lenient on absence (missing sections → empty) so a
+/// minimal hand-written answers file converts.
+pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> {
+    if answers.form_id != ENV_MANIFEST_FORM_ID {
+        return Err(OpError::InvalidArgument(format!(
+            "answers form_id `{}` is not `{ENV_MANIFEST_FORM_ID}`",
+            answers.form_id
+        )));
+    }
+    if answers.spec_version != ENV_MANIFEST_FORM_VERSION {
+        return Err(OpError::InvalidArgument(format!(
+            "answers spec_version `{}` is not `{ENV_MANIFEST_FORM_VERSION}` \
+             — re-run the wizard against the current form",
+            answers.spec_version
+        )));
+    }
+    let map = answers
+        .answers
+        .as_object()
+        .ok_or_else(|| OpError::InvalidArgument("answers must be a JSON object".to_string()))?;
+
+    let environment_id = opt_string(map, "environment_id")?.ok_or_else(|| {
+        OpError::InvalidArgument("answers: environment_id must be a non-empty string".to_string())
+    })?;
+    let public_base_url = opt_string(map, "public_base_url")?;
+    let trust_root = match map.get("trust_root_bootstrap") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => None,
+        Some(Value::Bool(true)) => Some(TrustRootDirective::Bootstrap),
+        Some(other) => {
+            return Err(OpError::InvalidArgument(format!(
+                "answers: trust_root_bootstrap must be a boolean, got {other}"
+            )));
+        }
+    };
+
+    let mut secrets = Vec::new();
+    for (idx, row) in rows(map, "secrets")?.iter().enumerate() {
+        let row = row_object("secrets", idx, row)?;
+        secrets.push(ManifestSecret {
+            path: req_row_string("secrets", idx, row, "path")?,
+            from_env: req_row_string("secrets", idx, row, "from_env")?,
+        });
+    }
+
+    let mut bundles = Vec::new();
+    for (idx, row) in rows(map, "bundles")?.iter().enumerate() {
+        let row = row_object("bundles", idx, row)?;
+        let bundle_id = req_row_string("bundles", idx, row, "bundle_id")?;
+        let config_overrides = match opt_row_string("bundles", idx, row, "config_overrides")? {
+            None => None,
+            Some(raw) => Some(
+                serde_json::from_str::<BTreeMap<String, BTreeMap<String, Value>>>(&raw).map_err(
+                    |err| {
+                        OpError::InvalidArgument(format!(
+                            "answers: bundles[{idx}] (`{bundle_id}`): config_overrides is \
+                             not a `<pack_id> -> <key> -> <value>` JSON object: {err}"
+                        ))
+                    },
+                )?,
+            ),
+        };
+        let hosts = split_csv(opt_row_string("bundles", idx, row, "route_hosts")?);
+        let path_prefixes = split_csv(opt_row_string("bundles", idx, row, "route_path_prefixes")?);
+        let tenant_selector = match (
+            opt_row_string("bundles", idx, row, "route_tenant")?,
+            opt_row_string("bundles", idx, row, "route_team")?,
+        ) {
+            (Some(tenant), Some(team)) => Some(TenantSelectorPayload { tenant, team }),
+            (None, None) => None,
+            _ => {
+                return Err(OpError::InvalidArgument(format!(
+                    "answers: bundles[{idx}] (`{bundle_id}`): set route_tenant and \
+                     route_team together (or neither)"
+                )));
+            }
+        };
+        let route_binding =
+            if hosts.is_empty() && path_prefixes.is_empty() && tenant_selector.is_none() {
+                None
+            } else {
+                Some(RouteBindingPayload {
+                    hosts,
+                    path_prefixes,
+                    tenant_selector,
+                })
+            };
+        bundles.push(ManifestBundle {
+            bundle_id,
+            bundle_path: PathBuf::from(req_row_string("bundles", idx, row, "bundle_path")?),
+            customer_id: opt_row_string("bundles", idx, row, "customer_id")?,
+            config_overrides,
+            route_binding,
+        });
+    }
+
+    let mut messaging_endpoints = Vec::new();
+    for (idx, row) in rows(map, "messaging_endpoints")?.iter().enumerate() {
+        let row = row_object("messaging_endpoints", idx, row)?;
+        let name = req_row_string("messaging_endpoints", idx, row, "name")?;
+        let welcome_flow = match (
+            opt_row_string("messaging_endpoints", idx, row, "welcome_bundle_id")?,
+            opt_row_string("messaging_endpoints", idx, row, "welcome_pack_id")?,
+            opt_row_string("messaging_endpoints", idx, row, "welcome_flow_id")?,
+        ) {
+            (Some(bundle_id), Some(pack_id), Some(flow_id)) => Some(ManifestWelcomeFlow {
+                bundle_id,
+                pack_id,
+                flow_id,
+            }),
+            (None, None, None) => None,
+            _ => {
+                return Err(OpError::InvalidArgument(format!(
+                    "answers: messaging_endpoints[{idx}] (`{name}`): set \
+                     welcome_bundle_id, welcome_pack_id and welcome_flow_id \
+                     together (or none)"
+                )));
+            }
+        };
+        messaging_endpoints.push(ManifestEndpoint {
+            name,
+            provider_type: req_row_string("messaging_endpoints", idx, row, "provider_type")?,
+            links: split_csv(opt_row_string("messaging_endpoints", idx, row, "links")?),
+            welcome_flow,
+            secret_refs: split_csv(opt_row_string(
+                "messaging_endpoints",
+                idx,
+                row,
+                "secret_refs",
+            )?),
+        });
+    }
+
+    Ok(EnvManifest {
+        schema: ENV_MANIFEST_SCHEMA_V1.to_string(),
+        environment: ManifestEnvironment {
+            id: environment_id,
+            public_base_url,
+        },
+        trust_root,
+        secrets,
+        bundles,
+        messaging_endpoints,
+    })
+}
+
+/// A `List` answer: absent/null → empty, anything but an array → error.
+fn rows<'a>(map: &'a serde_json::Map<String, Value>, key: &str) -> Result<&'a [Value], OpError> {
+    const EMPTY: &[Value] = &[];
+    match map.get(key) {
+        None | Some(Value::Null) => Ok(EMPTY),
+        Some(Value::Array(items)) => Ok(items.as_slice()),
+        Some(other) => Err(OpError::InvalidArgument(format!(
+            "answers: {key} must be an array, got {other}"
+        ))),
+    }
+}
+
+fn row_object<'a>(
+    section: &str,
+    idx: usize,
+    row: &'a Value,
+) -> Result<&'a serde_json::Map<String, Value>, OpError> {
+    row.as_object().ok_or_else(|| {
+        OpError::InvalidArgument(format!(
+            "answers: {section}[{idx}] must be an object, got {row}"
+        ))
+    })
+}
+
+/// Optional string answer: absent/null/blank → `None`; non-string → error.
+fn opt_string(map: &serde_json::Map<String, Value>, key: &str) -> Result<Option<String>, OpError> {
+    match map.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
+        }
+        Some(other) => Err(OpError::InvalidArgument(format!(
+            "answers: {key} must be a string, got {other}"
+        ))),
+    }
+}
+
+fn opt_row_string(
+    section: &str,
+    idx: usize,
+    row: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, OpError> {
+    opt_string(row, key).map_err(|_| {
+        OpError::InvalidArgument(format!("answers: {section}[{idx}].{key} must be a string"))
+    })
+}
+
+fn req_row_string(
+    section: &str,
+    idx: usize,
+    row: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<String, OpError> {
+    opt_row_string(section, idx, row, key)?.ok_or_else(|| {
+        OpError::InvalidArgument(format!(
+            "answers: {section}[{idx}].{key} must be a non-empty string"
+        ))
+    })
+}
+
+/// Split a comma-separated answer into trimmed, non-empty entries.
+fn split_csv(value: Option<String>) -> Vec<String> {
+    value
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,5 +1142,397 @@ mod tests {
         assert_eq!(manifest.secrets.len(), 2);
         assert_eq!(manifest.bundles.len(), 2);
         assert_eq!(manifest.messaging_endpoints.len(), 2);
+    }
+
+    /// Composite id (`list.field`) for every question, the same notation the
+    /// coverage table uses.
+    fn question_ids(spec: &FormSpec) -> BTreeSet<String> {
+        let mut ids = BTreeSet::new();
+        for q in &spec.questions {
+            match &q.list {
+                Some(list) => {
+                    for field in &list.fields {
+                        assert!(
+                            ids.insert(format!("{}.{}", q.id, field.id)),
+                            "duplicate question id {}.{}",
+                            q.id,
+                            field.id
+                        );
+                    }
+                }
+                None => {
+                    assert!(ids.insert(q.id.clone()), "duplicate question id {}", q.id);
+                }
+            }
+        }
+        ids
+    }
+
+    fn answers(value: Value) -> AnswerSet {
+        AnswerSet {
+            form_id: ENV_MANIFEST_FORM_ID.to_string(),
+            spec_version: ENV_MANIFEST_FORM_VERSION.to_string(),
+            answers: value,
+            meta: None,
+        }
+    }
+
+    #[test]
+    fn form_spec_never_asks_for_secret_values() {
+        // The design rule: secret questions ask for env-var NAMES, so no
+        // question is secret-flagged and every List question carries its row
+        // definition.
+        let spec = manifest_form_spec();
+        for q in &spec.questions {
+            assert!(!q.secret, "`{}` must not be a secret question", q.id);
+            match q.kind {
+                QuestionType::List => {
+                    let list = q.list.as_ref().unwrap_or_else(|| {
+                        panic!("List question `{}` is missing its row definition", q.id)
+                    });
+                    assert!(!list.fields.is_empty(), "`{}` has no row fields", q.id);
+                    for field in &list.fields {
+                        assert!(!field.secret, "`{}.{}` must not be secret", q.id, field.id);
+                    }
+                }
+                _ => assert!(q.list.is_none(), "`{}` is not a List but has rows", q.id),
+            }
+        }
+    }
+
+    #[test]
+    fn required_marks_the_normal_mode_surface() {
+        // `required` is validation truth AND the normal-mode marker under
+        // greentic-setup's `advanced || required` wizard filter. Everything
+        // the manifest allows to be absent must stay non-required.
+        let spec = manifest_form_spec();
+        let mut required = BTreeSet::new();
+        for q in &spec.questions {
+            if q.required {
+                required.insert(q.id.clone());
+            }
+            for field in q.list.iter().flat_map(|l| &l.fields) {
+                if field.required {
+                    required.insert(format!("{}.{}", q.id, field.id));
+                }
+            }
+        }
+        let expected: BTreeSet<String> = [
+            "environment_id",
+            "trust_root_bootstrap",
+            "secrets",
+            "secrets.path",
+            "secrets.from_env",
+            "bundles",
+            "bundles.bundle_id",
+            "bundles.bundle_path",
+            "messaging_endpoints",
+            "messaging_endpoints.name",
+            "messaging_endpoints.provider_type",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(required, expected);
+    }
+
+    #[test]
+    fn form_questions_and_manifest_fields_cover_each_other() {
+        // Bidirectional drift guard: every manifest field (leaf of
+        // `manifest_schema()`) maps to a question, and every question maps
+        // to a manifest field. Adding a field to the manifest or a question
+        // to the form fails this test until the mapping (and the
+        // counterpart) exists. `""` marks fields `answers_to_manifest`
+        // produces as constants.
+        const FIELD_TO_QUESTION: &[(&str, &str)] = &[
+            ("schema", ""),
+            ("environment.id", "environment_id"),
+            ("environment.public_base_url", "public_base_url"),
+            ("trust_root", "trust_root_bootstrap"),
+            ("secrets[].path", "secrets.path"),
+            ("secrets[].from_env", "secrets.from_env"),
+            ("bundles[].bundle_id", "bundles.bundle_id"),
+            ("bundles[].bundle_path", "bundles.bundle_path"),
+            ("bundles[].customer_id", "bundles.customer_id"),
+            ("bundles[].config_overrides", "bundles.config_overrides"),
+            ("bundles[].route_binding.hosts", "bundles.route_hosts"),
+            (
+                "bundles[].route_binding.path_prefixes",
+                "bundles.route_path_prefixes",
+            ),
+            (
+                "bundles[].route_binding.tenant_selector.tenant",
+                "bundles.route_tenant",
+            ),
+            (
+                "bundles[].route_binding.tenant_selector.team",
+                "bundles.route_team",
+            ),
+            ("messaging_endpoints[].name", "messaging_endpoints.name"),
+            (
+                "messaging_endpoints[].provider_type",
+                "messaging_endpoints.provider_type",
+            ),
+            ("messaging_endpoints[].links", "messaging_endpoints.links"),
+            (
+                "messaging_endpoints[].welcome_flow.bundle_id",
+                "messaging_endpoints.welcome_bundle_id",
+            ),
+            (
+                "messaging_endpoints[].welcome_flow.pack_id",
+                "messaging_endpoints.welcome_pack_id",
+            ),
+            (
+                "messaging_endpoints[].welcome_flow.flow_id",
+                "messaging_endpoints.welcome_flow_id",
+            ),
+            (
+                "messaging_endpoints[].secret_refs",
+                "messaging_endpoints.secret_refs",
+            ),
+        ];
+
+        fn collect_leaves(node: &Value, prefix: &str, out: &mut BTreeSet<String>) {
+            if let Some(items) = node.get("items") {
+                if items.get("properties").is_some() {
+                    collect_leaves(items, &format!("{prefix}[]"), out);
+                } else {
+                    out.insert(prefix.to_string());
+                }
+                return;
+            }
+            if let Some(props) = node.get("properties").and_then(Value::as_object) {
+                for (key, sub) in props {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    collect_leaves(sub, &path, out);
+                }
+                return;
+            }
+            out.insert(prefix.to_string());
+        }
+
+        let mut schema_leaves = BTreeSet::new();
+        collect_leaves(&manifest_schema(), "", &mut schema_leaves);
+        let mapped_fields: BTreeSet<String> = FIELD_TO_QUESTION
+            .iter()
+            .map(|(field, _)| field.to_string())
+            .collect();
+        assert_eq!(
+            schema_leaves, mapped_fields,
+            "manifest fields and the coverage table drifted — map every \
+             schema leaf to a question (or `\"\"` for constants)"
+        );
+
+        let mapped_questions: BTreeSet<String> = FIELD_TO_QUESTION
+            .iter()
+            .filter(|(_, q)| !q.is_empty())
+            .map(|(_, q)| q.to_string())
+            .collect();
+        assert_eq!(
+            question_ids(&manifest_form_spec()),
+            mapped_questions,
+            "form questions and the coverage table drifted — every question \
+             must map to a manifest field"
+        );
+    }
+
+    #[test]
+    fn answers_round_trip_to_valid_manifest() {
+        let spec = manifest_form_spec();
+        let set = answers(serde_json::json!({
+            "environment_id": "local",
+            "public_base_url": "https://bots.example.com",
+            "trust_root_bootstrap": true,
+            "secrets": [
+                {
+                    "path": "legal/_/messaging-telegram/telegram_bot_token",
+                    "from_env": "TELEGRAM_LEGAL_BOT_TOKEN"
+                }
+            ],
+            "bundles": [
+                {
+                    "bundle_id": "realbot-legal",
+                    "bundle_path": "bundle-workspace-legal/realbot-legal.gtbundle",
+                    "customer_id": "acme",
+                    "config_overrides": "{\"realbot\": {\"mode\": \"prod\"}}",
+                    "route_path_prefixes": "/legal, /legal-archive",
+                    "route_tenant": "legal",
+                    "route_team": "default"
+                }
+            ],
+            "messaging_endpoints": [
+                {
+                    "name": "realbot-legal",
+                    "provider_type": "messaging.telegram.bot",
+                    "links": "realbot-legal",
+                    "welcome_bundle_id": "realbot-legal",
+                    "welcome_pack_id": "realbot",
+                    "welcome_flow_id": "main"
+                }
+            ]
+        }));
+
+        let report = qa_spec::validate(&spec, &set.answers);
+        assert!(report.valid, "answers must pass the form spec: {report:?}");
+
+        let manifest = answers_to_manifest(&set).expect("converts");
+        manifest.validate_shape().expect("round-trip passes shape");
+
+        assert_eq!(manifest.environment.id, "local");
+        assert_eq!(
+            manifest.environment.public_base_url.as_deref(),
+            Some("https://bots.example.com")
+        );
+        assert_eq!(manifest.trust_root, Some(TrustRootDirective::Bootstrap));
+        assert_eq!(manifest.secrets.len(), 1);
+        assert_eq!(
+            manifest.secrets[0].from_env, "TELEGRAM_LEGAL_BOT_TOKEN",
+            "from_env carries the variable NAME"
+        );
+        let bundle = &manifest.bundles[0];
+        assert_eq!(bundle.customer_id.as_deref(), Some("acme"));
+        assert_eq!(
+            bundle.config_overrides.as_ref().unwrap()["realbot"]["mode"],
+            serde_json::json!("prod")
+        );
+        let rb = bundle.route_binding.as_ref().expect("route binding built");
+        assert_eq!(rb.path_prefixes, ["/legal", "/legal-archive"]);
+        assert!(rb.hosts.is_empty());
+        let selector = rb.tenant_selector.as_ref().expect("selector built");
+        assert_eq!(
+            (selector.tenant.as_str(), selector.team.as_str()),
+            ("legal", "default")
+        );
+        let ep = &manifest.messaging_endpoints[0];
+        assert_eq!(ep.links, ["realbot-legal"]);
+        assert_eq!(
+            ep.welcome_flow,
+            Some(ManifestWelcomeFlow {
+                bundle_id: "realbot-legal".to_string(),
+                pack_id: "realbot".to_string(),
+                flow_id: "main".to_string(),
+            })
+        );
+        assert!(ep.secret_refs.is_empty());
+    }
+
+    #[test]
+    fn minimal_answers_convert_leniently() {
+        // Conversion is lenient on absence (qa_spec::validate owns
+        // required-ness): a bare environment_id yields a valid empty
+        // manifest with no trust-root directive.
+        let manifest = answers_to_manifest(&answers(serde_json::json!({
+            "environment_id": "demo",
+            "trust_root_bootstrap": false
+        })))
+        .expect("converts");
+        manifest.validate_shape().expect("valid shape");
+        assert_eq!(manifest.environment.id, "demo");
+        assert_eq!(manifest.environment.public_base_url, None);
+        assert_eq!(manifest.trust_root, None);
+        assert!(manifest.secrets.is_empty());
+        assert!(manifest.bundles.is_empty());
+        assert!(manifest.messaging_endpoints.is_empty());
+    }
+
+    #[test]
+    fn answers_conversion_errors_name_the_gap() {
+        for (label, value, needle) in [
+            (
+                "missing environment_id",
+                serde_json::json!({}),
+                "environment_id",
+            ),
+            (
+                "tenant without team",
+                serde_json::json!({
+                    "environment_id": "local",
+                    "bundles": [{
+                        "bundle_id": "b", "bundle_path": "b.gtbundle",
+                        "route_tenant": "legal"
+                    }]
+                }),
+                "route_team",
+            ),
+            (
+                "partial welcome flow",
+                serde_json::json!({
+                    "environment_id": "local",
+                    "messaging_endpoints": [{
+                        "name": "n", "provider_type": "messaging.telegram.bot",
+                        "welcome_bundle_id": "b"
+                    }]
+                }),
+                "welcome_pack_id",
+            ),
+            (
+                "config_overrides not an object",
+                serde_json::json!({
+                    "environment_id": "local",
+                    "bundles": [{
+                        "bundle_id": "b", "bundle_path": "b.gtbundle",
+                        "config_overrides": "[1, 2]"
+                    }]
+                }),
+                "config_overrides",
+            ),
+            (
+                "row field of the wrong type",
+                serde_json::json!({
+                    "environment_id": "local",
+                    "secrets": [{"path": "a/_/p/tok", "from_env": 7}]
+                }),
+                "secrets[0].from_env",
+            ),
+        ] {
+            let err = answers_to_manifest(&answers(value)).unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "{label}: expected `{needle}` in `{err}`"
+            );
+        }
+    }
+
+    #[test]
+    fn answers_form_identity_is_checked() {
+        let mut set = answers(serde_json::json!({"environment_id": "local"}));
+        set.form_id = "something.else".to_string();
+        let err = answers_to_manifest(&set).unwrap_err();
+        assert!(err.to_string().contains(ENV_MANIFEST_FORM_ID), "{err}");
+
+        let mut set = answers(serde_json::json!({"environment_id": "local"}));
+        set.spec_version = "0".to_string();
+        let err = answers_to_manifest(&set).unwrap_err();
+        assert!(err.to_string().contains("spec_version"), "{err}");
+    }
+
+    #[test]
+    fn form_spec_enforces_required_row_fields() {
+        // Guards the row field ids against typos: a secrets row without
+        // `from_env` must fail qa-spec validation (not slide through as an
+        // unknown field).
+        let spec = manifest_form_spec();
+        let report = qa_spec::validate(
+            &spec,
+            &serde_json::json!({
+                "environment_id": "local",
+                "trust_root_bootstrap": false,
+                "secrets": [{"path": "default/_/p/tok"}],
+                "bundles": [],
+                "messaging_endpoints": []
+            }),
+        );
+        assert!(!report.valid);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| format!("{e:?}").contains("from_env")),
+            "missing row field must be reported: {report:?}"
+        );
     }
 }
