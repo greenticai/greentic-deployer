@@ -395,7 +395,7 @@ pub const ENV_MANIFEST_FORM_VERSION: &str = "1";
 ///   (`public_base_url`, `customer_id`, `config_overrides`, route binding,
 ///   welcome flow, …) are `required: false` and surface in advanced mode.
 ///   The three `List` sections are `required: false` — an empty section is
-///   a valid manifest, so absence must pass [`qa_spec::validate`], and the
+///   a valid manifest, so absence must pass [`qa_spec::validate()`], and the
 ///   qa prompt loop walks `List` questions regardless of `required` (its
 ///   normal-mode filter exempts tables). `trust_root_bootstrap` stays
 ///   `required` (a `false` answer is valid; the prompt fills the default).
