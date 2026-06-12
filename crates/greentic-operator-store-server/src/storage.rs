@@ -127,6 +127,12 @@ pub trait EnvironmentStorage: Send + Sync {
     /// Load `env_id`'s environment along with its revision. Verifies the
     /// stored integrity digest against the canonical JSON of the decoded
     /// payload before returning (A8 contract #6).
+    ///
+    /// `Spec` / `EnvIdMismatch` / `Json` from THIS method indicate stored-row
+    /// corruption, not a bad request — HTTP handlers must map load failures
+    /// via `api::load_storage_error` (500), never the blanket
+    /// request-error mapping (400). A trait-level load/write error split is
+    /// a PR-4.2b+ candidate once all verb groups are in.
     fn load_env(
         &self,
         env_id: &EnvId,

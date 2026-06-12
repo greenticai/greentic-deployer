@@ -27,33 +27,10 @@ use common::fresh_store;
 
 const IDEM_KEY: &str = "01JTKW5B4W4Q5Y1CQW93F7S5VH";
 
-/// Dispatch one JSON request and return `(status, parsed body)`.
+/// Dispatch one JSON request with the default `Idempotency-Key` and return
+/// `(status, parsed body)`. Thin wrapper over [`send_custom`].
 async fn send(app: Router, method: Method, path: &str, body: Option<Value>) -> (StatusCode, Value) {
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("Accept", "application/json")
-        .header("Idempotency-Key", IDEM_KEY);
-    let body = match body {
-        Some(value) => {
-            builder = builder.header("Content-Type", "application/json");
-            Body::from(value.to_string())
-        }
-        None => Body::empty(),
-    };
-    let response = app
-        .oneshot(builder.body(body).expect("build request"))
-        .await
-        .expect("dispatch request");
-    let status = response.status();
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("collect body")
-        .to_bytes();
-    let value: Value = serde_json::from_slice(&bytes).expect("json body");
-    (status, value)
+    send_custom(app, method, path, body, &[("Idempotency-Key", IDEM_KEY)]).await
 }
 
 fn create_body(env_id: &str) -> Value {

@@ -40,7 +40,7 @@ use greentic_deploy_spec::{
 };
 
 use crate::http::AppState;
-use crate::storage::{EnvironmentStorage, StorageError};
+use crate::storage::{EnvRevision, EnvironmentStorage, StorageError};
 
 /// `AuditDecision.policy` value while RBAC is not yet enforced (PR-4.4).
 /// Honest about what it is — every request is allowed.
@@ -154,20 +154,23 @@ struct MutationEnvelope<T> {
     audit: AuditEvent,
 }
 
-/// Build the audit record embedded in every 2xx mutation response. The
-/// client binds it back to the request: `env_id` must match the target env
-/// and `idempotency_key` must equal the request's `Idempotency-Key` header.
+/// Build the 2xx mutation response: the audit record (bound to the request
+/// via `env_id` + the `Idempotency-Key` the client sent — the PR-4.0 client
+/// validates both) wrapped in the A8 envelope. One call per handler so
+/// every verb group shares the exact shape; when PR-4.3 lands replay, the
+/// [`IdempotencyOutcome`] switch happens here, not in N handlers.
 #[allow(clippy::too_many_arguments)]
-fn audit_event(
+fn mutation_response<T: Serialize>(
+    result: T,
     env_id: &EnvId,
     noun: &str,
     verb: &str,
     target: Value,
-    idempotency_key: Option<String>,
+    idempotency_key: String,
     previous_generation: Option<u64>,
-    new_generation: u64,
-) -> AuditEvent {
-    AuditEvent {
+    revision: EnvRevision,
+) -> Response {
+    let audit = AuditEvent {
         schema: SchemaVersion::AUDIT_EVENT_V1.into(),
         event_id: ulid::Ulid::new().to_string(),
         ts: Utc::now(),
@@ -181,14 +184,22 @@ fn audit_event(
         verb: verb.to_string(),
         target,
         previous_generation,
-        new_generation: Some(new_generation),
-        idempotency_key,
+        new_generation: Some(revision.generation),
+        idempotency_key: Some(idempotency_key),
         authorization: AuditDecision::Allow {
             policy: POLICY_OPEN_DEV.to_string(),
             reason: "RBAC not yet enforced (PR-4.4)".to_string(),
         },
         result: AuditResult::Ok,
-    }
+    };
+    Json(MutationEnvelope {
+        result,
+        etag: revision.etag,
+        generation: revision.generation,
+        idempotency: IdempotencyOutcome::Applied,
+        audit,
+    })
+    .into_response()
 }
 
 /// Require a non-empty `Idempotency-Key` on every mutation (A8 §2). PR-4.3
@@ -247,31 +258,31 @@ fn parse_if_match(headers: &HeaderMap) -> Result<Option<StateEtag>, ApiError> {
 /// mapping where `Spec` → 400 is correct (the request payload caused it).
 fn load_storage_error(err: StorageError) -> ApiError {
     match err {
-        StorageError::Spec(ref inner) => {
-            tracing::error!(%inner, "stored environment state failed validation (Spec)");
-            ApiError(RemoteStoreError::Internal {
-                message: "stored environment state failed validation".to_string(),
-            })
-        }
-        StorageError::EnvIdMismatch {
-            ref keyed,
-            ref payload,
-        } => {
-            tracing::error!(
-                %keyed, %payload,
-                "stored environment state failed validation (EnvIdMismatch)"
-            );
-            ApiError(RemoteStoreError::Internal {
-                message: "stored environment state failed validation".to_string(),
-            })
-        }
-        StorageError::Json(ref inner) => {
-            tracing::error!(%inner, "stored environment state failed validation (Json)");
+        // The Display impls already carry the variant detail (spec reason,
+        // keyed/payload ids, serde message) — one arm, one log line.
+        corrupt @ (StorageError::Spec(_)
+        | StorageError::EnvIdMismatch { .. }
+        | StorageError::Json(_)) => {
+            tracing::error!(error = %corrupt, "stored environment state failed validation");
             ApiError(RemoteStoreError::Internal {
                 message: "stored environment state failed validation".to_string(),
             })
         }
         other => ApiError(map_storage_error(other)),
+    }
+}
+
+/// CAS precondition for a load-then-write handler: a client-supplied
+/// `If-Match` wins (server side of A8 #1; client wiring stays PR-3b-fu);
+/// otherwise pin the revision the handler just loaded — a torn-write guard
+/// only, not true client CAS.
+fn resolve_precondition(client_etag: Option<StateEtag>, loaded: &EnvRevision) -> Precondition {
+    match client_etag {
+        Some(etag) => Precondition {
+            if_match: Some(etag),
+            expected_generation: None,
+        },
+        None => Precondition::matching(loaded.etag.clone(), loaded.generation),
     }
 }
 
@@ -297,23 +308,17 @@ pub(crate) async fn create_environment<S: EnvironmentStorage>(
     // Existence is enforced by the storage layer's atomic create
     // (`AlreadyExists` → 409) — no load-then-check race.
     let revision = state.storage.create_env(&env).await?;
-    let audit = audit_event(
-        &env.environment_id,
+    let env_id = env.environment_id.clone();
+    Ok(mutation_response(
+        env,
+        &env_id,
         "env",
         "create",
-        json!({"environment_id": env.environment_id}),
-        Some(idem_key),
+        json!({"environment_id": env_id}),
+        idem_key,
         None,
-        revision.generation,
-    );
-    Ok(Json(MutationEnvelope {
-        result: env,
-        etag: revision.etag,
-        generation: revision.generation,
-        idempotency: IdempotencyOutcome::Applied,
-        audit,
-    })
-    .into_response())
+        revision,
+    ))
 }
 
 /// `PATCH /environments/{env_id}` — tri-state field patch (A8 route 2).
@@ -334,35 +339,18 @@ pub(crate) async fn update_environment<S: EnvironmentStorage>(
     let previous_generation = loaded.revision.generation;
     let mut env = loaded.value;
     engine::apply_environment_update(&mut env, patch);
-    // If the client sent If-Match, use it as the CAS precondition (server
-    // side of A8 #1; client wiring stays PR-3b-fu). Otherwise, pin the
-    // revision we just loaded as a torn-write guard only — true client CAS
-    // arrives with PR-3b-fu.
-    let precondition = match client_etag {
-        Some(etag) => Precondition {
-            if_match: Some(etag),
-            expected_generation: None,
-        },
-        None => Precondition::matching(loaded.revision.etag, previous_generation),
-    };
+    let precondition = resolve_precondition(client_etag, &loaded.revision);
     let revision = state.storage.update_env(&env, &precondition).await?;
-    let audit = audit_event(
+    Ok(mutation_response(
+        env,
         &env_id,
         "env",
         "update",
         json!({"environment_id": env_id}),
-        Some(idem_key),
+        idem_key,
         Some(previous_generation),
-        revision.generation,
-    );
-    Ok(Json(MutationEnvelope {
-        result: env,
-        etag: revision.etag,
-        generation: revision.generation,
-        idempotency: IdempotencyOutcome::Applied,
-        audit,
-    })
-    .into_response())
+        revision,
+    ))
 }
 
 /// `POST /environments/{env_id}/migrate-bindings` — merge pack/extension
@@ -387,16 +375,7 @@ pub(crate) async fn migrate_bindings<S: EnvironmentStorage>(
     let report = engine::merge_bindings(&mut env, payload.packs, payload.extensions);
     let revision = match &prior_revision {
         Some(prior) => {
-            // If the client sent If-Match, use it as the CAS precondition
-            // (server side of A8 #1); otherwise pin the loaded revision as a
-            // torn-write guard (true client CAS arrives with PR-3b-fu).
-            let precondition = match &client_etag {
-                Some(etag) => Precondition {
-                    if_match: Some(etag.clone()),
-                    expected_generation: None,
-                },
-                None => Precondition::matching(prior.etag.clone(), prior.generation),
-            };
+            let precondition = resolve_precondition(client_etag.clone(), prior);
             state.storage.update_env(&env, &precondition).await?
         }
         None => {
@@ -415,27 +394,21 @@ pub(crate) async fn migrate_bindings<S: EnvironmentStorage>(
             state.storage.create_env(&env).await?
         }
     };
-    let audit = audit_event(
+    let target = json!({
+        "environment_id": env_id,
+        "merged_slots": report.merged_slots,
+        "merged_extensions": report.merged_extensions,
+    });
+    Ok(mutation_response(
+        report,
         &env_id,
         "env",
         "migrate-bindings",
-        json!({
-            "environment_id": env_id,
-            "merged_slots": report.merged_slots,
-            "merged_extensions": report.merged_extensions,
-        }),
-        Some(idem_key),
+        target,
+        idem_key,
         prior_revision.map(|r| r.generation),
-        revision.generation,
-    );
-    Ok(Json(MutationEnvelope {
-        result: report,
-        etag: revision.etag,
-        generation: revision.generation,
-        idempotency: IdempotencyOutcome::Applied,
-        audit,
-    })
-    .into_response())
+        revision,
+    ))
 }
 
 // ---------------------------------------------------------------------------
