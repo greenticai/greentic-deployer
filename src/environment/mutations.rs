@@ -26,24 +26,29 @@ use greentic_deploy_spec::{
     BundleDeployment, BundleDeploymentStatus, BundleId, CapabilitySlot, CustomerId, DeploymentId,
     EnvId, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding, IdempotencyKey,
     MessagingEndpoint, MessagingEndpointId, PackId, RevenueShareEntry, Revision, RevisionId,
-    RouteBinding, TrafficSplit, TrafficSplitEntry,
+    RouteBinding,
 };
 use serde_json::Value;
 
 use super::StoreError;
 
-// PR-4.2a/4.2b: the env-lifecycle payload shapes (`ExtensionKey`,
+// PR-4.2a/4.2b/4.2c: the env-lifecycle payload shapes (`ExtensionKey`,
 // `FieldUpdate`, `UpdateEnvironmentPayload`, `MigrateSeedPayload`,
-// `MigrateMergePayload`) and the revision verb group's
+// `MigrateMergePayload`), the revision verb group's
 // (`StageRevisionPayload`, `WarmRevisionPayload`,
-// `RevisionTransitionOutcome`) moved to `greentic_deploy_spec::engine` so
+// `RevisionTransitionOutcome`) and the traffic verb group's
+// (`SetTrafficSplitPayload`, `ApplyTrafficSplitOutcome`,
+// `RollbackTrafficSplitOutcome`) moved to `greentic_deploy_spec::engine` so
 // the operator-store-server applies the same verb semantics (and wire
 // encoding) as `LocalFsStore`. Re-exported here so every existing
 // `environment::mutations::…` path keeps working. The revision payloads no
 // longer carry `idempotency_key` — the key rides the trait methods (and the
-// A8 `Idempotency-Key` header), matching every other verb group.
+// A8 `Idempotency-Key` header), matching every other verb group. (The
+// traffic outcomes gained an `environment` snapshot: the CLI emits
+// `TrafficSplitApplied` telemetry from it, identical local and remote.)
 pub use greentic_deploy_spec::engine::{
-    ExtensionKey, FieldUpdate, MigrateMergePayload, MigrateSeedPayload, RevisionTransitionOutcome,
+    ApplyTrafficSplitOutcome, ExtensionKey, FieldUpdate, MigrateMergePayload, MigrateSeedPayload,
+    RevisionTransitionOutcome, RollbackTrafficSplitOutcome, SetTrafficSplitPayload,
     StageRevisionPayload, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 
@@ -92,26 +97,6 @@ pub struct TrustRootRemoveOutcome {
     pub removed_key_id: String,
     pub removed_public_key_pem: Option<String>,
     pub trusted_key_count: usize,
-}
-
-/// Outcome of [`EnvironmentMutations::set_traffic_split`]. Carries the
-/// post-apply split and the generation transition for audit/observability.
-/// On an idempotent same-key-same-entries replay, `previous_generation`
-/// and `new_generation` are both `None` (no state change).
-#[derive(Debug, Clone)]
-pub struct ApplyTrafficSplitOutcome {
-    pub split: TrafficSplit,
-    pub previous_generation: Option<u64>,
-    pub new_generation: Option<u64>,
-}
-
-/// Outcome of [`EnvironmentMutations::rollback_traffic_split`]. Carries
-/// the restored split and the generation transition for audit/observability.
-#[derive(Debug, Clone)]
-pub struct RollbackTrafficSplitOutcome {
-    pub restored: TrafficSplit,
-    pub previous_generation: u64,
-    pub new_generation: u64,
 }
 
 /// Inputs to [`EnvironmentMutations::add_bundle`].
@@ -401,11 +386,8 @@ pub trait EnvironmentMutations: Send + Sync {
     fn set_traffic_split(
         &self,
         env_id: &EnvId,
-        deployment_id: DeploymentId,
-        entries: Vec<TrafficSplitEntry>,
+        payload: SetTrafficSplitPayload,
         idempotency_key: IdempotencyKey,
-        updated_by: String,
-        authorization_ref: Option<String>,
     ) -> Result<ApplyTrafficSplitOutcome, StoreError>;
 
     fn rollback_traffic_split(

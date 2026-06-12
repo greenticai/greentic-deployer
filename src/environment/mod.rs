@@ -44,8 +44,8 @@ pub use mutations::{
     AddBundlePayload, AddMessagingEndpointPayload, ApplyTrafficSplitOutcome, EnvironmentMutations,
     ExtensionKey, FieldUpdate, MigrateMergePayload, MigrateSeedPayload, RemoveBundleOutcome,
     RevisionTransitionOutcome, RollbackTrafficSplitOutcome, SetMessagingWelcomeFlowPayload,
-    StageRevisionPayload, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
-    UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
+    SetTrafficSplitPayload, StageRevisionPayload, TrustRootAddOutcome, TrustRootRemoveOutcome,
+    TrustRootSeed, UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 pub use runtime_config::materialize_runtime_config;
 pub use store::{EnvironmentStore, LocalFsStore, Locked, StoreError};

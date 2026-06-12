@@ -720,13 +720,18 @@ fn remote_traffic_set(
     let outcome = store
         .set_traffic_split(
             &env_id,
-            deployment_id,
-            parsed_entries,
+            greentic_deploy_spec::SetTrafficSplitPayload {
+                deployment_id,
+                entries: parsed_entries,
+                updated_by: payload.updated_by,
+                authorization_ref: Some(payload.authorization_ref.to_string_lossy().into_owned()),
+            },
             idempotency_key,
-            payload.updated_by,
-            Some(payload.authorization_ref.to_string_lossy().into_owned()),
         )
         .map_err(super::traffic::map_traffic_store_err)?;
+    // Telemetry parity with the local dispatch: the outcome carries the
+    // post-mutation env snapshot, so no local read is needed over HTTP.
+    super::traffic::emit_applied_telemetry(&outcome);
     Ok(OpOutcome::new(
         "traffic",
         "set",
@@ -750,6 +755,7 @@ fn remote_traffic_rollback(
     let outcome = store
         .rollback_traffic_split(&env_id, deployment_id, idempotency_key)
         .map_err(super::traffic::map_traffic_store_err)?;
+    super::traffic::emit_rollback_telemetry(&outcome);
     Ok(OpOutcome::new(
         "traffic",
         "rollback",
@@ -1421,7 +1427,8 @@ mod tests {
                 "previous_split_ref": null
             },
             "previous_generation": null,
-            "new_generation": 1
+            "new_generation": 1,
+            "environment": env_json()
         });
         let body = wrap_mutation(split);
         let mock = start_mock(vec![(200, &body)], None);

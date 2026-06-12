@@ -33,6 +33,16 @@ use greentic_types::EnvId;
 pub mod revisions;
 pub use revisions::*;
 
+/// Inline one-step-rollback stash scheme (`inline://` base64 tokens),
+/// shared by the traffic group here and the deployer CLI's pack/extension
+/// binding verbs.
+pub mod inline_stash;
+
+/// Traffic-split verb group (PR-4.2c). Re-exported flat like the groups
+/// above.
+pub mod traffic;
+pub use traffic::*;
+
 /// Failures produced by pure verb transforms. Each backend maps these onto
 /// its own error surface: `LocalFsStore` → `StoreError`,
 /// the operator-store-server → [`crate::remote::RemoteStoreError`].

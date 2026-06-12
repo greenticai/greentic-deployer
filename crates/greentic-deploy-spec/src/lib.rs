@@ -46,9 +46,11 @@ pub use credentials::{
     CredentialsValidationResult,
 };
 pub use engine::{
-    ActiveSplitRef, CreateEnvironmentPayload, EngineError, ExtensionKey, FieldUpdate,
-    HealthCheckId, HealthGateFailure, MergeReport, MigrateMergePayload, MigrateSeedPayload,
-    RevisionLifecycleError, RevisionTransition, RevisionTransitionOutcome, StageRevisionPayload,
+    ActiveSplitRef, ApplyTrafficSplitOutcome, CreateEnvironmentPayload, EngineError, ExtensionKey,
+    FieldUpdate, HealthCheckId, HealthGateFailure, MergeReport, MigrateMergePayload,
+    MigrateSeedPayload, RevisionLifecycleError, RevisionTransition, RevisionTransitionOutcome,
+    RollbackTrafficSplitOutcome, RollbackTrafficSplitPayload, SetTrafficSplitPayload,
+    StageRevisionPayload, TrafficRollbackTransition, TrafficSplitError, TrafficSplitTransition,
     UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 pub use environment::{

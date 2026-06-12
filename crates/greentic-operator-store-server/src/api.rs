@@ -31,12 +31,14 @@ use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use greentic_deploy_spec::engine::{self, EngineError, RevisionLifecycleError};
+use greentic_deploy_spec::engine::{self, EngineError, RevisionLifecycleError, TrafficSplitError};
 use greentic_deploy_spec::{
-    Actor, AuditDecision, AuditEvent, AuditResult, ConcurrencyConflict, CreateEnvironmentPayload,
-    EnvId, Environment, HealthStatus, IdempotencyOutcome, MigrateMergePayload, Precondition,
-    RemoteStoreError, RetentionPolicy, RevisionId, RevisionTransitionOutcome, RevocationConfig,
-    SchemaVersion, StageRevisionPayload, StateEtag, UpdateEnvironmentPayload, WarmRevisionPayload,
+    Actor, ApplyTrafficSplitOutcome, AuditDecision, AuditEvent, AuditResult, ConcurrencyConflict,
+    CreateEnvironmentPayload, EnvId, Environment, HealthStatus, IdempotencyKey, IdempotencyOutcome,
+    MigrateMergePayload, Precondition, RemoteStoreError, RetentionPolicy, RevisionId,
+    RevisionTransitionOutcome, RevocationConfig, RollbackTrafficSplitOutcome,
+    RollbackTrafficSplitPayload, SchemaVersion, SetTrafficSplitPayload, StageRevisionPayload,
+    StateEtag, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 
 use crate::http::AppState;
@@ -121,6 +123,49 @@ impl From<RevisionLifecycleError> for ApiError {
                     message: "revision lifecycle chain misconfigured".to_string(),
                 }
             }
+        })
+    }
+}
+
+/// Map a pure traffic-split failure onto the A8 wire vocabulary. No
+/// committed-on-error path here — the engine mutates only after every
+/// check passes, so any error means nothing was persisted.
+impl From<TrafficSplitError> for ApiError {
+    fn from(err: TrafficSplitError) -> Self {
+        Self(match err {
+            // The environment itself was loaded — the dependent
+            // (deployment / routed revision / stash payload) is missing.
+            TrafficSplitError::DeploymentNotFound { .. }
+            | TrafficSplitError::RevisionNotFound { .. }
+            | TrafficSplitError::NoSplit { .. }
+            | TrafficSplitError::SnapshotMissing { .. } => RemoteStoreError::DependentNotFound {
+                detail: err.to_string(),
+            },
+            // A8 §2 protocol violation: the key was reused with different
+            // entries — the canonical `idempotency-conflict` kind, not a
+            // generic domain conflict.
+            TrafficSplitError::IdempotencyKeyReused { .. } => {
+                RemoteStoreError::IdempotencyConflict {
+                    reason: err.to_string(),
+                }
+            }
+            // State conflicts the operator resolves before retrying
+            // (rebalance, warm the revision, forward-fix instead of a
+            // second rollback).
+            TrafficSplitError::WrongDeployment { .. }
+            | TrafficSplitError::AdmissionRevisionMissing { .. }
+            | TrafficSplitError::NotReady { .. }
+            | TrafficSplitError::SnapshotEncode { .. }
+            | TrafficSplitError::NoPreviousSnapshot { .. }
+            | TrafficSplitError::SnapshotDecode { .. } => RemoteStoreError::Conflict {
+                detail: err.to_string(),
+            },
+            // Spec validation (10,000 bps sum / schema discriminator): the
+            // request body named an invalid split — 400, before any state
+            // was touched.
+            TrafficSplitError::Invalid(spec) => RemoteStoreError::InvalidRequest {
+                detail: spec.to_string(),
+            },
         })
     }
 }
@@ -624,6 +669,112 @@ async fn revision_transition<S: EnvironmentStorage>(
         }
         Err(err) => Err(err.into()),
     }
+}
+
+/// `POST /environments/{env_id}/traffic` — replace the traffic-split entry
+/// list for one deployment (A8 route 8).
+///
+/// The `Idempotency-Key` header is handed to the engine, not just audited:
+/// the traffic group persists it into `TrafficSplit::idempotency_key` (it
+/// preserves the rollback target across same-key retries), and the engine's
+/// same-key-same-entries replay is a 200 with `new_generation: null` and
+/// nothing persisted. `runtime-config.json` materialization is a
+/// `LocalFsStore` projection of `traffic_splits` and deliberately does NOT
+/// happen here — remote consumers project it from the env document.
+pub(crate) async fn set_traffic_split<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<SetTrafficSplitPayload>,
+) -> Result<Response, ApiError> {
+    let idem_key = require_idempotency_key(&headers)?;
+    let client_etag = parse_if_match(&headers)?;
+    let env_id = parse_env_id(&env_id)?;
+    let engine_key = IdempotencyKey::new(idem_key.clone())
+        .expect("require_idempotency_key guarantees non-empty");
+    let loaded = state
+        .storage
+        .load_env(&env_id)
+        .await
+        .map_err(load_storage_error)?;
+    let previous_generation = loaded.revision.generation;
+    let mut env = loaded.value;
+    let transition = engine::set_traffic_split(&mut env, payload, &engine_key, Utc::now())?;
+    let revision = if transition.mutated() {
+        let precondition = resolve_precondition(client_etag, &loaded.revision);
+        state.storage.update_env(&env, &precondition).await?
+    } else {
+        // Idempotent replay: nothing changed — echo the loaded CAS
+        // coordinates so the client can keep chaining writes.
+        loaded.revision
+    };
+    let target = json!({
+        "environment_id": env_id,
+        "deployment_id": transition.split.deployment_id.to_string(),
+        "split_generation": transition.new_generation,
+    });
+    let outcome = ApplyTrafficSplitOutcome {
+        split: transition.split,
+        previous_generation: transition.previous_generation,
+        new_generation: transition.new_generation,
+        environment: env,
+    };
+    Ok(mutation_response(
+        outcome,
+        &env_id,
+        "traffic",
+        "set",
+        target,
+        idem_key,
+        Some(previous_generation),
+        revision,
+    ))
+}
+
+/// `POST /environments/{env_id}/traffic/rollback` — restore a deployment's
+/// one-step-previous split (A8 route 9). Always a genuine mutation (the
+/// generation advances, never rewinds), so unlike `set` there is no replay
+/// short-circuit.
+pub(crate) async fn rollback_traffic_split<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<RollbackTrafficSplitPayload>,
+) -> Result<Response, ApiError> {
+    let idem_key = require_idempotency_key(&headers)?;
+    let client_etag = parse_if_match(&headers)?;
+    let env_id = parse_env_id(&env_id)?;
+    let loaded = state
+        .storage
+        .load_env(&env_id)
+        .await
+        .map_err(load_storage_error)?;
+    let previous_generation = loaded.revision.generation;
+    let mut env = loaded.value;
+    let transition = engine::rollback_traffic_split(&mut env, payload.deployment_id, Utc::now())?;
+    let precondition = resolve_precondition(client_etag, &loaded.revision);
+    let revision = state.storage.update_env(&env, &precondition).await?;
+    let target = json!({
+        "environment_id": env_id,
+        "deployment_id": transition.restored.deployment_id.to_string(),
+        "split_generation": transition.new_generation,
+    });
+    let outcome = RollbackTrafficSplitOutcome {
+        restored: transition.restored,
+        previous_generation: transition.previous_generation,
+        new_generation: transition.new_generation,
+        environment: env,
+    };
+    Ok(mutation_response(
+        outcome,
+        &env_id,
+        "traffic",
+        "rollback",
+        target,
+        idem_key,
+        Some(previous_generation),
+        revision,
+    ))
 }
 
 // ---------------------------------------------------------------------------
