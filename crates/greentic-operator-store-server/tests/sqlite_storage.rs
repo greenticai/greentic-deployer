@@ -1456,3 +1456,145 @@ async fn record_audit_appends_without_touching_the_ledger() {
         .get("n");
     assert_eq!(count, 0);
 }
+
+// ---------------------------------------------------------------------------
+// restore_env_journaled: generation sequence + tombstone preservation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn restore_preserves_sidecar_generation_sequences_and_tombstones() {
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    let env = minimal_environment(&id);
+    let rev1 = store.create_env(&env).await.expect("create env");
+
+    // --- Set up runtime at generation 1, then advance to generation 2. ---
+    let runtime = minimal_runtime(&id);
+    let rt_rev1 = store
+        .upsert_runtime(&runtime, None)
+        .await
+        .expect("runtime gen 1");
+    assert_eq!(rt_rev1.generation, 1);
+
+    let mut runtime2 = minimal_runtime(&id);
+    runtime2
+        .discovered
+        .insert("listen_addr".to_string(), json!("127.0.0.1:0"));
+    let rt_rev2 = store
+        .upsert_runtime(
+            &runtime2,
+            Some(&Precondition::matching(
+                rt_rev1.etag.clone(),
+                rt_rev1.generation,
+            )),
+        )
+        .await
+        .expect("runtime gen 2");
+    assert_eq!(rt_rev2.generation, 2);
+
+    // --- Set up pack_answers: Deployer slot at gen 1. ---
+    let deployer_v1 = json!({"region": "eu-west-1"});
+    let pa_rev1 = store
+        .upsert_pack_answers(&id, CapabilitySlot::Deployer, &deployer_v1, None)
+        .await
+        .expect("deployer gen 1");
+    assert_eq!(pa_rev1.generation, 1);
+
+    // --- Take a backup (snapshot has Deployer slot + runtime). ---
+    let snapshot = store.load_env_snapshot(&id).await.expect("snapshot");
+    assert!(snapshot.runtime.is_some());
+    assert!(snapshot.pack_answers.contains_key("deployer"));
+
+    // --- Advance Deployer to gen 2 (post-backup mutation). ---
+    let deployer_v2 = json!({"region": "us-east-1"});
+    let pa_rev2 = store
+        .upsert_pack_answers(
+            &id,
+            CapabilitySlot::Deployer,
+            &deployer_v2,
+            Some(&Precondition::matching(
+                pa_rev1.etag.clone(),
+                pa_rev1.generation,
+            )),
+        )
+        .await
+        .expect("deployer gen 2");
+    assert_eq!(pa_rev2.generation, 2);
+
+    // --- Add a Secrets slot AFTER the backup (absent from snapshot). ---
+    let secrets_v1 = json!({"api_key": "abc123"});
+    store
+        .upsert_pack_answers(&id, CapabilitySlot::Secrets, &secrets_v1, None)
+        .await
+        .expect("secrets gen 1");
+
+    // --- Restore from the earlier snapshot. ---
+    let env_rev = store.load_env(&id).await.expect("load env");
+    let restore_rev = store
+        .restore_env_journaled(
+            &id,
+            &snapshot,
+            &Precondition::matching(env_rev.revision.etag, env_rev.revision.generation),
+            None,
+        )
+        .await
+        .expect("restore");
+    assert_eq!(restore_rev.generation, rev1.generation + 1);
+
+    // --- Assert: Deployer slot is LIVE at generation 3 (was 2, +1). ---
+    let loaded_deployer = store
+        .load_pack_answers(&id, CapabilitySlot::Deployer)
+        .await
+        .expect("load deployer")
+        .expect("deployer must be live after restore");
+    assert_eq!(
+        loaded_deployer.revision.generation, 3,
+        "deployer generation must continue (2+1=3), not reset to 1"
+    );
+    assert_eq!(
+        loaded_deployer.value, deployer_v1,
+        "deployer content must be the snapshot's (v1), not v2"
+    );
+
+    // --- Assert: Secrets slot is TOMBSTONED (absent from snapshot). ---
+    // load_pack_answers filters `deleted = 0`, so it should return None.
+    assert!(
+        store
+            .load_pack_answers(&id, CapabilitySlot::Secrets)
+            .await
+            .expect("load secrets")
+            .is_none(),
+        "secrets must be logically absent (tombstoned) after restore"
+    );
+    // Verify via raw SQL: the row exists with deleted=1 and generation=2 (was 1, +1).
+    let secrets_row = sqlx::query(
+        "SELECT generation, deleted FROM pack_answers \
+         WHERE env_id = $1 AND slot = $2",
+    )
+    .bind(id.as_str())
+    .bind(CapabilitySlot::Secrets.as_str())
+    .fetch_optional(store.pool())
+    .await
+    .expect("raw query");
+    let secrets_row = secrets_row.expect("secrets row must still exist (tombstoned, not deleted)");
+    let secrets_deleted: i32 = secrets_row.get("deleted");
+    let secrets_gen: i64 = secrets_row.get("generation");
+    assert_eq!(secrets_deleted, 1, "secrets must be tombstoned");
+    assert_eq!(
+        secrets_gen, 2,
+        "secrets generation must continue (1+1=2), not be hard-deleted"
+    );
+
+    // --- Assert: Runtime generation continued (was 2, +1 = 3). ---
+    // Verify via raw SQL (the trait method returns the typed struct, not gen).
+    let rt_row = sqlx::query("SELECT generation FROM environment_runtimes WHERE env_id = $1")
+        .bind(id.as_str())
+        .fetch_one(store.pool())
+        .await
+        .expect("runtime row");
+    let rt_gen: i64 = rt_row.get("generation");
+    assert_eq!(
+        rt_gen, 3,
+        "runtime generation must continue (2+1=3), not reset to 1"
+    );
+}

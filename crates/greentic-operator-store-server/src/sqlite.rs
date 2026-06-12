@@ -915,6 +915,8 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         let revision = update_env_in_tx(&mut tx, &env, precondition).await?;
 
         // 2. Runtime sidecar: upsert if present in snapshot, delete if absent.
+        //    Generation must continue the existing sequence (never reset to 1
+        //    when a row exists — mirrors `upsert_runtime`'s invariant).
         match &snapshot.runtime {
             Some(runtime_data) => {
                 let (etag, integrity, data) = serialize_for_write_value(runtime_data)?;
@@ -926,7 +928,7 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
                 if existing.is_some() {
                     sqlx::query(
                         "UPDATE environment_runtimes \
-                         SET data = $1, generation = 1, etag = $2, \
+                         SET data = $1, generation = generation + 1, etag = $2, \
                              integrity_digest = $3, updated_at = datetime('now') \
                          WHERE env_id = $4",
                     )
@@ -951,6 +953,8 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
                 }
             }
             None => {
+                // Hard delete is the only expressible "absent" for runtimes
+                // (the table has no tombstone column and no other delete path).
                 sqlx::query("DELETE FROM environment_runtimes WHERE env_id = $1")
                     .bind(env_id.as_str())
                     .execute(&mut *tx)
@@ -958,26 +962,80 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
             }
         }
 
-        // 3. Pack-answers sidecars: replace the full set atomically.
-        //    Delete all live rows, then insert the snapshot's entries.
-        sqlx::query("DELETE FROM pack_answers WHERE env_id = $1")
-            .bind(env_id.as_str())
-            .execute(&mut *tx)
-            .await?;
+        // 3. Pack-answers sidecars: tombstone-preserving restore.
+        //    The `pack_answers` table uses a `deleted` tombstone column so
+        //    generation sequences survive delete/recreate cycles (ABA
+        //    protection). A restore must continue those sequences, never
+        //    reset to 1 when a row already exists.
+        let existing_rows =
+            sqlx::query("SELECT slot, generation, deleted FROM pack_answers WHERE env_id = $1")
+                .bind(env_id.as_str())
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut existing_map: std::collections::HashMap<String, (u64, bool)> =
+            std::collections::HashMap::new();
+        for row in &existing_rows {
+            let slot: String = row.try_get("slot")?;
+            let generation: i64 = row.try_get("generation")?;
+            let deleted: i32 = row.try_get("deleted")?;
+            existing_map.insert(slot, (generation as u64, deleted != 0));
+        }
+
+        // (a) Snapshot slots: upsert (continuing generation) or insert.
         for (slot, answers_data) in &snapshot.pack_answers {
             let (etag, integrity, data) = serialize_for_write_value(answers_data)?;
-            sqlx::query(
-                "INSERT INTO pack_answers \
-                 (env_id, slot, generation, etag, data, integrity_digest) \
-                 VALUES ($1, $2, 1, $3, $4, $5)",
-            )
-            .bind(env_id.as_str())
-            .bind(slot)
-            .bind(&etag.0)
-            .bind(&data)
-            .bind(&integrity.digest)
-            .execute(&mut *tx)
-            .await?;
+            if let Some(&(old_gen, _)) = existing_map.get(slot.as_str()) {
+                // Row exists (live or tombstoned): update, continuing the
+                // generation sequence. `deleted = 0` resurrects a tombstone.
+                sqlx::query(
+                    "UPDATE pack_answers \
+                     SET data = $1, generation = $2, etag = $3, \
+                         integrity_digest = $4, deleted = 0, \
+                         updated_at = datetime('now') \
+                     WHERE env_id = $5 AND slot = $6",
+                )
+                .bind(&data)
+                .bind((old_gen + 1) as i64)
+                .bind(&etag.0)
+                .bind(&integrity.digest)
+                .bind(env_id.as_str())
+                .bind(slot.as_str())
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                // No row at all: first incarnation, generation 1.
+                sqlx::query(
+                    "INSERT INTO pack_answers \
+                     (env_id, slot, generation, etag, data, integrity_digest) \
+                     VALUES ($1, $2, 1, $3, $4, $5)",
+                )
+                .bind(env_id.as_str())
+                .bind(slot.as_str())
+                .bind(&etag.0)
+                .bind(&data)
+                .bind(&integrity.digest)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        // (b) Live rows NOT in the snapshot: soft-delete (tombstone),
+        //     mirroring `delete_pack_answers`. Already-tombstoned rows
+        //     not in the snapshot stay untouched.
+        for (slot, &(old_gen, is_deleted)) in &existing_map {
+            if !is_deleted && !snapshot.pack_answers.contains_key(slot.as_str()) {
+                sqlx::query(
+                    "UPDATE pack_answers \
+                     SET deleted = 1, generation = $1, \
+                         updated_at = datetime('now') \
+                     WHERE env_id = $2 AND slot = $3",
+                )
+                .bind((old_gen + 1) as i64)
+                .bind(env_id.as_str())
+                .bind(slot.as_str())
+                .execute(&mut *tx)
+                .await?;
+            }
         }
 
         journal_in_tx(&mut tx, journal).await?;
