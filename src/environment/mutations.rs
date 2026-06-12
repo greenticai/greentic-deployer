@@ -20,15 +20,11 @@
 //! sites in `src/cli/*` (15 logical verb groups, ~28 methods). They may
 //! tweak as PR-3a.2..16 add impls — flag drift in code review.
 
-use std::collections::BTreeMap;
-
 use greentic_deploy_spec::{
-    BundleDeployment, BundleDeploymentStatus, BundleId, CapabilitySlot, CustomerId, DeploymentId,
-    EnvId, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding, IdempotencyKey,
-    MessagingEndpoint, MessagingEndpointId, PackId, RevenueShareEntry, Revision, RevisionId,
-    RouteBinding,
+    BundleDeployment, BundleId, CapabilitySlot, DeploymentId, EnvId, EnvPackBinding, Environment,
+    EnvironmentHostConfig, ExtensionBinding, IdempotencyKey, MessagingEndpoint,
+    MessagingEndpointId, PackId, Revision, RevisionId,
 };
-use serde_json::Value;
 
 use super::StoreError;
 
@@ -50,54 +46,17 @@ use super::StoreError;
 // `TrustRootSeed`, `TrustRootAddOutcome`, `TrustRootRemoveOutcome`)
 // followed — shapes only; the pure transforms need crypto and live in
 // `greentic-operator-trust`.
+// PR-4.2g: the bundles group's shapes (`AddBundlePayload`,
+// `UpdateBundlePayload`, `RemoveBundleOutcome`) followed, dropping their
+// embedded `idempotency_key` — the key rides the trait methods (and the A8
+// `Idempotency-Key` header), matching every other verb group.
 pub use greentic_deploy_spec::engine::{
-    AddTrustedKeyPayload, ApplyTrafficSplitOutcome, ExtensionKey, FieldUpdate, MigrateMergePayload,
-    MigrateSeedPayload, RevisionTransitionOutcome, RollbackTrafficSplitOutcome,
-    SetTrafficSplitPayload, StageRevisionPayload, TrustRootAddOutcome, TrustRootRemoveOutcome,
-    TrustRootSeed, UpdateEnvironmentPayload, WarmRevisionPayload,
+    AddBundlePayload, AddTrustedKeyPayload, ApplyTrafficSplitOutcome, ExtensionKey, FieldUpdate,
+    MigrateMergePayload, MigrateSeedPayload, RemoveBundleOutcome, RevisionTransitionOutcome,
+    RollbackTrafficSplitOutcome, SetTrafficSplitPayload, StageRevisionPayload, TrustRootAddOutcome,
+    TrustRootRemoveOutcome, TrustRootSeed, UpdateBundlePayload, UpdateEnvironmentPayload,
+    WarmRevisionPayload,
 };
-
-/// Outcome of [`EnvironmentMutations::remove_bundle`]. Surfaces the
-/// archived revisions that were pruned alongside the deployment so the
-/// destructive side effect is explicit on the contract — the CLI records
-/// the IDs in the audit target, and HTTP backends can apply a separate
-/// authorization check against the prune set before committing.
-#[derive(Debug, Clone)]
-pub struct RemoveBundleOutcome {
-    pub deployment: BundleDeployment,
-    /// IDs of revisions removed from `Environment.revisions` as part of the
-    /// post-removal compaction (always in `Archived` state because the
-    /// live-state guard refuses any non-archived revision under the
-    /// deployment).
-    pub pruned_revision_ids: Vec<RevisionId>,
-}
-
-/// Inputs to [`EnvironmentMutations::add_bundle`].
-#[derive(Debug, Clone)]
-pub struct AddBundlePayload {
-    pub bundle_id: BundleId,
-    pub customer_id: CustomerId,
-    pub revenue_share: Vec<RevenueShareEntry>,
-    pub route_binding: Option<RouteBinding>,
-    pub authorization_ref: Option<String>,
-    pub config_overrides: BTreeMap<String, BTreeMap<String, Value>>,
-    /// A8 §2 idempotency key. The local-FS impl accepts and ignores;
-    /// the HTTP backend caches it for safe-retry replay.
-    pub idempotency_key: IdempotencyKey,
-}
-
-/// Inputs to [`EnvironmentMutations::update_bundle`].
-#[derive(Debug, Clone)]
-pub struct UpdateBundlePayload {
-    pub deployment_id: DeploymentId,
-    pub status: Option<BundleDeploymentStatus>,
-    pub route_binding: Option<RouteBinding>,
-    pub revenue_share: Option<Vec<RevenueShareEntry>>,
-    pub config_overrides: Option<BTreeMap<String, BTreeMap<String, Value>>>,
-    /// A8 §2 idempotency key. The local-FS impl accepts and ignores;
-    /// the HTTP backend caches it for safe-retry replay.
-    pub idempotency_key: IdempotencyKey,
-}
 
 /// Inputs to [`EnvironmentMutations::add_messaging_endpoint`].
 #[derive(Debug, Clone)]
@@ -249,16 +208,24 @@ pub trait EnvironmentMutations: Send + Sync {
     //   `op bundles add | update | remove`
     // -------------------------------------------------------------
 
+    /// `idempotency_key` is required for A8 §2 mutation replay; the local
+    /// impl accepts and ignores, the HTTP backend caches the original
+    /// outcome.
     fn add_bundle(
         &self,
         env_id: &EnvId,
         payload: AddBundlePayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<BundleDeployment, StoreError>;
 
+    /// `idempotency_key` is required for A8 §2 mutation replay; the local
+    /// impl accepts and ignores, the HTTP backend caches the original
+    /// outcome.
     fn update_bundle(
         &self,
         env_id: &EnvId,
         payload: UpdateBundlePayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<BundleDeployment, StoreError>;
 
     /// Remove a bundle deployment from the env. Refuses if the deployment

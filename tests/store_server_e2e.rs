@@ -1,5 +1,5 @@
 //! End-to-end proof of the PR-4.2a+ remote slices (env lifecycle,
-//! revisions, traffic, pack/extension bindings): the REAL
+//! revisions, traffic, pack/extension bindings, trust root, bundles): the REAL
 //! `HttpEnvironmentStore` client (blocking reqwest, A8 envelope + audit
 //! validation) drives the REAL operator-store-server (axum + SQLite) over
 //! a loopback listener — no mocks on either side.
@@ -21,12 +21,12 @@ use greentic_deploy_spec::{
     RevisionLifecycle, RouteBinding, SchemaVersion, SemVer, TenantSelector, TrafficSplitEntry,
 };
 use greentic_deployer::environment::{
-    AuthMethod, EnvironmentMutations, HealthCheckId, HealthGateFailure, HttpEnvironmentStore,
-    LifecycleError, StoreError,
+    AddBundlePayload, FieldUpdate, MigrateMergePayload, SetTrafficSplitPayload,
+    StageRevisionPayload, UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 use greentic_deployer::environment::{
-    FieldUpdate, MigrateMergePayload, SetTrafficSplitPayload, StageRevisionPayload,
-    UpdateEnvironmentPayload, WarmRevisionPayload,
+    AuthMethod, EnvironmentMutations, HealthCheckId, HealthGateFailure, HttpEnvironmentStore,
+    LifecycleError, StoreError,
 };
 use greentic_operator_store_server::http::router_with_operator_key;
 use greentic_operator_store_server::sqlite::SqliteEnvironmentStore;
@@ -492,6 +492,93 @@ async fn remote_env_lifecycle_end_to_end() {
             .expect("no-op remove");
         assert!(noop.removed_public_key_pem.is_none());
         assert_eq!(noop.trusted_key_count, 1);
+
+        // ----- PR-4.2g: the bundles verb group over the same wire. -----
+        // The trust root still holds the server's bootstrapped operator
+        // key (the remove above only revoked the caller-supplied one), so
+        // the server can sign revenue-policy versions.
+
+        let added_bundle = store
+            .add_bundle(
+                &id,
+                AddBundlePayload {
+                    bundle_id: BundleId::new("e2e-bundle"),
+                    customer_id: CustomerId::new("cust-e2e"),
+                    revenue_share: vec![RevenueShareEntry {
+                        party_id: PartyId::new("greentic"),
+                        basis_points: 10_000,
+                    }],
+                    route_binding: None,
+                    authorization_ref: None,
+                    config_overrides: Default::default(),
+                },
+                idem("k-bundle-add"),
+            )
+            .expect("add bundle");
+        assert_eq!(added_bundle.bundle_id.as_str(), "e2e-bundle");
+        assert_eq!(
+            added_bundle.revenue_policy_ref,
+            PathBuf::from("billing-policies/e2e-bundle/cust-e2e/v1.json.sig"),
+            "server-minted v1 policy ref"
+        );
+
+        // Duplicate (bundle, customer) → the server's 409 `already-exists`
+        // folds onto the same `Conflict` noun the local store raises.
+        let err = store
+            .add_bundle(
+                &id,
+                AddBundlePayload {
+                    bundle_id: BundleId::new("e2e-bundle"),
+                    customer_id: CustomerId::new("cust-e2e"),
+                    revenue_share: vec![RevenueShareEntry {
+                        party_id: PartyId::new("greentic"),
+                        basis_points: 10_000,
+                    }],
+                    route_binding: None,
+                    authorization_ref: None,
+                    config_overrides: Default::default(),
+                },
+                idem("k-bundle-add-dup"),
+            )
+            .expect_err("duplicate (bundle, customer) must conflict");
+        assert!(
+            matches!(err, StoreError::Conflict(_)),
+            "unexpected error: {err:?}"
+        );
+
+        // A revenue-share patch chains the next signed policy version.
+        let updated_bundle = store
+            .update_bundle(
+                &id,
+                UpdateBundlePayload {
+                    deployment_id: added_bundle.deployment_id,
+                    status: Some(BundleDeploymentStatus::Paused),
+                    route_binding: None,
+                    revenue_share: Some(vec![RevenueShareEntry {
+                        party_id: PartyId::new("partner"),
+                        basis_points: 10_000,
+                    }]),
+                    config_overrides: None,
+                },
+                idem("k-bundle-update"),
+            )
+            .expect("update bundle");
+        assert_eq!(updated_bundle.status, BundleDeploymentStatus::Paused);
+        assert_eq!(
+            updated_bundle.revenue_policy_ref,
+            PathBuf::from("billing-policies/e2e-bundle/cust-e2e/v2.json.sig"),
+            "revenue patch advances the policy chain"
+        );
+
+        // Quiesced (no revisions, no splits) → remove compacts cleanly.
+        let removed_bundle = store
+            .remove_bundle(&id, added_bundle.deployment_id, idem("k-bundle-rm"))
+            .expect("remove bundle");
+        assert_eq!(
+            removed_bundle.deployment.deployment_id,
+            added_bundle.deployment_id
+        );
+        assert!(removed_bundle.pruned_revision_ids.is_empty());
 
         staged.revision_id
     })

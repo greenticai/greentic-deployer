@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use fs4::fs_std::FileExt;
 use greentic_deploy_spec::{
-    CapabilitySlot, EnvId, Environment, EnvironmentRuntime, Precondition, SchemaVersion, SpecError,
-    StateEtag, StateIntegrity,
+    BundleId, CapabilitySlot, CustomerId, EnvId, Environment, EnvironmentRuntime, Precondition,
+    SchemaVersion, SpecError, StateEtag, StateIntegrity,
 };
 use serde_json::Value;
 use sqlx::{
@@ -34,7 +34,7 @@ use greentic_operator_trust::trust_root::{TRUST_ROOT_SCHEMA_V1, TrustRootDocumen
 
 use crate::storage::{
     EnvRevision, EnvironmentStorage, Loaded, LoadedAnswers, LoadedEnv, LoadedRuntime,
-    LoadedTrustRoot, StorageError,
+    LoadedTrustRoot, RevenuePolicyArtifact, StorageError,
 };
 
 impl From<sqlx::Error> for StorageError {
@@ -641,6 +641,68 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn upsert_revenue_policy(
+        &self,
+        env_id: &EnvId,
+        artifact: &RevenuePolicyArtifact,
+    ) -> Result<(), StorageError> {
+        // INSERT OR REPLACE by primary key: an orphan row left by a
+        // mutation that failed after this write gets overwritten when the
+        // retry rebuilds the same version (see the trait docs).
+        sqlx::query(
+            "INSERT OR REPLACE INTO revenue_policies \
+             (env_id, bundle_id, customer_id, version, policy_ref, doc, \
+              envelope, doc_sha256, key_id, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, datetime('now'))",
+        )
+        .bind(env_id.as_str())
+        .bind(artifact.bundle_id.as_str())
+        .bind(artifact.customer_id.as_str())
+        .bind(artifact.version as i64)
+        .bind(&artifact.policy_ref)
+        .bind(&artifact.doc)
+        .bind(&artifact.envelope)
+        .bind(&artifact.doc_sha256)
+        .bind(&artifact.key_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn load_revenue_policy(
+        &self,
+        env_id: &EnvId,
+        bundle_id: &BundleId,
+        customer_id: &CustomerId,
+        version: u64,
+    ) -> Result<Option<RevenuePolicyArtifact>, StorageError> {
+        let row = sqlx::query(
+            "SELECT policy_ref, doc, envelope, doc_sha256, key_id \
+             FROM revenue_policies \
+             WHERE env_id = $1 AND bundle_id = $2 AND customer_id = $3 \
+               AND version = $4",
+        )
+        .bind(env_id.as_str())
+        .bind(bundle_id.as_str())
+        .bind(customer_id.as_str())
+        .bind(version as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(RevenuePolicyArtifact {
+            bundle_id: bundle_id.clone(),
+            customer_id: customer_id.clone(),
+            version,
+            policy_ref: row.try_get("policy_ref")?,
+            doc: row.try_get("doc")?,
+            envelope: row.try_get("envelope")?,
+            doc_sha256: row.try_get("doc_sha256")?,
+            key_id: row.try_get("key_id")?,
+        }))
     }
 }
 

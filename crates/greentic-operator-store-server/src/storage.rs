@@ -8,8 +8,8 @@
 use std::future::Future;
 
 use greentic_deploy_spec::{
-    CapabilitySlot, ConcurrencyConflict, EnvId, Environment, EnvironmentRuntime, IntegrityError,
-    Precondition, PreconditionError, SpecError, StateEtag,
+    BundleId, CapabilitySlot, ConcurrencyConflict, CustomerId, EnvId, Environment,
+    EnvironmentRuntime, IntegrityError, Precondition, PreconditionError, SpecError, StateEtag,
 };
 use greentic_operator_trust::trust_root::TrustRootDocument;
 use serde_json::Value;
@@ -215,4 +215,48 @@ pub trait EnvironmentStorage: Send + Sync {
         doc: &TrustRootDocument,
         precondition: Option<&Precondition>,
     ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
+
+    /// Store a revenue-policy artifact version (PR-4.2g), overwriting any
+    /// orphan row at the same `(env_id, bundle_id, customer_id, version)`
+    /// key. No CAS: the environment row's CAS guards the bundle mutation
+    /// that writes a version, and version numbers derive from the
+    /// COMMITTED `revenue_policy_ref` — retry-after-partial-failure
+    /// rewrites the SAME version (the LocalFS orphan-overwrite semantics).
+    fn upsert_revenue_policy(
+        &self,
+        env_id: &EnvId,
+        artifact: &RevenuePolicyArtifact,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Load a stored revenue-policy artifact version, if present.
+    fn load_revenue_policy(
+        &self,
+        env_id: &EnvId,
+        bundle_id: &BundleId,
+        customer_id: &CustomerId,
+        version: u64,
+    ) -> impl Future<Output = Result<Option<RevenuePolicyArtifact>, StorageError>> + Send;
+}
+
+/// A stored revenue-policy version: the exact bytes the shared builder
+/// (`greentic_operator_trust::revenue_policy`) produced, plus the identity
+/// they are keyed under. The server-side analogue of the LocalFS
+/// `billing-policies/<bundle>/<customer>/vN.json{,.sig}` file pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevenuePolicyArtifact {
+    pub bundle_id: BundleId,
+    pub customer_id: CustomerId,
+    /// 1-based version within `(bundle_id, customer_id)`.
+    pub version: u64,
+    /// Canonical storage-relative sidecar ref — exactly the value pinned on
+    /// `BundleDeployment.revenue_policy_ref`.
+    pub policy_ref: String,
+    /// Exact bytes of `vN.json`.
+    pub doc: Vec<u8>,
+    /// Exact bytes of the DSSE envelope sidecar.
+    pub envelope: Vec<u8>,
+    /// Lowercase-hex SHA-256 of `doc` (the digest the DSSE subject pins).
+    pub doc_sha256: String,
+    /// `keyid` recorded in the DSSE envelope.
+    pub key_id: String,
 }

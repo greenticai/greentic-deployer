@@ -14,11 +14,14 @@ use std::collections::BTreeMap;
 
 use chrono::{TimeZone, Utc};
 use greentic_deploy_spec::{
-    CapabilitySlot, ConcurrencyConflict, EnvId, EnvPackBinding, Environment, EnvironmentHostConfig,
-    EnvironmentRuntime, PackDescriptor, PackId, Precondition, SchemaVersion, StateEtag,
+    BundleId, CapabilitySlot, ConcurrencyConflict, CustomerId, EnvId, EnvPackBinding, Environment,
+    EnvironmentHostConfig, EnvironmentRuntime, PackDescriptor, PackId, Precondition, SchemaVersion,
+    StateEtag,
 };
 use greentic_operator_store_server::sqlite::SqliteEnvironmentStore;
-use greentic_operator_store_server::storage::{EnvironmentStorage, StorageError};
+use greentic_operator_store_server::storage::{
+    EnvironmentStorage, RevenuePolicyArtifact, StorageError,
+};
 use greentic_operator_trust::test_support::keypair;
 use greentic_operator_trust::trust_root::{TrustRootDocument, TrustedKey};
 use serde_json::json;
@@ -781,4 +784,93 @@ async fn load_trust_root_detects_tampered_data() {
         matches!(err, StorageError::IntegrityMismatch { .. }),
         "expected IntegrityMismatch, got: {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// revenue_policies (PR-4.2g)
+// ---------------------------------------------------------------------------
+
+fn policy_artifact(version: u64, payload: &str) -> RevenuePolicyArtifact {
+    RevenuePolicyArtifact {
+        bundle_id: BundleId::new("acme"),
+        customer_id: CustomerId::new("cust-1"),
+        version,
+        policy_ref: format!("billing-policies/acme/cust-1/v{version}.json.sig"),
+        doc: payload.as_bytes().to_vec(),
+        envelope: format!("envelope-{payload}").into_bytes(),
+        doc_sha256: format!("sha-{payload}"),
+        key_id: "deadbeef".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn revenue_policy_round_trips_per_version() {
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    store
+        .upsert_revenue_policy(&id, &policy_artifact(1, "v1-doc"))
+        .await
+        .expect("store v1");
+    store
+        .upsert_revenue_policy(&id, &policy_artifact(2, "v2-doc"))
+        .await
+        .expect("store v2");
+
+    let v1 = store
+        .load_revenue_policy(&id, &BundleId::new("acme"), &CustomerId::new("cust-1"), 1)
+        .await
+        .expect("load v1")
+        .expect("v1 present");
+    assert_eq!(v1, policy_artifact(1, "v1-doc"));
+    let v2 = store
+        .load_revenue_policy(&id, &BundleId::new("acme"), &CustomerId::new("cust-1"), 2)
+        .await
+        .expect("load v2")
+        .expect("v2 present");
+    assert_eq!(v2.doc, b"v2-doc");
+
+    let absent = store
+        .load_revenue_policy(&id, &BundleId::new("acme"), &CustomerId::new("cust-1"), 3)
+        .await
+        .expect("load v3");
+    assert!(absent.is_none());
+    let other_customer = store
+        .load_revenue_policy(&id, &BundleId::new("acme"), &CustomerId::new("other"), 1)
+        .await
+        .expect("load other");
+    assert!(other_customer.is_none(), "keyed per (bundle, customer)");
+}
+
+#[tokio::test]
+async fn revenue_policy_overwrites_orphan_at_same_version() {
+    // A mutation that failed after the artifact write leaves an orphan row;
+    // the retry derives the SAME version from the committed ref and must
+    // overwrite it, never error or duplicate.
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    store
+        .upsert_revenue_policy(&id, &policy_artifact(1, "orphan"))
+        .await
+        .expect("first write");
+    store
+        .upsert_revenue_policy(&id, &policy_artifact(1, "retry"))
+        .await
+        .expect("retry overwrites");
+
+    let stored = store
+        .load_revenue_policy(&id, &BundleId::new("acme"), &CustomerId::new("cust-1"), 1)
+        .await
+        .expect("load")
+        .expect("present");
+    assert_eq!(stored.doc, b"retry");
 }

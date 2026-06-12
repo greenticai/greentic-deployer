@@ -120,6 +120,11 @@ where
             "/environments/{env_id}/extensions/rollback",
             post(api::rollback_extension_binding::<S>),
         )
+        .route("/environments/{env_id}/bundles", post(api::add_bundle::<S>))
+        .route(
+            "/environments/{env_id}/bundles/{deployment_id}",
+            patch(api::update_bundle::<S>).delete(api::remove_bundle::<S>),
+        )
         .route(
             "/environments/{env_id}/trust-root",
             get(api::get_trust_root::<S>),

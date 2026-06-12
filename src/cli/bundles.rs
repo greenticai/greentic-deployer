@@ -209,8 +209,8 @@ pub fn add(
                         payload.authorization_ref.to_string_lossy().into_owned(),
                     ),
                     config_overrides,
-                    idempotency_key,
                 },
+                idempotency_key,
             )
             .map_err(map_store_err_preserving_noun)?;
         let summary = BundleSummary::from(&env_id, &deployment);
@@ -296,8 +296,8 @@ pub fn update(
                     route_binding: new_route_binding,
                     revenue_share: new_revenue_share,
                     config_overrides: payload.config_overrides,
-                    idempotency_key,
                 },
+                idempotency_key,
             )
             .map_err(map_store_err_preserving_noun)?;
         let summary = BundleSummary::from(&env_id, &deployment);

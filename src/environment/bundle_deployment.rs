@@ -13,6 +13,15 @@
 //! `BundleDeployment.revenue_policy_ref` is set to the **env-relative** path of
 //! the latest sidecar.
 //!
+//! Since PR-4.2g the storage-free half — version derivation, document +
+//! predicate construction, DSSE signing, the trust-root refusal, and the
+//! in-memory self-verify — lives in
+//! [`greentic_operator_trust::revenue_policy`], shared with the
+//! operator-store-server (which persists the same bytes to its
+//! `revenue_policies` table). This module keeps the file-backed half: the
+//! env trust-root load, the atomic writes, and the on-disk re-read
+//! self-verify.
+//!
 //! ## Signing posture (C2)
 //!
 //! The `.sig` sidecar is a DSSE envelope (`application/vnd.in-toto+json`)
@@ -51,30 +60,23 @@
 //! `EnvironmentStore::transact` so the file write and the `env.json` update
 //! share one env flock.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use greentic_deploy_spec::{
-    BundleDeployment, RevenuePolicyDocument, RevenueShareEntry, SchemaVersion,
-};
-use greentic_distributor_client::signing::{
-    INTOTO_STATEMENT_TYPE, InTotoStatement, SigningError, Subject, sign_statement,
-    verify_artifact_dsse,
-};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use greentic_deploy_spec::{BundleDeployment, RevenueShareEntry};
+use greentic_distributor_client::signing::{SigningError, verify_artifact_dsse};
+use greentic_operator_trust::revenue_policy::{self, RevenuePolicyError};
 use thiserror::Error;
 
 use super::atomic_write::AtomicWriteError;
 use super::trust_root::{self, TrustRootError};
 use crate::operator_key::{OperatorKey, OperatorKeyError};
 
-/// Env-relative root directory holding all revenue-policy versions.
-const BILLING_DIR: &str = "billing-policies";
-
-/// Predicate type discriminator for the revenue-policy DSSE statement.
-pub const REVENUE_POLICY_PREDICATE_TYPE_V1: &str = "greentic.revenue-policy-predicate.v1";
+// Predicate shape + discriminator moved to the shared builder crate in
+// PR-4.2g; re-exported so `crate::environment::…` paths keep working.
+pub use greentic_operator_trust::revenue_policy::{
+    REVENUE_POLICY_PREDICATE_TYPE_V1, RevenuePolicyPredicate,
+};
 
 #[derive(Debug, Error)]
 pub enum BundleDeploymentError {
@@ -126,25 +128,24 @@ pub enum BundleDeploymentError {
     },
 }
 
-/// Predicate body recorded inside the DSSE Statement. Mirrors the
-/// document's identity fields so a reader of the `.sig` envelope alone can
-/// see what the signature covers without opening `vN.json`.
-///
-/// `previous_version_ref` is serialized as a forward-slash-normalized
-/// `String` (not a `PathBuf`) so the predicate is portable across
-/// operating systems — Windows back-slashes in a JSON path string would
-/// not resolve on POSIX verifiers.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RevenuePolicyPredicate {
-    pub schema: String,
-    pub deployment_id: greentic_deploy_spec::DeploymentId,
-    pub env_id: greentic_deploy_spec::EnvId,
-    pub bundle_id: greentic_deploy_spec::BundleId,
-    pub customer_id: greentic_deploy_spec::CustomerId,
-    pub version: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_version_ref: Option<String>,
-    pub signed_at: DateTime<Utc>,
+/// Map the shared builder's pure error onto this module's surface. Variant
+/// names and Display strings stay byte-identical to the pre-extraction
+/// enum; `OperatorKeyNotTrusted` regains the `env_dir` the backend-neutral
+/// builder cannot know.
+fn map_policy_error(err: RevenuePolicyError, env_dir: &Path) -> BundleDeploymentError {
+    match err {
+        RevenuePolicyError::Spec(e) => BundleDeploymentError::Spec(e),
+        RevenuePolicyError::UnsafeSegment(s) => BundleDeploymentError::UnsafeSegment(s),
+        RevenuePolicyError::VersionOverflow => BundleDeploymentError::VersionOverflow,
+        RevenuePolicyError::Sign(e) => BundleDeploymentError::Sign(e),
+        RevenuePolicyError::Serialize(e) => BundleDeploymentError::Serialize(e),
+        RevenuePolicyError::OperatorKeyNotTrusted { key_id } => {
+            BundleDeploymentError::OperatorKeyNotTrusted {
+                key_id,
+                env_dir: env_dir.to_path_buf(),
+            }
+        }
+    }
 }
 
 /// What a successful policy-version write produced.
@@ -162,20 +163,13 @@ pub struct RevenuePolicyVersion {
     pub key_id: String,
 }
 
-/// Convert a `PathBuf` into a `/`-separated string for cross-platform
-/// serialization inside DSSE predicates. On POSIX this is a no-op; on
-/// Windows it replaces `\\` with `/`.
-fn path_to_forward_slash(p: &Path) -> String {
-    p.to_string_lossy().replace('\\', "/")
-}
-
 /// Write the next revenue-policy version for `deployment` under `env_dir`,
 /// using `revenue_share` as the version's policy, `created_at` as its
 /// timestamp, and `operator_key` for DSSE signing.
 ///
 /// On disk, two files land under
 /// `<env_dir>/billing-policies/<bundle_id>/<customer_id>/`:
-/// - `vN.json` — the canonical-JSON [`RevenuePolicyDocument`].
+/// - `vN.json` — the canonical-JSON [`greentic_deploy_spec::RevenuePolicyDocument`].
 /// - `vN.json.sig` — a DSSE envelope whose in-toto v1 Statement pins the
 ///   document's SHA-256 and carries a [`RevenuePolicyPredicate`].
 ///
@@ -191,7 +185,7 @@ fn path_to_forward_slash(p: &Path) -> String {
 /// Returns the env-relative sidecar path the caller should store in
 /// `BundleDeployment.revenue_policy_ref`. Versions are 1-based and monotonic
 /// per `(bundle_id, customer_id)`; the new version chains backward to the prior
-/// one via [`RevenuePolicyDocument::previous_version_ref`].
+/// one via `RevenuePolicyDocument::previous_version_ref`.
 ///
 /// MUST run under the env flock (see module docs).
 pub fn write_revenue_policy_version(
@@ -201,111 +195,38 @@ pub fn write_revenue_policy_version(
     created_at: DateTime<Utc>,
     operator_key: &OperatorKey,
 ) -> Result<RevenuePolicyVersion, BundleDeploymentError> {
-    // Codex #1: load the env trust root (do NOT mutate it) and refuse to
-    // sign if the operator's key is not already trusted. Runs at the very
-    // top of the function so a failed precondition leaves NO partial
-    // artifacts (empty billing-policies subdirs, etc.) on disk. Auto-seeding
-    // here would defeat `gtc op trust-root remove` as a revocation boundary.
+    // Codex #1: load the env trust root (do NOT mutate it). The shared
+    // builder refuses to sign if the operator's key is not already trusted,
+    // BEFORE any bytes exist — so a failed precondition leaves NO partial
+    // artifacts (empty billing-policies subdirs, etc.) on disk.
     let trust_root = trust_root::load(env_dir)?;
-    let trusted = trust_root
-        .keys
-        .iter()
-        .any(|k| k.key_id.eq_ignore_ascii_case(&operator_key.key_id));
-    if !trusted {
-        return Err(BundleDeploymentError::OperatorKeyNotTrusted {
-            key_id: operator_key.key_id.clone(),
-            env_dir: env_dir.to_path_buf(),
-        });
-    }
-
-    // `BundleId`/`CustomerId` are opaque, unvalidated strings — guard against
-    // path traversal before they become directory segments.
-    let bundle_seg = safe_segment(deployment.bundle_id.as_str())?;
-    let customer_seg = safe_segment(deployment.customer_id.as_str())?;
-    let rel_dir = Path::new(BILLING_DIR).join(bundle_seg).join(customer_seg);
-    let abs_dir = env_dir.join(&rel_dir);
-
-    // Version is derived from the deployment's *committed* `revenue_policy_ref`
-    // (env.json), NOT from a filesystem scan. This keeps the operation
-    // idempotent under partial-I/O retry: callers persist env.json only after
-    // this writer returns, so a failed attempt (sidecar write or env save)
-    // leaves the committed ref unchanged and a retry rewrites the SAME version
-    // — overwriting any orphan files — instead of advancing past them. The
-    // committed state therefore never references an uncommitted or dangling
-    // version.
-    let version = next_version_from_ref(&deployment.revenue_policy_ref)?;
-    // Reconstruct the backward link under THIS deployment's billing dir rather
-    // than copying the committed ref verbatim. In the normal flow the two are
-    // identical (refs are always canonical); reconstructing additionally
-    // refuses to propagate a crafted/cross-env ref out of a tampered env.json.
-    let previous_version_ref_path = (version > 1).then(|| rel_dir.join(sidecar_name(version - 1)));
-
-    let doc = RevenuePolicyDocument {
-        schema: SchemaVersion::new(SchemaVersion::REVENUE_POLICY_V1),
-        version,
-        deployment_id: deployment.deployment_id,
-        env_id: deployment.env_id.clone(),
-        bundle_id: deployment.bundle_id.clone(),
-        customer_id: deployment.customer_id.clone(),
-        revenue_share: revenue_share.to_vec(),
+    let built = revenue_policy::build_revenue_policy_version(
+        deployment,
+        revenue_share,
         created_at,
-        previous_version_ref: previous_version_ref_path.clone(),
-    };
-    doc.validate()?;
+        operator_key,
+        &trust_root,
+    )
+    .map_err(|err| map_policy_error(err, env_dir))?;
 
-    let doc_bytes = serde_json::to_vec_pretty(&doc).map_err(BundleDeploymentError::Serialize)?;
-    // Lowercase-hex SHA-256 over the exact on-disk bytes — pinned in the
-    // DSSE Statement subject and re-derived in the self-verify below.
-    let doc_sha256_hex = sha256_hex(&doc_bytes);
-
-    let predicate = RevenuePolicyPredicate {
-        schema: REVENUE_POLICY_PREDICATE_TYPE_V1.to_string(),
-        deployment_id: deployment.deployment_id,
-        env_id: deployment.env_id.clone(),
-        bundle_id: deployment.bundle_id.clone(),
-        customer_id: deployment.customer_id.clone(),
-        version,
-        previous_version_ref: previous_version_ref_path
-            .as_deref()
-            .map(path_to_forward_slash),
-        signed_at: created_at,
-    };
-    let predicate_value =
-        serde_json::to_value(&predicate).map_err(BundleDeploymentError::Serialize)?;
-
-    let mut digest = BTreeMap::new();
-    digest.insert("sha256".to_string(), doc_sha256_hex.clone());
-    let statement = InTotoStatement {
-        type_: INTOTO_STATEMENT_TYPE.to_string(),
-        subject: vec![Subject {
-            name: document_name(version),
-            digest,
-        }],
-        predicate_type: REVENUE_POLICY_PREDICATE_TYPE_V1.to_string(),
-        predicate: predicate_value,
-    };
-
-    let envelope = sign_statement(&statement, &operator_key.private_pem, &operator_key.key_id)?;
-    let envelope_bytes =
-        serde_json::to_vec_pretty(&envelope).map_err(BundleDeploymentError::Serialize)?;
-
+    let doc_abs = env_dir.join(&built.doc_ref);
+    let sig_abs = env_dir.join(&built.policy_ref);
+    let abs_dir = doc_abs
+        .parent()
+        .expect("built refs always carry the billing-policies parent dir")
+        .to_path_buf();
     std::fs::create_dir_all(&abs_dir).map_err(|source| BundleDeploymentError::Io {
         path: abs_dir.clone(),
         source,
     })?;
 
-    let doc_rel = rel_dir.join(document_name(version));
-    let sig_rel = rel_dir.join(sidecar_name(version));
-    let doc_abs = env_dir.join(&doc_rel);
-    let sig_abs = env_dir.join(&sig_rel);
-
-    super::atomic_write::atomic_write_bytes(&doc_abs, &doc_bytes).map_err(|source| {
+    super::atomic_write::atomic_write_bytes(&doc_abs, &built.doc_bytes).map_err(|source| {
         BundleDeploymentError::Write {
             path: doc_abs.clone(),
             source,
         }
     })?;
-    super::atomic_write::atomic_write_bytes(&sig_abs, &envelope_bytes).map_err(|source| {
+    super::atomic_write::atomic_write_bytes(&sig_abs, &built.envelope_bytes).map_err(|source| {
         BundleDeploymentError::Write {
             path: sig_abs.clone(),
             source,
@@ -314,20 +235,18 @@ pub fn write_revenue_policy_version(
 
     // Self-verify: re-read BOTH files from disk, re-hash the doc, then
     // verify the envelope against the digest of what actually landed. The
-    // earlier shape used the in-memory `doc_sha256_hex` for the verify
-    // input, which would pass even if the on-disk doc was truncated or
-    // corrupted between atomic_write and this verify (e.g. NFS / out-of-
-    // disk-space / concurrent rename). Re-hashing the disk bytes catches
-    // write-time corruption at the moment it could be detected cheaply.
+    // builder already verified the in-memory bytes; re-hashing the disk
+    // bytes additionally catches write-time corruption (NFS / out-of-disk-
+    // space / concurrent rename) at the moment it is cheap to detect.
     let on_disk_doc = std::fs::read(&doc_abs).map_err(|source| BundleDeploymentError::Io {
         path: doc_abs.clone(),
         source,
     })?;
-    let on_disk_doc_sha256 = sha256_hex(&on_disk_doc);
-    if on_disk_doc_sha256 != doc_sha256_hex {
+    let on_disk_doc_sha256 = revenue_policy::sha256_hex(&on_disk_doc);
+    if on_disk_doc_sha256 != built.doc_sha256 {
         return Err(BundleDeploymentError::DocCorruptedAfterWrite {
             path: doc_abs.clone(),
-            expected: doc_sha256_hex.clone(),
+            expected: built.doc_sha256.clone(),
             actual: on_disk_doc_sha256,
         });
     }
@@ -338,67 +257,11 @@ pub fn write_revenue_policy_version(
     verify_artifact_dsse(&written, &on_disk_doc_sha256, &trust_root)?;
 
     Ok(RevenuePolicyVersion {
-        policy_ref: sig_rel,
-        version,
-        doc_sha256: doc_sha256_hex,
-        key_id: operator_key.key_id.clone(),
+        policy_ref: built.policy_ref,
+        version: built.version,
+        doc_sha256: built.doc_sha256,
+        key_id: built.key_id,
     })
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
-fn document_name(version: u64) -> String {
-    format!("v{version}.json")
-}
-
-fn sidecar_name(version: u64) -> String {
-    format!("v{version}.json.sig")
-}
-
-/// Reject anything that is not a single safe path component.
-fn safe_segment(seg: &str) -> Result<&str, BundleDeploymentError> {
-    if seg.is_empty()
-        || seg == "."
-        || seg == ".."
-        || seg.contains('/')
-        || seg.contains('\\')
-        || seg.contains('\0')
-    {
-        return Err(BundleDeploymentError::UnsafeSegment(seg.to_string()));
-    }
-    Ok(seg)
-}
-
-/// Derive the next version from the deployment's committed `revenue_policy_ref`.
-///
-/// A ref of the shape `…/vN.json.sig` (with `N >= 1`) yields `N + 1`; anything
-/// else — an empty placeholder on a fresh `add`, or a pre-B10 ref like
-/// `revenue.json` — yields `1`, i.e. the first B10 version. A committed ref
-/// already at the maximum returns [`BundleDeploymentError::VersionOverflow`]
-/// rather than panicking (debug) or wrapping to 0 (release).
-fn next_version_from_ref(current_ref: &Path) -> Result<u64, BundleDeploymentError> {
-    match parse_sidecar_version(current_ref) {
-        Some(n) => n
-            .checked_add(1)
-            .ok_or(BundleDeploymentError::VersionOverflow),
-        None => Ok(1),
-    }
-}
-
-/// Parse the version `N` out of a `…/vN.json.sig` sidecar path. Returns `None`
-/// for `v0` (not a valid 1-based version) so a corrupted ref is treated as
-/// "no prior version" instead of chaining to a schema-invalid v0.
-fn parse_sidecar_version(ref_path: &Path) -> Option<u64> {
-    let n = ref_path
-        .file_name()?
-        .to_str()?
-        .strip_prefix('v')?
-        .strip_suffix(".json.sig")?
-        .parse::<u64>()
-        .ok()?;
-    (n >= 1).then_some(n)
 }
 
 #[cfg(test)]
@@ -406,10 +269,12 @@ mod tests {
     use super::*;
     use crate::operator_key::{OperatorKey, load_or_generate_at};
     use greentic_deploy_spec::{
-        BundleDeploymentStatus, BundleId, CustomerId, DeploymentId, EnvId, PartyId, RouteBinding,
-        TenantSelector,
+        BundleDeploymentStatus, BundleId, CustomerId, DeploymentId, EnvId, PartyId,
+        RevenuePolicyDocument, RouteBinding, SchemaVersion, TenantSelector,
     };
-    use greentic_distributor_client::signing::{DsseEnvelope, TrustedKey, verify_artifact_dsse};
+    use greentic_distributor_client::signing::{DsseEnvelope, TrustedKey};
+    use greentic_operator_trust::revenue_policy::sha256_hex;
+    use std::collections::BTreeMap;
     use tempfile::{TempDir, tempdir};
 
     /// Test fixture: load/generate an operator key AND seed it into the env
@@ -789,20 +654,6 @@ mod tests {
         assert!(matches!(err, BundleDeploymentError::Spec(_)));
         // Nothing should have been written.
         assert!(!dir.path().join("billing-policies").exists());
-    }
-
-    #[test]
-    fn parse_sidecar_version_rejects_zero_and_garbage() {
-        assert_eq!(parse_sidecar_version(Path::new("a/b/v1.json.sig")), Some(1));
-        assert_eq!(
-            parse_sidecar_version(Path::new("a/b/v42.json.sig")),
-            Some(42)
-        );
-        // v0 is not a valid 1-based version → treated as "no prior".
-        assert_eq!(parse_sidecar_version(Path::new("a/b/v0.json.sig")), None);
-        assert_eq!(parse_sidecar_version(Path::new("revenue.json")), None);
-        assert_eq!(parse_sidecar_version(Path::new("v1.json")), None);
-        assert_eq!(parse_sidecar_version(Path::new("")), None);
     }
 
     #[test]

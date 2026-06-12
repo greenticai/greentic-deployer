@@ -18,10 +18,10 @@ use greentic_distributor_client::signing::TrustedKey;
 
 use greentic_deploy_spec::engine::{self, EngineError};
 use greentic_deploy_spec::{
-    BundleDeployment, BundleDeploymentStatus, BundleId, CapabilitySlot, DeploymentId, EnvId,
-    EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding, HealthStatus,
-    IdempotencyKey, MessagingEndpoint, MessagingEndpointId, RetentionPolicy, Revision, RevisionId,
-    RevisionLifecycle, RevocationConfig, RouteBinding, SchemaVersion, SecretRef, WelcomeFlowRef,
+    BundleDeployment, BundleId, CapabilitySlot, DeploymentId, EnvId, EnvPackBinding, Environment,
+    EnvironmentHostConfig, ExtensionBinding, HealthStatus, IdempotencyKey, MessagingEndpoint,
+    MessagingEndpointId, RetentionPolicy, Revision, RevisionId, RevocationConfig, SchemaVersion,
+    SecretRef, WelcomeFlowRef,
 };
 
 use super::bootstrap::{
@@ -106,6 +106,17 @@ fn map_binding_err(err: engine::BindingError) -> StoreError {
         | E::ExtensionGenerationOverflow { .. }
         | E::SnapshotEncode { .. }
         | E::SnapshotDecode { .. } => StoreError::Conflict(err.to_string()),
+    }
+}
+
+/// Map the engine's typed bundle errors onto the store surface. Messages
+/// are verbatim (the engine moved them in PR-4.2g), so operator-facing CLI
+/// errors are unchanged.
+fn map_bundle_err(err: engine::BundleError) -> StoreError {
+    use engine::BundleError as E;
+    match err {
+        E::DeploymentNotFound { .. } => StoreError::DependentNotFound(err.to_string()),
+        E::AlreadyDeployed { .. } | E::StillLive { .. } => StoreError::Conflict(err.to_string()),
     }
 }
 
@@ -393,122 +404,66 @@ impl LocalFsStore {
 
     /// Add a [`BundleDeployment`] to the env. Rejects with
     /// [`StoreError::Conflict`] when `(bundle_id, customer_id)` is already
-    /// deployed. Writes the v1 revenue-policy sidecar via
+    /// deployed (verb semantics live in [`engine::add_bundle`]). Writes the
+    /// v1 revenue-policy sidecar via
     /// [`super::write_revenue_policy_version`] and pins the resulting ref
     /// on the deployment.
     ///
-    /// `payload.idempotency_key` is accepted for trait conformance and
-    /// ignored locally; the HTTP backend caches it for A8 §2 replay.
+    /// `_idempotency_key` is accepted for trait conformance and ignored
+    /// locally; the HTTP backend caches it for A8 §2 replay.
     pub fn add_bundle(
         &self,
         env_id: &EnvId,
         payload: AddBundlePayload,
+        _idempotency_key: IdempotencyKey,
     ) -> Result<BundleDeployment, StoreError> {
         let env_dir = self.env_dir(env_id)?;
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            // P6 anchor (§5.4): one BundleDeployment per (env_id, bundle_id, customer_id).
-            if env
-                .bundles
-                .iter()
-                .any(|b| b.bundle_id == payload.bundle_id && b.customer_id == payload.customer_id)
-            {
-                return Err(StoreError::Conflict(format!(
-                    "bundle `{}` for customer `{}` already deployed in env `{}`",
-                    payload.bundle_id, payload.customer_id, env_id
-                )));
-            }
-            let created_at = Utc::now();
-            let route_binding = payload.route_binding.unwrap_or_else(|| RouteBinding {
-                hosts: Vec::new(),
-                path_prefixes: Vec::new(),
-                tenant_selector: greentic_deploy_spec::TenantSelector {
-                    tenant: "default".to_string(),
-                    team: "default".to_string(),
-                },
-            });
-            let authorization_ref = payload
-                .authorization_ref
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("auth.json"));
-            let mut deployment = BundleDeployment {
-                schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
-                deployment_id: crate::environment::mint_deployment_id(),
-                env_id: env_id.clone(),
-                bundle_id: payload.bundle_id,
-                customer_id: payload.customer_id,
-                status: BundleDeploymentStatus::Active,
-                current_revisions: Vec::new(),
-                route_binding,
-                revenue_share: payload.revenue_share,
-                // Replaced with the v1 policy sidecar path below.
-                revenue_policy_ref: std::path::PathBuf::new(),
-                usage: None,
-                created_at,
-                authorization_ref,
-                config_overrides: payload.config_overrides,
-            };
+            let idx = engine::add_bundle(
+                &mut env,
+                payload,
+                crate::environment::mint_deployment_id(),
+                Utc::now(),
+            )
+            .map_err(map_bundle_err)?;
             let operator_key = crate::operator_key::load_existing_only()?;
             let version = crate::environment::write_revenue_policy_version(
                 &env_dir,
-                &deployment,
-                &deployment.revenue_share,
-                created_at,
+                &env.bundles[idx],
+                &env.bundles[idx].revenue_share,
+                env.bundles[idx].created_at,
                 &operator_key,
             )?;
-            deployment.revenue_policy_ref = version.policy_ref;
-            env.bundles.push(deployment.clone());
+            env.bundles[idx].revenue_policy_ref = version.policy_ref;
             locked.save(&env)?;
-            Ok(deployment)
+            Ok(env.bundles[idx].clone())
         })
     }
 
     /// Patch a [`BundleDeployment`]'s scalar fields. `None` fields are
-    /// skipped. When `revenue_share` is `Some`, writes a new signed/versioned
+    /// skipped (verb semantics live in [`engine::update_bundle`]). When
+    /// `revenue_share` is `Some`, writes a new signed/versioned
     /// revenue-policy sidecar (chain-linked to the prior version) and pins
     /// the new ref on the deployment.
     ///
     /// Returns [`StoreError::DependentNotFound`] when `deployment_id` is
     /// absent under the env at lock-acquisition time.
     ///
-    /// `payload.idempotency_key` is accepted for trait conformance and
-    /// ignored locally; the HTTP backend caches it for A8 §2 replay.
+    /// `_idempotency_key` is accepted for trait conformance and ignored
+    /// locally; the HTTP backend caches it for A8 §2 replay.
     pub fn update_bundle(
         &self,
         env_id: &EnvId,
         payload: UpdateBundlePayload,
+        _idempotency_key: IdempotencyKey,
     ) -> Result<BundleDeployment, StoreError> {
-        let UpdateBundlePayload {
-            deployment_id,
-            status,
-            route_binding,
-            revenue_share,
-            config_overrides,
-            idempotency_key: _,
-        } = payload;
         let env_dir = self.env_dir(env_id)?;
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            let idx = env
-                .bundles
-                .iter()
-                .position(|b| b.deployment_id == deployment_id)
-                .ok_or_else(|| {
-                    StoreError::DependentNotFound(format!(
-                        "deployment `{deployment_id}` not found in env `{env_id}`"
-                    ))
-                })?;
-            if let Some(s) = status {
-                env.bundles[idx].status = s;
-            }
-            if let Some(rb) = route_binding {
-                env.bundles[idx].route_binding = rb;
-            }
-            if let Some(overrides) = config_overrides {
-                env.bundles[idx].config_overrides = overrides;
-            }
-            if let Some(shares) = revenue_share {
-                env.bundles[idx].revenue_share = shares;
+            let applied = engine::update_bundle(&mut env, payload).map_err(map_bundle_err)?;
+            if applied.revenue_share_changed {
+                let idx = applied.index;
                 let created_at = Utc::now();
                 let operator_key = crate::operator_key::load_existing_only()?;
                 let version = crate::environment::write_revenue_policy_version(
@@ -521,7 +476,7 @@ impl LocalFsStore {
                 env.bundles[idx].revenue_policy_ref = version.policy_ref;
             }
             locked.save(&env)?;
-            Ok(env.bundles[idx].clone())
+            Ok(env.bundles[applied.index].clone())
         })
     }
 
@@ -530,7 +485,8 @@ impl LocalFsStore {
     /// (any [`greentic_deploy_spec::TrafficSplit`] pointing at it, or any
     /// non-`Archived` revision under it) — callers run `op traffic clear`
     /// and archive revisions first. Drops archived revisions for the same
-    /// `deployment_id` so the env stays compact.
+    /// `deployment_id` so the env stays compact. Verb semantics live in
+    /// [`engine::remove_bundle`]; this wrapper owns the flock + persistence.
     ///
     /// Returns [`StoreError::DependentNotFound`] when the deployment is
     /// absent under the env at lock-acquisition time (matches the
@@ -546,52 +502,9 @@ impl LocalFsStore {
     ) -> Result<RemoveBundleOutcome, StoreError> {
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            let idx = env
-                .bundles
-                .iter()
-                .position(|b| b.deployment_id == deployment_id)
-                .ok_or_else(|| {
-                    StoreError::DependentNotFound(format!(
-                        "deployment `{deployment_id}` not found in env `{env_id}`"
-                    ))
-                })?;
-            // Live-state guard + prune set computed in one pass over
-            // `env.revisions`. `current_revisions` is plan-level future
-            // signal that A3's stage/warm path does not yet maintain, so
-            // it can't be the gate; the live-state proof is: any traffic
-            // split pointing at this deployment, or any non-`Archived`
-            // revision for it.
-            let active_splits = env
-                .traffic_splits
-                .iter()
-                .filter(|s| s.deployment_id == deployment_id)
-                .count();
-            let mut active_revisions = 0usize;
-            let mut pruned_revision_ids: Vec<RevisionId> = Vec::new();
-            for r in env.revisions.iter() {
-                if r.deployment_id != deployment_id {
-                    continue;
-                }
-                if matches!(r.lifecycle, RevisionLifecycle::Archived) {
-                    pruned_revision_ids.push(r.revision_id);
-                } else {
-                    active_revisions += 1;
-                }
-            }
-            if active_splits > 0 || active_revisions > 0 {
-                return Err(StoreError::Conflict(format!(
-                    "deployment `{deployment_id}` is still live: {active_splits} traffic split(s), \
-                     {active_revisions} non-archived revision(s). Archive revisions and clear the \
-                     split first."
-                )));
-            }
-            let deployment = env.bundles.remove(idx);
-            env.revisions.retain(|r| r.deployment_id != deployment_id);
+            let outcome = engine::remove_bundle(&mut env, deployment_id).map_err(map_bundle_err)?;
             locked.save(&env)?;
-            Ok(RemoveBundleOutcome {
-                deployment,
-                pruned_revision_ids,
-            })
+            Ok(outcome)
         })
     }
 
@@ -1575,8 +1488,9 @@ impl EnvironmentMutations for LocalFsStore {
         &self,
         env_id: &EnvId,
         payload: AddBundlePayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<BundleDeployment, StoreError> {
-        self.add_bundle(env_id, payload)
+        self.add_bundle(env_id, payload, idempotency_key)
     }
 
     /// See [`LocalFsStore::update_bundle`].
@@ -1584,8 +1498,9 @@ impl EnvironmentMutations for LocalFsStore {
         &self,
         env_id: &EnvId,
         payload: UpdateBundlePayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<BundleDeployment, StoreError> {
-        self.update_bundle(env_id, payload)
+        self.update_bundle(env_id, payload, idempotency_key)
     }
 
     /// See [`LocalFsStore::remove_bundle`].
