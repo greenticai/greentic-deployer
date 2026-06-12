@@ -17,9 +17,10 @@
 //! (the client enforces status↔body consistency).
 //!
 //! Not yet here (intentional follow-ups): idempotency replay (PR-4.3 — keys
-//! are accepted and echoed into the audit record, not yet cached), RBAC
-//! (PR-4.4 — every decision is an honest `Allow{policy: "open-dev"}`), and
-//! the audit log's durable append (PR-4.3).
+//! are required on every mutation and echoed into the audit record, not yet
+//! cached for replay), RBAC (PR-4.4 — every decision is an honest
+//! `Allow{policy: "open-dev"}`), and the audit log's durable append
+//! (PR-4.3).
 
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
@@ -32,9 +33,10 @@ use serde_json::{Value, json};
 
 use greentic_deploy_spec::engine::{self, EngineError};
 use greentic_deploy_spec::{
-    Actor, AuditDecision, AuditEvent, AuditResult, CreateEnvironmentPayload, EnvId, Environment,
-    HealthStatus, IdempotencyOutcome, MigrateMergePayload, Precondition, RemoteStoreError,
-    RetentionPolicy, RevocationConfig, SchemaVersion, StateEtag, UpdateEnvironmentPayload,
+    Actor, AuditDecision, AuditEvent, AuditResult, ConcurrencyConflict, CreateEnvironmentPayload,
+    EnvId, Environment, HealthStatus, IdempotencyOutcome, MigrateMergePayload, Precondition,
+    RemoteStoreError, RetentionPolicy, RevocationConfig, SchemaVersion, StateEtag,
+    UpdateEnvironmentPayload,
 };
 
 use crate::http::AppState;
@@ -189,13 +191,88 @@ fn audit_event(
     }
 }
 
-/// Pull the `Idempotency-Key` header (PR-4.3 adds replay; today the key is
-/// echoed into the audit record so the client's binding check passes).
-fn idempotency_key(headers: &HeaderMap) -> Option<String> {
-    headers
+/// Require a non-empty `Idempotency-Key` on every mutation (A8 §2). PR-4.3
+/// adds replay; today the key is echoed into the audit record so the
+/// client's binding check passes.
+fn require_idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
+    let key = headers
         .get("Idempotency-Key")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
+    match key {
+        Some(k) => Ok(k),
+        None => Err(ApiError(RemoteStoreError::InvalidRequest {
+            detail: "missing or empty Idempotency-Key header \
+                     (A8 §2: every mutating request must carry one)"
+                .to_string(),
+        })),
+    }
+}
+
+/// Parse an optional `If-Match` header into `Option<StateEtag>`. Accepts
+/// the strong quoted form (`"<hex>"`) and bare hex; rejects weak validators
+/// (`W/"…"`) and the wildcard `*` with a typed 400.
+fn parse_if_match(headers: &HeaderMap) -> Result<Option<StateEtag>, ApiError> {
+    let Some(raw) = headers.get("If-Match") else {
+        return Ok(None);
+    };
+    let s = raw.to_str().map_err(|_| {
+        ApiError(RemoteStoreError::InvalidRequest {
+            detail: "If-Match header is not valid ASCII".to_string(),
+        })
+    })?;
+    let s = s.trim();
+    if s.starts_with("W/") || s.starts_with("w/") {
+        return Err(ApiError(RemoteStoreError::InvalidRequest {
+            detail: "strong ETag required (weak validators `W/` are not accepted)".to_string(),
+        }));
+    }
+    if s == "*" {
+        return Err(ApiError(RemoteStoreError::InvalidRequest {
+            detail: "strong ETag required (`*` wildcard is not accepted)".to_string(),
+        }));
+    }
+    // Strip surrounding double quotes if present.
+    let inner = s
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(s);
+    Ok(Some(StateEtag(inner.to_string())))
+}
+
+/// Map a [`StorageError`] raised by LOADING persisted state — `Spec`,
+/// `EnvIdMismatch`, and `Json` on a stored row indicate corruption, not a
+/// client error. Write-path callers keep the existing `From<StorageError>`
+/// mapping where `Spec` → 400 is correct (the request payload caused it).
+fn load_storage_error(err: StorageError) -> ApiError {
+    match err {
+        StorageError::Spec(ref inner) => {
+            tracing::error!(%inner, "stored environment state failed validation (Spec)");
+            ApiError(RemoteStoreError::Internal {
+                message: "stored environment state failed validation".to_string(),
+            })
+        }
+        StorageError::EnvIdMismatch {
+            ref keyed,
+            ref payload,
+        } => {
+            tracing::error!(
+                %keyed, %payload,
+                "stored environment state failed validation (EnvIdMismatch)"
+            );
+            ApiError(RemoteStoreError::Internal {
+                message: "stored environment state failed validation".to_string(),
+            })
+        }
+        StorageError::Json(ref inner) => {
+            tracing::error!(%inner, "stored environment state failed validation (Json)");
+            ApiError(RemoteStoreError::Internal {
+                message: "stored environment state failed validation".to_string(),
+            })
+        }
+        other => ApiError(map_storage_error(other)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +285,7 @@ pub(crate) async fn create_environment<S: EnvironmentStorage>(
     headers: HeaderMap,
     ApiJson(payload): ApiJson<CreateEnvironmentPayload>,
 ) -> Result<Response, ApiError> {
+    let idem_key = require_idempotency_key(&headers)?;
     let env = engine::fresh_environment(
         &payload.env_id,
         payload.name,
@@ -224,7 +302,7 @@ pub(crate) async fn create_environment<S: EnvironmentStorage>(
         "env",
         "create",
         json!({"environment_id": env.environment_id}),
-        idempotency_key(&headers),
+        Some(idem_key),
         None,
         revision.generation,
     );
@@ -245,21 +323,35 @@ pub(crate) async fn update_environment<S: EnvironmentStorage>(
     headers: HeaderMap,
     ApiJson(patch): ApiJson<UpdateEnvironmentPayload>,
 ) -> Result<Response, ApiError> {
+    let idem_key = require_idempotency_key(&headers)?;
+    let client_etag = parse_if_match(&headers)?;
     let env_id = parse_env_id(&env_id)?;
-    let loaded = state.storage.load_env(&env_id).await?;
+    let loaded = state
+        .storage
+        .load_env(&env_id)
+        .await
+        .map_err(load_storage_error)?;
     let previous_generation = loaded.revision.generation;
     let mut env = loaded.value;
     engine::apply_environment_update(&mut env, patch);
-    // CAS against the revision we just loaded: a concurrent writer between
-    // our load and this update surfaces as 412 instead of a lost update.
-    let precondition = Precondition::matching(loaded.revision.etag, previous_generation);
+    // If the client sent If-Match, use it as the CAS precondition (server
+    // side of A8 #1; client wiring stays PR-3b-fu). Otherwise, pin the
+    // revision we just loaded as a torn-write guard only — true client CAS
+    // arrives with PR-3b-fu.
+    let precondition = match client_etag {
+        Some(etag) => Precondition {
+            if_match: Some(etag),
+            expected_generation: None,
+        },
+        None => Precondition::matching(loaded.revision.etag, previous_generation),
+    };
     let revision = state.storage.update_env(&env, &precondition).await?;
     let audit = audit_event(
         &env_id,
         "env",
         "update",
         json!({"environment_id": env_id}),
-        idempotency_key(&headers),
+        Some(idem_key),
         Some(previous_generation),
         revision.generation,
     );
@@ -281,11 +373,13 @@ pub(crate) async fn migrate_bindings<S: EnvironmentStorage>(
     headers: HeaderMap,
     ApiJson(payload): ApiJson<MigrateMergePayload>,
 ) -> Result<Response, ApiError> {
+    let idem_key = require_idempotency_key(&headers)?;
+    let client_etag = parse_if_match(&headers)?;
     let env_id = parse_env_id(&env_id)?;
     let existing = match state.storage.load_env(&env_id).await {
         Ok(loaded) => Some(loaded),
         Err(StorageError::NotFound(_)) => None,
-        Err(err) => return Err(err.into()),
+        Err(err) => return Err(load_storage_error(err)),
     };
     let prior_revision = existing.as_ref().map(|l| l.revision.clone());
     let mut env =
@@ -293,10 +387,33 @@ pub(crate) async fn migrate_bindings<S: EnvironmentStorage>(
     let report = engine::merge_bindings(&mut env, payload.packs, payload.extensions);
     let revision = match &prior_revision {
         Some(prior) => {
-            let precondition = Precondition::matching(prior.etag.clone(), prior.generation);
+            // If the client sent If-Match, use it as the CAS precondition
+            // (server side of A8 #1); otherwise pin the loaded revision as a
+            // torn-write guard (true client CAS arrives with PR-3b-fu).
+            let precondition = match &client_etag {
+                Some(etag) => Precondition {
+                    if_match: Some(etag.clone()),
+                    expected_generation: None,
+                },
+                None => Precondition::matching(prior.etag.clone(), prior.generation),
+            };
             state.storage.update_env(&env, &precondition).await?
         }
-        None => state.storage.create_env(&env).await?,
+        None => {
+            // Seed/create branch: If-Match on a resource that doesn't exist
+            // yet is a precondition failure per RFC 9110.
+            if let Some(client_etag) = &client_etag {
+                return Err(ApiError(RemoteStoreError::PreconditionFailed(
+                    ConcurrencyConflict {
+                        expected_etag: Some(client_etag.0.clone()),
+                        actual_etag: String::new(),
+                        expected_generation: None,
+                        actual_generation: 0,
+                    },
+                )));
+            }
+            state.storage.create_env(&env).await?
+        }
     };
     let audit = audit_event(
         &env_id,
@@ -307,7 +424,7 @@ pub(crate) async fn migrate_bindings<S: EnvironmentStorage>(
             "merged_slots": report.merged_slots,
             "merged_extensions": report.merged_extensions,
         }),
-        idempotency_key(&headers),
+        Some(idem_key),
         prior_revision.map(|r| r.generation),
         revision.generation,
     );
@@ -343,7 +460,11 @@ pub(crate) async fn get_environment<S: EnvironmentStorage>(
     Path(env_id): Path<String>,
 ) -> Result<Json<GetEnvironmentResponse>, ApiError> {
     let env_id = parse_env_id(&env_id)?;
-    let loaded = state.storage.load_env(&env_id).await?;
+    let loaded = state
+        .storage
+        .load_env(&env_id)
+        .await
+        .map_err(load_storage_error)?;
     Ok(Json(GetEnvironmentResponse {
         environment: loaded.value,
         etag: loaded.revision.etag,

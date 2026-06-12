@@ -59,6 +59,11 @@ pub enum EngineError {
 /// `#[serde(default, skip_serializing_if = "FieldUpdate::is_keep")]`).
 /// A present-but-`{"clear": false}` value deserializes to `Keep` — the
 /// caller said "don't clear" and named no new value.
+///
+/// Deserialization is **strict**: a body carrying both `value` and `clear`
+/// keys is rejected (contradictory patch intent), and unknown keys are
+/// rejected via `deny_unknown_fields`. `{"value": null}` is treated as
+/// absent for `T` that deserializes from null.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum FieldUpdate<T> {
     /// Leave the existing value unchanged (the prior `None` behavior).
@@ -108,14 +113,23 @@ impl<T> FieldUpdate<T> {
     }
 }
 
-/// Private serde representation: `{"value": T}` | `{"clear": bool}`.
-/// Untagged, so `value` is tried first — a body carrying both keys parses
-/// as `Set`.
-#[derive(Serialize, Deserialize)]
+/// Private serde representation for `Serialize` only: `{"value": v}` for
+/// `Set`, `{"clear": true}` for `Clear`. Deserialization uses a strict
+/// `deny_unknown_fields` helper below.
+#[derive(Serialize)]
 #[serde(untagged)]
 enum FieldUpdateRepr<T> {
     Set { value: T },
     Clear { clear: bool },
+}
+
+/// Strict deserialization helper — `deny_unknown_fields` rejects payloads
+/// carrying both `value` and `clear` (or any unknown key).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FieldUpdateDeHelper<T> {
+    value: Option<T>,
+    clear: Option<bool>,
 }
 
 impl<T: Serialize> Serialize for FieldUpdate<T> {
@@ -132,14 +146,27 @@ impl<T: Serialize> Serialize for FieldUpdate<T> {
 
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for FieldUpdate<T> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(
-            match Option::<FieldUpdateRepr<T>>::deserialize(deserializer)? {
-                None => Self::Keep,
-                Some(FieldUpdateRepr::Set { value }) => Self::Set(value),
-                Some(FieldUpdateRepr::Clear { clear: true }) => Self::Clear,
-                Some(FieldUpdateRepr::Clear { clear: false }) => Self::Keep,
+        // Outer `Option` maps JSON `null` (or absent field via `#[serde(default)]`)
+        // to `Keep`. The inner helper is `deny_unknown_fields`, so
+        // `{"value":…,"clear":…}` or any unknown key raises a typed error.
+        //
+        // NOTE: `{"value": null}` is indistinguishable from a missing `value`
+        // key for `T` that deserializes from null — treated as absent. Do not
+        // over-engineer: document this edge case and move on.
+        match Option::<FieldUpdateDeHelper<T>>::deserialize(deserializer)? {
+            None => Ok(Self::Keep),
+            Some(h) => match (h.value, h.clear) {
+                (Some(_), Some(_)) => Err(serde::de::Error::custom(
+                    "field update cannot carry both `value` and `clear`",
+                )),
+                (Some(v), None) => Ok(Self::Set(v)),
+                (None, Some(true)) => Ok(Self::Clear),
+                (None, Some(false)) => Ok(Self::Keep),
+                (None, None) => Err(serde::de::Error::custom(
+                    "field update object must carry `value` or `clear`",
+                )),
             },
-        )
+        }
     }
 }
 
@@ -554,6 +581,30 @@ mod tests {
         .unwrap();
         assert!(payload.region.is_keep());
         assert!(payload.tenant_org_id.is_keep());
+    }
+
+    #[test]
+    fn field_update_rejects_contradictory_value_and_clear() {
+        let err = serde_json::from_value::<UpdateEnvironmentPayload>(json!({
+            "region": {"value": "x", "clear": true},
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot carry both"),
+            "expected contradictory-field rejection: {err}"
+        );
+    }
+
+    #[test]
+    fn field_update_rejects_unknown_keys() {
+        let err = serde_json::from_value::<UpdateEnvironmentPayload>(json!({
+            "region": {"unknown_key": 1},
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "expected unknown-key rejection: {err}"
+        );
     }
 
     #[test]

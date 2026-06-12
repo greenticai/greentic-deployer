@@ -17,6 +17,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use greentic_operator_store_server::http::router;
+use greentic_operator_store_server::sqlite::SqliteEnvironmentStore;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::util::ServiceExt;
@@ -307,4 +308,257 @@ async fn migrate_bindings_seeds_missing_target_and_rejects_without_seed() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(read["environment"]["name"], "fresh");
     assert_eq!(read["environment"]["packs"][0]["slot"], "secrets");
+}
+
+// ---------------------------------------------------------------------------
+// send_custom — dispatch with explicit headers (no default Idempotency-Key)
+// ---------------------------------------------------------------------------
+
+/// Like `send` but accepts custom headers. Does NOT auto-inject Idempotency-Key.
+async fn send_custom(
+    app: Router,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("Accept", "application/json");
+    for &(name, value) in headers {
+        builder = builder.header(name, value);
+    }
+    let body = match body {
+        Some(value) => {
+            builder = builder.header("Content-Type", "application/json");
+            Body::from(value.to_string())
+        }
+        None => Body::empty(),
+    };
+    let response = app
+        .oneshot(builder.body(body).expect("build request"))
+        .await
+        .expect("dispatch request");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect body")
+        .to_bytes();
+    let value: Value = serde_json::from_slice(&bytes).expect("json body");
+    (status, value)
+}
+
+async fn app_with_store() -> (tempfile::TempDir, Router, Arc<SqliteEnvironmentStore>) {
+    let (dir, store) = fresh_store().await;
+    let store = Arc::new(store);
+    let app = router(Arc::clone(&store));
+    (dir, app, store)
+}
+
+// ---------------------------------------------------------------------------
+// FIX 2 — missing Idempotency-Key → 400
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mutation_without_idempotency_key_is_400() {
+    let (_d, app) = app().await;
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[], // no Idempotency-Key
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["kind"], "invalid-request");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Idempotency-Key"),
+        "detail must mention the header: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX 3 — If-Match enforcement
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn patch_with_stale_if_match_is_412() {
+    let (_d, app) = app().await;
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // PATCH with a stale etag → 412
+    let (status, body) = send_custom(
+        app,
+        Method::PATCH,
+        "/environments/local",
+        Some(json!({"name": "x"})),
+        &[("Idempotency-Key", IDEM_KEY), ("If-Match", "\"deadbeef\"")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "body: {body}");
+    assert_eq!(body["kind"], "precondition-failed");
+}
+
+#[tokio::test]
+async fn patch_with_current_if_match_succeeds() {
+    let (_d, app) = app().await;
+    let (status, created) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Read the current etag and use it in If-Match
+    let etag = created["etag"].as_str().unwrap();
+    let if_match = format!("\"{etag}\"");
+    let (status, body) = send_custom(
+        app,
+        Method::PATCH,
+        "/environments/local",
+        Some(json!({"name": "renamed"})),
+        &[("Idempotency-Key", IDEM_KEY), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["result"]["name"], "renamed");
+}
+
+#[tokio::test]
+async fn patch_with_weak_etag_is_400() {
+    let (_d, app) = app().await;
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send_custom(
+        app,
+        Method::PATCH,
+        "/environments/local",
+        Some(json!({"name": "x"})),
+        &[("Idempotency-Key", IDEM_KEY), ("If-Match", "W/\"abc\"")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["kind"], "invalid-request");
+}
+
+#[tokio::test]
+async fn migrate_bindings_with_if_match_on_missing_env_is_412() {
+    let (_d, app) = app().await;
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/ghost/migrate-bindings",
+        Some(json!({
+            "packs": [],
+            "extensions": [],
+            "seed_if_missing": {
+                "host_config": {"env_id": "ghost"},
+                "revocation": {},
+                "retention": {},
+                "health": {},
+            },
+        })),
+        &[("Idempotency-Key", IDEM_KEY), ("If-Match", "\"deadbeef\"")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "body: {body}");
+    assert_eq!(body["kind"], "precondition-failed");
+}
+
+// ---------------------------------------------------------------------------
+// FIX 4 — corrupt stored row → 500 (not 400)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_corrupt_stored_env_is_500_internal() {
+    let (_d, app, store) = app_with_store().await;
+
+    // Insert a corrupt row: env_id key is "corrupt" but the JSON payload says
+    // environment_id = "other". Compute integrity over the value so it passes
+    // the digest check and hits the EnvIdMismatch validation path.
+    let env = greentic_deploy_spec::engine::fresh_environment(
+        &greentic_deploy_spec::EnvId::try_from("other").unwrap(),
+        "other".to_string(),
+        greentic_deploy_spec::EnvironmentHostConfig {
+            env_id: greentic_deploy_spec::EnvId::try_from("other").unwrap(),
+            region: None,
+            tenant_org_id: None,
+            listen_addr: None,
+            public_base_url: None,
+        },
+        greentic_deploy_spec::RevocationConfig::default(),
+        greentic_deploy_spec::RetentionPolicy::default(),
+        greentic_deploy_spec::HealthStatus::default(),
+    );
+    let data = serde_json::to_value(&env).unwrap();
+    let integrity = greentic_deploy_spec::StateIntegrity::sha256_of(&data).unwrap();
+    let etag = greentic_deploy_spec::StateEtag::from_integrity(&integrity);
+
+    sqlx::query(
+        "INSERT INTO environments (env_id, generation, etag, data, integrity_digest) \
+         VALUES ($1, 1, $2, $3, $4)",
+    )
+    .bind("corrupt")
+    .bind(&etag.0)
+    .bind(&data)
+    .bind(&integrity.digest)
+    .execute(store.pool())
+    .await
+    .expect("insert corrupt row");
+
+    // GET /environments/corrupt must return 500 (not 400)
+    let (status, body) = send(app, Method::GET, "/environments/corrupt", None).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+    assert_eq!(body["kind"], "internal");
+}
+
+// ---------------------------------------------------------------------------
+// FIX 5 — strict FieldUpdate deserialization at the wire level
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn patch_with_contradictory_field_update_is_400() {
+    let (_d, app) = app().await;
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // {"region": {"value": "x", "clear": true}} is contradictory → 400
+    let (status, body) = send(
+        app,
+        Method::PATCH,
+        "/environments/local",
+        Some(json!({"region": {"value": "x", "clear": true}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["kind"], "invalid-request");
 }

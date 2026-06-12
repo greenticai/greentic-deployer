@@ -19,6 +19,15 @@ struct Args {
     /// SQLite database file (created, with parent directories, if missing).
     #[arg(long, env = "GREENTIC_STORE_DB")]
     db: PathBuf,
+    /// Allow binding to a non-loopback address. Dev-only escape hatch: the
+    /// server has no authentication yet (RBAC = PR-4.4). This flag will be
+    /// removed or replaced with a proper auth gate when RBAC lands.
+    #[arg(
+        long,
+        env = "GREENTIC_STORE_INSECURE_ALLOW_NON_LOOPBACK",
+        default_value_t = false
+    )]
+    insecure_allow_non_loopback: bool,
 }
 
 #[tokio::main]
@@ -29,6 +38,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
     let args = Args::parse();
+
+    if !args.bind.ip().is_loopback() {
+        if !args.insecure_allow_non_loopback {
+            return Err(format!(
+                "refusing to bind to non-loopback address `{}`: the server has no \
+                 authentication yet (RBAC = PR-4.4). Pass --insecure-allow-non-loopback \
+                 or set GREENTIC_STORE_INSECURE_ALLOW_NON_LOOPBACK=true to override.",
+                args.bind.ip()
+            )
+            .into());
+        }
+        tracing::warn!(
+            bind = %args.bind,
+            "binding to non-loopback address WITHOUT authentication — \
+             the server has no RBAC yet (PR-4.4)"
+        );
+    }
 
     // `open` creates the parent directory and the database file if missing.
     let store = SqliteEnvironmentStore::open(&args.db).await?;
