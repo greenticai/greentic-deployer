@@ -39,11 +39,27 @@ use rand::rngs::OsRng;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::environment::store::dirs_home;
-
 /// Override for the operator key path. When set, takes precedence over the
 /// `~/.greentic/operator/key.pem` default.
 pub const OPERATOR_KEY_PATH_ENV: &str = "GTC_OPERATOR_KEY_PATH";
+
+/// Home-directory resolution for the default key location. Mirrors the
+/// deployer's `environment::store::dirs_home` so the resolved path is
+/// identical whichever crate asks.
+#[cfg(unix)]
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(windows)]
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE").map(PathBuf::from)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn dirs_home() -> Option<PathBuf> {
+    None
+}
 
 #[derive(Debug, Error)]
 pub enum OperatorKeyError {

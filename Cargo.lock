@@ -2422,6 +2422,7 @@ dependencies = [
  "greentic-deploy-spec 0.1.0",
  "greentic-distributor-client",
  "greentic-operator-store-server",
+ "greentic-operator-trust",
  "greentic-secrets-lib",
  "greentic-telemetry",
  "greentic-types",
@@ -2552,6 +2553,21 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+]
+
+[[package]]
+name = "greentic-operator-trust"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "greentic-distributor-client",
+ "libc",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]
