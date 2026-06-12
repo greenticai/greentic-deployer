@@ -1,0 +1,88 @@
+# wizard.qaspec.yaml — K8s deployer env-pack (C6).
+#
+# Collects the operator-facing knobs the K8s deployer needs at bind time.
+# Kubernetes credential MATERIAL is not captured here — the deployer's
+# API identity is bound via `gtc op credentials rotate` after the
+# bootstrap rules pack is applied (see `bootstrap.rs`), and validation
+# runs typed `SelfSubjectAccessReview` probes against the operations in
+# `credentials.rs::VALIDATED_K8S_OPERATIONS`. Secrets stay on the secret
+# backend (B12a / `secret://` URI refs).
+#
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Trust-boundary disclosure (same gap as the AWS-ECS wizard):
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# There is no reader for `EnvPackBinding.answers_ref` today. The answers
+# captured below are PERSISTED on the binding but are NOT yet consumed by
+# manifest rendering or credential probes — `K8sParams::for_env` derives
+# sandbox defaults (`gtc-<env-id>` namespace, the S1 default image, two
+# router replicas) until the Phase D answers-reader lands. Treat this
+# wizard as DECLARATIVE INTENT recorded for Phase D consumption.
+#
+# Versioning: this spec rides the env-pack handler's
+# `K8sDeployerHandler::VERSION_REQ` (`>=1.0.0-dev, <2.0.0`). A breaking
+# change to the question set means a Major bump on the env-pack
+# descriptor and a fresh `wizard.qaspec.yaml`.
+
+id: greentic.deployer.k8s.wizard
+title: Kubernetes deployer
+version: "0.1.0"
+description: >-
+  Records the cluster scope the K8s deployer env-pack will operate
+  against. Phase D disclosure: answers are captured on the binding
+  (`answers_ref`) but NOT yet consumed by rendering or validation —
+  sandbox defaults apply until the answers reader lands. Credential
+  MATERIAL is never collected here.
+presentation:
+  intro: >-
+    Bind a Kubernetes environment. Today's manifest rendering and
+    `gtc op credentials requirements` use sandbox defaults (namespace
+    `gtc-<env-id>`, the GHCR runtime image, two router replicas); the
+    answers below are recorded on the binding for Phase D consumption.
+    Production requires a digest-pinned runtime image.
+
+questions:
+  - id: kubeconfig_context
+    type: string
+    title: Kubeconfig context (optional)
+    description: >-
+      Context name from your kubeconfig the deployer should target.
+      Leave blank to use the current context resolved by the standard
+      kubeconfig chain (`$KUBECONFIG`, `~/.kube/config`, in-cluster).
+    required: false
+
+  - id: namespace
+    type: string
+    title: Namespace (optional)
+    description: >-
+      Namespace the env's objects land in. Leave blank for the default
+      `gtc-<env-id>`. One namespace per (tenant, environment) pair; it
+      must match the namespace the bootstrap rules pack provisioned.
+    required: false
+    constraint:
+      max_len: 63
+      pattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+
+  - id: runtime_image
+    type: string
+    title: Runtime image (optional)
+    description: >-
+      Container image for the router and worker pods. Leave blank for
+      the sandbox default
+      (`ghcr.io/greenticai/greentic-start-distroless:latest`).
+      Production deployments MUST pin a digest
+      (`...@sha256:<digest>`) — the ship gate verifies it.
+    required: false
+    constraint:
+      pattern: '^[a-z0-9.\-_/:@]+$'
+
+  - id: router_replicas
+    type: string
+    title: Router replicas (optional)
+    description: >-
+      Replica count for the stable Greentic router Deployment. Leave
+      blank for the default of 2. The router must stay HA — values
+      below 2 are rejected at apply time.
+    required: false
+    default_value: "2"
+    constraint:
+      pattern: '^[0-9]+$'

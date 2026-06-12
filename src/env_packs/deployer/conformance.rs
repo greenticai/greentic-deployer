@@ -299,7 +299,10 @@ const FIXTURE_ENV_ID: &str = "conformance";
 const FIXTURE_BUNDLE_A: &str = "bundle.a";
 const FIXTURE_BUNDLE_B: &str = "bundle.b";
 
-fn build_fixture_env() -> Environment {
+/// The bench's 2-deployment / 3-revision fixture. `pub(crate)` so sibling
+/// deployer env-packs (K8s) can unit-test their render/verb logic against
+/// the exact env shape the bench drives them with.
+pub(crate) fn build_fixture_env() -> Environment {
     // Deterministic u128 seeds — fixture revisions/deployments stay
     // distinct from the unknown-revision sentinel (0xFFFF) used in
     // `check_unknown_revision_rejected`.
