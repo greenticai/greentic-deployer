@@ -307,15 +307,22 @@ pub fn set_traffic_split(
     assert_entries_all_ready(env, &entries)?;
     let (generation, previous_split_ref, prev_gen) = match prev_split_idx {
         Some(idx) => {
-            let prev = &env.traffic_splits[idx];
-            let snapshot =
-                serde_json::to_value(prev).map_err(|e| TrafficSplitError::SnapshotEncode {
+            // Serialize a clone with previous_split_ref cleared: the stash is
+            // one-step by contract (rollback overwrites the nested ref with
+            // None and never follows it), so serializing the live ref would
+            // nest stash-in-stash tokens that grow ~(4/3)^n without bound.
+            let mut stash_copy = env.traffic_splits[idx].clone();
+            let prev_generation = stash_copy.generation;
+            stash_copy.previous_split_ref = None;
+            let snapshot = serde_json::to_value(&stash_copy).map_err(|e| {
+                TrafficSplitError::SnapshotEncode {
                     detail: e.to_string(),
-                })?;
+                }
+            })?;
             (
-                prev.generation + 1,
+                prev_generation + 1,
                 Some(inline_stash::stash_inline(snapshot)),
-                Some(prev.generation),
+                Some(prev_generation),
             )
         }
         None => (0, None, None),
@@ -952,5 +959,74 @@ mod tests {
         let back: ApplyTrafficSplitOutcome = serde_json::from_value(value).unwrap();
         assert_eq!(back.split, outcome.split);
         assert_eq!(back.environment, outcome.environment);
+    }
+
+    #[test]
+    fn stash_is_bounded_to_one_level_across_multiple_sets() {
+        let deployment_id = DeploymentId::new();
+        let (mut env, r1, r2) = env_with_ready_revisions(deployment_id);
+
+        // Three successive sets with distinct keys, alternating revisions.
+        set_traffic_split(
+            &mut env,
+            set_payload(deployment_id, full_weight(r1)),
+            &idem("k1"),
+            fixed_now(),
+        )
+        .unwrap();
+        let t2 = set_traffic_split(
+            &mut env,
+            set_payload(deployment_id, full_weight(r2)),
+            &idem("k2"),
+            fixed_now(),
+        )
+        .unwrap();
+        let t3 = set_traffic_split(
+            &mut env,
+            set_payload(deployment_id, full_weight(r1)),
+            &idem("k3"),
+            fixed_now(),
+        )
+        .unwrap();
+
+        // The live split's stash decodes into a TrafficSplit whose own
+        // previous_split_ref is None — exactly one level, no nested token.
+        let stash3 = t3
+            .split
+            .previous_split_ref
+            .as_ref()
+            .expect("stash present after set #3");
+        let prev3: TrafficSplit =
+            serde_json::from_value(inline_stash::load_inline(stash3).expect("stash decodes"))
+                .expect("stash is a TrafficSplit");
+        assert_eq!(
+            prev3.previous_split_ref, None,
+            "stash must be one level deep"
+        );
+        assert_eq!(prev3.generation, 1);
+        assert_eq!(prev3.entries, full_weight(r2));
+
+        // Same check on set #2's stash.
+        let stash2 = t2
+            .split
+            .previous_split_ref
+            .as_ref()
+            .expect("stash present after set #2");
+        let prev2: TrafficSplit =
+            serde_json::from_value(inline_stash::load_inline(stash2).expect("stash decodes"))
+                .expect("stash is a TrafficSplit");
+        assert_eq!(
+            prev2.previous_split_ref, None,
+            "stash must be one level deep"
+        );
+
+        // Token length after set #3 is in the same ballpark as set #2 —
+        // proves boundedness (without the fix, #3 would embed #2's token).
+        let len3 = stash3.as_os_str().len();
+        let len2 = stash2.as_os_str().len();
+        assert!(
+            len3 <= len2 + 64,
+            "stash tokens must not grow unboundedly: len(#3)={len3} vs len(#2)={len2}",
+        );
     }
 }
