@@ -215,14 +215,7 @@ pub fn update_pack_binding(
     if !slot.binds_in_packs() {
         return Err(BindingError::NotPackSlot { slot });
     }
-    let idx = env
-        .packs
-        .iter()
-        .position(|b| b.slot == slot)
-        .ok_or_else(|| BindingError::SlotNotBound {
-            slot,
-            env_id: env.environment_id.clone(),
-        })?;
+    let idx = find_pack_slot(env, slot)?;
     if binding.slot != slot {
         return Err(BindingError::SlotMismatch {
             binding_slot: binding.slot,
@@ -262,14 +255,7 @@ pub fn remove_pack_binding(
     env: &mut Environment,
     slot: CapabilitySlot,
 ) -> Result<(EnvPackBinding, u64), BindingError> {
-    let idx = env
-        .packs
-        .iter()
-        .position(|b| b.slot == slot)
-        .ok_or_else(|| BindingError::SlotNotBound {
-            slot,
-            env_id: env.environment_id.clone(),
-        })?;
+    let idx = find_pack_slot(env, slot)?;
     let removed = env.packs.remove(idx);
     let generation = removed.generation;
     Ok((removed, generation))
@@ -284,14 +270,7 @@ pub fn rollback_pack_binding(
     env: &mut Environment,
     slot: CapabilitySlot,
 ) -> Result<(EnvPackBinding, u64), BindingError> {
-    let idx = env
-        .packs
-        .iter()
-        .position(|b| b.slot == slot)
-        .ok_or_else(|| BindingError::SlotNotBound {
-            slot,
-            env_id: env.environment_id.clone(),
-        })?;
+    let idx = find_pack_slot(env, slot)?;
     let prev_generation = env.packs[idx].generation;
     let new_generation =
         prev_generation
@@ -433,6 +412,18 @@ pub fn rollback_extension_binding(
     restored.previous_binding_ref = None;
     env.extensions[idx] = restored;
     Ok((env.extensions[idx].clone(), new_generation))
+}
+
+/// Locate the pack binding for `slot`, mirroring [`find_extension`] for
+/// the pack family.
+fn find_pack_slot(env: &Environment, slot: CapabilitySlot) -> Result<usize, BindingError> {
+    env.packs
+        .iter()
+        .position(|b| b.slot == slot)
+        .ok_or_else(|| BindingError::SlotNotBound {
+            slot,
+            env_id: env.environment_id.clone(),
+        })
 }
 
 fn find_extension(env: &Environment, key: &ExtensionKey) -> Result<usize, BindingError> {
