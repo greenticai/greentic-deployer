@@ -28,6 +28,11 @@ use crate::retention::{HealthStatus, RetentionPolicy, RevocationConfig};
 use crate::version::SchemaVersion;
 use greentic_types::EnvId;
 
+/// Revision-lifecycle verb group (PR-4.2b). Re-exported flat so call sites
+/// use `engine::stage_revision` etc. like the env-lifecycle group above.
+pub mod revisions;
+pub use revisions::*;
+
 /// Failures produced by pure verb transforms. Each backend maps these onto
 /// its own error surface: `LocalFsStore` → `StoreError`,
 /// the operator-store-server → [`crate::remote::RemoteStoreError`].

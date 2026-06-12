@@ -49,6 +49,22 @@ where
             "/environments/{env_id}/migrate-bindings",
             post(api::migrate_bindings::<S>),
         )
+        .route(
+            "/environments/{env_id}/revisions",
+            post(api::stage_revision::<S>),
+        )
+        .route(
+            "/environments/{env_id}/revisions/{revision_id}/warm",
+            post(api::warm_revision::<S>),
+        )
+        .route(
+            "/environments/{env_id}/revisions/{revision_id}/drain",
+            post(api::drain_revision::<S>),
+        )
+        .route(
+            "/environments/{env_id}/revisions/{revision_id}/archive",
+            post(api::archive_revision::<S>),
+        )
         .with_state(AppState { storage })
 }
 

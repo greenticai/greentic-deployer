@@ -22,6 +22,13 @@
 //!   the shared `greentic_deploy_spec::engine` transforms — the same code
 //!   `LocalFsStore` runs — and reply with the A8 mutation envelope.
 //!   (PR-4.2a)
+//! - The revision-lifecycle verb group (PR-4.2b):
+//!   `POST /environments/{env_id}/revisions` (stage) and
+//!   `POST /environments/{env_id}/revisions/{rid}/{warm|drain|archive}`.
+//!   The warm health gate is evaluated client-side and shipped as data; a
+//!   gate failure persists the `Failed` flip BEFORE the typed 422
+//!   (`health-gate-failed`) is returned — committed-on-error, mirroring
+//!   `LocalFsStore`.
 //! - `greentic-operator-store-server` binary: clap config (bind address
 //!   + database path), graceful shutdown.
 //!

@@ -21,37 +21,31 @@
 //! tweak as PR-3a.2..16 add impls — flag drift in code review.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use greentic_deploy_spec::{
     BundleDeployment, BundleDeploymentStatus, BundleId, CapabilitySlot, CustomerId, DeploymentId,
     EnvId, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding, IdempotencyKey,
-    MessagingEndpoint, MessagingEndpointId, PackId, PackListEntry, RevenueShareEntry, Revision,
-    RevisionId, RevisionLifecycle, RouteBinding, TrafficSplit, TrafficSplitEntry,
+    MessagingEndpoint, MessagingEndpointId, PackId, RevenueShareEntry, Revision, RevisionId,
+    RouteBinding, TrafficSplit, TrafficSplitEntry,
 };
 use serde_json::Value;
 
 use super::StoreError;
-use super::lifecycle::HealthGateFailure;
 
-// PR-4.2a: `ExtensionKey`, `FieldUpdate`, `UpdateEnvironmentPayload`,
-// `MigrateSeedPayload`, and `MigrateMergePayload` moved to
-// `greentic_deploy_spec::engine` so the operator-store-server applies the
-// same verb semantics (and wire encoding) as `LocalFsStore`. Re-exported
-// here so every existing `environment::mutations::…` path keeps working.
+// PR-4.2a/4.2b: the env-lifecycle payload shapes (`ExtensionKey`,
+// `FieldUpdate`, `UpdateEnvironmentPayload`, `MigrateSeedPayload`,
+// `MigrateMergePayload`) and the revision verb group's
+// (`StageRevisionPayload`, `WarmRevisionPayload`,
+// `RevisionTransitionOutcome`) moved to `greentic_deploy_spec::engine` so
+// the operator-store-server applies the same verb semantics (and wire
+// encoding) as `LocalFsStore`. Re-exported here so every existing
+// `environment::mutations::…` path keeps working. The revision payloads no
+// longer carry `idempotency_key` — the key rides the trait methods (and the
+// A8 `Idempotency-Key` header), matching every other verb group.
 pub use greentic_deploy_spec::engine::{
-    ExtensionKey, FieldUpdate, MigrateMergePayload, MigrateSeedPayload, UpdateEnvironmentPayload,
+    ExtensionKey, FieldUpdate, MigrateMergePayload, MigrateSeedPayload, RevisionTransitionOutcome,
+    StageRevisionPayload, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
-
-/// Outcome of mutating a revision-lifecycle verb (`warm`/`drain`/`archive`).
-/// Carries the post-transition revision, the parent env after the save, and
-/// the starting lifecycle for idempotent-no-op detection and audit emission.
-#[derive(Debug, Clone)]
-pub struct RevisionTransitionOutcome {
-    pub revision: Revision,
-    pub environment: Environment,
-    pub starting_lifecycle: RevisionLifecycle,
-}
 
 /// Outcome of [`EnvironmentMutations::remove_bundle`]. Surfaces the
 /// archived revisions that were pruned alongside the deployment so the
@@ -118,67 +112,6 @@ pub struct RollbackTrafficSplitOutcome {
     pub restored: TrafficSplit,
     pub previous_generation: u64,
     pub new_generation: u64,
-}
-
-/// Inputs to [`EnvironmentMutations::stage_revision`]. Bundled so the
-/// method signature stays under clippy's `too_many_arguments` threshold;
-/// the existing `cli::revisions::RevisionStagePayload` is the CLI-shaped
-/// counterpart and maps to this at the call site.
-///
-/// `revision_id` is supplied by the caller because the bundle staging
-/// step (extract + lock-pin + pack-config materialization) runs OUTSIDE
-/// the env flock and names its on-disk `rev_dir` after the ULID. Local
-/// callers mint it via [`crate::environment::mint_revision_id`]; an
-/// HTTP-backed server resolves it from the idempotency cache (PR-3b).
-///
-/// `pack_list` is the resolved pack list the local impl writes verbatim
-/// into `Revision.pack_list`. PR-3a.1 omitted it — without it the
-/// resulting Revision was missing data
-/// `Environment::validate`'s config-overrides cross-ref needs.
-#[derive(Debug, Clone)]
-pub struct StageRevisionPayload {
-    pub revision_id: RevisionId,
-    pub deployment_id: DeploymentId,
-    pub bundle_digest: String,
-    pub pack_list: Vec<PackListEntry>,
-    pub pack_list_lock_ref: PathBuf,
-    pub pack_config_refs: Vec<PathBuf>,
-    pub config_digest: String,
-    pub signature_sidecar_ref: PathBuf,
-    pub drain_seconds: u32,
-    /// A8 idempotency: same-key replay returns the originally staged
-    /// `Revision` without re-minting the ULID or advancing
-    /// `deployment.next_sequence`. Local impl accepts and ignores;
-    /// HTTP impl caches it for replay.
-    pub idempotency_key: IdempotencyKey,
-}
-
-/// Inputs to [`EnvironmentMutations::warm_revision`]. The closure-based gate
-/// from [`apply_revision_transition_with_health_gate`](super::apply_revision_transition_with_health_gate)
-/// can't cross the HTTP wire, so the deployer CLI evaluates runner health
-/// locally and ships the typed outcome. The impl applies `Ok(())` → `Ready`
-/// or `Err(failure)` → `Failed` atomically.
-#[derive(Debug, Clone)]
-pub struct WarmRevisionPayload {
-    pub revision_id: RevisionId,
-    /// The client-evaluated health-gate outcome. `Ok(())` advances the
-    /// revision to `Ready`; `Err(failure)` flips it to `Failed`
-    /// atomically inside the impl.
-    pub health_gate: Result<(), HealthGateFailure>,
-    pub idempotency_key: IdempotencyKey,
-    /// The revision lifecycle the caller observed at gate-evaluation time.
-    /// The typed verb checks under the env flock that the revision still
-    /// carries this lifecycle before applying the pre-evaluated gate result.
-    /// On mismatch (a concurrent mutation landed between gate-eval and
-    /// verb acquisition), the verb rejects with
-    /// [`super::lifecycle::LifecycleError::Conflict`] so a stale gate
-    /// outcome is never applied to env state it didn't observe.
-    ///
-    /// Idempotent-retry (revision already at the chain's final state) skips
-    /// the precondition check — the gate fires only when the chain actually
-    /// advanced, and a retry against an already-`Ready` revision is a
-    /// no-op regardless of the snapshot.
-    pub expected_lifecycle: RevisionLifecycle,
 }
 
 /// Inputs to [`EnvironmentMutations::add_bundle`].
@@ -308,10 +241,15 @@ pub trait EnvironmentMutations: Send + Sync {
     /// the pinned artifact pointers; `LocalFsStore`'s CLI helper resolves
     /// them from a local `.gtbundle` upstream of this call so the trait
     /// stays storage-only.
+    ///
+    /// `idempotency_key`: A8 §2 — same-key replay returns the originally
+    /// staged `Revision` without re-minting the ULID or advancing the
+    /// sequence. Local impl accepts and ignores; HTTP backends cache it.
     fn stage_revision(
         &self,
         env_id: &EnvId,
         payload: StageRevisionPayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<Revision, StoreError>;
 
     /// Transition a revision through its `warm` lifecycle chain, applying the
@@ -325,6 +263,7 @@ pub trait EnvironmentMutations: Send + Sync {
         &self,
         env_id: &EnvId,
         payload: WarmRevisionPayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<RevisionTransitionOutcome, StoreError>;
 
     /// Drain a `Ready` revision (graceful step-down → `Drained`).
