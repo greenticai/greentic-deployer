@@ -36,8 +36,8 @@
 //!   against an in-memory cluster fake.
 //! - [`credentials`] — `SelfSubjectAccessReview`-based
 //!   [`DeployerCredentials`](crate::credentials::DeployerCredentials)
-//!   (probes `Skipped` until the client ships; decision logic pinned by
-//!   mock tests).
+//!   (probes fail closed until the client ships; decision logic pinned
+//!   by mock tests).
 //! - [`bootstrap`] — minimum-privilege Namespace/ServiceAccount/Role/
 //!   RoleBinding rules pack, derived from the same operations list the
 //!   probes validate.

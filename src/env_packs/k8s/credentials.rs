@@ -165,7 +165,7 @@ pub trait K8sValidatorClient: std::fmt::Debug + Send + Sync {
 
 /// K8s deployer credentials handler.
 ///
-/// `Default` holds no client (scaffold posture — every probe `Skipped`);
+/// `Default` holds no client (scaffold posture — every probe fails closed);
 /// [`with_client`](Self::with_client) injects a mock today and the real
 /// kube-rs client once it ships.
 #[derive(Debug, Default)]
