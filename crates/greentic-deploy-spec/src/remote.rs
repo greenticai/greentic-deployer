@@ -320,6 +320,17 @@ pub enum RemoteStoreError {
     /// Resource does not exist — `404`.
     #[error("environment not found")]
     NotFound,
+    /// Create-shaped request targeting a resource that already exists — `409`.
+    /// Distinct from [`RemoteStoreError::IdempotencyConflict`] (same status):
+    /// that one is a key-reuse protocol violation, this one is a domain
+    /// conflict the caller resolves with an update verb instead.
+    #[error("already exists: {detail}")]
+    AlreadyExists { detail: String },
+    /// Request body failed validation before any state was touched — `400`.
+    /// Covers malformed payloads and key/payload mismatches (e.g. a body
+    /// whose `env_id` contradicts the URL).
+    #[error("invalid request: {detail}")]
+    InvalidRequest { detail: String },
     /// Stored state failed its integrity hash — `422`.
     #[error("integrity mismatch: expected {expected}, computed {actual}")]
     IntegrityMismatch { expected: String, actual: String },
@@ -340,6 +351,8 @@ impl RemoteStoreError {
             Self::IdempotencyConflict { .. } => 409,
             Self::Unauthorized { .. } => 403,
             Self::NotFound => 404,
+            Self::AlreadyExists { .. } => 409,
+            Self::InvalidRequest { .. } => 400,
             Self::IntegrityMismatch { .. } => 422,
             Self::NotYetImplemented { .. } => 501,
             Self::Internal { .. } => 500,
@@ -609,6 +622,20 @@ mod tests {
             409
         );
         assert_eq!(RemoteStoreError::NotFound.http_status(), 404);
+        assert_eq!(
+            RemoteStoreError::AlreadyExists {
+                detail: "x".to_string()
+            }
+            .http_status(),
+            409
+        );
+        assert_eq!(
+            RemoteStoreError::InvalidRequest {
+                detail: "x".to_string()
+            }
+            .http_status(),
+            400
+        );
         assert_eq!(
             RemoteStoreError::IntegrityMismatch {
                 expected: "a".to_string(),

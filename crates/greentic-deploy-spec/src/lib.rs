@@ -14,6 +14,7 @@ pub mod audit;
 pub mod bundle_deployment;
 pub mod capability_slot;
 pub mod credentials;
+pub mod engine;
 pub mod environment;
 pub mod environment_runtime;
 pub mod error;
@@ -43,6 +44,10 @@ pub use capability_slot::{CapabilitySlot, PackDescriptor, PackDescriptorParseErr
 pub use credentials::{
     Credentials, CredentialsBootstrap, CredentialsExpiry, CredentialsMode, CredentialsValidation,
     CredentialsValidationResult,
+};
+pub use engine::{
+    CreateEnvironmentPayload, EngineError, ExtensionKey, FieldUpdate, MergeReport,
+    MigrateMergePayload, MigrateSeedPayload, UpdateEnvironmentPayload,
 };
 pub use environment::{
     DEFAULT_LISTEN_ADDR, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding,

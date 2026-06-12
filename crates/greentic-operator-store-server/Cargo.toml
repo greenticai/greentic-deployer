@@ -9,7 +9,8 @@ publish = false
 
 [dependencies]
 greentic-deploy-spec = { path = "../greentic-deploy-spec", version = "0.1" }
-axum = "0.8"
+axum = { version = "0.8", features = ["macros"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 fs4 = "0.13"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
@@ -17,6 +18,7 @@ serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ulid = "1"
 
 [dependencies.sqlx]
 version = "0.8"
@@ -39,7 +41,6 @@ features = [
 ]
 
 [dev-dependencies]
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 http-body-util = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

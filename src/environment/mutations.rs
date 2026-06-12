@@ -21,71 +21,27 @@
 //! tweak as PR-3a.2..16 add impls — flag drift in code review.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use greentic_deploy_spec::{
     BundleDeployment, BundleDeploymentStatus, BundleId, CapabilitySlot, CustomerId, DeploymentId,
-    EnvId, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding, HealthStatus,
-    IdempotencyKey, MessagingEndpoint, MessagingEndpointId, PackId, PackListEntry, RetentionPolicy,
-    RevenueShareEntry, Revision, RevisionId, RevisionLifecycle, RevocationConfig, RouteBinding,
-    TrafficSplit, TrafficSplitEntry,
+    EnvId, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding, IdempotencyKey,
+    MessagingEndpoint, MessagingEndpointId, PackId, PackListEntry, RevenueShareEntry, Revision,
+    RevisionId, RevisionLifecycle, RouteBinding, TrafficSplit, TrafficSplitEntry,
 };
 use serde_json::Value;
 
 use super::StoreError;
 use super::lifecycle::HealthGateFailure;
 
-/// `(kind_path, instance_id)` composite key identifying one extension binding
-/// in `Environment::extensions`. `kind_path` is the canonical
-/// `ExtensionKind::path()` form (e.g. `"capability/memory/long-term"`).
-///
-/// `instance_id` is `Option<String>`: a `None` binding (the unnamed default)
-/// and a `Some("default")` binding on the same `kind_path` are **distinct**
-/// and may coexist — two `None` bindings on the same path collide.
-/// This mirrors `ExtensionBinding::instance_id` in `greentic-deploy-spec`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ExtensionKey {
-    pub kind_path: String,
-    pub instance_id: Option<String>,
-}
-
-impl ExtensionKey {
-    pub fn new(kind_path: impl Into<String>, instance_id: Option<String>) -> Self {
-        Self {
-            kind_path: kind_path.into(),
-            instance_id,
-        }
-    }
-
-    /// Derive the key from an existing [`ExtensionBinding`], mirroring the
-    /// `(descriptor-path, instance_id)` convention in `cli/extensions.rs`.
-    pub fn from_binding(b: &ExtensionBinding) -> Self {
-        Self {
-            kind_path: b.kind.path().to_string(),
-            instance_id: b.instance_id.clone(),
-        }
-    }
-
-    /// Whether `b` carries this `(kind_path, instance_id)` key. Borrowed
-    /// comparison — no allocation per element, so it's cheap inside a scan.
-    pub fn matches(&self, b: &ExtensionBinding) -> bool {
-        b.kind.path() == self.kind_path && b.instance_id.as_deref() == self.instance_id.as_deref()
-    }
-}
-
-/// Wire-stable rendering used by audit-event targets and CLI outcome JSON.
-/// `<kind_path>/<instance_id>` when an instance is present, otherwise just
-/// `<kind_path>`. Mirrors the CLI's `cli::extensions::ExtensionKey` Display
-/// so existing operator-facing strings stay byte-identical.
-impl std::fmt::Display for ExtensionKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.instance_id {
-            Some(inst) => write!(f, "{}/{}", self.kind_path, inst),
-            None => f.write_str(&self.kind_path),
-        }
-    }
-}
+// PR-4.2a: `ExtensionKey`, `FieldUpdate`, `UpdateEnvironmentPayload`,
+// `MigrateSeedPayload`, and `MigrateMergePayload` moved to
+// `greentic_deploy_spec::engine` so the operator-store-server applies the
+// same verb semantics (and wire encoding) as `LocalFsStore`. Re-exported
+// here so every existing `environment::mutations::…` path keeps working.
+pub use greentic_deploy_spec::engine::{
+    ExtensionKey, FieldUpdate, MigrateMergePayload, MigrateSeedPayload, UpdateEnvironmentPayload,
+};
 
 /// Outcome of mutating a revision-lifecycle verb (`warm`/`drain`/`archive`).
 /// Carries the post-transition revision, the parent env after the save, and
@@ -162,114 +118,6 @@ pub struct RollbackTrafficSplitOutcome {
     pub restored: TrafficSplit,
     pub previous_generation: u64,
     pub new_generation: u64,
-}
-
-/// Tri-state field for [`UpdateEnvironmentPayload`]: callers can keep the
-/// existing value, set a new one, or clear an optional field back to `None`.
-///
-/// `Keep` maps to the prior `None` behavior (no change). `Set(v)` maps to
-/// the prior `Some(v)`. `Clear` is new — it writes `None` into the
-/// persisted field, which the prior `Option<T>` shape could not express.
-///
-/// Only fields that are `Option<T>` on [`Environment`] /
-/// [`EnvironmentHostConfig`] may be `Clear`-ed. Required fields (e.g.
-/// `name`) use plain `Option<T>` and remain Keep/Set only.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum FieldUpdate<T> {
-    /// Leave the existing value unchanged (the prior `None` behavior).
-    #[default]
-    Keep,
-    /// Write a new value.
-    Set(T),
-    /// Clear an optional field back to `None`. Only valid for fields that
-    /// are `Option<T>` on the persisted struct. The store impl rejects
-    /// `Clear` on required fields with [`StoreError::Spec`].
-    Clear,
-}
-
-impl<T> FieldUpdate<T> {
-    /// Convert from `Option<T>` (backward-compat): `None` → `Keep`,
-    /// `Some(v)` → `Set(v)`. Existing callers that pass bare `None` keep
-    /// the prior semantics with no code change beyond wrapping.
-    pub fn from_option(opt: Option<T>) -> Self {
-        match opt {
-            Some(v) => Self::Set(v),
-            None => Self::Keep,
-        }
-    }
-
-    /// Convert from `Option<Option<T>>` (JSON tri-state): outer `None` →
-    /// `Keep`, `Some(None)` → `Clear`, `Some(Some(v))` → `Set(v)`.
-    pub fn from_double_option(opt: Option<Option<T>>) -> Self {
-        match opt {
-            None => Self::Keep,
-            Some(None) => Self::Clear,
-            Some(Some(v)) => Self::Set(v),
-        }
-    }
-
-    /// Whether this update is a no-op.
-    pub fn is_keep(&self) -> bool {
-        matches!(self, Self::Keep)
-    }
-
-    /// Apply this update to an `Option<T>` target field: `Keep` is a no-op,
-    /// `Set(v)` writes `Some(v)`, `Clear` writes `None`.
-    pub fn apply_to(self, target: &mut Option<T>) {
-        match self {
-            Self::Keep => {}
-            Self::Set(v) => *target = Some(v),
-            Self::Clear => *target = None,
-        }
-    }
-}
-
-/// Optional-field patch for [`EnvironmentMutations::update_environment`].
-/// Replaces the earlier `set_public_url` and `set_config` verbs — both were
-/// strict subsets of this patch shape, so collapsing them removes two
-/// HTTP endpoints and two impl bodies that would drift over time.
-///
-/// Required fields (`name`) stay `Option<T>` — `None` = keep, `Some(v)` = set.
-/// Optional fields (`region`, `tenant_org_id`, `listen_addr`,
-/// `public_base_url`) use [`FieldUpdate<T>`] so callers can distinguish
-/// Keep / Set / Clear.
-#[derive(Debug, Clone, Default)]
-pub struct UpdateEnvironmentPayload {
-    pub name: Option<String>,
-    pub region: FieldUpdate<String>,
-    pub tenant_org_id: FieldUpdate<String>,
-    pub listen_addr: FieldUpdate<SocketAddr>,
-    pub public_base_url: FieldUpdate<String>,
-}
-
-/// Optional seed payload for [`EnvironmentMutations::migrate_merge_bindings`].
-/// Supplied when the caller wants the impl to atomically create the target
-/// env (using these fields) if it doesn't exist yet, then merge the bindings
-/// into it. Mirrors the seed-from-source behavior of `op env migrate-dev`
-/// where the source's host config + policy state ride along onto the freshly
-/// created target.
-///
-/// `name` is intentionally omitted: the impl derives it from
-/// `target_env_id`. `schema` is set to the current `ENVIRONMENT_V1` constant
-/// by the impl, not threaded through the wire.
-#[derive(Debug, Clone)]
-pub struct MigrateSeedPayload {
-    pub host_config: EnvironmentHostConfig,
-    pub revocation: RevocationConfig,
-    pub retention: RetentionPolicy,
-    pub health: HealthStatus,
-}
-
-/// Inputs to [`EnvironmentMutations::migrate_merge_bindings`].
-#[derive(Debug, Clone)]
-pub struct MigrateMergePayload {
-    pub packs: Vec<EnvPackBinding>,
-    pub extensions: Vec<ExtensionBinding>,
-    /// When `Some`, the impl atomically creates the target env (using
-    /// these fields) if it doesn't exist yet, then merges the bindings
-    /// into it. When `None`, the impl returns `StoreError::NotFound` if
-    /// the target doesn't exist — the caller is asserting target presence.
-    pub seed_if_missing: Option<MigrateSeedPayload>,
 }
 
 /// Inputs to [`EnvironmentMutations::stage_revision`]. Bundled so the
@@ -732,89 +580,6 @@ mod tests {
     #[allow(dead_code)]
     fn _is_object_safe(_: &dyn EnvironmentMutations) {}
 
-    #[test]
-    fn field_update_default_is_keep() {
-        let fu: FieldUpdate<String> = FieldUpdate::default();
-        assert!(fu.is_keep());
-        assert_eq!(fu, FieldUpdate::Keep);
-    }
-
-    #[test]
-    fn field_update_from_option_maps_none_to_keep_and_some_to_set() {
-        let keep: FieldUpdate<String> = FieldUpdate::from_option(None);
-        assert!(keep.is_keep());
-
-        let set = FieldUpdate::from_option(Some("value".to_string()));
-        assert_eq!(set, FieldUpdate::Set("value".to_string()));
-        assert!(!set.is_keep());
-    }
-
-    #[test]
-    fn field_update_apply_to_writes_target() {
-        let mut target: Option<String> = Some("old".to_string());
-
-        FieldUpdate::<String>::Keep.apply_to(&mut target);
-        assert_eq!(target.as_deref(), Some("old"), "Keep must not touch target");
-
-        FieldUpdate::Set("new".to_string()).apply_to(&mut target);
-        assert_eq!(target.as_deref(), Some("new"), "Set must overwrite");
-
-        FieldUpdate::<String>::Clear.apply_to(&mut target);
-        assert_eq!(target, None, "Clear must write None");
-
-        // Clear on already-None is a no-op.
-        FieldUpdate::<String>::Clear.apply_to(&mut target);
-        assert_eq!(target, None);
-    }
-
-    #[test]
-    fn field_update_from_double_option_tri_state() {
-        let keep: FieldUpdate<String> = FieldUpdate::from_double_option(None);
-        assert_eq!(keep, FieldUpdate::Keep);
-
-        let clear: FieldUpdate<String> = FieldUpdate::from_double_option(Some(None));
-        assert_eq!(clear, FieldUpdate::Clear);
-        assert!(!clear.is_keep());
-
-        let set: FieldUpdate<String> =
-            FieldUpdate::from_double_option(Some(Some("value".to_string())));
-        assert_eq!(set, FieldUpdate::Set("value".to_string()));
-    }
-
-    #[test]
-    fn update_environment_payload_defaults_to_all_keep() {
-        let payload = UpdateEnvironmentPayload::default();
-        assert!(payload.name.is_none());
-        assert!(payload.region.is_keep());
-        assert!(payload.tenant_org_id.is_keep());
-        assert!(payload.listen_addr.is_keep());
-        assert!(payload.public_base_url.is_keep());
-    }
-
-    #[test]
-    fn extension_key_roundtrips() {
-        let key = ExtensionKey::new("capability/memory/long-term", Some("default".to_string()));
-        assert_eq!(key.kind_path, "capability/memory/long-term");
-        assert_eq!(key.instance_id, Some("default".to_string()));
-
-        // Hashable + Eq for use in `HashMap` / `HashSet` (the existing
-        // `extensions.rs` uses `(kind.path(), instance_id)` as a lookup
-        // key).
-        let mut set = std::collections::HashSet::new();
-        set.insert(key.clone());
-        assert!(set.contains(&key));
-
-        // `None` and `Some("default")` on the SAME kind_path are distinct
-        // identities: an unnamed binding (None) is the default instance,
-        // a named "default" binding is a separate instance — both coexist
-        // per `ExtensionBinding`'s doc comment in `greentic-deploy-spec`.
-        let unnamed = ExtensionKey::new("capability/memory/long-term", None);
-        assert_ne!(unnamed, key, "None and Some(_) must differ");
-        assert!(
-            !set.contains(&unnamed),
-            "None key must not hash-collide with Some(_) key"
-        );
-        set.insert(unnamed.clone());
-        assert_eq!(set.len(), 2);
-    }
+    // `FieldUpdate` / `UpdateEnvironmentPayload` / `ExtensionKey` unit tests
+    // moved to `greentic_deploy_spec::engine` alongside the types (PR-4.2a).
 }
