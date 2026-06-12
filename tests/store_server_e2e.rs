@@ -1,4 +1,5 @@
-//! End-to-end proof of the PR-4.2a/4.2b remote slices: the REAL
+//! End-to-end proof of the PR-4.2a+ remote slices (env lifecycle,
+//! revisions, traffic, pack/extension bindings): the REAL
 //! `HttpEnvironmentStore` client (blocking reqwest, A8 envelope + audit
 //! validation) drives the REAL operator-store-server (axum + SQLite) over
 //! a loopback listener — no mocks on either side.
@@ -14,10 +15,10 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use greentic_deploy_spec::{
-    BundleDeployment, BundleDeploymentStatus, BundleId, CustomerId, DeploymentId, EnvId,
-    EnvironmentHostConfig, IdempotencyKey, PackListEntry, PartyId, Precondition, RevenueShareEntry,
-    RevisionId, RevisionLifecycle, RouteBinding, SchemaVersion, SemVer, TenantSelector,
-    TrafficSplitEntry,
+    BundleDeployment, BundleDeploymentStatus, BundleId, CapabilitySlot, CustomerId, DeploymentId,
+    EnvId, EnvPackBinding, EnvironmentHostConfig, ExtensionBinding, ExtensionKey, IdempotencyKey,
+    PackDescriptor, PackId, PackListEntry, PartyId, Precondition, RevenueShareEntry, RevisionId,
+    RevisionLifecycle, RouteBinding, SchemaVersion, SemVer, TenantSelector, TrafficSplitEntry,
 };
 use greentic_deployer::environment::{
     AuthMethod, EnvironmentMutations, HealthCheckId, HealthGateFailure, HttpEnvironmentStore,
@@ -61,7 +62,7 @@ fn stage_payload(deployment_id: DeploymentId) -> StageRevisionPayload {
 
 /// Seed a bundle deployment into an existing env directly through the
 /// server's storage backend — the bundles verb group has no server route
-/// yet (PR-4.2d+).
+/// yet (PR-4.2e+).
 async fn seed_deployment(backend: &SqliteEnvironmentStore, id: &EnvId) -> DeploymentId {
     let loaded = backend.load_env(id).await.expect("load env");
     let mut env = loaded.value;
@@ -349,6 +350,89 @@ async fn remote_env_lifecycle_end_to_end() {
             .expect_err("no prior version to roll back to");
         assert!(
             matches!(err, StoreError::Conflict(_)),
+            "unexpected error: {err:?}"
+        );
+
+        // ----- PR-4.2d: the binding verb groups over the same wire. -----
+
+        let pack_binding = |kind: &str| EnvPackBinding {
+            slot: CapabilitySlot::Secrets,
+            kind: PackDescriptor::try_new(format!("{kind}@1.0.0")).expect("descriptor"),
+            pack_ref: PackId::new(kind),
+            answers_ref: None,
+            generation: 0,
+            previous_binding_ref: None,
+        };
+        let added = store
+            .add_pack_binding(&id, pack_binding("greentic.secrets"), idem("k-pack-add"))
+            .expect("add pack binding");
+        assert_eq!(added.slot, CapabilitySlot::Secrets);
+
+        // Duplicate add → the same `Conflict` noun the local store raises.
+        let err = store
+            .add_pack_binding(&id, pack_binding("greentic.other"), idem("k-pack-add-2"))
+            .expect_err("slot already bound");
+        assert!(
+            matches!(err, StoreError::Conflict(_)),
+            "unexpected error: {err:?}"
+        );
+
+        let (updated, generation) = store
+            .update_pack_binding(
+                &id,
+                CapabilitySlot::Secrets,
+                pack_binding("greentic.vault"),
+                idem("k-pack-update"),
+            )
+            .expect("update pack binding");
+        assert_eq!(generation, 1);
+        assert!(
+            updated.previous_binding_ref.is_some(),
+            "prior binding stashed for one-step rollback"
+        );
+
+        let (restored, generation) = store
+            .rollback_pack_binding(&id, CapabilitySlot::Secrets, idem("k-pack-rollback"))
+            .expect("rollback pack binding");
+        assert_eq!(generation, 2);
+        assert_eq!(restored.kind.as_str(), "greentic.secrets@1.0.0");
+        assert!(restored.previous_binding_ref.is_none());
+
+        let ext_binding = |pack_ref: &str| ExtensionBinding {
+            kind: PackDescriptor::try_new("greentic.memory@0.1.0").expect("descriptor"),
+            pack_ref: PackId::new(pack_ref),
+            instance_id: Some("alt".to_string()),
+            answers_ref: None,
+            generation: 0,
+            previous_binding_ref: None,
+        };
+        let ext_key = ExtensionKey::new("greentic.memory", Some("alt".to_string()));
+        store
+            .add_extension_binding(&id, ext_binding("greentic.memory"), idem("k-ext-add"))
+            .expect("add extension binding");
+        let (updated, generation) = store
+            .update_extension_binding(
+                &id,
+                ext_key.clone(),
+                ext_binding("greentic.memory-v2"),
+                idem("k-ext-update"),
+            )
+            .expect("update extension binding");
+        assert_eq!(generation, 1);
+        assert_eq!(updated.pack_ref.as_str(), "greentic.memory-v2");
+
+        let (removed, _) = store
+            .remove_extension_binding(&id, ext_key.clone(), idem("k-ext-remove"))
+            .expect("remove extension binding");
+        assert_eq!(removed.pack_ref.as_str(), "greentic.memory-v2");
+
+        // Removed key → the server's 404 `dependent-not-found` maps to the
+        // same noun the local store uses.
+        let err = store
+            .remove_extension_binding(&id, ext_key, idem("k-ext-remove-2"))
+            .expect_err("key no longer bound");
+        assert!(
+            matches!(err, StoreError::DependentNotFound(_)),
             "unexpected error: {err:?}"
         );
 

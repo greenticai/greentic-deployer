@@ -43,6 +43,11 @@ pub mod inline_stash;
 pub mod traffic;
 pub use traffic::*;
 
+/// Pack/extension-binding verb group (PR-4.2d). Re-exported flat like the
+/// groups above.
+pub mod bindings;
+pub use bindings::*;
+
 /// Failures produced by pure verb transforms. Each backend maps these onto
 /// its own error surface: `LocalFsStore` → `StoreError`,
 /// the operator-store-server → [`crate::remote::RemoteStoreError`].
@@ -276,9 +281,16 @@ pub struct MergeReport {
 /// and a `Some("default")` binding on the same `kind_path` are **distinct**
 /// and may coexist — two `None` bindings on the same path collide.
 /// This mirrors [`ExtensionBinding::instance_id`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Serde shape (PR-4.2d): the key rides inside
+/// [`ExtensionKeyedPayload`](crate::engine::ExtensionKeyedPayload) on the
+/// A8 wire as `{"kind_path": …, "instance_id": …}` — `instance_id` is
+/// serialized explicitly (`null` for `None`, matching the PR-3b client's
+/// encoding) and tolerated absent on deserialize.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ExtensionKey {
     pub kind_path: String,
+    #[serde(default)]
     pub instance_id: Option<String>,
 }
 

@@ -46,12 +46,14 @@ pub use credentials::{
     CredentialsValidationResult,
 };
 pub use engine::{
-    ActiveSplitRef, ApplyTrafficSplitOutcome, CreateEnvironmentPayload, EngineError, ExtensionKey,
-    FieldUpdate, HealthCheckId, HealthGateFailure, MergeReport, MigrateMergePayload,
-    MigrateSeedPayload, RevisionLifecycleError, RevisionTransition, RevisionTransitionOutcome,
-    RollbackTrafficSplitOutcome, RollbackTrafficSplitPayload, SetTrafficSplitPayload,
-    StageRevisionPayload, TrafficRollbackTransition, TrafficSplitError, TrafficSplitTransition,
-    UpdateEnvironmentPayload, WarmRevisionPayload,
+    ActiveSplitRef, ApplyTrafficSplitOutcome, BindingError, BindingGenerationOutcome,
+    CreateEnvironmentPayload, EngineError, ExtensionBindingPayload, ExtensionKey,
+    ExtensionKeyedPayload, FieldUpdate, HealthCheckId, HealthGateFailure, MergeReport,
+    MigrateMergePayload, MigrateSeedPayload, PackBindingPayload, RevisionLifecycleError,
+    RevisionTransition, RevisionTransitionOutcome, RollbackTrafficSplitOutcome,
+    RollbackTrafficSplitPayload, SetTrafficSplitPayload, StageRevisionPayload,
+    TrafficRollbackTransition, TrafficSplitError, TrafficSplitTransition, UpdateEnvironmentPayload,
+    WarmRevisionPayload,
 };
 pub use environment::{
     DEFAULT_LISTEN_ADDR, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding,

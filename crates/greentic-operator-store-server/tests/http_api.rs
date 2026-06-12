@@ -554,7 +554,7 @@ use greentic_deploy_spec::{
 use std::path::PathBuf;
 
 /// Seed an env carrying one bundle deployment directly through the storage
-/// backend — the bundles verb group has no server route yet (PR-4.2d+), and
+/// backend — the bundles verb group has no server route yet (PR-4.2e+), and
 /// revisions can only be staged under an existing deployment.
 async fn seed_env_with_deployment(store: &SqliteEnvironmentStore, env_id: &str) -> DeploymentId {
     let eid = EnvId::try_from(env_id).expect("env id");
@@ -1256,4 +1256,409 @@ async fn traffic_rollback_without_split_is_404_dependent_not_found() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
     assert_eq!(body["kind"], "dependent-not-found");
+}
+
+// ---------------------------------------------------------------------------
+// Pack / extension binding routes (PR-4.2d)
+// ---------------------------------------------------------------------------
+
+/// The pinned A8 pack-binding request body (matches the shared
+/// `PackBindingPayload` wire encoding).
+fn pack_body(slot: &str, kind: &str) -> Value {
+    json!({
+        "binding": {
+            "slot": slot,
+            "kind": format!("{kind}@1.0.0"),
+            "pack_ref": kind,
+            "generation": 0,
+        }
+    })
+}
+
+/// The pinned A8 keyed-extension request body (`ExtensionKeyedPayload`):
+/// `binding: None` is absent, the key's `instance_id` rides explicitly.
+fn extension_key_body(kind_path: &str, instance_id: Option<&str>, binding: Option<Value>) -> Value {
+    let mut body = json!({
+        "key": {"kind_path": kind_path, "instance_id": instance_id},
+    });
+    if let Some(binding) = binding {
+        body["binding"] = binding;
+    }
+    body
+}
+
+fn extension_binding(kind: &str, instance_id: Option<&str>, pack_ref: &str) -> Value {
+    json!({
+        "kind": format!("{kind}@0.1.0"),
+        "pack_ref": pack_ref,
+        "instance_id": instance_id,
+        "generation": 0,
+    })
+}
+
+#[tokio::test]
+async fn pack_binding_add_update_rollback_walk() {
+    let (_d, app) = app().await;
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Add binds the slot and returns the bare binding.
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/packs",
+        Some(pack_body("secrets", "greentic.secrets")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_envelope(&body, "local");
+    assert_eq!(body["audit"]["noun"], "env-packs");
+    assert_eq!(body["audit"]["verb"], "add");
+    assert_eq!(body["audit"]["target"]["environment_id"], "local");
+    assert_eq!(body["audit"]["target"]["slot"], "secrets");
+    assert_eq!(body["result"]["slot"], "secrets");
+
+    // Duplicate add → 409 already-exists; nothing persisted on top.
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/packs",
+        Some(pack_body("secrets", "greentic.other")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "already-exists");
+
+    // Update replaces the binding, bumps the generation, stashes the prior.
+    let (status, body) = send(
+        app.clone(),
+        Method::PATCH,
+        "/environments/local/packs/secrets",
+        Some(pack_body("secrets", "greentic.vault")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["audit"]["verb"], "update");
+    assert_eq!(body["result"]["generation"], 1);
+    assert_eq!(body["result"]["binding"]["kind"], "greentic.vault@1.0.0");
+    let stash = body["result"]["binding"]["previous_binding_ref"]
+        .as_str()
+        .expect("prior binding stashed");
+    assert!(stash.starts_with("inline://"), "stash token: {stash}");
+
+    // Rollback restores the original and clears the stash (single-step).
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/packs/secrets/rollback",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["audit"]["verb"], "rollback");
+    assert_eq!(body["result"]["generation"], 2);
+    assert_eq!(body["result"]["binding"]["kind"], "greentic.secrets@1.0.0");
+    assert!(body["result"]["binding"]["previous_binding_ref"].is_null());
+
+    // Second rollback → 409 conflict (no previous binding left).
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/packs/secrets/rollback",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "conflict");
+
+    // Durable: the restored binding survives a fresh read.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    let packs = read["environment"]["packs"].as_array().expect("packs");
+    assert_eq!(packs.len(), 1);
+    assert_eq!(packs[0]["kind"], "greentic.secrets@1.0.0");
+    assert_eq!(packs[0]["generation"], 2);
+}
+
+#[tokio::test]
+async fn pack_binding_remove_returns_removed_binding() {
+    let (_d, app) = app().await;
+    send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/packs",
+        Some(pack_body("secrets", "greentic.secrets")),
+    )
+    .await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::DELETE,
+        "/environments/local/packs/secrets",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["audit"]["verb"], "remove");
+    assert_eq!(body["result"]["binding"]["kind"], "greentic.secrets@1.0.0");
+
+    // Second remove → 404 dependent-not-found (slot no longer bound).
+    let (status, body) = send(
+        app,
+        Method::DELETE,
+        "/environments/local/packs/secrets",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["kind"], "dependent-not-found");
+}
+
+#[tokio::test]
+async fn pack_binding_rejects_n_per_env_and_unknown_slots() {
+    let (_d, app) = app().await;
+    send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+
+    // N-per-env slot in the body → typed 400 (the engine's wire guard;
+    // the deployer CLI rejects these upstream with its own message).
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/packs",
+        Some(pack_body("messaging", "greentic.slack")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["kind"], "invalid-request");
+
+    // Unknown slot path segment → typed 400, not a 500 or a router miss.
+    let (status, body) = send(
+        app,
+        Method::PATCH,
+        "/environments/local/packs/nonsense",
+        Some(pack_body("secrets", "greentic.secrets")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["kind"], "invalid-request");
+}
+
+#[tokio::test]
+async fn extension_binding_add_update_remove_walk() {
+    let (_d, app) = app().await;
+    send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+
+    // Add the unnamed default instance.
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/extensions",
+        Some(json!({"binding": extension_binding("greentic.memory", None, "greentic.memory")})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_envelope(&body, "local");
+    assert_eq!(body["audit"]["noun"], "extensions");
+    assert_eq!(body["audit"]["target"]["kind_path"], "greentic.memory");
+    assert!(body["audit"]["target"]["instance_id"].is_null());
+
+    // A named instance on the same path coexists with the default.
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/extensions",
+        Some(
+            json!({"binding": extension_binding("greentic.memory", Some("alt"), "greentic.memory")}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Re-adding the default key → 409 already-exists.
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/extensions",
+        Some(json!({"binding": extension_binding("greentic.memory", None, "greentic.memory")})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "already-exists");
+
+    // Keyed update swaps the pack_ref and bumps the generation.
+    let (status, body) = send(
+        app.clone(),
+        Method::PATCH,
+        "/environments/local/extensions",
+        Some(extension_key_body(
+            "greentic.memory",
+            None,
+            Some(extension_binding(
+                "greentic.memory",
+                None,
+                "greentic.memory-v2",
+            )),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["audit"]["verb"], "update");
+    assert_eq!(body["result"]["generation"], 1);
+    assert_eq!(body["result"]["binding"]["pack_ref"], "greentic.memory-v2");
+
+    // Keyed remove targets ONLY the default instance; `alt` survives.
+    let (status, body) = send(
+        app.clone(),
+        Method::DELETE,
+        "/environments/local/extensions",
+        Some(extension_key_body("greentic.memory", None, None)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["audit"]["verb"], "remove");
+
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    let extensions = read["environment"]["extensions"]
+        .as_array()
+        .expect("extensions");
+    assert_eq!(extensions.len(), 1);
+    assert_eq!(extensions[0]["instance_id"], "alt");
+}
+
+#[tokio::test]
+async fn extension_update_without_binding_is_400() {
+    let (_d, app) = app().await;
+    send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+
+    let (status, body) = send(
+        app,
+        Method::PATCH,
+        "/environments/local/extensions",
+        Some(extension_key_body("greentic.memory", None, None)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["kind"], "invalid-request");
+}
+
+#[tokio::test]
+async fn extension_rollback_restores_previous_binding() {
+    let (_d, app) = app().await;
+    send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/extensions",
+        Some(json!({"binding": extension_binding("greentic.memory", None, "greentic.memory")})),
+    )
+    .await;
+    send(
+        app.clone(),
+        Method::PATCH,
+        "/environments/local/extensions",
+        Some(extension_key_body(
+            "greentic.memory",
+            None,
+            Some(extension_binding(
+                "greentic.memory",
+                None,
+                "greentic.memory-v2",
+            )),
+        )),
+    )
+    .await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/extensions/rollback",
+        Some(extension_key_body("greentic.memory", None, None)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["audit"]["verb"], "rollback");
+    assert_eq!(body["result"]["generation"], 2);
+    assert_eq!(body["result"]["binding"]["pack_ref"], "greentic.memory");
+
+    // No stash left → second rollback is a 409 conflict.
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/extensions/rollback",
+        Some(extension_key_body("greentic.memory", None, None)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "conflict");
+
+    // Unknown key → 404 dependent-not-found.
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/environments/local/extensions/rollback",
+        Some(extension_key_body("greentic.ghost", None, None)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["kind"], "dependent-not-found");
+}
+
+#[tokio::test]
+async fn binding_routes_on_ghost_env_are_404_not_found() {
+    let (_d, app) = app().await;
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/ghost/packs",
+        Some(pack_body("secrets", "greentic.secrets")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["kind"], "not-found");
+
+    let (status, body) = send(
+        app,
+        Method::DELETE,
+        "/environments/ghost/extensions",
+        Some(extension_key_body("greentic.memory", None, None)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["kind"], "not-found");
 }

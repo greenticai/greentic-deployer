@@ -347,29 +347,11 @@ fn remove_schema() -> Value {
     })
 }
 
-// Stash + reload previous binding payload.
-//
-// Phase A keeps the operator's local-only `EnvironmentStore` surface
-// dependency-free; rather than adding a sibling history-log file (which
-// would need its own backup/lock contract), we stash the previous JSON
-// inside the new binding's `previous_binding_ref` *by encoding it directly*
-// as a base64 JSON token under a sentinel path prefix. This is intentionally
-// minimal — one step of rollback, no history — and matches the plan's note
-// that multi-step history is A8's contract. The encoding itself moved to
-// `greentic_deploy_spec::engine::inline_stash` in PR-4.2c (the traffic
-// engine writes/reads the same tokens); these wrappers keep the existing
-// call sites stable.
-
-/// Stash a binding snapshot inline so `rollback` can restore it without a
-/// sidecar history file. Reused by sibling N-collection nouns (e.g.
-/// `extensions`) that share the one-step-rollback contract.
-pub(crate) fn stash_previous(snapshot: Value) -> PathBuf {
-    greentic_deploy_spec::engine::inline_stash::stash_inline(snapshot)
-}
-
-pub(crate) fn load_previous(prev_ref: &std::path::Path) -> Option<Value> {
-    greentic_deploy_spec::engine::inline_stash::load_inline(prev_ref)
-}
+// The previous-binding stash (one-step rollback, `inline://` base64
+// tokens) lives in `greentic_deploy_spec::engine::inline_stash`; the
+// binding verbs that write/read it moved to
+// `greentic_deploy_spec::engine::bindings` in PR-4.2d, so this module no
+// longer touches the encoding directly.
 
 #[cfg(test)]
 mod tests {
@@ -538,17 +520,6 @@ mod tests {
                 "slot {slot} should be rejected, got {err:?}"
             );
         }
-    }
-
-    #[test]
-    fn stash_previous_roundtrip_smoke() {
-        // The encoding itself is pinned by the engine's inline_stash tests;
-        // this pins the delegation (and the `inline://` token shape the
-        // persisted `previous_binding_ref` fields carry).
-        let snapshot = serde_json::json!({"slot": "secrets", "generation": 2});
-        let token = stash_previous(snapshot.clone());
-        assert!(token.to_string_lossy().starts_with("inline://"));
-        assert_eq!(load_previous(&token), Some(snapshot));
     }
 
     #[test]
