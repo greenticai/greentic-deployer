@@ -9,6 +9,16 @@
 //! real-cluster and production acceptance, not this scaffold — sandbox
 //! defaults per that doc.
 //!
+//! ## Answers consumption
+//!
+//! `op env render` reads the binding's `answers_ref` and feeds it to
+//! [`K8sParams::from_answers`](manifests::K8sParams::from_answers) so
+//! operator overrides (namespace, runtime image, router replicas) reach
+//! the rendered manifests. The Deployer verbs (`warm_revision`,
+//! `apply_traffic_split`) still use `K8sParams::for_env` sandbox
+//! defaults — they have no env-dir access on the trait; threading
+//! answers into them rides the PR-5.3 orchestration wiring.
+//!
 //! ## Operator CLI lifecycle verb disclaimer
 //!
 //! The operator CLI's revision/traffic verbs (`gtc op revision warm`,

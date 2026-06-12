@@ -9,14 +9,14 @@
 # backend (B12a / `secret://` URI refs).
 #
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Trust-boundary disclosure (same gap as the AWS-ECS wizard):
+# Trust-boundary disclosure (partial — rendering closed, probes still open):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# There is no reader for `EnvPackBinding.answers_ref` today. The answers
-# captured below are PERSISTED on the binding but are NOT yet consumed by
-# manifest rendering or credential probes — `K8sParams::for_env` derives
-# sandbox defaults (`gtc-<env-id>` namespace, the S1 default image, two
-# router replicas) until the Phase D answers-reader lands. Treat this
-# wizard as DECLARATIVE INTENT recorded for Phase D consumption.
+# Manifest rendering (`gtc op env render`) NOW consumes these answers via
+# `K8sParams::from_answers` — namespace, runtime_image, and router_replicas
+# propagate into the rendered manifests. Credential probes still run
+# against the ambient environment (same gap as the AWS-ECS wizard);
+# threading answers into the Deployer verbs (warm/apply_traffic_split)
+# rides the PR-5.3 orchestration wiring.
 #
 # Versioning: this spec rides the env-pack handler's
 # `K8sDeployerHandler::VERSION_REQ` (`>=1.0.0-dev, <2.0.0`). A breaking
@@ -28,20 +28,21 @@ title: Kubernetes deployer
 version: "0.1.0"
 description: >-
   Records the cluster scope the K8s deployer env-pack will operate
-  against. Phase D disclosure: answers are captured on the binding
-  (`answers_ref`) but NOT yet consumed by rendering or validation —
-  sandbox defaults apply until the answers reader lands. Credential
-  MATERIAL is never collected here.
+  against. Manifest rendering (`op env render`) consumes these answers
+  to override namespace, runtime image, and router replicas. Credential
+  probes still run against the ambient environment. Credential MATERIAL
+  is never collected here.
 presentation:
   intro: >-
-    Bind a Kubernetes environment. Today's manifest rendering and
-    `gtc op credentials requirements` use sandbox defaults (namespace
-    `gtc-<env-id>`, the GHCR runtime image, two router replicas); the
-    answers below are recorded on the binding for Phase D consumption.
-    Production requires a digest-pinned runtime image. Note: env ids
-    that require lossy sanitization (uppercase, `.`, `_`) or exceed
-    the 63-char RFC 1123 limit get a collision-proof hash suffix
-    (`gtc-<prefix>-<hash8>`) — see `manifests::namespace_for_env`.
+    Bind a Kubernetes environment. Manifest rendering (`op env render`)
+    consumes these answers: namespace, runtime image, and router replicas
+    propagate into the rendered manifests. Credential probes and
+    Deployer verbs (warm, apply_traffic_split) still use sandbox
+    defaults until PR-5.3 orchestration wiring. Production requires a
+    digest-pinned runtime image. Note: env ids that require lossy
+    sanitization (uppercase, `.`, `_`) or exceed the 63-char RFC 1123
+    limit get a collision-proof hash suffix (`gtc-<prefix>-<hash8>`) —
+    see `manifests::namespace_for_env`.
 
 questions:
   - id: kubeconfig_context

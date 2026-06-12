@@ -492,14 +492,23 @@ pub fn tool_check(
 /// applying anything — the artifact for direct-apply preview, GitOps
 /// repository handoff, or rendered-manifest handoff.
 ///
+/// When the env's Deployer-slot binding records wizard answers
+/// (`answers_ref`), the renderer consumes them so operator overrides
+/// (custom namespace, digest-pinned image, replica count) propagate into
+/// the rendered manifests. When no answers are recorded, sandbox defaults
+/// apply.
+///
 /// With `--output <dir>` each object is written as
-/// `<NN>-<kind>-<name>.yaml` in apply order (same-named files are
-/// overwritten); `stale_files` in the outcome lists `.yaml` leftovers in
-/// the directory that this render did NOT write (e.g. workers of a since-
-/// archived revision) — remove them before `kubectl apply -f <dir>`.
+/// `<NN>-<kind>-<name>.yaml` in apply order. The output directory is
+/// render-managed for files matching the `<NN>-*.yaml` pattern (one or
+/// more leading digits followed by `-`): stale managed files from
+/// previous renders are removed so `kubectl apply -f <dir>` can never
+/// resurrect an archived revision. Other files (e.g. `kustomization.yaml`)
+/// are left untouched and reported in the outcome.
 /// Without `--output` the manifests are embedded in the JSON outcome.
 pub fn render(
     store: &LocalFsStore,
+    registry: &crate::env_packs::EnvPackRegistry,
     flags: &OpFlags,
     args: super::dispatch::EnvRenderArgs,
 ) -> Result<OpOutcome, OpError> {
@@ -520,7 +529,6 @@ pub fn render(
     }
     let env = store.load(&env_id)?;
     let descriptor = resolve_render_kind(&env, args.kind.as_deref())?;
-    let registry = crate::env_packs::EnvPackRegistry::with_builtins();
     let handler = registry
         .resolve_for_slot(CapabilitySlot::Deployer, &descriptor)
         .map_err(|e| OpError::Conflict(e.to_string()))?;
@@ -530,23 +538,86 @@ pub fn render(
             descriptor.path()
         ))
     })?;
-    let objects = renderer.render_environment(&env);
+
+    // Load answers from the binding IFF the env's Deployer-slot binding
+    // exists, its kind path matches the resolved descriptor, and
+    // `answers_ref` is `Some`.
+    let (answers, answers_ref_wire) = load_render_answers(store, &env, &descriptor)?;
+    let objects = renderer
+        .render_environment(&env, answers.as_ref())
+        .map_err(|e| OpError::Conflict(e.to_string()))?;
 
     let mut result = json!({
         "environment_id": env.environment_id.as_str(),
         "kind": descriptor.as_str(),
         "object_count": objects.len(),
+        "answers_ref": answers_ref_wire,
     });
     match args.output {
         Some(dir) => {
-            let (files, stale_files) = write_rendered_objects(&dir, &objects)?;
+            let write_result = write_rendered_objects(&dir, &objects)?;
             result["output_dir"] = json!(dir);
-            result["files"] = json!(files);
-            result["stale_files"] = json!(stale_files);
+            result["files"] = json!(write_result.files);
+            result["removed_stale_files"] = json!(write_result.removed_stale_files);
+            result["unmanaged_files"] = json!(write_result.unmanaged_files);
         }
         None => result["manifests"] = Value::Array(objects),
     }
     Ok(OpOutcome::new(NOUN, "render", result))
+}
+
+/// Load the deployer binding's recorded wizard answers for the render path.
+///
+/// Returns `(Some(json), env-relative path string)` when the binding exists
+/// with `answers_ref`, the binding's kind path matches the descriptor, and
+/// the file is readable. `(None, null)` when no answers are recorded.
+/// Errors (fail-closed) when `answers_ref` is set but the file is missing,
+/// unreadable, or contains invalid JSON — never silently falls back to
+/// defaults.
+fn load_render_answers(
+    store: &LocalFsStore,
+    env: &greentic_deploy_spec::Environment,
+    descriptor: &greentic_deploy_spec::PackDescriptor,
+) -> Result<(Option<Value>, Value), OpError> {
+    let binding = env.pack_for_slot(CapabilitySlot::Deployer);
+    let answers_ref = match binding {
+        Some(b) if b.kind.path() == descriptor.path() => b.answers_ref.as_ref(),
+        _ => None,
+    };
+    let Some(rel_path) = answers_ref else {
+        return Ok((None, Value::Null));
+    };
+    let env_dir = store.env_dir(&env.environment_id)?;
+    // Containment check: the answers file must live under the env dir.
+    crate::path_safety::normalize_under_root(&env_dir, rel_path).map_err(|e| {
+        OpError::Conflict(format!(
+            "answers_ref `{}` escapes env directory: {e}",
+            rel_path.display()
+        ))
+    })?;
+    let abs_path = env_dir.join(rel_path);
+    let raw = std::fs::read_to_string(&abs_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            OpError::Conflict(format!(
+                "binding records answers_ref `{}` but the file does not exist \
+                 — re-run the binding wizard or fix the binding",
+                rel_path.display()
+            ))
+        } else {
+            OpError::Io {
+                path: abs_path.clone(),
+                source: e,
+            }
+        }
+    })?;
+    let answers: Value = serde_json::from_str(&raw).map_err(|e| {
+        OpError::Conflict(format!(
+            "answers_ref `{}` contains invalid JSON: {e}",
+            rel_path.display()
+        ))
+    })?;
+    let wire = json!(rel_path.to_string_lossy());
+    Ok((Some(answers), wire))
 }
 
 /// Resolve the `--kind` argument for `op env render` to a full
@@ -581,39 +652,97 @@ fn resolve_render_kind(
     }
 }
 
+/// Result of [`write_rendered_objects`].
+struct WriteResult {
+    /// Files written by this render.
+    files: Vec<String>,
+    /// Render-managed `.yaml` files from a previous render that were removed
+    /// from disk because they are no longer in the desired state.
+    removed_stale_files: Vec<String>,
+    /// Non-managed `.yaml` or other files present in the directory that were
+    /// left untouched (e.g. a user's `kustomization.yaml`).
+    unmanaged_files: Vec<String>,
+}
+
 /// Write each rendered object as a YAML file under `dir` (created if
-/// missing). Returns `(written, stale)` file names — `stale` is every
-/// pre-existing `.yaml` in `dir` this render did not write.
+/// missing). The output directory is render-managed for files matching
+/// the `<NN>-*.yaml` pattern: stale managed files from previous renders
+/// are deleted so `kubectl apply -f <dir>` can never resurrect an archived
+/// revision. Other files are left alone and reported.
+///
+/// All objects are pre-serialized before any filesystem write so a
+/// serialization failure leaves the directory untouched.
 fn write_rendered_objects(
     dir: &std::path::Path,
     objects: &[Value],
-) -> Result<(Vec<String>, Vec<String>), OpError> {
+) -> Result<WriteResult, OpError> {
     let io_err = |source: std::io::Error| OpError::Io {
         path: dir.to_path_buf(),
         source,
     };
-    std::fs::create_dir_all(dir).map_err(io_err)?;
-    let mut files = Vec::with_capacity(objects.len());
+
+    // 1. Pre-serialize ALL objects before touching the filesystem.
+    let mut pairs: Vec<(String, String)> = Vec::with_capacity(objects.len());
     for (index, object) in objects.iter().enumerate() {
         let file_name = rendered_object_file_name(index, object);
-        let path = dir.join(&file_name);
         let yaml = serde_yaml_bw::to_string(object).map_err(|e| OpError::Io {
-            path: path.clone(),
+            path: dir.join(&file_name),
             source: std::io::Error::other(format!("manifest YAML serialization: {e}")),
         })?;
-        std::fs::write(&path, yaml).map_err(|source| OpError::Io { path, source })?;
-        files.push(file_name);
+        pairs.push((file_name, yaml));
     }
-    let mut stale_files = Vec::new();
+
+    // 2. Write files.
+    std::fs::create_dir_all(dir).map_err(io_err)?;
+    let mut files = Vec::with_capacity(pairs.len());
+    for (file_name, yaml) in &pairs {
+        let path = dir.join(file_name);
+        std::fs::write(&path, yaml).map_err(|source| OpError::Io { path, source })?;
+        files.push(file_name.clone());
+    }
+
+    // 3. Scan and clean up stale render-managed files.
+    let mut removed_stale_files = Vec::new();
+    let mut unmanaged_files = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(io_err)? {
         let name = entry.map_err(io_err)?.file_name();
         let name = name.to_string_lossy().into_owned();
-        if name.ends_with(".yaml") && !files.contains(&name) {
-            stale_files.push(name);
+        if files.contains(&name) {
+            continue;
         }
+        if name.ends_with(".yaml") && is_render_managed_name(&name) {
+            let path = dir.join(&name);
+            std::fs::remove_file(&path).map_err(|source| OpError::Io { path, source })?;
+            removed_stale_files.push(name);
+        } else if name.ends_with(".yaml") {
+            unmanaged_files.push(name);
+        }
+        // Non-yaml files are silently ignored.
     }
-    stale_files.sort();
-    Ok((files, stale_files))
+    removed_stale_files.sort();
+    unmanaged_files.sort();
+
+    Ok(WriteResult {
+        files,
+        removed_stale_files,
+        unmanaged_files,
+    })
+}
+
+/// Whether a file name matches the render-managed pattern: a non-empty
+/// leading run of ASCII digits followed by `-` and ending in `.yaml`.
+/// Our naming convention is `<NN>-<kind>-<name>.yaml` where NN can exceed
+/// 99, so we accept 1+ digits. Implemented without a regex dependency.
+fn is_render_managed_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    // Must end in .yaml (already checked by caller, but be defensive).
+    if !name.ends_with(".yaml") {
+        return false;
+    }
+    // Find the first non-digit byte.
+    let digit_end = bytes.iter().position(|b| !b.is_ascii_digit()).unwrap_or(0);
+    // Must have at least one digit followed by `-`.
+    digit_end > 0 && bytes.get(digit_end) == Some(&b'-')
 }
 
 /// `<NN>-<kind>-<name>.yaml`, lowercased and restricted to `[a-z0-9.-]`
@@ -2477,6 +2606,10 @@ mod tests {
         }
     }
 
+    fn builtins() -> crate::env_packs::EnvPackRegistry {
+        crate::env_packs::EnvPackRegistry::with_builtins()
+    }
+
     fn store_with_k8s_env(dir: &std::path::Path) -> LocalFsStore {
         use crate::cli::tests_common::make_binding;
         let store = LocalFsStore::new(dir);
@@ -2493,7 +2626,14 @@ mod tests {
     fn render_embeds_manifests_without_output() {
         let dir = tempdir().unwrap();
         let store = store_with_k8s_env(dir.path());
-        let outcome = render(&store, &OpFlags::default(), render_args("zain", None, None)).unwrap();
+        let reg = builtins();
+        let outcome = render(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            render_args("zain", None, None),
+        )
+        .unwrap();
         assert_eq!(outcome.op, "render");
         assert_eq!(
             outcome.result.get("kind").and_then(Value::as_str),
@@ -2521,9 +2661,11 @@ mod tests {
     fn render_writes_apply_ordered_yaml_files() {
         let dir = tempdir().unwrap();
         let store = store_with_k8s_env(dir.path());
+        let reg = builtins();
         let out = dir.path().join("rendered");
         let outcome = render(
             &store,
+            &reg,
             &OpFlags::default(),
             render_args("zain", None, Some(out.clone())),
         )
@@ -2542,7 +2684,7 @@ mod tests {
         assert_eq!(
             outcome
                 .result
-                .get("stale_files")
+                .get("removed_stale_files")
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(0)
@@ -2554,23 +2696,65 @@ mod tests {
     }
 
     #[test]
-    fn render_reports_stale_yaml_leftovers() {
+    fn render_removes_stale_managed_files_and_reports_unmanaged() {
         let dir = tempdir().unwrap();
         let store = store_with_k8s_env(dir.path());
+        let reg = builtins();
         let out = dir.path().join("rendered");
         std::fs::create_dir_all(&out).unwrap();
-        std::fs::write(out.join("zz-old-worker.yaml"), "kind: Deployment\n").unwrap();
+        // A render-managed pattern file (digits + dash prefix) from a
+        // previous render — must be deleted.
+        std::fs::write(
+            out.join("99-deployment-gtc-worker-old.yaml"),
+            "kind: Deployment\n",
+        )
+        .unwrap();
+        // A user-owned file — must survive.
+        std::fs::write(
+            out.join("kustomization.yaml"),
+            "apiVersion: kustomize.config.k8s.io/v1beta1\n",
+        )
+        .unwrap();
+        // Non-YAML — silently ignored.
         std::fs::write(out.join("notes.txt"), "not a manifest\n").unwrap();
         let outcome = render(
             &store,
+            &reg,
+            &OpFlags::default(),
+            render_args("zain", None, Some(out.clone())),
+        )
+        .unwrap();
+        // Managed stale file was removed from disk.
+        assert!(
+            !out.join("99-deployment-gtc-worker-old.yaml").exists(),
+            "stale managed file must be deleted from disk"
+        );
+        assert_eq!(
+            outcome.result.get("removed_stale_files"),
+            Some(&json!(["99-deployment-gtc-worker-old.yaml"])),
+        );
+        // Unmanaged file survives on disk.
+        assert!(out.join("kustomization.yaml").exists());
+        assert_eq!(
+            outcome.result.get("unmanaged_files"),
+            Some(&json!(["kustomization.yaml"])),
+        );
+        // Re-render into the same dir is idempotent: no stale files.
+        let outcome2 = render(
+            &store,
+            &reg,
             &OpFlags::default(),
             render_args("zain", None, Some(out)),
         )
         .unwrap();
         assert_eq!(
-            outcome.result.get("stale_files"),
-            Some(&json!(["zz-old-worker.yaml"])),
-            "leftover .yaml files are reported; non-YAML files are ignored"
+            outcome2
+                .result
+                .get("removed_stale_files")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0),
+            "idempotent re-render must report empty removed_stale_files"
         );
     }
 
@@ -2578,9 +2762,11 @@ mod tests {
     fn render_bare_path_kind_must_match_the_binding() {
         let dir = tempdir().unwrap();
         let store = store_with_k8s_env(dir.path());
+        let reg = builtins();
         // Bare path matching the binding reuses its pinned version.
         let outcome = render(
             &store,
+            &reg,
             &OpFlags::default(),
             render_args("zain", Some("greentic.deployer.k8s"), None),
         )
@@ -2592,6 +2778,7 @@ mod tests {
         // A bare path that matches nothing is rejected — no version guessing.
         let err = render(
             &store,
+            &reg,
             &OpFlags::default(),
             render_args("zain", Some("greentic.deployer.other"), None),
         )
@@ -2603,12 +2790,20 @@ mod tests {
     fn render_without_deployer_binding_requires_kind() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
         store.save(&make_env("bare")).unwrap();
-        let err = render(&store, &OpFlags::default(), render_args("bare", None, None)).unwrap_err();
+        let err = render(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            render_args("bare", None, None),
+        )
+        .unwrap_err();
         assert!(matches!(err, OpError::Conflict(_)), "{err}");
         // An explicit full descriptor renders an unbound kind (preview).
         let outcome = render(
             &store,
+            &reg,
             &OpFlags::default(),
             render_args("bare", Some("greentic.deployer.k8s@1.0.0"), None),
         )
@@ -2624,6 +2819,7 @@ mod tests {
         use crate::cli::tests_common::make_binding;
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
         let mut env = make_env("local");
         env.packs.push(make_binding(
             CapabilitySlot::Deployer,
@@ -2632,6 +2828,7 @@ mod tests {
         store.save(&env).unwrap();
         let err = render(
             &store,
+            &reg,
             &OpFlags::default(),
             render_args("local", None, None),
         )
@@ -2648,8 +2845,10 @@ mod tests {
     fn render_missing_env_is_not_found() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
         let err = render(
             &store,
+            &reg,
             &OpFlags::default(),
             render_args("ghost", None, None),
         )
@@ -2661,11 +2860,218 @@ mod tests {
     fn render_schema_only_returns_input_schema() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
         let flags = OpFlags {
             schema_only: true,
             ..OpFlags::default()
         };
-        let outcome = render(&store, &flags, render_args("zain", None, None)).unwrap();
+        let outcome = render(&store, &reg, &flags, render_args("zain", None, None)).unwrap();
         assert!(outcome.result.get("input_schema").is_some());
+    }
+
+    // ---- Fix 1: answers_ref consumption ------------------------------------
+
+    #[test]
+    fn render_with_answers_overrides_namespace() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("zain");
+        // Build a binding WITH answers_ref.
+        let mut binding = make_binding(CapabilitySlot::Deployer, "greentic.deployer.k8s@1.0.0");
+        binding.answers_ref = Some(PathBuf::from("env-packs/deployer/answers.json"));
+        env.packs.push(binding);
+        store.save(&env).unwrap();
+        // Write the answers file under the env dir.
+        let env_dir = store.env_dir(&EnvId::try_from("zain").unwrap()).unwrap();
+        let answers_dir = env_dir.join("env-packs/deployer");
+        std::fs::create_dir_all(&answers_dir).unwrap();
+        std::fs::write(
+            answers_dir.join("answers.json"),
+            r#"{"namespace": "custom-ns"}"#,
+        )
+        .unwrap();
+        let outcome = render(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            render_args("zain", None, None),
+        )
+        .unwrap();
+        // The namespace override must reach the rendered manifests.
+        let manifests = outcome
+            .result
+            .get("manifests")
+            .and_then(Value::as_array)
+            .expect("manifests");
+        assert_eq!(
+            manifests[0]["metadata"]["name"].as_str(),
+            Some("custom-ns"),
+            "Namespace object uses the answer override"
+        );
+        // answers_ref appears in the outcome.
+        assert_eq!(
+            outcome.result.get("answers_ref").and_then(Value::as_str),
+            Some("env-packs/deployer/answers.json"),
+        );
+    }
+
+    #[test]
+    fn render_answers_ref_missing_file_is_conflict() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("zain");
+        let mut binding = make_binding(CapabilitySlot::Deployer, "greentic.deployer.k8s@1.0.0");
+        binding.answers_ref = Some(PathBuf::from("env-packs/deployer/answers.json"));
+        env.packs.push(binding);
+        store.save(&env).unwrap();
+        // Do NOT write the answers file.
+        let err = render(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            render_args("zain", None, None),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn render_answers_ref_invalid_json_is_conflict() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("zain");
+        let mut binding = make_binding(CapabilitySlot::Deployer, "greentic.deployer.k8s@1.0.0");
+        binding.answers_ref = Some(PathBuf::from("env-packs/deployer/answers.json"));
+        env.packs.push(binding);
+        store.save(&env).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("zain").unwrap()).unwrap();
+        let answers_dir = env_dir.join("env-packs/deployer");
+        std::fs::create_dir_all(&answers_dir).unwrap();
+        std::fs::write(answers_dir.join("answers.json"), "not json{").unwrap();
+        let err = render(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            render_args("zain", None, None),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn render_answers_ref_invalid_replicas_is_conflict() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("zain");
+        let mut binding = make_binding(CapabilitySlot::Deployer, "greentic.deployer.k8s@1.0.0");
+        binding.answers_ref = Some(PathBuf::from("env-packs/deployer/answers.json"));
+        env.packs.push(binding);
+        store.save(&env).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("zain").unwrap()).unwrap();
+        let answers_dir = env_dir.join("env-packs/deployer");
+        std::fs::create_dir_all(&answers_dir).unwrap();
+        std::fs::write(
+            answers_dir.join("answers.json"),
+            r#"{"router_replicas": "1"}"#,
+        )
+        .unwrap();
+        let err = render(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            render_args("zain", None, None),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+    }
+
+    // ---- Fix 3: plug-in registry threading ---------------------------------
+
+    #[test]
+    fn render_uses_caller_provided_registry() {
+        use crate::cli::tests_common::make_binding;
+        use crate::env_packs::render::{ManifestRenderer, RenderError};
+        use crate::env_packs::slot::EnvPackHandler;
+
+        /// A test-only deployer handler with a custom renderer.
+        #[derive(Debug)]
+        struct FakeDeployerHandler;
+
+        impl EnvPackHandler for FakeDeployerHandler {
+            fn slot(&self) -> CapabilitySlot {
+                CapabilitySlot::Deployer
+            }
+            fn descriptor_path(&self) -> &str {
+                "test.deployer.fake"
+            }
+            fn supported_versions(&self) -> semver::VersionReq {
+                "^1.0.0".parse().unwrap()
+            }
+            fn deployer_credentials(&self) -> Option<&dyn crate::credentials::DeployerCredentials> {
+                // Reuse local-process credentials to satisfy the register gate.
+                static CREDS: std::sync::LazyLock<
+                    crate::env_packs::local_process::LocalProcessCredentials,
+                > = std::sync::LazyLock::new(
+                    crate::env_packs::local_process::LocalProcessCredentials::default,
+                );
+                Some(&*CREDS)
+            }
+            fn as_manifest_renderer(&self) -> Option<&dyn ManifestRenderer> {
+                Some(self)
+            }
+        }
+
+        impl ManifestRenderer for FakeDeployerHandler {
+            fn render_environment(
+                &self,
+                _env: &greentic_deploy_spec::Environment,
+                _answers: Option<&serde_json::Value>,
+            ) -> Result<Vec<Value>, RenderError> {
+                Ok(vec![json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "fake-rendered"},
+                })])
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("plug");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "test.deployer.fake@1.0.0",
+        ));
+        store.save(&env).unwrap();
+
+        let mut reg = crate::env_packs::EnvPackRegistry::with_builtins();
+        reg.register(Box::new(FakeDeployerHandler)).unwrap();
+
+        let outcome = render(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            render_args("plug", None, None),
+        )
+        .unwrap();
+        let manifests = outcome
+            .result
+            .get("manifests")
+            .and_then(Value::as_array)
+            .expect("manifests");
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(
+            manifests[0]["metadata"]["name"].as_str(),
+            Some("fake-rendered"),
+            "the custom renderer's objects must come back"
+        );
     }
 }

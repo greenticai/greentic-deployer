@@ -833,7 +833,7 @@ pub fn dispatch_op_with_registry(
 
     let store = build_store(&cmd).inspect_err(|err| print_error(noun, verb, err))?;
     let result = match cmd.noun {
-        OpNoun::Env { verb } => dispatch_env(&store, &flags, verb),
+        OpNoun::Env { verb } => dispatch_env(&store, registry, &flags, verb),
         OpNoun::EnvPacks { verb } => dispatch_env_packs(&store, &flags, verb),
         OpNoun::Bundles { verb } => dispatch_bundles(&store, &flags, verb),
         OpNoun::Revisions { verb } => dispatch_revisions(&store, &flags, verb),
@@ -971,7 +971,12 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
     }
 }
 
-fn dispatch_env(store: &LocalFsStore, flags: &OpFlags, verb: EnvVerb) -> Result<(), OpError> {
+fn dispatch_env(
+    store: &LocalFsStore,
+    registry: &crate::env_packs::EnvPackRegistry,
+    flags: &OpFlags,
+    verb: EnvVerb,
+) -> Result<(), OpError> {
     let outcome = match verb {
         EnvVerb::Init(args) => super::env::init(store, flags, args.into_payload(flags)?)?,
         EnvVerb::Apply(mut args) => {
@@ -995,7 +1000,7 @@ fn dispatch_env(store: &LocalFsStore, flags: &OpFlags, verb: EnvVerb) -> Result<
         EnvVerb::Show { env_id } => super::env::show(store, flags, &env_id)?,
         EnvVerb::Doctor { env_id } => super::env::doctor(store, flags, &env_id)?,
         EnvVerb::ToolCheck { env_id } => super::env::tool_check(store, flags, &env_id)?,
-        EnvVerb::Render(args) => super::env::render(store, flags, args)?,
+        EnvVerb::Render(args) => super::env::render(store, registry, flags, args)?,
         EnvVerb::Destroy { env_id, confirm } => {
             super::env::destroy(store, flags, &env_id, confirm)?
         }

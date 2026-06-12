@@ -6,13 +6,19 @@
 //! what the [`Deployer`](crate::env_packs::deployer::Deployer) verbs apply
 //! — same functions, same params — so a rendered-manifest or GitOps
 //! handoff converges to the same state as direct apply (plan §6 step 10).
+//!
+//! When the binding records wizard answers (`answers_ref`), the renderer
+//! feeds them to [`K8sParams::from_answers`] so operator overrides (custom
+//! namespace, digest-pinned image, replica count) propagate into the
+//! rendered manifests. When no answers are recorded, sandbox defaults
+//! apply (`K8sParams::for_env`).
 
 use greentic_deploy_spec::{Environment, RevisionLifecycle};
 use serde_json::Value;
 
 use super::K8sDeployerHandler;
 use super::manifests::{self, K8sParams};
-use crate::env_packs::render::ManifestRenderer;
+use crate::env_packs::render::{ManifestRenderer, RenderError};
 
 /// Whether a revision's persisted lifecycle puts its worker objects in the
 /// cluster's desired state.
@@ -35,15 +41,19 @@ fn has_cluster_presence(lifecycle: RevisionLifecycle) -> bool {
 }
 
 impl ManifestRenderer for K8sDeployerHandler {
-    fn render_environment(&self, env: &Environment) -> Vec<Value> {
-        let params = K8sParams::for_env(env);
+    fn render_environment(
+        &self,
+        env: &Environment,
+        answers: Option<&serde_json::Value>,
+    ) -> Result<Vec<Value>, RenderError> {
+        let params = K8sParams::from_answers(env, answers).map_err(RenderError::InvalidAnswers)?;
         let mut objects = manifests::render_environment_manifests(env, &params);
         for revision in &env.revisions {
             if has_cluster_presence(revision.lifecycle) {
                 objects.extend(manifests::render_worker_manifests(env, revision, &params));
             }
         }
-        objects
+        Ok(objects)
     }
 }
 
@@ -82,7 +92,7 @@ mod tests {
         let env_level = manifests::render_environment_manifests(&env, &params);
 
         let handler = K8sDeployerHandler::default();
-        let objects = handler.render_environment(&env);
+        let objects = handler.render_environment(&env, None).unwrap();
 
         assert_eq!(
             &objects[..env_level.len()],
@@ -130,8 +140,21 @@ mod tests {
         let env = build_fixture_env();
         let handler = K8sDeployerHandler::default();
         assert_eq!(
-            handler.render_environment(&env),
-            handler.render_environment(&env)
+            handler.render_environment(&env, None).unwrap(),
+            handler.render_environment(&env, None).unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_answers_surface_render_error() {
+        let env = build_fixture_env();
+        let handler = K8sDeployerHandler::default();
+        // Non-object answers must be rejected.
+        let bad = serde_json::json!("not an object");
+        let err = handler.render_environment(&env, Some(&bad)).unwrap_err();
+        assert!(
+            matches!(err, RenderError::InvalidAnswers(_)),
+            "expected InvalidAnswers, got {err:?}"
         );
     }
 }
