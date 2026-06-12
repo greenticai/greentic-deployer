@@ -4,6 +4,7 @@ members = [
     "crates/greentic-deploy-spec",
     "crates/greentic-environment-store-postgres",
     "crates/greentic-operator-store-server",
+    "crates/greentic-operator-trust",
 ]
 resolver = "2"
 
@@ -68,6 +69,7 @@ greentic-bundle = ">=1.2.0-dev, <1.3.0-0"
 greentic-config = ">=1.1.0-dev, <1.2.0-0"
 greentic-config-types = ">=1.1.0-dev, <1.2.0-0"
 greentic-deploy-spec = { path = "crates/greentic-deploy-spec", version = "0.1" }
+greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.1" }
 serde_json = "1"
 semver = "1"
 thiserror = "2"
@@ -221,6 +223,8 @@ version = "3"
 [dev-dependencies]
 wat = "1"
 base64 = "0.22"
+# Re-declared to turn on `test_support` (shared keypair fixtures) for tests.
+greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.1", features = ["test-utils"] }
 # Path-only (no version) on purpose: the server crate is `publish = false`,
 # and cargo strips versionless path dev-deps at publish time. Used by the
 # `store_server_e2e` test to drive the real `HttpEnvironmentStore` client

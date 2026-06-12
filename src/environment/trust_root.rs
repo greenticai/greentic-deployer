@@ -10,20 +10,19 @@
 //! verifiers don't translate between two shapes. A missing file yields an
 //! empty `TrustRoot` — verification then fails closed because no key matches.
 //!
-//! Mutations go through [`add_trusted_key`] / [`remove_trusted_key`], which
-//! validate the public key parses as Ed25519 SPKI and that the supplied
-//! `key_id` matches the derivation in
-//! [`greentic_distributor_client::signing::key_id_for_public_key_pem`]
-//! before persisting. This rejects stale/wrong-cased ids and a mismatch
-//! between the PEM and the id at write time, where it's actionable, rather
-//! than at verify time where the failure looks like a missing key.
+//! Document semantics (schema envelope, key validation, add/remove
+//! transforms) live in [`greentic_operator_trust::trust_root`] so the
+//! operator-store-server's SQLite-backed trust roots drive the SAME
+//! functions (PR-4.2e); this module owns only the file persistence —
+//! atomic writes plus the `backups/` copy of each predecessor.
 
 use std::path::{Path, PathBuf};
 
-use greentic_distributor_client::signing::{
-    SigningError, TrustRoot, TrustedKey, key_id_for_public_key_pem,
+use greentic_distributor_client::signing::{TrustRoot, TrustedKey};
+pub use greentic_operator_trust::trust_root::{
+    TRUST_ROOT_SCHEMA_V1, TrustRootDocError, TrustRootDocument,
 };
-use serde::{Deserialize, Serialize};
+use greentic_operator_trust::trust_root::{apply_add, apply_remove, validate_trusted_key};
 use thiserror::Error;
 
 use super::atomic_write::{AtomicWriteError, atomic_write_json, copy_to_backup};
@@ -31,9 +30,6 @@ use super::atomic_write::{AtomicWriteError, atomic_write_json, copy_to_backup};
 /// Env-relative sub-directory under which previous `trust-root.json`
 /// revisions are copied before each save (Codex #3 recovery hook).
 const TRUST_ROOT_BACKUP_DIR: &str = "backups";
-
-/// Schema discriminator for the trust-root file.
-pub const TRUST_ROOT_SCHEMA_V1: &str = "greentic.trust-root.v1";
 
 /// Filename under `<env_dir>` holding the trust-root document.
 pub const TRUST_ROOT_FILE: &str = "trust-root.json";
@@ -58,39 +54,12 @@ pub enum TrustRootError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("trust-root schema `{found}` is not the expected `{TRUST_ROOT_SCHEMA_V1}`")]
-    BadSchema { found: String },
-    #[error("trust-root key validation: {0}")]
-    Key(#[from] SigningError),
-    #[error(
-        "trust-root key_id `{supplied}` does not match the derivation from the public key (`{derived}`)"
-    )]
-    KeyIdMismatch { supplied: String, derived: String },
-    #[error("trust-root key_id `{0}` must be a non-empty hex string")]
-    EmptyKeyId(String),
-}
-
-/// On-disk envelope wrapping the distributor-client trust-root.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TrustRootDocument {
-    pub schema: String,
-    pub keys: Vec<TrustedKey>,
-}
-
-impl TrustRootDocument {
-    fn v1(keys: Vec<TrustedKey>) -> Self {
-        Self {
-            schema: TRUST_ROOT_SCHEMA_V1.to_string(),
-            keys,
-        }
-    }
-
-    fn into_trust_root(self) -> Result<TrustRoot, TrustRootError> {
-        if self.schema != TRUST_ROOT_SCHEMA_V1 {
-            return Err(TrustRootError::BadSchema { found: self.schema });
-        }
-        Ok(TrustRoot::new(self.keys))
-    }
+    /// Document-level validation/schema failure — see
+    /// [`greentic_operator_trust::trust_root::TrustRootDocError`].
+    /// Transparent so user-facing messages are unchanged from when these
+    /// variants lived inline here.
+    #[error(transparent)]
+    Doc(#[from] TrustRootDocError),
 }
 
 /// Absolute path to `<env_dir>/trust-root.json` (the file is not required to
@@ -118,7 +87,7 @@ pub fn load(env_dir: &Path) -> Result<TrustRoot, TrustRootError> {
             path: path.clone(),
             source,
         })?;
-    doc.into_trust_root()
+    Ok(doc.into_trust_root()?)
 }
 
 /// Add or overwrite a trusted key. Validates that `public_key_pem` parses as
@@ -135,24 +104,9 @@ pub fn load(env_dir: &Path) -> Result<TrustRoot, TrustRootError> {
 /// [`crate::cli::trust_root`]) honor this; test fixtures that own the
 /// tempdir exclusively are the only sanctioned exception.
 pub fn add_trusted_key(env_dir: &Path, key: TrustedKey) -> Result<TrustRoot, TrustRootError> {
-    if key.key_id.trim().is_empty() {
-        return Err(TrustRootError::EmptyKeyId(key.key_id));
-    }
-    let derived = key_id_for_public_key_pem(&key.public_key_pem)?;
-    if !key.key_id.eq_ignore_ascii_case(&derived) {
-        return Err(TrustRootError::KeyIdMismatch {
-            supplied: key.key_id,
-            derived,
-        });
-    }
-
+    let key = validate_trusted_key(key)?;
     let mut current = load_keys(env_dir)?;
-    let normalized_id = derived;
-    current.retain(|k| !k.key_id.eq_ignore_ascii_case(&normalized_id));
-    current.push(TrustedKey {
-        key_id: normalized_id,
-        public_key_pem: key.public_key_pem,
-    });
+    apply_add(&mut current, key);
     save(env_dir, &current)?;
     Ok(TrustRoot::new(current))
 }
@@ -167,9 +121,7 @@ pub fn add_trusted_key(env_dir: &Path, key: TrustedKey) -> Result<TrustRoot, Tru
 /// [`crate::environment::EnvironmentStore::transact`].
 pub fn remove_trusted_key(env_dir: &Path, key_id: &str) -> Result<TrustRoot, TrustRootError> {
     let mut current = load_keys(env_dir)?;
-    let before = current.len();
-    current.retain(|k| !k.key_id.eq_ignore_ascii_case(key_id));
-    if current.len() != before {
+    if apply_remove(&mut current, key_id) {
         save(env_dir, &current)?;
     }
     Ok(TrustRoot::new(current))
@@ -204,18 +156,8 @@ fn save(env_dir: &Path, keys: &[TrustedKey]) -> Result<(), TrustRootError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey as Ed25519SigningKey;
-    use ed25519_dalek::pkcs8::EncodePublicKey;
-    use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+    use greentic_operator_trust::test_support::keypair;
     use tempfile::tempdir;
-
-    fn keypair(seed: u8) -> (String, String) {
-        let sk = Ed25519SigningKey::from_bytes(&[seed; 32]);
-        let vk = sk.verifying_key();
-        let pub_pem = vk.to_public_key_pem(LineEnding::LF).unwrap();
-        let key_id = key_id_for_public_key_pem(&pub_pem).unwrap();
-        (pub_pem, key_id)
-    }
 
     #[test]
     fn load_missing_file_returns_empty_trust_root() {
@@ -272,7 +214,10 @@ mod tests {
             },
         )
         .expect_err("mismatched id must be rejected");
-        assert!(matches!(err, TrustRootError::KeyIdMismatch { .. }));
+        assert!(matches!(
+            err,
+            TrustRootError::Doc(TrustRootDocError::KeyIdMismatch { .. })
+        ));
         // File was never written.
         assert!(!trust_root_path(dir.path()).exists());
     }
@@ -289,7 +234,10 @@ mod tests {
             },
         )
         .expect_err("empty id must be rejected");
-        assert!(matches!(err, TrustRootError::EmptyKeyId(_)));
+        assert!(matches!(
+            err,
+            TrustRootError::Doc(TrustRootDocError::EmptyKeyId(_))
+        ));
     }
 
     #[test]
@@ -303,7 +251,10 @@ mod tests {
             },
         )
         .expect_err("bad pem must be rejected");
-        assert!(matches!(err, TrustRootError::Key(_)));
+        assert!(matches!(
+            err,
+            TrustRootError::Doc(TrustRootDocError::Key(_))
+        ));
         assert!(!trust_root_path(dir.path()).exists());
     }
 
@@ -495,7 +446,10 @@ mod tests {
         )
         .unwrap();
         let err = load(dir.path()).expect_err("bad schema must reject");
-        assert!(matches!(err, TrustRootError::BadSchema { .. }));
+        assert!(matches!(
+            err,
+            TrustRootError::Doc(TrustRootDocError::BadSchema { .. })
+        ));
     }
 
     #[test]

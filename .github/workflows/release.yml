@@ -223,5 +223,5 @@ jobs:
       contents: read
     uses: greenticai/.github/.github/workflows/crates-publish.yml@main
     with:
-      crates: "greentic-deploy-spec greentic-deployer"
+      crates: "greentic-deploy-spec greentic-operator-trust greentic-deployer"
     secrets: inherit

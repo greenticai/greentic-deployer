@@ -28,7 +28,10 @@ pub mod juju_machine;
 pub mod k8s_raw;
 pub mod multi_target;
 pub mod operator;
-pub mod operator_key;
+// Moved to the `greentic-operator-trust` crate (PR-4.2e) so the
+// operator-store-server can load/generate its own operator key; re-exported
+// so `crate::operator_key::*` call sites stay unchanged.
+pub use greentic_operator_trust::operator_key;
 pub mod pack_introspect;
 pub mod path_safety;
 pub mod plan;
