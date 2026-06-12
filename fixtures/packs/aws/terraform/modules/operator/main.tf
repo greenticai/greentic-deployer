@@ -497,7 +497,7 @@ resource "aws_ecs_task_definition" "this" {
     local.bundle_fetcher_enabled ? [
       {
         name      = "bundle-fetcher"
-        image     = "public.ecr.aws/aws-cli/aws-cli:2"
+        image     = "public.ecr.aws/aws-cli/aws-cli:latest"
         essential = false
         command = [
           "s3",
@@ -624,10 +624,6 @@ resource "aws_ecs_task_definition" "this" {
           {
             name  = "GREENTIC_ALLOW_ENV_SECRETS"
             value = "1"
-          },
-          {
-            name  = "GREENTIC_SECRETS_MANAGER_PACK"
-            value = "providers/deployer/aws.gtpack"
           }
         ] : [],
         [

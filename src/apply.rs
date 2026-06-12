@@ -2405,12 +2405,16 @@ fn ensure_aws_runtime_secret_wiring(path: &Path) -> Result<()> {
         contents = contents.replacen(marker, &format!("{policy}{marker}"), 1);
     }
     if !contents.contains("bundle_fetcher_enabled") {
-        contents = contents.replace(
-            r#"  admin_secret_prefix       = "greentic/admin/${local.name_prefix}""#,
-            r#"  admin_secret_prefix       = "greentic/admin/${local.name_prefix}"
-  bundle_fetcher_enabled    = trimspace(var.bundle_s3_object_ref) != ""
-  operator_bundle_source    = local.bundle_fetcher_enabled ? "/greentic-bundle/bundle.gtbundle" : var.bundle_source"#,
-        );
+        if let Some(line) = contents
+            .lines()
+            .find(|line| line.trim_start().starts_with("admin_secret_prefix ="))
+            .map(str::to_string)
+        {
+            let replacement = format!(
+                "{line}\n  bundle_fetcher_enabled = trimspace(var.bundle_s3_object_ref) != \"\"\n  operator_bundle_source = local.bundle_fetcher_enabled ? \"/greentic-bundle/bundle.gtbundle\" : var.bundle_source"
+            );
+            contents = contents.replacen(&line, &replacement, 1);
+        }
         contents = contents.replace(
             r#"  task_role_arn            = aws_iam_role.task_execution.arn
 
@@ -2425,7 +2429,7 @@ fn ensure_aws_runtime_secret_wiring(path: &Path) -> Result<()> {
     local.bundle_fetcher_enabled ? [
       {
         name      = "bundle-fetcher"
-        image     = "public.ecr.aws/aws-cli/aws-cli:2"
+        image     = "public.ecr.aws/aws-cli/aws-cli:latest"
         essential = false
         command = [
           "s3",
@@ -2514,10 +2518,6 @@ fn ensure_aws_runtime_secret_wiring(path: &Path) -> Result<()> {
         r#"          {
             name  = "GREENTIC_ALLOW_ENV_SECRETS"
             value = "1"
-          },
-          {
-            name  = "GREENTIC_SECRETS_MANAGER_PACK"
-            value = "providers/deployer/aws.gtpack"
           }"#,
     );
     if !contents.contains("GREENTIC_SECRETS_BACKEND") {
@@ -2534,10 +2534,6 @@ fn ensure_aws_runtime_secret_wiring(path: &Path) -> Result<()> {
           {
             name  = "GREENTIC_ALLOW_ENV_SECRETS"
             value = "1"
-          },
-          {
-            name  = "GREENTIC_SECRETS_MANAGER_PACK"
-            value = "providers/deployer/aws.gtpack"
           }
         ] : [],
         [
