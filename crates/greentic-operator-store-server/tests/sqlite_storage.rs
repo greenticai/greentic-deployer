@@ -767,7 +767,7 @@ async fn load_trust_root_detects_tampered_data() {
 
     // Tamper with the stored JSON without updating integrity_digest.
     sqlx::query("UPDATE trust_roots SET data = $1 WHERE env_id = $2")
-        .bind(serde_json::to_value(&trust_doc(&[8])).unwrap())
+        .bind(serde_json::to_value(trust_doc(&[8])).unwrap())
         .bind(id.as_str())
         .execute(store.pool())
         .await
