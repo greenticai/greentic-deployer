@@ -31,14 +31,18 @@ use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use greentic_deploy_spec::engine::{self, EngineError, RevisionLifecycleError, TrafficSplitError};
+use greentic_deploy_spec::engine::{
+    self, BindingError, EngineError, RevisionLifecycleError, TrafficSplitError,
+};
 use greentic_deploy_spec::{
-    Actor, ApplyTrafficSplitOutcome, AuditDecision, AuditEvent, AuditResult, ConcurrencyConflict,
-    CreateEnvironmentPayload, EnvId, Environment, HealthStatus, IdempotencyKey, IdempotencyOutcome,
-    MigrateMergePayload, Precondition, RemoteStoreError, RetentionPolicy, RevisionId,
-    RevisionTransitionOutcome, RevocationConfig, RollbackTrafficSplitOutcome,
-    RollbackTrafficSplitPayload, SchemaVersion, SetTrafficSplitPayload, StageRevisionPayload,
-    StateEtag, UpdateEnvironmentPayload, WarmRevisionPayload,
+    Actor, ApplyTrafficSplitOutcome, AuditDecision, AuditEvent, AuditResult,
+    BindingGenerationOutcome, CapabilitySlot, ConcurrencyConflict, CreateEnvironmentPayload, EnvId,
+    Environment, ExtensionBindingPayload, ExtensionKeyedPayload, HealthStatus, IdempotencyKey,
+    IdempotencyOutcome, MigrateMergePayload, PackBindingPayload, Precondition, RemoteStoreError,
+    RetentionPolicy, RevisionId, RevisionTransitionOutcome, RevocationConfig,
+    RollbackTrafficSplitOutcome, RollbackTrafficSplitPayload, SchemaVersion,
+    SetTrafficSplitPayload, StageRevisionPayload, StateEtag, UpdateEnvironmentPayload,
+    WarmRevisionPayload,
 };
 
 use crate::http::AppState;
@@ -165,6 +169,51 @@ impl From<TrafficSplitError> for ApiError {
             // was touched.
             TrafficSplitError::Invalid(spec) => RemoteStoreError::InvalidRequest {
                 detail: spec.to_string(),
+            },
+        })
+    }
+}
+
+/// Map a pure binding failure onto the A8 wire vocabulary. The simplest
+/// persist rule of the verb groups: every check runs before the single
+/// mutation, so any error means nothing was persisted.
+impl From<BindingError> for ApiError {
+    fn from(err: BindingError) -> Self {
+        Self(match err {
+            // The environment itself was loaded — the dependent
+            // (slot / extension key / stash payload) is missing.
+            BindingError::SlotNotBound { .. }
+            | BindingError::ExtensionNotBound { .. }
+            | BindingError::SlotSnapshotMissing { .. }
+            | BindingError::ExtensionSnapshotMissing { .. } => {
+                RemoteStoreError::DependentNotFound {
+                    detail: err.to_string(),
+                }
+            }
+            // `add` on an occupied slot/key: the resource exists — same
+            // kind the create/stage verbs use (client folds both kinds
+            // into the local impl's `Conflict` noun).
+            BindingError::SlotAlreadyBound { .. } | BindingError::ExtensionAlreadyBound { .. } => {
+                RemoteStoreError::AlreadyExists {
+                    detail: err.to_string(),
+                }
+            }
+            // The request body named an N-per-env slot — invalid before
+            // any state was touched. Unreachable through the deployer CLI
+            // (rejected upstream); this guards the raw wire surface.
+            BindingError::NotPackSlot { .. } => RemoteStoreError::InvalidRequest {
+                detail: err.to_string(),
+            },
+            // State conflicts the operator resolves before retrying.
+            BindingError::SlotMismatch { .. }
+            | BindingError::ExtensionKeyMismatch { .. }
+            | BindingError::SlotNoPrevious { .. }
+            | BindingError::ExtensionNoPrevious { .. }
+            | BindingError::SlotGenerationOverflow { .. }
+            | BindingError::ExtensionGenerationOverflow { .. }
+            | BindingError::SnapshotEncode { .. }
+            | BindingError::SnapshotDecode { .. } => RemoteStoreError::Conflict {
+                detail: err.to_string(),
             },
         })
     }
@@ -775,6 +824,248 @@ pub(crate) async fn rollback_traffic_split<S: EnvironmentStorage>(
         Some(previous_generation),
         revision,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Handlers — pack / extension bindings (PR-4.2d)
+// ---------------------------------------------------------------------------
+
+/// Parse a path segment into a [`CapabilitySlot`], rejecting unknown slots
+/// with a typed 400 (the URL form is the lowercase `as_str` rendering the
+/// client emits).
+fn parse_capability_slot(raw: &str) -> Result<CapabilitySlot, ApiError> {
+    CapabilitySlot::ALL
+        .iter()
+        .copied()
+        .find(|slot| slot.as_str() == raw)
+        .ok_or_else(|| {
+            ApiError(RemoteStoreError::InvalidRequest {
+                detail: format!("invalid capability slot `{raw}`"),
+            })
+        })
+}
+
+/// Shared load → pure-engine transform → persist → A8 envelope cycle for
+/// the eight binding verbs. The binding group's persist rule is the
+/// simplest of the verb groups — every `Ok` is a mutation, every `Err`
+/// leaves the env untouched — so one helper serves all of them (the
+/// analogue of `revision_transition` for the revision group). `apply`
+/// returns the response body plus the audit-target fragment;
+/// `environment_id` is injected here so every verb's target carries it.
+async fn binding_mutation<S, T, F>(
+    state: AppState<S>,
+    raw_env_id: String,
+    headers: HeaderMap,
+    verb: &'static str,
+    noun: &'static str,
+    apply: F,
+) -> Result<Response, ApiError>
+where
+    S: EnvironmentStorage,
+    T: Serialize,
+    F: FnOnce(&mut Environment) -> Result<(T, Value), ApiError>,
+{
+    let idem_key = require_idempotency_key(&headers)?;
+    let client_etag = parse_if_match(&headers)?;
+    let env_id = parse_env_id(&raw_env_id)?;
+    let loaded = state
+        .storage
+        .load_env(&env_id)
+        .await
+        .map_err(load_storage_error)?;
+    let previous_generation = loaded.revision.generation;
+    let mut env = loaded.value;
+    let (result, mut target) = apply(&mut env)?;
+    let precondition = resolve_precondition(client_etag, &loaded.revision);
+    let revision = state.storage.update_env(&env, &precondition).await?;
+    if let Value::Object(map) = &mut target {
+        map.insert("environment_id".to_string(), json!(env_id));
+    }
+    Ok(mutation_response(
+        result,
+        &env_id,
+        noun,
+        verb,
+        target,
+        idem_key,
+        Some(previous_generation),
+        revision,
+    ))
+}
+
+/// `POST /environments/{env_id}/packs` — bind a new env-pack slot
+/// (A8 route 10).
+pub(crate) async fn add_pack_binding<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<PackBindingPayload>,
+) -> Result<Response, ApiError> {
+    binding_mutation(state, env_id, headers, "add", "env-packs", |env| {
+        let added = engine::add_pack_binding(env, payload.binding)?;
+        let target = json!({"slot": added.slot, "kind": added.kind});
+        Ok((added, target))
+    })
+    .await
+}
+
+/// `PATCH /environments/{env_id}/packs/{slot}` — replace the binding on an
+/// existing slot, stashing the prior one for one-step rollback (A8 route 11).
+pub(crate) async fn update_pack_binding<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path((env_id, slot)): Path<(String, String)>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<PackBindingPayload>,
+) -> Result<Response, ApiError> {
+    let slot = parse_capability_slot(&slot)?;
+    binding_mutation(state, env_id, headers, "update", "env-packs", |env| {
+        let (binding, generation) = engine::update_pack_binding(env, slot, payload.binding)?;
+        let target = json!({"slot": binding.slot, "kind": binding.kind});
+        Ok((
+            BindingGenerationOutcome {
+                binding,
+                generation,
+            },
+            target,
+        ))
+    })
+    .await
+}
+
+/// `DELETE /environments/{env_id}/packs/{slot}` — remove a pack-binding
+/// slot (A8 route 12).
+pub(crate) async fn remove_pack_binding<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path((env_id, slot)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let slot = parse_capability_slot(&slot)?;
+    binding_mutation(state, env_id, headers, "remove", "env-packs", |env| {
+        let (binding, generation) = engine::remove_pack_binding(env, slot)?;
+        let target = json!({"slot": slot});
+        Ok((
+            BindingGenerationOutcome {
+                binding,
+                generation,
+            },
+            target,
+        ))
+    })
+    .await
+}
+
+/// `POST /environments/{env_id}/packs/{slot}/rollback` — restore a slot's
+/// one-step-previous binding (A8 route 13).
+pub(crate) async fn rollback_pack_binding<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path((env_id, slot)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let slot = parse_capability_slot(&slot)?;
+    binding_mutation(state, env_id, headers, "rollback", "env-packs", |env| {
+        let (binding, generation) = engine::rollback_pack_binding(env, slot)?;
+        let target = json!({"slot": slot});
+        Ok((
+            BindingGenerationOutcome {
+                binding,
+                generation,
+            },
+            target,
+        ))
+    })
+    .await
+}
+
+/// `POST /environments/{env_id}/extensions` — add a new extension binding
+/// (A8 route 14).
+pub(crate) async fn add_extension_binding<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<ExtensionBindingPayload>,
+) -> Result<Response, ApiError> {
+    binding_mutation(state, env_id, headers, "add", "extensions", |env| {
+        let added = engine::add_extension_binding(env, payload.binding)?;
+        let target = json!({"kind_path": added.kind.path(), "instance_id": added.instance_id});
+        Ok((added, target))
+    })
+    .await
+}
+
+/// `PATCH /environments/{env_id}/extensions` — replace an existing
+/// extension binding identified by the body's key (A8 route 15). The
+/// keyed extension verbs carry the key in the body rather than the URL
+/// because `kind_path` contains `/` (the PR-3b client pinned this shape).
+pub(crate) async fn update_extension_binding<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<ExtensionKeyedPayload>,
+) -> Result<Response, ApiError> {
+    let Some(binding) = payload.binding else {
+        return Err(ApiError(RemoteStoreError::InvalidRequest {
+            detail: "update requires `binding` in the request body".to_string(),
+        }));
+    };
+    let key = payload.key;
+    binding_mutation(state, env_id, headers, "update", "extensions", |env| {
+        let target = json!({"kind_path": key.kind_path, "instance_id": key.instance_id});
+        let (binding, generation) = engine::update_extension_binding(env, &key, binding)?;
+        Ok((
+            BindingGenerationOutcome {
+                binding,
+                generation,
+            },
+            target,
+        ))
+    })
+    .await
+}
+
+/// `DELETE /environments/{env_id}/extensions` — remove an extension
+/// binding identified by the body's key (A8 route 16).
+pub(crate) async fn remove_extension_binding<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<ExtensionKeyedPayload>,
+) -> Result<Response, ApiError> {
+    let key = payload.key;
+    binding_mutation(state, env_id, headers, "remove", "extensions", |env| {
+        let target = json!({"kind_path": key.kind_path, "instance_id": key.instance_id});
+        let (binding, generation) = engine::remove_extension_binding(env, &key)?;
+        Ok((
+            BindingGenerationOutcome {
+                binding,
+                generation,
+            },
+            target,
+        ))
+    })
+    .await
+}
+
+/// `POST /environments/{env_id}/extensions/rollback` — restore an
+/// extension binding's one-step-previous snapshot (A8 route 17).
+pub(crate) async fn rollback_extension_binding<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<ExtensionKeyedPayload>,
+) -> Result<Response, ApiError> {
+    let key = payload.key;
+    binding_mutation(state, env_id, headers, "rollback", "extensions", |env| {
+        let target = json!({"kind_path": key.kind_path, "instance_id": key.instance_id});
+        let (binding, generation) = engine::rollback_extension_binding(env, &key)?;
+        Ok((
+            BindingGenerationOutcome {
+                binding,
+                generation,
+            },
+            target,
+        ))
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------

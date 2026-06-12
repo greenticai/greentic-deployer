@@ -76,11 +76,12 @@
 use std::collections::BTreeMap;
 
 use greentic_deploy_spec::{
-    AuditDecision, AuditEvent, AuditResult, BundleDeployment, BundleDeploymentStatus, BundleId,
-    CapabilitySlot, CustomerId, DeploymentId, EnvId, EnvPackBinding, Environment,
-    EnvironmentHostConfig, ExtensionBinding, IdempotencyKey, IdempotencyOutcome, MessagingEndpoint,
-    MessagingEndpointId, PackId, RemoteStoreError, RevenueShareEntry, Revision, RevisionId,
-    RollbackTrafficSplitPayload, RouteBinding, StateEtag,
+    AuditDecision, AuditEvent, AuditResult, BindingGenerationOutcome, BundleDeployment,
+    BundleDeploymentStatus, BundleId, CapabilitySlot, CustomerId, DeploymentId, EnvId,
+    EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding, ExtensionBindingPayload,
+    ExtensionKeyedPayload, IdempotencyKey, IdempotencyOutcome, MessagingEndpoint,
+    MessagingEndpointId, PackBindingPayload, PackId, RemoteStoreError, RevenueShareEntry, Revision,
+    RevisionId, RollbackTrafficSplitPayload, RouteBinding, StateEtag,
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::Client;
@@ -654,44 +655,10 @@ struct RemoveBundleResponse {
     pruned_revision_ids: Vec<RevisionId>,
 }
 
-#[derive(Serialize)]
-struct PackBindingRequest {
-    binding: EnvPackBinding,
-}
-
-/// Response for pack/extension update/remove/rollback that returns a binding + generation.
-#[derive(Deserialize)]
-struct BindingGenerationResponse<T> {
-    binding: T,
-    generation: u64,
-}
-
-#[derive(Serialize)]
-struct ExtensionBindingRequest {
-    binding: ExtensionBinding,
-}
-
-#[derive(Serialize)]
-struct ExtensionKeyedRequest {
-    key: WireExtensionKey,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    binding: Option<ExtensionBinding>,
-}
-
-#[derive(Serialize)]
-struct WireExtensionKey {
-    kind_path: String,
-    instance_id: Option<String>,
-}
-
-impl From<&ExtensionKey> for WireExtensionKey {
-    fn from(k: &ExtensionKey) -> Self {
-        Self {
-            kind_path: k.kind_path.clone(),
-            instance_id: k.instance_id.clone(),
-        }
-    }
-}
+// Binding wire shapes (`PackBindingPayload`, `ExtensionBindingPayload`,
+// `ExtensionKeyedPayload`, `BindingGenerationOutcome`) are the shared
+// `greentic_deploy_spec::engine` types since PR-4.2d — the client
+// serializes the same structs the server deserializes.
 
 // Traffic wire shapes (`SetTrafficSplitPayload`,
 // `RollbackTrafficSplitPayload`, `ApplyTrafficSplitOutcome`,
@@ -971,7 +938,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<EnvPackBinding, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let req = PackBindingRequest { binding };
+        let req = PackBindingPayload { binding };
         self.send_mutation(
             env_id,
             reqwest::Method::POST,
@@ -989,8 +956,8 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<(EnvPackBinding, u64), StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let req = PackBindingRequest { binding };
-        let resp: BindingGenerationResponse<EnvPackBinding> = self.send_mutation(
+        let req = PackBindingPayload { binding };
+        let resp: BindingGenerationOutcome<EnvPackBinding> = self.send_mutation(
             env_id,
             reqwest::Method::PATCH,
             &format!(
@@ -1011,7 +978,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<(EnvPackBinding, u64), StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let resp: BindingGenerationResponse<EnvPackBinding> = self.send_mutation_no_body(
+        let resp: BindingGenerationOutcome<EnvPackBinding> = self.send_mutation_no_body(
             env_id,
             reqwest::Method::DELETE,
             &format!(
@@ -1031,7 +998,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<(EnvPackBinding, u64), StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let resp: BindingGenerationResponse<EnvPackBinding> = self.send_mutation_no_body(
+        let resp: BindingGenerationOutcome<EnvPackBinding> = self.send_mutation_no_body(
             env_id,
             reqwest::Method::POST,
             &format!(
@@ -1051,7 +1018,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<ExtensionBinding, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let req = ExtensionBindingRequest { binding };
+        let req = ExtensionBindingPayload { binding };
         self.send_mutation(
             env_id,
             reqwest::Method::POST,
@@ -1072,11 +1039,11 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<(ExtensionBinding, u64), StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let req = ExtensionKeyedRequest {
-            key: WireExtensionKey::from(&key),
+        let req = ExtensionKeyedPayload {
+            key,
             binding: Some(binding),
         };
-        let resp: BindingGenerationResponse<ExtensionBinding> = self.send_mutation(
+        let resp: BindingGenerationOutcome<ExtensionBinding> = self.send_mutation(
             env_id,
             reqwest::Method::PATCH,
             &format!(
@@ -1096,11 +1063,8 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<(ExtensionBinding, u64), StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let req = ExtensionKeyedRequest {
-            key: WireExtensionKey::from(&key),
-            binding: None,
-        };
-        let resp: BindingGenerationResponse<ExtensionBinding> = self.send_mutation(
+        let req = ExtensionKeyedPayload { key, binding: None };
+        let resp: BindingGenerationOutcome<ExtensionBinding> = self.send_mutation(
             env_id,
             reqwest::Method::DELETE,
             &format!(
@@ -1120,11 +1084,8 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<(ExtensionBinding, u64), StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let req = ExtensionKeyedRequest {
-            key: WireExtensionKey::from(&key),
-            binding: None,
-        };
-        let resp: BindingGenerationResponse<ExtensionBinding> = self.send_mutation(
+        let req = ExtensionKeyedPayload { key, binding: None };
+        let resp: BindingGenerationOutcome<ExtensionBinding> = self.send_mutation(
             env_id,
             reqwest::Method::POST,
             &format!(

@@ -38,10 +38,20 @@
 //!   `LocalFsStore` projection, and `TrafficSplitApplied` telemetry is
 //!   emitted by the operator CLI from the outcome's env snapshot — not
 //!   here.
+//! - The pack/extension-binding verb group (PR-4.2d):
+//!   `POST /environments/{env_id}/packs`,
+//!   `PATCH|DELETE /environments/{env_id}/packs/{slot}`,
+//!   `POST /environments/{env_id}/packs/{slot}/rollback`, and
+//!   `POST|PATCH|DELETE /environments/{env_id}/extensions` +
+//!   `POST /environments/{env_id}/extensions/rollback` (keyed extension
+//!   verbs carry the `(kind_path, instance_id)` key in the body —
+//!   `kind_path` contains `/`). Every `Ok` persists, every error leaves
+//!   the env untouched; N-per-env slots are a typed 400 at the wire (the
+//!   CLI rejects them upstream, the server can't rely on that).
 //! - `greentic-operator-store-server` binary: clap config (bind address
 //!   + database path), graceful shutdown.
 //!
-//! Out of scope, intentional follow-ups (PR-4.2c+):
+//! Out of scope, intentional follow-ups (PR-4.2e+):
 //!
 //! - The remaining A8 verb groups (route table pinned in the deployer's
 //!   `environment::http_store` module doc), each landing with its engine

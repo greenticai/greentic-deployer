@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router, extract::State, http::StatusCode};
 use serde_json::{Value, json};
 
@@ -72,6 +72,28 @@ where
         .route(
             "/environments/{env_id}/traffic/rollback",
             post(api::rollback_traffic_split::<S>),
+        )
+        .route(
+            "/environments/{env_id}/packs",
+            post(api::add_pack_binding::<S>),
+        )
+        .route(
+            "/environments/{env_id}/packs/{slot}",
+            patch(api::update_pack_binding::<S>).delete(api::remove_pack_binding::<S>),
+        )
+        .route(
+            "/environments/{env_id}/packs/{slot}/rollback",
+            post(api::rollback_pack_binding::<S>),
+        )
+        .route(
+            "/environments/{env_id}/extensions",
+            post(api::add_extension_binding::<S>)
+                .patch(api::update_extension_binding::<S>)
+                .delete(api::remove_extension_binding::<S>),
+        )
+        .route(
+            "/environments/{env_id}/extensions/rollback",
+            post(api::rollback_extension_binding::<S>),
         )
         .with_state(AppState { storage })
 }

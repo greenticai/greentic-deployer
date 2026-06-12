@@ -82,6 +82,33 @@ fn map_traffic_err(err: engine::TrafficSplitError) -> StoreError {
     }
 }
 
+/// Map a pure binding failure onto the local store's error surface,
+/// preserving the kinds the pre-engine closures raised (PR-4.2d): a
+/// missing slot / extension / stash payload is a dependent lookup miss;
+/// everything else is an operator-resolvable conflict. `NotPackSlot` is
+/// unreachable through the CLI (rejected upstream with its own message) —
+/// it exists for the store-server's wire surface.
+fn map_binding_err(err: engine::BindingError) -> StoreError {
+    use engine::BindingError as E;
+    match err {
+        E::SlotNotBound { .. }
+        | E::ExtensionNotBound { .. }
+        | E::SlotSnapshotMissing { .. }
+        | E::ExtensionSnapshotMissing { .. } => StoreError::DependentNotFound(err.to_string()),
+        E::SlotAlreadyBound { .. }
+        | E::SlotMismatch { .. }
+        | E::NotPackSlot { .. }
+        | E::SlotNoPrevious { .. }
+        | E::SlotGenerationOverflow { .. }
+        | E::ExtensionAlreadyBound { .. }
+        | E::ExtensionKeyMismatch { .. }
+        | E::ExtensionNoPrevious { .. }
+        | E::ExtensionGenerationOverflow { .. }
+        | E::SnapshotEncode { .. }
+        | E::SnapshotDecode { .. } => StoreError::Conflict(err.to_string()),
+    }
+}
+
 impl LocalFsStore {
     // -------------------------------------------------------------
     // Environment lifecycle  (PR-3a.3)
@@ -575,6 +602,8 @@ impl LocalFsStore {
 
     /// Bind a new env-pack slot. Rejects with [`StoreError::Conflict`]
     /// when the slot is already bound (callers should `update` instead).
+    /// Verb semantics live in [`engine::add_pack_binding`]; this wrapper
+    /// owns the flock + persistence.
     ///
     /// `_idempotency_key` is accepted for trait conformance and ignored
     /// locally; the HTTP backend caches it for A8 §2 replay.
@@ -586,21 +615,15 @@ impl LocalFsStore {
     ) -> Result<EnvPackBinding, StoreError> {
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            if env.pack_for_slot(binding.slot).is_some() {
-                return Err(StoreError::Conflict(format!(
-                    "slot `{}` already bound on env `{}`; use update",
-                    binding.slot, env_id
-                )));
-            }
-            env.packs.push(binding.clone());
+            let added = engine::add_pack_binding(&mut env, binding).map_err(map_binding_err)?;
             locked.save(&env)?;
-            Ok(env.packs.last().expect("just pushed").clone())
+            Ok(added)
         })
     }
 
-    /// Replace the binding on an existing slot. Snapshots the prior binding
-    /// inline via [`crate::cli::env_packs::stash_previous`] so one-step
-    /// `rollback` works without a sidecar history file.
+    /// Replace the binding on an existing slot. The engine snapshots the
+    /// prior binding inline (one-step-rollback stash) — see
+    /// [`engine::update_pack_binding`].
     ///
     /// Returns `(new_binding, new_generation)`.
     ///
@@ -615,35 +638,10 @@ impl LocalFsStore {
     ) -> Result<(EnvPackBinding, u64), StoreError> {
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            let idx = env
-                .packs
-                .iter()
-                .position(|b| b.slot == slot)
-                .ok_or_else(|| {
-                    StoreError::DependentNotFound(format!(
-                        "slot `{}` not bound on env `{}`",
-                        slot, env_id
-                    ))
-                })?;
-            if binding.slot != slot {
-                return Err(StoreError::Conflict(format!(
-                    "binding slot `{}` does not match target slot `{}`",
-                    binding.slot, slot
-                )));
-            }
-            let prev_generation = env.packs[idx].generation;
-            let prev_snapshot = serde_json::to_value(&env.packs[idx])
-                .map_err(|e| StoreError::Conflict(format!("snapshot prior binding: {e}")))?;
-            let new_generation = prev_generation + 1;
-            let mut new_binding = EnvPackBinding {
-                generation: new_generation,
-                ..binding
-            };
-            new_binding.previous_binding_ref =
-                Some(crate::cli::env_packs::stash_previous(prev_snapshot));
-            env.packs[idx] = new_binding;
+            let (updated, new_generation) =
+                engine::update_pack_binding(&mut env, slot, binding).map_err(map_binding_err)?;
             locked.save(&env)?;
-            Ok((env.packs[idx].clone(), new_generation))
+            Ok((updated, new_generation))
         })
     }
 
@@ -660,18 +658,8 @@ impl LocalFsStore {
     ) -> Result<(EnvPackBinding, u64), StoreError> {
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            let idx = env
-                .packs
-                .iter()
-                .position(|b| b.slot == slot)
-                .ok_or_else(|| {
-                    StoreError::DependentNotFound(format!(
-                        "slot `{}` not bound on env `{}`",
-                        slot, env_id
-                    ))
-                })?;
-            let removed = env.packs.remove(idx);
-            let generation = removed.generation;
+            let (removed, generation) =
+                engine::remove_pack_binding(&mut env, slot).map_err(map_binding_err)?;
             locked.save(&env)?;
             Ok((removed, generation))
         })
@@ -693,38 +681,10 @@ impl LocalFsStore {
     ) -> Result<(EnvPackBinding, u64), StoreError> {
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            let idx = env
-                .packs
-                .iter()
-                .position(|b| b.slot == slot)
-                .ok_or_else(|| {
-                    StoreError::DependentNotFound(format!(
-                        "slot `{}` not bound on env `{}`",
-                        slot, env_id
-                    ))
-                })?;
-            let prev_generation = env.packs[idx].generation;
-            let prev_ref = env.packs[idx].previous_binding_ref.clone().ok_or_else(|| {
-                StoreError::Conflict(format!(
-                    "slot `{}` on env `{}` has no previous binding to roll back to",
-                    slot, env_id
-                ))
-            })?;
-            let prev_value = crate::cli::env_packs::load_previous(&prev_ref).ok_or_else(|| {
-                StoreError::DependentNotFound(format!(
-                    "previous binding payload `{}` missing for slot `{}`",
-                    prev_ref.display(),
-                    slot
-                ))
-            })?;
-            let mut restored: EnvPackBinding = serde_json::from_value(prev_value)
-                .map_err(|e| StoreError::Conflict(format!("deserialise previous binding: {e}")))?;
-            restored.generation = prev_generation + 1;
-            restored.previous_binding_ref = None;
-            let new_generation = restored.generation;
-            env.packs[idx] = restored;
+            let (restored, new_generation) =
+                engine::rollback_pack_binding(&mut env, slot).map_err(map_binding_err)?;
             locked.save(&env)?;
-            Ok((env.packs[idx].clone(), new_generation))
+            Ok((restored, new_generation))
         })
     }
 
@@ -844,7 +804,8 @@ impl LocalFsStore {
     /// Add a new extension binding to the env. Rejects with
     /// [`StoreError::Conflict`] if a binding with the same
     /// `(kind.path(), instance_id)` key already exists — callers wanting
-    /// to replace use [`Self::update_extension_binding`].
+    /// to replace use [`Self::update_extension_binding`]. Verb semantics
+    /// live in [`engine::add_extension_binding`].
     ///
     /// `_idempotency_key` is accepted for trait conformance and ignored
     /// locally; the HTTP backend caches it for A8 §2 replay.
@@ -854,24 +815,19 @@ impl LocalFsStore {
         binding: ExtensionBinding,
         _idempotency_key: IdempotencyKey,
     ) -> Result<ExtensionBinding, StoreError> {
-        let key = ExtensionKey::from_binding(&binding);
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            if env.extensions.iter().any(|b| key.matches(b)) {
-                return Err(StoreError::Conflict(format!(
-                    "extension `{}` is already bound on env `{}`; use update",
-                    key, env_id
-                )));
-            }
-            env.extensions.push(binding.clone());
+            let added =
+                engine::add_extension_binding(&mut env, binding).map_err(map_binding_err)?;
             locked.save(&env)?;
-            Ok(env.extensions.last().expect("just pushed").clone())
+            Ok(added)
         })
     }
 
-    /// Replace an existing extension binding identified by `key`. Bumps
-    /// `generation` to `previous + 1` and stashes the prior binding inline
-    /// so [`Self::rollback_extension_binding`] can restore it.
+    /// Replace an existing extension binding identified by `key`. The
+    /// engine bumps `generation` and stashes the prior binding inline so
+    /// [`Self::rollback_extension_binding`] can restore it — see
+    /// [`engine::update_extension_binding`].
     ///
     /// Returns `(new_binding, new_generation)`.
     ///
@@ -886,32 +842,11 @@ impl LocalFsStore {
     ) -> Result<(ExtensionBinding, u64), StoreError> {
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            let idx = env
-                .extensions
-                .iter()
-                .position(|b| key.matches(b))
-                .ok_or_else(|| {
-                    StoreError::DependentNotFound(format!(
-                        "extension `{}` not bound on env `{}`",
-                        key, env_id
-                    ))
-                })?;
-            let prev_generation = env.extensions[idx].generation;
-            let new_generation = prev_generation.checked_add(1).ok_or_else(|| {
-                StoreError::Conflict(format!(
-                    "extension `{}` on env `{}`: generation overflow ({})",
-                    key, env_id, prev_generation
-                ))
-            })?;
-            let prev_snapshot = serde_json::to_value(&env.extensions[idx])
-                .map_err(|e| StoreError::Conflict(format!("snapshot prior binding: {e}")))?;
-            let mut new_binding = binding;
-            new_binding.generation = new_generation;
-            new_binding.previous_binding_ref =
-                Some(crate::cli::env_packs::stash_previous(prev_snapshot));
-            env.extensions[idx] = new_binding;
+            let (updated, new_generation) =
+                engine::update_extension_binding(&mut env, &key, binding)
+                    .map_err(map_binding_err)?;
             locked.save(&env)?;
-            Ok((env.extensions[idx].clone(), new_generation))
+            Ok((updated, new_generation))
         })
     }
 
@@ -928,18 +863,8 @@ impl LocalFsStore {
     ) -> Result<(ExtensionBinding, u64), StoreError> {
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            let idx = env
-                .extensions
-                .iter()
-                .position(|b| key.matches(b))
-                .ok_or_else(|| {
-                    StoreError::DependentNotFound(format!(
-                        "extension `{}` not bound on env `{}`",
-                        key, env_id
-                    ))
-                })?;
-            let removed = env.extensions.remove(idx);
-            let generation = removed.generation;
+            let (removed, generation) =
+                engine::remove_extension_binding(&mut env, &key).map_err(map_binding_err)?;
             locked.save(&env)?;
             Ok((removed, generation))
         })
@@ -959,46 +884,10 @@ impl LocalFsStore {
     ) -> Result<(ExtensionBinding, u64), StoreError> {
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            let idx = env
-                .extensions
-                .iter()
-                .position(|b| key.matches(b))
-                .ok_or_else(|| {
-                    StoreError::DependentNotFound(format!(
-                        "extension `{}` not bound on env `{}`",
-                        key, env_id
-                    ))
-                })?;
-            let prev_generation = env.extensions[idx].generation;
-            let new_generation = prev_generation.checked_add(1).ok_or_else(|| {
-                StoreError::Conflict(format!(
-                    "extension `{}` on env `{}`: generation overflow ({})",
-                    key, env_id, prev_generation
-                ))
-            })?;
-            let prev_ref = env.extensions[idx]
-                .previous_binding_ref
-                .clone()
-                .ok_or_else(|| {
-                    StoreError::Conflict(format!(
-                        "extension `{}` on env `{}` has no previous binding to roll back to",
-                        key, env_id
-                    ))
-                })?;
-            let prev_value = crate::cli::env_packs::load_previous(&prev_ref).ok_or_else(|| {
-                StoreError::DependentNotFound(format!(
-                    "previous binding payload `{}` missing for extension `{}`",
-                    prev_ref.display(),
-                    key
-                ))
-            })?;
-            let mut restored: ExtensionBinding = serde_json::from_value(prev_value)
-                .map_err(|e| StoreError::Conflict(format!("deserialise previous binding: {e}")))?;
-            restored.generation = new_generation;
-            restored.previous_binding_ref = None;
-            env.extensions[idx] = restored;
+            let (restored, new_generation) =
+                engine::rollback_extension_binding(&mut env, &key).map_err(map_binding_err)?;
             locked.save(&env)?;
-            Ok((env.extensions[idx].clone(), new_generation))
+            Ok((restored, new_generation))
         })
     }
 
