@@ -1662,3 +1662,55 @@ async fn binding_routes_on_ghost_env_are_404_not_found() {
     assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
     assert_eq!(body["kind"], "not-found");
 }
+
+#[tokio::test]
+async fn extension_update_with_mismatched_key_is_409_conflict() {
+    let (_d, app) = app().await;
+    send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+
+    // Add the default (None) instance.
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/extensions",
+        Some(json!({"binding": extension_binding("greentic.memory", None, "greentic.memory")})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "add failed: {body}");
+
+    // PATCH with key targeting the default instance but a replacement
+    // binding whose instance_id differs ("renamed") — must be rejected.
+    let (status, body) = send(
+        app.clone(),
+        Method::PATCH,
+        "/environments/local/extensions",
+        Some(extension_key_body(
+            "greentic.memory",
+            None,
+            Some(extension_binding(
+                "greentic.memory",
+                Some("renamed"),
+                "greentic.memory",
+            )),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "conflict");
+
+    // Nothing persisted: the stored extension still has instance_id null
+    // and generation 0.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    let extensions = read["environment"]["extensions"]
+        .as_array()
+        .expect("extensions");
+    assert_eq!(extensions.len(), 1);
+    assert!(extensions[0]["instance_id"].is_null());
+    assert_eq!(extensions[0]["generation"], 0);
+}

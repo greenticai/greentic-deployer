@@ -206,6 +206,7 @@ impl From<BindingError> for ApiError {
             },
             // State conflicts the operator resolves before retrying.
             BindingError::SlotMismatch { .. }
+            | BindingError::ExtensionKeyMismatch { .. }
             | BindingError::SlotNoPrevious { .. }
             | BindingError::ExtensionNoPrevious { .. }
             | BindingError::SlotGenerationOverflow { .. }

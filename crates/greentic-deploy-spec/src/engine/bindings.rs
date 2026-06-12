@@ -53,7 +53,11 @@
 //! local path — but the store-server takes the binding straight off the
 //! wire, and without the guard a remote client could wedge an N-per-env
 //! binding into `packs`, where its second instance would be falsely
-//! rejected as a duplicate slot.
+//! rejected as a duplicate slot. [`update_extension_binding`] similarly
+//! rejects a replacement binding whose `(kind_path, instance_id)` differs
+//! from the target key (`ExtensionKeyMismatch`, the pack family's
+//! `SlotMismatch` mirror); CLI callers derive both from one payload so the
+//! check is wire-surface-only.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -107,6 +111,11 @@ pub enum BindingError {
     ExtensionAlreadyBound { key: ExtensionKey, env_id: EnvId },
     #[error("extension `{key}` not bound on env `{env_id}`")]
     ExtensionNotBound { key: ExtensionKey, env_id: EnvId },
+    #[error("binding key `{binding_key}` does not match target key `{target_key}`")]
+    ExtensionKeyMismatch {
+        binding_key: ExtensionKey,
+        target_key: ExtensionKey,
+    },
     #[error("extension `{key}` on env `{env_id}` has no previous binding to roll back to")]
     ExtensionNoPrevious { key: ExtensionKey, env_id: EnvId },
     #[error("previous binding payload `{}` missing for extension `{key}`", prev_ref.display())]
@@ -345,6 +354,13 @@ pub fn update_extension_binding(
     binding: ExtensionBinding,
 ) -> Result<(ExtensionBinding, u64), BindingError> {
     let idx = find_extension(env, key)?;
+    let binding_key = ExtensionKey::from_binding(&binding);
+    if binding_key != *key {
+        return Err(BindingError::ExtensionKeyMismatch {
+            binding_key,
+            target_key: key.clone(),
+        });
+    }
     let prev_generation = env.extensions[idx].generation;
     let new_generation = prev_generation.checked_add(1).ok_or_else(|| {
         BindingError::ExtensionGenerationOverflow {
@@ -709,6 +725,26 @@ mod tests {
             err.to_string(),
             "extension `greentic.memory` not bound on env `local`"
         );
+    }
+
+    #[test]
+    fn update_extension_binding_rejects_key_mismatch() {
+        let mut env = minimal_env();
+        env.extensions.push(ext("greentic.memory", None));
+        let key = ExtensionKey::new("greentic.memory", None);
+        // The replacement binding carries a different instance_id.
+        let err = update_extension_binding(&mut env, &key, ext("greentic.memory", Some("alt")))
+            .unwrap_err();
+        assert!(
+            matches!(err, BindingError::ExtensionKeyMismatch { .. }),
+            "expected ExtensionKeyMismatch, got: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "binding key `greentic.memory/alt` does not match target key `greentic.memory`"
+        );
+        assert_eq!(env.extensions.len(), 1, "env untouched on Err");
+        assert_eq!(env.extensions[0].generation, 0, "generation untouched");
     }
 
     #[test]

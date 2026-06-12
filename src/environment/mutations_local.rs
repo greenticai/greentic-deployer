@@ -101,6 +101,7 @@ fn map_binding_err(err: engine::BindingError) -> StoreError {
         | E::SlotNoPrevious { .. }
         | E::SlotGenerationOverflow { .. }
         | E::ExtensionAlreadyBound { .. }
+        | E::ExtensionKeyMismatch { .. }
         | E::ExtensionNoPrevious { .. }
         | E::ExtensionGenerationOverflow { .. }
         | E::SnapshotEncode { .. }
