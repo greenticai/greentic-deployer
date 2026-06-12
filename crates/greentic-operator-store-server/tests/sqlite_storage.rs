@@ -1264,3 +1264,183 @@ async fn ledger_evicts_beyond_the_per_env_window() {
         "other env's key must survive"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Backups + standalone audit append (A8 #3/#5, PR-4.4)
+// ---------------------------------------------------------------------------
+
+use greentic_deploy_spec::{BackupManifest, StateIntegrity};
+use greentic_operator_store_server::storage::{MAX_BACKUPS_PER_ENV, StoredBackup};
+
+fn stored_backup(id: &EnvId, backup_id: &str, env: &Environment) -> StoredBackup {
+    let state = serde_json::to_value(env).expect("env json");
+    let integrity = StateIntegrity::sha256_of(&state).expect("hash");
+    StoredBackup {
+        manifest: BackupManifest {
+            schema: SchemaVersion::BACKUP_MANIFEST_V1.into(),
+            backup_id: backup_id.to_string(),
+            env_id: id.clone(),
+            created_at: Utc.with_ymd_and_hms(2026, 6, 12, 0, 0, 0).unwrap(),
+            generation: 1,
+            integrity,
+            size_bytes: state.to_string().len() as u64,
+        },
+        state,
+    }
+}
+
+#[tokio::test]
+async fn backup_round_trips_with_its_journal_in_one_transaction() {
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    let env = minimal_environment(&id);
+    store.create_env(&env).await.expect("create env");
+
+    let backup = stored_backup(&id, "01JTKW5B4W4Q5Y1CQW93F7S5VH", &env);
+    store
+        .create_backup_journaled(&backup, Some(&journal(&id, "BK-1", "fp-bk1")))
+        .await
+        .expect("create backup");
+
+    // Manifest round-trips through list + load; the snapshot is verbatim.
+    let listed = store.list_backups(&id).await.expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].backup_id, backup.manifest.backup_id);
+    assert_eq!(listed[0].generation, 1);
+    assert_eq!(listed[0].integrity.digest, backup.manifest.integrity.digest);
+    assert_eq!(listed[0].created_at, backup.manifest.created_at);
+    assert_eq!(listed[0].size_bytes, backup.manifest.size_bytes);
+    let loaded = store
+        .load_backup(&id, &backup.manifest.backup_id)
+        .await
+        .expect("load")
+        .expect("present");
+    assert_eq!(loaded.state, backup.state);
+
+    // The journal landed with it.
+    assert!(
+        store
+            .lookup_idempotency(&id, "BK-1")
+            .await
+            .expect("lookup")
+            .is_some()
+    );
+    assert_eq!(audit_event_ids(&store, &id).await, vec!["evt-BK-1"]);
+}
+
+#[tokio::test]
+async fn the_backup_cap_refuses_and_rolls_the_journal_back() {
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    let env = minimal_environment(&id);
+    store.create_env(&env).await.expect("create env");
+
+    for i in 0..MAX_BACKUPS_PER_ENV {
+        store
+            .create_backup_journaled(&stored_backup(&id, &format!("SEED-{i:05}"), &env), None)
+            .await
+            .expect("seed backup");
+    }
+
+    let err = store
+        .create_backup_journaled(
+            &stored_backup(&id, "ONE-TOO-MANY", &env),
+            Some(&journal(&id, "BK-CAP", "fp-cap")),
+        )
+        .await
+        .expect_err("cap must refuse");
+    assert!(matches!(err, StorageError::BackupLimitReached { limit, .. }
+        if limit == MAX_BACKUPS_PER_ENV));
+
+    // Nothing committed: no row, no ledger entry, no audit append.
+    assert!(
+        store
+            .load_backup(&id, "ONE-TOO-MANY")
+            .await
+            .expect("load")
+            .is_none()
+    );
+    assert!(
+        store
+            .lookup_idempotency(&id, "BK-CAP")
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+    assert!(audit_event_ids(&store, &id).await.is_empty());
+
+    // Another env is unaffected by this env's cap.
+    let other = env_id("other");
+    let other_env = minimal_environment(&other);
+    store.create_env(&other_env).await.expect("create other");
+    store
+        .create_backup_journaled(&stored_backup(&other, "OTHER-1", &other_env), None)
+        .await
+        .expect("other env stays under its own cap");
+}
+
+#[tokio::test]
+async fn deleting_a_missing_backup_writes_nothing() {
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    let env = minimal_environment(&id);
+    store.create_env(&env).await.expect("create env");
+
+    let deleted = store
+        .delete_backup_journaled(&id, "NOPE", Some(&journal(&id, "DEL-1", "fp-del")))
+        .await
+        .expect("delete");
+    assert!(!deleted);
+    // The journal did not ride a no-op delete: the key stays free.
+    assert!(
+        store
+            .lookup_idempotency(&id, "DEL-1")
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+    assert!(audit_event_ids(&store, &id).await.is_empty());
+
+    // A real delete journals atomically.
+    store
+        .create_backup_journaled(&stored_backup(&id, "REAL", &env), None)
+        .await
+        .expect("create backup");
+    let deleted = store
+        .delete_backup_journaled(&id, "REAL", Some(&journal(&id, "DEL-2", "fp-del2")))
+        .await
+        .expect("delete");
+    assert!(deleted);
+    assert!(
+        store
+            .load_backup(&id, "REAL")
+            .await
+            .expect("load")
+            .is_none()
+    );
+    assert_eq!(audit_event_ids(&store, &id).await, vec!["evt-DEL-2"]);
+}
+
+#[tokio::test]
+async fn record_audit_appends_without_touching_the_ledger() {
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+
+    store
+        .record_audit(
+            &id,
+            "evt-denial",
+            &json!({"authorization": {"decision": "deny"}}),
+        )
+        .await
+        .expect("record audit");
+
+    assert_eq!(audit_event_ids(&store, &id).await, vec!["evt-denial"]);
+    // No idempotency row was created by the standalone append.
+    let count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM idempotency_ledger")
+        .fetch_one(store.pool())
+        .await
+        .expect("count")
+        .get("n");
+    assert_eq!(count, 0);
+}

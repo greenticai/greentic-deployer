@@ -59,23 +59,38 @@
 //!   consume nothing. The ledger is bounded per-environment
 //!   (`MAX_LEDGER_ROWS_PER_ENV` = 4096 rows, clock-free eviction in the
 //!   inserting transaction); the audit log is deliberately append-only
-//!   without bound — archival/backup is the PR-4.4 story.
+//!   without bound — archival is the backup story below.
+//! - RBAC (A8 #3, PR-4.4): [`rbac::RbacEngine`] — static bearer-token
+//!   authentication with coarse roles (`admin` / `operator` /
+//!   `read-only`), evaluated BEFORE the replay gate on every route.
+//!   Without a token file the engine is the honest `open-dev` allow-all
+//!   (loopback dev posture, unchanged wire shapes); with one, requests
+//!   fail closed (`403 unauthorized`) and denied mutations still append
+//!   a durable audit row (contract: "the rejected attempt is still
+//!   audited").
+//! - Backup/restore (A8 #5, PR-4.4): `POST/GET
+//!   /environments/{env_id}/backups`, `DELETE .../backups/{backup_id}`,
+//!   and `POST /environments/{env_id}/restore`. Backups snapshot the
+//!   environment row (full canonical JSON + integrity digest, the
+//!   contract's `BackupManifest`); restore is a guarded mutation whose
+//!   `RestoreRequest.precondition` must pin prior state, verifies the
+//!   snapshot's digest before applying (contract #6 on the backup
+//!   itself), and commits through the same journaled CAS write as any
+//!   other mutation. Backups are bounded per-environment
+//!   (`MAX_BACKUPS_PER_ENV`): the cap REFUSES new backups (409) instead
+//!   of silently evicting recovery points.
 //!
-//! Out of scope, intentional follow-ups (PR-4.2e+):
+//! Out of scope, intentional follow-ups:
 //!
-//! - The remaining A8 verb groups (route table pinned in the deployer's
-//!   `environment::http_store` module doc), each landing with its engine
-//!   extraction from `mutations_local.rs`. FS-coupled steps
-//!   (revenue-policy signing, operator key, trust-root files) need
-//!   injected server-side seams.
-//! - RBAC (A8 #3, denials = 403 + A8 `unauthorized` body; today every
-//!   decision is an honest `Allow{policy: "open-dev"}`) and
-//!   backup/restore (A8 #5) (PR-4.4).
+//! - Read-verb dispatch from the deployer CLI (GET endpoints exist; the
+//!   CLI wiring is tracked as the read-verbs follow-up).
+//! - The Phase D server-side secrets sink (lifts the two messaging 501s).
 //! - Postgres backend adapter (the parked
 //!   `greentic-environment-store-postgres` crate implements this trait
 //!   when a managed-DB deployment mandates it).
 
 pub mod api;
 pub mod http;
+pub mod rbac;
 pub mod sqlite;
 pub mod storage;

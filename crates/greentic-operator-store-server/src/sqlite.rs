@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use fs4::fs_std::FileExt;
 use greentic_deploy_spec::{
-    BundleId, CapabilitySlot, CustomerId, EnvId, Environment, EnvironmentRuntime, Precondition,
-    SchemaVersion, SpecError, StateEtag, StateIntegrity,
+    BackupManifest, BundleId, CapabilitySlot, CustomerId, EnvId, Environment, EnvironmentRuntime,
+    INTEGRITY_ALGORITHM_SHA256, Precondition, SchemaVersion, SpecError, StateEtag, StateIntegrity,
 };
 use serde_json::Value;
 use sqlx::{
@@ -34,7 +34,8 @@ use greentic_operator_trust::trust_root::{TRUST_ROOT_SCHEMA_V1, TrustRootDocumen
 
 use crate::storage::{
     EnvRevision, EnvironmentStorage, Loaded, LoadedAnswers, LoadedEnv, LoadedRuntime,
-    LoadedTrustRoot, MutationJournal, RevenuePolicyArtifact, StorageError, StoredIdempotencyRecord,
+    LoadedTrustRoot, MutationJournal, RevenuePolicyArtifact, StorageError, StoredBackup,
+    StoredIdempotencyRecord,
 };
 
 impl From<sqlx::Error> for StorageError {
@@ -746,6 +747,120 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
             key_id: row.try_get("key_id")?,
         }))
     }
+
+    // --- backups (A8 #5, PR-4.4) -----------------------------------------
+
+    async fn create_backup_journaled(
+        &self,
+        backup: &StoredBackup,
+        journal: Option<&MutationJournal>,
+    ) -> Result<(), StorageError> {
+        let manifest = &backup.manifest;
+        let mut tx = self.pool.begin().await?;
+        // Cap check inside the same transaction (single-writer pool, so
+        // count-then-insert cannot race another create).
+        let count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM backups WHERE env_id = $1")
+            .bind(manifest.env_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get("n")?;
+        if count >= crate::storage::MAX_BACKUPS_PER_ENV {
+            return Err(StorageError::BackupLimitReached {
+                env_id: manifest.env_id.clone(),
+                limit: crate::storage::MAX_BACKUPS_PER_ENV,
+            });
+        }
+        sqlx::query(
+            "INSERT INTO backups \
+             (env_id, backup_id, created_at, generation, integrity, size_bytes, state) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(manifest.env_id.as_str())
+        .bind(&manifest.backup_id)
+        .bind(manifest.created_at.to_rfc3339())
+        .bind(manifest.generation as i64)
+        .bind(&manifest.integrity.digest)
+        .bind(manifest.size_bytes as i64)
+        .bind(&backup.state)
+        .execute(&mut *tx)
+        .await?;
+        journal_in_tx(&mut tx, journal).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_backups(&self, env_id: &EnvId) -> Result<Vec<BackupManifest>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT backup_id, created_at, generation, integrity, size_bytes \
+             FROM backups WHERE env_id = $1 ORDER BY backup_id",
+        )
+        .bind(env_id.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| decode_backup_manifest(env_id, row))
+            .collect()
+    }
+
+    async fn load_backup(
+        &self,
+        env_id: &EnvId,
+        backup_id: &str,
+    ) -> Result<Option<StoredBackup>, StorageError> {
+        let row = sqlx::query(
+            "SELECT backup_id, created_at, generation, integrity, size_bytes, state \
+             FROM backups WHERE env_id = $1 AND backup_id = $2",
+        )
+        .bind(env_id.as_str())
+        .bind(backup_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(StoredBackup {
+            manifest: decode_backup_manifest(env_id, &row)?,
+            state: row.try_get("state")?,
+        }))
+    }
+
+    async fn delete_backup_journaled(
+        &self,
+        env_id: &EnvId,
+        backup_id: &str,
+        journal: Option<&MutationJournal>,
+    ) -> Result<bool, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        let deleted = sqlx::query("DELETE FROM backups WHERE env_id = $1 AND backup_id = $2")
+            .bind(env_id.as_str())
+            .bind(backup_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if deleted == 0 {
+            // Nothing happened — write nothing (the journal must never
+            // record a mutation that did not apply).
+            return Ok(false);
+        }
+        journal_in_tx(&mut tx, journal).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn record_audit(
+        &self,
+        env_id: &EnvId,
+        event_id: &str,
+        event: &Value,
+    ) -> Result<(), StorageError> {
+        sqlx::query("INSERT INTO audit_log (env_id, event_id, event) VALUES ($1, $2, $3)")
+            .bind(env_id.as_str())
+            .bind(event_id)
+            .bind(event)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 // --- helpers ------------------------------------------------------------
@@ -806,6 +921,31 @@ async fn journal_in_tx(
         .execute(&mut **tx)
         .await?;
     Ok(())
+}
+
+/// Rebuild a [`BackupManifest`] from its row. The schema and integrity
+/// algorithm are constants of this backend (every backup is created by
+/// [`EnvironmentStorage::create_backup_journaled`] with
+/// `StateIntegrity::sha256_of`), so only the digest is stored.
+fn decode_backup_manifest(env_id: &EnvId, row: &SqliteRow) -> Result<BackupManifest, StorageError> {
+    let created_at: String = row.try_get("created_at")?;
+    let created_at = chrono::DateTime::parse_from_rfc3339(&created_at)
+        .map_err(StorageError::backend)?
+        .with_timezone(&chrono::Utc);
+    let generation: i64 = row.try_get("generation")?;
+    let size_bytes: i64 = row.try_get("size_bytes")?;
+    Ok(BackupManifest {
+        schema: SchemaVersion::BACKUP_MANIFEST_V1.into(),
+        backup_id: row.try_get("backup_id")?,
+        env_id: env_id.clone(),
+        created_at,
+        generation: generation as u64,
+        integrity: StateIntegrity {
+            algorithm: INTEGRITY_ALGORITHM_SHA256.to_string(),
+            digest: row.try_get("integrity")?,
+        },
+        size_bytes: size_bytes as u64,
+    })
 }
 
 /// CAS-checked environment UPDATE inside an existing transaction — the

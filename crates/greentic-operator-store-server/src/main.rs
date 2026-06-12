@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use greentic_operator_store_server::http::{router, router_with_operator_key};
+use greentic_operator_store_server::http::{RouterOptions, router_with_options};
+use greentic_operator_store_server::rbac::RbacEngine;
 use greentic_operator_store_server::sqlite::SqliteEnvironmentStore;
 
 /// Operator store server: HTTP front for the Greentic environment store.
@@ -25,9 +26,17 @@ struct Args {
     /// `~/.greentic/operator/key.pem`.
     #[arg(long, env = "GREENTIC_STORE_OPERATOR_KEY")]
     operator_key: Option<PathBuf>,
-    /// Allow binding to a non-loopback address. Dev-only escape hatch: the
-    /// server has no authentication yet (RBAC = PR-4.4). This flag will be
-    /// removed or replaced with a proper auth gate when RBAC lands.
+    /// RBAC token file (JSON, schema `greentic.store-rbac.v1`): SHA-256
+    /// token digests mapped to named actors and roles
+    /// (`admin`/`operator`/`read-only`). When set, every request must
+    /// carry a matching `Authorization: Bearer` token (fail closed); when
+    /// unset, the server runs the open-dev allow-all policy and refuses
+    /// non-loopback binds without the insecure escape hatch.
+    #[arg(long, env = "GREENTIC_STORE_RBAC_TOKENS")]
+    rbac_tokens: Option<PathBuf>,
+    /// Allow binding to a non-loopback address WITHOUT RBAC tokens.
+    /// Dev-only escape hatch — with `--rbac-tokens` configured,
+    /// non-loopback binds are allowed without it.
     #[arg(
         long,
         env = "GREENTIC_STORE_INSECURE_ALLOW_NON_LOOPBACK",
@@ -45,30 +54,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     let args = Args::parse();
 
-    if !args.bind.ip().is_loopback() {
+    // Fail fast on a malformed policy — it must never silently degrade to
+    // open-dev.
+    let rbac = match &args.rbac_tokens {
+        Some(path) => RbacEngine::from_token_file(path)?,
+        None => RbacEngine::open_dev(),
+    };
+
+    if !args.bind.ip().is_loopback() && !rbac.is_enforcing() {
         if !args.insecure_allow_non_loopback {
             return Err(format!(
-                "refusing to bind to non-loopback address `{}`: the server has no \
-                 authentication yet (RBAC = PR-4.4). Pass --insecure-allow-non-loopback \
-                 or set GREENTIC_STORE_INSECURE_ALLOW_NON_LOOPBACK=true to override.",
+                "refusing to bind to non-loopback address `{}` without authentication: \
+                 configure --rbac-tokens (or GREENTIC_STORE_RBAC_TOKENS), or pass \
+                 --insecure-allow-non-loopback / set \
+                 GREENTIC_STORE_INSECURE_ALLOW_NON_LOOPBACK=true to override.",
                 args.bind.ip()
             )
             .into());
         }
         tracing::warn!(
             bind = %args.bind,
-            "binding to non-loopback address WITHOUT authentication — \
-             the server has no RBAC yet (PR-4.4)"
+            "binding to non-loopback address WITHOUT authentication \
+             (open-dev RBAC; --rbac-tokens not configured)"
+        );
+    }
+    if !args.bind.ip().is_loopback() && rbac.is_enforcing() {
+        // Plain-HTTP bearer tokens travel in cleartext; the deployer
+        // client refuses that combination outright. Production puts a
+        // TLS-terminating proxy in front.
+        tracing::warn!(
+            bind = %args.bind,
+            "serving bearer-token auth over plain HTTP on a non-loopback \
+             address — terminate TLS in front of this server"
         );
     }
 
     // `open` creates the parent directory and the database file if missing.
     let store = SqliteEnvironmentStore::open(&args.db).await?;
     let storage = Arc::new(store);
-    let app = match args.operator_key {
-        Some(path) => router_with_operator_key(storage, path),
-        None => router(storage),
-    };
+    let app = router_with_options(
+        storage,
+        RouterOptions {
+            operator_key_path: args.operator_key,
+            rbac,
+        },
+    );
 
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     tracing::info!(

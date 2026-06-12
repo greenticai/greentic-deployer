@@ -46,6 +46,17 @@
 //! | `add_trusted_key`             | POST   | `/environments/{env_id}/trust-root/keys`                  |
 //! | `remove_trusted_key`          | DELETE | `/environments/{env_id}/trust-root/keys/{key_id}`         |
 //!
+//! The backup/restore group (A8 #5, PR-4.4) is server-only — `LocalFsStore`
+//! has no implementation, so these are inherent methods on
+//! [`HttpEnvironmentStore`], not `EnvironmentMutations` verbs:
+//!
+//! | Inherent method               | Method | Path                                                      |
+//! |-------------------------------|--------|-----------------------------------------------------------|
+//! | `create_backup`               | POST   | `/environments/{env_id}/backups`                          |
+//! | `list_backups`                | GET    | `/environments/{env_id}/backups`                          |
+//! | `delete_backup`               | DELETE | `/environments/{env_id}/backups/{backup_id}`              |
+//! | `restore`                     | POST   | `/environments/{env_id}/restore`                          |
+//!
 //! # Headers
 //!
 //! - `Content-Type: application/json` / `Accept: application/json` on every request.
@@ -74,12 +85,12 @@
 //! - PR-3c wires dispatch between `LocalFsStore` and `HttpEnvironmentStore`
 
 use greentic_deploy_spec::{
-    AuditDecision, AuditEvent, AuditResult, BindingGenerationOutcome, BundleDeployment, BundleId,
-    CapabilitySlot, DeploymentId, EnvId, EnvPackBinding, Environment, EnvironmentHostConfig,
-    ExtensionBinding, ExtensionBindingPayload, ExtensionKeyedPayload, IdempotencyKey,
-    IdempotencyOutcome, MessagingBundleLinkPayload, MessagingEndpoint, MessagingEndpointId,
-    PackBindingPayload, RemoteStoreError, Revision, RevisionId, RollbackTrafficSplitPayload,
-    RotateWebhookSecretPayload, StateEtag,
+    AuditDecision, AuditEvent, AuditResult, BackupManifest, BindingGenerationOutcome,
+    BundleDeployment, BundleId, CapabilitySlot, DeploymentId, EnvId, EnvPackBinding, Environment,
+    EnvironmentHostConfig, ExtensionBinding, ExtensionBindingPayload, ExtensionKeyedPayload,
+    IdempotencyKey, IdempotencyOutcome, MessagingBundleLinkPayload, MessagingEndpoint,
+    MessagingEndpointId, PackBindingPayload, RemoteStoreError, RestoreOutcome, RestoreRequest,
+    Revision, RevisionId, RollbackTrafficSplitPayload, RotateWebhookSecretPayload, StateEtag,
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::Client;
@@ -356,6 +367,91 @@ impl HttpEnvironmentStore {
         idempotency_key: Option<&str>,
     ) -> Result<R, StoreError> {
         self.send_mutation::<(), R>(expected_env, method, path, idempotency_key, None)
+    }
+
+    // -----------------------------------------------------------------------
+    // Backup / restore (A8 #5, PR-4.4) — server-only operations
+    // -----------------------------------------------------------------------
+    //
+    // `LocalFsStore` has no backup implementation (a local store is backed
+    // up by copying the directory), so these live as inherent methods
+    // rather than `EnvironmentMutations` verbs. The mutating three wear the
+    // standard A8 envelope (audit validation applies unchanged); `list` is
+    // a plain read.
+
+    /// `POST /environments/{env_id}/backups` — snapshot the environment's
+    /// stored state server-side; returns the contract's manifest.
+    pub fn create_backup(
+        &self,
+        env_id: &EnvId,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<BackupManifest, StoreError> {
+        self.send_mutation_no_body(
+            env_id,
+            reqwest::Method::POST,
+            &self.env_path(env_id, "/backups"),
+            Some(idempotency_key.as_str()),
+        )
+    }
+
+    /// `GET /environments/{env_id}/backups` — list backup manifests,
+    /// oldest first.
+    pub fn list_backups(&self, env_id: &EnvId) -> Result<Vec<BackupManifest>, StoreError> {
+        #[derive(Deserialize)]
+        struct BackupsResponse {
+            backups: Vec<BackupManifest>,
+        }
+        let response: BackupsResponse = self.send::<(), _>(
+            reqwest::Method::GET,
+            &self.env_path(env_id, "/backups"),
+            None,
+            None,
+        )?;
+        Ok(response.backups)
+    }
+
+    /// `DELETE /environments/{env_id}/backups/{backup_id}` — drop one
+    /// backup (the server's per-env backup store is bounded; at the cap,
+    /// `create_backup` refuses until old ones are deleted).
+    pub fn delete_backup(
+        &self,
+        env_id: &EnvId,
+        backup_id: &str,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<(), StoreError> {
+        let path = format!(
+            "{}/{}",
+            self.env_path(env_id, "/backups"),
+            encode_segment(backup_id)
+        );
+        let _ack: serde_json::Value = self.send_mutation_no_body(
+            env_id,
+            reqwest::Method::DELETE,
+            &path,
+            Some(idempotency_key.as_str()),
+        )?;
+        Ok(())
+    }
+
+    /// `POST /environments/{env_id}/restore` — restore the environment
+    /// from a named backup. `request.precondition` MUST pin prior state
+    /// (the server answers 428 otherwise; a stale pin is a 412). The
+    /// returned outcome's `integrity` equals the backup's recorded digest,
+    /// and [`RestoreOutcome::etag`] is the restored state's strong
+    /// validator for the next CAS write.
+    pub fn restore(
+        &self,
+        env_id: &EnvId,
+        request: &RestoreRequest,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<RestoreOutcome, StoreError> {
+        self.send_mutation(
+            env_id,
+            reqwest::Method::POST,
+            &self.env_path(env_id, "/restore"),
+            Some(idempotency_key.as_str()),
+            Some(request),
+        )
     }
 }
 
