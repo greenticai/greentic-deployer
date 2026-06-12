@@ -30,6 +30,8 @@ locals {
   admin_bind                = "127.0.0.1:${local.admin_port}"
   effective_public_base_url = trimspace(var.public_base_url) != "" ? var.public_base_url : "http://${aws_lb.this.dns_name}"
   admin_secret_prefix       = "greentic/admin/${local.name_prefix}"
+  bundle_fetcher_enabled    = trimspace(var.bundle_s3_object_ref) != ""
+  operator_bundle_source    = local.bundle_fetcher_enabled ? "/greentic-bundle/bundle.gtbundle" : var.bundle_source
   effective_vpc_id          = var.use_default_vpc ? data.aws_vpc.default[0].id : aws_vpc.this[0].id
   effective_subnet_ids      = var.use_default_vpc ? slice(data.aws_subnets.default[0].ids, 0, min(2, length(data.aws_subnets.default[0].ids))) : aws_subnet.public[*].id
   common_tags = {
@@ -459,6 +461,25 @@ resource "aws_iam_role_policy" "task_runtime_secrets" {
   })
 }
 
+resource "aws_iam_role_policy" "task_bundle_s3_object" {
+  count = trimspace(var.bundle_s3_object_arn) != "" ? 1 : 0
+  name  = "${local.name_prefix}-task-bundle-s3-object"
+  role  = aws_iam_role.task_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject"
+        ]
+        Resource = var.bundle_s3_object_arn
+      }
+    ]
+  })
+}
+
 resource "aws_ecs_task_definition" "this" {
   family                   = "${local.name_prefix}-task"
   requires_compatibilities = ["FARGATE"]
@@ -468,7 +489,40 @@ resource "aws_ecs_task_definition" "this" {
   execution_role_arn       = aws_iam_role.task_execution.arn
   task_role_arn            = aws_iam_role.task_execution.arn
 
-  container_definitions = jsonencode([
+  volume {
+    name = "greentic-bundle"
+  }
+
+  container_definitions = jsonencode(concat(
+    local.bundle_fetcher_enabled ? [
+      {
+        name      = "bundle-fetcher"
+        image     = "public.ecr.aws/aws-cli/aws-cli:latest"
+        essential = false
+        command = [
+          "s3",
+          "cp",
+          var.bundle_s3_object_ref,
+          local.operator_bundle_source
+        ]
+        mountPoints = [
+          {
+            sourceVolume  = "greentic-bundle"
+            containerPath = "/greentic-bundle"
+            readOnly      = false
+          }
+        ]
+        logConfiguration = {
+          logDriver = "awslogs"
+          options = {
+            awslogs-group         = aws_cloudwatch_log_group.this.name
+            awslogs-region        = data.aws_region.current.name
+            awslogs-stream-prefix = "bundle-fetcher"
+          }
+        }
+      }
+    ] : [],
+    [
     {
       name      = "app"
       image     = var.operator_image
@@ -476,7 +530,7 @@ resource "aws_ecs_task_definition" "this" {
       command = [
         "start",
         "--bundle",
-        var.bundle_source,
+        local.operator_bundle_source,
         "--tenant",
         var.tenant,
         "--cloudflared",
@@ -487,6 +541,19 @@ resource "aws_ecs_task_definition" "this" {
         "--admin-port",
         tostring(local.admin_port)
       ]
+      dependsOn = local.bundle_fetcher_enabled ? [
+        {
+          containerName = "bundle-fetcher"
+          condition     = "SUCCESS"
+        }
+      ] : []
+      mountPoints = local.bundle_fetcher_enabled ? [
+        {
+          sourceVolume  = "greentic-bundle"
+          containerPath = "/greentic-bundle"
+          readOnly      = true
+        }
+      ] : []
       portMappings = [
         {
           containerPort = local.app_port
@@ -498,7 +565,7 @@ resource "aws_ecs_task_definition" "this" {
         [
           {
             name  = "GREENTIC_BUNDLE_SOURCE"
-            value = var.bundle_source
+            value = local.operator_bundle_source
           },
           {
             name  = "GREENTIC_BUNDLE_DIGEST"
@@ -557,10 +624,6 @@ resource "aws_ecs_task_definition" "this" {
           {
             name  = "GREENTIC_ALLOW_ENV_SECRETS"
             value = "1"
-          },
-          {
-            name  = "GREENTIC_SECRETS_MANAGER_PACK"
-            value = "providers/deployer/aws.gtpack"
           }
         ] : [],
         [
@@ -635,7 +698,8 @@ resource "aws_ecs_task_definition" "this" {
         }
       }
     }
-  ])
+    ]
+  ))
 
   tags = local.common_tags
 }

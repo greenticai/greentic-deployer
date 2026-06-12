@@ -773,32 +773,52 @@ fn resolve_from_setup_answers(
     requirement: &RuntimeSecretRequirement,
     checked_sources: &mut Vec<String>,
 ) -> Option<(PathBuf, String)> {
-    let config_id = config_id_from_pack_path(&requirement.source)?;
-    let path = bundle_root
-        .join("state/config")
-        .join(config_id)
-        .join("setup-answers.json");
-    checked_sources.push(path.display().to_string());
-    let contents = std::fs::read_to_string(&path).ok()?;
-    let answers = serde_json::from_str::<BTreeMap<String, JsonValue>>(&contents).ok()?;
-    for (key, value) in answers {
-        if canonical_secret_name(&key) != requirement.key {
-            continue;
-        }
-        if let Some(value) = value.as_str()
-            && !value.is_empty()
-        {
-            if let Some(env_key) = extract_env_placeholder(value) {
-                checked_sources.push(format!("env ${{{env_key}}} (from setup-answers)"));
-                return match env::var(&env_key) {
-                    Ok(resolved) if !resolved.is_empty() => Some((path, resolved)),
-                    _ => None,
-                };
+    for config_id in setup_answer_config_id_candidates(&requirement.source) {
+        let path = bundle_root
+            .join("state/config")
+            .join(config_id)
+            .join("setup-answers.json");
+        checked_sources.push(path.display().to_string());
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(_) => continue,
+        };
+        let answers = match serde_json::from_str::<BTreeMap<String, JsonValue>>(&contents) {
+            Ok(answers) => answers,
+            Err(_) => continue,
+        };
+        for (key, value) in answers {
+            if canonical_secret_name(&key) != requirement.key {
+                continue;
             }
-            return Some((path, value.to_string()));
+            if let Some(value) = value.as_str()
+                && !value.is_empty()
+            {
+                if let Some(env_key) = extract_env_placeholder(value) {
+                    checked_sources.push(format!("env ${{{env_key}}} (from setup-answers)"));
+                    return match env::var(&env_key) {
+                        Ok(resolved) if !resolved.is_empty() => Some((path, resolved)),
+                        _ => None,
+                    };
+                }
+                return Some((path, value.to_string()));
+            }
         }
     }
     None
+}
+
+fn setup_answer_config_id_candidates(pack_path: &Path) -> Vec<String> {
+    let Some(config_id) = config_id_from_pack_path(pack_path) else {
+        return Vec::new();
+    };
+    let mut candidates = vec![config_id.clone()];
+    if let Some((base, _)) = config_id.split_once("-gtpack-sha-")
+        && !base.is_empty()
+    {
+        candidates.push(base.to_string());
+    }
+    candidates
 }
 
 // Parse a whole-string `${VAR}` placeholder and return `VAR`.
@@ -849,6 +869,20 @@ mod tests {
         assert_eq!(extract_env_placeholder("${}"), None);
         assert_eq!(extract_env_placeholder("${VAR WITH SPACE}"), None);
         assert_eq!(extract_env_placeholder("${NESTED${INNER}}"), None);
+    }
+
+    #[test]
+    fn setup_answer_config_id_candidates_include_gtpack_sha_base_alias() {
+        let candidates = setup_answer_config_id_candidates(Path::new(
+            "/tmp/packs/deep-research-demo-gtpack-sha-abc123.gtpack",
+        ));
+        assert_eq!(
+            candidates,
+            vec![
+                "deep-research-demo-gtpack-sha-abc123".to_string(),
+                "deep-research-demo".to_string(),
+            ]
+        );
     }
 
     #[test]

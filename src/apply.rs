@@ -2137,6 +2137,8 @@ fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path
   deployment_name_prefix = var.deployment_name_prefix
   operator_image        = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
   bundle_source         = var.bundle_source
+  bundle_s3_object_ref  = var.bundle_s3_object_ref
+  bundle_s3_object_arn  = var.bundle_s3_object_arn
   bundle_digest         = var.bundle_digest
   repo_registry_base    = var.repo_registry_base
   store_registry_base   = var.store_registry_base
@@ -2253,6 +2255,18 @@ output "admin_client_key_secret_ref" {{
     )?;
     ensure_terraform_variable_declared(
         &terraform_root.join("variables.tf"),
+        "bundle_s3_object_ref",
+        "string",
+        Some(""),
+    )?;
+    ensure_terraform_variable_declared(
+        &terraform_root.join("variables.tf"),
+        "bundle_s3_object_arn",
+        "string",
+        Some(""),
+    )?;
+    ensure_terraform_variable_declared(
+        &terraform_root.join("variables.tf"),
         "runtime_secret_prefix",
         "string",
         Some(""),
@@ -2283,6 +2297,18 @@ output "admin_client_key_secret_ref" {{
         ensure_terraform_variable_declared(
             &module_variables,
             "deployment_name_prefix",
+            "string",
+            Some(""),
+        )?;
+        ensure_terraform_variable_declared(
+            &module_variables,
+            "bundle_s3_object_ref",
+            "string",
+            Some(""),
+        )?;
+        ensure_terraform_variable_declared(
+            &module_variables,
+            "bundle_s3_object_arn",
             "string",
             Some(""),
         )?;
@@ -2321,6 +2347,7 @@ fn ensure_aws_runtime_secret_wiring(path: &Path) -> Result<()> {
         && contents.contains("GREENTIC_ALLOW_ENV_SECRETS")
         && contents.contains("runtime_secret_env")
         && contents.contains("task_runtime_secrets")
+        && contents.contains("task_bundle_s3_object")
     {
         return Ok(());
     }
@@ -2353,6 +2380,118 @@ fn ensure_aws_runtime_secret_wiring(path: &Path) -> Result<()> {
 "#;
         contents = contents.replacen(marker, &format!("{policy}{marker}"), 1);
     }
+    if !contents.contains("task_bundle_s3_object") {
+        let marker = r#"resource "aws_ecs_task_definition" "this" {"#;
+        let policy = r#"resource "aws_iam_role_policy" "task_bundle_s3_object" {
+  count = trimspace(var.bundle_s3_object_arn) != "" ? 1 : 0
+  name  = "${local.name_prefix}-task-bundle-s3-object"
+  role  = aws_iam_role.task_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject"
+        ]
+        Resource = var.bundle_s3_object_arn
+      }
+    ]
+  })
+}
+
+"#;
+        contents = contents.replacen(marker, &format!("{policy}{marker}"), 1);
+    }
+    if !contents.contains("bundle_fetcher_enabled") {
+        if let Some(line) = contents
+            .lines()
+            .find(|line| line.trim_start().starts_with("admin_secret_prefix ="))
+            .map(str::to_string)
+        {
+            let replacement = format!(
+                "{line}\n  bundle_fetcher_enabled = trimspace(var.bundle_s3_object_ref) != \"\"\n  operator_bundle_source = local.bundle_fetcher_enabled ? \"/greentic-bundle/bundle.gtbundle\" : var.bundle_source"
+            );
+            contents = contents.replacen(&line, &replacement, 1);
+        }
+        contents = contents.replace(
+            r#"  task_role_arn            = aws_iam_role.task_execution.arn
+
+  container_definitions = jsonencode(["#,
+            r#"  task_role_arn            = aws_iam_role.task_execution.arn
+
+  volume {
+    name = "greentic-bundle"
+  }
+
+  container_definitions = jsonencode(concat(
+    local.bundle_fetcher_enabled ? [
+      {
+        name      = "bundle-fetcher"
+        image     = "public.ecr.aws/aws-cli/aws-cli:latest"
+        essential = false
+        command = [
+          "s3",
+          "cp",
+          var.bundle_s3_object_ref,
+          local.operator_bundle_source
+        ]
+        mountPoints = [
+          {
+            sourceVolume  = "greentic-bundle"
+            containerPath = "/greentic-bundle"
+            readOnly      = false
+          }
+        ]
+        logConfiguration = {
+          logDriver = "awslogs"
+          options = {
+            awslogs-group         = aws_cloudwatch_log_group.this.name
+            awslogs-region        = data.aws_region.current.name
+            awslogs-stream-prefix = "bundle-fetcher"
+          }
+        }
+      }
+    ] : [],
+    ["#,
+        );
+        contents = contents.replace("var.bundle_source,", "local.operator_bundle_source,");
+        contents = contents.replace(
+            r#"            name  = "GREENTIC_BUNDLE_SOURCE"
+            value = var.bundle_source"#,
+            r#"            name  = "GREENTIC_BUNDLE_SOURCE"
+            value = local.operator_bundle_source"#,
+        );
+        contents = contents.replace(
+            r#"      portMappings = ["#,
+            r#"      dependsOn = local.bundle_fetcher_enabled ? [
+        {
+          containerName = "bundle-fetcher"
+          condition     = "SUCCESS"
+        }
+      ] : []
+      mountPoints = local.bundle_fetcher_enabled ? [
+        {
+          sourceVolume  = "greentic-bundle"
+          containerPath = "/greentic-bundle"
+          readOnly      = true
+        }
+      ] : []
+      portMappings = ["#,
+        );
+        contents = contents.replace(
+            r#"    }
+  ])
+
+  tags = local.common_tags"#,
+            r#"    }
+    ]
+  ))
+
+  tags = local.common_tags"#,
+        );
+    }
     if !contents.contains(r#"data "aws_secretsmanager_secret" "runtime""#) {
         let marker = r#"resource "aws_ecs_task_definition" "this" {"#;
         let data_source = r#"data "aws_secretsmanager_secret" "runtime" {
@@ -2379,10 +2518,6 @@ fn ensure_aws_runtime_secret_wiring(path: &Path) -> Result<()> {
         r#"          {
             name  = "GREENTIC_ALLOW_ENV_SECRETS"
             value = "1"
-          },
-          {
-            name  = "GREENTIC_SECRETS_MANAGER_PACK"
-            value = "providers/deployer/aws.gtpack"
           }"#,
     );
     if !contents.contains("GREENTIC_SECRETS_BACKEND") {
@@ -2399,10 +2534,6 @@ fn ensure_aws_runtime_secret_wiring(path: &Path) -> Result<()> {
           {
             name  = "GREENTIC_ALLOW_ENV_SECRETS"
             value = "1"
-          },
-          {
-            name  = "GREENTIC_SECRETS_MANAGER_PACK"
-            value = "providers/deployer/aws.gtpack"
           }
         ] : [],
         [
@@ -2482,6 +2613,16 @@ fn ensure_terraform_variable_declared(
     Ok(())
 }
 
+fn aws_bundle_s3_object_arn(bundle_source: &str) -> Option<String> {
+    let rest = bundle_source.trim().strip_prefix("s3://")?;
+    let (bucket, key) = rest.split_once('/')?;
+    let key = key.trim_start_matches('/');
+    if bucket.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some(format!("arn:aws:s3:::{bucket}/{key}"))
+}
+
 fn materialize_generated_tfvars(
     config: &DeployerConfig,
     terraform_root: &Path,
@@ -2520,6 +2661,9 @@ fn materialize_generated_tfvars(
 
     if let Some(bundle_source) = config.bundle_source.as_ref() {
         replace_tfvars_assignment(&mut contents, "bundle_source", bundle_source);
+        if let Some(s3_arn) = aws_bundle_s3_object_arn(bundle_source) {
+            replace_tfvars_assignment(&mut contents, "bundle_s3_object_arn", &s3_arn);
+        }
     }
     if let Some(bundle_digest) = config.bundle_digest.as_ref() {
         replace_tfvars_assignment(&mut contents, "bundle_digest", bundle_digest);
@@ -5276,15 +5420,20 @@ data "aws_region" "current" {}
         assert!(rendered.contains(r#"tenant                = var.tenant"#));
         let variables =
             std::fs::read_to_string(terraform_root.join("variables.tf")).expect("read variables");
+        assert!(variables.contains(r#"variable "bundle_s3_object_ref""#));
+        assert!(variables.contains(r#"variable "bundle_s3_object_arn""#));
         assert!(variables.contains(r#"variable "runtime_secret_prefix""#));
         let module_variables =
             std::fs::read_to_string(terraform_root.join("modules/operator/variables.tf"))
                 .expect("read module variables");
+        assert!(module_variables.contains(r#"variable "bundle_s3_object_ref""#));
+        assert!(module_variables.contains(r#"variable "bundle_s3_object_arn""#));
         assert!(module_variables.contains(r#"variable "runtime_secret_prefix""#));
         let module_main = std::fs::read_to_string(terraform_root.join("modules/operator/main.tf"))
             .expect("read module main");
         assert!(module_main.contains("GREENTIC_SECRETS_BACKEND"));
         assert!(module_main.contains("task_runtime_secrets"));
+        assert!(module_main.contains("task_bundle_s3_object"));
     }
 
     #[test]
