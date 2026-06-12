@@ -4,7 +4,14 @@
 //! first (shared helpers — `require_revision`, `enforce_split_invariants`),
 //! provider work second. The provider work is "render the deterministic
 //! desired state, hand it to the [`K8sCluster`](super::cluster::K8sCluster)
-//! seam":
+//! seam".
+//!
+//! **Note:** the Deployer verbs use [`K8sParams::for_env`] sandbox
+//! defaults — they have no env-dir access on the trait, so the binding's
+//! `answers_ref` is not available here. Threading answers into
+//! `warm_revision` / `apply_traffic_split` rides the PR-5.3 orchestration
+//! wiring. `op env render` already consumes answers via
+//! [`K8sParams::from_answers`].
 //!
 //! | Verb | Provider side-effect |
 //! |---|---|

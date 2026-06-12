@@ -9,6 +9,16 @@
 //! real-cluster and production acceptance, not this scaffold — sandbox
 //! defaults per that doc.
 //!
+//! ## Answers consumption
+//!
+//! `op env render` reads the binding's `answers_ref` and feeds it to
+//! [`K8sParams::from_answers`](manifests::K8sParams::from_answers) so
+//! operator overrides (namespace, runtime image, router replicas) reach
+//! the rendered manifests. The Deployer verbs (`warm_revision`,
+//! `apply_traffic_split`) still use `K8sParams::for_env` sandbox
+//! defaults — they have no env-dir access on the trait; threading
+//! answers into them rides the PR-5.3 orchestration wiring.
+//!
 //! ## Operator CLI lifecycle verb disclaimer
 //!
 //! The operator CLI's revision/traffic verbs (`gtc op revision warm`,
@@ -34,6 +44,9 @@
 //! - [`deployer`] — `impl Deployer for K8sDeployerHandler`; passes
 //!   [`run_conformance`](crate::env_packs::deployer::run_conformance)
 //!   against an in-memory cluster fake.
+//! - [`render`] — `impl ManifestRenderer for K8sDeployerHandler`; backs
+//!   `gtc op env render` with the same rendering functions the
+//!   [`deployer`] verbs apply (plan §6 step 10).
 //! - [`credentials`] — `SelfSubjectAccessReview`-based
 //!   [`DeployerCredentials`](crate::credentials::DeployerCredentials)
 //!   (probes fail closed until the client ships; decision logic pinned
@@ -47,6 +60,7 @@ pub mod cluster;
 pub mod credentials;
 pub mod deployer;
 pub mod manifests;
+pub mod render;
 
 use std::sync::Arc;
 
@@ -129,6 +143,10 @@ impl EnvPackHandler for K8sDeployerHandler {
     }
 
     fn as_deployer(&self) -> Option<&dyn crate::env_packs::deployer::Deployer> {
+        Some(self)
+    }
+
+    fn as_manifest_renderer(&self) -> Option<&dyn crate::env_packs::render::ManifestRenderer> {
         Some(self)
     }
 }

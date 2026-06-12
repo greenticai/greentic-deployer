@@ -316,6 +316,11 @@ pub enum EnvVerb {
     ToolCheck {
         env_id: String,
     },
+    /// Render the env's declarative desired state through the deployer
+    /// env-pack's manifest renderer, without applying anything (plan §6
+    /// step 10). With `--output` writes one YAML file per object in apply
+    /// order; otherwise embeds the manifests in the JSON outcome.
+    Render(EnvRenderArgs),
     Destroy {
         env_id: String,
         #[arg(long)]
@@ -508,6 +513,26 @@ pub struct EnvUpdateArgs {
     /// Tenant organization id this env belongs to.
     #[arg(long = "tenant-org")]
     pub tenant_org_id: Option<String>,
+}
+
+/// Args for `op env render <env_id> [--kind <descriptor>] [--output <dir>]`.
+/// Read-only: renders without applying. `--answers`/`--schema` payload
+/// machinery does not apply — the inputs are these three direct args.
+#[derive(Args, Debug)]
+pub struct EnvRenderArgs {
+    /// Environment id (e.g. `zain-prod`).
+    pub env_id: String,
+    /// Deployer env-pack kind to render with — a full `<path>@<version>`
+    /// descriptor, or a bare path matching the env's deployer binding.
+    /// Defaults to the env's Deployer-slot binding.
+    #[arg(long)]
+    pub kind: Option<String>,
+    /// Directory to write one YAML file per object (created if missing;
+    /// same-named files are overwritten). Files are named
+    /// `<NN>-<kind>-<name>.yaml` in apply order. Without this flag the
+    /// manifests are embedded in the JSON outcome instead.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
 }
 
 /// Args for `op env set-public-url <env_id> <URL>`. Both fields are
@@ -808,7 +833,7 @@ pub fn dispatch_op_with_registry(
 
     let store = build_store(&cmd).inspect_err(|err| print_error(noun, verb, err))?;
     let result = match cmd.noun {
-        OpNoun::Env { verb } => dispatch_env(&store, &flags, verb),
+        OpNoun::Env { verb } => dispatch_env(&store, registry, &flags, verb),
         OpNoun::EnvPacks { verb } => dispatch_env_packs(&store, &flags, verb),
         OpNoun::Bundles { verb } => dispatch_bundles(&store, &flags, verb),
         OpNoun::Revisions { verb } => dispatch_revisions(&store, &flags, verb),
@@ -841,6 +866,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 EnvVerb::Show { .. } => "show",
                 EnvVerb::Doctor { .. } => "doctor",
                 EnvVerb::ToolCheck { .. } => "tool-check",
+                EnvVerb::Render(_) => "render",
                 EnvVerb::Destroy { .. } => "destroy",
                 EnvVerb::MigrateDev { .. } => "migrate-dev",
                 EnvVerb::MigrateState { .. } => "migrate-state",
@@ -945,7 +971,12 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
     }
 }
 
-fn dispatch_env(store: &LocalFsStore, flags: &OpFlags, verb: EnvVerb) -> Result<(), OpError> {
+fn dispatch_env(
+    store: &LocalFsStore,
+    registry: &crate::env_packs::EnvPackRegistry,
+    flags: &OpFlags,
+    verb: EnvVerb,
+) -> Result<(), OpError> {
     let outcome = match verb {
         EnvVerb::Init(args) => super::env::init(store, flags, args.into_payload(flags)?)?,
         EnvVerb::Apply(mut args) => {
@@ -969,6 +1000,7 @@ fn dispatch_env(store: &LocalFsStore, flags: &OpFlags, verb: EnvVerb) -> Result<
         EnvVerb::Show { env_id } => super::env::show(store, flags, &env_id)?,
         EnvVerb::Doctor { env_id } => super::env::doctor(store, flags, &env_id)?,
         EnvVerb::ToolCheck { env_id } => super::env::tool_check(store, flags, &env_id)?,
+        EnvVerb::Render(args) => super::env::render(store, registry, flags, args)?,
         EnvVerb::Destroy { env_id, confirm } => {
             super::env::destroy(store, flags, &env_id, confirm)?
         }

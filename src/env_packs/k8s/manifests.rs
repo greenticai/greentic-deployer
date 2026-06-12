@@ -68,10 +68,11 @@ const SERVE_PORT: u16 = 8080;
 /// Operator-tunable knobs for the rendered manifests.
 ///
 /// [`K8sParams::for_env`] derives the sandbox defaults from the env
-/// alone. The env-pack wizard (`wizard.qaspec.yaml`) records overrides on
-/// the binding's `answers_ref`; plumbing those answers into this struct
-/// rides the same Phase D answers-reader gap disclosed on the AWS-ECS
-/// wizard (no `answers_ref` reader exists yet).
+/// alone. [`K8sParams::from_answers`] overlays the binding's recorded
+/// wizard answers (namespace, runtime image, router replicas) on top of
+/// those defaults — `op env render` calls this path. The Deployer verbs
+/// still use `for_env` until the PR-5.3 orchestration wiring threads
+/// answers into them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct K8sParams {
     /// Namespace every rendered object lands in. One namespace per
@@ -93,6 +94,136 @@ impl K8sParams {
             router_replicas: 2,
         }
     }
+
+    /// Build params from the deployer binding's recorded wizard answers.
+    ///
+    /// `answers` is the flat JSON object keyed by wizard question id (the
+    /// ecosystem's qa-spec answers convention). `None` (or an object with
+    /// all relevant keys unset / blank) falls back to sandbox defaults —
+    /// wizard questions are optional.
+    ///
+    /// Validation:
+    /// - `namespace`: valid RFC 1123 label (used verbatim — the wizard
+    ///   says it must match the namespace the bootstrap rules pack
+    ///   provisioned). `null` / empty-string → default.
+    /// - `runtime_image`: non-empty string matching `[a-z0-9.\-_/:@]+`.
+    ///   `null` / empty-string → default.
+    /// - `router_replicas`: JSON string or number parsed to `u32`; must
+    ///   be >= 2 (the router must stay HA). `null` / empty-string →
+    ///   default.
+    /// - `kubeconfig_context`: silently accepted and ignored (client-
+    ///   targeting knob, not a manifest knob).
+    /// - Any other key → `Err` (fail closed on wizard version skew or
+    ///   typos).
+    pub fn from_answers(
+        env: &Environment,
+        answers: Option<&serde_json::Value>,
+    ) -> Result<Self, String> {
+        let Some(answers) = answers else {
+            return Ok(Self::for_env(env));
+        };
+        let obj = answers
+            .as_object()
+            .ok_or_else(|| "answers must be a JSON object".to_string())?;
+
+        let defaults = Self::for_env(env);
+
+        // Reject unknown keys first (fail closed on version skew).
+        const KNOWN_KEYS: &[&str] = &[
+            "kubeconfig_context",
+            "namespace",
+            "runtime_image",
+            "router_replicas",
+        ];
+        for key in obj.keys() {
+            if !KNOWN_KEYS.contains(&key.as_str()) {
+                return Err(format!("unknown answer key `{key}`"));
+            }
+        }
+
+        let namespace = match answer_string(obj, "namespace") {
+            Some(ns) => {
+                if !is_dns1123_label(&ns) {
+                    return Err(format!("namespace `{ns}` is not a valid RFC 1123 label"));
+                }
+                ns
+            }
+            None => defaults.namespace,
+        };
+
+        let runtime_image = match answer_string(obj, "runtime_image") {
+            Some(img) => {
+                if !img
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b".-_/:@".contains(&b))
+                {
+                    return Err(format!("runtime_image `{img}` contains invalid characters"));
+                }
+                img
+            }
+            None => defaults.runtime_image,
+        };
+
+        let router_replicas = match obj.get("router_replicas") {
+            None | Some(serde_json::Value::Null) => defaults.router_replicas,
+            Some(v) => {
+                let n: u32 = match v {
+                    serde_json::Value::String(s) if s.is_empty() => defaults.router_replicas,
+                    serde_json::Value::String(s) => s
+                        .parse::<u32>()
+                        .map_err(|e| format!("router_replicas `{s}` is not a valid u32: {e}"))?,
+                    serde_json::Value::Number(n) => n
+                        .as_u64()
+                        .and_then(|v| u32::try_from(v).ok())
+                        .ok_or_else(|| format!("router_replicas `{n}` is not a valid u32"))?,
+                    _ => {
+                        return Err(format!(
+                            "router_replicas must be a string or number, got {v}"
+                        ));
+                    }
+                };
+                if n < 2 {
+                    return Err(format!(
+                        "router_replicas must be >= 2 (HA requirement), got {n}"
+                    ));
+                }
+                n
+            }
+        };
+
+        // kubeconfig_context: silently accepted and ignored.
+
+        Ok(Self {
+            namespace,
+            runtime_image,
+            router_replicas,
+        })
+    }
+}
+
+/// Extract a non-empty string answer, treating JSON `null` and empty
+/// strings as "left blank in the wizard" (unset).
+fn answer_string(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    match obj.get(key) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if s.is_empty() => None,
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(other) => Some(other.to_string()),
+    }
+}
+
+/// Check whether `s` is a valid RFC 1123 DNS label: lowercase
+/// alphanumeric + `-`, no leading/trailing `-`, length 1..=63.
+pub fn is_dns1123_label(s: &str) -> bool {
+    let len = s.len();
+    if len == 0 || len > 63 {
+        return false;
+    }
+    if s.starts_with('-') || s.ends_with('-') {
+        return false;
+    }
+    s.bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Default namespace for an env, derived from the env id.
@@ -555,7 +686,9 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
 /// ConfigMap (the router mounts it — must exist first), router
 /// Deployment + Service + PDB, NetworkPolicies. Per-revision worker
 /// objects are NOT included — they ride the revision lifecycle verbs.
-/// The `gtc op env render` verb (follow-up PR) writes this set to disk.
+/// `gtc op env render` emits this set (plus present-revision workers)
+/// through the [`ManifestRenderer`](crate::env_packs::render::ManifestRenderer)
+/// impl in [`super::render`].
 pub fn render_environment_manifests(env: &Environment, params: &K8sParams) -> Vec<Value> {
     let mut manifests = vec![
         render_namespace(env, params),
@@ -832,5 +965,191 @@ mod tests {
                 m["kind"]
             );
         }
+    }
+
+    // ---- from_answers + is_dns1123_label -----------------------------------
+
+    #[test]
+    fn from_answers_none_equals_for_env() {
+        let env = build_fixture_env();
+        assert_eq!(
+            K8sParams::from_answers(&env, None).unwrap(),
+            K8sParams::for_env(&env),
+        );
+    }
+
+    #[test]
+    fn from_answers_empty_object_equals_for_env() {
+        let env = build_fixture_env();
+        let empty = serde_json::json!({});
+        assert_eq!(
+            K8sParams::from_answers(&env, Some(&empty)).unwrap(),
+            K8sParams::for_env(&env),
+        );
+    }
+
+    #[test]
+    fn from_answers_custom_namespace_propagates() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"namespace": "my-ns"});
+        let params = K8sParams::from_answers(&env, Some(&answers)).unwrap();
+        assert_eq!(params.namespace, "my-ns");
+        // Custom namespace propagates into every rendered object.
+        let manifests = render_environment_manifests(&env, &params);
+        assert_eq!(manifests[0]["metadata"]["name"], "my-ns");
+        for m in &manifests[1..] {
+            assert_eq!(
+                m["metadata"]["namespace"].as_str(),
+                Some("my-ns"),
+                "{} namespace mismatch",
+                m["kind"]
+            );
+        }
+        // Worker objects too.
+        for rev in &env.revisions {
+            let workers = render_worker_manifests(&env, rev, &params);
+            for w in &workers {
+                assert_eq!(
+                    w["metadata"]["namespace"].as_str(),
+                    Some("my-ns"),
+                    "worker {} namespace mismatch",
+                    w["kind"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn from_answers_custom_runtime_image() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"runtime_image": "ghcr.io/acme/rt@sha256:abc123"});
+        let params = K8sParams::from_answers(&env, Some(&answers)).unwrap();
+        assert_eq!(params.runtime_image, "ghcr.io/acme/rt@sha256:abc123");
+        // Router and worker containers use the image.
+        let router = render_router_deployment(&env, &params);
+        assert_eq!(
+            router["spec"]["template"]["spec"]["containers"][0]["image"].as_str(),
+            Some("ghcr.io/acme/rt@sha256:abc123")
+        );
+        let worker = render_worker_deployment(&env, &env.revisions[0], &params);
+        assert_eq!(
+            worker["spec"]["template"]["spec"]["containers"][0]["image"].as_str(),
+            Some("ghcr.io/acme/rt@sha256:abc123")
+        );
+    }
+
+    #[test]
+    fn from_answers_router_replicas_override() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"router_replicas": "4"});
+        let params = K8sParams::from_answers(&env, Some(&answers)).unwrap();
+        assert_eq!(params.router_replicas, 4);
+    }
+
+    #[test]
+    fn from_answers_router_replicas_as_number() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"router_replicas": 3});
+        let params = K8sParams::from_answers(&env, Some(&answers)).unwrap();
+        assert_eq!(params.router_replicas, 3);
+    }
+
+    #[test]
+    fn from_answers_router_replicas_one_rejected() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"router_replicas": "1"});
+        let err = K8sParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(err.contains("must be >= 2"), "got: {err}");
+    }
+
+    #[test]
+    fn from_answers_unknown_key_rejected() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"bogus_key": "value"});
+        let err = K8sParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(err.contains("bogus_key"), "got: {err}");
+    }
+
+    #[test]
+    fn from_answers_invalid_namespace_rejected() {
+        let env = build_fixture_env();
+        // Uppercase is not valid RFC 1123.
+        let answers = serde_json::json!({"namespace": "MyNS"});
+        let err = K8sParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(err.contains("not a valid RFC 1123"), "got: {err}");
+    }
+
+    #[test]
+    fn from_answers_namespace_too_long_rejected() {
+        let env = build_fixture_env();
+        let long = "a".repeat(64);
+        let answers = serde_json::json!({"namespace": long});
+        let err = K8sParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(err.contains("not a valid RFC 1123"), "got: {err}");
+    }
+
+    #[test]
+    fn from_answers_non_object_rejected() {
+        let env = build_fixture_env();
+        let bad = serde_json::json!("not an object");
+        let err = K8sParams::from_answers(&env, Some(&bad)).unwrap_err();
+        assert!(err.contains("JSON object"), "got: {err}");
+    }
+
+    #[test]
+    fn from_answers_empty_string_falls_back_to_default() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "namespace": "",
+            "runtime_image": "",
+            "router_replicas": "",
+        });
+        assert_eq!(
+            K8sParams::from_answers(&env, Some(&answers)).unwrap(),
+            K8sParams::for_env(&env),
+        );
+    }
+
+    #[test]
+    fn from_answers_null_values_fall_back_to_default() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "namespace": null,
+            "runtime_image": null,
+            "router_replicas": null,
+            "kubeconfig_context": null,
+        });
+        assert_eq!(
+            K8sParams::from_answers(&env, Some(&answers)).unwrap(),
+            K8sParams::for_env(&env),
+        );
+    }
+
+    #[test]
+    fn from_answers_kubeconfig_context_ignored() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"kubeconfig_context": "my-ctx"});
+        let params = K8sParams::from_answers(&env, Some(&answers)).unwrap();
+        // kubeconfig_context is a client-targeting knob, not a manifest
+        // knob — it must not affect any rendered param.
+        assert_eq!(params, K8sParams::for_env(&env));
+    }
+
+    #[test]
+    fn is_dns1123_label_accepts_valid() {
+        assert!(is_dns1123_label("my-ns"));
+        assert!(is_dns1123_label("a"));
+        assert!(is_dns1123_label("abc-123"));
+        assert!(is_dns1123_label(&"a".repeat(63)));
+    }
+
+    #[test]
+    fn is_dns1123_label_rejects_invalid() {
+        assert!(!is_dns1123_label(""));
+        assert!(!is_dns1123_label("-abc"));
+        assert!(!is_dns1123_label("abc-"));
+        assert!(!is_dns1123_label("ABC"));
+        assert!(!is_dns1123_label("a.b"));
+        assert!(!is_dns1123_label(&"a".repeat(64)));
     }
 }

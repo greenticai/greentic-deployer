@@ -112,6 +112,18 @@ pub trait EnvPackHandler: std::fmt::Debug + Send + Sync {
     fn as_deployer(&self) -> Option<&dyn super::deployer::Deployer> {
         None
     }
+
+    /// Deployer-only: declarative manifest rendering seam (plan §6 step 10).
+    ///
+    /// Returns `Some(_)` only on `Deployer`-slot handlers whose desired
+    /// state is expressible as declarative manifest documents (K8s) —
+    /// this is what `gtc op env render` dispatches through. The default
+    /// `None` is NOT an error state: imperative deployers (local-process,
+    /// AWS-ECS) have no manifest form, and the render verb reports the
+    /// kind as non-renderable.
+    fn as_manifest_renderer(&self) -> Option<&dyn super::render::ManifestRenderer> {
+        None
+    }
 }
 
 /// A built-in, metadata-only handler. One value per default `local` binding.
