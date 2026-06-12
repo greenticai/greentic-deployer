@@ -23,6 +23,16 @@ variable "bundle_source" {
   type = string
 }
 
+variable "bundle_s3_object_ref" {
+  type    = string
+  default = ""
+}
+
+variable "bundle_s3_object_arn" {
+  type    = string
+  default = ""
+}
+
 variable "redis_url" {
   type    = string
   default = ""

@@ -13,6 +13,8 @@ module "operator_aws" {
   deployment_name_prefix = local.name_prefix
   operator_image         = local.operator_image
   bundle_source          = var.bundle_source
+  bundle_s3_object_ref   = var.bundle_s3_object_ref
+  bundle_s3_object_arn   = var.bundle_s3_object_arn
   bundle_digest          = var.bundle_digest
   redis_url              = var.redis_url
   repo_registry_base     = var.repo_registry_base
