@@ -321,6 +321,13 @@ pub struct RevisionTransition {
 /// already committed at its target state, possibly with live traffic — a
 /// transient gate failure must not demote it).
 ///
+/// `expected_start` is the warm verb's PR-3a.6b lifecycle precondition:
+/// when `Some`, the revision's current lifecycle must equal it before any
+/// edge applies, or the walk rejects with
+/// [`RevisionLifecycleError::Conflict`]. The check is skipped when the
+/// revision already sits at the chain's final state — the gate never fires
+/// on that idempotent-retry path, so a stale snapshot is harmless there.
+///
 /// `prune_from_splits = true` is the archive-path knob: refuses with
 /// [`RevisionLifecycleError::ActiveTrafficReference`] while any traffic
 /// split still references the revision, otherwise removes the revision
@@ -329,14 +336,18 @@ pub struct RevisionTransition {
 /// On gate failure the revision's lifecycle is flipped to `Failed` in
 /// place and [`RevisionLifecycleError::HealthGateFailed`] is returned —
 /// see the module's persist rule.
+///
+/// Returns the post-transition revision together with the lifecycle it
+/// started from (the archive eviction-vs-retirement discriminator).
 pub fn walk_revision_chain<F, G>(
     env: &mut Environment,
     revision_id: RevisionId,
     accepted_chain: &[(RevisionLifecycle, RevisionLifecycle)],
+    expected_start: Option<RevisionLifecycle>,
     on_final: F,
     prune_from_splits: bool,
     health_gate: G,
-) -> Result<Revision, RevisionLifecycleError>
+) -> Result<RevisionTransition, RevisionLifecycleError>
 where
     F: FnOnce(&mut Revision),
     G: FnOnce(&Environment, &Revision) -> Result<(), HealthGateFailure>,
@@ -344,6 +355,10 @@ where
     if accepted_chain.is_empty() {
         return Err(RevisionLifecycleError::EmptyChain);
     }
+    let final_state = accepted_chain
+        .last()
+        .map(|(_, to)| *to)
+        .expect("chain non-empty: checked above");
 
     let idx = env
         .revisions
@@ -353,6 +368,18 @@ where
             env_id: env.environment_id.clone(),
             revision_id,
         })?;
+    let starting_lifecycle = env.revisions[idx].lifecycle;
+
+    if let Some(expected) = expected_start
+        && starting_lifecycle != final_state
+        && starting_lifecycle != expected
+    {
+        return Err(RevisionLifecycleError::Conflict {
+            revision_id,
+            actual: starting_lifecycle,
+            expected_starts: vec![expected],
+        });
+    }
 
     let mut chain_advanced = false;
     for (from, to) in accepted_chain {
@@ -367,11 +394,6 @@ where
             chain_advanced = true;
         }
     }
-
-    let final_state = accepted_chain
-        .last()
-        .map(|(_, to)| *to)
-        .expect("chain non-empty: checked above");
 
     if env.revisions[idx].lifecycle != final_state {
         let expected_starts = accepted_chain.iter().map(|(from, _)| *from).collect();
@@ -448,7 +470,10 @@ where
         }
     }
 
-    Ok(env.revisions[idx].clone())
+    Ok(RevisionTransition {
+        revision: env.revisions[idx].clone(),
+        starting_lifecycle,
+    })
 }
 
 /// Stage a fresh revision under `payload.deployment_id`: resolve the
@@ -531,22 +556,14 @@ pub fn warm_revision(
         health_gate,
         expected_lifecycle,
     } = payload;
-    let starting_lifecycle = lifecycle_of(env, revision_id)?;
-    let is_idempotent_retry = starting_lifecycle == RevisionLifecycle::Ready;
-    if !is_idempotent_retry && starting_lifecycle != expected_lifecycle {
-        return Err(RevisionLifecycleError::Conflict {
-            revision_id,
-            actual: starting_lifecycle,
-            expected_starts: vec![expected_lifecycle],
-        });
-    }
-    let revision = walk_revision_chain(
+    walk_revision_chain(
         env,
         revision_id,
         &[
             (RevisionLifecycle::Staged, RevisionLifecycle::Warming),
             (RevisionLifecycle::Warming, RevisionLifecycle::Ready),
         ],
+        Some(expected_lifecycle),
         |r| {
             r.warmed_at = Some(now);
         },
@@ -554,11 +571,7 @@ pub fn warm_revision(
         // FnOnce closure consumes the pre-evaluated outcome — the chain
         // walker only fires the gate when the chain actually advanced.
         |_env, _rev| health_gate,
-    )?;
-    Ok(RevisionTransition {
-        revision,
-        starting_lifecycle,
-    })
+    )
 }
 
 /// Transition a `Ready` revision to `Draining`. Pure lifecycle stamp — the
@@ -568,19 +581,15 @@ pub fn drain_revision(
     env: &mut Environment,
     revision_id: RevisionId,
 ) -> Result<RevisionTransition, RevisionLifecycleError> {
-    let starting_lifecycle = lifecycle_of(env, revision_id)?;
-    let revision = walk_revision_chain(
+    walk_revision_chain(
         env,
         revision_id,
         &[(RevisionLifecycle::Ready, RevisionLifecycle::Draining)],
+        None,
         |_| {},
         false,
         |_env, _rev| Ok(()),
-    )?;
-    Ok(RevisionTransition {
-        revision,
-        starting_lifecycle,
-    })
+    )
 }
 
 /// Archive a revision, walking any of `Staged | Warming | Ready | Failed`
@@ -591,8 +600,7 @@ pub fn archive_revision(
     env: &mut Environment,
     revision_id: RevisionId,
 ) -> Result<RevisionTransition, RevisionLifecycleError> {
-    let starting_lifecycle = lifecycle_of(env, revision_id)?;
-    let revision = walk_revision_chain(
+    walk_revision_chain(
         env,
         revision_id,
         &[
@@ -603,29 +611,11 @@ pub fn archive_revision(
             (RevisionLifecycle::Draining, RevisionLifecycle::Inactive),
             (RevisionLifecycle::Inactive, RevisionLifecycle::Archived),
         ],
+        None,
         |_| {},
         true,
         |_env, _rev| Ok(()),
-    )?;
-    Ok(RevisionTransition {
-        revision,
-        starting_lifecycle,
-    })
-}
-
-/// Current lifecycle of `revision_id`, or [`RevisionLifecycleError::NotFound`].
-fn lifecycle_of(
-    env: &Environment,
-    revision_id: RevisionId,
-) -> Result<RevisionLifecycle, RevisionLifecycleError> {
-    env.revisions
-        .iter()
-        .find(|r| r.revision_id == revision_id)
-        .map(|r| r.lifecycle)
-        .ok_or_else(|| RevisionLifecycleError::NotFound {
-            env_id: env.environment_id.clone(),
-            revision_id,
-        })
+    )
 }
 
 #[cfg(test)]

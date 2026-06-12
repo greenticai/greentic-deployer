@@ -281,13 +281,14 @@ where
         &mut env,
         revision_id,
         accepted_chain,
+        None,
         on_final,
         prune_from_splits,
         health_gate,
     ) {
-        Ok(revision) => {
+        Ok(transition) => {
             locked.save(&env)?;
-            Ok(revision)
+            Ok(transition.revision)
         }
         Err(err) if err.env_mutated() => {
             locked.save(&env)?;
