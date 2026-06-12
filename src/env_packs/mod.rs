@@ -9,12 +9,14 @@
 #[cfg(feature = "creds-aws")]
 pub mod aws;
 pub mod deployer;
+pub mod k8s;
 pub mod local_process;
 pub mod registry;
 pub mod slot;
 
 #[cfg(feature = "creds-aws")]
 pub use aws::{AwsDeployerCredentials, AwsEcsDeployerHandler, AwsValidatorClient};
+pub use k8s::{K8sDeployerCredentials, K8sDeployerHandler, K8sValidatorClient};
 pub use local_process::{LocalProcessCredentials, LocalProcessDeployerHandler};
 pub use registry::{EnvPackRegistry, RegistryError};
 pub use slot::{BUILTIN_HANDLERS, BuiltinHandler, EnvPackHandler};
