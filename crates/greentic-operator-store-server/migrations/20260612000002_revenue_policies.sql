@@ -5,12 +5,14 @@
 -- the DSSE envelope the shared builder
 -- (`greentic_operator_trust::revenue_policy`) produced.
 --
--- No CAS columns: the environment row's CAS guards the bundle mutation
--- that writes a version, and version numbers derive from the COMMITTED
--- `BundleDeployment.revenue_policy_ref` — a mutation that fails after this
--- insert leaves an orphan row at the same version, which the retry
--- overwrites (INSERT OR REPLACE), mirroring the LocalFS orphan-file
--- semantics. Rows are never deleted.
+-- No CAS columns: rows commit in the SAME transaction as the environment
+-- CAS update that pins their ref (`update_env_with_revenue_policy`), so a
+-- conflicting env write rolls the artifact back too and committed env
+-- state never references (or is shadowed by) a losing mutation's
+-- artifact. Version numbers derive from the COMMITTED
+-- `BundleDeployment.revenue_policy_ref`; a same-version rebuild (same-key
+-- retry, PR-4.3) overwrites via INSERT OR REPLACE. Rows are never
+-- deleted.
 --
 -- IMMUTABLE AFTER FIRST MERGE: sqlx tracks applied migrations by checksum
 -- in `_sqlx_migrations`. All subsequent schema changes must land as new

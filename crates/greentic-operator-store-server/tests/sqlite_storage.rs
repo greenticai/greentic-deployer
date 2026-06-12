@@ -789,6 +789,11 @@ async fn load_trust_root_detects_tampered_data() {
 // ---------------------------------------------------------------------------
 // revenue_policies (PR-4.2g)
 // ---------------------------------------------------------------------------
+//
+// The artifact never lands alone: `update_env_with_revenue_policy` commits
+// the artifact row, the environment CAS update, and a re-check of the
+// trust-root revision the signature was evaluated against in ONE
+// transaction (the server analogue of the LocalFS flock).
 
 fn policy_artifact(version: u64, payload: &str) -> RevenuePolicyArtifact {
     RevenuePolicyArtifact {
@@ -803,42 +808,61 @@ fn policy_artifact(version: u64, payload: &str) -> RevenuePolicyArtifact {
     }
 }
 
+async fn load_policy(
+    store: &SqliteEnvironmentStore,
+    id: &EnvId,
+    version: u64,
+) -> Option<RevenuePolicyArtifact> {
+    store
+        .load_revenue_policy(
+            id,
+            &BundleId::new("acme"),
+            &CustomerId::new("cust-1"),
+            version,
+        )
+        .await
+        .expect("load artifact")
+}
+
 #[tokio::test]
-async fn revenue_policy_round_trips_per_version() {
+async fn revenue_policy_commits_with_env_and_round_trips_per_version() {
     let (_dir, store) = fresh_store().await;
     let id = env_id("local");
-    store
-        .create_env(&minimal_environment(&id))
-        .await
-        .expect("create env");
+    let env = minimal_environment(&id);
+    let rev1 = store.create_env(&env).await.expect("create env");
 
-    store
-        .upsert_revenue_policy(&id, &policy_artifact(1, "v1-doc"))
+    // No trust-root row → pin is None.
+    let rev2 = store
+        .update_env_with_revenue_policy(
+            &env,
+            &Precondition::matching(rev1.etag.clone(), rev1.generation),
+            &policy_artifact(1, "v1-doc"),
+            None,
+        )
         .await
-        .expect("store v1");
-    store
-        .upsert_revenue_policy(&id, &policy_artifact(2, "v2-doc"))
-        .await
-        .expect("store v2");
+        .expect("commit v1 + env");
+    assert_eq!(rev2.generation, 2, "env CAS advanced with the artifact");
 
-    let v1 = store
-        .load_revenue_policy(&id, &BundleId::new("acme"), &CustomerId::new("cust-1"), 1)
+    let rev3 = store
+        .update_env_with_revenue_policy(
+            &env,
+            &Precondition::matching(rev2.etag.clone(), rev2.generation),
+            &policy_artifact(2, "v2-doc"),
+            None,
+        )
         .await
-        .expect("load v1")
-        .expect("v1 present");
-    assert_eq!(v1, policy_artifact(1, "v1-doc"));
-    let v2 = store
-        .load_revenue_policy(&id, &BundleId::new("acme"), &CustomerId::new("cust-1"), 2)
-        .await
-        .expect("load v2")
-        .expect("v2 present");
-    assert_eq!(v2.doc, b"v2-doc");
+        .expect("commit v2 + env");
+    assert_eq!(rev3.generation, 3);
 
-    let absent = store
-        .load_revenue_policy(&id, &BundleId::new("acme"), &CustomerId::new("cust-1"), 3)
-        .await
-        .expect("load v3");
-    assert!(absent.is_none());
+    assert_eq!(
+        load_policy(&store, &id, 1).await.expect("v1 present"),
+        policy_artifact(1, "v1-doc")
+    );
+    assert_eq!(
+        load_policy(&store, &id, 2).await.expect("v2 present").doc,
+        b"v2-doc"
+    );
+    assert!(load_policy(&store, &id, 3).await.is_none());
     let other_customer = store
         .load_revenue_policy(&id, &BundleId::new("acme"), &CustomerId::new("other"), 1)
         .await
@@ -847,30 +871,149 @@ async fn revenue_policy_round_trips_per_version() {
 }
 
 #[tokio::test]
-async fn revenue_policy_overwrites_orphan_at_same_version() {
-    // A mutation that failed after the artifact write leaves an orphan row;
-    // the retry derives the SAME version from the committed ref and must
-    // overwrite it, never error or duplicate.
+async fn revenue_policy_rolls_back_when_env_cas_fails() {
+    // Codex F1: a CAS conflict on the environment must take the artifact
+    // down with it — a committed env can never reference (or be shadowed
+    // by) an artifact from a losing concurrent mutation.
     let (_dir, store) = fresh_store().await;
     let id = env_id("local");
-    store
-        .create_env(&minimal_environment(&id))
-        .await
-        .expect("create env");
+    let env = minimal_environment(&id);
+    let rev1 = store.create_env(&env).await.expect("create env");
 
-    store
-        .upsert_revenue_policy(&id, &policy_artifact(1, "orphan"))
+    // Advance the env so the captured precondition goes stale.
+    let rev2 = store
+        .update_env(
+            &env,
+            &Precondition::matching(rev1.etag.clone(), rev1.generation),
+        )
         .await
-        .expect("first write");
-    store
-        .upsert_revenue_policy(&id, &policy_artifact(1, "retry"))
-        .await
-        .expect("retry overwrites");
+        .expect("advance env");
+    assert_eq!(rev2.generation, 2);
 
-    let stored = store
-        .load_revenue_policy(&id, &BundleId::new("acme"), &CustomerId::new("cust-1"), 1)
+    let err = store
+        .update_env_with_revenue_policy(
+            &env,
+            &Precondition::matching(rev1.etag, rev1.generation), // stale
+            &policy_artifact(1, "loser"),
+            None,
+        )
         .await
-        .expect("load")
-        .expect("present");
-    assert_eq!(stored.doc, b"retry");
+        .expect_err("stale CAS must fail");
+    assert!(
+        matches!(err, StorageError::PreconditionFailed { .. }),
+        "expected PreconditionFailed, got: {err:?}"
+    );
+    assert!(
+        load_policy(&store, &id, 1).await.is_none(),
+        "artifact must roll back with the failed env CAS"
+    );
+}
+
+#[tokio::test]
+async fn revenue_policy_rejects_when_trust_root_moved_since_load() {
+    // Codex F2: a trust-root mutation (e.g. revocation) between the
+    // handler's load and the signing commit must invalidate the commit —
+    // the pinned revision no longer matches.
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    let env = minimal_environment(&id);
+    let rev1 = store.create_env(&env).await.expect("create env");
+
+    // The signer loaded the trust root at generation 1...
+    let root_rev1 = store
+        .upsert_trust_root(&id, &trust_doc(&[7]), None)
+        .await
+        .expect("seed trust root");
+    // ...then a concurrent mutation (revocation) advanced it.
+    store
+        .upsert_trust_root(
+            &id,
+            &trust_doc(&[8]),
+            Some(&Precondition::matching(
+                root_rev1.etag.clone(),
+                root_rev1.generation,
+            )),
+        )
+        .await
+        .expect("concurrent trust-root mutation");
+
+    let err = store
+        .update_env_with_revenue_policy(
+            &env,
+            &Precondition::matching(rev1.etag.clone(), rev1.generation),
+            &policy_artifact(1, "stale-signature"),
+            Some(&root_rev1), // pin from BEFORE the concurrent mutation
+        )
+        .await
+        .expect_err("moved trust root must reject the commit");
+    assert!(
+        matches!(err, StorageError::TrustRootChanged { .. }),
+        "expected TrustRootChanged, got: {err:?}"
+    );
+    assert!(
+        load_policy(&store, &id, 1).await.is_none(),
+        "nothing persists on a trust-root pin mismatch"
+    );
+    let env_after = store.load_env(&id).await.expect("load env");
+    assert_eq!(env_after.revision.generation, 1, "env untouched");
+}
+
+#[tokio::test]
+async fn revenue_policy_rejects_when_trust_root_appeared_since_load() {
+    // The None-pin arm: the signer observed NO trust-root row (and could
+    // only have refused — but the storage contract still rejects if a row
+    // appeared, keeping the invariant unconditional).
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    let env = minimal_environment(&id);
+    let rev1 = store.create_env(&env).await.expect("create env");
+    store
+        .upsert_trust_root(&id, &trust_doc(&[7]), None)
+        .await
+        .expect("row appears after the signer's load");
+
+    let err = store
+        .update_env_with_revenue_policy(
+            &env,
+            &Precondition::matching(rev1.etag, rev1.generation),
+            &policy_artifact(1, "doc"),
+            None, // signer saw no row
+        )
+        .await
+        .expect_err("appeared trust root must reject the commit");
+    assert!(matches!(err, StorageError::TrustRootChanged { .. }));
+}
+
+#[tokio::test]
+async fn revenue_policy_overwrites_replayed_version_under_matching_pin() {
+    // Same-version rebuilds (a same-key retry after a lost response,
+    // PR-4.3) overwrite the row rather than duplicate or error.
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    let env = minimal_environment(&id);
+    let rev1 = store.create_env(&env).await.expect("create env");
+
+    let rev2 = store
+        .update_env_with_revenue_policy(
+            &env,
+            &Precondition::matching(rev1.etag, rev1.generation),
+            &policy_artifact(1, "first"),
+            None,
+        )
+        .await
+        .expect("first commit");
+    store
+        .update_env_with_revenue_policy(
+            &env,
+            &Precondition::matching(rev2.etag, rev2.generation),
+            &policy_artifact(1, "rebuild"),
+            None,
+        )
+        .await
+        .expect("same-version rebuild overwrites");
+
+    assert_eq!(
+        load_policy(&store, &id, 1).await.expect("present").doc,
+        b"rebuild"
+    );
 }

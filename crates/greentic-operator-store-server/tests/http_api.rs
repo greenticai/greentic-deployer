@@ -2488,3 +2488,77 @@ async fn bundles_remove_unknown_deployment_is_404_dependent_not_found() {
     assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
     assert_eq!(body["kind"], "dependent-not-found");
 }
+
+#[tokio::test]
+async fn bundles_concurrent_updates_keep_env_and_artifact_consistent() {
+    // Codex F1 at the route level: two concurrent revenue-share updates of
+    // the same deployment race load → build → commit. Whatever the
+    // interleave (full serialization → both 200; overlapping loads → the
+    // loser's CAS fails 412 and its artifact rolls back), the COMMITTED
+    // environment must reference an artifact whose content matches the
+    // committed revenue share.
+    let (_d, app, store) = bundles_app().await;
+    let did = add_one_bundle(&app, "acme", "cust-1").await;
+
+    let update = |party: &str, key: &str| {
+        let body = json!({
+            "deployment_id": did.to_string(),
+            "revenue_share": [{"party_id": party, "basis_points": 10_000}],
+        });
+        let key = key.to_string();
+        let app = app.clone();
+        async move {
+            send_custom(
+                app,
+                Method::PATCH,
+                &format!("/environments/local/bundles/{did}"),
+                Some(body),
+                &[("Idempotency-Key", &key)],
+            )
+            .await
+        }
+    };
+    let (r1, r2) = tokio::join!(update("party-a", "RACE-A"), update("party-b", "RACE-B"));
+
+    for (status, body) in [&r1, &r2] {
+        assert!(
+            *status == StatusCode::OK || *status == StatusCode::PRECONDITION_FAILED,
+            "unexpected status {status}: {body}"
+        );
+    }
+    assert!(
+        r1.0 == StatusCode::OK || r2.0 == StatusCode::OK,
+        "at least one update commits: {} / {}",
+        r1.1,
+        r2.1
+    );
+
+    // Committed env state and the artifact behind its ref agree.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    let bundle = &read["environment"]["bundles"][0];
+    let committed_party = bundle["revenue_share"][0]["party_id"]
+        .as_str()
+        .expect("party");
+    let ref_str = bundle["revenue_policy_ref"].as_str().expect("ref");
+    let version: u64 = ref_str
+        .rsplit_once("/v")
+        .and_then(|(_, tail)| tail.strip_suffix(".json.sig"))
+        .expect("vN ref shape")
+        .parse()
+        .expect("numeric version");
+    let artifact = store
+        .load_revenue_policy(
+            &EnvId::try_from("local").unwrap(),
+            &BundleId::new("acme"),
+            &CustomerId::new("cust-1"),
+            version,
+        )
+        .await
+        .expect("load artifact")
+        .expect("referenced artifact exists");
+    let doc: Value = serde_json::from_slice(&artifact.doc).expect("doc decodes");
+    assert_eq!(
+        doc["revenue_share"][0]["party_id"], committed_party,
+        "committed env and its referenced artifact must agree; env: {bundle}, doc: {doc}"
+    );
+}

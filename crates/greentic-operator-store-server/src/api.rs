@@ -290,6 +290,11 @@ fn map_storage_error(err: StorageError) -> RemoteStoreError {
         StorageError::EnvIdMismatch { keyed, payload } => RemoteStoreError::InvalidRequest {
             detail: format!("environment_id mismatch: keyed `{keyed}`, payload `{payload}`"),
         },
+        // Retryable: a concurrent trust-root mutation (e.g. revocation)
+        // raced a signing commit; the caller reloads and re-evaluates.
+        err @ StorageError::TrustRootChanged { .. } => RemoteStoreError::Conflict {
+            detail: err.to_string(),
+        },
         // Backend/serde internals stay opaque — no driver details on the wire.
         StorageError::Integrity(_) | StorageError::Json(_) | StorageError::Backend(_) => {
             RemoteStoreError::Internal {
@@ -1115,11 +1120,14 @@ pub(crate) async fn rollback_extension_binding<S: EnvironmentStorage>(
 // trust root coming from the env's trust-root ROW (closed by default: no
 // row ⇒ empty trust root ⇒ the builder refuses — run
 // `POST …/trust-root/bootstrap` first) and the signature coming from the
-// SERVER's operator key. Write order mirrors the LocalFS flock sequence:
-// policy artifact first, env document (with the pinned ref) second — a CAS
-// failure on the env write leaves an orphan policy row at the same
-// version, which the retry overwrites (versions derive from the COMMITTED
-// ref).
+// SERVER's operator key. The artifact row, the env document (with the
+// pinned ref), and a re-check of the trust-root revision the signature
+// was evaluated against commit in ONE transaction
+// (`update_env_with_revenue_policy`) — the server analogue of the LocalFS
+// flock, under which the policy-file write and the env.json save are a
+// single critical section. A CAS conflict therefore rolls the artifact
+// back too, and a trust-root mutation racing the signing window surfaces
+// as a retryable 409 instead of committing a stale signature.
 
 /// Map the shared revenue-policy builder's refusals onto the A8 wire
 /// vocabulary. `env_id` contextualizes the not-trusted message the
@@ -1177,23 +1185,36 @@ fn parse_deployment_id(raw: &str) -> Result<DeploymentId, ApiError> {
     })
 }
 
-/// Build + persist the next revenue-policy version for `deployment` and
-/// return the built artifact (the caller pins `policy_ref` on the
-/// deployment before persisting the env). Trust root comes from the env's
-/// row — absent row decodes to an EMPTY trust root, so the shared builder
-/// refuses closed-by-default until the env is bootstrapped.
-async fn write_revenue_policy<S: EnvironmentStorage>(
+/// A built-but-not-yet-committed revenue-policy version: the artifact row
+/// ready for storage plus the trust-root row revision the signature was
+/// evaluated against. Committing is the handler's job, via
+/// `update_env_with_revenue_policy` — ONE transaction re-checks the pin,
+/// stores the artifact, and CAS-updates the environment, so committed env
+/// state, the artifact it references, and the trust root that authorized
+/// the signature can never diverge (Codex F1/F2).
+struct PendingRevenuePolicy {
+    built: revenue_policy::BuiltRevenuePolicyVersion,
+    artifact: RevenuePolicyArtifact,
+    trust_root_pin: Option<EnvRevision>,
+}
+
+/// Build the next revenue-policy version for `deployment`. Trust root
+/// comes from the env's row — absent row decodes to an EMPTY trust root,
+/// so the shared builder refuses closed-by-default until the env is
+/// bootstrapped. Pure build: nothing is persisted here.
+async fn build_revenue_policy<S: EnvironmentStorage>(
     state: &AppState<S>,
     env_id: &EnvId,
     deployment: &BundleDeployment,
     created_at: chrono::DateTime<Utc>,
-) -> Result<revenue_policy::BuiltRevenuePolicyVersion, ApiError> {
-    let trust_root = match state
+) -> Result<PendingRevenuePolicy, ApiError> {
+    let loaded_root = state
         .storage
         .load_trust_root(env_id)
         .await
-        .map_err(load_storage_error)?
-    {
+        .map_err(load_storage_error)?;
+    let trust_root_pin = loaded_root.as_ref().map(|l| l.revision.clone());
+    let trust_root = match loaded_root {
         Some(loaded) => loaded.value.into_trust_root()?,
         None => TrustRoot::default(),
     };
@@ -1206,23 +1227,21 @@ async fn write_revenue_policy<S: EnvironmentStorage>(
         &trust_root,
     )
     .map_err(|err| map_revenue_policy_error(err, env_id))?;
-    state
-        .storage
-        .upsert_revenue_policy(
-            env_id,
-            &RevenuePolicyArtifact {
-                bundle_id: deployment.bundle_id.clone(),
-                customer_id: deployment.customer_id.clone(),
-                version: built.version,
-                policy_ref: built.policy_ref.to_string_lossy().replace('\\', "/"),
-                doc: built.doc_bytes.clone(),
-                envelope: built.envelope_bytes.clone(),
-                doc_sha256: built.doc_sha256.clone(),
-                key_id: built.key_id.clone(),
-            },
-        )
-        .await?;
-    Ok(built)
+    let artifact = RevenuePolicyArtifact {
+        bundle_id: deployment.bundle_id.clone(),
+        customer_id: deployment.customer_id.clone(),
+        version: built.version,
+        policy_ref: built.policy_ref.to_string_lossy().replace('\\', "/"),
+        doc: built.doc_bytes.clone(),
+        envelope: built.envelope_bytes.clone(),
+        doc_sha256: built.doc_sha256.clone(),
+        key_id: built.key_id.clone(),
+    };
+    Ok(PendingRevenuePolicy {
+        built,
+        artifact,
+        trust_root_pin,
+    })
 }
 
 /// `POST /environments/{env_id}/bundles` — deploy a bundle for a customer
@@ -1246,17 +1265,25 @@ pub(crate) async fn add_bundle<S: EnvironmentStorage>(
     let mut env = loaded.value;
     let now = Utc::now();
     let idx = engine::add_bundle(&mut env, payload, DeploymentId::new(), now)?;
-    let built = write_revenue_policy(&state, &env_id, &env.bundles[idx], now).await?;
-    env.bundles[idx].revenue_policy_ref = built.policy_ref;
+    let pending = build_revenue_policy(&state, &env_id, &env.bundles[idx], now).await?;
+    env.bundles[idx].revenue_policy_ref = pending.built.policy_ref.clone();
     let precondition = resolve_precondition(client_etag, &loaded.revision);
-    let revision = state.storage.update_env(&env, &precondition).await?;
+    let revision = state
+        .storage
+        .update_env_with_revenue_policy(
+            &env,
+            &precondition,
+            &pending.artifact,
+            pending.trust_root_pin.as_ref(),
+        )
+        .await?;
     let deployment = env.bundles[idx].clone();
     let target = json!({
         "environment_id": env_id,
         "deployment_id": deployment.deployment_id,
         "bundle_id": deployment.bundle_id,
         "customer_id": deployment.customer_id,
-        "revenue_policy_version": built.version,
+        "revenue_policy_version": pending.built.version,
     });
     Ok(mutation_response(
         deployment,
@@ -1301,14 +1328,29 @@ pub(crate) async fn update_bundle<S: EnvironmentStorage>(
     let mut env = loaded.value;
     let applied = engine::update_bundle(&mut env, payload)?;
     let idx = applied.index;
-    let mut policy_version = None;
-    if applied.revenue_share_changed {
-        let built = write_revenue_policy(&state, &env_id, &env.bundles[idx], Utc::now()).await?;
-        policy_version = Some(built.version);
-        env.bundles[idx].revenue_policy_ref = built.policy_ref;
-    }
+    let pending = if applied.revenue_share_changed {
+        let pending = build_revenue_policy(&state, &env_id, &env.bundles[idx], Utc::now()).await?;
+        env.bundles[idx].revenue_policy_ref = pending.built.policy_ref.clone();
+        Some(pending)
+    } else {
+        None
+    };
+    let policy_version = pending.as_ref().map(|p| p.built.version);
     let precondition = resolve_precondition(client_etag, &loaded.revision);
-    let revision = state.storage.update_env(&env, &precondition).await?;
+    let revision = match &pending {
+        Some(p) => {
+            state
+                .storage
+                .update_env_with_revenue_policy(
+                    &env,
+                    &precondition,
+                    &p.artifact,
+                    p.trust_root_pin.as_ref(),
+                )
+                .await?
+        }
+        None => state.storage.update_env(&env, &precondition).await?,
+    };
     let deployment = env.bundles[idx].clone();
     let target = json!({
         "environment_id": env_id,

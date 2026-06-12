@@ -223,45 +223,10 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         env: &Environment,
         precondition: &Precondition,
     ) -> Result<EnvRevision, StorageError> {
-        validate_environment(env)?;
-        if !precondition.is_conditional() {
-            return Err(StorageError::PreconditionRequired);
-        }
-        let (etag, integrity, data) = serialize_for_write(env)?;
-
         let mut tx = self.pool.begin().await?;
-        let current = sqlx::query("SELECT generation, etag FROM environments WHERE env_id = $1")
-            .bind(env.environment_id.as_str())
-            .fetch_optional(&mut *tx)
-            .await?;
-        let Some(current) = current else {
-            return Err(StorageError::NotFound(env.environment_id.clone()));
-        };
-        let current_rev = decode_revision(&current)?;
-        precondition
-            .check(&current_rev.etag, current_rev.generation)
-            .map_err(|e| StorageError::from_precondition(env.environment_id.clone(), e))?;
-
-        let new_gen = current_rev.generation + 1;
-        sqlx::query(
-            "UPDATE environments \
-             SET data = $1, generation = $2, etag = $3, integrity_digest = $4, \
-                 updated_at = datetime('now') \
-             WHERE env_id = $5",
-        )
-        .bind(&data)
-        .bind(new_gen as i64)
-        .bind(&etag.0)
-        .bind(&integrity.digest)
-        .bind(env.environment_id.as_str())
-        .execute(&mut *tx)
-        .await?;
+        let revision = update_env_in_tx(&mut tx, env, precondition).await?;
         tx.commit().await?;
-
-        Ok(EnvRevision {
-            generation: new_gen,
-            etag,
-        })
+        Ok(revision)
     }
 
     // --- runtime --------------------------------------------------------
@@ -643,14 +608,38 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         Ok(())
     }
 
-    async fn upsert_revenue_policy(
+    async fn update_env_with_revenue_policy(
         &self,
-        env_id: &EnvId,
+        env: &Environment,
+        precondition: &Precondition,
         artifact: &RevenuePolicyArtifact,
-    ) -> Result<(), StorageError> {
-        // INSERT OR REPLACE by primary key: an orphan row left by a
-        // mutation that failed after this write gets overwritten when the
-        // retry rebuilds the same version (see the trait docs).
+        trust_root_pin: Option<&EnvRevision>,
+    ) -> Result<EnvRevision, StorageError> {
+        let env_id = &env.environment_id;
+        let mut tx = self.pool.begin().await?;
+
+        // 1. The trust root the caller signed against must not have moved
+        //    (a concurrent revocation between load and commit invalidates
+        //    the signature it would otherwise race past).
+        let current_root =
+            sqlx::query("SELECT generation, etag FROM trust_roots WHERE env_id = $1")
+                .bind(env_id.as_str())
+                .fetch_optional(&mut *tx)
+                .await?;
+        let unchanged = match (&current_root, trust_root_pin) {
+            (None, None) => true,
+            (Some(row), Some(pin)) => decode_revision(row)? == *pin,
+            _ => false,
+        };
+        if !unchanged {
+            return Err(StorageError::TrustRootChanged {
+                env_id: env_id.clone(),
+            });
+        }
+
+        // 2. The artifact, INSERT OR REPLACE on its version key (a
+        //    same-key replay rebuilding the same version overwrites
+        //    rather than duplicates).
         sqlx::query(
             "INSERT OR REPLACE INTO revenue_policies \
              (env_id, bundle_id, customer_id, version, policy_ref, doc, \
@@ -666,9 +655,15 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         .bind(&artifact.envelope)
         .bind(&artifact.doc_sha256)
         .bind(&artifact.key_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+
+        // 3. The environment under its CAS pin. A conflict here rolls the
+        //    artifact back too — committed env state and the artifact it
+        //    references commit or fail as one.
+        let revision = update_env_in_tx(&mut tx, env, precondition).await?;
+        tx.commit().await?;
+        Ok(revision)
     }
 
     async fn load_revenue_policy(
@@ -707,6 +702,53 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
 }
 
 // --- helpers ------------------------------------------------------------
+
+/// CAS-checked environment UPDATE inside an existing transaction — the
+/// shared body of `update_env` and `update_env_with_revenue_policy`. The
+/// caller owns commit/rollback.
+async fn update_env_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    env: &Environment,
+    precondition: &Precondition,
+) -> Result<EnvRevision, StorageError> {
+    validate_environment(env)?;
+    if !precondition.is_conditional() {
+        return Err(StorageError::PreconditionRequired);
+    }
+    let (etag, integrity, data) = serialize_for_write(env)?;
+
+    let current = sqlx::query("SELECT generation, etag FROM environments WHERE env_id = $1")
+        .bind(env.environment_id.as_str())
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(current) = current else {
+        return Err(StorageError::NotFound(env.environment_id.clone()));
+    };
+    let current_rev = decode_revision(&current)?;
+    precondition
+        .check(&current_rev.etag, current_rev.generation)
+        .map_err(|e| StorageError::from_precondition(env.environment_id.clone(), e))?;
+
+    let new_gen = current_rev.generation + 1;
+    sqlx::query(
+        "UPDATE environments \
+         SET data = $1, generation = $2, etag = $3, integrity_digest = $4, \
+             updated_at = datetime('now') \
+         WHERE env_id = $5",
+    )
+    .bind(&data)
+    .bind(new_gen as i64)
+    .bind(&etag.0)
+    .bind(&integrity.digest)
+    .bind(env.environment_id.as_str())
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(EnvRevision {
+        generation: new_gen,
+        etag,
+    })
+}
 
 fn validate_environment(env: &Environment) -> Result<(), StorageError> {
     if env.schema.as_str() != SchemaVersion::ENVIRONMENT_V1 {
