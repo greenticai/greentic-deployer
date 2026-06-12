@@ -1993,3 +1993,139 @@ async fn trust_root_verbs_on_missing_env_are_404() {
         assert_eq!(body["kind"], "not-found", "{method} {path}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Concurrent trust-root first-write convergence (F3 race fix)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn trust_root_concurrent_seeds_converge() {
+    let (_d, app, _store) = app_with_trust_key().await;
+    create_local_env(&app).await;
+
+    // Fire 4 concurrent seeds with distinct idempotency keys.
+    let (r1, r2, r3, r4) = tokio::join!(
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/trust-root/seed",
+            None,
+            &[("Idempotency-Key", "SEED-RACE-1")],
+        ),
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/trust-root/seed",
+            None,
+            &[("Idempotency-Key", "SEED-RACE-2")],
+        ),
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/trust-root/seed",
+            None,
+            &[("Idempotency-Key", "SEED-RACE-3")],
+        ),
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/trust-root/seed",
+            None,
+            &[("Idempotency-Key", "SEED-RACE-4")],
+        ),
+    );
+
+    let results = [r1, r2, r3, r4];
+    for (i, (status, body)) in results.iter().enumerate() {
+        assert_eq!(*status, StatusCode::OK, "seed {i} body: {body}");
+    }
+
+    // Exactly one result is non-null (the winner); the rest are null no-ops.
+    let non_null_count = results
+        .iter()
+        .filter(|(_, body)| !body["result"].is_null())
+        .count();
+    assert_eq!(
+        non_null_count, 1,
+        "exactly one seed must win; got {non_null_count} non-null results"
+    );
+
+    // Final state: exactly 1 key.
+    let (status, body) = send(app, Method::GET, "/environments/local/trust-root", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["keys"].as_array().expect("keys").len(), 1);
+}
+
+#[tokio::test]
+async fn trust_root_concurrent_adds_of_distinct_keys_both_land() {
+    let (_d, app, _store) = app_with_trust_key().await;
+    create_local_env(&app).await;
+
+    let (pem_a, id_a) = keypair(60);
+    let (pem_b, id_b) = keypair(61);
+
+    let (r1, r2) = tokio::join!(
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/trust-root/keys",
+            Some(json!({"key_id": id_a, "public_key_pem": pem_a})),
+            &[("Idempotency-Key", "ADD-RACE-1")],
+        ),
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/trust-root/keys",
+            Some(json!({"key_id": id_b, "public_key_pem": pem_b})),
+            &[("Idempotency-Key", "ADD-RACE-2")],
+        ),
+    );
+
+    assert_eq!(r1.0, StatusCode::OK, "add key A: {}", r1.1);
+    assert_eq!(r2.0, StatusCode::OK, "add key B: {}", r2.1);
+
+    // Both distinct keys must be present.
+    let (status, body) = send(app, Method::GET, "/environments/local/trust-root", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["keys"].as_array().expect("keys").len(),
+        2,
+        "both distinct keys must land: {body}"
+    );
+}
+
+#[tokio::test]
+async fn trust_root_concurrent_bootstraps_converge() {
+    let (_d, app, _store) = app_with_trust_key().await;
+    create_local_env(&app).await;
+
+    let (r1, r2) = tokio::join!(
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/trust-root/bootstrap",
+            None,
+            &[("Idempotency-Key", "BOOT-RACE-1")],
+        ),
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/trust-root/bootstrap",
+            None,
+            &[("Idempotency-Key", "BOOT-RACE-2")],
+        ),
+    );
+
+    assert_eq!(r1.0, StatusCode::OK, "bootstrap 1: {}", r1.1);
+    assert_eq!(r2.0, StatusCode::OK, "bootstrap 2: {}", r2.1);
+
+    // Both report the same key_id.
+    let kid1 = r1.1["result"]["key_id"].as_str().expect("key_id 1");
+    let kid2 = r2.1["result"]["key_id"].as_str().expect("key_id 2");
+    assert_eq!(kid1, kid2, "both bootstraps must report the same key");
+
+    // Final state: exactly 1 key.
+    let (status, body) = send(app, Method::GET, "/environments/local/trust-root", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["keys"].as_array().expect("keys").len(), 1);
+}

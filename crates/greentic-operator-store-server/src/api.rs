@@ -1107,10 +1107,16 @@ pub(crate) async fn rollback_extension_binding<S: EnvironmentStorage>(
 // unchanged CAS coordinates (previous == new generation — mirroring the
 // local path, whose trust-root audit records carry no generations), while
 // the trust-root row's OWN generation/etag pins the upsert internally so
-// concurrent trust-root mutations conflict with a 412 like every other
-// verb group. The pure semantics (key-id canonicalization, validation,
-// add/remove transforms) come from `greentic-operator-trust` — the same
-// functions `LocalFsStore` drives, per the same-derivation rule.
+// concurrent trust-root mutations that carry a CAS pin conflict with a 412
+// like every other verb group. First-write races (load returns None,
+// concurrent writer inserts before this writer) are detected as
+// `PreconditionRequired` with no precondition — an unambiguous signal
+// because trust-root rows are never deleted — and converge
+// deterministically via a single reload-and-retry (the retry carries a CAS
+// pin, so a second conflict surfaces as an honest 412). The pure semantics
+// (key-id canonicalization, validation, add/remove transforms) come from
+// `greentic-operator-trust` — the same functions `LocalFsStore` drives,
+// per the same-derivation rule.
 
 /// Decoded preamble shared by the four trust-root mutations: the
 /// idempotency key, the parsed env id, the env's CAS coordinates (the
@@ -1193,30 +1199,96 @@ fn operator_key_unavailable() -> ApiError {
     })
 }
 
+/// Outcome of a trust-root upsert attempt.
+enum TrustRootPersist {
+    Persisted,
+    /// The row appeared between the handler's load and this write
+    /// (`PreconditionRequired` with no precondition can only mean that —
+    /// see `doc_and_precondition`). The caller reloads and retries once;
+    /// the retry carries a CAS pin, so a second race surfaces as an
+    /// honest 412.
+    Raced,
+}
+
+async fn upsert_trust_root_or_race<S: EnvironmentStorage>(
+    state: &AppState<S>,
+    env_id: &EnvId,
+    doc: &TrustRootDocument,
+    precondition: Option<&Precondition>,
+) -> Result<TrustRootPersist, ApiError> {
+    match state
+        .storage
+        .upsert_trust_root(env_id, doc, precondition)
+        .await
+    {
+        Ok(_revision) => Ok(TrustRootPersist::Persisted),
+        Err(StorageError::PreconditionRequired) if precondition.is_none() => {
+            Ok(TrustRootPersist::Raced)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// What a granting verb does when the first write races a concurrent
+/// creator (the row appeared between load and write).
+enum GrantRace {
+    /// `bootstrap` — reload and re-grant under the CAS pin (idempotent
+    /// re-grant; the local flock-serialized backend converges the same
+    /// way).
+    Retry,
+    /// `seed` — the gate flipped concurrently; the verb's contract is
+    /// the silent `null` no-op, exactly as if the row had existed at
+    /// load time.
+    NoOp,
+}
+
 /// Shared body of bootstrap/seed: add the server operator key to the
 /// (possibly fresh) document — idempotent re-grant on case-insensitive
-/// `key_id` collision — and persist under the row's CAS pin.
+/// `key_id` collision — and persist under the row's CAS pin. Returns
+/// `None` only when a `GrantRace::NoOp` seed observes the concurrent
+/// first write (the row it could not see at load time).
 async fn grant_operator_key<S: EnvironmentStorage>(
     state: &AppState<S>,
     env_id: &EnvId,
-    current: Option<LoadedTrustRoot>,
-) -> Result<TrustRootSeed, ApiError> {
+    mut current: Option<LoadedTrustRoot>,
+    on_race: GrantRace,
+) -> Result<Option<TrustRootSeed>, ApiError> {
+    // Validate and load the operator key ONCE (outside the retry loop).
     let op_key = load_server_operator_key(state.operator_key_path.clone()).await?;
-    let (mut doc, precondition) = doc_and_precondition(current);
     let entry = trust_root::validate_trusted_key(TrustedKey {
         key_id: op_key.key_id.clone(),
         public_key_pem: op_key.public_pem.clone(),
     })?;
-    trust_root::apply_add(&mut doc.keys, entry);
-    state
-        .storage
-        .upsert_trust_root(env_id, &doc, precondition.as_ref())
-        .await?;
-    Ok(TrustRootSeed {
-        key_id: op_key.key_id,
-        public_key_pem: op_key.public_pem,
-        trusted_key_count: doc.keys.len(),
-    })
+
+    // The loop terminates after at most 2 iterations: trust-root rows are
+    // never deleted, so after a `Raced` the reload returns `Some` →
+    // `doc_and_precondition` yields `Some(precondition)` → the
+    // `precondition.is_none()` guard in `upsert_trust_root_or_race` can
+    // never fire again → the next attempt either persists or 412s.
+    loop {
+        let (mut doc, precondition) = doc_and_precondition(current);
+        trust_root::apply_add(&mut doc.keys, entry.clone());
+        match upsert_trust_root_or_race(state, env_id, &doc, precondition.as_ref()).await? {
+            TrustRootPersist::Persisted => {
+                return Ok(Some(TrustRootSeed {
+                    key_id: op_key.key_id,
+                    public_key_pem: op_key.public_pem,
+                    trusted_key_count: doc.keys.len(),
+                }));
+            }
+            TrustRootPersist::Raced => match on_race {
+                GrantRace::NoOp => return Ok(None),
+                GrantRace::Retry => {
+                    current = state
+                        .storage
+                        .load_trust_root(env_id)
+                        .await
+                        .map_err(load_storage_error)?;
+                    // Continue — next iteration carries a CAS pin.
+                }
+            },
+        }
+    }
 }
 
 /// `POST /environments/{env_id}/trust-root/bootstrap` — load (or generate)
@@ -1228,7 +1300,9 @@ pub(crate) async fn bootstrap_trust_root<S: EnvironmentStorage>(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let req = load_trust_root_request(&state, &env_id, &headers).await?;
-    let seed = grant_operator_key(&state, &req.env_id, req.current).await?;
+    let seed = grant_operator_key(&state, &req.env_id, req.current, GrantRace::Retry)
+        .await?
+        .expect("Retry mode always grants");
     let target = json!({"environment_id": req.env_id, "key_id": seed.key_id});
     Ok(mutation_response(
         seed,
@@ -1255,7 +1329,7 @@ pub(crate) async fn seed_trust_root<S: EnvironmentStorage>(
     let req = load_trust_root_request(&state, &env_id, &headers).await?;
     let seed = match req.current {
         Some(_) => None,
-        None => Some(grant_operator_key(&state, &req.env_id, None).await?),
+        None => grant_operator_key(&state, &req.env_id, None, GrantRace::NoOp).await?,
     };
     let mut target = json!({"environment_id": req.env_id});
     if let (Some(seed), Value::Object(map)) = (&seed, &mut target) {
@@ -1285,7 +1359,6 @@ pub(crate) async fn add_trusted_key<S: EnvironmentStorage>(
     ApiJson(payload): ApiJson<AddTrustedKeyPayload>,
 ) -> Result<Response, ApiError> {
     let req = load_trust_root_request(&state, &env_id, &headers).await?;
-    let (mut doc, precondition) = doc_and_precondition(req.current);
     let supplied_key_id = payload.key_id.clone();
     let entry = trust_root::validate_trusted_key(TrustedKey {
         key_id: payload.key_id,
@@ -1299,11 +1372,25 @@ pub(crate) async fn add_trusted_key<S: EnvironmentStorage>(
         "key_id": supplied_key_id,
         "public_key_pem": entry.public_key_pem,
     });
-    trust_root::apply_add(&mut doc.keys, entry);
-    state
-        .storage
-        .upsert_trust_root(&req.env_id, &doc, precondition.as_ref())
-        .await?;
+
+    // Single-retry loop for first-write races — same termination argument
+    // as `grant_operator_key`: after `Raced` the reload is `Some` → the
+    // retry carries a CAS pin → `Raced` is unreachable on the second pass.
+    let mut current = req.current;
+    let doc = loop {
+        let (mut doc, precondition) = doc_and_precondition(current);
+        trust_root::apply_add(&mut doc.keys, entry.clone());
+        match upsert_trust_root_or_race(&state, &req.env_id, &doc, precondition.as_ref()).await? {
+            TrustRootPersist::Persisted => break doc,
+            TrustRootPersist::Raced => {
+                current = state
+                    .storage
+                    .load_trust_root(&req.env_id)
+                    .await
+                    .map_err(load_storage_error)?;
+            }
+        }
+    };
     let outcome = TrustRootAddOutcome {
         added_key_id: supplied_key_id,
         trusted_key_count: doc.keys.len(),
