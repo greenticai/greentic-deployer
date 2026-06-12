@@ -29,11 +29,24 @@
 //!
 //! Unlike the bindings/bundles groups (key = transport metadata), this
 //! group embeds the key in `MessagingEndpoint.updated_by`
-//! (`"<by>#idem=<key>"`) and uses it for same-key replay detection on
-//! `add` and `rotate-webhook-secret` — so the transforms take the
+//! (`"<by>#idem=<op>:<key>"`) and uses it for **operation-scoped**
+//! same-key replay detection on `add` and `rotate-webhook-secret` — so
+//! the transforms take the
 //! [`IdempotencyKey`](crate::IdempotencyKey) (the traffic-group
 //! precedent). The server hands the A8 `Idempotency-Key` header to the
 //! engine; the durable replay ledger remains PR-4.3.
+//!
+//! The operation name (`add`, `link-bundle`, `unlink-bundle`,
+//! `set-welcome-flow`, `rotate-webhook-secret`) is part of the stamp so
+//! a key used by one verb cannot satisfy a replay check for a different
+//! verb. Without the op in the stamp a `rotate-webhook-secret` replaying
+//! a key that was originally stamped by `add` would report success
+//! without actually rotating — a false SUCCESS that never provisions
+//! anything. Endpoints stamped under the old format (`"<by>#idem=<key>"`,
+//! without `<op>:`) simply never match the new replay checks; a
+//! cross-version retry re-executes instead of replaying, which is
+//! acceptable — crash-retry replay is best-effort until the PR-4.3
+//! request-fingerprint replay ledger.
 //!
 //! # Persist rule (read before calling)
 //!
@@ -208,6 +221,14 @@ pub struct MessagingApplied {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Canonical operation names for the idem stamp. Each matches the audit-verb
+/// vocabulary (`body["audit"]["verb"]` in the operator-store-server).
+const OP_ADD: &str = "add";
+const OP_LINK_BUNDLE: &str = "link-bundle";
+const OP_UNLINK_BUNDLE: &str = "unlink-bundle";
+const OP_SET_WELCOME_FLOW: &str = "set-welcome-flow";
+const OP_ROTATE_WEBHOOK_SECRET: &str = "rotate-webhook-secret";
+
 /// Telegram-class providers need a per-endpoint webhook secret generated at
 /// creation time. Covers `"telegram"`, `"telegram.<x>"`,
 /// `"messaging.telegram"`, and `"messaging.telegram.<x>"` — strict on the
@@ -219,18 +240,24 @@ fn is_telegram_class(provider_type: &str) -> bool {
     rest == "telegram" || rest.starts_with("telegram.")
 }
 
-/// Embed the idempotency key in `updated_by` so a same-key retry surfaces
-/// as the original mutation. `MessagingEndpoint` has no separate
+/// Embed the idempotency key AND operation name in `updated_by` so a
+/// same-key retry surfaces as the original mutation only when the
+/// operation matches. `MessagingEndpoint` has no separate
 /// `idempotency_key` field; the encoding keeps the replay contract without
 /// bloating the spec type.
-fn format_idem_writer(updated_by: &str, idempotency_key: &str) -> String {
-    format!("{updated_by}#idem={idempotency_key}")
+fn format_idem_writer(updated_by: &str, op: &str, idempotency_key: &str) -> String {
+    format!("{updated_by}#idem={op}:{idempotency_key}")
 }
 
-/// Build the `#idem=<key>` suffix once so a linear scan over
+/// Build the `#idem=<op>:<key>` suffix once so a linear scan over
 /// `messaging_endpoints` does not allocate a fresh `String` per element.
-fn idem_suffix(idempotency_key: &str) -> String {
-    format!("#idem={idempotency_key}")
+///
+/// The `#idem=` anchor combined with full-suffix `ends_with` matching
+/// means a crafted key containing `:` cannot cross-match operations —
+/// the op portion is fixed between `#idem=` and the first `:`, and the
+/// key portion is everything after that first `:`.
+fn idem_suffix(op: &str, idempotency_key: &str) -> String {
+    format!("#idem={op}:{idempotency_key}")
 }
 
 fn carries_idem_key(endpoint: &MessagingEndpoint, idem_suffix: &str) -> bool {
@@ -241,12 +268,13 @@ fn carries_idem_key(endpoint: &MessagingEndpoint, idem_suffix: &str) -> bool {
 fn stamp_mutation(
     endpoint: &mut MessagingEndpoint,
     updated_by: &str,
+    op: &str,
     idempotency_key: &str,
     now: DateTime<Utc>,
 ) {
     endpoint.generation = endpoint.generation.saturating_add(1);
     endpoint.updated_at = now;
-    endpoint.updated_by = format_idem_writer(updated_by, idempotency_key);
+    endpoint.updated_by = format_idem_writer(updated_by, op, idempotency_key);
 }
 
 /// Locate a messaging endpoint by id, returning
@@ -332,10 +360,13 @@ pub fn add_messaging_endpoint(
     now: DateTime<Utc>,
     provision: impl FnOnce(Option<&SecretRef>) -> Result<SecretRef, MessagingError>,
 ) -> Result<MessagingApplied, MessagingError> {
-    let suffix = idem_suffix(idempotency_key.as_str());
-    // Idempotent replay: re-running with the same key returns the
-    // previously-created endpoint iff the payload's instance identity
-    // matches what was stored.
+    let suffix = idem_suffix(OP_ADD, idempotency_key.as_str());
+    // Idempotent replay: re-running with the same key AND same op
+    // returns the previously-created endpoint iff the payload's instance
+    // identity matches what was stored. A key stamped by a different op
+    // (link-bundle, rotate, etc.) does NOT satisfy this check — the add
+    // proceeds as a fresh mutation and the duplicate-identity check
+    // below still guards collisions.
     if let Some(idx) = env
         .messaging_endpoints
         .iter()
@@ -397,7 +428,7 @@ pub fn add_messaging_endpoint(
         generation: 0,
         created_at: now,
         updated_at: now,
-        updated_by: format_idem_writer(&payload.updated_by, idempotency_key.as_str()),
+        updated_by: format_idem_writer(&payload.updated_by, OP_ADD, idempotency_key.as_str()),
     });
     Ok(MessagingApplied {
         index: env.messaging_endpoints.len() - 1,
@@ -436,6 +467,7 @@ pub fn link_messaging_bundle(
     stamp_mutation(
         &mut env.messaging_endpoints[idx],
         updated_by,
+        OP_LINK_BUNDLE,
         idempotency_key.as_str(),
         now,
     );
@@ -481,6 +513,7 @@ pub fn unlink_messaging_bundle(
     stamp_mutation(
         &mut env.messaging_endpoints[idx],
         updated_by,
+        OP_UNLINK_BUNDLE,
         idempotency_key.as_str(),
         now,
     );
@@ -527,6 +560,7 @@ pub fn set_messaging_welcome_flow(
     stamp_mutation(
         &mut env.messaging_endpoints[idx],
         &payload.updated_by,
+        OP_SET_WELCOME_FLOW,
         idempotency_key.as_str(),
         now,
     );
@@ -567,7 +601,7 @@ pub fn rotate_messaging_webhook_secret(
     provision: impl FnOnce(Option<&SecretRef>) -> Result<SecretRef, MessagingError>,
 ) -> Result<MessagingApplied, MessagingError> {
     let idx = find_endpoint_idx(env, endpoint_id)?;
-    let suffix = idem_suffix(idempotency_key.as_str());
+    let suffix = idem_suffix(OP_ROTATE_WEBHOOK_SECRET, idempotency_key.as_str());
     if carries_idem_key(&env.messaging_endpoints[idx], &suffix) {
         return Ok(MessagingApplied {
             index: idx,
@@ -579,6 +613,7 @@ pub fn rotate_messaging_webhook_secret(
     stamp_mutation(
         &mut env.messaging_endpoints[idx],
         updated_by,
+        OP_ROTATE_WEBHOOK_SECRET,
         idempotency_key.as_str(),
         now,
     );
@@ -707,7 +742,7 @@ mod tests {
         assert!(applied.mutated);
         let ep = &env.messaging_endpoints[applied.index];
         assert_eq!(ep.provider_type, "teams");
-        assert_eq!(ep.updated_by, "tester#idem=k1");
+        assert_eq!(ep.updated_by, "tester#idem=add:k1");
         assert_eq!(ep.generation, 0);
         assert!(ep.webhook_secret_ref.is_none());
     }
@@ -849,7 +884,7 @@ mod tests {
         let ep = &env.messaging_endpoints[applied.index];
         assert_eq!(ep.linked_bundles, vec![bundle_id]);
         assert_eq!(ep.generation, 1);
-        assert_eq!(ep.updated_by, "op#idem=k2");
+        assert_eq!(ep.updated_by, "op#idem=link-bundle:k2");
     }
 
     #[test]
@@ -1148,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn rotate_replay_skips_provision() {
+    fn rotate_same_key_replay_skips_provision() {
         let mut env = minimal_env();
         let applied = add_messaging_endpoint(
             &mut env,
@@ -1160,14 +1195,26 @@ mod tests {
         )
         .unwrap();
         let eid = env.messaging_endpoints[applied.index].endpoint_id;
-        // The add stamped `#idem=k1`; a rotate replaying the same key must
-        // not re-provision (it would overwrite the live secret).
+        // First rotate with key "k-rotate" — must provision.
+        rotate_messaging_webhook_secret(
+            &mut env,
+            eid,
+            "op",
+            &key("k-rotate"),
+            fixed_now(),
+            |existing| {
+                assert_eq!(existing, Some(&fixed_ref()));
+                Ok(fixed_ref())
+            },
+        )
+        .unwrap();
+        // Same-op same-key replay — provision must NOT run.
         let before = env.clone();
         let rotated = rotate_messaging_webhook_secret(
             &mut env,
             eid,
             "op",
-            &key("k1"),
+            &key("k-rotate"),
             fixed_now(),
             no_provision,
         )
@@ -1190,6 +1237,84 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, MessagingError::EndpointNotFound { .. }));
+    }
+
+    // --- cross-op idem-key isolation (regression for the operation-scope fix) -----
+
+    /// Regression: add-with-K then rotate-with-K must NOT take the replay
+    /// path — the rotate must invoke provision and report `mutated == true`.
+    #[test]
+    fn rotate_with_add_key_does_not_replay() {
+        let mut env = minimal_env();
+        let applied = add_messaging_endpoint(
+            &mut env,
+            add_payload("telegram", "bot-a"),
+            MessagingEndpointId::new(),
+            &key("k-shared"),
+            fixed_now(),
+            |_| Ok(fixed_ref()),
+        )
+        .unwrap();
+        assert!(applied.mutated);
+        let eid = env.messaging_endpoints[applied.index].endpoint_id;
+        // Rotate reusing the add's key — provision MUST run.
+        let mut provision_called = false;
+        let rotated = rotate_messaging_webhook_secret(
+            &mut env,
+            eid,
+            "op",
+            &key("k-shared"),
+            fixed_now(),
+            |existing| {
+                provision_called = true;
+                assert_eq!(existing, Some(&fixed_ref()));
+                Ok(fixed_ref())
+            },
+        )
+        .unwrap();
+        assert!(
+            provision_called,
+            "provision must be called for a cross-op key"
+        );
+        assert!(rotated.mutated);
+        assert_eq!(env.messaging_endpoints[rotated.index].generation, 1);
+    }
+
+    /// Regression: link-bundle stamps key K on an endpoint; a subsequent
+    /// `add_messaging_endpoint` with the SAME key K and a DIFFERENT identity
+    /// must NOT raise `IdempotencyKeyReuse` — it must create the new
+    /// endpoint (fresh mutation, guarded by the duplicate-identity check).
+    #[test]
+    fn add_with_link_stamped_key_proceeds_as_fresh_mutation() {
+        let mut env = minimal_env();
+        let bundle_id = deployed_bundle(&mut env, "legal-pack");
+        let idx = added(&mut env, "teams", "legal", "k1");
+        let eid = env.messaging_endpoints[idx].endpoint_id;
+        // Link stamps key "k-shared" onto the existing endpoint.
+        link_messaging_bundle(
+            &mut env,
+            eid,
+            bundle_id,
+            "op",
+            &key("k-shared"),
+            fixed_now(),
+        )
+        .unwrap();
+        // Now add a NEW endpoint with the SAME key but different identity.
+        let applied = add_messaging_endpoint(
+            &mut env,
+            add_payload("slack", "ops"),
+            MessagingEndpointId::new(),
+            &key("k-shared"),
+            fixed_now(),
+            no_provision,
+        )
+        .unwrap();
+        assert!(applied.mutated);
+        assert_eq!(
+            env.messaging_endpoints[applied.index].provider_type,
+            "slack"
+        );
     }
 
     // --- telegram classifier -------------------------------------------------------

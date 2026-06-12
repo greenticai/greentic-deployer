@@ -617,7 +617,7 @@ async fn remote_env_lifecycle_end_to_end() {
             )
             .expect("add messaging endpoint");
         assert_eq!(ep.provider_id, "legal-bot");
-        assert_eq!(ep.updated_by, "e2e#idem=k-msg-add");
+        assert_eq!(ep.updated_by, "e2e#idem=add:k-msg-add");
 
         // Telegram-class add → the server's 501 maps onto the same
         // `NotYetImplemented` noun PR-4.0 reserved for it.

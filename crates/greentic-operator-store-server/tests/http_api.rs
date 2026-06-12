@@ -2624,7 +2624,7 @@ async fn messaging_add_persists_endpoint_with_server_minted_id() {
     assert_eq!(result["generation"], 0);
     assert_eq!(
         result["updated_by"],
-        format!("tester#idem={IDEM_KEY}"),
+        format!("tester#idem=add:{IDEM_KEY}"),
         "the idem key must be stamped into updated_by"
     );
     let eid = result["endpoint_id"].as_str().expect("server-minted id");
@@ -2749,7 +2749,7 @@ async fn messaging_link_and_unlink_roundtrip() {
     assert_eq!(body["audit"]["verb"], "link-bundle");
     assert_eq!(body["result"]["linked_bundles"], json!(["acme"]));
     assert_eq!(body["result"]["generation"], 1);
-    assert_eq!(body["result"]["updated_by"], "op#idem=k-link");
+    assert_eq!(body["result"]["updated_by"], "op#idem=link-bundle:k-link");
 
     // Re-linking is a no-op: the env CAS must not advance.
     let linked_gen = body["generation"].as_u64().expect("generation");
@@ -2975,4 +2975,29 @@ async fn messaging_rotate_secret_is_501_until_the_secrets_sink_lands() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
     assert_eq!(body["kind"], "dependent-not-found");
+}
+
+/// Regression: add a (non-telegram) endpoint with key K, then POST
+/// rotate-secret with the SAME key K — the rotate must reach the
+/// refusing provision sink (501), not falsely replay as 200.
+#[tokio::test]
+async fn messaging_rotate_with_add_key_does_not_falsely_replay() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+    let eid = add_one_endpoint(&app, "teams", "legal-bot", "k-shared").await;
+
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/rotate-secret"),
+        Some(json!({"updated_by": "op"})),
+        &[("Idempotency-Key", "k-shared")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_IMPLEMENTED,
+        "rotate with add's key must hit the sink (501), not replay (200): {body}"
+    );
+    assert_eq!(body["kind"], "not-yet-implemented");
 }
