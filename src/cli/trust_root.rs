@@ -331,19 +331,8 @@ mod tests {
     use super::*;
     use crate::cli::tests_common::make_env;
     use crate::environment::EnvironmentStore;
-    use ed25519_dalek::SigningKey as Ed25519SigningKey;
-    use ed25519_dalek::pkcs8::EncodePublicKey;
-    use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
-    use greentic_distributor_client::signing::key_id_for_public_key_pem;
+    use greentic_operator_trust::test_support::keypair;
     use tempfile::tempdir;
-
-    fn keypair(seed: u8) -> (String, String) {
-        let sk = Ed25519SigningKey::from_bytes(&[seed; 32]);
-        let vk = sk.verifying_key();
-        let pem = vk.to_public_key_pem(LineEnding::LF).unwrap();
-        let id = key_id_for_public_key_pem(&pem).unwrap();
-        (pem, id)
-    }
 
     #[test]
     fn list_on_fresh_env_returns_empty_keys() {

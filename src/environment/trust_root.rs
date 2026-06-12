@@ -156,19 +156,8 @@ fn save(env_dir: &Path, keys: &[TrustedKey]) -> Result<(), TrustRootError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey as Ed25519SigningKey;
-    use ed25519_dalek::pkcs8::EncodePublicKey;
-    use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
-    use greentic_distributor_client::signing::key_id_for_public_key_pem;
+    use greentic_operator_trust::test_support::keypair;
     use tempfile::tempdir;
-
-    fn keypair(seed: u8) -> (String, String) {
-        let sk = Ed25519SigningKey::from_bytes(&[seed; 32]);
-        let vk = sk.verifying_key();
-        let pub_pem = vk.to_public_key_pem(LineEnding::LF).unwrap();
-        let key_id = key_id_for_public_key_pem(&pub_pem).unwrap();
-        (pub_pem, key_id)
-    }
 
     #[test]
     fn load_missing_file_returns_empty_trust_root() {

@@ -12,6 +12,11 @@ documentation = "https://docs.greentic.ai/deployer/operator-trust"
 keywords = ["greentic", "deployer", "trust-root", "ed25519", "signing"]
 categories = ["development-tools"]
 
+[features]
+# Exposes `test_support` (deterministic keypair fixtures) to downstream
+# crates' dev-dependencies.
+test-utils = []
+
 [dependencies]
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "zeroize"] }
 # Only the (ungated) `signing` module is used. `default-features = false`

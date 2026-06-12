@@ -108,17 +108,7 @@ pub fn apply_remove(keys: &mut Vec<TrustedKey>, key_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey as Ed25519SigningKey;
-    use ed25519_dalek::pkcs8::EncodePublicKey;
-    use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
-
-    fn keypair(seed: u8) -> (String, String) {
-        let sk = Ed25519SigningKey::from_bytes(&[seed; 32]);
-        let vk = sk.verifying_key();
-        let pub_pem = vk.to_public_key_pem(LineEnding::LF).unwrap();
-        let key_id = key_id_for_public_key_pem(&pub_pem).unwrap();
-        (pub_pem, key_id)
-    }
+    use crate::test_support::keypair;
 
     #[test]
     fn validate_accepts_canonical_entry() {

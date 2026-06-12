@@ -21,4 +21,6 @@
 //! second derivation path.
 
 pub mod operator_key;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support;
 pub mod trust_root;
