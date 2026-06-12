@@ -1,34 +1,43 @@
 //! A8 route handlers — environment-lifecycle verb group (PR-4.2a).
 //!
-//! Each mutation handler follows the same shape the remaining verb groups
-//! will reuse:
+//! Each mutation handler follows the same shape across every verb group:
 //!
 //! 1. decode the shared wire payload (`greentic_deploy_spec::engine` types —
-//!    the SAME structs the `HttpEnvironmentStore` client serializes);
-//! 2. load current state from [`EnvironmentStorage`];
-//! 3. apply the pure `greentic_deploy_spec::engine` transform (identical to
+//!    the SAME structs the `HttpEnvironmentStore` client serializes),
+//!    capturing the request's [`RequestFingerprint`] on the way through;
+//! 2. run the [`replay_gate`] (A8 §2, PR-4.3): a key already consumed by a
+//!    committed mutation replays its ledgered response verbatim (marker
+//!    flipped to `replayed`), any other reuse is a typed 409;
+//! 3. load current state from [`EnvironmentStorage`];
+//! 4. apply the pure `greentic_deploy_spec::engine` transform (identical to
 //!    what `LocalFsStore` runs);
-//! 4. persist under a CAS precondition pinned to the loaded revision;
-//! 5. reply with the A8 mutation envelope `{result, etag, generation,
-//!    idempotency, audit}` — the PR-4.0 client rejects any 2xx whose audit
-//!    record is missing, denied, non-ok, or names the wrong env/key.
+//! 5. build the A8 mutation envelope `{result, etag, generation,
+//!    idempotency, audit}` BEFORE the commit (sound because the post-commit
+//!    revision is deterministic under the fully pinned precondition — see
+//!    [`next_revision`]) — the PR-4.0 client rejects any 2xx whose audit
+//!    record is missing, denied, non-ok, or names the wrong env/key;
+//! 6. persist under a CAS precondition pinned to the loaded revision,
+//!    with the [`MutationJournal`] (the ledger row + the durable audit-log
+//!    append) committing in the SAME transaction — a committed mutation can
+//!    never lack its replay entry or its audit row, and a rolled-back one
+//!    never leaves either.
 //!
 //! Errors travel as [`RemoteStoreError`] JSON with the matching HTTP status
-//! (the client enforces status↔body consistency).
+//! (the client enforces status↔body consistency); they are never ledgered —
+//! except the warm health gate's committed-on-error 422, whose persisted
+//! `Failed` flip consumes the key like any commit.
 //!
-//! Not yet here (intentional follow-ups): idempotency replay (PR-4.3 — keys
-//! are required on every mutation and echoed into the audit record, not yet
-//! cached for replay), RBAC (PR-4.4 — every decision is an honest
-//! `Allow{policy: "open-dev"}`), and the audit log's durable append
-//! (PR-4.3).
+//! Not yet here (intentional follow-up): RBAC (PR-4.4 — every decision is
+//! an honest `Allow{policy: "open-dev"}`, and denials are not yet audited).
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{FromRequest, Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{FromRequest, FromRequestParts, Path, Request, State};
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use serde::Serialize;
@@ -43,13 +52,13 @@ use greentic_deploy_spec::{
     AuditDecision, AuditEvent, AuditResult, BindingGenerationOutcome, BundleDeployment,
     CapabilitySlot, ConcurrencyConflict, CreateEnvironmentPayload, DeploymentId, EnvId,
     Environment, ExtensionBindingPayload, ExtensionKeyedPayload, HealthStatus, IdempotencyKey,
-    IdempotencyOutcome, MessagingBundleLinkPayload, MessagingEndpointId, MigrateMergePayload,
-    PackBindingPayload, Precondition, RemoteStoreError, RetentionPolicy, RevisionId,
-    RevisionTransitionOutcome, RevocationConfig, RollbackTrafficSplitOutcome,
+    IdempotencyOutcome, IdempotencyRecord, MessagingBundleLinkPayload, MessagingEndpointId,
+    MigrateMergePayload, PackBindingPayload, Precondition, RemoteStoreError, RetentionPolicy,
+    RevisionId, RevisionTransitionOutcome, RevocationConfig, RollbackTrafficSplitOutcome,
     RollbackTrafficSplitPayload, RotateWebhookSecretPayload, SchemaVersion, SecretRef,
     SetMessagingWelcomeFlowPayload, SetTrafficSplitPayload, StageRevisionPayload, StateEtag,
-    TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload,
-    WarmRevisionPayload,
+    StateIntegrity, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
+    UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 use greentic_operator_trust::operator_key::{self, OperatorKey};
 use greentic_operator_trust::revenue_policy::{self, RevenuePolicyError};
@@ -59,7 +68,8 @@ use greentic_operator_trust::trust_root::{
 
 use crate::http::AppState;
 use crate::storage::{
-    EnvRevision, EnvironmentStorage, LoadedTrustRoot, RevenuePolicyArtifact, StorageError,
+    EnvRevision, EnvironmentStorage, LoadedTrustRoot, MutationJournal, RevenuePolicyArtifact,
+    StorageError,
 };
 
 /// `AuditDecision.policy` value while RBAC is not yet enforced (PR-4.4).
@@ -298,6 +308,13 @@ fn map_storage_error(err: StorageError) -> RemoteStoreError {
         err @ StorageError::TrustRootChanged { .. } => RemoteStoreError::Conflict {
             detail: err.to_string(),
         },
+        // A concurrent request committed the same key first (the ledger
+        // insert lost the race); the retry replays its stored response.
+        err @ StorageError::IdempotencyKeyCommitted { .. } => {
+            RemoteStoreError::IdempotencyConflict {
+                reason: err.to_string(),
+            }
+        }
         // Backend/serde internals stay opaque — no driver details on the wire.
         StorageError::Integrity(_) | StorageError::Json(_) | StorageError::Backend(_) => {
             RemoteStoreError::Internal {
@@ -307,10 +324,71 @@ fn map_storage_error(err: StorageError) -> RemoteStoreError {
     }
 }
 
-/// `Json<T>` with the rejection mapped to the typed A8 400 body.
-#[derive(FromRequest)]
-#[from_request(via(Json), rejection(ApiError))]
-pub(crate) struct ApiJson<T>(pub(crate) T);
+/// Canonical request identity for the replay ledger (A8 §2): SHA-256 over
+/// `{method, path, body}` via the contract's hashing helper
+/// ([`IdempotencyRecord::fingerprint`]), so a same-key retry of the same
+/// request replays regardless of JSON formatting, while the same key on a
+/// different body, path, or method is a `409 idempotency-conflict`.
+/// Headers — `If-Match` included — are deliberately excluded: a replay
+/// returns an already-committed response whose precondition was enforced
+/// at first execution.
+#[derive(Debug, Clone)]
+pub(crate) struct RequestFingerprint(String);
+
+impl RequestFingerprint {
+    /// Bodyless requests hash the body as JSON `null`, matching the
+    /// client's body-free sends.
+    fn compute(method: &Method, path: &str, body: &Value) -> Result<Self, ApiError> {
+        let canonical = json!({"method": method.as_str(), "path": path, "body": body});
+        IdempotencyRecord::fingerprint(&canonical)
+            .map(Self)
+            .map_err(|err| {
+                tracing::error!(error = %err, "request fingerprint hashing failed");
+                ApiError(RemoteStoreError::Internal {
+                    message: "request fingerprint hashing failed".to_string(),
+                })
+            })
+    }
+}
+
+/// `Json<T>` with the rejection mapped to the typed A8 400 body, capturing
+/// the request's [`RequestFingerprint`] on the way through — extraction
+/// consumes the body, so this is the one place its canonical `Value` is
+/// available.
+pub(crate) struct ApiJson<T>(pub(crate) T, pub(crate) RequestFingerprint);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+        let Json(body): Json<Value> = Json::from_request(req, state).await?;
+        let fingerprint = RequestFingerprint::compute(&method, &path, &body)?;
+        let payload: T = serde_json::from_value(body).map_err(|err| {
+            ApiError(RemoteStoreError::InvalidRequest {
+                detail: format!("invalid request body: {err}"),
+            })
+        })?;
+        Ok(ApiJson(payload, fingerprint))
+    }
+}
+
+/// [`RequestFingerprint`] extractor for bodyless mutations (DELETEs and the
+/// body-free POST verbs).
+pub(crate) struct Fingerprint(pub(crate) RequestFingerprint);
+
+impl<S: Send + Sync> FromRequestParts<S> for Fingerprint {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        RequestFingerprint::compute(&parts.method, parts.uri.path(), &Value::Null).map(Self)
+    }
+}
 
 /// Parse a path segment into an [`EnvId`], rejecting invalid ids with a
 /// typed 400 instead of a 500 from a downstream `try_from`.
@@ -337,22 +415,41 @@ struct MutationEnvelope<T> {
     audit: AuditEvent,
 }
 
-/// Build the 2xx mutation response: the audit record (bound to the request
-/// via `env_id` + the `Idempotency-Key` the client sent — the PR-4.0 client
-/// validates both) wrapped in the A8 envelope. One call per handler so
-/// every verb group shares the exact shape; when PR-4.3 lands replay, the
-/// [`IdempotencyOutcome`] switch happens here, not in N handlers.
+/// A mutation response built BEFORE its commit: the response to send plus
+/// the [`MutationJournal`] (ledger + audit rows) that must land inside the
+/// commit's transaction. Building first is what makes the ledgered
+/// response exact — and it is sound because the post-commit revision is
+/// deterministic under the fully pinned [`resolve_precondition`] CAS
+/// (see [`next_revision`]).
+struct PreparedMutation {
+    status: StatusCode,
+    body: Value,
+    journal: MutationJournal,
+}
+
+impl PreparedMutation {
+    fn into_response(self) -> Response {
+        (self.status, Json(self.body)).into_response()
+    }
+}
+
+/// Build the 2xx mutation envelope (the audit record — bound to the
+/// request via `env_id` + the `Idempotency-Key`, which the PR-4.0 client
+/// validates — wrapped in the A8 `{result, etag, generation, idempotency,
+/// audit}` shape) together with its journal rows. One call per handler so
+/// every verb group shares the exact shape.
 #[allow(clippy::too_many_arguments)]
-fn mutation_response<T: Serialize>(
+fn prepare_mutation<T: Serialize>(
     result: T,
     env_id: &EnvId,
     noun: &str,
     verb: &str,
     target: Value,
     idempotency_key: String,
+    fingerprint: &RequestFingerprint,
     previous_generation: Option<u64>,
     revision: EnvRevision,
-) -> Response {
+) -> Result<PreparedMutation, ApiError> {
     let audit = AuditEvent {
         schema: SchemaVersion::AUDIT_EVENT_V1.into(),
         event_id: ulid::Ulid::new().to_string(),
@@ -368,26 +465,204 @@ fn mutation_response<T: Serialize>(
         target,
         previous_generation,
         new_generation: Some(revision.generation),
-        idempotency_key: Some(idempotency_key),
+        idempotency_key: Some(idempotency_key.clone()),
         authorization: AuditDecision::Allow {
             policy: POLICY_OPEN_DEV.to_string(),
             reason: "RBAC not yet enforced (PR-4.4)".to_string(),
         },
         result: AuditResult::Ok,
     };
-    Json(MutationEnvelope {
+    let audit_event = serde_json::to_value(&audit).map_err(envelope_encode_error)?;
+    let audit_event_id = audit.event_id.clone();
+    let body = serde_json::to_value(MutationEnvelope {
         result,
         etag: revision.etag,
         generation: revision.generation,
         idempotency: IdempotencyOutcome::Applied,
         audit,
     })
-    .into_response()
+    .map_err(envelope_encode_error)?;
+    Ok(PreparedMutation {
+        status: StatusCode::OK,
+        body: body.clone(),
+        journal: MutationJournal {
+            env_id: env_id.clone(),
+            idempotency_key,
+            operation: format!("{noun}.{verb}"),
+            request_fingerprint: fingerprint.0.clone(),
+            response_status: StatusCode::OK.as_u16(),
+            response_body: body,
+            audit_event,
+            audit_event_id,
+        },
+    })
 }
 
-/// Require a non-empty `Idempotency-Key` on every mutation (A8 §2). PR-4.3
-/// adds replay; today the key is echoed into the audit record so the
-/// client's binding check passes.
+/// Build a COMMITTED-on-error response (the warm health gate's `Failed`
+/// flip): the mutation persists, so the key is consumed, the typed error
+/// body becomes the ledgered response — replayed verbatim, it carries no
+/// `idempotency` field — and the audit append records the non-ok outcome.
+#[allow(clippy::too_many_arguments)]
+fn prepare_committed_error(
+    error: &RemoteStoreError,
+    env_id: &EnvId,
+    noun: &str,
+    verb: &str,
+    target: Value,
+    idempotency_key: String,
+    fingerprint: &RequestFingerprint,
+    previous_generation: Option<u64>,
+    new_generation: u64,
+) -> Result<PreparedMutation, ApiError> {
+    let body = serde_json::to_value(error).map_err(envelope_encode_error)?;
+    let kind = body["kind"].as_str().unwrap_or("internal").to_string();
+    let audit = AuditEvent {
+        schema: SchemaVersion::AUDIT_EVENT_V1.into(),
+        event_id: ulid::Ulid::new().to_string(),
+        ts: Utc::now(),
+        actor: Actor {
+            kind: "store-server".to_string(),
+            user: None,
+            uid: None,
+        },
+        env_id: env_id.as_str().to_string(),
+        noun: noun.to_string(),
+        verb: verb.to_string(),
+        target,
+        previous_generation,
+        new_generation: Some(new_generation),
+        idempotency_key: Some(idempotency_key.clone()),
+        authorization: AuditDecision::Allow {
+            policy: POLICY_OPEN_DEV.to_string(),
+            reason: "RBAC not yet enforced (PR-4.4)".to_string(),
+        },
+        result: AuditResult::Error {
+            kind,
+            message: error.to_string(),
+        },
+    };
+    let audit_event_id = audit.event_id.clone();
+    let status =
+        StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    Ok(PreparedMutation {
+        status,
+        body: body.clone(),
+        journal: MutationJournal {
+            env_id: env_id.clone(),
+            idempotency_key,
+            operation: format!("{noun}.{verb}"),
+            request_fingerprint: fingerprint.0.clone(),
+            response_status: status.as_u16(),
+            response_body: body,
+            audit_event: serde_json::to_value(&audit).map_err(envelope_encode_error)?,
+            audit_event_id,
+        },
+    })
+}
+
+fn envelope_encode_error(err: serde_json::Error) -> ApiError {
+    tracing::error!(error = %err, "mutation envelope failed to serialize");
+    ApiError(RemoteStoreError::Internal {
+        message: "mutation envelope failed to serialize".to_string(),
+    })
+}
+
+/// The replay gate (A8 §2), run before any state is loaded. A key already
+/// consumed by a committed mutation either replays that mutation's stored
+/// response verbatim — only the `idempotency` marker flips to `replayed`;
+/// everything else, original audit record included, is untouched — or, on
+/// a fingerprint mismatch, rejects the reuse with the typed 409. Failed
+/// requests are never ledgered, so their keys retry freely.
+async fn replay_gate<S: EnvironmentStorage>(
+    state: &AppState<S>,
+    env_id: &EnvId,
+    idem_key: &str,
+    fingerprint: &RequestFingerprint,
+) -> Result<Option<Response>, ApiError> {
+    let record = state
+        .storage
+        .lookup_idempotency(env_id, idem_key)
+        .await
+        .map_err(load_storage_error)?;
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    if record.request_fingerprint != fingerprint.0 {
+        return Err(ApiError(RemoteStoreError::IdempotencyConflict {
+            reason: format!(
+                "idempotency key `{idem_key}` was already used by a different \
+                 `{}` request on env `{env_id}`; pass a fresh key",
+                record.operation
+            ),
+        }));
+    }
+    let mut body = record.response_body;
+    // Success envelopes flip their marker; committed-on-error bodies have
+    // no `idempotency` field and replay byte-identical.
+    if body.get("idempotency").is_some() {
+        body["idempotency"] = serde_json::to_value(IdempotencyOutcome::Replayed)
+            .expect("IdempotencyOutcome serializes");
+    }
+    let status =
+        StatusCode::from_u16(record.response_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    Ok(Some((status, Json(body)).into_response()))
+}
+
+/// Converge a post-gate failure onto the replay contract: when the
+/// mutation failed but the ledger MEANWHILE holds a fingerprint-matching
+/// row for this `(env, key)`, a concurrent duplicate of the SAME request
+/// won the race — the operation committed, so replay the winner's
+/// response instead of surfacing a conflict the caller cannot act on.
+/// Anything else (miss, fingerprint mismatch, lookup failure) surfaces
+/// the original error: the recheck must never mask it.
+async fn error_or_replay<S: EnvironmentStorage>(
+    state: &AppState<S>,
+    env_id: &EnvId,
+    idem_key: &str,
+    fingerprint: &RequestFingerprint,
+    err: ApiError,
+) -> Result<Response, ApiError> {
+    match replay_gate(state, env_id, idem_key, fingerprint).await {
+        Ok(Some(replay)) => Ok(replay),
+        Ok(None) | Err(_) => Err(err),
+    }
+}
+
+/// The CAS coordinates `env` WILL have after a commit under a fully pinned
+/// precondition: the etag derives from content exactly as the storage
+/// layer derives it (`serialize → sha256`), and the generation is the
+/// pinned one plus one. This determinism is what lets the journaled
+/// response body be built BEFORE the commit and land inside the same
+/// transaction.
+fn next_revision(env: &Environment, loaded: &EnvRevision) -> Result<EnvRevision, ApiError> {
+    Ok(EnvRevision {
+        generation: loaded.generation + 1,
+        etag: content_etag(env)?,
+    })
+}
+
+/// [`next_revision`]'s create-shaped sibling: a fresh row is generation 1.
+fn created_revision(env: &Environment) -> Result<EnvRevision, ApiError> {
+    Ok(EnvRevision {
+        generation: 1,
+        etag: content_etag(env)?,
+    })
+}
+
+fn content_etag(env: &Environment) -> Result<StateEtag, ApiError> {
+    let data = serde_json::to_value(env).map_err(envelope_encode_error)?;
+    let integrity = StateIntegrity::sha256_of(&data).map_err(|err| {
+        tracing::error!(error = %err, "environment content hashing failed");
+        ApiError(RemoteStoreError::Internal {
+            message: "environment content hashing failed".to_string(),
+        })
+    })?;
+    Ok(StateEtag::from_integrity(&integrity))
+}
+
+/// Require a non-empty `Idempotency-Key` on every mutation (A8 §2). The
+/// key is echoed into the audit record (the client's binding check) and
+/// consumed by [`replay_gate`] + the ledger on every committed outcome.
 fn require_idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
     let key = headers
         .get("Idempotency-Key")
@@ -395,6 +670,9 @@ fn require_idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
         .map(str::to_string)
         .filter(|s| !s.trim().is_empty());
     match key {
+        Some(k) if k.len() > 255 => Err(ApiError(RemoteStoreError::InvalidRequest {
+            detail: "Idempotency-Key exceeds 255 bytes (A8 §2 recommends a ULID)".to_string(),
+        })),
         Some(k) => Ok(k),
         None => Err(ApiError(RemoteStoreError::InvalidRequest {
             detail: "missing or empty Idempotency-Key header \
@@ -457,15 +735,17 @@ fn load_storage_error(err: StorageError) -> ApiError {
 
 /// CAS precondition for a load-then-write handler: a client-supplied
 /// `If-Match` wins (server side of A8 #1; client wiring stays PR-3b-fu);
-/// otherwise pin the revision the handler just loaded — a torn-write guard
+/// otherwise pin the etag the handler just loaded — a torn-write guard
 /// only, not true client CAS.
+///
+/// BOTH forms additionally pin the loaded generation (PR-4.3): the
+/// post-commit revision is then deterministically `loaded + 1`, which the
+/// pre-built journal body depends on — and the client-etag form no longer
+/// races past a content-identical, generation-bumped concurrent write.
 fn resolve_precondition(client_etag: Option<StateEtag>, loaded: &EnvRevision) -> Precondition {
-    match client_etag {
-        Some(etag) => Precondition {
-            if_match: Some(etag),
-            expected_generation: None,
-        },
-        None => Precondition::matching(loaded.etag.clone(), loaded.generation),
+    Precondition {
+        if_match: Some(client_etag.unwrap_or_else(|| loaded.etag.clone())),
+        expected_generation: Some(loaded.generation),
     }
 }
 
@@ -477,31 +757,47 @@ fn resolve_precondition(client_etag: Option<StateEtag>, loaded: &EnvRevision) ->
 pub(crate) async fn create_environment<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<CreateEnvironmentPayload>,
+    ApiJson(payload, fingerprint): ApiJson<CreateEnvironmentPayload>,
 ) -> Result<Response, ApiError> {
     let idem_key = require_idempotency_key(&headers)?;
-    let env = engine::fresh_environment(
-        &payload.env_id,
-        payload.name,
-        payload.host_config,
-        RevocationConfig::default(),
-        RetentionPolicy::default(),
-        HealthStatus::default(),
-    );
-    // Existence is enforced by the storage layer's atomic create
-    // (`AlreadyExists` → 409) — no load-then-check race.
-    let revision = state.storage.create_env(&env).await?;
-    let env_id = env.environment_id.clone();
-    Ok(mutation_response(
-        env,
-        &env_id,
-        "env",
-        "create",
-        json!({"environment_id": env_id}),
-        idem_key,
-        None,
-        revision,
-    ))
+    let env_id = payload.env_id.clone();
+    if let Some(replay) = replay_gate(&state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(replay);
+    }
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let env = engine::fresh_environment(
+            &payload.env_id,
+            payload.name,
+            payload.host_config,
+            RevocationConfig::default(),
+            RetentionPolicy::default(),
+            HealthStatus::default(),
+        );
+        let prepared = prepare_mutation(
+            &env,
+            &env_id,
+            "env",
+            "create",
+            json!({"environment_id": env_id}),
+            idem_key,
+            &fingerprint,
+            None,
+            created_revision(&env)?,
+        )?;
+        // Existence is enforced by the storage layer's atomic create
+        // (`AlreadyExists` → 409) — no load-then-check race.
+        state
+            .storage
+            .create_env_journaled(&env, Some(&prepared.journal))
+            .await?;
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
 }
 
 /// `PATCH /environments/{env_id}` — tri-state field patch (A8 route 2).
@@ -509,31 +805,47 @@ pub(crate) async fn update_environment<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path(env_id): Path<String>,
     headers: HeaderMap,
-    ApiJson(patch): ApiJson<UpdateEnvironmentPayload>,
+    ApiJson(patch, fingerprint): ApiJson<UpdateEnvironmentPayload>,
 ) -> Result<Response, ApiError> {
     let idem_key = require_idempotency_key(&headers)?;
     let client_etag = parse_if_match(&headers)?;
     let env_id = parse_env_id(&env_id)?;
-    let loaded = state
-        .storage
-        .load_env(&env_id)
-        .await
-        .map_err(load_storage_error)?;
-    let previous_generation = loaded.revision.generation;
-    let mut env = loaded.value;
-    engine::apply_environment_update(&mut env, patch);
-    let precondition = resolve_precondition(client_etag, &loaded.revision);
-    let revision = state.storage.update_env(&env, &precondition).await?;
-    Ok(mutation_response(
-        env,
-        &env_id,
-        "env",
-        "update",
-        json!({"environment_id": env_id}),
-        idem_key,
-        Some(previous_generation),
-        revision,
-    ))
+    if let Some(replay) = replay_gate(&state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(replay);
+    }
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let loaded = state
+            .storage
+            .load_env(&env_id)
+            .await
+            .map_err(load_storage_error)?;
+        let previous_generation = loaded.revision.generation;
+        let mut env = loaded.value;
+        engine::apply_environment_update(&mut env, patch);
+        let precondition = resolve_precondition(client_etag, &loaded.revision);
+        let prepared = prepare_mutation(
+            &env,
+            &env_id,
+            "env",
+            "update",
+            json!({"environment_id": env_id}),
+            idem_key,
+            &fingerprint,
+            Some(previous_generation),
+            next_revision(&env, &loaded.revision)?,
+        )?;
+        state
+            .storage
+            .update_env_journaled(&env, &precondition, Some(&prepared.journal))
+            .await?;
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
 }
 
 /// `POST /environments/{env_id}/migrate-bindings` — merge pack/extension
@@ -542,56 +854,81 @@ pub(crate) async fn migrate_bindings<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path(env_id): Path<String>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<MigrateMergePayload>,
+    ApiJson(payload, fingerprint): ApiJson<MigrateMergePayload>,
 ) -> Result<Response, ApiError> {
     let idem_key = require_idempotency_key(&headers)?;
     let client_etag = parse_if_match(&headers)?;
     let env_id = parse_env_id(&env_id)?;
-    let existing = match state.storage.load_env(&env_id).await {
-        Ok(loaded) => Some(loaded),
-        Err(StorageError::NotFound(_)) => None,
-        Err(err) => return Err(load_storage_error(err)),
-    };
-    let prior_revision = existing.as_ref().map(|l| l.revision.clone());
-    let mut env =
-        engine::seed_or_existing(existing.map(|l| l.value), &env_id, payload.seed_if_missing)?;
-    let report = engine::merge_bindings(&mut env, payload.packs, payload.extensions);
-    let revision = match &prior_revision {
-        Some(prior) => {
-            let precondition = resolve_precondition(client_etag.clone(), prior);
-            state.storage.update_env(&env, &precondition).await?
-        }
-        None => {
-            // Seed/create branch: If-Match on a resource that doesn't exist
-            // yet is a precondition failure per RFC 9110.
-            if let Some(client_etag) = &client_etag {
-                return Err(ApiError(RemoteStoreError::PreconditionFailed(
-                    ConcurrencyConflict {
-                        expected_etag: Some(client_etag.0.clone()),
-                        actual_etag: String::new(),
-                        expected_generation: None,
-                        actual_generation: 0,
-                    },
-                )));
+    if let Some(replay) = replay_gate(&state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(replay);
+    }
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let existing = match state.storage.load_env(&env_id).await {
+            Ok(loaded) => Some(loaded),
+            Err(StorageError::NotFound(_)) => None,
+            Err(err) => return Err(load_storage_error(err)),
+        };
+        let prior_revision = existing.as_ref().map(|l| l.revision.clone());
+        let mut env =
+            engine::seed_or_existing(existing.map(|l| l.value), &env_id, payload.seed_if_missing)?;
+        let report = engine::merge_bindings(&mut env, payload.packs, payload.extensions);
+        let target = json!({
+            "environment_id": env_id,
+            "merged_slots": report.merged_slots,
+            "merged_extensions": report.merged_extensions,
+        });
+        let revision = match &prior_revision {
+            Some(prior) => next_revision(&env, prior)?,
+            None => {
+                // Seed/create branch: If-Match on a resource that doesn't exist
+                // yet is a precondition failure per RFC 9110.
+                if let Some(client_etag) = &client_etag {
+                    return Err(ApiError(RemoteStoreError::PreconditionFailed(
+                        ConcurrencyConflict {
+                            expected_etag: Some(client_etag.0.clone()),
+                            actual_etag: String::new(),
+                            expected_generation: None,
+                            actual_generation: 0,
+                        },
+                    )));
+                }
+                created_revision(&env)?
             }
-            state.storage.create_env(&env).await?
+        };
+        let prepared = prepare_mutation(
+            &report,
+            &env_id,
+            "env",
+            "migrate-bindings",
+            target,
+            idem_key,
+            &fingerprint,
+            prior_revision.as_ref().map(|r| r.generation),
+            revision,
+        )?;
+        match &prior_revision {
+            Some(prior) => {
+                let precondition = resolve_precondition(client_etag, prior);
+                state
+                    .storage
+                    .update_env_journaled(&env, &precondition, Some(&prepared.journal))
+                    .await?;
+            }
+            None => {
+                state
+                    .storage
+                    .create_env_journaled(&env, Some(&prepared.journal))
+                    .await?;
+            }
         }
-    };
-    let target = json!({
-        "environment_id": env_id,
-        "merged_slots": report.merged_slots,
-        "merged_extensions": report.merged_extensions,
-    });
-    Ok(mutation_response(
-        report,
-        &env_id,
-        "env",
-        "migrate-bindings",
-        target,
-        idem_key,
-        prior_revision.map(|r| r.generation),
-        revision,
-    ))
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -614,37 +951,53 @@ pub(crate) async fn stage_revision<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path(env_id): Path<String>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<StageRevisionPayload>,
+    ApiJson(payload, fingerprint): ApiJson<StageRevisionPayload>,
 ) -> Result<Response, ApiError> {
     let idem_key = require_idempotency_key(&headers)?;
     let client_etag = parse_if_match(&headers)?;
     let env_id = parse_env_id(&env_id)?;
-    let loaded = state
-        .storage
-        .load_env(&env_id)
-        .await
-        .map_err(load_storage_error)?;
-    let previous_generation = loaded.revision.generation;
-    let mut env = loaded.value;
-    let staged = engine::stage_revision(&mut env, payload, Utc::now())?;
-    let precondition = resolve_precondition(client_etag, &loaded.revision);
-    let revision = state.storage.update_env(&env, &precondition).await?;
-    let target = json!({
-        "environment_id": env_id,
-        "revision_id": staged.revision_id.to_string(),
-        "deployment_id": staged.deployment_id.to_string(),
-        "lifecycle_to": "staged",
-    });
-    Ok(mutation_response(
-        staged,
-        &env_id,
-        "revisions",
-        "stage",
-        target,
-        idem_key,
-        Some(previous_generation),
-        revision,
-    ))
+    if let Some(replay) = replay_gate(&state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(replay);
+    }
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let loaded = state
+            .storage
+            .load_env(&env_id)
+            .await
+            .map_err(load_storage_error)?;
+        let previous_generation = loaded.revision.generation;
+        let mut env = loaded.value;
+        let staged = engine::stage_revision(&mut env, payload, Utc::now())?;
+        let precondition = resolve_precondition(client_etag, &loaded.revision);
+        let target = json!({
+            "environment_id": env_id,
+            "revision_id": staged.revision_id.to_string(),
+            "deployment_id": staged.deployment_id.to_string(),
+            "lifecycle_to": "staged",
+        });
+        let prepared = prepare_mutation(
+            &staged,
+            &env_id,
+            "revisions",
+            "stage",
+            target,
+            idem_key,
+            &fingerprint,
+            Some(previous_generation),
+            next_revision(&env, &loaded.revision)?,
+        )?;
+        state
+            .storage
+            .update_env_journaled(&env, &precondition, Some(&prepared.journal))
+            .await?;
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
 }
 
 /// `POST /environments/{env_id}/revisions/{revision_id}/warm` — drive
@@ -655,7 +1008,7 @@ pub(crate) async fn warm_revision<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, revision_id)): Path<(String, String)>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<WarmRevisionPayload>,
+    ApiJson(payload, fingerprint): ApiJson<WarmRevisionPayload>,
 ) -> Result<Response, ApiError> {
     let revision_id = parse_revision_id(&revision_id)?;
     if payload.revision_id != revision_id {
@@ -666,7 +1019,7 @@ pub(crate) async fn warm_revision<S: EnvironmentStorage>(
             ),
         }));
     }
-    revision_transition(&state, &env_id, &headers, "warm", |env| {
+    revision_transition(&state, &env_id, &headers, &fingerprint, "warm", |env| {
         engine::warm_revision(env, payload, Utc::now())
     })
     .await
@@ -678,9 +1031,10 @@ pub(crate) async fn drain_revision<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, revision_id)): Path<(String, String)>,
     headers: HeaderMap,
+    Fingerprint(fingerprint): Fingerprint,
 ) -> Result<Response, ApiError> {
     let revision_id = parse_revision_id(&revision_id)?;
-    revision_transition(&state, &env_id, &headers, "drain", |env| {
+    revision_transition(&state, &env_id, &headers, &fingerprint, "drain", |env| {
         engine::drain_revision(env, revision_id)
     })
     .await
@@ -693,9 +1047,10 @@ pub(crate) async fn archive_revision<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, revision_id)): Path<(String, String)>,
     headers: HeaderMap,
+    Fingerprint(fingerprint): Fingerprint,
 ) -> Result<Response, ApiError> {
     let revision_id = parse_revision_id(&revision_id)?;
-    revision_transition(&state, &env_id, &headers, "archive", |env| {
+    revision_transition(&state, &env_id, &headers, &fingerprint, "archive", |env| {
         engine::archive_revision(env, revision_id)
     })
     .await
@@ -706,60 +1061,109 @@ pub(crate) async fn archive_revision<S: EnvironmentStorage>(
 ///
 /// Persist rule: `Ok` persists and responds 2xx; an `env_mutated` error (the
 /// warm gate's flip to `Failed`) persists FIRST and then surfaces the typed
-/// 422 — committed-on-error, mirroring `LocalFsStore`. A persist failure on
-/// that path takes precedence (the client must not be told the gate failure
-/// is durable when it isn't). Every other error discards the in-memory env.
-///
+/// 422 — committed-on-error, mirroring `LocalFsStore`. Both committed
+/// outcomes journal (the gate failure's 422 body is its ledgered response —
+/// a same-key retry replays it instead of re-walking the chain); a persist
+/// failure on the gate path takes precedence (the client must not be told
+/// the gate failure is durable when it isn't). Every other error discards
+/// the in-memory env and consumes no key.
 async fn revision_transition<S: EnvironmentStorage>(
     state: &AppState<S>,
     env_id: &str,
     headers: &HeaderMap,
+    fingerprint: &RequestFingerprint,
     verb: &'static str,
     apply: impl FnOnce(&mut Environment) -> Result<engine::RevisionTransition, RevisionLifecycleError>,
 ) -> Result<Response, ApiError> {
     let idem_key = require_idempotency_key(headers)?;
     let client_etag = parse_if_match(headers)?;
     let env_id = parse_env_id(env_id)?;
-    let loaded = state
-        .storage
-        .load_env(&env_id)
-        .await
-        .map_err(load_storage_error)?;
-    let previous_generation = loaded.revision.generation;
-    let mut env = loaded.value;
-    match apply(&mut env) {
-        Ok(transition) => {
-            let precondition = resolve_precondition(client_etag, &loaded.revision);
-            let revision = state.storage.update_env(&env, &precondition).await?;
-            let target = json!({
-                "environment_id": env_id,
-                "revision_id": transition.revision.revision_id.to_string(),
-                "lifecycle_to": transition.revision.lifecycle,
-            });
-            let outcome = RevisionTransitionOutcome {
-                revision: transition.revision,
-                environment: env,
-                starting_lifecycle: transition.starting_lifecycle,
-            };
-            Ok(mutation_response(
-                outcome,
-                &env_id,
-                "revisions",
-                verb,
-                target,
-                idem_key,
-                Some(previous_generation),
-                revision,
-            ))
+    if let Some(replay) = replay_gate(state, &env_id, &idem_key, fingerprint).await? {
+        return Ok(replay);
+    }
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let loaded = state
+            .storage
+            .load_env(&env_id)
+            .await
+            .map_err(load_storage_error)?;
+        let previous_generation = loaded.revision.generation;
+        let mut env = loaded.value;
+        match apply(&mut env) {
+            Ok(transition) => {
+                let precondition = resolve_precondition(client_etag, &loaded.revision);
+                let target = json!({
+                    "environment_id": env_id,
+                    "revision_id": transition.revision.revision_id.to_string(),
+                    "lifecycle_to": transition.revision.lifecycle,
+                });
+                let next = next_revision(&env, &loaded.revision)?;
+                let outcome = RevisionTransitionOutcome {
+                    revision: transition.revision,
+                    environment: env,
+                    starting_lifecycle: transition.starting_lifecycle,
+                };
+                let prepared = prepare_mutation(
+                    &outcome,
+                    &env_id,
+                    "revisions",
+                    verb,
+                    target,
+                    idem_key,
+                    fingerprint,
+                    Some(previous_generation),
+                    next,
+                )?;
+                state
+                    .storage
+                    .update_env_journaled(
+                        &outcome.environment,
+                        &precondition,
+                        Some(&prepared.journal),
+                    )
+                    .await?;
+                Ok(prepared.into_response())
+            }
+            Err(err) if err.env_mutated() => {
+                // Health-gate failure: the engine flipped the revision to
+                // `Failed` in memory — persist before surfacing the typed 422.
+                let target = json!({
+                    "environment_id": env_id,
+                    "revision_id": match &err {
+                        RevisionLifecycleError::HealthGateFailed { revision_id, .. } =>
+                            Some(revision_id.to_string()),
+                        _ => None,
+                    },
+                    "lifecycle_to": "failed",
+                });
+                let next_generation = next_revision(&env, &loaded.revision)?.generation;
+                let api_err = ApiError::from(err);
+                let prepared = prepare_committed_error(
+                    &api_err.0,
+                    &env_id,
+                    "revisions",
+                    verb,
+                    target,
+                    idem_key,
+                    fingerprint,
+                    Some(previous_generation),
+                    next_generation,
+                )?;
+                let precondition = resolve_precondition(client_etag, &loaded.revision);
+                state
+                    .storage
+                    .update_env_journaled(&env, &precondition, Some(&prepared.journal))
+                    .await?;
+                Ok(prepared.into_response())
+            }
+            Err(err) => Err(err.into()),
         }
-        Err(err) if err.env_mutated() => {
-            // Health-gate failure: the engine flipped the revision to
-            // `Failed` in memory — persist before surfacing the typed 422.
-            let precondition = resolve_precondition(client_etag, &loaded.revision);
-            state.storage.update_env(&env, &precondition).await?;
-            Err(err.into())
-        }
-        Err(err) => Err(err.into()),
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(state, &env_id, &recheck_key, fingerprint, err).await,
     }
 }
 
@@ -777,50 +1181,75 @@ pub(crate) async fn set_traffic_split<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path(env_id): Path<String>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<SetTrafficSplitPayload>,
+    ApiJson(payload, fingerprint): ApiJson<SetTrafficSplitPayload>,
 ) -> Result<Response, ApiError> {
     let idem_key = require_idempotency_key(&headers)?;
     let client_etag = parse_if_match(&headers)?;
     let env_id = parse_env_id(&env_id)?;
-    let engine_key = IdempotencyKey::new(idem_key.clone())
-        .expect("require_idempotency_key guarantees non-empty");
-    let loaded = state
-        .storage
-        .load_env(&env_id)
-        .await
-        .map_err(load_storage_error)?;
-    let previous_generation = loaded.revision.generation;
-    let mut env = loaded.value;
-    let transition = engine::set_traffic_split(&mut env, payload, &engine_key, Utc::now())?;
-    let revision = if transition.mutated() {
-        let precondition = resolve_precondition(client_etag, &loaded.revision);
-        state.storage.update_env(&env, &precondition).await?
-    } else {
-        // Idempotent replay: nothing changed — echo the loaded CAS
+    if let Some(replay) = replay_gate(&state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(replay);
+    }
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let engine_key = IdempotencyKey::new(idem_key.clone())
+            .expect("require_idempotency_key guarantees non-empty");
+        let loaded = state
+            .storage
+            .load_env(&env_id)
+            .await
+            .map_err(load_storage_error)?;
+        let previous_generation = loaded.revision.generation;
+        let mut env = loaded.value;
+        let transition = engine::set_traffic_split(&mut env, payload, &engine_key, Utc::now())?;
+        let mutated = transition.mutated();
+        // The domain-level replay branch (`mutated == false`) is reached only
+        // when the split's stored key predates this server's ledger (state
+        // migrated from a LocalFS store) — same-key retries against THIS
+        // server are intercepted by the gate above. Echo the loaded CAS
         // coordinates so the client can keep chaining writes.
-        loaded.revision
-    };
-    let target = json!({
-        "environment_id": env_id,
-        "deployment_id": transition.split.deployment_id.to_string(),
-        "split_generation": transition.new_generation,
-    });
-    let outcome = ApplyTrafficSplitOutcome {
-        split: transition.split,
-        previous_generation: transition.previous_generation,
-        new_generation: transition.new_generation,
-        environment: env,
-    };
-    Ok(mutation_response(
-        outcome,
-        &env_id,
-        "traffic",
-        "set",
-        target,
-        idem_key,
-        Some(previous_generation),
-        revision,
-    ))
+        let revision = if mutated {
+            next_revision(&env, &loaded.revision)?
+        } else {
+            loaded.revision.clone()
+        };
+        let target = json!({
+            "environment_id": env_id,
+            "deployment_id": transition.split.deployment_id.to_string(),
+            "split_generation": transition.new_generation,
+        });
+        let outcome = ApplyTrafficSplitOutcome {
+            split: transition.split,
+            previous_generation: transition.previous_generation,
+            new_generation: transition.new_generation,
+            environment: env,
+        };
+        let prepared = prepare_mutation(
+            &outcome,
+            &env_id,
+            "traffic",
+            "set",
+            target,
+            idem_key,
+            &fingerprint,
+            Some(previous_generation),
+            revision,
+        )?;
+        if mutated {
+            let precondition = resolve_precondition(client_etag, &loaded.revision);
+            state
+                .storage
+                .update_env_journaled(&outcome.environment, &precondition, Some(&prepared.journal))
+                .await?;
+        } else {
+            state.storage.record_journal(&prepared.journal).await?;
+        }
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
 }
 
 /// `POST /environments/{env_id}/traffic/rollback` — restore a deployment's
@@ -831,42 +1260,60 @@ pub(crate) async fn rollback_traffic_split<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path(env_id): Path<String>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<RollbackTrafficSplitPayload>,
+    ApiJson(payload, fingerprint): ApiJson<RollbackTrafficSplitPayload>,
 ) -> Result<Response, ApiError> {
     let idem_key = require_idempotency_key(&headers)?;
     let client_etag = parse_if_match(&headers)?;
     let env_id = parse_env_id(&env_id)?;
-    let loaded = state
-        .storage
-        .load_env(&env_id)
-        .await
-        .map_err(load_storage_error)?;
-    let previous_generation = loaded.revision.generation;
-    let mut env = loaded.value;
-    let transition = engine::rollback_traffic_split(&mut env, payload.deployment_id, Utc::now())?;
-    let precondition = resolve_precondition(client_etag, &loaded.revision);
-    let revision = state.storage.update_env(&env, &precondition).await?;
-    let target = json!({
-        "environment_id": env_id,
-        "deployment_id": transition.restored.deployment_id.to_string(),
-        "split_generation": transition.new_generation,
-    });
-    let outcome = RollbackTrafficSplitOutcome {
-        restored: transition.restored,
-        previous_generation: transition.previous_generation,
-        new_generation: transition.new_generation,
-        environment: env,
-    };
-    Ok(mutation_response(
-        outcome,
-        &env_id,
-        "traffic",
-        "rollback",
-        target,
-        idem_key,
-        Some(previous_generation),
-        revision,
-    ))
+    if let Some(replay) = replay_gate(&state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(replay);
+    }
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let loaded = state
+            .storage
+            .load_env(&env_id)
+            .await
+            .map_err(load_storage_error)?;
+        let previous_generation = loaded.revision.generation;
+        let mut env = loaded.value;
+        let transition =
+            engine::rollback_traffic_split(&mut env, payload.deployment_id, Utc::now())?;
+        let precondition = resolve_precondition(client_etag, &loaded.revision);
+        let target = json!({
+            "environment_id": env_id,
+            "deployment_id": transition.restored.deployment_id.to_string(),
+            "split_generation": transition.new_generation,
+        });
+        let next = next_revision(&env, &loaded.revision)?;
+        let outcome = RollbackTrafficSplitOutcome {
+            restored: transition.restored,
+            previous_generation: transition.previous_generation,
+            new_generation: transition.new_generation,
+            environment: env,
+        };
+        let prepared = prepare_mutation(
+            &outcome,
+            &env_id,
+            "traffic",
+            "rollback",
+            target,
+            idem_key,
+            &fingerprint,
+            Some(previous_generation),
+            next,
+        )?;
+        state
+            .storage
+            .update_env_journaled(&outcome.environment, &precondition, Some(&prepared.journal))
+            .await?;
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -899,6 +1346,7 @@ async fn binding_mutation<S, T, F>(
     state: AppState<S>,
     raw_env_id: String,
     headers: HeaderMap,
+    fingerprint: RequestFingerprint,
     verb: &'static str,
     noun: &'static str,
     apply: F,
@@ -911,29 +1359,45 @@ where
     let idem_key = require_idempotency_key(&headers)?;
     let client_etag = parse_if_match(&headers)?;
     let env_id = parse_env_id(&raw_env_id)?;
-    let loaded = state
-        .storage
-        .load_env(&env_id)
-        .await
-        .map_err(load_storage_error)?;
-    let previous_generation = loaded.revision.generation;
-    let mut env = loaded.value;
-    let (result, mut target) = apply(&mut env)?;
-    let precondition = resolve_precondition(client_etag, &loaded.revision);
-    let revision = state.storage.update_env(&env, &precondition).await?;
-    if let Value::Object(map) = &mut target {
-        map.insert("environment_id".to_string(), json!(env_id));
+    if let Some(replay) = replay_gate(&state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(replay);
     }
-    Ok(mutation_response(
-        result,
-        &env_id,
-        noun,
-        verb,
-        target,
-        idem_key,
-        Some(previous_generation),
-        revision,
-    ))
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let loaded = state
+            .storage
+            .load_env(&env_id)
+            .await
+            .map_err(load_storage_error)?;
+        let previous_generation = loaded.revision.generation;
+        let mut env = loaded.value;
+        let (result, mut target) = apply(&mut env)?;
+        let precondition = resolve_precondition(client_etag, &loaded.revision);
+        if let Value::Object(map) = &mut target {
+            map.insert("environment_id".to_string(), json!(env_id));
+        }
+        let prepared = prepare_mutation(
+            &result,
+            &env_id,
+            noun,
+            verb,
+            target,
+            idem_key,
+            &fingerprint,
+            Some(previous_generation),
+            next_revision(&env, &loaded.revision)?,
+        )?;
+        state
+            .storage
+            .update_env_journaled(&env, &precondition, Some(&prepared.journal))
+            .await?;
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
 }
 
 /// `POST /environments/{env_id}/packs` — bind a new env-pack slot
@@ -942,13 +1406,21 @@ pub(crate) async fn add_pack_binding<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path(env_id): Path<String>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<PackBindingPayload>,
+    ApiJson(payload, fingerprint): ApiJson<PackBindingPayload>,
 ) -> Result<Response, ApiError> {
-    binding_mutation(state, env_id, headers, "add", "env-packs", |env| {
-        let added = engine::add_pack_binding(env, payload.binding)?;
-        let target = json!({"slot": added.slot, "kind": added.kind});
-        Ok((added, target))
-    })
+    binding_mutation(
+        state,
+        env_id,
+        headers,
+        fingerprint,
+        "add",
+        "env-packs",
+        |env| {
+            let added = engine::add_pack_binding(env, payload.binding)?;
+            let target = json!({"slot": added.slot, "kind": added.kind});
+            Ok((added, target))
+        },
+    )
     .await
 }
 
@@ -958,20 +1430,28 @@ pub(crate) async fn update_pack_binding<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, slot)): Path<(String, String)>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<PackBindingPayload>,
+    ApiJson(payload, fingerprint): ApiJson<PackBindingPayload>,
 ) -> Result<Response, ApiError> {
     let slot = parse_capability_slot(&slot)?;
-    binding_mutation(state, env_id, headers, "update", "env-packs", |env| {
-        let (binding, generation) = engine::update_pack_binding(env, slot, payload.binding)?;
-        let target = json!({"slot": binding.slot, "kind": binding.kind});
-        Ok((
-            BindingGenerationOutcome {
-                binding,
-                generation,
-            },
-            target,
-        ))
-    })
+    binding_mutation(
+        state,
+        env_id,
+        headers,
+        fingerprint,
+        "update",
+        "env-packs",
+        |env| {
+            let (binding, generation) = engine::update_pack_binding(env, slot, payload.binding)?;
+            let target = json!({"slot": binding.slot, "kind": binding.kind});
+            Ok((
+                BindingGenerationOutcome {
+                    binding,
+                    generation,
+                },
+                target,
+            ))
+        },
+    )
     .await
 }
 
@@ -981,19 +1461,28 @@ pub(crate) async fn remove_pack_binding<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, slot)): Path<(String, String)>,
     headers: HeaderMap,
+    Fingerprint(fingerprint): Fingerprint,
 ) -> Result<Response, ApiError> {
     let slot = parse_capability_slot(&slot)?;
-    binding_mutation(state, env_id, headers, "remove", "env-packs", |env| {
-        let (binding, generation) = engine::remove_pack_binding(env, slot)?;
-        let target = json!({"slot": slot});
-        Ok((
-            BindingGenerationOutcome {
-                binding,
-                generation,
-            },
-            target,
-        ))
-    })
+    binding_mutation(
+        state,
+        env_id,
+        headers,
+        fingerprint,
+        "remove",
+        "env-packs",
+        |env| {
+            let (binding, generation) = engine::remove_pack_binding(env, slot)?;
+            let target = json!({"slot": slot});
+            Ok((
+                BindingGenerationOutcome {
+                    binding,
+                    generation,
+                },
+                target,
+            ))
+        },
+    )
     .await
 }
 
@@ -1003,19 +1492,28 @@ pub(crate) async fn rollback_pack_binding<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, slot)): Path<(String, String)>,
     headers: HeaderMap,
+    Fingerprint(fingerprint): Fingerprint,
 ) -> Result<Response, ApiError> {
     let slot = parse_capability_slot(&slot)?;
-    binding_mutation(state, env_id, headers, "rollback", "env-packs", |env| {
-        let (binding, generation) = engine::rollback_pack_binding(env, slot)?;
-        let target = json!({"slot": slot});
-        Ok((
-            BindingGenerationOutcome {
-                binding,
-                generation,
-            },
-            target,
-        ))
-    })
+    binding_mutation(
+        state,
+        env_id,
+        headers,
+        fingerprint,
+        "rollback",
+        "env-packs",
+        |env| {
+            let (binding, generation) = engine::rollback_pack_binding(env, slot)?;
+            let target = json!({"slot": slot});
+            Ok((
+                BindingGenerationOutcome {
+                    binding,
+                    generation,
+                },
+                target,
+            ))
+        },
+    )
     .await
 }
 
@@ -1025,13 +1523,21 @@ pub(crate) async fn add_extension_binding<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path(env_id): Path<String>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<ExtensionBindingPayload>,
+    ApiJson(payload, fingerprint): ApiJson<ExtensionBindingPayload>,
 ) -> Result<Response, ApiError> {
-    binding_mutation(state, env_id, headers, "add", "extensions", |env| {
-        let added = engine::add_extension_binding(env, payload.binding)?;
-        let target = json!({"kind_path": added.kind.path(), "instance_id": added.instance_id});
-        Ok((added, target))
-    })
+    binding_mutation(
+        state,
+        env_id,
+        headers,
+        fingerprint,
+        "add",
+        "extensions",
+        |env| {
+            let added = engine::add_extension_binding(env, payload.binding)?;
+            let target = json!({"kind_path": added.kind.path(), "instance_id": added.instance_id});
+            Ok((added, target))
+        },
+    )
     .await
 }
 
@@ -1043,7 +1549,7 @@ pub(crate) async fn update_extension_binding<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path(env_id): Path<String>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<ExtensionKeyedPayload>,
+    ApiJson(payload, fingerprint): ApiJson<ExtensionKeyedPayload>,
 ) -> Result<Response, ApiError> {
     let Some(binding) = payload.binding else {
         return Err(ApiError(RemoteStoreError::InvalidRequest {
@@ -1051,17 +1557,25 @@ pub(crate) async fn update_extension_binding<S: EnvironmentStorage>(
         }));
     };
     let key = payload.key;
-    binding_mutation(state, env_id, headers, "update", "extensions", |env| {
-        let target = json!({"kind_path": key.kind_path, "instance_id": key.instance_id});
-        let (binding, generation) = engine::update_extension_binding(env, &key, binding)?;
-        Ok((
-            BindingGenerationOutcome {
-                binding,
-                generation,
-            },
-            target,
-        ))
-    })
+    binding_mutation(
+        state,
+        env_id,
+        headers,
+        fingerprint,
+        "update",
+        "extensions",
+        |env| {
+            let target = json!({"kind_path": key.kind_path, "instance_id": key.instance_id});
+            let (binding, generation) = engine::update_extension_binding(env, &key, binding)?;
+            Ok((
+                BindingGenerationOutcome {
+                    binding,
+                    generation,
+                },
+                target,
+            ))
+        },
+    )
     .await
 }
 
@@ -1071,20 +1585,28 @@ pub(crate) async fn remove_extension_binding<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path(env_id): Path<String>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<ExtensionKeyedPayload>,
+    ApiJson(payload, fingerprint): ApiJson<ExtensionKeyedPayload>,
 ) -> Result<Response, ApiError> {
     let key = payload.key;
-    binding_mutation(state, env_id, headers, "remove", "extensions", |env| {
-        let target = json!({"kind_path": key.kind_path, "instance_id": key.instance_id});
-        let (binding, generation) = engine::remove_extension_binding(env, &key)?;
-        Ok((
-            BindingGenerationOutcome {
-                binding,
-                generation,
-            },
-            target,
-        ))
-    })
+    binding_mutation(
+        state,
+        env_id,
+        headers,
+        fingerprint,
+        "remove",
+        "extensions",
+        |env| {
+            let target = json!({"kind_path": key.kind_path, "instance_id": key.instance_id});
+            let (binding, generation) = engine::remove_extension_binding(env, &key)?;
+            Ok((
+                BindingGenerationOutcome {
+                    binding,
+                    generation,
+                },
+                target,
+            ))
+        },
+    )
     .await
 }
 
@@ -1094,20 +1616,28 @@ pub(crate) async fn rollback_extension_binding<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path(env_id): Path<String>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<ExtensionKeyedPayload>,
+    ApiJson(payload, fingerprint): ApiJson<ExtensionKeyedPayload>,
 ) -> Result<Response, ApiError> {
     let key = payload.key;
-    binding_mutation(state, env_id, headers, "rollback", "extensions", |env| {
-        let target = json!({"kind_path": key.kind_path, "instance_id": key.instance_id});
-        let (binding, generation) = engine::rollback_extension_binding(env, &key)?;
-        Ok((
-            BindingGenerationOutcome {
-                binding,
-                generation,
-            },
-            target,
-        ))
-    })
+    binding_mutation(
+        state,
+        env_id,
+        headers,
+        fingerprint,
+        "rollback",
+        "extensions",
+        |env| {
+            let target = json!({"kind_path": key.kind_path, "instance_id": key.instance_id});
+            let (binding, generation) = engine::rollback_extension_binding(env, &key)?;
+            Ok((
+                BindingGenerationOutcome {
+                    binding,
+                    generation,
+                },
+                target,
+            ))
+        },
+    )
     .await
 }
 
@@ -1254,50 +1784,64 @@ pub(crate) async fn add_bundle<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path(env_id): Path<String>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<engine::AddBundlePayload>,
+    ApiJson(payload, fingerprint): ApiJson<engine::AddBundlePayload>,
 ) -> Result<Response, ApiError> {
     let idem_key = require_idempotency_key(&headers)?;
     let client_etag = parse_if_match(&headers)?;
     let env_id = parse_env_id(&env_id)?;
-    let loaded = state
-        .storage
-        .load_env(&env_id)
-        .await
-        .map_err(load_storage_error)?;
-    let previous_generation = loaded.revision.generation;
-    let mut env = loaded.value;
-    let now = Utc::now();
-    let idx = engine::add_bundle(&mut env, payload, DeploymentId::new(), now)?;
-    let pending = build_revenue_policy(&state, &env_id, &env.bundles[idx], now).await?;
-    env.bundles[idx].revenue_policy_ref = pending.built.policy_ref.clone();
-    let precondition = resolve_precondition(client_etag, &loaded.revision);
-    let revision = state
-        .storage
-        .update_env_with_revenue_policy(
-            &env,
-            &precondition,
-            &pending.artifact,
-            pending.trust_root_pin.as_ref(),
-        )
-        .await?;
-    let deployment = env.bundles[idx].clone();
-    let target = json!({
-        "environment_id": env_id,
-        "deployment_id": deployment.deployment_id,
-        "bundle_id": deployment.bundle_id,
-        "customer_id": deployment.customer_id,
-        "revenue_policy_version": pending.built.version,
-    });
-    Ok(mutation_response(
-        deployment,
-        &env_id,
-        "bundles",
-        "add",
-        target,
-        idem_key,
-        Some(previous_generation),
-        revision,
-    ))
+    if let Some(replay) = replay_gate(&state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(replay);
+    }
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let loaded = state
+            .storage
+            .load_env(&env_id)
+            .await
+            .map_err(load_storage_error)?;
+        let previous_generation = loaded.revision.generation;
+        let mut env = loaded.value;
+        let now = Utc::now();
+        let idx = engine::add_bundle(&mut env, payload, DeploymentId::new(), now)?;
+        let pending = build_revenue_policy(&state, &env_id, &env.bundles[idx], now).await?;
+        env.bundles[idx].revenue_policy_ref = pending.built.policy_ref.clone();
+        let precondition = resolve_precondition(client_etag, &loaded.revision);
+        let deployment = &env.bundles[idx];
+        let target = json!({
+            "environment_id": env_id,
+            "deployment_id": deployment.deployment_id,
+            "bundle_id": deployment.bundle_id,
+            "customer_id": deployment.customer_id,
+            "revenue_policy_version": pending.built.version,
+        });
+        let prepared = prepare_mutation(
+            deployment,
+            &env_id,
+            "bundles",
+            "add",
+            target,
+            idem_key,
+            &fingerprint,
+            Some(previous_generation),
+            next_revision(&env, &loaded.revision)?,
+        )?;
+        state
+            .storage
+            .update_env_with_revenue_policy_journaled(
+                &env,
+                &precondition,
+                &pending.artifact,
+                pending.trust_root_pin.as_ref(),
+                Some(&prepared.journal),
+            )
+            .await?;
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
 }
 
 /// `PATCH /environments/{env_id}/bundles/{deployment_id}` — patch a
@@ -1308,7 +1852,7 @@ pub(crate) async fn update_bundle<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, deployment_id)): Path<(String, String)>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<engine::UpdateBundlePayload>,
+    ApiJson(payload, fingerprint): ApiJson<engine::UpdateBundlePayload>,
 ) -> Result<Response, ApiError> {
     let idem_key = require_idempotency_key(&headers)?;
     let client_etag = parse_if_match(&headers)?;
@@ -1322,54 +1866,74 @@ pub(crate) async fn update_bundle<S: EnvironmentStorage>(
             ),
         }));
     }
-    let loaded = state
-        .storage
-        .load_env(&env_id)
-        .await
-        .map_err(load_storage_error)?;
-    let previous_generation = loaded.revision.generation;
-    let mut env = loaded.value;
-    let applied = engine::update_bundle(&mut env, payload)?;
-    let idx = applied.index;
-    let pending = if applied.revenue_share_changed {
-        let pending = build_revenue_policy(&state, &env_id, &env.bundles[idx], Utc::now()).await?;
-        env.bundles[idx].revenue_policy_ref = pending.built.policy_ref.clone();
-        Some(pending)
-    } else {
-        None
-    };
-    let policy_version = pending.as_ref().map(|p| p.built.version);
-    let precondition = resolve_precondition(client_etag, &loaded.revision);
-    let revision = match &pending {
-        Some(p) => {
-            state
-                .storage
-                .update_env_with_revenue_policy(
-                    &env,
-                    &precondition,
-                    &p.artifact,
-                    p.trust_root_pin.as_ref(),
-                )
-                .await?
+    if let Some(replay) = replay_gate(&state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(replay);
+    }
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let loaded = state
+            .storage
+            .load_env(&env_id)
+            .await
+            .map_err(load_storage_error)?;
+        let previous_generation = loaded.revision.generation;
+        let mut env = loaded.value;
+        let applied = engine::update_bundle(&mut env, payload)?;
+        let idx = applied.index;
+        let pending = if applied.revenue_share_changed {
+            let pending =
+                build_revenue_policy(&state, &env_id, &env.bundles[idx], Utc::now()).await?;
+            env.bundles[idx].revenue_policy_ref = pending.built.policy_ref.clone();
+            Some(pending)
+        } else {
+            None
+        };
+        let policy_version = pending.as_ref().map(|p| p.built.version);
+        let precondition = resolve_precondition(client_etag, &loaded.revision);
+        let deployment = &env.bundles[idx];
+        let target = json!({
+            "environment_id": env_id,
+            "deployment_id": deployment.deployment_id,
+            "revenue_policy_version": policy_version,
+        });
+        let prepared = prepare_mutation(
+            deployment,
+            &env_id,
+            "bundles",
+            "update",
+            target,
+            idem_key,
+            &fingerprint,
+            Some(previous_generation),
+            next_revision(&env, &loaded.revision)?,
+        )?;
+        match &pending {
+            Some(p) => {
+                state
+                    .storage
+                    .update_env_with_revenue_policy_journaled(
+                        &env,
+                        &precondition,
+                        &p.artifact,
+                        p.trust_root_pin.as_ref(),
+                        Some(&prepared.journal),
+                    )
+                    .await?;
+            }
+            None => {
+                state
+                    .storage
+                    .update_env_journaled(&env, &precondition, Some(&prepared.journal))
+                    .await?;
+            }
         }
-        None => state.storage.update_env(&env, &precondition).await?,
-    };
-    let deployment = env.bundles[idx].clone();
-    let target = json!({
-        "environment_id": env_id,
-        "deployment_id": deployment.deployment_id,
-        "revenue_policy_version": policy_version,
-    });
-    Ok(mutation_response(
-        deployment,
-        &env_id,
-        "bundles",
-        "update",
-        target,
-        idem_key,
-        Some(previous_generation),
-        revision,
-    ))
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
 }
 
 /// `DELETE /environments/{env_id}/bundles/{deployment_id}` — remove a
@@ -1380,36 +1944,53 @@ pub(crate) async fn remove_bundle<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, deployment_id)): Path<(String, String)>,
     headers: HeaderMap,
+    Fingerprint(fingerprint): Fingerprint,
 ) -> Result<Response, ApiError> {
     let idem_key = require_idempotency_key(&headers)?;
     let client_etag = parse_if_match(&headers)?;
     let env_id = parse_env_id(&env_id)?;
     let deployment_id = parse_deployment_id(&deployment_id)?;
-    let loaded = state
-        .storage
-        .load_env(&env_id)
-        .await
-        .map_err(load_storage_error)?;
-    let previous_generation = loaded.revision.generation;
-    let mut env = loaded.value;
-    let outcome = engine::remove_bundle(&mut env, deployment_id)?;
-    let precondition = resolve_precondition(client_etag, &loaded.revision);
-    let revision = state.storage.update_env(&env, &precondition).await?;
-    let target = json!({
-        "environment_id": env_id,
-        "deployment_id": deployment_id,
-        "pruned_revision_ids": outcome.pruned_revision_ids,
-    });
-    Ok(mutation_response(
-        outcome,
-        &env_id,
-        "bundles",
-        "remove",
-        target,
-        idem_key,
-        Some(previous_generation),
-        revision,
-    ))
+    if let Some(replay) = replay_gate(&state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(replay);
+    }
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let loaded = state
+            .storage
+            .load_env(&env_id)
+            .await
+            .map_err(load_storage_error)?;
+        let previous_generation = loaded.revision.generation;
+        let mut env = loaded.value;
+        let removed = engine::remove_bundle(&mut env, deployment_id)?;
+        let precondition = resolve_precondition(client_etag, &loaded.revision);
+        let target = json!({
+            "environment_id": env_id,
+            "deployment_id": deployment_id,
+            "pruned_revision_ids": removed.pruned_revision_ids,
+        });
+        let prepared = prepare_mutation(
+            &removed,
+            &env_id,
+            "bundles",
+            "remove",
+            target,
+            idem_key,
+            &fingerprint,
+            Some(previous_generation),
+            next_revision(&env, &loaded.revision)?,
+        )?;
+        state
+            .storage
+            .update_env_journaled(&env, &precondition, Some(&prepared.journal))
+            .await?;
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1502,6 +2083,7 @@ async fn messaging_mutation<S, T, F>(
     state: AppState<S>,
     raw_env_id: String,
     headers: HeaderMap,
+    fingerprint: RequestFingerprint,
     verb: &'static str,
     apply: F,
 ) -> Result<Response, ApiError>
@@ -1513,37 +2095,60 @@ where
     let idem_key = require_idempotency_key(&headers)?;
     let client_etag = parse_if_match(&headers)?;
     let env_id = parse_env_id(&raw_env_id)?;
-    let engine_key = IdempotencyKey::new(idem_key.clone())
-        .expect("require_idempotency_key guarantees non-empty");
-    let loaded = state
-        .storage
-        .load_env(&env_id)
-        .await
-        .map_err(load_storage_error)?;
-    let previous_generation = loaded.revision.generation;
-    let mut env = loaded.value;
-    let (result, mut target, mutated) = apply(&mut env, &engine_key)?;
-    let revision = if mutated {
-        let precondition = resolve_precondition(client_etag, &loaded.revision);
-        state.storage.update_env(&env, &precondition).await?
-    } else {
-        // Idempotent replay / no-op: nothing changed — echo the loaded CAS
-        // coordinates so the client can keep chaining writes.
-        loaded.revision
-    };
-    if let Value::Object(map) = &mut target {
-        map.insert("environment_id".to_string(), json!(env_id));
+    if let Some(replay) = replay_gate(&state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(replay);
     }
-    Ok(mutation_response(
-        result,
-        &env_id,
-        "messaging.endpoint",
-        verb,
-        target,
-        idem_key,
-        Some(previous_generation),
-        revision,
-    ))
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let engine_key = IdempotencyKey::new(idem_key.clone())
+            .expect("require_idempotency_key guarantees non-empty");
+        let loaded = state
+            .storage
+            .load_env(&env_id)
+            .await
+            .map_err(load_storage_error)?;
+        let previous_generation = loaded.revision.generation;
+        let mut env = loaded.value;
+        let (result, mut target, mutated) = apply(&mut env, &engine_key)?;
+        // Domain-level no-op (a fresh key naming already-converged state):
+        // nothing changed — echo the loaded CAS coordinates so the client can
+        // keep chaining writes, but still ledger the response (the key is
+        // consumed; its retry must replay, not re-evaluate against later state).
+        let revision = if mutated {
+            next_revision(&env, &loaded.revision)?
+        } else {
+            loaded.revision.clone()
+        };
+        if let Value::Object(map) = &mut target {
+            map.insert("environment_id".to_string(), json!(env_id));
+        }
+        let prepared = prepare_mutation(
+            &result,
+            &env_id,
+            "messaging.endpoint",
+            verb,
+            target,
+            idem_key,
+            &fingerprint,
+            Some(previous_generation),
+            revision,
+        )?;
+        if mutated {
+            let precondition = resolve_precondition(client_etag, &loaded.revision);
+            state
+                .storage
+                .update_env_journaled(&env, &precondition, Some(&prepared.journal))
+                .await?;
+        } else {
+            state.storage.record_journal(&prepared.journal).await?;
+        }
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
 }
 
 /// `POST /environments/{env_id}/messaging` — add a messaging endpoint
@@ -1553,9 +2158,9 @@ pub(crate) async fn add_messaging_endpoint<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path(env_id): Path<String>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<AddMessagingEndpointPayload>,
+    ApiJson(payload, fingerprint): ApiJson<AddMessagingEndpointPayload>,
 ) -> Result<Response, ApiError> {
-    messaging_mutation(state, env_id, headers, "add", |env, key| {
+    messaging_mutation(state, env_id, headers, fingerprint, "add", |env, key| {
         let applied = engine::add_messaging_endpoint(
             env,
             payload,
@@ -1581,25 +2186,32 @@ pub(crate) async fn link_messaging_bundle<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, endpoint_id)): Path<(String, String)>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<MessagingBundleLinkPayload>,
+    ApiJson(payload, fingerprint): ApiJson<MessagingBundleLinkPayload>,
 ) -> Result<Response, ApiError> {
     let endpoint_id = parse_endpoint_id(&endpoint_id)?;
-    messaging_mutation(state, env_id, headers, "link-bundle", |env, key| {
-        let target = json!({
-            "endpoint_id": endpoint_id.to_string(),
-            "bundle_id": payload.bundle_id,
-        });
-        let applied = engine::link_messaging_bundle(
-            env,
-            endpoint_id,
-            payload.bundle_id,
-            &payload.updated_by,
-            key,
-            Utc::now(),
-        )?;
-        let ep = env.messaging_endpoints[applied.index].clone();
-        Ok((ep, target, applied.mutated))
-    })
+    messaging_mutation(
+        state,
+        env_id,
+        headers,
+        fingerprint,
+        "link-bundle",
+        |env, key| {
+            let target = json!({
+                "endpoint_id": endpoint_id.to_string(),
+                "bundle_id": payload.bundle_id,
+            });
+            let applied = engine::link_messaging_bundle(
+                env,
+                endpoint_id,
+                payload.bundle_id,
+                &payload.updated_by,
+                key,
+                Utc::now(),
+            )?;
+            let ep = env.messaging_endpoints[applied.index].clone();
+            Ok((ep, target, applied.mutated))
+        },
+    )
     .await
 }
 
@@ -1609,25 +2221,32 @@ pub(crate) async fn unlink_messaging_bundle<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, endpoint_id)): Path<(String, String)>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<MessagingBundleLinkPayload>,
+    ApiJson(payload, fingerprint): ApiJson<MessagingBundleLinkPayload>,
 ) -> Result<Response, ApiError> {
     let endpoint_id = parse_endpoint_id(&endpoint_id)?;
-    messaging_mutation(state, env_id, headers, "unlink-bundle", |env, key| {
-        let target = json!({
-            "endpoint_id": endpoint_id.to_string(),
-            "bundle_id": payload.bundle_id,
-        });
-        let applied = engine::unlink_messaging_bundle(
-            env,
-            endpoint_id,
-            payload.bundle_id,
-            &payload.updated_by,
-            key,
-            Utc::now(),
-        )?;
-        let ep = env.messaging_endpoints[applied.index].clone();
-        Ok((ep, target, applied.mutated))
-    })
+    messaging_mutation(
+        state,
+        env_id,
+        headers,
+        fingerprint,
+        "unlink-bundle",
+        |env, key| {
+            let target = json!({
+                "endpoint_id": endpoint_id.to_string(),
+                "bundle_id": payload.bundle_id,
+            });
+            let applied = engine::unlink_messaging_bundle(
+                env,
+                endpoint_id,
+                payload.bundle_id,
+                &payload.updated_by,
+                key,
+                Utc::now(),
+            )?;
+            let ep = env.messaging_endpoints[applied.index].clone();
+            Ok((ep, target, applied.mutated))
+        },
+    )
     .await
 }
 
@@ -1639,7 +2258,7 @@ pub(crate) async fn set_messaging_welcome_flow<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, endpoint_id)): Path<(String, String)>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<SetMessagingWelcomeFlowPayload>,
+    ApiJson(payload, fingerprint): ApiJson<SetMessagingWelcomeFlowPayload>,
 ) -> Result<Response, ApiError> {
     let url_endpoint_id = parse_endpoint_id(&endpoint_id)?;
     if payload.endpoint_id != url_endpoint_id {
@@ -1650,17 +2269,24 @@ pub(crate) async fn set_messaging_welcome_flow<S: EnvironmentStorage>(
             ),
         }));
     }
-    messaging_mutation(state, env_id, headers, "set-welcome-flow", |env, key| {
-        let target = json!({
-            "endpoint_id": payload.endpoint_id.to_string(),
-            "bundle_id": payload.bundle_id,
-            "pack_id": payload.pack_id,
-            "flow_id": payload.flow_id,
-        });
-        let applied = engine::set_messaging_welcome_flow(env, payload, key, Utc::now())?;
-        let ep = env.messaging_endpoints[applied.index].clone();
-        Ok((ep, target, applied.mutated))
-    })
+    messaging_mutation(
+        state,
+        env_id,
+        headers,
+        fingerprint,
+        "set-welcome-flow",
+        |env, key| {
+            let target = json!({
+                "endpoint_id": payload.endpoint_id.to_string(),
+                "bundle_id": payload.bundle_id,
+                "pack_id": payload.pack_id,
+                "flow_id": payload.flow_id,
+            });
+            let applied = engine::set_messaging_welcome_flow(env, payload, key, Utc::now())?;
+            let ep = env.messaging_endpoints[applied.index].clone();
+            Ok((ep, target, applied.mutated))
+        },
+    )
     .await
 }
 
@@ -1671,13 +2297,21 @@ pub(crate) async fn remove_messaging_endpoint<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, endpoint_id)): Path<(String, String)>,
     headers: HeaderMap,
+    Fingerprint(fingerprint): Fingerprint,
 ) -> Result<Response, ApiError> {
     let endpoint_id = parse_endpoint_id(&endpoint_id)?;
-    messaging_mutation(state, env_id, headers, "remove", |env, _key| {
-        let mutated = engine::remove_messaging_endpoint(env, endpoint_id);
-        let target = json!({"endpoint_id": endpoint_id.to_string()});
-        Ok((endpoint_id, target, mutated))
-    })
+    messaging_mutation(
+        state,
+        env_id,
+        headers,
+        fingerprint,
+        "remove",
+        |env, _key| {
+            let mutated = engine::remove_messaging_endpoint(env, endpoint_id);
+            let target = json!({"endpoint_id": endpoint_id.to_string()});
+            Ok((endpoint_id, target, mutated))
+        },
+    )
     .await
 }
 
@@ -1690,13 +2324,14 @@ pub(crate) async fn rotate_messaging_webhook_secret<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, endpoint_id)): Path<(String, String)>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<RotateWebhookSecretPayload>,
+    ApiJson(payload, fingerprint): ApiJson<RotateWebhookSecretPayload>,
 ) -> Result<Response, ApiError> {
     let endpoint_id = parse_endpoint_id(&endpoint_id)?;
     messaging_mutation(
         state,
         env_id,
         headers,
+        fingerprint,
         "rotate-webhook-secret",
         |env, key| {
             let applied = engine::rotate_messaging_webhook_secret(
@@ -1737,23 +2372,34 @@ pub(crate) async fn rotate_messaging_webhook_secret<S: EnvironmentStorage>(
 // per the same-derivation rule.
 
 /// Decoded preamble shared by the four trust-root mutations: the
-/// idempotency key, the parsed env id, the env's CAS coordinates (the
-/// `load_env` doubles as the 404 existence gate), and the current
-/// trust-root row if one exists.
+/// idempotency key + request fingerprint, the parsed env id, the env's
+/// CAS coordinates (the `load_env` doubles as the 404 existence gate),
+/// and the current trust-root row if one exists. The replay gate runs
+/// BEFORE the loads — a replayed verb touches no state.
 struct TrustRootRequest {
     idem_key: String,
+    fingerprint: RequestFingerprint,
     env_id: EnvId,
     env_revision: EnvRevision,
     current: Option<LoadedTrustRoot>,
+}
+
+enum TrustRootGate {
+    Replay(Response),
+    Fresh(TrustRootRequest),
 }
 
 async fn load_trust_root_request<S: EnvironmentStorage>(
     state: &AppState<S>,
     raw_env_id: &str,
     headers: &HeaderMap,
-) -> Result<TrustRootRequest, ApiError> {
+    fingerprint: RequestFingerprint,
+) -> Result<TrustRootGate, ApiError> {
     let idem_key = require_idempotency_key(headers)?;
     let env_id = parse_env_id(raw_env_id)?;
+    if let Some(replay) = replay_gate(state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(TrustRootGate::Replay(replay));
+    }
     let env = state
         .storage
         .load_env(&env_id)
@@ -1764,12 +2410,13 @@ async fn load_trust_root_request<S: EnvironmentStorage>(
         .load_trust_root(&env_id)
         .await
         .map_err(load_storage_error)?;
-    Ok(TrustRootRequest {
+    Ok(TrustRootGate::Fresh(TrustRootRequest {
         idem_key,
+        fingerprint,
         env_id,
         env_revision: env.revision,
         current,
-    })
+    }))
 }
 
 /// Split the loaded row into a workable document plus the CAS pin for the
@@ -1837,22 +2484,34 @@ enum FirstWriteRace {
 /// iterations: trust-root rows are never deleted, so after a race the
 /// reload returns `Some` → the retry carries a CAS pin → the race guard
 /// cannot fire again, and a second conflict surfaces as an honest 412.
+///
+/// `prepare` builds the verb's response from the post-mutate document;
+/// its journal rides each upsert attempt, so the ledger + audit rows
+/// commit with — and only with — the attempt that persists (a losing
+/// attempt's transaction rolls them back along with the document).
 async fn persist_trust_root_mutation<S: EnvironmentStorage>(
     state: &AppState<S>,
     env_id: &EnvId,
     mut current: Option<LoadedTrustRoot>,
     on_race: FirstWriteRace,
     mutate: impl Fn(&mut TrustRootDocument),
-) -> Result<Option<TrustRootDocument>, ApiError> {
+    prepare: impl Fn(&TrustRootDocument) -> Result<PreparedMutation, ApiError>,
+) -> Result<Option<PreparedMutation>, ApiError> {
     loop {
         let (mut doc, precondition) = doc_and_precondition(current);
         mutate(&mut doc);
+        let prepared = prepare(&doc)?;
         match state
             .storage
-            .upsert_trust_root(env_id, &doc, precondition.as_ref())
+            .upsert_trust_root_journaled(
+                env_id,
+                &doc,
+                precondition.as_ref(),
+                Some(&prepared.journal),
+            )
             .await
         {
-            Ok(_revision) => return Ok(Some(doc)),
+            Ok(_revision) => return Ok(Some(prepared)),
             Err(StorageError::PreconditionRequired) if precondition.is_none() => match on_race {
                 FirstWriteRace::NoOp => return Ok(None),
                 FirstWriteRace::Retry => {
@@ -1870,32 +2529,40 @@ async fn persist_trust_root_mutation<S: EnvironmentStorage>(
 
 /// Shared body of bootstrap/seed: add the server operator key to the
 /// (possibly fresh) document — idempotent re-grant on case-insensitive
-/// `key_id` collision — and persist under the row's CAS pin. Returns
-/// `None` only when a [`FirstWriteRace::NoOp`] seed observes the
-/// concurrent first write (the row it could not see at load time).
+/// `key_id` collision — and persist under the row's CAS pin, journaling
+/// in the same transaction. `prepare` builds the verb-specific envelope
+/// from the granted seed. Returns `None` only when a
+/// [`FirstWriteRace::NoOp`] seed observes the concurrent first write (the
+/// row it could not see at load time).
 async fn grant_operator_key<S: EnvironmentStorage>(
     state: &AppState<S>,
     env_id: &EnvId,
     current: Option<LoadedTrustRoot>,
     on_race: FirstWriteRace,
-) -> Result<Option<TrustRootSeed>, ApiError> {
+    prepare: impl Fn(TrustRootSeed) -> Result<PreparedMutation, ApiError>,
+) -> Result<Option<PreparedMutation>, ApiError> {
     let op_key = load_server_operator_key(state.operator_key_path.clone()).await?;
     let entry = trust_root::validate_trusted_key(TrustedKey {
         key_id: op_key.key_id.clone(),
         public_key_pem: op_key.public_pem.clone(),
     })?;
-    let Some(doc) = persist_trust_root_mutation(state, env_id, current, on_race, |doc| {
-        trust_root::apply_add(&mut doc.keys, entry.clone());
-    })
-    .await?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(TrustRootSeed {
-        key_id: op_key.key_id,
-        public_key_pem: op_key.public_pem,
-        trusted_key_count: doc.keys.len(),
-    }))
+    persist_trust_root_mutation(
+        state,
+        env_id,
+        current,
+        on_race,
+        |doc| {
+            trust_root::apply_add(&mut doc.keys, entry.clone());
+        },
+        |doc| {
+            prepare(TrustRootSeed {
+                key_id: op_key.key_id.clone(),
+                public_key_pem: op_key.public_pem.clone(),
+                trusted_key_count: doc.keys.len(),
+            })
+        },
+    )
+    .await
 }
 
 /// `POST /environments/{env_id}/trust-root/bootstrap` — load (or generate)
@@ -1905,22 +2572,45 @@ pub(crate) async fn bootstrap_trust_root<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path(env_id): Path<String>,
     headers: HeaderMap,
+    Fingerprint(fingerprint): Fingerprint,
 ) -> Result<Response, ApiError> {
-    let req = load_trust_root_request(&state, &env_id, &headers).await?;
-    let seed = grant_operator_key(&state, &req.env_id, req.current, FirstWriteRace::Retry)
-        .await?
-        .expect("Retry mode always grants");
-    let target = json!({"environment_id": req.env_id, "key_id": seed.key_id});
-    Ok(mutation_response(
-        seed,
-        &req.env_id,
-        "trust-root",
-        "bootstrap",
-        target,
-        req.idem_key,
-        Some(req.env_revision.generation),
-        req.env_revision,
-    ))
+    let req = match load_trust_root_request(&state, &env_id, &headers, fingerprint).await? {
+        TrustRootGate::Replay(replay) => return Ok(replay),
+        TrustRootGate::Fresh(req) => req,
+    };
+    let TrustRootRequest {
+        idem_key,
+        fingerprint,
+        env_id,
+        env_revision,
+        current,
+    } = req;
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let prepared =
+            grant_operator_key(&state, &env_id, current, FirstWriteRace::Retry, |seed| {
+                let target = json!({"environment_id": env_id, "key_id": seed.key_id});
+                prepare_mutation(
+                    &seed,
+                    &env_id,
+                    "trust-root",
+                    "bootstrap",
+                    target,
+                    idem_key.clone(),
+                    &fingerprint,
+                    Some(env_revision.generation),
+                    env_revision.clone(),
+                )
+            })
+            .await?
+            .expect("Retry mode always grants");
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
 }
 
 /// `POST /environments/{env_id}/trust-root/seed` — first-init-only variant
@@ -1932,26 +2622,65 @@ pub(crate) async fn seed_trust_root<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path(env_id): Path<String>,
     headers: HeaderMap,
+    Fingerprint(fingerprint): Fingerprint,
 ) -> Result<Response, ApiError> {
-    let req = load_trust_root_request(&state, &env_id, &headers).await?;
-    let seed = match req.current {
-        Some(_) => None,
-        None => grant_operator_key(&state, &req.env_id, None, FirstWriteRace::NoOp).await?,
+    let req = match load_trust_root_request(&state, &env_id, &headers, fingerprint).await? {
+        TrustRootGate::Replay(replay) => return Ok(replay),
+        TrustRootGate::Fresh(req) => req,
     };
-    let mut target = json!({"environment_id": req.env_id});
-    if let (Some(seed), Value::Object(map)) = (&seed, &mut target) {
-        map.insert("key_id".to_string(), json!(seed.key_id));
+    let TrustRootRequest {
+        idem_key,
+        fingerprint,
+        env_id,
+        env_revision,
+        current,
+    } = req;
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let prepare_with = |seed: Option<TrustRootSeed>| {
+            let mut target = json!({"environment_id": env_id});
+            if let (Some(seed), Value::Object(map)) = (&seed, &mut target) {
+                map.insert("key_id".to_string(), json!(seed.key_id));
+            }
+            prepare_mutation(
+                &seed,
+                &env_id,
+                "trust-root",
+                "seed",
+                target,
+                idem_key.clone(),
+                &fingerprint,
+                Some(env_revision.generation),
+                env_revision.clone(),
+            )
+        };
+        let granted = match current {
+            Some(_) => None,
+            None => {
+                grant_operator_key(&state, &env_id, None, FirstWriteRace::NoOp, |seed| {
+                    prepare_with(Some(seed))
+                })
+                .await?
+            }
+        };
+        let prepared = match granted {
+            Some(prepared) => prepared,
+            None => {
+                // No-op (the root already exists, or a concurrent first write
+                // raced this seed): the `null` result still consumes the key —
+                // record it standalone so a same-key retry replays it.
+                let prepared = prepare_with(None)?;
+                state.storage.record_journal(&prepared.journal).await?;
+                prepared
+            }
+        };
+        Ok(prepared.into_response())
     }
-    Ok(mutation_response(
-        seed,
-        &req.env_id,
-        "trust-root",
-        "seed",
-        target,
-        req.idem_key,
-        Some(req.env_revision.generation),
-        req.env_revision,
-    ))
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
 }
 
 /// `POST /environments/{env_id}/trust-root/keys` — validate and add a
@@ -1963,89 +2692,143 @@ pub(crate) async fn add_trusted_key<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path(env_id): Path<String>,
     headers: HeaderMap,
-    ApiJson(payload): ApiJson<AddTrustedKeyPayload>,
+    ApiJson(payload, fingerprint): ApiJson<AddTrustedKeyPayload>,
 ) -> Result<Response, ApiError> {
-    let req = load_trust_root_request(&state, &env_id, &headers).await?;
-    let supplied_key_id = payload.key_id.clone();
-    let entry = trust_root::validate_trusted_key(TrustedKey {
-        key_id: payload.key_id,
-        public_key_pem: payload.public_key_pem,
-    })?;
-    // The audit target carries the full PEM so a later-removed key can be
-    // reconstructed from the audit log alone — same recovery rationale as
-    // the local CLI's audit target.
-    let target = json!({
-        "environment_id": req.env_id,
-        "key_id": supplied_key_id,
-        "public_key_pem": entry.public_key_pem,
-    });
-
-    let doc = persist_trust_root_mutation(
-        &state,
-        &req.env_id,
-        req.current,
-        FirstWriteRace::Retry,
-        |doc| {
-            trust_root::apply_add(&mut doc.keys, entry.clone());
-        },
-    )
-    .await?
-    .expect("Retry mode always persists");
-    let outcome = TrustRootAddOutcome {
-        added_key_id: supplied_key_id,
-        trusted_key_count: doc.keys.len(),
+    let req = match load_trust_root_request(&state, &env_id, &headers, fingerprint).await? {
+        TrustRootGate::Replay(replay) => return Ok(replay),
+        TrustRootGate::Fresh(req) => req,
     };
-    Ok(mutation_response(
-        outcome,
-        &req.env_id,
-        "trust-root",
-        "add",
-        target,
-        req.idem_key,
-        Some(req.env_revision.generation),
-        req.env_revision,
-    ))
+    let TrustRootRequest {
+        idem_key,
+        fingerprint,
+        env_id,
+        env_revision,
+        current,
+    } = req;
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let supplied_key_id = payload.key_id.clone();
+        let entry = trust_root::validate_trusted_key(TrustedKey {
+            key_id: payload.key_id,
+            public_key_pem: payload.public_key_pem,
+        })?;
+        // The audit target carries the full PEM so a later-removed key can be
+        // reconstructed from the audit log alone — same recovery rationale as
+        // the local CLI's audit target.
+        let target = json!({
+            "environment_id": env_id,
+            "key_id": supplied_key_id,
+            "public_key_pem": entry.public_key_pem,
+        });
+
+        let prepared = persist_trust_root_mutation(
+            &state,
+            &env_id,
+            current,
+            FirstWriteRace::Retry,
+            |doc| {
+                trust_root::apply_add(&mut doc.keys, entry.clone());
+            },
+            |doc| {
+                let outcome = TrustRootAddOutcome {
+                    added_key_id: supplied_key_id.clone(),
+                    trusted_key_count: doc.keys.len(),
+                };
+                prepare_mutation(
+                    &outcome,
+                    &env_id,
+                    "trust-root",
+                    "add",
+                    target.clone(),
+                    idem_key.clone(),
+                    &fingerprint,
+                    Some(env_revision.generation),
+                    env_revision.clone(),
+                )
+            },
+        )
+        .await?
+        .expect("Retry mode always persists");
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
 }
 
 /// `DELETE /environments/{env_id}/trust-root/keys/{key_id}` — remove a
 /// trusted key by case-insensitive id (A8 route 21). Silent no-op when the
 /// id is absent; the pre-removal PEM is captured for the outcome's
-/// recovery material. A no-op never persists — it must not materialize a
-/// trust-root row where none existed (row absence is the seed gate).
+/// recovery material. A no-op never persists the document — it must not
+/// materialize a trust-root row where none existed (row absence is the
+/// seed gate) — but its response is still ledgered: the removed-PEM
+/// recovery material survives a lost response (a same-key retry replays
+/// it instead of reporting "nothing removed").
 pub(crate) async fn remove_trusted_key<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, key_id)): Path<(String, String)>,
     headers: HeaderMap,
+    Fingerprint(fingerprint): Fingerprint,
 ) -> Result<Response, ApiError> {
-    let req = load_trust_root_request(&state, &env_id, &headers).await?;
-    let (mut doc, precondition) = doc_and_precondition(req.current);
-    let removed_public_key_pem = doc
-        .keys
-        .iter()
-        .find(|k| k.key_id.eq_ignore_ascii_case(&key_id))
-        .map(|k| k.public_key_pem.clone());
-    if trust_root::apply_remove(&mut doc.keys, &key_id) {
-        state
-            .storage
-            .upsert_trust_root(&req.env_id, &doc, precondition.as_ref())
-            .await?;
-    }
-    let target = json!({"environment_id": req.env_id, "key_id": key_id});
-    let outcome = TrustRootRemoveOutcome {
-        removed_key_id: key_id,
-        removed_public_key_pem,
-        trusted_key_count: doc.keys.len(),
+    let req = match load_trust_root_request(&state, &env_id, &headers, fingerprint).await? {
+        TrustRootGate::Replay(replay) => return Ok(replay),
+        TrustRootGate::Fresh(req) => req,
     };
-    Ok(mutation_response(
-        outcome,
-        &req.env_id,
-        "trust-root",
-        "remove",
-        target,
-        req.idem_key,
-        Some(req.env_revision.generation),
-        req.env_revision,
-    ))
+    let TrustRootRequest {
+        idem_key,
+        fingerprint,
+        env_id,
+        env_revision,
+        current,
+    } = req;
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let (mut doc, precondition) = doc_and_precondition(current);
+        let removed_public_key_pem = doc
+            .keys
+            .iter()
+            .find(|k| k.key_id.eq_ignore_ascii_case(&key_id))
+            .map(|k| k.public_key_pem.clone());
+        let removed = trust_root::apply_remove(&mut doc.keys, &key_id);
+        let target = json!({"environment_id": env_id, "key_id": key_id});
+        let removed_outcome = TrustRootRemoveOutcome {
+            removed_key_id: key_id,
+            removed_public_key_pem,
+            trusted_key_count: doc.keys.len(),
+        };
+        let prepared = prepare_mutation(
+            &removed_outcome,
+            &env_id,
+            "trust-root",
+            "remove",
+            target,
+            idem_key,
+            &fingerprint,
+            Some(env_revision.generation),
+            env_revision,
+        )?;
+        if removed {
+            state
+                .storage
+                .upsert_trust_root_journaled(
+                    &env_id,
+                    &doc,
+                    precondition.as_ref(),
+                    Some(&prepared.journal),
+                )
+                .await?;
+        } else {
+            state.storage.record_journal(&prepared.journal).await?;
+        }
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
 }
 
 // ---------------------------------------------------------------------------

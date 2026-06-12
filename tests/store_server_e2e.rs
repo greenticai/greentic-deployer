@@ -344,12 +344,26 @@ async fn remote_env_lifecycle_end_to_end() {
         assert_eq!(outcome.split.idempotency_key, "k-traffic-1");
         assert_eq!(outcome.environment.environment_id, id);
 
-        // Same-key-same-entries replay → no-op success with NONE
-        // generations (the local idempotency contract, served remotely).
+        // Same-key-same-request retry → the PR-4.3 transport replay: the
+        // server returns the ORIGINAL ledgered response verbatim (so
+        // `new_generation` echoes the first commit, unlike the LocalFS
+        // domain no-op's `None`), the client's audit/key binding checks
+        // pass against the original audit event, and nothing re-applies.
         let replay = store
             .set_traffic_split(&id, full_weight(), idem("k-traffic-1"))
-            .expect("replay is a no-op success");
-        assert_eq!(replay.new_generation, None);
+            .expect("replay is a verbatim success");
+        assert_eq!(replay.new_generation, Some(0));
+        assert_eq!(replay.split.idempotency_key, "k-traffic-1");
+
+        // Reusing a consumed key for a DIFFERENT request is the typed A8
+        // idempotency conflict, raised at the replay gate.
+        let err = store
+            .rollback_traffic_split(&id, deployment_id, idem("k-traffic-1"))
+            .expect_err("key reuse across requests");
+        assert!(
+            matches!(&err, StoreError::Conflict(msg) if msg.contains("idempotency")),
+            "unexpected error: {err:?}"
+        );
 
         // Rollback without a prior snapshot → the same `Conflict` noun the
         // local store raises.

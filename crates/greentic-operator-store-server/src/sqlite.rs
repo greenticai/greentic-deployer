@@ -34,7 +34,7 @@ use greentic_operator_trust::trust_root::{TRUST_ROOT_SCHEMA_V1, TrustRootDocumen
 
 use crate::storage::{
     EnvRevision, EnvironmentStorage, Loaded, LoadedAnswers, LoadedEnv, LoadedRuntime,
-    LoadedTrustRoot, RevenuePolicyArtifact, StorageError,
+    LoadedTrustRoot, MutationJournal, RevenuePolicyArtifact, StorageError, StoredIdempotencyRecord,
 };
 
 impl From<sqlx::Error> for StorageError {
@@ -185,12 +185,19 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         })
     }
 
-    async fn create_env(&self, env: &Environment) -> Result<EnvRevision, StorageError> {
+    async fn create_env_journaled(
+        &self,
+        env: &Environment,
+        journal: Option<&MutationJournal>,
+    ) -> Result<EnvRevision, StorageError> {
         validate_environment(env)?;
         let (etag, integrity, data) = serialize_for_write(env)?;
 
         // ON CONFLICT DO NOTHING returns zero rows on collision. We then
         // look up the existing generation to give the caller a useful error.
+        // The collision path never reaches the journal insert, so a lost
+        // create consumes no idempotency key.
+        let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query(
             "INSERT INTO environments (env_id, generation, etag, data, integrity_digest) \
              VALUES ($1, 1, $2, $3, $4) \
@@ -201,15 +208,17 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         .bind(&etag.0)
         .bind(&data)
         .bind(&integrity.digest)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
         if let Some(row) = inserted {
+            journal_in_tx(&mut tx, journal).await?;
+            tx.commit().await?;
             return decode_revision(&row);
         }
         let existing = sqlx::query("SELECT generation FROM environments WHERE env_id = $1")
             .bind(env.environment_id.as_str())
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
         let generation: i64 = existing.try_get("generation")?;
         Err(StorageError::AlreadyExists {
@@ -218,15 +227,49 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         })
     }
 
-    async fn update_env(
+    async fn update_env_journaled(
         &self,
         env: &Environment,
         precondition: &Precondition,
+        journal: Option<&MutationJournal>,
     ) -> Result<EnvRevision, StorageError> {
         let mut tx = self.pool.begin().await?;
         let revision = update_env_in_tx(&mut tx, env, precondition).await?;
+        journal_in_tx(&mut tx, journal).await?;
         tx.commit().await?;
         Ok(revision)
+    }
+
+    async fn lookup_idempotency(
+        &self,
+        env_id: &EnvId,
+        key: &str,
+    ) -> Result<Option<StoredIdempotencyRecord>, StorageError> {
+        let row = sqlx::query(
+            "SELECT operation, request_fingerprint, response_status, response_body \
+             FROM idempotency_ledger WHERE env_id = $1 AND idempotency_key = $2",
+        )
+        .bind(env_id.as_str())
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let status: i64 = row.try_get("response_status")?;
+        Ok(Some(StoredIdempotencyRecord {
+            operation: row.try_get("operation")?,
+            request_fingerprint: row.try_get("request_fingerprint")?,
+            response_status: status as u16,
+            response_body: row.try_get("response_body")?,
+        }))
+    }
+
+    async fn record_journal(&self, journal: &MutationJournal) -> Result<(), StorageError> {
+        let mut tx = self.pool.begin().await?;
+        journal_in_tx(&mut tx, Some(journal)).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     // --- runtime --------------------------------------------------------
@@ -491,11 +534,12 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         }))
     }
 
-    async fn upsert_trust_root(
+    async fn upsert_trust_root_journaled(
         &self,
         env_id: &EnvId,
         doc: &TrustRootDocument,
         precondition: Option<&Precondition>,
+        journal: Option<&MutationJournal>,
     ) -> Result<EnvRevision, StorageError> {
         if doc.schema != TRUST_ROOT_SCHEMA_V1 {
             return Err(StorageError::Spec(SpecError::SchemaMismatch {
@@ -555,6 +599,7 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
                 new_gen
             }
         };
+        journal_in_tx(&mut tx, journal).await?;
         tx.commit().await?;
         Ok(EnvRevision {
             generation: new_gen,
@@ -608,12 +653,13 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         Ok(())
     }
 
-    async fn update_env_with_revenue_policy(
+    async fn update_env_with_revenue_policy_journaled(
         &self,
         env: &Environment,
         precondition: &Precondition,
         artifact: &RevenuePolicyArtifact,
         trust_root_pin: Option<&EnvRevision>,
+        journal: Option<&MutationJournal>,
     ) -> Result<EnvRevision, StorageError> {
         let env_id = &env.environment_id;
         let mut tx = self.pool.begin().await?;
@@ -662,6 +708,7 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         //    artifact back too — committed env state and the artifact it
         //    references commit or fail as one.
         let revision = update_env_in_tx(&mut tx, env, precondition).await?;
+        journal_in_tx(&mut tx, journal).await?;
         tx.commit().await?;
         Ok(revision)
     }
@@ -702,6 +749,64 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
 }
 
 // --- helpers ------------------------------------------------------------
+
+/// Write a [`MutationJournal`]'s ledger + audit rows inside the caller's
+/// transaction (PR-4.3). `None` is a no-op so the journal-free trait
+/// defaults share the same code paths.
+///
+/// The ledger insert is a plain INSERT against the `(env_id,
+/// idempotency_key)` primary key: a violation means a concurrent request
+/// committed the same key between this request's replay-gate lookup and
+/// its commit — surfaced as [`StorageError::IdempotencyKeyCommitted`], the
+/// caller's whole transaction (mutation included) rolls back, and the
+/// retry replays the winner's stored response.
+async fn journal_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    journal: Option<&MutationJournal>,
+) -> Result<(), StorageError> {
+    let Some(journal) = journal else {
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO idempotency_ledger \
+         (env_id, idempotency_key, operation, request_fingerprint, \
+          response_status, response_body) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(journal.env_id.as_str())
+    .bind(&journal.idempotency_key)
+    .bind(&journal.operation)
+    .bind(&journal.request_fingerprint)
+    .bind(journal.response_status as i64)
+    .bind(&journal.response_body)
+    .execute(&mut **tx)
+    .await
+    .map_err(|err| match &err {
+        sqlx::Error::Database(db) if db.is_unique_violation() => {
+            StorageError::IdempotencyKeyCommitted {
+                env_id: journal.env_id.clone(),
+                key: journal.idempotency_key.clone(),
+            }
+        }
+        _ => StorageError::from(err),
+    })?;
+    sqlx::query(
+        "DELETE FROM idempotency_ledger WHERE env_id = $1 AND rowid NOT IN ( \
+         SELECT rowid FROM idempotency_ledger WHERE env_id = $1 \
+         ORDER BY rowid DESC LIMIT $2)",
+    )
+    .bind(journal.env_id.as_str())
+    .bind(crate::storage::MAX_LEDGER_ROWS_PER_ENV)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("INSERT INTO audit_log (env_id, event_id, event) VALUES ($1, $2, $3)")
+        .bind(journal.env_id.as_str())
+        .bind(&journal.audit_event_id)
+        .bind(&journal.audit_event)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
 
 /// CAS-checked environment UPDATE inside an existing transaction — the
 /// shared body of `update_env` and `update_env_with_revenue_policy`. The
