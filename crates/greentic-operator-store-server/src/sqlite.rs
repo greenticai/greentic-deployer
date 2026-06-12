@@ -33,7 +33,7 @@ use sqlx::{
 use greentic_operator_trust::trust_root::{TRUST_ROOT_SCHEMA_V1, TrustRootDocument};
 
 use crate::storage::{
-    EnvRevision, EnvironmentStorage, Loaded, LoadedAnswers, LoadedEnv, LoadedRuntime,
+    EnvRevision, EnvSnapshot, EnvironmentStorage, Loaded, LoadedAnswers, LoadedEnv, LoadedRuntime,
     LoadedTrustRoot, MutationJournal, RevenuePolicyArtifact, StorageError, StoredBackup,
     StoredIdempotencyRecord,
 };
@@ -772,8 +772,9 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         }
         sqlx::query(
             "INSERT INTO backups \
-             (env_id, backup_id, created_at, generation, integrity, size_bytes, state) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             (env_id, backup_id, created_at, generation, integrity, size_bytes, state, \
+              snapshot_digest) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(manifest.env_id.as_str())
         .bind(&manifest.backup_id)
@@ -782,6 +783,7 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         .bind(&manifest.integrity.digest)
         .bind(manifest.size_bytes as i64)
         .bind(&backup.state)
+        .bind(&backup.snapshot_digest)
         .execute(&mut *tx)
         .await?;
         journal_in_tx(&mut tx, journal).await?;
@@ -808,7 +810,8 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         backup_id: &str,
     ) -> Result<Option<StoredBackup>, StorageError> {
         let row = sqlx::query(
-            "SELECT backup_id, created_at, generation, integrity, size_bytes, state \
+            "SELECT backup_id, created_at, generation, integrity, size_bytes, state, \
+                    snapshot_digest \
              FROM backups WHERE env_id = $1 AND backup_id = $2",
         )
         .bind(env_id.as_str())
@@ -821,6 +824,7 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         Ok(Some(StoredBackup {
             manifest: decode_backup_manifest(env_id, &row)?,
             state: row.try_get("state")?,
+            snapshot_digest: row.try_get("snapshot_digest")?,
         }))
     }
 
@@ -845,6 +849,140 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         journal_in_tx(&mut tx, journal).await?;
         tx.commit().await?;
         Ok(true)
+    }
+
+    async fn load_env_snapshot(&self, env_id: &EnvId) -> Result<EnvSnapshot, StorageError> {
+        // One transaction so the capture cannot be torn by an interleaved
+        // mutation (the single-connection pool serializes statements but
+        // NOT multi-statement sequences outside a tx).
+        let mut tx = self.pool.begin().await?;
+
+        // Environment row (required — callers already verified existence).
+        let env_row = sqlx::query("SELECT data FROM environments WHERE env_id = $1")
+            .bind(env_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(env_row) = env_row else {
+            return Err(StorageError::NotFound(env_id.clone()));
+        };
+        let environment: Value = env_row.try_get("data")?;
+
+        // Runtime sidecar (optional).
+        let runtime_row = sqlx::query("SELECT data FROM environment_runtimes WHERE env_id = $1")
+            .bind(env_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+        let runtime: Option<Value> = match runtime_row {
+            Some(row) => Some(row.try_get("data")?),
+            None => None,
+        };
+
+        // Pack-answers sidecars (optional, only live rows).
+        let answer_rows =
+            sqlx::query("SELECT slot, data FROM pack_answers WHERE env_id = $1 AND deleted = 0")
+                .bind(env_id.as_str())
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut pack_answers = std::collections::BTreeMap::new();
+        for row in &answer_rows {
+            let slot: String = row.try_get("slot")?;
+            let data: Value = row.try_get("data")?;
+            pack_answers.insert(slot, data);
+        }
+
+        tx.commit().await?;
+        Ok(EnvSnapshot {
+            environment,
+            runtime,
+            pack_answers,
+        })
+    }
+
+    async fn restore_env_journaled(
+        &self,
+        env_id: &EnvId,
+        snapshot: &EnvSnapshot,
+        precondition: &Precondition,
+        journal: Option<&MutationJournal>,
+    ) -> Result<EnvRevision, StorageError> {
+        // Decode + validate the environment from the snapshot before writing.
+        let env: Environment = serde_json::from_value(snapshot.environment.clone())?;
+        validate_environment(&env)?;
+
+        let mut tx = self.pool.begin().await?;
+
+        // 1. CAS-guarded environment update.
+        let revision = update_env_in_tx(&mut tx, &env, precondition).await?;
+
+        // 2. Runtime sidecar: upsert if present in snapshot, delete if absent.
+        match &snapshot.runtime {
+            Some(runtime_data) => {
+                let (etag, integrity, data) = serialize_for_write_value(runtime_data)?;
+                let existing =
+                    sqlx::query("SELECT 1 AS one FROM environment_runtimes WHERE env_id = $1")
+                        .bind(env_id.as_str())
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                if existing.is_some() {
+                    sqlx::query(
+                        "UPDATE environment_runtimes \
+                         SET data = $1, generation = 1, etag = $2, \
+                             integrity_digest = $3, updated_at = datetime('now') \
+                         WHERE env_id = $4",
+                    )
+                    .bind(&data)
+                    .bind(&etag.0)
+                    .bind(&integrity.digest)
+                    .bind(env_id.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+                } else {
+                    sqlx::query(
+                        "INSERT INTO environment_runtimes \
+                         (env_id, generation, etag, data, integrity_digest) \
+                         VALUES ($1, 1, $2, $3, $4)",
+                    )
+                    .bind(env_id.as_str())
+                    .bind(&etag.0)
+                    .bind(&data)
+                    .bind(&integrity.digest)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+            None => {
+                sqlx::query("DELETE FROM environment_runtimes WHERE env_id = $1")
+                    .bind(env_id.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        // 3. Pack-answers sidecars: replace the full set atomically.
+        //    Delete all live rows, then insert the snapshot's entries.
+        sqlx::query("DELETE FROM pack_answers WHERE env_id = $1")
+            .bind(env_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        for (slot, answers_data) in &snapshot.pack_answers {
+            let (etag, integrity, data) = serialize_for_write_value(answers_data)?;
+            sqlx::query(
+                "INSERT INTO pack_answers \
+                 (env_id, slot, generation, etag, data, integrity_digest) \
+                 VALUES ($1, $2, 1, $3, $4, $5)",
+            )
+            .bind(env_id.as_str())
+            .bind(slot)
+            .bind(&etag.0)
+            .bind(&data)
+            .bind(&integrity.digest)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        journal_in_tx(&mut tx, journal).await?;
+        tx.commit().await?;
+        Ok(revision)
     }
 
     async fn record_audit(
@@ -1016,6 +1154,16 @@ fn serialize_for_write<T: serde::Serialize>(
     let integrity = StateIntegrity::sha256_of(&data)?;
     let etag = StateEtag::from_integrity(&integrity);
     Ok((etag, integrity, data))
+}
+
+/// [`serialize_for_write`] for an already-serialized `Value` — used by the
+/// restore path where the snapshot carries raw JSON, not typed structs.
+fn serialize_for_write_value(
+    data: &Value,
+) -> Result<(StateEtag, StateIntegrity, Value), StorageError> {
+    let integrity = StateIntegrity::sha256_of(data)?;
+    let etag = StateEtag::from_integrity(&integrity);
+    Ok((etag, integrity, data.clone()))
 }
 
 /// Wrap an `io::Error` with call-site context as a [`StorageError::Backend`].

@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use greentic_deploy_spec::{Actor, AuditDecision};
+use greentic_deploy_spec::{Actor, AuditDecision, EnvId};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -78,11 +78,32 @@ impl Role {
     }
 }
 
+/// Environment scope for a token: either unrestricted (all environments)
+/// or restricted to an explicit set.
+#[derive(Debug, Clone)]
+pub enum EnvScope {
+    /// The token may access any environment.
+    All,
+    /// The token may only access environments whose id appears in the set.
+    Restricted(Vec<EnvId>),
+}
+
+impl EnvScope {
+    /// Does this scope grant access to `env_id`?
+    pub fn permits(&self, env_id: &EnvId) -> bool {
+        match self {
+            EnvScope::All => true,
+            EnvScope::Restricted(ids) => ids.iter().any(|id| id == env_id),
+        }
+    }
+}
+
 /// One configured principal: the authenticated identity behind a token.
 #[derive(Debug, Clone)]
 struct Principal {
     actor: String,
     role: Role,
+    scope: EnvScope,
 }
 
 /// On-disk token file shape (`--rbac-tokens`).
@@ -99,6 +120,10 @@ struct TokenEntry {
     /// Actor name recorded in audit events (`Actor.user`).
     actor: String,
     role: Role,
+    /// Optional environment scope: when present, the token may only access
+    /// the listed environment ids; absent or `null` means "all envs".
+    #[serde(default)]
+    env_ids: Option<Vec<String>>,
 }
 
 /// Why the token file was rejected at startup. Startup-only — never a
@@ -127,6 +152,16 @@ pub enum RbacConfigError {
     EmptyActor { index: usize },
     #[error("token entry {index}: duplicate `token_sha256`")]
     DuplicateDigest { index: usize },
+    #[error(
+        "token entry {index}: `env_ids` is present but empty (omit the field for all-env access)"
+    )]
+    EmptyEnvIds { index: usize },
+    #[error("token entry {index}: invalid env id `{env_id}`: {reason}")]
+    InvalidEnvId {
+        index: usize,
+        env_id: String,
+        reason: String,
+    },
 }
 
 /// The outcome of authenticating + authorizing one request.
@@ -145,6 +180,10 @@ pub struct RbacDenial {
     pub actor: Actor,
     pub policy: String,
     pub reason: String,
+    /// `true` when the token was recognized (the denial is a role/scope
+    /// check, not a missing-token rejection). Callers gate durable audit
+    /// persistence on this: anonymous denials are logged but not persisted.
+    pub authenticated: bool,
 }
 
 /// The server's authorization engine. Cheap to share (`Arc` in `AppState`).
@@ -194,11 +233,32 @@ impl RbacEngine {
             if entry.actor.trim().is_empty() {
                 return Err(RbacConfigError::EmptyActor { index });
             }
+            let scope = match entry.env_ids {
+                None => EnvScope::All,
+                Some(ref ids) if ids.is_empty() => {
+                    return Err(RbacConfigError::EmptyEnvIds { index });
+                }
+                Some(ids) => {
+                    let mut parsed = Vec::with_capacity(ids.len());
+                    for raw in &ids {
+                        let env_id = EnvId::try_from(raw.as_str()).map_err(|err| {
+                            RbacConfigError::InvalidEnvId {
+                                index,
+                                env_id: raw.clone(),
+                                reason: err.to_string(),
+                            }
+                        })?;
+                        parsed.push(env_id);
+                    }
+                    EnvScope::Restricted(parsed)
+                }
+            };
             let clash = principals.insert(
                 digest,
                 Principal {
                     actor: entry.actor,
                     role: entry.role,
+                    scope,
                 },
             );
             if clash.is_some() {
@@ -215,8 +275,11 @@ impl RbacEngine {
     }
 
     /// Authenticate the request's bearer token. `Ok` carries the principal
-    /// (named actor + role); `Err` carries the anonymous denial.
-    fn authenticate(&self, bearer_token: Option<&str>) -> Result<(Actor, Role), RbacDenial> {
+    /// (named actor + role + env scope); `Err` carries the anonymous denial.
+    fn authenticate(
+        &self,
+        bearer_token: Option<&str>,
+    ) -> Result<(Actor, Role, EnvScope), RbacDenial> {
         let Posture::StaticTokens { principals } = &self.0 else {
             // Open-dev: anonymous admin-equivalent. Actor kind matches the
             // pre-PR-4.4 audit shape.
@@ -227,6 +290,7 @@ impl RbacEngine {
                     uid: None,
                 },
                 Role::Admin,
+                EnvScope::All,
             ));
         };
         let denied = || RbacDenial {
@@ -237,6 +301,7 @@ impl RbacEngine {
             },
             policy: POLICY_STATIC_TOKENS.to_string(),
             reason: "missing or unrecognized bearer token".to_string(),
+            authenticated: false,
         };
         let token = bearer_token.ok_or_else(denied)?;
         let digest = hex::encode(Sha256::digest(token.as_bytes()));
@@ -248,20 +313,22 @@ impl RbacEngine {
                 uid: None,
             },
             principal.role,
+            principal.scope.clone(),
         ))
     }
 
-    /// Authorize a MUTATION (`noun.verb`). The returned [`AuthContext`]
-    /// carries the Allow decision destined for the mutation's audit event;
-    /// a denial carries the actor + Deny material for the durable denial
-    /// audit row the caller must write.
+    /// Authorize a MUTATION (`noun.verb`) on `env_id`. The returned
+    /// [`AuthContext`] carries the Allow decision destined for the mutation's
+    /// audit event; a denial carries the actor + Deny material for the
+    /// durable denial audit row the caller must write.
     pub fn authorize_mutation(
         &self,
         bearer_token: Option<&str>,
+        env_id: &EnvId,
         noun: &str,
         verb: &str,
     ) -> Result<AuthContext, RbacDenial> {
-        let (actor, role) = self.authenticate(bearer_token)?;
+        let (actor, role, scope) = self.authenticate(bearer_token)?;
         if let Posture::OpenDev = self.0 {
             return Ok(AuthContext {
                 actor,
@@ -269,6 +336,16 @@ impl RbacEngine {
                     policy: POLICY_OPEN_DEV.to_string(),
                     reason: "RBAC tokens not configured; open-dev allows all".to_string(),
                 },
+            });
+        }
+        if !scope.permits(env_id) {
+            return Err(RbacDenial {
+                policy: POLICY_STATIC_TOKENS.to_string(),
+                reason: format!(
+                    "token is not scoped for environment `{env_id}` on `{noun}.{verb}`"
+                ),
+                actor,
+                authenticated: true,
             });
         }
         if role.allows_mutation(noun) {
@@ -284,14 +361,40 @@ impl RbacEngine {
                 policy: POLICY_STATIC_TOKENS.to_string(),
                 reason: format!("role `{}` does not permit `{noun}.{verb}`", role.as_str()),
                 actor,
+                authenticated: true,
             })
         }
     }
 
-    /// Authorize a READ: any authenticated actor. Read denials are not
-    /// audited (the contract audits mutating calls).
-    pub fn authorize_read(&self, bearer_token: Option<&str>) -> Result<(), RbacDenial> {
-        self.authenticate(bearer_token).map(|_| ())
+    /// Authorize a READ on a specific environment: any authenticated actor
+    /// whose scope includes `env_id`. `env_id` is `None` for collection
+    /// reads (e.g. `GET /environments`) where filtering happens post-auth
+    /// via [`Self::read_scope`].
+    pub fn authorize_read(
+        &self,
+        bearer_token: Option<&str>,
+        env_id: Option<&EnvId>,
+    ) -> Result<(), RbacDenial> {
+        let (_actor, _role, scope) = self.authenticate(bearer_token)?;
+        if let Some(id) = env_id
+            && !scope.permits(id)
+        {
+            return Err(RbacDenial {
+                actor: _actor,
+                policy: POLICY_STATIC_TOKENS.to_string(),
+                reason: format!("token is not scoped for environment `{id}`"),
+                authenticated: true,
+            });
+        }
+        Ok(())
+    }
+
+    /// Return the environment scope for a bearer token, so callers can
+    /// filter collection reads (e.g. `GET /environments`). Returns
+    /// `EnvScope::All` for open-dev and all-env tokens.
+    pub fn read_scope(&self, bearer_token: Option<&str>) -> Result<EnvScope, RbacDenial> {
+        let (_actor, _role, scope) = self.authenticate(bearer_token)?;
+        Ok(scope)
     }
 }
 
@@ -324,33 +427,42 @@ mod tests {
         RbacEngine::from_token_file(&path).expect("valid token file")
     }
 
+    fn test_env_id() -> EnvId {
+        EnvId::try_from("local").expect("valid env id")
+    }
+
     #[test]
     fn open_dev_allows_everything_with_the_honest_policy() {
         let engine = RbacEngine::open_dev();
+        let id = test_env_id();
         let ctx = engine
-            .authorize_mutation(None, "trust-root", "bootstrap")
+            .authorize_mutation(None, &id, "trust-root", "bootstrap")
             .expect("open-dev allows");
         assert_eq!(ctx.actor.kind, "store-server");
         match ctx.decision {
             AuditDecision::Allow { policy, .. } => assert_eq!(policy, POLICY_OPEN_DEV),
             AuditDecision::Deny { .. } => panic!("open-dev must allow"),
         }
-        engine.authorize_read(None).expect("open-dev reads");
+        engine.authorize_read(None, None).expect("open-dev reads");
         assert!(!engine.is_enforcing());
     }
 
     #[test]
     fn missing_and_unknown_tokens_are_anonymous_denials() {
         let engine = engine_with(&[("s3cret", "alice", "admin")]);
+        let id = test_env_id();
         assert!(engine.is_enforcing());
         for token in [None, Some("wrong")] {
             let denial = engine
-                .authorize_mutation(token, "env", "update")
+                .authorize_mutation(token, &id, "env", "update")
                 .expect_err("must deny");
             assert_eq!(denial.actor.kind, "anonymous");
             assert_eq!(denial.policy, POLICY_STATIC_TOKENS);
             assert!(denial.reason.contains("bearer token"));
-            engine.authorize_read(token).expect_err("reads gated too");
+            assert!(!denial.authenticated);
+            engine
+                .authorize_read(token, None)
+                .expect_err("reads gated too");
         }
     }
 
@@ -361,26 +473,28 @@ mod tests {
             ("op-tok", "deployer", "operator"),
             ("ro-tok", "viewer", "read-only"),
         ]);
+        let id = test_env_id();
         // Admin: everything, including key custody.
         engine
-            .authorize_mutation(Some("admin-tok"), "trust-root", "bootstrap")
+            .authorize_mutation(Some("admin-tok"), &id, "trust-root", "bootstrap")
             .expect("admin may manage trust root");
         // Operator: deploy ops yes, key custody no.
         let ctx = engine
-            .authorize_mutation(Some("op-tok"), "env", "update")
+            .authorize_mutation(Some("op-tok"), &id, "env", "update")
             .expect("operator may deploy");
         assert_eq!(ctx.actor.user.as_deref(), Some("deployer"));
         let denial = engine
-            .authorize_mutation(Some("op-tok"), "trust-root", "keys.add")
+            .authorize_mutation(Some("op-tok"), &id, "trust-root", "keys.add")
             .expect_err("operator must not manage trust root");
         assert!(denial.reason.contains("operator"));
         assert_eq!(denial.actor.user.as_deref(), Some("deployer"));
+        assert!(denial.authenticated);
         // Read-only: reads yes, mutations no.
         engine
-            .authorize_read(Some("ro-tok"))
+            .authorize_read(Some("ro-tok"), None)
             .expect("read-only may read");
         engine
-            .authorize_mutation(Some("ro-tok"), "traffic", "set")
+            .authorize_mutation(Some("ro-tok"), &id, "traffic", "set")
             .expect_err("read-only must not mutate");
     }
 
@@ -465,8 +579,110 @@ mod tests {
         )
         .unwrap();
         let engine = RbacEngine::from_token_file(&path).expect("valid");
+        let id = test_env_id();
         engine
-            .authorize_mutation(Some("tok"), "env", "create")
+            .authorize_mutation(Some("tok"), &id, "env", "create")
             .expect("uppercase digest still matches");
+    }
+
+    #[test]
+    fn env_scoped_token_restricts_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": RBAC_TOKENS_SCHEMA_V1,
+                "tokens": [{
+                    "token_sha256": sha256_hex("scoped-tok"),
+                    "actor": "scoped-user",
+                    "role": "admin",
+                    "env_ids": ["staging"],
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let engine = RbacEngine::from_token_file(&path).expect("valid");
+        let staging = EnvId::try_from("staging").expect("valid");
+        let prod = EnvId::try_from("prod").expect("valid");
+
+        // Mutations on the scoped env succeed.
+        engine
+            .authorize_mutation(Some("scoped-tok"), &staging, "env", "create")
+            .expect("scoped token may access staging");
+
+        // Mutations on a different env are denied (authenticated denial).
+        let denial = engine
+            .authorize_mutation(Some("scoped-tok"), &prod, "env", "create")
+            .expect_err("scoped token must not access prod");
+        assert!(denial.authenticated);
+        assert!(denial.reason.contains("not scoped"));
+
+        // Reads on the scoped env succeed; others are denied.
+        engine
+            .authorize_read(Some("scoped-tok"), Some(&staging))
+            .expect("scoped read on staging");
+        engine
+            .authorize_read(Some("scoped-tok"), Some(&prod))
+            .expect_err("scoped read on prod must deny");
+
+        // Collection read (None env_id) succeeds — filtering is the caller's job.
+        engine
+            .authorize_read(Some("scoped-tok"), None)
+            .expect("collection read always passes auth");
+
+        // read_scope returns the restriction.
+        let scope = engine.read_scope(Some("scoped-tok")).expect("read_scope");
+        assert!(scope.permits(&staging));
+        assert!(!scope.permits(&prod));
+    }
+
+    #[test]
+    fn empty_env_ids_is_rejected_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": RBAC_TOKENS_SCHEMA_V1,
+                "tokens": [{
+                    "token_sha256": sha256_hex("tok"),
+                    "actor": "a",
+                    "role": "admin",
+                    "env_ids": [],
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            RbacEngine::from_token_file(&path),
+            Err(RbacConfigError::EmptyEnvIds { index: 0 })
+        ));
+    }
+
+    #[test]
+    fn invalid_env_id_in_scope_is_rejected_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": RBAC_TOKENS_SCHEMA_V1,
+                "tokens": [{
+                    "token_sha256": sha256_hex("tok"),
+                    "actor": "a",
+                    "role": "admin",
+                    "env_ids": ["valid", "INVALID ID WITH SPACES"],
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            RbacEngine::from_token_file(&path),
+            Err(RbacConfigError::InvalidEnvId { index: 0, .. })
+        ));
     }
 }

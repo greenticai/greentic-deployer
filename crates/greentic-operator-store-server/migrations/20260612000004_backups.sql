@@ -13,12 +13,13 @@
 -- so the insert is refused (409) until old backups are deleted explicitly.
 
 CREATE TABLE backups (
-    env_id      TEXT NOT NULL,
-    backup_id   TEXT NOT NULL,
-    created_at  TEXT NOT NULL,
-    generation  INTEGER NOT NULL,
-    integrity   TEXT NOT NULL,
-    size_bytes  INTEGER NOT NULL,
-    state       TEXT NOT NULL,
+    env_id           TEXT NOT NULL,
+    backup_id        TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    generation       INTEGER NOT NULL,
+    integrity        TEXT NOT NULL,
+    size_bytes       INTEGER NOT NULL,
+    state            TEXT NOT NULL,
+    snapshot_digest  TEXT NOT NULL,
     PRIMARY KEY (env_id, backup_id)
 );

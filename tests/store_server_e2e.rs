@@ -922,8 +922,9 @@ async fn rbac_bearer_token_end_to_end() {
         let base = Url::parse(&format!("http://{addr}/")).expect("base url");
         let id = env_id("local");
 
-        // No token → typed Unauthorized (the denial is still audited
-        // server-side; the route tests pin that).
+        // No token → typed Unauthorized (unauthenticated denials are logged
+        // but not persisted; only authenticated denials are durably audited;
+        // the route tests pin both).
         let anonymous = HttpEnvironmentStore::new(base.clone(), AuthMethod::None).expect("client");
         let err = anonymous
             .create_environment(&id, "local".to_string(), host_config("local"))

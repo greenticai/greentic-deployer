@@ -3717,6 +3717,7 @@ use greentic_operator_store_server::rbac::RbacEngine;
 const ADMIN_TOKEN: &str = "admin-tok";
 const OPERATOR_TOKEN: &str = "op-tok";
 const READER_TOKEN: &str = "ro-tok";
+const SCOPED_TOKEN: &str = "scoped-tok";
 
 fn write_token_file(dir: &std::path::Path) -> std::path::PathBuf {
     use sha2::{Digest, Sha256};
@@ -3730,6 +3731,7 @@ fn write_token_file(dir: &std::path::Path) -> std::path::PathBuf {
                 {"token_sha256": digest(ADMIN_TOKEN), "actor": "root", "role": "admin"},
                 {"token_sha256": digest(OPERATOR_TOKEN), "actor": "deployer", "role": "operator"},
                 {"token_sha256": digest(READER_TOKEN), "actor": "viewer", "role": "read-only"},
+                {"token_sha256": digest(SCOPED_TOKEN), "actor": "scoped-admin", "role": "admin", "env_ids": ["staging"]},
             ],
         }))
         .expect("token json"),
@@ -3769,7 +3771,7 @@ async fn audit_log_events(store: &SqliteEnvironmentStore, env: &str) -> Vec<Valu
 }
 
 #[tokio::test]
-async fn missing_token_is_403_audited_durably_and_keeps_the_key_free() {
+async fn missing_token_is_403_not_persisted_and_keeps_the_key_free() {
     let (_d, app, store) = rbac_app().await;
     let (status, body) = send_custom(
         app.clone(),
@@ -3783,15 +3785,13 @@ async fn missing_token_is_403_audited_durably_and_keeps_the_key_free() {
     assert_eq!(body["kind"], "unauthorized");
     assert_eq!(body["policy"], "static-tokens");
 
-    // The denial is on the durable audit log ("the rejected attempt is
-    // still audited"), attributed to the anonymous actor with the key echo.
+    // Anonymous denials are logged but NOT persisted (Finding 2): the
+    // audit log must be empty — unauthenticated callers cannot flood it.
     let events = audit_log_events(&store, "local").await;
-    assert_eq!(events.len(), 1, "denial must be audited: {events:?}");
-    assert_eq!(events[0]["authorization"]["decision"], "deny");
-    assert_eq!(events[0]["actor"]["kind"], "anonymous");
-    assert_eq!(events[0]["idempotency_key"], "RBAC-K1");
-    assert_eq!(events[0]["noun"], "env");
-    assert_eq!(events[0]["verb"], "create");
+    assert!(
+        events.is_empty(),
+        "anonymous denial must not be persisted: {events:?}"
+    );
 
     // The key was NOT consumed: the authorized retry applies fresh.
     let admin = bearer(ADMIN_TOKEN);
@@ -4187,9 +4187,10 @@ async fn a_tampered_backup_is_never_restored() {
     assert_eq!(status, StatusCode::OK);
     let backup_id = backup["result"]["backup_id"].as_str().unwrap();
 
-    // Tamper the snapshot at rest: its digest no longer matches.
+    // Tamper the composite snapshot at rest: its digest no longer matches.
     sqlx::query(
-        "UPDATE backups SET state = json_set(state, '$.name', 'evil') WHERE backup_id = $1",
+        "UPDATE backups SET state = json_set(state, '$.environment.name', 'evil') \
+         WHERE backup_id = $1",
     )
     .bind(backup_id)
     .execute(store.pool())
@@ -4318,8 +4319,9 @@ async fn the_backup_cap_refuses_instead_of_evicting() {
     for i in 0..cap {
         sqlx::query(
             "INSERT INTO backups (env_id, backup_id, created_at, generation, \
-             integrity, size_bytes, state) VALUES ('local', $1, '2026-06-12T00:00:00Z', \
-             1, 'digest', 2, '{}')",
+             integrity, size_bytes, state, snapshot_digest) \
+             VALUES ('local', $1, '2026-06-12T00:00:00Z', \
+             1, 'digest', 2, '{}', 'digest')",
         )
         .bind(format!("SEED-{i:05}"))
         .execute(store.pool())
@@ -4337,4 +4339,105 @@ async fn the_backup_cap_refuses_instead_of_evicting() {
             .contains("delete old backups"),
         "detail guides the operator: {body}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Env-scoped RBAC tokens (Finding 1)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn env_scoped_token_can_only_access_its_environments() {
+    let (_d, app, store) = rbac_app().await;
+    let admin = bearer(ADMIN_TOKEN);
+    let scoped = bearer(SCOPED_TOKEN);
+
+    // Admin creates two envs: "staging" (the scoped token's env) and "prod".
+    for env in ["staging", "prod"] {
+        let (status, _) = send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments",
+            Some(create_body(env)),
+            &[
+                ("Idempotency-Key", &format!("SCOPE-CREATE-{env}")),
+                ("Authorization", &admin),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // Scoped token can mutate staging.
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::PATCH,
+        "/environments/staging",
+        Some(json!({"name": "staging-renamed"})),
+        &[
+            ("Idempotency-Key", "SCOPE-PATCH-1"),
+            ("Authorization", &scoped),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Scoped token cannot mutate prod.
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::PATCH,
+        "/environments/prod",
+        Some(json!({"name": "prod-renamed"})),
+        &[
+            ("Idempotency-Key", "SCOPE-PATCH-2"),
+            ("Authorization", &scoped),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert!(body["reason"].as_str().unwrap().contains("not scoped"));
+
+    // Scoped authenticated denial IS persisted (unlike anonymous ones).
+    // The first event is from the admin's create; the second is the denial.
+    let events = audit_log_events(&store, "prod").await;
+    assert_eq!(events.len(), 2, "create + scoped denial: {events:?}");
+    let denial = &events[1];
+    assert_eq!(denial["authorization"]["decision"], "deny");
+    assert_eq!(denial["actor"]["user"], "scoped-admin");
+
+    // Scoped token can read staging.
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::GET,
+        "/environments/staging",
+        None,
+        &[("Authorization", &scoped)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["environment"]["name"], "staging-renamed");
+
+    // Scoped token cannot read prod.
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::GET,
+        "/environments/prod",
+        None,
+        &[("Authorization", &scoped)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+
+    // List envs returns only the scoped env.
+    let (status, body) = send_custom(
+        app,
+        Method::GET,
+        "/environments",
+        None,
+        &[("Authorization", &scoped)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let envs = body["environments"].as_array().unwrap();
+    assert_eq!(envs.len(), 1);
+    assert_eq!(envs[0], "staging");
 }

@@ -1272,9 +1272,20 @@ async fn ledger_evicts_beyond_the_per_env_window() {
 use greentic_deploy_spec::{BackupManifest, StateIntegrity};
 use greentic_operator_store_server::storage::{MAX_BACKUPS_PER_ENV, StoredBackup};
 
+use greentic_operator_store_server::storage::EnvSnapshot;
+
 fn stored_backup(id: &EnvId, backup_id: &str, env: &Environment) -> StoredBackup {
-    let state = serde_json::to_value(env).expect("env json");
-    let integrity = StateIntegrity::sha256_of(&state).expect("hash");
+    let env_json = serde_json::to_value(env).expect("env json");
+    let integrity = StateIntegrity::sha256_of(&env_json).expect("hash");
+    let snapshot = EnvSnapshot {
+        environment: env_json,
+        runtime: None,
+        pack_answers: std::collections::BTreeMap::new(),
+    };
+    let state = serde_json::to_value(&snapshot).expect("snapshot json");
+    let snapshot_digest = StateIntegrity::sha256_of(&state)
+        .expect("snapshot hash")
+        .digest;
     StoredBackup {
         manifest: BackupManifest {
             schema: SchemaVersion::BACKUP_MANIFEST_V1.into(),
@@ -1286,6 +1297,7 @@ fn stored_backup(id: &EnvId, backup_id: &str, env: &Environment) -> StoredBackup
             size_bytes: state.to_string().len() as u64,
         },
         state,
+        snapshot_digest,
     }
 }
 

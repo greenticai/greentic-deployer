@@ -705,7 +705,7 @@ async fn authorize_mutation<S: EnvironmentStorage>(
 ) -> Result<AuthContext, ApiError> {
     let denial = match state
         .rbac
-        .authorize_mutation(bearer_token(headers), noun, verb)
+        .authorize_mutation(bearer_token(headers), env_id, noun, verb)
     {
         Ok(auth) => return Ok(auth),
         Err(denial) => denial,
@@ -714,6 +714,7 @@ async fn authorize_mutation<S: EnvironmentStorage>(
         actor,
         policy,
         reason,
+        authenticated,
     } = denial;
     // Lenient key read: the denial is audited with whatever the request
     // carried, even a key require_idempotency_key would reject.
@@ -743,34 +744,49 @@ async fn authorize_mutation<S: EnvironmentStorage>(
             message: format!("unauthorized: {reason} (policy `{policy}`)"),
         },
     };
-    match serde_json::to_value(&audit) {
-        Ok(event) => {
-            if let Err(err) = state
-                .storage
-                .record_audit(env_id, &audit.event_id, &event)
-                .await
-            {
-                tracing::error!(error = %err, env_id = %env_id, "denial audit append failed");
+    // Durable audit persistence is gated on `authenticated`: anonymous
+    // denials (missing/unrecognized token) are logged but not persisted —
+    // an unauthenticated caller could flood the audit table.
+    if authenticated {
+        match serde_json::to_value(&audit) {
+            Ok(event) => {
+                if let Err(err) = state
+                    .storage
+                    .record_audit(env_id, &audit.event_id, &event)
+                    .await
+                {
+                    tracing::error!(error = %err, env_id = %env_id, "denial audit append failed");
+                }
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "denial audit event failed to serialize");
             }
         }
-        Err(err) => {
-            tracing::error!(error = %err, "denial audit event failed to serialize");
-        }
+    } else {
+        tracing::warn!(
+            env_id = %env_id,
+            noun = noun,
+            verb = verb,
+            "unauthenticated denial (not persisted)"
+        );
     }
     Err(ApiError(RemoteStoreError::Unauthorized { policy, reason }))
 }
 
-/// Authorize one READ: any authenticated actor. Read denials return the
-/// same typed 403 but are not audited (the contract audits mutating calls).
+/// Authorize one READ: any authenticated actor whose scope includes
+/// `env_id`. `env_id` is `None` for collection reads where filtering
+/// happens post-auth via [`crate::rbac::RbacEngine::read_scope`].
 fn authorize_read<S: EnvironmentStorage>(
     state: &AppState<S>,
     headers: &HeaderMap,
+    env_id: Option<&EnvId>,
 ) -> Result<(), ApiError> {
-    state.rbac.authorize_read(bearer_token(headers)).map_err(
-        |RbacDenial { policy, reason, .. }| {
+    state
+        .rbac
+        .authorize_read(bearer_token(headers), env_id)
+        .map_err(|RbacDenial { policy, reason, .. }| {
             ApiError(RemoteStoreError::Unauthorized { policy, reason })
-        },
-    )
+        })
 }
 
 /// Parse an optional `If-Match` header into `Option<StateEtag>`. Accepts
@@ -2971,8 +2987,15 @@ pub(crate) async fn list_environments<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    authorize_read(&state, &headers)?;
+    // Use `read_scope` directly: it authenticates AND returns the scope
+    // for filtering — one call instead of authenticate-then-authenticate.
+    let scope = state.rbac.read_scope(bearer_token(&headers)).map_err(
+        |RbacDenial { policy, reason, .. }| {
+            ApiError(RemoteStoreError::Unauthorized { policy, reason })
+        },
+    )?;
     let envs = state.storage.list_envs().await?;
+    let envs: Vec<_> = envs.into_iter().filter(|id| scope.permits(id)).collect();
     Ok(Json(json!({ "environments": envs })))
 }
 
@@ -2985,8 +3008,8 @@ pub(crate) async fn get_environment<S: EnvironmentStorage>(
     Path(env_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<GetEnvironmentResponse>, ApiError> {
-    authorize_read(&state, &headers)?;
     let env_id = parse_env_id(&env_id)?;
+    authorize_read(&state, &headers, Some(&env_id))?;
     let loaded = state
         .storage
         .load_env(&env_id)
@@ -3017,8 +3040,8 @@ pub(crate) async fn get_trust_root<S: EnvironmentStorage>(
     Path(env_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    authorize_read(&state, &headers)?;
     let env_id = parse_env_id(&env_id)?;
+    authorize_read(&state, &headers, Some(&env_id))?;
     if !state.storage.exists(&env_id).await? {
         return Err(ApiError(RemoteStoreError::NotFound));
     }
@@ -3072,16 +3095,33 @@ pub(crate) async fn create_backup<S: EnvironmentStorage>(
             .load_env(&env_id)
             .await
             .map_err(load_storage_error)?;
-        let state_json = serde_json::to_value(&loaded.value).map_err(envelope_encode_error)?;
-        let integrity = StateIntegrity::sha256_of(&state_json).map_err(|err| {
+        // Build the composite snapshot: env + runtime + pack_answers.
+        let snapshot = state
+            .storage
+            .load_env_snapshot(&env_id)
+            .await
+            .map_err(load_storage_error)?;
+        let snapshot_json = serde_json::to_value(&snapshot).map_err(envelope_encode_error)?;
+        let snapshot_digest = StateIntegrity::sha256_of(&snapshot_json).map_err(|err| {
             tracing::error!(error = %err, "backup snapshot hashing failed");
             ApiError(RemoteStoreError::Internal {
                 message: "backup snapshot hashing failed".to_string(),
             })
         })?;
+        // The manifest's integrity covers the environment document only
+        // (contract-level digest); the snapshot_digest covers the
+        // composite including sidecars. Hash the snapshot's env value
+        // (the raw `Value` stored at rest) rather than the loaded typed
+        // `Environment` — guarantees the restore cross-check matches.
+        let integrity = StateIntegrity::sha256_of(&snapshot.environment).map_err(|err| {
+            tracing::error!(error = %err, "env integrity hashing failed");
+            ApiError(RemoteStoreError::Internal {
+                message: "env integrity hashing failed".to_string(),
+            })
+        })?;
         // Size of the stored TEXT column — informational, documented as
         // the snapshot's serialized size.
-        let size_bytes = state_json.to_string().len() as u64;
+        let size_bytes = snapshot_json.to_string().len() as u64;
         let manifest = BackupManifest {
             schema: SchemaVersion::BACKUP_MANIFEST_V1.into(),
             backup_id: ulid::Ulid::new().to_string(),
@@ -3113,7 +3153,8 @@ pub(crate) async fn create_backup<S: EnvironmentStorage>(
             .create_backup_journaled(
                 &StoredBackup {
                     manifest,
-                    state: state_json,
+                    state: snapshot_json,
+                    snapshot_digest: snapshot_digest.digest,
                 },
                 Some(&prepared.journal),
             )
@@ -3134,8 +3175,8 @@ pub(crate) async fn list_backups<S: EnvironmentStorage>(
     Path(env_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    authorize_read(&state, &headers)?;
     let env_id = parse_env_id(&env_id)?;
+    authorize_read(&state, &headers, Some(&env_id))?;
     if !state.storage.exists(&env_id).await? {
         return Err(ApiError(RemoteStoreError::NotFound));
     }
@@ -3238,27 +3279,36 @@ pub(crate) async fn restore_environment<S: EnvironmentStorage>(
                     detail: format!("backup `{}` not found in env `{env_id}`", payload.backup_id),
                 })
             })?;
-        // Contract #6 on the backup itself: a snapshot that no longer
-        // hashes to its recorded digest must never be restored.
+        // Verify the composite snapshot's digest before restoring.
         let recomputed = StateIntegrity::sha256_of(&backup.state).map_err(|err| {
             tracing::error!(error = %err, "backup snapshot hashing failed");
             ApiError(RemoteStoreError::Internal {
                 message: "backup snapshot hashing failed".to_string(),
             })
         })?;
-        if recomputed.digest != backup.manifest.integrity.digest {
+        if recomputed.digest != backup.snapshot_digest {
             return Err(ApiError(RemoteStoreError::IntegrityMismatch {
-                expected: backup.manifest.integrity.digest.clone(),
+                expected: backup.snapshot_digest.clone(),
                 actual: recomputed.digest,
             }));
         }
-        let restored_env: Environment = serde_json::from_value(backup.state).map_err(|err| {
-            tracing::error!(error = %err, backup_id = %payload.backup_id,
-                    "backup snapshot failed to decode");
-            ApiError(RemoteStoreError::Internal {
-                message: "backup snapshot failed to decode".to_string(),
-            })
-        })?;
+        // Decode the composite snapshot.
+        let snapshot: crate::storage::EnvSnapshot =
+            serde_json::from_value(backup.state).map_err(|err| {
+                tracing::error!(error = %err, backup_id = %payload.backup_id,
+                        "backup snapshot failed to decode");
+                ApiError(RemoteStoreError::Internal {
+                    message: "backup snapshot failed to decode".to_string(),
+                })
+            })?;
+        let restored_env: Environment = serde_json::from_value(snapshot.environment.clone())
+            .map_err(|err| {
+                tracing::error!(error = %err, backup_id = %payload.backup_id,
+                        "backup environment failed to decode");
+                ApiError(RemoteStoreError::Internal {
+                    message: "backup environment failed to decode".to_string(),
+                })
+            })?;
         let loaded = state
             .storage
             .load_env(&env_id)
@@ -3300,7 +3350,7 @@ pub(crate) async fn restore_environment<S: EnvironmentStorage>(
         let precondition = resolve_precondition(None, &loaded.revision);
         state
             .storage
-            .update_env_journaled(&restored_env, &precondition, Some(&prepared.journal))
+            .restore_env_journaled(&env_id, &snapshot, &precondition, Some(&prepared.journal))
             .await?;
         Ok(prepared.into_response())
     }

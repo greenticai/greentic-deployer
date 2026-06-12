@@ -62,23 +62,26 @@
 //!   without bound — archival is the backup story below.
 //! - RBAC (A8 #3, PR-4.4): [`rbac::RbacEngine`] — static bearer-token
 //!   authentication with coarse roles (`admin` / `operator` /
-//!   `read-only`), evaluated BEFORE the replay gate on every route.
-//!   Without a token file the engine is the honest `open-dev` allow-all
-//!   (loopback dev posture, unchanged wire shapes); with one, requests
-//!   fail closed (`403 unauthorized`) and denied mutations still append
-//!   a durable audit row (contract: "the rejected attempt is still
-//!   audited").
+//!   `read-only`) and optional per-environment scoping (`env_ids`),
+//!   evaluated BEFORE the replay gate on every route. Without a token
+//!   file the engine is the honest `open-dev` allow-all (loopback dev
+//!   posture, unchanged wire shapes); with one, requests fail closed
+//!   (`403 unauthorized`) and denied mutations by AUTHENTICATED actors
+//!   still append a durable audit row (contract: "the rejected attempt
+//!   is still audited"); anonymous denials (missing/unrecognized tokens)
+//!   are logged but not persisted.
 //! - Backup/restore (A8 #5, PR-4.4): `POST/GET
 //!   /environments/{env_id}/backups`, `DELETE .../backups/{backup_id}`,
 //!   and `POST /environments/{env_id}/restore`. Backups snapshot the
-//!   environment row (full canonical JSON + integrity digest, the
-//!   contract's `BackupManifest`); restore is a guarded mutation whose
-//!   `RestoreRequest.precondition` must pin prior state, verifies the
-//!   snapshot's digest before applying (contract #6 on the backup
-//!   itself), and commits through the same journaled CAS write as any
-//!   other mutation. Backups are bounded per-environment
-//!   (`MAX_BACKUPS_PER_ENV`): the cap REFUSES new backups (409) instead
-//!   of silently evicting recovery points.
+//!   composite environment state (environment document + runtime sidecar
+//!   + pack-answers sidecars, as an [`storage::EnvSnapshot`] with a
+//!     separate `snapshot_digest`); restore is a guarded mutation whose
+//!     `RestoreRequest.precondition` must pin prior state, verifies the
+//!     composite snapshot's digest before applying, and commits through
+//!     [`storage::EnvironmentStorage::restore_env_journaled`] — replacing
+//!     all three resources atomically in one transaction. Backups are
+//!     bounded per-environment (`MAX_BACKUPS_PER_ENV`): the cap REFUSES
+//!     new backups (409) instead of silently evicting recovery points.
 //!
 //! Out of scope, intentional follow-ups:
 //!

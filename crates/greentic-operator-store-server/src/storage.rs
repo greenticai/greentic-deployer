@@ -154,14 +154,32 @@ pub const MAX_LEDGER_ROWS_PER_ENV: i64 = 4096;
 /// asking the operator to delete explicitly.
 pub const MAX_BACKUPS_PER_ENV: i64 = 256;
 
+/// Composite environment snapshot: the environment document plus any
+/// sidecar state (runtime, pack answers) captured at backup time.
+/// Restore reverts all three atomically.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EnvSnapshot {
+    /// The environment row (the `Environment` document).
+    pub environment: Value,
+    /// The runtime sidecar, if present at backup time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<Value>,
+    /// Pack-answers sidecars keyed by slot, if any were present.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub pack_answers: std::collections::BTreeMap<String, Value>,
+}
+
 /// One stored backup: the contract's [`BackupManifest`] metadata plus the
-/// full canonical-JSON snapshot of the environment row it captured.
+/// full composite snapshot of the environment it captured.
 #[derive(Debug, Clone)]
 pub struct StoredBackup {
     pub manifest: BackupManifest,
-    /// The environment's canonical JSON at backup time. Restore verifies
+    /// The composite snapshot's canonical JSON. Restore verifies
     /// `manifest.integrity` against this value before applying.
     pub state: Value,
+    /// SHA-256 of `state` — stored alongside the snapshot so the load path
+    /// can verify without re-hashing.
+    pub snapshot_digest: String,
 }
 
 /// Everything the server must persist about ONE committed mutation, beyond
@@ -465,6 +483,29 @@ pub trait EnvironmentStorage: Send + Sync {
         backup_id: &str,
         journal: Option<&MutationJournal>,
     ) -> impl Future<Output = Result<bool, StorageError>> + Send;
+
+    /// Load the composite environment snapshot for a backup: the environment
+    /// document, the runtime sidecar (if any), and all pack-answers sidecars.
+    /// Used by `create_backup` to build the [`EnvSnapshot`] atomically.
+    fn load_env_snapshot(
+        &self,
+        env_id: &EnvId,
+    ) -> impl Future<Output = Result<EnvSnapshot, StorageError>> + Send;
+
+    /// Restore a composite [`EnvSnapshot`] atomically: replace the
+    /// environment row, upsert/delete the runtime sidecar, and upsert/delete
+    /// every pack-answers sidecar — all inside ONE transaction together with
+    /// the [`MutationJournal`] rows. The `precondition` guards the
+    /// environment row (the CAS target); the sidecars are replaced
+    /// unconditionally (their preconditions were not captured at backup time,
+    /// and restoring partial state is worse than restoring all of it).
+    fn restore_env_journaled(
+        &self,
+        env_id: &EnvId,
+        snapshot: &EnvSnapshot,
+        precondition: &Precondition,
+        journal: Option<&MutationJournal>,
+    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
 
     /// Append ONE audit row with no idempotency-ledger row — the durable
     /// record of a DENIED mutation (A8 #3: "the rejected attempt is still
