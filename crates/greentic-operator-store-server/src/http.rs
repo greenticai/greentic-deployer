@@ -126,6 +126,30 @@ where
             patch(api::update_bundle::<S>).delete(api::remove_bundle::<S>),
         )
         .route(
+            "/environments/{env_id}/messaging",
+            post(api::add_messaging_endpoint::<S>),
+        )
+        .route(
+            "/environments/{env_id}/messaging/{endpoint_id}",
+            delete(api::remove_messaging_endpoint::<S>),
+        )
+        .route(
+            "/environments/{env_id}/messaging/{endpoint_id}/link",
+            post(api::link_messaging_bundle::<S>),
+        )
+        .route(
+            "/environments/{env_id}/messaging/{endpoint_id}/unlink",
+            post(api::unlink_messaging_bundle::<S>),
+        )
+        .route(
+            "/environments/{env_id}/messaging/{endpoint_id}/welcome-flow",
+            post(api::set_messaging_welcome_flow::<S>),
+        )
+        .route(
+            "/environments/{env_id}/messaging/{endpoint_id}/rotate-secret",
+            post(api::rotate_messaging_webhook_secret::<S>),
+        )
+        .route(
             "/environments/{env_id}/trust-root",
             get(api::get_trust_root::<S>),
         )

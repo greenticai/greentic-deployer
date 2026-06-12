@@ -21,7 +21,7 @@ use greentic_deploy_spec::{
     BundleDeployment, BundleId, CapabilitySlot, DeploymentId, EnvId, EnvPackBinding, Environment,
     EnvironmentHostConfig, ExtensionBinding, HealthStatus, IdempotencyKey, MessagingEndpoint,
     MessagingEndpointId, RetentionPolicy, Revision, RevisionId, RevocationConfig, SchemaVersion,
-    SecretRef, WelcomeFlowRef,
+    SecretRef,
 };
 
 use super::bootstrap::{
@@ -117,6 +117,26 @@ fn map_bundle_err(err: engine::BundleError) -> StoreError {
     match err {
         E::DeploymentNotFound { .. } => StoreError::DependentNotFound(err.to_string()),
         E::AlreadyDeployed { .. } | E::StillLive { .. } => StoreError::Conflict(err.to_string()),
+    }
+}
+
+/// Map the engine's typed messaging errors onto the store surface. Messages
+/// are verbatim (the engine moved them in PR-4.2h), so operator-facing CLI
+/// errors are unchanged. `SecretProvision` carries the dev-store sink's
+/// message and keeps the `Conflict` noun this store raised before the move.
+fn map_messaging_err(err: engine::MessagingError) -> StoreError {
+    use engine::MessagingError as E;
+    match err {
+        E::EndpointNotFound { .. } | E::BundleNotDeployed { .. } => {
+            StoreError::DependentNotFound(err.to_string())
+        }
+        E::IdempotencyKeyReuse { .. }
+        | E::EndpointAlreadyExists { .. }
+        | E::WelcomeFlowOwned { .. } => StoreError::Conflict(err.to_string()),
+        E::BundleNotLinked { .. } | E::WelcomePackUnknown { .. } | E::InvalidSecretRef { .. } => {
+            StoreError::InvalidArgument(err.to_string())
+        }
+        E::SecretProvision(message) => StoreError::Conflict(message),
     }
 }
 
@@ -895,9 +915,16 @@ impl LocalFsStore {
     }
 
     // -------------------------------------------------------------
-    // Messaging endpoint CRUD  (PR-3a.10)
+    // Messaging endpoint CRUD  (PR-3a.10, engine rewire PR-4.2h)
     //   `op messaging endpoint add | link-bundle | unlink-bundle
     //                  | set-welcome-flow | remove | rotate-webhook-secret`
+    //
+    // The verb semantics live in `greentic_deploy_spec::engine::messaging`
+    // (shared with the operator-store-server). This impl supplies the env
+    // flock, the dev-store webhook-secret sink, and the derived
+    // `<env_dir>/messaging/` projection refresh — the projection runs on
+    // EVERY outcome (including engine no-op replays) because it also
+    // repairs a stale projection from a prior failed call.
     // -------------------------------------------------------------
 
     /// Add a messaging endpoint. Rejects with [`StoreError::Conflict`] when
@@ -912,101 +939,21 @@ impl LocalFsStore {
         &self,
         env_id: &EnvId,
         payload: AddMessagingEndpointPayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError> {
-        use crate::cli::messaging::{
-            carries_idem_key, format_idem_writer, idem_suffix, is_telegram_class,
-            provision_webhook_secret,
-        };
-        let idem_suffix_str = idem_suffix(payload.idempotency_key.as_str());
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            // Idempotent replay: re-running with the same key returns the
-            // previously-created endpoint iff the payload's instance
-            // identity matches what was stored.
-            if let Some(prev) = env
-                .messaging_endpoints
-                .iter()
-                .find(|e| carries_idem_key(e, &idem_suffix_str))
-            {
-                if prev.provider_type == payload.provider_type
-                    && prev.provider_id == payload.provider_id
-                {
-                    let ep = prev.clone();
-                    locked
-                        .refresh_messaging_projection(&env)
-                        .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
-                    return Ok(ep);
-                }
-                return Err(StoreError::Conflict(format!(
-                    "idempotency key `{}` already used to add `{}`/`{}` in env `{env_id}`; pass a fresh key",
-                    payload.idempotency_key.as_str(),
-                    prev.provider_type,
-                    prev.provider_id
-                )));
-            }
-            if env
-                .messaging_endpoints
-                .iter()
-                .any(|e| {
-                    e.provider_type == payload.provider_type
-                        && e.provider_id == payload.provider_id
-                })
-            {
-                return Err(StoreError::Conflict(format!(
-                    "messaging endpoint with provider_type=`{}` provider_id=`{}` already exists in env `{env_id}`",
-                    payload.provider_type, payload.provider_id
-                )));
-            }
-            // Validate secret_refs BEFORE provisioning the webhook secret so
-            // a malformed ref does not leave an orphan secret in the dev-store.
-            let secret_refs: Vec<SecretRef> = payload
-                .secret_refs
-                .iter()
-                .map(|r| {
-                    SecretRef::try_new(r)
-                        .map_err(|e| StoreError::InvalidArgument(format!("secret_ref `{r}`: {e}")))
-                })
-                .collect::<Result<_, _>>()?;
-            let now = Utc::now();
             let eid = MessagingEndpointId::new();
-            let webhook_secret_ref = if is_telegram_class(&payload.provider_type) {
-                Some(
-                    provision_webhook_secret(self, env_id, &eid, None)
-                        .map_err(|e| StoreError::Conflict(e.to_string()))?,
-                )
-            } else {
-                None
-            };
-            let endpoint = MessagingEndpoint {
-                schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
-                env_id: env_id.clone(),
-                endpoint_id: eid,
-                provider_id: payload.provider_id.clone(),
-                provider_type: payload.provider_type.clone(),
-                display_name: payload.display_name.clone(),
-                secret_refs,
-                webhook_secret_ref,
-                linked_bundles: Vec::new(),
-                welcome_flow: None,
-                generation: 0,
-                created_at: now,
-                updated_at: now,
-                updated_by: format_idem_writer(
-                    &payload.updated_by,
-                    payload.idempotency_key.as_str(),
-                ),
-            };
-            env.messaging_endpoints.push(endpoint);
-            locked.save(&env)?;
-            let ep = env
-                .messaging_endpoints
-                .last()
-                .expect("just pushed endpoint")
-                .clone();
-            locked
-                .refresh_messaging_projection(&env)
-                .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
-            Ok(ep)
+            let applied = engine::add_messaging_endpoint(
+                &mut env,
+                payload,
+                eid,
+                &idempotency_key,
+                Utc::now(),
+                |existing| self.provision_webhook_secret_sink(env_id, &eid, existing),
+            )
+            .map_err(map_messaging_err)?;
+            self.finish_messaging_mutation(locked, &env, applied)
         })
     }
 
@@ -1022,37 +969,18 @@ impl LocalFsStore {
         updated_by: String,
         idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError> {
-        use crate::cli::messaging::stamp_mutation;
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            let idx = find_messaging_endpoint_idx(&env, endpoint_id, env_id)?;
-            if !env.bundles.iter().any(|b| b.bundle_id == bundle_id) {
-                return Err(StoreError::DependentNotFound(format!(
-                    "bundle `{bundle_id}` is not deployed in env `{env_id}`"
-                )));
-            }
-            if env.messaging_endpoints[idx]
-                .linked_bundles
-                .contains(&bundle_id)
-            {
-                let ep = env.messaging_endpoints[idx].clone();
-                locked
-                    .refresh_messaging_projection(&env)
-                    .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
-                return Ok(ep);
-            }
-            env.messaging_endpoints[idx].linked_bundles.push(bundle_id);
-            stamp_mutation(
-                &mut env.messaging_endpoints[idx],
+            let applied = engine::link_messaging_bundle(
+                &mut env,
+                endpoint_id,
+                bundle_id,
                 &updated_by,
-                idempotency_key.as_str(),
-            );
-            locked.save(&env)?;
-            let ep = env.messaging_endpoints[idx].clone();
-            locked
-                .refresh_messaging_projection(&env)
-                .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
-            Ok(ep)
+                &idempotency_key,
+                Utc::now(),
+            )
+            .map_err(map_messaging_err)?;
+            self.finish_messaging_mutation(locked, &env, applied)
         })
     }
 
@@ -1068,46 +996,23 @@ impl LocalFsStore {
         updated_by: String,
         idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError> {
-        use crate::cli::messaging::stamp_mutation;
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            let idx = find_messaging_endpoint_idx(&env, endpoint_id, env_id)?;
-            let bundle_idx = env.messaging_endpoints[idx]
-                .linked_bundles
-                .iter()
-                .position(|b| b == &bundle_id);
-            let Some(bidx) = bundle_idx else {
-                // Idempotent: unlinking a bundle that isn't linked is a no-op.
-                let ep = env.messaging_endpoints[idx].clone();
-                locked
-                    .refresh_messaging_projection(&env)
-                    .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
-                return Ok(ep);
-            };
-            if let Some(welcome) = &env.messaging_endpoints[idx].welcome_flow
-                && welcome.bundle_id == bundle_id
-            {
-                return Err(StoreError::Conflict(format!(
-                    "cannot unlink bundle `{bundle_id}` from endpoint `{endpoint_id}` while it owns the welcome_flow; clear the welcome_flow first via `set-welcome-flow` to a different linked bundle, or `remove` the endpoint"
-                )));
-            }
-            env.messaging_endpoints[idx].linked_bundles.remove(bidx);
-            stamp_mutation(
-                &mut env.messaging_endpoints[idx],
+            let applied = engine::unlink_messaging_bundle(
+                &mut env,
+                endpoint_id,
+                bundle_id,
                 &updated_by,
-                idempotency_key.as_str(),
-            );
-            locked.save(&env)?;
-            let ep = env.messaging_endpoints[idx].clone();
-            locked
-                .refresh_messaging_projection(&env)
-                .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
-            Ok(ep)
+                &idempotency_key,
+                Utc::now(),
+            )
+            .map_err(map_messaging_err)?;
+            self.finish_messaging_mutation(locked, &env, applied)
         })
     }
 
     /// Set the welcome flow on a messaging endpoint. Rejects with
-    /// [`StoreError::Conflict`] when the bundle is not linked, or when
+    /// [`StoreError::InvalidArgument`] when the bundle is not linked, or when
     /// `pack_id` does not appear in any current revision's pack_list.
     /// Idempotent when the same welcome flow ref is already set (repairs a
     /// stale projection).
@@ -1115,46 +1020,14 @@ impl LocalFsStore {
         &self,
         env_id: &EnvId,
         payload: SetMessagingWelcomeFlowPayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError> {
-        use crate::cli::messaging::stamp_mutation;
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            let idx =
-                find_messaging_endpoint_idx(&env, payload.endpoint_id, env_id)?;
-            if !env.messaging_endpoints[idx]
-                .linked_bundles
-                .contains(&payload.bundle_id)
-            {
-                return Err(StoreError::InvalidArgument(format!(
-                    "welcome_flow bundle `{}` is not linked to endpoint `{}`; link it first via `link-bundle`",
-                    payload.bundle_id, payload.endpoint_id
-                )));
-            }
-            validate_welcome_pack_id_store(&env, &payload.bundle_id, payload.pack_id.as_str())?;
-            let new_welcome = WelcomeFlowRef {
-                bundle_id: payload.bundle_id.clone(),
-                pack_id: payload.pack_id.clone(),
-                flow_id: payload.flow_id.clone(),
-            };
-            if env.messaging_endpoints[idx].welcome_flow.as_ref() == Some(&new_welcome) {
-                let ep = env.messaging_endpoints[idx].clone();
-                locked
-                    .refresh_messaging_projection(&env)
-                    .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
-                return Ok(ep);
-            }
-            env.messaging_endpoints[idx].welcome_flow = Some(new_welcome);
-            stamp_mutation(
-                &mut env.messaging_endpoints[idx],
-                &payload.updated_by,
-                payload.idempotency_key.as_str(),
-            );
-            locked.save(&env)?;
-            let ep = env.messaging_endpoints[idx].clone();
-            locked
-                .refresh_messaging_projection(&env)
-                .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
-            Ok(ep)
+            let applied =
+                engine::set_messaging_welcome_flow(&mut env, payload, &idempotency_key, Utc::now())
+                    .map_err(map_messaging_err)?;
+            self.finish_messaging_mutation(locked, &env, applied)
         })
     }
 
@@ -1168,20 +1041,11 @@ impl LocalFsStore {
     ) -> Result<MessagingEndpointId, StoreError> {
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            let idx = env
-                .messaging_endpoints
-                .iter()
-                .position(|e| e.endpoint_id == endpoint_id);
-            let Some(idx) = idx else {
-                // Idempotent: removing an absent endpoint succeeds. Repair
-                // any stale projection from a prior failed call.
-                locked
-                    .refresh_messaging_projection(&env)
-                    .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
-                return Ok(endpoint_id);
-            };
-            env.messaging_endpoints.remove(idx);
-            locked.save(&env)?;
+            if engine::remove_messaging_endpoint(&mut env, endpoint_id) {
+                locked.save(&env)?;
+            }
+            // Refresh runs even on the absent-endpoint no-op: it repairs a
+            // stale projection from a prior failed call.
             locked
                 .refresh_messaging_projection(&env)
                 .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
@@ -1201,42 +1065,55 @@ impl LocalFsStore {
         updated_by: String,
         idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError> {
-        use crate::cli::messaging::{
-            carries_idem_key, idem_suffix, provision_webhook_secret, stamp_mutation,
-        };
-        let idem_suffix_str = idem_suffix(idempotency_key.as_str());
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
-            let idx = find_messaging_endpoint_idx(&env, endpoint_id, env_id)?;
-            // Idempotent replay: if the endpoint already carries this idem key,
-            // the rotation already landed — return the existing endpoint.
-            if carries_idem_key(&env.messaging_endpoints[idx], &idem_suffix_str) {
-                let ep = env.messaging_endpoints[idx].clone();
-                locked
-                    .refresh_messaging_projection(&env)
-                    .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
-                return Ok(ep);
-            }
-            let secret_ref = provision_webhook_secret(
-                self,
-                env_id,
-                &endpoint_id,
-                env.messaging_endpoints[idx].webhook_secret_ref.as_ref(),
-            )
-            .map_err(|e| StoreError::Conflict(e.to_string()))?;
-            env.messaging_endpoints[idx].webhook_secret_ref = Some(secret_ref);
-            stamp_mutation(
-                &mut env.messaging_endpoints[idx],
+            let applied = engine::rotate_messaging_webhook_secret(
+                &mut env,
+                endpoint_id,
                 &updated_by,
-                idempotency_key.as_str(),
-            );
-            locked.save(&env)?;
-            let ep = env.messaging_endpoints[idx].clone();
-            locked
-                .refresh_messaging_projection(&env)
-                .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
-            Ok(ep)
+                &idempotency_key,
+                Utc::now(),
+                |existing| self.provision_webhook_secret_sink(env_id, &endpoint_id, existing),
+            )
+            .map_err(map_messaging_err)?;
+            self.finish_messaging_mutation(locked, &env, applied)
         })
+    }
+
+    /// The LocalFS webhook-secret sink for the engine's `provision` seam:
+    /// mint a CSPRNG value and write it into the env-pack dev-store via
+    /// [`crate::cli::messaging::provision_webhook_secret`]. Failures map to
+    /// [`engine::MessagingError::SecretProvision`], which
+    /// [`map_messaging_err`] folds back onto the `Conflict` noun this store
+    /// raised before the engine rewire.
+    fn provision_webhook_secret_sink(
+        &self,
+        env_id: &EnvId,
+        endpoint_id: &MessagingEndpointId,
+        existing_ref: Option<&SecretRef>,
+    ) -> Result<SecretRef, engine::MessagingError> {
+        crate::cli::messaging::provision_webhook_secret(self, env_id, endpoint_id, existing_ref)
+            .map_err(|e| engine::MessagingError::SecretProvision(e.to_string()))
+    }
+
+    /// Shared tail of every endpoint-returning messaging verb: persist when
+    /// the engine actually mutated, refresh the derived projection on EVERY
+    /// outcome (no-op replays repair a stale projection from a prior failed
+    /// call), and clone the affected endpoint out.
+    fn finish_messaging_mutation(
+        &self,
+        locked: &super::store::Locked<'_>,
+        env: &Environment,
+        applied: engine::MessagingApplied,
+    ) -> Result<MessagingEndpoint, StoreError> {
+        if applied.mutated {
+            locked.save(env)?;
+        }
+        let ep = env.messaging_endpoints[applied.index].clone();
+        locked
+            .refresh_messaging_projection(env)
+            .map_err(|e| StoreError::CommittedAfterSave(Box::new(e)))?;
+        Ok(ep)
     }
 
     // -------------------------------------------------------------
@@ -1321,65 +1198,9 @@ impl LocalFsStore {
     }
 }
 
-/// Locate a messaging endpoint by id inside an environment, returning
-/// [`StoreError::DependentNotFound`] when absent.
-fn find_messaging_endpoint_idx(
-    env: &Environment,
-    endpoint_id: MessagingEndpointId,
-    env_id: &EnvId,
-) -> Result<usize, StoreError> {
-    env.messaging_endpoints
-        .iter()
-        .position(|e| e.endpoint_id == endpoint_id)
-        .ok_or_else(|| {
-            StoreError::DependentNotFound(format!(
-                "messaging endpoint `{endpoint_id}` not found in env `{env_id}`"
-            ))
-        })
-}
-
-/// Store-level welcome-flow pack_id validation mirroring
-/// [`crate::cli::messaging::validate_welcome_pack_id`] but returning
-/// [`StoreError::Conflict`] instead of `OpError`.
-fn validate_welcome_pack_id_store(
-    env: &Environment,
-    bundle_id: &BundleId,
-    pack_id: &str,
-) -> Result<(), StoreError> {
-    let bundles: Vec<_> = env
-        .bundles
-        .iter()
-        .filter(|b| b.bundle_id == *bundle_id)
-        .collect();
-    if bundles.is_empty() {
-        return Ok(());
-    }
-    let mut saw_any_pack = false;
-    let mut known_packs: Vec<String> = Vec::new();
-    for bundle in bundles {
-        for rev_id in &bundle.current_revisions {
-            let Some(rev) = env.revisions.iter().find(|r| r.revision_id == *rev_id) else {
-                continue;
-            };
-            for entry in &rev.pack_list {
-                saw_any_pack = true;
-                if entry.pack_id.as_str() == pack_id {
-                    return Ok(());
-                }
-                known_packs.push(entry.pack_id.as_str().to_string());
-            }
-        }
-    }
-    if !saw_any_pack {
-        return Ok(());
-    }
-    known_packs.sort();
-    known_packs.dedup();
-    Err(StoreError::InvalidArgument(format!(
-        "welcome_flow.pack_id `{pack_id}` does not appear in any current revision of bundle `{bundle_id}` (known: [{}])",
-        known_packs.join(", ")
-    )))
-}
+// Endpoint lookup and welcome-flow pack_id validation moved to
+// `greentic_deploy_spec::engine::messaging` (PR-4.2h) so the
+// operator-store-server validates identically.
 
 // `fresh_environment` moved to `greentic_deploy_spec::engine` (PR-4.2a) so
 // the operator-store-server seeds envs identically.
@@ -1620,8 +1441,9 @@ impl EnvironmentMutations for LocalFsStore {
         &self,
         env_id: &EnvId,
         payload: AddMessagingEndpointPayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError> {
-        self.add_messaging_endpoint(env_id, payload)
+        self.add_messaging_endpoint(env_id, payload, idempotency_key)
     }
 
     /// See [`LocalFsStore::link_messaging_bundle`].
@@ -1653,8 +1475,9 @@ impl EnvironmentMutations for LocalFsStore {
         &self,
         env_id: &EnvId,
         payload: SetMessagingWelcomeFlowPayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError> {
-        self.set_messaging_welcome_flow(env_id, payload)
+        self.set_messaging_welcome_flow(env_id, payload, idempotency_key)
     }
 
     /// See [`LocalFsStore::remove_messaging_endpoint`].

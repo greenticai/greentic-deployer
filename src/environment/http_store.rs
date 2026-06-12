@@ -77,8 +77,9 @@ use greentic_deploy_spec::{
     AuditDecision, AuditEvent, AuditResult, BindingGenerationOutcome, BundleDeployment, BundleId,
     CapabilitySlot, DeploymentId, EnvId, EnvPackBinding, Environment, EnvironmentHostConfig,
     ExtensionBinding, ExtensionBindingPayload, ExtensionKeyedPayload, IdempotencyKey,
-    IdempotencyOutcome, MessagingEndpoint, MessagingEndpointId, PackBindingPayload, PackId,
-    RemoteStoreError, Revision, RevisionId, RollbackTrafficSplitPayload, StateEtag,
+    IdempotencyOutcome, MessagingBundleLinkPayload, MessagingEndpoint, MessagingEndpointId,
+    PackBindingPayload, RemoteStoreError, Revision, RevisionId, RollbackTrafficSplitPayload,
+    RotateWebhookSecretPayload, StateEtag,
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::Client;
@@ -636,36 +637,11 @@ fn map_remote_error(err: RemoteStoreError) -> StoreError {
 // `greentic_deploy_spec::engine` types since PR-4.2c — the client
 // serializes the same structs the server deserializes.
 
-#[derive(Serialize)]
-struct AddMessagingEndpointRequest {
-    provider_id: String,
-    provider_type: String,
-    display_name: String,
-    secret_refs: Vec<String>,
-    updated_by: String,
-}
-
-/// Body for both `link-bundle` and `unlink-bundle` messaging-endpoint verbs.
-/// The two routes diverge by URL suffix only.
-#[derive(Serialize)]
-struct MessagingBundleLinkRequest {
-    bundle_id: BundleId,
-    updated_by: String,
-}
-
-#[derive(Serialize)]
-struct SetMessagingWelcomeFlowRequest {
-    endpoint_id: MessagingEndpointId,
-    bundle_id: BundleId,
-    pack_id: PackId,
-    flow_id: String,
-    updated_by: String,
-}
-
-#[derive(Serialize)]
-struct RotateWebhookSecretRequest {
-    updated_by: String,
-}
+// Messaging wire shapes (`AddMessagingEndpointPayload`,
+// `MessagingBundleLinkPayload`, `SetMessagingWelcomeFlowPayload`,
+// `RotateWebhookSecretPayload`) are the shared
+// `greentic_deploy_spec::engine` types since PR-4.2h — the client
+// serializes the same structs the server deserializes.
 
 // Trust-root wire shapes (`AddTrustedKeyPayload`, `TrustRootSeed`,
 // `TrustRootAddOutcome`, `TrustRootRemoveOutcome`) are the shared
@@ -1070,21 +1046,15 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         &self,
         env_id: &EnvId,
         payload: AddMessagingEndpointPayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError> {
-        let idem_key = payload.idempotency_key.as_str().to_string();
-        let req = AddMessagingEndpointRequest {
-            provider_id: payload.provider_id,
-            provider_type: payload.provider_type,
-            display_name: payload.display_name,
-            secret_refs: payload.secret_refs,
-            updated_by: payload.updated_by,
-        };
+        let idem_key = idempotency_key.as_str().to_string();
         self.send_mutation(
             env_id,
             reqwest::Method::POST,
             &self.env_path(env_id, "/messaging"),
             Some(&idem_key),
-            Some(&req),
+            Some(&payload),
         )
     }
 
@@ -1097,7 +1067,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let req = MessagingBundleLinkRequest {
+        let req = MessagingBundleLinkPayload {
             bundle_id,
             updated_by,
         };
@@ -1123,7 +1093,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let req = MessagingBundleLinkRequest {
+        let req = MessagingBundleLinkPayload {
             bundle_id,
             updated_by,
         };
@@ -1144,16 +1114,10 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         &self,
         env_id: &EnvId,
         payload: SetMessagingWelcomeFlowPayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError> {
-        let idem_key = payload.idempotency_key.as_str().to_string();
+        let idem_key = idempotency_key.as_str().to_string();
         let eid = payload.endpoint_id.to_string();
-        let req = SetMessagingWelcomeFlowRequest {
-            endpoint_id: payload.endpoint_id,
-            bundle_id: payload.bundle_id,
-            pack_id: payload.pack_id,
-            flow_id: payload.flow_id,
-            updated_by: payload.updated_by,
-        };
         self.send_mutation(
             env_id,
             reqwest::Method::POST,
@@ -1163,7 +1127,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
                 encode_segment(&eid),
             ),
             Some(&idem_key),
-            Some(&req),
+            Some(&payload),
         )
     }
 
@@ -1193,7 +1157,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let req = RotateWebhookSecretRequest { updated_by };
+        let req = RotateWebhookSecretPayload { updated_by };
         self.send_mutation(
             env_id,
             reqwest::Method::POST,
@@ -1274,7 +1238,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use greentic_deploy_spec::RevisionLifecycle;
+    use greentic_deploy_spec::{PackId, RevisionLifecycle};
     use std::io::{BufRead, BufReader, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::path::PathBuf;
@@ -2197,8 +2161,8 @@ mod tests {
                 display_name: "Telegram Bot".to_string(),
                 secret_refs: Vec::new(),
                 updated_by: "tester".to_string(),
-                idempotency_key: idem(),
             },
+            idem(),
         );
         assert!(result.is_ok());
     }
@@ -2243,8 +2207,8 @@ mod tests {
                 pack_id: PackId::new("greentic-messaging"),
                 flow_id: "welcome".to_string(),
                 updated_by: "tester".to_string(),
-                idempotency_key: idem(),
             },
+            idem(),
         );
         assert!(result.is_ok());
     }
