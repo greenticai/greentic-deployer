@@ -16,11 +16,16 @@
 //! where it looks like a missing key. The returned entry carries the
 //! canonical (lowercase) id, so stores never persist a caller-cased one.
 
-use greentic_distributor_client::signing::{
-    SigningError, TrustRoot, TrustedKey, key_id_for_public_key_pem,
-};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+// Re-exported so consumers (the deployer, the operator-store-server) build
+// trust-root entries through this crate without a direct
+// `greentic-distributor-client` dependency — the canonical types and the
+// single key-id derivation stay in one place.
+pub use greentic_distributor_client::signing::{
+    SigningError, TrustRoot, TrustedKey, key_id_for_public_key_pem,
+};
 
 /// Schema discriminator for the trust-root document.
 pub const TRUST_ROOT_SCHEMA_V1: &str = "greentic.trust-root.v1";

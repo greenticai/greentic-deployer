@@ -28,9 +28,10 @@ use greentic_deployer::environment::{
     FieldUpdate, MigrateMergePayload, SetTrafficSplitPayload, StageRevisionPayload,
     UpdateEnvironmentPayload, WarmRevisionPayload,
 };
-use greentic_operator_store_server::http::router;
+use greentic_operator_store_server::http::router_with_operator_key;
 use greentic_operator_store_server::sqlite::SqliteEnvironmentStore;
 use greentic_operator_store_server::storage::EnvironmentStorage;
+use greentic_operator_trust::test_support::keypair;
 use url::Url;
 
 fn env_id(raw: &str) -> EnvId {
@@ -123,10 +124,16 @@ async fn remote_env_lifecycle_end_to_end() {
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
     let serve_backend = Arc::clone(&backend);
+    // The server operator key lives in the test's TempDir — the trust-root
+    // bootstrap verb mints it there instead of `~/.greentic`.
+    let operator_key_path = dir.path().join("operator-key.pem");
     tokio::spawn(async move {
-        axum::serve(listener, router(serve_backend))
-            .await
-            .expect("serve");
+        axum::serve(
+            listener,
+            router_with_operator_key(serve_backend, operator_key_path),
+        )
+        .await
+        .expect("serve");
     });
 
     // The blocking reqwest client must not run on a tokio worker thread.
@@ -435,6 +442,56 @@ async fn remote_env_lifecycle_end_to_end() {
             matches!(err, StoreError::DependentNotFound(_)),
             "unexpected error: {err:?}"
         );
+
+        // ----- PR-4.2f: the trust-root verb group over the same wire. -----
+
+        // Bootstrap mints the SERVER's operator key (no request body — the
+        // PR-3b wire contract) and grants it on the env trust root.
+        let seed = store.bootstrap_trust_root(&id).expect("bootstrap");
+        assert_eq!(seed.trusted_key_count, 1);
+        assert!(seed.public_key_pem.contains("PUBLIC KEY"));
+
+        // Already bootstrapped — seed-if-absent's no-op travels as a
+        // `null` result and decodes back to `None`.
+        let again = store
+            .seed_trust_root_if_absent(&id)
+            .expect("seed after bootstrap");
+        assert!(again.is_none(), "seed must no-op once bootstrapped");
+
+        // Add a caller-supplied key; the shared validation canonicalizes
+        // and the outcome echoes the supplied id (local parity).
+        let (pem, key_id) = keypair(81);
+        let added = store
+            .add_trusted_key(&id, key_id.clone(), pem.clone(), idem("k-trust-add"))
+            .expect("add trusted key");
+        assert_eq!(added.added_key_id, key_id);
+        assert_eq!(added.trusted_key_count, 2);
+
+        // Mismatched id → the server's 400 `invalid-request` maps onto the
+        // same `InvalidArgument` noun the CLI mapper uses.
+        let (_pem_b, id_b) = keypair(82);
+        let err = store
+            .add_trusted_key(&id, id_b, pem.clone(), idem("k-trust-add-bad"))
+            .expect_err("mismatched key id must be rejected");
+        assert!(
+            matches!(err, StoreError::InvalidArgument(_)),
+            "unexpected error: {err:?}"
+        );
+
+        // Remove returns the recovery PEM; the repeat is a silent no-op.
+        let removed = store
+            .remove_trusted_key(&id, key_id.clone(), idem("k-trust-rm"))
+            .expect("remove trusted key");
+        assert_eq!(
+            removed.removed_public_key_pem.as_deref(),
+            Some(pem.as_str())
+        );
+        assert_eq!(removed.trusted_key_count, 1);
+        let noop = store
+            .remove_trusted_key(&id, key_id, idem("k-trust-rm-2"))
+            .expect("no-op remove");
+        assert!(noop.removed_public_key_pem.is_none());
+        assert_eq!(noop.trusted_key_count, 1);
 
         staged.revision_id
     })

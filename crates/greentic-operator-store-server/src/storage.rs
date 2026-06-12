@@ -11,6 +11,7 @@ use greentic_deploy_spec::{
     CapabilitySlot, ConcurrencyConflict, EnvId, Environment, EnvironmentRuntime, IntegrityError,
     Precondition, PreconditionError, SpecError, StateEtag,
 };
+use greentic_operator_trust::trust_root::TrustRootDocument;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -40,6 +41,8 @@ pub type LoadedEnv = Loaded<Environment>;
 pub type LoadedRuntime = Loaded<EnvironmentRuntime>;
 /// `load_pack_answers` return type.
 pub type LoadedAnswers = Loaded<Value>;
+/// `load_trust_root` return type.
+pub type LoadedTrustRoot = Loaded<TrustRootDocument>;
 
 /// Errors surfaced by a storage backend.
 ///
@@ -193,4 +196,23 @@ pub trait EnvironmentStorage: Send + Sync {
         slot: CapabilitySlot,
         precondition: &Precondition,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Load `env_id`'s trust-root document (PR-4.2f). `None` mirrors the
+    /// LocalFS backend's missing `trust-root.json` — it is how the
+    /// seed-if-absent verb detects "never bootstrapped", so an empty
+    /// document and an absent row are distinct states.
+    fn load_trust_root(
+        &self,
+        env_id: &EnvId,
+    ) -> impl Future<Output = Result<Option<LoadedTrustRoot>, StorageError>> + Send;
+
+    /// Upsert the trust-root document. Same precondition semantics as
+    /// [`Self::upsert_runtime`] — first write (no existing row) must be
+    /// unconditional, later writes require a conditional precondition.
+    fn upsert_trust_root(
+        &self,
+        env_id: &EnvId,
+        doc: &TrustRootDocument,
+        precondition: Option<&Precondition>,
+    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
 }

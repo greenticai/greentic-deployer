@@ -19,6 +19,8 @@ use greentic_deploy_spec::{
 };
 use greentic_operator_store_server::sqlite::SqliteEnvironmentStore;
 use greentic_operator_store_server::storage::{EnvironmentStorage, StorageError};
+use greentic_operator_trust::test_support::keypair;
+use greentic_operator_trust::trust_root::{TrustRootDocument, TrustedKey};
 use serde_json::json;
 use sqlx::Row;
 
@@ -627,4 +629,156 @@ async fn second_open_of_same_file_is_rejected_while_lock_held() {
     let _store_b = SqliteEnvironmentStore::open(&db_path)
         .await
         .expect("re-open after drop must succeed");
+}
+
+// --- trust root (PR-4.2f) ---
+
+fn trust_doc(seeds: &[u8]) -> TrustRootDocument {
+    TrustRootDocument::v1(
+        seeds
+            .iter()
+            .map(|&seed| {
+                let (pem, id) = keypair(seed);
+                TrustedKey {
+                    key_id: id,
+                    public_key_pem: pem,
+                }
+            })
+            .collect(),
+    )
+}
+
+#[tokio::test]
+async fn trust_root_round_trip_with_cas() {
+    let (_d, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    // Row absence is load-bearing (the seed-if-absent gate) — a fresh env
+    // reads `None`, not an empty document.
+    assert!(store.load_trust_root(&id).await.expect("load").is_none());
+
+    let doc = trust_doc(&[1]);
+    let rev1 = store
+        .upsert_trust_root(&id, &doc, None)
+        .await
+        .expect("first upsert (no pc)");
+    assert_eq!(rev1.generation, 1);
+
+    let loaded = store
+        .load_trust_root(&id)
+        .await
+        .expect("load")
+        .expect("present");
+    assert_eq!(loaded.value, doc);
+    assert_eq!(loaded.revision, rev1);
+
+    let doc2 = trust_doc(&[1, 2]);
+    let pc = Precondition::matching(rev1.etag.clone(), rev1.generation);
+    let rev2 = store
+        .upsert_trust_root(&id, &doc2, Some(&pc))
+        .await
+        .expect("second upsert");
+    assert_eq!(rev2.generation, 2);
+
+    let err = store
+        .upsert_trust_root(&id, &doc2, None)
+        .await
+        .expect_err("missing pc on existing row must reject");
+    assert!(matches!(err, StorageError::PreconditionRequired));
+}
+
+#[tokio::test]
+async fn trust_root_conditional_upsert_on_absent_row_is_not_found() {
+    let (_d, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    let pc = Precondition::matching(StateEtag("stale".to_string()), 1);
+    let err = store
+        .upsert_trust_root(&id, &trust_doc(&[3]), Some(&pc))
+        .await
+        .expect_err("conditional write against an absent row must reject");
+    assert!(matches!(err, StorageError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn trust_root_stale_precondition_conflicts() {
+    let (_d, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    let rev1 = store
+        .upsert_trust_root(&id, &trust_doc(&[4]), None)
+        .await
+        .expect("first upsert");
+    let stale = Precondition::matching(StateEtag("stale".to_string()), rev1.generation);
+    let err = store
+        .upsert_trust_root(&id, &trust_doc(&[4, 5]), Some(&stale))
+        .await
+        .expect_err("stale etag must conflict");
+    let StorageError::PreconditionFailed { conflict, .. } = err else {
+        panic!("expected PreconditionFailed, got: {err:?}");
+    };
+    let ConcurrencyConflict { actual_etag, .. } = conflict;
+    assert_eq!(actual_etag, rev1.etag.0);
+}
+
+#[tokio::test]
+async fn trust_root_rejects_unknown_schema() {
+    let (_d, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    let mut doc = trust_doc(&[6]);
+    doc.schema = "greentic.trust-root.v999".to_string();
+    let err = store
+        .upsert_trust_root(&id, &doc, None)
+        .await
+        .expect_err("unknown schema must reject before write");
+    assert!(matches!(err, StorageError::Spec(_)), "got: {err:?}");
+}
+
+#[tokio::test]
+async fn load_trust_root_detects_tampered_data() {
+    let (_d, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    store
+        .upsert_trust_root(&id, &trust_doc(&[7]), None)
+        .await
+        .expect("upsert trust root");
+
+    // Tamper with the stored JSON without updating integrity_digest.
+    sqlx::query("UPDATE trust_roots SET data = $1 WHERE env_id = $2")
+        .bind(serde_json::to_value(trust_doc(&[8])).unwrap())
+        .bind(id.as_str())
+        .execute(store.pool())
+        .await
+        .expect("tamper");
+
+    let err = store
+        .load_trust_root(&id)
+        .await
+        .expect_err("tampered trust root must fail integrity check");
+    assert!(
+        matches!(err, StorageError::IntegrityMismatch { .. }),
+        "expected IntegrityMismatch, got: {err:?}"
+    );
 }

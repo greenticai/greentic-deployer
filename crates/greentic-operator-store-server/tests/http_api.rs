@@ -16,9 +16,10 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use greentic_operator_store_server::http::router;
+use greentic_operator_store_server::http::{router, router_with_operator_key};
 use greentic_operator_store_server::sqlite::SqliteEnvironmentStore;
 use greentic_operator_store_server::storage::EnvironmentStorage;
+use greentic_operator_trust::test_support::keypair;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::util::ServiceExt;
@@ -1713,4 +1714,418 @@ async fn extension_update_with_mismatched_key_is_409_conflict() {
     assert_eq!(extensions.len(), 1);
     assert!(extensions[0]["instance_id"].is_null());
     assert_eq!(extensions[0]["generation"], 0);
+}
+
+// ---------------------------------------------------------------------------
+// PR-4.2f — trust-root verb group
+// ---------------------------------------------------------------------------
+
+/// Like [`app_with_store`], but with the server operator key pinned to a
+/// file inside the test's `TempDir` (so bootstrap/seed never touch the
+/// real `~/.greentic/operator/key.pem`).
+async fn app_with_trust_key() -> (tempfile::TempDir, Router, Arc<SqliteEnvironmentStore>) {
+    let (dir, store) = fresh_store().await;
+    let store = Arc::new(store);
+    let app = router_with_operator_key(Arc::clone(&store), dir.path().join("operator-key.pem"));
+    (dir, app, store)
+}
+
+async fn create_local_env(app: &Router) {
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create env failed: {body}");
+}
+
+#[tokio::test]
+async fn trust_root_bootstrap_grants_operator_key_idempotently() {
+    let (_d, app, _store) = app_with_trust_key().await;
+    create_local_env(&app).await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/trust-root/bootstrap",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_envelope(&body, "local");
+    assert_eq!(body["audit"]["noun"], "trust-root");
+    assert_eq!(body["audit"]["verb"], "bootstrap");
+    let key_id = body["result"]["key_id"]
+        .as_str()
+        .expect("key_id")
+        .to_string();
+    assert!(
+        body["result"]["public_key_pem"]
+            .as_str()
+            .unwrap_or("")
+            .contains("PUBLIC KEY")
+    );
+    assert_eq!(body["result"]["trusted_key_count"], 1);
+
+    // Re-grant: same server key, same single entry.
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/trust-root/bootstrap",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["result"]["key_id"], key_id.as_str());
+    assert_eq!(body["result"]["trusted_key_count"], 1);
+
+    let (status, body) = send(app, Method::GET, "/environments/local/trust-root", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["environment_id"], "local");
+    assert_eq!(body["keys"].as_array().expect("keys").len(), 1);
+    assert_eq!(body["keys"][0]["key_id"], key_id.as_str());
+}
+
+#[tokio::test]
+async fn trust_root_seed_mints_once_then_nulls() {
+    let (_d, app, store) = app_with_trust_key().await;
+    create_local_env(&app).await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/trust-root/seed",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_envelope(&body, "local");
+    assert_eq!(body["audit"]["verb"], "seed");
+    assert_eq!(body["result"]["trusted_key_count"], 1);
+
+    // Already seeded — the no-op contract is a 200 with a `null` result.
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/environments/local/trust-root/seed",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_envelope(&body, "local");
+    assert!(body["result"].is_null(), "body: {body}");
+
+    let loaded = store
+        .load_trust_root(&greentic_deploy_spec::EnvId::try_from("local").unwrap())
+        .await
+        .expect("load")
+        .expect("row exists after seed");
+    assert_eq!(loaded.value.keys.len(), 1);
+}
+
+#[tokio::test]
+async fn trust_root_add_validates_and_canonicalizes() {
+    let (_d, app, _store) = app_with_trust_key().await;
+    create_local_env(&app).await;
+
+    // Uppercase id is accepted (validated against the derivation
+    // case-insensitively); the outcome echoes the caller's form while the
+    // stored entry is canonical lowercase.
+    let (pem, id) = keypair(40);
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/trust-root/keys",
+        Some(json!({"key_id": id.to_uppercase(), "public_key_pem": pem})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_envelope(&body, "local");
+    assert_eq!(body["audit"]["verb"], "add");
+    assert_eq!(body["result"]["added_key_id"], id.to_uppercase());
+    assert_eq!(body["result"]["trusted_key_count"], 1);
+
+    let (status, body) = send(
+        app.clone(),
+        Method::GET,
+        "/environments/local/trust-root",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["keys"][0]["key_id"],
+        id.as_str(),
+        "stored id is canonical"
+    );
+
+    // A key_id that does not match the PEM's derivation → typed 400
+    // before any state is touched.
+    let (pem_a, _) = keypair(41);
+    let (_, id_b) = keypair(42);
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/trust-root/keys",
+        Some(json!({"key_id": id_b, "public_key_pem": pem_a})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["kind"], "invalid-request");
+
+    // Adding the trust root via `add` also flips the seed gate.
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/environments/local/trust-root/seed",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body["result"].is_null(),
+        "manual add must count as bootstrapped: {body}"
+    );
+}
+
+#[tokio::test]
+async fn trust_root_remove_returns_pem_and_noops_on_absent() {
+    let (_d, app, store) = app_with_trust_key().await;
+    create_local_env(&app).await;
+    let local = greentic_deploy_spec::EnvId::try_from("local").unwrap();
+
+    // No-op remove on an env that was never bootstrapped must NOT
+    // materialize a trust-root row (row absence is the seed gate).
+    let (status, body) = send(
+        app.clone(),
+        Method::DELETE,
+        "/environments/local/trust-root/keys/deadbeef",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body["result"]["removed_public_key_pem"].is_null());
+    assert_eq!(body["result"]["trusted_key_count"], 0);
+    assert!(
+        store.load_trust_root(&local).await.expect("load").is_none(),
+        "no-op remove must not create the trust-root row"
+    );
+
+    let (pem, id) = keypair(43);
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/trust-root/keys",
+        Some(json!({"key_id": id, "public_key_pem": pem})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Case-insensitive removal returns the removed PEM (recovery material).
+    let (status, body) = send(
+        app.clone(),
+        Method::DELETE,
+        &format!("/environments/local/trust-root/keys/{}", id.to_uppercase()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_envelope(&body, "local");
+    assert_eq!(body["audit"]["verb"], "remove");
+    assert_eq!(body["result"]["removed_key_id"], id.to_uppercase());
+    assert_eq!(body["result"]["removed_public_key_pem"], pem.as_str());
+    assert_eq!(body["result"]["trusted_key_count"], 0);
+
+    // Second remove: silent no-op, PEM gone, row (and its generation) kept.
+    let (status, body) = send(
+        app,
+        Method::DELETE,
+        &format!("/environments/local/trust-root/keys/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body["result"]["removed_public_key_pem"].is_null());
+    let loaded = store
+        .load_trust_root(&local)
+        .await
+        .expect("load")
+        .expect("row survives emptying");
+    assert!(loaded.value.keys.is_empty());
+    assert_eq!(
+        loaded.revision.generation, 2,
+        "no-op remove must not bump the row generation"
+    );
+}
+
+#[tokio::test]
+async fn trust_root_verbs_on_missing_env_are_404() {
+    let (_d, app, _store) = app_with_trust_key().await;
+    let (pem, id) = keypair(44);
+    let cases: Vec<(Method, &str, Option<Value>)> = vec![
+        (Method::GET, "/environments/ghost/trust-root", None),
+        (
+            Method::POST,
+            "/environments/ghost/trust-root/bootstrap",
+            None,
+        ),
+        (Method::POST, "/environments/ghost/trust-root/seed", None),
+        (
+            Method::POST,
+            "/environments/ghost/trust-root/keys",
+            Some(json!({"key_id": id, "public_key_pem": pem})),
+        ),
+        (
+            Method::DELETE,
+            "/environments/ghost/trust-root/keys/deadbeef",
+            None,
+        ),
+    ];
+    for (method, path, payload) in cases {
+        let (status, body) = send(app.clone(), method.clone(), path, payload).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{method} {path} body: {body}"
+        );
+        assert_eq!(body["kind"], "not-found", "{method} {path}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent trust-root first-write convergence (F3 race fix)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn trust_root_concurrent_seeds_converge() {
+    let (_d, app, _store) = app_with_trust_key().await;
+    create_local_env(&app).await;
+
+    // Fire 4 concurrent seeds with distinct idempotency keys.
+    let (r1, r2, r3, r4) = tokio::join!(
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/trust-root/seed",
+            None,
+            &[("Idempotency-Key", "SEED-RACE-1")],
+        ),
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/trust-root/seed",
+            None,
+            &[("Idempotency-Key", "SEED-RACE-2")],
+        ),
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/trust-root/seed",
+            None,
+            &[("Idempotency-Key", "SEED-RACE-3")],
+        ),
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/trust-root/seed",
+            None,
+            &[("Idempotency-Key", "SEED-RACE-4")],
+        ),
+    );
+
+    let results = [r1, r2, r3, r4];
+    for (i, (status, body)) in results.iter().enumerate() {
+        assert_eq!(*status, StatusCode::OK, "seed {i} body: {body}");
+    }
+
+    // Exactly one result is non-null (the winner); the rest are null no-ops.
+    let non_null_count = results
+        .iter()
+        .filter(|(_, body)| !body["result"].is_null())
+        .count();
+    assert_eq!(
+        non_null_count, 1,
+        "exactly one seed must win; got {non_null_count} non-null results"
+    );
+
+    // Final state: exactly 1 key.
+    let (status, body) = send(app, Method::GET, "/environments/local/trust-root", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["keys"].as_array().expect("keys").len(), 1);
+}
+
+#[tokio::test]
+async fn trust_root_concurrent_adds_of_distinct_keys_both_land() {
+    let (_d, app, _store) = app_with_trust_key().await;
+    create_local_env(&app).await;
+
+    let (pem_a, id_a) = keypair(60);
+    let (pem_b, id_b) = keypair(61);
+
+    let (r1, r2) = tokio::join!(
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/trust-root/keys",
+            Some(json!({"key_id": id_a, "public_key_pem": pem_a})),
+            &[("Idempotency-Key", "ADD-RACE-1")],
+        ),
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/trust-root/keys",
+            Some(json!({"key_id": id_b, "public_key_pem": pem_b})),
+            &[("Idempotency-Key", "ADD-RACE-2")],
+        ),
+    );
+
+    assert_eq!(r1.0, StatusCode::OK, "add key A: {}", r1.1);
+    assert_eq!(r2.0, StatusCode::OK, "add key B: {}", r2.1);
+
+    // Both distinct keys must be present.
+    let (status, body) = send(app, Method::GET, "/environments/local/trust-root", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["keys"].as_array().expect("keys").len(),
+        2,
+        "both distinct keys must land: {body}"
+    );
+}
+
+#[tokio::test]
+async fn trust_root_concurrent_bootstraps_converge() {
+    let (_d, app, _store) = app_with_trust_key().await;
+    create_local_env(&app).await;
+
+    let (r1, r2) = tokio::join!(
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/trust-root/bootstrap",
+            None,
+            &[("Idempotency-Key", "BOOT-RACE-1")],
+        ),
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/trust-root/bootstrap",
+            None,
+            &[("Idempotency-Key", "BOOT-RACE-2")],
+        ),
+    );
+
+    assert_eq!(r1.0, StatusCode::OK, "bootstrap 1: {}", r1.1);
+    assert_eq!(r2.0, StatusCode::OK, "bootstrap 2: {}", r2.1);
+
+    // Both report the same key_id.
+    let kid1 = r1.1["result"]["key_id"].as_str().expect("key_id 1");
+    let kid2 = r2.1["result"]["key_id"].as_str().expect("key_id 2");
+    assert_eq!(kid1, kid2, "both bootstraps must report the same key");
+
+    // Final state: exactly 1 key.
+    let (status, body) = send(app, Method::GET, "/environments/local/trust-root", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["keys"].as_array().expect("keys").len(), 1);
 }
