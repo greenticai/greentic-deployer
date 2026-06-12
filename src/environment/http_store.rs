@@ -74,14 +74,13 @@
 //! - PR-3c wires dispatch between `LocalFsStore` and `HttpEnvironmentStore`
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use greentic_deploy_spec::{
     AuditDecision, AuditEvent, AuditResult, BundleDeployment, BundleDeploymentStatus, BundleId,
     CapabilitySlot, CustomerId, DeploymentId, EnvId, EnvPackBinding, Environment,
     EnvironmentHostConfig, ExtensionBinding, IdempotencyKey, IdempotencyOutcome, MessagingEndpoint,
-    MessagingEndpointId, PackId, PackListEntry, RemoteStoreError, RevenueShareEntry, Revision,
-    RevisionId, RevisionLifecycle, RouteBinding, StateEtag, TrafficSplit, TrafficSplitEntry,
+    MessagingEndpointId, PackId, RemoteStoreError, RevenueShareEntry, Revision, RevisionId,
+    RouteBinding, StateEtag, TrafficSplit, TrafficSplitEntry,
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::Client;
@@ -578,6 +577,23 @@ fn map_remote_error(err: RemoteStoreError) -> StoreError {
         // Same noun the local impl uses for create-on-existing — the CLI
         // mapper downcasts `Conflict` uniformly across backends.
         RemoteStoreError::AlreadyExists { detail } => StoreError::Conflict(detail),
+        RemoteStoreError::Conflict { detail } => StoreError::Conflict(detail),
+        RemoteStoreError::DependentNotFound { detail } => StoreError::DependentNotFound(detail),
+        // Reconstruct the local store's typed health-gate failure so CLI
+        // callers (committed-on-error handling, gate-failed telemetry emit)
+        // behave identically against a remote store. The server persisted
+        // the `Failed` lifecycle before responding — committed, like local.
+        RemoteStoreError::HealthGateFailed {
+            revision_id,
+            failed_checks,
+            message,
+        } => StoreError::Lifecycle(Box::new(
+            crate::environment::LifecycleError::HealthGateFailed {
+                revision_id,
+                failed_checks,
+                message,
+            },
+        )),
         RemoteStoreError::InvalidRequest { detail } => StoreError::InvalidArgument(detail),
         RemoteStoreError::IntegrityMismatch { expected, actual } => StoreError::InvalidArgument(
             format!("integrity mismatch: expected {expected}, computed {actual}"),
@@ -599,55 +615,13 @@ fn map_remote_error(err: RemoteStoreError) -> StoreError {
 
 // Env-lifecycle wire shapes (`CreateEnvironmentPayload`,
 // `UpdateEnvironmentPayload`, `MigrateMergePayload`, `MergeReport`) moved to
-// `greentic_deploy_spec::engine` in PR-4.2a — the payload structs now carry
-// serde derives in the exact wire encoding this module established, so the
-// client serializes them directly and the operator-store-server deserializes
-// the same types. Remaining verb groups migrate as their routes land.
-
-#[derive(Serialize)]
-struct StageRevisionRequest {
-    revision_id: RevisionId,
-    deployment_id: DeploymentId,
-    bundle_digest: String,
-    pack_list: Vec<PackListEntry>,
-    pack_list_lock_ref: PathBuf,
-    pack_config_refs: Vec<PathBuf>,
-    config_digest: String,
-    signature_sidecar_ref: PathBuf,
-    drain_seconds: u32,
-}
-
-#[derive(Serialize)]
-struct WarmRevisionRequest {
-    health_gate_ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    health_gate_failure: Option<WireHealthGateFailure>,
-    expected_lifecycle: RevisionLifecycle,
-}
-
-#[derive(Serialize)]
-struct WireHealthGateFailure {
-    failed_checks: Vec<String>,
-    message: String,
-}
-
-/// Response for revision lifecycle transitions (warm/drain/archive).
-#[derive(Deserialize)]
-struct RevisionTransitionResponse {
-    revision: Revision,
-    environment: Environment,
-    starting_lifecycle: RevisionLifecycle,
-}
-
-impl From<RevisionTransitionResponse> for RevisionTransitionOutcome {
-    fn from(resp: RevisionTransitionResponse) -> Self {
-        Self {
-            revision: resp.revision,
-            environment: resp.environment,
-            starting_lifecycle: resp.starting_lifecycle,
-        }
-    }
-}
+// `greentic_deploy_spec::engine` in PR-4.2a; the revision verb group's
+// (`StageRevisionPayload`, `WarmRevisionPayload`,
+// `RevisionTransitionOutcome`) followed in PR-4.2b — the payload structs
+// now carry serde derives in the exact wire encoding this module
+// established, so the client serializes them directly and the
+// operator-store-server deserializes the same types. Remaining verb groups
+// migrate as their routes land.
 
 #[derive(Serialize)]
 struct AddBundleRequest {
@@ -868,25 +842,15 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         &self,
         env_id: &EnvId,
         payload: StageRevisionPayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<Revision, StoreError> {
-        let idem_key = payload.idempotency_key.as_str().to_string();
-        let req = StageRevisionRequest {
-            revision_id: payload.revision_id,
-            deployment_id: payload.deployment_id,
-            bundle_digest: payload.bundle_digest,
-            pack_list: payload.pack_list,
-            pack_list_lock_ref: payload.pack_list_lock_ref,
-            pack_config_refs: payload.pack_config_refs,
-            config_digest: payload.config_digest,
-            signature_sidecar_ref: payload.signature_sidecar_ref,
-            drain_seconds: payload.drain_seconds,
-        };
+        let idem_key = idempotency_key.as_str().to_string();
         self.send_mutation(
             env_id,
             reqwest::Method::POST,
             &self.env_path(env_id, "/revisions"),
             Some(&idem_key),
-            Some(&req),
+            Some(&payload),
         )
     }
 
@@ -894,18 +858,11 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         &self,
         env_id: &EnvId,
         payload: WarmRevisionPayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<RevisionTransitionOutcome, StoreError> {
-        let idem_key = payload.idempotency_key.as_str().to_string();
-        let rid = &payload.revision_id;
-        let req = WarmRevisionRequest {
-            health_gate_ok: payload.health_gate.is_ok(),
-            health_gate_failure: payload.health_gate.err().map(|f| WireHealthGateFailure {
-                failed_checks: f.failed_checks.iter().map(|c| format!("{c:?}")).collect(),
-                message: f.message,
-            }),
-            expected_lifecycle: payload.expected_lifecycle,
-        };
-        let resp: RevisionTransitionResponse = self.send_mutation(
+        let idem_key = idempotency_key.as_str().to_string();
+        let rid = payload.revision_id;
+        self.send_mutation(
             env_id,
             reqwest::Method::POST,
             &format!(
@@ -914,9 +871,8 @@ impl EnvironmentMutations for HttpEnvironmentStore {
                 encode_segment(&rid.to_string()),
             ),
             Some(&idem_key),
-            Some(&req),
-        )?;
-        Ok(resp.into())
+            Some(&payload),
+        )
     }
 
     fn drain_revision(
@@ -926,7 +882,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<RevisionTransitionOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let resp: RevisionTransitionResponse = self.send_mutation_no_body(
+        self.send_mutation_no_body(
             env_id,
             reqwest::Method::POST,
             &format!(
@@ -935,8 +891,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
                 encode_segment(&revision_id.to_string()),
             ),
             Some(&idem_key),
-        )?;
-        Ok(resp.into())
+        )
     }
 
     fn archive_revision(
@@ -946,7 +901,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<RevisionTransitionOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let resp: RevisionTransitionResponse = self.send_mutation_no_body(
+        self.send_mutation_no_body(
             env_id,
             reqwest::Method::POST,
             &format!(
@@ -955,8 +910,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
                 encode_segment(&revision_id.to_string()),
             ),
             Some(&idem_key),
-        )?;
-        Ok(resp.into())
+        )
     }
 
     fn add_bundle(
@@ -1496,8 +1450,10 @@ impl EnvironmentMutations for HttpEnvironmentStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use greentic_deploy_spec::RevisionLifecycle;
     use std::io::{BufRead, BufReader, Write};
     use std::net::{SocketAddr, TcpListener};
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     /// Minimal mock server: binds an ephemeral port, accepts one request,
@@ -1997,8 +1953,8 @@ mod tests {
                 config_digest: "sha256:00".to_string(),
                 signature_sidecar_ref: PathBuf::from("rev.sig"),
                 drain_seconds: 30,
-                idempotency_key: idem(),
             },
+            idem(),
         );
         assert!(result.is_ok());
     }
@@ -2023,8 +1979,8 @@ mod tests {
                 config_digest: "sha256:00".to_string(),
                 signature_sidecar_ref: PathBuf::from("rev.sig"),
                 drain_seconds: 30,
-                idempotency_key: idem(),
             },
+            idem(),
         );
         assert!(matches!(result, Err(StoreError::InvalidArgument(_))));
     }
@@ -2078,9 +2034,9 @@ mod tests {
             WarmRevisionPayload {
                 revision_id: RevisionId::new(),
                 health_gate: Ok(()),
-                idempotency_key: idem(),
                 expected_lifecycle: RevisionLifecycle::Staged,
             },
+            idem(),
         );
         assert!(result.is_ok());
         let outcome = result.unwrap();
@@ -2604,8 +2560,8 @@ mod tests {
                 config_digest: "sha256:00".to_string(),
                 signature_sidecar_ref: PathBuf::from("rev.sig"),
                 drain_seconds: 30,
-                idempotency_key: idem(),
             },
+            idem(),
         );
     }
 

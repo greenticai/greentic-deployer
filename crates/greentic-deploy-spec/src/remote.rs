@@ -331,6 +331,29 @@ pub enum RemoteStoreError {
     /// whose `env_id` contradicts the URL).
     #[error("invalid request: {detail}")]
     InvalidRequest { detail: String },
+    /// Domain/state conflict that is neither a create-on-existing
+    /// ([`RemoteStoreError::AlreadyExists`]) nor a key-reuse protocol
+    /// violation ([`RemoteStoreError::IdempotencyConflict`]) — `409`.
+    /// E.g. a revision observed in a lifecycle the verb cannot start from,
+    /// or an archive blocked by live traffic references.
+    #[error("conflict: {detail}")]
+    Conflict { detail: String },
+    /// The environment exists but a sub-resource the verb references
+    /// (deployment, revision, slot, …) does not — `404`. Distinct from
+    /// [`RemoteStoreError::NotFound`] (the environment itself is missing)
+    /// so clients can tell "wrong env" from "wrong dependent id".
+    #[error("dependent not found: {detail}")]
+    DependentNotFound { detail: String },
+    /// The warm/ready health gate rejected the revision — `422`. The server
+    /// has ALREADY persisted the revision's lifecycle as `Failed` before
+    /// returning this (mirror of the local store's committed-on-error
+    /// contract); clients must treat the mutation as committed.
+    #[error("health gate failed for revision `{revision_id}`: {message}")]
+    HealthGateFailed {
+        revision_id: crate::ids::RevisionId,
+        failed_checks: Vec<crate::engine::HealthCheckId>,
+        message: String,
+    },
     /// Stored state failed its integrity hash — `422`.
     #[error("integrity mismatch: expected {expected}, computed {actual}")]
     IntegrityMismatch { expected: String, actual: String },
@@ -353,6 +376,9 @@ impl RemoteStoreError {
             Self::NotFound => 404,
             Self::AlreadyExists { .. } => 409,
             Self::InvalidRequest { .. } => 400,
+            Self::Conflict { .. } => 409,
+            Self::DependentNotFound { .. } => 404,
+            Self::HealthGateFailed { .. } => 422,
             Self::IntegrityMismatch { .. } => 422,
             Self::NotYetImplemented { .. } => 501,
             Self::Internal { .. } => 500,
@@ -658,6 +684,29 @@ mod tests {
             .http_status(),
             500
         );
+        assert_eq!(
+            RemoteStoreError::Conflict {
+                detail: "x".to_string()
+            }
+            .http_status(),
+            409
+        );
+        assert_eq!(
+            RemoteStoreError::DependentNotFound {
+                detail: "x".to_string()
+            }
+            .http_status(),
+            404
+        );
+        assert_eq!(
+            RemoteStoreError::HealthGateFailed {
+                revision_id: crate::ids::RevisionId::new(),
+                failed_checks: Vec::new(),
+                message: "x".to_string()
+            }
+            .http_status(),
+            422
+        );
     }
 
     #[test]
@@ -668,6 +717,20 @@ mod tests {
         };
         let json = serde_json::to_value(&err).unwrap();
         assert_eq!(json["kind"], "unauthorized");
+        let back: RemoteStoreError = serde_json::from_value(json).unwrap();
+        assert_eq!(back, err);
+    }
+
+    #[test]
+    fn health_gate_failed_round_trips_tagged() {
+        let err = RemoteStoreError::HealthGateFailed {
+            revision_id: crate::ids::RevisionId::new(),
+            failed_checks: vec![crate::engine::HealthCheckId::RouteTable],
+            message: "route table invalid".to_string(),
+        };
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["kind"], "health-gate-failed");
+        assert_eq!(json["failed_checks"][0], "route-table");
         let back: RemoteStoreError = serde_json::from_value(json).unwrap();
         assert_eq!(back, err);
     }

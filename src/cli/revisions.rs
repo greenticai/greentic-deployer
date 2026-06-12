@@ -295,7 +295,6 @@ pub fn stage(
             config_digest,
             signature_sidecar_ref,
             drain_seconds,
-            idempotency_key: mint_idempotency_key(),
         };
         // Post-staging cleanup: if the typed verb fails after the
         // `--bundle` path already wrote files under `rev_dir`, drop
@@ -303,7 +302,7 @@ pub fn stage(
         // that existed pre-PR too: the old closure could return Err
         // from `locked.save(&env)` with the rev_dir already populated.
         let revision = store
-            .stage_revision(&env_id, store_payload)
+            .stage_revision(&env_id, store_payload, mint_idempotency_key())
             .inspect_err(|_| {
                 if has_bundle {
                     drop_rev_dir();
@@ -435,9 +434,9 @@ where
                 WarmRevisionPayload {
                     revision_id,
                     health_gate: gate_result,
-                    idempotency_key,
                     expected_lifecycle: current_lifecycle,
                 },
+                idempotency_key,
             )
             .inspect_err(|err| {
                 if err.is_committed_after_save() {

@@ -31,12 +31,12 @@ use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use greentic_deploy_spec::engine::{self, EngineError};
+use greentic_deploy_spec::engine::{self, EngineError, RevisionLifecycleError};
 use greentic_deploy_spec::{
     Actor, AuditDecision, AuditEvent, AuditResult, ConcurrencyConflict, CreateEnvironmentPayload,
     EnvId, Environment, HealthStatus, IdempotencyOutcome, MigrateMergePayload, Precondition,
-    RemoteStoreError, RetentionPolicy, RevocationConfig, SchemaVersion, StateEtag,
-    UpdateEnvironmentPayload,
+    RemoteStoreError, RetentionPolicy, RevisionId, RevisionTransitionOutcome, RevocationConfig,
+    SchemaVersion, StageRevisionPayload, StateEtag, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 
 use crate::http::AppState;
@@ -75,6 +75,52 @@ impl From<EngineError> for ApiError {
     fn from(err: EngineError) -> Self {
         Self(match err {
             EngineError::NotFound(_) => RemoteStoreError::NotFound,
+        })
+    }
+}
+
+/// Map a pure revision-lifecycle failure onto the A8 wire vocabulary.
+/// `HealthGateFailed` is the committed-on-error case: the warm handler
+/// persists the `Failed` flip BEFORE this conversion runs (the engine's
+/// persist rule), so the typed 422 always describes durable state.
+impl From<RevisionLifecycleError> for ApiError {
+    fn from(err: RevisionLifecycleError) -> Self {
+        Self(match err {
+            // The environment itself was loaded — only the dependent
+            // (revision / deployment) is missing.
+            RevisionLifecycleError::NotFound { .. }
+            | RevisionLifecycleError::DeploymentNotFound { .. } => {
+                RemoteStoreError::DependentNotFound {
+                    detail: err.to_string(),
+                }
+            }
+            RevisionLifecycleError::Conflict { .. }
+            | RevisionLifecycleError::ActiveTrafficReference { .. } => RemoteStoreError::Conflict {
+                detail: err.to_string(),
+            },
+            RevisionLifecycleError::HealthGateFailed {
+                revision_id,
+                failed_checks,
+                message,
+            } => RemoteStoreError::HealthGateFailed {
+                revision_id,
+                failed_checks,
+                message,
+            },
+            err @ RevisionLifecycleError::DuplicateRevision { .. } => {
+                RemoteStoreError::AlreadyExists {
+                    detail: err.to_string(),
+                }
+            }
+            // The chains are server-side constants — a client request can
+            // never legitimately produce these. Programming error, 500.
+            internal @ (RevisionLifecycleError::InvalidTransition { .. }
+            | RevisionLifecycleError::EmptyChain) => {
+                tracing::error!(error = %internal, "revision chain constant rejected by spec");
+                RemoteStoreError::Internal {
+                    message: "revision lifecycle chain misconfigured".to_string(),
+                }
+            }
         })
     }
 }
@@ -409,6 +455,175 @@ pub(crate) async fn migrate_bindings<S: EnvironmentStorage>(
         prior_revision.map(|r| r.generation),
         revision,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Handlers — revision lifecycle (PR-4.2b)
+// ---------------------------------------------------------------------------
+
+/// Parse a path segment into a [`RevisionId`] (ULID), rejecting malformed
+/// ids with a typed 400.
+fn parse_revision_id(raw: &str) -> Result<RevisionId, ApiError> {
+    raw.parse::<ulid::Ulid>().map(RevisionId).map_err(|err| {
+        ApiError(RemoteStoreError::InvalidRequest {
+            detail: format!("invalid revision id `{raw}`: {err}"),
+        })
+    })
+}
+
+/// `POST /environments/{env_id}/revisions` — stage a fresh revision under
+/// an existing deployment (A8 route 4).
+pub(crate) async fn stage_revision<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<StageRevisionPayload>,
+) -> Result<Response, ApiError> {
+    let idem_key = require_idempotency_key(&headers)?;
+    let client_etag = parse_if_match(&headers)?;
+    let env_id = parse_env_id(&env_id)?;
+    let loaded = state
+        .storage
+        .load_env(&env_id)
+        .await
+        .map_err(load_storage_error)?;
+    let previous_generation = loaded.revision.generation;
+    let mut env = loaded.value;
+    let staged = engine::stage_revision(&mut env, payload, Utc::now())?;
+    let precondition = resolve_precondition(client_etag, &loaded.revision);
+    let revision = state.storage.update_env(&env, &precondition).await?;
+    let target = json!({
+        "environment_id": env_id,
+        "revision_id": staged.revision_id.to_string(),
+        "deployment_id": staged.deployment_id.to_string(),
+        "lifecycle_to": "staged",
+    });
+    Ok(mutation_response(
+        staged,
+        &env_id,
+        "revisions",
+        "stage",
+        target,
+        idem_key,
+        Some(previous_generation),
+        revision,
+    ))
+}
+
+/// `POST /environments/{env_id}/revisions/{revision_id}/warm` — drive
+/// `Staged → Warming → Ready`, applying the client-evaluated health-gate
+/// outcome from the body (A8 route 5). The body's `revision_id` must match
+/// the URL's.
+pub(crate) async fn warm_revision<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path((env_id, revision_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<WarmRevisionPayload>,
+) -> Result<Response, ApiError> {
+    let revision_id = parse_revision_id(&revision_id)?;
+    if payload.revision_id != revision_id {
+        return Err(ApiError(RemoteStoreError::InvalidRequest {
+            detail: format!(
+                "body revision_id `{}` contradicts URL revision id `{revision_id}`",
+                payload.revision_id
+            ),
+        }));
+    }
+    revision_transition(&state, &env_id, &headers, "warm", |env| {
+        engine::warm_revision(env, payload, Utc::now())
+    })
+    .await
+}
+
+/// `POST /environments/{env_id}/revisions/{revision_id}/drain` —
+/// `Ready → Draining` (A8 route 6).
+pub(crate) async fn drain_revision<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path((env_id, revision_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let revision_id = parse_revision_id(&revision_id)?;
+    revision_transition(&state, &env_id, &headers, "drain", |env| {
+        engine::drain_revision(env, revision_id)
+    })
+    .await
+}
+
+/// `POST /environments/{env_id}/revisions/{revision_id}/archive` — walk the
+/// revision to `Archived`, refusing while live traffic still references it
+/// (A8 route 7).
+pub(crate) async fn archive_revision<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path((env_id, revision_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let revision_id = parse_revision_id(&revision_id)?;
+    revision_transition(&state, &env_id, &headers, "archive", |env| {
+        engine::archive_revision(env, revision_id)
+    })
+    .await
+}
+
+/// Shared warm/drain/archive body: load → pure engine transform → persist
+/// per the engine's rule → A8 envelope around [`RevisionTransitionOutcome`].
+///
+/// Persist rule: `Ok` persists and responds 2xx; an `env_mutated` error (the
+/// warm gate's flip to `Failed`) persists FIRST and then surfaces the typed
+/// 422 — committed-on-error, mirroring `LocalFsStore`. A persist failure on
+/// that path takes precedence (the client must not be told the gate failure
+/// is durable when it isn't). Every other error discards the in-memory env.
+///
+async fn revision_transition<S: EnvironmentStorage>(
+    state: &AppState<S>,
+    env_id: &str,
+    headers: &HeaderMap,
+    verb: &'static str,
+    apply: impl FnOnce(&mut Environment) -> Result<engine::RevisionTransition, RevisionLifecycleError>,
+) -> Result<Response, ApiError> {
+    let idem_key = require_idempotency_key(headers)?;
+    let client_etag = parse_if_match(headers)?;
+    let env_id = parse_env_id(env_id)?;
+    let loaded = state
+        .storage
+        .load_env(&env_id)
+        .await
+        .map_err(load_storage_error)?;
+    let previous_generation = loaded.revision.generation;
+    let mut env = loaded.value;
+    match apply(&mut env) {
+        Ok(transition) => {
+            let precondition = resolve_precondition(client_etag, &loaded.revision);
+            let revision = state.storage.update_env(&env, &precondition).await?;
+            let target = json!({
+                "environment_id": env_id,
+                "revision_id": transition.revision.revision_id.to_string(),
+                "lifecycle_to": transition.revision.lifecycle,
+            });
+            let outcome = RevisionTransitionOutcome {
+                revision: transition.revision,
+                environment: env,
+                starting_lifecycle: transition.starting_lifecycle,
+            };
+            Ok(mutation_response(
+                outcome,
+                &env_id,
+                "revisions",
+                verb,
+                target,
+                idem_key,
+                Some(previous_generation),
+                revision,
+            ))
+        }
+        Err(err) if err.env_mutated() => {
+            // Health-gate failure: the engine flipped the revision to
+            // `Failed` in memory — persist before surfacing the typed 422.
+            let precondition = resolve_precondition(client_etag, &loaded.revision);
+            state.storage.update_env(&env, &precondition).await?;
+            Err(err.into())
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 // ---------------------------------------------------------------------------

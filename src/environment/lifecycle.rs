@@ -25,64 +25,22 @@
 //! `Revision` struct itself and pushes it onto `Environment.revisions`. The
 //! lifecycle guard only owns transitions between *existing* revisions.
 
-use greentic_deploy_spec::{
-    BundleId, DeploymentId, Environment, Revision, RevisionId, RevisionLifecycle,
-    is_valid_transition,
-};
+use greentic_deploy_spec::engine::RevisionLifecycleError;
+use greentic_deploy_spec::{Environment, Revision, RevisionId, RevisionLifecycle};
 use thiserror::Error;
 
 use crate::environment::{Locked, StoreError};
 
-/// Identifies which health-gate check failed in [`HealthGateFailure`].
-///
-/// Surfaced via [`LifecycleError::HealthGateFailed`] so operators (and
-/// future audit-log consumers) can render structured failure detail
-/// rather than a free-form message.
-///
-/// The four checks correspond to the warm/ready gate's responsibilities
-/// per `plans/next-gen-deployment.md` B9: route table, runtime config,
-/// signature status, provider health.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HealthCheckId {
-    /// Static route table validates against the revision's pack list.
-    RouteTable,
-    /// Materialized `runtime-config.json` loads and validates.
-    RuntimeConfig,
-    /// Revision's `signature_sidecar_ref` exists and verifies.
-    SignatureStatus,
-    /// Providers in the revision's pack list are reachable / healthy.
-    ProviderHealth,
-}
-
-/// Why a [warm/ready health gate](apply_revision_transition_with_health_gate)
-/// rejected a revision. Returned by the closure passed to the gate-aware
-/// helper; surfaced inside [`LifecycleError::HealthGateFailed`] after the
-/// helper has flipped the revision's lifecycle to `Failed` and saved.
-///
-/// `failed_checks` MAY be empty (e.g. the gate aborted before any check
-/// completed) — `message` always carries human-readable detail.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HealthGateFailure {
-    pub failed_checks: Vec<HealthCheckId>,
-    pub message: String,
-}
-
-/// Identifies a `TrafficSplit` (by its `(deployment_id, bundle_id)` key)
-/// for error-reporting purposes. Surfaced in
-/// [`LifecycleError::ActiveTrafficReference`] so operators can locate the
-/// splits they need to rebalance before retrying the archive.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveSplitRef {
-    pub deployment_id: DeploymentId,
-    pub bundle_id: BundleId,
-    /// Weight (basis points) of the *archived* revision's entry in this
-    /// split. Lets callers distinguish "100% live route" from "partial
-    /// canary" without re-loading the env.
-    pub weight_bps: u32,
-}
+// PR-4.2b: the pure types (and the chain-walk core below) moved to
+// `greentic_deploy_spec::engine` so the operator-store-server applies the
+// same lifecycle semantics as `LocalFsStore`. Re-exported here so every
+// existing `environment::lifecycle::…` path keeps working.
+pub use greentic_deploy_spec::engine::{ActiveSplitRef, HealthCheckId, HealthGateFailure};
 
 /// Errors produced by [`apply_revision_transition`]. Cleanly maps onto
-/// `cli::OpError` via the `From` impl in `cli/mod.rs`.
+/// `cli::OpError` via the `From` impl in `cli/mod.rs`. The storage-free
+/// variants mirror [`RevisionLifecycleError`] 1:1 (see the `From` impl
+/// below); [`LifecycleError::Store`] is the local-storage addition.
 #[derive(Debug, Error)]
 pub enum LifecycleError {
     /// The targeted revision was not present in the loaded environment.
@@ -149,6 +107,59 @@ pub enum LifecycleError {
     /// Underlying storage layer failure (load/save through the `Locked<'_>`).
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+/// Lift a pure-engine lifecycle failure onto the local storage-aware error.
+/// Variants map 1:1; the engine's stage-verb `DeploymentNotFound` (which has
+/// no lifecycle twin here) surfaces through the storage variant the CLI
+/// already maps to a dependent-not-found.
+impl From<RevisionLifecycleError> for LifecycleError {
+    fn from(err: RevisionLifecycleError) -> Self {
+        match err {
+            RevisionLifecycleError::NotFound {
+                env_id,
+                revision_id,
+            } => Self::NotFound {
+                env_id,
+                revision_id,
+            },
+            RevisionLifecycleError::InvalidTransition { from, to } => {
+                Self::InvalidTransition { from, to }
+            }
+            RevisionLifecycleError::Conflict {
+                revision_id,
+                actual,
+                expected_starts,
+            } => Self::Conflict {
+                revision_id,
+                actual,
+                expected_starts,
+            },
+            RevisionLifecycleError::EmptyChain => Self::EmptyChain,
+            RevisionLifecycleError::ActiveTrafficReference {
+                revision_id,
+                splits,
+            } => Self::ActiveTrafficReference {
+                revision_id,
+                splits,
+            },
+            RevisionLifecycleError::HealthGateFailed {
+                revision_id,
+                failed_checks,
+                message,
+            } => Self::HealthGateFailed {
+                revision_id,
+                failed_checks,
+                message,
+            },
+            err @ RevisionLifecycleError::DuplicateRevision { .. } => {
+                Self::Store(StoreError::Conflict(err.to_string()))
+            }
+            err @ RevisionLifecycleError::DeploymentNotFound { .. } => {
+                Self::Store(StoreError::DependentNotFound(err.to_string()))
+            }
+        }
+    }
 }
 
 /// Apply a revision lifecycle transition under an already-held env lock.
@@ -260,124 +271,31 @@ where
     F: FnOnce(&mut Revision),
     G: FnOnce(&Environment, &Revision) -> Result<(), HealthGateFailure>,
 {
-    if accepted_chain.is_empty() {
-        return Err(LifecycleError::EmptyChain);
-    }
-
+    // The pure chain-walk core moved to `greentic_deploy_spec::engine` in
+    // PR-4.2b (the operator-store-server drives the same function). This
+    // wrapper owns the storage halves: load before, save per the engine's
+    // persist rule — `Ok` and `env_mutated` errors (the gate-failed flip to
+    // `Failed`) persist; every other error discards the in-memory env.
     let mut env = locked.load()?;
-    let idx = env
-        .revisions
-        .iter()
-        .position(|r| r.revision_id == revision_id)
-        .ok_or_else(|| LifecycleError::NotFound {
-            env_id: locked.env_id().clone(),
-            revision_id,
-        })?;
-
-    let mut chain_advanced = false;
-    for (from, to) in accepted_chain {
-        if env.revisions[idx].lifecycle == *from {
-            if !is_valid_transition(*from, *to) {
-                return Err(LifecycleError::InvalidTransition {
-                    from: *from,
-                    to: *to,
-                });
-            }
-            env.revisions[idx].lifecycle = *to;
-            chain_advanced = true;
+    match greentic_deploy_spec::engine::walk_revision_chain(
+        &mut env,
+        revision_id,
+        accepted_chain,
+        None,
+        on_final,
+        prune_from_splits,
+        health_gate,
+    ) {
+        Ok(transition) => {
+            locked.save(&env)?;
+            Ok(transition.revision)
         }
-    }
-
-    let final_state = accepted_chain
-        .last()
-        .map(|(_, to)| *to)
-        .expect("chain non-empty: checked above");
-
-    if env.revisions[idx].lifecycle != final_state {
-        let expected_starts = accepted_chain.iter().map(|(from, _)| *from).collect();
-        return Err(LifecycleError::Conflict {
-            revision_id,
-            actual: env.revisions[idx].lifecycle,
-            expected_starts,
-        });
-    }
-
-    if prune_from_splits {
-        // Refuse to archive a revision that still routes live traffic.
-        // Blindly pruning would either silently drop the route (100%
-        // single-entry split) or produce weights that no longer sum to
-        // 10,000 bps (the spec invariant — `locked.save` would reject
-        // with a SpecError that doesn't explain the live-traffic angle).
-        let active_refs: Vec<ActiveSplitRef> = env
-            .traffic_splits
-            .iter()
-            .flat_map(|split| {
-                split
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.revision_id == revision_id)
-                    .map(|entry| ActiveSplitRef {
-                        deployment_id: split.deployment_id,
-                        bundle_id: split.bundle_id.clone(),
-                        weight_bps: entry.weight_bps,
-                    })
-            })
-            .collect();
-        if !active_refs.is_empty() {
-            return Err(LifecycleError::ActiveTrafficReference {
-                revision_id,
-                splits: active_refs,
-            });
+        Err(err) if err.env_mutated() => {
+            locked.save(&env)?;
+            Err(err.into())
         }
+        Err(err) => Err(err.into()),
     }
-
-    // Health gate fires ONLY when the chain actually advanced. An idempotent
-    // retry against an already-final revision (chain walk a no-op) skips
-    // the gate because the revision is already committed at its target
-    // state and may have live traffic routing to it — a transient gate
-    // failure must not demote a healthy live revision to `Failed` while the
-    // runtime-config materializer continues to route traffic to it (route
-    // table is derived from `traffic_splits`, not `lifecycle`). On the
-    // chain-advanced path the gate sees the post-chain `(env, revision)`
-    // view; rejection flips lifecycle to `Failed` and saves before
-    // returning the typed error.
-    if chain_advanced && let Err(failure) = health_gate(&env, &env.revisions[idx]) {
-        let prior = env.revisions[idx].lifecycle;
-        if !is_valid_transition(prior, RevisionLifecycle::Failed) {
-            // Caller passed a chain whose final state can't transition to
-            // Failed (e.g. an archive-style chain). Bail without persisting —
-            // there's no spec-legal way to record "failed gate" from here.
-            return Err(LifecycleError::InvalidTransition {
-                from: prior,
-                to: RevisionLifecycle::Failed,
-            });
-        }
-        env.revisions[idx].lifecycle = RevisionLifecycle::Failed;
-        locked.save(&env)?;
-        return Err(LifecycleError::HealthGateFailed {
-            revision_id,
-            failed_checks: failure.failed_checks,
-            message: failure.message,
-        });
-    }
-
-    on_final(&mut env.revisions[idx]);
-
-    if prune_from_splits {
-        // No live traffic references at this point (guard above).
-        // Remove the revision from each matching deployment's tracking
-        // list; traffic splits themselves are untouched (none referenced
-        // this revision anyway).
-        let deployment_id = env.revisions[idx].deployment_id;
-        for bundle in env.bundles.iter_mut() {
-            if bundle.deployment_id == deployment_id {
-                bundle.current_revisions.retain(|rid| *rid != revision_id);
-            }
-        }
-    }
-
-    locked.save(&env)?;
-    Ok(env.revisions[idx].clone())
 }
 
 #[cfg(test)]

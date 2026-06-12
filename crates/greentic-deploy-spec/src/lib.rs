@@ -46,8 +46,10 @@ pub use credentials::{
     CredentialsValidationResult,
 };
 pub use engine::{
-    CreateEnvironmentPayload, EngineError, ExtensionKey, FieldUpdate, MergeReport,
-    MigrateMergePayload, MigrateSeedPayload, UpdateEnvironmentPayload,
+    ActiveSplitRef, CreateEnvironmentPayload, EngineError, ExtensionKey, FieldUpdate,
+    HealthCheckId, HealthGateFailure, MergeReport, MigrateMergePayload, MigrateSeedPayload,
+    RevisionLifecycleError, RevisionTransition, RevisionTransitionOutcome, StageRevisionPayload,
+    UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 pub use environment::{
     DEFAULT_LISTEN_ADDR, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding,
