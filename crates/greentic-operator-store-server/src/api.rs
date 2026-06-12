@@ -35,18 +35,21 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use greentic_deploy_spec::engine::{
-    self, BindingError, BundleError, EngineError, RevisionLifecycleError, TrafficSplitError,
+    self, BindingError, BundleError, EngineError, MessagingError, RevisionLifecycleError,
+    TrafficSplitError,
 };
 use greentic_deploy_spec::{
-    Actor, AddTrustedKeyPayload, ApplyTrafficSplitOutcome, AuditDecision, AuditEvent, AuditResult,
-    BindingGenerationOutcome, BundleDeployment, CapabilitySlot, ConcurrencyConflict,
-    CreateEnvironmentPayload, DeploymentId, EnvId, Environment, ExtensionBindingPayload,
-    ExtensionKeyedPayload, HealthStatus, IdempotencyKey, IdempotencyOutcome, MigrateMergePayload,
+    Actor, AddMessagingEndpointPayload, AddTrustedKeyPayload, ApplyTrafficSplitOutcome,
+    AuditDecision, AuditEvent, AuditResult, BindingGenerationOutcome, BundleDeployment,
+    CapabilitySlot, ConcurrencyConflict, CreateEnvironmentPayload, DeploymentId, EnvId,
+    Environment, ExtensionBindingPayload, ExtensionKeyedPayload, HealthStatus, IdempotencyKey,
+    IdempotencyOutcome, MessagingBundleLinkPayload, MessagingEndpointId, MigrateMergePayload,
     PackBindingPayload, Precondition, RemoteStoreError, RetentionPolicy, RevisionId,
     RevisionTransitionOutcome, RevocationConfig, RollbackTrafficSplitOutcome,
-    RollbackTrafficSplitPayload, SchemaVersion, SetTrafficSplitPayload, StageRevisionPayload,
-    StateEtag, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
-    UpdateEnvironmentPayload, WarmRevisionPayload,
+    RollbackTrafficSplitPayload, RotateWebhookSecretPayload, SchemaVersion, SecretRef,
+    SetMessagingWelcomeFlowPayload, SetTrafficSplitPayload, StageRevisionPayload, StateEtag,
+    TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload,
+    WarmRevisionPayload,
 };
 use greentic_operator_trust::operator_key::{self, OperatorKey};
 use greentic_operator_trust::revenue_policy::{self, RevenuePolicyError};
@@ -1407,6 +1410,309 @@ pub(crate) async fn remove_bundle<S: EnvironmentStorage>(
         Some(previous_generation),
         revision,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Handlers — messaging endpoints (PR-4.2h)
+// ---------------------------------------------------------------------------
+//
+// The verb semantics come from `greentic_deploy_spec::engine::messaging` —
+// the same transforms `LocalFsStore` drives, per the same-derivation rule.
+// Two LocalFS-only steps deliberately have no server analogue:
+//
+// - The derived `<env_dir>/messaging/` projection refresh — remote
+//   consumers read the environment via `GET` (the runtime-config
+//   projection precedent).
+// - The webhook-secret SINK: the server has no secrets store yet, so its
+//   `provision` closure refuses and telegram-class `add` /
+//   `rotate-webhook-secret` answer 501 `not-yet-implemented` until the
+//   Phase D secrets sink lands. The refusal fires exactly where the
+//   LocalFS sink would write — after replay/duplicate/ref validation —
+//   so every other path through the verbs behaves identically.
+//
+// Persist rule: the engine reports `mutated == false` for idempotent
+// replays/no-ops — the handler then echoes the loaded CAS coordinates
+// instead of writing (the traffic-set precedent).
+
+impl From<MessagingError> for ApiError {
+    fn from(err: MessagingError) -> Self {
+        Self(match err {
+            MessagingError::IdempotencyKeyReuse { .. } => RemoteStoreError::IdempotencyConflict {
+                reason: err.to_string(),
+            },
+            // The client folds 409 `already-exists` onto the same
+            // `Conflict` noun the local store raises.
+            MessagingError::EndpointAlreadyExists { .. } => RemoteStoreError::AlreadyExists {
+                detail: err.to_string(),
+            },
+            MessagingError::EndpointNotFound { .. } | MessagingError::BundleNotDeployed { .. } => {
+                RemoteStoreError::DependentNotFound {
+                    detail: err.to_string(),
+                }
+            }
+            MessagingError::WelcomeFlowOwned { .. } => RemoteStoreError::Conflict {
+                detail: err.to_string(),
+            },
+            MessagingError::BundleNotLinked { .. }
+            | MessagingError::WelcomePackUnknown { .. }
+            | MessagingError::InvalidSecretRef { .. } => RemoteStoreError::InvalidRequest {
+                detail: err.to_string(),
+            },
+            // Only the refusing server sink produces this variant here
+            // (LocalFS maps its dev-store sink failures to `Conflict`
+            // instead) — so 501 is the accurate wire rendering.
+            MessagingError::SecretProvision(detail) => {
+                RemoteStoreError::NotYetImplemented { detail }
+            }
+        })
+    }
+}
+
+/// Parse a path segment into a [`MessagingEndpointId`], rejecting
+/// non-ULID input with a typed 400.
+fn parse_endpoint_id(raw: &str) -> Result<MessagingEndpointId, ApiError> {
+    raw.parse::<ulid::Ulid>()
+        .map(MessagingEndpointId)
+        .map_err(|e| {
+            ApiError(RemoteStoreError::InvalidRequest {
+                detail: format!("invalid endpoint_id `{raw}`: {e}"),
+            })
+        })
+}
+
+/// The server's webhook-secret `provision` seam: refuse until the Phase D
+/// secrets sink lands (see the section comment).
+fn server_webhook_secret_sink(_existing: Option<&SecretRef>) -> Result<SecretRef, MessagingError> {
+    Err(MessagingError::SecretProvision(
+        "webhook-secret provisioning is not yet implemented on the operator store server \
+         (needs the Phase D secrets sink); telegram-class `add` and `rotate-webhook-secret` \
+         remain local-only until it lands"
+            .to_string(),
+    ))
+}
+
+/// Shared load → pure-engine transform → persist-if-mutated → A8 envelope
+/// cycle for the six messaging verbs (the `binding_mutation` analogue,
+/// plus the replay short-circuit). `apply` receives the engine-shaped
+/// [`IdempotencyKey`] because this group uses the key as domain state
+/// (replay detection), and returns the response body, the audit-target
+/// fragment (`environment_id` is injected here), and whether the env was
+/// actually mutated.
+async fn messaging_mutation<S, T, F>(
+    state: AppState<S>,
+    raw_env_id: String,
+    headers: HeaderMap,
+    verb: &'static str,
+    apply: F,
+) -> Result<Response, ApiError>
+where
+    S: EnvironmentStorage,
+    T: Serialize,
+    F: FnOnce(&mut Environment, &IdempotencyKey) -> Result<(T, Value, bool), ApiError>,
+{
+    let idem_key = require_idempotency_key(&headers)?;
+    let client_etag = parse_if_match(&headers)?;
+    let env_id = parse_env_id(&raw_env_id)?;
+    let engine_key = IdempotencyKey::new(idem_key.clone())
+        .expect("require_idempotency_key guarantees non-empty");
+    let loaded = state
+        .storage
+        .load_env(&env_id)
+        .await
+        .map_err(load_storage_error)?;
+    let previous_generation = loaded.revision.generation;
+    let mut env = loaded.value;
+    let (result, mut target, mutated) = apply(&mut env, &engine_key)?;
+    let revision = if mutated {
+        let precondition = resolve_precondition(client_etag, &loaded.revision);
+        state.storage.update_env(&env, &precondition).await?
+    } else {
+        // Idempotent replay / no-op: nothing changed — echo the loaded CAS
+        // coordinates so the client can keep chaining writes.
+        loaded.revision
+    };
+    if let Value::Object(map) = &mut target {
+        map.insert("environment_id".to_string(), json!(env_id));
+    }
+    Ok(mutation_response(
+        result,
+        &env_id,
+        "messaging.endpoint",
+        verb,
+        target,
+        idem_key,
+        Some(previous_generation),
+        revision,
+    ))
+}
+
+/// `POST /environments/{env_id}/messaging` — add a messaging endpoint
+/// (A8 messaging route 1). The server mints the [`MessagingEndpointId`]
+/// (the bundles-group `DeploymentId` precedent).
+pub(crate) async fn add_messaging_endpoint<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<AddMessagingEndpointPayload>,
+) -> Result<Response, ApiError> {
+    messaging_mutation(state, env_id, headers, "add", |env, key| {
+        let applied = engine::add_messaging_endpoint(
+            env,
+            payload,
+            MessagingEndpointId::new(),
+            key,
+            Utc::now(),
+            server_webhook_secret_sink,
+        )?;
+        let ep = env.messaging_endpoints[applied.index].clone();
+        let target = json!({
+            "endpoint_id": ep.endpoint_id.to_string(),
+            "provider_id": ep.provider_id,
+            "provider_type": ep.provider_type,
+        });
+        Ok((ep, target, applied.mutated))
+    })
+    .await
+}
+
+/// `POST /environments/{env_id}/messaging/{endpoint_id}/link` — link a
+/// deployed bundle to an endpoint (A8 messaging route 2).
+pub(crate) async fn link_messaging_bundle<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path((env_id, endpoint_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<MessagingBundleLinkPayload>,
+) -> Result<Response, ApiError> {
+    let endpoint_id = parse_endpoint_id(&endpoint_id)?;
+    messaging_mutation(state, env_id, headers, "link-bundle", |env, key| {
+        let target = json!({
+            "endpoint_id": endpoint_id.to_string(),
+            "bundle_id": payload.bundle_id,
+        });
+        let applied = engine::link_messaging_bundle(
+            env,
+            endpoint_id,
+            payload.bundle_id,
+            &payload.updated_by,
+            key,
+            Utc::now(),
+        )?;
+        let ep = env.messaging_endpoints[applied.index].clone();
+        Ok((ep, target, applied.mutated))
+    })
+    .await
+}
+
+/// `POST /environments/{env_id}/messaging/{endpoint_id}/unlink` — unlink a
+/// bundle from an endpoint (A8 messaging route 3).
+pub(crate) async fn unlink_messaging_bundle<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path((env_id, endpoint_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<MessagingBundleLinkPayload>,
+) -> Result<Response, ApiError> {
+    let endpoint_id = parse_endpoint_id(&endpoint_id)?;
+    messaging_mutation(state, env_id, headers, "unlink-bundle", |env, key| {
+        let target = json!({
+            "endpoint_id": endpoint_id.to_string(),
+            "bundle_id": payload.bundle_id,
+        });
+        let applied = engine::unlink_messaging_bundle(
+            env,
+            endpoint_id,
+            payload.bundle_id,
+            &payload.updated_by,
+            key,
+            Utc::now(),
+        )?;
+        let ep = env.messaging_endpoints[applied.index].clone();
+        Ok((ep, target, applied.mutated))
+    })
+    .await
+}
+
+/// `POST /environments/{env_id}/messaging/{endpoint_id}/welcome-flow` —
+/// set the endpoint's welcome flow (A8 messaging route 4). The body
+/// carries `endpoint_id` too (the PR-3b client pinned that shape); the
+/// server cross-checks it against the URL segment.
+pub(crate) async fn set_messaging_welcome_flow<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path((env_id, endpoint_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<SetMessagingWelcomeFlowPayload>,
+) -> Result<Response, ApiError> {
+    let url_endpoint_id = parse_endpoint_id(&endpoint_id)?;
+    if payload.endpoint_id != url_endpoint_id {
+        return Err(ApiError(RemoteStoreError::InvalidRequest {
+            detail: format!(
+                "body endpoint_id `{}` does not match URL endpoint_id `{url_endpoint_id}`",
+                payload.endpoint_id
+            ),
+        }));
+    }
+    messaging_mutation(state, env_id, headers, "set-welcome-flow", |env, key| {
+        let target = json!({
+            "endpoint_id": payload.endpoint_id.to_string(),
+            "bundle_id": payload.bundle_id,
+            "pack_id": payload.pack_id,
+            "flow_id": payload.flow_id,
+        });
+        let applied = engine::set_messaging_welcome_flow(env, payload, key, Utc::now())?;
+        let ep = env.messaging_endpoints[applied.index].clone();
+        Ok((ep, target, applied.mutated))
+    })
+    .await
+}
+
+/// `DELETE /environments/{env_id}/messaging/{endpoint_id}` — remove an
+/// endpoint (A8 messaging route 5). Idempotent: removing an absent
+/// endpoint succeeds without writing.
+pub(crate) async fn remove_messaging_endpoint<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path((env_id, endpoint_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let endpoint_id = parse_endpoint_id(&endpoint_id)?;
+    messaging_mutation(state, env_id, headers, "remove", |env, _key| {
+        let mutated = engine::remove_messaging_endpoint(env, endpoint_id);
+        let target = json!({"endpoint_id": endpoint_id.to_string()});
+        Ok((endpoint_id, target, mutated))
+    })
+    .await
+}
+
+/// `POST /environments/{env_id}/messaging/{endpoint_id}/rotate-secret` —
+/// rotate the endpoint's webhook secret (A8 messaging route 6). Until the
+/// Phase D secrets sink lands this answers 501 wherever the LocalFS sink
+/// would mint a value (unknown endpoints still 404 first; a same-key
+/// replay still succeeds without re-minting).
+pub(crate) async fn rotate_messaging_webhook_secret<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path((env_id, endpoint_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<RotateWebhookSecretPayload>,
+) -> Result<Response, ApiError> {
+    let endpoint_id = parse_endpoint_id(&endpoint_id)?;
+    messaging_mutation(
+        state,
+        env_id,
+        headers,
+        "rotate-webhook-secret",
+        |env, key| {
+            let applied = engine::rotate_messaging_webhook_secret(
+                env,
+                endpoint_id,
+                &payload.updated_by,
+                key,
+                Utc::now(),
+                server_webhook_secret_sink,
+            )?;
+            let ep = env.messaging_endpoints[applied.index].clone();
+            let target = json!({"endpoint_id": endpoint_id.to_string()});
+            Ok((ep, target, applied.mutated))
+        },
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

@@ -15,7 +15,6 @@
 //! distinct from `provider_type` (`teams`); the two together are unique per
 //! environment.
 
-use chrono::Utc;
 use greentic_deploy_spec::{
     BundleId, EnvId, MessagingEndpoint, MessagingEndpointId, PackId, SecretRef,
 };
@@ -499,8 +498,8 @@ pub fn add(
                     display_name,
                     secret_refs: payload.secret_refs,
                     updated_by,
-                    idempotency_key,
                 },
+                idempotency_key,
             )
             .inspect_err(|err| {
                 if err.is_committed_after_save() {
@@ -716,8 +715,8 @@ pub fn set_welcome_flow(
                     pack_id: PackId::new(pack_id),
                     flow_id,
                     updated_by,
-                    idempotency_key,
                 },
+                idempotency_key,
             )
             .inspect_err(|err| {
                 if err.is_committed_after_save() {
@@ -870,34 +869,12 @@ fn require_nonempty(field: &str, value: &str) -> Result<String, OpError> {
     Ok(value.to_string())
 }
 
-/// Embed the idempotency key in `updated_by` so a same-key retry surfaces as
-/// the original mutation. `MessagingEndpoint` has no separate
-/// `idempotency_key` field today; the encoding here keeps the contract
-/// without bloating the spec type for one CLI-side concern.
-pub(crate) fn format_idem_writer(updated_by: &str, idempotency_key: &str) -> String {
-    format!("{updated_by}#idem={idempotency_key}")
-}
-
-/// Build the `#idem=<key>` suffix once at the call site so a linear scan
-/// over `messaging_endpoints` does not allocate a fresh `String` per element.
-pub(crate) fn idem_suffix(idempotency_key: &str) -> String {
-    format!("#idem={idempotency_key}")
-}
-
-pub(crate) fn carries_idem_key(endpoint: &MessagingEndpoint, idem_suffix: &str) -> bool {
-    endpoint.updated_by.ends_with(idem_suffix)
-}
-
-/// Telegram-class providers need a per-endpoint webhook secret generated at
-/// creation time. Covers `"telegram"`, `"telegram.<x>"`,
-/// `"messaging.telegram"`, and `"messaging.telegram.<x>"` — strict on the dot
-/// so `"telegrambot"` and `"messaging.telegrambot"` do NOT match.
-pub(crate) fn is_telegram_class(provider_type: &str) -> bool {
-    let rest = provider_type
-        .strip_prefix("messaging.")
-        .unwrap_or(provider_type);
-    rest == "telegram" || rest.starts_with("telegram.")
-}
+// The idem-writer stamp helpers (`format_idem_writer`, `idem_suffix`,
+// `carries_idem_key`, `stamp_mutation`) and the telegram-class classifier
+// moved to `greentic_deploy_spec::engine::messaging` (PR-4.2h) so the
+// operator-store-server applies identical replay/stamping semantics. What
+// stays here is the LocalFS webhook-secret SINK: CSPRNG value generation +
+// the dev-store write below.
 
 /// Generate a 32-char CSPRNG secret from `[A-Za-z0-9]` (≈190 bits entropy).
 fn generate_webhook_secret() -> Result<String, OpError> {
@@ -979,16 +956,6 @@ fn write_webhook_secret_to_devstore(
     );
     let store_uri = super::secrets::secret_ref_to_store_uri(secret_ref);
     super::secrets::dev_store_put(&dev_path, &store_uri, value)
-}
-
-pub(crate) fn stamp_mutation(
-    endpoint: &mut MessagingEndpoint,
-    updated_by: &str,
-    idempotency_key: &str,
-) {
-    endpoint.generation = endpoint.generation.saturating_add(1);
-    endpoint.updated_at = Utc::now();
-    endpoint.updated_by = format_idem_writer(updated_by, idempotency_key);
 }
 
 // --- schema stubs ------------------------------------------------------------

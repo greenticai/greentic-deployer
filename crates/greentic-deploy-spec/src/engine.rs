@@ -59,6 +59,12 @@ pub use trust_root::*;
 pub mod bundles;
 pub use bundles::*;
 
+/// Messaging-endpoint verb group (PR-4.2h). Re-exported flat like the
+/// groups above. The webhook-secret minting step stays behind each
+/// backend's `provision` closure seam (see the module doc).
+pub mod messaging;
+pub use messaging::*;
+
 /// Failures produced by pure verb transforms. Each backend maps these onto
 /// its own error surface: `LocalFsStore` → `StoreError`,
 /// the operator-store-server → [`crate::remote::RemoteStoreError`].

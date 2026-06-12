@@ -23,7 +23,7 @@
 use greentic_deploy_spec::{
     BundleDeployment, BundleId, CapabilitySlot, DeploymentId, EnvId, EnvPackBinding, Environment,
     EnvironmentHostConfig, ExtensionBinding, IdempotencyKey, MessagingEndpoint,
-    MessagingEndpointId, PackId, Revision, RevisionId,
+    MessagingEndpointId, Revision, RevisionId,
 };
 
 use super::StoreError;
@@ -50,35 +50,18 @@ use super::StoreError;
 // `UpdateBundlePayload`, `RemoveBundleOutcome`) followed, dropping their
 // embedded `idempotency_key` — the key rides the trait methods (and the A8
 // `Idempotency-Key` header), matching every other verb group.
+// PR-4.2h: the messaging group's shapes (`AddMessagingEndpointPayload`,
+// `SetMessagingWelcomeFlowPayload`) followed, likewise dropping their
+// embedded `idempotency_key` — though in this group the key is also DOMAIN
+// state (replay detection via the `updated_by` stamp), so the engine
+// transforms receive it as a parameter.
 pub use greentic_deploy_spec::engine::{
-    AddBundlePayload, AddTrustedKeyPayload, ApplyTrafficSplitOutcome, ExtensionKey, FieldUpdate,
-    MigrateMergePayload, MigrateSeedPayload, RemoveBundleOutcome, RevisionTransitionOutcome,
-    RollbackTrafficSplitOutcome, SetTrafficSplitPayload, StageRevisionPayload, TrustRootAddOutcome,
-    TrustRootRemoveOutcome, TrustRootSeed, UpdateBundlePayload, UpdateEnvironmentPayload,
-    WarmRevisionPayload,
+    AddBundlePayload, AddMessagingEndpointPayload, AddTrustedKeyPayload, ApplyTrafficSplitOutcome,
+    ExtensionKey, FieldUpdate, MigrateMergePayload, MigrateSeedPayload, RemoveBundleOutcome,
+    RevisionTransitionOutcome, RollbackTrafficSplitOutcome, SetMessagingWelcomeFlowPayload,
+    SetTrafficSplitPayload, StageRevisionPayload, TrustRootAddOutcome, TrustRootRemoveOutcome,
+    TrustRootSeed, UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
-
-/// Inputs to [`EnvironmentMutations::add_messaging_endpoint`].
-#[derive(Debug, Clone)]
-pub struct AddMessagingEndpointPayload {
-    pub provider_id: String,
-    pub provider_type: String,
-    pub display_name: String,
-    pub secret_refs: Vec<String>,
-    pub updated_by: String,
-    pub idempotency_key: IdempotencyKey,
-}
-
-/// Inputs to [`EnvironmentMutations::set_messaging_welcome_flow`].
-#[derive(Debug, Clone)]
-pub struct SetMessagingWelcomeFlowPayload {
-    pub endpoint_id: MessagingEndpointId,
-    pub bundle_id: BundleId,
-    pub pack_id: PackId,
-    pub flow_id: String,
-    pub updated_by: String,
-    pub idempotency_key: IdempotencyKey,
-}
 
 /// The typed-verb persistence operations a Greentic environment store
 /// performs in response to `op …` CLI verbs.
@@ -343,10 +326,15 @@ pub trait EnvironmentMutations: Send + Sync {
     //                  | set-welcome-flow | remove | rotate-webhook-secret`
     // -------------------------------------------------------------
 
+    /// `idempotency_key` is both A8 §2 transport metadata AND domain state
+    /// in this group: the key is embedded in the endpoint's `updated_by`
+    /// stamp and drives same-key replay detection (see
+    /// `greentic_deploy_spec::engine::messaging`).
     fn add_messaging_endpoint(
         &self,
         env_id: &EnvId,
         payload: AddMessagingEndpointPayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError>;
 
     fn link_messaging_bundle(
@@ -367,10 +355,14 @@ pub trait EnvironmentMutations: Send + Sync {
         idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError>;
 
+    /// `idempotency_key` semantics as on
+    /// [`Self::add_messaging_endpoint`] — transport metadata that doubles
+    /// as the replay-detection stamp.
     fn set_messaging_welcome_flow(
         &self,
         env_id: &EnvId,
         payload: SetMessagingWelcomeFlowPayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError>;
 
     fn remove_messaging_endpoint(

@@ -206,12 +206,14 @@ fn route_remote(
                     let payload = args.into_remove_payload("remove", flags)?;
                     remote_messaging_remove(store, flags, payload)
                 }
-                MessagingEndpointVerb::RotateWebhookSecret(_) => Err(OpError::NotYetImplemented(
-                    "`messaging rotate-webhook-secret` against a remote --store-url store \
-                         is not supported yet (writes the secret to the local dev-store; needs \
-                         server-side secret handling; tracked as PR-3c follow-up)"
-                        .to_string(),
-                )),
+                MessagingEndpointVerb::RotateWebhookSecret(args) => {
+                    // The route exists since PR-4.2h; the server itself
+                    // answers 501 `not-yet-implemented` until its Phase D
+                    // secrets sink lands, so the capability knowledge lives
+                    // server-side, not in a CLI guard.
+                    let payload = args.into_rotate_payload("rotate-webhook-secret", flags)?;
+                    remote_messaging_rotate(store, flags, payload)
+                }
                 MessagingEndpointVerb::List { .. } => Err(not_supported("messaging.endpoint list")),
                 MessagingEndpointVerb::Show { .. } => Err(not_supported("messaging.endpoint show")),
             },
@@ -840,8 +842,8 @@ fn remote_messaging_add(
                 display_name,
                 secret_refs: payload.secret_refs,
                 updated_by,
-                idempotency_key,
             },
+            idempotency_key,
         )
         .map_err(map_store_err_preserving_noun)?;
     Ok(OpOutcome::new(
@@ -918,8 +920,8 @@ fn remote_messaging_set_welcome_flow(
                 pack_id: PackId::new(pack_id),
                 flow_id,
                 updated_by,
-                idempotency_key,
             },
+            idempotency_key,
         )
         .map_err(map_store_err_preserving_noun)?;
     Ok(OpOutcome::new(
@@ -946,6 +948,27 @@ fn remote_messaging_remove(
         "messaging.endpoint",
         "remove",
         json!({"environment_id": env_id.as_str(), "endpoint_id": removed_id.to_string()}),
+    ))
+}
+
+fn remote_messaging_rotate(
+    store: &dyn EnvironmentMutations,
+    flags: &OpFlags,
+    payload: Option<super::messaging::EndpointRotateWebhookSecretPayload>,
+) -> Result<OpOutcome, OpError> {
+    let payload = resolve_payload(flags, payload)?;
+    let env_id = parse_env_id(&payload.environment_id)?;
+    let endpoint_id = parse_endpoint_id(&payload.endpoint_id)?;
+    let updated_by = require_nonempty("updated_by", &payload.updated_by)?;
+    let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
+    let ep = store
+        .rotate_messaging_webhook_secret(&env_id, endpoint_id, updated_by, idempotency_key)
+        .map_err(map_store_err_preserving_noun)?;
+    Ok(OpOutcome::new(
+        "messaging.endpoint",
+        "rotate-webhook-secret",
+        serde_json::to_value(super::messaging::EndpointSummary::from(&env_id, &ep))
+            .expect("EndpointSummary is json-safe"),
     ))
 }
 
@@ -1620,7 +1643,11 @@ mod tests {
     }
 
     #[test]
-    fn messaging_rotate_webhook_secret_blocked() {
+    fn messaging_rotate_webhook_secret_dispatches_to_the_wire() {
+        // PR-4.2h removed the CLI-side guard: rotate now reaches the HTTP
+        // store (the SERVER answers 501 until its secrets sink lands). With
+        // a connection-refusing dummy store the verb must fail at the
+        // transport — anything but the old CLI-side `NotYetImplemented`.
         let result = route_remote(
             &build_dummy_store(),
             &no_flags(),
@@ -1637,8 +1664,10 @@ mod tests {
                 },
             },
         );
+        assert!(result.is_err(), "dummy store must refuse the connection");
         assert!(
-            matches!(result, Err(OpError::NotYetImplemented(m)) if m.contains("rotate-webhook-secret"))
+            !matches!(result, Err(OpError::NotYetImplemented(_))),
+            "the CLI-side rotate guard must be gone"
         );
     }
 

@@ -21,8 +21,9 @@ use greentic_deploy_spec::{
     RevisionLifecycle, RouteBinding, SchemaVersion, SemVer, TenantSelector, TrafficSplitEntry,
 };
 use greentic_deployer::environment::{
-    AddBundlePayload, FieldUpdate, MigrateMergePayload, SetTrafficSplitPayload,
-    StageRevisionPayload, UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
+    AddBundlePayload, AddMessagingEndpointPayload, FieldUpdate, MigrateMergePayload,
+    SetMessagingWelcomeFlowPayload, SetTrafficSplitPayload, StageRevisionPayload,
+    UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 use greentic_deployer::environment::{
     AuthMethod, EnvironmentMutations, HealthCheckId, HealthGateFailure, HttpEnvironmentStore,
@@ -579,6 +580,136 @@ async fn remote_env_lifecycle_end_to_end() {
             added_bundle.deployment_id
         );
         assert!(removed_bundle.pruned_revision_ids.is_empty());
+
+        // ----- PR-4.2h: the messaging verb group over the same wire. -----
+
+        // A deployed bundle for the link/welcome verbs to reference.
+        let msg_bundle = store
+            .add_bundle(
+                &id,
+                AddBundlePayload {
+                    bundle_id: BundleId::new("e2e-msg-bundle"),
+                    customer_id: CustomerId::new("cust-e2e"),
+                    revenue_share: vec![RevenueShareEntry {
+                        party_id: PartyId::new("greentic"),
+                        basis_points: 10_000,
+                    }],
+                    route_binding: None,
+                    authorization_ref: None,
+                    config_overrides: Default::default(),
+                },
+                idem("k-msg-bundle"),
+            )
+            .expect("add bundle for messaging");
+
+        // Add: the server mints the endpoint id and stamps the idem key.
+        let ep = store
+            .add_messaging_endpoint(
+                &id,
+                AddMessagingEndpointPayload {
+                    provider_id: "legal-bot".to_string(),
+                    provider_type: "teams".to_string(),
+                    display_name: "Legal".to_string(),
+                    secret_refs: Vec::new(),
+                    updated_by: "e2e".to_string(),
+                },
+                idem("k-msg-add"),
+            )
+            .expect("add messaging endpoint");
+        assert_eq!(ep.provider_id, "legal-bot");
+        assert_eq!(ep.updated_by, "e2e#idem=add:k-msg-add");
+
+        // Telegram-class add → the server's 501 maps onto the same
+        // `NotYetImplemented` noun PR-4.0 reserved for it.
+        let err = store
+            .add_messaging_endpoint(
+                &id,
+                AddMessagingEndpointPayload {
+                    provider_id: "tg-bot".to_string(),
+                    provider_type: "telegram".to_string(),
+                    display_name: "Telegram".to_string(),
+                    secret_refs: Vec::new(),
+                    updated_by: "e2e".to_string(),
+                },
+                idem("k-msg-add-tg"),
+            )
+            .expect_err("telegram-class add needs the Phase D secrets sink");
+        assert!(
+            matches!(err, StoreError::NotYetImplemented(_)),
+            "unexpected error: {err:?}"
+        );
+
+        // Link → welcome-flow → unlink-blocked-by-welcome → remove.
+        let linked = store
+            .link_messaging_bundle(
+                &id,
+                ep.endpoint_id,
+                msg_bundle.bundle_id.clone(),
+                "e2e".to_string(),
+                idem("k-msg-link"),
+            )
+            .expect("link bundle");
+        assert_eq!(linked.linked_bundles, vec![msg_bundle.bundle_id.clone()]);
+        assert_eq!(linked.generation, 1);
+
+        let with_welcome = store
+            .set_messaging_welcome_flow(
+                &id,
+                SetMessagingWelcomeFlowPayload {
+                    endpoint_id: ep.endpoint_id,
+                    bundle_id: msg_bundle.bundle_id.clone(),
+                    pack_id: PackId::new("welcome-pack"),
+                    flow_id: "hello".to_string(),
+                    updated_by: "e2e".to_string(),
+                },
+                idem("k-msg-welcome"),
+            )
+            .expect("set welcome flow");
+        assert_eq!(
+            with_welcome
+                .welcome_flow
+                .as_ref()
+                .map(|w| w.flow_id.as_str()),
+            Some("hello")
+        );
+
+        // The welcome-owner guard folds onto the local `Conflict` noun.
+        let err = store
+            .unlink_messaging_bundle(
+                &id,
+                ep.endpoint_id,
+                msg_bundle.bundle_id.clone(),
+                "e2e".to_string(),
+                idem("k-msg-unlink"),
+            )
+            .expect_err("welcome owner must block unlink");
+        assert!(
+            matches!(err, StoreError::Conflict(_)),
+            "unexpected error: {err:?}"
+        );
+
+        // Rotate → the server's 501 (no secrets sink yet).
+        let err = store
+            .rotate_messaging_webhook_secret(
+                &id,
+                ep.endpoint_id,
+                "e2e".to_string(),
+                idem("k-msg-rotate"),
+            )
+            .expect_err("rotate needs the Phase D secrets sink");
+        assert!(
+            matches!(err, StoreError::NotYetImplemented(_)),
+            "unexpected error: {err:?}"
+        );
+
+        // Remove is idempotent: second call succeeds on the absent id.
+        let removed_eid = store
+            .remove_messaging_endpoint(&id, ep.endpoint_id)
+            .expect("remove endpoint");
+        assert_eq!(removed_eid, ep.endpoint_id);
+        store
+            .remove_messaging_endpoint(&id, ep.endpoint_id)
+            .expect("idempotent re-remove");
 
         staged.revision_id
     })

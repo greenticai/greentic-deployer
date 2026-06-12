@@ -2562,3 +2562,442 @@ async fn bundles_concurrent_updates_keep_env_and_artifact_consistent() {
         "committed env and its referenced artifact must agree; env: {bundle}, doc: {doc}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR-4.2h — messaging verb group
+// ---------------------------------------------------------------------------
+
+fn add_endpoint_body(provider_type: &str, provider_id: &str) -> Value {
+    json!({
+        "provider_id": provider_id,
+        "provider_type": provider_type,
+        "display_name": format!("{provider_type} {provider_id}"),
+        "secret_refs": [],
+        "updated_by": "tester",
+    })
+}
+
+/// Add an endpoint under an explicit idempotency key (the messaging group
+/// uses the key as replay-detection domain state, so tests that add more
+/// than one endpoint must vary it) and return the server-minted id.
+async fn add_one_endpoint(
+    app: &Router,
+    provider_type: &str,
+    provider_id: &str,
+    key: &str,
+) -> String {
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/messaging",
+        Some(add_endpoint_body(provider_type, provider_id)),
+        &[("Idempotency-Key", key)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "add endpoint failed: {body}");
+    body["result"]["endpoint_id"]
+        .as_str()
+        .expect("endpoint_id")
+        .to_string()
+}
+
+#[tokio::test]
+async fn messaging_add_persists_endpoint_with_server_minted_id() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/messaging",
+        Some(add_endpoint_body("teams", "legal-bot")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_envelope(&body, "local");
+    assert_eq!(body["audit"]["noun"], "messaging.endpoint");
+    assert_eq!(body["audit"]["verb"], "add");
+    assert_eq!(body["audit"]["target"]["provider_type"], "teams");
+    let result = &body["result"];
+    assert_eq!(result["provider_id"], "legal-bot");
+    assert_eq!(result["provider_type"], "teams");
+    assert_eq!(result["generation"], 0);
+    assert_eq!(
+        result["updated_by"],
+        format!("tester#idem=add:{IDEM_KEY}"),
+        "the idem key must be stamped into updated_by"
+    );
+    let eid = result["endpoint_id"].as_str().expect("server-minted id");
+    assert!(eid.parse::<ulid::Ulid>().is_ok());
+    // Env CAS advanced (create=1 → endpoint add=2).
+    assert_eq!(body["generation"], 2);
+
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["endpoint_id"],
+        eid
+    );
+}
+
+#[tokio::test]
+async fn messaging_add_telegram_class_is_501_and_persists_nothing() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/messaging",
+        Some(add_endpoint_body("telegram", "tg-bot")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "body: {body}");
+    assert_eq!(body["kind"], "not-yet-implemented");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("secrets sink"),
+        "detail must point at the missing sink: {body}"
+    );
+
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["messaging_endpoints"],
+        json!([]),
+        "the refused add must not persist"
+    );
+    assert_eq!(read["generation"], 1, "env CAS must not advance");
+}
+
+#[tokio::test]
+async fn messaging_add_duplicate_identity_is_409_already_exists() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+    add_one_endpoint(&app, "teams", "legal-bot", "k-add-1").await;
+
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/messaging",
+        Some(add_endpoint_body("teams", "legal-bot")),
+        &[("Idempotency-Key", "k-add-2")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "already-exists");
+}
+
+#[tokio::test]
+async fn messaging_add_same_key_replay_returns_existing_without_cas_advance() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+    let eid = add_one_endpoint(&app, "teams", "legal-bot", "k-replay").await;
+
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/messaging",
+        Some(add_endpoint_body("teams", "legal-bot")),
+        &[("Idempotency-Key", "k-replay")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["result"]["endpoint_id"], eid,
+        "replay must return the original endpoint"
+    );
+    assert_eq!(
+        body["generation"], 2,
+        "no-op replay must echo the loaded CAS coordinates"
+    );
+}
+
+#[tokio::test]
+async fn messaging_add_key_reuse_with_different_identity_is_409_idempotency_conflict() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+    add_one_endpoint(&app, "teams", "legal-bot", "k-shared").await;
+
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/messaging",
+        Some(add_endpoint_body("slack", "ops-bot")),
+        &[("Idempotency-Key", "k-shared")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "idempotency-conflict");
+}
+
+#[tokio::test]
+async fn messaging_link_and_unlink_roundtrip() {
+    let (_d, app, _store) = bundles_app().await;
+    add_one_bundle(&app, "acme", "cust-1").await;
+    let eid = add_one_endpoint(&app, "teams", "legal-bot", "k-add").await;
+
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/link"),
+        Some(json!({"bundle_id": "acme", "updated_by": "op"})),
+        &[("Idempotency-Key", "k-link")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["audit"]["verb"], "link-bundle");
+    assert_eq!(body["result"]["linked_bundles"], json!(["acme"]));
+    assert_eq!(body["result"]["generation"], 1);
+    assert_eq!(body["result"]["updated_by"], "op#idem=link-bundle:k-link");
+
+    // Re-linking is a no-op: the env CAS must not advance.
+    let linked_gen = body["generation"].as_u64().expect("generation");
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/link"),
+        Some(json!({"bundle_id": "acme", "updated_by": "op"})),
+        &[("Idempotency-Key", "k-link-2")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["generation"].as_u64().expect("generation"), linked_gen);
+
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/unlink"),
+        Some(json!({"bundle_id": "acme", "updated_by": "op"})),
+        &[("Idempotency-Key", "k-unlink")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["audit"]["verb"], "unlink-bundle");
+    assert_eq!(body["result"]["linked_bundles"], json!([]));
+}
+
+#[tokio::test]
+async fn messaging_link_unknown_bundle_is_404_dependent_not_found() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+    let eid = add_one_endpoint(&app, "teams", "legal-bot", "k-add").await;
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/link"),
+        Some(json!({"bundle_id": "ghost", "updated_by": "op"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["kind"], "dependent-not-found");
+}
+
+#[tokio::test]
+async fn messaging_unknown_endpoint_is_404_dependent_not_found() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+    let ghost = ulid::Ulid::new().to_string();
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        &format!("/environments/local/messaging/{ghost}/link"),
+        Some(json!({"bundle_id": "acme", "updated_by": "op"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["kind"], "dependent-not-found");
+}
+
+#[tokio::test]
+async fn messaging_invalid_endpoint_id_segment_is_400() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/environments/local/messaging/not-a-ulid/link",
+        Some(json!({"bundle_id": "acme", "updated_by": "op"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["kind"], "invalid-request");
+}
+
+#[tokio::test]
+async fn messaging_welcome_flow_set_and_url_mismatch_rejected() {
+    let (_d, app, _store) = bundles_app().await;
+    add_one_bundle(&app, "acme", "cust-1").await;
+    let eid = add_one_endpoint(&app, "teams", "legal-bot", "k-add").await;
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/link"),
+        Some(json!({"bundle_id": "acme", "updated_by": "op"})),
+        &[("Idempotency-Key", "k-link")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let welcome = json!({
+        "endpoint_id": eid,
+        "bundle_id": "acme",
+        "pack_id": "welcome-pack",
+        "flow_id": "hello",
+        "updated_by": "op",
+    });
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/welcome-flow"),
+        Some(welcome.clone()),
+        &[("Idempotency-Key", "k-welcome")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["audit"]["verb"], "set-welcome-flow");
+    assert_eq!(body["result"]["welcome_flow"]["pack_id"], "welcome-pack");
+
+    // Body endpoint_id contradicting the URL → typed 400 before any load.
+    let other = ulid::Ulid::new().to_string();
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        &format!("/environments/local/messaging/{other}/welcome-flow"),
+        Some(welcome),
+        &[("Idempotency-Key", "k-welcome-2")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["kind"], "invalid-request");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("does not match URL"),
+        "detail must name the mismatch: {body}"
+    );
+}
+
+#[tokio::test]
+async fn messaging_welcome_flow_on_unlinked_bundle_is_400() {
+    let (_d, app, _store) = bundles_app().await;
+    add_one_bundle(&app, "acme", "cust-1").await;
+    let eid = add_one_endpoint(&app, "teams", "legal-bot", "k-add").await;
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/welcome-flow"),
+        Some(json!({
+            "endpoint_id": eid,
+            "bundle_id": "acme",
+            "pack_id": "welcome-pack",
+            "flow_id": "hello",
+            "updated_by": "op",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["kind"], "invalid-request");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("link it first"),
+        "detail must guide to link-bundle: {body}"
+    );
+}
+
+#[tokio::test]
+async fn messaging_remove_is_idempotent_without_second_cas_advance() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+    let eid = add_one_endpoint(&app, "teams", "legal-bot", "k-add").await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::DELETE,
+        &format!("/environments/local/messaging/{eid}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["audit"]["verb"], "remove");
+    assert_eq!(body["result"], eid, "result is the removed endpoint id");
+    let removed_gen = body["generation"].as_u64().expect("generation");
+
+    // Removing an absent endpoint succeeds without writing.
+    let (status, body) = send(
+        app,
+        Method::DELETE,
+        &format!("/environments/local/messaging/{eid}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["generation"].as_u64().expect("generation"),
+        removed_gen
+    );
+}
+
+#[tokio::test]
+async fn messaging_rotate_secret_is_501_until_the_secrets_sink_lands() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+    let eid = add_one_endpoint(&app, "teams", "legal-bot", "k-add").await;
+
+    // Existing endpoint, fresh key → the refusing sink answers 501.
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/rotate-secret"),
+        Some(json!({"updated_by": "op"})),
+        &[("Idempotency-Key", "k-rotate")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "body: {body}");
+    assert_eq!(body["kind"], "not-yet-implemented");
+
+    // Validation order pin: an unknown endpoint still 404s BEFORE the sink.
+    let ghost = ulid::Ulid::new().to_string();
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        &format!("/environments/local/messaging/{ghost}/rotate-secret"),
+        Some(json!({"updated_by": "op"})),
+        &[("Idempotency-Key", "k-rotate-2")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["kind"], "dependent-not-found");
+}
+
+/// Regression: add a (non-telegram) endpoint with key K, then POST
+/// rotate-secret with the SAME key K — the rotate must reach the
+/// refusing provision sink (501), not falsely replay as 200.
+#[tokio::test]
+async fn messaging_rotate_with_add_key_does_not_falsely_replay() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+    let eid = add_one_endpoint(&app, "teams", "legal-bot", "k-shared").await;
+
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/rotate-secret"),
+        Some(json!({"updated_by": "op"})),
+        &[("Idempotency-Key", "k-shared")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_IMPLEMENTED,
+        "rotate with add's key must hit the sink (501), not replay (200): {body}"
+    );
+    assert_eq!(body["kind"], "not-yet-implemented");
+}
