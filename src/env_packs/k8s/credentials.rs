@@ -11,16 +11,20 @@
 //! bootstrap-then-validate loop converges exactly like the AWS-ECS
 //! `VALIDATED_IAM_VERBS` precedent.
 //!
-//! ## Scaffold posture: probes are `Skipped` until the typed client lands
+//! ## Scaffold posture: probes FAIL CLOSED until the typed client lands
 //!
 //! The typed Kubernetes API client (kube-rs) ships in the K8s apply PR.
 //! Until then [`K8sDeployerCredentials::default`] holds no client and
-//! every probe reports [`CapabilityStatus::Skipped`] — the documented
-//! status for "the probe machinery isn't wired yet" (see
-//! [`crate::credentials`]'s Phase A constraint). The decision logic
-//! (reachable → per-op SSAR → Pass/Fail mapping) is fully implemented
-//! and pinned by mock-client tests, so the real client plugs into
-//! [`K8sValidatorClient`] without touching `validate`.
+//! every probe reports [`CapabilityStatus::Fail`] — NOT `Skipped`,
+//! because `RequirementsReport::passed()` treats `Skipped` as non-
+//! blocking (it only checks for `Fail`), so an all-`Skipped` report
+//! would persist `CredentialsValidationResult::Pass` with zero actual
+//! checks. Failing closed matches the AWS credential-chain-missing
+//! precedent and ensures `gtc op credentials requirements` never
+//! reports a false pass. The decision logic (reachable → per-op SSAR →
+//! Pass/Fail mapping) is fully implemented and pinned by mock-client
+//! tests, so the real client plugs into [`K8sValidatorClient`] without
+//! touching `validate`.
 //!
 //! ## Bootstrap
 //!
@@ -148,7 +152,10 @@ pub trait K8sValidatorClient: std::fmt::Debug + Send + Sync {
     async fn who_am_i(&self) -> Result<ClusterIdentity, K8sClientError>;
 
     /// Run one `SelfSubjectAccessReview` per operation, scoped to
-    /// `namespace`. Returns one decision per operation in input order.
+    /// `namespace`. Returns one decision per operation, in the SAME order
+    /// as the input `operations` slice — `validate()` enforces both the
+    /// count and per-index operation identity defensively (a partial or
+    /// re-ordered response must never authorize).
     async fn review_access<'a>(
         &'a self,
         namespace: &'a str,
@@ -230,17 +237,21 @@ impl DeployerCredentials for K8sDeployerCredentials {
         let caps = self.required_capabilities();
 
         let Some(client) = self.client.as_ref() else {
-            // Scaffold posture: no client machinery wired yet — Skipped,
-            // not Fail (the documented "we couldn't check" status). The
-            // persisted Credentials doc lists every cap as missing, so
-            // an operator never sees a false pass.
+            // Scaffold posture: no client machinery wired yet — Fail,
+            // not Skipped. `RequirementsReport::passed()` treats Skipped
+            // as non-blocking, so an all-Skipped report would persist
+            // `result: pass` even though zero capabilities were actually
+            // verified. Failing closed matches the AWS precedent (chain-
+            // missing → every cap Fail) and ensures `gtc op credentials
+            // requirements` never reports a false pass.
             return RequirementsReport::new(
                 caps.into_iter()
                     .map(|capability| CapabilityCheck {
                         capability,
-                        status: CapabilityStatus::Skipped {
+                        status: CapabilityStatus::Fail {
                             reason: "typed Kubernetes API client is not wired yet \
-                                     (ships in the Phase D K8s apply PR)"
+                                     (ships in the Phase D K8s apply PR); \
+                                     credentials cannot be validated — failing closed"
                                 .to_string(),
                         },
                     })
@@ -265,6 +276,30 @@ impl DeployerCredentials for K8sDeployerCredentials {
                     ));
                 }
             };
+
+        // Validate response shape BEFORE building per-op checks: a
+        // partial or mis-ordered response must never authorize.
+        if decisions.len() != VALIDATED_K8S_OPERATIONS.len() {
+            return self.reachable_pass_ops_failed(&format!(
+                "SelfSubjectAccessReview returned {} decisions for {} operations",
+                decisions.len(),
+                VALIDATED_K8S_OPERATIONS.len()
+            ));
+        }
+        for (i, (expected, actual)) in VALIDATED_K8S_OPERATIONS
+            .iter()
+            .zip(decisions.iter())
+            .enumerate()
+        {
+            if actual.operation != *expected {
+                return self.reachable_pass_ops_failed(&format!(
+                    "SelfSubjectAccessReview decision[{i}] operation mismatch: \
+                     expected `{}`, got `{}`",
+                    expected.capability_id(),
+                    actual.operation.capability_id()
+                ));
+            }
+        }
 
         let mut checks = Vec::with_capacity(1 + decisions.len());
         checks.push(CapabilityCheck {
@@ -467,27 +502,33 @@ mod tests {
         );
     }
 
-    /// Scaffold posture: no client wired — every probe Skipped (recorded
-    /// as missing, never a false pass or a spurious fail).
+    /// Scaffold posture: no client wired — every probe Fail (fail closed).
+    /// `RequirementsReport::passed()` treats Skipped as non-blocking, so
+    /// an all-Skipped report would persist `result: pass` — Fail prevents
+    /// that.
     #[test]
-    fn validate_without_a_client_skips_every_capability() {
+    fn validate_without_a_client_fails_closed() {
         let creds = K8sDeployerCredentials::default();
         let env_id = EnvId::try_from("zain-prod").unwrap();
         let hc = default_host_config(&env_id);
         let dir = tempdir().unwrap();
         let report = creds.validate(&ctx(dir.path(), &env_id, &hc));
-        assert!(report.passed(), "Skipped does not block overall pass");
+        assert!(!report.passed(), "no-client report must NOT pass");
         assert_eq!(
             report.missing().len(),
             creds.required_capabilities().len(),
-            "every Skipped cap must be recorded as missing"
+            "every Fail cap must be recorded as missing"
         );
         for check in &report.checks {
-            assert!(
-                matches!(check.status, CapabilityStatus::Skipped { .. }),
-                "expected Skipped, got {:?}",
-                check.status
-            );
+            match &check.status {
+                CapabilityStatus::Fail { reason } => {
+                    assert!(
+                        reason.contains("not wired yet"),
+                        "reason must mention the missing client: {reason}"
+                    );
+                }
+                other => panic!("expected Fail, got {other:?}"),
+            }
         }
     }
 
@@ -598,6 +639,95 @@ mod tests {
             match &check.status {
                 CapabilityStatus::Fail { reason } => {
                     assert!(reason.contains("connection reset"), "reason: {reason}");
+                }
+                other => panic!("expected Fail, got {other:?}"),
+            }
+        }
+    }
+
+    /// FIX 3: a truncated (empty) decisions vec must fail closed — zip
+    /// would silently skip every operation.
+    #[test]
+    fn validate_fails_closed_on_truncated_review_response() {
+        let mock = Arc::new(
+            MockK8sClient::default()
+                .with_identity(Ok(identity()))
+                .with_review(Ok(vec![])),
+        );
+        let creds = K8sDeployerCredentials::with_client(mock);
+        let env_id = EnvId::try_from("zain-prod").unwrap();
+        let hc = default_host_config(&env_id);
+        let dir = tempdir().unwrap();
+        let report = creds.validate(&ctx(dir.path(), &env_id, &hc));
+        assert!(!report.passed(), "truncated response must not pass");
+        // Reachable passes (identity resolved), every op fails.
+        let reachable = report
+            .checks
+            .iter()
+            .find(|c| c.capability.id == K8S_API_REACHABLE_CAP)
+            .unwrap();
+        assert!(matches!(reachable.status, CapabilityStatus::Pass));
+        let op_checks: Vec<_> = report
+            .checks
+            .iter()
+            .filter(|c| c.capability.id != K8S_API_REACHABLE_CAP)
+            .collect();
+        assert_eq!(op_checks.len(), VALIDATED_K8S_OPERATIONS.len());
+        for check in &op_checks {
+            match &check.status {
+                CapabilityStatus::Fail { reason } => {
+                    assert!(
+                        reason.contains("0 decisions for"),
+                        "reason must mention the count mismatch: {reason}"
+                    );
+                }
+                other => panic!("expected Fail, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            report.missing().len(),
+            VALIDATED_K8S_OPERATIONS.len(),
+            "every operation cap must be missing"
+        );
+    }
+
+    /// FIX 3: decisions returned in wrong order must fail closed.
+    #[test]
+    fn validate_fails_closed_on_mismatched_operation_order() {
+        let mut decisions = all_allowed();
+        // Swap the first two decisions so the operations don't match.
+        decisions.swap(0, 1);
+        let mock = Arc::new(
+            MockK8sClient::default()
+                .with_identity(Ok(identity()))
+                .with_review(Ok(decisions)),
+        );
+        let creds = K8sDeployerCredentials::with_client(mock);
+        let env_id = EnvId::try_from("zain-prod").unwrap();
+        let hc = default_host_config(&env_id);
+        let dir = tempdir().unwrap();
+        let report = creds.validate(&ctx(dir.path(), &env_id, &hc));
+        assert!(!report.passed(), "mismatched operations must not pass");
+        let reachable = report
+            .checks
+            .iter()
+            .find(|c| c.capability.id == K8S_API_REACHABLE_CAP)
+            .unwrap();
+        assert!(matches!(reachable.status, CapabilityStatus::Pass));
+        // Every operation cap fails with a reason mentioning the mismatch.
+        let op_checks: Vec<_> = report
+            .checks
+            .iter()
+            .filter(|c| c.capability.id != K8S_API_REACHABLE_CAP)
+            .collect();
+        assert_eq!(op_checks.len(), VALIDATED_K8S_OPERATIONS.len());
+        for check in &op_checks {
+            match &check.status {
+                CapabilityStatus::Fail { reason } => {
+                    assert!(
+                        reason.contains("mismatch"),
+                        "reason must mention the mismatch: {reason}"
+                    );
                 }
                 other => panic!("expected Fail, got {other:?}"),
             }

@@ -38,7 +38,10 @@ presentation:
     `gtc op credentials requirements` use sandbox defaults (namespace
     `gtc-<env-id>`, the GHCR runtime image, two router replicas); the
     answers below are recorded on the binding for Phase D consumption.
-    Production requires a digest-pinned runtime image.
+    Production requires a digest-pinned runtime image. Note: env ids
+    that require lossy sanitization (uppercase, `.`, `_`) or exceed
+    the 63-char RFC 1123 limit get a collision-proof hash suffix
+    (`gtc-<prefix>-<hash8>`) — see `manifests::namespace_for_env`.
 
 questions:
   - id: kubeconfig_context
@@ -55,8 +58,10 @@ questions:
     title: Namespace (optional)
     description: >-
       Namespace the env's objects land in. Leave blank for the default
-      `gtc-<env-id>`. One namespace per (tenant, environment) pair; it
-      must match the namespace the bootstrap rules pack provisioned.
+      `gtc-<env-id>` (clean ids) or `gtc-<prefix>-<hash8>` (lossy or
+      long ids — see `manifests::namespace_for_env`). One namespace
+      per (tenant, environment) pair; it must match the namespace the
+      bootstrap rules pack provisioned.
     required: false
     constraint:
       max_len: 63

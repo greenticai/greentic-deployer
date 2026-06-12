@@ -47,6 +47,7 @@
 
 use greentic_deploy_spec::{EnvId, Environment, Revision};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::environment::runtime_config::materialize_runtime_config;
 
@@ -94,10 +95,68 @@ impl K8sParams {
     }
 }
 
-/// Default namespace for an env: `gtc-<env-id>`, sanitized to an RFC 1123
-/// label (env ids permit `.`/`_`/uppercase; namespaces do not).
+/// Default namespace for an env, derived from the env id.
+///
+/// Clean ids (already `[a-z0-9-]`, no leading/trailing `-`, and
+/// `"gtc-" + id` fits in 63 chars) stay friendly: `gtc-<id>`.
+/// Otherwise (any lossy character mapping or overflow) the namespace
+/// gets a stable content-hash suffix: `gtc-<sanitized-prefix>-<hash8>`
+/// where `hash8` = first 8 hex chars of SHA-256 over the RAW env id
+/// string. Two distinct env ids can therefore never collide — the hash
+/// discriminates when the sanitized form is ambiguous.
+///
+/// Env ids are unique per store, so hashing the env id alone suffices.
+/// Cross-store collisions on one shared cluster are a production-
+/// acceptance concern, out of scaffold scope.
 pub fn namespace_for_env(env_id: &EnvId) -> String {
-    sanitize_dns1123_label(&format!("gtc-{}", env_id.as_str()))
+    let raw = env_id.as_str();
+    let prefix = "gtc-";
+
+    // Fast path: if the raw id is already clean RFC 1123 and fits, use
+    // the friendly form directly — no hash needed.
+    let is_clean = !raw.is_empty()
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !raw.starts_with('-')
+        && !raw.ends_with('-')
+        && (prefix.len() + raw.len()) <= 63;
+
+    if is_clean {
+        return format!("{prefix}{raw}");
+    }
+
+    // Slow path: lossy/truncated derivation — append a content hash so
+    // distinct env ids that sanitize identically still get unique
+    // namespaces.
+    let hash8 = {
+        let digest = Sha256::digest(raw.as_bytes());
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}",
+            digest[0], digest[1], digest[2], digest[3]
+        )
+    };
+
+    let sanitized = sanitize_dns1123_label(raw);
+    if sanitized.is_empty() {
+        // Degenerate ids (e.g. `...`) — the sanitized form is empty.
+        return format!("{prefix}{hash8}");
+    }
+
+    // Truncate the sanitized prefix so `gtc-<prefix>-<hash8>` ≤ 63.
+    // Layout: "gtc-" (4) + prefix + "-" (1) + hash8 (8) = 13 + prefix.
+    let max_prefix_len = 63 - prefix.len() - 1 - hash8.len(); // 63 - 4 - 1 - 8 = 50
+    let truncated = if sanitized.len() > max_prefix_len {
+        sanitized[..max_prefix_len].trim_end_matches('-')
+    } else {
+        &sanitized
+    };
+
+    if truncated.is_empty() {
+        format!("{prefix}{hash8}")
+    } else {
+        format!("{prefix}{truncated}-{hash8}")
+    }
 }
 
 /// Name of a revision's worker Deployment AND Service (same name, two
@@ -110,12 +169,12 @@ pub fn worker_name(revision: &Revision) -> String {
     )
 }
 
-/// Coerce a string into an RFC 1123 label: lowercase, `[a-z0-9-]` only
-/// (other characters map to `-`), trimmed to 63 chars, no leading or
-/// trailing `-`. Total functions only — a degenerate input yields `gtc`
-/// rather than an invalid name.
+/// Coerce a string into an RFC 1123 label fragment: lowercase,
+/// `[a-z0-9-]` only (other characters map to `-`), no leading or
+/// trailing `-`. Does NOT truncate — callers control length budgets.
+/// Returns an empty string for degenerate inputs (all-separator).
 fn sanitize_dns1123_label(raw: &str) -> String {
-    let mut s: String = raw
+    let s: String = raw
         .to_lowercase()
         .chars()
         .map(|c| {
@@ -126,13 +185,7 @@ fn sanitize_dns1123_label(raw: &str) -> String {
             }
         })
         .collect();
-    s.truncate(63);
-    let trimmed = s.trim_matches('-');
-    if trimmed.is_empty() {
-        "gtc".to_string()
-    } else {
-        trimmed.to_string()
-    }
+    s.trim_matches('-').to_string()
 }
 
 /// Shared labels stamped on every object the env-pack renders.
@@ -537,17 +590,87 @@ mod tests {
     #[test]
     fn sanitize_dns1123_label_handles_env_id_charset() {
         // EnvId permits uppercase, `.` and `_` — namespaces do not.
-        assert_eq!(
-            sanitize_dns1123_label("gtc-Prod.EU_west"),
-            "gtc-prod-eu-west"
-        );
+        assert_eq!(sanitize_dns1123_label("Prod.EU_west"), "prod-eu-west");
         // Trailing separator junk is trimmed.
-        assert_eq!(sanitize_dns1123_label("gtc-x-"), "gtc-x");
-        // 63-char cap.
-        let long = format!("gtc-{}", "a".repeat(80));
-        assert_eq!(sanitize_dns1123_label(&long).len(), 63);
-        // Degenerate input still yields a valid label.
-        assert_eq!(sanitize_dns1123_label("..."), "gtc");
+        assert_eq!(sanitize_dns1123_label("x-"), "x");
+        // Degenerate input yields empty (caller handles fallback).
+        assert_eq!(sanitize_dns1123_label("..."), "");
+    }
+
+    #[test]
+    fn namespace_collision_proof_distinct_ids_never_share_namespace() {
+        // `prod-eu-west` is clean → friendly `gtc-prod-eu-west`.
+        let clean = EnvId::try_from("prod-eu-west").unwrap();
+        let ns_clean = namespace_for_env(&clean);
+        assert_eq!(ns_clean, "gtc-prod-eu-west");
+
+        // `Prod.EU_west` sanitizes to the same fragment but is lossy →
+        // gets a hash suffix → DIFFERENT namespace.
+        let lossy = EnvId::try_from("Prod.EU_west").unwrap();
+        let ns_lossy = namespace_for_env(&lossy);
+        assert_ne!(
+            ns_lossy, ns_clean,
+            "lossy derivation must not collide with the clean id"
+        );
+        assert!(
+            ns_lossy.starts_with("gtc-prod-eu-west-"),
+            "lossy namespace must start with the sanitized prefix: {ns_lossy}"
+        );
+        // Hash suffix is 8 hex chars.
+        let suffix = ns_lossy.strip_prefix("gtc-prod-eu-west-").unwrap();
+        assert_eq!(suffix.len(), 8);
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "suffix must be hex: {suffix}"
+        );
+    }
+
+    #[test]
+    fn namespace_long_ids_truncated_but_distinct() {
+        // Two long ids that share a 50-char sanitized prefix but differ
+        // after that — they must produce different namespaces, both ≤ 63.
+        let base = "a".repeat(55);
+        let id_a = EnvId::try_from(format!("{base}xxxxx")).unwrap();
+        let id_b = EnvId::try_from(format!("{base}yyyyy")).unwrap();
+        let ns_a = namespace_for_env(&id_a);
+        let ns_b = namespace_for_env(&id_b);
+        assert_ne!(ns_a, ns_b, "truncated long ids must not collide");
+        assert!(ns_a.len() <= 63, "namespace must be ≤ 63 chars: {ns_a}");
+        assert!(ns_b.len() <= 63, "namespace must be ≤ 63 chars: {ns_b}");
+        // Both are valid RFC 1123.
+        for ns in [&ns_a, &ns_b] {
+            assert!(
+                ns.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "invalid RFC 1123: {ns}"
+            );
+            assert!(
+                !ns.starts_with('-') && !ns.ends_with('-'),
+                "leading/trailing dash: {ns}"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_derivation_is_deterministic() {
+        let id = EnvId::try_from("Prod.EU_west").unwrap();
+        let a = namespace_for_env(&id);
+        let b = namespace_for_env(&id);
+        assert_eq!(a, b, "same id must always produce the same namespace");
+    }
+
+    #[test]
+    fn namespace_degenerate_id_gets_hash_only() {
+        // An env id made entirely of dots: sanitizes to empty.
+        let id = EnvId::try_from("...").unwrap();
+        let ns = namespace_for_env(&id);
+        assert!(ns.starts_with("gtc-"), "must have gtc- prefix: {ns}");
+        // "gtc-" + 8 hex = 12 chars
+        assert_eq!(ns.len(), 12);
+        assert!(
+            ns[4..].chars().all(|c| c.is_ascii_hexdigit()),
+            "must be gtc-<hex8>: {ns}"
+        );
     }
 
     #[test]

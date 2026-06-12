@@ -9,6 +9,17 @@
 //! real-cluster and production acceptance, not this scaffold — sandbox
 //! defaults per that doc.
 //!
+//! ## Operator CLI lifecycle verb disclaimer
+//!
+//! The operator CLI's revision/traffic verbs (`gtc op revision warm`,
+//! `gtc op traffic set`, etc.) do not yet invoke `Deployer` impls —
+//! they are storage-layer only, true for every registered deployer
+//! today (including AWS-ECS since C3; there is no non-test caller of
+//! `as_deployer()` anywhere). Until the PR-5.x orchestration wiring
+//! lands, binding `greentic.deployer.k8s` gives the credentials and
+//! bootstrap surface only; no cluster workloads are created or mutated
+//! by lifecycle verbs.
+//!
 //! Module layout (mirrors the local-process / AWS-ECS reference shape):
 //!
 //! - `mod.rs` (this file) — the [`EnvPackHandler`] surface: slot,
