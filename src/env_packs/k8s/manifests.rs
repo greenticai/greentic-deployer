@@ -555,7 +555,9 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
 /// ConfigMap (the router mounts it — must exist first), router
 /// Deployment + Service + PDB, NetworkPolicies. Per-revision worker
 /// objects are NOT included — they ride the revision lifecycle verbs.
-/// The `gtc op env render` verb (follow-up PR) writes this set to disk.
+/// `gtc op env render` emits this set (plus present-revision workers)
+/// through the [`ManifestRenderer`](crate::env_packs::render::ManifestRenderer)
+/// impl in [`super::render`].
 pub fn render_environment_manifests(env: &Environment, params: &K8sParams) -> Vec<Value> {
     let mut manifests = vec![
         render_namespace(env, params),

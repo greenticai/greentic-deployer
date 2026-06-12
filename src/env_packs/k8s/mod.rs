@@ -34,6 +34,9 @@
 //! - [`deployer`] — `impl Deployer for K8sDeployerHandler`; passes
 //!   [`run_conformance`](crate::env_packs::deployer::run_conformance)
 //!   against an in-memory cluster fake.
+//! - [`render`] — `impl ManifestRenderer for K8sDeployerHandler`; backs
+//!   `gtc op env render` with the same rendering functions the
+//!   [`deployer`] verbs apply (plan §6 step 10).
 //! - [`credentials`] — `SelfSubjectAccessReview`-based
 //!   [`DeployerCredentials`](crate::credentials::DeployerCredentials)
 //!   (probes fail closed until the client ships; decision logic pinned
@@ -47,6 +50,7 @@ pub mod cluster;
 pub mod credentials;
 pub mod deployer;
 pub mod manifests;
+pub mod render;
 
 use std::sync::Arc;
 
@@ -129,6 +133,10 @@ impl EnvPackHandler for K8sDeployerHandler {
     }
 
     fn as_deployer(&self) -> Option<&dyn crate::env_packs::deployer::Deployer> {
+        Some(self)
+    }
+
+    fn as_manifest_renderer(&self) -> Option<&dyn crate::env_packs::render::ManifestRenderer> {
         Some(self)
     }
 }

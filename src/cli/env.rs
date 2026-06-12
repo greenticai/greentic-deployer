@@ -4,7 +4,9 @@
 //! mutating call validates the payload before touching disk.
 
 use chrono::Utc;
-use greentic_deploy_spec::{EnvId, Environment, EnvironmentHostConfig, validate_public_base_url};
+use greentic_deploy_spec::{
+    CapabilitySlot, EnvId, Environment, EnvironmentHostConfig, validate_public_base_url,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -481,6 +483,163 @@ pub fn tool_check(
             "checked_at": Utc::now(),
         }),
     ))
+}
+
+/// `op env render <env_id> [--kind <descriptor>] [--output <dir>]` (plan §6
+/// step 10). Renders the env's declarative desired state through the
+/// deployer env-pack's
+/// [`ManifestRenderer`](crate::env_packs::ManifestRenderer) without
+/// applying anything — the artifact for direct-apply preview, GitOps
+/// repository handoff, or rendered-manifest handoff.
+///
+/// With `--output <dir>` each object is written as
+/// `<NN>-<kind>-<name>.yaml` in apply order (same-named files are
+/// overwritten); `stale_files` in the outcome lists `.yaml` leftovers in
+/// the directory that this render did NOT write (e.g. workers of a since-
+/// archived revision) — remove them before `kubectl apply -f <dir>`.
+/// Without `--output` the manifests are embedded in the JSON outcome.
+pub fn render(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    args: super::dispatch::EnvRenderArgs,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(
+            NOUN,
+            "render",
+            json!({
+                "input_schema": "env_id positional; --kind <path[@version]> optional \
+                 (defaults to the env's deployer binding); --output <dir> optional"
+            }),
+        ));
+    }
+    let env_id = EnvId::try_from(args.env_id.as_str())
+        .map_err(|e| OpError::InvalidArgument(format!("env_id: {e}")))?;
+    if !store.exists(&env_id)? {
+        return Err(OpError::NotFound(format!("environment `{env_id}`")));
+    }
+    let env = store.load(&env_id)?;
+    let descriptor = resolve_render_kind(&env, args.kind.as_deref())?;
+    let registry = crate::env_packs::EnvPackRegistry::with_builtins();
+    let handler = registry
+        .resolve_for_slot(CapabilitySlot::Deployer, &descriptor)
+        .map_err(|e| OpError::Conflict(e.to_string()))?;
+    let renderer = handler.as_manifest_renderer().ok_or_else(|| {
+        OpError::Conflict(format!(
+            "env-pack kind `{}` does not support manifest rendering",
+            descriptor.path()
+        ))
+    })?;
+    let objects = renderer.render_environment(&env);
+
+    let mut result = json!({
+        "environment_id": env.environment_id.as_str(),
+        "kind": descriptor.as_str(),
+        "object_count": objects.len(),
+    });
+    match args.output {
+        Some(dir) => {
+            let (files, stale_files) = write_rendered_objects(&dir, &objects)?;
+            result["output_dir"] = json!(dir);
+            result["files"] = json!(files);
+            result["stale_files"] = json!(stale_files);
+        }
+        None => result["manifests"] = Value::Array(objects),
+    }
+    Ok(OpOutcome::new(NOUN, "render", result))
+}
+
+/// Resolve the `--kind` argument for `op env render` to a full
+/// [`PackDescriptor`].
+///
+/// - Absent → the env's Deployer-slot binding (the common case).
+/// - Full `<path>@<version>` → parsed as-is, so an operator can preview a
+///   kind before binding it.
+/// - Bare path → must match the env's deployer binding, whose pinned
+///   version is reused. A bare path with no matching binding is rejected
+///   rather than guessing a version.
+fn resolve_render_kind(
+    env: &Environment,
+    kind: Option<&str>,
+) -> Result<greentic_deploy_spec::PackDescriptor, OpError> {
+    let binding = env.pack_for_slot(CapabilitySlot::Deployer);
+    match kind {
+        None => binding.map(|b| b.kind.clone()).ok_or_else(|| {
+            OpError::Conflict(
+                "env has no deployer binding; pass --kind <path>@<version>".to_string(),
+            )
+        }),
+        Some(k) if k.contains('@') => greentic_deploy_spec::PackDescriptor::try_new(k)
+            .map_err(|e| OpError::InvalidArgument(format!("--kind: {e}"))),
+        Some(path) => match binding {
+            Some(b) if b.kind.path() == path => Ok(b.kind.clone()),
+            _ => Err(OpError::InvalidArgument(format!(
+                "--kind `{path}` carries no version and does not match the env's \
+                 deployer binding; pass a full `<path>@<version>`"
+            ))),
+        },
+    }
+}
+
+/// Write each rendered object as a YAML file under `dir` (created if
+/// missing). Returns `(written, stale)` file names — `stale` is every
+/// pre-existing `.yaml` in `dir` this render did not write.
+fn write_rendered_objects(
+    dir: &std::path::Path,
+    objects: &[Value],
+) -> Result<(Vec<String>, Vec<String>), OpError> {
+    let io_err = |source: std::io::Error| OpError::Io {
+        path: dir.to_path_buf(),
+        source,
+    };
+    std::fs::create_dir_all(dir).map_err(io_err)?;
+    let mut files = Vec::with_capacity(objects.len());
+    for (index, object) in objects.iter().enumerate() {
+        let file_name = rendered_object_file_name(index, object);
+        let path = dir.join(&file_name);
+        let yaml = serde_yaml_bw::to_string(object).map_err(|e| OpError::Io {
+            path: path.clone(),
+            source: std::io::Error::other(format!("manifest YAML serialization: {e}")),
+        })?;
+        std::fs::write(&path, yaml).map_err(|source| OpError::Io { path, source })?;
+        files.push(file_name);
+    }
+    let mut stale_files = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(io_err)? {
+        let name = entry.map_err(io_err)?.file_name();
+        let name = name.to_string_lossy().into_owned();
+        if name.ends_with(".yaml") && !files.contains(&name) {
+            stale_files.push(name);
+        }
+    }
+    stale_files.sort();
+    Ok((files, stale_files))
+}
+
+/// `<NN>-<kind>-<name>.yaml`, lowercased and restricted to `[a-z0-9.-]`
+/// so a renderer-supplied name can never traverse out of the output dir.
+fn rendered_object_file_name(index: usize, object: &Value) -> String {
+    let sanitize = |s: &str| -> String {
+        s.to_ascii_lowercase()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    };
+    let kind = object
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("object");
+    let name = object
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("unnamed");
+    format!("{index:02}-{}-{}.yaml", sanitize(kind), sanitize(name))
 }
 
 /// `op env init`. Idempotent bootstrap of the `local` env with its five
@@ -2298,5 +2457,215 @@ mod tests {
             .into_payload("update", &OpFlags::default())
             .expect_err("should reject");
         assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    // -- render -------------------------------------------------------------
+
+    use crate::cli::dispatch::EnvRenderArgs;
+    use std::path::PathBuf;
+
+    /// `K8sParams::for_env` env-level set: Namespace, ConfigMap, router
+    /// Deployment + Service + PDB, 4 NetworkPolicies. An env with no
+    /// present revisions renders exactly these.
+    const K8S_ENV_LEVEL_OBJECT_COUNT: usize = 9;
+
+    fn render_args(env_id: &str, kind: Option<&str>, output: Option<PathBuf>) -> EnvRenderArgs {
+        EnvRenderArgs {
+            env_id: env_id.to_string(),
+            kind: kind.map(str::to_string),
+            output,
+        }
+    }
+
+    fn store_with_k8s_env(dir: &std::path::Path) -> LocalFsStore {
+        use crate::cli::tests_common::make_binding;
+        let store = LocalFsStore::new(dir);
+        let mut env = make_env("zain");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.k8s@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        store
+    }
+
+    #[test]
+    fn render_embeds_manifests_without_output() {
+        let dir = tempdir().unwrap();
+        let store = store_with_k8s_env(dir.path());
+        let outcome = render(&store, &OpFlags::default(), render_args("zain", None, None)).unwrap();
+        assert_eq!(outcome.op, "render");
+        assert_eq!(
+            outcome.result.get("kind").and_then(Value::as_str),
+            Some("greentic.deployer.k8s@1.0.0"),
+            "kind defaults to the env's deployer binding"
+        );
+        let manifests = outcome
+            .result
+            .get("manifests")
+            .and_then(Value::as_array)
+            .expect("manifests embedded when --output is absent");
+        assert_eq!(manifests.len(), K8S_ENV_LEVEL_OBJECT_COUNT);
+        assert_eq!(
+            outcome.result.get("object_count").and_then(Value::as_u64),
+            Some(K8S_ENV_LEVEL_OBJECT_COUNT as u64)
+        );
+        assert_eq!(
+            manifests[0].get("kind").and_then(Value::as_str),
+            Some("Namespace"),
+            "apply order starts with the Namespace"
+        );
+    }
+
+    #[test]
+    fn render_writes_apply_ordered_yaml_files() {
+        let dir = tempdir().unwrap();
+        let store = store_with_k8s_env(dir.path());
+        let out = dir.path().join("rendered");
+        let outcome = render(
+            &store,
+            &OpFlags::default(),
+            render_args("zain", None, Some(out.clone())),
+        )
+        .unwrap();
+        assert!(outcome.result.get("manifests").is_none());
+        let files: Vec<String> = outcome
+            .result
+            .get("files")
+            .and_then(Value::as_array)
+            .expect("files list")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(files.len(), K8S_ENV_LEVEL_OBJECT_COUNT);
+        assert_eq!(files[0], "00-namespace-gtc-zain.yaml");
+        assert_eq!(
+            outcome
+                .result
+                .get("stale_files")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        for name in &files {
+            let raw = std::fs::read_to_string(out.join(name)).expect("rendered file exists");
+            let _: Value = serde_yaml_bw::from_str(&raw).expect("file parses back as YAML");
+        }
+    }
+
+    #[test]
+    fn render_reports_stale_yaml_leftovers() {
+        let dir = tempdir().unwrap();
+        let store = store_with_k8s_env(dir.path());
+        let out = dir.path().join("rendered");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("zz-old-worker.yaml"), "kind: Deployment\n").unwrap();
+        std::fs::write(out.join("notes.txt"), "not a manifest\n").unwrap();
+        let outcome = render(
+            &store,
+            &OpFlags::default(),
+            render_args("zain", None, Some(out)),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.result.get("stale_files"),
+            Some(&json!(["zz-old-worker.yaml"])),
+            "leftover .yaml files are reported; non-YAML files are ignored"
+        );
+    }
+
+    #[test]
+    fn render_bare_path_kind_must_match_the_binding() {
+        let dir = tempdir().unwrap();
+        let store = store_with_k8s_env(dir.path());
+        // Bare path matching the binding reuses its pinned version.
+        let outcome = render(
+            &store,
+            &OpFlags::default(),
+            render_args("zain", Some("greentic.deployer.k8s"), None),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.result.get("kind").and_then(Value::as_str),
+            Some("greentic.deployer.k8s@1.0.0")
+        );
+        // A bare path that matches nothing is rejected — no version guessing.
+        let err = render(
+            &store,
+            &OpFlags::default(),
+            render_args("zain", Some("greentic.deployer.other"), None),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "{err}");
+    }
+
+    #[test]
+    fn render_without_deployer_binding_requires_kind() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("bare")).unwrap();
+        let err = render(&store, &OpFlags::default(), render_args("bare", None, None)).unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "{err}");
+        // An explicit full descriptor renders an unbound kind (preview).
+        let outcome = render(
+            &store,
+            &OpFlags::default(),
+            render_args("bare", Some("greentic.deployer.k8s@1.0.0"), None),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.result.get("object_count").and_then(Value::as_u64),
+            Some(K8S_ENV_LEVEL_OBJECT_COUNT as u64)
+        );
+    }
+
+    #[test]
+    fn render_rejects_kind_without_a_renderer() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            crate::defaults::LOCAL_DEPLOYER_PACK,
+        ));
+        store.save(&env).unwrap();
+        let err = render(
+            &store,
+            &OpFlags::default(),
+            render_args("local", None, None),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => {
+                assert!(msg.contains("does not support manifest rendering"), "{msg}")
+            }
+            other => panic!("expected Conflict, got {other}"),
+        }
+    }
+
+    #[test]
+    fn render_missing_env_is_not_found() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let err = render(
+            &store,
+            &OpFlags::default(),
+            render_args("ghost", None, None),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::NotFound(_)), "{err}");
+    }
+
+    #[test]
+    fn render_schema_only_returns_input_schema() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let flags = OpFlags {
+            schema_only: true,
+            ..OpFlags::default()
+        };
+        let outcome = render(&store, &flags, render_args("zain", None, None)).unwrap();
+        assert!(outcome.result.get("input_schema").is_some());
     }
 }
