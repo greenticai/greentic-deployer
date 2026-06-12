@@ -22,6 +22,9 @@
 //! `Allow{policy: "open-dev"}`), and the audit log's durable append
 //! (PR-4.3).
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, Path, State};
@@ -35,18 +38,20 @@ use greentic_deploy_spec::engine::{
     self, BindingError, EngineError, RevisionLifecycleError, TrafficSplitError,
 };
 use greentic_deploy_spec::{
-    Actor, ApplyTrafficSplitOutcome, AuditDecision, AuditEvent, AuditResult,
+    Actor, AddTrustedKeyPayload, ApplyTrafficSplitOutcome, AuditDecision, AuditEvent, AuditResult,
     BindingGenerationOutcome, CapabilitySlot, ConcurrencyConflict, CreateEnvironmentPayload, EnvId,
     Environment, ExtensionBindingPayload, ExtensionKeyedPayload, HealthStatus, IdempotencyKey,
     IdempotencyOutcome, MigrateMergePayload, PackBindingPayload, Precondition, RemoteStoreError,
     RetentionPolicy, RevisionId, RevisionTransitionOutcome, RevocationConfig,
     RollbackTrafficSplitOutcome, RollbackTrafficSplitPayload, SchemaVersion,
-    SetTrafficSplitPayload, StageRevisionPayload, StateEtag, UpdateEnvironmentPayload,
-    WarmRevisionPayload,
+    SetTrafficSplitPayload, StageRevisionPayload, StateEtag, TrustRootAddOutcome,
+    TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
+use greentic_operator_trust::operator_key::{self, OperatorKey};
+use greentic_operator_trust::trust_root::{self, TrustRootDocError, TrustRootDocument, TrustedKey};
 
 use crate::http::AppState;
-use crate::storage::{EnvRevision, EnvironmentStorage, StorageError};
+use crate::storage::{EnvRevision, EnvironmentStorage, LoadedTrustRoot, StorageError};
 
 /// `AuditDecision.policy` value while RBAC is not yet enforced (PR-4.4).
 /// Honest about what it is — every request is allowed.
@@ -215,6 +220,30 @@ impl From<BindingError> for ApiError {
             | BindingError::SnapshotDecode { .. } => RemoteStoreError::Conflict {
                 detail: err.to_string(),
             },
+        })
+    }
+}
+
+/// Map a trust-root document failure onto the A8 wire vocabulary. The
+/// validation variants describe the request input (a supplied key_id/PEM
+/// pair, or the server's own operator key) — 400 before any state is
+/// touched. `BadSchema` is only produced when unwrapping a STORED
+/// document, which the storage layer already schema-checks on load —
+/// reaching it here is a programming error, 500.
+impl From<TrustRootDocError> for ApiError {
+    fn from(err: TrustRootDocError) -> Self {
+        Self(match err {
+            invalid @ (TrustRootDocError::Key(_)
+            | TrustRootDocError::KeyIdMismatch { .. }
+            | TrustRootDocError::EmptyKeyId(_)) => RemoteStoreError::InvalidRequest {
+                detail: invalid.to_string(),
+            },
+            bad @ TrustRootDocError::BadSchema { .. } => {
+                tracing::error!(error = %bad, "trust-root schema rejected outside storage");
+                RemoteStoreError::Internal {
+                    message: "trust-root document schema misconfigured".to_string(),
+                }
+            }
         })
     }
 }
@@ -1069,6 +1098,270 @@ pub(crate) async fn rollback_extension_binding<S: EnvironmentStorage>(
 }
 
 // ---------------------------------------------------------------------------
+// Handlers — trust root (PR-4.2f)
+// ---------------------------------------------------------------------------
+//
+// The trust root is an env-scoped sidecar resource (the server analogue of
+// the LocalFS `<env_dir>/trust-root.json`): its verbs never touch the
+// environment document. The mutation envelope therefore echoes the ENV's
+// unchanged CAS coordinates (previous == new generation — mirroring the
+// local path, whose trust-root audit records carry no generations), while
+// the trust-root row's OWN generation/etag pins the upsert internally so
+// concurrent trust-root mutations conflict with a 412 like every other
+// verb group. The pure semantics (key-id canonicalization, validation,
+// add/remove transforms) come from `greentic-operator-trust` — the same
+// functions `LocalFsStore` drives, per the same-derivation rule.
+
+/// Decoded preamble shared by the four trust-root mutations: the
+/// idempotency key, the parsed env id, the env's CAS coordinates (the
+/// `load_env` doubles as the 404 existence gate), and the current
+/// trust-root row if one exists.
+struct TrustRootRequest {
+    idem_key: String,
+    env_id: EnvId,
+    env_revision: EnvRevision,
+    current: Option<LoadedTrustRoot>,
+}
+
+async fn load_trust_root_request<S: EnvironmentStorage>(
+    state: &AppState<S>,
+    raw_env_id: &str,
+    headers: &HeaderMap,
+) -> Result<TrustRootRequest, ApiError> {
+    let idem_key = require_idempotency_key(headers)?;
+    let env_id = parse_env_id(raw_env_id)?;
+    let env = state
+        .storage
+        .load_env(&env_id)
+        .await
+        .map_err(load_storage_error)?;
+    let current = state
+        .storage
+        .load_trust_root(&env_id)
+        .await
+        .map_err(load_storage_error)?;
+    Ok(TrustRootRequest {
+        idem_key,
+        env_id,
+        env_revision: env.revision,
+        current,
+    })
+}
+
+/// Split the loaded row into a workable document plus the CAS pin for the
+/// follow-up upsert (`None` = create-if-absent first write).
+fn doc_and_precondition(
+    current: Option<LoadedTrustRoot>,
+) -> (TrustRootDocument, Option<Precondition>) {
+    match current {
+        Some(loaded) => (
+            loaded.value,
+            Some(Precondition::matching(
+                loaded.revision.etag,
+                loaded.revision.generation,
+            )),
+        ),
+        None => (TrustRootDocument::v1(Vec::new()), None),
+    }
+}
+
+/// Load (or first-time generate) the SERVER's operator signing key — the
+/// remote analogue of the CLI's `operator_key::load_or_generate`. The
+/// PR-3b wire contract sends NO body on bootstrap/seed: the key is the
+/// server's identity, never the caller's. Key-file I/O (and a possible
+/// keygen) runs on the blocking pool.
+async fn load_server_operator_key(path: Option<Arc<PathBuf>>) -> Result<OperatorKey, ApiError> {
+    let loaded = tokio::task::spawn_blocking(move || match path {
+        Some(path) => operator_key::load_or_generate_at(&path),
+        None => operator_key::load_or_generate(),
+    })
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "operator-key loader task failed");
+        operator_key_unavailable()
+    })?;
+    loaded.map_err(|err| {
+        // Filesystem detail stays in the log, not on the wire.
+        tracing::error!(error = %err, "server operator key unavailable");
+        operator_key_unavailable()
+    })
+}
+
+fn operator_key_unavailable() -> ApiError {
+    ApiError(RemoteStoreError::Internal {
+        message: "server operator key unavailable".to_string(),
+    })
+}
+
+/// Shared body of bootstrap/seed: add the server operator key to the
+/// (possibly fresh) document — idempotent re-grant on case-insensitive
+/// `key_id` collision — and persist under the row's CAS pin.
+async fn grant_operator_key<S: EnvironmentStorage>(
+    state: &AppState<S>,
+    env_id: &EnvId,
+    current: Option<LoadedTrustRoot>,
+) -> Result<TrustRootSeed, ApiError> {
+    let op_key = load_server_operator_key(state.operator_key_path.clone()).await?;
+    let (mut doc, precondition) = doc_and_precondition(current);
+    let entry = trust_root::validate_trusted_key(TrustedKey {
+        key_id: op_key.key_id.clone(),
+        public_key_pem: op_key.public_pem.clone(),
+    })?;
+    trust_root::apply_add(&mut doc.keys, entry);
+    state
+        .storage
+        .upsert_trust_root(env_id, &doc, precondition.as_ref())
+        .await?;
+    Ok(TrustRootSeed {
+        key_id: op_key.key_id,
+        public_key_pem: op_key.public_pem,
+        trusted_key_count: doc.keys.len(),
+    })
+}
+
+/// `POST /environments/{env_id}/trust-root/bootstrap` — load (or generate)
+/// the server operator key and grant it on the env trust root (A8 route
+/// 18). Idempotent re-grant, mirroring `LocalFsStore::bootstrap_trust_root`.
+pub(crate) async fn bootstrap_trust_root<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let req = load_trust_root_request(&state, &env_id, &headers).await?;
+    let seed = grant_operator_key(&state, &req.env_id, req.current).await?;
+    let target = json!({"environment_id": req.env_id, "key_id": seed.key_id});
+    Ok(mutation_response(
+        seed,
+        &req.env_id,
+        "trust-root",
+        "bootstrap",
+        target,
+        req.idem_key,
+        Some(req.env_revision.generation),
+        req.env_revision,
+    ))
+}
+
+/// `POST /environments/{env_id}/trust-root/seed` — first-init-only variant
+/// (A8 route 19): a `null` result when a trust root already exists
+/// (operator has touched it via bootstrap/add/remove), the freshly granted
+/// seed otherwise. Row existence is the gate — the server analogue of the
+/// LocalFS `trust-root.json` existence check.
+pub(crate) async fn seed_trust_root<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let req = load_trust_root_request(&state, &env_id, &headers).await?;
+    let seed = match req.current {
+        Some(_) => None,
+        None => Some(grant_operator_key(&state, &req.env_id, None).await?),
+    };
+    let mut target = json!({"environment_id": req.env_id});
+    if let (Some(seed), Value::Object(map)) = (&seed, &mut target) {
+        map.insert("key_id".to_string(), json!(seed.key_id));
+    }
+    Ok(mutation_response(
+        seed,
+        &req.env_id,
+        "trust-root",
+        "seed",
+        target,
+        req.idem_key,
+        Some(req.env_revision.generation),
+        req.env_revision,
+    ))
+}
+
+/// `POST /environments/{env_id}/trust-root/keys` — validate and add a
+/// caller-supplied `(key_id, public_key_pem)` entry (A8 route 20).
+/// Idempotent on case-insensitive `key_id` collision (the PEM is
+/// replaced). The stored entry carries the canonical lowercase id; the
+/// outcome echoes the caller's form, mirroring `LocalFsStore`.
+pub(crate) async fn add_trusted_key<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<AddTrustedKeyPayload>,
+) -> Result<Response, ApiError> {
+    let req = load_trust_root_request(&state, &env_id, &headers).await?;
+    let (mut doc, precondition) = doc_and_precondition(req.current);
+    let supplied_key_id = payload.key_id.clone();
+    let entry = trust_root::validate_trusted_key(TrustedKey {
+        key_id: payload.key_id,
+        public_key_pem: payload.public_key_pem,
+    })?;
+    // The audit target carries the full PEM so a later-removed key can be
+    // reconstructed from the audit log alone — same recovery rationale as
+    // the local CLI's audit target.
+    let target = json!({
+        "environment_id": req.env_id,
+        "key_id": supplied_key_id,
+        "public_key_pem": entry.public_key_pem,
+    });
+    trust_root::apply_add(&mut doc.keys, entry);
+    state
+        .storage
+        .upsert_trust_root(&req.env_id, &doc, precondition.as_ref())
+        .await?;
+    let outcome = TrustRootAddOutcome {
+        added_key_id: supplied_key_id,
+        trusted_key_count: doc.keys.len(),
+    };
+    Ok(mutation_response(
+        outcome,
+        &req.env_id,
+        "trust-root",
+        "add",
+        target,
+        req.idem_key,
+        Some(req.env_revision.generation),
+        req.env_revision,
+    ))
+}
+
+/// `DELETE /environments/{env_id}/trust-root/keys/{key_id}` — remove a
+/// trusted key by case-insensitive id (A8 route 21). Silent no-op when the
+/// id is absent; the pre-removal PEM is captured for the outcome's
+/// recovery material. A no-op never persists — it must not materialize a
+/// trust-root row where none existed (row absence is the seed gate).
+pub(crate) async fn remove_trusted_key<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path((env_id, key_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let req = load_trust_root_request(&state, &env_id, &headers).await?;
+    let (mut doc, precondition) = doc_and_precondition(req.current);
+    let removed_public_key_pem = doc
+        .keys
+        .iter()
+        .find(|k| k.key_id.eq_ignore_ascii_case(&key_id))
+        .map(|k| k.public_key_pem.clone());
+    if trust_root::apply_remove(&mut doc.keys, &key_id) {
+        state
+            .storage
+            .upsert_trust_root(&req.env_id, &doc, precondition.as_ref())
+            .await?;
+    }
+    let target = json!({"environment_id": req.env_id, "key_id": key_id});
+    let outcome = TrustRootRemoveOutcome {
+        removed_key_id: key_id,
+        removed_public_key_pem,
+        trusted_key_count: doc.keys.len(),
+    };
+    Ok(mutation_response(
+        outcome,
+        &req.env_id,
+        "trust-root",
+        "remove",
+        target,
+        req.idem_key,
+        Some(req.env_revision.generation),
+        req.env_revision,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Handlers — reads
 // ---------------------------------------------------------------------------
 
@@ -1108,4 +1401,27 @@ pub struct GetEnvironmentResponse {
     pub environment: Environment,
     pub etag: StateEtag,
     pub generation: u64,
+}
+
+/// `GET /environments/{env_id}/trust-root` — list the env's trusted keys.
+/// An absent row reads as an empty key set (closed-by-default, mirroring
+/// the LocalFS `load`), while a missing ENV is still a 404. Plain JSON in
+/// the local CLI's `trust-root list` shape; the remote-dispatch `list`
+/// verb wires up to this in the read-verbs follow-up.
+pub(crate) async fn get_trust_root<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let env_id = parse_env_id(&env_id)?;
+    if !state.storage.exists(&env_id).await? {
+        return Err(ApiError(RemoteStoreError::NotFound));
+    }
+    let keys = state
+        .storage
+        .load_trust_root(&env_id)
+        .await
+        .map_err(load_storage_error)?
+        .map(|loaded| loaded.value.keys)
+        .unwrap_or_default();
+    Ok(Json(json!({"environment_id": env_id, "keys": keys})))
 }

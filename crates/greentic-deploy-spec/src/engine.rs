@@ -48,6 +48,11 @@ pub use traffic::*;
 pub mod bindings;
 pub use bindings::*;
 
+/// Trust-root verb group wire shapes (PR-4.2f). Shapes only — the pure
+/// transforms need crypto and live in `greentic-operator-trust`.
+pub mod trust_root;
+pub use trust_root::*;
+
 /// Failures produced by pure verb transforms. Each backend maps these onto
 /// its own error surface: `LocalFsStore` → `StoreError`,
 /// the operator-store-server → [`crate::remote::RemoteStoreError`].

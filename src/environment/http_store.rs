@@ -90,11 +90,11 @@ use serde_json::Value;
 use url::Url;
 
 use super::mutations::{
-    AddBundlePayload, AddMessagingEndpointPayload, ApplyTrafficSplitOutcome, EnvironmentMutations,
-    ExtensionKey, MigrateMergePayload, RemoveBundleOutcome, RevisionTransitionOutcome,
-    RollbackTrafficSplitOutcome, SetMessagingWelcomeFlowPayload, SetTrafficSplitPayload,
-    StageRevisionPayload, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
-    UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
+    AddBundlePayload, AddMessagingEndpointPayload, AddTrustedKeyPayload, ApplyTrafficSplitOutcome,
+    EnvironmentMutations, ExtensionKey, MigrateMergePayload, RemoveBundleOutcome,
+    RevisionTransitionOutcome, RollbackTrafficSplitOutcome, SetMessagingWelcomeFlowPayload,
+    SetTrafficSplitPayload, StageRevisionPayload, TrustRootAddOutcome, TrustRootRemoveOutcome,
+    TrustRootSeed, UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 use super::store::StoreError;
 
@@ -697,31 +697,10 @@ struct RotateWebhookSecretRequest {
     updated_by: String,
 }
 
-#[derive(Serialize)]
-struct AddTrustedKeyRequest {
-    key_id: String,
-    public_key_pem: String,
-}
-
-#[derive(Deserialize)]
-struct TrustRootSeedResponse {
-    key_id: String,
-    public_key_pem: String,
-    trusted_key_count: usize,
-}
-
-#[derive(Deserialize)]
-struct TrustRootAddResponse {
-    added_key_id: String,
-    trusted_key_count: usize,
-}
-
-#[derive(Deserialize)]
-struct TrustRootRemoveResponse {
-    removed_key_id: String,
-    removed_public_key_pem: Option<String>,
-    trusted_key_count: usize,
-}
+// Trust-root wire shapes (`AddTrustedKeyPayload`, `TrustRootSeed`,
+// `TrustRootAddOutcome`, `TrustRootRemoveOutcome`) are the shared
+// `greentic_deploy_spec::engine` types since PR-4.2f — the client
+// serializes/deserializes the same structs the server does.
 
 // ---------------------------------------------------------------------------
 // EnvironmentMutations impl
@@ -1277,20 +1256,12 @@ impl EnvironmentMutations for HttpEnvironmentStore {
 
     fn bootstrap_trust_root(&self, env_id: &EnvId) -> Result<TrustRootSeed, StoreError> {
         let idem_key = mint_idempotency_key();
-        let resp: TrustRootSeedResponse = self.send_mutation_no_body(
+        self.send_mutation_no_body(
             env_id,
             reqwest::Method::POST,
-            &format!(
-                "environments/{}/trust-root/bootstrap",
-                encode_segment(env_id.as_str())
-            ),
+            &self.env_path(env_id, "/trust-root/bootstrap"),
             Some(&idem_key),
-        )?;
-        Ok(TrustRootSeed {
-            key_id: resp.key_id,
-            public_key_pem: resp.public_key_pem,
-            trusted_key_count: resp.trusted_key_count,
-        })
+        )
     }
 
     fn seed_trust_root_if_absent(
@@ -1298,20 +1269,12 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         env_id: &EnvId,
     ) -> Result<Option<TrustRootSeed>, StoreError> {
         let idem_key = mint_idempotency_key();
-        let resp: Option<TrustRootSeedResponse> = self.send_mutation_no_body(
+        self.send_mutation_no_body(
             env_id,
             reqwest::Method::POST,
-            &format!(
-                "environments/{}/trust-root/seed",
-                encode_segment(env_id.as_str())
-            ),
+            &self.env_path(env_id, "/trust-root/seed"),
             Some(&idem_key),
-        )?;
-        Ok(resp.map(|r| TrustRootSeed {
-            key_id: r.key_id,
-            public_key_pem: r.public_key_pem,
-            trusted_key_count: r.trusted_key_count,
-        }))
+        )
     }
 
     fn add_trusted_key(
@@ -1322,24 +1285,17 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<TrustRootAddOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let req = AddTrustedKeyRequest {
+        let req = AddTrustedKeyPayload {
             key_id,
             public_key_pem,
         };
-        let resp: TrustRootAddResponse = self.send_mutation(
+        self.send_mutation(
             env_id,
             reqwest::Method::POST,
-            &format!(
-                "environments/{}/trust-root/keys",
-                encode_segment(env_id.as_str())
-            ),
+            &self.env_path(env_id, "/trust-root/keys"),
             Some(&idem_key),
             Some(&req),
-        )?;
-        Ok(TrustRootAddOutcome {
-            added_key_id: resp.added_key_id,
-            trusted_key_count: resp.trusted_key_count,
-        })
+        )
     }
 
     fn remove_trusted_key(
@@ -1349,7 +1305,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<TrustRootRemoveOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let resp: TrustRootRemoveResponse = self.send_mutation_no_body(
+        self.send_mutation_no_body(
             env_id,
             reqwest::Method::DELETE,
             &format!(
@@ -1358,12 +1314,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
                 encode_segment(&key_id),
             ),
             Some(&idem_key),
-        )?;
-        Ok(TrustRootRemoveOutcome {
-            removed_key_id: resp.removed_key_id,
-            removed_public_key_pem: resp.removed_public_key_pem,
-            trusted_key_count: resp.trusted_key_count,
-        })
+        )
     }
 }
 

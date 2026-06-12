@@ -46,10 +46,15 @@ use super::StoreError;
 // A8 `Idempotency-Key` header), matching every other verb group. (The
 // traffic outcomes gained an `environment` snapshot: the CLI emits
 // `TrafficSplitApplied` telemetry from it, identical local and remote.)
+// PR-4.2f: the trust-root group's wire shapes (`AddTrustedKeyPayload`,
+// `TrustRootSeed`, `TrustRootAddOutcome`, `TrustRootRemoveOutcome`)
+// followed — shapes only; the pure transforms need crypto and live in
+// `greentic-operator-trust`.
 pub use greentic_deploy_spec::engine::{
-    ApplyTrafficSplitOutcome, ExtensionKey, FieldUpdate, MigrateMergePayload, MigrateSeedPayload,
-    RevisionTransitionOutcome, RollbackTrafficSplitOutcome, SetTrafficSplitPayload,
-    StageRevisionPayload, UpdateEnvironmentPayload, WarmRevisionPayload,
+    AddTrustedKeyPayload, ApplyTrafficSplitOutcome, ExtensionKey, FieldUpdate, MigrateMergePayload,
+    MigrateSeedPayload, RevisionTransitionOutcome, RollbackTrafficSplitOutcome,
+    SetTrafficSplitPayload, StageRevisionPayload, TrustRootAddOutcome, TrustRootRemoveOutcome,
+    TrustRootSeed, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 
 /// Outcome of [`EnvironmentMutations::remove_bundle`]. Surfaces the
@@ -65,38 +70,6 @@ pub struct RemoveBundleOutcome {
     /// live-state guard refuses any non-archived revision under the
     /// deployment).
     pub pruned_revision_ids: Vec<RevisionId>,
-}
-
-/// Outcome of seeding the bootstrap trust root for an env (the operator
-/// signing key for revenue policies and other env-scoped DSSE artifacts).
-///
-/// `trusted_key_count` is the post-add total — the CLI surfaces it on the
-/// wire so operators can see at a glance whether they added a duplicate.
-#[derive(Debug, Clone)]
-pub struct TrustRootSeed {
-    pub key_id: String,
-    pub public_key_pem: String,
-    pub trusted_key_count: usize,
-}
-
-/// Outcome of [`EnvironmentMutations::add_trusted_key`]. The store returns
-/// typed data so every backend stays uniform; the CLI shapes the wire JSON
-/// (adding `environment_id` from the caller's request context).
-#[derive(Debug, Clone)]
-pub struct TrustRootAddOutcome {
-    pub added_key_id: String,
-    pub trusted_key_count: usize,
-}
-
-/// Outcome of [`EnvironmentMutations::remove_trusted_key`]. `removed_public_key_pem`
-/// is `None` when the key was already absent (silent no-op); the HTTP backend
-/// MUST cache the original `Some(pem)` against the idempotency key so a retry
-/// returns the original PEM rather than `None`.
-#[derive(Debug, Clone)]
-pub struct TrustRootRemoveOutcome {
-    pub removed_key_id: String,
-    pub removed_public_key_pem: Option<String>,
-    pub trusted_key_count: usize,
 }
 
 /// Inputs to [`EnvironmentMutations::add_bundle`].
@@ -453,8 +426,10 @@ pub trait EnvironmentMutations: Send + Sync {
     //   (`seed_trust_root_if_absent` is called from `op env init`)
     // -------------------------------------------------------------
 
-    /// Generate and persist a fresh operator signing key for the env.
-    /// Rejects if a trust root already exists.
+    /// Load (or generate) the backend's operator signing key and add it to
+    /// the env trust root. Idempotent re-grant: a second call with the same
+    /// operator key is a no-op on the key set (case-insensitive `key_id`
+    /// dedup), and it never rejects on an existing trust root.
     fn bootstrap_trust_root(&self, env_id: &EnvId) -> Result<TrustRootSeed, StoreError>;
 
     /// Idempotent variant called from `op env init`: returns `Some(seed)`

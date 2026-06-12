@@ -2542,6 +2542,7 @@ dependencies = [
  "clap",
  "fs4",
  "greentic-deploy-spec 0.1.0",
+ "greentic-operator-trust",
  "http-body-util",
  "serde",
  "serde_json",

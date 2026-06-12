@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use greentic_operator_store_server::http::router;
+use greentic_operator_store_server::http::{router, router_with_operator_key};
 use greentic_operator_store_server::sqlite::SqliteEnvironmentStore;
 
 /// Operator store server: HTTP front for the Greentic environment store.
@@ -19,6 +19,12 @@ struct Args {
     /// SQLite database file (created, with parent directories, if missing).
     #[arg(long, env = "GREENTIC_STORE_DB")]
     db: PathBuf,
+    /// Path of the server's operator signing key (PEM, created on first
+    /// trust-root bootstrap/seed if missing). Defaults to the standard
+    /// operator-key resolution: `GTC_OPERATOR_KEY_PATH`, else
+    /// `~/.greentic/operator/key.pem`.
+    #[arg(long, env = "GREENTIC_STORE_OPERATOR_KEY")]
+    operator_key: Option<PathBuf>,
     /// Allow binding to a non-loopback address. Dev-only escape hatch: the
     /// server has no authentication yet (RBAC = PR-4.4). This flag will be
     /// removed or replaced with a proper auth gate when RBAC lands.
@@ -58,7 +64,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // `open` creates the parent directory and the database file if missing.
     let store = SqliteEnvironmentStore::open(&args.db).await?;
-    let app = router(Arc::new(store));
+    let storage = Arc::new(store);
+    let app = match args.operator_key {
+        Some(path) => router_with_operator_key(storage, path),
+        None => router(storage),
+    };
 
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     tracing::info!(

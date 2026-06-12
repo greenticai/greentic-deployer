@@ -30,8 +30,11 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
 };
 
+use greentic_operator_trust::trust_root::{TRUST_ROOT_SCHEMA_V1, TrustRootDocument};
+
 use crate::storage::{
-    EnvRevision, EnvironmentStorage, Loaded, LoadedAnswers, LoadedEnv, LoadedRuntime, StorageError,
+    EnvRevision, EnvironmentStorage, Loaded, LoadedAnswers, LoadedEnv, LoadedRuntime,
+    LoadedTrustRoot, StorageError,
 };
 
 impl From<sqlx::Error> for StorageError {
@@ -480,6 +483,108 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
                 .bind(&integrity.digest)
                 .bind(env_id.as_str())
                 .bind(slot.as_str())
+                .execute(&mut *tx)
+                .await?;
+                new_gen
+            }
+        };
+        tx.commit().await?;
+        Ok(EnvRevision {
+            generation: new_gen,
+            etag,
+        })
+    }
+
+    // --- trust root -------------------------------------------------------
+
+    async fn load_trust_root(
+        &self,
+        env_id: &EnvId,
+    ) -> Result<Option<LoadedTrustRoot>, StorageError> {
+        let row = sqlx::query(
+            "SELECT generation, etag, data, integrity_digest \
+             FROM trust_roots WHERE env_id = $1",
+        )
+        .bind(env_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let (revision, data, stored_digest) = decode_revision_with_data(&row)?;
+        verify_integrity(env_id, &data, stored_digest)?;
+        let doc: TrustRootDocument = serde_json::from_value(data)?;
+        if doc.schema != TRUST_ROOT_SCHEMA_V1 {
+            return Err(StorageError::Spec(SpecError::SchemaMismatch {
+                expected: TRUST_ROOT_SCHEMA_V1,
+                actual: doc.schema,
+            }));
+        }
+        Ok(Some(Loaded {
+            value: doc,
+            revision,
+        }))
+    }
+
+    async fn upsert_trust_root(
+        &self,
+        env_id: &EnvId,
+        doc: &TrustRootDocument,
+        precondition: Option<&Precondition>,
+    ) -> Result<EnvRevision, StorageError> {
+        if doc.schema != TRUST_ROOT_SCHEMA_V1 {
+            return Err(StorageError::Spec(SpecError::SchemaMismatch {
+                expected: TRUST_ROOT_SCHEMA_V1,
+                actual: doc.schema.clone(),
+            }));
+        }
+        let (etag, integrity, data) = serialize_for_write(doc)?;
+
+        let mut tx = self.pool.begin().await?;
+        let current = sqlx::query("SELECT generation, etag FROM trust_roots WHERE env_id = $1")
+            .bind(env_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+
+        let new_gen = match current {
+            None => {
+                // Row absent: only the create-if-absent path (no
+                // precondition) applies — see `upsert_runtime`.
+                if precondition.is_some_and(|pc| pc.is_conditional()) {
+                    return Err(StorageError::NotFound(env_id.clone()));
+                }
+                sqlx::query(
+                    "INSERT INTO trust_roots \
+                     (env_id, generation, etag, data, integrity_digest) \
+                     VALUES ($1, 1, $2, $3, $4)",
+                )
+                .bind(env_id.as_str())
+                .bind(&etag.0)
+                .bind(&data)
+                .bind(&integrity.digest)
+                .execute(&mut *tx)
+                .await?;
+                1
+            }
+            Some(current) => {
+                let Some(pc) = precondition else {
+                    return Err(StorageError::PreconditionRequired);
+                };
+                let current_rev = decode_revision(&current)?;
+                pc.check(&current_rev.etag, current_rev.generation)
+                    .map_err(|e| StorageError::from_precondition(env_id.clone(), e))?;
+                let new_gen = current_rev.generation + 1;
+                sqlx::query(
+                    "UPDATE trust_roots \
+                     SET data = $1, generation = $2, etag = $3, \
+                         integrity_digest = $4, updated_at = datetime('now') \
+                     WHERE env_id = $5",
+                )
+                .bind(&data)
+                .bind(new_gen as i64)
+                .bind(&etag.0)
+                .bind(&integrity.digest)
+                .bind(env_id.as_str())
                 .execute(&mut *tx)
                 .await?;
                 new_gen
