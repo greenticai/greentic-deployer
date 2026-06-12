@@ -625,8 +625,8 @@ fn remote_bundles_add(
                 route_binding: Some(super::bundles::into_route_binding(route_binding_payload)),
                 authorization_ref: Some(payload.authorization_ref.to_string_lossy().into_owned()),
                 config_overrides: payload.config_overrides,
-                idempotency_key,
             },
+            idempotency_key,
         )
         .map_err(map_store_err_preserving_noun)?;
     Ok(OpOutcome::new(
@@ -662,8 +662,8 @@ fn remote_bundles_update(
                 route_binding: new_route_binding,
                 revenue_share: new_revenue_share,
                 config_overrides: payload.config_overrides,
-                idempotency_key,
             },
+            idempotency_key,
         )
         .map_err(map_store_err_preserving_noun)?;
     Ok(OpOutcome::new(

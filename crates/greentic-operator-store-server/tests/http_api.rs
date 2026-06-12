@@ -555,8 +555,10 @@ use greentic_deploy_spec::{
 use std::path::PathBuf;
 
 /// Seed an env carrying one bundle deployment directly through the storage
-/// backend — the bundles verb group has no server route yet (PR-4.2e+), and
-/// revisions can only be staged under an existing deployment.
+/// backend — revision tests need a deployment but not the bundle group's
+/// trust-root/revenue-policy preconditions (`POST /bundles` exists since
+/// PR-4.2g; the revision tests stay storage-seeded to keep them
+/// independent).
 async fn seed_env_with_deployment(store: &SqliteEnvironmentStore, env_id: &str) -> DeploymentId {
     let eid = EnvId::try_from(env_id).expect("env id");
     let mut env = greentic_deploy_spec::engine::fresh_environment(
@@ -2128,4 +2130,435 @@ async fn trust_root_concurrent_bootstraps_converge() {
     let (status, body) = send(app, Method::GET, "/environments/local/trust-root", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["keys"].as_array().expect("keys").len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// PR-4.2g — bundles verb group
+// ---------------------------------------------------------------------------
+
+fn add_bundle_body(bundle: &str, customer: &str) -> Value {
+    json!({
+        "bundle_id": bundle,
+        "customer_id": customer,
+        "revenue_share": [{"party_id": "greentic", "basis_points": 10_000}],
+        "config_overrides": {},
+    })
+}
+
+/// App + env + bootstrapped trust root — the precondition for any bundle
+/// verb that writes a revenue policy (the server refuses closed-by-default
+/// otherwise).
+async fn bundles_app() -> (tempfile::TempDir, Router, Arc<SqliteEnvironmentStore>) {
+    let (dir, app, store) = app_with_trust_key().await;
+    create_local_env(&app).await;
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/trust-root/bootstrap",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bootstrap failed: {body}");
+    (dir, app, store)
+}
+
+async fn add_one_bundle(app: &Router, bundle: &str, customer: &str) -> DeploymentId {
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/bundles",
+        Some(add_bundle_body(bundle, customer)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "add bundle failed: {body}");
+    body["result"]["deployment_id"]
+        .as_str()
+        .expect("deployment_id")
+        .parse::<ulid::Ulid>()
+        .map(DeploymentId)
+        .expect("ulid deployment_id")
+}
+
+#[tokio::test]
+async fn bundles_add_persists_deployment_and_signed_policy_artifact() {
+    let (_d, app, store) = bundles_app().await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/bundles",
+        Some(add_bundle_body("acme", "cust-1")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_envelope(&body, "local");
+    assert_eq!(body["audit"]["noun"], "bundles");
+    assert_eq!(body["audit"]["verb"], "add");
+    assert_eq!(body["audit"]["target"]["revenue_policy_version"], 1);
+    let result = &body["result"];
+    assert_eq!(result["bundle_id"], "acme");
+    assert_eq!(result["customer_id"], "cust-1");
+    assert_eq!(result["status"], "active");
+    assert_eq!(
+        result["revenue_policy_ref"],
+        "billing-policies/acme/cust-1/v1.json.sig"
+    );
+    let deployment_id = result["deployment_id"].as_str().expect("server-minted id");
+    assert!(deployment_id.parse::<ulid::Ulid>().is_ok());
+    // Env CAS advanced (create=1 → bundle add=2).
+    assert_eq!(body["generation"], 2);
+
+    // The artifact row holds the exact built bytes, self-consistent.
+    let artifact = store
+        .load_revenue_policy(
+            &EnvId::try_from("local").unwrap(),
+            &BundleId::new("acme"),
+            &CustomerId::new("cust-1"),
+            1,
+        )
+        .await
+        .expect("load artifact")
+        .expect("v1 artifact stored");
+    assert_eq!(
+        artifact.policy_ref,
+        "billing-policies/acme/cust-1/v1.json.sig"
+    );
+    assert_eq!(
+        artifact.doc_sha256,
+        greentic_operator_trust::revenue_policy::sha256_hex(&artifact.doc)
+    );
+    let doc: Value = serde_json::from_slice(&artifact.doc).expect("doc decodes");
+    assert_eq!(doc["schema"], "greentic.revenue-policy.v1");
+    assert_eq!(doc["version"], 1);
+    assert_eq!(doc["deployment_id"], deployment_id);
+    assert!(doc.get("previous_version_ref").is_none(), "v1 has no chain");
+    // The sidecar is a DSSE envelope signed by the bootstrapped server key.
+    let envelope: Value = serde_json::from_slice(&artifact.envelope).expect("envelope decodes");
+    assert_eq!(envelope["payloadType"], "application/vnd.in-toto+json");
+    assert_eq!(envelope["signatures"][0]["keyid"], artifact.key_id.as_str());
+
+    // And the stored environment carries the pinned ref.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["bundles"][0]["revenue_policy_ref"],
+        "billing-policies/acme/cust-1/v1.json.sig"
+    );
+}
+
+#[tokio::test]
+async fn bundles_add_without_trust_root_is_409_not_trusted_and_persists_nothing() {
+    let (_d, app, store) = app_with_trust_key().await;
+    create_local_env(&app).await;
+    // No bootstrap: the trust-root row is absent → empty trust root →
+    // closed-by-default refusal.
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/bundles",
+        Some(add_bundle_body("acme", "cust-1")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "conflict");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("is not trusted in env `local`"),
+        "detail should guide to bootstrap: {body}"
+    );
+
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(read["environment"]["bundles"], json!([]));
+    let artifact = store
+        .load_revenue_policy(
+            &EnvId::try_from("local").unwrap(),
+            &BundleId::new("acme"),
+            &CustomerId::new("cust-1"),
+            1,
+        )
+        .await
+        .expect("load artifact");
+    assert!(artifact.is_none(), "refusal must leave no artifact row");
+}
+
+#[tokio::test]
+async fn bundles_add_duplicate_pair_is_409_already_exists() {
+    let (_d, app, _store) = bundles_app().await;
+    add_one_bundle(&app, "acme", "cust-1").await;
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/bundles",
+        Some(add_bundle_body("acme", "cust-1")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "already-exists");
+
+    // Same bundle, different customer: a distinct deployment.
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/environments/local/bundles",
+        Some(add_bundle_body("acme", "cust-2")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
+#[tokio::test]
+async fn bundles_update_revenue_share_chains_policy_v2() {
+    let (_d, app, store) = bundles_app().await;
+    let did = add_one_bundle(&app, "acme", "cust-1").await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::PATCH,
+        &format!("/environments/local/bundles/{did}"),
+        Some(json!({
+            "deployment_id": did.to_string(),
+            "status": "paused",
+            "revenue_share": [{"party_id": "partner", "basis_points": 10_000}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_envelope(&body, "local");
+    assert_eq!(body["audit"]["verb"], "update");
+    assert_eq!(body["audit"]["target"]["revenue_policy_version"], 2);
+    assert_eq!(body["result"]["status"], "paused");
+    assert_eq!(
+        body["result"]["revenue_policy_ref"],
+        "billing-policies/acme/cust-1/v2.json.sig"
+    );
+    assert_eq!(
+        body["result"]["revenue_share"],
+        json!([{"party_id": "partner", "basis_points": 10_000}])
+    );
+
+    // v2 chains back to the committed v1 sidecar.
+    let artifact = store
+        .load_revenue_policy(
+            &EnvId::try_from("local").unwrap(),
+            &BundleId::new("acme"),
+            &CustomerId::new("cust-1"),
+            2,
+        )
+        .await
+        .expect("load artifact")
+        .expect("v2 artifact stored");
+    let doc: Value = serde_json::from_slice(&artifact.doc).expect("doc decodes");
+    assert_eq!(
+        doc["previous_version_ref"],
+        "billing-policies/acme/cust-1/v1.json.sig"
+    );
+}
+
+#[tokio::test]
+async fn bundles_update_without_revenue_share_writes_no_policy() {
+    let (_d, app, store) = bundles_app().await;
+    let did = add_one_bundle(&app, "acme", "cust-1").await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::PATCH,
+        &format!("/environments/local/bundles/{did}"),
+        Some(json!({
+            "deployment_id": did.to_string(),
+            "status": "paused",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body["audit"]["target"]["revenue_policy_version"].is_null());
+    assert_eq!(
+        body["result"]["revenue_policy_ref"], "billing-policies/acme/cust-1/v1.json.sig",
+        "ref unchanged"
+    );
+    let artifact = store
+        .load_revenue_policy(
+            &EnvId::try_from("local").unwrap(),
+            &BundleId::new("acme"),
+            &CustomerId::new("cust-1"),
+            2,
+        )
+        .await
+        .expect("load artifact");
+    assert!(artifact.is_none(), "no v2 without a revenue_share patch");
+}
+
+#[tokio::test]
+async fn bundles_update_unknown_deployment_is_404_dependent_not_found() {
+    let (_d, app, _store) = bundles_app().await;
+    let ghost = DeploymentId::new();
+    let (status, body) = send(
+        app,
+        Method::PATCH,
+        &format!("/environments/local/bundles/{ghost}"),
+        Some(json!({"deployment_id": ghost.to_string(), "status": "paused"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["kind"], "dependent-not-found");
+}
+
+#[tokio::test]
+async fn bundles_update_body_url_mismatch_is_400() {
+    let (_d, app, _store) = bundles_app().await;
+    let did = add_one_bundle(&app, "acme", "cust-1").await;
+    let other = DeploymentId::new();
+    let (status, body) = send(
+        app,
+        Method::PATCH,
+        &format!("/environments/local/bundles/{did}"),
+        Some(json!({"deployment_id": other.to_string(), "status": "paused"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["kind"], "invalid-request");
+}
+
+#[tokio::test]
+async fn bundles_remove_quiesced_deployment_prunes_and_persists() {
+    let (_d, app, _store) = bundles_app().await;
+    let did = add_one_bundle(&app, "acme", "cust-1").await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::DELETE,
+        &format!("/environments/local/bundles/{did}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_envelope(&body, "local");
+    assert_eq!(body["audit"]["verb"], "remove");
+    assert_eq!(
+        body["result"]["deployment"]["deployment_id"],
+        did.to_string()
+    );
+    assert_eq!(body["result"]["pruned_revision_ids"], json!([]));
+
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(read["environment"]["bundles"], json!([]));
+}
+
+#[tokio::test]
+async fn bundles_remove_with_live_revision_is_409_conflict() {
+    let (_d, app, _store) = bundles_app().await;
+    let did = add_one_bundle(&app, "acme", "cust-1").await;
+    // Stage a revision under the deployment — live state.
+    stage_one(&app, did).await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::DELETE,
+        &format!("/environments/local/bundles/{did}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "conflict");
+    assert!(
+        body["detail"].as_str().unwrap_or("").contains("still live"),
+        "body: {body}"
+    );
+
+    // Nothing removed.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(read["environment"]["bundles"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        read["environment"]["revisions"].as_array().unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn bundles_remove_unknown_deployment_is_404_dependent_not_found() {
+    let (_d, app, _store) = bundles_app().await;
+    let ghost = DeploymentId::new();
+    let (status, body) = send(
+        app,
+        Method::DELETE,
+        &format!("/environments/local/bundles/{ghost}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["kind"], "dependent-not-found");
+}
+
+#[tokio::test]
+async fn bundles_concurrent_updates_keep_env_and_artifact_consistent() {
+    // Codex F1 at the route level: two concurrent revenue-share updates of
+    // the same deployment race load → build → commit. Whatever the
+    // interleave (full serialization → both 200; overlapping loads → the
+    // loser's CAS fails 412 and its artifact rolls back), the COMMITTED
+    // environment must reference an artifact whose content matches the
+    // committed revenue share.
+    let (_d, app, store) = bundles_app().await;
+    let did = add_one_bundle(&app, "acme", "cust-1").await;
+
+    let update = |party: &str, key: &str| {
+        let body = json!({
+            "deployment_id": did.to_string(),
+            "revenue_share": [{"party_id": party, "basis_points": 10_000}],
+        });
+        let key = key.to_string();
+        let app = app.clone();
+        async move {
+            send_custom(
+                app,
+                Method::PATCH,
+                &format!("/environments/local/bundles/{did}"),
+                Some(body),
+                &[("Idempotency-Key", &key)],
+            )
+            .await
+        }
+    };
+    let (r1, r2) = tokio::join!(update("party-a", "RACE-A"), update("party-b", "RACE-B"));
+
+    for (status, body) in [&r1, &r2] {
+        assert!(
+            *status == StatusCode::OK || *status == StatusCode::PRECONDITION_FAILED,
+            "unexpected status {status}: {body}"
+        );
+    }
+    assert!(
+        r1.0 == StatusCode::OK || r2.0 == StatusCode::OK,
+        "at least one update commits: {} / {}",
+        r1.1,
+        r2.1
+    );
+
+    // Committed env state and the artifact behind its ref agree.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    let bundle = &read["environment"]["bundles"][0];
+    let committed_party = bundle["revenue_share"][0]["party_id"]
+        .as_str()
+        .expect("party");
+    let ref_str = bundle["revenue_policy_ref"].as_str().expect("ref");
+    let version: u64 = ref_str
+        .rsplit_once("/v")
+        .and_then(|(_, tail)| tail.strip_suffix(".json.sig"))
+        .expect("vN ref shape")
+        .parse()
+        .expect("numeric version");
+    let artifact = store
+        .load_revenue_policy(
+            &EnvId::try_from("local").unwrap(),
+            &BundleId::new("acme"),
+            &CustomerId::new("cust-1"),
+            version,
+        )
+        .await
+        .expect("load artifact")
+        .expect("referenced artifact exists");
+    let doc: Value = serde_json::from_slice(&artifact.doc).expect("doc decodes");
+    assert_eq!(
+        doc["revenue_share"][0]["party_id"], committed_party,
+        "committed env and its referenced artifact must agree; env: {bundle}, doc: {doc}"
+    );
 }

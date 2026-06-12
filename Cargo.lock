@@ -2560,12 +2560,16 @@ dependencies = [
 name = "greentic-operator-trust"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "ed25519-dalek",
+ "greentic-deploy-spec 0.1.0",
  "greentic-distributor-client",
+ "hex",
  "libc",
  "rand 0.9.4",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "zeroize",

@@ -35,23 +35,29 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use greentic_deploy_spec::engine::{
-    self, BindingError, EngineError, RevisionLifecycleError, TrafficSplitError,
+    self, BindingError, BundleError, EngineError, RevisionLifecycleError, TrafficSplitError,
 };
 use greentic_deploy_spec::{
     Actor, AddTrustedKeyPayload, ApplyTrafficSplitOutcome, AuditDecision, AuditEvent, AuditResult,
-    BindingGenerationOutcome, CapabilitySlot, ConcurrencyConflict, CreateEnvironmentPayload, EnvId,
-    Environment, ExtensionBindingPayload, ExtensionKeyedPayload, HealthStatus, IdempotencyKey,
-    IdempotencyOutcome, MigrateMergePayload, PackBindingPayload, Precondition, RemoteStoreError,
-    RetentionPolicy, RevisionId, RevisionTransitionOutcome, RevocationConfig,
-    RollbackTrafficSplitOutcome, RollbackTrafficSplitPayload, SchemaVersion,
-    SetTrafficSplitPayload, StageRevisionPayload, StateEtag, TrustRootAddOutcome,
-    TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload, WarmRevisionPayload,
+    BindingGenerationOutcome, BundleDeployment, CapabilitySlot, ConcurrencyConflict,
+    CreateEnvironmentPayload, DeploymentId, EnvId, Environment, ExtensionBindingPayload,
+    ExtensionKeyedPayload, HealthStatus, IdempotencyKey, IdempotencyOutcome, MigrateMergePayload,
+    PackBindingPayload, Precondition, RemoteStoreError, RetentionPolicy, RevisionId,
+    RevisionTransitionOutcome, RevocationConfig, RollbackTrafficSplitOutcome,
+    RollbackTrafficSplitPayload, SchemaVersion, SetTrafficSplitPayload, StageRevisionPayload,
+    StateEtag, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
+    UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 use greentic_operator_trust::operator_key::{self, OperatorKey};
-use greentic_operator_trust::trust_root::{self, TrustRootDocError, TrustRootDocument, TrustedKey};
+use greentic_operator_trust::revenue_policy::{self, RevenuePolicyError};
+use greentic_operator_trust::trust_root::{
+    self, TrustRoot, TrustRootDocError, TrustRootDocument, TrustedKey,
+};
 
 use crate::http::AppState;
-use crate::storage::{EnvRevision, EnvironmentStorage, LoadedTrustRoot, StorageError};
+use crate::storage::{
+    EnvRevision, EnvironmentStorage, LoadedTrustRoot, RevenuePolicyArtifact, StorageError,
+};
 
 /// `AuditDecision.policy` value while RBAC is not yet enforced (PR-4.4).
 /// Honest about what it is — every request is allowed.
@@ -283,6 +289,11 @@ fn map_storage_error(err: StorageError) -> RemoteStoreError {
         },
         StorageError::EnvIdMismatch { keyed, payload } => RemoteStoreError::InvalidRequest {
             detail: format!("environment_id mismatch: keyed `{keyed}`, payload `{payload}`"),
+        },
+        // Retryable: a concurrent trust-root mutation (e.g. revocation)
+        // raced a signing commit; the caller reloads and re-evaluates.
+        err @ StorageError::TrustRootChanged { .. } => RemoteStoreError::Conflict {
+            detail: err.to_string(),
         },
         // Backend/serde internals stay opaque — no driver details on the wire.
         StorageError::Integrity(_) | StorageError::Json(_) | StorageError::Backend(_) => {
@@ -1095,6 +1106,307 @@ pub(crate) async fn rollback_extension_binding<S: EnvironmentStorage>(
         ))
     })
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Handlers — bundle deployments (PR-4.2g)
+// ---------------------------------------------------------------------------
+//
+// `add` and `update --revenue-share` carry the verb group's side effect:
+// the signed, versioned revenue-policy artifact (B10). The server drives
+// the SAME pure builder the LocalFS backend does
+// (`greentic_operator_trust::revenue_policy::build_revenue_policy_version`)
+// and stores the produced bytes in the `revenue_policies` table, with the
+// trust root coming from the env's trust-root ROW (closed by default: no
+// row ⇒ empty trust root ⇒ the builder refuses — run
+// `POST …/trust-root/bootstrap` first) and the signature coming from the
+// SERVER's operator key. The artifact row, the env document (with the
+// pinned ref), and a re-check of the trust-root revision the signature
+// was evaluated against commit in ONE transaction
+// (`update_env_with_revenue_policy`) — the server analogue of the LocalFS
+// flock, under which the policy-file write and the env.json save are a
+// single critical section. A CAS conflict therefore rolls the artifact
+// back too, and a trust-root mutation racing the signing window surfaces
+// as a retryable 409 instead of committing a stale signature.
+
+/// Map the shared revenue-policy builder's refusals onto the A8 wire
+/// vocabulary. `env_id` contextualizes the not-trusted message the
+/// backend-neutral builder cannot know.
+fn map_revenue_policy_error(err: RevenuePolicyError, env_id: &EnvId) -> ApiError {
+    ApiError(match err {
+        RevenuePolicyError::OperatorKeyNotTrusted { key_id } => RemoteStoreError::Conflict {
+            detail: format!(
+                "operator key `{key_id}` is not trusted in env `{env_id}`; \
+                 run the trust-root bootstrap verb first (`POST \
+                 /environments/{env_id}/trust-root/bootstrap`)"
+            ),
+        },
+        RevenuePolicyError::UnsafeSegment(_) | RevenuePolicyError::Spec(_) => {
+            RemoteStoreError::InvalidRequest {
+                detail: err.to_string(),
+            }
+        }
+        RevenuePolicyError::VersionOverflow => RemoteStoreError::Conflict {
+            detail: err.to_string(),
+        },
+        // Signing/serialization failures are server-side configuration or
+        // bug territory, never the caller's fault.
+        RevenuePolicyError::Sign(_) | RevenuePolicyError::Serialize(_) => {
+            RemoteStoreError::Internal {
+                message: err.to_string(),
+            }
+        }
+    })
+}
+
+impl From<BundleError> for ApiError {
+    fn from(err: BundleError) -> Self {
+        Self(match err {
+            // Create-shaped duplicate: resolve with `bundles update`.
+            BundleError::AlreadyDeployed { .. } => RemoteStoreError::AlreadyExists {
+                detail: err.to_string(),
+            },
+            // The environment was loaded; only the deployment is missing.
+            BundleError::DeploymentNotFound { .. } => RemoteStoreError::DependentNotFound {
+                detail: err.to_string(),
+            },
+            BundleError::StillLive { .. } => RemoteStoreError::Conflict {
+                detail: err.to_string(),
+            },
+        })
+    }
+}
+
+fn parse_deployment_id(raw: &str) -> Result<DeploymentId, ApiError> {
+    raw.parse::<ulid::Ulid>().map(DeploymentId).map_err(|err| {
+        ApiError(RemoteStoreError::InvalidRequest {
+            detail: format!("invalid deployment id `{raw}`: {err}"),
+        })
+    })
+}
+
+/// A built-but-not-yet-committed revenue-policy version: the artifact row
+/// ready for storage plus the trust-root row revision the signature was
+/// evaluated against. Committing is the handler's job, via
+/// `update_env_with_revenue_policy` — ONE transaction re-checks the pin,
+/// stores the artifact, and CAS-updates the environment, so committed env
+/// state, the artifact it references, and the trust root that authorized
+/// the signature can never diverge (Codex F1/F2).
+struct PendingRevenuePolicy {
+    built: revenue_policy::BuiltRevenuePolicyVersion,
+    artifact: RevenuePolicyArtifact,
+    trust_root_pin: Option<EnvRevision>,
+}
+
+/// Build the next revenue-policy version for `deployment`. Trust root
+/// comes from the env's row — absent row decodes to an EMPTY trust root,
+/// so the shared builder refuses closed-by-default until the env is
+/// bootstrapped. Pure build: nothing is persisted here.
+async fn build_revenue_policy<S: EnvironmentStorage>(
+    state: &AppState<S>,
+    env_id: &EnvId,
+    deployment: &BundleDeployment,
+    created_at: chrono::DateTime<Utc>,
+) -> Result<PendingRevenuePolicy, ApiError> {
+    let loaded_root = state
+        .storage
+        .load_trust_root(env_id)
+        .await
+        .map_err(load_storage_error)?;
+    let trust_root_pin = loaded_root.as_ref().map(|l| l.revision.clone());
+    let trust_root = match loaded_root {
+        Some(loaded) => loaded.value.into_trust_root()?,
+        None => TrustRoot::default(),
+    };
+    let operator_key = load_server_operator_key(state.operator_key_path.clone()).await?;
+    let built = revenue_policy::build_revenue_policy_version(
+        deployment,
+        &deployment.revenue_share,
+        created_at,
+        &operator_key,
+        &trust_root,
+    )
+    .map_err(|err| map_revenue_policy_error(err, env_id))?;
+    let artifact = RevenuePolicyArtifact {
+        bundle_id: deployment.bundle_id.clone(),
+        customer_id: deployment.customer_id.clone(),
+        version: built.version,
+        policy_ref: built.policy_ref.to_string_lossy().replace('\\', "/"),
+        doc: built.doc_bytes.clone(),
+        envelope: built.envelope_bytes.clone(),
+        doc_sha256: built.doc_sha256.clone(),
+        key_id: built.key_id.clone(),
+    };
+    Ok(PendingRevenuePolicy {
+        built,
+        artifact,
+        trust_root_pin,
+    })
+}
+
+/// `POST /environments/{env_id}/bundles` — deploy a bundle for a customer
+/// (A8 route 7). The server mints the [`DeploymentId`] (the wire payload
+/// carries none) and writes the v1 revenue-policy artifact.
+pub(crate) async fn add_bundle<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<engine::AddBundlePayload>,
+) -> Result<Response, ApiError> {
+    let idem_key = require_idempotency_key(&headers)?;
+    let client_etag = parse_if_match(&headers)?;
+    let env_id = parse_env_id(&env_id)?;
+    let loaded = state
+        .storage
+        .load_env(&env_id)
+        .await
+        .map_err(load_storage_error)?;
+    let previous_generation = loaded.revision.generation;
+    let mut env = loaded.value;
+    let now = Utc::now();
+    let idx = engine::add_bundle(&mut env, payload, DeploymentId::new(), now)?;
+    let pending = build_revenue_policy(&state, &env_id, &env.bundles[idx], now).await?;
+    env.bundles[idx].revenue_policy_ref = pending.built.policy_ref.clone();
+    let precondition = resolve_precondition(client_etag, &loaded.revision);
+    let revision = state
+        .storage
+        .update_env_with_revenue_policy(
+            &env,
+            &precondition,
+            &pending.artifact,
+            pending.trust_root_pin.as_ref(),
+        )
+        .await?;
+    let deployment = env.bundles[idx].clone();
+    let target = json!({
+        "environment_id": env_id,
+        "deployment_id": deployment.deployment_id,
+        "bundle_id": deployment.bundle_id,
+        "customer_id": deployment.customer_id,
+        "revenue_policy_version": pending.built.version,
+    });
+    Ok(mutation_response(
+        deployment,
+        &env_id,
+        "bundles",
+        "add",
+        target,
+        idem_key,
+        Some(previous_generation),
+        revision,
+    ))
+}
+
+/// `PATCH /environments/{env_id}/bundles/{deployment_id}` — patch a
+/// deployment's scalar fields (A8 route 8). A `revenue_share` patch writes
+/// the next chained revenue-policy version. The body's `deployment_id` is
+/// cross-checked against the URL segment (the warm-revision precedent).
+pub(crate) async fn update_bundle<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path((env_id, deployment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ApiJson(payload): ApiJson<engine::UpdateBundlePayload>,
+) -> Result<Response, ApiError> {
+    let idem_key = require_idempotency_key(&headers)?;
+    let client_etag = parse_if_match(&headers)?;
+    let env_id = parse_env_id(&env_id)?;
+    let url_deployment_id = parse_deployment_id(&deployment_id)?;
+    if payload.deployment_id != url_deployment_id {
+        return Err(ApiError(RemoteStoreError::InvalidRequest {
+            detail: format!(
+                "body deployment_id `{}` does not match URL deployment_id `{url_deployment_id}`",
+                payload.deployment_id
+            ),
+        }));
+    }
+    let loaded = state
+        .storage
+        .load_env(&env_id)
+        .await
+        .map_err(load_storage_error)?;
+    let previous_generation = loaded.revision.generation;
+    let mut env = loaded.value;
+    let applied = engine::update_bundle(&mut env, payload)?;
+    let idx = applied.index;
+    let pending = if applied.revenue_share_changed {
+        let pending = build_revenue_policy(&state, &env_id, &env.bundles[idx], Utc::now()).await?;
+        env.bundles[idx].revenue_policy_ref = pending.built.policy_ref.clone();
+        Some(pending)
+    } else {
+        None
+    };
+    let policy_version = pending.as_ref().map(|p| p.built.version);
+    let precondition = resolve_precondition(client_etag, &loaded.revision);
+    let revision = match &pending {
+        Some(p) => {
+            state
+                .storage
+                .update_env_with_revenue_policy(
+                    &env,
+                    &precondition,
+                    &p.artifact,
+                    p.trust_root_pin.as_ref(),
+                )
+                .await?
+        }
+        None => state.storage.update_env(&env, &precondition).await?,
+    };
+    let deployment = env.bundles[idx].clone();
+    let target = json!({
+        "environment_id": env_id,
+        "deployment_id": deployment.deployment_id,
+        "revenue_policy_version": policy_version,
+    });
+    Ok(mutation_response(
+        deployment,
+        &env_id,
+        "bundles",
+        "update",
+        target,
+        idem_key,
+        Some(previous_generation),
+        revision,
+    ))
+}
+
+/// `DELETE /environments/{env_id}/bundles/{deployment_id}` — remove a
+/// quiesced deployment (A8 route 9). Refuses while live state remains;
+/// the pruned archived-revision ids ride the outcome AND the audit target
+/// so the destructive compaction is explicit.
+pub(crate) async fn remove_bundle<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path((env_id, deployment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let idem_key = require_idempotency_key(&headers)?;
+    let client_etag = parse_if_match(&headers)?;
+    let env_id = parse_env_id(&env_id)?;
+    let deployment_id = parse_deployment_id(&deployment_id)?;
+    let loaded = state
+        .storage
+        .load_env(&env_id)
+        .await
+        .map_err(load_storage_error)?;
+    let previous_generation = loaded.revision.generation;
+    let mut env = loaded.value;
+    let outcome = engine::remove_bundle(&mut env, deployment_id)?;
+    let precondition = resolve_precondition(client_etag, &loaded.revision);
+    let revision = state.storage.update_env(&env, &precondition).await?;
+    let target = json!({
+        "environment_id": env_id,
+        "deployment_id": deployment_id,
+        "pruned_revision_ids": outcome.pruned_revision_ids,
+    });
+    Ok(mutation_response(
+        outcome,
+        &env_id,
+        "bundles",
+        "remove",
+        target,
+        idem_key,
+        Some(previous_generation),
+        revision,
+    ))
 }
 
 // ---------------------------------------------------------------------------

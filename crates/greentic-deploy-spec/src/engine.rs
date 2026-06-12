@@ -53,6 +53,12 @@ pub use bindings::*;
 pub mod trust_root;
 pub use trust_root::*;
 
+/// Bundle-deployment verb group (PR-4.2g). Re-exported flat like the
+/// groups above. The revenue-policy signing step stays behind each
+/// backend's seam (`greentic-operator-trust::revenue_policy`).
+pub mod bundles;
+pub use bundles::*;
+
 /// Failures produced by pure verb transforms. Each backend maps these onto
 /// its own error surface: `LocalFsStore` → `StoreError`,
 /// the operator-store-server → [`crate::remote::RemoteStoreError`].

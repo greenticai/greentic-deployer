@@ -73,20 +73,16 @@
 //! - `AuthMethod::Mtls` for production (mTLS)
 //! - PR-3c wires dispatch between `LocalFsStore` and `HttpEnvironmentStore`
 
-use std::collections::BTreeMap;
-
 use greentic_deploy_spec::{
-    AuditDecision, AuditEvent, AuditResult, BindingGenerationOutcome, BundleDeployment,
-    BundleDeploymentStatus, BundleId, CapabilitySlot, CustomerId, DeploymentId, EnvId,
-    EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding, ExtensionBindingPayload,
-    ExtensionKeyedPayload, IdempotencyKey, IdempotencyOutcome, MessagingEndpoint,
-    MessagingEndpointId, PackBindingPayload, PackId, RemoteStoreError, RevenueShareEntry, Revision,
-    RevisionId, RollbackTrafficSplitPayload, RouteBinding, StateEtag,
+    AuditDecision, AuditEvent, AuditResult, BindingGenerationOutcome, BundleDeployment, BundleId,
+    CapabilitySlot, DeploymentId, EnvId, EnvPackBinding, Environment, EnvironmentHostConfig,
+    ExtensionBinding, ExtensionBindingPayload, ExtensionKeyedPayload, IdempotencyKey,
+    IdempotencyOutcome, MessagingEndpoint, MessagingEndpointId, PackBindingPayload, PackId,
+    RemoteStoreError, Revision, RevisionId, RollbackTrafficSplitPayload, StateEtag,
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use url::Url;
 
 use super::mutations::{
@@ -624,36 +620,10 @@ fn map_remote_error(err: RemoteStoreError) -> StoreError {
 // operator-store-server deserializes the same types. Remaining verb groups
 // migrate as their routes land.
 
-#[derive(Serialize)]
-struct AddBundleRequest {
-    bundle_id: BundleId,
-    customer_id: CustomerId,
-    revenue_share: Vec<RevenueShareEntry>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    route_binding: Option<RouteBinding>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    authorization_ref: Option<String>,
-    config_overrides: BTreeMap<String, BTreeMap<String, Value>>,
-}
-
-#[derive(Serialize)]
-struct UpdateBundleRequest {
-    deployment_id: DeploymentId,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<BundleDeploymentStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    route_binding: Option<RouteBinding>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    revenue_share: Option<Vec<RevenueShareEntry>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    config_overrides: Option<BTreeMap<String, BTreeMap<String, Value>>>,
-}
-
-#[derive(Deserialize)]
-struct RemoveBundleResponse {
-    deployment: BundleDeployment,
-    pruned_revision_ids: Vec<RevisionId>,
-}
+// Bundle wire shapes (`AddBundlePayload`, `UpdateBundlePayload`,
+// `RemoveBundleOutcome`) are the shared `greentic_deploy_spec::engine`
+// types since PR-4.2g — the client serializes the same structs the server
+// deserializes.
 
 // Binding wire shapes (`PackBindingPayload`, `ExtensionBindingPayload`,
 // `ExtensionKeyedPayload`, `BindingGenerationOutcome`) are the shared
@@ -841,22 +811,15 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         &self,
         env_id: &EnvId,
         payload: AddBundlePayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<BundleDeployment, StoreError> {
-        let idem_key = payload.idempotency_key.as_str().to_string();
-        let req = AddBundleRequest {
-            bundle_id: payload.bundle_id,
-            customer_id: payload.customer_id,
-            revenue_share: payload.revenue_share,
-            route_binding: payload.route_binding,
-            authorization_ref: payload.authorization_ref,
-            config_overrides: payload.config_overrides,
-        };
+        let idem_key = idempotency_key.as_str().to_string();
         self.send_mutation(
             env_id,
             reqwest::Method::POST,
             &self.env_path(env_id, "/bundles"),
             Some(&idem_key),
-            Some(&req),
+            Some(&payload),
         )
     }
 
@@ -864,16 +827,10 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         &self,
         env_id: &EnvId,
         payload: UpdateBundlePayload,
+        idempotency_key: IdempotencyKey,
     ) -> Result<BundleDeployment, StoreError> {
-        let idem_key = payload.idempotency_key.as_str().to_string();
+        let idem_key = idempotency_key.as_str().to_string();
         let did = payload.deployment_id.to_string();
-        let req = UpdateBundleRequest {
-            deployment_id: payload.deployment_id,
-            status: payload.status,
-            route_binding: payload.route_binding,
-            revenue_share: payload.revenue_share,
-            config_overrides: payload.config_overrides,
-        };
         self.send_mutation(
             env_id,
             reqwest::Method::PATCH,
@@ -883,7 +840,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
                 encode_segment(&did),
             ),
             Some(&idem_key),
-            Some(&req),
+            Some(&payload),
         )
     }
 
@@ -894,7 +851,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<RemoveBundleOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let resp: RemoveBundleResponse = self.send_mutation_no_body(
+        self.send_mutation_no_body(
             env_id,
             reqwest::Method::DELETE,
             &format!(
@@ -903,11 +860,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
                 encode_segment(&deployment_id.to_string()),
             ),
             Some(&idem_key),
-        )?;
-        Ok(RemoveBundleOutcome {
-            deployment: resp.deployment,
-            pruned_revision_ids: resp.pruned_revision_ids,
-        })
+        )
     }
 
     fn add_pack_binding(
@@ -1965,13 +1918,13 @@ mod tests {
             &env_id(),
             AddBundlePayload {
                 bundle_id: BundleId::new("fast2flow"),
-                customer_id: CustomerId::new("local-dev"),
+                customer_id: greentic_deploy_spec::CustomerId::new("local-dev"),
                 revenue_share: Vec::new(),
                 route_binding: None,
                 authorization_ref: None,
-                config_overrides: BTreeMap::new(),
-                idempotency_key: idem(),
+                config_overrides: std::collections::BTreeMap::new(),
             },
+            idem(),
         );
         assert!(result.is_ok());
     }
@@ -1984,12 +1937,12 @@ mod tests {
             &env_id(),
             UpdateBundlePayload {
                 deployment_id: DeploymentId::new(),
-                status: Some(BundleDeploymentStatus::Active),
+                status: Some(greentic_deploy_spec::BundleDeploymentStatus::Active),
                 route_binding: None,
                 revenue_share: None,
                 config_overrides: None,
-                idempotency_key: idem(),
             },
+            idem(),
         );
         assert!(result.is_ok());
     }

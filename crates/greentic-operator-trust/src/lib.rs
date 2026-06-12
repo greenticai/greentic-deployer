@@ -13,6 +13,9 @@
 //! - [`trust_root`] — the `greentic.trust-root.v1` document envelope and
 //!   the pure validate/add/remove transforms; persistence (file or SQL)
 //!   stays with the caller.
+//! - [`revenue_policy`] — the pure builder for signed, versioned
+//!   revenue-policy artifacts (B10): document bytes + DSSE sidecar bytes +
+//!   canonical refs; storage (file or SQL) stays with the caller.
 //!
 //! Verifier types ([`TrustRoot`](greentic_distributor_client::signing::TrustRoot),
 //! [`TrustedKey`](greentic_distributor_client::signing::TrustedKey)) and the
@@ -21,6 +24,7 @@
 //! second derivation path.
 
 pub mod operator_key;
+pub mod revenue_policy;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_support;
 pub mod trust_root;

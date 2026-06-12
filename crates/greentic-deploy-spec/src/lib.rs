@@ -46,15 +46,15 @@ pub use credentials::{
     CredentialsValidationResult,
 };
 pub use engine::{
-    ActiveSplitRef, AddTrustedKeyPayload, ApplyTrafficSplitOutcome, BindingError,
-    BindingGenerationOutcome, CreateEnvironmentPayload, EngineError, ExtensionBindingPayload,
-    ExtensionKey, ExtensionKeyedPayload, FieldUpdate, HealthCheckId, HealthGateFailure,
-    MergeReport, MigrateMergePayload, MigrateSeedPayload, PackBindingPayload,
-    RevisionLifecycleError, RevisionTransition, RevisionTransitionOutcome,
-    RollbackTrafficSplitOutcome, RollbackTrafficSplitPayload, SetTrafficSplitPayload,
-    StageRevisionPayload, TrafficRollbackTransition, TrafficSplitError, TrafficSplitTransition,
-    TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload,
-    WarmRevisionPayload,
+    ActiveSplitRef, AddBundlePayload, AddTrustedKeyPayload, ApplyTrafficSplitOutcome, BindingError,
+    BindingGenerationOutcome, BundleError, BundleUpdateApplied, CreateEnvironmentPayload,
+    EngineError, ExtensionBindingPayload, ExtensionKey, ExtensionKeyedPayload, FieldUpdate,
+    HealthCheckId, HealthGateFailure, MergeReport, MigrateMergePayload, MigrateSeedPayload,
+    PackBindingPayload, RemoveBundleOutcome, RevisionLifecycleError, RevisionTransition,
+    RevisionTransitionOutcome, RollbackTrafficSplitOutcome, RollbackTrafficSplitPayload,
+    SetTrafficSplitPayload, StageRevisionPayload, TrafficRollbackTransition, TrafficSplitError,
+    TrafficSplitTransition, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
+    UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 pub use environment::{
     DEFAULT_LISTEN_ADDR, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding,

@@ -8,8 +8,8 @@
 use std::future::Future;
 
 use greentic_deploy_spec::{
-    CapabilitySlot, ConcurrencyConflict, EnvId, Environment, EnvironmentRuntime, IntegrityError,
-    Precondition, PreconditionError, SpecError, StateEtag,
+    BundleId, CapabilitySlot, ConcurrencyConflict, CustomerId, EnvId, Environment,
+    EnvironmentRuntime, IntegrityError, Precondition, PreconditionError, SpecError, StateEtag,
 };
 use greentic_operator_trust::trust_root::TrustRootDocument;
 use serde_json::Value;
@@ -56,6 +56,7 @@ pub type LoadedTrustRoot = Loaded<TrustRootDocument>;
 /// | `PreconditionRequired` | `428` |
 /// | `PreconditionFailed` | `412` |
 /// | `IntegrityMismatch` | `422` |
+/// | `TrustRootChanged` | `409` |
 /// | `Spec` / `EnvIdMismatch` | `400` |
 /// | `Json` / `Integrity` / `Backend` | `500` |
 ///
@@ -85,6 +86,13 @@ pub enum StorageError {
     },
     #[error("environment_id mismatch: row keyed by `{keyed}`, payload says `{payload}`")]
     EnvIdMismatch { keyed: EnvId, payload: EnvId },
+    /// The trust-root row moved (or appeared) between the handler's load
+    /// and a signing commit pinned to it — a concurrent trust-root
+    /// mutation (e.g. a revocation) raced the signature. Retryable: the
+    /// caller reloads the trust root and re-evaluates. Maps to `409
+    /// conflict` on the wire.
+    #[error("trust root for `{env_id}` changed concurrently; reload and retry the mutation")]
+    TrustRootChanged { env_id: EnvId },
     #[error(transparent)]
     Spec(#[from] SpecError),
     #[error(transparent)]
@@ -215,4 +223,65 @@ pub trait EnvironmentStorage: Send + Sync {
         doc: &TrustRootDocument,
         precondition: Option<&Precondition>,
     ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
+
+    /// Persist `env` (under `precondition`) AND `artifact` in ONE
+    /// transaction (PR-4.2g) — the server analogue of the LocalFS flock,
+    /// under which the policy-file write and the `env.json` save are a
+    /// single critical section. A CAS failure on the environment row
+    /// rolls the artifact back too, so committed environment state and
+    /// the artifact it references can never diverge (concurrent
+    /// same-version builds serialize on the env CAS; the loser writes
+    /// nothing).
+    ///
+    /// `trust_root_pin` is the trust-root row revision the caller
+    /// observed when it selected the signing trust root (`None` = the
+    /// row was absent). The transaction re-checks the row against the
+    /// pin and rejects with [`StorageError::TrustRootChanged`] when it
+    /// moved — a concurrent revocation between load and commit must
+    /// invalidate the signature it would otherwise have raced past.
+    ///
+    /// The artifact lands via INSERT OR REPLACE on its
+    /// `(env_id, bundle_id, customer_id, version)` key: version numbers
+    /// derive from the COMMITTED `revenue_policy_ref`, so a replayed
+    /// build of the same version (same-key retry, PR-4.3) overwrites
+    /// rather than duplicates.
+    fn update_env_with_revenue_policy(
+        &self,
+        env: &Environment,
+        precondition: &Precondition,
+        artifact: &RevenuePolicyArtifact,
+        trust_root_pin: Option<&EnvRevision>,
+    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
+
+    /// Load a stored revenue-policy artifact version, if present.
+    fn load_revenue_policy(
+        &self,
+        env_id: &EnvId,
+        bundle_id: &BundleId,
+        customer_id: &CustomerId,
+        version: u64,
+    ) -> impl Future<Output = Result<Option<RevenuePolicyArtifact>, StorageError>> + Send;
+}
+
+/// A stored revenue-policy version: the exact bytes the shared builder
+/// (`greentic_operator_trust::revenue_policy`) produced, plus the identity
+/// they are keyed under. The server-side analogue of the LocalFS
+/// `billing-policies/<bundle>/<customer>/vN.json{,.sig}` file pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevenuePolicyArtifact {
+    pub bundle_id: BundleId,
+    pub customer_id: CustomerId,
+    /// 1-based version within `(bundle_id, customer_id)`.
+    pub version: u64,
+    /// Canonical storage-relative sidecar ref — exactly the value pinned on
+    /// `BundleDeployment.revenue_policy_ref`.
+    pub policy_ref: String,
+    /// Exact bytes of `vN.json`.
+    pub doc: Vec<u8>,
+    /// Exact bytes of the DSSE envelope sidecar.
+    pub envelope: Vec<u8>,
+    /// Lowercase-hex SHA-256 of `doc` (the digest the DSSE subject pins).
+    pub doc_sha256: String,
+    /// `keyid` recorded in the DSSE envelope.
+    pub key_id: String,
 }
