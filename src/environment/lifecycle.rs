@@ -152,6 +152,9 @@ impl From<RevisionLifecycleError> for LifecycleError {
                 failed_checks,
                 message,
             },
+            err @ RevisionLifecycleError::DuplicateRevision { .. } => {
+                Self::Store(StoreError::Conflict(err.to_string()))
+            }
             err @ RevisionLifecycleError::DeploymentNotFound { .. } => {
                 Self::Store(StoreError::DependentNotFound(err.to_string()))
             }

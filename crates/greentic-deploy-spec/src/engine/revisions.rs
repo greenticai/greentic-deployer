@@ -157,6 +157,17 @@ pub enum RevisionLifecycleError {
         failed_checks: Vec<HealthCheckId>,
         message: String,
     },
+    /// A revision with this id already exists in the environment. The
+    /// stage verb's `revision_id` is caller-supplied (the bundle staging
+    /// step names its rev_dir after the ULID before the verb runs), so a
+    /// retry of a lost stage response replays the same id — appending a
+    /// second copy would corrupt every `revision_id` lookup. Backends map
+    /// this to their create-on-existing conflict (HTTP 409).
+    #[error("revision `{revision_id}` already exists in env `{env_id}`")]
+    DuplicateRevision {
+        env_id: EnvId,
+        revision_id: RevisionId,
+    },
     /// The deployment the verb references does not exist in the environment.
     #[error("deployment `{deployment_id}` not found in env `{env_id}`")]
     DeploymentNotFound {
@@ -448,6 +459,16 @@ pub fn stage_revision(
     payload: StageRevisionPayload,
     now: DateTime<Utc>,
 ) -> Result<Revision, RevisionLifecycleError> {
+    if env
+        .revisions
+        .iter()
+        .any(|r| r.revision_id == payload.revision_id)
+    {
+        return Err(RevisionLifecycleError::DuplicateRevision {
+            env_id: env.environment_id.clone(),
+            revision_id: payload.revision_id,
+        });
+    }
     let bundle_id = env
         .bundles
         .iter()
@@ -719,6 +740,29 @@ mod tests {
         let second = stage_revision(&mut env, stage_payload(deployment_id), fixed_now()).unwrap();
         assert_eq!(second.sequence, 2);
         assert_eq!(env.revisions.len(), 2);
+    }
+
+    #[test]
+    fn stage_rejects_duplicate_revision_id() {
+        let deployment_id = DeploymentId::new();
+        let mut env = env_with_deployment(deployment_id);
+
+        let payload = stage_payload(deployment_id);
+        let dup = StageRevisionPayload {
+            revision_id: payload.revision_id,
+            ..stage_payload(deployment_id)
+        };
+        stage_revision(&mut env, payload, fixed_now()).unwrap();
+        let err = stage_revision(&mut env, dup, fixed_now()).unwrap_err();
+        assert_eq!(
+            err,
+            RevisionLifecycleError::DuplicateRevision {
+                env_id: env_id(),
+                revision_id: env.revisions[0].revision_id,
+            }
+        );
+        assert_eq!(env.revisions.len(), 1);
+        assert!(!err.env_mutated());
     }
 
     #[test]

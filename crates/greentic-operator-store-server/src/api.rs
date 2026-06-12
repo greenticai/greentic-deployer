@@ -107,6 +107,11 @@ impl From<RevisionLifecycleError> for ApiError {
                 failed_checks,
                 message,
             },
+            err @ RevisionLifecycleError::DuplicateRevision { .. } => {
+                RemoteStoreError::AlreadyExists {
+                    detail: err.to_string(),
+                }
+            }
             // The chains are server-side constants — a client request can
             // never legitimately produce these. Programming error, 500.
             internal @ (RevisionLifecycleError::InvalidTransition { .. }

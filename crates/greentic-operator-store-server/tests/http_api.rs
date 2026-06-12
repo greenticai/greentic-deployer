@@ -681,6 +681,40 @@ async fn stage_returns_staged_revision_and_persists() {
 }
 
 #[tokio::test]
+async fn stage_same_revision_id_twice_is_409_already_exists() {
+    let (_d, app, store) = app_with_store().await;
+    let deployment_id = seed_env_with_deployment(&store, "local").await;
+    let revision_id = RevisionId::new();
+
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/revisions",
+        Some(stage_body(deployment_id, revision_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A retry of a lost response replays the same caller-minted ULID —
+    // it must conflict, never append a second copy.
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/revisions",
+        Some(stage_body(deployment_id, revision_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "already-exists");
+
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["revisions"].as_array().unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn stage_unknown_deployment_is_404_dependent_not_found() {
     let (_d, app, store) = app_with_store().await;
     seed_env_with_deployment(&store, "local").await;
