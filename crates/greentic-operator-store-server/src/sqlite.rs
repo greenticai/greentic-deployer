@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use fs4::fs_std::FileExt;
 use greentic_deploy_spec::{
-    BundleId, CapabilitySlot, CustomerId, EnvId, Environment, EnvironmentRuntime, Precondition,
-    SchemaVersion, SpecError, StateEtag, StateIntegrity,
+    BackupManifest, BundleId, CapabilitySlot, CustomerId, EnvId, Environment, EnvironmentRuntime,
+    INTEGRITY_ALGORITHM_SHA256, Precondition, SchemaVersion, SpecError, StateEtag, StateIntegrity,
 };
 use serde_json::Value;
 use sqlx::{
@@ -33,8 +33,9 @@ use sqlx::{
 use greentic_operator_trust::trust_root::{TRUST_ROOT_SCHEMA_V1, TrustRootDocument};
 
 use crate::storage::{
-    EnvRevision, EnvironmentStorage, Loaded, LoadedAnswers, LoadedEnv, LoadedRuntime,
-    LoadedTrustRoot, MutationJournal, RevenuePolicyArtifact, StorageError, StoredIdempotencyRecord,
+    EnvRevision, EnvSnapshot, EnvironmentStorage, Loaded, LoadedAnswers, LoadedEnv, LoadedRuntime,
+    LoadedTrustRoot, MutationJournal, RevenuePolicyArtifact, StorageError, StoredBackup,
+    StoredIdempotencyRecord,
 };
 
 impl From<sqlx::Error> for StorageError {
@@ -746,6 +747,316 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
             key_id: row.try_get("key_id")?,
         }))
     }
+
+    // --- backups (A8 #5, PR-4.4) -----------------------------------------
+
+    async fn create_backup_journaled(
+        &self,
+        backup: &StoredBackup,
+        journal: Option<&MutationJournal>,
+    ) -> Result<(), StorageError> {
+        let manifest = &backup.manifest;
+        let mut tx = self.pool.begin().await?;
+        // Cap check inside the same transaction (single-writer pool, so
+        // count-then-insert cannot race another create).
+        let count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM backups WHERE env_id = $1")
+            .bind(manifest.env_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get("n")?;
+        if count >= crate::storage::MAX_BACKUPS_PER_ENV {
+            return Err(StorageError::BackupLimitReached {
+                env_id: manifest.env_id.clone(),
+                limit: crate::storage::MAX_BACKUPS_PER_ENV,
+            });
+        }
+        sqlx::query(
+            "INSERT INTO backups \
+             (env_id, backup_id, created_at, generation, integrity, size_bytes, state, \
+              snapshot_digest) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(manifest.env_id.as_str())
+        .bind(&manifest.backup_id)
+        .bind(manifest.created_at.to_rfc3339())
+        .bind(manifest.generation as i64)
+        .bind(&manifest.integrity.digest)
+        .bind(manifest.size_bytes as i64)
+        .bind(&backup.state)
+        .bind(&backup.snapshot_digest)
+        .execute(&mut *tx)
+        .await?;
+        journal_in_tx(&mut tx, journal).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_backups(&self, env_id: &EnvId) -> Result<Vec<BackupManifest>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT backup_id, created_at, generation, integrity, size_bytes \
+             FROM backups WHERE env_id = $1 ORDER BY backup_id",
+        )
+        .bind(env_id.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| decode_backup_manifest(env_id, row))
+            .collect()
+    }
+
+    async fn load_backup(
+        &self,
+        env_id: &EnvId,
+        backup_id: &str,
+    ) -> Result<Option<StoredBackup>, StorageError> {
+        let row = sqlx::query(
+            "SELECT backup_id, created_at, generation, integrity, size_bytes, state, \
+                    snapshot_digest \
+             FROM backups WHERE env_id = $1 AND backup_id = $2",
+        )
+        .bind(env_id.as_str())
+        .bind(backup_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(StoredBackup {
+            manifest: decode_backup_manifest(env_id, &row)?,
+            state: row.try_get("state")?,
+            snapshot_digest: row.try_get("snapshot_digest")?,
+        }))
+    }
+
+    async fn delete_backup_journaled(
+        &self,
+        env_id: &EnvId,
+        backup_id: &str,
+        journal: Option<&MutationJournal>,
+    ) -> Result<bool, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        let deleted = sqlx::query("DELETE FROM backups WHERE env_id = $1 AND backup_id = $2")
+            .bind(env_id.as_str())
+            .bind(backup_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if deleted == 0 {
+            // Nothing happened — write nothing (the journal must never
+            // record a mutation that did not apply).
+            return Ok(false);
+        }
+        journal_in_tx(&mut tx, journal).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn load_env_snapshot(&self, env_id: &EnvId) -> Result<EnvSnapshot, StorageError> {
+        // One transaction so the capture cannot be torn by an interleaved
+        // mutation (the single-connection pool serializes statements but
+        // NOT multi-statement sequences outside a tx).
+        let mut tx = self.pool.begin().await?;
+
+        // Environment row (required — callers already verified existence).
+        let env_row = sqlx::query("SELECT data FROM environments WHERE env_id = $1")
+            .bind(env_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(env_row) = env_row else {
+            return Err(StorageError::NotFound(env_id.clone()));
+        };
+        let environment: Value = env_row.try_get("data")?;
+
+        // Runtime sidecar (optional).
+        let runtime_row = sqlx::query("SELECT data FROM environment_runtimes WHERE env_id = $1")
+            .bind(env_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+        let runtime: Option<Value> = match runtime_row {
+            Some(row) => Some(row.try_get("data")?),
+            None => None,
+        };
+
+        // Pack-answers sidecars (optional, only live rows).
+        let answer_rows =
+            sqlx::query("SELECT slot, data FROM pack_answers WHERE env_id = $1 AND deleted = 0")
+                .bind(env_id.as_str())
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut pack_answers = std::collections::BTreeMap::new();
+        for row in &answer_rows {
+            let slot: String = row.try_get("slot")?;
+            let data: Value = row.try_get("data")?;
+            pack_answers.insert(slot, data);
+        }
+
+        tx.commit().await?;
+        Ok(EnvSnapshot {
+            environment,
+            runtime,
+            pack_answers,
+        })
+    }
+
+    async fn restore_env_journaled(
+        &self,
+        env_id: &EnvId,
+        snapshot: &EnvSnapshot,
+        precondition: &Precondition,
+        journal: Option<&MutationJournal>,
+    ) -> Result<EnvRevision, StorageError> {
+        // Decode + validate the environment from the snapshot before writing.
+        let env: Environment = serde_json::from_value(snapshot.environment.clone())?;
+        validate_environment(&env)?;
+
+        let mut tx = self.pool.begin().await?;
+
+        // 1. CAS-guarded environment update.
+        let revision = update_env_in_tx(&mut tx, &env, precondition).await?;
+
+        // 2. Runtime sidecar: upsert if present in snapshot, delete if absent.
+        //    Generation must continue the existing sequence (never reset to 1
+        //    when a row exists — mirrors `upsert_runtime`'s invariant).
+        match &snapshot.runtime {
+            Some(runtime_data) => {
+                let (etag, integrity, data) = serialize_for_write_value(runtime_data)?;
+                let existing =
+                    sqlx::query("SELECT 1 AS one FROM environment_runtimes WHERE env_id = $1")
+                        .bind(env_id.as_str())
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                if existing.is_some() {
+                    sqlx::query(
+                        "UPDATE environment_runtimes \
+                         SET data = $1, generation = generation + 1, etag = $2, \
+                             integrity_digest = $3, updated_at = datetime('now') \
+                         WHERE env_id = $4",
+                    )
+                    .bind(&data)
+                    .bind(&etag.0)
+                    .bind(&integrity.digest)
+                    .bind(env_id.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+                } else {
+                    sqlx::query(
+                        "INSERT INTO environment_runtimes \
+                         (env_id, generation, etag, data, integrity_digest) \
+                         VALUES ($1, 1, $2, $3, $4)",
+                    )
+                    .bind(env_id.as_str())
+                    .bind(&etag.0)
+                    .bind(&data)
+                    .bind(&integrity.digest)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+            None => {
+                // Hard delete is the only expressible "absent" for runtimes
+                // (the table has no tombstone column and no other delete path).
+                sqlx::query("DELETE FROM environment_runtimes WHERE env_id = $1")
+                    .bind(env_id.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        // 3. Pack-answers sidecars: tombstone-preserving restore.
+        //    The `pack_answers` table uses a `deleted` tombstone column so
+        //    generation sequences survive delete/recreate cycles (ABA
+        //    protection). A restore must continue those sequences, never
+        //    reset to 1 when a row already exists.
+        let existing_rows =
+            sqlx::query("SELECT slot, generation, deleted FROM pack_answers WHERE env_id = $1")
+                .bind(env_id.as_str())
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut existing_map: std::collections::HashMap<String, (u64, bool)> =
+            std::collections::HashMap::new();
+        for row in &existing_rows {
+            let slot: String = row.try_get("slot")?;
+            let generation: i64 = row.try_get("generation")?;
+            let deleted: i32 = row.try_get("deleted")?;
+            existing_map.insert(slot, (generation as u64, deleted != 0));
+        }
+
+        // (a) Snapshot slots: upsert (continuing generation) or insert.
+        for (slot, answers_data) in &snapshot.pack_answers {
+            let (etag, integrity, data) = serialize_for_write_value(answers_data)?;
+            if let Some(&(old_gen, _)) = existing_map.get(slot.as_str()) {
+                // Row exists (live or tombstoned): update, continuing the
+                // generation sequence. `deleted = 0` resurrects a tombstone.
+                sqlx::query(
+                    "UPDATE pack_answers \
+                     SET data = $1, generation = $2, etag = $3, \
+                         integrity_digest = $4, deleted = 0, \
+                         updated_at = datetime('now') \
+                     WHERE env_id = $5 AND slot = $6",
+                )
+                .bind(&data)
+                .bind((old_gen + 1) as i64)
+                .bind(&etag.0)
+                .bind(&integrity.digest)
+                .bind(env_id.as_str())
+                .bind(slot.as_str())
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                // No row at all: first incarnation, generation 1.
+                sqlx::query(
+                    "INSERT INTO pack_answers \
+                     (env_id, slot, generation, etag, data, integrity_digest) \
+                     VALUES ($1, $2, 1, $3, $4, $5)",
+                )
+                .bind(env_id.as_str())
+                .bind(slot.as_str())
+                .bind(&etag.0)
+                .bind(&data)
+                .bind(&integrity.digest)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        // (b) Live rows NOT in the snapshot: soft-delete (tombstone),
+        //     mirroring `delete_pack_answers`. Already-tombstoned rows
+        //     not in the snapshot stay untouched.
+        for (slot, &(old_gen, is_deleted)) in &existing_map {
+            if !is_deleted && !snapshot.pack_answers.contains_key(slot.as_str()) {
+                sqlx::query(
+                    "UPDATE pack_answers \
+                     SET deleted = 1, generation = $1, \
+                         updated_at = datetime('now') \
+                     WHERE env_id = $2 AND slot = $3",
+                )
+                .bind((old_gen + 1) as i64)
+                .bind(env_id.as_str())
+                .bind(slot.as_str())
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        journal_in_tx(&mut tx, journal).await?;
+        tx.commit().await?;
+        Ok(revision)
+    }
+
+    async fn record_audit(
+        &self,
+        env_id: &EnvId,
+        event_id: &str,
+        event: &Value,
+    ) -> Result<(), StorageError> {
+        sqlx::query("INSERT INTO audit_log (env_id, event_id, event) VALUES ($1, $2, $3)")
+            .bind(env_id.as_str())
+            .bind(event_id)
+            .bind(event)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 // --- helpers ------------------------------------------------------------
@@ -806,6 +1117,31 @@ async fn journal_in_tx(
         .execute(&mut **tx)
         .await?;
     Ok(())
+}
+
+/// Rebuild a [`BackupManifest`] from its row. The schema and integrity
+/// algorithm are constants of this backend (every backup is created by
+/// [`EnvironmentStorage::create_backup_journaled`] with
+/// `StateIntegrity::sha256_of`), so only the digest is stored.
+fn decode_backup_manifest(env_id: &EnvId, row: &SqliteRow) -> Result<BackupManifest, StorageError> {
+    let created_at: String = row.try_get("created_at")?;
+    let created_at = chrono::DateTime::parse_from_rfc3339(&created_at)
+        .map_err(StorageError::backend)?
+        .with_timezone(&chrono::Utc);
+    let generation: i64 = row.try_get("generation")?;
+    let size_bytes: i64 = row.try_get("size_bytes")?;
+    Ok(BackupManifest {
+        schema: SchemaVersion::BACKUP_MANIFEST_V1.into(),
+        backup_id: row.try_get("backup_id")?,
+        env_id: env_id.clone(),
+        created_at,
+        generation: generation as u64,
+        integrity: StateIntegrity {
+            algorithm: INTEGRITY_ALGORITHM_SHA256.to_string(),
+            digest: row.try_get("integrity")?,
+        },
+        size_bytes: size_bytes as u64,
+    })
 }
 
 /// CAS-checked environment UPDATE inside an existing transaction — the
@@ -876,6 +1212,16 @@ fn serialize_for_write<T: serde::Serialize>(
     let integrity = StateIntegrity::sha256_of(&data)?;
     let etag = StateEtag::from_integrity(&integrity);
     Ok((etag, integrity, data))
+}
+
+/// [`serialize_for_write`] for an already-serialized `Value` — used by the
+/// restore path where the snapshot carries raw JSON, not typed structs.
+fn serialize_for_write_value(
+    data: &Value,
+) -> Result<(StateEtag, StateIntegrity, Value), StorageError> {
+    let integrity = StateIntegrity::sha256_of(data)?;
+    let etag = StateEtag::from_integrity(&integrity);
+    Ok((etag, integrity, data.clone()))
 }
 
 /// Wrap an `io::Error` with call-site context as a [`StorageError::Backend`].

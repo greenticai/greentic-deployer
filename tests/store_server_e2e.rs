@@ -742,3 +742,217 @@ async fn remote_env_lifecycle_end_to_end() {
     .expect("revision client task")
     .await;
 }
+
+/// PR-4.4 backup/restore (A8 #5) over the real wire: the client's inherent
+/// backup methods drive the server's bounded backup store; restore is a
+/// guarded mutation whose body-carried precondition pins prior state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backup_restore_end_to_end() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SqliteEnvironmentStore::open(&dir.path().join("store.sqlite"))
+        .await
+        .expect("open sqlite store");
+    let backend = Arc::new(store);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let serve_backend = Arc::clone(&backend);
+    let operator_key_path = dir.path().join("operator-key.pem");
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router_with_operator_key(serve_backend, operator_key_path),
+        )
+        .await
+        .expect("serve");
+    });
+
+    let id = env_id("local");
+
+    // Create + snapshot + mutate past the snapshot.
+    let client_id = id.clone();
+    let backup_manifest = tokio::task::spawn_blocking(move || {
+        let base = Url::parse(&format!("http://{addr}/")).expect("base url");
+        let store = HttpEnvironmentStore::new(base, AuthMethod::None).expect("client");
+        store
+            .create_environment(&client_id, "local".to_string(), host_config("local"))
+            .expect("create environment");
+        let manifest = store
+            .create_backup(&client_id, &idem("k-backup-1"))
+            .expect("create backup");
+        assert_eq!(manifest.env_id, client_id);
+        assert_eq!(manifest.generation, 1);
+        let listed = store.list_backups(&client_id).expect("list backups");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].backup_id, manifest.backup_id);
+        store
+            .update_environment(
+                &client_id,
+                UpdateEnvironmentPayload {
+                    name: Some("mutated-past-the-snapshot".to_string()),
+                    region: FieldUpdate::Keep,
+                    tenant_org_id: FieldUpdate::Keep,
+                    listen_addr: FieldUpdate::Keep,
+                    public_base_url: FieldUpdate::Keep,
+                },
+            )
+            .expect("update environment");
+        manifest
+    })
+    .await
+    .expect("backup client task");
+
+    // The restore precondition pins the CURRENT server state (the client's
+    // envelope metadata is not surfaced yet — PR-3b-fu — so read the CAS
+    // coordinates through the backend, as an operator would via GET).
+    let current = backend.load_env(&id).await.expect("load env");
+    assert_eq!(current.value.name, "mutated-past-the-snapshot");
+    let pin = Precondition::matching(current.revision.etag, current.revision.generation);
+
+    let client_id = id.clone();
+    tokio::task::spawn_blocking(move || {
+        let base = Url::parse(&format!("http://{addr}/")).expect("base url");
+        let store = HttpEnvironmentStore::new(base, AuthMethod::None).expect("client");
+
+        // A blind restore (empty pin) never deserializes server-side as a
+        // pass: the typed 428 maps onto the client's Conflict noun family.
+        let err = store
+            .restore(
+                &client_id,
+                &greentic_deploy_spec::RestoreRequest {
+                    backup_id: backup_manifest.backup_id.clone(),
+                    precondition: Precondition::default(),
+                },
+                &idem("k-restore-blind"),
+            )
+            .expect_err("blind restore must be refused");
+        assert!(
+            matches!(err, StoreError::Conflict(ref msg) if msg.contains("precondition")),
+            "unexpected error: {err:?}"
+        );
+
+        let outcome = store
+            .restore(
+                &client_id,
+                &greentic_deploy_spec::RestoreRequest {
+                    backup_id: backup_manifest.backup_id.clone(),
+                    precondition: pin,
+                },
+                &idem("k-restore-1"),
+            )
+            .expect("restore");
+        assert_eq!(outcome.restored_generation, 3);
+        assert_eq!(
+            outcome.integrity.digest, backup_manifest.integrity.digest,
+            "restored content must hash to the snapshot digest"
+        );
+
+        // Delete the backup; restoring from it again is a typed 404.
+        store
+            .delete_backup(&client_id, &backup_manifest.backup_id, &idem("k-bk-del"))
+            .expect("delete backup");
+        assert!(
+            store
+                .list_backups(&client_id)
+                .expect("list after delete")
+                .is_empty()
+        );
+    })
+    .await
+    .expect("restore client task");
+
+    // The restore is durable: content reverted, generation monotonic.
+    let restored = backend.load_env(&id).await.expect("load env");
+    assert_eq!(restored.value.name, "local");
+    assert_eq!(restored.revision.generation, 3);
+}
+
+/// PR-4.4 RBAC (A8 #3) over the real wire: the client's `AuthMethod::Bearer`
+/// against a token-enforcing server — a valid token deploys, a missing or
+/// unknown one maps onto the typed `StoreError::Unauthorized`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rbac_bearer_token_end_to_end() {
+    use greentic_operator_store_server::http::{RouterOptions, router_with_options};
+    use greentic_operator_store_server::rbac::RbacEngine;
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SqliteEnvironmentStore::open(&dir.path().join("store.sqlite"))
+        .await
+        .expect("open sqlite store");
+    let backend = Arc::new(store);
+
+    let token_path = dir.path().join("rbac-tokens.json");
+    std::fs::write(
+        &token_path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "greentic.store-rbac.v1",
+            "tokens": [{
+                "token_sha256": hex::encode(Sha256::digest(b"e2e-secret")),
+                "actor": "e2e",
+                "role": "operator",
+            }],
+        }))
+        .expect("token json"),
+    )
+    .expect("write token file");
+    let rbac = RbacEngine::from_token_file(&token_path).expect("valid token file");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router_with_options(
+                backend,
+                RouterOptions {
+                    operator_key_path: Some(dir.path().join("operator-key.pem")),
+                    rbac,
+                },
+            ),
+        )
+        .await
+        .expect("serve");
+    });
+
+    tokio::task::spawn_blocking(move || {
+        let base = Url::parse(&format!("http://{addr}/")).expect("base url");
+        let id = env_id("local");
+
+        // No token → typed Unauthorized (unauthenticated denials are logged
+        // but not persisted; only authenticated denials are durably audited;
+        // the route tests pin both).
+        let anonymous = HttpEnvironmentStore::new(base.clone(), AuthMethod::None).expect("client");
+        let err = anonymous
+            .create_environment(&id, "local".to_string(), host_config("local"))
+            .expect_err("anonymous mutation must be denied");
+        assert!(
+            matches!(err, StoreError::Unauthorized { ref policy, .. } if policy == "static-tokens"),
+            "unexpected error: {err:?}"
+        );
+
+        // Wrong token → same denial.
+        let wrong = HttpEnvironmentStore::new(
+            base.clone(),
+            AuthMethod::Bearer("not-the-secret".to_string()),
+        )
+        .expect("client");
+        let err = wrong
+            .create_environment(&id, "local".to_string(), host_config("local"))
+            .expect_err("unknown token must be denied");
+        assert!(matches!(err, StoreError::Unauthorized { .. }));
+
+        // The named operator deploys.
+        let authed = HttpEnvironmentStore::new(base, AuthMethod::Bearer("e2e-secret".to_string()))
+            .expect("client");
+        let created = authed
+            .create_environment(&id, "local".to_string(), host_config("local"))
+            .expect("authorized create");
+        assert_eq!(created.environment_id, id);
+    })
+    .await
+    .expect("client task");
+}

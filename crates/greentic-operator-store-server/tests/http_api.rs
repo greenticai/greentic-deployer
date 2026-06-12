@@ -3699,3 +3699,745 @@ async fn oversized_idempotency_key_is_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
     assert_eq!(body["kind"], "invalid-request");
 }
+
+// ---------------------------------------------------------------------------
+// RBAC (A8 #3, PR-4.4)
+// ---------------------------------------------------------------------------
+//
+// Static bearer-token enforcement: missing/unknown tokens and insufficient
+// roles are typed 403s; denied MUTATIONS still append a durable audit row
+// (with the Deny decision and the anonymous-or-named actor) but never
+// consume the idempotency key; reads require any valid token; the replay
+// gate sits BEHIND authorization. The 87 tests above all run open-dev —
+// pinning that an unconfigured engine changes nothing.
+
+use greentic_operator_store_server::http::{RouterOptions, router_with_options};
+use greentic_operator_store_server::rbac::RbacEngine;
+
+const ADMIN_TOKEN: &str = "admin-tok";
+const OPERATOR_TOKEN: &str = "op-tok";
+const READER_TOKEN: &str = "ro-tok";
+const SCOPED_TOKEN: &str = "scoped-tok";
+
+fn write_token_file(dir: &std::path::Path) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let digest = |t: &str| hex::encode(Sha256::digest(t.as_bytes()));
+    let path = dir.join("rbac-tokens.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "schema": "greentic.store-rbac.v1",
+            "tokens": [
+                {"token_sha256": digest(ADMIN_TOKEN), "actor": "root", "role": "admin"},
+                {"token_sha256": digest(OPERATOR_TOKEN), "actor": "deployer", "role": "operator"},
+                {"token_sha256": digest(READER_TOKEN), "actor": "viewer", "role": "read-only"},
+                {"token_sha256": digest(SCOPED_TOKEN), "actor": "scoped-admin", "role": "admin", "env_ids": ["staging"]},
+            ],
+        }))
+        .expect("token json"),
+    )
+    .expect("write token file");
+    path
+}
+
+async fn rbac_app() -> (tempfile::TempDir, Router, Arc<SqliteEnvironmentStore>) {
+    let (dir, store) = fresh_store().await;
+    let store = Arc::new(store);
+    let tokens = write_token_file(dir.path());
+    let app = router_with_options(
+        Arc::clone(&store),
+        RouterOptions {
+            operator_key_path: Some(dir.path().join("operator-key.pem")),
+            rbac: RbacEngine::from_token_file(&tokens).expect("valid token file"),
+        },
+    );
+    (dir, app, store)
+}
+
+fn bearer(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
+/// Full audit-log events recorded for `env`, in append order.
+async fn audit_log_events(store: &SqliteEnvironmentStore, env: &str) -> Vec<Value> {
+    sqlx::query("SELECT event FROM audit_log WHERE env_id = $1 ORDER BY id ASC")
+        .bind(env)
+        .fetch_all(store.pool())
+        .await
+        .expect("audit query")
+        .into_iter()
+        .map(|r| r.get::<Value, _>("event"))
+        .collect()
+}
+
+#[tokio::test]
+async fn missing_token_is_403_not_persisted_and_keeps_the_key_free() {
+    let (_d, app, store) = rbac_app().await;
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "RBAC-K1")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["kind"], "unauthorized");
+    assert_eq!(body["policy"], "static-tokens");
+
+    // Anonymous denials are logged but NOT persisted (Finding 2): the
+    // audit log must be empty — unauthenticated callers cannot flood it.
+    let events = audit_log_events(&store, "local").await;
+    assert!(
+        events.is_empty(),
+        "anonymous denial must not be persisted: {events:?}"
+    );
+
+    // The key was NOT consumed: the authorized retry applies fresh.
+    let admin = bearer(ADMIN_TOKEN);
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "RBAC-K1"), ("Authorization", &admin)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["idempotency"]["idempotency"], "applied");
+}
+
+#[tokio::test]
+async fn unknown_token_is_403() {
+    let (_d, app, _store) = rbac_app().await;
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[
+            ("Idempotency-Key", "RBAC-K2"),
+            ("Authorization", "Bearer not-a-token"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["kind"], "unauthorized");
+}
+
+#[tokio::test]
+async fn reads_require_any_valid_token() {
+    let (_d, app, _store) = rbac_app().await;
+    let (status, body) = send_custom(app.clone(), Method::GET, "/environments", None, &[]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["kind"], "unauthorized");
+
+    let reader = bearer(READER_TOKEN);
+    let (status, body) = send_custom(
+        app,
+        Method::GET,
+        "/environments",
+        None,
+        &[("Authorization", &reader)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body["environments"].is_array());
+}
+
+#[tokio::test]
+async fn read_only_role_cannot_mutate_and_the_denial_names_the_actor() {
+    let (_d, app, store) = rbac_app().await;
+    let admin = bearer(ADMIN_TOKEN);
+    let (status, _) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "RBAC-K3"), ("Authorization", &admin)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let reader = bearer(READER_TOKEN);
+    let (status, body) = send_custom(
+        app,
+        Method::PATCH,
+        "/environments/local",
+        Some(json!({"name": "renamed"})),
+        &[("Idempotency-Key", "RBAC-K4"), ("Authorization", &reader)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert!(
+        body["reason"].as_str().unwrap().contains("read-only"),
+        "reason names the role: {body}"
+    );
+
+    let events = audit_log_events(&store, "local").await;
+    let denial = events.last().expect("denial audited");
+    assert_eq!(denial["authorization"]["decision"], "deny");
+    assert_eq!(denial["actor"]["kind"], "bearer-token");
+    assert_eq!(denial["actor"]["user"], "viewer");
+    assert_eq!(denial["verb"], "update");
+}
+
+#[tokio::test]
+async fn operator_role_deploys_but_cannot_touch_trust_root_custody() {
+    let (_d, app, _store) = rbac_app().await;
+    let operator = bearer(OPERATOR_TOKEN);
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "RBAC-K5"), ("Authorization", &operator)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    // The allow decision and the named actor land in the audit record.
+    assert_eq!(body["audit"]["authorization"]["decision"], "allow");
+    assert_eq!(body["audit"]["authorization"]["policy"], "static-tokens");
+    assert_eq!(body["audit"]["actor"]["kind"], "bearer-token");
+    assert_eq!(body["audit"]["actor"]["user"], "deployer");
+
+    // Key custody (who may sign revenue policies) is admin-only.
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/trust-root/bootstrap",
+        None,
+        &[("Idempotency-Key", "RBAC-K6"), ("Authorization", &operator)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert!(
+        body["reason"]
+            .as_str()
+            .unwrap()
+            .contains("trust-root.bootstrap"),
+        "reason names the op: {body}"
+    );
+
+    let admin = bearer(ADMIN_TOKEN);
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/trust-root/bootstrap",
+        None,
+        &[("Idempotency-Key", "RBAC-K7"), ("Authorization", &admin)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
+#[tokio::test]
+async fn replay_sits_behind_authorization() {
+    let (_d, app, _store) = rbac_app().await;
+    let admin = bearer(ADMIN_TOKEN);
+    let (status, first) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "RBAC-K8"), ("Authorization", &admin)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Same key + body without a token: 403, not a replay.
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "RBAC-K8")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+
+    // Authorized retry replays the original verbatim.
+    let (status, replayed) = send_custom(
+        app,
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "RBAC-K8"), ("Authorization", &admin)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replayed["idempotency"]["idempotency"], "replayed");
+    assert_eq!(replayed["audit"]["event_id"], first["audit"]["event_id"]);
+}
+
+// ---------------------------------------------------------------------------
+// Backups + restore (A8 #5, PR-4.4)
+// ---------------------------------------------------------------------------
+//
+// A backup snapshots the environment row; restore is a guarded mutation
+// whose body-carried precondition MUST pin prior state. The snapshot's
+// integrity digest is re-verified before a restore applies (contract #6 on
+// the backup itself), and the per-env backup store is bounded — at the cap
+// `create` refuses (409) instead of evicting recovery points.
+
+#[tokio::test]
+async fn backup_then_restore_reverts_content_and_advances_generation() {
+    let (_d, app, store) = app_with_store().await;
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Snapshot generation 1 (name == "local").
+    let (status, backup) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {backup}");
+    assert_envelope(&backup, "local");
+    let manifest = &backup["result"];
+    assert_eq!(manifest["schema"], "greentic.backup-manifest.v1");
+    assert_eq!(manifest["env_id"], "local");
+    assert_eq!(manifest["generation"], 1);
+    assert!(manifest["size_bytes"].as_u64().unwrap() > 0);
+    let backup_id = manifest["backup_id"].as_str().unwrap().to_string();
+    // The env itself is untouched: the envelope echoes generation 1.
+    assert_eq!(backup["generation"], 1);
+
+    // Mutate past the snapshot.
+    let (status, patched) = send(
+        app.clone(),
+        Method::PATCH,
+        "/environments/local",
+        Some(json!({"name": "renamed"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(patched["generation"], 2);
+
+    // Restore under the CURRENT pin (etag + generation from the patch).
+    let (status, restored) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/restore",
+        Some(json!({
+            "backup_id": backup_id,
+            "precondition": {
+                "if_match": patched["etag"],
+                "expected_generation": 2,
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {restored}");
+    assert_envelope(&restored, "local");
+    assert_eq!(restored["result"]["restored_generation"], 3);
+    // The outcome's integrity equals the backup's recorded digest…
+    assert_eq!(
+        restored["result"]["integrity"]["digest"],
+        manifest["integrity"]["digest"]
+    );
+    // …and the envelope's etag IS that digest (restored content == backup).
+    assert_eq!(
+        restored["etag"], manifest["integrity"]["digest"],
+        "restored etag must equal the snapshot digest"
+    );
+
+    // Content reverted; generation stayed monotonic.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(read["environment"]["name"], "local");
+    assert_eq!(read["generation"], 3);
+
+    // create + patch + backup + restore all audited durably.
+    assert_eq!(audit_log_event_ids(&store, "local").await.len(), 4);
+}
+
+#[tokio::test]
+async fn restore_with_an_empty_precondition_is_428() {
+    let (_d, app) = app().await;
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, backup) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap();
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/environments/local/restore",
+        Some(json!({"backup_id": backup_id, "precondition": {}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_REQUIRED, "body: {body}");
+    assert_eq!(body["kind"], "precondition-required");
+}
+
+#[tokio::test]
+async fn restore_with_a_stale_precondition_is_412_and_applies_nothing() {
+    let (_d, app) = app().await;
+    let (status, created) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let stale_etag = created["etag"].clone();
+    let (status, backup) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap();
+    let (status, _) = send(
+        app.clone(),
+        Method::PATCH,
+        "/environments/local",
+        Some(json!({"name": "renamed"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Pin the PRE-patch state: stale → 412.
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/restore",
+        Some(json!({
+            "backup_id": backup_id,
+            "precondition": {"if_match": stale_etag, "expected_generation": 1},
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "body: {body}");
+    assert_eq!(body["kind"], "precondition-failed");
+
+    // Nothing applied: the rename is still in place.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(read["environment"]["name"], "renamed");
+    assert_eq!(read["generation"], 2);
+}
+
+#[tokio::test]
+async fn restore_of_an_unknown_backup_is_404() {
+    let (_d, app) = app().await;
+    let (status, created) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/environments/local/restore",
+        Some(json!({
+            "backup_id": "01JTKW5B4W4Q5Y1CQW93F7S5VH",
+            "precondition": {"if_match": created["etag"], "expected_generation": 1},
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["kind"], "dependent-not-found");
+}
+
+#[tokio::test]
+async fn a_tampered_backup_is_never_restored() {
+    let (_d, app, store) = app_with_store().await;
+    let (status, created) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, backup) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap();
+
+    // Tamper the composite snapshot at rest: its digest no longer matches.
+    sqlx::query(
+        "UPDATE backups SET state = json_set(state, '$.environment.name', 'evil') \
+         WHERE backup_id = $1",
+    )
+    .bind(backup_id)
+    .execute(store.pool())
+    .await
+    .expect("tamper");
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/environments/local/restore",
+        Some(json!({
+            "backup_id": backup_id,
+            "precondition": {"if_match": created["etag"], "expected_generation": 1},
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+    assert_eq!(body["kind"], "integrity-mismatch");
+}
+
+#[tokio::test]
+async fn backup_create_replay_returns_the_same_manifest_without_a_second_row() {
+    let (_d, app) = app().await;
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, first) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+        &[("Idempotency-Key", "BK-1")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, second) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+        &[("Idempotency-Key", "BK-1")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["idempotency"]["idempotency"], "replayed");
+    assert_eq!(second["result"]["backup_id"], first["result"]["backup_id"]);
+
+    // Exactly one backup row exists.
+    let (_, list) = send(app, Method::GET, "/environments/local/backups", None).await;
+    assert_eq!(list["backups"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn delete_backup_then_restore_is_404() {
+    let (_d, app) = app().await;
+    let (status, created) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, backup) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+
+    let delete_path = format!("/environments/local/backups/{backup_id}");
+    let (status, deleted) = send(app.clone(), Method::DELETE, &delete_path, None).await;
+    assert_eq!(status, StatusCode::OK, "body: {deleted}");
+    assert_envelope(&deleted, "local");
+    assert_eq!(deleted["result"]["deleted"], true);
+
+    let (_, list) = send(
+        app.clone(),
+        Method::GET,
+        "/environments/local/backups",
+        None,
+    )
+    .await;
+    assert!(list["backups"].as_array().unwrap().is_empty());
+
+    // Deleting again (or restoring) is a 404 that consumes nothing.
+    let (status, body) = send(app.clone(), Method::DELETE, &delete_path, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["kind"], "dependent-not-found");
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/environments/local/restore",
+        Some(json!({
+            "backup_id": backup_id,
+            "precondition": {"if_match": created["etag"], "expected_generation": 1},
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+}
+
+#[tokio::test]
+async fn the_backup_cap_refuses_instead_of_evicting() {
+    let (_d, app, store) = app_with_store().await;
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Seed the cap directly (raw rows — the route would be slow here).
+    let cap = greentic_operator_store_server::storage::MAX_BACKUPS_PER_ENV;
+    for i in 0..cap {
+        sqlx::query(
+            "INSERT INTO backups (env_id, backup_id, created_at, generation, \
+             integrity, size_bytes, state, snapshot_digest) \
+             VALUES ('local', $1, '2026-06-12T00:00:00Z', \
+             1, 'digest', 2, '{}', 'digest')",
+        )
+        .bind(format!("SEED-{i:05}"))
+        .execute(store.pool())
+        .await
+        .expect("seed backup row");
+    }
+
+    let (status, body) = send(app, Method::POST, "/environments/local/backups", None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "conflict");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("delete old backups"),
+        "detail guides the operator: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Env-scoped RBAC tokens (Finding 1)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn env_scoped_token_can_only_access_its_environments() {
+    let (_d, app, store) = rbac_app().await;
+    let admin = bearer(ADMIN_TOKEN);
+    let scoped = bearer(SCOPED_TOKEN);
+
+    // Admin creates two envs: "staging" (the scoped token's env) and "prod".
+    for env in ["staging", "prod"] {
+        let (status, _) = send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments",
+            Some(create_body(env)),
+            &[
+                ("Idempotency-Key", &format!("SCOPE-CREATE-{env}")),
+                ("Authorization", &admin),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // Scoped token can mutate staging.
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::PATCH,
+        "/environments/staging",
+        Some(json!({"name": "staging-renamed"})),
+        &[
+            ("Idempotency-Key", "SCOPE-PATCH-1"),
+            ("Authorization", &scoped),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Scoped token cannot mutate prod.
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::PATCH,
+        "/environments/prod",
+        Some(json!({"name": "prod-renamed"})),
+        &[
+            ("Idempotency-Key", "SCOPE-PATCH-2"),
+            ("Authorization", &scoped),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert!(body["reason"].as_str().unwrap().contains("not scoped"));
+
+    // Scoped authenticated denial IS persisted (unlike anonymous ones).
+    // The first event is from the admin's create; the second is the denial.
+    let events = audit_log_events(&store, "prod").await;
+    assert_eq!(events.len(), 2, "create + scoped denial: {events:?}");
+    let denial = &events[1];
+    assert_eq!(denial["authorization"]["decision"], "deny");
+    assert_eq!(denial["actor"]["user"], "scoped-admin");
+
+    // Scoped token can read staging.
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::GET,
+        "/environments/staging",
+        None,
+        &[("Authorization", &scoped)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["environment"]["name"], "staging-renamed");
+
+    // Scoped token cannot read prod.
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::GET,
+        "/environments/prod",
+        None,
+        &[("Authorization", &scoped)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+
+    // List envs returns only the scoped env.
+    let (status, body) = send_custom(
+        app,
+        Method::GET,
+        "/environments",
+        None,
+        &[("Authorization", &scoped)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let envs = body["environments"].as_array().unwrap();
+    assert_eq!(envs.len(), 1);
+    assert_eq!(envs[0], "staging");
+}

@@ -1,10 +1,12 @@
 //! Axum surface for the operator store server.
 //!
 //! Health endpoints (`/healthz` liveness, `/readyz` storage-probing
-//! readiness) plus the A8 verb routes from [`crate::api`]. PR-4.2a serves
-//! the environment-lifecycle group; the remaining verb groups from the
-//! route table pinned in the deployer's `environment::http_store` module
-//! doc land group-by-group in PR-4.2b+.
+//! readiness) plus the A8 verb routes from [`crate::api`] — the full route
+//! table pinned in the deployer's `environment::http_store` module doc,
+//! plus the backup/restore group (A8 #5, PR-4.4). Authorization
+//! ([`crate::rbac::RbacEngine`]) is part of the shared [`AppState`]:
+//! [`RouterOptions::rbac`] selects open-dev (default) or static-token
+//! enforcement.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,6 +16,7 @@ use axum::{Json, Router, extract::State, http::StatusCode};
 use serde_json::{Value, json};
 
 use crate::api;
+use crate::rbac::RbacEngine;
 use crate::storage::EnvironmentStorage;
 
 /// Shared handler state. Manual `Clone` so `S` itself doesn't need to be
@@ -25,6 +28,9 @@ pub struct AppState<S> {
     /// `None` falls back to the CLI's standard resolution
     /// (`GTC_OPERATOR_KEY_PATH` env var, else `~/.greentic/operator/key.pem`).
     pub operator_key_path: Option<Arc<PathBuf>>,
+    /// Authorization engine (A8 #3): open-dev allows everything; static
+    /// tokens fail closed.
+    pub rbac: Arc<RbacEngine>,
 }
 
 impl<S> Clone for AppState<S> {
@@ -32,17 +38,35 @@ impl<S> Clone for AppState<S> {
         Self {
             storage: Arc::clone(&self.storage),
             operator_key_path: self.operator_key_path.clone(),
+            rbac: Arc::clone(&self.rbac),
         }
     }
 }
 
-/// Build the server router over any [`EnvironmentStorage`] backend, with
-/// the default operator-key resolution (see [`AppState::operator_key_path`]).
+/// Optional router configuration beyond the storage backend.
+pub struct RouterOptions {
+    /// See [`AppState::operator_key_path`].
+    pub operator_key_path: Option<PathBuf>,
+    /// See [`AppState::rbac`]. Defaults to [`RbacEngine::open_dev`].
+    pub rbac: RbacEngine,
+}
+
+impl Default for RouterOptions {
+    fn default() -> Self {
+        Self {
+            operator_key_path: None,
+            rbac: RbacEngine::open_dev(),
+        }
+    }
+}
+
+/// Build the server router over any [`EnvironmentStorage`] backend with
+/// default options (open-dev RBAC, standard operator-key resolution).
 pub fn router<S>(storage: Arc<S>) -> Router
 where
     S: EnvironmentStorage + 'static,
 {
-    build_router(storage, None)
+    router_with_options(storage, RouterOptions::default())
 }
 
 /// [`router`] with an explicit operator-key path — the trust-root
@@ -52,10 +76,17 @@ pub fn router_with_operator_key<S>(storage: Arc<S>, operator_key_path: PathBuf) 
 where
     S: EnvironmentStorage + 'static,
 {
-    build_router(storage, Some(Arc::new(operator_key_path)))
+    router_with_options(
+        storage,
+        RouterOptions {
+            operator_key_path: Some(operator_key_path),
+            ..RouterOptions::default()
+        },
+    )
 }
 
-fn build_router<S>(storage: Arc<S>, operator_key_path: Option<Arc<PathBuf>>) -> Router
+/// [`router`] with full [`RouterOptions`].
+pub fn router_with_options<S>(storage: Arc<S>, options: RouterOptions) -> Router
 where
     S: EnvironmentStorage + 'static,
 {
@@ -169,13 +200,28 @@ where
             "/environments/{env_id}/trust-root/keys/{key_id}",
             delete(api::remove_trusted_key::<S>),
         )
+        .route(
+            "/environments/{env_id}/backups",
+            get(api::list_backups::<S>).post(api::create_backup::<S>),
+        )
+        .route(
+            "/environments/{env_id}/backups/{backup_id}",
+            delete(api::delete_backup::<S>),
+        )
+        .route(
+            "/environments/{env_id}/restore",
+            post(api::restore_environment::<S>),
+        )
         .with_state(AppState {
             storage,
-            operator_key_path,
+            operator_key_path: options.operator_key_path.map(Arc::new),
+            rbac: Arc::new(options.rbac),
         })
 }
 
-/// Liveness: the process is up. Deliberately storage-free.
+/// Liveness: the process is up. Deliberately storage-free (and
+/// deliberately unauthenticated, like `/readyz` — orchestrator probes
+/// carry no tokens and the endpoints expose no environment state).
 async fn healthz() -> Json<Value> {
     Json(json!({
         "status": "ok",

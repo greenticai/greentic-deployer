@@ -1264,3 +1264,337 @@ async fn ledger_evicts_beyond_the_per_env_window() {
         "other env's key must survive"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Backups + standalone audit append (A8 #3/#5, PR-4.4)
+// ---------------------------------------------------------------------------
+
+use greentic_deploy_spec::{BackupManifest, StateIntegrity};
+use greentic_operator_store_server::storage::{MAX_BACKUPS_PER_ENV, StoredBackup};
+
+use greentic_operator_store_server::storage::EnvSnapshot;
+
+fn stored_backup(id: &EnvId, backup_id: &str, env: &Environment) -> StoredBackup {
+    let env_json = serde_json::to_value(env).expect("env json");
+    let integrity = StateIntegrity::sha256_of(&env_json).expect("hash");
+    let snapshot = EnvSnapshot {
+        environment: env_json,
+        runtime: None,
+        pack_answers: std::collections::BTreeMap::new(),
+    };
+    let state = serde_json::to_value(&snapshot).expect("snapshot json");
+    let snapshot_digest = StateIntegrity::sha256_of(&state)
+        .expect("snapshot hash")
+        .digest;
+    StoredBackup {
+        manifest: BackupManifest {
+            schema: SchemaVersion::BACKUP_MANIFEST_V1.into(),
+            backup_id: backup_id.to_string(),
+            env_id: id.clone(),
+            created_at: Utc.with_ymd_and_hms(2026, 6, 12, 0, 0, 0).unwrap(),
+            generation: 1,
+            integrity,
+            size_bytes: state.to_string().len() as u64,
+        },
+        state,
+        snapshot_digest,
+    }
+}
+
+#[tokio::test]
+async fn backup_round_trips_with_its_journal_in_one_transaction() {
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    let env = minimal_environment(&id);
+    store.create_env(&env).await.expect("create env");
+
+    let backup = stored_backup(&id, "01JTKW5B4W4Q5Y1CQW93F7S5VH", &env);
+    store
+        .create_backup_journaled(&backup, Some(&journal(&id, "BK-1", "fp-bk1")))
+        .await
+        .expect("create backup");
+
+    // Manifest round-trips through list + load; the snapshot is verbatim.
+    let listed = store.list_backups(&id).await.expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].backup_id, backup.manifest.backup_id);
+    assert_eq!(listed[0].generation, 1);
+    assert_eq!(listed[0].integrity.digest, backup.manifest.integrity.digest);
+    assert_eq!(listed[0].created_at, backup.manifest.created_at);
+    assert_eq!(listed[0].size_bytes, backup.manifest.size_bytes);
+    let loaded = store
+        .load_backup(&id, &backup.manifest.backup_id)
+        .await
+        .expect("load")
+        .expect("present");
+    assert_eq!(loaded.state, backup.state);
+
+    // The journal landed with it.
+    assert!(
+        store
+            .lookup_idempotency(&id, "BK-1")
+            .await
+            .expect("lookup")
+            .is_some()
+    );
+    assert_eq!(audit_event_ids(&store, &id).await, vec!["evt-BK-1"]);
+}
+
+#[tokio::test]
+async fn the_backup_cap_refuses_and_rolls_the_journal_back() {
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    let env = minimal_environment(&id);
+    store.create_env(&env).await.expect("create env");
+
+    for i in 0..MAX_BACKUPS_PER_ENV {
+        store
+            .create_backup_journaled(&stored_backup(&id, &format!("SEED-{i:05}"), &env), None)
+            .await
+            .expect("seed backup");
+    }
+
+    let err = store
+        .create_backup_journaled(
+            &stored_backup(&id, "ONE-TOO-MANY", &env),
+            Some(&journal(&id, "BK-CAP", "fp-cap")),
+        )
+        .await
+        .expect_err("cap must refuse");
+    assert!(matches!(err, StorageError::BackupLimitReached { limit, .. }
+        if limit == MAX_BACKUPS_PER_ENV));
+
+    // Nothing committed: no row, no ledger entry, no audit append.
+    assert!(
+        store
+            .load_backup(&id, "ONE-TOO-MANY")
+            .await
+            .expect("load")
+            .is_none()
+    );
+    assert!(
+        store
+            .lookup_idempotency(&id, "BK-CAP")
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+    assert!(audit_event_ids(&store, &id).await.is_empty());
+
+    // Another env is unaffected by this env's cap.
+    let other = env_id("other");
+    let other_env = minimal_environment(&other);
+    store.create_env(&other_env).await.expect("create other");
+    store
+        .create_backup_journaled(&stored_backup(&other, "OTHER-1", &other_env), None)
+        .await
+        .expect("other env stays under its own cap");
+}
+
+#[tokio::test]
+async fn deleting_a_missing_backup_writes_nothing() {
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    let env = minimal_environment(&id);
+    store.create_env(&env).await.expect("create env");
+
+    let deleted = store
+        .delete_backup_journaled(&id, "NOPE", Some(&journal(&id, "DEL-1", "fp-del")))
+        .await
+        .expect("delete");
+    assert!(!deleted);
+    // The journal did not ride a no-op delete: the key stays free.
+    assert!(
+        store
+            .lookup_idempotency(&id, "DEL-1")
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+    assert!(audit_event_ids(&store, &id).await.is_empty());
+
+    // A real delete journals atomically.
+    store
+        .create_backup_journaled(&stored_backup(&id, "REAL", &env), None)
+        .await
+        .expect("create backup");
+    let deleted = store
+        .delete_backup_journaled(&id, "REAL", Some(&journal(&id, "DEL-2", "fp-del2")))
+        .await
+        .expect("delete");
+    assert!(deleted);
+    assert!(
+        store
+            .load_backup(&id, "REAL")
+            .await
+            .expect("load")
+            .is_none()
+    );
+    assert_eq!(audit_event_ids(&store, &id).await, vec!["evt-DEL-2"]);
+}
+
+#[tokio::test]
+async fn record_audit_appends_without_touching_the_ledger() {
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+
+    store
+        .record_audit(
+            &id,
+            "evt-denial",
+            &json!({"authorization": {"decision": "deny"}}),
+        )
+        .await
+        .expect("record audit");
+
+    assert_eq!(audit_event_ids(&store, &id).await, vec!["evt-denial"]);
+    // No idempotency row was created by the standalone append.
+    let count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM idempotency_ledger")
+        .fetch_one(store.pool())
+        .await
+        .expect("count")
+        .get("n");
+    assert_eq!(count, 0);
+}
+
+// ---------------------------------------------------------------------------
+// restore_env_journaled: generation sequence + tombstone preservation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn restore_preserves_sidecar_generation_sequences_and_tombstones() {
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    let env = minimal_environment(&id);
+    let rev1 = store.create_env(&env).await.expect("create env");
+
+    // --- Set up runtime at generation 1, then advance to generation 2. ---
+    let runtime = minimal_runtime(&id);
+    let rt_rev1 = store
+        .upsert_runtime(&runtime, None)
+        .await
+        .expect("runtime gen 1");
+    assert_eq!(rt_rev1.generation, 1);
+
+    let mut runtime2 = minimal_runtime(&id);
+    runtime2
+        .discovered
+        .insert("listen_addr".to_string(), json!("127.0.0.1:0"));
+    let rt_rev2 = store
+        .upsert_runtime(
+            &runtime2,
+            Some(&Precondition::matching(
+                rt_rev1.etag.clone(),
+                rt_rev1.generation,
+            )),
+        )
+        .await
+        .expect("runtime gen 2");
+    assert_eq!(rt_rev2.generation, 2);
+
+    // --- Set up pack_answers: Deployer slot at gen 1. ---
+    let deployer_v1 = json!({"region": "eu-west-1"});
+    let pa_rev1 = store
+        .upsert_pack_answers(&id, CapabilitySlot::Deployer, &deployer_v1, None)
+        .await
+        .expect("deployer gen 1");
+    assert_eq!(pa_rev1.generation, 1);
+
+    // --- Take a backup (snapshot has Deployer slot + runtime). ---
+    let snapshot = store.load_env_snapshot(&id).await.expect("snapshot");
+    assert!(snapshot.runtime.is_some());
+    assert!(snapshot.pack_answers.contains_key("deployer"));
+
+    // --- Advance Deployer to gen 2 (post-backup mutation). ---
+    let deployer_v2 = json!({"region": "us-east-1"});
+    let pa_rev2 = store
+        .upsert_pack_answers(
+            &id,
+            CapabilitySlot::Deployer,
+            &deployer_v2,
+            Some(&Precondition::matching(
+                pa_rev1.etag.clone(),
+                pa_rev1.generation,
+            )),
+        )
+        .await
+        .expect("deployer gen 2");
+    assert_eq!(pa_rev2.generation, 2);
+
+    // --- Add a Secrets slot AFTER the backup (absent from snapshot). ---
+    let secrets_v1 = json!({"api_key": "abc123"});
+    store
+        .upsert_pack_answers(&id, CapabilitySlot::Secrets, &secrets_v1, None)
+        .await
+        .expect("secrets gen 1");
+
+    // --- Restore from the earlier snapshot. ---
+    let env_rev = store.load_env(&id).await.expect("load env");
+    let restore_rev = store
+        .restore_env_journaled(
+            &id,
+            &snapshot,
+            &Precondition::matching(env_rev.revision.etag, env_rev.revision.generation),
+            None,
+        )
+        .await
+        .expect("restore");
+    assert_eq!(restore_rev.generation, rev1.generation + 1);
+
+    // --- Assert: Deployer slot is LIVE at generation 3 (was 2, +1). ---
+    let loaded_deployer = store
+        .load_pack_answers(&id, CapabilitySlot::Deployer)
+        .await
+        .expect("load deployer")
+        .expect("deployer must be live after restore");
+    assert_eq!(
+        loaded_deployer.revision.generation, 3,
+        "deployer generation must continue (2+1=3), not reset to 1"
+    );
+    assert_eq!(
+        loaded_deployer.value, deployer_v1,
+        "deployer content must be the snapshot's (v1), not v2"
+    );
+
+    // --- Assert: Secrets slot is TOMBSTONED (absent from snapshot). ---
+    // load_pack_answers filters `deleted = 0`, so it should return None.
+    assert!(
+        store
+            .load_pack_answers(&id, CapabilitySlot::Secrets)
+            .await
+            .expect("load secrets")
+            .is_none(),
+        "secrets must be logically absent (tombstoned) after restore"
+    );
+    // Verify via raw SQL: the row exists with deleted=1 and generation=2 (was 1, +1).
+    let secrets_row = sqlx::query(
+        "SELECT generation, deleted FROM pack_answers \
+         WHERE env_id = $1 AND slot = $2",
+    )
+    .bind(id.as_str())
+    .bind(CapabilitySlot::Secrets.as_str())
+    .fetch_optional(store.pool())
+    .await
+    .expect("raw query");
+    let secrets_row = secrets_row.expect("secrets row must still exist (tombstoned, not deleted)");
+    let secrets_deleted: i32 = secrets_row.get("deleted");
+    let secrets_gen: i64 = secrets_row.get("generation");
+    assert_eq!(secrets_deleted, 1, "secrets must be tombstoned");
+    assert_eq!(
+        secrets_gen, 2,
+        "secrets generation must continue (1+1=2), not be hard-deleted"
+    );
+
+    // --- Assert: Runtime generation continued (was 2, +1 = 3). ---
+    // Verify via raw SQL (the trait method returns the typed struct, not gen).
+    let rt_row = sqlx::query("SELECT generation FROM environment_runtimes WHERE env_id = $1")
+        .bind(id.as_str())
+        .fetch_one(store.pool())
+        .await
+        .expect("runtime row");
+    let rt_gen: i64 = rt_row.get("generation");
+    assert_eq!(
+        rt_gen, 3,
+        "runtime generation must continue (2+1=3), not reset to 1"
+    );
+}

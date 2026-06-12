@@ -8,7 +8,7 @@
 use std::future::Future;
 
 use greentic_deploy_spec::{
-    BundleId, CapabilitySlot, ConcurrencyConflict, CustomerId, EnvId, Environment,
+    BackupManifest, BundleId, CapabilitySlot, ConcurrencyConflict, CustomerId, EnvId, Environment,
     EnvironmentRuntime, IntegrityError, Precondition, PreconditionError, SpecError, StateEtag,
 };
 use greentic_operator_trust::trust_root::TrustRootDocument;
@@ -104,6 +104,14 @@ pub enum StorageError {
          on env `{env_id}`; retry to replay its response"
     )]
     IdempotencyKeyCommitted { env_id: EnvId, key: String },
+    /// The per-environment backup cap is reached. Unlike the idempotency
+    /// ledger, backups are never silently evicted — the operator must
+    /// delete old ones explicitly. Maps to `409 conflict` on the wire.
+    #[error(
+        "environment `{env_id}` already holds {limit} backups; \
+         delete old backups before creating new ones"
+    )]
+    BackupLimitReached { env_id: EnvId, limit: i64 },
     #[error(transparent)]
     Spec(#[from] SpecError),
     #[error(transparent)]
@@ -138,6 +146,41 @@ impl StorageError {
 /// deliberately NOT bounded — it must never forget a committed mutation;
 /// archival is the PR-4.4 backup story.
 pub const MAX_LEDGER_ROWS_PER_ENV: i64 = 4096;
+
+/// Per-environment backup cap (A8 #5). Backups are operator-initiated
+/// recovery points, so the cap REFUSES new creates
+/// ([`StorageError::BackupLimitReached`], 409 on the wire) rather than
+/// evicting old ones — silently dropping a recovery point is worse than
+/// asking the operator to delete explicitly.
+pub const MAX_BACKUPS_PER_ENV: i64 = 256;
+
+/// Composite environment snapshot: the environment document plus any
+/// sidecar state (runtime, pack answers) captured at backup time.
+/// Restore reverts all three atomically.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EnvSnapshot {
+    /// The environment row (the `Environment` document).
+    pub environment: Value,
+    /// The runtime sidecar, if present at backup time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<Value>,
+    /// Pack-answers sidecars keyed by slot, if any were present.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub pack_answers: std::collections::BTreeMap<String, Value>,
+}
+
+/// One stored backup: the contract's [`BackupManifest`] metadata plus the
+/// full composite snapshot of the environment it captured.
+#[derive(Debug, Clone)]
+pub struct StoredBackup {
+    pub manifest: BackupManifest,
+    /// The composite snapshot's canonical JSON. Restore verifies
+    /// `manifest.integrity` against this value before applying.
+    pub state: Value,
+    /// SHA-256 of `state` — stored alongside the snapshot so the load path
+    /// can verify without re-hashing.
+    pub snapshot_digest: String,
+}
 
 /// Everything the server must persist about ONE committed mutation, beyond
 /// the mutated resource itself (PR-4.3): the idempotency-ledger row (the
@@ -403,6 +446,77 @@ pub trait EnvironmentStorage: Send + Sync {
         customer_id: &CustomerId,
         version: u64,
     ) -> impl Future<Output = Result<Option<RevenuePolicyArtifact>, StorageError>> + Send;
+
+    /// Persist one backup (A8 #5) — manifest metadata + the full state
+    /// snapshot — together with its [`MutationJournal`] rows in ONE
+    /// transaction. Enforces [`MAX_BACKUPS_PER_ENV`] inside the same
+    /// transaction: at the cap the insert is refused with
+    /// [`StorageError::BackupLimitReached`] and nothing (journal included)
+    /// is written.
+    fn create_backup_journaled(
+        &self,
+        backup: &StoredBackup,
+        journal: Option<&MutationJournal>,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// List `env_id`'s backup manifests, oldest first (`backup_id` is a
+    /// ULID, so lexicographic order is creation order).
+    fn list_backups(
+        &self,
+        env_id: &EnvId,
+    ) -> impl Future<Output = Result<Vec<BackupManifest>, StorageError>> + Send;
+
+    /// Load one backup (manifest + snapshot), if present.
+    fn load_backup(
+        &self,
+        env_id: &EnvId,
+        backup_id: &str,
+    ) -> impl Future<Output = Result<Option<StoredBackup>, StorageError>> + Send;
+
+    /// Delete one backup together with its journal rows in ONE
+    /// transaction. Returns `false` (and writes NOTHING, journal included)
+    /// when the backup does not exist — the handler maps that to a 404 and
+    /// the request's key stays unconsumed.
+    fn delete_backup_journaled(
+        &self,
+        env_id: &EnvId,
+        backup_id: &str,
+        journal: Option<&MutationJournal>,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send;
+
+    /// Load the composite environment snapshot for a backup: the environment
+    /// document, the runtime sidecar (if any), and all pack-answers sidecars.
+    /// Used by `create_backup` to build the [`EnvSnapshot`] atomically.
+    fn load_env_snapshot(
+        &self,
+        env_id: &EnvId,
+    ) -> impl Future<Output = Result<EnvSnapshot, StorageError>> + Send;
+
+    /// Restore a composite [`EnvSnapshot`] atomically: replace the
+    /// environment row, upsert/delete the runtime sidecar, and upsert/delete
+    /// every pack-answers sidecar — all inside ONE transaction together with
+    /// the [`MutationJournal`] rows. The `precondition` guards the
+    /// environment row (the CAS target); the sidecars are replaced
+    /// unconditionally (their preconditions were not captured at backup time,
+    /// and restoring partial state is worse than restoring all of it).
+    fn restore_env_journaled(
+        &self,
+        env_id: &EnvId,
+        snapshot: &EnvSnapshot,
+        precondition: &Precondition,
+        journal: Option<&MutationJournal>,
+    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
+
+    /// Append ONE audit row with no idempotency-ledger row — the durable
+    /// record of a DENIED mutation (A8 #3: "the rejected attempt is still
+    /// audited"). Denials never consume the request's idempotency key, so
+    /// they must not ride [`Self::record_journal`].
+    fn record_audit(
+        &self,
+        env_id: &EnvId,
+        event_id: &str,
+        event: &Value,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 }
 
 /// A stored revenue-policy version: the exact bytes the shared builder
