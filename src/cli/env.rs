@@ -589,26 +589,31 @@ fn load_render_answers(
     };
     let env_dir = store.env_dir(&env.environment_id)?;
     // Containment check: the answers file must live under the env dir.
-    crate::path_safety::normalize_under_root(&env_dir, rel_path).map_err(|e| {
-        OpError::Conflict(format!(
-            "answers_ref `{}` escapes env directory: {e}",
-            rel_path.display()
-        ))
-    })?;
-    let abs_path = env_dir.join(rel_path);
-    let raw = std::fs::read_to_string(&abs_path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            OpError::Conflict(format!(
-                "binding records answers_ref `{}` but the file does not exist \
-                 — re-run the binding wizard or fix the binding",
-                rel_path.display()
-            ))
-        } else {
-            OpError::Io {
-                path: abs_path.clone(),
-                source: e,
-            }
+    // `normalize_under_root` canonicalizes, so it ALSO fails when the file
+    // simply does not exist — discriminate the two so a missing file gets
+    // an actionable message instead of a path-escape one. Both fail closed.
+    let abs_path = match crate::path_safety::normalize_under_root(&env_dir, rel_path) {
+        Ok(canon) => canon,
+        Err(e) => {
+            let missing =
+                !rel_path.is_absolute() && env_dir.join(rel_path).symlink_metadata().is_err();
+            return Err(if missing {
+                OpError::Conflict(format!(
+                    "binding records answers_ref `{}` but the file does not exist \
+                     — re-run the binding wizard or fix the binding",
+                    rel_path.display()
+                ))
+            } else {
+                OpError::Conflict(format!(
+                    "answers_ref `{}` escapes env directory: {e}",
+                    rel_path.display()
+                ))
+            });
         }
+    };
+    let raw = std::fs::read_to_string(&abs_path).map_err(|e| OpError::Io {
+        path: abs_path.clone(),
+        source: e,
     })?;
     let answers: Value = serde_json::from_str(&raw).map_err(|e| {
         OpError::Conflict(format!(
@@ -2936,7 +2941,46 @@ mod tests {
             render_args("zain", None, None),
         )
         .unwrap_err();
-        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+        // The MESSAGE matters: a missing file must say so, not surface the
+        // containment-check's "escapes env directory" canonicalize failure.
+        match err {
+            OpError::Conflict(msg) => {
+                assert!(msg.contains("does not exist"), "got: {msg}")
+            }
+            other => panic!("expected Conflict, got {other}"),
+        }
+    }
+
+    #[test]
+    fn render_answers_ref_escaping_env_dir_is_conflict() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("zain");
+        let mut binding = make_binding(CapabilitySlot::Deployer, "greentic.deployer.k8s@1.0.0");
+        // `..`-relative ref pointing at an EXISTING file outside the env dir:
+        // must be rejected as an escape, never read.
+        binding.answers_ref = Some(PathBuf::from("../outside-answers.json"));
+        env.packs.push(binding);
+        store.save(&env).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("zain").unwrap()).unwrap();
+        std::fs::write(
+            env_dir.parent().unwrap().join("outside-answers.json"),
+            r#"{"namespace": "evil-ns"}"#,
+        )
+        .unwrap();
+        let err = render(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            render_args("zain", None, None),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(msg.contains("escapes"), "got: {msg}"),
+            other => panic!("expected Conflict, got {other}"),
+        }
     }
 
     #[test]
