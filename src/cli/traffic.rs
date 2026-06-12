@@ -6,9 +6,9 @@
 //! [`TrafficSplit::validate`].
 //!
 //! Rollback: the prior `TrafficSplit` is stashed inline under
-//! `previous_split_ref` using the same `inline://<base64>` token scheme as
-//! `env_packs::stash_previous` so rollback works without a sidecar history
-//! file. Multi-step history is A8's contract.
+//! `previous_split_ref` using the `inline://<base64>` token scheme from
+//! `greentic_deploy_spec::engine::inline_stash` so rollback works without a
+//! sidecar history file. Multi-step history is A8's contract.
 //!
 //! In-process router wiring (the `RevisionDispatcher` in `greentic-start`)
 //! is Phase B. A3 only mutates the spec object; making it observable in the
@@ -29,7 +29,6 @@ use super::{
 };
 
 const NOUN: &str = "traffic";
-pub(crate) const PREV_PREFIX: &str = "inline://";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrafficSetPayload {
@@ -153,11 +152,15 @@ pub fn set(
         let outcome = store
             .set_traffic_split(
                 &env_id,
-                deployment_id,
-                parsed_entries,
+                greentic_deploy_spec::SetTrafficSplitPayload {
+                    deployment_id,
+                    entries: parsed_entries,
+                    updated_by: payload.updated_by,
+                    authorization_ref: Some(
+                        payload.authorization_ref.to_string_lossy().into_owned(),
+                    ),
+                },
                 idempotency_key,
-                payload.updated_by,
-                Some(payload.authorization_ref.to_string_lossy().into_owned()),
             )
             .inspect_err(|err| {
                 if err.is_committed_after_save() {
@@ -165,6 +168,7 @@ pub fn set(
                 }
             })
             .map_err(map_traffic_store_err)?;
+        emit_applied_telemetry(&outcome);
         let gens = super::AuditGens {
             previous: outcome.previous_generation,
             new: outcome.new_generation,
@@ -177,6 +181,34 @@ pub fn set(
         );
         Ok((op_outcome, gens))
     })
+}
+
+/// C5.3: emit `TrafficSplitApplied` from the outcome's env snapshot — the
+/// same env the store just persisted, so tenant attribution has no TOCTOU
+/// window with a concurrent writer, local or remote. The idempotent no-op
+/// replay carries `new_generation: None` and must NOT double-count the
+/// transition.
+pub(crate) fn emit_applied_telemetry(outcome: &crate::environment::ApplyTrafficSplitOutcome) {
+    if outcome.new_generation.is_some() {
+        crate::rollout_telemetry::emit_traffic_split_applied(
+            &outcome.environment,
+            outcome.split.deployment_id,
+            &outcome.split.bundle_id,
+            outcome.split.generation,
+        );
+    }
+}
+
+/// C5.3: emit `TrafficSplitApplied` for the rollback path too — a rollback
+/// advances generation and materializes into runtime-config exactly like a
+/// forward `set`, so monitoring pipelines need the same lifecycle event.
+pub(crate) fn emit_rollback_telemetry(outcome: &crate::environment::RollbackTrafficSplitOutcome) {
+    crate::rollout_telemetry::emit_traffic_split_applied(
+        &outcome.environment,
+        outcome.restored.deployment_id,
+        &outcome.restored.bundle_id,
+        outcome.restored.generation,
+    );
 }
 
 /// Build a [`TrafficSetPayload`] from clap-derived args.
@@ -400,6 +432,7 @@ pub fn rollback(
                 }
             })
             .map_err(map_traffic_store_err)?;
+        emit_rollback_telemetry(&outcome);
         let gens = super::AuditGens {
             previous: Some(outcome.previous_generation),
             new: Some(outcome.new_generation),
@@ -505,24 +538,10 @@ fn show_schema() -> Value {
     })
 }
 
-// Inline base64 token re-used from env_packs. Duplicated rather than promoted
-// to a shared module to keep the surface area small while we figure out
-// whether multi-step history (A8) really wants this scheme at all.
-
-pub(crate) fn stash_inline(snapshot: Value) -> PathBuf {
-    let mut encoded = String::from(PREV_PREFIX);
-    let raw = serde_json::to_string(&snapshot).expect("Value re-serialises");
-    encoded.push_str(&crate::cli::env_packs::base64_encode_public(raw.as_bytes()));
-    PathBuf::from(encoded)
-}
-
-pub(crate) fn load_inline(prev_ref: &std::path::Path) -> Option<Value> {
-    let token = prev_ref.to_str()?;
-    let encoded = token.strip_prefix(PREV_PREFIX)?;
-    let bytes = crate::cli::env_packs::base64_decode_public(encoded)?;
-    let raw = std::str::from_utf8(&bytes).ok()?;
-    serde_json::from_str(raw).ok()
-}
+// The `inline://` stash scheme moved to
+// `greentic_deploy_spec::engine::inline_stash` in PR-4.2c — the pure
+// traffic transforms write/read the tokens, so both backends must share
+// one implementation.
 
 #[cfg(test)]
 mod tests {

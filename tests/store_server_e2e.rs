@@ -17,14 +17,15 @@ use greentic_deploy_spec::{
     BundleDeployment, BundleDeploymentStatus, BundleId, CustomerId, DeploymentId, EnvId,
     EnvironmentHostConfig, IdempotencyKey, PackListEntry, PartyId, Precondition, RevenueShareEntry,
     RevisionId, RevisionLifecycle, RouteBinding, SchemaVersion, SemVer, TenantSelector,
+    TrafficSplitEntry,
 };
 use greentic_deployer::environment::{
     AuthMethod, EnvironmentMutations, HealthCheckId, HealthGateFailure, HttpEnvironmentStore,
     LifecycleError, StoreError,
 };
 use greentic_deployer::environment::{
-    FieldUpdate, MigrateMergePayload, StageRevisionPayload, UpdateEnvironmentPayload,
-    WarmRevisionPayload,
+    FieldUpdate, MigrateMergePayload, SetTrafficSplitPayload, StageRevisionPayload,
+    UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 use greentic_operator_store_server::http::router;
 use greentic_operator_store_server::sqlite::SqliteEnvironmentStore;
@@ -60,7 +61,7 @@ fn stage_payload(deployment_id: DeploymentId) -> StageRevisionPayload {
 
 /// Seed a bundle deployment into an existing env directly through the
 /// server's storage backend — the bundles verb group has no server route
-/// yet (PR-4.2c+).
+/// yet (PR-4.2d+).
 async fn seed_deployment(backend: &SqliteEnvironmentStore, id: &EnvId) -> DeploymentId {
     let loaded = backend.load_env(id).await.expect("load env");
     let mut env = loaded.value;
@@ -291,6 +292,63 @@ async fn remote_env_lifecycle_end_to_end() {
             .expect_err("unknown revision must be dependent-not-found");
         assert!(
             matches!(err, StoreError::DependentNotFound(_)),
+            "unexpected error: {err:?}"
+        );
+
+        // ----- PR-4.2c: the traffic verb group over the same wire. -----
+
+        // A fresh `Ready` revision to route traffic at (the previous one
+        // was archived above).
+        let staged_third = store
+            .stage_revision(&id, stage_payload(deployment_id), idem("k-stage-3"))
+            .expect("stage third revision");
+        let r3 = store
+            .warm_revision(
+                &id,
+                WarmRevisionPayload {
+                    revision_id: staged_third.revision_id,
+                    health_gate: Ok(()),
+                    expected_lifecycle: RevisionLifecycle::Staged,
+                },
+                idem("k-warm-3"),
+            )
+            .expect("warm third revision")
+            .revision
+            .revision_id;
+        let full_weight = || SetTrafficSplitPayload {
+            deployment_id,
+            entries: vec![TrafficSplitEntry {
+                revision_id: r3,
+                weight_bps: 10_000,
+            }],
+            updated_by: "e2e".to_string(),
+            authorization_ref: None,
+        };
+
+        // Set — the server resolves the deployment, runs §5.3 admission,
+        // and persists generation 0. The outcome carries the env snapshot
+        // the CLI's telemetry emission reads.
+        let outcome = store
+            .set_traffic_split(&id, full_weight(), idem("k-traffic-1"))
+            .expect("set traffic split");
+        assert_eq!(outcome.new_generation, Some(0));
+        assert_eq!(outcome.split.idempotency_key, "k-traffic-1");
+        assert_eq!(outcome.environment.environment_id, id);
+
+        // Same-key-same-entries replay → no-op success with NONE
+        // generations (the local idempotency contract, served remotely).
+        let replay = store
+            .set_traffic_split(&id, full_weight(), idem("k-traffic-1"))
+            .expect("replay is a no-op success");
+        assert_eq!(replay.new_generation, None);
+
+        // Rollback without a prior snapshot → the same `Conflict` noun the
+        // local store raises.
+        let err = store
+            .rollback_traffic_split(&id, deployment_id, idem("k-traffic-rb"))
+            .expect_err("no prior version to roll back to");
+        assert!(
+            matches!(err, StoreError::Conflict(_)),
             "unexpected error: {err:?}"
         );
 

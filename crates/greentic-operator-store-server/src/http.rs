@@ -65,6 +65,14 @@ where
             "/environments/{env_id}/revisions/{revision_id}/archive",
             post(api::archive_revision::<S>),
         )
+        .route(
+            "/environments/{env_id}/traffic",
+            post(api::set_traffic_split::<S>),
+        )
+        .route(
+            "/environments/{env_id}/traffic/rollback",
+            post(api::rollback_traffic_split::<S>),
+        )
         .with_state(AppState { storage })
 }
 

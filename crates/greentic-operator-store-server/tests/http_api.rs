@@ -554,7 +554,7 @@ use greentic_deploy_spec::{
 use std::path::PathBuf;
 
 /// Seed an env carrying one bundle deployment directly through the storage
-/// backend — the bundles verb group has no server route yet (PR-4.2c+), and
+/// backend — the bundles verb group has no server route yet (PR-4.2d+), and
 /// revisions can only be staged under an existing deployment.
 async fn seed_env_with_deployment(store: &SqliteEnvironmentStore, env_id: &str) -> DeploymentId {
     let eid = EnvId::try_from(env_id).expect("env id");
@@ -926,8 +926,9 @@ async fn archive_with_live_traffic_reference_is_409() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // Route 100% of traffic to the revision, directly through storage (the
-    // traffic verb group has no server route yet, PR-4.2c+).
+    // Route 100% of traffic to the revision, directly through storage — a
+    // hand-built split keeps this guard test independent of the traffic
+    // route's own §5.3 admission checks.
     let eid = EnvId::try_from("local").expect("env id");
     let loaded = store.load_env(&eid).await.expect("load");
     let mut env = loaded.value;
@@ -974,4 +975,285 @@ async fn archive_with_live_traffic_reference_is_409() {
     // Refusal persisted nothing — the revision stays ready.
     let (_, read) = send(app, Method::GET, "/environments/local", None).await;
     assert_eq!(read["environment"]["revisions"][0]["lifecycle"], "ready");
+}
+
+// ---------------------------------------------------------------------------
+// Traffic routes (PR-4.2c)
+// ---------------------------------------------------------------------------
+
+/// The pinned A8 set-traffic request body (matches the shared
+/// `SetTrafficSplitPayload` wire encoding; `authorization_ref` absent).
+fn traffic_body(deployment_id: DeploymentId, entries: &[(RevisionId, u32)]) -> Value {
+    json!({
+        "deployment_id": deployment_id.to_string(),
+        "entries": entries
+            .iter()
+            .map(|(rid, bps)| json!({"revision_id": rid.to_string(), "weight_bps": bps}))
+            .collect::<Vec<_>>(),
+        "updated_by": "operator@test",
+    })
+}
+
+/// Stage one revision and warm it to `Ready` over HTTP.
+async fn ready_one(app: &Router, deployment_id: DeploymentId) -> RevisionId {
+    let revision_id = stage_one(app, deployment_id).await;
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        &format!("/environments/local/revisions/{revision_id}/warm"),
+        Some(warm_body(revision_id, "staged")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "warm failed: {body}");
+    revision_id
+}
+
+#[tokio::test]
+async fn traffic_set_persists_split_and_same_key_replay_is_noop() {
+    let (_d, app, store) = app_with_store().await;
+    let deployment_id = seed_env_with_deployment(&store, "local").await;
+    let rid = ready_one(&app, deployment_id).await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/traffic",
+        Some(traffic_body(deployment_id, &[(rid, 10_000)])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_envelope(&body, "local");
+    assert_eq!(body["audit"]["verb"], "set");
+    assert_eq!(body["result"]["split"]["generation"], 0);
+    assert_eq!(
+        body["result"]["split"]["idempotency_key"], IDEM_KEY,
+        "the A8 header key must persist into the split (rollback-target contract)"
+    );
+    assert_eq!(body["result"]["previous_generation"], Value::Null);
+    assert_eq!(body["result"]["new_generation"], 0);
+    assert_eq!(body["result"]["environment"]["environment_id"], "local");
+    let committed_generation = body["generation"].as_u64().expect("envelope generation");
+
+    // Same key + same entries → no-op replay: 200, nothing persisted, the
+    // envelope echoes the unchanged CAS coordinates.
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/traffic",
+        Some(traffic_body(deployment_id, &[(rid, 10_000)])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["result"]["new_generation"], Value::Null);
+    assert_eq!(body["result"]["split"]["generation"], 0);
+    assert_eq!(
+        body["generation"].as_u64().expect("envelope generation"),
+        committed_generation,
+        "no-op replay must not advance the env CAS generation"
+    );
+
+    // Durable: exactly one split.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    let splits = read["environment"]["traffic_splits"]
+        .as_array()
+        .expect("splits array");
+    assert_eq!(splits.len(), 1);
+    assert_eq!(splits[0]["generation"], 0);
+}
+
+#[tokio::test]
+async fn traffic_set_key_reuse_with_different_entries_is_409_idempotency_conflict() {
+    let (_d, app, store) = app_with_store().await;
+    let deployment_id = seed_env_with_deployment(&store, "local").await;
+    let r1 = ready_one(&app, deployment_id).await;
+    let r2 = ready_one(&app, deployment_id).await;
+
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/traffic",
+        Some(traffic_body(deployment_id, &[(r1, 10_000)])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/traffic",
+        Some(traffic_body(deployment_id, &[(r2, 10_000)])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "idempotency-conflict");
+
+    // The live split is untouched.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["traffic_splits"][0]["entries"][0]["revision_id"],
+        r1.to_string()
+    );
+}
+
+#[tokio::test]
+async fn traffic_new_key_advances_generation_and_rollback_restores_previous() {
+    let (_d, app, store) = app_with_store().await;
+    let deployment_id = seed_env_with_deployment(&store, "local").await;
+    let r1 = ready_one(&app, deployment_id).await;
+    let r2 = ready_one(&app, deployment_id).await;
+
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/traffic",
+        Some(traffic_body(deployment_id, &[(r1, 10_000)])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A NEW key replaces the split and stashes the prior one.
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/traffic",
+        Some(traffic_body(deployment_id, &[(r2, 10_000)])),
+        &[("Idempotency-Key", "01JTKW5B4W4Q5Y1CQW93F7S5VJ")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["result"]["previous_generation"], 0);
+    assert_eq!(body["result"]["new_generation"], 1);
+
+    // Rollback restores the r1 split under generation 2 (advance, never
+    // rewind).
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/traffic/rollback",
+        Some(json!({"deployment_id": deployment_id.to_string()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_envelope(&body, "local");
+    assert_eq!(body["audit"]["verb"], "rollback");
+    assert_eq!(body["result"]["previous_generation"], 1);
+    assert_eq!(body["result"]["new_generation"], 2);
+    assert_eq!(
+        body["result"]["restored"]["entries"][0]["revision_id"],
+        r1.to_string()
+    );
+
+    // The restored split has no further snapshot — a second rollback is a
+    // 409 conflict, not a flip-flop.
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/traffic/rollback",
+        Some(json!({"deployment_id": deployment_id.to_string()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "conflict");
+
+    // Durable: generation 2 routing r1.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(read["environment"]["traffic_splits"][0]["generation"], 2);
+    assert_eq!(
+        read["environment"]["traffic_splits"][0]["entries"][0]["revision_id"],
+        r1.to_string()
+    );
+}
+
+#[tokio::test]
+async fn traffic_set_unknown_deployment_is_404_dependent_not_found() {
+    let (_d, app, store) = app_with_store().await;
+    seed_env_with_deployment(&store, "local").await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/traffic",
+        Some(traffic_body(DeploymentId::new(), &[])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["kind"], "dependent-not-found");
+
+    // Missing env entirely → plain not-found.
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/environments/ghost/traffic",
+        Some(traffic_body(DeploymentId::new(), &[])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["kind"], "not-found");
+}
+
+#[tokio::test]
+async fn traffic_set_non_ready_revision_is_409_conflict() {
+    let (_d, app, store) = app_with_store().await;
+    let deployment_id = seed_env_with_deployment(&store, "local").await;
+    // Staged, never warmed — §5.3 admission must refuse it.
+    let rid = stage_one(&app, deployment_id).await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/traffic",
+        Some(traffic_body(deployment_id, &[(rid, 10_000)])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "conflict");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("only `Ready` revisions"),
+        "detail must explain the admission refusal: {body}"
+    );
+
+    // Nothing persisted.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert!(
+        read["environment"]["traffic_splits"]
+            .as_array()
+            .expect("splits array")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn traffic_set_bad_weight_sum_is_400_invalid_request() {
+    let (_d, app, store) = app_with_store().await;
+    let deployment_id = seed_env_with_deployment(&store, "local").await;
+    let rid = ready_one(&app, deployment_id).await;
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/environments/local/traffic",
+        Some(traffic_body(deployment_id, &[(rid, 9_999)])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["kind"], "invalid-request");
+}
+
+#[tokio::test]
+async fn traffic_rollback_without_split_is_404_dependent_not_found() {
+    let (_d, app, store) = app_with_store().await;
+    let deployment_id = seed_env_with_deployment(&store, "local").await;
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/environments/local/traffic/rollback",
+        Some(json!({"deployment_id": deployment_id.to_string()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["kind"], "dependent-not-found");
 }

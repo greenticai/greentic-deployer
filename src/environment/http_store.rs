@@ -80,7 +80,7 @@ use greentic_deploy_spec::{
     CapabilitySlot, CustomerId, DeploymentId, EnvId, EnvPackBinding, Environment,
     EnvironmentHostConfig, ExtensionBinding, IdempotencyKey, IdempotencyOutcome, MessagingEndpoint,
     MessagingEndpointId, PackId, RemoteStoreError, RevenueShareEntry, Revision, RevisionId,
-    RouteBinding, StateEtag, TrafficSplit, TrafficSplitEntry,
+    RollbackTrafficSplitPayload, RouteBinding, StateEtag,
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::Client;
@@ -91,9 +91,9 @@ use url::Url;
 use super::mutations::{
     AddBundlePayload, AddMessagingEndpointPayload, ApplyTrafficSplitOutcome, EnvironmentMutations,
     ExtensionKey, MigrateMergePayload, RemoveBundleOutcome, RevisionTransitionOutcome,
-    RollbackTrafficSplitOutcome, SetMessagingWelcomeFlowPayload, StageRevisionPayload,
-    TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed, UpdateBundlePayload,
-    UpdateEnvironmentPayload, WarmRevisionPayload,
+    RollbackTrafficSplitOutcome, SetMessagingWelcomeFlowPayload, SetTrafficSplitPayload,
+    StageRevisionPayload, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
+    UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 use super::store::StoreError;
 
@@ -693,33 +693,11 @@ impl From<&ExtensionKey> for WireExtensionKey {
     }
 }
 
-#[derive(Serialize)]
-struct SetTrafficSplitRequest {
-    deployment_id: DeploymentId,
-    entries: Vec<TrafficSplitEntry>,
-    updated_by: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    authorization_ref: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ApplyTrafficSplitResponse {
-    split: TrafficSplit,
-    previous_generation: Option<u64>,
-    new_generation: Option<u64>,
-}
-
-#[derive(Serialize)]
-struct RollbackTrafficSplitRequest {
-    deployment_id: DeploymentId,
-}
-
-#[derive(Deserialize)]
-struct RollbackTrafficSplitResponse {
-    restored: TrafficSplit,
-    previous_generation: u64,
-    new_generation: u64,
-}
+// Traffic wire shapes (`SetTrafficSplitPayload`,
+// `RollbackTrafficSplitPayload`, `ApplyTrafficSplitOutcome`,
+// `RollbackTrafficSplitOutcome`) are the shared
+// `greentic_deploy_spec::engine` types since PR-4.2c — the client
+// serializes the same structs the server deserializes.
 
 #[derive(Serialize)]
 struct AddMessagingEndpointRequest {
@@ -1162,31 +1140,17 @@ impl EnvironmentMutations for HttpEnvironmentStore {
     fn set_traffic_split(
         &self,
         env_id: &EnvId,
-        deployment_id: DeploymentId,
-        entries: Vec<TrafficSplitEntry>,
+        payload: SetTrafficSplitPayload,
         idempotency_key: IdempotencyKey,
-        updated_by: String,
-        authorization_ref: Option<String>,
     ) -> Result<ApplyTrafficSplitOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let req = SetTrafficSplitRequest {
-            deployment_id,
-            entries,
-            updated_by,
-            authorization_ref,
-        };
-        let resp: ApplyTrafficSplitResponse = self.send_mutation(
+        self.send_mutation(
             env_id,
             reqwest::Method::POST,
             &self.env_path(env_id, "/traffic"),
             Some(&idem_key),
-            Some(&req),
-        )?;
-        Ok(ApplyTrafficSplitOutcome {
-            split: resp.split,
-            previous_generation: resp.previous_generation,
-            new_generation: resp.new_generation,
-        })
+            Some(&payload),
+        )
     }
 
     fn rollback_traffic_split(
@@ -1196,8 +1160,8 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         idempotency_key: IdempotencyKey,
     ) -> Result<RollbackTrafficSplitOutcome, StoreError> {
         let idem_key = idempotency_key.as_str().to_string();
-        let req = RollbackTrafficSplitRequest { deployment_id };
-        let resp: RollbackTrafficSplitResponse = self.send_mutation(
+        let req = RollbackTrafficSplitPayload { deployment_id };
+        self.send_mutation(
             env_id,
             reqwest::Method::POST,
             &format!(
@@ -1206,12 +1170,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             ),
             Some(&idem_key),
             Some(&req),
-        )?;
-        Ok(RollbackTrafficSplitOutcome {
-            restored: resp.restored,
-            previous_generation: resp.previous_generation,
-            new_generation: resp.new_generation,
-        })
+        )
     }
 
     fn add_messaging_endpoint(
@@ -2304,22 +2263,26 @@ mod tests {
         let domain = serde_json::json!({
             "split": sample_traffic_split(),
             "previous_generation": 1,
-            "new_generation": 2
+            "new_generation": 2,
+            "environment": sample_env_domain()
         });
         let body = wrap_mutation(domain);
         let (_mock, store) = happy_store(200, &body);
         let result = store.set_traffic_split(
             &env_id(),
-            DeploymentId::new(),
-            Vec::new(),
+            SetTrafficSplitPayload {
+                deployment_id: DeploymentId::new(),
+                entries: Vec::new(),
+                updated_by: "tester".to_string(),
+                authorization_ref: None,
+            },
             idem(),
-            "tester".to_string(),
-            None,
         );
         assert!(result.is_ok());
         let outcome = result.unwrap();
         assert_eq!(outcome.previous_generation, Some(1));
         assert_eq!(outcome.new_generation, Some(2));
+        assert_eq!(outcome.environment.environment_id, env_id());
     }
 
     #[test]
@@ -2327,7 +2290,8 @@ mod tests {
         let domain = serde_json::json!({
             "restored": sample_traffic_split(),
             "previous_generation": 2,
-            "new_generation": 3
+            "new_generation": 3,
+            "environment": sample_env_domain()
         });
         let body = wrap_mutation(domain);
         let (_mock, store) = happy_store(200, &body);

@@ -29,10 +29,19 @@
 //!   gate failure persists the `Failed` flip BEFORE the typed 422
 //!   (`health-gate-failed`) is returned — committed-on-error, mirroring
 //!   `LocalFsStore`.
+//! - The traffic verb group (PR-4.2c):
+//!   `POST /environments/{env_id}/traffic` (set) and
+//!   `POST /environments/{env_id}/traffic/rollback`. The idempotent
+//!   same-key-same-entries replay is a 200 with `new_generation: null` and
+//!   nothing persisted; key reuse with different entries is the typed 409
+//!   `idempotency-conflict`. `runtime-config.json` materialization stays a
+//!   `LocalFsStore` projection, and `TrafficSplitApplied` telemetry is
+//!   emitted by the operator CLI from the outcome's env snapshot — not
+//!   here.
 //! - `greentic-operator-store-server` binary: clap config (bind address
 //!   + database path), graceful shutdown.
 //!
-//! Out of scope, intentional follow-ups (PR-4.2b+):
+//! Out of scope, intentional follow-ups (PR-4.2c+):
 //!
 //! - The remaining A8 verb groups (route table pinned in the deployer's
 //!   `environment::http_store` module doc), each landing with its engine
