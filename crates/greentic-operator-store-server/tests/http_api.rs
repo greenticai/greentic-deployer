@@ -29,10 +29,15 @@ use common::fresh_store;
 
 const IDEM_KEY: &str = "01JTKW5B4W4Q5Y1CQW93F7S5VH";
 
-/// Dispatch one JSON request with the default `Idempotency-Key` and return
-/// `(status, parsed body)`. Thin wrapper over [`send_custom`].
+/// Dispatch one JSON request with a FRESH `Idempotency-Key` and return
+/// `(status, parsed body)`. Thin wrapper over [`send_custom`]. Fresh keys
+/// per call mirror real clients (PR-4.3: the replay ledger consumes every
+/// committed key, so a shared key would replay/conflict across the
+/// sequential mutations these tests drive); tests that deliberately reuse
+/// a key use [`send_custom`] with an explicit one.
 async fn send(app: Router, method: Method, path: &str, body: Option<Value>) -> (StatusCode, Value) {
-    send_custom(app, method, path, body, &[("Idempotency-Key", IDEM_KEY)]).await
+    let key = ulid::Ulid::new().to_string();
+    send_custom(app, method, path, body, &[("Idempotency-Key", &key)]).await
 }
 
 fn create_body(env_id: &str) -> Value {
@@ -50,7 +55,14 @@ fn assert_envelope(body: &Value, env_id: &str) {
     assert_eq!(body["idempotency"]["idempotency"], "applied");
     let audit = &body["audit"];
     assert_eq!(audit["env_id"], env_id);
-    assert_eq!(audit["idempotency_key"], IDEM_KEY);
+    // `send` mints a fresh key per call — assert presence here; the
+    // explicit-key tests (replay, stamps) assert the exact echo.
+    assert!(
+        audit["idempotency_key"]
+            .as_str()
+            .is_some_and(|k| !k.is_empty()),
+        "audit must echo the idempotency key: {body}"
+    );
     assert_eq!(audit["authorization"]["decision"], "allow");
     assert_eq!(audit["result"]["outcome"], "ok");
 }
@@ -1017,11 +1029,12 @@ async fn traffic_set_persists_split_and_same_key_replay_is_noop() {
     let deployment_id = seed_env_with_deployment(&store, "local").await;
     let rid = ready_one(&app, deployment_id).await;
 
-    let (status, body) = send(
+    let (status, body) = send_custom(
         app.clone(),
         Method::POST,
         "/environments/local/traffic",
         Some(traffic_body(deployment_id, &[(rid, 10_000)])),
+        &[("Idempotency-Key", IDEM_KEY)],
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -1035,28 +1048,31 @@ async fn traffic_set_persists_split_and_same_key_replay_is_noop() {
     assert_eq!(body["result"]["previous_generation"], Value::Null);
     assert_eq!(body["result"]["new_generation"], 0);
     assert_eq!(body["result"]["environment"]["environment_id"], "local");
-    let committed_generation = body["generation"].as_u64().expect("envelope generation");
+    let original = body;
 
-    // Same key + same entries → no-op replay: 200, nothing persisted, the
-    // envelope echoes the unchanged CAS coordinates.
-    let (status, body) = send(
+    // Same key + same request → the PR-4.3 transport replay: the ledgered
+    // original response verbatim (same audit event, same generations),
+    // only the `idempotency` marker flips to `replayed`. Nothing persists.
+    let (status, body) = send_custom(
         app.clone(),
         Method::POST,
         "/environments/local/traffic",
         Some(traffic_body(deployment_id, &[(rid, 10_000)])),
+        &[("Idempotency-Key", IDEM_KEY)],
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["result"]["new_generation"], Value::Null);
-    assert_eq!(body["result"]["split"]["generation"], 0);
+    assert_eq!(body["idempotency"]["idempotency"], "replayed");
+    assert_eq!(body["result"], original["result"]);
     assert_eq!(
-        body["generation"].as_u64().expect("envelope generation"),
-        committed_generation,
-        "no-op replay must not advance the env CAS generation"
+        body["audit"]["event_id"], original["audit"]["event_id"],
+        "a replay returns the ORIGINAL audit event, not a fresh one"
     );
+    assert_eq!(body["generation"], original["generation"]);
 
-    // Durable: exactly one split.
+    // Durable: exactly one split, env generation unmoved past the commit.
     let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(read["generation"], original["generation"]);
     let splits = read["environment"]["traffic_splits"]
         .as_array()
         .expect("splits array");
@@ -1071,20 +1087,24 @@ async fn traffic_set_key_reuse_with_different_entries_is_409_idempotency_conflic
     let r1 = ready_one(&app, deployment_id).await;
     let r2 = ready_one(&app, deployment_id).await;
 
-    let (status, _) = send(
+    let (status, _) = send_custom(
         app.clone(),
         Method::POST,
         "/environments/local/traffic",
         Some(traffic_body(deployment_id, &[(r1, 10_000)])),
+        &[("Idempotency-Key", IDEM_KEY)],
     )
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, body) = send(
+    // The 409 now fires at the PR-4.3 replay gate (fingerprint mismatch);
+    // the engine's domain-level key check still guards the LocalFS backend.
+    let (status, body) = send_custom(
         app.clone(),
         Method::POST,
         "/environments/local/traffic",
         Some(traffic_body(deployment_id, &[(r2, 10_000)])),
+        &[("Idempotency-Key", IDEM_KEY)],
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
@@ -2606,17 +2626,22 @@ async fn messaging_add_persists_endpoint_with_server_minted_id() {
     let (_d, app) = app().await;
     create_local_env(&app).await;
 
-    let (status, body) = send(
+    let (status, body) = send_custom(
         app.clone(),
         Method::POST,
         "/environments/local/messaging",
         Some(add_endpoint_body("teams", "legal-bot")),
+        &[("Idempotency-Key", IDEM_KEY)],
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_envelope(&body, "local");
     assert_eq!(body["audit"]["noun"], "messaging.endpoint");
     assert_eq!(body["audit"]["verb"], "add");
+    assert_eq!(
+        body["audit"]["idempotency_key"], IDEM_KEY,
+        "the audit must echo the exact key sent"
+    );
     assert_eq!(body["audit"]["target"]["provider_type"], "teams");
     let result = &body["result"];
     assert_eq!(result["provider_id"], "legal-bot");
@@ -2978,8 +3003,11 @@ async fn messaging_rotate_secret_is_501_until_the_secrets_sink_lands() {
 }
 
 /// Regression: add a (non-telegram) endpoint with key K, then POST
-/// rotate-secret with the SAME key K — the rotate must reach the
-/// refusing provision sink (501), not falsely replay as 200.
+/// rotate-secret with the SAME key K — the rotate must NOT falsely
+/// replay add's success as 200. Since PR-4.3 the transport replay gate
+/// rejects the cross-operation reuse with a typed 409 (the add's ledger
+/// row carries a different request fingerprint) one layer before the
+/// engine's op-scoped stamps, which still guard the LocalFS backend.
 #[tokio::test]
 async fn messaging_rotate_with_add_key_does_not_falsely_replay() {
     let (_d, app) = app().await;
@@ -2996,8 +3024,471 @@ async fn messaging_rotate_with_add_key_does_not_falsely_replay() {
     .await;
     assert_eq!(
         status,
-        StatusCode::NOT_IMPLEMENTED,
-        "rotate with add's key must hit the sink (501), not replay (200): {body}"
+        StatusCode::CONFLICT,
+        "rotate with add's key must be rejected, not replay add's 200: {body}"
     );
-    assert_eq!(body["kind"], "not-yet-implemented");
+    assert_eq!(body["kind"], "idempotency-conflict");
+    assert!(
+        body["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("messaging.endpoint.add"),
+        "the conflict names the operation that consumed the key: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency replay ledger + durable audit log (PR-4.3)
+// ---------------------------------------------------------------------------
+//
+// The transport-level replay contract every verb group now shares: a key
+// consumed by a committed mutation replays that mutation's stored response
+// verbatim (marker flipped to `replayed`), any other reuse of the key is a
+// typed 409, failed requests consume nothing, and every committed mutation
+// leaves a durable `audit_log` row — written in the SAME transaction as
+// the mutation itself.
+
+use sqlx::Row;
+
+/// All audit-log event ids recorded for `env`, in append order.
+async fn audit_log_event_ids(store: &SqliteEnvironmentStore, env: &str) -> Vec<String> {
+    sqlx::query("SELECT event_id FROM audit_log WHERE env_id = $1 ORDER BY id ASC")
+        .bind(env)
+        .fetch_all(store.pool())
+        .await
+        .expect("audit query")
+        .into_iter()
+        .map(|r| r.get::<String, _>("event_id"))
+        .collect()
+}
+
+#[tokio::test]
+async fn replay_returns_verbatim_original_and_appends_no_second_audit_row() {
+    let (_d, app, store) = app_with_store().await;
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let patch = json!({"name": "renamed"});
+    let (status, original) = send_custom(
+        app.clone(),
+        Method::PATCH,
+        "/environments/local",
+        Some(patch.clone()),
+        &[("Idempotency-Key", "k-patch")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {original}");
+    assert_eq!(original["idempotency"]["idempotency"], "applied");
+
+    // The response audit record IS the durable audit-log append.
+    let logged = audit_log_event_ids(&store, "local").await;
+    assert_eq!(logged.len(), 2, "create + update");
+    assert_eq!(logged[1], original["audit"]["event_id"]);
+
+    // Same key + same request → verbatim replay: original audit event,
+    // original CAS coordinates, marker flipped — and NOTHING appended.
+    let (status, replay) = send_custom(
+        app.clone(),
+        Method::PATCH,
+        "/environments/local",
+        Some(patch),
+        &[("Idempotency-Key", "k-patch")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {replay}");
+    assert_eq!(replay["idempotency"]["idempotency"], "replayed");
+    assert_eq!(replay["result"], original["result"]);
+    assert_eq!(replay["audit"], original["audit"]);
+    assert_eq!(replay["etag"], original["etag"]);
+    assert_eq!(replay["generation"], original["generation"]);
+    assert_eq!(audit_log_event_ids(&store, "local").await.len(), 2);
+
+    // The env did not move.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(read["generation"], original["generation"]);
+    assert_eq!(read["environment"]["name"], "renamed");
+}
+
+#[tokio::test]
+async fn same_key_with_different_body_is_409_idempotency_conflict() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+
+    let (status, _) = send_custom(
+        app.clone(),
+        Method::PATCH,
+        "/environments/local",
+        Some(json!({"name": "first"})),
+        &[("Idempotency-Key", "k-reuse")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::PATCH,
+        "/environments/local",
+        Some(json!({"name": "second"})),
+        &[("Idempotency-Key", "k-reuse")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "idempotency-conflict");
+    assert!(
+        body["reason"].as_str().unwrap_or("").contains("env.update"),
+        "the conflict names the operation that consumed the key: {body}"
+    );
+
+    // The second patch was rejected before touching state.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(read["environment"]["name"], "first");
+}
+
+#[tokio::test]
+async fn bodyless_replay_is_verbatim_and_path_scoped() {
+    let (_d, app, store) = app_with_store().await;
+    let deployment_id = seed_env_with_deployment(&store, "local").await;
+    let rid = ready_one(&app, deployment_id).await;
+
+    let drain_path = format!("/environments/local/revisions/{rid}/drain");
+    let (status, original) = send_custom(
+        app.clone(),
+        Method::POST,
+        &drain_path,
+        None,
+        &[("Idempotency-Key", "k-drain")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {original}");
+
+    // Same key, same bodyless request → verbatim replay (the ORIGINAL
+    // audit event comes back)...
+    let (status, replay) = send_custom(
+        app.clone(),
+        Method::POST,
+        &drain_path,
+        None,
+        &[("Idempotency-Key", "k-drain")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {replay}");
+    assert_eq!(replay["idempotency"]["idempotency"], "replayed");
+    assert_eq!(replay["audit"]["event_id"], original["audit"]["event_id"]);
+
+    // ...while a FRESH key re-executes (the drain walk is an idempotent
+    // no-op here) and mints a fresh audit event — the contrast that pins
+    // replay-vs-reexecution apart.
+    let (status, body) = send(app.clone(), Method::POST, &drain_path, None).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["idempotency"]["idempotency"], "applied");
+    assert_ne!(body["audit"]["event_id"], original["audit"]["event_id"]);
+
+    // Same key on a DIFFERENT bodyless route: the path is part of the
+    // fingerprint, so this is reuse, not replay.
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        &format!("/environments/local/revisions/{rid}/archive"),
+        None,
+        &[("Idempotency-Key", "k-drain")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "idempotency-conflict");
+}
+
+#[tokio::test]
+async fn warm_gate_failure_consumes_the_key_and_replays_the_422() {
+    let (_d, app, store) = app_with_store().await;
+    let deployment_id = seed_env_with_deployment(&store, "local").await;
+    let revision_id = stage_one(&app, deployment_id).await;
+
+    let gate_fail = json!({
+        "revision_id": revision_id.to_string(),
+        "health_gate": {
+            "ok": false,
+            "failure": {
+                "failed_checks": ["route-table"],
+                "message": "route table invalid",
+            },
+        },
+        "expected_lifecycle": "staged",
+    });
+    let warm_path = format!("/environments/local/revisions/{revision_id}/warm");
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        &warm_path,
+        Some(gate_fail.clone()),
+        &[("Idempotency-Key", "k-warm-fail")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+    assert_eq!(body["kind"], "health-gate-failed");
+
+    // Committed-on-error consumed the key: the durable audit log records
+    // the non-ok outcome...
+    let logged = audit_log_event_ids(&store, "local").await;
+    let last = logged.last().expect("audit row");
+    let event: Value = sqlx::query("SELECT event FROM audit_log WHERE event_id = $1")
+        .bind(last)
+        .fetch_one(store.pool())
+        .await
+        .expect("event row")
+        .get::<Value, _>("event");
+    assert_eq!(event["verb"], "warm");
+    assert_eq!(event["result"]["outcome"], "error");
+    assert_eq!(event["result"]["kind"], "health-gate-failed");
+
+    // ...and a same-key retry replays the 422 verbatim instead of
+    // re-walking the (now Failed) revision into a different error.
+    let (status, replay) = send_custom(
+        app.clone(),
+        Method::POST,
+        &warm_path,
+        Some(gate_fail),
+        &[("Idempotency-Key", "k-warm-fail")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {replay}");
+    assert_eq!(replay, body, "committed-on-error bodies replay byte-equal");
+    assert_eq!(
+        audit_log_event_ids(&store, "local").await.len(),
+        logged.len()
+    );
+}
+
+#[tokio::test]
+async fn failed_requests_do_not_consume_the_key() {
+    let (_d, app) = app().await;
+
+    // 404 — the env does not exist yet; the key must survive.
+    let (status, _) = send_custom(
+        app.clone(),
+        Method::PATCH,
+        "/environments/local",
+        Some(json!({"name": "ghost"})),
+        &[("Idempotency-Key", "k-fail-free")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The same key then commits a completely different request cleanly.
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "k-fail-free")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["idempotency"]["idempotency"], "applied");
+}
+
+#[tokio::test]
+async fn delayed_retry_replays_the_original_instead_of_overwriting_newer_state() {
+    // The 4.2c F1 hazard, closed: a duplicate of an OLD traffic set
+    // arriving after a newer set must not re-apply the old entries.
+    let (_d, app, store) = app_with_store().await;
+    let deployment_id = seed_env_with_deployment(&store, "local").await;
+    let r1 = ready_one(&app, deployment_id).await;
+    let r2 = ready_one(&app, deployment_id).await;
+
+    let old_set = traffic_body(deployment_id, &[(r1, 10_000)]);
+    let (status, original) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/traffic",
+        Some(old_set.clone()),
+        &[("Idempotency-Key", "k-old")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/traffic",
+        Some(traffic_body(deployment_id, &[(r2, 10_000)])),
+        &[("Idempotency-Key", "k-new")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The delayed duplicate of the OLD request: replayed, not re-applied.
+    let (status, replay) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/traffic",
+        Some(old_set),
+        &[("Idempotency-Key", "k-old")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {replay}");
+    assert_eq!(replay["idempotency"]["idempotency"], "replayed");
+    assert_eq!(replay["result"], original["result"]);
+
+    // The NEWER split stays live.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["traffic_splits"][0]["entries"][0]["revision_id"],
+        r2.to_string()
+    );
+}
+
+#[tokio::test]
+async fn bundles_add_retry_replays_without_a_second_policy_version() {
+    // The 4.2g F3 hazard, closed: a same-key retry of `bundles add` must
+    // not rebuild/duplicate the signed revenue-policy artifact.
+    let (_d, app, store) = bundles_app().await;
+
+    let (status, original) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/bundles",
+        Some(add_bundle_body("acme", "cust-1")),
+        &[("Idempotency-Key", "k-bundle")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {original}");
+
+    let (status, replay) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/bundles",
+        Some(add_bundle_body("acme", "cust-1")),
+        &[("Idempotency-Key", "k-bundle")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {replay}");
+    assert_eq!(replay["idempotency"]["idempotency"], "replayed");
+    assert_eq!(
+        replay["result"]["deployment_id"], original["result"]["deployment_id"],
+        "the replay echoes the ORIGINAL server-minted deployment id"
+    );
+
+    // Exactly one deployment, exactly one policy version.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(read["environment"]["bundles"].as_array().unwrap().len(), 1);
+    let bundle_id = BundleId::new("acme");
+    let customer_id = CustomerId::new("cust-1");
+    let env = EnvId::try_from("local").expect("env id");
+    assert!(
+        store
+            .load_revenue_policy(&env, &bundle_id, &customer_id, 1)
+            .await
+            .expect("load v1")
+            .is_some()
+    );
+    assert!(
+        store
+            .load_revenue_policy(&env, &bundle_id, &customer_id, 2)
+            .await
+            .expect("load v2")
+            .is_none(),
+        "no second version may exist after a replayed add"
+    );
+}
+
+#[tokio::test]
+async fn trust_root_remove_replay_preserves_the_recovery_pem() {
+    // The 4.2f F2 hazard, closed: a lost remove response's PEM recovery
+    // material is replayed, not re-derived from the now-keyless root.
+    let (dir, store) = fresh_store().await;
+    let store = Arc::new(store);
+    let app = router_with_operator_key(Arc::clone(&store), dir.path().join("operator-key.pem"));
+    create_local_env(&app).await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/trust-root/bootstrap",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let key_id = body["result"]["key_id"]
+        .as_str()
+        .expect("key id")
+        .to_string();
+
+    let remove_path = format!("/environments/local/trust-root/keys/{key_id}");
+    let (status, original) = send_custom(
+        app.clone(),
+        Method::DELETE,
+        &remove_path,
+        None,
+        &[("Idempotency-Key", "k-remove")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {original}");
+    let pem = original["result"]["removed_public_key_pem"]
+        .as_str()
+        .expect("recovery PEM")
+        .to_string();
+
+    // Re-execution would now find nothing to remove (PEM = null); the
+    // replay returns the ORIGINAL response, PEM included.
+    let (status, replay) = send_custom(
+        app,
+        Method::DELETE,
+        &remove_path,
+        None,
+        &[("Idempotency-Key", "k-remove")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {replay}");
+    assert_eq!(replay["idempotency"]["idempotency"], "replayed");
+    assert_eq!(replay["result"]["removed_public_key_pem"], pem.as_str());
+}
+
+#[tokio::test]
+async fn domain_noop_with_fresh_key_is_journaled_for_replay() {
+    // A fresh key naming already-converged state (here: trust-root seed on
+    // an existing root) is a 200 no-op that still consumes its key — the
+    // retry replays instead of re-evaluating against whatever state holds
+    // later.
+    let (dir, store) = fresh_store().await;
+    let store = Arc::new(store);
+    let app = router_with_operator_key(Arc::clone(&store), dir.path().join("operator-key.pem"));
+    create_local_env(&app).await;
+
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/trust-root/bootstrap",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, original) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/trust-root/seed",
+        None,
+        &[("Idempotency-Key", "k-seed-noop")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {original}");
+    assert!(original["result"].is_null(), "existing root → null seed");
+
+    let (status, replay) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/trust-root/seed",
+        None,
+        &[("Idempotency-Key", "k-seed-noop")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {replay}");
+    assert_eq!(replay["idempotency"]["idempotency"], "replayed");
+    assert_eq!(replay["audit"]["event_id"], original["audit"]["event_id"]);
 }

@@ -20,7 +20,7 @@ use greentic_deploy_spec::{
 };
 use greentic_operator_store_server::sqlite::SqliteEnvironmentStore;
 use greentic_operator_store_server::storage::{
-    EnvironmentStorage, RevenuePolicyArtifact, StorageError,
+    EnvironmentStorage, MutationJournal, RevenuePolicyArtifact, StorageError,
 };
 use greentic_operator_trust::test_support::keypair;
 use greentic_operator_trust::trust_root::{TrustRootDocument, TrustedKey};
@@ -1016,4 +1016,188 @@ async fn revenue_policy_overwrites_replayed_version_under_matching_pin() {
         load_policy(&store, &id, 1).await.expect("present").doc,
         b"rebuild"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency ledger + audit log (PR-4.3)
+// ---------------------------------------------------------------------------
+
+fn journal(id: &EnvId, key: &str, fingerprint: &str) -> MutationJournal {
+    MutationJournal {
+        env_id: id.clone(),
+        idempotency_key: key.to_string(),
+        operation: "env.update".to_string(),
+        request_fingerprint: fingerprint.to_string(),
+        response_status: 200,
+        response_body: json!({"result": {"ok": true}, "idempotency": {"idempotency": "applied"}}),
+        audit_event: json!({"event_id": format!("evt-{key}"), "verb": "update"}),
+        audit_event_id: format!("evt-{key}"),
+    }
+}
+
+async fn audit_event_ids(store: &SqliteEnvironmentStore, id: &EnvId) -> Vec<String> {
+    sqlx::query("SELECT event_id FROM audit_log WHERE env_id = $1 ORDER BY id ASC")
+        .bind(id.as_str())
+        .fetch_all(store.pool())
+        .await
+        .expect("audit query")
+        .into_iter()
+        .map(|r| r.get::<String, _>("event_id"))
+        .collect()
+}
+
+#[tokio::test]
+async fn update_env_journaled_commits_ledger_and_audit_atomically() {
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    let mut env = minimal_environment(&id);
+    let rev = store.create_env(&env).await.expect("create env");
+
+    env.name = "renamed".to_string();
+    let journal = journal(&id, "k-1", "fp-1");
+    store
+        .update_env_journaled(
+            &env,
+            &Precondition::matching(rev.etag, rev.generation),
+            Some(&journal),
+        )
+        .await
+        .expect("journaled update");
+
+    let record = store
+        .lookup_idempotency(&id, "k-1")
+        .await
+        .expect("lookup")
+        .expect("ledger row");
+    assert_eq!(record.operation, "env.update");
+    assert_eq!(record.request_fingerprint, "fp-1");
+    assert_eq!(record.response_status, 200);
+    assert_eq!(record.response_body, journal.response_body);
+    assert_eq!(audit_event_ids(&store, &id).await, vec!["evt-k-1"]);
+}
+
+#[tokio::test]
+async fn cas_conflict_rolls_the_journal_back_with_the_mutation() {
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    let mut env = minimal_environment(&id);
+    store.create_env(&env).await.expect("create env");
+
+    env.name = "renamed".to_string();
+    let err = store
+        .update_env_journaled(
+            &env,
+            &Precondition::matching(StateEtag("stale".to_string()), 99),
+            Some(&journal(&id, "k-lost", "fp")),
+        )
+        .await
+        .expect_err("stale precondition");
+    assert!(matches!(err, StorageError::PreconditionFailed { .. }));
+
+    // The failed mutation consumed nothing: no ledger row, no audit row.
+    assert!(
+        store
+            .lookup_idempotency(&id, "k-lost")
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+    assert!(audit_event_ids(&store, &id).await.is_empty());
+}
+
+#[tokio::test]
+async fn duplicate_ledger_key_rolls_back_the_whole_transaction() {
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    let mut env = minimal_environment(&id);
+    let rev = store.create_env(&env).await.expect("create env");
+
+    env.name = "first".to_string();
+    let rev2 = store
+        .update_env_journaled(
+            &env,
+            &Precondition::matching(rev.etag, rev.generation),
+            Some(&journal(&id, "k-dup", "fp-a")),
+        )
+        .await
+        .expect("first commit");
+
+    // Same key again (the concurrent-duplicate shape): the ledger PK
+    // violation must abort the transaction — env row INCLUDED.
+    env.name = "second".to_string();
+    let err = store
+        .update_env_journaled(
+            &env,
+            &Precondition::matching(rev2.etag.clone(), rev2.generation),
+            Some(&journal(&id, "k-dup", "fp-b")),
+        )
+        .await
+        .expect_err("duplicate key");
+    assert!(matches!(err, StorageError::IdempotencyKeyCommitted { .. }));
+
+    let loaded = store.load_env(&id).await.expect("load");
+    assert_eq!(loaded.value.name, "first", "loser's env write rolled back");
+    assert_eq!(loaded.revision.generation, rev2.generation);
+    assert_eq!(audit_event_ids(&store, &id).await.len(), 1);
+}
+
+#[tokio::test]
+async fn record_journal_standalone_round_trips() {
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+
+    store
+        .record_journal(&journal(&id, "k-noop", "fp-n"))
+        .await
+        .expect("standalone record");
+    let record = store
+        .lookup_idempotency(&id, "k-noop")
+        .await
+        .expect("lookup")
+        .expect("row");
+    assert_eq!(record.request_fingerprint, "fp-n");
+    assert_eq!(audit_event_ids(&store, &id).await, vec!["evt-k-noop"]);
+
+    // Unknown keys stay misses.
+    assert!(
+        store
+            .lookup_idempotency(&id, "k-other")
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn create_env_journaled_journals_only_the_winning_create() {
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    let env = minimal_environment(&id);
+
+    store
+        .create_env_journaled(&env, Some(&journal(&id, "k-create", "fp-c")))
+        .await
+        .expect("create");
+    assert!(
+        store
+            .lookup_idempotency(&id, "k-create")
+            .await
+            .expect("lookup")
+            .is_some()
+    );
+
+    // The losing duplicate (different key) journals nothing.
+    let err = store
+        .create_env_journaled(&env, Some(&journal(&id, "k-create-2", "fp-c2")))
+        .await
+        .expect_err("already exists");
+    assert!(matches!(err, StorageError::AlreadyExists { .. }));
+    assert!(
+        store
+            .lookup_idempotency(&id, "k-create-2")
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+    assert_eq!(audit_event_ids(&store, &id).await.len(), 1);
 }

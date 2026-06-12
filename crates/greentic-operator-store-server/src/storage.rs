@@ -57,6 +57,7 @@ pub type LoadedTrustRoot = Loaded<TrustRootDocument>;
 /// | `PreconditionFailed` | `412` |
 /// | `IntegrityMismatch` | `422` |
 /// | `TrustRootChanged` | `409` |
+/// | `IdempotencyKeyCommitted` | `409` (`idempotency-conflict`) |
 /// | `Spec` / `EnvIdMismatch` | `400` |
 /// | `Json` / `Integrity` / `Backend` | `500` |
 ///
@@ -93,6 +94,16 @@ pub enum StorageError {
     /// conflict` on the wire.
     #[error("trust root for `{env_id}` changed concurrently; reload and retry the mutation")]
     TrustRootChanged { env_id: EnvId },
+    /// A concurrent request committed the same `(env_id, idempotency_key)`
+    /// ledger row between this request's replay-gate lookup and its commit
+    /// (the ledger insert hit the primary key). The whole transaction —
+    /// mutation included — rolls back; the retry replays the winner's
+    /// stored response. Maps to `409 idempotency-conflict` on the wire.
+    #[error(
+        "idempotency key `{key}` was committed concurrently by another request \
+         on env `{env_id}`; retry to replay its response"
+    )]
+    IdempotencyKeyCommitted { env_id: EnvId, key: String },
     #[error(transparent)]
     Spec(#[from] SpecError),
     #[error(transparent)]
@@ -118,6 +129,52 @@ impl StorageError {
     }
 }
 
+/// Everything the server must persist about ONE committed mutation, beyond
+/// the mutated resource itself (PR-4.3): the idempotency-ledger row (the
+/// durable form of `greentic_deploy_spec::remote::IdempotencyRecord` — it
+/// additionally stores the response's `result` payload, which the contract
+/// type's `MutationResponse` omits) and the audit-log append.
+///
+/// Built by the handler BEFORE the commit — the post-commit revision is
+/// deterministic under a fully pinned precondition (`generation + 1`, etag
+/// from content) — and handed to the journaled storage verbs so both rows
+/// land in the SAME transaction as the mutation. No-op mutations (idempotent
+/// domain replays that persist nothing) journal via
+/// [`EnvironmentStorage::record_journal`] instead.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MutationJournal {
+    pub env_id: EnvId,
+    pub idempotency_key: String,
+    /// Canonical `{noun}.{verb}` of the A8 route (forensics + conflict
+    /// diagnostics; the replay match itself is fingerprint-driven).
+    pub operation: String,
+    /// SHA-256 over the canonical request (method + path + body) — see
+    /// `api::RequestFingerprint`.
+    pub request_fingerprint: String,
+    /// HTTP status of the recorded response (`200`, or `422` for the warm
+    /// health gate's committed-on-error path).
+    pub response_status: u16,
+    /// The FULL response body, replayed verbatim on a same-key same-request
+    /// retry (modulo the `idempotency` marker flip to `replayed`).
+    pub response_body: Value,
+    /// The audit record as JSON — also embedded in `response_body` for
+    /// success responses; standalone for committed-on-error responses.
+    pub audit_event: Value,
+    /// The audit record's ULID (the `audit_log.event_id` column).
+    pub audit_event_id: String,
+}
+
+/// A ledger row loaded for the replay gate: enough to tell a verbatim
+/// retry (fingerprint match → replay `response_body`) from a same-key
+/// different-request protocol violation (mismatch → `409`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredIdempotencyRecord {
+    pub operation: String,
+    pub request_fingerprint: String,
+    pub response_status: u16,
+    pub response_body: Value,
+}
+
 /// Storage backend contract for the operator store server.
 ///
 /// Methods are declared as `-> impl Future + Send` rather than `async fn`
@@ -125,6 +182,11 @@ impl StorageError {
 /// await them without an unnameable-`Send`-bound escape hatch.
 /// Implementations still write plain `async fn` bodies — the compiler
 /// checks the resulting future against the declared `Send` bound.
+///
+/// The four committing verbs each exist in two forms: the `*_journaled`
+/// required method (mutation + [`MutationJournal`] rows in ONE transaction —
+/// what the A8 handlers call) and a provided journal-free default delegating
+/// with `None` (storage-level tests and non-A8 callers).
 pub trait EnvironmentStorage: Send + Sync {
     /// Cheap connectivity probe for readiness checks.
     fn ping(&self) -> impl Future<Output = Result<(), StorageError>> + Send;
@@ -150,20 +212,58 @@ pub trait EnvironmentStorage: Send + Sync {
     ) -> impl Future<Output = Result<LoadedEnv, StorageError>> + Send;
 
     /// Create `env` if-absent. Fails [`StorageError::AlreadyExists`] if the
-    /// row already exists; never silently overwrites.
+    /// row already exists; never silently overwrites. With `Some(journal)`
+    /// the ledger + audit rows commit in the same transaction (and are
+    /// rolled back when the create loses to an existing row).
+    fn create_env_journaled(
+        &self,
+        env: &Environment,
+        journal: Option<&MutationJournal>,
+    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
+
+    /// Journal-free [`Self::create_env_journaled`].
     fn create_env(
         &self,
         env: &Environment,
-    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
+    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send {
+        self.create_env_journaled(env, None)
+    }
 
     /// Update `env` under `precondition`. Rejects an empty precondition
     /// with [`StorageError::PreconditionRequired`] (A8 contract #1, blind
-    /// writes never apply).
+    /// writes never apply). With `Some(journal)` the ledger + audit rows
+    /// commit in the same transaction — a CAS conflict rolls them back too.
+    fn update_env_journaled(
+        &self,
+        env: &Environment,
+        precondition: &Precondition,
+        journal: Option<&MutationJournal>,
+    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
+
+    /// Journal-free [`Self::update_env_journaled`].
     fn update_env(
         &self,
         env: &Environment,
         precondition: &Precondition,
-    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
+    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send {
+        self.update_env_journaled(env, precondition, None)
+    }
+
+    /// Load the ledger row for `(env_id, key)`, if a committed mutation
+    /// already consumed the key (the replay gate's lookup).
+    fn lookup_idempotency(
+        &self,
+        env_id: &EnvId,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<StoredIdempotencyRecord>, StorageError>> + Send;
+
+    /// Persist a [`MutationJournal`] on its own (one small transaction) —
+    /// the path for idempotent no-op mutations, whose responses must still
+    /// be replayable although no resource row was written.
+    fn record_journal(
+        &self,
+        journal: &MutationJournal,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     fn load_runtime(
         &self,
@@ -217,12 +317,25 @@ pub trait EnvironmentStorage: Send + Sync {
     /// Upsert the trust-root document. Same precondition semantics as
     /// [`Self::upsert_runtime`] — first write (no existing row) must be
     /// unconditional, later writes require a conditional precondition.
+    /// With `Some(journal)` the ledger + audit rows commit in the same
+    /// transaction.
+    fn upsert_trust_root_journaled(
+        &self,
+        env_id: &EnvId,
+        doc: &TrustRootDocument,
+        precondition: Option<&Precondition>,
+        journal: Option<&MutationJournal>,
+    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
+
+    /// Journal-free [`Self::upsert_trust_root_journaled`].
     fn upsert_trust_root(
         &self,
         env_id: &EnvId,
         doc: &TrustRootDocument,
         precondition: Option<&Precondition>,
-    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
+    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send {
+        self.upsert_trust_root_journaled(env_id, doc, precondition, None)
+    }
 
     /// Persist `env` (under `precondition`) AND `artifact` in ONE
     /// transaction (PR-4.2g) — the server analogue of the LocalFS flock,
@@ -242,16 +355,35 @@ pub trait EnvironmentStorage: Send + Sync {
     ///
     /// The artifact lands via INSERT OR REPLACE on its
     /// `(env_id, bundle_id, customer_id, version)` key: version numbers
-    /// derive from the COMMITTED `revenue_policy_ref`, so a replayed
-    /// build of the same version (same-key retry, PR-4.3) overwrites
-    /// rather than duplicates.
+    /// derive from the COMMITTED `revenue_policy_ref`, so a same-version
+    /// rebuild racing past the replay gate overwrites rather than
+    /// duplicates. With `Some(journal)` the ledger + audit rows join the
+    /// same transaction.
+    fn update_env_with_revenue_policy_journaled(
+        &self,
+        env: &Environment,
+        precondition: &Precondition,
+        artifact: &RevenuePolicyArtifact,
+        trust_root_pin: Option<&EnvRevision>,
+        journal: Option<&MutationJournal>,
+    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
+
+    /// Journal-free [`Self::update_env_with_revenue_policy_journaled`].
     fn update_env_with_revenue_policy(
         &self,
         env: &Environment,
         precondition: &Precondition,
         artifact: &RevenuePolicyArtifact,
         trust_root_pin: Option<&EnvRevision>,
-    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
+    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send {
+        self.update_env_with_revenue_policy_journaled(
+            env,
+            precondition,
+            artifact,
+            trust_root_pin,
+            None,
+        )
+    }
 
     /// Load a stored revenue-policy artifact version, if present.
     fn load_revenue_policy(

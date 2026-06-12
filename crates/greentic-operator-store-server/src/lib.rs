@@ -50,6 +50,14 @@
 //!   CLI rejects them upstream, the server can't rely on that).
 //! - `greentic-operator-store-server` binary: clap config (bind address
 //!   + database path), graceful shutdown.
+//! - The A8 §2 idempotency replay ledger + the audit log's durable append
+//!   (PR-4.3): every committed mutation writes its ledger row (canonical
+//!   request fingerprint + the full original response) and its audit-log
+//!   row in the SAME transaction as the mutation; a same-key retry replays
+//!   the original response verbatim (`idempotency: replayed`), any other
+//!   key reuse is a typed `409 idempotency-conflict`, and failed requests
+//!   consume nothing. Both tables grow without bound by design —
+//!   control-plane paced; retention/backup is the PR-4.4 story.
 //!
 //! Out of scope, intentional follow-ups (PR-4.2e+):
 //!
@@ -58,9 +66,6 @@
 //!   extraction from `mutations_local.rs`. FS-coupled steps
 //!   (revenue-policy signing, operator key, trust-root files) need
 //!   injected server-side seams.
-//! - Idempotency replay (A8 #2 — keys are required on every mutation and
-//!   echoed into the audit record, not yet cached for replay) and the audit
-//!   log's durable append (PR-4.3).
 //! - RBAC (A8 #3, denials = 403 + A8 `unauthorized` body; today every
 //!   decision is an honest `Allow{policy: "open-dev"}`) and
 //!   backup/restore (A8 #5) (PR-4.4).
