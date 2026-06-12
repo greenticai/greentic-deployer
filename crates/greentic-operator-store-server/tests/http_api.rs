@@ -3492,3 +3492,210 @@ async fn domain_noop_with_fresh_key_is_journaled_for_replay() {
     assert_eq!(replay["idempotency"]["idempotency"], "replayed");
     assert_eq!(replay["audit"]["event_id"], original["audit"]["event_id"]);
 }
+
+// ---------------------------------------------------------------------------
+// Concurrent same-key convergence via error_or_replay (Finding 1)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn concurrent_same_key_updates_converge_on_one_commit() {
+    let (_d, app, store) = app_with_store().await;
+    create_local_env(&app).await;
+
+    let patch = json!({"name": "concurrent"});
+    let (r1, r2) = tokio::join!(
+        send_custom(
+            app.clone(),
+            Method::PATCH,
+            "/environments/local",
+            Some(patch.clone()),
+            &[("Idempotency-Key", "RACE-UPD")],
+        ),
+        send_custom(
+            app.clone(),
+            Method::PATCH,
+            "/environments/local",
+            Some(patch),
+            &[("Idempotency-Key", "RACE-UPD")],
+        ),
+    );
+
+    assert_eq!(r1.0, StatusCode::OK, "r1: {}", r1.1);
+    assert_eq!(r2.0, StatusCode::OK, "r2: {}", r2.1);
+    assert_eq!(
+        r1.1["audit"]["event_id"], r2.1["audit"]["event_id"],
+        "both must share the same audit event"
+    );
+
+    // Exactly one applied, one replayed.
+    let mut markers = vec![
+        r1.1["idempotency"]["idempotency"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        r2.1["idempotency"]["idempotency"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    ];
+    markers.sort();
+    assert_eq!(markers, vec!["applied", "replayed"]);
+
+    // Generation advanced exactly once (create=1, update=2).
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(read["generation"], 2);
+
+    // Audit log: create + one update = 2 rows.
+    assert_eq!(audit_log_event_ids(&store, "local").await.len(), 2);
+}
+
+#[tokio::test]
+async fn concurrent_same_key_creates_converge() {
+    let (_d, app, _store) = app_with_store().await;
+
+    let (r1, r2) = tokio::join!(
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments",
+            Some(create_body("fresh")),
+            &[("Idempotency-Key", "RACE-CREATE")],
+        ),
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments",
+            Some(create_body("fresh")),
+            &[("Idempotency-Key", "RACE-CREATE")],
+        ),
+    );
+
+    assert_eq!(r1.0, StatusCode::OK, "r1: {}", r1.1);
+    assert_eq!(r2.0, StatusCode::OK, "r2: {}", r2.1);
+    assert_eq!(r1.1["audit"]["event_id"], r2.1["audit"]["event_id"]);
+
+    // The env appears exactly once.
+    let (_, list) = send(app, Method::GET, "/environments", None).await;
+    let envs = list["environments"].as_array().expect("envs");
+    assert_eq!(
+        envs.iter().filter(|e| e.as_str() == Some("fresh")).count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_same_key_bundle_adds_mint_one_deployment() {
+    let (_d, app, store) = bundles_app().await;
+
+    let (r1, r2) = tokio::join!(
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/bundles",
+            Some(add_bundle_body("acme", "cust-1")),
+            &[("Idempotency-Key", "RACE-BUNDLE")],
+        ),
+        send_custom(
+            app.clone(),
+            Method::POST,
+            "/environments/local/bundles",
+            Some(add_bundle_body("acme", "cust-1")),
+            &[("Idempotency-Key", "RACE-BUNDLE")],
+        ),
+    );
+
+    assert_eq!(r1.0, StatusCode::OK, "r1: {}", r1.1);
+    assert_eq!(r2.0, StatusCode::OK, "r2: {}", r2.1);
+    assert_eq!(
+        r1.1["result"]["deployment_id"], r2.1["result"]["deployment_id"],
+        "both must echo the same server-minted deployment id"
+    );
+
+    // Exactly one deployment.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(read["environment"]["bundles"].as_array().unwrap().len(), 1);
+
+    // No second revenue-policy version.
+    let env = EnvId::try_from("local").expect("env id");
+    let bundle_id = BundleId::new("acme");
+    let customer_id = CustomerId::new("cust-1");
+    assert!(
+        store
+            .load_revenue_policy(&env, &bundle_id, &customer_id, 2)
+            .await
+            .expect("load v2")
+            .is_none(),
+        "no second policy version after concurrent add"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_same_key_trust_root_removes_share_the_pem() {
+    let (dir, store) = fresh_store().await;
+    let store = Arc::new(store);
+    let app = router_with_operator_key(Arc::clone(&store), dir.path().join("operator-key.pem"));
+    create_local_env(&app).await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/trust-root/bootstrap",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bootstrap: {body}");
+    let key_id = body["result"]["key_id"]
+        .as_str()
+        .expect("key_id")
+        .to_string();
+
+    let remove_path = format!("/environments/local/trust-root/keys/{key_id}");
+    let (r1, r2) = tokio::join!(
+        send_custom(
+            app.clone(),
+            Method::DELETE,
+            &remove_path,
+            None,
+            &[("Idempotency-Key", "RACE-RM")],
+        ),
+        send_custom(
+            app.clone(),
+            Method::DELETE,
+            &remove_path,
+            None,
+            &[("Idempotency-Key", "RACE-RM")],
+        ),
+    );
+
+    assert_eq!(r1.0, StatusCode::OK, "r1: {}", r1.1);
+    assert_eq!(r2.0, StatusCode::OK, "r2: {}", r2.1);
+    // Both must carry the recovery PEM.
+    assert!(
+        r1.1["result"]["removed_public_key_pem"].as_str().is_some(),
+        "r1 must have PEM"
+    );
+    assert_eq!(
+        r1.1["result"]["removed_public_key_pem"], r2.1["result"]["removed_public_key_pem"],
+        "both must echo the same recovery PEM"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Key-size cap + ledger window (Finding 2)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn oversized_idempotency_key_is_400() {
+    let (_d, app) = app().await;
+    let big_key = "X".repeat(300);
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", &big_key)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["kind"], "invalid-request");
+}

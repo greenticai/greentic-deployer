@@ -1201,3 +1201,66 @@ async fn create_env_journaled_journals_only_the_winning_create() {
     );
     assert_eq!(audit_event_ids(&store, &id).await.len(), 1);
 }
+
+#[tokio::test]
+async fn ledger_evicts_beyond_the_per_env_window() {
+    use greentic_operator_store_server::storage::MAX_LEDGER_ROWS_PER_ENV;
+
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    let env = minimal_environment(&id);
+    store.create_env(&env).await.expect("create env");
+
+    let cap = MAX_LEDGER_ROWS_PER_ENV as usize;
+    for i in 0..cap + 1 {
+        store
+            .record_journal(&journal(&id, &format!("k-{i}"), &format!("fp-{i}")))
+            .await
+            .expect("record journal");
+    }
+
+    // k-0 should be evicted, the last key should survive.
+    assert!(
+        store
+            .lookup_idempotency(&id, "k-0")
+            .await
+            .expect("lookup")
+            .is_none(),
+        "k-0 should have been evicted"
+    );
+    assert!(
+        store
+            .lookup_idempotency(&id, &format!("k-{cap}"))
+            .await
+            .expect("lookup")
+            .is_some(),
+        "last key should survive"
+    );
+
+    // Row count for this env equals the cap.
+    let count: i64 =
+        sqlx::query("SELECT COUNT(*) AS cnt FROM idempotency_ledger WHERE env_id = $1")
+            .bind(id.as_str())
+            .fetch_one(store.pool())
+            .await
+            .expect("count")
+            .get("cnt");
+    assert_eq!(count, MAX_LEDGER_ROWS_PER_ENV);
+
+    // Eviction is per-env: a journal under a second env id survives.
+    let id2 = env_id("other");
+    let env2 = minimal_environment(&id2);
+    store.create_env(&env2).await.expect("create env2");
+    store
+        .record_journal(&journal(&id2, "k-other", "fp-other"))
+        .await
+        .expect("record other");
+    assert!(
+        store
+            .lookup_idempotency(&id2, "k-other")
+            .await
+            .expect("lookup")
+            .is_some(),
+        "other env's key must survive"
+    );
+}

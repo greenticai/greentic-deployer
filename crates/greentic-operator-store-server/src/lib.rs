@@ -56,8 +56,10 @@
 //!   row in the SAME transaction as the mutation; a same-key retry replays
 //!   the original response verbatim (`idempotency: replayed`), any other
 //!   key reuse is a typed `409 idempotency-conflict`, and failed requests
-//!   consume nothing. Both tables grow without bound by design —
-//!   control-plane paced; retention/backup is the PR-4.4 story.
+//!   consume nothing. The ledger is bounded per-environment
+//!   (`MAX_LEDGER_ROWS_PER_ENV` = 4096 rows, clock-free eviction in the
+//!   inserting transaction); the audit log is deliberately append-only
+//!   without bound — archival/backup is the PR-4.4 story.
 //!
 //! Out of scope, intentional follow-ups (PR-4.2e+):
 //!

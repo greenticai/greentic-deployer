@@ -129,6 +129,16 @@ impl StorageError {
     }
 }
 
+/// Per-environment replay-window size: the ledger keeps the most recent
+/// N committed mutations' responses (clock-free — measured in mutations,
+/// not seconds; matches the ecosystem's bounded-map posture). Older rows
+/// are evicted inside the same transaction that inserts a new one; a
+/// retry of an evicted key simply re-executes, the same acceptance the
+/// replay contract already grants pre-ledger requests. The audit log is
+/// deliberately NOT bounded — it must never forget a committed mutation;
+/// archival is the PR-4.4 backup story.
+pub const MAX_LEDGER_ROWS_PER_ENV: i64 = 4096;
+
 /// Everything the server must persist about ONE committed mutation, beyond
 /// the mutated resource itself (PR-4.3): the idempotency-ledger row (the
 /// durable form of `greentic_deploy_spec::remote::IdempotencyRecord` — it

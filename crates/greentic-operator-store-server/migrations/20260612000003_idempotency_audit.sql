@@ -13,9 +13,12 @@
 -- server emits (previously the record only rode the response envelope).
 -- `id` is the append order; `event` is the full AuditEvent JSON.
 --
--- Both tables grow without bound by design: the store is human-paced
--- control-plane state, the audit log must never forget a committed
--- mutation, and retention/backup is the PR-4.4 story.
+-- The idempotency ledger is bounded per-environment: at most
+-- `MAX_LEDGER_ROWS_PER_ENV` (4096) rows per env_id survive; older rows
+-- are evicted inside the same transaction that inserts a new one (see
+-- `journal_in_tx`). A retry of an evicted key simply re-executes. The
+-- audit log is deliberately append-only without bound — it must never
+-- forget a committed mutation; archival/backup is the PR-4.4 story.
 
 CREATE TABLE idempotency_ledger (
     env_id              TEXT NOT NULL,

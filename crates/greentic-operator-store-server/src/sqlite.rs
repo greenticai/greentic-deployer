@@ -790,6 +790,15 @@ async fn journal_in_tx(
         }
         _ => StorageError::from(err),
     })?;
+    sqlx::query(
+        "DELETE FROM idempotency_ledger WHERE env_id = $1 AND rowid NOT IN ( \
+         SELECT rowid FROM idempotency_ledger WHERE env_id = $1 \
+         ORDER BY rowid DESC LIMIT $2)",
+    )
+    .bind(journal.env_id.as_str())
+    .bind(crate::storage::MAX_LEDGER_ROWS_PER_ENV)
+    .execute(&mut **tx)
+    .await?;
     sqlx::query("INSERT INTO audit_log (env_id, event_id, event) VALUES ($1, $2, $3)")
         .bind(journal.env_id.as_str())
         .bind(&journal.audit_event_id)
