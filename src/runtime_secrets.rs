@@ -6,8 +6,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use greentic_secrets_lib::{DevStore, SecretsStore};
+use greentic_types::{ExtensionInline, decode_pack_manifest};
+use rand::RngExt as _;
 use serde::Deserialize;
+use serde_cbor::value::Value as CborValue;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use zip::{ZipArchive, result::ZipError};
@@ -18,6 +22,7 @@ use crate::error::{DeployerError, Result};
 
 const DEV_SECRETS_PATH_ENV: &str = "GREENTIC_DEV_SECRETS_PATH";
 const TEAM_DEFAULT: &str = "_";
+const EXT_GENERATED_SECRETS_V1: &str = "greentic.generated-secrets.v1";
 const SECRET_ASSET_PATHS: &[&str] = &[
     "assets/secret-requirements.json",
     "assets/secret_requirements.json",
@@ -32,7 +37,23 @@ pub struct RuntimeSecretRequirement {
     pub key: String,
     pub required: bool,
     pub default_value: Option<String>,
+    pub generated: Option<GeneratedSecretRequirement>,
     pub source: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeneratedSecretRequirement {
+    pub policy: String,
+    pub length: usize,
+    pub encoding: String,
+    pub scope: GeneratedSecretScope,
+    pub regenerate_if_present: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeneratedSecretScope {
+    pub level: String,
+    pub team: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -63,6 +84,7 @@ pub enum SecretValueSource {
     DevStore { path: PathBuf },
     SetupAnswers { path: PathBuf },
     SetupDefault,
+    Generated,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,7 +184,7 @@ pub fn collect_requirements(ctx: &RuntimeSecretContext) -> Result<Vec<RuntimeSec
             let uri = canonical_secret_uri(
                 &ctx.environment,
                 &ctx.tenant,
-                ctx.team.as_deref(),
+                requirement_team(req.generated.as_ref(), ctx.team.as_deref()),
                 &provider_id,
                 &key,
             );
@@ -174,6 +196,7 @@ pub fn collect_requirements(ctx: &RuntimeSecretContext) -> Result<Vec<RuntimeSec
                     key,
                     required: req.required,
                     default_value: req.default_value,
+                    generated: req.generated,
                     source: pack_path.clone(),
                 });
         }
@@ -339,6 +362,23 @@ pub async fn resolve_runtime_secrets(
                 value: SecretValue(value.clone()),
                 source: SecretValueSource::SetupDefault,
             });
+        } else if let Some(generated) = &requirement.generated {
+            checked_sources.push("generated secret metadata".to_string());
+            match generated_secret_value(generated) {
+                Ok(value) => resolved.push(ResolvedRuntimeSecret {
+                    requirement: requirement.clone(),
+                    value: SecretValue(value),
+                    source: SecretValueSource::Generated,
+                }),
+                Err(err) if requirement.required => {
+                    checked_sources.push(format!("generation failed: {err}"));
+                    missing.push(MissingRuntimeSecret {
+                        requirement: requirement.clone(),
+                        checked_sources,
+                    });
+                }
+                Err(_) => {}
+            }
         } else if requirement.required {
             missing.push(MissingRuntimeSecret {
                 requirement: requirement.clone(),
@@ -497,6 +537,21 @@ fn canonical_team(team: Option<&str>) -> &str {
     }
 }
 
+fn requirement_team<'a>(
+    generated: Option<&'a GeneratedSecretRequirement>,
+    default_team: Option<&'a str>,
+) -> Option<&'a str> {
+    let Some(generated) = generated else {
+        return default_team;
+    };
+    if generated.scope.level.eq_ignore_ascii_case("tenant")
+        || generated.scope.team.as_deref() == Some("_")
+    {
+        return None;
+    }
+    generated.scope.team.as_deref().or(default_team)
+}
+
 fn dev_store_paths(bundle_root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(path) = env::var_os(DEV_SECRETS_PATH_ENV) {
@@ -611,7 +666,7 @@ fn is_probably_tar(path: &Path) -> Result<bool> {
 }
 
 fn load_secret_requirements_from_dir(pack_path: &Path) -> Result<Vec<PackSecretRequirement>> {
-    let mut requirements = Vec::new();
+    let mut requirements = load_generated_requirements_from_dir(pack_path)?;
     for asset in SECRET_ASSET_PATHS {
         let path = pack_path.join(asset);
         if path.exists() {
@@ -633,7 +688,7 @@ fn load_secret_requirements_from_zip(pack_path: &Path) -> Result<Vec<PackSecretR
         Ok(archive) => archive,
         Err(_) => return Ok(Vec::new()),
     };
-    let mut requirements = Vec::new();
+    let mut requirements = load_generated_requirements_from_zip(&mut archive)?;
     for asset in SECRET_ASSET_PATHS {
         match archive.by_name(asset) {
             Ok(mut entry) => {
@@ -687,27 +742,90 @@ fn load_secret_requirements_from_tar(pack_path: &Path) -> Result<Vec<PackSecretR
             let mut contents = String::new();
             entry.read_to_string(&mut contents)?;
             requirements.extend(parse_setup_secret_requirements(&contents, &path)?);
+        } else if path_str == "manifest.cbor" {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            requirements.extend(load_generated_requirements_from_manifest_cbor_bytes(
+                &bytes,
+            )?);
+        } else if path_str == "pack.manifest.json" {
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents)?;
+            requirements.extend(load_generated_requirements_from_manifest_json_str(
+                &contents,
+            )?);
         }
     }
     Ok(dedup_requirements(requirements))
 }
 
 fn parse_requirements(contents: &str, path: &Path) -> Result<Vec<PackSecretRequirement>> {
-    serde_json::from_str(contents).map_err(|err| {
-        DeployerError::Config(format!(
-            "parse secret requirements from {}: {err}",
-            path.display()
-        ))
-    })
+    let path_display = path.display().to_string();
+    let requirements: Vec<AssetSecretRequirement> =
+        serde_json::from_str(contents).map_err(|err| {
+            DeployerError::Config(format!(
+                "parse secret requirements from {path_display}: {err}"
+            ))
+        })?;
+    Ok(requirements
+        .into_iter()
+        .filter_map(asset_requirement_to_pack_requirement)
+        .collect())
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PackSecretRequirement {
     key: String,
+    required: bool,
+    default_value: Option<String>,
+    generated: Option<GeneratedSecretRequirement>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssetSecretRequirement {
+    key: Option<String>,
+    name: Option<String>,
     #[serde(default = "default_required")]
     required: bool,
     #[serde(default)]
     default_value: Option<String>,
+    #[serde(default)]
+    generated: Option<AssetGeneratedSecret>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct AssetGeneratedSecret {
+    policy: Option<String>,
+    length: Option<usize>,
+    encoding: Option<String>,
+    scope: Option<AssetGeneratedSecretScope>,
+    #[serde(default)]
+    regenerate_if_present: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct AssetGeneratedSecretScope {
+    level: Option<String>,
+    team: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeneratedSecretsExtension {
+    #[serde(default)]
+    secrets: Vec<GeneratedSecretEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeneratedSecretEntry {
+    key: String,
+    #[serde(default = "default_required")]
+    required: bool,
+    policy: Option<String>,
+    length: Option<usize>,
+    encoding: Option<String>,
+    scope: Option<AssetGeneratedSecretScope>,
+    #[serde(default)]
+    regenerate_if_present: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -733,11 +851,9 @@ fn parse_setup_secret_requirements(
     contents: &str,
     path: &Path,
 ) -> Result<Vec<PackSecretRequirement>> {
+    let path_display = path.display().to_string();
     let setup: SetupSpec = serde_yaml_bw::from_str(contents).map_err(|err| {
-        DeployerError::Config(format!(
-            "parse setup secrets from {}: {err}",
-            path.display()
-        ))
+        DeployerError::Config(format!("parse setup secrets from {path_display}: {err}"))
     })?;
     Ok(setup
         .questions
@@ -747,6 +863,7 @@ fn parse_setup_secret_requirements(
             key: question.secret_key.unwrap_or(question.name),
             required: question.required,
             default_value: question.default,
+            generated: None,
         })
         .collect())
 }
@@ -762,10 +879,256 @@ fn dedup_requirements(requirements: Vec<PackSecretRequirement>) -> Vec<PackSecre
                 if existing.default_value.is_none() {
                     existing.default_value = requirement.default_value.clone();
                 }
+                if existing.generated.is_none() {
+                    existing.generated = requirement.generated.clone();
+                }
             })
             .or_insert(requirement);
     }
     by_key.into_values().collect()
+}
+
+fn asset_requirement_to_pack_requirement(
+    req: AssetSecretRequirement,
+) -> Option<PackSecretRequirement> {
+    let key = req.key.or(req.name)?;
+    Some(PackSecretRequirement {
+        key,
+        required: req.required,
+        default_value: req.default_value,
+        generated: req.generated.map(|generated| GeneratedSecretRequirement {
+            policy: generated.policy.unwrap_or_else(|| "random".to_string()),
+            length: generated.length.unwrap_or(32),
+            encoding: generated
+                .encoding
+                .unwrap_or_else(|| "base64url".to_string()),
+            scope: GeneratedSecretScope {
+                level: generated
+                    .scope
+                    .as_ref()
+                    .and_then(|scope| scope.level.clone())
+                    .unwrap_or_else(|| "team".to_string()),
+                team: generated.scope.and_then(|scope| scope.team),
+            },
+            regenerate_if_present: generated.regenerate_if_present.unwrap_or(false),
+        }),
+    })
+}
+
+fn load_generated_requirements_from_dir(pack_path: &Path) -> Result<Vec<PackSecretRequirement>> {
+    let manifest_cbor = pack_path.join("manifest.cbor");
+    if manifest_cbor.exists() {
+        let bytes = std::fs::read(&manifest_cbor)?;
+        let requirements = load_generated_requirements_from_manifest_cbor_bytes(&bytes)?;
+        if !requirements.is_empty() {
+            return Ok(requirements);
+        }
+    }
+    let manifest_json = pack_path.join("pack.manifest.json");
+    if manifest_json.exists() {
+        let contents = std::fs::read_to_string(&manifest_json)?;
+        return load_generated_requirements_from_manifest_json_str(&contents);
+    }
+    Ok(Vec::new())
+}
+
+fn load_generated_requirements_from_zip<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+) -> Result<Vec<PackSecretRequirement>> {
+    match archive.by_name("manifest.cbor") {
+        Ok(mut entry) => {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            let requirements = load_generated_requirements_from_manifest_cbor_bytes(&bytes)?;
+            if !requirements.is_empty() {
+                return Ok(requirements);
+            }
+        }
+        Err(ZipError::FileNotFound) => {}
+        Err(err) => return Err(DeployerError::Other(err.to_string())),
+    }
+    match archive.by_name("pack.manifest.json") {
+        Ok(mut entry) => {
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents)?;
+            load_generated_requirements_from_manifest_json_str(&contents)
+        }
+        Err(ZipError::FileNotFound) => Ok(Vec::new()),
+        Err(err) => Err(DeployerError::Other(err.to_string())),
+    }
+}
+
+fn load_generated_requirements_from_manifest_cbor_bytes(
+    bytes: &[u8],
+) -> Result<Vec<PackSecretRequirement>> {
+    if let Ok(manifest) = decode_pack_manifest(bytes) {
+        let Some(value) = manifest
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get(EXT_GENERATED_SECRETS_V1))
+            .and_then(|extension| extension.inline.as_ref())
+        else {
+            return Ok(Vec::new());
+        };
+        let ExtensionInline::Other(value) = value else {
+            return Ok(Vec::new());
+        };
+        return parse_generated_secrets_extension(value.clone());
+    }
+
+    let Ok(value) = serde_cbor::from_slice::<CborValue>(bytes) else {
+        return Ok(Vec::new());
+    };
+    let Some(inline) = cbor_generated_extension_inline(&value) else {
+        return Ok(Vec::new());
+    };
+    let json = cbor_to_json(inline)?;
+    parse_generated_secrets_extension(json)
+}
+
+fn load_generated_requirements_from_manifest_json_str(
+    contents: &str,
+) -> Result<Vec<PackSecretRequirement>> {
+    let manifest: serde_json::Value = serde_json::from_str(contents).map_err(|err| {
+        DeployerError::Config(format!("parse pack.manifest.json generated secrets: {err}"))
+    })?;
+    let Some(value) = manifest
+        .get("extensions")
+        .and_then(|extensions| extensions.get(EXT_GENERATED_SECRETS_V1))
+        .and_then(|extension| extension.get("inline"))
+    else {
+        return Ok(Vec::new());
+    };
+    parse_generated_secrets_extension(value.clone())
+}
+
+fn parse_generated_secrets_extension(
+    value: serde_json::Value,
+) -> Result<Vec<PackSecretRequirement>> {
+    let extension: GeneratedSecretsExtension = serde_json::from_value(value).map_err(|err| {
+        DeployerError::Config(format!("parse generated secrets extension: {err}"))
+    })?;
+    Ok(extension
+        .secrets
+        .into_iter()
+        .filter(|secret| secret.required)
+        .map(|secret| PackSecretRequirement {
+            key: secret.key,
+            required: true,
+            default_value: None,
+            generated: Some(GeneratedSecretRequirement {
+                policy: secret.policy.unwrap_or_else(|| "random".to_string()),
+                length: secret.length.unwrap_or(20),
+                encoding: secret.encoding.unwrap_or_else(|| "raw_text".to_string()),
+                scope: GeneratedSecretScope {
+                    level: secret
+                        .scope
+                        .as_ref()
+                        .and_then(|scope| scope.level.clone())
+                        .unwrap_or_else(|| "tenant".to_string()),
+                    team: secret.scope.and_then(|scope| scope.team),
+                },
+                regenerate_if_present: secret.regenerate_if_present.unwrap_or(false),
+            }),
+        })
+        .collect())
+}
+
+fn cbor_generated_extension_inline(value: &CborValue) -> Option<&CborValue> {
+    let CborValue::Map(map) = value else {
+        return None;
+    };
+    let extensions = cbor_map_get(map, "extensions")?;
+    let CborValue::Map(extensions) = extensions else {
+        return None;
+    };
+    let extension = cbor_map_get(extensions, EXT_GENERATED_SECRETS_V1)?;
+    let CborValue::Map(extension) = extension else {
+        return None;
+    };
+    cbor_map_get(extension, "inline")
+}
+
+fn cbor_map_get<'a>(map: &'a BTreeMap<CborValue, CborValue>, key: &str) -> Option<&'a CborValue> {
+    map.iter().find_map(|(candidate, value)| match candidate {
+        CborValue::Text(text) if text == key => Some(value),
+        _ => None,
+    })
+}
+
+fn cbor_to_json(value: &CborValue) -> Result<serde_json::Value> {
+    match value {
+        CborValue::Null => Ok(serde_json::Value::Null),
+        CborValue::Bool(value) => Ok(serde_json::Value::Bool(*value)),
+        CborValue::Integer(value) => Ok(serde_json::Value::Number(
+            serde_json::Number::from_i128(*value).ok_or_else(|| {
+                DeployerError::Config("generated secrets integer is out of range".to_string())
+            })?,
+        )),
+        CborValue::Float(value) => serde_json::Number::from_f64(*value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| DeployerError::Config("generated secrets float is invalid".to_string())),
+        CborValue::Bytes(_) => Err(DeployerError::Config(
+            "generated secrets extension cannot contain bytes".to_string(),
+        )),
+        CborValue::Text(value) => Ok(serde_json::Value::String(value.clone())),
+        CborValue::Array(values) => values
+            .iter()
+            .map(cbor_to_json)
+            .collect::<Result<Vec<_>>>()
+            .map(serde_json::Value::Array),
+        CborValue::Map(map) => {
+            let mut object = serde_json::Map::new();
+            for (key, value) in map {
+                let CborValue::Text(key) = key else {
+                    return Err(DeployerError::Config(
+                        "generated secrets extension object key must be a string".to_string(),
+                    ));
+                };
+                object.insert(key.clone(), cbor_to_json(value)?);
+            }
+            Ok(serde_json::Value::Object(object))
+        }
+        _ => Err(DeployerError::Config(
+            "generated secrets extension contains unsupported CBOR value".to_string(),
+        )),
+    }
+}
+
+fn generated_secret_value(generated: &GeneratedSecretRequirement) -> Result<String> {
+    if !generated.policy.eq_ignore_ascii_case("random") {
+        return Err(DeployerError::Config(format!(
+            "unsupported generated secret policy `{}`",
+            generated.policy
+        )));
+    }
+    let length = generated.length.max(1);
+    match generated.encoding.as_str() {
+        "raw_text" => Ok(random_ascii(length)),
+        "base64url" => {
+            let mut bytes = vec![0u8; length];
+            rand::rng().fill(&mut bytes[..]);
+            Ok(URL_SAFE_NO_PAD.encode(bytes))
+        }
+        "hex" => {
+            let mut bytes = vec![0u8; length];
+            rand::rng().fill(&mut bytes[..]);
+            Ok(hex::encode(bytes))
+        }
+        other => Err(DeployerError::Config(format!(
+            "unsupported generated secret encoding `{other}`"
+        ))),
+    }
+}
+
+fn random_ascii(length: usize) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+    let mut bytes = vec![0u8; length];
+    rand::rng().fill(&mut bytes[..]);
+    bytes
+        .into_iter()
+        .map(|byte| ALPHABET[usize::from(byte) % ALPHABET.len()] as char)
+        .collect()
 }
 
 fn resolve_from_setup_answers(
@@ -942,6 +1305,315 @@ mod tests {
     }
 
     #[test]
+    fn collect_requirements_discovers_generated_secret_from_manifest_cbor_extension() {
+        use greentic_types::{
+            ExtensionInline, ExtensionRef, PackId, PackKind, PackManifest, PackSignatures,
+            encode_pack_manifest,
+        };
+        use semver::Version;
+        use serde_json::json;
+        use std::io::Write;
+        use zip::write::FileOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("packs/messaging-webchat-gui.gtpack");
+        std::fs::create_dir_all(pack.parent().unwrap()).unwrap();
+        let mut extensions = BTreeMap::new();
+        extensions.insert(
+            "greentic.generated-secrets.v1".to_string(),
+            ExtensionRef {
+                kind: "greentic.generated-secrets.v1".to_string(),
+                version: "1".to_string(),
+                digest: None,
+                location: None,
+                inline: Some(ExtensionInline::Other(json!({
+                    "secrets": [{
+                        "key": "jwt_signing_key",
+                        "aliases": ["JWT_SIGNING_KEY"],
+                        "required": true,
+                        "policy": "random",
+                        "length": 20,
+                        "encoding": "raw_text",
+                        "scope": {"level": "tenant", "team": "_"},
+                        "regenerate_if_present": false
+                    }]
+                }))),
+            },
+        );
+        let manifest = PackManifest {
+            schema_version: "1".to_string(),
+            pack_id: PackId::new("messaging-webchat-gui").unwrap(),
+            name: None,
+            version: Version::parse("0.0.0").unwrap(),
+            kind: PackKind::Provider,
+            publisher: "test".to_string(),
+            components: Vec::new(),
+            flows: Vec::new(),
+            dependencies: Vec::new(),
+            capabilities: Vec::new(),
+            secret_requirements: Vec::new(),
+            signatures: PackSignatures::default(),
+            bootstrap: None,
+            extensions: Some(extensions),
+        };
+        let file = File::create(&pack).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", FileOptions::<()>::default())
+            .unwrap();
+        zip.write_all(&encode_pack_manifest(&manifest).unwrap())
+            .unwrap();
+        zip.finish().unwrap();
+
+        let ctx = RuntimeSecretContext {
+            bundle_root: dir.path().to_path_buf(),
+            pack_paths: vec![pack],
+            environment: "dev".into(),
+            tenant: "demo".into(),
+            team: Some("default".into()),
+        };
+
+        let requirements = collect_requirements(&ctx).unwrap();
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(
+            requirements[0].uri,
+            "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key"
+        );
+        assert_eq!(requirements[0].key, "jwt_signing_key");
+        assert!(requirements[0].generated.is_some());
+    }
+
+    #[test]
+    fn collect_requirements_discovers_generated_secret_from_pack_manifest_json_extension() {
+        use std::io::Write;
+        use zip::write::FileOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("packs/messaging-webchat-gui.gtpack");
+        std::fs::create_dir_all(pack.parent().unwrap()).unwrap();
+        let file = File::create(&pack).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("pack.manifest.json", FileOptions::<()>::default())
+            .unwrap();
+        zip.write_all(
+            br#"{
+                "extensions": {
+                    "greentic.generated-secrets.v1": {
+                        "inline": {
+                            "secrets": [{
+                                "key": "jwt_signing_key",
+                                "policy": "random",
+                                "length": 20,
+                                "encoding": "raw_text",
+                                "scope": {"level": "tenant", "team": "_"}
+                            }]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        zip.finish().unwrap();
+
+        let ctx = RuntimeSecretContext {
+            bundle_root: dir.path().to_path_buf(),
+            pack_paths: vec![pack],
+            environment: "dev".into(),
+            tenant: "demo".into(),
+            team: Some("default".into()),
+        };
+
+        let requirements = collect_requirements(&ctx).unwrap();
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(
+            requirements[0].uri,
+            "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key"
+        );
+        assert!(requirements[0].generated.is_some());
+    }
+
+    #[test]
+    fn runtime_secret_env_map_includes_generated_secret_uri_and_key_alias() {
+        use greentic_types::{
+            ExtensionInline, ExtensionRef, PackId, PackKind, PackManifest, PackSignatures,
+            encode_pack_manifest,
+        };
+        use semver::Version;
+        use serde_json::json;
+        use std::io::Write;
+        use zip::write::FileOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_root = dir.path();
+        let pack = bundle_root.join("packs/messaging-webchat-gui.gtpack");
+        std::fs::create_dir_all(pack.parent().unwrap()).unwrap();
+        let mut extensions = BTreeMap::new();
+        extensions.insert(
+            "greentic.generated-secrets.v1".to_string(),
+            ExtensionRef {
+                kind: "greentic.generated-secrets.v1".to_string(),
+                version: "1".to_string(),
+                digest: None,
+                location: None,
+                inline: Some(ExtensionInline::Other(json!({
+                    "secrets": [{
+                        "key": "jwt_signing_key",
+                        "policy": "random",
+                        "length": 20,
+                        "encoding": "raw_text",
+                        "scope": {"level": "tenant", "team": "_"}
+                    }]
+                }))),
+            },
+        );
+        let manifest = PackManifest {
+            schema_version: "1".to_string(),
+            pack_id: PackId::new("messaging-webchat-gui").unwrap(),
+            name: None,
+            version: Version::parse("0.0.0").unwrap(),
+            kind: PackKind::Provider,
+            publisher: "test".to_string(),
+            components: Vec::new(),
+            flows: Vec::new(),
+            dependencies: Vec::new(),
+            capabilities: Vec::new(),
+            secret_requirements: Vec::new(),
+            signatures: PackSignatures::default(),
+            bootstrap: None,
+            extensions: Some(extensions),
+        };
+        let file = File::create(&pack).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", FileOptions::<()>::default())
+            .unwrap();
+        zip.write_all(&encode_pack_manifest(&manifest).unwrap())
+            .unwrap();
+        zip.finish().unwrap();
+
+        let config = DeployerConfig {
+            capability: DeployerCapability::Apply,
+            provider: Provider::Aws,
+            strategy: "iac-only".into(),
+            tenant: "demo".into(),
+            environment: "dev".into(),
+            pack_path: pack.clone(),
+            bundle_root: Some(bundle_root.to_path_buf()),
+            providers_dir: PathBuf::from("providers/deployer"),
+            packs_dir: PathBuf::from("packs"),
+            provider_pack: None,
+            pack_ref: None,
+            distributor_url: None,
+            distributor_token: None,
+            preview: false,
+            dry_run: false,
+            execute_local: true,
+            output: crate::config::OutputFormat::Json,
+            greentic: greentic_config::ConfigResolver::new()
+                .load()
+                .unwrap()
+                .config,
+            provenance: greentic_config::ProvenanceMap::new(),
+            config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
+            bundle_source: Some("file:///tmp/demo.gtbundle".into()),
+            bundle_digest: Some(
+                "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
+            ),
+            repo_registry_base: None,
+            store_registry_base: None,
+        };
+
+        let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
+        assert!(env_map.contains_key("secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key"));
+        assert!(env_map.contains_key("jwt_signing_key"));
+    }
+
+    #[tokio::test]
+    async fn cloud_apply_resolution_generates_generated_secret_without_setup_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("packs/messaging-webchat-gui");
+        std::fs::create_dir_all(pack.join("assets")).unwrap();
+        std::fs::write(
+            pack.join("assets/secret-requirements.json"),
+            r#"[{
+                "key":"jwt_signing_key",
+                "required":true,
+                "generated":{
+                    "policy":"random",
+                    "length":20,
+                    "encoding":"raw_text",
+                    "scope":{"level":"tenant","team":"_"},
+                    "regenerate_if_present":false
+                }
+            }]"#,
+        )
+        .unwrap();
+
+        let ctx = RuntimeSecretContext {
+            bundle_root: dir.path().to_path_buf(),
+            pack_paths: vec![pack],
+            environment: "dev".into(),
+            tenant: "demo".into(),
+            team: Some("default".into()),
+        };
+        let requirements = collect_requirements(&ctx).unwrap();
+        let resolution = resolve_runtime_secrets(&ctx, &requirements).await;
+
+        assert!(resolution.missing.is_empty());
+        assert_eq!(resolution.resolved.len(), 1);
+        assert_eq!(resolution.resolved[0].value.expose().len(), 20);
+        assert!(matches!(
+            resolution.resolved[0].source,
+            SecretValueSource::Generated
+        ));
+    }
+
+    #[test]
+    fn generated_secret_value_supports_start_encodings() {
+        let raw = generated_secret_value(&GeneratedSecretRequirement {
+            policy: "random".into(),
+            length: 20,
+            encoding: "raw_text".into(),
+            scope: GeneratedSecretScope {
+                level: "tenant".into(),
+                team: Some("_".into()),
+            },
+            regenerate_if_present: false,
+        })
+        .unwrap();
+        assert_eq!(raw.len(), 20);
+
+        let b64 = generated_secret_value(&GeneratedSecretRequirement {
+            policy: "random".into(),
+            length: 20,
+            encoding: "base64url".into(),
+            scope: GeneratedSecretScope {
+                level: "tenant".into(),
+                team: Some("_".into()),
+            },
+            regenerate_if_present: false,
+        })
+        .unwrap();
+        assert!(!b64.contains('+'));
+        assert!(!b64.contains('/'));
+        assert!(!b64.contains('='));
+
+        let hex = generated_secret_value(&GeneratedSecretRequirement {
+            policy: "random".into(),
+            length: 20,
+            encoding: "hex".into(),
+            scope: GeneratedSecretScope {
+                level: "tenant".into(),
+                team: Some("_".into()),
+            },
+            regenerate_if_present: false,
+        })
+        .unwrap();
+        assert_eq!(hex.len(), 40);
+        assert!(hex.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
     fn flat_secret_name_limits_length_with_digest() {
         let name = flat_cloud_secret_name(
             "greentic/dev/demo/default",
@@ -1055,6 +1727,7 @@ questions:
             key: "api_key".into(),
             required: true,
             default_value: None,
+            generated: None,
             source: dir.path().join("packs/demo-pack.gtpack"),
         };
 
