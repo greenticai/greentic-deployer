@@ -139,12 +139,7 @@ pub async fn resolve_for_cloud_apply(
         return Ok(None);
     };
 
-    let mut pack_paths = vec![config.pack_path.clone()];
-    if let Some(provider_pack) = config.provider_pack.as_ref() {
-        pack_paths.push(provider_pack.clone());
-    }
-    pack_paths.extend(discover_bundle_pack_paths(&bundle_root)?);
-    pack_paths = dedup_paths(pack_paths);
+    let pack_paths = pack_paths_for_cloud_apply(config, &bundle_root)?;
 
     let ctx = RuntimeSecretContext {
         bundle_root,
@@ -202,6 +197,52 @@ pub fn collect_requirements(ctx: &RuntimeSecretContext) -> Result<Vec<RuntimeSec
         }
     }
     Ok(by_uri.into_values().collect())
+}
+
+fn pack_paths_for_cloud_apply(config: &DeployerConfig, bundle_root: &Path) -> Result<Vec<PathBuf>> {
+    let mut pack_paths = vec![config.pack_path.clone()];
+    if let Some(provider_pack) = config.provider_pack.as_ref() {
+        pack_paths.push(provider_pack.clone());
+    }
+    pack_paths.extend(
+        discover_bundle_pack_paths(bundle_root)?
+            .into_iter()
+            .filter(|path| include_pack_for_cloud_provider(config.provider, bundle_root, path)),
+    );
+    Ok(dedup_paths(pack_paths))
+}
+
+fn include_pack_for_cloud_provider(
+    provider: Provider,
+    bundle_root: &Path,
+    pack_path: &Path,
+) -> bool {
+    let Ok(relative) = pack_path.strip_prefix(bundle_root) else {
+        return true;
+    };
+    let mut components = relative.components();
+    let Some(std::path::Component::Normal(first)) = components.next() else {
+        return true;
+    };
+    let Some(std::path::Component::Normal(second)) = components.next() else {
+        return true;
+    };
+    if first != "providers" || second != "secrets" {
+        return true;
+    }
+    let Some(active_stem) = active_secrets_provider_pack_stem(provider) else {
+        return false;
+    };
+    provider_id_from_pack_path(pack_path) == active_stem
+}
+
+fn active_secrets_provider_pack_stem(provider: Provider) -> Option<&'static str> {
+    match provider {
+        Provider::Aws => Some("aws-sm"),
+        Provider::Gcp => Some("gcp-sm"),
+        Provider::Azure => Some("azure-kv"),
+        _ => None,
+    }
 }
 
 pub fn runtime_secret_env_map_for_cloud(
@@ -1645,6 +1686,105 @@ questions:
         let paths = discover_bundle_pack_paths(dir.path()).unwrap();
         assert_eq!(paths.len(), 1);
         assert!(paths[0].ends_with("messaging-webchat-gui.gtpack"));
+    }
+
+    #[tokio::test]
+    async fn cloud_apply_resolution_filters_secrets_provider_packs_by_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_root = dir.path();
+        let app_pack = bundle_root.join("packs/greentic-main-website");
+        std::fs::create_dir_all(&app_pack).unwrap();
+        std::fs::write(app_pack.join("pack.yaml"), "id: greentic-main-website\n").unwrap();
+
+        let aws_provider = bundle_root.join("providers/secrets/aws-sm");
+        std::fs::create_dir_all(aws_provider.join("assets")).unwrap();
+        std::fs::write(
+            aws_provider.join("pack.yaml"),
+            "id: greentic.secrets.aws-sm\n",
+        )
+        .unwrap();
+        std::fs::write(
+            aws_provider.join("assets/secret-requirements.json"),
+            r#"[{
+                "key":"aws_runtime_probe",
+                "required":true,
+                "generated":{
+                    "policy":"random",
+                    "length":20,
+                    "encoding":"raw_text",
+                    "scope":{"level":"tenant","team":"_"}
+                }
+            }]"#,
+        )
+        .unwrap();
+
+        for (provider_dir, key) in [
+            ("gcp-sm", "gcp_project_credentials"),
+            ("azure-kv", "azure_key_vault_credentials"),
+        ] {
+            let inactive_provider = bundle_root.join("providers/secrets").join(provider_dir);
+            std::fs::create_dir_all(inactive_provider.join("assets")).unwrap();
+            std::fs::write(
+                inactive_provider.join("pack.yaml"),
+                format!("id: greentic.secrets.{provider_dir}\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                inactive_provider.join("assets/secret-requirements.json"),
+                format!(r#"[{{"key":"{key}","required":true}}]"#),
+            )
+            .unwrap();
+        }
+
+        let config = DeployerConfig {
+            capability: DeployerCapability::Apply,
+            provider: Provider::Aws,
+            strategy: "iac-only".into(),
+            tenant: "demo".into(),
+            environment: "dev".into(),
+            pack_path: app_pack,
+            bundle_root: Some(bundle_root.to_path_buf()),
+            providers_dir: PathBuf::from("providers/deployer"),
+            packs_dir: PathBuf::from("packs"),
+            provider_pack: None,
+            pack_ref: None,
+            distributor_url: None,
+            distributor_token: None,
+            preview: false,
+            dry_run: false,
+            execute_local: true,
+            output: crate::config::OutputFormat::Json,
+            greentic: greentic_config::ConfigResolver::new()
+                .load()
+                .unwrap()
+                .config,
+            provenance: greentic_config::ProvenanceMap::new(),
+            config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
+            bundle_source: Some("file:///tmp/demo.gtbundle".into()),
+            bundle_digest: Some(
+                "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
+            ),
+            repo_registry_base: None,
+            store_registry_base: None,
+        };
+
+        let resolution = resolve_for_cloud_apply(&config)
+            .await
+            .expect("resolve AWS cloud runtime secrets")
+            .expect("runtime secrets should be present");
+        let resolved_uris = resolution
+            .resolved
+            .iter()
+            .map(|secret| secret.requirement.uri.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            resolved_uris,
+            vec!["secrets://dev/demo/_/aws-sm/aws_runtime_probe"]
+        );
+        assert!(resolution.missing.is_empty());
     }
 
     #[tokio::test]
