@@ -253,7 +253,9 @@ pub fn runtime_secret_env_map_for_cloud(
             }
             _ => continue,
         };
-        env_map.insert(requirement.uri, remote_name.clone());
+        if let Some(env_key) = canonical_secret_store_key(&requirement.uri) {
+            env_map.insert(env_key, remote_name.clone());
+        }
         env_map.insert(requirement.key, remote_name);
     }
     Ok(env_map)
@@ -372,6 +374,11 @@ pub async fn resolve_runtime_secrets(
                 }),
                 Err(err) if requirement.required => {
                     checked_sources.push(format!("generation failed: {err}"));
+                    tracing::warn!(
+                        secret_uri = %requirement.uri,
+                        secret_key = %requirement.key,
+                        "required runtime secret could not be generated"
+                    );
                     missing.push(MissingRuntimeSecret {
                         requirement: requirement.clone(),
                         checked_sources,
@@ -380,6 +387,12 @@ pub async fn resolve_runtime_secrets(
                 Err(_) => {}
             }
         } else if requirement.required {
+            tracing::warn!(
+                secret_uri = %requirement.uri,
+                secret_key = %requirement.key,
+                checked_sources = ?checked_sources,
+                "required runtime secret is not available"
+            );
             missing.push(MissingRuntimeSecret {
                 requirement: requirement.clone(),
                 checked_sources,
@@ -1432,7 +1445,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_secret_env_map_includes_generated_secret_uri_and_key_alias() {
+    fn runtime_secret_env_map_includes_generated_secret_canonical_env_and_key_alias() {
         use greentic_types::{
             ExtensionInline, ExtensionRef, PackId, PackKind, PackManifest, PackSignatures,
             encode_pack_manifest,
@@ -1524,8 +1537,15 @@ mod tests {
         };
 
         let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
-        assert!(env_map.contains_key("secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key"));
+        assert!(
+            env_map.contains_key(
+                "GREENTIC_SECRET__DEV__DEMO_____MESSAGING_WEBCHAT_GUI__JWT_SIGNING_KEY"
+            )
+        );
         assert!(env_map.contains_key("jwt_signing_key"));
+        assert!(
+            !env_map.contains_key("secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key")
+        );
     }
 
     #[tokio::test]
@@ -1806,11 +1826,13 @@ questions:
         };
 
         let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
-        assert!(env_map.contains_key("secrets://dev/demo/_/demo-app/api_key"));
+        assert!(env_map.contains_key("GREENTIC_SECRET__DEV__DEMO_____DEMO_APP__API_KEY"));
         assert!(env_map.contains_key("api_key"));
-        assert!(env_map.contains_key("secrets://dev/demo/_/demo-app/jwt_signing_key"));
+        assert!(env_map.contains_key("GREENTIC_SECRET__DEV__DEMO_____DEMO_APP__JWT_SIGNING_KEY"));
         assert!(env_map.contains_key("jwt_signing_key"));
-        assert!(!env_map.contains_key("secrets://dev/demo/_/demo-app/oauth_client_secret"));
+        assert!(
+            !env_map.contains_key("GREENTIC_SECRET__DEV__DEMO_____DEMO_APP__OAUTH_CLIENT_SECRET")
+        );
         assert!(!env_map.contains_key("oauth_client_secret"));
     }
 
@@ -1869,7 +1891,10 @@ questions:
 
         let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
         assert!(env_map.contains_key("api_key_secret"));
-        assert!(env_map.contains_key("secrets://dev/demo/_/deep-research-demo/api_key_secret"));
+        assert!(
+            env_map
+                .contains_key("GREENTIC_SECRET__DEV__DEMO_____DEEP_RESEARCH_DEMO__API_KEY_SECRET")
+        );
     }
 
     #[test]

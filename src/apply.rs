@@ -5725,6 +5725,80 @@ data "aws_region" "current" {}
     }
 
     #[test]
+    fn generated_aws_tfvars_expose_runtime_secrets_with_canonical_env_names() {
+        let base = std::env::current_dir()
+            .expect("cwd")
+            .join("target/tmp-tests");
+        std::fs::create_dir_all(&base).expect("create tmp base");
+        let dir = tempfile::tempdir_in(base).expect("temp dir");
+        let bundle_root = dir.path();
+        let terraform_root = bundle_root.join("terraform");
+        std::fs::create_dir_all(&terraform_root).expect("terraform root");
+        std::fs::write(
+            terraform_root.join("staging.tfvars.example"),
+            r#"
+cloud = "aws"
+tenant = "demo"
+environment = "dev"
+runtime_secret_env = {}
+"#,
+        )
+        .expect("write tfvars example");
+
+        let pack_path = bundle_root.join("packs/messaging-webchat-gui");
+        std::fs::create_dir_all(&pack_path).expect("pack dir");
+        std::fs::write(
+            pack_path.join("pack.manifest.json"),
+            r#"{
+  "extensions": {
+    "greentic.generated-secrets.v1": {
+      "inline": {
+        "secrets": [{
+          "key": "jwt_signing_key",
+          "required": true,
+          "policy": "random",
+          "length": 20,
+          "encoding": "raw_text",
+          "scope": {"level": "tenant", "team": "_"}
+        }]
+      }
+    }
+  }
+}"#,
+        )
+        .expect("write manifest");
+
+        let config = DeployerConfig {
+            provider: Provider::Aws,
+            tenant: "demo".into(),
+            environment: "dev".into(),
+            pack_path: pack_path.clone(),
+            bundle_root: Some(bundle_root.to_path_buf()),
+            provider_pack: None,
+            bundle_source: Some("s3://bucket/bundle.gtbundle".into()),
+            ..config_for(pack_path, DeployerCapability::Apply)
+        };
+
+        let generated =
+            materialize_generated_tfvars(&config, &terraform_root, "staging.tfvars.example")
+                .expect("generate tfvars")
+                .expect("tfvars generated");
+        let contents =
+            std::fs::read_to_string(terraform_root.join(generated)).expect("read generated tfvars");
+
+        assert!(
+            contents.contains(
+                "\"GREENTIC_SECRET__DEV__DEMO_____MESSAGING_WEBCHAT_GUI__JWT_SIGNING_KEY\""
+            )
+        );
+        assert!(contents.contains("\"jwt_signing_key\""));
+        assert!(
+            !contents.contains("\"secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key\""),
+            "runtime_secret_env must not use a secrets:// URI as an ECS env var name: {contents}"
+        );
+    }
+
+    #[test]
     fn deployment_name_prefix_normalization_keeps_cloud_names_bounded() {
         assert_eq!(
             normalize_deployment_name_prefix(" Maarten/Deep Research Demo!!! "),
