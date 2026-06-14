@@ -16,7 +16,7 @@ ci/ensure_fixture_tools.sh
 echo "==> replay deployer scaffolds"
 cargo run --features internal-tools --bin replay_deployer_scaffolds
 
-echo "==> build and validate fixture gtpacks"
+echo "==> ensure fixture gtpacks"
 cargo run --features internal-tools --bin build_fixture_gtpacks
 
 echo "==> cargo test"

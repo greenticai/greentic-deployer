@@ -139,12 +139,7 @@ pub async fn resolve_for_cloud_apply(
         return Ok(None);
     };
 
-    let mut pack_paths = vec![config.pack_path.clone()];
-    if let Some(provider_pack) = config.provider_pack.as_ref() {
-        pack_paths.push(provider_pack.clone());
-    }
-    pack_paths.extend(discover_bundle_pack_paths(&bundle_root)?);
-    pack_paths = dedup_paths(pack_paths);
+    let pack_paths = pack_paths_for_cloud_apply(config, &bundle_root)?;
 
     let ctx = RuntimeSecretContext {
         bundle_root,
@@ -204,82 +199,59 @@ pub fn collect_requirements(ctx: &RuntimeSecretContext) -> Result<Vec<RuntimeSec
     Ok(by_uri.into_values().collect())
 }
 
-pub fn runtime_secret_env_map_for_cloud(
-    config: &DeployerConfig,
-) -> Result<BTreeMap<String, String>> {
-    if !matches!(
-        config.provider,
-        Provider::Aws | Provider::Azure | Provider::Gcp
-    ) {
-        return Ok(BTreeMap::new());
-    }
-    let Some(bundle_root) = config
-        .bundle_root
-        .clone()
-        .or_else(|| infer_bundle_root_from_pack_path(&config.pack_path))
-    else {
-        return Ok(BTreeMap::new());
-    };
-
+fn pack_paths_for_cloud_apply(config: &DeployerConfig, bundle_root: &Path) -> Result<Vec<PathBuf>> {
     let mut pack_paths = vec![config.pack_path.clone()];
     if let Some(provider_pack) = config.provider_pack.as_ref() {
         pack_paths.push(provider_pack.clone());
     }
-    pack_paths.extend(discover_bundle_pack_paths(&bundle_root)?);
-    pack_paths = dedup_paths(pack_paths);
-
-    let ctx = RuntimeSecretContext {
-        bundle_root,
-        pack_paths,
-        environment: config.environment.clone(),
-        tenant: config.tenant.clone(),
-        team: None,
-    };
-    let prefix = default_cloud_secret_prefix(&config.environment, &config.tenant, None);
-    let mut env_map = BTreeMap::new();
-    for requirement in collect_requirements(&ctx)? {
-        if !requirement.required
-            && !optional_requirement_has_local_value(&ctx.bundle_root, &requirement)
-        {
-            continue;
-        }
-        let remote_name = match config.provider {
-            Provider::Aws => cloud_secret_name(&prefix, &requirement.provider_id, &requirement.key),
-            Provider::Azure => {
-                flat_cloud_secret_name(&prefix, &requirement.provider_id, &requirement.key, 127)
-            }
-            Provider::Gcp => {
-                flat_cloud_secret_name(&prefix, &requirement.provider_id, &requirement.key, 255)
-            }
-            _ => continue,
-        };
-        if let Some(env_key) = canonical_secret_store_key(&requirement.uri) {
-            env_map.insert(env_key, remote_name.clone());
-        }
-        env_map.insert(requirement.key, remote_name);
-    }
-    Ok(env_map)
+    pack_paths.extend(
+        discover_bundle_pack_paths(bundle_root)?
+            .into_iter()
+            .filter(|path| include_pack_for_cloud_provider(config.provider, bundle_root, path)),
+    );
+    Ok(dedup_paths(pack_paths))
 }
 
-fn optional_requirement_has_local_value(
+fn include_pack_for_cloud_provider(
+    provider: Provider,
     bundle_root: &Path,
-    requirement: &RuntimeSecretRequirement,
+    pack_path: &Path,
 ) -> bool {
-    if requirement
-        .default_value
-        .as_ref()
-        .is_some_and(|value| !value.is_empty())
-    {
+    let Ok(relative) = pack_path.strip_prefix(bundle_root) else {
+        return true;
+    };
+    let mut components = relative.components();
+    let Some(std::path::Component::Normal(first)) = components.next() else {
+        return true;
+    };
+    let Some(std::path::Component::Normal(second)) = components.next() else {
+        return true;
+    };
+    if first != "providers" || second != "secrets" {
         return true;
     }
-    if let Some(env_key) = canonical_secret_store_key(&requirement.uri)
-        && let Ok(value) = env::var(env_key)
-        && !value.is_empty()
-    {
-        return true;
+    let Some(active_stem) = active_secrets_provider_pack_stem(provider) else {
+        return false;
+    };
+    provider_id_from_pack_path(pack_path) == active_stem
+}
+
+fn active_secrets_provider_pack_stem(provider: Provider) -> Option<&'static str> {
+    match provider {
+        Provider::Aws => Some("aws-sm"),
+        Provider::Gcp => Some("gcp-sm"),
+        Provider::Azure => Some("azure-kv"),
+        _ => None,
     }
-    let mut checked_sources = Vec::new();
-    resolve_from_setup_answers(bundle_root, requirement, &mut checked_sources).is_some()
+}
+
+pub fn runtime_secret_env_map_for_cloud(
+    _config: &DeployerConfig,
+) -> Result<BTreeMap<String, String>> {
+    // Cloud runtimes now receive `state/config/platform/secrets-provider.json`.
+    // Runtime secrets are still resolved and promoted before apply, but they
+    // must not be exposed as `GREENTIC_SECRET__...` environment variables.
+    Ok(BTreeMap::new())
 }
 
 pub async fn resolve_runtime_secrets(
@@ -1445,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_secret_env_map_includes_generated_secret_canonical_env_and_key_alias() {
+    fn runtime_secret_env_map_omits_generated_secret_env_aliases_for_cloud_binding() {
         use greentic_types::{
             ExtensionInline, ExtensionRef, PackId, PackKind, PackManifest, PackSignatures,
             encode_pack_manifest,
@@ -1537,15 +1509,7 @@ mod tests {
         };
 
         let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
-        assert!(
-            env_map.contains_key(
-                "GREENTIC_SECRET__DEV__DEMO_____MESSAGING_WEBCHAT_GUI__JWT_SIGNING_KEY"
-            )
-        );
-        assert!(env_map.contains_key("jwt_signing_key"));
-        assert!(
-            !env_map.contains_key("secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key")
-        );
+        assert!(env_map.is_empty());
     }
 
     #[tokio::test]
@@ -1725,6 +1689,105 @@ questions:
     }
 
     #[tokio::test]
+    async fn cloud_apply_resolution_filters_secrets_provider_packs_by_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_root = dir.path();
+        let app_pack = bundle_root.join("packs/greentic-main-website");
+        std::fs::create_dir_all(&app_pack).unwrap();
+        std::fs::write(app_pack.join("pack.yaml"), "id: greentic-main-website\n").unwrap();
+
+        let aws_provider = bundle_root.join("providers/secrets/aws-sm");
+        std::fs::create_dir_all(aws_provider.join("assets")).unwrap();
+        std::fs::write(
+            aws_provider.join("pack.yaml"),
+            "id: greentic.secrets.aws-sm\n",
+        )
+        .unwrap();
+        std::fs::write(
+            aws_provider.join("assets/secret-requirements.json"),
+            r#"[{
+                "key":"aws_runtime_probe",
+                "required":true,
+                "generated":{
+                    "policy":"random",
+                    "length":20,
+                    "encoding":"raw_text",
+                    "scope":{"level":"tenant","team":"_"}
+                }
+            }]"#,
+        )
+        .unwrap();
+
+        for (provider_dir, key) in [
+            ("gcp-sm", "gcp_project_credentials"),
+            ("azure-kv", "azure_key_vault_credentials"),
+        ] {
+            let inactive_provider = bundle_root.join("providers/secrets").join(provider_dir);
+            std::fs::create_dir_all(inactive_provider.join("assets")).unwrap();
+            std::fs::write(
+                inactive_provider.join("pack.yaml"),
+                format!("id: greentic.secrets.{provider_dir}\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                inactive_provider.join("assets/secret-requirements.json"),
+                format!(r#"[{{"key":"{key}","required":true}}]"#),
+            )
+            .unwrap();
+        }
+
+        let config = DeployerConfig {
+            capability: DeployerCapability::Apply,
+            provider: Provider::Aws,
+            strategy: "iac-only".into(),
+            tenant: "demo".into(),
+            environment: "dev".into(),
+            pack_path: app_pack,
+            bundle_root: Some(bundle_root.to_path_buf()),
+            providers_dir: PathBuf::from("providers/deployer"),
+            packs_dir: PathBuf::from("packs"),
+            provider_pack: None,
+            pack_ref: None,
+            distributor_url: None,
+            distributor_token: None,
+            preview: false,
+            dry_run: false,
+            execute_local: true,
+            output: crate::config::OutputFormat::Json,
+            greentic: greentic_config::ConfigResolver::new()
+                .load()
+                .unwrap()
+                .config,
+            provenance: greentic_config::ProvenanceMap::new(),
+            config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
+            bundle_source: Some("file:///tmp/demo.gtbundle".into()),
+            bundle_digest: Some(
+                "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
+            ),
+            repo_registry_base: None,
+            store_registry_base: None,
+        };
+
+        let resolution = resolve_for_cloud_apply(&config)
+            .await
+            .expect("resolve AWS cloud runtime secrets")
+            .expect("runtime secrets should be present");
+        let resolved_uris = resolution
+            .resolved
+            .iter()
+            .map(|secret| secret.requirement.uri.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            resolved_uris,
+            vec!["secrets://dev/demo/_/aws-sm/aws_runtime_probe"]
+        );
+        assert!(resolution.missing.is_empty());
+    }
+
+    #[tokio::test]
     async fn resolves_secret_values_from_setup_answers() {
         let dir = tempfile::tempdir().unwrap();
         let answers_dir = dir.path().join("state/config/demo-pack");
@@ -1762,7 +1825,7 @@ questions:
     }
 
     #[test]
-    fn runtime_secret_env_map_skips_unresolved_optional_secrets() {
+    fn runtime_secret_env_map_omits_explicit_secret_env_aliases_for_cloud_binding() {
         let dir = tempfile::tempdir().unwrap();
         let bundle_root = dir.path();
         let packs_dir = bundle_root.join("packs");
@@ -1826,18 +1889,11 @@ questions:
         };
 
         let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
-        assert!(env_map.contains_key("GREENTIC_SECRET__DEV__DEMO_____DEMO_APP__API_KEY"));
-        assert!(env_map.contains_key("api_key"));
-        assert!(env_map.contains_key("GREENTIC_SECRET__DEV__DEMO_____DEMO_APP__JWT_SIGNING_KEY"));
-        assert!(env_map.contains_key("jwt_signing_key"));
-        assert!(
-            !env_map.contains_key("GREENTIC_SECRET__DEV__DEMO_____DEMO_APP__OAUTH_CLIENT_SECRET")
-        );
-        assert!(!env_map.contains_key("oauth_client_secret"));
+        assert!(env_map.is_empty());
     }
 
     #[test]
-    fn runtime_secret_env_map_includes_optional_setup_secret_with_default() {
+    fn runtime_secret_env_map_omits_optional_setup_secret_default_for_cloud_binding() {
         let dir = tempfile::tempdir().unwrap();
         let bundle_root = dir.path();
         let packs_dir = bundle_root.join("packs");
@@ -1890,11 +1946,7 @@ questions:
         };
 
         let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
-        assert!(env_map.contains_key("api_key_secret"));
-        assert!(
-            env_map
-                .contains_key("GREENTIC_SECRET__DEV__DEMO_____DEEP_RESEARCH_DEMO__API_KEY_SECRET")
-        );
+        assert!(env_map.is_empty());
     }
 
     #[test]

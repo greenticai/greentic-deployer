@@ -389,11 +389,6 @@ resource "aws_secretsmanager_secret_version" "operator" {
   secret_string = each.value
 }
 
-data "aws_secretsmanager_secret" "runtime" {
-  for_each = var.runtime_secret_env
-  name     = each.value
-}
-
 resource "aws_iam_role_policy" "task_execution_admin_secrets" {
   name = "${local.name_prefix}-task-exec-admin-secrets"
   role = aws_iam_role.task_execution.id
@@ -616,16 +611,6 @@ resource "aws_ecs_task_definition" "this" {
             value = "120"
           }
         ],
-        trimspace(var.runtime_secret_prefix) != "" ? [
-          {
-            name  = "GREENTIC_SECRETS_BACKEND"
-            value = "env"
-          },
-          {
-            name  = "GREENTIC_ALLOW_ENV_SECRETS"
-            value = "1"
-          }
-        ] : [],
         [
           {
             name  = "PUBLIC_BASE_URL"
@@ -674,12 +659,6 @@ resource "aws_ecs_task_definition" "this" {
           {
             name      = "GREENTIC_ADMIN_SERVER_KEY_PEM"
             valueFrom = aws_secretsmanager_secret.admin_server_key.arn
-          }
-        ],
-        [
-          for name, secret_name in var.runtime_secret_env : {
-            name      = name
-            valueFrom = data.aws_secretsmanager_secret.runtime[name].arn
           }
         ],
         [
