@@ -2,26 +2,35 @@
 set -euo pipefail
 
 required_bins=(greentic-pack greentic-flow)
-required_specs=(greentic-pack@0.5.6 greentic-flow@0.5.8)
+required_versions=(0.5.8 0.5.11)
+required_specs=(greentic-pack@0.5.8 greentic-flow@0.5.11)
 
 cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-if [[ -d "$cargo_home/bin" ]]; then
-  export PATH="$cargo_home/bin:$PATH"
-fi
+mkdir -p "$cargo_home/bin"
+export PATH="$cargo_home/bin:$PATH"
 
 missing=()
-for bin in "${required_bins[@]}"; do
+for i in "${!required_bins[@]}"; do
+  bin="${required_bins[$i]}"
+  version="${required_versions[$i]}"
   if ! command -v "$bin" >/dev/null 2>&1; then
+    missing+=("$bin")
+    continue
+  fi
+
+  actual="$("$bin" --version 2>/dev/null || true)"
+  expected="$bin $version"
+  if [[ "$actual" != "$expected" ]]; then
     missing+=("$bin")
   fi
 done
 
 if ((${#missing[@]} == 0)); then
-  echo "Greentic fixture tools are already installed."
+  echo "Greentic fixture tools are already installed at required versions."
   exit 0
 fi
 
-echo "Missing Greentic fixture tool(s): ${missing[*]}"
+echo "Missing or stale Greentic fixture tool(s): ${missing[*]}"
 
 binstall_bin="$(command -v cargo-binstall || true)"
 if [[ -z "$binstall_bin" && -x "$cargo_home/bin/cargo-binstall" ]]; then
@@ -34,8 +43,16 @@ if [[ -z "$binstall_bin" ]]; then
   exit 1
 fi
 
-"$binstall_bin" --no-confirm --force "${required_specs[@]}"
+"$binstall_bin" --no-confirm --force --disable-strategies compile "${required_specs[@]}"
 
-for bin in "${required_bins[@]}"; do
+for i in "${!required_bins[@]}"; do
+  bin="${required_bins[$i]}"
+  version="${required_versions[$i]}"
   command -v "$bin" >/dev/null 2>&1
+  actual="$("$bin" --version 2>/dev/null || true)"
+  expected="$bin $version"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "Expected $expected, got ${actual:-<no version output>}" >&2
+    exit 1
+  fi
 done
