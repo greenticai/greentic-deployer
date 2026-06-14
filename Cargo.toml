@@ -30,7 +30,7 @@ categories = [
 ]
 
 [features]
-default = ["bundle-upload-aws", "runtime-secrets-aws", "creds-aws"]
+default = ["bundle-upload-aws", "runtime-secrets-aws", "creds-aws", "k8s-client"]
 internal-tools = []
 test-utils = []
 bundle-upload-aws = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime-api"]
@@ -40,6 +40,10 @@ runtime-secrets-aws = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "dep:aws-
 # alongside the other AWS deps; the env-pack registers only when this is
 # enabled.
 creds-aws = ["dep:aws-sdk-sts", "dep:aws-sdk-iam", "dep:aws-config", "dep:aws-smithy-runtime-api"]
+# Phase D K8s slice (PR-5.2): typed Kubernetes API client behind the
+# `K8sCluster` / `K8sValidatorClient` seams. Default-on alongside the AWS
+# deps; kube's defaults are client + rustls-tls + ring (no openssl).
+k8s-client = ["dep:kube", "dep:k8s-openapi"]
 bundle-upload-gcp = []
 bundle-upload-azure = []
 
@@ -217,12 +221,33 @@ features = [
     "rt-tokio",
 ]
 
+[dependencies.kube]
+version = "3.1"
+optional = true
+
+[dependencies.k8s-openapi]
+# Version feature pins the generated API types, not the cluster we can
+# talk to — v1_33 types are forward-compatible with newer servers and
+# cover everything the deployer touches (all stable since well before
+# 1.31). Bump only when a newer-only API field is needed.
+version = "0.27"
+optional = true
+features = [
+    "v1_33",
+]
+
 [dependencies.tempfile]
 version = "3"
 
 [dev-dependencies]
 wat = "1"
 base64 = "0.22"
+# kube-client mock harness (PR-5.2): drive a real `kube::Client` against
+# a `tower_test::mock` service so the K8sCluster / K8sValidatorClient
+# impls are asserted at the HTTP layer without a cluster.
+tower-test = "0.4"
+http = "1"
+http-body-util = "0.1"
 # Re-declared to turn on `test_support` (shared keypair fixtures) for tests.
 greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.1", features = ["test-utils"] }
 # Path-only (no version) on purpose: the server crate is `publish = false`,

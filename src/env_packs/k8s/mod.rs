@@ -1,10 +1,12 @@
 //! K8s deployer env-pack (Phase D, K8s/Zain slice — PR-5.0 scaffold).
 //!
 //! Backs the `greentic.deployer.k8s@1.0.0` binding — the first
-//! real-cloud proving ground of the next-gen deployment model. This
+//! real-cloud proving ground of the next-gen deployment model. The
 //! scaffold ships the full deterministic half of the slice; the typed
-//! Kubernetes API client (kube-rs) and the kind/real-cluster E2E land in
-//! the follow-up K8s apply PR against the seams defined here. Zain's
+//! Kubernetes API client landed as [`kube_client`] (PR-5.2, `k8s-client`
+//! feature) behind the seams defined here. Constructing that client from
+//! the binding's answers and binding it to verb dispatch — plus the
+//! kind/real-cluster E2E — is the PR-5.3 orchestration wiring. Zain's
 //! infrastructure answers (`plans/zain-k8s-alignment.md`) gate the
 //! real-cluster and production acceptance, not this scaffold — sandbox
 //! defaults per that doc.
@@ -40,7 +42,11 @@
 //!   Restricted-profile hardened).
 //! - [`cluster`] — the [`K8sCluster`] side-effect seam (`apply`/`delete`).
 //!   Default is [`UnconfiguredCluster`]: provider verbs fail honestly
-//!   until the typed client ships.
+//!   until PR-5.3 binds a connected client.
+//! - [`kube_client`] (`k8s-client` feature) — the production kube-rs
+//!   impls of both client seams: [`KubeCluster`] (forced server-side
+//!   apply + idempotent delete) and [`KubeValidatorClient`]
+//!   (`SelfSubjectReview` / `SelfSubjectAccessReview` probes).
 //! - [`deployer`] — `impl Deployer for K8sDeployerHandler`; passes
 //!   [`run_conformance`](crate::env_packs::deployer::run_conformance)
 //!   against an in-memory cluster fake.
@@ -59,6 +65,8 @@ pub mod bootstrap;
 pub mod cluster;
 pub mod credentials;
 pub mod deployer;
+#[cfg(feature = "k8s-client")]
+pub mod kube_client;
 pub mod manifests;
 pub mod render;
 
@@ -72,6 +80,8 @@ use crate::tool_check::ToolCheck;
 
 pub use cluster::{K8sCluster, K8sClusterError, ObjectRef, UnconfiguredCluster};
 pub use credentials::{K8sDeployerCredentials, K8sValidatorClient};
+#[cfg(feature = "k8s-client")]
+pub use kube_client::{KubeCluster, KubeValidatorClient};
 
 /// Native handler for the K8s deployer env-pack.
 #[derive(Debug)]
@@ -102,7 +112,8 @@ impl K8sDeployerHandler {
     pub const VERSION_REQ: &'static str = ">=1.0.0-dev, <2.0.0";
 
     /// Construct with a pluggable cluster seam. Tests pass the in-memory
-    /// fake; the K8s apply PR passes the kube-rs-backed client.
+    /// fake; the PR-5.3 orchestration wiring passes a connected
+    /// [`KubeCluster`].
     pub fn with_cluster(cluster: Arc<dyn K8sCluster>) -> Self {
         Self {
             creds: K8sDeployerCredentials::default(),
