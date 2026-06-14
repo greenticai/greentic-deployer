@@ -24,7 +24,7 @@ fn main() -> Result<()> {
         .collect::<Vec<_>>();
     if !missing_tools.is_empty() {
         bail!(
-            "missing external tool(s): {}; install them with `cargo binstall --no-confirm --disable-strategies compile greentic-pack@0.5.8 greentic-flow@0.5.11`",
+            "missing external tool(s): {}; install them with `cargo binstall --no-confirm --disable-strategies compile greentic-pack greentic-flow`",
             missing_tools.join(", ")
         );
     }
