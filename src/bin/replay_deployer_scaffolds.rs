@@ -24,7 +24,7 @@ fn main() -> Result<()> {
         .collect::<Vec<_>>();
     if !missing_tools.is_empty() {
         bail!(
-            "missing external tool(s): {}; install them with `cargo binstall --no-confirm --disable-strategies compile greentic-pack greentic-flow`",
+            "missing external tool(s): {}; install them with `ci/ensure_fixture_tools.sh` or `cargo install greentic-pack` and `cargo install greentic-flow`",
             missing_tools.join(", ")
         );
     }
