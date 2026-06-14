@@ -184,6 +184,41 @@ pub fn collect_requirements(ctx: &RuntimeSecretContext) -> Result<Vec<RuntimeSec
     Ok(by_uri.into_values().collect())
 }
 
+/// Secret requirements a built bundle declares, for the env-manifest
+/// wizard's "ask only what's needed" secrets step.
+///
+/// `bundle_root` is the bundle workspace directory (the parent of the
+/// `.gtbundle` artifact), where `packs/` and `providers/` live. Each pack's
+/// `secret-requirements.json` is read and scoped to `environment`/`tenant`
+/// (team `_`) via the same [`collect_requirements`] the cloud-apply path
+/// uses — so the wizard derives exactly the paths the apply engine later
+/// writes. Returns an empty vec when the bundle declares no secrets (or has
+/// not been built yet — `packs/` absent).
+pub fn bundle_secret_requirements(
+    bundle_root: &Path,
+    environment: &str,
+    tenant: &str,
+) -> Result<Vec<RuntimeSecretRequirement>> {
+    let pack_paths = discover_bundle_pack_paths(bundle_root)?;
+    let ctx = RuntimeSecretContext {
+        bundle_root: bundle_root.to_path_buf(),
+        pack_paths,
+        environment: environment.to_string(),
+        tenant: tenant.to_string(),
+        team: None,
+    };
+    collect_requirements(&ctx)
+}
+
+/// The dev-store manifest `path` (`<tenant>/<team>/<pack>/<name>`) carried
+/// by a `secrets://<environment>/...` URI — the inverse of
+/// [`canonical_secret_uri`]'s prefix. `None` when `uri` is not a
+/// `secrets://` URI scoped to `environment`.
+pub fn manifest_secret_path(uri: &str, environment: &str) -> Option<String> {
+    uri.strip_prefix(&format!("secrets://{environment}/"))
+        .map(str::to_string)
+}
+
 pub fn runtime_secret_env_map_for_cloud(
     config: &DeployerConfig,
 ) -> Result<BTreeMap<String, String>> {
@@ -874,6 +909,60 @@ mod tests {
                 &requirements[0].key
             ),
             "greentic/dev/demo/_/messaging_webchat_gui/jwt_signing_key"
+        );
+    }
+
+    #[test]
+    fn bundle_secret_requirements_reads_packs_dir_scoped_to_tenant() {
+        // Mirrors the env-manifest wizard: a built bundle workspace with a
+        // provider pack under `packs/` whose `secret-requirements.json`
+        // declares one key. The wizard derives exactly the manifest secret
+        // path the apply engine later writes.
+        let dir = tempfile::tempdir().unwrap();
+        let pack_dir = dir.path().join("packs/messaging-telegram");
+        std::fs::create_dir_all(pack_dir.join("assets")).unwrap();
+        // `pack.yaml` marks the directory as a pack so `discover_bundle_pack_paths`
+        // picks it up (real bundles ship `.gtpack` archives; a marked dir is the
+        // lighter-weight equivalent for the test).
+        std::fs::write(pack_dir.join("pack.yaml"), "id: messaging-telegram\n").unwrap();
+        std::fs::write(
+            pack_dir.join("assets/secret-requirements.json"),
+            r#"[{"key":"TELEGRAM_BOT_TOKEN","required":true}]"#,
+        )
+        .unwrap();
+
+        let reqs = bundle_secret_requirements(dir.path(), "local", "legal").unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(
+            reqs[0].uri,
+            "secrets://local/legal/_/messaging-telegram/telegram_bot_token"
+        );
+        // …and the inverse strips the env prefix back to the manifest path.
+        assert_eq!(
+            manifest_secret_path(&reqs[0].uri, "local").as_deref(),
+            Some("legal/_/messaging-telegram/telegram_bot_token")
+        );
+    }
+
+    #[test]
+    fn bundle_secret_requirements_empty_when_unbuilt() {
+        // No `packs/` dir (bundle not built yet) → no requirements, no error.
+        let dir = tempfile::tempdir().unwrap();
+        let reqs = bundle_secret_requirements(dir.path(), "local", "legal").unwrap();
+        assert!(reqs.is_empty());
+    }
+
+    #[test]
+    fn manifest_secret_path_rejects_foreign_env_or_scheme() {
+        assert_eq!(
+            manifest_secret_path("secrets://prod/legal/_/p/tok", "local"),
+            None,
+            "different env is not stripped"
+        );
+        assert_eq!(
+            manifest_secret_path("https://example.com/x", "local"),
+            None,
+            "non-secrets scheme is rejected"
         );
     }
 

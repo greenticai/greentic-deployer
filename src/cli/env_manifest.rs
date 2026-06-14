@@ -617,13 +617,17 @@ pub fn manifest_form_spec() -> FormSpec {
         store: Vec::new(),
         validations: Vec::new(),
         includes: Vec::new(),
+        // Secrets come LAST: the terminal wizard derives the required
+        // secret paths from the bundles/endpoints just authored and asks
+        // only for the env-var name, so the section is most useful after
+        // those are known. Other front-ends render the same order.
         questions: vec![
             environment_id,
             public_base_url,
             trust_root_bootstrap,
-            secrets,
             bundles,
             messaging_endpoints,
+            secrets,
         ],
     }
 }
