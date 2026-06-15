@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use greentic_deploy_spec::CapabilitySlot;
 use qa_spec::spec::ListSpec;
 use qa_spec::spec::question::QuestionPolicy;
-use qa_spec::{AnswerSet, FormSpec, QuestionSpec, QuestionType};
+use qa_spec::{AnswerSet, Expr, FormSpec, QuestionSpec, QuestionType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -881,6 +881,7 @@ pub fn manifest_form_spec() -> FormSpec {
                 true,
             ),
         ],
+        item_label: Some("secret".to_string()),
     });
 
     let mut bundles = question(
@@ -932,31 +933,65 @@ pub fn manifest_form_spec() -> FormSpec {
                 "Comma-separated host names for the route binding.",
                 false,
             ),
-            question(
-                "route_path_prefixes",
-                QuestionType::String,
-                "Route path prefixes",
-                "Comma-separated HTTP path prefixes, each starting with `/` \
-                 (e.g. /legal).",
-                false,
-            ),
-            question(
-                "route_tenant",
-                QuestionType::String,
-                "Route tenant",
-                "Tenant for the route binding's tenant selector — set \
-                 together with `route_team`.",
-                false,
-            ),
-            question(
-                "route_team",
-                QuestionType::String,
-                "Route team",
-                "Team for the route binding's tenant selector — set \
-                 together with `route_tenant`.",
-                false,
-            ),
+            {
+                // Defaults to `/<bundle_id>` (the everyday single-prefix
+                // route); the operator overrides for multi-prefix or custom
+                // routes. `computed_overridable` ⇒ shown as the prompt
+                // default, not force-applied.
+                let mut q = question(
+                    "route_path_prefixes",
+                    QuestionType::String,
+                    "Route path prefixes",
+                    "Comma-separated HTTP path prefixes, each starting with `/` \
+                     (e.g. /legal).",
+                    false,
+                );
+                q.computed = Some(Expr::Concat {
+                    parts: vec![
+                        Expr::Literal {
+                            value: Value::String("/".to_string()),
+                        },
+                        Expr::Var {
+                            path: "bundle_id".to_string(),
+                        },
+                    ],
+                });
+                q.computed_overridable = true;
+                q
+            },
+            {
+                // Defaults to the bundle id so each bundle gets its own
+                // tenant scope out of the box.
+                let mut q = question(
+                    "route_tenant",
+                    QuestionType::String,
+                    "Route tenant",
+                    "Tenant for the route binding's tenant selector — set \
+                     together with `route_team`.",
+                    false,
+                );
+                q.computed = Some(Expr::Var {
+                    path: "bundle_id".to_string(),
+                });
+                q.computed_overridable = true;
+                q
+            },
+            {
+                // Defaults to the `default` team (the common single-team
+                // case); paired with `route_tenant` to form the selector.
+                let mut q = question(
+                    "route_team",
+                    QuestionType::String,
+                    "Route team",
+                    "Team for the route binding's tenant selector — set \
+                     together with `route_tenant`.",
+                    false,
+                );
+                q.default_value = Some("default".to_string());
+                q
+            },
         ],
+        item_label: Some("bundle".to_string()),
     });
 
     let mut messaging_endpoints = question(
@@ -985,13 +1020,23 @@ pub fn manifest_form_spec() -> FormSpec {
                 "Provider class, e.g. messaging.telegram.bot.",
                 true,
             ),
-            question(
-                "links",
-                QuestionType::String,
-                "Linked bundle ids",
-                "Comma-separated `bundle_id`s this endpoint admits.",
-                false,
-            ),
+            {
+                // Defaults to the endpoint name, which by convention matches
+                // the bundle id it fronts (e.g. endpoint `legal` admits
+                // bundle `legal`). Override to admit several bundles.
+                let mut q = question(
+                    "links",
+                    QuestionType::String,
+                    "Linked bundle ids",
+                    "Comma-separated `bundle_id`s this endpoint admits.",
+                    false,
+                );
+                q.computed = Some(Expr::Var {
+                    path: "name".to_string(),
+                });
+                q.computed_overridable = true;
+                q
+            },
             question(
                 "welcome_bundle_id",
                 QuestionType::String,
@@ -1021,6 +1066,7 @@ pub fn manifest_form_spec() -> FormSpec {
                 false,
             ),
         ],
+        item_label: Some("Messaging endpoint".to_string()),
     });
 
     FormSpec {
@@ -1689,6 +1735,83 @@ mod tests {
         .map(str::to_string)
         .collect();
         assert_eq!(required, expected);
+    }
+
+    #[test]
+    fn derived_row_defaults_evaluate_from_sibling_columns() {
+        // The everyday-wiring defaults: a single-bundle `legal` setup should
+        // pre-fill route prefix `/legal`, tenant `legal`, team `default`, and
+        // endpoint link `legal` — each derived from a sibling column in the
+        // same row via `computed` (+ `computed_overridable`, so the wizard
+        // surfaces them as overridable prompt defaults) or a static default.
+        let spec = manifest_form_spec();
+
+        fn list_fields<'a>(spec: &'a FormSpec, id: &str) -> &'a [QuestionSpec] {
+            spec.questions
+                .iter()
+                .find(|q| q.id == id)
+                .and_then(|q| q.list.as_ref())
+                .map(|l| l.fields.as_slice())
+                .unwrap_or_else(|| panic!("list `{id}` missing"))
+        }
+        fn field<'a>(fields: &'a [QuestionSpec], id: &str) -> &'a QuestionSpec {
+            fields
+                .iter()
+                .find(|f| f.id == id)
+                .unwrap_or_else(|| panic!("field `{id}` missing"))
+        }
+        // Row context as the wizard builds it: keys are sibling field ids.
+        let bundle_row = serde_json::json!({ "bundle_id": "legal" });
+        let endpoint_row = serde_json::json!({ "name": "legal" });
+
+        let bundles = list_fields(&spec, "bundles");
+        let prefixes = field(bundles, "route_path_prefixes");
+        assert!(prefixes.computed_overridable);
+        assert_eq!(
+            prefixes
+                .computed
+                .as_ref()
+                .and_then(|e| e.evaluate_value(&bundle_row)),
+            Some(serde_json::json!("/legal"))
+        );
+        let tenant = field(bundles, "route_tenant");
+        assert!(tenant.computed_overridable);
+        assert_eq!(
+            tenant
+                .computed
+                .as_ref()
+                .and_then(|e| e.evaluate_value(&bundle_row)),
+            Some(serde_json::json!("legal"))
+        );
+        assert_eq!(
+            field(bundles, "route_team").default_value.as_deref(),
+            Some("default")
+        );
+
+        let endpoints = list_fields(&spec, "messaging_endpoints");
+        let links = field(endpoints, "links");
+        assert!(links.computed_overridable);
+        assert_eq!(
+            links
+                .computed
+                .as_ref()
+                .and_then(|e| e.evaluate_value(&endpoint_row)),
+            Some(serde_json::json!("legal"))
+        );
+
+        // Custom row-add labels for the terminal wizard prompt.
+        let label = |id: &str| {
+            spec.questions
+                .iter()
+                .find(|q| q.id == id)
+                .and_then(|q| q.list.as_ref())
+                .and_then(|l| l.item_label.clone())
+        };
+        assert_eq!(label("bundles").as_deref(), Some("bundle"));
+        assert_eq!(
+            label("messaging_endpoints").as_deref(),
+            Some("Messaging endpoint")
+        );
     }
 
     #[test]
