@@ -4626,4 +4626,91 @@ mod tests {
         assert!(pos("deploy-bundle") < pos("add-extension"));
         assert!(pos("add-extension") < pos("add-endpoint"));
     }
+
+    // --- G5 fresh-env pack diff against default bindings ---
+
+    /// On a fresh local env (no env on disk), `env init` will create 5 default
+    /// pack bindings. The planner must diff manifest packs against those
+    /// defaults so a pack targeting a default slot emits UpdatePackBinding (if
+    /// the desired binding differs) or a no-op (if identical), never an
+    /// unconditional AddPackBinding that would fail with SlotAlreadyBound.
+    /// A pack targeting a non-default slot (e.g. revocation) still correctly
+    /// emits AddPackBinding.
+    #[test]
+    fn fresh_env_pack_on_default_slot_emits_update_not_add() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        // No env on disk — this is a fresh-env scenario.
+
+        // Pack 1: deployer with SAME kind+pack_ref as the default → no-op.
+        // Pack 2: telemetry with DIFFERENT kind → update.
+        // Pack 3: revocation (not in defaults) → add.
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [
+                {
+                    "slot": "deployer",
+                    "kind": crate::defaults::LOCAL_DEPLOYER_PACK,
+                    "pack_ref": crate::defaults::LOCAL_DEPLOYER_PACK
+                },
+                {
+                    "slot": "telemetry",
+                    "kind": "greentic.telemetry.otlp@2.0.0",
+                    "pack_ref": "builtin:otlp"
+                },
+                {
+                    "slot": "revocation",
+                    "kind": "greentic.revocation.crl@1.0.0",
+                    "pack_ref": "builtin:crl"
+                }
+            ]
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let plan = run_dry(&store, &manifest_path).expect("dry-run on fresh env");
+        let steps = plan.result["steps"].as_array().expect("steps array");
+
+        // Find each pack step by its key (= slot name).
+        let find_step = |key: &str| {
+            steps
+                .iter()
+                .find(|s| s["key"] == key)
+                .unwrap_or_else(|| panic!("no step with key `{key}` in {steps:?}"))
+        };
+
+        // deployer: identical to default → no-op (kind is still add-pack-binding
+        // because the no-op variant reuses that kind label).
+        let deployer = find_step("deployer");
+        assert_eq!(
+            deployer["action"].as_str().unwrap(),
+            "no-op",
+            "deployer must be no-op (matches default): {deployer}"
+        );
+
+        // telemetry: differs from default → update-pack-binding.
+        let telemetry = find_step("telemetry");
+        assert_eq!(
+            telemetry["kind"].as_str().unwrap(),
+            "update-pack-binding",
+            "telemetry must be update (differs from default): {telemetry}"
+        );
+        assert_eq!(
+            telemetry["action"].as_str().unwrap(),
+            "update",
+            "telemetry action must be update: {telemetry}"
+        );
+
+        // revocation: not in defaults → add-pack-binding.
+        let revocation = find_step("revocation");
+        assert_eq!(
+            revocation["kind"].as_str().unwrap(),
+            "add-pack-binding",
+            "revocation must be add (not in defaults): {revocation}"
+        );
+        assert_eq!(
+            revocation["action"].as_str().unwrap(),
+            "create",
+            "revocation action must be create: {revocation}"
+        );
+    }
 }
