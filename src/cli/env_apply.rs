@@ -915,6 +915,49 @@ fn resolve_and_validate(
         });
     }
 
+    // Validate that every declared `answers_ref` resolves to an existing file
+    // relative to the manifest directory. The schema contract says "relative to
+    // the manifest", so catch missing files at plan time rather than letting a
+    // later `op env render` fail with a confusing path error.
+    // NOTE: the stored path is the raw manifest-relative value. The consumer
+    // (`load_render_answers`) resolves relative to the *env* directory, which
+    // may differ. A future iteration should copy the file into the env dir or
+    // store an env-relative path; for now we at least fail fast on a typo.
+    for p in &manifest.packs {
+        if let Some(ar) = &p.answers_ref {
+            let resolved = if ar.is_absolute() {
+                ar.clone()
+            } else {
+                manifest_dir.join(ar)
+            };
+            if !resolved.is_file() {
+                return Err(OpError::InvalidArgument(format!(
+                    "packs[] slot `{}`: answers_ref `{}` does not exist (resolved to `{}`)",
+                    p.slot,
+                    ar.display(),
+                    resolved.display()
+                )));
+            }
+        }
+    }
+    for ext in &manifest.extensions {
+        if let Some(ar) = &ext.answers_ref {
+            let resolved = if ar.is_absolute() {
+                ar.clone()
+            } else {
+                manifest_dir.join(ar)
+            };
+            if !resolved.is_file() {
+                return Err(OpError::InvalidArgument(format!(
+                    "extensions[] kind `{}`: answers_ref `{}` does not exist (resolved to `{}`)",
+                    ext.kind,
+                    ar.display(),
+                    resolved.display()
+                )));
+            }
+        }
+    }
+
     Ok(ApplyContext {
         env_id,
         manifest,
@@ -1127,8 +1170,28 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
 
     // 4. Env-packs — each manifest pack binds one core capability slot.
     //    Look up the existing binding by slot; absent → add, differs → update.
+    //
+    //    On a fresh env (`ctx.env == None`, always `local` here) the preceding
+    //    EnsureEnvironment step will create the env with five default bindings
+    //    (deployer, secrets, telemetry, sessions, state). We must diff against
+    //    those defaults so packs targeting a default slot emit UpdatePackBinding
+    //    (or no-op) instead of an unconditional AddPackBinding that would fail
+    //    with `SlotAlreadyBound` after `env init` runs.
+    let default_bindings = if ctx.env.is_none() {
+        Some(
+            crate::defaults::local_pack_bindings()
+                .map_err(|e| OpError::InvalidArgument(format!("default pack bindings: {e}")))?,
+        )
+    } else {
+        None
+    };
     for mp in &ctx.manifest.packs {
-        let existing = ctx.env.as_ref().and_then(|e| e.pack_for_slot(mp.slot));
+        let existing = match &ctx.env {
+            Some(e) => e.pack_for_slot(mp.slot),
+            None => default_bindings
+                .as_ref()
+                .and_then(|bs| bs.iter().find(|b| b.slot == mp.slot)),
+        };
         match existing {
             None => {
                 let desired_hash = hash_json(&json!({
