@@ -739,8 +739,18 @@ fn resolve_and_validate(
                 }),
             },
             None => {
-                if let Some(prefilled) = prefilled_secrets.get(&s.path) {
-                    Some(prefilled.expose().to_string())
+                // An author-supplied value wins. An EMPTY prefilled value is
+                // treated as no value — consistent with the env/prompt branches
+                // (which filter empties) — so it falls through to the store
+                // check / prompt / missing path instead of reaching
+                // `secrets::put`, which rejects empties only at execute, after
+                // earlier steps have already mutated state.
+                let prefilled = prefilled_secrets
+                    .get(&s.path)
+                    .map(|value| value.expose())
+                    .filter(|value| !value.is_empty());
+                if let Some(value) = prefilled {
+                    Some(value.to_string())
                 } else if super::secrets::dev_store_has(&env_dir, &env_id, &s.path)? {
                     // Already stored — nothing to collect or put. Skip
                     // entirely: not a value, not a missing input.
@@ -4417,6 +4427,40 @@ mod tests {
         let put = steps.iter().find(|s| s["kind"] == "put-secret").unwrap();
         assert_eq!(put["detail"], "pasted (cannot diff until A9)");
         assert_eq!(dev_store_value(dir.path()), b"tok-typed".to_vec());
+    }
+
+    #[test]
+    fn paste_secret_empty_prefilled_is_treated_as_missing() {
+        // A prefilled value that is empty must NOT slip through as resolved
+        // (it would only be rejected by `secrets::put` at execute, after
+        // earlier steps mutated state). Like the env/prompt branches, an empty
+        // prefilled value falls through to the missing-input report.
+        let (dir, store) = seeded_store_with_dev_secrets();
+        let manifest_path = write_manifest(dir.path(), &paste_secrets_manifest());
+        let flags = OpFlags {
+            schema_only: false,
+            answers: Some(manifest_path.clone()),
+        };
+        let mut prefilled = BTreeMap::new();
+        prefilled.insert(SECRET_PATH.to_string(), SecretValue::from(String::new()));
+        let err = apply_with_lookups(
+            &store,
+            &flags,
+            ApplyOptions {
+                mode: ApplyMode::Apply,
+                non_interactive: true,
+                prefilled_secrets: prefilled,
+                ..ApplyOptions::default()
+            },
+            &|_| None,
+            None,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("1 missing input(s)"), "{msg}");
+        assert!(msg.contains("paste"), "names the paste source: {msg}");
+        // Aborted before any mutation — no audit log written.
+        assert!(!dir.path().join("local/audit/events.jsonl").exists());
     }
 
     #[test]
