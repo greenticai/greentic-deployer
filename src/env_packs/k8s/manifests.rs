@@ -112,7 +112,8 @@ impl K8sParams {
     ///   be >= 2 (the router must stay HA). `null` / empty-string →
     ///   default.
     /// - `kubeconfig_context`: silently accepted and ignored (client-
-    ///   targeting knob, not a manifest knob).
+    ///   targeting knob, not a manifest knob — consumed by
+    ///   [`kube_client::connect`](super::kube_client::connect)).
     /// - Any other key → `Err` (fail closed on wizard version skew or
     ///   typos).
     pub fn from_answers(
@@ -319,13 +320,20 @@ fn sanitize_dns1123_label(raw: &str) -> String {
     s.trim_matches('-').to_string()
 }
 
+/// Label key identifying the owning environment, stamped on every
+/// rendered object by `common_labels`. The kube client's ownership
+/// guard reads it back — they MUST share this constant so a rename can't
+/// silently turn the guard into a no-op.
+pub const ENV_LABEL: &str = "greentic.ai/env";
+
 /// Shared labels stamped on every object the env-pack renders.
 fn common_labels(env: &Environment, component: &str) -> Value {
-    json!({
+    let mut labels = json!({
         "app.kubernetes.io/managed-by": "greentic",
         "app.kubernetes.io/component": component,
-        "greentic.ai/env": env.environment_id.as_str(),
-    })
+    });
+    labels[ENV_LABEL] = json!(env.environment_id.as_str());
+    labels
 }
 
 /// Worker pod selector labels: the revision ULID is the identity (plan
@@ -396,7 +404,7 @@ pub fn render_namespace(env: &Environment, params: &K8sParams) -> Value {
 /// / `GREENTIC_BUNDLE_ID` / `GREENTIC_BUNDLE_DIGEST`) so the runtime
 /// entrypoint can resolve and verify its bundle. Bundle DELIVERY into the
 /// pod (distributor-pull init container vs. baked image) is decided in
-/// the K8s apply PR; the identity contract here is delivery-agnostic.
+/// PR-5.3; the identity contract here is delivery-agnostic.
 ///
 /// Readiness probes `/healthz` today; the per-revision
 /// `/healthz/<revision_id>` route is the acceptance-gate target once

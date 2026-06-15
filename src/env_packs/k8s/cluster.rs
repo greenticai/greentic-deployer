@@ -8,14 +8,16 @@
 //! - The manifest computation in [`super::manifests`] stays pure and
 //!   testable without a cluster — the conformance bench runs against an
 //!   in-memory fake and exercises the REAL desired-state logic.
-//! - The typed Kubernetes client (kube-rs) lands as one impl of this
-//!   trait in the follow-up K8s apply PR without touching the verbs.
+//! - The typed Kubernetes client lands as one impl of this trait
+//!   ([`KubeCluster`](super::kube_client::KubeCluster), `k8s-client`
+//!   feature) without touching the verbs.
 //!
 //! The default binding is [`UnconfiguredCluster`]: every call fails with
-//! [`K8sClusterError::Unconfigured`]. That is the honest answer for a
-//! binary that ships the K8s env-pack scaffold but no API client yet —
-//! a `revisions warm` against a K8s-bound env surfaces "no cluster
-//! client configured" instead of pretending provider work happened.
+//! [`K8sClusterError::Unconfigured`]. That is the honest answer until
+//! the PR-5.3 orchestration wiring constructs a connected client from
+//! the binding's answers — a `revisions warm` against a K8s-bound env
+//! surfaces "no cluster client configured" instead of pretending
+//! provider work happened.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -38,27 +40,30 @@ impl ObjectRef {
     /// [`K8sClusterError::InvalidManifest`] rather than panicking inside
     /// a deployer verb.
     pub fn from_manifest(manifest: &Value) -> Result<Self, K8sClusterError> {
-        let field = |path: &[&str]| -> Result<String, K8sClusterError> {
-            let mut cur = manifest;
-            for p in path {
-                cur = cur.get(p).ok_or_else(|| {
-                    K8sClusterError::InvalidManifest(format!(
-                        "manifest is missing `{}`",
-                        path.join(".")
-                    ))
-                })?;
-            }
-            cur.as_str().map(str::to_string).ok_or_else(|| {
-                K8sClusterError::InvalidManifest(format!("`{}` is not a string", path.join(".")))
-            })
-        };
         Ok(Self {
-            api_version: field(&["apiVersion"])?,
-            kind: field(&["kind"])?,
-            namespace: field(&["metadata", "namespace"])?,
-            name: field(&["metadata", "name"])?,
+            api_version: manifest_field(manifest, &["apiVersion"])?,
+            kind: manifest_field(manifest, &["kind"])?,
+            namespace: manifest_field(manifest, &["metadata", "namespace"])?,
+            name: manifest_field(manifest, &["metadata", "name"])?,
         })
     }
+}
+
+/// Read a required string field from a rendered manifest by JSON path.
+///
+/// Shared by [`ObjectRef::from_manifest`] and the kube client's
+/// `api_for`; a missing or non-string field is a render bug, surfaced as
+/// [`K8sClusterError::InvalidManifest`].
+pub(super) fn manifest_field(manifest: &Value, path: &[&str]) -> Result<String, K8sClusterError> {
+    let mut cur = manifest;
+    for p in path {
+        cur = cur.get(p).ok_or_else(|| {
+            K8sClusterError::InvalidManifest(format!("manifest is missing `{}`", path.join(".")))
+        })?;
+    }
+    cur.as_str().map(str::to_string).ok_or_else(|| {
+        K8sClusterError::InvalidManifest(format!("`{}` is not a string", path.join(".")))
+    })
 }
 
 impl std::fmt::Display for ObjectRef {
@@ -78,12 +83,13 @@ impl std::fmt::Display for ObjectRef {
 /// client config / cluster access, re-run the verb).
 #[derive(Debug, Error)]
 pub enum K8sClusterError {
-    /// No API client is wired. The scaffold's default — the typed
-    /// kube-rs client lands in the K8s apply PR.
+    /// No API client is bound. The handler's default — the typed client
+    /// exists ([`KubeCluster`](super::kube_client::KubeCluster)) but the
+    /// PR-5.3 orchestration wiring constructs and binds it.
     #[error(
-        "no Kubernetes API client is configured for the K8s deployer env-pack; \
-         the typed cluster client ships in the Phase D K8s apply PR — until then \
-         K8s provider verbs cannot run"
+        "no Kubernetes API client is bound to the K8s deployer env-pack; \
+         binding a connected cluster client rides the Phase D orchestration \
+         wiring (PR-5.3) — until then K8s provider verbs cannot run"
     )]
     Unconfigured,
     /// The rendered manifest was missing identity fields — a render bug.
@@ -92,6 +98,17 @@ pub enum K8sClusterError {
     /// The Kubernetes API rejected the call.
     #[error("Kubernetes API error: {0}")]
     Api(String),
+    /// Refusing to overwrite an object owned by a different environment.
+    #[error(
+        "refusing to apply `{object}` in namespace `{namespace}`: \
+         it is owned by env `{existing_env}` but this apply belongs to env `{incoming_env}`"
+    )]
+    OwnershipConflict {
+        object: String,
+        namespace: String,
+        existing_env: String,
+        incoming_env: String,
+    },
 }
 
 /// Declarative mutation surface against one cluster.
@@ -131,7 +148,7 @@ impl K8sCluster for UnconfiguredCluster {
 
 /// In-memory fake honoring the [`K8sCluster`] idempotency contract.
 /// Backs the conformance run and the verb-behavior tests; integration
-/// against a real cluster is the kind E2E in the K8s apply PR.
+/// against a real cluster is the PR-5.3 kind E2E.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub struct InMemoryCluster {

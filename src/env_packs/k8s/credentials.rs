@@ -11,9 +11,12 @@
 //! bootstrap-then-validate loop converges exactly like the AWS-ECS
 //! `VALIDATED_IAM_VERBS` precedent.
 //!
-//! ## Scaffold posture: probes FAIL CLOSED until the typed client lands
+//! ## Default posture: probes FAIL CLOSED until a client is bound
 //!
-//! The typed Kubernetes API client (kube-rs) ships in the K8s apply PR.
+//! The typed Kubernetes API client exists
+//! ([`KubeValidatorClient`](super::kube_client::KubeValidatorClient),
+//! `k8s-client` feature), but constructing it from the binding's answers
+//! and handing it to this handler is the PR-5.3 orchestration wiring.
 //! Until then [`K8sDeployerCredentials::default`] holds no client and
 //! every probe reports [`CapabilityStatus::Fail`] — NOT `Skipped`,
 //! because `RequirementsReport::passed()` treats `Skipped` as non-
@@ -145,7 +148,7 @@ pub enum K8sClientError {
 }
 
 /// Pluggable validator client. Unit tests mock this; the production
-/// kube-rs impl lands in the K8s apply PR.
+/// impl is [`KubeValidatorClient`](super::kube_client::KubeValidatorClient).
 #[async_trait::async_trait]
 pub trait K8sValidatorClient: std::fmt::Debug + Send + Sync {
     /// Resolve the credential's cluster identity (SelfSubjectReview).
@@ -165,9 +168,10 @@ pub trait K8sValidatorClient: std::fmt::Debug + Send + Sync {
 
 /// K8s deployer credentials handler.
 ///
-/// `Default` holds no client (scaffold posture — every probe fails closed);
-/// [`with_client`](Self::with_client) injects a mock today and the real
-/// kube-rs client once it ships.
+/// `Default` holds no client (every probe fails closed);
+/// [`with_client`](Self::with_client) injects a mock in tests and a
+/// connected [`KubeValidatorClient`](super::kube_client::KubeValidatorClient)
+/// once the PR-5.3 wiring constructs one.
 #[derive(Debug, Default)]
 pub struct K8sDeployerCredentials {
     client: Option<Arc<dyn K8sValidatorClient>>,
@@ -237,9 +241,9 @@ impl DeployerCredentials for K8sDeployerCredentials {
         let caps = self.required_capabilities();
 
         let Some(client) = self.client.as_ref() else {
-            // Scaffold posture: no client machinery wired yet — Fail,
-            // not Skipped. `RequirementsReport::passed()` treats Skipped
-            // as non-blocking, so an all-Skipped report would persist
+            // No client bound — Fail, not Skipped.
+            // `RequirementsReport::passed()` treats Skipped as
+            // non-blocking, so an all-Skipped report would persist
             // `result: pass` even though zero capabilities were actually
             // verified. Failing closed matches the AWS precedent (chain-
             // missing → every cap Fail) and ensures `gtc op credentials
@@ -249,9 +253,10 @@ impl DeployerCredentials for K8sDeployerCredentials {
                     .map(|capability| CapabilityCheck {
                         capability,
                         status: CapabilityStatus::Fail {
-                            reason: "typed Kubernetes API client is not wired yet \
-                                     (ships in the Phase D K8s apply PR); \
-                                     credentials cannot be validated — failing closed"
+                            reason: "no Kubernetes API client is bound to the K8s \
+                                     deployer env-pack (binding one rides the Phase D \
+                                     orchestration wiring, PR-5.3); credentials cannot \
+                                     be validated — failing closed"
                                 .to_string(),
                         },
                     })
@@ -523,7 +528,7 @@ mod tests {
             match &check.status {
                 CapabilityStatus::Fail { reason } => {
                     assert!(
-                        reason.contains("not wired yet"),
+                        reason.contains("no Kubernetes API client is bound"),
                         "reason must mention the missing client: {reason}"
                     );
                 }

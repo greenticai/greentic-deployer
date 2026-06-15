@@ -15,7 +15,7 @@
 //!
 //! | Verb | Provider side-effect |
 //! |---|---|
-//! | `stage_revision` | None today. The bundle artifact is delivered to the pod at warm time (delivery mechanism is the apply PR's decision); there is no per-revision registry upload step yet. |
+//! | `stage_revision` | None today. The bundle artifact is delivered to the pod at warm time (delivery mechanism is a PR-5.3 decision); there is no per-revision registry upload step yet. |
 //! | `warm_revision` | Apply the revision's worker Deployment + ClusterIP Service. |
 //! | `drain_revision` | None — drain semantics are routing-side. The router stops dispatching NEW sessions when the `TrafficSplit` changes (`apply_traffic_split`); provider resources stay up through the drain window so in-flight sessions finish. Teardown is `archive_revision`'s job. |
 //! | `archive_revision` | Delete the worker Deployment + Service (idempotent against absent). |
@@ -24,8 +24,9 @@
 //! Idempotency falls out of the seam's contract: `apply` is a
 //! declarative upsert, `delete` of an absent object is `Ok`. The
 //! conformance bench runs against an in-memory fake cluster (the verbs +
-//! rendering are fully exercised); the real kube-rs-backed seam lands in
-//! the K8s apply PR and inherits the same verbs unchanged.
+//! rendering are fully exercised); the real kube-rs-backed seam
+//! ([`KubeCluster`](super::kube_client::KubeCluster)) inherits the same
+//! verbs unchanged once the PR-5.3 wiring binds it.
 
 use async_trait::async_trait;
 use greentic_deploy_spec::{DeploymentId, Environment, Revision, RevisionId};
@@ -82,6 +83,12 @@ impl Deployer for K8sDeployerHandler {
         let params = K8sParams::for_env(env);
         self.apply_all(&render_worker_manifests(env, revision, &params))
             .await?;
+        // warm returns once the API server has accepted the worker manifests.
+        // The live-cluster readiness wait (observed `.status.observedGeneration`
+        // + available replicas + the per-revision `/healthz/<revision_id>`
+        // probe before the revision is promoted Warming → Ready) rides PR-5.3
+        // alongside Deployer-verb dispatch and the RevisionHealthGate seam —
+        // it is intentionally NOT performed inside the upsert primitive.
         Ok(WarmOutcome::default())
     }
 
