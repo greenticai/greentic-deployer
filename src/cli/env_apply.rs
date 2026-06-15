@@ -82,12 +82,15 @@ use super::bundles::{
     BundleUpdatePayload, RevenueShareEntryPayload, RouteBindingPayload, convert_revenue_share,
     into_route_binding,
 };
+use super::config::ConfigSetPayload;
 use super::deploy::BundleDeployPayload;
 use super::env::EnvInitPayload;
 use super::env_manifest::{
     ENV_MANIFEST_SCHEMA_V1, EnvManifest, ManifestBundle, ManifestEndpoint, ManifestRevision,
     ManifestWelcomeFlow, TrustRootDirective, compute_effective_weights_bps, manifest_schema,
 };
+use super::env_packs::EnvPackBindingPayload;
+use super::extensions::ExtensionBindingPayload;
 use super::messaging::{
     EndpointAddPayload, EndpointLinkBundlePayload, EndpointSetWelcomeFlowPayload, EndpointSummary,
 };
@@ -141,11 +144,16 @@ impl ApplyAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplyStepKind {
     EnsureEnvironment,
+    UpdateHostConfig,
     BootstrapTrustRoot,
+    AddPackBinding,
+    UpdatePackBinding,
     PutSecret,
     DeployBundle,
     DeploySplit,
     UpdateBundle,
+    AddExtension,
+    UpdateExtension,
     AddEndpoint,
     LinkEndpoint,
     SetWelcomeFlow,
@@ -155,11 +163,16 @@ impl ApplyStepKind {
     fn label(self) -> &'static str {
         match self {
             ApplyStepKind::EnsureEnvironment => "ensure-environment",
+            ApplyStepKind::UpdateHostConfig => "update-host-config",
             ApplyStepKind::BootstrapTrustRoot => "bootstrap-trust-root",
+            ApplyStepKind::AddPackBinding => "add-pack-binding",
+            ApplyStepKind::UpdatePackBinding => "update-pack-binding",
             ApplyStepKind::PutSecret => "put-secret",
             ApplyStepKind::DeployBundle => "deploy-bundle",
             ApplyStepKind::DeploySplit => "deploy-split",
             ApplyStepKind::UpdateBundle => "update-bundle",
+            ApplyStepKind::AddExtension => "add-extension",
+            ApplyStepKind::UpdateExtension => "update-extension",
             ApplyStepKind::AddEndpoint => "add-endpoint",
             ApplyStepKind::LinkEndpoint => "link-endpoint",
             ApplyStepKind::SetWelcomeFlow => "set-welcome-flow",
@@ -225,6 +238,11 @@ enum StepOp {
         revenue_share: Option<Vec<RevenueShareEntryPayload>>,
         revisions: Vec<SplitRevisionEntry>,
     },
+    UpdateHostConfig(Box<ConfigSetPayload>),
+    AddPackBinding(Box<EnvPackBindingPayload>),
+    UpdatePackBinding(Box<EnvPackBindingPayload>),
+    AddExtension(Box<ExtensionBindingPayload>),
+    UpdateExtension(Box<ExtensionBindingPayload>),
     BundleUpdate(Box<BundleUpdatePayload>),
     EndpointAdd(Box<EndpointAddPayload>),
     EndpointLink {
@@ -635,10 +653,18 @@ fn resolve_and_validate(
     let env = if store.exists(&env_id)? {
         Some(store.load(&env_id)?)
     } else {
+        // `env apply` reconciles an EXISTING non-local env, but it cannot
+        // CREATE one: the local store is authorization-gated to `local` only
+        // (A7 `authorize_local_only`), so non-local env creation is reserved
+        // for the remote operator store. Surface a clear error at plan time
+        // rather than letting execute hit a confusing `Unauthorized`.
         if env_id.as_str() != crate::defaults::LOCAL_ENV_ID {
             return Err(OpError::NotFound(format!(
-                "environment `{env_id}` not found — v1 `env apply` bootstraps only the \
-                 `local` environment; create `{env_id}` first with `gtc op env create`"
+                "environment `{env_id}` not found — `env apply` can reconcile an existing \
+                 non-local environment but cannot create one locally (the `local`-only \
+                 authorization policy reserves non-local env creation for the remote \
+                 operator store). Create `{env_id}` via the operator store first, or use \
+                 `local`."
             )));
         }
         None
@@ -951,19 +977,24 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
     let mut steps = Vec::new();
     let env_id_str = ctx.env_id.as_str().to_string();
 
-    // 1. EnsureEnvironment.
+    // 1. EnsureEnvironment. `ctx.env == None` only ever reaches here for the
+    //    `local` env — `resolve_and_validate` rejects a non-existent non-local
+    //    env before diffing (non-local creation is reserved for the remote
+    //    operator store, A7).
     match &ctx.env {
-        None => steps.push(ApplyStep {
-            kind: ApplyStepKind::EnsureEnvironment,
-            key: env_id_str.clone(),
-            action: ApplyAction::Create,
-            detail: "env init (local bootstrap: default env-pack bindings + trust-root seed)"
-                .to_string(),
-            idempotency_key: None,
-            op: StepOp::EnvInit {
-                public_base_url: ctx.canonical_public_base_url.clone(),
-            },
-        }),
+        None => {
+            steps.push(ApplyStep {
+                kind: ApplyStepKind::EnsureEnvironment,
+                key: env_id_str.clone(),
+                action: ApplyAction::Create,
+                detail: "env init (local bootstrap: default env-pack bindings + trust-root seed)"
+                    .to_string(),
+                idempotency_key: None,
+                op: StepOp::EnvInit {
+                    public_base_url: ctx.canonical_public_base_url.clone(),
+                },
+            });
+        }
         Some(env) => match &ctx.canonical_public_base_url {
             Some(url) if env.host_config.public_base_url.as_deref() != Some(url.as_str()) => {
                 steps.push(ApplyStep {
@@ -983,12 +1014,208 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
         },
     }
 
-    // 2. BootstrapTrustRoot.
+    // 2. UpdateHostConfig (name, region, tenant_org_id, listen_addr).
+    //    Compares declared manifest fields against the live env; any declared
+    //    field that differs emits ONE UpdateHostConfig step. On a fresh env
+    //    (env == None) the host-config update is deferred to after the
+    //    EnsureEnvironment execute creates the env.
+    if let Some(env) = &ctx.env {
+        let me = &ctx.manifest.environment;
+        let name_differs = me.name.as_ref().is_some_and(|n| *n != env.name);
+        let region_differs = me
+            .region
+            .as_ref()
+            .is_some_and(|r| env.host_config.region.as_deref() != Some(r.as_str()));
+        let tenant_org_differs = me
+            .tenant_org_id
+            .as_ref()
+            .is_some_and(|t| env.host_config.tenant_org_id.as_deref() != Some(t.as_str()));
+        let listen_addr_differs = me.listen_addr.as_ref().is_some_and(|la| {
+            let parsed: std::net::SocketAddr = la
+                .parse()
+                .expect("validate_shape already validated listen_addr");
+            env.host_config.listen_addr != Some(parsed)
+        });
+
+        if name_differs || region_differs || tenant_org_differs || listen_addr_differs {
+            let mut fields = Vec::new();
+            if name_differs {
+                fields.push("name");
+            }
+            if region_differs {
+                fields.push("region");
+            }
+            if tenant_org_differs {
+                fields.push("tenant_org_id");
+            }
+            if listen_addr_differs {
+                fields.push("listen_addr");
+            }
+            let desired_hash = hash_json(&json!({
+                "name": me.name,
+                "region": me.region,
+                "tenant_org_id": me.tenant_org_id,
+                "listen_addr": me.listen_addr,
+            }));
+            let ikey = derive_idempotency_key(
+                &ctx.env_id,
+                ApplyStepKind::UpdateHostConfig.label(),
+                &env_id_str,
+                &desired_hash,
+            );
+            steps.push(ApplyStep {
+                kind: ApplyStepKind::UpdateHostConfig,
+                key: env_id_str.clone(),
+                action: ApplyAction::Update,
+                detail: format!("set {}", fields.join(", ")),
+                idempotency_key: Some(ikey),
+                op: StepOp::UpdateHostConfig(Box::new(ConfigSetPayload {
+                    environment_id: env_id_str.clone(),
+                    name: me.name.clone(),
+                    region: me.region.clone(),
+                    tenant_org_id: me.tenant_org_id.clone(),
+                    listen_addr: me.listen_addr.clone(),
+                    public_base_url: None, // public_base_url is handled by SetPublicUrl
+                })),
+            });
+        } else {
+            let has_declared_host_config = me.name.is_some()
+                || me.region.is_some()
+                || me.tenant_org_id.is_some()
+                || me.listen_addr.is_some();
+            if has_declared_host_config {
+                steps.push(ApplyStep::no_op(
+                    ApplyStepKind::UpdateHostConfig,
+                    env_id_str.clone(),
+                    "host-config unchanged",
+                ));
+            }
+        }
+    } else {
+        // Fresh env (always `local` here — see EnsureEnvironment). `env init`
+        // does NOT thread name/region/tenant_org_id/listen_addr, so a declared
+        // host-config is applied by a deferred UpdateHostConfig step that runs
+        // after the env is created.
+        let me = &ctx.manifest.environment;
+        let has_host_config = me.name.is_some()
+            || me.region.is_some()
+            || me.tenant_org_id.is_some()
+            || me.listen_addr.is_some();
+        if has_host_config {
+            steps.push(ApplyStep {
+                kind: ApplyStepKind::UpdateHostConfig,
+                key: env_id_str.clone(),
+                action: ApplyAction::Create,
+                detail: "set host-config on fresh env".to_string(),
+                idempotency_key: None,
+                op: StepOp::UpdateHostConfig(Box::new(ConfigSetPayload {
+                    environment_id: env_id_str.clone(),
+                    name: me.name.clone(),
+                    region: me.region.clone(),
+                    tenant_org_id: me.tenant_org_id.clone(),
+                    listen_addr: me.listen_addr.clone(),
+                    public_base_url: None,
+                })),
+            });
+        }
+    }
+
+    // 3. BootstrapTrustRoot.
     if ctx.manifest.trust_root == Some(TrustRootDirective::Bootstrap) {
         steps.push(trust_root_step(store, ctx)?);
     }
 
-    // 3. Secrets — always-put: `op secrets get` is not-yet-implemented for
+    // 4. Env-packs — each manifest pack binds one core capability slot.
+    //    Look up the existing binding by slot; absent → add, differs → update.
+    for mp in &ctx.manifest.packs {
+        let existing = ctx.env.as_ref().and_then(|e| e.pack_for_slot(mp.slot));
+        match existing {
+            None => {
+                let desired_hash = hash_json(&json!({
+                    "slot": mp.slot.to_string(),
+                    "kind": mp.kind,
+                    "pack_ref": mp.pack_ref,
+                    "answers_ref": mp.answers_ref,
+                }));
+                let ikey = derive_idempotency_key(
+                    &ctx.env_id,
+                    ApplyStepKind::AddPackBinding.label(),
+                    &mp.slot.to_string(),
+                    &desired_hash,
+                );
+                steps.push(ApplyStep {
+                    kind: ApplyStepKind::AddPackBinding,
+                    key: mp.slot.to_string(),
+                    action: ApplyAction::Create,
+                    detail: format!("{} ({})", mp.kind, mp.pack_ref),
+                    idempotency_key: Some(ikey.clone()),
+                    op: StepOp::AddPackBinding(Box::new(EnvPackBindingPayload {
+                        environment_id: env_id_str.clone(),
+                        slot: mp.slot,
+                        kind: mp.kind.clone(),
+                        pack_ref: mp.pack_ref.clone(),
+                        answers_ref: mp.answers_ref.clone(),
+                        idempotency_key: Some(ikey),
+                    })),
+                });
+            }
+            Some(b) => {
+                let kind_differs = b.kind.to_string() != mp.kind;
+                let pack_ref_differs = b.pack_ref.as_str() != mp.pack_ref;
+                let answers_ref_differs = mp
+                    .answers_ref
+                    .as_ref()
+                    .is_some_and(|ar| b.answers_ref.as_ref() != Some(ar));
+                if kind_differs || pack_ref_differs || answers_ref_differs {
+                    let desired_hash = hash_json(&json!({
+                        "slot": mp.slot.to_string(),
+                        "kind": mp.kind,
+                        "pack_ref": mp.pack_ref,
+                        "answers_ref": mp.answers_ref,
+                    }));
+                    let ikey = derive_idempotency_key(
+                        &ctx.env_id,
+                        ApplyStepKind::UpdatePackBinding.label(),
+                        &mp.slot.to_string(),
+                        &desired_hash,
+                    );
+                    let mut what = Vec::new();
+                    if kind_differs {
+                        what.push(format!("kind → {}", mp.kind));
+                    }
+                    if pack_ref_differs {
+                        what.push(format!("pack_ref → {}", mp.pack_ref));
+                    }
+                    if answers_ref_differs {
+                        what.push("answers_ref".to_string());
+                    }
+                    steps.push(ApplyStep {
+                        kind: ApplyStepKind::UpdatePackBinding,
+                        key: mp.slot.to_string(),
+                        action: ApplyAction::Update,
+                        detail: what.join(", "),
+                        idempotency_key: Some(ikey.clone()),
+                        op: StepOp::UpdatePackBinding(Box::new(EnvPackBindingPayload {
+                            environment_id: env_id_str.clone(),
+                            slot: mp.slot,
+                            kind: mp.kind.clone(),
+                            pack_ref: mp.pack_ref.clone(),
+                            answers_ref: mp.answers_ref.clone(),
+                            idempotency_key: Some(ikey),
+                        })),
+                    });
+                } else {
+                    steps.push(ApplyStep::no_op(
+                        ApplyStepKind::AddPackBinding,
+                        mp.slot.to_string(),
+                        format!("bound ({}, {})", mp.kind, mp.pack_ref),
+                    ));
+                }
+            }
+        }
+    }
+
+    // 5. Secrets — always-put: `op secrets get` is not-yet-implemented for
     //    every backend, so values cannot be diffed. The plan says so
     //    explicitly rather than ever claiming a false no-op; when A9 lands a
     //    real `get`, this tightens to write-if-changed with no schema
@@ -1253,7 +1480,112 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
         }
     }
 
-    // 5. Endpoints (add → link → welcome-flow, per endpoint in manifest order).
+    // 8. Extensions — N-per-env open namespace, keyed by (kind.path(), instance_id).
+    for mx in &ctx.manifest.extensions {
+        let kind_path = greentic_deploy_spec::PackDescriptor::try_new(&mx.kind)
+            .expect("validate_shape already validated kind")
+            .path()
+            .to_string();
+        let ext_key = format!(
+            "{}{}",
+            kind_path,
+            mx.instance_id
+                .as_ref()
+                .map(|i| format!("/{i}"))
+                .unwrap_or_default()
+        );
+        let existing = ctx.env.as_ref().and_then(|e| {
+            e.extensions
+                .iter()
+                .find(|b| b.kind.path() == kind_path && b.instance_id == mx.instance_id)
+        });
+        match existing {
+            None => {
+                let desired_hash = hash_json(&json!({
+                    "kind": mx.kind,
+                    "pack_ref": mx.pack_ref,
+                    "instance_id": mx.instance_id,
+                    "answers_ref": mx.answers_ref,
+                }));
+                let ikey = derive_idempotency_key(
+                    &ctx.env_id,
+                    ApplyStepKind::AddExtension.label(),
+                    &ext_key,
+                    &desired_hash,
+                );
+                steps.push(ApplyStep {
+                    kind: ApplyStepKind::AddExtension,
+                    key: ext_key,
+                    action: ApplyAction::Create,
+                    detail: format!("{} ({})", mx.kind, mx.pack_ref),
+                    idempotency_key: Some(ikey.clone()),
+                    op: StepOp::AddExtension(Box::new(ExtensionBindingPayload {
+                        environment_id: env_id_str.clone(),
+                        kind: mx.kind.clone(),
+                        pack_ref: mx.pack_ref.clone(),
+                        instance_id: mx.instance_id.clone(),
+                        answers_ref: mx.answers_ref.clone(),
+                        idempotency_key: Some(ikey),
+                    })),
+                });
+            }
+            Some(b) => {
+                let kind_differs = b.kind.to_string() != mx.kind;
+                let pack_ref_differs = b.pack_ref.as_str() != mx.pack_ref;
+                let answers_ref_differs = mx
+                    .answers_ref
+                    .as_ref()
+                    .is_some_and(|ar| b.answers_ref.as_ref() != Some(ar));
+                if kind_differs || pack_ref_differs || answers_ref_differs {
+                    let desired_hash = hash_json(&json!({
+                        "kind": mx.kind,
+                        "pack_ref": mx.pack_ref,
+                        "instance_id": mx.instance_id,
+                        "answers_ref": mx.answers_ref,
+                    }));
+                    let ikey = derive_idempotency_key(
+                        &ctx.env_id,
+                        ApplyStepKind::UpdateExtension.label(),
+                        &ext_key,
+                        &desired_hash,
+                    );
+                    let mut what = Vec::new();
+                    if kind_differs {
+                        what.push(format!("kind → {}", mx.kind));
+                    }
+                    if pack_ref_differs {
+                        what.push(format!("pack_ref → {}", mx.pack_ref));
+                    }
+                    if answers_ref_differs {
+                        what.push("answers_ref".to_string());
+                    }
+                    steps.push(ApplyStep {
+                        kind: ApplyStepKind::UpdateExtension,
+                        key: ext_key,
+                        action: ApplyAction::Update,
+                        detail: what.join(", "),
+                        idempotency_key: Some(ikey.clone()),
+                        op: StepOp::UpdateExtension(Box::new(ExtensionBindingPayload {
+                            environment_id: env_id_str.clone(),
+                            kind: mx.kind.clone(),
+                            pack_ref: mx.pack_ref.clone(),
+                            instance_id: mx.instance_id.clone(),
+                            answers_ref: mx.answers_ref.clone(),
+                            idempotency_key: Some(ikey),
+                        })),
+                    });
+                } else {
+                    steps.push(ApplyStep::no_op(
+                        ApplyStepKind::AddExtension,
+                        ext_key,
+                        format!("bound ({}, {})", mx.kind, mx.pack_ref),
+                    ));
+                }
+            }
+        }
+    }
+
+    // 9. Endpoints (add → link → welcome-flow, per endpoint in manifest order).
     //    Reuses the match computed during validation (Fix 6); verify() re-matches
     //    the freshly reloaded env on purpose.
     for re in &ctx.endpoints {
@@ -1476,6 +1808,21 @@ fn execute(store: &LocalFsStore, ctx: &ApplyContext, steps: &[ApplyStep]) -> Res
             StepOp::SetPublicUrl { url } => {
                 super::env::set_public_url(store, &exec_flags, ctx.env_id.as_str(), url).map(|_| ())
             }
+            StepOp::UpdateHostConfig(payload) => {
+                super::config::set(store, &exec_flags, Some((**payload).clone())).map(|_| ())
+            }
+            StepOp::AddPackBinding(payload) => {
+                super::env_packs::add(store, &exec_flags, Some((**payload).clone())).map(|_| ())
+            }
+            StepOp::UpdatePackBinding(payload) => {
+                super::env_packs::update(store, &exec_flags, Some((**payload).clone())).map(|_| ())
+            }
+            StepOp::AddExtension(payload) => {
+                super::extensions::add(store, &exec_flags, Some((**payload).clone())).map(|_| ())
+            }
+            StepOp::UpdateExtension(payload) => {
+                super::extensions::update(store, &exec_flags, Some((**payload).clone())).map(|_| ())
+            }
             StepOp::TrustRootBootstrap => super::trust_root::bootstrap(
                 store,
                 &exec_flags,
@@ -1623,6 +1970,47 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
         }
     }
 
+    // Host-config fields.
+    {
+        let me = &ctx.manifest.environment;
+        if let Some(name) = &me.name {
+            checked += 1;
+            if *name != env.name {
+                failures.push(format!("name is `{}`, expected `{name}`", env.name));
+            }
+        }
+        if let Some(region) = &me.region {
+            checked += 1;
+            if env.host_config.region.as_deref() != Some(region.as_str()) {
+                failures.push(format!(
+                    "region is `{:?}`, expected `{region}`",
+                    env.host_config.region
+                ));
+            }
+        }
+        if let Some(tenant_org_id) = &me.tenant_org_id {
+            checked += 1;
+            if env.host_config.tenant_org_id.as_deref() != Some(tenant_org_id.as_str()) {
+                failures.push(format!(
+                    "tenant_org_id is `{:?}`, expected `{tenant_org_id}`",
+                    env.host_config.tenant_org_id
+                ));
+            }
+        }
+        if let Some(listen_addr) = &me.listen_addr {
+            checked += 1;
+            let parsed: std::net::SocketAddr = listen_addr
+                .parse()
+                .expect("validate_shape already validated listen_addr");
+            if env.host_config.listen_addr != Some(parsed) {
+                failures.push(format!(
+                    "listen_addr is `{:?}`, expected `{parsed}`",
+                    env.host_config.listen_addr
+                ));
+            }
+        }
+    }
+
     if ctx.manifest.trust_root == Some(TrustRootDirective::Bootstrap) {
         checked += 1;
         let env_dir = store.env_dir(&ctx.env_id)?;
@@ -1638,6 +2026,67 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
                 short_key_id(&k.key_id)
             )),
             Err(e) => failures.push(format!("operator key not loadable: {e}")),
+        }
+    }
+
+    // Env-packs.
+    for mp in &ctx.manifest.packs {
+        checked += 1;
+        let Some(b) = env.pack_for_slot(mp.slot) else {
+            failures.push(format!("pack slot `{}` is not bound", mp.slot));
+            continue;
+        };
+        if b.kind.to_string() != mp.kind {
+            failures.push(format!(
+                "pack slot `{}`: kind is `{}`, expected `{}`",
+                mp.slot, b.kind, mp.kind
+            ));
+        }
+        if b.pack_ref.as_str() != mp.pack_ref {
+            failures.push(format!(
+                "pack slot `{}`: pack_ref is `{}`, expected `{}`",
+                mp.slot,
+                b.pack_ref.as_str(),
+                mp.pack_ref
+            ));
+        }
+    }
+
+    // Extensions.
+    for mx in &ctx.manifest.extensions {
+        checked += 1;
+        let kind_path = greentic_deploy_spec::PackDescriptor::try_new(&mx.kind)
+            .expect("validate_shape already validated kind")
+            .path()
+            .to_string();
+        let ext_key = format!(
+            "{}{}",
+            kind_path,
+            mx.instance_id
+                .as_ref()
+                .map(|i| format!("/{i}"))
+                .unwrap_or_default()
+        );
+        let Some(b) = env
+            .extensions
+            .iter()
+            .find(|b| b.kind.path() == kind_path && b.instance_id == mx.instance_id)
+        else {
+            failures.push(format!("extension `{ext_key}` is not bound"));
+            continue;
+        };
+        if b.kind.to_string() != mx.kind {
+            failures.push(format!(
+                "extension `{ext_key}`: kind is `{}`, expected `{}`",
+                b.kind, mx.kind
+            ));
+        }
+        if b.pack_ref.as_str() != mx.pack_ref {
+            failures.push(format!(
+                "extension `{ext_key}`: pack_ref is `{}`, expected `{}`",
+                b.pack_ref.as_str(),
+                mx.pack_ref
+            ));
         }
     }
 
@@ -2899,18 +3348,29 @@ mod tests {
     }
 
     #[test]
-    fn missing_nonlocal_env_is_rejected() {
+    fn nonexistent_nonlocal_env_gives_clear_error() {
+        // `env apply` can reconcile an existing non-local env, but creating one
+        // is reserved for the remote operator store (A7) — a non-existent
+        // non-local env must fail at plan time with a clear message.
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let manifest = json!({
             "schema": ENV_MANIFEST_SCHEMA_V1,
-            "environment": {"id": "prod"}
+            "environment": {
+                "id": "prod",
+                "name": "Production",
+                "region": "us-east-1",
+                "tenant_org_id": "org-42",
+            }
         });
         let manifest_path = write_manifest(dir.path(), &manifest);
         let err = run_apply(&store, &manifest_path).unwrap_err();
         match err {
             OpError::NotFound(msg) => {
-                assert!(msg.contains("bootstraps only"), "got: {msg}")
+                assert!(
+                    msg.contains("cannot create one locally") && msg.contains("operator store"),
+                    "got: {msg}"
+                );
             }
             other => panic!("expected NotFound, got {other:?}"),
         }
@@ -3808,5 +4268,299 @@ mod tests {
             }
             other => panic!("expected Conflict, got {other:?}"),
         }
+    }
+
+    // --- G5: env-pack bindings ---
+
+    #[test]
+    fn pack_binding_add_then_idempotent() {
+        let (dir, store) = seeded_store();
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "deployer",
+                "kind": "greentic.deployer.local@1.0.0",
+                "pack_ref": "builtin:deployer-local"
+            }]
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let outcome = run_apply(&store, &manifest_path).expect("add pack binding");
+        let actions = step_actions(&outcome.result);
+        assert!(
+            actions.contains(&("add-pack-binding".to_string(), "create".to_string())),
+            "must plan add-pack-binding: {actions:?}"
+        );
+
+        let env = load_local(&store);
+        let binding = env.pack_for_slot(CapabilitySlot::Deployer);
+        assert!(binding.is_some(), "deployer slot must be bound");
+        let b = binding.unwrap();
+        assert_eq!(b.kind.to_string(), "greentic.deployer.local@1.0.0");
+        assert_eq!(b.pack_ref.as_str(), "builtin:deployer-local");
+
+        // Idempotent re-apply.
+        let second = run_apply(&store, &manifest_path).expect("re-apply");
+        assert_eq!(second.result["changed"], 0, "{}", second.result);
+    }
+
+    #[test]
+    fn pack_binding_update_on_kind_change() {
+        let (dir, store) = seeded_store();
+        // Seed with v1.
+        let v1 = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "deployer",
+                "kind": "greentic.deployer.local@1.0.0",
+                "pack_ref": "builtin:deployer-local"
+            }]
+        });
+        let v1_path = write_manifest(dir.path(), &v1);
+        run_apply(&store, &v1_path).expect("first apply");
+
+        // Update to v2.
+        let v2 = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "deployer",
+                "kind": "greentic.deployer.local@2.0.0",
+                "pack_ref": "builtin:deployer-local-v2"
+            }]
+        });
+        let v2_path = write_manifest(dir.path(), &v2);
+        let plan = run_dry(&store, &v2_path).expect("dry-run");
+        let actions = step_actions(&plan.result);
+        assert!(
+            actions.contains(&("update-pack-binding".to_string(), "update".to_string())),
+            "must plan update-pack-binding: {actions:?}"
+        );
+
+        run_apply(&store, &v2_path).expect("apply update");
+        let env = load_local(&store);
+        let b = env.pack_for_slot(CapabilitySlot::Deployer).expect("bound");
+        assert_eq!(b.kind.to_string(), "greentic.deployer.local@2.0.0");
+        assert_eq!(b.pack_ref.as_str(), "builtin:deployer-local-v2");
+        assert!(b.generation > 0, "generation must bump on update");
+    }
+
+    #[test]
+    fn pack_binding_rejects_messaging_slot() {
+        let dir = tempdir().unwrap();
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "messaging",
+                "kind": "greentic.messaging.telegram@1.0.0",
+                "pack_ref": "builtin:msg"
+            }]
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let loaded: EnvManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let err = loaded.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("messaging"), "got: {err}");
+    }
+
+    // --- G6: extensions ---
+
+    #[test]
+    fn extension_add_then_idempotent() {
+        let (dir, store) = seeded_store();
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "extensions": [{
+                "kind": "greentic.ext.memory@1.0.0",
+                "pack_ref": "builtin:memory-chronicle",
+                "instance_id": "default"
+            }]
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let outcome = run_apply(&store, &manifest_path).expect("add extension");
+        let actions = step_actions(&outcome.result);
+        assert!(
+            actions.contains(&("add-extension".to_string(), "create".to_string())),
+            "must plan add-extension: {actions:?}"
+        );
+
+        let env = load_local(&store);
+        assert_eq!(env.extensions.len(), 1);
+        let ext = &env.extensions[0];
+        assert_eq!(ext.kind.to_string(), "greentic.ext.memory@1.0.0");
+        assert_eq!(ext.pack_ref.as_str(), "builtin:memory-chronicle");
+        assert_eq!(ext.instance_id.as_deref(), Some("default"));
+
+        // Idempotent re-apply.
+        let second = run_apply(&store, &manifest_path).expect("re-apply");
+        assert_eq!(second.result["changed"], 0, "{}", second.result);
+    }
+
+    #[test]
+    fn extension_update_on_pack_ref_change() {
+        let (dir, store) = seeded_store();
+        let v1 = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "extensions": [{
+                "kind": "greentic.ext.memory@1.0.0",
+                "pack_ref": "builtin:memory-v1"
+            }]
+        });
+        let v1_path = write_manifest(dir.path(), &v1);
+        run_apply(&store, &v1_path).expect("first apply");
+
+        let v2 = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "extensions": [{
+                "kind": "greentic.ext.memory@1.0.0",
+                "pack_ref": "builtin:memory-v2"
+            }]
+        });
+        let v2_path = write_manifest(dir.path(), &v2);
+        let plan = run_dry(&store, &v2_path).expect("dry-run");
+        let actions = step_actions(&plan.result);
+        assert!(
+            actions.contains(&("update-extension".to_string(), "update".to_string())),
+            "must plan update-extension: {actions:?}"
+        );
+
+        run_apply(&store, &v2_path).expect("apply update");
+        let env = load_local(&store);
+        assert_eq!(env.extensions[0].pack_ref.as_str(), "builtin:memory-v2");
+        assert!(
+            env.extensions[0].generation > 0,
+            "generation must bump on update"
+        );
+    }
+
+    #[test]
+    fn extension_bad_instance_id_rejected_by_shape() {
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "extensions": [{
+                "kind": "greentic.ext.memory@1.0.0",
+                "pack_ref": "builtin:memory",
+                "instance_id": "BAD_ID!"
+            }]
+        });
+        let loaded: EnvManifest = serde_json::from_value(manifest).unwrap();
+        let err = loaded.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("instance_id"), "got: {err}");
+    }
+
+    #[test]
+    fn extension_duplicate_key_rejected_by_shape() {
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "extensions": [
+                {"kind": "greentic.ext.memory@1.0.0", "pack_ref": "a", "instance_id": "x"},
+                {"kind": "greentic.ext.memory@2.0.0", "pack_ref": "b", "instance_id": "x"},
+            ]
+        });
+        let loaded: EnvManifest = serde_json::from_value(manifest).unwrap();
+        let err = loaded.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "got: {err}");
+    }
+
+    // --- G7: host-config reconcile ---
+
+    #[test]
+    fn host_config_reconcile_then_idempotent() {
+        let (dir, store) = seeded_store();
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {
+                "id": "local",
+                "name": "Local Dev",
+                "region": "eu-west-1",
+                "tenant_org_id": "org-99",
+                "listen_addr": "0.0.0.0:9090"
+            }
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let outcome = run_apply(&store, &manifest_path).expect("host-config apply");
+        let actions = step_actions(&outcome.result);
+        assert!(
+            actions.contains(&("update-host-config".to_string(), "update".to_string()))
+                || actions.contains(&("update-host-config".to_string(), "create".to_string())),
+            "must plan update-host-config: {actions:?}"
+        );
+
+        let env = load_local(&store);
+        assert_eq!(env.name, "Local Dev");
+        assert_eq!(env.host_config.region.as_deref(), Some("eu-west-1"));
+        assert_eq!(env.host_config.tenant_org_id.as_deref(), Some("org-99"));
+        assert_eq!(
+            env.host_config.listen_addr,
+            Some("0.0.0.0:9090".parse().unwrap())
+        );
+
+        // Idempotent re-apply.
+        let second = run_apply(&store, &manifest_path).expect("re-apply");
+        assert_eq!(second.result["changed"], 0, "{}", second.result);
+    }
+
+    #[test]
+    fn host_config_bad_listen_addr_rejected_by_shape() {
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {
+                "id": "local",
+                "listen_addr": "not-an-addr"
+            }
+        });
+        let loaded: EnvManifest = serde_json::from_value(manifest).unwrap();
+        let err = loaded.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("listen_addr"), "got: {err}");
+    }
+
+    // --- G5+G6 ordering ---
+
+    #[test]
+    fn packs_before_secrets_extensions_before_endpoints() {
+        let (dir, store) = seeded_store_with_dev_secrets();
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "deployer",
+                "kind": "greentic.deployer.local@1.0.0",
+                "pack_ref": "builtin:deployer-local"
+            }],
+            "secrets": [{"path": SECRET_PATH, "from_env": "APPLY_ORDER_VAR"}],
+            "bundles": [{"bundle_id": "quickstart", "bundle_path": fixture()}],
+            "extensions": [{
+                "kind": "greentic.ext.memory@1.0.0",
+                "pack_ref": "builtin:memory"
+            }],
+            "messaging_endpoints": [{
+                "name": "bot",
+                "provider_type": "messaging.telegram.bot",
+                "links": ["quickstart"]
+            }]
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let lookup = |_: &str| Some("tok".to_string());
+        let plan =
+            run_with_lookup(&store, &manifest_path, ApplyMode::DryRun, &lookup).expect("dry-run");
+        let steps = plan.result["steps"].as_array().expect("steps");
+        let pos = |kind: &str| {
+            steps
+                .iter()
+                .position(|s| s["kind"] == kind)
+                .unwrap_or_else(|| panic!("no `{kind}` step in {steps:?}"))
+        };
+        assert!(pos("ensure-environment") < pos("add-pack-binding"));
+        assert!(pos("add-pack-binding") < pos("put-secret"));
+        assert!(pos("put-secret") < pos("deploy-bundle"));
+        assert!(pos("deploy-bundle") < pos("add-extension"));
+        assert!(pos("add-extension") < pos("add-endpoint"));
     }
 }
