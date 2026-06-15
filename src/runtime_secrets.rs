@@ -248,7 +248,7 @@ fn active_secrets_provider_pack_stem(provider: Provider) -> Option<&'static str>
 pub fn runtime_secret_env_map_for_cloud(
     _config: &DeployerConfig,
 ) -> Result<BTreeMap<String, String>> {
-    // Cloud runtimes now receive `state/config/platform/secrets-provider.json`.
+    // Cloud runtimes receive `.providers/platform/secrets-provider.json`.
     // Runtime secrets are still resolved and promoted before apply, but they
     // must not be exposed as `GREENTIC_SECRET__...` environment variables.
     Ok(BTreeMap::new())
