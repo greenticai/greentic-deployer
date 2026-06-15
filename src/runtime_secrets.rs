@@ -8,7 +8,7 @@ use std::{
 
 use greentic_secrets_lib::{
     DevStore, GeneratedSecretRequirement, GeneratedSecretScope, SecretsStore, TEAM_PLACEHOLDER,
-    canonical_secret_name, canonical_secret_store_key, normalize_team,
+    canonical_secret_name, canonical_secret_store_key, generated_scope_team, normalize_team,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -177,13 +177,19 @@ pub fn collect_requirements(ctx: &RuntimeSecretContext) -> Result<Vec<RuntimeSec
         let provider_id = provider_id_from_pack_path(pack_path);
         for req in load_secret_requirements_from_pack(pack_path)? {
             let key = canonical_secret_name(&req.key);
-            let uri = canonical_secret_uri(
-                &ctx.environment,
-                &ctx.tenant,
-                ctx.team.as_deref(),
-                &provider_id,
-                &key,
-            );
+            let generated = req
+                .generated
+                .as_ref()
+                .map(AssetGeneratedSecret::to_requirement);
+            // A system-generated secret is minted under the team its scope
+            // resolves to (`generated_scope_team`) — NOT the context team — so
+            // the deployer reads/promotes it from exactly where the runtime
+            // seeded it. Operator-supplied secrets stay on the context team.
+            let team = match &generated {
+                Some(generated) => generated_scope_team(generated, ctx.team.as_deref()),
+                None => ctx.team.as_deref(),
+            };
+            let uri = canonical_secret_uri(&ctx.environment, &ctx.tenant, team, &provider_id, &key);
             let aliases = req
                 .aliases
                 .iter()
@@ -198,10 +204,7 @@ pub fn collect_requirements(ctx: &RuntimeSecretContext) -> Result<Vec<RuntimeSec
                     required: req.required,
                     default_value: req.default_value,
                     aliases,
-                    generated: req
-                        .generated
-                        .as_ref()
-                        .map(AssetGeneratedSecret::to_requirement),
+                    generated,
                     source: pack_path.clone(),
                 });
         }
@@ -359,13 +362,19 @@ pub async fn resolve_runtime_secrets(
         let mut checked_sources = Vec::new();
         // Candidate store URIs: the primary, then any aliases (a value seeded
         // under a legacy/aliased name still satisfies the requirement, mirroring
-        // greentic-start). Alias URIs share the requirement's provider/scope.
+        // greentic-start). Alias URIs must share the primary's resolved scope:
+        // a generated secret lives under `generated_scope_team`, not the context
+        // team (the same derivation `collect_requirements` used for the primary).
+        let team = match &requirement.generated {
+            Some(generated) => generated_scope_team(generated, ctx.team.as_deref()),
+            None => ctx.team.as_deref(),
+        };
         let candidate_uris: Vec<String> = std::iter::once(requirement.uri.clone())
             .chain(requirement.aliases.iter().map(|alias| {
                 canonical_secret_uri(
                     &ctx.environment,
                     &ctx.tenant,
-                    ctx.team.as_deref(),
+                    team,
                     &requirement.provider_id,
                     alias,
                 )
@@ -1387,5 +1396,71 @@ questions:
         assert_eq!(generated.encoding, "raw_text");
         assert_eq!(generated.scope.level, "tenant");
         assert_eq!(generated.scope.team.as_deref(), Some("_"));
+    }
+
+    #[tokio::test]
+    async fn generated_secret_resolves_from_its_declared_team_scope() {
+        // A generated secret explicitly scoped to a real team is minted by the
+        // runtime under that team (`generated_scope_team`), not the context
+        // team (`_`). The deployer must derive the SAME team for both the
+        // primary URI and the alias candidate URIs, or it searches `_` and
+        // misses the value — the cloud-promotion gap this consolidation closes.
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_root = dir.path();
+        let pack_dir = bundle_root.join("packs/messaging-webex/assets");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("secret-requirements.json"),
+            r#"[{"key":"webex_webhook_secret","aliases":["legacy_webhook"],"required":true,"generated":{"policy":"random","length":20,"encoding":"raw_text","scope":{"level":"team","team":"legal"}}}]"#,
+        )
+        .unwrap();
+
+        let ctx = RuntimeSecretContext {
+            bundle_root: bundle_root.to_path_buf(),
+            pack_paths: vec![bundle_root.join("packs/messaging-webex")],
+            environment: "dev".into(),
+            tenant: "demo".into(),
+            team: None,
+        };
+        let reqs = collect_requirements(&ctx).unwrap();
+        assert_eq!(reqs.len(), 1);
+        // Primary URI is scoped to the declared team `legal`, not `_`.
+        assert!(
+            reqs[0].uri.starts_with("secrets://dev/demo/legal/"),
+            "generated secret must be team-scoped, got {}",
+            reqs[0].uri,
+        );
+
+        // Seed the value under the *alias* at the same team scope; resolution
+        // must find it via the team-scoped alias candidate URI.
+        let alias_uri = canonical_secret_uri(
+            "dev",
+            "demo",
+            Some("legal"),
+            &reqs[0].provider_id,
+            "legacy_webhook",
+        );
+        let store_path = bundle_root.join(".greentic/state/dev/.dev.secrets.env");
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        {
+            let store = DevStore::with_path(&store_path).unwrap();
+            store
+                .put(
+                    &alias_uri,
+                    greentic_secrets_lib::SecretFormat::Text,
+                    b"team-scoped-value",
+                )
+                .await
+                .unwrap();
+        }
+
+        let resolution = resolve_runtime_secrets(&ctx, &reqs).await;
+        assert!(
+            resolution.missing.is_empty(),
+            "team-scoped alias value must resolve: {:?}",
+            resolution.missing,
+        );
+        assert_eq!(resolution.resolved.len(), 1);
+        assert_eq!(resolution.resolved[0].value.expose(), "team-scoped-value");
     }
 }

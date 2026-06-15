@@ -339,7 +339,16 @@ pub(super) fn validate_dev_store_secret_path(rel_path: &str) -> Result<(), OpErr
 /// deployer's resolver use — so the predicate can't drift from the
 /// transformation it guards.
 fn is_canonical_team(team: &str) -> bool {
-    greentic_secrets_lib::normalize_team(Some(team)).as_deref() == Some(team)
+    // `normalize_team` returns `None` for the team-less cases (`default`,
+    // empty, whitespace, AND the `_` placeholder itself). The canonical
+    // string form of a team-less segment is `TEAM_PLACEHOLDER` (`_`), so a
+    // segment is store-canonical iff it equals its normalization rendered
+    // back through that placeholder — this accepts `_` (and real team names)
+    // while still rejecting `default`/empty.
+    greentic_secrets_lib::normalize_team(Some(team))
+        .as_deref()
+        .unwrap_or(greentic_secrets_lib::TEAM_PLACEHOLDER)
+        == team
 }
 
 fn is_canonical_secret_name(name: &str) -> bool {
@@ -654,6 +663,23 @@ mod tests {
                 "team `{team}` got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn canonical_team_accepts_placeholder_and_real_teams() {
+        // The `_` placeholder IS the canonical team-less segment. Routing the
+        // validator through the lib's `normalize_team` (which returns `None`
+        // for `_`) must not make the documented `default/_/...` path
+        // unwritable — regression for the secrets-lib consolidation.
+        assert!(
+            is_canonical_team("_"),
+            "`_` is the canonical team-less segment"
+        );
+        assert!(is_canonical_team("legal"), "a real team name is canonical");
+        assert!(!is_canonical_team("default"));
+        assert!(!is_canonical_team("Default"));
+        assert!(!is_canonical_team(""));
+        assert!(!is_canonical_team(" _ "));
     }
 
     #[test]
