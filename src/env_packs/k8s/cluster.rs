@@ -95,6 +95,17 @@ pub enum K8sClusterError {
     /// The Kubernetes API rejected the call.
     #[error("Kubernetes API error: {0}")]
     Api(String),
+    /// Refusing to overwrite an object owned by a different environment.
+    #[error(
+        "refusing to apply `{object}` in namespace `{namespace}`: \
+         it is owned by env `{existing_env}` but this apply belongs to env `{incoming_env}`"
+    )]
+    OwnershipConflict {
+        object: String,
+        namespace: String,
+        existing_env: String,
+        incoming_env: String,
+    },
 }
 
 /// Declarative mutation surface against one cluster.

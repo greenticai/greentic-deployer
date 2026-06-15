@@ -11,13 +11,16 @@
 //!   client: `SelfSubjectReview` for identity, one
 //!   `SelfSubjectAccessReview` per validated operation, in request order.
 //!
-//! Construction is explicit ([`connect`]): a kubeconfig-context override
-//! (the wizard's `kubeconfig_context` answer — a client-targeting knob,
-//! deliberately not a manifest input) or ambient inference (kubeconfig
-//! current-context, then in-cluster service account). The handler default
-//! stays [`UnconfiguredCluster`](super::cluster::UnconfiguredCluster) —
-//! reading the binding's answer and binding a connected client to verb
-//! dispatch is the PR-5.3 orchestration wiring.
+//! Construction is explicit ([`connect`]): the deployer authenticates as
+//! its **bound ServiceAccount credential** when `bound_token` is
+//! provided, overriding the resolved kubeconfig/in-cluster context's auth
+//! while keeping that context's endpoint + CA.  `kubeconfig_context`
+//! selects which context supplies endpoint/CA; passing `None` for
+//! `bound_token` falls back to the ambient context identity (dev /
+//! in-cluster).  Resolving `Environment.credentials_ref` into a token is
+//! the caller's job in the PR-5.3 orchestration wiring.  The handler
+//! default stays
+//! [`UnconfiguredCluster`](super::cluster::UnconfiguredCluster).
 //!
 //! Resource routing is a **closed table** ([`api_route_for`]) covering
 //! exactly the kinds [`super::manifests`] renders. Kubernetes plurals are
@@ -46,16 +49,28 @@ use super::credentials::{
 /// they set.
 pub const FIELD_MANAGER: &str = "greentic-deployer";
 
-/// Build a typed client from the operator's ambient Kubernetes access.
+/// Build a typed client from the operator's Kubernetes access.
 ///
-/// `kubeconfig_context` is the binding's wizard answer: `Some` selects
-/// that named kubeconfig context; `None` infers (kubeconfig
-/// current-context first, in-cluster service account second — kube-rs
-/// `Config::infer` semantics). All failures fold into
-/// [`K8sClientError::NoClusterAccess`] — the operator's fix path is the
-/// same regardless (fix kubeconfig / cluster access).
-pub async fn connect(kubeconfig_context: Option<&str>) -> Result<kube::Client, K8sClientError> {
-    let config = match kubeconfig_context {
+/// `kubeconfig_context` selects which kubeconfig context supplies the
+/// endpoint + CA: `Some` picks that named context; `None` infers
+/// (kubeconfig current-context first, in-cluster service account
+/// second — kube-rs `Config::infer` semantics).
+///
+/// `bound_token`, when `Some`, **overrides** the resolved context's auth
+/// with the deployer's bound ServiceAccount credential (keeping the
+/// context's endpoint + CA).  This is the correct-by-construction seam:
+/// credential *resolution* (`Environment.credentials_ref` → token) stays
+/// caller-side in the PR-5.3 orchestration wiring; passing `None` falls
+/// back to the ambient context identity (dev / in-cluster).
+///
+/// All failures fold into [`K8sClientError::NoClusterAccess`] — the
+/// operator's fix path is the same regardless (fix kubeconfig / cluster
+/// access).
+pub async fn connect(
+    kubeconfig_context: Option<&str>,
+    bound_token: Option<&str>,
+) -> Result<kube::Client, K8sClientError> {
+    let mut config = match kubeconfig_context {
         Some(context) => kube::Config::from_kubeconfig(&KubeConfigOptions {
             context: Some(context.to_string()),
             ..Default::default()
@@ -68,7 +83,18 @@ pub async fn connect(kubeconfig_context: Option<&str>) -> Result<kube::Client, K
             .await
             .map_err(|e| K8sClientError::NoClusterAccess(e.to_string()))?,
     };
+    apply_bound_token(&mut config, bound_token);
     kube::Client::try_from(config).map_err(|e| K8sClientError::NoClusterAccess(e.to_string()))
+}
+
+/// Override the resolved config's auth with a bound ServiceAccount token.
+///
+/// Pure helper — unit-testable without a live cluster.  When `token` is
+/// `None` the config is left unchanged (ambient identity fallback).
+fn apply_bound_token(config: &mut kube::Config, token: Option<&str>) {
+    if let Some(tok) = token {
+        config.auth_info.token = Some(tok.into());
+    }
 }
 
 /// Whether a kind lives in a namespace or at cluster scope.
@@ -180,10 +206,47 @@ impl std::fmt::Debug for KubeCluster {
     }
 }
 
+/// The label key every rendered manifest carries to identify the owning
+/// environment.  Used by the ownership guard in [`KubeCluster::apply`].
+const ENV_LABEL: &str = "greentic.ai/env";
+
+/// JSON Pointer for the env label inside a manifest's `metadata.labels`.
+/// The `/` in the label key is escaped as `~1` per RFC 6901.
+const ENV_LABEL_POINTER: &str = "/metadata/labels/greentic.ai~1env";
+
 #[async_trait]
 impl K8sCluster for KubeCluster {
     async fn apply(&self, manifest: &Value) -> Result<(), K8sClusterError> {
         let (api, name) = self.api_for(manifest)?;
+        let incoming_env = manifest.pointer(ENV_LABEL_POINTER).and_then(Value::as_str);
+
+        // Ownership guard: if an object already exists and carries a
+        // different env label, refuse the apply — two envs sharing a
+        // namespace with fixed env-level names (gtc-router,
+        // gtc-runtime-config) would clobber each other otherwise.
+        if let Some(existing) = api.get_opt(&name).await.map_err(map_cluster_error)? {
+            let existing_env = existing
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(ENV_LABEL))
+                .map(String::as_str);
+            if let (Some(inc), Some(ext)) = (incoming_env, existing_env)
+                && inc != ext
+            {
+                let namespace = manifest
+                    .pointer("/metadata/namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<cluster-scoped>");
+                return Err(K8sClusterError::OwnershipConflict {
+                    object: name,
+                    namespace: namespace.to_string(),
+                    existing_env: ext.to_string(),
+                    incoming_env: inc.to_string(),
+                });
+            }
+        }
+
         // Server-side apply IS the trait's upsert contract: same manifest
         // twice succeeds twice and converges. Forced — the deployer owns
         // every field it renders.
@@ -359,8 +422,24 @@ mod tests {
         json!({
             "apiVersion": "apps/v1",
             "kind": "Deployment",
-            "metadata": {"name": "gtc-worker-a", "namespace": "gtc-zain"},
+            "metadata": {
+                "name": "gtc-worker-a",
+                "namespace": "gtc-zain",
+                "labels": {"greentic.ai/env": "gtc-zain"},
+            },
             "spec": {"replicas": 1},
+        })
+    }
+
+    /// 404 Status body — `get_opt` interprets this as `Ok(None)`.
+    fn not_found_status() -> Value {
+        json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Failure",
+            "code": 404,
+            "reason": "NotFound",
+            "message": "not found",
         })
     }
 
@@ -370,10 +449,13 @@ mod tests {
         let cluster = KubeCluster::new(client);
         let manifest = deployment_manifest();
 
-        let (result, request) = tokio::join!(
-            cluster.apply(&manifest),
-            respond_json(&mut handle, 200, manifest.clone()),
-        );
+        let respond = async {
+            // GET (ownership check) → 404
+            let _get = respond_json(&mut handle, 404, not_found_status()).await;
+            // PATCH (server-side apply)
+            respond_json(&mut handle, 200, manifest.clone()).await
+        };
+        let (result, request) = tokio::join!(cluster.apply(&manifest), respond);
         result.unwrap();
 
         assert_eq!(request.method(), http::Method::PATCH);
@@ -413,10 +495,11 @@ mod tests {
             "metadata": {"name": "gtc-zain"},
         });
 
-        let (result, request) = tokio::join!(
-            cluster.apply(&manifest),
-            respond_json(&mut handle, 200, manifest.clone()),
-        );
+        let respond = async {
+            let _get = respond_json(&mut handle, 404, not_found_status()).await;
+            respond_json(&mut handle, 200, manifest.clone()).await
+        };
+        let (result, request) = tokio::join!(cluster.apply(&manifest), respond);
         result.unwrap();
         assert_eq!(request.uri().path(), "/api/v1/namespaces/gtc-zain");
     }
@@ -431,10 +514,11 @@ mod tests {
             "kind": "NetworkPolicy",
             "metadata": {"name": "deny-all", "namespace": "gtc-zain"},
         });
-        let (result, request) = tokio::join!(
-            cluster.apply(&netpol),
-            respond_json(&mut handle, 200, netpol.clone()),
-        );
+        let respond = async {
+            let _get = respond_json(&mut handle, 404, not_found_status()).await;
+            respond_json(&mut handle, 200, netpol.clone()).await
+        };
+        let (result, request) = tokio::join!(cluster.apply(&netpol), respond);
         result.unwrap();
         assert_eq!(
             request.uri().path(),
@@ -446,10 +530,11 @@ mod tests {
             "kind": "PodDisruptionBudget",
             "metadata": {"name": "router", "namespace": "gtc-zain"},
         });
-        let (result, request) = tokio::join!(
-            cluster.apply(&pdb),
-            respond_json(&mut handle, 200, pdb.clone()),
-        );
+        let respond = async {
+            let _get = respond_json(&mut handle, 404, not_found_status()).await;
+            respond_json(&mut handle, 200, pdb.clone()).await
+        };
+        let (result, request) = tokio::join!(cluster.apply(&pdb), respond);
         result.unwrap();
         assert_eq!(
             request.uri().path(),
@@ -755,5 +840,88 @@ mod tests {
             decisions[0].decision,
             AccessDecision::Denied("no reason supplied".to_string())
         );
+    }
+
+    // ── apply_bound_token ──────────────────────────────────────────
+
+    #[test]
+    fn apply_bound_token_sets_token_when_some() {
+        let mut cfg = kube::Config::new("https://example.invalid/".parse().unwrap());
+        assert!(cfg.auth_info.token.is_none());
+        apply_bound_token(&mut cfg, Some("tok"));
+        assert!(cfg.auth_info.token.is_some());
+    }
+
+    #[test]
+    fn apply_bound_token_leaves_none_when_none() {
+        let mut cfg = kube::Config::new("https://example.invalid/".parse().unwrap());
+        apply_bound_token(&mut cfg, None);
+        assert!(cfg.auth_info.token.is_none());
+    }
+
+    // ── ownership guard ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn apply_rejects_a_foreign_owned_object() {
+        let (client, mut handle) = mock_client();
+        let cluster = KubeCluster::new(client);
+        let manifest = deployment_manifest(); // env label = "gtc-zain"
+
+        // Existing object belongs to a different env.
+        let existing = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "gtc-worker-a",
+                "namespace": "gtc-zain",
+                "labels": {"greentic.ai/env": "other-env"},
+            },
+        });
+
+        let respond = async {
+            // GET returns the foreign-owned object.
+            respond_json(&mut handle, 200, existing).await
+            // No PATCH must follow — the guard rejects before patching.
+        };
+        let (result, _get_request) = tokio::join!(cluster.apply(&manifest), respond);
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                K8sClusterError::OwnershipConflict {
+                    ref existing_env,
+                    ref incoming_env,
+                    ..
+                } if existing_env == "other-env" && incoming_env == "gtc-zain"
+            ),
+            "expected OwnershipConflict, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_proceeds_when_existing_object_is_same_env() {
+        let (client, mut handle) = mock_client();
+        let cluster = KubeCluster::new(client);
+        let manifest = deployment_manifest(); // env label = "gtc-zain"
+
+        // Existing object has the SAME env label.
+        let existing = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "gtc-worker-a",
+                "namespace": "gtc-zain",
+                "labels": {"greentic.ai/env": "gtc-zain"},
+            },
+        });
+
+        let respond = async {
+            let _get = respond_json(&mut handle, 200, existing).await;
+            respond_json(&mut handle, 200, manifest.clone()).await
+        };
+        let (result, patch_request) = tokio::join!(cluster.apply(&manifest), respond);
+        result.unwrap();
+        // The PATCH was actually sent.
+        assert_eq!(patch_request.method(), http::Method::PATCH);
     }
 }

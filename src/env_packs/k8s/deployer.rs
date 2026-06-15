@@ -83,6 +83,12 @@ impl Deployer for K8sDeployerHandler {
         let params = K8sParams::for_env(env);
         self.apply_all(&render_worker_manifests(env, revision, &params))
             .await?;
+        // warm returns once the API server has accepted the worker manifests.
+        // The live-cluster readiness wait (observed `.status.observedGeneration`
+        // + available replicas + the per-revision `/healthz/<revision_id>`
+        // probe before the revision is promoted Warming → Ready) rides PR-5.3
+        // alongside Deployer-verb dispatch and the RevisionHealthGate seam —
+        // it is intentionally NOT performed inside the upsert primitive.
         Ok(WarmOutcome::default())
     }
 
