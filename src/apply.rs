@@ -1989,14 +1989,21 @@ fn materialize_secrets_provider_binding(config: &DeployerConfig, deploy_dir: &Pa
     let Some(binding) = secrets_provider_binding_for_target(config) else {
         return Ok(());
     };
-    let path = deploy_dir.join(SECRETS_PROVIDER_BINDING_RELATIVE_PATH);
+    let bytes =
+        serde_json::to_vec_pretty(&binding).map_err(|err| DeployerError::Other(err.to_string()))?;
+    write_secrets_provider_binding(deploy_dir, &bytes)?;
+    if let Some(bundle_root) = config.bundle_root.as_deref() {
+        write_secrets_provider_binding(bundle_root, &bytes)?;
+    }
+    Ok(())
+}
+
+fn write_secrets_provider_binding(root: &Path, bytes: &[u8]) -> Result<()> {
+    let path = root.join(SECRETS_PROVIDER_BINDING_RELATIVE_PATH);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(&binding).map_err(|err| DeployerError::Other(err.to_string()))?,
-    )?;
+    fs::write(path, bytes)?;
     Ok(())
 }
 
@@ -5357,6 +5364,68 @@ kind: Deployment
         let note = std::fs::read_to_string(artifacts.deploy_dir.join("terraform-handoff.txt"))
             .expect("read terraform handoff note");
         assert!(note.contains("secrets_provider_binding="));
+    }
+
+    #[test]
+    fn materializes_cloud_secrets_provider_binding_into_runtime_bundle_root() {
+        let base = std::env::current_dir()
+            .expect("cwd")
+            .join("target/tmp-tests");
+        std::fs::create_dir_all(&base).expect("create tmp base");
+        let dir = tempfile::tempdir_in(base).expect("temp dir");
+        let bundle_root = dir.path().join("bundle");
+        let deploy_dir = dir.path().join("deploy");
+        std::fs::create_dir_all(&bundle_root).expect("create bundle root");
+        std::fs::create_dir_all(&deploy_dir).expect("create deploy dir");
+        let pack_path = bundle_root.join("packs/app.gtpack");
+        std::fs::create_dir_all(pack_path.parent().unwrap()).expect("create packs dir");
+
+        let cases = [
+            (
+                Provider::Aws,
+                "greentic.secrets.aws-sm",
+                "providers/secrets/aws-sm.gtpack",
+            ),
+            (
+                Provider::Gcp,
+                "greentic.secrets.gcp-sm",
+                "providers/secrets/gcp-sm.gtpack",
+            ),
+            (
+                Provider::Azure,
+                "greentic.secrets.azure-kv",
+                "providers/secrets/azure-kv.gtpack",
+            ),
+        ];
+
+        for (provider, expected_provider_id, expected_pack) in cases {
+            let target_deploy_dir = deploy_dir.join(provider.as_str());
+            std::fs::create_dir_all(&target_deploy_dir).expect("create target deploy dir");
+            let config = DeployerConfig {
+                provider,
+                tenant: "demo".into(),
+                environment: "dev".into(),
+                pack_path: pack_path.clone(),
+                bundle_root: Some(bundle_root.clone()),
+                ..config_for(pack_path.clone(), DeployerCapability::Plan)
+            };
+
+            materialize_secrets_provider_binding(&config, &target_deploy_dir)
+                .expect("materialize secrets provider binding");
+
+            for root in [&target_deploy_dir, &bundle_root] {
+                let binding_path = root.join(SECRETS_PROVIDER_BINDING_RELATIVE_PATH);
+                let binding: SecretsProviderBinding =
+                    serde_json::from_slice(&std::fs::read(&binding_path).expect("read binding"))
+                        .expect("parse binding");
+                assert_eq!(binding.provider_id, expected_provider_id);
+                assert_eq!(binding.pack, expected_pack);
+                assert_eq!(
+                    binding.config.get("namespace_prefix").map(String::as_str),
+                    Some("greentic/dev/demo/_")
+                );
+            }
+        }
     }
 
     #[test]
