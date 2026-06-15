@@ -3,13 +3,12 @@
 //! Fills the two pluggable seams the scaffold (PR-5.0) defined, one type
 //! per seam:
 //!
-//! - [`KubeCluster`] — [`K8sCluster`](super::cluster::K8sCluster) over a
-//!   typed [`kube::Client`]: declarative **server-side apply** (field
-//!   manager [`FIELD_MANAGER`], forced) and idempotent delete (404 ⇒
-//!   `Ok`, honoring the retried-`archive_revision` contract).
-//! - [`KubeValidatorClient`] —
-//!   [`K8sValidatorClient`](super::credentials::K8sValidatorClient) over
-//!   the same client: `SelfSubjectReview` for identity, one
+//! - [`KubeCluster`] — [`K8sCluster`] over a typed [`kube::Client`]:
+//!   declarative **server-side apply** (field manager [`FIELD_MANAGER`],
+//!   forced) and idempotent delete (404 ⇒ `Ok`, honoring the
+//!   retried-`archive_revision` contract).
+//! - [`KubeValidatorClient`] — [`K8sValidatorClient`] over the same
+//!   client: `SelfSubjectReview` for identity, one
 //!   `SelfSubjectAccessReview` per validated operation, in request order.
 //!
 //! Construction is explicit ([`connect`]): a kubeconfig-context override

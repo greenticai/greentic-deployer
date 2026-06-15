@@ -138,10 +138,11 @@ impl EnvPackHandler for K8sDeployerHandler {
     }
 
     fn preflight(&self) -> Vec<ToolCheck> {
-        // Cluster mutation goes through the typed API seam, not a
-        // `kubectl` shell-out (plan §6 step 9), so no external tool is
-        // mandatory. If the apply PR adds an optional kubectl fallback
-        // adapter, its ToolCheck surfaces here.
+        // Cluster mutation goes through the typed API seam
+        // ([`kube_client::KubeCluster`]), not a `kubectl` shell-out
+        // (plan §6 step 9), so no external tool is mandatory. If a later
+        // PR adds an optional kubectl fallback adapter, its ToolCheck
+        // surfaces here.
         Vec::new()
     }
 
