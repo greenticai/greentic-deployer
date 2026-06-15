@@ -2385,6 +2385,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "greentic-config-types",
+ "greentic-secrets-spec",
  "greentic-types",
  "hex",
  "http 1.4.2",

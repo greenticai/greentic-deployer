@@ -17,7 +17,12 @@ use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
 
-const SECRET_SCHEME: &str = "secret://";
+// `SecretRef` and its parse error now live in `greentic-secrets-spec` so the
+// whole ecosystem shares one definition of the `secret://` scheme and one
+// authoritative `secret://` <-> `secrets://` converter. Re-exported here so the
+// deploy-spec object model (and its public API) are unchanged.
+pub use greentic_secrets_spec::{SecretRef, SecretRefParseError};
+
 const RUNTIME_SCHEME: &str = "runtime://";
 const EXTENSION_SCHEME: &str = "ext://";
 
@@ -98,11 +103,6 @@ macro_rules! uri_ref {
         }
     };
 }
-
-uri_ref!(
-    /// Reference into the env's secrets env-pack: `secret://<env>/<path>`.
-    SecretRef, SecretRefParseError, SECRET_SCHEME
-);
 
 uri_ref!(
     /// Reference into [`EnvironmentRuntime::discovered`](crate::EnvironmentRuntime):
@@ -242,16 +242,6 @@ pub enum ExtensionRefParseError {
     EmptyInstance,
     #[error("extension-ref instance id contains invalid character `{0}`")]
     InvalidInstanceChar(char),
-}
-
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum SecretRefParseError {
-    #[error("secret-ref must start with `secret://`")]
-    MissingScheme,
-    #[error("secret-ref path is empty")]
-    EmptyPath,
-    #[error("secret-ref must carry an env segment: `secret://<env>/<path>`")]
-    EmptyEnvSegment,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
