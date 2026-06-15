@@ -106,9 +106,13 @@ pub struct ManifestSecret {
     /// Dev-store path `<tenant>/<team>/<pack>/<name>` — exactly the
     /// `SecretsPutPayload.path` shape.
     pub path: String,
-    /// Name of the environment variable holding the value. Secret VALUES
-    /// never appear in the manifest.
-    pub from_env: String,
+    /// Name of the environment variable holding the value — apply reads
+    /// `$from_env` at apply time. Absent ⇒ the value is supplied
+    /// interactively (a masked paste prompt) and read back from the env's
+    /// secrets store on re-apply. Secret VALUES never appear in the manifest
+    /// either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_env: Option<String>,
 }
 
 /// One env-pack binding: a core capability slot bound to a pack descriptor.
@@ -348,9 +352,12 @@ impl EnvManifest {
                      (order-dependent last-write-wins is never what you want)"
                 )));
             }
-            if s.from_env.trim().is_empty() {
+            if let Some(from_env) = &s.from_env
+                && from_env.trim().is_empty()
+            {
                 return Err(OpError::InvalidArgument(format!(
-                    "secret `{rel_path}`: from_env must name an environment variable"
+                    "secret `{rel_path}`: from_env, when present, must name an environment \
+                     variable — omit it entirely for a pasted (interactively-supplied) secret"
                 )));
             }
         }
@@ -663,11 +670,11 @@ pub fn manifest_schema() -> Value {
                 "description": "dev-store secret entries; always-put (values cannot be diffed until A9)",
                 "items": {
                     "type": "object",
-                    "required": ["path", "from_env"],
+                    "required": ["path"],
                     "additionalProperties": false,
                     "properties": {
                         "path": {"type": "string", "description": "<tenant>/<team>/<pack>/<name>"},
-                        "from_env": {"type": "string", "description": "env var holding the value; values never appear in the manifest"}
+                        "from_env": {"type": "string", "description": "env var holding the value; omit for a pasted (interactively-supplied) secret. Values never appear in the manifest either way"}
                     }
                 }
             },
@@ -856,10 +863,43 @@ pub fn manifest_form_spec() -> FormSpec {
         "secrets",
         QuestionType::List,
         "Secrets",
-        "Dev-store secret entries. Each names the environment VARIABLE \
-         holding the value — values never go into a manifest.",
+        "Dev-store secret entries. Each secret's value comes either from a \
+         named environment variable or from a value you paste in — values \
+         never go into a manifest.",
         false,
     );
+    // Not `required`: a sensible default of `env` keeps older answer rows
+    // (which only carried `from_env`) valid, and drives the prompt default.
+    let mut secret_source = question(
+        "source",
+        QuestionType::Enum,
+        "Secret source",
+        "`env` reads the value from a named environment variable at apply \
+         time; `paste` lets you enter the value interactively — it is stored \
+         in the env's secrets store, never in the manifest.",
+        false,
+    );
+    secret_source.choices = Some(vec!["env".to_string(), "paste".to_string()]);
+    secret_source.default_value = Some("env".to_string());
+
+    let mut secret_from_env = question(
+        "from_env",
+        QuestionType::String,
+        "Environment variable name",
+        "Name of the variable holding the secret value (e.g. \
+         TELEGRAM_BOT_TOKEN) — the name, never the value. Required when the \
+         source is `env`.",
+        false,
+    );
+    secret_from_env.visible_if = Some(Expr::Eq {
+        left: Box::new(Expr::Var {
+            path: "source".to_string(),
+        }),
+        right: Box::new(Expr::Literal {
+            value: Value::String("env".to_string()),
+        }),
+    });
+
     secrets.list = Some(ListSpec {
         min_items: None,
         max_items: None,
@@ -872,14 +912,8 @@ pub fn manifest_form_spec() -> FormSpec {
                  default/_/messaging-telegram/telegram_bot_token",
                 true,
             ),
-            question(
-                "from_env",
-                QuestionType::String,
-                "Environment variable name",
-                "Name of the variable holding the secret value (e.g. \
-                 TELEGRAM_BOT_TOKEN) — the name, never the value.",
-                true,
-            ),
+            secret_source,
+            secret_from_env,
         ],
         item_label: Some("secret".to_string()),
     });
@@ -1180,10 +1214,21 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
     let mut secrets = Vec::new();
     for (idx, row) in rows(map, "secrets")?.iter().enumerate() {
         let row = row_object("secrets", idx, row)?;
-        secrets.push(ManifestSecret {
-            path: req_row_string("secrets", idx, row, "path")?,
-            from_env: req_row_string("secrets", idx, row, "from_env")?,
-        });
+        let path = req_row_string("secrets", idx, row, "path")?;
+        // `source` selects where the value comes from. Defaulting to `env`
+        // keeps older answer rows (which only carried `from_env`) working.
+        let source =
+            opt_row_string("secrets", idx, row, "source")?.unwrap_or_else(|| "env".to_string());
+        let from_env = match source.as_str() {
+            "env" => Some(req_row_string("secrets", idx, row, "from_env")?),
+            "paste" => None,
+            other => {
+                return Err(OpError::InvalidArgument(format!(
+                    "answers: secrets[{idx}]: source must be `env` or `paste`, got `{other}`"
+                )));
+            }
+        };
+        secrets.push(ManifestSecret { path, from_env });
     }
 
     let mut bundles = Vec::new();
@@ -1482,6 +1527,118 @@ mod tests {
     }
 
     #[test]
+    fn paste_secret_omits_from_env_and_validates() {
+        // A paste-sourced secret carries no `from_env`; validate_shape accepts
+        // it and serialization omits the field (no plaintext, no empty key).
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "secrets": [{"path": "legal/_/p/tok"}]
+        }))
+        .unwrap();
+        manifest
+            .validate_shape()
+            .expect("paste secret is shape-valid");
+        assert_eq!(manifest.secrets[0].from_env, None);
+        let json = serde_json::to_value(&manifest).unwrap();
+        assert!(
+            json["secrets"][0].get("from_env").is_none(),
+            "absent from_env is omitted, not serialized as null"
+        );
+    }
+
+    #[test]
+    fn answers_to_manifest_maps_secret_source() {
+        // `source: env` keeps `from_env`.
+        let env_set = answers(serde_json::json!({
+            "environment_id": "local",
+            "secrets": [{"path": "legal/_/p/tok", "source": "env", "from_env": "LEGAL_TOK"}]
+        }));
+        assert_eq!(
+            answers_to_manifest(&env_set).unwrap().secrets[0]
+                .from_env
+                .as_deref(),
+            Some("LEGAL_TOK")
+        );
+
+        // `source: paste` drops `from_env`.
+        let paste_set = answers(serde_json::json!({
+            "environment_id": "local",
+            "secrets": [{"path": "legal/_/p/tok", "source": "paste"}]
+        }));
+        assert_eq!(
+            answers_to_manifest(&paste_set).unwrap().secrets[0].from_env,
+            None
+        );
+
+        // No `source` defaults to `env` (back-compat with older answer rows).
+        let legacy_set = answers(serde_json::json!({
+            "environment_id": "local",
+            "secrets": [{"path": "legal/_/p/tok", "from_env": "LEGACY"}]
+        }));
+        assert_eq!(
+            answers_to_manifest(&legacy_set).unwrap().secrets[0]
+                .from_env
+                .as_deref(),
+            Some("LEGACY")
+        );
+
+        // An unknown source is a clear error, not a silent default.
+        let bad_set = answers(serde_json::json!({
+            "environment_id": "local",
+            "secrets": [{"path": "legal/_/p/tok", "source": "vault"}]
+        }));
+        let err = answers_to_manifest(&bad_set).unwrap_err();
+        assert!(err.to_string().contains("source must be"), "{err}");
+    }
+
+    #[test]
+    fn form_spec_secrets_models_env_or_paste() {
+        let spec = manifest_form_spec();
+        let secrets = spec
+            .questions
+            .iter()
+            .find(|q| q.id == "secrets")
+            .expect("secrets question");
+        let list = secrets.list.as_ref().expect("secrets is a list");
+
+        let source = list
+            .fields
+            .iter()
+            .find(|f| f.id == "source")
+            .expect("source column");
+        assert_eq!(source.kind, QuestionType::Enum);
+        assert_eq!(
+            source.choices.as_deref(),
+            Some(&["env".to_string(), "paste".to_string()][..])
+        );
+        assert_eq!(source.default_value.as_deref(), Some("env"));
+        assert!(!source.required, "source defaults to env, never required");
+
+        let from_env = list
+            .fields
+            .iter()
+            .find(|f| f.id == "from_env")
+            .expect("from_env column");
+        assert!(
+            !from_env.required,
+            "from_env is needed only for env-sourced secrets"
+        );
+        assert_eq!(
+            from_env.visible_if,
+            Some(Expr::Eq {
+                left: Box::new(Expr::Var {
+                    path: "source".to_string()
+                }),
+                right: Box::new(Expr::Literal {
+                    value: Value::String("env".to_string())
+                }),
+            }),
+            "from_env is shown only when source == env"
+        );
+    }
+
+    #[test]
     fn duplicate_bundle_id_rejected() {
         let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
             "schema": ENV_MANIFEST_SCHEMA_V1,
@@ -1724,8 +1881,10 @@ mod tests {
         let expected: BTreeSet<String> = [
             "environment_id",
             "trust_root_bootstrap",
+            // `secrets.from_env` is no longer required (a paste secret omits
+            // it); `secrets.source` defaults to `env`, so it is not required
+            // either.
             "secrets.path",
-            "secrets.from_env",
             "bundles.bundle_id",
             "bundles.bundle_path",
             "messaging_endpoints.name",
@@ -1928,16 +2087,22 @@ mod tests {
              schema leaf to a question (or `\"\"` for constants)"
         );
 
-        let mapped_questions: BTreeSet<String> = FIELD_TO_QUESTION
+        // `secrets.source` is a UI-only discriminator: it selects whether a
+        // secret carries `from_env` (env-sourced) or omits it (paste-sourced).
+        // It drives `secrets[].from_env`'s presence rather than mapping to a
+        // manifest field of its own.
+        const FORM_ONLY_QUESTIONS: &[&str] = &["secrets.source"];
+        let mut mapped_questions: BTreeSet<String> = FIELD_TO_QUESTION
             .iter()
             .filter(|(_, q)| !q.is_empty())
             .map(|(_, q)| q.to_string())
             .collect();
+        mapped_questions.extend(FORM_ONLY_QUESTIONS.iter().map(|q| q.to_string()));
         assert_eq!(
             question_ids(&manifest_form_spec()),
             mapped_questions,
             "form questions and the coverage table drifted — every question \
-             must map to a manifest field"
+             must map to a manifest field (or be a declared form-only discriminator)"
         );
     }
 
@@ -1991,7 +2156,8 @@ mod tests {
         assert_eq!(manifest.trust_root, Some(TrustRootDirective::Bootstrap));
         assert_eq!(manifest.secrets.len(), 1);
         assert_eq!(
-            manifest.secrets[0].from_env, "TELEGRAM_LEGAL_BOT_TOKEN",
+            manifest.secrets[0].from_env.as_deref(),
+            Some("TELEGRAM_LEGAL_BOT_TOKEN"),
             "from_env carries the variable NAME"
         );
         let bundle = &manifest.bundles[0];
@@ -2133,16 +2299,17 @@ mod tests {
 
     #[test]
     fn form_spec_enforces_required_row_fields() {
-        // Guards the row field ids against typos: a secrets row without
-        // `from_env` must fail qa-spec validation (not slide through as an
-        // unknown field).
+        // Guards the row field ids against typos: a secrets row without the
+        // required `path` must fail qa-spec validation (not slide through as
+        // an unknown field). `from_env` is optional now (paste secrets omit
+        // it), so `path` is the row's required field to probe.
         let spec = manifest_form_spec();
         let report = qa_spec::validate(
             &spec,
             &serde_json::json!({
                 "environment_id": "local",
                 "trust_root_bootstrap": false,
-                "secrets": [{"path": "default/_/p/tok"}],
+                "secrets": [{"source": "env", "from_env": "X"}],
                 "bundles": [],
                 "messaging_endpoints": []
             }),
@@ -2152,7 +2319,7 @@ mod tests {
             report
                 .errors
                 .iter()
-                .any(|e| format!("{e:?}").contains("from_env")),
+                .any(|e| format!("{e:?}").contains("path")),
             "missing row field must be reported: {report:?}"
         );
     }

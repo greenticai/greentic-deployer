@@ -410,6 +410,61 @@ pub(super) fn dev_store_put(path: &Path, uri: &str, value: &str) -> Result<(), O
     })
 }
 
+/// Whether the env's dev store already holds a non-empty value at `rel_path`
+/// (`<tenant>/<team>/<pack>/<name>`). `env apply` uses this so a paste-sourced
+/// secret (`from_env` absent) that is already stored is treated as satisfied —
+/// no re-prompt, no missing input — making the store the source of truth for
+/// pasted values across re-applies. A missing store file (fresh env) reads as
+/// `false`.
+pub(super) fn dev_store_has(
+    env_dir: &Path,
+    env_id: &EnvId,
+    rel_path: &str,
+) -> Result<bool, OpError> {
+    let dev_path = resolve_dev_store_path(
+        env_dir,
+        std::env::var_os(DEV_SECRETS_PATH_ENV).map(PathBuf::from),
+    );
+    if !dev_path.exists() {
+        return Ok(false);
+    }
+    let uri = format!(
+        "secrets://{}/{}",
+        env_id.as_str(),
+        rel_path.trim_start_matches('/')
+    );
+    dev_store_contains(&dev_path, &uri)
+}
+
+/// Read one key from a dev store, reporting only presence. Same
+/// dedicated-thread runtime hop as [`dev_store_put`] (the caller may sit on a
+/// current-thread runtime where `block_in_place` panics). A backend `get`
+/// error (missing key / unreadable) maps to `false` — absence, not a hard
+/// failure — so apply re-collects the value rather than aborting.
+fn dev_store_contains(path: &Path, uri: &str) -> Result<bool, OpError> {
+    let io_err = |message: String| OpError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(message),
+    };
+    let store = DevStore::with_path(path.to_path_buf())
+        .map_err(|e| io_err(format!("open dev store: {e}")))?;
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| io_err(format!("build runtime: {e}")))?;
+                let present = rt.block_on(async {
+                    matches!(store.get(uri).await, Ok(bytes) if !bytes.is_empty())
+                });
+                Ok(present)
+            })
+            .join()
+            .expect("dev-store read thread panicked")
+    })
+}
+
 /// Sidecar lock path for a dev store file: the full path with `.lock`
 /// appended (`.dev.secrets.env` → `.dev.secrets.env.lock`). Appending to the
 /// whole path (not just the file name) keeps the directory component intact

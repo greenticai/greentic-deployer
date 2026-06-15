@@ -459,6 +459,9 @@ impl EnvApplyArgs {
             updated_by: self.updated_by,
             yes: self.yes,
             non_interactive: self.non_interactive,
+            // The CLI never pre-collects paste-sourced secrets; an unset value
+            // is prompted (interactive) or reported missing (headless).
+            ..Default::default()
         }
     }
 }
