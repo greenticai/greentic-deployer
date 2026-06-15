@@ -49,14 +49,14 @@ fn ensure_replayed_scaffolds(
     scaffold_root: &Path,
     fixture_dirs: &[PathBuf],
 ) -> Result<()> {
-    let missing_before = missing_replayed_scaffolds(scaffold_root, fixture_dirs)?;
-    if missing_before.is_empty() {
+    let stale_before = stale_replayed_scaffolds(scaffold_root, fixture_dirs)?;
+    if stale_before.is_empty() {
         return Ok(());
     }
 
     eprintln!(
-        "replaying deployer scaffolds before fixture gtpack build; missing: {}",
-        missing_before.join(", ")
+        "replaying deployer scaffolds before fixture gtpack build; stale or missing: {}",
+        stale_before.join(", ")
     );
     run_command(
         "cargo",
@@ -80,6 +80,21 @@ fn ensure_replayed_scaffolds(
     Ok(())
 }
 
+fn stale_replayed_scaffolds(scaffold_root: &Path, fixture_dirs: &[PathBuf]) -> Result<Vec<String>> {
+    let mut stale = Vec::new();
+    for fixture_dir in fixture_dirs {
+        let fixture_name = fixture_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("fixture name missing for {}", fixture_dir.display()))?;
+        let pack_yaml = scaffold_root.join(fixture_name).join("pack.yaml");
+        if !pack_yaml.is_file() || tree_has_newer_file(fixture_dir, &pack_yaml)? {
+            stale.push(fixture_name.to_string());
+        }
+    }
+    Ok(stale)
+}
+
 fn missing_replayed_scaffolds(
     scaffold_root: &Path,
     fixture_dirs: &[PathBuf],
@@ -100,10 +115,15 @@ fn missing_replayed_scaffolds(
 fn ensure_fixture_gtpack(fixture_dir: &Path, pack_root: &Path, output_path: &Path) -> Result<bool> {
     if output_path.is_file() {
         match validate_fixture_gtpack(fixture_dir, output_path) {
-            Ok(()) if !tree_has_newer_file(fixture_dir, output_path)? => return Ok(false),
+            Ok(())
+                if !tree_has_newer_file(fixture_dir, output_path)?
+                    && !tree_has_newer_file(pack_root, output_path)? =>
+            {
+                return Ok(false);
+            }
             Ok(()) => {
                 eprintln!(
-                    "existing fixture gtpack {} is older than fixture sources; rebuilding",
+                    "existing fixture gtpack {} is older than fixture sources or replayed scaffold; rebuilding",
                     output_path.display()
                 );
             }

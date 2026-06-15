@@ -1729,7 +1729,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "0.5.17"
+version = "0.5.18"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1828,9 +1828,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-api"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33b05da6497a5b153592dfa6891db30696e152db755ad31344f867f89d8fd61d"
+checksum = "3b8569128f9d44b9f602f2ff375dbb284abda244ae2d667943002cc7c599f01d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1839,9 +1839,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-core"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "163826dfe0ead6553581d8d09bf74f66479570e7433d005bf1a9b566d9d3de6d"
+checksum = "44abae2d61ac14ed6fecafade1e27b09ce45ae2cf3460b664175dd7cc76ecbb1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1851,7 +1851,7 @@ dependencies = [
  "greentic-secrets-spec",
  "greentic-types",
  "hkdf",
- "lru 0.17.0",
+ "lru 0.18.0",
  "once_cell",
  "rand 0.10.1",
  "reqwest 0.13.4",
@@ -1867,9 +1867,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-lib"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61ae64224552cd7961859c2d04f8a848b268e85dfa0c5e3a3e9c0cbb2656b688"
+checksum = "f00c4293df7d23f40165aeb9ed10b4d01a9f3993c092225e590944781dc3f933"
 dependencies = [
  "async-trait",
  "greentic-secrets-api",
@@ -1881,9 +1881,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-provider-dev"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59bab04dae2096f0a19c72e27173b67b1b9a29c5f6ab6662bdf3698f995e39fb"
+checksum = "ba62880b0245180d741b2e0cc903ec0d07740d87eec7bf81fcde7a7d2e436b8f"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1898,9 +1898,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-spec"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d53eae0820853253dc6760c7c7044ec5d97922200e7abc0a57d363432da0993d"
+checksum = "dea2060c764a1c32e466ee5d49b467bd2eca1e597be8fd3f843aa4f1e9fd0c35"
 dependencies = [
  "async-trait",
  "greentic-types",
@@ -2637,9 +2637,9 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e0b564323a0fb6d54b864f625ae139de9612e27edb944dda37c109f05aac531"
+checksum = "8a860605968fce16869fd239cf4237a82f3ac470723415db603b0e8b6c8d4fb9"
 dependencies = [
  "hashbrown 0.17.1",
 ]
