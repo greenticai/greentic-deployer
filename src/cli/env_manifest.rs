@@ -88,9 +88,18 @@ pub struct ManifestSecret {
 pub struct ManifestBundle {
     /// Natural key — unique within the manifest.
     pub bundle_id: String,
-    /// Local `.gtbundle`. Relative paths resolve against the manifest
-    /// file's directory (not the CWD), so manifests are relocatable.
-    pub bundle_path: PathBuf,
+    /// Single-revision form (100 % traffic): local `.gtbundle`. Relative
+    /// paths resolve against the manifest file's directory (not the CWD),
+    /// so manifests are relocatable. Mutually exclusive with `revisions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_path: Option<PathBuf>,
+    /// Multi-revision / traffic-split form: each entry names a revision
+    /// with its own bundle artifact and optional weight. Mutually
+    /// exclusive with `bundle_path`. The wizard (`answers_to_manifest`)
+    /// always produces the single-revision form; multi-revision is
+    /// JSON-first (hand-authored or generated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revisions: Option<Vec<ManifestRevision>>,
     /// Billing principal (P6/B10): required for non-`local` environments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub customer_id: Option<String>,
@@ -102,6 +111,34 @@ pub struct ManifestBundle {
     /// on re-deploy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_binding: Option<RouteBindingPayload>,
+}
+
+/// One revision in a multi-revision bundle entry. Each carries its own
+/// bundle artifact path and optional traffic weight / drain / abort knobs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestRevision {
+    /// Manifest-local handle — unique within the bundle's `revisions[]`.
+    pub name: String,
+    /// Local `.gtbundle`. Same path-resolution rules as
+    /// [`ManifestBundle::bundle_path`].
+    pub bundle_path: PathBuf,
+    /// Traffic weight as a percentage (0..=100). Mutually exclusive with
+    /// `weight_bps` on the same revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_percent: Option<u32>,
+    /// Traffic weight in basis points (0..=10 000). Mutually exclusive
+    /// with `weight_percent` on the same revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_bps: Option<u32>,
+    /// Per-revision drain window override (seconds). Forwarded to
+    /// `RevisionStagePayload.drain_seconds`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_seconds: Option<u32>,
+    /// Abort-metric names for canary evaluation. Reserved for the
+    /// canary-evaluation engine (not consumed by apply today).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub abort_metrics: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +221,61 @@ impl EnvManifest {
                     b.bundle_id
                 )));
             }
+            // XOR: exactly one of `bundle_path` / `revisions` must be set.
+            match (&b.bundle_path, &b.revisions) {
+                (Some(_), None) | (None, Some(_)) => {}
+                (Some(_), Some(_)) => {
+                    return Err(OpError::InvalidArgument(format!(
+                        "bundle `{}`: `bundle_path` and `revisions` are mutually exclusive \
+                         — use `bundle_path` for single-revision (100 %) or `revisions` \
+                         for a traffic split",
+                        b.bundle_id
+                    )));
+                }
+                (None, None) => {
+                    return Err(OpError::InvalidArgument(format!(
+                        "bundle `{}`: either `bundle_path` or `revisions` must be set",
+                        b.bundle_id
+                    )));
+                }
+            }
+
+            // Per-revision validation (multi-revision form only).
+            if let Some(revisions) = &b.revisions {
+                if revisions.is_empty() {
+                    return Err(OpError::InvalidArgument(format!(
+                        "bundle `{}`: `revisions` must not be empty",
+                        b.bundle_id
+                    )));
+                }
+                let mut rev_names = BTreeSet::new();
+                for rev in revisions {
+                    if rev.name.trim().is_empty() {
+                        return Err(OpError::InvalidArgument(format!(
+                            "bundle `{}`: revision name must not be empty",
+                            b.bundle_id
+                        )));
+                    }
+                    if !rev_names.insert(rev.name.as_str()) {
+                        return Err(OpError::InvalidArgument(format!(
+                            "bundle `{}`: duplicate revision name `{}`",
+                            b.bundle_id, rev.name
+                        )));
+                    }
+                    // Per-revision: weight_percent and weight_bps are mutually exclusive.
+                    if rev.weight_percent.is_some() && rev.weight_bps.is_some() {
+                        return Err(OpError::InvalidArgument(format!(
+                            "bundle `{}`, revision `{}`: `weight_percent` and `weight_bps` \
+                             are mutually exclusive",
+                            b.bundle_id, rev.name
+                        )));
+                    }
+                }
+                // Weight consistency: all-set must sum to FULL_TRAFFIC_BPS;
+                // all-unset = equal split (computed at resolve time); mixed = error.
+                validate_revision_weights(&b.bundle_id, revisions)?;
+            }
+
             if let Some(rb) = &b.route_binding {
                 rb.validate()?;
                 for prefix in &rb.path_prefixes {
@@ -228,6 +320,84 @@ impl EnvManifest {
             }
         }
         Ok(())
+    }
+}
+
+/// Full traffic in basis points (10 000 bps = 100 %).
+pub(crate) const FULL_TRAFFIC_BPS: u32 = 10_000;
+
+/// Validate the weight consistency of a multi-revision bundle entry.
+///
+/// Three cases:
+/// - **All unset**: equal split — computed at resolve time, nothing to
+///   validate here.
+/// - **All set** (via `weight_percent` or `weight_bps`): must sum to
+///   exactly [`FULL_TRAFFIC_BPS`] (10 000 bps).
+/// - **Mixed** (some set, some unset): error — no implicit remainder.
+fn validate_revision_weights(
+    bundle_id: &str,
+    revisions: &[ManifestRevision],
+) -> Result<(), OpError> {
+    let has_weight: Vec<bool> = revisions
+        .iter()
+        .map(|r| r.weight_percent.is_some() || r.weight_bps.is_some())
+        .collect();
+    let all_set = has_weight.iter().all(|&w| w);
+    let none_set = has_weight.iter().all(|&w| !w);
+    if !all_set && !none_set {
+        return Err(OpError::InvalidArgument(format!(
+            "bundle `{bundle_id}`: either ALL revisions must declare a weight or NONE \
+             (equal split) — mixing set and unset weights is not allowed"
+        )));
+    }
+    if all_set {
+        let sum: u32 = revisions
+            .iter()
+            .map(|r| effective_bps_single(r).expect("all_set guarantees a weight"))
+            .sum();
+        if sum != FULL_TRAFFIC_BPS {
+            return Err(OpError::InvalidArgument(format!(
+                "bundle `{bundle_id}`: revision weights sum to {sum} bps, must be exactly \
+                 {FULL_TRAFFIC_BPS} (100 %)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve one revision's declared weight to basis points. `None` when the
+/// revision has no weight (equal-split case).
+fn effective_bps_single(rev: &ManifestRevision) -> Option<u32> {
+    if let Some(pct) = rev.weight_percent {
+        // 1 % = 100 bps.
+        Some(pct * 100)
+    } else {
+        rev.weight_bps
+    }
+}
+
+/// Compute the effective weight in basis points for every revision in a
+/// multi-revision entry. Callers have already passed `validate_shape`, so
+/// weights are either all-set or all-unset.
+///
+/// - **All set**: each revision's declared value (percent * 100 or bps).
+/// - **All unset**: equal split — `floor(10000 / n)` per revision,
+///   remainder added to the first.
+pub(crate) fn compute_effective_weights_bps(revisions: &[ManifestRevision]) -> Vec<u32> {
+    let n = revisions.len() as u32;
+    assert!(n > 0, "validated: revisions is non-empty");
+    if revisions[0].weight_percent.is_none() && revisions[0].weight_bps.is_none() {
+        // Equal split.
+        let base = FULL_TRAFFIC_BPS / n;
+        let remainder = FULL_TRAFFIC_BPS - base * n;
+        (0..n)
+            .map(|i| if i == 0 { base + remainder } else { base })
+            .collect()
+    } else {
+        revisions
+            .iter()
+            .map(|r| effective_bps_single(r).expect("validated: all-set"))
+            .collect()
     }
 }
 
@@ -317,11 +487,28 @@ pub fn manifest_schema() -> Value {
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "required": ["bundle_id", "bundle_path"],
+                    "required": ["bundle_id"],
                     "additionalProperties": false,
                     "properties": {
                         "bundle_id": {"type": "string"},
-                        "bundle_path": {"type": "string", "description": "local .gtbundle; relative to the manifest file"},
+                        "bundle_path": {"type": ["string", "null"], "description": "single-revision form: local .gtbundle; relative to the manifest file; mutually exclusive with `revisions`"},
+                        "revisions": {
+                            "type": "array",
+                            "description": "multi-revision / traffic-split form; mutually exclusive with `bundle_path`",
+                            "items": {
+                                "type": "object",
+                                "required": ["name", "bundle_path"],
+                                "additionalProperties": false,
+                                "properties": {
+                                    "name": {"type": "string", "description": "manifest-local handle, unique within the bundle"},
+                                    "bundle_path": {"type": "string", "description": "local .gtbundle; relative to the manifest file"},
+                                    "weight_percent": {"type": ["integer", "null"], "description": "0..100; mutually exclusive with weight_bps"},
+                                    "weight_bps": {"type": ["integer", "null"], "description": "0..10000; mutually exclusive with weight_percent"},
+                                    "drain_seconds": {"type": ["integer", "null"], "description": "per-revision drain window override"},
+                                    "abort_metrics": {"type": "array", "items": {"type": "string"}, "description": "reserved for canary evaluation"}
+                                }
+                            }
+                        },
                         "customer_id": {"type": ["string", "null"], "description": "required for non-local envs (B10)"},
                         "config_overrides": {"type": ["object", "null"], "description": "<pack_id> -> <key> -> <json>; absent=untouched, {}=clear, map=replace"},
                         "route_binding": {
@@ -764,7 +951,13 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
             };
         bundles.push(ManifestBundle {
             bundle_id,
-            bundle_path: PathBuf::from(req_row_string("bundles", idx, row, "bundle_path")?),
+            bundle_path: Some(PathBuf::from(req_row_string(
+                "bundles",
+                idx,
+                row,
+                "bundle_path",
+            )?)),
+            revisions: None,
             customer_id: opt_row_string("bundles", idx, row, "customer_id")?,
             config_overrides,
             route_binding,
@@ -1274,6 +1467,13 @@ mod tests {
             ("secrets[].from_env", "secrets.from_env"),
             ("bundles[].bundle_id", "bundles.bundle_id"),
             ("bundles[].bundle_path", "bundles.bundle_path"),
+            // Multi-revision fields are JSON-first (no form question).
+            ("bundles[].revisions[].name", ""),
+            ("bundles[].revisions[].bundle_path", ""),
+            ("bundles[].revisions[].weight_percent", ""),
+            ("bundles[].revisions[].weight_bps", ""),
+            ("bundles[].revisions[].drain_seconds", ""),
+            ("bundles[].revisions[].abort_metrics", ""),
             ("bundles[].customer_id", "bundles.customer_id"),
             ("bundles[].config_overrides", "bundles.config_overrides"),
             ("bundles[].route_binding.hosts", "bundles.route_hosts"),
@@ -1575,5 +1775,229 @@ mod tests {
                 .any(|e| format!("{e:?}").contains("from_env")),
             "missing row field must be reported: {report:?}"
         );
+    }
+
+    // --- multi-revision tests ---
+
+    #[test]
+    fn multi_revision_deserialize_and_validate() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "canary-test",
+                "revisions": [
+                    {"name": "stable", "bundle_path": "stable.gtbundle", "weight_bps": 9000},
+                    {"name": "canary", "bundle_path": "canary.gtbundle", "weight_bps": 1000}
+                ]
+            }]
+        }))
+        .unwrap();
+        manifest.validate_shape().expect("valid multi-revision");
+        let revs = manifest.bundles[0].revisions.as_ref().unwrap();
+        assert_eq!(revs.len(), 2);
+        assert_eq!(revs[0].name, "stable");
+        assert_eq!(revs[1].weight_bps, Some(1000));
+    }
+
+    #[test]
+    fn multi_revision_equal_split_no_weights() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "ab-test",
+                "revisions": [
+                    {"name": "a", "bundle_path": "a.gtbundle"},
+                    {"name": "b", "bundle_path": "b.gtbundle"},
+                    {"name": "c", "bundle_path": "c.gtbundle"}
+                ]
+            }]
+        }))
+        .unwrap();
+        manifest.validate_shape().expect("valid equal-split");
+        let revs = manifest.bundles[0].revisions.as_ref().unwrap();
+        let weights = compute_effective_weights_bps(revs);
+        // 10000 / 3 = 3333 each, remainder 1 to first.
+        assert_eq!(weights, vec![3334, 3333, 3333]);
+        assert_eq!(weights.iter().sum::<u32>(), FULL_TRAFFIC_BPS);
+    }
+
+    #[test]
+    fn multi_revision_weight_percent_converts_to_bps() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "pct-test",
+                "revisions": [
+                    {"name": "a", "bundle_path": "a.gtbundle", "weight_percent": 70},
+                    {"name": "b", "bundle_path": "b.gtbundle", "weight_percent": 30}
+                ]
+            }]
+        }))
+        .unwrap();
+        manifest.validate_shape().expect("valid percent weights");
+        let revs = manifest.bundles[0].revisions.as_ref().unwrap();
+        let weights = compute_effective_weights_bps(revs);
+        assert_eq!(weights, vec![7000, 3000]);
+    }
+
+    #[test]
+    fn multi_revision_weight_sum_not_10000_fails() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "bad-sum",
+                "revisions": [
+                    {"name": "a", "bundle_path": "a.gtbundle", "weight_bps": 5000},
+                    {"name": "b", "bundle_path": "b.gtbundle", "weight_bps": 3000}
+                ]
+            }]
+        }))
+        .unwrap();
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("8000 bps"), "{err}");
+        assert!(err.to_string().contains("10000"), "{err}");
+    }
+
+    #[test]
+    fn both_bundle_path_and_revisions_fails() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "both",
+                "bundle_path": "both.gtbundle",
+                "revisions": [
+                    {"name": "a", "bundle_path": "a.gtbundle"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn neither_bundle_path_nor_revisions_fails() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "neither"
+            }]
+        }))
+        .unwrap();
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("must be set"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_revision_name_fails() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "dups",
+                "revisions": [
+                    {"name": "same", "bundle_path": "a.gtbundle", "weight_bps": 5000},
+                    {"name": "same", "bundle_path": "b.gtbundle", "weight_bps": 5000}
+                ]
+            }]
+        }))
+        .unwrap();
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("duplicate revision name"), "{err}");
+    }
+
+    #[test]
+    fn mixed_set_unset_weights_fails() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "mixed",
+                "revisions": [
+                    {"name": "a", "bundle_path": "a.gtbundle", "weight_bps": 5000},
+                    {"name": "b", "bundle_path": "b.gtbundle"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("mixing set and unset"), "{err}");
+    }
+
+    #[test]
+    fn weight_percent_and_bps_on_same_revision_fails() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "clash",
+                "revisions": [
+                    {"name": "a", "bundle_path": "a.gtbundle",
+                     "weight_percent": 50, "weight_bps": 5000},
+                    {"name": "b", "bundle_path": "b.gtbundle",
+                     "weight_percent": 50, "weight_bps": 5000}
+                ]
+            }]
+        }))
+        .unwrap();
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn empty_revisions_array_fails() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "empty-revs",
+                "revisions": []
+            }]
+        }))
+        .unwrap();
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn answers_to_manifest_stays_single_revision() {
+        // The wizard always produces the single-revision form.
+        let set = answers(serde_json::json!({
+            "environment_id": "local",
+            "trust_root_bootstrap": false,
+            "bundles": [{
+                "bundle_id": "b",
+                "bundle_path": "b.gtbundle"
+            }]
+        }));
+        let manifest = answers_to_manifest(&set).expect("converts");
+        manifest.validate_shape().expect("valid shape");
+        assert!(manifest.bundles[0].bundle_path.is_some());
+        assert!(manifest.bundles[0].revisions.is_none());
+    }
+
+    #[test]
+    fn single_revision_equal_split_is_full_traffic() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "solo",
+                "revisions": [
+                    {"name": "only", "bundle_path": "only.gtbundle"}
+                ]
+            }]
+        }))
+        .unwrap();
+        manifest.validate_shape().expect("valid");
+        let revs = manifest.bundles[0].revisions.as_ref().unwrap();
+        let weights = compute_effective_weights_bps(revs);
+        assert_eq!(weights, vec![FULL_TRAFFIC_BPS]);
     }
 }

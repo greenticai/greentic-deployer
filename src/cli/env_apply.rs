@@ -81,8 +81,8 @@ use super::bundles::{BundleUpdatePayload, RouteBindingPayload, into_route_bindin
 use super::deploy::BundleDeployPayload;
 use super::env::EnvInitPayload;
 use super::env_manifest::{
-    ENV_MANIFEST_SCHEMA_V1, EnvManifest, ManifestBundle, ManifestEndpoint, ManifestWelcomeFlow,
-    TrustRootDirective, manifest_schema,
+    ENV_MANIFEST_SCHEMA_V1, EnvManifest, ManifestBundle, ManifestEndpoint, ManifestRevision,
+    ManifestWelcomeFlow, TrustRootDirective, compute_effective_weights_bps, manifest_schema,
 };
 use super::messaging::{
     EndpointAddPayload, EndpointLinkBundlePayload, EndpointSetWelcomeFlowPayload, EndpointSummary,
@@ -140,6 +140,7 @@ enum ApplyStepKind {
     BootstrapTrustRoot,
     PutSecret,
     DeployBundle,
+    DeploySplit,
     UpdateBundle,
     AddEndpoint,
     LinkEndpoint,
@@ -153,12 +154,25 @@ impl ApplyStepKind {
             ApplyStepKind::BootstrapTrustRoot => "bootstrap-trust-root",
             ApplyStepKind::PutSecret => "put-secret",
             ApplyStepKind::DeployBundle => "deploy-bundle",
+            ApplyStepKind::DeploySplit => "deploy-split",
             ApplyStepKind::UpdateBundle => "update-bundle",
             ApplyStepKind::AddEndpoint => "add-endpoint",
             ApplyStepKind::LinkEndpoint => "link-endpoint",
             ApplyStepKind::SetWelcomeFlow => "set-welcome-flow",
         }
     }
+}
+
+/// One revision inside a [`StepOp::DeploySplit`]. Carries the resolved
+/// artifact path and digest for TOCTOU re-verification, plus the effective
+/// weight already computed by [`compute_effective_weights_bps`].
+#[derive(Debug, Clone)]
+struct SplitRevisionEntry {
+    name: String,
+    resolved_path: PathBuf,
+    expected_digest: String,
+    weight_bps: u32,
+    drain_seconds: Option<u32>,
 }
 
 /// Reference to an endpoint that may not exist yet at plan time. `Created`
@@ -191,6 +205,17 @@ enum StepOp {
         /// Digest recorded at plan time; re-verified just before the deploy
         /// step executes to shrink the validate→execute TOCTOU window.
         expected_digest: String,
+    },
+    /// Multi-revision traffic-split deploy: stage each revision, warm it,
+    /// then set the combined traffic split. Each entry carries its own
+    /// artifact path and digest for TOCTOU re-verification.
+    DeploySplit {
+        env_id: String,
+        bundle_id: String,
+        customer_id: Option<String>,
+        config_overrides: Option<BTreeMap<String, BTreeMap<String, Value>>>,
+        route_binding: Option<RouteBindingPayload>,
+        revisions: Vec<SplitRevisionEntry>,
     },
     BundleUpdate(Box<BundleUpdatePayload>),
     EndpointAdd(Box<EndpointAddPayload>),
@@ -239,15 +264,28 @@ impl ApplyStep {
 
 // --- validated context ---------------------------------------------------------
 
-/// A manifest bundle entry paired with its resolved artifact metadata.
-struct ResolvedBundle {
-    spec: ManifestBundle,
+/// One resolved revision inside a multi-revision bundle entry.
+struct ResolvedRevision {
+    spec: ManifestRevision,
     resolved_path: PathBuf,
     digest: String,
+    /// Effective weight in basis points, computed by
+    /// [`compute_effective_weights_bps`].
+    weight_bps: u32,
+}
+
+/// A manifest bundle entry paired with its resolved artifact metadata.
+/// For single-revision entries (`bundle_path` form), `revisions` holds
+/// exactly one entry at full weight. Multi-revision entries hold one per
+/// declared revision.
+struct ResolvedBundle {
+    spec: ManifestBundle,
     /// Billing principal resolved during validation (from
     /// `resolve_customer_id`). Used to match deployments by the same
     /// `(bundle_id, customer_id)` pair that `op deploy` keys on.
     customer_id: CustomerId,
+    /// Resolved revisions. Always non-empty after validation.
+    revisions: Vec<ResolvedRevision>,
 }
 
 /// A manifest endpoint entry paired with its store match (if any).
@@ -655,29 +693,85 @@ fn resolve_and_validate(
     let mut resolved_bundles = Vec::with_capacity(manifest.bundles.len());
     for b in &manifest.bundles {
         let customer_id = super::bundles::resolve_customer_id(&env_id, b.customer_id.clone())?;
-        let resolved_path = if b.bundle_path.is_absolute() {
-            b.bundle_path.clone()
+
+        // Resolve each artifact path (single-revision or multi-revision).
+        let artifact_specs: Vec<(&std::path::Path, Option<&ManifestRevision>)> =
+            if let Some(bp) = &b.bundle_path {
+                vec![(bp.as_path(), None)]
+            } else if let Some(revs) = &b.revisions {
+                revs.iter()
+                    .map(|r| (r.bundle_path.as_path(), Some(r)))
+                    .collect()
+            } else {
+                // validate_shape already rejects this, but be safe.
+                continue;
+            };
+
+        let mut any_missing = false;
+        let mut resolved_revs = Vec::with_capacity(artifact_specs.len());
+
+        // For multi-revision, compute effective weights (validated by
+        // validate_shape). Single-revision always gets FULL_TRAFFIC_BPS.
+        let weights: Vec<u32> = if let Some(revs) = &b.revisions {
+            compute_effective_weights_bps(revs)
         } else {
-            manifest_dir.join(&b.bundle_path)
+            vec![super::deploy::FULL_TRAFFIC_BPS]
         };
-        if !resolved_path.is_file() {
-            missing.push(MissingItem {
-                kind: MissingKind::BundleArtifact,
-                key: b.bundle_id.clone(),
-                source: format!("path:{}", resolved_path.display()),
+
+        for (i, (artifact_path, rev_spec)) in artifact_specs.iter().enumerate() {
+            let resolved_path = if artifact_path.is_absolute() {
+                artifact_path.to_path_buf()
+            } else {
+                manifest_dir.join(artifact_path)
+            };
+            if !resolved_path.is_file() {
+                let key = match rev_spec {
+                    Some(r) => format!("{}:{}", b.bundle_id, r.name),
+                    None => b.bundle_id.clone(),
+                };
+                missing.push(MissingItem {
+                    kind: MissingKind::BundleArtifact,
+                    key,
+                    source: format!("path:{}", resolved_path.display()),
+                });
+                any_missing = true;
+                continue;
+            }
+            let digest =
+                super::bundle_stage::sha256_file(&resolved_path).map_err(|source| OpError::Io {
+                    path: resolved_path.clone(),
+                    source,
+                })?;
+            let spec = rev_spec.cloned().unwrap_or_else(|| {
+                // Synthesize a ManifestRevision for single-revision entries.
+                ManifestRevision {
+                    name: "default".to_string(),
+                    bundle_path: b
+                        .bundle_path
+                        .clone()
+                        .expect("single-revision has bundle_path"),
+                    weight_percent: None,
+                    weight_bps: Some(super::deploy::FULL_TRAFFIC_BPS),
+                    drain_seconds: None,
+                    abort_metrics: Vec::new(),
+                }
             });
+            resolved_revs.push(ResolvedRevision {
+                spec,
+                resolved_path,
+                digest,
+                weight_bps: weights[i],
+            });
+        }
+
+        if any_missing {
             continue;
         }
-        let digest =
-            super::bundle_stage::sha256_file(&resolved_path).map_err(|source| OpError::Io {
-                path: resolved_path.clone(),
-                source,
-            })?;
+
         resolved_bundles.push(ResolvedBundle {
             spec: b.clone(),
-            resolved_path,
-            digest,
             customer_id,
+            revisions: resolved_revs,
         });
     }
 
@@ -922,16 +1016,43 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
     // 4. Bundles (keyed on `(bundle_id, customer_id)` — the same natural key
     //    that `op deploy` uses).
     for rb in &ctx.bundles {
+        let is_multi = rb.spec.revisions.is_some();
         let existing = ctx.env.as_ref().and_then(|e| {
             e.bundles.iter().find(|d| {
                 d.bundle_id.as_str() == rb.spec.bundle_id && d.customer_id == rb.customer_id
             })
         });
+
+        // Helper: the primary digest for single-revision entries (first
+        // and only element).
+        let primary_digest = || rb.revisions[0].digest.clone();
+
         match existing {
+            None if is_multi => {
+                let digests: Vec<String> = rb
+                    .revisions
+                    .iter()
+                    .map(|r| format!("{}@{}", r.spec.name, short_digest(&r.digest)))
+                    .collect();
+                let detail = format!(
+                    "{} revision(s) [{}] → {}",
+                    rb.revisions.len(),
+                    digests.join(", "),
+                    binding_summary(&rb.spec.route_binding.clone().map(into_route_binding))
+                );
+                steps.push(ApplyStep {
+                    kind: ApplyStepKind::DeploySplit,
+                    key: rb.spec.bundle_id.clone(),
+                    action: ApplyAction::Create,
+                    detail,
+                    idempotency_key: None,
+                    op: deploy_split_op(&env_id_str, rb),
+                });
+            }
             None => {
                 let detail = format!(
                     "{} → {}",
-                    short_digest(&rb.digest),
+                    short_digest(&primary_digest()),
                     binding_summary(&rb.spec.route_binding.clone().map(into_route_binding))
                 );
                 steps.push(ApplyStep {
@@ -946,9 +1067,96 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                             rb,
                             rb.spec.route_binding.clone(),
                         )),
-                        expected_digest: rb.digest.clone(),
+                        expected_digest: primary_digest(),
                     },
                 });
+            }
+            Some(dep) if is_multi => {
+                let env = ctx.env.as_ref().expect("existing deployment implies env");
+                let converged = split_converged(env, dep.deployment_id, &rb.revisions);
+                let desired_binding: Option<RouteBinding> =
+                    rb.spec.route_binding.clone().map(into_route_binding);
+                let binding_differs = desired_binding
+                    .as_ref()
+                    .is_some_and(|b| *b != dep.route_binding);
+                let overrides_differ = rb
+                    .spec
+                    .config_overrides
+                    .as_ref()
+                    .is_some_and(|o| *o != dep.config_overrides);
+
+                if !converged {
+                    let digests: Vec<String> = rb
+                        .revisions
+                        .iter()
+                        .map(|r| format!("{}@{}", r.spec.name, short_digest(&r.digest)))
+                        .collect();
+                    let detail = format!(
+                        "split not converged → re-deploy {} revision(s) [{}]",
+                        rb.revisions.len(),
+                        digests.join(", ")
+                    );
+                    steps.push(ApplyStep {
+                        kind: ApplyStepKind::DeploySplit,
+                        key: rb.spec.bundle_id.clone(),
+                        action: ApplyAction::Update,
+                        detail,
+                        idempotency_key: None,
+                        op: deploy_split_op(&env_id_str, rb),
+                    });
+                }
+
+                if binding_differs || (overrides_differ && converged) {
+                    let route_binding = binding_differs.then(|| {
+                        rb.spec
+                            .route_binding
+                            .clone()
+                            .expect("binding_differs implies manifest binding")
+                    });
+                    let config_overrides = (overrides_differ && converged)
+                        .then(|| rb.spec.config_overrides.clone().expect("overrides_differ"));
+                    let desired_hash = hash_json(&json!({
+                        "route_binding": route_binding,
+                        "config_overrides": config_overrides,
+                    }));
+                    let ikey = derive_idempotency_key(
+                        &ctx.env_id,
+                        ApplyStepKind::UpdateBundle.label(),
+                        &rb.spec.bundle_id,
+                        &desired_hash,
+                    );
+                    let mut what = Vec::new();
+                    if binding_differs {
+                        what.push(format!("binding → {}", binding_summary(&desired_binding)));
+                    }
+                    if config_overrides.is_some() {
+                        what.push("config_overrides".to_string());
+                    }
+                    steps.push(ApplyStep {
+                        kind: ApplyStepKind::UpdateBundle,
+                        key: rb.spec.bundle_id.clone(),
+                        action: ApplyAction::Update,
+                        detail: what.join(", "),
+                        idempotency_key: Some(ikey.clone()),
+                        op: StepOp::BundleUpdate(Box::new(BundleUpdatePayload {
+                            environment_id: env_id_str.clone(),
+                            deployment_id: dep.deployment_id.to_string(),
+                            status: None,
+                            route_binding,
+                            revenue_share: None,
+                            config_overrides,
+                            idempotency_key: Some(ikey),
+                        })),
+                    });
+                }
+
+                if converged && !binding_differs && !overrides_differ {
+                    steps.push(ApplyStep::no_op(
+                        ApplyStepKind::DeploySplit,
+                        rb.spec.bundle_id.clone(),
+                        format!("split converged ({} revision(s))", rb.revisions.len()),
+                    ));
+                }
             }
             Some(dep) => {
                 let desired_binding: Option<RouteBinding> =
@@ -962,7 +1170,7 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     .as_ref()
                     .is_some_and(|o| *o != dep.config_overrides);
                 let env = ctx.env.as_ref().expect("existing deployment implies env");
-                let converged = deployment_converged(env, dep.deployment_id, &rb.digest);
+                let converged = deployment_converged(env, dep.deployment_id, &primary_digest());
                 let needs_deploy = !converged;
                 let live = live_revision_digest(env, dep.deployment_id);
 
@@ -976,13 +1184,13 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                         format!(
                             "digest {} → {} (blue-green re-stage)",
                             live.map(short_digest).unwrap_or("none"),
-                            short_digest(&rb.digest)
+                            short_digest(&primary_digest())
                         )
                     } else {
                         format!(
                             "traffic split is not a single 100% entry \
                              → re-deploy reconverges ({})",
-                            short_digest(&rb.digest)
+                            short_digest(&primary_digest())
                         )
                     };
                     steps.push(ApplyStep {
@@ -998,7 +1206,7 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                             // AFTER the deploy lands, so None here —
                             // deploy rejects a differing binding.
                             payload: Box::new(deploy_payload(&env_id_str, rb, None)),
-                            expected_digest: rb.digest.clone(),
+                            expected_digest: primary_digest(),
                         },
                     });
                 }
@@ -1051,7 +1259,7 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     steps.push(ApplyStep::no_op(
                         ApplyStepKind::DeployBundle,
                         rb.spec.bundle_id.clone(),
-                        format!("digest match ({})", short_digest(&rb.digest)),
+                        format!("digest match ({})", short_digest(&primary_digest())),
                     ));
                 }
             }
@@ -1241,7 +1449,9 @@ fn execute(store: &LocalFsStore, ctx: &ApplyContext, steps: &[ApplyStep]) -> Res
     // mutates the store. The per-Deploy-step re-check stays because later
     // steps in the same run can still race with external writes.
     for rb in &ctx.bundles {
-        ensure_artifact_unchanged(&rb.resolved_path, &rb.digest)?;
+        for rr in &rb.revisions {
+            ensure_artifact_unchanged(&rr.resolved_path, &rr.digest)?;
+        }
     }
 
     // Sub-verbs get clean flags: payloads are passed directly, never re-read
@@ -1316,6 +1526,10 @@ fn execute(store: &LocalFsStore, ctx: &ApplyContext, steps: &[ApplyStep]) -> Res
                     expected_digest,
                 )?;
                 super::deploy::deploy(store, &exec_flags, Some((**payload).clone())).map(|_| ())
+            }
+            StepOp::DeploySplit { .. } => {
+                execute_deploy_split(store, &exec_flags, &step.op)?;
+                Ok(())
             }
             StepOp::BundleUpdate(payload) => {
                 super::bundles::update(store, &exec_flags, Some((**payload).clone())).map(|_| ())
@@ -1450,13 +1664,25 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
             failures.push(format!("bundle `{}` is not deployed", rb.spec.bundle_id));
             continue;
         };
-        if !deployment_converged(&env, dep.deployment_id, &rb.digest) {
-            failures.push(format!(
-                "bundle `{}`: live revision digest is `{}`, expected `{}`",
-                rb.spec.bundle_id,
-                live_revision_digest(&env, dep.deployment_id).unwrap_or("none"),
-                rb.digest
-            ));
+        let is_multi = rb.spec.revisions.is_some();
+        if is_multi {
+            if !split_converged(&env, dep.deployment_id, &rb.revisions) {
+                failures.push(format!(
+                    "bundle `{}`: traffic split not converged ({} revision(s) expected)",
+                    rb.spec.bundle_id,
+                    rb.revisions.len()
+                ));
+            }
+        } else {
+            let primary_digest = &rb.revisions[0].digest;
+            if !deployment_converged(&env, dep.deployment_id, primary_digest) {
+                failures.push(format!(
+                    "bundle `{}`: live revision digest is `{}`, expected `{}`",
+                    rb.spec.bundle_id,
+                    live_revision_digest(&env, dep.deployment_id).unwrap_or("none"),
+                    primary_digest
+                ));
+            }
         }
         if let Some(binding) = &rb.spec.route_binding {
             let desired = into_route_binding(binding.clone());
@@ -1518,8 +1744,8 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
 
 // --- helpers --------------------------------------------------------------------
 
-/// Build a [`BundleDeployPayload`] from a resolved bundle, sharing the 5
-/// fields common to both the create and re-deploy sites.
+/// Build a [`BundleDeployPayload`] from a resolved single-revision bundle.
+/// The primary (first) resolved revision supplies the artifact path.
 fn deploy_payload(
     env_id: &str,
     rb: &ResolvedBundle,
@@ -1529,11 +1755,157 @@ fn deploy_payload(
         environment_id: env_id.to_string(),
         bundle_id: rb.spec.bundle_id.clone(),
         customer_id: rb.spec.customer_id.clone(),
-        bundle_path: Some(rb.resolved_path.clone()),
+        bundle_path: Some(rb.revisions[0].resolved_path.clone()),
         idempotency_key: None,
         config_overrides: rb.spec.config_overrides.clone(),
         route_binding,
     }
+}
+
+/// Build a [`StepOp::DeploySplit`] from a resolved multi-revision bundle.
+fn deploy_split_op(env_id: &str, rb: &ResolvedBundle) -> StepOp {
+    StepOp::DeploySplit {
+        env_id: env_id.to_string(),
+        bundle_id: rb.spec.bundle_id.clone(),
+        customer_id: rb.spec.customer_id.clone(),
+        config_overrides: rb.spec.config_overrides.clone(),
+        route_binding: rb.spec.route_binding.clone(),
+        revisions: rb
+            .revisions
+            .iter()
+            .map(|rr| SplitRevisionEntry {
+                name: rr.spec.name.clone(),
+                resolved_path: rr.resolved_path.clone(),
+                expected_digest: rr.digest.clone(),
+                weight_bps: rr.weight_bps,
+                drain_seconds: rr.spec.drain_seconds,
+            })
+            .collect(),
+    }
+}
+
+/// Execute a multi-revision deploy: add the bundle (if new), stage each
+/// revision, warm each, then set the combined traffic split. Takes the
+/// whole `StepOp` by reference and destructures the `DeploySplit` variant.
+fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> Result<(), OpError> {
+    use super::bundles::{BundleAddPayload, BundleSummary};
+    use super::revisions::{RevisionStagePayload, RevisionSummary, RevisionTransitionPayload};
+    use super::traffic::{TrafficSetEntryPayload, TrafficSetPayload};
+
+    let StepOp::DeploySplit {
+        env_id,
+        bundle_id,
+        customer_id,
+        config_overrides,
+        route_binding,
+        revisions: split_revs,
+    } = op
+    else {
+        unreachable!("execute_deploy_split called with non-DeploySplit op");
+    };
+
+    let env_id_parsed = EnvId::try_from(env_id.as_str())
+        .map_err(|e| OpError::InvalidArgument(format!("environment_id: {e}")))?;
+    let resolved_customer =
+        super::bundles::resolve_customer_id(&env_id_parsed, customer_id.clone())?;
+
+    let env = store.load(&env_id_parsed)?;
+    let existing = env
+        .bundles
+        .iter()
+        .find(|b| b.bundle_id.as_str() == bundle_id.as_str() && b.customer_id == resolved_customer);
+
+    let deployment_id = match existing {
+        Some(b) => b.deployment_id.to_string(),
+        None => {
+            let add_payload = BundleAddPayload {
+                environment_id: env_id.clone(),
+                bundle_id: bundle_id.clone(),
+                customer_id: customer_id.clone(),
+                route_binding: route_binding.clone().unwrap_or_default(),
+                revenue_share: super::bundles::default_revenue_share(),
+                authorization_ref: super::bundles::default_authorization_ref(),
+                config_overrides: config_overrides.clone().unwrap_or_default(),
+                idempotency_key: None,
+            };
+            let outcome = super::bundles::add(store, flags, Some(add_payload))?;
+            let summary: BundleSummary = serde_json::from_value(outcome.result).map_err(|e| {
+                OpError::InvalidArgument(format!("internal: bundle add summary: {e}"))
+            })?;
+            summary.deployment_id
+        }
+    };
+
+    // Stage + warm each revision.
+    let mut traffic_entries = Vec::with_capacity(split_revs.len());
+    for rev in split_revs {
+        eprintln!(
+            "  split: staging revision `{}` ({})",
+            rev.name,
+            short_digest(&rev.expected_digest)
+        );
+        // TOCTOU re-check per revision.
+        ensure_artifact_unchanged(&rev.resolved_path, &rev.expected_digest)?;
+
+        let stage_payload = RevisionStagePayload {
+            environment_id: env_id.to_string(),
+            deployment_id: deployment_id.clone(),
+            bundle_path: Some(rev.resolved_path.clone()),
+            bundle_digest: super::revisions::default_bundle_digest(),
+            pack_list: Vec::new(),
+            pack_list_lock_ref: PathBuf::new(),
+            config_digest: super::revisions::default_config_digest(),
+            signature_sidecar_ref: super::revisions::default_signature_sidecar_ref(),
+            drain_seconds: rev
+                .drain_seconds
+                .unwrap_or_else(super::revisions::default_drain_seconds),
+        };
+        let stage_outcome = super::revisions::stage(store, flags, Some(stage_payload))?;
+        let staged: RevisionSummary =
+            serde_json::from_value(stage_outcome.result).map_err(|e| {
+                OpError::InvalidArgument(format!("internal: revision stage summary: {e}"))
+            })?;
+
+        super::revisions::warm(
+            store,
+            flags,
+            Some(RevisionTransitionPayload {
+                environment_id: env_id.to_string(),
+                revision_id: staged.revision_id.clone(),
+                idempotency_key: None,
+            }),
+        )?;
+
+        traffic_entries.push(TrafficSetEntryPayload {
+            revision_id: staged.revision_id,
+            weight_bps: Some(rev.weight_bps),
+            weight_percent: None,
+        });
+    }
+
+    // Set the combined traffic split.
+    let ikey = format!(
+        "deploy-split:{deployment_id}:{}",
+        traffic_entries
+            .iter()
+            .map(|e| e.revision_id.as_str())
+            .collect::<Vec<_>>()
+            .join("+")
+    );
+    super::traffic::set(
+        store,
+        flags,
+        Some(TrafficSetPayload {
+            environment_id: env_id.to_string(),
+            deployment_id: deployment_id.clone(),
+            entries: traffic_entries,
+            updated_by: super::traffic::default_updated_by(),
+            idempotency_key: ikey,
+            authorization_ref: super::traffic::default_authorization_ref(),
+        }),
+    )?;
+
+    Ok(())
 }
 
 /// Deterministic, replay-safe idempotency key:
@@ -1618,6 +1990,56 @@ fn deployment_converged(
         .iter()
         .find(|r| r.revision_id == entry.revision_id)
         .is_some_and(|r| digest_is_real(&r.bundle_digest) && r.bundle_digest == expected_digest)
+}
+
+/// Multi-revision convergence: the deployment's traffic split is the exact
+/// `(digest, weight_bps)` multiset declared by `expected` — every live entry
+/// resolves to a real-digest revision, and the live `(digest, weight)` bag
+/// equals the expected bag. Order-independent (both bags are sorted before
+/// comparison) and duplicate-safe: two expected revisions that share the same
+/// artifact AND weight require two matching live entries, not one. A false
+/// "converged" is the dangerous direction — it would silently skip applying
+/// the desired split — so this is multiset equality, not set containment.
+fn split_converged(
+    env: &Environment,
+    deployment_id: DeploymentId,
+    expected: &[ResolvedRevision],
+) -> bool {
+    let Some(split) = env
+        .traffic_splits
+        .iter()
+        .find(|s| s.deployment_id == deployment_id)
+    else {
+        return false;
+    };
+    if split.entries.len() != expected.len() {
+        return false;
+    }
+    // Live `(digest, weight_bps)` bag. Any entry pointing at a missing or
+    // placeholder-digest revision fails convergence outright.
+    let mut live_bag: Vec<(&str, u32)> = Vec::with_capacity(split.entries.len());
+    for entry in &split.entries {
+        let Some(rev) = env
+            .revisions
+            .iter()
+            .find(|r| r.revision_id == entry.revision_id)
+        else {
+            return false;
+        };
+        if !digest_is_real(&rev.bundle_digest) {
+            return false;
+        }
+        live_bag.push((rev.bundle_digest.as_str(), entry.weight_bps));
+    }
+    // Expected `(digest, weight_bps)` bag.
+    let mut expected_bag: Vec<(&str, u32)> = expected
+        .iter()
+        .map(|rr| (rr.digest.as_str(), rr.weight_bps))
+        .collect();
+    // Multiset equality via sort-and-compare (counts already match).
+    live_bag.sort_unstable();
+    expected_bag.sort_unstable();
+    live_bag == expected_bag
 }
 
 /// Re-hash the artifact at `path` and verify it still matches the digest
@@ -2393,6 +2815,120 @@ mod tests {
             "mixed split must plan a re-deploy: {actions:?}"
         );
         assert!(plan.result["changed"].as_u64().unwrap() >= 1);
+    }
+
+    // --- split_converged is multiset equality, not set containment ---
+
+    /// Build a `ResolvedRevision` with the given digest + weight (the only
+    /// two fields `split_converged` reads).
+    fn resolved_rev(name: &str, digest: &str, weight_bps: u32) -> ResolvedRevision {
+        ResolvedRevision {
+            spec: ManifestRevision {
+                name: name.to_string(),
+                bundle_path: PathBuf::from(format!("{name}.gtbundle")),
+                weight_percent: None,
+                weight_bps: Some(weight_bps),
+                drain_seconds: None,
+                abort_metrics: Vec::new(),
+            },
+            resolved_path: PathBuf::from(format!("{name}.gtbundle")),
+            digest: digest.to_string(),
+            weight_bps,
+        }
+    }
+
+    /// Seed an env with a two-entry split over two revisions, returning the
+    /// env and its deployment id. Each `(digest, weight_bps)` is applied to a
+    /// distinct revision.
+    fn env_with_two_entry_split(live: [(&str, u32); 2]) -> (Environment, DeploymentId) {
+        use greentic_deploy_spec::TrafficSplitEntry;
+        let mut env = make_env("local");
+        let dep = make_bundle_deployment("local", "quickstart");
+        let dep_id = dep.deployment_id;
+        let mut rev1 = make_revision("local", "quickstart", &dep_id, 1, RevisionLifecycle::Ready);
+        rev1.bundle_digest = live[0].0.to_string();
+        let mut rev2 = make_revision("local", "quickstart", &dep_id, 2, RevisionLifecycle::Ready);
+        rev2.bundle_digest = live[1].0.to_string();
+        let mut split =
+            make_traffic_split("local", "quickstart", &dep_id, &rev1.revision_id, "seed");
+        split.entries[0].weight_bps = live[0].1;
+        split.entries.push(TrafficSplitEntry {
+            revision_id: rev2.revision_id,
+            weight_bps: live[1].1,
+        });
+        env.bundles.push(dep);
+        env.revisions.push(rev1);
+        env.revisions.push(rev2);
+        env.traffic_splits.push(split);
+        (env, dep_id)
+    }
+
+    #[test]
+    fn split_converged_matches_exact_multiset() {
+        let (env, dep_id) =
+            env_with_two_entry_split([("sha256:aaaa11", 5_000), ("sha256:bbbb22", 5_000)]);
+        let expected = [
+            resolved_rev("a", "sha256:aaaa11", 5_000),
+            resolved_rev("b", "sha256:bbbb22", 5_000),
+        ];
+        assert!(
+            split_converged(&env, dep_id, &expected),
+            "identical (digest, weight) bag must converge"
+        );
+        // Order-independence: same bag, swapped expected order.
+        let swapped = [
+            resolved_rev("b", "sha256:bbbb22", 5_000),
+            resolved_rev("a", "sha256:aaaa11", 5_000),
+        ];
+        assert!(split_converged(&env, dep_id, &swapped));
+    }
+
+    #[test]
+    fn split_converged_rejects_duplicate_digest_mismatch() {
+        // Live bag has TWO distinct digests; expected names the SAME digest
+        // twice. A set-containment check (the old `.any()`) would falsely
+        // report convergence; a multiset check must reject it — otherwise the
+        // desired split is silently never applied.
+        let (env, dep_id) =
+            env_with_two_entry_split([("sha256:aaaa11", 5_000), ("sha256:bbbb22", 5_000)]);
+        let expected = [
+            resolved_rev("a", "sha256:aaaa11", 5_000),
+            resolved_rev("a-dup", "sha256:aaaa11", 5_000),
+        ];
+        assert!(
+            !split_converged(&env, dep_id, &expected),
+            "duplicate-digest expected bag must NOT match a two-distinct-digest live split"
+        );
+    }
+
+    #[test]
+    fn split_converged_rejects_weight_mismatch() {
+        let (env, dep_id) =
+            env_with_two_entry_split([("sha256:aaaa11", 6_000), ("sha256:bbbb22", 4_000)]);
+        let expected = [
+            resolved_rev("a", "sha256:aaaa11", 5_000),
+            resolved_rev("b", "sha256:bbbb22", 5_000),
+        ];
+        assert!(
+            !split_converged(&env, dep_id, &expected),
+            "same digests but different weights must not converge"
+        );
+    }
+
+    #[test]
+    fn split_converged_rejects_placeholder_digest() {
+        // A live revision still carrying the staging placeholder digest is
+        // not a real deploy — convergence must fail.
+        let (env, dep_id) =
+            env_with_two_entry_split([("sha256:00", 5_000), ("sha256:bbbb22", 5_000)]);
+        let expected = [
+            resolved_rev("a", "sha256:00", 5_000),
+            resolved_rev("b", "sha256:bbbb22", 5_000),
+        ];
+        assert!(
+            !split_converged(&env, dep_id, &expected),
+            "placeholder live digest must not be treated as converged"
+        );
     }
 
     // --- Fix 4: deploy BEFORE binding update ---
