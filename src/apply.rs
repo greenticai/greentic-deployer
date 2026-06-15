@@ -34,7 +34,9 @@ use greentic_telemetry::{TelemetryCtx, set_current_telemetry_ctx};
 use serde_json;
 use serde_yaml_bw as serde_yaml;
 
-const SECRETS_PROVIDER_BINDING_RELATIVE_PATH: &str = "state/config/platform/secrets-provider.json";
+const SECRETS_PROVIDER_BINDING_RELATIVE_PATH: &str = ".providers/platform/secrets-provider.json";
+const LEGACY_SECRETS_PROVIDER_BINDING_RELATIVE_PATH: &str =
+    "state/config/platform/secrets-provider.json";
 const SECRETS_PROVIDER_BINDING_SCHEMA_VERSION: &str = "greentic.secrets.binding.v1";
 
 #[derive(Debug, Clone, Serialize)]
@@ -1991,15 +1993,24 @@ fn materialize_secrets_provider_binding(config: &DeployerConfig, deploy_dir: &Pa
     };
     let bytes =
         serde_json::to_vec_pretty(&binding).map_err(|err| DeployerError::Other(err.to_string()))?;
-    write_secrets_provider_binding(deploy_dir, &bytes)?;
+    write_secrets_provider_binding(deploy_dir, SECRETS_PROVIDER_BINDING_RELATIVE_PATH, &bytes)?;
+    write_secrets_provider_binding(
+        deploy_dir,
+        LEGACY_SECRETS_PROVIDER_BINDING_RELATIVE_PATH,
+        &bytes,
+    )?;
     if let Some(bundle_root) = config.bundle_root.as_deref() {
-        write_secrets_provider_binding(bundle_root, &bytes)?;
+        write_secrets_provider_binding(
+            bundle_root,
+            SECRETS_PROVIDER_BINDING_RELATIVE_PATH,
+            &bytes,
+        )?;
     }
     Ok(())
 }
 
-fn write_secrets_provider_binding(root: &Path, bytes: &[u8]) -> Result<()> {
-    let path = root.join(SECRETS_PROVIDER_BINDING_RELATIVE_PATH);
+fn write_secrets_provider_binding(root: &Path, relative_path: &str, bytes: &[u8]) -> Result<()> {
+    let path = root.join(relative_path);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -5361,6 +5372,12 @@ kind: Deployment
             metadata.secrets_provider_binding.as_deref(),
             Some(SECRETS_PROVIDER_BINDING_RELATIVE_PATH)
         );
+        assert!(
+            artifacts
+                .deploy_dir
+                .join(LEGACY_SECRETS_PROVIDER_BINDING_RELATIVE_PATH)
+                .is_file()
+        );
         let note = std::fs::read_to_string(artifacts.deploy_dir.join("terraform-handoff.txt"))
             .expect("read terraform handoff note");
         assert!(note.contains("secrets_provider_binding="));
@@ -5425,6 +5442,16 @@ kind: Deployment
                     Some("greentic/dev/demo/_")
                 );
             }
+            assert!(
+                target_deploy_dir
+                    .join(LEGACY_SECRETS_PROVIDER_BINDING_RELATIVE_PATH)
+                    .is_file()
+            );
+            assert!(
+                !bundle_root
+                    .join(LEGACY_SECRETS_PROVIDER_BINDING_RELATIVE_PATH)
+                    .exists()
+            );
         }
     }
 
