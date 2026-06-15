@@ -320,13 +320,20 @@ fn sanitize_dns1123_label(raw: &str) -> String {
     s.trim_matches('-').to_string()
 }
 
+/// Label key identifying the owning environment, stamped on every
+/// rendered object by `common_labels`. The kube client's ownership
+/// guard reads it back — they MUST share this constant so a rename can't
+/// silently turn the guard into a no-op.
+pub const ENV_LABEL: &str = "greentic.ai/env";
+
 /// Shared labels stamped on every object the env-pack renders.
 fn common_labels(env: &Environment, component: &str) -> Value {
-    json!({
+    let mut labels = json!({
         "app.kubernetes.io/managed-by": "greentic",
         "app.kubernetes.io/component": component,
-        "greentic.ai/env": env.environment_id.as_str(),
-    })
+    });
+    labels[ENV_LABEL] = json!(env.environment_id.as_str());
+    labels
 }
 
 /// Worker pod selector labels: the revision ULID is the identity (plan

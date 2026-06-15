@@ -22,7 +22,7 @@
 //! default stays
 //! [`UnconfiguredCluster`](super::cluster::UnconfiguredCluster).
 //!
-//! Resource routing is a **closed table** ([`api_route_for`]) covering
+//! Resource routing is a **closed table** (`api_route_for`) covering
 //! exactly the kinds [`super::manifests`] renders. Kubernetes plurals are
 //! irregular (`networkpolicies`, `poddisruptionbudgets`), so a naive
 //! pluralizer would silently build wrong URLs; an unrendered kind is a
@@ -37,11 +37,12 @@ use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParam
 use kube::config::KubeConfigOptions;
 use serde_json::Value;
 
-use super::cluster::{K8sCluster, K8sClusterError, ObjectRef};
+use super::cluster::{K8sCluster, K8sClusterError, ObjectRef, manifest_field};
 use super::credentials::{
     AccessDecision, ClusterIdentity, K8sClientError, K8sOperation, K8sValidatorClient,
     OperationDecision,
 };
+use super::manifests::ENV_LABEL;
 
 /// Server-side-apply field manager identifying the deployer's writes.
 /// Forced conflicts are correct for a controller-style owner: the
@@ -142,6 +143,21 @@ fn api_route_for(api_version: &str, kind: &str) -> Result<(ApiResource, Scope), 
     ))
 }
 
+/// Build the dynamic API for one routed `(resource, scope)`. Cluster-scoped
+/// kinds ignore `namespace`. Shared by `apply`/`api_for` and `delete` so
+/// both route identically.
+fn dynamic_api(
+    client: &kube::Client,
+    resource: &ApiResource,
+    scope: Scope,
+    namespace: &str,
+) -> Api<DynamicObject> {
+    match scope {
+        Scope::Cluster => Api::all_with(client.clone(), resource),
+        Scope::Namespaced => Api::namespaced_with(client.clone(), namespace, resource),
+    }
+}
+
 /// Cluster failures at the kube transport boundary. The seam does not
 /// distinguish transport from auth (same operator fix path), so
 /// everything folds into [`K8sClusterError::Api`] with the server's
@@ -168,34 +184,20 @@ impl KubeCluster {
 
     /// Resolve the dynamic API + object name for one rendered manifest.
     fn api_for(&self, manifest: &Value) -> Result<(Api<DynamicObject>, String), K8sClusterError> {
-        let field = |path: &[&str]| -> Result<String, K8sClusterError> {
-            let mut cur = manifest;
-            for p in path {
-                cur = cur.get(p).ok_or_else(|| {
-                    K8sClusterError::InvalidManifest(format!(
-                        "manifest is missing `{}`",
-                        path.join(".")
-                    ))
-                })?;
-            }
-            cur.as_str().map(str::to_string).ok_or_else(|| {
-                K8sClusterError::InvalidManifest(format!("`{}` is not a string", path.join(".")))
-            })
-        };
-        let api_version = field(&["apiVersion"])?;
-        let kind = field(&["kind"])?;
-        let name = field(&["metadata", "name"])?;
+        let api_version = manifest_field(manifest, &["apiVersion"])?;
+        let kind = manifest_field(manifest, &["kind"])?;
+        let name = manifest_field(manifest, &["metadata", "name"])?;
         let (resource, scope) = api_route_for(&api_version, &kind)?;
-        let api = match scope {
-            // The Namespace object itself carries no `metadata.namespace`
-            // — cluster-scoped kinds route through the all-cluster API.
-            Scope::Cluster => Api::all_with(self.client.clone(), &resource),
-            Scope::Namespaced => {
-                let namespace = field(&["metadata", "namespace"])?;
-                Api::namespaced_with(self.client.clone(), &namespace, &resource)
-            }
+        // The Namespace object itself carries no `metadata.namespace` —
+        // cluster-scoped kinds ignore it in `dynamic_api`.
+        let namespace = match scope {
+            Scope::Cluster => String::new(),
+            Scope::Namespaced => manifest_field(manifest, &["metadata", "namespace"])?,
         };
-        Ok((api, name))
+        Ok((
+            dynamic_api(&self.client, &resource, scope, &namespace),
+            name,
+        ))
     }
 }
 
@@ -206,19 +208,20 @@ impl std::fmt::Debug for KubeCluster {
     }
 }
 
-/// The label key every rendered manifest carries to identify the owning
-/// environment.  Used by the ownership guard in [`KubeCluster::apply`].
-const ENV_LABEL: &str = "greentic.ai/env";
-
-/// JSON Pointer for the env label inside a manifest's `metadata.labels`.
-/// The `/` in the label key is escaped as `~1` per RFC 6901.
-const ENV_LABEL_POINTER: &str = "/metadata/labels/greentic.ai~1env";
+/// Read a manifest's owning-environment label (`metadata.labels[ENV_LABEL]`).
+fn manifest_env_label(manifest: &Value) -> Option<&str> {
+    manifest
+        .get("metadata")
+        .and_then(|m| m.get("labels"))
+        .and_then(|l| l.get(ENV_LABEL))
+        .and_then(Value::as_str)
+}
 
 #[async_trait]
 impl K8sCluster for KubeCluster {
     async fn apply(&self, manifest: &Value) -> Result<(), K8sClusterError> {
         let (api, name) = self.api_for(manifest)?;
-        let incoming_env = manifest.pointer(ENV_LABEL_POINTER).and_then(Value::as_str);
+        let incoming_env = manifest_env_label(manifest);
 
         // Ownership guard: if an object already exists and carries a
         // different env label, refuse the apply — two envs sharing a
@@ -259,12 +262,7 @@ impl K8sCluster for KubeCluster {
 
     async fn delete(&self, object: &ObjectRef) -> Result<(), K8sClusterError> {
         let (resource, scope) = api_route_for(&object.api_version, &object.kind)?;
-        let api: Api<DynamicObject> = match scope {
-            Scope::Cluster => Api::all_with(self.client.clone(), &resource),
-            Scope::Namespaced => {
-                Api::namespaced_with(self.client.clone(), &object.namespace, &resource)
-            }
-        };
+        let api = dynamic_api(&self.client, &resource, scope, &object.namespace);
         match api.delete(&object.name, &DeleteParams::default()).await {
             Ok(_) => Ok(()),
             // Absent => Ok: the trait's retried-archive contract.
@@ -443,20 +441,30 @@ mod tests {
         })
     }
 
+    /// Drive a happy-path `apply`: answer the ownership GET with a 404
+    /// (no existing object) then the PATCH with 200, asserting success.
+    /// Returns the captured PATCH request for the caller's assertions.
+    async fn apply_ok(
+        cluster: &KubeCluster,
+        handle: &mut MockHandle,
+        manifest: &Value,
+    ) -> Request<Body> {
+        let respond = async {
+            let _get = respond_json(handle, 404, not_found_status()).await;
+            respond_json(handle, 200, manifest.clone()).await
+        };
+        let (result, patch) = tokio::join!(cluster.apply(manifest), respond);
+        result.unwrap();
+        patch
+    }
+
     #[tokio::test]
     async fn apply_is_forced_server_side_apply_with_field_manager() {
         let (client, mut handle) = mock_client();
         let cluster = KubeCluster::new(client);
         let manifest = deployment_manifest();
 
-        let respond = async {
-            // GET (ownership check) → 404
-            let _get = respond_json(&mut handle, 404, not_found_status()).await;
-            // PATCH (server-side apply)
-            respond_json(&mut handle, 200, manifest.clone()).await
-        };
-        let (result, request) = tokio::join!(cluster.apply(&manifest), respond);
-        result.unwrap();
+        let request = apply_ok(&cluster, &mut handle, &manifest).await;
 
         assert_eq!(request.method(), http::Method::PATCH);
         assert_eq!(
@@ -495,12 +503,7 @@ mod tests {
             "metadata": {"name": "gtc-zain"},
         });
 
-        let respond = async {
-            let _get = respond_json(&mut handle, 404, not_found_status()).await;
-            respond_json(&mut handle, 200, manifest.clone()).await
-        };
-        let (result, request) = tokio::join!(cluster.apply(&manifest), respond);
-        result.unwrap();
+        let request = apply_ok(&cluster, &mut handle, &manifest).await;
         assert_eq!(request.uri().path(), "/api/v1/namespaces/gtc-zain");
     }
 
@@ -514,12 +517,7 @@ mod tests {
             "kind": "NetworkPolicy",
             "metadata": {"name": "deny-all", "namespace": "gtc-zain"},
         });
-        let respond = async {
-            let _get = respond_json(&mut handle, 404, not_found_status()).await;
-            respond_json(&mut handle, 200, netpol.clone()).await
-        };
-        let (result, request) = tokio::join!(cluster.apply(&netpol), respond);
-        result.unwrap();
+        let request = apply_ok(&cluster, &mut handle, &netpol).await;
         assert_eq!(
             request.uri().path(),
             "/apis/networking.k8s.io/v1/namespaces/gtc-zain/networkpolicies/deny-all"
@@ -530,12 +528,7 @@ mod tests {
             "kind": "PodDisruptionBudget",
             "metadata": {"name": "router", "namespace": "gtc-zain"},
         });
-        let respond = async {
-            let _get = respond_json(&mut handle, 404, not_found_status()).await;
-            respond_json(&mut handle, 200, pdb.clone()).await
-        };
-        let (result, request) = tokio::join!(cluster.apply(&pdb), respond);
-        result.unwrap();
+        let request = apply_ok(&cluster, &mut handle, &pdb).await;
         assert_eq!(
             request.uri().path(),
             "/apis/policy/v1/namespaces/gtc-zain/poddisruptionbudgets/router"

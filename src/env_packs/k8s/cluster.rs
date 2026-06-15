@@ -40,27 +40,30 @@ impl ObjectRef {
     /// [`K8sClusterError::InvalidManifest`] rather than panicking inside
     /// a deployer verb.
     pub fn from_manifest(manifest: &Value) -> Result<Self, K8sClusterError> {
-        let field = |path: &[&str]| -> Result<String, K8sClusterError> {
-            let mut cur = manifest;
-            for p in path {
-                cur = cur.get(p).ok_or_else(|| {
-                    K8sClusterError::InvalidManifest(format!(
-                        "manifest is missing `{}`",
-                        path.join(".")
-                    ))
-                })?;
-            }
-            cur.as_str().map(str::to_string).ok_or_else(|| {
-                K8sClusterError::InvalidManifest(format!("`{}` is not a string", path.join(".")))
-            })
-        };
         Ok(Self {
-            api_version: field(&["apiVersion"])?,
-            kind: field(&["kind"])?,
-            namespace: field(&["metadata", "namespace"])?,
-            name: field(&["metadata", "name"])?,
+            api_version: manifest_field(manifest, &["apiVersion"])?,
+            kind: manifest_field(manifest, &["kind"])?,
+            namespace: manifest_field(manifest, &["metadata", "namespace"])?,
+            name: manifest_field(manifest, &["metadata", "name"])?,
         })
     }
+}
+
+/// Read a required string field from a rendered manifest by JSON path.
+///
+/// Shared by [`ObjectRef::from_manifest`] and the kube client's
+/// `api_for`; a missing or non-string field is a render bug, surfaced as
+/// [`K8sClusterError::InvalidManifest`].
+pub(super) fn manifest_field(manifest: &Value, path: &[&str]) -> Result<String, K8sClusterError> {
+    let mut cur = manifest;
+    for p in path {
+        cur = cur.get(p).ok_or_else(|| {
+            K8sClusterError::InvalidManifest(format!("manifest is missing `{}`", path.join(".")))
+        })?;
+    }
+    cur.as_str().map(str::to_string).ok_or_else(|| {
+        K8sClusterError::InvalidManifest(format!("`{}` is not a string", path.join(".")))
+    })
 }
 
 impl std::fmt::Display for ObjectRef {
