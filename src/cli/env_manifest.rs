@@ -17,6 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use greentic_deploy_spec::CapabilitySlot;
 use qa_spec::spec::ListSpec;
 use qa_spec::spec::question::QuestionPolicy;
 use qa_spec::{AnswerSet, FormSpec, QuestionSpec, QuestionType};
@@ -47,8 +48,17 @@ pub struct EnvManifest {
     /// not-yet-implemented, so values cannot be diffed until A9).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<ManifestSecret>,
+    /// Env-pack bindings (capability slots that `binds_in_packs`). Each slot
+    /// must be a core capability (not Messaging/Extension). Applied after
+    /// trust-root, before secrets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packs: Vec<ManifestPack>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bundles: Vec<ManifestBundle>,
+    /// Extension bindings (N-per-env, open namespace). Applied after bundles,
+    /// before messaging endpoints.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<ManifestExtension>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messaging_endpoints: Vec<ManifestEndpoint>,
 }
@@ -56,13 +66,29 @@ pub struct EnvManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestEnvironment {
-    /// Environment id. v1 apply can bootstrap only the `local` env (the
-    /// `env init` path); any other id must already exist.
+    /// Environment id. Apply bootstraps `local` (via `env init`, seeding the
+    /// default env-pack bindings). Any other id must ALREADY exist — apply
+    /// reconciles a non-local env but cannot create one (non-local creation
+    /// is reserved for the remote operator store, A7).
     pub id: String,
     /// When set, persisted via the `env set-public-url` path. Absent/`null`
     /// means "leave whatever is there" (upsert — apply never clears it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_base_url: Option<String>,
+    /// Human-readable display name. Absent = leave untouched; set = reconciled
+    /// via `op config set` on the existing env.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Cloud region tag. Absent = leave untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// Tenant organization id. Absent = leave untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_org_id: Option<String>,
+    /// Bind address for the runtime's local HTTP listener (parsed as
+    /// `SocketAddr` during shape validation). Absent = leave untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<String>,
 }
 
 /// v1 accepts only the string `"bootstrap"`. A future
@@ -83,6 +109,37 @@ pub struct ManifestSecret {
     /// Name of the environment variable holding the value. Secret VALUES
     /// never appear in the manifest.
     pub from_env: String,
+}
+
+/// One env-pack binding: a core capability slot bound to a pack descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestPack {
+    /// The capability slot (must satisfy `binds_in_packs()`).
+    pub slot: CapabilitySlot,
+    /// Pack descriptor string, e.g. `greentic.secrets.dev-store@1.0.0`.
+    pub kind: String,
+    /// Pack reference (registry id or local path).
+    pub pack_ref: String,
+    /// Optional answers file relative to the manifest directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers_ref: Option<PathBuf>,
+}
+
+/// One extension binding in the open-namespace `extensions[]` section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestExtension {
+    /// Pack descriptor string, e.g. `acme.oauth.auth0@1.0.0`.
+    pub kind: String,
+    /// Pack reference (registry id or local path).
+    pub pack_ref: String,
+    /// Instance selector for N instances of the same extension type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    /// Optional answers file relative to the manifest directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers_ref: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +257,82 @@ impl EnvManifest {
                 "environment.id must not be empty".to_string(),
             ));
         }
+        // listen_addr: parse-validate as SocketAddr at shape time.
+        if let Some(raw) = &self.environment.listen_addr {
+            raw.parse::<std::net::SocketAddr>().map_err(|e| {
+                OpError::InvalidArgument(format!(
+                    "environment.listen_addr `{raw}` is not a valid socket address: {e}"
+                ))
+            })?;
+        }
+
+        // Env-pack bindings: each slot must bind in packs, unique slots,
+        // kind must parse as PackDescriptor, pack_ref non-empty.
+        let mut pack_slots = BTreeSet::new();
+        for p in &self.packs {
+            if !p.slot.binds_in_packs() {
+                return Err(OpError::InvalidArgument(format!(
+                    "packs[]: slot `{}` does not bind in packs — use \
+                     messaging_endpoints[] or extensions[] instead",
+                    p.slot
+                )));
+            }
+            if !pack_slots.insert(p.slot) {
+                return Err(OpError::InvalidArgument(format!(
+                    "duplicate slot `{}` in manifest packs[]",
+                    p.slot
+                )));
+            }
+            greentic_deploy_spec::PackDescriptor::try_new(&p.kind).map_err(|e| {
+                OpError::InvalidArgument(format!("packs[] slot `{}`: kind: {e}", p.slot))
+            })?;
+            if p.pack_ref.trim().is_empty() {
+                return Err(OpError::InvalidArgument(format!(
+                    "packs[] slot `{}`: pack_ref must not be empty",
+                    p.slot
+                )));
+            }
+        }
+
+        // Extension bindings: unique (kind.path(), instance_id), kind parses,
+        // instance_id chars [a-z0-9-] non-empty when present, pack_ref non-empty.
+        let mut ext_keys = BTreeSet::new();
+        for ext in &self.extensions {
+            let descriptor =
+                greentic_deploy_spec::PackDescriptor::try_new(&ext.kind).map_err(|e| {
+                    OpError::InvalidArgument(format!("extensions[]: kind `{}`: {e}", ext.kind))
+                })?;
+            if ext.pack_ref.trim().is_empty() {
+                return Err(OpError::InvalidArgument(format!(
+                    "extensions[] kind `{}`: pack_ref must not be empty",
+                    ext.kind
+                )));
+            }
+            if let Some(inst) = &ext.instance_id
+                && (inst.is_empty()
+                    || !inst
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
+            {
+                return Err(OpError::InvalidArgument(format!(
+                    "extensions[] kind `{}`: instance_id `{inst}` must be non-empty \
+                     and contain only [a-z0-9-]",
+                    ext.kind
+                )));
+            }
+            let key = (
+                descriptor.path().to_string(),
+                ext.instance_id.as_deref().unwrap_or("").to_string(),
+            );
+            if !ext_keys.insert(key) {
+                return Err(OpError::InvalidArgument(format!(
+                    "duplicate extension (path `{}`, instance_id {:?}) in manifest extensions[]",
+                    descriptor.path(),
+                    ext.instance_id
+                )));
+            }
+        }
+
         // Secrets: path shape + canonicality via the same checks
         // `secrets.rs::put` applies (shared helper — the two surfaces cannot
         // drift), so a bad path fails the whole apply here instead of
@@ -516,8 +649,12 @@ pub fn manifest_schema() -> Value {
                 "required": ["id"],
                 "additionalProperties": false,
                 "properties": {
-                    "id": {"type": "string", "description": "Environment id; v1 bootstraps only `local`"},
-                    "public_base_url": {"type": ["string", "null"], "description": "origin-only URL; absent = leave untouched"}
+                    "id": {"type": "string", "description": "Environment id; `local` bootstraps via env init; any other id must already exist (apply reconciles, the operator store creates)"},
+                    "public_base_url": {"type": ["string", "null"], "description": "origin-only URL; absent = leave untouched"},
+                    "name": {"type": ["string", "null"], "description": "display name; absent = leave untouched (or default to id on create)"},
+                    "region": {"type": ["string", "null"], "description": "cloud region tag; absent = leave untouched"},
+                    "tenant_org_id": {"type": ["string", "null"], "description": "tenant organization id; absent = leave untouched"},
+                    "listen_addr": {"type": ["string", "null"], "description": "bind address (SocketAddr); absent = leave untouched"}
                 }
             },
             "trust_root": {"enum": ["bootstrap", null], "description": "`bootstrap` seeds the operator key (idempotent)"},
@@ -531,6 +668,21 @@ pub fn manifest_schema() -> Value {
                     "properties": {
                         "path": {"type": "string", "description": "<tenant>/<team>/<pack>/<name>"},
                         "from_env": {"type": "string", "description": "env var holding the value; values never appear in the manifest"}
+                    }
+                }
+            },
+            "packs": {
+                "type": "array",
+                "description": "env-pack bindings (core capability slots); applied after trust-root, before secrets",
+                "items": {
+                    "type": "object",
+                    "required": ["slot", "kind", "pack_ref"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "slot": {"type": "string", "description": "capability slot (must satisfy binds_in_packs)"},
+                        "kind": {"type": "string", "description": "PackDescriptor — `<namespace>.<id>@<semver>`"},
+                        "pack_ref": {"type": "string", "description": "pack reference (registry id or local path)"},
+                        "answers_ref": {"type": ["string", "null"], "description": "optional answers file relative to the manifest"}
                     }
                 }
             },
@@ -588,6 +740,21 @@ pub fn manifest_schema() -> Value {
                                 }
                             }
                         }
+                    }
+                }
+            },
+            "extensions": {
+                "type": "array",
+                "description": "extension bindings (N-per-env open namespace); applied after bundles, before endpoints",
+                "items": {
+                    "type": "object",
+                    "required": ["kind", "pack_ref"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "kind": {"type": "string", "description": "PackDescriptor — `<namespace>.<id>@<semver>`"},
+                        "pack_ref": {"type": "string", "description": "pack reference (registry id or local path)"},
+                        "instance_id": {"type": ["string", "null"], "description": "instance selector for N instances of the same type; [a-z0-9-]"},
+                        "answers_ref": {"type": ["string", "null"], "description": "optional answers file relative to the manifest"}
                     }
                 }
             },
@@ -659,8 +826,9 @@ pub fn manifest_form_spec() -> FormSpec {
         "environment_id",
         QuestionType::String,
         "Environment id",
-        "Environment to apply to. v1 apply can bootstrap only `local`; any \
-         other id must already exist.",
+        "Environment to apply to. `local` bootstraps with default env-pack \
+         bindings; any other id must already exist (apply reconciles it; \
+         non-local env creation is reserved for the operator store).",
         true,
     );
     environment_id.default_value = Some("local".to_string());
@@ -1073,10 +1241,16 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
         environment: ManifestEnvironment {
             id: environment_id,
             public_base_url,
+            name: None,
+            region: None,
+            tenant_org_id: None,
+            listen_addr: None,
         },
         trust_root,
         secrets,
+        packs: Vec::new(),
         bundles,
+        extensions: Vec::new(),
         messaging_endpoints,
     })
 }
@@ -1529,9 +1703,17 @@ mod tests {
             ("schema", ""),
             ("environment.id", "environment_id"),
             ("environment.public_base_url", "public_base_url"),
+            ("environment.name", ""),
+            ("environment.region", ""),
+            ("environment.tenant_org_id", ""),
+            ("environment.listen_addr", ""),
             ("trust_root", "trust_root_bootstrap"),
             ("secrets[].path", "secrets.path"),
             ("secrets[].from_env", "secrets.from_env"),
+            ("packs[].slot", ""),
+            ("packs[].kind", ""),
+            ("packs[].pack_ref", ""),
+            ("packs[].answers_ref", ""),
             ("bundles[].bundle_id", "bundles.bundle_id"),
             ("bundles[].bundle_path", "bundles.bundle_path"),
             // Multi-revision fields are JSON-first (no form question).
@@ -1560,6 +1742,10 @@ mod tests {
                 "bundles[].route_binding.tenant_selector.team",
                 "bundles.route_team",
             ),
+            ("extensions[].kind", ""),
+            ("extensions[].pack_ref", ""),
+            ("extensions[].instance_id", ""),
+            ("extensions[].answers_ref", ""),
             ("messaging_endpoints[].name", "messaging_endpoints.name"),
             (
                 "messaging_endpoints[].provider_type",
