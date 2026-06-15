@@ -333,17 +333,26 @@ pub(super) fn validate_dev_store_secret_path(rel_path: &str) -> Result<(), OpErr
 }
 
 /// A segment is writable iff the runtime reader's canonicalization maps it to
-/// itself — anything else is written under a key no lookup will ever use.
-/// Both checks call the deployer-local copies of the reader's functions
-/// (`runtime_secrets::{canonical_team,canonical_secret_name}`, faithful
-/// mirrors of greentic-start's) so the predicate can't drift from the
+/// itself — anything else is written under a key no lookup will ever use. Both
+/// checks call the shared `greentic-secrets` definitions (`normalize_team` /
+/// `canonical_secret_name`) — the same functions the runtime reader and the
+/// deployer's resolver use — so the predicate can't drift from the
 /// transformation it guards.
 fn is_canonical_team(team: &str) -> bool {
-    crate::runtime_secrets::canonical_team(Some(team)) == team
+    // `normalize_team` returns `None` for the team-less cases (`default`,
+    // empty, whitespace, AND the `_` placeholder itself). The canonical
+    // string form of a team-less segment is `TEAM_PLACEHOLDER` (`_`), so a
+    // segment is store-canonical iff it equals its normalization rendered
+    // back through that placeholder — this accepts `_` (and real team names)
+    // while still rejecting `default`/empty.
+    greentic_secrets_lib::normalize_team(Some(team))
+        .as_deref()
+        .unwrap_or(greentic_secrets_lib::TEAM_PLACEHOLDER)
+        == team
 }
 
 fn is_canonical_secret_name(name: &str) -> bool {
-    crate::runtime_secrets::canonical_secret_name(name) == name
+    greentic_secrets_lib::canonical_secret_name(name) == name
 }
 
 /// Write one value into the dev store from this sync context.
@@ -367,15 +376,22 @@ fn is_canonical_secret_name(name: &str) -> bool {
 ///
 /// Failures map to `OpError::Io` keyed on the store path — the dev store is
 /// a local file, and adding a dedicated `OpError` variant would break
-/// Map a deploy-spec `SecretRef` (scheme `secret://`) to the dev-store's
-/// native URI (scheme `secrets://`, plural). The two schemes are deliberately
-/// distinct contracts — deploy-spec refs vs runtime-store keys — and the
-/// mapping is just a scheme rename today. Centralizing it here keeps every
-/// caller doing the same translation and gives one grep target if the
-/// mapping ever grows beyond a rename. See the `secrets://` vs `secret://`
-/// trap noted in workspace memory.
-pub(super) fn secret_ref_to_store_uri(secret_ref: &SecretRef) -> String {
-    secret_ref.as_str().replacen("secret://", "secrets://", 1)
+/// Map a deploy-spec [`SecretRef`] (`secret://`) to its runtime dev-store URI
+/// (`secrets://`), delegating to the one authoritative converter in
+/// `greentic-secrets` ([`SecretRef::to_store_uri`]) instead of a local
+/// `replacen`. It additionally re-canonicalizes the team segment (`default` →
+/// `_`), and errors when the ref is not a store-aligned 5-segment URI (a scheme
+/// flip alone has no canonical store location for other shapes).
+pub(super) fn secret_ref_to_store_uri(secret_ref: &SecretRef) -> Result<String, OpError> {
+    secret_ref
+        .to_store_uri()
+        .map(|uri| uri.to_string())
+        .map_err(|e| {
+            OpError::InvalidArgument(format!(
+                "secret ref `{}` is not a store-aligned URI: {e}",
+                secret_ref.as_str()
+            ))
+        })
 }
 
 /// downstream exhaustive matches (greentic-operator's HTTP status mapping).
@@ -702,6 +718,23 @@ mod tests {
                 "team `{team}` got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn canonical_team_accepts_placeholder_and_real_teams() {
+        // The `_` placeholder IS the canonical team-less segment. Routing the
+        // validator through the lib's `normalize_team` (which returns `None`
+        // for `_`) must not make the documented `default/_/...` path
+        // unwritable — regression for the secrets-lib consolidation.
+        assert!(
+            is_canonical_team("_"),
+            "`_` is the canonical team-less segment"
+        );
+        assert!(is_canonical_team("legal"), "a real team name is canonical");
+        assert!(!is_canonical_team("default"));
+        assert!(!is_canonical_team("Default"));
+        assert!(!is_canonical_team(""));
+        assert!(!is_canonical_team(" _ "));
     }
 
     #[test]

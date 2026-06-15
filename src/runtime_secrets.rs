@@ -6,7 +6,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use greentic_secrets_lib::{DevStore, SecretsStore};
+use greentic_secrets_lib::{
+    DevStore, GeneratedSecretRequirement, GeneratedSecretScope, SecretsStore, TEAM_PLACEHOLDER,
+    canonical_secret_name, canonical_secret_store_key, generated_scope_team, normalize_team,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use zip::{ZipArchive, result::ZipError};
@@ -16,7 +19,6 @@ use crate::contract::DeployerCapability;
 use crate::error::{DeployerError, Result};
 
 const DEV_SECRETS_PATH_ENV: &str = "GREENTIC_DEV_SECRETS_PATH";
-const TEAM_DEFAULT: &str = "_";
 const SECRET_ASSET_PATHS: &[&str] = &[
     "assets/secret-requirements.json",
     "assets/secret_requirements.json",
@@ -31,6 +33,16 @@ pub struct RuntimeSecretRequirement {
     pub key: String,
     pub required: bool,
     pub default_value: Option<String>,
+    /// Canonicalized alternate names a previously-seeded value may live under.
+    /// Resolution checks these URIs too, mirroring greentic-start so a value
+    /// stored under a legacy/aliased key is still found and promoted.
+    pub aliases: Vec<String>,
+    /// Generation policy when the secret is system-generated; `None` =
+    /// operator-supplied. Carried (parsed into the shared `greentic-secrets`
+    /// model) so the deployer is *aware* which secrets are system-minted — used
+    /// today for a clearer missing-secret diagnostic; the active mint/promote
+    /// pass is a deferred follow-up.
+    pub generated: Option<GeneratedSecretRequirement>,
     pub source: PathBuf,
 }
 
@@ -149,8 +161,11 @@ pub async fn resolve_for_cloud_apply(
 }
 
 pub fn default_cloud_secret_prefix(environment: &str, tenant: &str, team: Option<&str>) -> String {
-    let team = canonical_team(team);
-    format!("greentic/{environment}/{tenant}/{team}")
+    let team = normalize_team(team);
+    format!(
+        "greentic/{environment}/{tenant}/{}",
+        team.as_deref().unwrap_or(TEAM_PLACEHOLDER)
+    )
 }
 
 pub fn collect_requirements(ctx: &RuntimeSecretContext) -> Result<Vec<RuntimeSecretRequirement>> {
@@ -162,13 +177,24 @@ pub fn collect_requirements(ctx: &RuntimeSecretContext) -> Result<Vec<RuntimeSec
         let provider_id = provider_id_from_pack_path(pack_path);
         for req in load_secret_requirements_from_pack(pack_path)? {
             let key = canonical_secret_name(&req.key);
-            let uri = canonical_secret_uri(
-                &ctx.environment,
-                &ctx.tenant,
-                ctx.team.as_deref(),
-                &provider_id,
-                &key,
-            );
+            let generated = req
+                .generated
+                .as_ref()
+                .map(AssetGeneratedSecret::to_requirement);
+            // A system-generated secret is minted under the team its scope
+            // resolves to (`generated_scope_team`) — NOT the context team — so
+            // the deployer reads/promotes it from exactly where the runtime
+            // seeded it. Operator-supplied secrets stay on the context team.
+            let team = match &generated {
+                Some(generated) => generated_scope_team(generated, ctx.team.as_deref()),
+                None => ctx.team.as_deref(),
+            };
+            let uri = canonical_secret_uri(&ctx.environment, &ctx.tenant, team, &provider_id, &key);
+            let aliases = req
+                .aliases
+                .iter()
+                .map(|alias| canonical_secret_name(alias))
+                .collect();
             by_uri
                 .entry(uri.clone())
                 .or_insert(RuntimeSecretRequirement {
@@ -177,6 +203,8 @@ pub fn collect_requirements(ctx: &RuntimeSecretContext) -> Result<Vec<RuntimeSec
                     key,
                     required: req.required,
                     default_value: req.default_value,
+                    aliases,
+                    generated,
                     source: pack_path.clone(),
                 });
         }
@@ -332,57 +360,79 @@ pub async fn resolve_runtime_secrets(
 
     for requirement in requirements {
         let mut checked_sources = Vec::new();
-        if let Some(env_key) = canonical_secret_store_key(&requirement.uri) {
-            checked_sources.push(format!("env {env_key}"));
-            if let Ok(value) = env::var(&env_key)
-                && !value.is_empty()
-            {
-                resolved.push(ResolvedRuntimeSecret {
-                    requirement: requirement.clone(),
-                    value: SecretValue(value),
-                    source: SecretValueSource::Env { key: env_key },
-                });
-                continue;
-            }
-        }
+        // Candidate store URIs: the primary, then any aliases (a value seeded
+        // under a legacy/aliased name still satisfies the requirement, mirroring
+        // greentic-start). Alias URIs must share the primary's resolved scope:
+        // a generated secret lives under `generated_scope_team`, not the context
+        // team (the same derivation `collect_requirements` used for the primary).
+        let team = match &requirement.generated {
+            Some(generated) => generated_scope_team(generated, ctx.team.as_deref()),
+            None => ctx.team.as_deref(),
+        };
+        let candidate_uris: Vec<String> = std::iter::once(requirement.uri.clone())
+            .chain(requirement.aliases.iter().map(|alias| {
+                canonical_secret_uri(
+                    &ctx.environment,
+                    &ctx.tenant,
+                    team,
+                    &requirement.provider_id,
+                    alias,
+                )
+            }))
+            .collect();
 
         let mut found = None;
-        for path in &store_paths {
-            checked_sources.push(path.display().to_string());
-            if !path.exists() {
-                continue;
-            }
-            if let Ok(store) = DevStore::with_path(path)
-                && let Ok(bytes) = store.get(&requirement.uri).await
-                && let Ok(value) = String::from_utf8(bytes)
-                && !value.is_empty()
-            {
-                // `gtc setup --non-interactive` writes raw `${VAR}` placeholders
-                // into the dev secrets store. Expand them here against the
-                // process env so the promoted cloud secret carries the actual
-                // value, not the placeholder string. If the env var is unset,
-                // treat the dev-store entry as unresolved and mark the
-                // requirement missing.
-                if let Some(env_key) = extract_env_placeholder(&value) {
-                    checked_sources.push(format!("env ${{{env_key}}} (from dev store)"));
-                    match env::var(&env_key) {
-                        Ok(resolved) if !resolved.is_empty() => {
-                            found = Some((path.clone(), resolved));
-                            break;
-                        }
-                        _ => continue,
-                    }
+        'candidates: for uri in &candidate_uris {
+            if let Some(env_key) = canonical_secret_store_key(uri) {
+                checked_sources.push(format!("env {env_key}"));
+                if let Ok(value) = env::var(&env_key)
+                    && !value.is_empty()
+                {
+                    found = Some((SecretValueSource::Env { key: env_key }, value));
+                    break 'candidates;
                 }
-                found = Some((path.clone(), value));
-                break;
+            }
+
+            for path in &store_paths {
+                checked_sources.push(path.display().to_string());
+                if !path.exists() {
+                    continue;
+                }
+                if let Ok(store) = DevStore::with_path(path)
+                    && let Ok(bytes) = store.get(uri).await
+                    && let Ok(value) = String::from_utf8(bytes)
+                    && !value.is_empty()
+                {
+                    // `gtc setup --non-interactive` writes raw `${VAR}`
+                    // placeholders into the dev secrets store. Expand them here
+                    // against the process env so the promoted cloud secret
+                    // carries the actual value, not the placeholder string. If
+                    // the env var is unset, treat the dev-store entry as
+                    // unresolved and keep looking.
+                    if let Some(env_key) = extract_env_placeholder(&value) {
+                        checked_sources.push(format!("env ${{{env_key}}} (from dev store)"));
+                        match env::var(&env_key) {
+                            Ok(expanded) if !expanded.is_empty() => {
+                                found = Some((
+                                    SecretValueSource::DevStore { path: path.clone() },
+                                    expanded,
+                                ));
+                                break 'candidates;
+                            }
+                            _ => continue,
+                        }
+                    }
+                    found = Some((SecretValueSource::DevStore { path: path.clone() }, value));
+                    break 'candidates;
+                }
             }
         }
 
-        if let Some((path, value)) = found {
+        if let Some((source, value)) = found {
             resolved.push(ResolvedRuntimeSecret {
                 requirement: requirement.clone(),
                 value: SecretValue(value),
-                source: SecretValueSource::DevStore { path },
+                source,
             });
         } else if requirement.required {
             missing.push(MissingRuntimeSecret {
@@ -399,6 +449,11 @@ pub fn format_missing_runtime_secrets(missing: &[MissingRuntimeSecret]) -> Strin
     let mut out = String::from("missing required runtime secrets:\n");
     for entry in missing {
         out.push_str(&format!("  - {}\n", entry.requirement.uri));
+        if entry.requirement.generated.is_some() {
+            out.push_str(
+                "    (system-generated — run `gtc setup` / provisioning to mint it before deploy)\n",
+            );
+        }
         out.push_str("    checked:\n");
         for source in &entry.checked_sources {
             out.push_str(&format!("      - {source}\n"));
@@ -456,6 +511,15 @@ pub fn flat_cloud_secret_name(
     format!("{}{}", normalized[..keep].trim_matches('-'), suffix)
 }
 
+/// Build a canonical runtime secret store URI
+/// (`secrets://<env>/<tenant>/<team|_>/<provider>/<name>`).
+///
+/// Team normalization (`default`/empty → `_`) and name normalization both come
+/// from `greentic-secrets` so this can never drift from the runtime reader. The
+/// `provider` segment is taken verbatim — pack ids carry hyphens the runtime
+/// preserves. `canonical_secret_store_key`, `canonical_secret_name`, and
+/// `normalize_team`/`TEAM_PLACEHOLDER` are likewise the shared library
+/// definitions (imported above).
 pub fn canonical_secret_uri(
     env: &str,
     tenant: &str,
@@ -463,83 +527,15 @@ pub fn canonical_secret_uri(
     provider: &str,
     key: &str,
 ) -> String {
+    let team = normalize_team(team);
     format!(
         "secrets://{}/{}/{}/{}/{}",
         env,
         tenant,
-        canonical_team(team),
+        team.as_deref().unwrap_or(TEAM_PLACEHOLDER),
         provider,
         canonical_secret_name(key)
     )
-}
-
-pub fn canonical_secret_store_key(uri: &str) -> Option<String> {
-    let trimmed = uri.strip_prefix("secrets://")?;
-    let segments: Vec<&str> = trimmed.split('/').collect();
-    if segments.len() != 5 {
-        return None;
-    }
-    let mut parts = vec!["GREENTIC_SECRET".to_string()];
-    parts.extend(segments.into_iter().map(normalize_store_segment));
-    Some(parts.join("__"))
-}
-
-pub fn canonical_secret_name(raw: &str) -> String {
-    let mut result = String::with_capacity(raw.len());
-    let mut prev_underscore = false;
-
-    for ch in raw.chars() {
-        let Some(normalized) = normalize_secret_char(ch) else {
-            continue;
-        };
-        if normalized == '_' {
-            if prev_underscore {
-                continue;
-            }
-            prev_underscore = true;
-        } else {
-            prev_underscore = false;
-        }
-        result.push(normalized);
-    }
-
-    let trimmed = result.trim_matches('_');
-    if trimmed.is_empty() {
-        "secret".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn normalize_secret_char(ch: char) -> Option<char> {
-    match ch {
-        'A'..='Z' => Some(ch.to_ascii_lowercase()),
-        'a'..='z' | '0'..='9' | '_' => Some(ch),
-        '-' | '.' | ' ' | '/' => Some('_'),
-        _ => None,
-    }
-}
-
-fn normalize_store_segment(segment: &str) -> String {
-    segment
-        .chars()
-        .map(|ch| match ch {
-            'A'..='Z' | '0'..='9' => ch,
-            'a'..='z' => ch.to_ascii_uppercase(),
-            '_' => '_',
-            _ => '_',
-        })
-        .collect()
-}
-
-pub(crate) fn canonical_team(team: Option<&str>) -> &str {
-    match team
-        .map(str::trim)
-        .filter(|team| !team.is_empty() && !team.eq_ignore_ascii_case("default"))
-    {
-        Some(team) => team,
-        None => TEAM_DEFAULT,
-    }
 }
 
 fn dev_store_paths(bundle_root: &Path) -> Vec<PathBuf> {
@@ -742,10 +738,58 @@ fn parse_requirements(contents: &str, path: &Path) -> Result<Vec<PackSecretRequi
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct PackSecretRequirement {
     key: String,
+    #[serde(default)]
+    aliases: Vec<String>,
     #[serde(default = "default_required")]
     required: bool,
     #[serde(default)]
     default_value: Option<String>,
+    #[serde(default)]
+    generated: Option<AssetGeneratedSecret>,
+}
+
+/// The `generated` block of a pack `secret-requirements.json` entry — the
+/// deployer's own reader for the shared generation model (Option A: parsers
+/// stay per-repo). Optional fields take the same asset-path defaults
+/// greentic-start applies (length 32, `base64url`, team scope) so a pack mints
+/// identically wherever it's read; [`AssetGeneratedSecret::to_requirement`]
+/// lifts it into the canonical [`GeneratedSecretRequirement`].
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct AssetGeneratedSecret {
+    policy: Option<String>,
+    length: Option<usize>,
+    encoding: Option<String>,
+    scope: Option<AssetGeneratedSecretScope>,
+    #[serde(default)]
+    regenerate_if_present: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct AssetGeneratedSecretScope {
+    level: Option<String>,
+    team: Option<String>,
+}
+
+impl AssetGeneratedSecret {
+    fn to_requirement(&self) -> GeneratedSecretRequirement {
+        GeneratedSecretRequirement {
+            policy: self.policy.clone().unwrap_or_else(|| "random".to_string()),
+            length: self.length.unwrap_or(32),
+            encoding: self
+                .encoding
+                .clone()
+                .unwrap_or_else(|| "base64url".to_string()),
+            scope: GeneratedSecretScope {
+                level: self
+                    .scope
+                    .as_ref()
+                    .and_then(|scope| scope.level.clone())
+                    .unwrap_or_else(|| "team".to_string()),
+                team: self.scope.as_ref().and_then(|scope| scope.team.clone()),
+            },
+            regenerate_if_present: self.regenerate_if_present.unwrap_or(false),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -783,8 +827,10 @@ fn parse_setup_secret_requirements(
         .filter(|question| question.secret)
         .map(|question| PackSecretRequirement {
             key: question.secret_key.unwrap_or(question.name),
+            aliases: Vec::new(),
             required: question.required,
             default_value: question.default,
+            generated: None,
         })
         .collect())
 }
@@ -799,6 +845,12 @@ fn dedup_requirements(requirements: Vec<PackSecretRequirement>) -> Vec<PackSecre
                 existing.required |= requirement.required;
                 if existing.default_value.is_none() {
                     existing.default_value = requirement.default_value.clone();
+                }
+                if existing.aliases.is_empty() {
+                    existing.aliases = requirement.aliases.clone();
+                }
+                if existing.generated.is_none() {
+                    existing.generated = requirement.generated.clone();
                 }
             })
             .or_insert(requirement);
@@ -1083,6 +1135,8 @@ questions:
             key: "api_key".into(),
             required: true,
             default_value: None,
+            aliases: Vec::new(),
+            generated: None,
             source: dir.path().join("packs/demo-pack.gtpack"),
         };
 
@@ -1262,5 +1316,151 @@ questions:
     fn secret_value_debug_is_redacted() {
         let value = SecretValue("super-secret".to_string());
         assert_eq!(format!("{value:?}"), "<redacted>");
+    }
+
+    #[tokio::test]
+    async fn resolve_runtime_secrets_honors_alias_uris() {
+        // A value seeded only under an alias URI must still satisfy the
+        // requirement (mirrors greentic-start's alias handling).
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_root = dir.path();
+        let store_path = bundle_root.join(".greentic/state/dev/.dev.secrets.env");
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        let alias_uri = canonical_secret_uri("dev", "demo", None, "demo_pack", "legacy_jwt_key");
+        {
+            let store = DevStore::with_path(&store_path).unwrap();
+            store
+                .put(
+                    &alias_uri,
+                    greentic_secrets_lib::SecretFormat::Text,
+                    b"aliased-value",
+                )
+                .await
+                .unwrap();
+        }
+
+        let ctx = RuntimeSecretContext {
+            bundle_root: bundle_root.to_path_buf(),
+            pack_paths: Vec::new(),
+            environment: "dev".into(),
+            tenant: "demo".into(),
+            team: None,
+        };
+        let requirement = RuntimeSecretRequirement {
+            uri: canonical_secret_uri("dev", "demo", None, "demo_pack", "jwt_signing_key"),
+            provider_id: "demo_pack".into(),
+            key: "jwt_signing_key".into(),
+            required: true,
+            default_value: None,
+            aliases: vec!["legacy_jwt_key".into()],
+            generated: None,
+            source: bundle_root.join("packs/demo-pack.gtpack"),
+        };
+
+        let resolution = resolve_runtime_secrets(&ctx, &[requirement]).await;
+        assert!(resolution.missing.is_empty(), "alias value must resolve");
+        assert_eq!(resolution.resolved.len(), 1);
+        assert_eq!(resolution.resolved[0].value.expose(), "aliased-value");
+    }
+
+    #[test]
+    fn collect_requirements_parses_generated_and_aliases() {
+        // The deployer parses the pack's `generated`/`aliases` metadata into the
+        // shared `greentic-secrets` model so it is aware which secrets are
+        // system-minted (Option A: reader stays here, model is shared).
+        let dir = tempfile::tempdir().unwrap();
+        let pack_dir = dir.path().join("packs/messaging-webex/assets");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("secret-requirements.json"),
+            r#"[{"key":"webex_webhook_secret","aliases":["WEBEX_WEBHOOK_SECRET"],"required":true,"generated":{"policy":"random","length":20,"encoding":"raw_text","scope":{"level":"tenant","team":"_"}}}]"#,
+        )
+        .unwrap();
+
+        let ctx = RuntimeSecretContext {
+            bundle_root: dir.path().to_path_buf(),
+            pack_paths: vec![dir.path().join("packs/messaging-webex")],
+            environment: "dev".into(),
+            tenant: "demo".into(),
+            team: None,
+        };
+        let reqs = collect_requirements(&ctx).unwrap();
+        assert_eq!(reqs.len(), 1);
+        let req = &reqs[0];
+        assert_eq!(req.key, "webex_webhook_secret");
+        // Aliases are canonicalized to match the store-key derivation.
+        assert_eq!(req.aliases, vec!["webex_webhook_secret".to_string()]);
+        let generated = req.generated.as_ref().expect("generated policy parsed");
+        assert_eq!(generated.policy, "random");
+        assert_eq!(generated.length, 20);
+        assert_eq!(generated.encoding, "raw_text");
+        assert_eq!(generated.scope.level, "tenant");
+        assert_eq!(generated.scope.team.as_deref(), Some("_"));
+    }
+
+    #[tokio::test]
+    async fn generated_secret_resolves_from_its_declared_team_scope() {
+        // A generated secret explicitly scoped to a real team is minted by the
+        // runtime under that team (`generated_scope_team`), not the context
+        // team (`_`). The deployer must derive the SAME team for both the
+        // primary URI and the alias candidate URIs, or it searches `_` and
+        // misses the value — the cloud-promotion gap this consolidation closes.
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_root = dir.path();
+        let pack_dir = bundle_root.join("packs/messaging-webex/assets");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("secret-requirements.json"),
+            r#"[{"key":"webex_webhook_secret","aliases":["legacy_webhook"],"required":true,"generated":{"policy":"random","length":20,"encoding":"raw_text","scope":{"level":"team","team":"legal"}}}]"#,
+        )
+        .unwrap();
+
+        let ctx = RuntimeSecretContext {
+            bundle_root: bundle_root.to_path_buf(),
+            pack_paths: vec![bundle_root.join("packs/messaging-webex")],
+            environment: "dev".into(),
+            tenant: "demo".into(),
+            team: None,
+        };
+        let reqs = collect_requirements(&ctx).unwrap();
+        assert_eq!(reqs.len(), 1);
+        // Primary URI is scoped to the declared team `legal`, not `_`.
+        assert!(
+            reqs[0].uri.starts_with("secrets://dev/demo/legal/"),
+            "generated secret must be team-scoped, got {}",
+            reqs[0].uri,
+        );
+
+        // Seed the value under the *alias* at the same team scope; resolution
+        // must find it via the team-scoped alias candidate URI.
+        let alias_uri = canonical_secret_uri(
+            "dev",
+            "demo",
+            Some("legal"),
+            &reqs[0].provider_id,
+            "legacy_webhook",
+        );
+        let store_path = bundle_root.join(".greentic/state/dev/.dev.secrets.env");
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        {
+            let store = DevStore::with_path(&store_path).unwrap();
+            store
+                .put(
+                    &alias_uri,
+                    greentic_secrets_lib::SecretFormat::Text,
+                    b"team-scoped-value",
+                )
+                .await
+                .unwrap();
+        }
+
+        let resolution = resolve_runtime_secrets(&ctx, &reqs).await;
+        assert!(
+            resolution.missing.is_empty(),
+            "team-scoped alias value must resolve: {:?}",
+            resolution.missing,
+        );
+        assert_eq!(resolution.resolved.len(), 1);
+        assert_eq!(resolution.resolved[0].value.expose(), "team-scoped-value");
     }
 }

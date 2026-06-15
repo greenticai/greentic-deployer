@@ -18,8 +18,6 @@
 use greentic_deploy_spec::{
     BundleId, EnvId, MessagingEndpoint, MessagingEndpointId, PackId, SecretRef,
 };
-use rand::TryRngCore;
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::str::FromStr;
@@ -876,19 +874,29 @@ fn require_nonempty(field: &str, value: &str) -> Result<String, OpError> {
 // stays here is the LocalFS webhook-secret SINK: CSPRNG value generation +
 // the dev-store write below.
 
-/// Generate a 32-char CSPRNG secret from `[A-Za-z0-9]` (≈190 bits entropy).
+/// The generation policy for a per-endpoint webhook secret: 32 `raw_text`
+/// characters. Routed through the shared `greentic-secrets` generator so the
+/// deployer mints webhook material the same way every other consumer mints a
+/// pack-declared generated secret (instead of a local ad-hoc CSPRNG).
+fn webhook_secret_policy() -> greentic_secrets_lib::GeneratedSecretRequirement {
+    greentic_secrets_lib::GeneratedSecretRequirement {
+        policy: "random".to_string(),
+        length: 32,
+        encoding: "raw_text".to_string(),
+        scope: greentic_secrets_lib::GeneratedSecretScope {
+            level: "tenant".to_string(),
+            team: Some("_".to_string()),
+        },
+        regenerate_if_present: false,
+    }
+}
+
+/// Mint a fresh per-endpoint webhook secret via the shared generator.
 fn generate_webhook_secret() -> Result<String, OpError> {
-    const LEN: usize = 32;
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut bytes = [0u8; LEN];
-    OsRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|e| OpError::InvalidArgument(format!("CSPRNG entropy failure: {e}")))?;
-    let secret: String = bytes
-        .iter()
-        .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
-        .collect();
-    Ok(secret)
+    let (bytes, _) = greentic_secrets_lib::generate_secret_value(&webhook_secret_policy())
+        .map_err(|e| OpError::InvalidArgument(format!("webhook secret generation: {e}")))?;
+    String::from_utf8(bytes)
+        .map_err(|e| OpError::InvalidArgument(format!("webhook secret encoding: {e}")))
 }
 
 /// Construct the deterministic `SecretRef` URI for an endpoint's webhook
@@ -954,7 +962,7 @@ fn write_webhook_secret_to_devstore(
         &env_dir,
         std::env::var_os(super::secrets::DEV_SECRETS_PATH_ENV).map(PathBuf::from),
     );
-    let store_uri = super::secrets::secret_ref_to_store_uri(secret_ref);
+    let store_uri = super::secrets::secret_ref_to_store_uri(secret_ref)?;
     super::secrets::dev_store_put(&dev_path, &store_uri, value)
 }
 
@@ -1705,7 +1713,8 @@ mod tests {
             &env_dir,
             std::env::var_os(crate::cli::secrets::DEV_SECRETS_PATH_ENV).map(PathBuf::from),
         );
-        let store_uri = crate::cli::secrets::secret_ref_to_store_uri(secret_ref);
+        let store_uri =
+            crate::cli::secrets::secret_ref_to_store_uri(secret_ref).expect("store-aligned ref");
         let dev = DevStore::with_path(dev_path).expect("open dev store");
         let bytes = tokio::runtime::Builder::new_current_thread()
             .enable_all()
