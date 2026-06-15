@@ -334,6 +334,10 @@ struct ApplyContext {
     /// Secret paths whose value came from the TTY prompter rather than the
     /// named env var — the plan row says `prompted` instead of `from $VAR`.
     prompted_paths: BTreeSet<String>,
+    /// Paste-sourced secret paths already present in the env's store (no value
+    /// to collect or put — store-as-source-of-truth). These get neither a put
+    /// step nor a missing-input report; `diff` skips them entirely.
+    store_satisfied_paths: BTreeSet<String>,
     bundles: Vec<ResolvedBundle>,
     endpoints: Vec<ResolvedEndpoint>,
     env: Option<Environment>,
@@ -434,6 +438,12 @@ pub struct ApplyOptions {
     /// confirmation (implies `yes`). Missing inputs are collected and
     /// reported instead of asked for.
     pub non_interactive: bool,
+    /// Pre-collected values for paste-sourced secrets (manifest `from_env`
+    /// absent), keyed by the manifest secret `path`. An interactive author
+    /// (the `gtc setup --env` wizard) collects each value once and hands it
+    /// here so apply does not prompt again; env-sourced secrets ignore this.
+    /// Never serialized — `SecretValue`'s `Debug` renders a placeholder.
+    pub prefilled_secrets: BTreeMap<String, SecretValue>,
 }
 
 /// Write the skeleton `greentic.env-manifest.v1` template to `path`.
@@ -489,20 +499,26 @@ pub fn apply(
     )
 }
 
-/// Fallback asked for a secret value when the manifest's `from_env`
-/// variable is unset: `(manifest path, from_env name) -> value`. `None`
-/// means "still missing" — the path lands in the missing-inputs report.
+/// Asked for a secret value: `(manifest path, from_env name) -> value`.
+/// For an env-sourced secret this is the fallback when `$from_env` is unset;
+/// for a paste-sourced secret (`from_env` absent) the caller passes an empty
+/// `from_env`, and this is the primary collection path. `None` means "still
+/// missing" — the path lands in the missing-inputs report.
 type SecretPrompter = dyn Fn(&str, &str) -> Option<String>;
 
-/// Masked TTY prompt for one missing secret value. Empty input declines —
-/// the path stays missing and apply aborts with the full report. The value
-/// lives only in the in-memory [`SecretValue`] map, exactly like an
-/// env-resolved one; it never reaches the manifest, plan, report, or audit.
+/// Masked TTY prompt for one secret value. Empty input declines — the path
+/// stays missing and apply aborts with the full report. The value lives only
+/// in the in-memory [`SecretValue`] map, exactly like an env-resolved one; it
+/// never reaches the manifest, plan, report, or audit. An empty `from_env`
+/// marks a paste-sourced secret (no env var to name), changing the wording
+/// from "unset variable" to a plain value prompt.
 fn prompt_secret_value(path: &str, from_env: &str) -> Option<String> {
-    let value = rpassword::prompt_password(format!(
-        "secret `{path}`: ${from_env} is unset — enter value (hidden; empty to abort): "
-    ))
-    .ok()?;
+    let prompt = if from_env.is_empty() {
+        format!("secret `{path}`: enter value (hidden; empty to abort): ")
+    } else {
+        format!("secret `{path}`: ${from_env} is unset — enter value (hidden; empty to abort): ")
+    };
+    let value = rpassword::prompt_password(prompt).ok()?;
     (!value.is_empty()).then_some(value)
 }
 
@@ -525,6 +541,7 @@ fn apply_with_lookups(
         updated_by,
         yes,
         non_interactive,
+        prefilled_secrets,
     } = opts;
     let yes = yes || non_interactive;
     let manifest_path = flags.answers.clone().ok_or_else(|| {
@@ -550,6 +567,7 @@ fn apply_with_lookups(
         updated_by,
         env_lookup,
         prompter,
+        &prefilled_secrets,
     )?;
     let steps = diff(store, &ctx)?;
     render_plan(&steps, &ctx.warnings, &ctx.missing);
@@ -644,6 +662,7 @@ fn resolve_and_validate(
     updated_by: String,
     env_lookup: &dyn Fn(&str) -> Option<String>,
     prompter: Option<&SecretPrompter>,
+    prefilled_secrets: &BTreeMap<String, SecretValue>,
 ) -> Result<ApplyContext, OpError> {
     let env_id = EnvId::try_from(manifest.environment.id.as_str())
         .map_err(|e| OpError::InvalidArgument(format!("environment.id: {e}")))?;
@@ -693,20 +712,45 @@ fn resolve_and_validate(
     // An unresolvable value is a MISSING INPUT, not a structural error:
     // collect every gap (offering the TTY prompter as a fallback) instead
     // of failing on the first, so one run reports the complete list.
+    //
+    // Per-secret resolution by source:
+    // - env-sourced (`from_env: Some`): read `$from_env`, falling back to an
+    //   interactive masked prompt when it is unset (today's behavior).
+    // - paste-sourced (`from_env: None`): use an author-supplied value
+    //   (`prefilled_secrets`, the wizard hand-off) if present; else, if the
+    //   value is already in the env's secrets store, it is satisfied with no
+    //   re-prompt and no put (the store is the source of truth for pasted
+    //   values); else prompt interactively; else report it missing.
+    let env_dir = store.env_dir(&env_id)?;
     let mut missing = Vec::new();
     let mut secret_values = BTreeMap::new();
     let mut prompted_paths = BTreeSet::new();
+    let mut store_satisfied_paths = BTreeSet::new();
     for s in &manifest.secrets {
-        let env_value = env_lookup(&s.from_env).filter(|v| !v.is_empty());
-        let value = match env_value {
-            Some(v) => Some(v),
-            None => prompter.and_then(|p| {
-                let v = p(&s.path, &s.from_env).filter(|v| !v.is_empty());
-                if v.is_some() {
-                    prompted_paths.insert(s.path.clone());
+        let value = match &s.from_env {
+            Some(from_env) => match env_lookup(from_env).filter(|v| !v.is_empty()) {
+                Some(v) => Some(v),
+                None => prompter.and_then(|p| {
+                    let v = p(&s.path, from_env).filter(|v| !v.is_empty());
+                    if v.is_some() {
+                        prompted_paths.insert(s.path.clone());
+                    }
+                    v
+                }),
+            },
+            None => {
+                if let Some(prefilled) = prefilled_secrets.get(&s.path) {
+                    Some(prefilled.expose().to_string())
+                } else if super::secrets::dev_store_has(&env_dir, &env_id, &s.path)? {
+                    // Already stored — nothing to collect or put. Skip
+                    // entirely: not a value, not a missing input.
+                    store_satisfied_paths.insert(s.path.clone());
+                    continue;
+                } else {
+                    // Empty `from_env` selects the paste-prompt wording.
+                    prompter.and_then(|p| p(&s.path, "").filter(|v| !v.is_empty()))
                 }
-                v
-            }),
+            }
         };
         match value {
             Some(v) => {
@@ -715,7 +759,10 @@ fn resolve_and_validate(
             None => missing.push(MissingItem {
                 kind: MissingKind::SecretValue,
                 key: s.path.clone(),
-                source: format!("env:{}", s.from_env),
+                source: match &s.from_env {
+                    Some(from_env) => format!("env:{from_env}"),
+                    None => "paste".to_string(),
+                },
             }),
         }
     }
@@ -963,6 +1010,7 @@ fn resolve_and_validate(
         manifest,
         secret_values,
         prompted_paths,
+        store_satisfied_paths,
         bundles: resolved_bundles,
         endpoints: resolved_endpoints,
         env,
@@ -1285,6 +1333,14 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
     //    change. Secrets land before bundles so a just-deployed revision
     //    never serves a request that resolves a missing secret.
     for s in &ctx.manifest.secrets {
+        // A paste-sourced secret already in the store needs no put step
+        // (store-as-source-of-truth). A missing-input secret still emits an
+        // undiffable put step for plan visibility — it never reaches execute
+        // because the mutating path aborts on missing inputs first, exactly
+        // as for an unset env var.
+        if ctx.store_satisfied_paths.contains(&s.path) {
+            continue;
+        }
         // Deliberately NO deterministic idempotency key: an always-put is
         // by definition a NEW write (values cannot be diffed until A9), so
         // a value-insensitive key would stamp two semantically different
@@ -1294,10 +1350,12 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
         // conflict rule). `secrets::put` mints a fresh per-invocation key
         // instead (second exception alongside deploy's per-revision
         // cut-over key).
-        let detail = if ctx.prompted_paths.contains(&s.path) {
-            "prompted (cannot diff until A9)".to_string()
-        } else {
-            format!("from ${} (cannot diff until A9)", s.from_env)
+        let detail = match &s.from_env {
+            None => "pasted (cannot diff until A9)".to_string(),
+            Some(_) if ctx.prompted_paths.contains(&s.path) => {
+                "prompted (cannot diff until A9)".to_string()
+            }
+            Some(from_env) => format!("from ${from_env} (cannot diff until A9)"),
         };
         steps.push(ApplyStep {
             kind: ApplyStepKind::PutSecret,
@@ -4052,6 +4110,7 @@ mod tests {
             "test".to_string(),
             &lookup,
             None,
+            &BTreeMap::new(),
         )
         .unwrap();
         let steps = diff(&store, &ctx).unwrap();
@@ -4221,6 +4280,143 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("1 missing input(s)"), "{err}");
         assert!(!dir.path().join("local/audit/events.jsonl").exists());
+    }
+
+    // --- paste-sourced secrets (manifest `from_env` absent) -----------------
+
+    /// A paste-sourced secret entry: no `from_env`, value supplied out of band.
+    fn paste_secrets_manifest() -> Value {
+        json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "secrets": [{"path": SECRET_PATH}]
+        })
+    }
+
+    fn dev_store_value(dir: &Path) -> Vec<u8> {
+        let store_path = dir
+            .join("local")
+            .join(super::super::secrets::DEV_STORE_RELATIVE);
+        dev_store_read(&store_path, &format!("secrets://local/{SECRET_PATH}"))
+    }
+
+    #[test]
+    fn paste_secret_prefilled_value_is_put_and_plan_says_pasted() {
+        // The wizard's hand-off: a pre-collected value, no env var, no prompt.
+        let (dir, store) = seeded_store_with_dev_secrets();
+        let manifest_path = write_manifest(dir.path(), &paste_secrets_manifest());
+        let flags = OpFlags {
+            schema_only: false,
+            answers: Some(manifest_path.clone()),
+        };
+        let mut prefilled = BTreeMap::new();
+        prefilled.insert(
+            SECRET_PATH.to_string(),
+            SecretValue::from("tok-pasted-42".to_string()),
+        );
+        let outcome = apply_with_lookups(
+            &store,
+            &flags,
+            ApplyOptions {
+                mode: ApplyMode::Apply,
+                non_interactive: true,
+                prefilled_secrets: prefilled,
+                ..ApplyOptions::default()
+            },
+            &|_| None,
+            None,
+        )
+        .expect("prefilled paste apply succeeds");
+
+        let envelope = serde_json::to_string(&outcome).unwrap();
+        assert!(!envelope.contains("tok-pasted-42"), "{envelope}");
+        let steps = outcome.result["steps"].as_array().unwrap();
+        let put = steps.iter().find(|s| s["kind"] == "put-secret").unwrap();
+        assert_eq!(put["detail"], "pasted (cannot diff until A9)");
+        assert!(outcome.result["missing"].as_array().unwrap().is_empty());
+        assert_eq!(dev_store_value(dir.path()), b"tok-pasted-42".to_vec());
+    }
+
+    #[test]
+    fn paste_secret_already_in_store_is_a_noop() {
+        // Store-as-source-of-truth: with the value already present, a re-apply
+        // that can't re-collect it (no prefill, no prompter) is satisfied —
+        // no put step, no missing input, value untouched.
+        let (dir, store) = seeded_store_with_dev_secrets();
+        let manifest_path = write_manifest(dir.path(), &paste_secrets_manifest());
+        // Seed via a first prefilled apply.
+        let mut prefilled = BTreeMap::new();
+        prefilled.insert(
+            SECRET_PATH.to_string(),
+            SecretValue::from("tok-stored".to_string()),
+        );
+        let flags = OpFlags {
+            schema_only: false,
+            answers: Some(manifest_path.clone()),
+        };
+        apply_with_lookups(
+            &store,
+            &flags,
+            ApplyOptions {
+                mode: ApplyMode::Apply,
+                non_interactive: true,
+                prefilled_secrets: prefilled,
+                ..ApplyOptions::default()
+            },
+            &|_| None,
+            None,
+        )
+        .expect("seed apply");
+
+        // Second apply: no prefill, no prompter, non-interactive.
+        let outcome = run_with_lookup(&store, &manifest_path, ApplyMode::Apply, &|_| None)
+            .expect("re-apply is a no-op, not a missing-input failure");
+        let steps = outcome.result["steps"].as_array().unwrap();
+        assert!(
+            !steps.iter().any(|s| s["kind"] == "put-secret"),
+            "an already-stored paste secret needs no put step: {steps:?}"
+        );
+        assert!(outcome.result["missing"].as_array().unwrap().is_empty());
+        assert_eq!(dev_store_value(dir.path()), b"tok-stored".to_vec());
+    }
+
+    #[test]
+    fn paste_secret_missing_when_absent_and_non_interactive() {
+        // No prefill, not in the store, no prompter → reported missing with a
+        // `paste` source (not an env var), and apply aborts before mutation.
+        let (dir, store) = seeded_store_with_dev_secrets();
+        let manifest_path = write_manifest(dir.path(), &paste_secrets_manifest());
+        let err = run_with_lookup(&store, &manifest_path, ApplyMode::Apply, &|_| None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("1 missing input(s)"), "{msg}");
+        assert!(msg.contains("paste"), "names the paste source: {msg}");
+        assert!(msg.contains(SECRET_PATH), "{msg}");
+        assert!(!dir.path().join("local/audit/events.jsonl").exists());
+    }
+
+    #[test]
+    fn paste_secret_prompts_with_value_wording() {
+        // Interactive, no prefill, not in store → masked prompt; the prompter
+        // receives an empty `from_env` (paste wording) and the value is put.
+        let (dir, store) = seeded_store_with_dev_secrets();
+        let manifest_path = write_manifest(dir.path(), &paste_secrets_manifest());
+        let prompter = |path: &str, from_env: &str| {
+            assert_eq!(path, SECRET_PATH);
+            assert_eq!(from_env, "", "paste secrets prompt with an empty from_env");
+            Some("tok-typed".to_string())
+        };
+        let outcome = run_with_lookup_and_prompter(
+            &store,
+            &manifest_path,
+            ApplyMode::Apply,
+            &|_| None,
+            Some(&prompter),
+        )
+        .expect("paste prompt apply succeeds");
+        let steps = outcome.result["steps"].as_array().unwrap();
+        let put = steps.iter().find(|s| s["kind"] == "put-secret").unwrap();
+        assert_eq!(put["detail"], "pasted (cannot diff until A9)");
+        assert_eq!(dev_store_value(dir.path()), b"tok-typed".to_vec());
     }
 
     #[test]
