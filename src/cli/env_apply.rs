@@ -69,7 +69,8 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use greentic_deploy_spec::{
-    CustomerId, DeploymentId, EnvId, Environment, MessagingEndpoint, RouteBinding,
+    BundleDeploymentStatus, CustomerId, DeploymentId, EnvId, Environment, MessagingEndpoint,
+    RouteBinding,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -77,7 +78,10 @@ use sha2::{Digest, Sha256};
 use crate::environment::{EnvironmentStore, LocalFsStore, trust_root as store_trust_root};
 use crate::runtime_secrets::SecretValue;
 
-use super::bundles::{BundleUpdatePayload, RouteBindingPayload, into_route_binding};
+use super::bundles::{
+    BundleUpdatePayload, RevenueShareEntryPayload, RouteBindingPayload, convert_revenue_share,
+    into_route_binding,
+};
 use super::deploy::BundleDeployPayload;
 use super::env::EnvInitPayload;
 use super::env_manifest::{
@@ -215,6 +219,10 @@ enum StepOp {
         customer_id: Option<String>,
         config_overrides: Option<BTreeMap<String, BTreeMap<String, Value>>>,
         route_binding: Option<RouteBindingPayload>,
+        /// Revenue-share split applied on the FRESH-add path (`None` =
+        /// `greentic@10000`). Reconciled via `bundles update` for an
+        /// existing deployment.
+        revenue_share: Option<Vec<RevenueShareEntryPayload>>,
         revisions: Vec<SplitRevisionEntry>,
     },
     BundleUpdate(Box<BundleUpdatePayload>),
@@ -1106,51 +1114,40 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     });
                 }
 
-                if binding_differs || (overrides_differ && converged) {
-                    let route_binding = binding_differs.then(|| {
+                // Metadata reconcile. `config_overrides` defers to a converged
+                // split (it otherwise rides the next re-split run); revenue_
+                // share/status are deployment-level and reconcile independently
+                // of the split (a re-split never touches them).
+                let diff = BundleMetaDiff {
+                    route_binding: binding_differs.then(|| {
                         rb.spec
                             .route_binding
                             .clone()
                             .expect("binding_differs implies manifest binding")
-                    });
-                    let config_overrides = (overrides_differ && converged)
-                        .then(|| rb.spec.config_overrides.clone().expect("overrides_differ"));
-                    let desired_hash = hash_json(&json!({
-                        "route_binding": route_binding,
-                        "config_overrides": config_overrides,
-                    }));
-                    let ikey = derive_idempotency_key(
-                        &ctx.env_id,
-                        ApplyStepKind::UpdateBundle.label(),
-                        &rb.spec.bundle_id,
-                        &desired_hash,
-                    );
-                    let mut what = Vec::new();
-                    if binding_differs {
-                        what.push(format!("binding → {}", binding_summary(&desired_binding)));
-                    }
-                    if config_overrides.is_some() {
-                        what.push("config_overrides".to_string());
-                    }
-                    steps.push(ApplyStep {
-                        kind: ApplyStepKind::UpdateBundle,
-                        key: rb.spec.bundle_id.clone(),
-                        action: ApplyAction::Update,
-                        detail: what.join(", "),
-                        idempotency_key: Some(ikey.clone()),
-                        op: StepOp::BundleUpdate(Box::new(BundleUpdatePayload {
-                            environment_id: env_id_str.clone(),
-                            deployment_id: dep.deployment_id.to_string(),
-                            status: None,
-                            route_binding,
-                            revenue_share: None,
-                            config_overrides,
-                            idempotency_key: Some(ikey),
-                        })),
-                    });
+                    }),
+                    config_overrides: (overrides_differ && converged)
+                        .then(|| rb.spec.config_overrides.clone().expect("overrides_differ")),
+                    revenue_share: revenue_share_differs(rb, dep).then(|| {
+                        rb.spec
+                            .revenue_share
+                            .clone()
+                            .expect("differs implies manifest")
+                    }),
+                    status: status_differs(rb, dep).then(|| rb.spec.status.expect("differs")),
+                };
+                let did_update = !diff.is_noop();
+                if let Some(step) = bundle_meta_update_step(
+                    &ctx.env_id,
+                    &env_id_str,
+                    &rb.spec.bundle_id,
+                    dep.deployment_id,
+                    &desired_binding,
+                    diff,
+                ) {
+                    steps.push(step);
                 }
 
-                if converged && !binding_differs && !overrides_differ {
+                if converged && !did_update {
                     steps.push(ApplyStep::no_op(
                         ApplyStepKind::DeploySplit,
                         rb.spec.bundle_id.clone(),
@@ -1211,51 +1208,41 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     });
                 }
 
-                if binding_differs || (overrides_differ && !needs_deploy) {
-                    let route_binding = binding_differs.then(|| {
+                // Metadata reconcile. `config_overrides` ride the deploy when
+                // re-staging (so they defer here while `needs_deploy`); the
+                // binding is applied AFTER the deploy lands; revenue_share/
+                // status are deployment-level and reconcile independently of
+                // the deploy (a re-deploy never resets them).
+                let diff = BundleMetaDiff {
+                    route_binding: binding_differs.then(|| {
                         rb.spec
                             .route_binding
                             .clone()
                             .expect("binding_differs implies manifest binding")
-                    });
-                    let config_overrides = (overrides_differ && !needs_deploy)
-                        .then(|| rb.spec.config_overrides.clone().expect("overrides_differ"));
-                    let desired_hash = hash_json(&json!({
-                        "route_binding": route_binding,
-                        "config_overrides": config_overrides,
-                    }));
-                    let ikey = derive_idempotency_key(
-                        &ctx.env_id,
-                        ApplyStepKind::UpdateBundle.label(),
-                        &rb.spec.bundle_id,
-                        &desired_hash,
-                    );
-                    let mut what = Vec::new();
-                    if binding_differs {
-                        what.push(format!("binding → {}", binding_summary(&desired_binding)));
-                    }
-                    if config_overrides.is_some() {
-                        what.push("config_overrides".to_string());
-                    }
-                    steps.push(ApplyStep {
-                        kind: ApplyStepKind::UpdateBundle,
-                        key: rb.spec.bundle_id.clone(),
-                        action: ApplyAction::Update,
-                        detail: what.join(", "),
-                        idempotency_key: Some(ikey.clone()),
-                        op: StepOp::BundleUpdate(Box::new(BundleUpdatePayload {
-                            environment_id: env_id_str.clone(),
-                            deployment_id: dep.deployment_id.to_string(),
-                            status: None,
-                            route_binding,
-                            revenue_share: None,
-                            config_overrides,
-                            idempotency_key: Some(ikey),
-                        })),
-                    });
+                    }),
+                    config_overrides: (overrides_differ && !needs_deploy)
+                        .then(|| rb.spec.config_overrides.clone().expect("overrides_differ")),
+                    revenue_share: revenue_share_differs(rb, dep).then(|| {
+                        rb.spec
+                            .revenue_share
+                            .clone()
+                            .expect("differs implies manifest")
+                    }),
+                    status: status_differs(rb, dep).then(|| rb.spec.status.expect("differs")),
+                };
+                let did_update = !diff.is_noop();
+                if let Some(step) = bundle_meta_update_step(
+                    &ctx.env_id,
+                    &env_id_str,
+                    &rb.spec.bundle_id,
+                    dep.deployment_id,
+                    &desired_binding,
+                    diff,
+                ) {
+                    steps.push(step);
                 }
 
-                if !needs_deploy && !binding_differs && !overrides_differ {
+                if !needs_deploy && !did_update {
                     steps.push(ApplyStep::no_op(
                         ApplyStepKind::DeployBundle,
                         rb.spec.bundle_id.clone(),
@@ -1701,6 +1688,35 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
                 rb.spec.bundle_id
             ));
         }
+        // revenue_share (G2) is threaded into the create path AND reconciled
+        // for existing deployments, so it is correct after a single apply —
+        // assert it whenever declared.
+        if let Some(shares) = &rb.spec.revenue_share
+            && convert_revenue_share(shares) != dep.revenue_share
+        {
+            failures.push(format!(
+                "bundle `{}`: revenue_share differs from the manifest",
+                rb.spec.bundle_id
+            ));
+        }
+        // status (G3) is reconcile-only against an EXISTING deployment. A
+        // deployment created during THIS apply is born `active`, so a declared
+        // non-`active` status converges on the next apply — don't fail verify
+        // for it here. Assert only when the deployment pre-dated this apply.
+        let existed_pre_apply = ctx.env.as_ref().is_some_and(|e| {
+            e.bundles
+                .iter()
+                .any(|d| d.bundle_id == dep.bundle_id && d.customer_id == dep.customer_id)
+        });
+        if let Some(status) = rb.spec.status
+            && existed_pre_apply
+            && status != dep.status
+        {
+            failures.push(format!(
+                "bundle `{}`: status is `{:?}`, expected `{status:?}`",
+                rb.spec.bundle_id, dep.status
+            ));
+        }
     }
 
     // Verify endpoints against the freshly reloaded env (re-match on
@@ -1744,6 +1760,113 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
 
 // --- helpers --------------------------------------------------------------------
 
+/// True when the manifest declares a revenue-share that differs from the live
+/// deployment's split. Absent in the manifest = "leave untouched" = no diff.
+fn revenue_share_differs(
+    rb: &ResolvedBundle,
+    dep: &greentic_deploy_spec::BundleDeployment,
+) -> bool {
+    rb.spec
+        .revenue_share
+        .as_ref()
+        .is_some_and(|s| convert_revenue_share(s) != dep.revenue_share)
+}
+
+/// True when the manifest declares a status that differs from the live
+/// deployment's status. Absent in the manifest = "leave untouched" = no diff.
+fn status_differs(rb: &ResolvedBundle, dep: &greentic_deploy_spec::BundleDeployment) -> bool {
+    rb.spec.status.is_some_and(|s| s != dep.status)
+}
+
+/// Desired `bundles update` mutations for one bundle entry, derived against a
+/// live deployment. Each `Some` field is applied; an all-`None` set means no
+/// update step is needed.
+struct BundleMetaDiff {
+    /// Set when the manifest route binding differs from the live binding.
+    route_binding: Option<RouteBindingPayload>,
+    /// Set when overrides differ AND the deploy/stage gate allows applying
+    /// them this run (they otherwise ride the deploy, or defer one apply).
+    config_overrides: Option<BTreeMap<String, BTreeMap<String, Value>>>,
+    /// Set when the manifest revenue-share differs from the live split.
+    revenue_share: Option<Vec<RevenueShareEntryPayload>>,
+    /// Set when the manifest status differs from the live status.
+    status: Option<BundleDeploymentStatus>,
+}
+
+impl BundleMetaDiff {
+    fn is_noop(&self) -> bool {
+        self.route_binding.is_none()
+            && self.config_overrides.is_none()
+            && self.revenue_share.is_none()
+            && self.status.is_none()
+    }
+}
+
+/// Build a `bundles update` step from the desired metadata mutations, or
+/// `None` when nothing differs. Centralizes the idempotency-key derivation,
+/// the human `detail` string, and the payload so both reconcile arms
+/// (single- and multi-revision) share one construction.
+fn bundle_meta_update_step(
+    env_id: &EnvId,
+    env_id_str: &str,
+    bundle_id: &str,
+    deployment_id: DeploymentId,
+    desired_binding: &Option<RouteBinding>,
+    diff: BundleMetaDiff,
+) -> Option<ApplyStep> {
+    if diff.is_noop() {
+        return None;
+    }
+    // Hash the revenue-share as ordered (party, bps) pairs (the payload type
+    // isn't directly hashable through `hash_json` without this projection).
+    let revenue_share_hash = diff.revenue_share.as_ref().map(|s| {
+        s.iter()
+            .map(|e| (e.party_id.clone(), e.basis_points))
+            .collect::<Vec<_>>()
+    });
+    let desired_hash = hash_json(&json!({
+        "route_binding": diff.route_binding,
+        "config_overrides": diff.config_overrides,
+        "revenue_share": revenue_share_hash,
+        "status": diff.status,
+    }));
+    let ikey = derive_idempotency_key(
+        env_id,
+        ApplyStepKind::UpdateBundle.label(),
+        bundle_id,
+        &desired_hash,
+    );
+    let mut what = Vec::new();
+    if diff.route_binding.is_some() {
+        what.push(format!("binding → {}", binding_summary(desired_binding)));
+    }
+    if diff.config_overrides.is_some() {
+        what.push("config_overrides".to_string());
+    }
+    if diff.revenue_share.is_some() {
+        what.push("revenue_share".to_string());
+    }
+    if let Some(s) = diff.status {
+        what.push(format!("status → {s:?}"));
+    }
+    Some(ApplyStep {
+        kind: ApplyStepKind::UpdateBundle,
+        key: bundle_id.to_string(),
+        action: ApplyAction::Update,
+        detail: what.join(", "),
+        idempotency_key: Some(ikey.clone()),
+        op: StepOp::BundleUpdate(Box::new(BundleUpdatePayload {
+            environment_id: env_id_str.to_string(),
+            deployment_id: deployment_id.to_string(),
+            status: diff.status,
+            route_binding: diff.route_binding,
+            revenue_share: diff.revenue_share,
+            config_overrides: diff.config_overrides,
+            idempotency_key: Some(ikey),
+        })),
+    })
+}
+
 /// Build a [`BundleDeployPayload`] from a resolved single-revision bundle.
 /// The primary (first) resolved revision supplies the artifact path.
 fn deploy_payload(
@@ -1759,6 +1882,9 @@ fn deploy_payload(
         idempotency_key: None,
         config_overrides: rb.spec.config_overrides.clone(),
         route_binding,
+        // Threaded into the FRESH-add path; ignored by `deploy` on a
+        // re-deploy (the existing split is reconciled via `bundles update`).
+        revenue_share: rb.spec.revenue_share.clone(),
     }
 }
 
@@ -1770,6 +1896,7 @@ fn deploy_split_op(env_id: &str, rb: &ResolvedBundle) -> StepOp {
         customer_id: rb.spec.customer_id.clone(),
         config_overrides: rb.spec.config_overrides.clone(),
         route_binding: rb.spec.route_binding.clone(),
+        revenue_share: rb.spec.revenue_share.clone(),
         revisions: rb
             .revisions
             .iter()
@@ -1798,6 +1925,7 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
         customer_id,
         config_overrides,
         route_binding,
+        revenue_share,
         revisions: split_revs,
     } = op
     else {
@@ -1823,7 +1951,9 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
                 bundle_id: bundle_id.clone(),
                 customer_id: customer_id.clone(),
                 route_binding: route_binding.clone().unwrap_or_default(),
-                revenue_share: super::bundles::default_revenue_share(),
+                revenue_share: revenue_share
+                    .clone()
+                    .unwrap_or_else(super::bundles::default_revenue_share),
                 authorization_ref: super::bundles::default_authorization_ref(),
                 config_overrides: config_overrides.clone().unwrap_or_default(),
                 idempotency_key: None,
@@ -2453,6 +2583,134 @@ mod tests {
         );
     }
 
+    // --- G2/G3: revenue_share + status ---
+
+    /// Minimal single-revision manifest with no binding/endpoints — the base
+    /// for the metadata-reconcile tests.
+    fn plain_bundle_manifest() -> Value {
+        json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "quickstart", "bundle_path": fixture()}]
+        })
+    }
+
+    #[test]
+    fn status_reconciles_against_existing_deployment() {
+        let (dir, store) = seeded_store();
+        let base = plain_bundle_manifest();
+        let base_path = write_manifest(dir.path(), &base);
+        run_apply(&store, &base_path).expect("first apply");
+        assert_eq!(
+            load_local(&store).bundles[0].status,
+            BundleDeploymentStatus::Active
+        );
+
+        // Re-apply with status: paused → one update-bundle, no re-stage.
+        let mut paused = base.clone();
+        paused["bundles"][0]["status"] = json!("paused");
+        let paused_path = write_manifest(dir.path(), &paused);
+        let plan = run_dry(&store, &paused_path).expect("dry-run");
+        let actions = step_actions(&plan.result);
+        assert!(
+            actions.contains(&("update-bundle".to_string(), "update".to_string())),
+            "status change must plan an update-bundle: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|(k, a)| k != "deploy-bundle" || a == "no-op"),
+            "status change must not re-stage: {actions:?}"
+        );
+
+        run_apply(&store, &paused_path).expect("apply pause");
+        assert_eq!(
+            load_local(&store).bundles[0].status,
+            BundleDeploymentStatus::Paused
+        );
+
+        // Idempotent: re-applying the paused manifest changes nothing.
+        let plan2 = run_dry(&store, &paused_path).expect("dry-run 2");
+        assert_eq!(plan2.result["changed"], 0, "{}", plan2.result);
+    }
+
+    #[test]
+    fn revenue_share_reconciles_against_existing_deployment() {
+        let (dir, store) = seeded_store();
+        let base = plain_bundle_manifest();
+        let base_path = write_manifest(dir.path(), &base);
+        run_apply(&store, &base_path).expect("first apply");
+        // Default split = greentic@10000.
+        assert_eq!(load_local(&store).bundles[0].revenue_share.len(), 1);
+
+        let mut split = base.clone();
+        split["bundles"][0]["revenue_share"] = json!([
+            {"party_id": "greentic", "basis_points": 7000},
+            {"party_id": "partner", "basis_points": 3000}
+        ]);
+        let split_path = write_manifest(dir.path(), &split);
+        let plan = run_dry(&store, &split_path).expect("dry-run");
+        assert!(
+            step_actions(&plan.result)
+                .contains(&("update-bundle".to_string(), "update".to_string())),
+            "revenue_share change must plan an update-bundle"
+        );
+
+        run_apply(&store, &split_path).expect("apply revenue split");
+        let env = load_local(&store);
+        let shares = &env.bundles[0].revenue_share;
+        assert_eq!(shares.len(), 2);
+        assert_eq!(shares[0].party_id.as_str(), "greentic");
+        assert_eq!(shares[0].basis_points, 7000);
+        assert_eq!(shares[1].party_id.as_str(), "partner");
+        assert_eq!(shares[1].basis_points, 3000);
+
+        // Idempotent.
+        let plan2 = run_dry(&store, &split_path).expect("dry-run 2");
+        assert_eq!(plan2.result["changed"], 0, "{}", plan2.result);
+    }
+
+    #[test]
+    fn revenue_share_threaded_into_fresh_deploy_single_apply() {
+        let (dir, store) = seeded_store();
+        let mut manifest = plain_bundle_manifest();
+        manifest["bundles"][0]["revenue_share"] = json!([
+            {"party_id": "greentic", "basis_points": 6000},
+            {"party_id": "partner", "basis_points": 4000}
+        ]);
+        let p = write_manifest(dir.path(), &manifest);
+        // A SINGLE apply must converge — verify asserts revenue_share, so this
+        // proves it is threaded into the create path (not deferred).
+        run_apply(&store, &p).expect("fresh apply with revenue_share must verify");
+        let shares = &load_local(&store).bundles[0].revenue_share;
+        assert_eq!(shares.len(), 2);
+        assert_eq!(shares[1].party_id.as_str(), "partner");
+        assert_eq!(shares[1].basis_points, 4000);
+        assert_eq!(run_dry(&store, &p).expect("dry").result["changed"], 0);
+    }
+
+    #[test]
+    fn status_on_fresh_create_defers_one_apply_without_failing_verify() {
+        let (dir, store) = seeded_store();
+        let mut manifest = plain_bundle_manifest();
+        manifest["bundles"][0]["status"] = json!("paused");
+        let p = write_manifest(dir.path(), &manifest);
+        // First apply creates the deployment (born `active`); verify must NOT
+        // fail for the not-yet-applied `paused` status (reconcile-only).
+        run_apply(&store, &p).expect("fresh apply with status must not fail verify");
+        assert_eq!(
+            load_local(&store).bundles[0].status,
+            BundleDeploymentStatus::Active
+        );
+        // Second apply: the deployment now pre-dates the apply → status
+        // reconciles to paused, single-apply from here.
+        run_apply(&store, &p).expect("second apply pauses");
+        assert_eq!(
+            load_local(&store).bundles[0].status,
+            BundleDeploymentStatus::Paused
+        );
+    }
+
     #[test]
     fn degenerate_live_digest_fails_toward_redeploy() {
         let (dir, store) = seeded_store();
@@ -2674,6 +2932,7 @@ mod tests {
                 idempotency_key: None,
                 config_overrides: None,
                 route_binding: None,
+                revenue_share: None,
             }),
         )
         .expect("imperative deploy");
@@ -3529,6 +3788,7 @@ mod tests {
                 path_prefixes: vec!["/v1".to_string()],
                 tenant_selector: None,
             }),
+            revenue_share: None,
         };
         super::super::deploy::deploy(&store, &OpFlags::default(), Some(p.clone()))
             .expect("first deploy");

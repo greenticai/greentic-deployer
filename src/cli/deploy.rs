@@ -48,7 +48,10 @@ use serde_json::{Value, json};
 
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
-use super::bundles::{BundleAddPayload, BundleSummary, BundleUpdatePayload, RouteBindingPayload};
+use super::bundles::{
+    BundleAddPayload, BundleSummary, BundleUpdatePayload, RevenueShareEntryPayload,
+    RouteBindingPayload,
+};
 use super::revisions::{RevisionStagePayload, RevisionSummary, RevisionTransitionPayload};
 use super::traffic::{TrafficSetEntryPayload, TrafficSetPayload};
 use super::{OpError, OpFlags, OpOutcome};
@@ -103,6 +106,12 @@ pub struct BundleDeployPayload {
     /// `bundles update --route-binding`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_binding: Option<RouteBindingPayload>,
+    /// Revenue-share split applied on a FRESH deploy (forwarded to
+    /// `bundles add`). `None` = the `greentic@10000` default. Ignored on a
+    /// re-deploy (a blue-green version bump leaves the existing split
+    /// untouched — change it via `bundles update`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revenue_share: Option<Vec<RevenueShareEntryPayload>>,
 }
 
 fn default_environment_id() -> String {
@@ -293,7 +302,10 @@ pub fn deploy(
                 bundle_id: bundle_id.clone(),
                 customer_id: payload.customer_id.clone(),
                 route_binding: payload.route_binding.clone().unwrap_or_default(),
-                revenue_share: super::bundles::default_revenue_share(),
+                revenue_share: payload
+                    .revenue_share
+                    .clone()
+                    .unwrap_or_else(super::bundles::default_revenue_share),
                 authorization_ref: super::bundles::default_authorization_ref(),
                 // Fresh deploy: BundleAddPayload takes a plain BTreeMap
                 // (no prior state to clear). Unwrap the Option; None → empty.
@@ -480,6 +492,9 @@ pub fn payload_from_deploy_args(
         idempotency_key,
         config_overrides,
         route_binding,
+        // `op deploy` CLI has no revenue-share flag; defaults stay in
+        // `bundles add`. The env-manifest apply path sets this directly.
+        revenue_share: None,
     }))
 }
 
@@ -712,6 +727,7 @@ mod tests {
             idempotency_key: None,
             config_overrides: None,
             route_binding: None,
+            revenue_share: None,
         }
     }
 

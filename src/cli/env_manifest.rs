@@ -23,8 +23,10 @@ use qa_spec::{AnswerSet, FormSpec, QuestionSpec, QuestionType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use greentic_deploy_spec::BundleDeploymentStatus;
+
 use super::OpError;
-use super::bundles::{RouteBindingPayload, TenantSelectorPayload};
+use super::bundles::{RevenueShareEntryPayload, RouteBindingPayload, TenantSelectorPayload};
 
 /// Exact `schema` discriminator the manifest must carry.
 pub const ENV_MANIFEST_SCHEMA_V1: &str = "greentic.env-manifest.v1";
@@ -103,6 +105,18 @@ pub struct ManifestBundle {
     /// Billing principal (P6/B10): required for non-`local` environments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub customer_id: Option<String>,
+    /// Revenue-share split (G2). Absent = leave untouched (`greentic@10000`
+    /// on a fresh deploy). When set, the entries' `basis_points` must sum to
+    /// exactly 10 000; applied at create time and reconciled via
+    /// `bundles update` for an existing deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revenue_share: Option<Vec<RevenueShareEntryPayload>>,
+    /// Deployment status (G3): `active` | `paused` | `archived`. Absent =
+    /// leave untouched. Reconciled via `bundles update` against an existing
+    /// deployment; a freshly-created deployment is always `active` and a
+    /// declared non-`active` status converges on the next apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<BundleDeploymentStatus>,
     /// Forwarded verbatim with `op deploy`'s three-valued semantics:
     /// absent = leave untouched, `{}` = explicit clear, non-empty = replace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -274,6 +288,43 @@ impl EnvManifest {
                 // Weight consistency: all-set must sum to FULL_TRAFFIC_BPS;
                 // all-unset = equal split (computed at resolve time); mixed = error.
                 validate_revision_weights(&b.bundle_id, revisions)?;
+            }
+
+            // Revenue-share (G2): when declared, the split must be non-empty
+            // and sum to exactly FULL_TRAFFIC_BPS — mirrors the spec's
+            // `validate_revenue_share` so a bad split fails at manifest-shape
+            // time with a clear message instead of at store-save time.
+            if let Some(shares) = &b.revenue_share {
+                if shares.is_empty() {
+                    return Err(OpError::InvalidArgument(format!(
+                        "bundle `{}`: `revenue_share` must not be empty",
+                        b.bundle_id
+                    )));
+                }
+                let mut parties = BTreeSet::new();
+                let mut sum: u64 = 0;
+                for entry in shares {
+                    if entry.party_id.trim().is_empty() {
+                        return Err(OpError::InvalidArgument(format!(
+                            "bundle `{}`: revenue_share party_id must not be empty",
+                            b.bundle_id
+                        )));
+                    }
+                    if !parties.insert(entry.party_id.as_str()) {
+                        return Err(OpError::InvalidArgument(format!(
+                            "bundle `{}`: duplicate revenue_share party_id `{}`",
+                            b.bundle_id, entry.party_id
+                        )));
+                    }
+                    sum += u64::from(entry.basis_points);
+                }
+                if sum != u64::from(FULL_TRAFFIC_BPS) {
+                    return Err(OpError::InvalidArgument(format!(
+                        "bundle `{}`: revenue_share basis_points sum to {sum}, must be exactly \
+                         {FULL_TRAFFIC_BPS}",
+                        b.bundle_id
+                    )));
+                }
             }
 
             if let Some(rb) = &b.route_binding {
@@ -510,6 +561,20 @@ pub fn manifest_schema() -> Value {
                             }
                         },
                         "customer_id": {"type": ["string", "null"], "description": "required for non-local envs (B10)"},
+                        "revenue_share": {
+                            "type": ["array", "null"],
+                            "description": "G2: billing split; basis_points must sum to 10000; absent=untouched (greentic@10000)",
+                            "items": {
+                                "type": "object",
+                                "required": ["party_id", "basis_points"],
+                                "additionalProperties": false,
+                                "properties": {
+                                    "party_id": {"type": "string"},
+                                    "basis_points": {"type": "integer", "description": "0..10000; all entries sum to 10000"}
+                                }
+                            }
+                        },
+                        "status": {"type": ["string", "null"], "enum": ["active", "paused", "archived", null], "description": "G3: deployment status; absent=untouched; reconciled against an existing deployment"},
                         "config_overrides": {"type": ["object", "null"], "description": "<pack_id> -> <key> -> <json>; absent=untouched, {}=clear, map=replace"},
                         "route_binding": {
                             "type": ["object", "null"],
@@ -959,6 +1024,8 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
             )?)),
             revisions: None,
             customer_id: opt_row_string("bundles", idx, row, "customer_id")?,
+            revenue_share: None,
+            status: None,
             config_overrides,
             route_binding,
         });
@@ -1475,6 +1542,10 @@ mod tests {
             ("bundles[].revisions[].drain_seconds", ""),
             ("bundles[].revisions[].abort_metrics", ""),
             ("bundles[].customer_id", "bundles.customer_id"),
+            // revenue_share / status are JSON-first (no form question).
+            ("bundles[].revenue_share[].party_id", ""),
+            ("bundles[].revenue_share[].basis_points", ""),
+            ("bundles[].status", ""),
             ("bundles[].config_overrides", "bundles.config_overrides"),
             ("bundles[].route_binding.hosts", "bundles.route_hosts"),
             (
@@ -1999,5 +2070,98 @@ mod tests {
         let revs = manifest.bundles[0].revisions.as_ref().unwrap();
         let weights = compute_effective_weights_bps(revs);
         assert_eq!(weights, vec![FULL_TRAFFIC_BPS]);
+    }
+
+    // --- G2/G3: revenue_share + status shape ---
+
+    fn bundle_with(extra: serde_json::Value) -> EnvManifest {
+        let mut bundle = serde_json::json!({
+            "bundle_id": "b",
+            "bundle_path": "b.gtbundle"
+        });
+        bundle
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [bundle]
+        }))
+        .expect("deserialize")
+    }
+
+    #[test]
+    fn revenue_share_valid_sum_passes() {
+        let manifest = bundle_with(serde_json::json!({
+            "revenue_share": [
+                {"party_id": "greentic", "basis_points": 8000},
+                {"party_id": "partner", "basis_points": 2000}
+            ]
+        }));
+        manifest.validate_shape().expect("valid 10000 sum");
+        assert_eq!(manifest.bundles[0].revenue_share.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn revenue_share_wrong_sum_fails() {
+        let manifest = bundle_with(serde_json::json!({
+            "revenue_share": [
+                {"party_id": "greentic", "basis_points": 8000},
+                {"party_id": "partner", "basis_points": 1000}
+            ]
+        }));
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("9000"), "{err}");
+        assert!(err.to_string().contains("10000"), "{err}");
+    }
+
+    #[test]
+    fn revenue_share_empty_fails() {
+        let manifest = bundle_with(serde_json::json!({ "revenue_share": [] }));
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn revenue_share_duplicate_party_fails() {
+        let manifest = bundle_with(serde_json::json!({
+            "revenue_share": [
+                {"party_id": "greentic", "basis_points": 5000},
+                {"party_id": "greentic", "basis_points": 5000}
+            ]
+        }));
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate revenue_share party_id"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn status_deserializes_lowercase() {
+        for (text, want) in [
+            ("active", BundleDeploymentStatus::Active),
+            ("paused", BundleDeploymentStatus::Paused),
+            ("archived", BundleDeploymentStatus::Archived),
+        ] {
+            let manifest = bundle_with(serde_json::json!({ "status": text }));
+            manifest.validate_shape().expect("valid status");
+            assert_eq!(manifest.bundles[0].status, Some(want), "status `{text}`");
+        }
+    }
+
+    #[test]
+    fn unknown_status_rejected_at_parse() {
+        let err = serde_json::from_value::<EnvManifest>(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "b", "bundle_path": "b.gtbundle", "status": "running"}]
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("status") || err.to_string().contains("variant"),
+            "{err}"
+        );
     }
 }
