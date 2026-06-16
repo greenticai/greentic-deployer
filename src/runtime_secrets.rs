@@ -607,6 +607,19 @@ pub async fn resolve_runtime_secrets(
                             _ => continue,
                         }
                     }
+                    // A `greentic-start`-seeded placeholder is not a real
+                    // secret. Treat it as unresolved and keep searching: if no
+                    // real value turns up, a required secret fails the deploy
+                    // (it lands in `missing`); an optional one is skipped, so a
+                    // value an operator pre-seeded directly in the cloud secret
+                    // manager survives instead of being clobbered.
+                    if is_placeholder_secret_value(&value) {
+                        checked_sources.push(format!(
+                            "{} (auto-seeded placeholder, ignored)",
+                            path.display()
+                        ));
+                        continue;
+                    }
                     found = Some((SecretValueSource::DevStore { path: path.clone() }, value));
                     break 'candidates;
                 }
@@ -1058,6 +1071,22 @@ fn extract_env_placeholder(value: &str) -> Option<String> {
         return None;
     }
     Some(inner.to_string())
+}
+
+/// Values `greentic-start` auto-seeds into the dev store for un-provisioned
+/// secrets (`secrets_setup::placeholder_text_for_uri`): `ollama-placeholder`
+/// for `*api_key*`-shaped URIs, `placeholder for <uri>` for everything else.
+/// These are NOT real credentials. Promoting one to a cloud secret manager
+/// would both ship a non-working value AND clobber any real value an operator
+/// pre-seeded there, so the cloud-apply resolver treats them as unresolved.
+///
+/// NOTE: the marker strings are duplicated from `greentic-start`
+/// (`secrets_setup.rs`) and must stay in sync. A shared sentinel in the
+/// foundation crate is the deeper fix (tracked with the secrets-lib scaffold
+/// follow-up), out of scope for this surgical change.
+fn is_placeholder_secret_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed == "ollama-placeholder" || trimmed.starts_with("placeholder for ")
 }
 
 fn default_required() -> bool {
@@ -1670,6 +1699,122 @@ questions:
             generated: None,
             source: PathBuf::from("environment.json"),
         }
+    }
+
+    async fn seed_dev_store_value(bundle_root: &Path, uri: &str, value: &[u8]) {
+        use greentic_secrets_lib::{DevStore, SecretFormat};
+        let store_path = bundle_root.join(".greentic/state/dev/.dev.secrets.env");
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        let store = DevStore::with_path(&store_path).unwrap();
+        store.put(uri, SecretFormat::Text, value).await.unwrap();
+    }
+
+    fn ctx_for(bundle_root: &Path, environment: &str, tenant: &str) -> RuntimeSecretContext {
+        RuntimeSecretContext {
+            bundle_root: bundle_root.to_path_buf(),
+            pack_paths: Vec::new(),
+            environment: environment.into(),
+            tenant: tenant.into(),
+            team: None,
+            extra_dev_store_roots: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn is_placeholder_secret_value_matches_only_start_markers() {
+        assert!(is_placeholder_secret_value("ollama-placeholder"));
+        assert!(is_placeholder_secret_value("  ollama-placeholder  "));
+        assert!(is_placeholder_secret_value(
+            "placeholder for secrets://dev/demo/_/x/y"
+        ));
+        // Genuine credentials and the unexpanded ${VAR} form must NOT match.
+        assert!(!is_placeholder_secret_value("sk-realkey-123"));
+        assert!(!is_placeholder_secret_value(""));
+        assert!(!is_placeholder_secret_value("${OPENAI_API_KEY}"));
+        assert!(!is_placeholder_secret_value("ollama"));
+    }
+
+    #[tokio::test]
+    async fn resolve_treats_start_placeholder_as_unresolved_required_is_missing() {
+        // A required secret whose only dev-store value is a greentic-start
+        // placeholder must NOT resolve: the deploy fails loudly (the secret
+        // lands in `missing`) instead of promoting `ollama-placeholder` to the
+        // cloud secret manager.
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "secrets://dev/demo/_/openai/api_key";
+        seed_dev_store_value(dir.path(), uri, b"ollama-placeholder").await;
+
+        let ctx = ctx_for(dir.path(), "dev", "demo");
+        let resolution = resolve_runtime_secrets(&ctx, &[req(uri, "openai", "api_key")]).await;
+
+        assert!(
+            resolution.resolved.is_empty(),
+            "a placeholder must not resolve"
+        );
+        assert_eq!(resolution.missing.len(), 1);
+        assert_eq!(resolution.missing[0].requirement.uri, uri);
+        assert!(
+            resolution.missing[0]
+                .checked_sources
+                .iter()
+                .any(|s| s.contains("auto-seeded placeholder")),
+            "the ignored placeholder source must be recorded for the operator: {:?}",
+            resolution.missing[0].checked_sources,
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_skips_optional_placeholder_so_cloud_value_survives() {
+        // An OPTIONAL secret backed only by a placeholder is dropped (neither
+        // resolved nor missing), so it is never promoted — a value an operator
+        // pre-seeded directly in the cloud secret manager is left intact.
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "secrets://dev/demo/_/openai/api_key";
+        seed_dev_store_value(dir.path(), uri, b"ollama-placeholder").await;
+
+        let ctx = ctx_for(dir.path(), "dev", "demo");
+        let mut requirement = req(uri, "openai", "api_key");
+        requirement.required = false;
+        let resolution = resolve_runtime_secrets(&ctx, &[requirement]).await;
+
+        assert!(resolution.resolved.is_empty());
+        assert!(
+            resolution.missing.is_empty(),
+            "an optional placeholder is skipped, not reported missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_ignores_generic_placeholder_for_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "secrets://dev/demo/_/webhook/token";
+        seed_dev_store_value(
+            dir.path(),
+            uri,
+            b"placeholder for secrets://dev/demo/_/webhook/token",
+        )
+        .await;
+
+        let ctx = ctx_for(dir.path(), "dev", "demo");
+        let resolution = resolve_runtime_secrets(&ctx, &[req(uri, "webhook", "token")]).await;
+
+        assert!(resolution.resolved.is_empty());
+        assert_eq!(resolution.missing.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_still_accepts_a_real_value_after_placeholder_guard() {
+        // Regression: the guard must not over-match a genuine credential.
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "secrets://dev/demo/_/openai/api_key";
+        seed_dev_store_value(dir.path(), uri, b"sk-realkey-123").await;
+
+        let ctx = ctx_for(dir.path(), "dev", "demo");
+        let resolution = resolve_runtime_secrets(&ctx, &[req(uri, "openai", "api_key")]).await;
+
+        assert!(resolution.missing.is_empty());
+        assert_eq!(resolution.resolved.len(), 1);
+        assert_eq!(resolution.resolved[0].value.expose(), "sk-realkey-123");
     }
 
     fn env_with_webhook_endpoint(
