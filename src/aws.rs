@@ -148,6 +148,7 @@ impl AwsRequest {
             allow_remote_in_offline: self.allow_remote_in_offline,
             deploy_pack_id_override: self.deploy_pack_id_override,
             deploy_flow_id_override: self.deploy_flow_id_override,
+            extra_env: std::collections::BTreeMap::new(),
         }
     }
 }
