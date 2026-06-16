@@ -1100,7 +1100,10 @@ fn extract_env_placeholder(value: &str) -> Option<String> {
 /// follow-up), out of scope for this surgical change.
 fn is_placeholder_secret_value(value: &str, uri: &str) -> bool {
     let trimmed = value.trim();
-    trimmed == "ollama-placeholder" || trimmed == format!("placeholder for {uri}")
+    trimmed == "ollama-placeholder"
+        || trimmed
+            .strip_prefix("placeholder for ")
+            .is_some_and(|rest| rest == uri)
 }
 
 fn default_required() -> bool {
