@@ -5,7 +5,7 @@
 
 use chrono::Utc;
 use greentic_deploy_spec::{
-    CapabilitySlot, EnvId, Environment, EnvironmentHostConfig, validate_public_base_url,
+    CapabilitySlot, EnvId, Environment, EnvironmentHostConfig, RevisionId, validate_public_base_url,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -602,7 +602,7 @@ pub fn reconcile(
         return Err(OpError::NotFound(format!("environment `{env_id}`")));
     }
     let env = store.load(&env_id)?;
-    let descriptor = resolve_render_kind(&env, args.kind.as_deref())?;
+    let descriptor = resolve_live_deployer_kind(&env, args.kind.as_deref())?;
 
     // Reconcile applies rendered manifests to a live cluster — K8s-specific.
     let k8s_path = crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
@@ -682,6 +682,173 @@ fn reconcile_k8s_cluster(
     Err(OpError::Conflict(
         "this build was compiled without the `k8s-client` feature; \
          `op env reconcile` needs it to connect to a cluster"
+            .to_string(),
+    ))
+}
+
+/// `op env apply-revision <env_id> <revision_id> [--kind <descriptor>]` — bring
+/// a SINGLE revision's worker resources into agreement with its recorded
+/// lifecycle. A revision with cluster presence (Warming / Ready / Draining)
+/// has its worker Deployment + Service applied; an absent one (Staged / Failed
+/// / Archived / Inactive) has them torn down. The surgical counterpart of
+/// `reconcile`, which converges the WHOLE env — `apply-revision` assumes the
+/// env-level set (namespace, router) already exists (establish it with
+/// `reconcile`), so it only touches the one revision's worker pair.
+///
+/// K8s deployer env-pack only today (same gate as `reconcile`). Connects
+/// through the binding's `kubeconfig_context` answer with the ambient
+/// kubeconfig / in-cluster identity; resolving the env's bound ServiceAccount
+/// token rides the Phase D secrets sink.
+///
+/// # Known gaps (Phase D later slices)
+///
+/// - **Answer / namespace drift.** Both branches render the worker objects from
+///   the binding's *current* answers, so the teardown targets the namespace the
+///   answers name *now*. If a revision was warmed in namespace A and the binding
+///   namespace later changes to B, the archive branch deletes B's worker (a
+///   no-op) and reports success, leaving A's worker running — the same drift
+///   `reconcile`'s prune already has. A drift-safe teardown needs the
+///   per-revision applied-param snapshot or the label-based GC seam
+///   (`K8sCluster::list`) tracked with `reconcile`'s prune-scope gap; until then
+///   the binding namespace must stay stable while a revision is live (the
+///   wizard already states the namespace must match the bootstrap rules pack).
+pub fn apply_revision(
+    store: &LocalFsStore,
+    registry: &crate::env_packs::EnvPackRegistry,
+    flags: &OpFlags,
+    args: super::dispatch::EnvApplyRevisionArgs,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(
+            NOUN,
+            "apply-revision",
+            json!({
+                "input_schema": "env_id + revision_id positional; --kind <path[@version]> optional \
+                 (defaults to the env's deployer binding)"
+            }),
+        ));
+    }
+    let env_id = EnvId::try_from(args.env_id.as_str())
+        .map_err(|e| OpError::InvalidArgument(format!("env_id: {e}")))?;
+    if !store.exists(&env_id)? {
+        return Err(OpError::NotFound(format!("environment `{env_id}`")));
+    }
+    let env = store.load(&env_id)?;
+
+    let descriptor = resolve_live_deployer_kind(&env, args.kind.as_deref())?;
+
+    // Same K8s-only gate as reconcile: applying manifests to a live cluster is
+    // K8s-specific today. This "is the verb applicable to this env" check runs
+    // before the per-revision lookup so a non-K8s env rejects regardless of the
+    // revision arg.
+    let k8s_path = crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
+    if descriptor.path() != k8s_path {
+        return Err(OpError::Conflict(format!(
+            "env apply-revision is only supported for the `{k8s_path}` deployer env-pack \
+             today; `{}` cannot be applied to a live cluster",
+            descriptor.path()
+        )));
+    }
+    // Parity with reconcile: confirm the kind is actually registered.
+    let _handler = registry
+        .resolve_for_slot(CapabilitySlot::Deployer, &descriptor)
+        .map_err(|e| OpError::Conflict(e.to_string()))?;
+
+    let revision_id = {
+        use std::str::FromStr;
+        let ulid = ulid::Ulid::from_str(&args.revision_id)
+            .map_err(|e| OpError::InvalidArgument(format!("revision_id: {e}")))?;
+        RevisionId(ulid)
+    };
+    let revision = env
+        .revisions
+        .iter()
+        .find(|r| r.revision_id == revision_id)
+        .ok_or_else(|| {
+            OpError::NotFound(format!(
+                "revision `{revision_id}` not found in env `{env_id}`"
+            ))
+        })?;
+
+    let (answers, answers_ref_wire) = load_render_answers(store, &env, &descriptor)?;
+
+    // Present → apply the worker pair (warm); absent → tear it down (archive).
+    // Same B7 two-state presence model the renderer and reconcile use.
+    let present = crate::env_packs::k8s::manifests::has_cluster_presence(revision.lifecycle);
+    let action = if present { "warmed" } else { "archived" };
+    let worker_name = crate::env_packs::k8s::manifests::worker_name(revision);
+    let lifecycle = revision.lifecycle;
+
+    apply_revision_k8s_cluster(&env, revision_id, present, answers.as_ref())?;
+
+    Ok(OpOutcome::new(
+        NOUN,
+        "apply-revision",
+        json!({
+            "environment_id": env.environment_id.as_str(),
+            "kind": descriptor.as_str(),
+            "revision_id": revision_id.to_string(),
+            "lifecycle": lifecycle,
+            // Which Deployer verb the recorded lifecycle drove.
+            "action": action,
+            "worker_name": worker_name,
+            "answers_ref": answers_ref_wire,
+            // Identity the cluster was mutated as — see `reconcile`.
+            "identity": "ambient",
+        }),
+    ))
+}
+
+/// Connect to the cluster and dispatch the single revision's Deployer verb:
+/// `warm_revision` when present, `archive_revision` when absent. Requires the
+/// `k8s-client` feature.
+#[cfg(feature = "k8s-client")]
+fn apply_revision_k8s_cluster(
+    env: &Environment,
+    revision_id: RevisionId,
+    present: bool,
+    answers: Option<&Value>,
+) -> Result<(), OpError> {
+    use crate::env_packs::deployer::Deployer;
+    use crate::env_packs::k8s::async_bridge::run_k8s_async;
+    use crate::env_packs::k8s::kube_client::connect;
+    use crate::env_packs::k8s::manifests::kubeconfig_context_from_answers;
+    use crate::env_packs::k8s::{K8sDeployerHandler, KubeCluster};
+    use std::sync::Arc;
+
+    let kubeconfig_context = kubeconfig_context_from_answers(answers);
+    run_k8s_async(async move {
+        // bound_token = None: ambient identity today (same as reconcile).
+        let client = connect(kubeconfig_context.as_deref(), None)
+            .await
+            .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
+        let handler = K8sDeployerHandler::with_cluster(Arc::new(KubeCluster::new(client)));
+        let result = if present {
+            handler
+                .warm_revision(env, revision_id, answers)
+                .await
+                .map(|_| ())
+        } else {
+            handler
+                .archive_revision(env, revision_id, answers)
+                .await
+                .map(|_| ())
+        };
+        result.map_err(|e| OpError::Conflict(e.to_string()))
+    })
+}
+
+/// `k8s-client`-less builds cannot talk to a cluster.
+#[cfg(not(feature = "k8s-client"))]
+fn apply_revision_k8s_cluster(
+    _env: &Environment,
+    _revision_id: RevisionId,
+    _present: bool,
+    _answers: Option<&Value>,
+) -> Result<(), OpError> {
+    Err(OpError::Conflict(
+        "this build was compiled without the `k8s-client` feature; \
+         `op env apply-revision` needs it to connect to a cluster"
             .to_string(),
     ))
 }
@@ -775,6 +942,39 @@ fn resolve_render_kind(
             ))),
         },
     }
+}
+
+/// Resolve the deployer descriptor for a LIVE (cluster-mutating) verb
+/// (`reconcile`, `apply-revision`).
+///
+/// Unlike [`resolve_render_kind`] — which backs the read-only `render` preview
+/// and deliberately lets a full `--kind` describe an *unbound* deployer — a
+/// live verb must mutate ONLY the env's declared deployer. The resolved
+/// descriptor's **path** must equal the env's Deployer-slot binding path, so a
+/// full `--kind` may override the binding's *version* (same deployer) but can
+/// neither switch deployers (e.g. force `greentic.deployer.k8s` onto a
+/// local-process env) nor apply to an env with no deployer binding at all.
+/// Without this, `--kind <full k8s descriptor>` would drive K8s apply/teardown
+/// against a cluster for an env that was never K8s-bound.
+fn resolve_live_deployer_kind(
+    env: &Environment,
+    kind: Option<&str>,
+) -> Result<greentic_deploy_spec::PackDescriptor, OpError> {
+    let descriptor = resolve_render_kind(env, kind)?;
+    let bound = env.pack_for_slot(CapabilitySlot::Deployer).ok_or_else(|| {
+        OpError::Conflict(
+            "env has no deployer binding; a live apply must target a bound deployer".to_string(),
+        )
+    })?;
+    if descriptor.path() != bound.kind.path() {
+        return Err(OpError::Conflict(format!(
+            "env is bound to deployer `{}`; a live apply cannot use `{}` — it is not the env's \
+             bound deployer (a full `--kind` may override the version, not switch deployers)",
+            bound.kind.path(),
+            descriptor.path()
+        )));
+    }
+    Ok(descriptor)
 }
 
 /// Result of [`write_rendered_objects`].
@@ -3060,6 +3260,183 @@ mod tests {
         let outcome = reconcile(&store, &reg, &flags, reconcile_args("zain", None)).unwrap();
         assert_eq!(outcome.op, "reconcile");
         assert!(outcome.result.get("input_schema").is_some());
+    }
+
+    // -- apply-revision -----------------------------------------------------
+
+    use crate::cli::dispatch::EnvApplyRevisionArgs;
+
+    fn apply_revision_args(
+        env_id: &str,
+        revision_id: &str,
+        kind: Option<&str>,
+    ) -> EnvApplyRevisionArgs {
+        EnvApplyRevisionArgs {
+            env_id: env_id.to_string(),
+            revision_id: revision_id.to_string(),
+            kind: kind.map(str::to_string),
+        }
+    }
+
+    /// A non-K8s deployer kind cannot be applied to a cluster — the verb
+    /// rejects at the applicability gate, before the per-revision lookup (so a
+    /// bogus revision id is irrelevant here).
+    #[test]
+    fn apply_revision_rejects_non_k8s_deployer_kind() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            crate::defaults::LOCAL_DEPLOYER_PACK,
+        ));
+        store.save(&env).unwrap();
+        let err = apply_revision(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_revision_args("local", "00000000000000000000000000", None),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(msg.contains("only supported for"), "{msg}"),
+            other => panic!("expected Conflict, got {other}"),
+        }
+    }
+
+    #[test]
+    fn apply_revision_missing_env_is_not_found() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let err = apply_revision(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_revision_args("ghost", "00000000000000000000000000", None),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::NotFound(_)), "{err}");
+    }
+
+    /// A K8s env with a revision id that isn't staged → NotFound, surfaced
+    /// AFTER the applicability gate (the env IS K8s) but before any connect.
+    #[test]
+    fn apply_revision_missing_revision_is_not_found() {
+        let dir = tempdir().unwrap();
+        let store = store_with_k8s_env(dir.path());
+        let reg = builtins();
+        let err = apply_revision(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_revision_args("zain", "00000000000000000000000000", None),
+        )
+        .unwrap_err();
+        match err {
+            OpError::NotFound(msg) => assert!(msg.contains("revision"), "{msg}"),
+            other => panic!("expected NotFound(revision), got {other}"),
+        }
+    }
+
+    /// An unparseable revision id is rejected as InvalidArgument (after the
+    /// applicability gate passes).
+    #[test]
+    fn apply_revision_bad_revision_id_is_invalid_argument() {
+        let dir = tempdir().unwrap();
+        let store = store_with_k8s_env(dir.path());
+        let reg = builtins();
+        let err = apply_revision(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_revision_args("zain", "not-a-ulid", None),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "{err}");
+    }
+
+    #[test]
+    fn apply_revision_schema_only_returns_input_schema() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let flags = OpFlags {
+            schema_only: true,
+            ..OpFlags::default()
+        };
+        let outcome = apply_revision(
+            &store,
+            &reg,
+            &flags,
+            apply_revision_args("zain", "00000000000000000000000000", None),
+        )
+        .unwrap();
+        assert_eq!(outcome.op, "apply-revision");
+        assert!(outcome.result.get("input_schema").is_some());
+    }
+
+    /// A live verb must not be forced onto a deployer the env isn't bound to: a
+    /// full `--kind` K8s override against a local-process-bound env is rejected
+    /// at the binding-match guard, before any cluster connect (the Codex F1
+    /// fix). The same guard backs `reconcile`.
+    #[test]
+    fn apply_revision_rejects_unbound_deployer_kind_override() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            crate::defaults::LOCAL_DEPLOYER_PACK,
+        ));
+        store.save(&env).unwrap();
+        let err = apply_revision(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_revision_args(
+                "local",
+                "00000000000000000000000000",
+                Some("greentic.deployer.k8s@1.0.0"),
+            ),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(
+                msg.contains("bound to deployer") && msg.contains("not the env's"),
+                "{msg}"
+            ),
+            other => panic!("expected Conflict (unbound deployer), got {other}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_rejects_unbound_deployer_kind_override() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            crate::defaults::LOCAL_DEPLOYER_PACK,
+        ));
+        store.save(&env).unwrap();
+        let err = reconcile(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            reconcile_args("local", Some("greentic.deployer.k8s@1.0.0")),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(msg.contains("bound to deployer"), "{msg}"),
+            other => panic!("expected Conflict (unbound deployer), got {other}"),
+        }
     }
 
     // ---- Fix 1: answers_ref consumption ------------------------------------

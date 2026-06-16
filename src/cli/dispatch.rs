@@ -326,6 +326,11 @@ pub enum EnvVerb {
     /// counterpart of `render`). K8s deployer env-pack only today; connects
     /// through the binding's `kubeconfig_context` answer.
     Reconcile(EnvReconcileArgs),
+    /// Bring a SINGLE revision's worker resources into agreement with its
+    /// recorded lifecycle (present → apply the worker pair, absent → tear it
+    /// down) — the surgical counterpart of `reconcile`. K8s deployer env-pack
+    /// only today; connects through the binding's `kubeconfig_context` answer.
+    ApplyRevision(EnvApplyRevisionArgs),
     Destroy {
         env_id: String,
         #[arg(long)]
@@ -551,6 +556,24 @@ pub struct EnvReconcileArgs {
     /// Environment id (e.g. `zain-prod`).
     pub env_id: String,
     /// Deployer env-pack kind to reconcile with — a full `<path>@<version>`
+    /// descriptor, or a bare path matching the env's deployer binding.
+    /// Defaults to the env's Deployer-slot binding.
+    #[arg(long)]
+    pub kind: Option<String>,
+}
+
+/// Args for `op env apply-revision <env_id> <revision_id> [--kind <descriptor>]`.
+/// Surgical single-revision counterpart of `reconcile`: brings ONE revision's
+/// worker resources into agreement with its recorded lifecycle (present →
+/// apply, absent → tear down). Assumes the env-level set (namespace, router)
+/// already exists — `reconcile` establishes that.
+#[derive(Args, Debug)]
+pub struct EnvApplyRevisionArgs {
+    /// Environment id (e.g. `zain-prod`).
+    pub env_id: String,
+    /// Revision id (ULID) to apply — must already exist in the env.
+    pub revision_id: String,
+    /// Deployer env-pack kind to apply with — a full `<path>@<version>`
     /// descriptor, or a bare path matching the env's deployer binding.
     /// Defaults to the env's Deployer-slot binding.
     #[arg(long)]
@@ -890,6 +913,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 EnvVerb::ToolCheck { .. } => "tool-check",
                 EnvVerb::Render(_) => "render",
                 EnvVerb::Reconcile(_) => "reconcile",
+                EnvVerb::ApplyRevision(_) => "apply-revision",
                 EnvVerb::Destroy { .. } => "destroy",
                 EnvVerb::MigrateDev { .. } => "migrate-dev",
                 EnvVerb::MigrateState { .. } => "migrate-state",
@@ -1025,6 +1049,7 @@ fn dispatch_env(
         EnvVerb::ToolCheck { env_id } => super::env::tool_check(store, flags, &env_id)?,
         EnvVerb::Render(args) => super::env::render(store, registry, flags, args)?,
         EnvVerb::Reconcile(args) => super::env::reconcile(store, registry, flags, args)?,
+        EnvVerb::ApplyRevision(args) => super::env::apply_revision(store, registry, flags, args)?,
         EnvVerb::Destroy { env_id, confirm } => {
             super::env::destroy(store, flags, &env_id, confirm)?
         }
