@@ -7,7 +7,10 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use greentic_secrets_lib::{DevStore, SecretsStore};
+use greentic_secrets_lib::{
+    DevStore, SecretsStore, TEAM_PLACEHOLDER, canonical_secret_name, canonical_secret_store_key,
+    normalize_team,
+};
 use greentic_types::{ExtensionInline, decode_pack_manifest};
 use rand::RngExt as _;
 use serde::Deserialize;
@@ -21,7 +24,6 @@ use crate::contract::DeployerCapability;
 use crate::error::{DeployerError, Result};
 
 const DEV_SECRETS_PATH_ENV: &str = "GREENTIC_DEV_SECRETS_PATH";
-const TEAM_DEFAULT: &str = "_";
 const EXT_GENERATED_SECRETS_V1: &str = "greentic.generated-secrets.v1";
 const SECRET_ASSET_PATHS: &[&str] = &[
     "assets/secret-requirements.json",
@@ -163,8 +165,11 @@ pub async fn resolve_for_cloud_apply(
 }
 
 pub fn default_cloud_secret_prefix(environment: &str, tenant: &str, team: Option<&str>) -> String {
-    let team = canonical_team(team);
-    format!("greentic/{environment}/{tenant}/{team}")
+    let team = normalize_team(team);
+    format!(
+        "greentic/{environment}/{tenant}/{}",
+        team.as_deref().unwrap_or(TEAM_PLACEHOLDER)
+    )
 }
 
 pub fn collect_requirements(ctx: &RuntimeSecretContext) -> Result<Vec<RuntimeSecretRequirement>> {
@@ -443,83 +448,15 @@ pub fn canonical_secret_uri(
     provider: &str,
     key: &str,
 ) -> String {
+    let team = normalize_team(team);
     format!(
         "secrets://{}/{}/{}/{}/{}",
         env,
         tenant,
-        canonical_team(team),
+        team.as_deref().unwrap_or(TEAM_PLACEHOLDER),
         provider,
         canonical_secret_name(key)
     )
-}
-
-pub fn canonical_secret_store_key(uri: &str) -> Option<String> {
-    let trimmed = uri.strip_prefix("secrets://")?;
-    let segments: Vec<&str> = trimmed.split('/').collect();
-    if segments.len() != 5 {
-        return None;
-    }
-    let mut parts = vec!["GREENTIC_SECRET".to_string()];
-    parts.extend(segments.into_iter().map(normalize_store_segment));
-    Some(parts.join("__"))
-}
-
-pub fn canonical_secret_name(raw: &str) -> String {
-    let mut result = String::with_capacity(raw.len());
-    let mut prev_underscore = false;
-
-    for ch in raw.chars() {
-        let Some(normalized) = normalize_secret_char(ch) else {
-            continue;
-        };
-        if normalized == '_' {
-            if prev_underscore {
-                continue;
-            }
-            prev_underscore = true;
-        } else {
-            prev_underscore = false;
-        }
-        result.push(normalized);
-    }
-
-    let trimmed = result.trim_matches('_');
-    if trimmed.is_empty() {
-        "secret".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn normalize_secret_char(ch: char) -> Option<char> {
-    match ch {
-        'A'..='Z' => Some(ch.to_ascii_lowercase()),
-        'a'..='z' | '0'..='9' | '_' => Some(ch),
-        '-' | '.' | ' ' | '/' => Some('_'),
-        _ => None,
-    }
-}
-
-fn normalize_store_segment(segment: &str) -> String {
-    segment
-        .chars()
-        .map(|ch| match ch {
-            'A'..='Z' | '0'..='9' => ch,
-            'a'..='z' => ch.to_ascii_uppercase(),
-            '_' => '_',
-            _ => '_',
-        })
-        .collect()
-}
-
-fn canonical_team(team: Option<&str>) -> &str {
-    match team
-        .map(str::trim)
-        .filter(|team| !team.is_empty() && !team.eq_ignore_ascii_case("default"))
-    {
-        Some(team) => team,
-        None => TEAM_DEFAULT,
-    }
 }
 
 fn requirement_team<'a>(
