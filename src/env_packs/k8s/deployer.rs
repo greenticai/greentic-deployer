@@ -34,11 +34,14 @@ use serde_json::Value;
 
 use super::K8sDeployerHandler;
 use super::cluster::{K8sClusterError, ObjectRef};
-use super::manifests::{K8sParams, render_runtime_config_map, render_worker_manifests};
+use super::manifests::{
+    K8sParams, has_cluster_presence, render_runtime_config_map, render_worker_manifests,
+};
 use crate::env_packs::deployer::{
     ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome, TrafficSplitOutcome,
     WarmOutcome, enforce_split_invariants, require_revision,
 };
+use crate::env_packs::render::ManifestRenderer;
 
 /// Cluster failures surface as provider failures — the verb's
 /// preconditions have already passed by the time the seam is touched.
@@ -59,6 +62,67 @@ impl K8sDeployerHandler {
         }
         Ok(())
     }
+
+    /// Converge the cluster on the env's full desired state.
+    ///
+    /// This is the provider-side effect that `gtc op env reconcile` drives
+    /// (the first caller of a connected [`K8sCluster`](super::cluster::K8sCluster)).
+    /// Unlike the per-revision lifecycle verbs, it owns the WHOLE env:
+    ///
+    /// 1. **Apply** the rendered desired state — the env-level set (Namespace,
+    ///    router, runtime-config ConfigMap, NetworkPolicies) plus the worker
+    ///    pair of every revision with cluster presence. The manifest set comes
+    ///    from [`render_environment`](crate::env_packs::render::ManifestRenderer::render_environment),
+    ///    so reconcile applies EXACTLY what `op env render` shows — render and
+    ///    apply converge by construction.
+    /// 2. **Prune** the worker pair of every revision WITHOUT cluster presence
+    ///    (archived / failed / post-drain inactive). `delete` of an absent
+    ///    object is `Ok`, so pruning is idempotent and safe against a partial
+    ///    prior teardown.
+    ///
+    /// Env-level objects are never pruned here — tearing down the namespace /
+    /// router is env destruction, a separate verb. Reconcile only converges a
+    /// live env.
+    pub async fn reconcile(
+        &self,
+        env: &Environment,
+        answers: Option<&Value>,
+    ) -> Result<ReconcileReport, DeployerError> {
+        let desired = self
+            .render_environment(env, answers)
+            .map_err(|e| DeployerError::Provider(e.to_string()))?;
+        let mut applied = Vec::with_capacity(desired.len());
+        for manifest in &desired {
+            self.cluster.apply(manifest).await.map_err(provider)?;
+            applied.push(ObjectRef::from_manifest(manifest).map_err(provider)?);
+        }
+
+        // `params` is recomputed (pure, cheap) only to render the prune set;
+        // the present set already came from `render_environment` above.
+        let params = K8sParams::from_answers(env, answers)
+            .map_err(|e| DeployerError::Provider(format!("invalid answers: {e}")))?;
+        let mut pruned = Vec::new();
+        for revision in &env.revisions {
+            if !has_cluster_presence(revision.lifecycle) {
+                for manifest in render_worker_manifests(env, revision, &params) {
+                    let object = ObjectRef::from_manifest(&manifest).map_err(provider)?;
+                    self.cluster.delete(&object).await.map_err(provider)?;
+                    pruned.push(object);
+                }
+            }
+        }
+        Ok(ReconcileReport { applied, pruned })
+    }
+}
+
+/// Outcome of [`K8sDeployerHandler::reconcile`].
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReconcileReport {
+    /// Objects upserted to converge desired state (env-level set +
+    /// present-revision workers), in apply order.
+    pub applied: Vec<ObjectRef>,
+    /// Worker objects deleted for revisions without cluster presence.
+    pub pruned: Vec<ObjectRef>,
 }
 
 #[async_trait]
@@ -141,7 +205,7 @@ mod tests {
     use super::*;
     use crate::env_packs::deployer::conformance::build_fixture_env;
     use crate::env_packs::deployer::run_conformance;
-    use crate::env_packs::k8s::cluster::InMemoryCluster;
+    use crate::env_packs::k8s::cluster::{InMemoryCluster, K8sCluster};
     use crate::env_packs::k8s::manifests::{RUNTIME_CONFIG_MAP_NAME, worker_name};
 
     fn handler_with_fake() -> (K8sDeployerHandler, Arc<InMemoryCluster>) {
@@ -226,6 +290,64 @@ mod tests {
         )
         .unwrap();
         assert_eq!(payload, expected);
+    }
+
+    #[tokio::test]
+    async fn reconcile_applies_desired_state_and_is_idempotent() {
+        let (handler, cluster) = handler_with_fake();
+        let env = build_fixture_env();
+
+        let report = handler.reconcile(&env, None).await.unwrap();
+
+        // The applied set IS the renderer's desired state (render↔apply
+        // convergence) and every object landed in the cluster.
+        let desired = handler.render_environment(&env, None).unwrap();
+        assert_eq!(report.applied.len(), desired.len());
+        assert_eq!(cluster.objects().len(), desired.len());
+
+        // Prune touches the worker pair of every NOT-present revision.
+        let absent = env
+            .revisions
+            .iter()
+            .filter(|r| !has_cluster_presence(r.lifecycle))
+            .count();
+        assert_eq!(report.pruned.len(), absent * 2);
+
+        // Reconcile again: declarative upsert leaves identical cluster state.
+        let before = cluster.objects();
+        let report2 = handler.reconcile(&env, None).await.unwrap();
+        assert_eq!(report2.applied.len(), desired.len());
+        assert_eq!(cluster.objects(), before, "reconcile is idempotent");
+    }
+
+    #[tokio::test]
+    async fn reconcile_prunes_workers_left_over_from_a_now_absent_revision() {
+        let (handler, cluster) = handler_with_fake();
+        let env = build_fixture_env();
+        let params = K8sParams::for_env(&env);
+
+        // A non-present revision whose worker objects still linger on the
+        // cluster (e.g. it was Ready, got archived after the last reconcile).
+        let absent = env
+            .revisions
+            .iter()
+            .find(|r| !has_cluster_presence(r.lifecycle))
+            .expect("fixture has a non-present revision");
+        for manifest in render_worker_manifests(&env, absent, &params) {
+            cluster.apply(&manifest).await.unwrap();
+        }
+        let lingering = worker_name(absent);
+        assert!(
+            cluster.objects().keys().any(|o| o.name == lingering),
+            "precondition: the absent revision's workers are on the cluster"
+        );
+
+        handler.reconcile(&env, None).await.unwrap();
+
+        assert!(
+            !cluster.objects().keys().any(|o| o.name == lingering),
+            "reconcile prunes the now-absent revision's workers"
+        );
     }
 
     /// Preconditions run BEFORE any cluster call: an unknown revision or

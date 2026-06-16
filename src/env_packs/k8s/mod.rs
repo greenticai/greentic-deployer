@@ -4,33 +4,37 @@
 //! real-cloud proving ground of the next-gen deployment model. The
 //! scaffold ships the full deterministic half of the slice; the typed
 //! Kubernetes API client landed as [`kube_client`] (PR-5.2, `k8s-client`
-//! feature) behind the seams defined here. Constructing that client from
-//! the binding's answers and binding it to verb dispatch — plus the
-//! kind/real-cluster E2E — is the PR-5.3 orchestration wiring. Zain's
+//! feature) behind the seams defined here. `gtc op env reconcile` (PR-5.3)
+//! constructs that client from the binding's answers and applies the
+//! rendered desired state through it
+//! ([`K8sDeployerHandler::reconcile`](deployer::K8sDeployerHandler::reconcile)).
+//! Lighting up `gtc op credentials requirements` against the live cluster
+//! (binding the validator client), per-revision Deployer-verb dispatch, and
+//! the kind/real-cluster E2E remain later PR-5.3 slices. Zain's
 //! infrastructure answers (`plans/zain-k8s-alignment.md`) gate the
 //! real-cluster and production acceptance, not this scaffold — sandbox
 //! defaults per that doc.
 //!
 //! ## Answers consumption
 //!
-//! `op env render` reads the binding's `answers_ref` and feeds it to
-//! [`K8sParams::from_answers`](manifests::K8sParams::from_answers) so
-//! operator overrides (namespace, runtime image, router replicas) reach
-//! the rendered manifests. The Deployer verbs (`warm_revision`,
-//! `apply_traffic_split`) still use `K8sParams::for_env` sandbox
-//! defaults — they have no env-dir access on the trait; threading
-//! answers into them rides the PR-5.3 orchestration wiring.
+//! `op env render` and `op env reconcile` read the binding's `answers_ref`
+//! and feed it to [`K8sParams::from_answers`](manifests::K8sParams::from_answers)
+//! so operator overrides (namespace, runtime image, router replicas) reach
+//! the rendered manifests; reconcile additionally reads `kubeconfig_context`
+//! to target the cluster. The per-revision Deployer verbs (`warm_revision`,
+//! `apply_traffic_split`) still use `K8sParams::for_env` sandbox defaults —
+//! they have no env-dir access on the trait; threading answers into them
+//! rides the per-revision Deployer-verb dispatch slice.
 //!
-//! ## Operator CLI lifecycle verb disclaimer
+//! ## Operator CLI verb disclaimer
 //!
-//! The operator CLI's revision/traffic verbs (`gtc op revision warm`,
-//! `gtc op traffic set`, etc.) do not yet invoke `Deployer` impls —
-//! they are storage-layer only, true for every registered deployer
-//! today (including AWS-ECS since C3; there is no non-test caller of
-//! `as_deployer()` anywhere). Until the PR-5.x orchestration wiring
-//! lands, binding `greentic.deployer.k8s` gives the credentials and
-//! bootstrap surface only; no cluster workloads are created or mutated
-//! by lifecycle verbs.
+//! `gtc op env reconcile` is the apply path: it constructs a connected
+//! cluster client and creates / upserts / prunes cluster workloads. The
+//! per-revision lifecycle verbs (`gtc op revision warm`, `gtc op traffic
+//! set`, etc.) remain storage-layer only — they record desired state and
+//! do not invoke `Deployer` impls, true for every registered deployer
+//! (including AWS-ECS since C3). Per-revision Deployer-verb dispatch and the
+//! live-cluster readiness wait are later PR-5.3 slices.
 //!
 //! Module layout (mirrors the local-process / AWS-ECS reference shape):
 //!
@@ -61,6 +65,7 @@
 //!   RoleBinding rules pack, derived from the same operations list the
 //!   probes validate.
 
+pub(crate) mod async_bridge;
 pub mod bootstrap;
 pub mod cluster;
 pub mod credentials;
@@ -80,6 +85,7 @@ use crate::tool_check::ToolCheck;
 
 pub use cluster::{K8sCluster, K8sClusterError, ObjectRef, UnconfiguredCluster};
 pub use credentials::{K8sDeployerCredentials, K8sValidatorClient};
+pub use deployer::ReconcileReport;
 #[cfg(feature = "k8s-client")]
 pub use kube_client::{KubeCluster, KubeValidatorClient};
 

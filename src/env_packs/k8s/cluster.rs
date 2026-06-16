@@ -24,26 +24,35 @@ use serde_json::Value;
 use thiserror::Error;
 
 /// Identity of one Kubernetes object — enough to delete it.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct ObjectRef {
     pub api_version: String,
     pub kind: String,
-    pub namespace: String,
+    /// `None` for cluster-scoped objects (e.g. the env's `Namespace`).
+    pub namespace: Option<String>,
     pub name: String,
 }
 
 impl ObjectRef {
     /// Extract the identity fields from a rendered manifest.
     ///
-    /// Every manifest [`super::manifests`] renders carries all four
-    /// fields; a manifest that doesn't is a render bug, surfaced as
-    /// [`K8sClusterError::InvalidManifest`] rather than panicking inside
-    /// a deployer verb.
+    /// `apiVersion`, `kind`, and `metadata.name` are required — a manifest
+    /// missing one is a render bug, surfaced as
+    /// [`K8sClusterError::InvalidManifest`] rather than panicking inside a
+    /// deployer verb. `metadata.namespace` is OPTIONAL: cluster-scoped kinds
+    /// (the env's `Namespace`) legitimately omit it, so an absent namespace
+    /// is recorded as `None`, not an error. Namespaced kinds always carry it
+    /// (renderer-guaranteed), and the real client's apply re-reads it for
+    /// namespaced scope, so the render-bug guard is preserved where it bites.
     pub fn from_manifest(manifest: &Value) -> Result<Self, K8sClusterError> {
         Ok(Self {
             api_version: manifest_field(manifest, &["apiVersion"])?,
             kind: manifest_field(manifest, &["kind"])?,
-            namespace: manifest_field(manifest, &["metadata", "namespace"])?,
+            namespace: manifest
+                .get("metadata")
+                .and_then(|m| m.get("namespace"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
             name: manifest_field(manifest, &["metadata", "name"])?,
         })
     }
@@ -68,11 +77,10 @@ pub(super) fn manifest_field(manifest: &Value, path: &[&str]) -> Result<String, 
 
 impl std::fmt::Display for ObjectRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}/{} {}/{}",
-            self.api_version, self.kind, self.namespace, self.name
-        )
+        match &self.namespace {
+            Some(ns) => write!(f, "{}/{} {}/{}", self.api_version, self.kind, ns, self.name),
+            None => write!(f, "{}/{} {}", self.api_version, self.kind, self.name),
+        }
     }
 }
 
@@ -205,18 +213,29 @@ mod tests {
             ObjectRef {
                 api_version: "v1".into(),
                 kind: "Service".into(),
-                namespace: "ns-a".into(),
+                namespace: Some("ns-a".into()),
                 name: "svc-a".into(),
             }
         );
     }
 
     #[test]
-    fn object_ref_rejects_manifest_without_namespace() {
-        let m = json!({"apiVersion": "v1", "kind": "Service", "metadata": {"name": "x"}});
+    fn object_ref_without_namespace_is_cluster_scoped() {
+        // The env's cluster-scoped Namespace object legitimately omits
+        // `metadata.namespace` — recorded as `None`, not a render bug.
+        let m = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "gtc-zain"}});
+        let r = ObjectRef::from_manifest(&m).unwrap();
+        assert_eq!(r.namespace, None);
+        assert_eq!(r.kind, "Namespace");
+    }
+
+    #[test]
+    fn object_ref_rejects_manifest_without_name() {
+        // A missing required field (name) IS a render bug.
+        let m = json!({"apiVersion": "v1", "kind": "Service", "metadata": {"namespace": "ns"}});
         let err = ObjectRef::from_manifest(&m).unwrap_err();
         assert!(
-            matches!(err, K8sClusterError::InvalidManifest(ref msg) if msg.contains("metadata.namespace")),
+            matches!(err, K8sClusterError::InvalidManifest(ref msg) if msg.contains("metadata.name")),
             "got {err:?}"
         );
     }

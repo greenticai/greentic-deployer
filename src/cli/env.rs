@@ -566,6 +566,120 @@ pub fn render(
     Ok(OpOutcome::new(NOUN, "render", result))
 }
 
+/// `op env reconcile <env_id> [--kind <descriptor>]` — apply the env's
+/// declarative desired state to its live cluster and prune the workers of
+/// revisions no longer present. The apply-side counterpart of `render` (use
+/// `render` for a no-side-effect preview, or a GitOps repository handoff).
+///
+/// K8s deployer env-pack only today: applying rendered manifests to a cluster
+/// is K8s-specific, so other deployer kinds surface a `Conflict` (the AWS-ECS
+/// reconcile path is a later Phase D slice). The same `answers_ref` /
+/// `--kind` resolution as `render` applies.
+///
+/// The deployer connects through the binding's `kubeconfig_context` answer
+/// and authenticates with the ambient kubeconfig / in-cluster identity today;
+/// resolving the env's rotated ServiceAccount token (`credentials_ref` →
+/// bearer) rides the Phase D secrets sink.
+pub fn reconcile(
+    store: &LocalFsStore,
+    registry: &crate::env_packs::EnvPackRegistry,
+    flags: &OpFlags,
+    args: super::dispatch::EnvReconcileArgs,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(
+            NOUN,
+            "reconcile",
+            json!({
+                "input_schema": "env_id positional; --kind <path[@version]> optional \
+                 (defaults to the env's deployer binding)"
+            }),
+        ));
+    }
+    let env_id = EnvId::try_from(args.env_id.as_str())
+        .map_err(|e| OpError::InvalidArgument(format!("env_id: {e}")))?;
+    if !store.exists(&env_id)? {
+        return Err(OpError::NotFound(format!("environment `{env_id}`")));
+    }
+    let env = store.load(&env_id)?;
+    let descriptor = resolve_render_kind(&env, args.kind.as_deref())?;
+
+    // Reconcile applies rendered manifests to a live cluster — K8s-specific.
+    let k8s_path = crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
+    if descriptor.path() != k8s_path {
+        return Err(OpError::Conflict(format!(
+            "env reconcile is only supported for the `{k8s_path}` deployer env-pack \
+             today; `{}` cannot be reconciled to a live cluster (the AWS-ECS reconcile \
+             path is a later Phase D slice)",
+            descriptor.path()
+        )));
+    }
+    // Parity with render: confirm the kind is actually registered.
+    let _handler = registry
+        .resolve_for_slot(CapabilitySlot::Deployer, &descriptor)
+        .map_err(|e| OpError::Conflict(e.to_string()))?;
+
+    let (answers, answers_ref_wire) = load_render_answers(store, &env, &descriptor)?;
+    let report = reconcile_k8s_cluster(&env, answers.as_ref())?;
+
+    Ok(OpOutcome::new(
+        NOUN,
+        "reconcile",
+        json!({
+            "environment_id": env.environment_id.as_str(),
+            "kind": descriptor.as_str(),
+            "answers_ref": answers_ref_wire,
+            "applied_count": report.applied.len(),
+            "pruned_count": report.pruned.len(),
+            "applied": report.applied,
+            "pruned": report.pruned,
+        }),
+    ))
+}
+
+/// Connect to the cluster (binding's `kubeconfig_context`, ambient/in-cluster
+/// identity) and converge desired state. Requires the `k8s-client` feature.
+#[cfg(feature = "k8s-client")]
+fn reconcile_k8s_cluster(
+    env: &Environment,
+    answers: Option<&Value>,
+) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
+    use crate::env_packs::k8s::async_bridge::run_k8s_async;
+    use crate::env_packs::k8s::kube_client::connect;
+    use crate::env_packs::k8s::manifests::kubeconfig_context_from_answers;
+    use crate::env_packs::k8s::{K8sDeployerHandler, KubeCluster};
+    use std::sync::Arc;
+
+    let kubeconfig_context = kubeconfig_context_from_answers(answers);
+    run_k8s_async(async move {
+        // bound_token = None: the deployer uses the ambient kubeconfig /
+        // in-cluster identity today. `connect` already takes the bound token,
+        // so resolving `credentials_ref` → bearer is a caller-side change for
+        // the Phase D secrets sink — not a seam change here.
+        let client = connect(kubeconfig_context.as_deref(), None)
+            .await
+            .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
+        let handler = K8sDeployerHandler::with_cluster(Arc::new(KubeCluster::new(client)));
+        handler
+            .reconcile(env, answers)
+            .await
+            .map_err(|e| OpError::Conflict(e.to_string()))
+    })
+}
+
+/// `k8s-client`-less builds cannot talk to a cluster.
+#[cfg(not(feature = "k8s-client"))]
+fn reconcile_k8s_cluster(
+    _env: &Environment,
+    _answers: Option<&Value>,
+) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
+    Err(OpError::Conflict(
+        "this build was compiled without the `k8s-client` feature; \
+         `op env reconcile` needs it to connect to a cluster"
+            .to_string(),
+    ))
+}
+
 /// Load the deployer binding's recorded wizard answers for the render path.
 ///
 /// Returns `(Some(json), env-relative path string)` when the binding exists
@@ -2871,6 +2985,74 @@ mod tests {
             ..OpFlags::default()
         };
         let outcome = render(&store, &reg, &flags, render_args("zain", None, None)).unwrap();
+        assert!(outcome.result.get("input_schema").is_some());
+    }
+
+    // -- reconcile ----------------------------------------------------------
+
+    use crate::cli::dispatch::EnvReconcileArgs;
+
+    fn reconcile_args(env_id: &str, kind: Option<&str>) -> EnvReconcileArgs {
+        EnvReconcileArgs {
+            env_id: env_id.to_string(),
+            kind: kind.map(str::to_string),
+        }
+    }
+
+    /// A non-K8s deployer kind cannot be reconciled to a cluster — the verb
+    /// rejects before any connect attempt (here the env's default binding is
+    /// local-process).
+    #[test]
+    fn reconcile_rejects_non_k8s_deployer_kind() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            crate::defaults::LOCAL_DEPLOYER_PACK,
+        ));
+        store.save(&env).unwrap();
+        let err = reconcile(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            reconcile_args("local", None),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(msg.contains("only supported for"), "{msg}"),
+            other => panic!("expected Conflict, got {other}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_missing_env_is_not_found() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let err = reconcile(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            reconcile_args("ghost", None),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::NotFound(_)), "{err}");
+    }
+
+    #[test]
+    fn reconcile_schema_only_returns_input_schema() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let flags = OpFlags {
+            schema_only: true,
+            ..OpFlags::default()
+        };
+        let outcome = reconcile(&store, &reg, &flags, reconcile_args("zain", None)).unwrap();
+        assert_eq!(outcome.op, "reconcile");
         assert!(outcome.result.get("input_schema").is_some());
     }
 

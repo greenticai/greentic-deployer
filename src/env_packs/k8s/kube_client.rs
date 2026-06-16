@@ -262,7 +262,9 @@ impl K8sCluster for KubeCluster {
 
     async fn delete(&self, object: &ObjectRef) -> Result<(), K8sClusterError> {
         let (resource, scope) = api_route_for(&object.api_version, &object.kind)?;
-        let api = dynamic_api(&self.client, &resource, scope, &object.namespace);
+        // Cluster-scoped objects carry no namespace; `dynamic_api` ignores it.
+        let namespace = object.namespace.as_deref().unwrap_or_default();
+        let api = dynamic_api(&self.client, &resource, scope, namespace);
         match api.delete(&object.name, &DeleteParams::default()).await {
             Ok(_) => Ok(()),
             // Absent => Ok: the trait's retried-archive contract.
@@ -573,7 +575,7 @@ mod tests {
         ObjectRef {
             api_version: "apps/v1".into(),
             kind: "Deployment".into(),
-            namespace: "gtc-zain".into(),
+            namespace: Some("gtc-zain".into()),
             name: "gtc-worker-a".into(),
         }
     }
