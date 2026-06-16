@@ -89,6 +89,7 @@ impl SnapRequest {
             bundle_digest: None,
             repo_registry_base: None,
             store_registry_base: None,
+            extra_env: std::collections::BTreeMap::new(),
         }
     }
 }

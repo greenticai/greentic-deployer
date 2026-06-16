@@ -90,6 +90,7 @@ impl TerraformRequest {
             bundle_digest: None,
             repo_registry_base: None,
             store_registry_base: None,
+            extra_env: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -177,6 +178,7 @@ mod tests {
                 .config,
             provenance: greentic_config::ProvenanceMap::new(),
             config_warnings: Vec::new(),
+            extra_env: std::collections::BTreeMap::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
             bundle_source: None,

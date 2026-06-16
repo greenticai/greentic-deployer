@@ -716,6 +716,7 @@ mod tests {
             allow_remote_in_offline: false,
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
+            extra_env: std::collections::BTreeMap::new(),
         };
         let config = DeployerConfig::resolve(request).expect("config");
         let descriptor = resolve_builtin_extension_for_config(&config).expect("descriptor");

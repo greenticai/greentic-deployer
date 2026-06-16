@@ -1526,6 +1526,7 @@ fn run_multi_target(command: MultiTargetCommand) -> Result<()> {
         bundle_digest: None,
         repo_registry_base: None,
         store_registry_base: None,
+        extra_env: std::collections::BTreeMap::new(),
     })
 }
 
@@ -1705,6 +1706,7 @@ fn run_aws(command: AwsCommand) -> Result<()> {
             allow_remote_in_offline: shared.executable.common.allow_remote_in_offline,
             providers_dir: default_providers_dir(),
             packs_dir: default_packs_dir(),
+            extra_env: std::collections::BTreeMap::new(),
         },
         aws::resolve_config,
         aws::run_config,
@@ -1773,6 +1775,7 @@ fn run_azure(command: AzureCommand) -> Result<()> {
             allow_remote_in_offline: shared.executable.common.allow_remote_in_offline,
             providers_dir: default_providers_dir(),
             packs_dir: default_packs_dir(),
+            extra_env: std::collections::BTreeMap::new(),
         },
         azure::resolve_config,
         azure::run_config,
@@ -1833,6 +1836,7 @@ fn run_gcp(command: GcpCommand) -> Result<()> {
             allow_remote_in_offline: shared.executable.common.allow_remote_in_offline,
             providers_dir: default_providers_dir(),
             packs_dir: default_packs_dir(),
+            extra_env: std::collections::BTreeMap::new(),
         },
         gcp::resolve_config,
         gcp::run_config,

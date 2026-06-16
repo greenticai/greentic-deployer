@@ -84,6 +84,9 @@ pub struct DeployerRequest {
     pub allow_remote_in_offline: bool,
     pub deploy_pack_id_override: Option<String>,
     pub deploy_flow_id_override: Option<String>,
+    /// Extra environment variables injected onto the deploy subprocess (e.g.
+    /// resolved BYOC cloud credentials). Empty by default → ambient-only behavior.
+    pub extra_env: std::collections::BTreeMap<String, String>,
 }
 
 impl DeployerRequest {
@@ -121,6 +124,7 @@ impl DeployerRequest {
             allow_remote_in_offline: false,
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
+            extra_env: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -154,6 +158,7 @@ pub struct DeployerConfig {
     pub config_warnings: Vec<String>,
     pub deploy_pack_id_override: Option<String>,
     pub deploy_flow_id_override: Option<String>,
+    pub extra_env: std::collections::BTreeMap<String, String>,
 }
 
 impl DeployerConfig {
@@ -228,6 +233,7 @@ impl DeployerConfig {
             config_warnings: resolved.warnings,
             deploy_pack_id_override: request.deploy_pack_id_override,
             deploy_flow_id_override: request.deploy_flow_id_override,
+            extra_env: request.extra_env,
         })
     }
 
