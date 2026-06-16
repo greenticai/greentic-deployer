@@ -71,6 +71,7 @@ pub async fn connect(
     kubeconfig_context: Option<&str>,
     bound_token: Option<&str>,
 ) -> Result<kube::Client, K8sClientError> {
+    install_default_crypto_provider();
     let mut config = match kubeconfig_context {
         Some(context) => kube::Config::from_kubeconfig(&KubeConfigOptions {
             context: Some(context.to_string()),
@@ -86,6 +87,22 @@ pub async fn connect(
     };
     apply_bound_token(&mut config, bound_token);
     kube::Client::try_from(config).map_err(|e| K8sClientError::NoClusterAccess(e.to_string()))
+}
+
+/// Pin a process-default rustls `CryptoProvider` before any TLS handshake.
+///
+/// rustls 0.23 refuses to auto-select a provider when more than one is
+/// compiled in, and this workspace links both: `ring` (kube's bundled TLS)
+/// and `aws-lc-rs` (the AWS SDK's). Without an explicit default the first
+/// real cluster connection panics inside rustls — a failure invisible to the
+/// unit tests, which drive a pre-built `kube::Client` over a `tower-test`
+/// mock and never open a socket. Install `ring` (kube's choice) once; if a
+/// provider is already set (another caller, or a future dependency default),
+/// that one wins and this is a no-op.
+fn install_default_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
 }
 
 /// Override the resolved config's auth with a bound ServiceAccount token.
