@@ -602,7 +602,7 @@ pub fn reconcile(
         return Err(OpError::NotFound(format!("environment `{env_id}`")));
     }
     let env = store.load(&env_id)?;
-    let descriptor = resolve_render_kind(&env, args.kind.as_deref())?;
+    let descriptor = resolve_live_deployer_kind(&env, args.kind.as_deref())?;
 
     // Reconcile applies rendered manifests to a live cluster — K8s-specific.
     let k8s_path = crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
@@ -699,6 +699,19 @@ fn reconcile_k8s_cluster(
 /// through the binding's `kubeconfig_context` answer with the ambient
 /// kubeconfig / in-cluster identity; resolving the env's bound ServiceAccount
 /// token rides the Phase D secrets sink.
+///
+/// # Known gaps (Phase D later slices)
+///
+/// - **Answer / namespace drift.** Both branches render the worker objects from
+///   the binding's *current* answers, so the teardown targets the namespace the
+///   answers name *now*. If a revision was warmed in namespace A and the binding
+///   namespace later changes to B, the archive branch deletes B's worker (a
+///   no-op) and reports success, leaving A's worker running — the same drift
+///   `reconcile`'s prune already has. A drift-safe teardown needs the
+///   per-revision applied-param snapshot or the label-based GC seam
+///   (`K8sCluster::list`) tracked with `reconcile`'s prune-scope gap; until then
+///   the binding namespace must stay stable while a revision is live (the
+///   wizard already states the namespace must match the bootstrap rules pack).
 pub fn apply_revision(
     store: &LocalFsStore,
     registry: &crate::env_packs::EnvPackRegistry,
@@ -722,7 +735,7 @@ pub fn apply_revision(
     }
     let env = store.load(&env_id)?;
 
-    let descriptor = resolve_render_kind(&env, args.kind.as_deref())?;
+    let descriptor = resolve_live_deployer_kind(&env, args.kind.as_deref())?;
 
     // Same K8s-only gate as reconcile: applying manifests to a live cluster is
     // K8s-specific today. This "is the verb applicable to this env" check runs
@@ -929,6 +942,39 @@ fn resolve_render_kind(
             ))),
         },
     }
+}
+
+/// Resolve the deployer descriptor for a LIVE (cluster-mutating) verb
+/// (`reconcile`, `apply-revision`).
+///
+/// Unlike [`resolve_render_kind`] — which backs the read-only `render` preview
+/// and deliberately lets a full `--kind` describe an *unbound* deployer — a
+/// live verb must mutate ONLY the env's declared deployer. The resolved
+/// descriptor's **path** must equal the env's Deployer-slot binding path, so a
+/// full `--kind` may override the binding's *version* (same deployer) but can
+/// neither switch deployers (e.g. force `greentic.deployer.k8s` onto a
+/// local-process env) nor apply to an env with no deployer binding at all.
+/// Without this, `--kind <full k8s descriptor>` would drive K8s apply/teardown
+/// against a cluster for an env that was never K8s-bound.
+fn resolve_live_deployer_kind(
+    env: &Environment,
+    kind: Option<&str>,
+) -> Result<greentic_deploy_spec::PackDescriptor, OpError> {
+    let descriptor = resolve_render_kind(env, kind)?;
+    let bound = env.pack_for_slot(CapabilitySlot::Deployer).ok_or_else(|| {
+        OpError::Conflict(
+            "env has no deployer binding; a live apply must target a bound deployer".to_string(),
+        )
+    })?;
+    if descriptor.path() != bound.kind.path() {
+        return Err(OpError::Conflict(format!(
+            "env is bound to deployer `{}`; a live apply cannot use `{}` — it is not the env's \
+             bound deployer (a full `--kind` may override the version, not switch deployers)",
+            bound.kind.path(),
+            descriptor.path()
+        )));
+    }
+    Ok(descriptor)
 }
 
 /// Result of [`write_rendered_objects`].
@@ -3330,6 +3376,67 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.op, "apply-revision");
         assert!(outcome.result.get("input_schema").is_some());
+    }
+
+    /// A live verb must not be forced onto a deployer the env isn't bound to: a
+    /// full `--kind` K8s override against a local-process-bound env is rejected
+    /// at the binding-match guard, before any cluster connect (the Codex F1
+    /// fix). The same guard backs `reconcile`.
+    #[test]
+    fn apply_revision_rejects_unbound_deployer_kind_override() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            crate::defaults::LOCAL_DEPLOYER_PACK,
+        ));
+        store.save(&env).unwrap();
+        let err = apply_revision(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_revision_args(
+                "local",
+                "00000000000000000000000000",
+                Some("greentic.deployer.k8s@1.0.0"),
+            ),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(
+                msg.contains("bound to deployer") && msg.contains("not the env's"),
+                "{msg}"
+            ),
+            other => panic!("expected Conflict (unbound deployer), got {other}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_rejects_unbound_deployer_kind_override() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            crate::defaults::LOCAL_DEPLOYER_PACK,
+        ));
+        store.save(&env).unwrap();
+        let err = reconcile(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            reconcile_args("local", Some("greentic.deployer.k8s@1.0.0")),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(msg.contains("bound to deployer"), "{msg}"),
+            other => panic!("expected Conflict (unbound deployer), got {other}"),
+        }
     }
 
     // ---- Fix 1: answers_ref consumption ------------------------------------
