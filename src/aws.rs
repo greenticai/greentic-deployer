@@ -357,8 +357,13 @@ impl crate::runtime_secret_sink::RuntimeSecretSink for AwsCliSecretSink {
             "--secret-string",
             &secret_file,
         ]);
-        for (key, value) in tags {
-            create.arg("--tags").arg(format!("Key={key},Value={value}"));
+        // A single `--tags` with all tags: repeating the flag makes the AWS CLI
+        // keep only the last one, which silently dropped every tag but one.
+        if !tags.is_empty() {
+            create.arg("--tags");
+            for (key, value) in tags {
+                create.arg(format!("Key={key},Value={value}"));
+            }
         }
 
         let create = create
@@ -398,6 +403,38 @@ impl crate::runtime_secret_sink::RuntimeSecretSink for AwsCliSecretSink {
                 DeployerError::Other(format!("run aws secretsmanager put-secret-value: {err}"))
             })?;
         if update.status.success() {
+            // put-secret-value updates the value but not tags, so a pre-existing
+            // secret stays untagged (this is why `list-secrets --filters
+            // tag-key=greentic:managed-by` came back empty). Apply tags
+            // explicitly; this is best-effort metadata, so don't fail the deploy.
+            if !tags.is_empty() {
+                let mut tag = ProcessCommand::new("aws");
+                tag.args([
+                    "secretsmanager",
+                    "tag-resource",
+                    "--region",
+                    &self.region,
+                    "--secret-id",
+                    name,
+                    "--tags",
+                ]);
+                for (key, value) in tags {
+                    tag.arg(format!("Key={key},Value={value}"));
+                }
+                match tag.stdout(Stdio::null()).stderr(Stdio::piped()).output() {
+                    Ok(out) if out.status.success() => {}
+                    Ok(out) => tracing::warn!(
+                        secret = %name,
+                        stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                        "failed to tag existing secret on update"
+                    ),
+                    Err(err) => tracing::warn!(
+                        secret = %name,
+                        %err,
+                        "failed to invoke aws secretsmanager tag-resource"
+                    ),
+                }
+            }
             Ok(UpsertOutcome::Updated)
         } else {
             Err(DeployerError::Other(format!(
