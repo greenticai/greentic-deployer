@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use greentic_deploy_spec::CapabilitySlot;
+use greentic_deploy_spec::GUI_DEFAULT_ENV_ID;
 use qa_spec::spec::ListSpec;
 use qa_spec::spec::question::QuestionPolicy;
 use qa_spec::{AnswerSet, Expr, FormSpec, QuestionSpec, QuestionType};
@@ -823,11 +824,24 @@ pub const ENV_MANIFEST_FORM_ID: &str = "greentic.env-manifest";
 /// converting wrong.
 pub const ENV_MANIFEST_FORM_VERSION: &str = "1";
 
+/// [`manifest_form_spec_for_env`] for the default env id ([`GUI_DEFAULT_ENV_ID`],
+/// i.e. `local`). Back-compat entry point for callers that don't yet thread the
+/// target env id; prefer the `_for_env` form so the `webchat_gui` default
+/// reflects the env (off for non-local).
+pub fn manifest_form_spec() -> FormSpec {
+    manifest_form_spec_for_env(GUI_DEFAULT_ENV_ID)
+}
+
 /// The one `qa_spec::FormSpec` for authoring a manifest. The greentic-setup
 /// terminal wizard, the future web UI, and Adaptive-Card front-ends all
 /// render these same questions; [`answers_to_manifest`] converts the
 /// resulting [`AnswerSet`] into a typed [`EnvManifest`] — the manifest stays
 /// the durable artifact, answers are an input mechanism.
+///
+/// `env_id` is the environment the wizard targets; it sets the `webchat_gui`
+/// default (on for `local`, off elsewhere — see [`GUI_DEFAULT_ENV_ID`]) so a
+/// non-local pass doesn't default the loopback-only console on. It does not
+/// otherwise constrain the answers.
 ///
 /// Conventions (each pinned by a test):
 /// - Repeating manifest sections (`secrets[]`, `bundles[]`,
@@ -849,7 +863,7 @@ pub const ENV_MANIFEST_FORM_VERSION: &str = "1";
 /// - Nested string arrays (`links`, `route_path_prefixes`, …) are
 ///   comma-separated `String` questions — qa-spec `List` rows cannot nest
 ///   lists. [`answers_to_manifest`] owns the split.
-pub fn manifest_form_spec() -> FormSpec {
+pub fn manifest_form_spec_for_env(env_id: &str) -> FormSpec {
     let mut environment_id = question(
         "environment_id",
         QuestionType::String,
@@ -891,7 +905,11 @@ pub fn manifest_form_spec() -> FormSpec {
          intend it.",
         true,
     );
-    webchat_gui.default_value = Some("true".to_string());
+    // Env-aware default so a non-local wizard pass doesn't silently enable the
+    // loopback-only console: matches `resolved_gui_enabled()` (on for the
+    // `local` env id, off elsewhere) — the single home of the policy lives in
+    // `GUI_DEFAULT_ENV_ID`. `Some(_)` answers still override either way.
+    webchat_gui.default_value = Some((env_id == GUI_DEFAULT_ENV_ID).to_string());
 
     let mut secrets = question(
         "secrets",
@@ -1907,6 +1925,32 @@ mod tests {
                 _ => assert!(q.list.is_none(), "`{}` is not a List but has rows", q.id),
             }
         }
+    }
+
+    fn webchat_gui_default(spec: &FormSpec) -> Option<&str> {
+        spec.questions
+            .iter()
+            .find(|q| q.id == "webchat_gui")
+            .expect("webchat_gui question")
+            .default_value
+            .as_deref()
+    }
+
+    #[test]
+    fn webchat_gui_default_is_env_aware() {
+        // `local` opts the loopback console in by default; any other env id
+        // defaults it OFF so a non-local wizard pass doesn't silently enable
+        // an unauthenticated surface. Mirrors `resolved_gui_enabled()`.
+        assert_eq!(
+            webchat_gui_default(&manifest_form_spec_for_env(GUI_DEFAULT_ENV_ID)),
+            Some("true")
+        );
+        assert_eq!(
+            webchat_gui_default(&manifest_form_spec_for_env("prod")),
+            Some("false")
+        );
+        // Back-compat entry point keeps the historical local default.
+        assert_eq!(webchat_gui_default(&manifest_form_spec()), Some("true"));
     }
 
     #[test]
