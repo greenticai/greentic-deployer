@@ -98,6 +98,19 @@ pub struct ManifestEnvironment {
     pub gui_enabled: Option<bool>,
 }
 
+impl ManifestEnvironment {
+    /// True if the manifest declares any field that flows through `op config
+    /// set` / the `UpdateHostConfig` apply step. `public_base_url` is excluded
+    /// on purpose — it's reconciled by the separate `SetPublicUrl` step.
+    pub(crate) fn declares_host_config(&self) -> bool {
+        self.name.is_some()
+            || self.region.is_some()
+            || self.tenant_org_id.is_some()
+            || self.listen_addr.is_some()
+            || self.gui_enabled.is_some()
+    }
+}
+
 /// v1 accepts only the string `"bootstrap"`. A future
 /// `{ "additional_keys": [...] }` shape extends this enum without a schema
 /// bump.

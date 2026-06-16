@@ -1115,7 +1115,7 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
         },
     }
 
-    // 2. UpdateHostConfig (name, region, tenant_org_id, listen_addr).
+    // 2. UpdateHostConfig (name, region, tenant_org_id, listen_addr, gui_enabled).
     //    Compares declared manifest fields against the live env; any declared
     //    field that differs emits ONE UpdateHostConfig step. On a fresh env
     //    (env == None) the host-config update is deferred to after the
@@ -1195,19 +1195,12 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     gui_enabled: me.gui_enabled,
                 })),
             });
-        } else {
-            let has_declared_host_config = me.name.is_some()
-                || me.region.is_some()
-                || me.tenant_org_id.is_some()
-                || me.listen_addr.is_some()
-                || me.gui_enabled.is_some();
-            if has_declared_host_config {
-                steps.push(ApplyStep::no_op(
-                    ApplyStepKind::UpdateHostConfig,
-                    env_id_str.clone(),
-                    "host-config unchanged",
-                ));
-            }
+        } else if me.declares_host_config() {
+            steps.push(ApplyStep::no_op(
+                ApplyStepKind::UpdateHostConfig,
+                env_id_str.clone(),
+                "host-config unchanged",
+            ));
         }
     } else {
         // Fresh env (always `local` here — see EnsureEnvironment). `env init`
@@ -1215,12 +1208,7 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
         // host-config is applied by a deferred UpdateHostConfig step that runs
         // after the env is created.
         let me = &ctx.manifest.environment;
-        let has_host_config = me.name.is_some()
-            || me.region.is_some()
-            || me.tenant_org_id.is_some()
-            || me.listen_addr.is_some()
-            || me.gui_enabled.is_some();
-        if has_host_config {
+        if me.declares_host_config() {
             steps.push(ApplyStep {
                 kind: ApplyStepKind::UpdateHostConfig,
                 key: env_id_str.clone(),
