@@ -48,6 +48,9 @@ pub struct AwsRequest {
     pub allow_remote_in_offline: bool,
     pub providers_dir: PathBuf,
     pub packs_dir: PathBuf,
+    /// Extra environment variables injected onto the deploy subprocess (e.g.
+    /// resolved BYOC cloud credentials). Empty by default → ambient-only behavior.
+    pub extra_env: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +119,7 @@ impl AwsRequest {
             allow_remote_in_offline: false,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
+            extra_env: std::collections::BTreeMap::new(),
         }
     }
 
@@ -148,7 +152,7 @@ impl AwsRequest {
             allow_remote_in_offline: self.allow_remote_in_offline,
             deploy_pack_id_override: self.deploy_pack_id_override,
             deploy_flow_id_override: self.deploy_flow_id_override,
-            extra_env: std::collections::BTreeMap::new(),
+            extra_env: self.extra_env,
         }
     }
 }
@@ -204,6 +208,7 @@ fn build_aws_request_from_ext(
         allow_remote_in_offline: false,
         providers_dir: std::path::PathBuf::from("providers/deployer"),
         packs_dir: std::path::PathBuf::from("packs"),
+        extra_env: std::collections::BTreeMap::new(),
     }
 }
 
@@ -756,6 +761,18 @@ mod tests {
         assert_eq!(request.provider, Provider::Aws);
         assert_eq!(request.strategy, "iac-only");
         assert_eq!(request.tenant, "acme");
+    }
+
+    #[test]
+    fn aws_request_forwards_extra_env() {
+        use std::collections::BTreeMap;
+        let mut req = AwsRequest::new(DeployerCapability::Plan, "acme", PathBuf::from("pack-dir"));
+        req.extra_env = BTreeMap::from([("AWS_ACCESS_KEY_ID".to_string(), "AKIA".to_string())]);
+        let dr = req.into_deployer_request();
+        assert_eq!(
+            dr.extra_env.get("AWS_ACCESS_KEY_ID").map(String::as_str),
+            Some("AKIA")
+        );
     }
 
     #[test]

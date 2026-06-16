@@ -40,6 +40,9 @@ pub struct GcpRequest {
     pub allow_remote_in_offline: bool,
     pub providers_dir: PathBuf,
     pub packs_dir: PathBuf,
+    /// Extra environment variables injected onto the deploy subprocess (e.g.
+    /// resolved BYOC cloud credentials). Empty by default → ambient-only behavior.
+    pub extra_env: std::collections::BTreeMap<String, String>,
 }
 
 impl GcpRequest {
@@ -74,6 +77,7 @@ impl GcpRequest {
             allow_remote_in_offline: false,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
+            extra_env: std::collections::BTreeMap::new(),
         }
     }
 
@@ -106,7 +110,7 @@ impl GcpRequest {
             allow_remote_in_offline: self.allow_remote_in_offline,
             deploy_pack_id_override: self.deploy_pack_id_override,
             deploy_flow_id_override: self.deploy_flow_id_override,
-            extra_env: std::collections::BTreeMap::new(),
+            extra_env: self.extra_env,
         }
     }
 }
@@ -189,6 +193,7 @@ fn build_gcp_request_from_ext(
         allow_remote_in_offline: false,
         providers_dir: std::path::PathBuf::from("providers/deployer"),
         packs_dir: std::path::PathBuf::from("packs"),
+        extra_env: std::collections::BTreeMap::new(),
     }
 }
 

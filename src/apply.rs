@@ -1064,6 +1064,7 @@ fn execute_local_terraform_operation(
         &script_path,
         &runtime_artifacts.deploy_dir,
         config.provider,
+        &config.extra_env,
         runtime_artifacts,
         &stdout_log,
         &stderr_log,
@@ -1081,6 +1082,7 @@ fn execute_local_terraform_operation(
                     &cleanup_script,
                     &runtime_artifacts.deploy_dir,
                     config.provider,
+                    &config.extra_env,
                     runtime_artifacts,
                     cleanup_stdout,
                     cleanup_stderr,
@@ -1092,6 +1094,7 @@ fn execute_local_terraform_operation(
                         &script_path,
                         &runtime_artifacts.deploy_dir,
                         config.provider,
+                        &config.extra_env,
                         runtime_artifacts,
                         retry_stdout,
                         retry_stderr,
@@ -1140,7 +1143,7 @@ fn execute_local_terraform_operation(
         "destroyed"
     };
     if operation == "apply" {
-        let _ = capture_terraform_outputs(config.provider, runtime_artifacts);
+        let _ = capture_terraform_outputs(config.provider, &config.extra_env, runtime_artifacts);
         wait_for_runtime_readiness(config.provider, runtime_artifacts)?;
     }
     let endpoints = if operation == "apply" {
@@ -1181,7 +1184,11 @@ fn execute_local_terraform_operation(
     }))
 }
 
-fn apply_default_cloud_envs(command: &mut Command, provider: crate::config::Provider) {
+fn apply_default_cloud_envs(
+    command: &mut Command,
+    provider: crate::config::Provider,
+    extra_env: &std::collections::BTreeMap<String, String>,
+) {
     if provider == crate::config::Provider::Aws {
         if std::env::var_os("AWS_REGION").is_none() {
             command.env("AWS_REGION", "eu-north-1");
@@ -1190,12 +1197,17 @@ fn apply_default_cloud_envs(command: &mut Command, provider: crate::config::Prov
             command.env("AWS_DEFAULT_REGION", "eu-north-1");
         }
     }
+    // Caller-supplied vars (e.g. resolved BYOC credentials) win over ambient defaults.
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
 }
 
 fn run_script_capture_logs(
     script_path: &Path,
     current_dir: &Path,
     provider: crate::config::Provider,
+    extra_env: &std::collections::BTreeMap<String, String>,
     runtime_artifacts: &RuntimeArtifacts,
     stdout_log: &str,
     stderr_log: &str,
@@ -1204,7 +1216,7 @@ fn run_script_capture_logs(
     // foxguard: ignore[rs/no-command-injection]
     let mut command = Command::new(script_path);
     command.current_dir(current_dir);
-    apply_default_cloud_envs(&mut command, provider);
+    apply_default_cloud_envs(&mut command, provider, extra_env);
     let output = command.output().map_err(DeployerError::Io)?;
     fs::write(
         runtime_artifacts.deploy_dir.join(stdout_log),
@@ -1465,6 +1477,7 @@ fn wait_for_runtime_readiness(
 
 fn capture_terraform_outputs(
     provider: crate::config::Provider,
+    extra_env: &std::collections::BTreeMap<String, String>,
     runtime_artifacts: &RuntimeArtifacts,
 ) -> Result<()> {
     let terraform_root = runtime_artifacts.deploy_dir.join("terraform");
@@ -1484,7 +1497,7 @@ fn capture_terraform_outputs(
         .current_dir(&terraform_root)
         .arg("output")
         .arg("-json");
-    apply_default_cloud_envs(&mut command, provider);
+    apply_default_cloud_envs(&mut command, provider, extra_env);
     let output = command.output().map_err(DeployerError::Io)?;
 
     if !output.status.success() {
@@ -4131,6 +4144,25 @@ mod tests {
         CapabilitySpecV1, DeployerCapability, DeployerContractV1, PlannerSpecV1,
         set_deployer_contract_v1,
     };
+
+    #[test]
+    fn apply_default_cloud_envs_injects_extra_env_over_region_defaults() {
+        use std::collections::BTreeMap;
+        let mut extra = BTreeMap::new();
+        extra.insert("AWS_ACCESS_KEY_ID".to_string(), "AKIA_TEST".to_string());
+        extra.insert("AWS_REGION".to_string(), "us-east-1".to_string());
+        let mut command = Command::new("true");
+        apply_default_cloud_envs(&mut command, Provider::Aws, &extra);
+        let envs: std::collections::HashMap<String, String> = command
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+            .collect();
+        assert_eq!(
+            envs.get("AWS_ACCESS_KEY_ID").map(String::as_str),
+            Some("AKIA_TEST")
+        );
+        assert_eq!(envs.get("AWS_REGION").map(String::as_str), Some("us-east-1"));
+    }
     use crate::deployment::{EXECUTOR_TEST_LOCK, clear_deployment_executor};
     use greentic_types::cbor::encode_pack_manifest;
     use greentic_types::component::{ComponentCapabilities, ComponentManifest, ComponentProfiles};
@@ -4168,6 +4200,7 @@ mod tests {
                 .config,
             provenance: greentic_config::ProvenanceMap::new(),
             config_warnings: Vec::new(),
+            extra_env: std::collections::BTreeMap::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
             bundle_source: None,
@@ -4818,6 +4851,7 @@ kind: Deployment
             greentic,
             provenance: greentic_config::ProvenanceMap::new(),
             config_warnings: Vec::new(),
+            extra_env: std::collections::BTreeMap::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
             bundle_source: None,
@@ -4889,6 +4923,7 @@ kind: Deployment
             greentic,
             provenance: greentic_config::ProvenanceMap::new(),
             config_warnings: Vec::new(),
+            extra_env: std::collections::BTreeMap::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
             bundle_source: Some("file:///tmp/apply-test.gtbundle".into()),
@@ -4975,6 +5010,7 @@ kind: Deployment
             greentic,
             provenance: greentic_config::ProvenanceMap::new(),
             config_warnings: Vec::new(),
+            extra_env: std::collections::BTreeMap::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
             bundle_source: Some("file:///tmp/demo.gtbundle".into()),
@@ -5325,6 +5361,7 @@ data "aws_region" "current" {}
             greentic,
             provenance: greentic_config::ProvenanceMap::new(),
             config_warnings: Vec::new(),
+            extra_env: std::collections::BTreeMap::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
             bundle_source: Some("file:///tmp/demo.gtbundle".into()),
@@ -5436,6 +5473,7 @@ data "aws_region" "current" {}
             greentic,
             provenance: greentic_config::ProvenanceMap::new(),
             config_warnings: Vec::new(),
+            extra_env: std::collections::BTreeMap::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
             bundle_source: Some("file:///tmp/demo.gtbundle".into()),
@@ -5549,6 +5587,7 @@ data "aws_region" "current" {}
             greentic,
             provenance: greentic_config::ProvenanceMap::new(),
             config_warnings: Vec::new(),
+            extra_env: std::collections::BTreeMap::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
             bundle_source: Some("file:///tmp/demo-v2.gtbundle".into()),
@@ -5808,6 +5847,7 @@ data "aws_region" "current" {}
             greentic,
             provenance: greentic_config::ProvenanceMap::new(),
             config_warnings: Vec::new(),
+            extra_env: std::collections::BTreeMap::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
             bundle_source: None,
@@ -5901,6 +5941,7 @@ data "aws_region" "current" {}
             greentic,
             provenance: greentic_config::ProvenanceMap::new(),
             config_warnings: Vec::new(),
+            extra_env: std::collections::BTreeMap::new(),
             deploy_pack_id_override: None,
             deploy_flow_id_override: None,
             bundle_source: None,
