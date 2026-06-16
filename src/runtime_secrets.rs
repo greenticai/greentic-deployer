@@ -573,8 +573,13 @@ pub async fn resolve_runtime_secrets(
                 if let Ok(value) = env::var(&env_key)
                     && !value.is_empty()
                 {
-                    found = Some((SecretValueSource::Env { key: env_key }, value));
-                    break 'candidates;
+                    if is_placeholder_secret_value(&value, uri) {
+                        checked_sources
+                            .push(format!("env {env_key} (auto-seeded placeholder, ignored)"));
+                    } else {
+                        found = Some((SecretValueSource::Env { key: env_key }, value));
+                        break 'candidates;
+                    }
                 }
             }
 
@@ -597,7 +602,10 @@ pub async fn resolve_runtime_secrets(
                     if let Some(env_key) = extract_env_placeholder(&value) {
                         checked_sources.push(format!("env ${{{env_key}}} (from dev store)"));
                         match env::var(&env_key) {
-                            Ok(expanded) if !expanded.is_empty() => {
+                            Ok(expanded)
+                                if !expanded.is_empty()
+                                    && !is_placeholder_secret_value(&expanded, uri) =>
+                            {
                                 found = Some((
                                     SecretValueSource::DevStore { path: path.clone() },
                                     expanded,
@@ -613,7 +621,7 @@ pub async fn resolve_runtime_secrets(
                     // (it lands in `missing`); an optional one is skipped, so a
                     // value an operator pre-seeded directly in the cloud secret
                     // manager survives instead of being clobbered.
-                    if is_placeholder_secret_value(&value) {
+                    if is_placeholder_secret_value(&value, uri) {
                         checked_sources.push(format!(
                             "{} (auto-seeded placeholder, ignored)",
                             path.display()
@@ -1073,20 +1081,26 @@ fn extract_env_placeholder(value: &str) -> Option<String> {
     Some(inner.to_string())
 }
 
-/// Values `greentic-start` auto-seeds into the dev store for un-provisioned
-/// secrets (`secrets_setup::placeholder_text_for_uri`): `ollama-placeholder`
-/// for `*api_key*`-shaped URIs, `placeholder for <uri>` for everything else.
-/// These are NOT real credentials. Promoting one to a cloud secret manager
-/// would both ship a non-working value AND clobber any real value an operator
+/// Whether `value` (the value resolved for `uri`) is a placeholder
+/// `greentic-start` auto-seeds into the dev store for un-provisioned secrets
+/// (`secrets_setup::placeholder_text_for_uri`): `ollama-placeholder` for
+/// `api_key`-shaped URIs, `placeholder for <uri>` for everything else. These
+/// are NOT real credentials — promoting one to a cloud secret manager would
+/// both ship a non-working value AND clobber any real value an operator
 /// pre-seeded there, so the cloud-apply resolver treats them as unresolved.
+///
+/// Both forms are matched **exactly**, never by prefix: `ollama-placeholder`
+/// is a globally-unique sentinel, and `placeholder for <uri>` is compared
+/// against *this* candidate's `uri` so an arbitrary operator value that merely
+/// begins with `placeholder for ` is not misclassified as unresolved.
 ///
 /// NOTE: the marker strings are duplicated from `greentic-start`
 /// (`secrets_setup.rs`) and must stay in sync. A shared sentinel in the
 /// foundation crate is the deeper fix (tracked with the secrets-lib scaffold
 /// follow-up), out of scope for this surgical change.
-fn is_placeholder_secret_value(value: &str) -> bool {
+fn is_placeholder_secret_value(value: &str, uri: &str) -> bool {
     let trimmed = value.trim();
-    trimmed == "ollama-placeholder" || trimmed.starts_with("placeholder for ")
+    trimmed == "ollama-placeholder" || trimmed == format!("placeholder for {uri}")
 }
 
 fn default_required() -> bool {
@@ -1721,17 +1735,30 @@ questions:
     }
 
     #[test]
-    fn is_placeholder_secret_value_matches_only_start_markers() {
-        assert!(is_placeholder_secret_value("ollama-placeholder"));
-        assert!(is_placeholder_secret_value("  ollama-placeholder  "));
+    fn is_placeholder_secret_value_matches_only_exact_start_markers() {
+        let uri = "secrets://dev/demo/_/openai/api_key";
+        // `ollama-placeholder` is a global sentinel (URI-independent), trimmed.
+        assert!(is_placeholder_secret_value("ollama-placeholder", uri));
+        assert!(is_placeholder_secret_value("  ollama-placeholder  ", uri));
+        // `placeholder for <uri>` matches ONLY for its own URI.
         assert!(is_placeholder_secret_value(
-            "placeholder for secrets://dev/demo/_/x/y"
+            "placeholder for secrets://dev/demo/_/openai/api_key",
+            uri
         ));
-        // Genuine credentials and the unexpanded ${VAR} form must NOT match.
-        assert!(!is_placeholder_secret_value("sk-realkey-123"));
-        assert!(!is_placeholder_secret_value(""));
-        assert!(!is_placeholder_secret_value("${OPENAI_API_KEY}"));
-        assert!(!is_placeholder_secret_value("ollama"));
+        assert!(
+            !is_placeholder_secret_value("placeholder for secrets://dev/demo/_/other/key", uri),
+            "the templated marker must not match a different URI"
+        );
+        // Genuine credentials (incl. a real value that merely *starts with*
+        // `placeholder for `) and the unexpanded ${VAR} form must NOT match.
+        assert!(!is_placeholder_secret_value(
+            "placeholder for my passphrase",
+            uri
+        ));
+        assert!(!is_placeholder_secret_value("sk-realkey-123", uri));
+        assert!(!is_placeholder_secret_value("", uri));
+        assert!(!is_placeholder_secret_value("${OPENAI_API_KEY}", uri));
+        assert!(!is_placeholder_secret_value("ollama", uri));
     }
 
     #[tokio::test]
@@ -1785,7 +1812,9 @@ questions:
     }
 
     #[tokio::test]
-    async fn resolve_ignores_generic_placeholder_for_prefix() {
+    async fn resolve_ignores_uri_scoped_placeholder_for_marker() {
+        // The `placeholder for <uri>` marker (start's non-api_key form) seeded
+        // under its own URI is treated as unresolved.
         let dir = tempfile::tempdir().unwrap();
         let uri = "secrets://dev/demo/_/webhook/token";
         seed_dev_store_value(
@@ -1800,6 +1829,28 @@ questions:
 
         assert!(resolution.resolved.is_empty());
         assert_eq!(resolution.missing.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_keeps_real_value_that_merely_starts_with_placeholder_for() {
+        // Codex F2 regression: a genuine secret value beginning with
+        // "placeholder for " — but NOT equal to the exact `placeholder for
+        // <uri>` marker — must still resolve. The matcher is exact, not a
+        // prefix, so real operator bytes are never misclassified.
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "secrets://dev/demo/_/app/passphrase";
+        let real = b"placeholder for the vault, rotated monthly";
+        seed_dev_store_value(dir.path(), uri, real).await;
+
+        let ctx = ctx_for(dir.path(), "dev", "demo");
+        let resolution = resolve_runtime_secrets(&ctx, &[req(uri, "app", "passphrase")]).await;
+
+        assert!(resolution.missing.is_empty());
+        assert_eq!(resolution.resolved.len(), 1);
+        assert_eq!(
+            resolution.resolved[0].value.expose(),
+            "placeholder for the vault, rotated monthly"
+        );
     }
 
     #[tokio::test]
