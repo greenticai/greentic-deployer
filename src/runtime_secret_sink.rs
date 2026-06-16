@@ -67,6 +67,7 @@ pub fn runtime_secret_tags(
 ///
 /// Each secret is written under its canonical cloud name (`cloud_secret_name`)
 /// with the standard tag set; the returned report lists what was promoted.
+#[allow(clippy::too_many_arguments)]
 pub fn promote_runtime_secrets(
     sink: &dyn RuntimeSecretSink,
     resolved: &[ResolvedRuntimeSecret],
@@ -206,13 +207,8 @@ mod tests {
         );
         assert_eq!(puts[0].value, "generated-key");
         assert_eq!(puts[0].outcome, UpsertOutcome::Created);
-        assert!(
-            puts[0]
-                .tags
-                .iter()
-                .any(|(k, v)| k == "greentic:secret-uri"
-                    && v == "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key")
-        );
+        assert!(puts[0].tags.iter().any(|(k, v)| k == "greentic:secret-uri"
+            && v == "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key"));
         assert!(
             puts[0]
                 .tags
@@ -227,13 +223,29 @@ mod tests {
         let sink = RecordingSink::default();
         let resolved = vec![make_resolved("p", "k", "v1")];
         promote_runtime_secrets(
-            &sink, &resolved, "greentic/dev/demo/_", None, "dev", "demo", "_", "aws", "sm",
+            &sink,
+            &resolved,
+            "greentic/dev/demo/_",
+            None,
+            "dev",
+            "demo",
+            "_",
+            "aws",
+            "sm",
         )
         .expect("first");
 
         let resolved = vec![make_resolved("p", "k", "v2")];
         promote_runtime_secrets(
-            &sink, &resolved, "greentic/dev/demo/_", None, "dev", "demo", "_", "aws", "sm",
+            &sink,
+            &resolved,
+            "greentic/dev/demo/_",
+            None,
+            "dev",
+            "demo",
+            "_",
+            "aws",
+            "sm",
         )
         .expect("second");
 
@@ -241,7 +253,10 @@ mod tests {
         assert_eq!(puts.len(), 2);
         assert_eq!(puts[0].outcome, UpsertOutcome::Created);
         assert_eq!(puts[1].outcome, UpsertOutcome::Updated);
-        assert_eq!(sink.store.borrow().get("greentic/dev/demo/_/p/k").unwrap(), "v2");
+        assert_eq!(
+            sink.store.borrow().get("greentic/dev/demo/_/p/k").unwrap(),
+            "v2"
+        );
     }
 
     #[test]
@@ -252,7 +267,15 @@ mod tests {
         };
         let resolved = vec![make_resolved("p", "k", "v")];
         let err = promote_runtime_secrets(
-            &sink, &resolved, "greentic/dev/demo/_", None, "dev", "demo", "_", "aws", "sm",
+            &sink,
+            &resolved,
+            "greentic/dev/demo/_",
+            None,
+            "dev",
+            "demo",
+            "_",
+            "aws",
+            "sm",
         )
         .unwrap_err();
         assert!(err.to_string().contains("sink rejected"));
@@ -262,7 +285,15 @@ mod tests {
     fn empty_resolved_set_promotes_nothing() {
         let sink = RecordingSink::default();
         let report = promote_runtime_secrets(
-            &sink, &[], "greentic/dev/demo/_", None, "dev", "demo", "_", "aws", "sm",
+            &sink,
+            &[],
+            "greentic/dev/demo/_",
+            None,
+            "dev",
+            "demo",
+            "_",
+            "aws",
+            "sm",
         )
         .expect("promote");
         assert!(report.promoted.is_empty());

@@ -16,6 +16,16 @@ if ! git diff --cached --name-only --diff-filter=ACM | grep -qE '\.rs$|Cargo\.to
     exit 0
 fi
 
+# Keep Cargo.lock in sync with the manifests (e.g. after a version bump) so
+# that --locked builds in CI / pre-push do not fail. Only workspace members
+# are touched; external dependencies are left as-is.
+echo "pre-commit: cargo update --workspace"
+cargo update --workspace
+if ! git diff --quiet -- Cargo.lock; then
+    git add Cargo.lock
+    echo "pre-commit: re-staged Cargo.lock"
+fi
+
 echo "pre-commit: cargo fmt --all --check"
 if ! cargo fmt --all -- --check; then
     echo
