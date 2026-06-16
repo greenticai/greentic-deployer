@@ -45,7 +45,7 @@
 //! uppercase in label VALUES (`greentic.ai/revision: <ULID>`) to match
 //! the spec's canonical ULID rendering.
 
-use greentic_deploy_spec::{EnvId, Environment, Revision};
+use greentic_deploy_spec::{EnvId, Environment, Revision, RevisionLifecycle};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -211,6 +211,22 @@ fn answer_string(obj: &serde_json::Map<String, serde_json::Value>, key: &str) ->
         Some(serde_json::Value::String(s)) => Some(s.clone()),
         Some(other) => Some(other.to_string()),
     }
+}
+
+/// The `kubeconfig_context` wizard answer — which kubeconfig context the
+/// deployer connects through ([`super::kube_client::connect`]). It is a
+/// client-targeting knob, NOT a manifest knob, so [`K8sParams::from_answers`]
+/// accepts-and-ignores it; the reconcile path reads it here instead. `null`
+/// / empty / absent → `None` (infer current-context / in-cluster).
+///
+/// Reading it through the same flat-answers convention as the manifest knobs
+/// keeps a single home for "how a K8s wizard answer is parsed".
+///
+/// Gated on `k8s-client`: its only consumer is the reconcile path's
+/// `connect`, which is itself feature-gated.
+#[cfg(feature = "k8s-client")]
+pub(crate) fn kubeconfig_context_from_answers(answers: Option<&Value>) -> Option<String> {
+    answer_string(answers?.as_object()?, "kubeconfig_context")
 }
 
 /// Check whether `s` is a valid RFC 1123 DNS label: lowercase
@@ -492,6 +508,30 @@ pub fn render_worker_manifests(
     ]
 }
 
+/// Whether a revision's persisted lifecycle puts its worker objects in the
+/// cluster's desired state.
+///
+/// `warm_revision` applies the worker pair (`Staged → Warming → Ready`) and
+/// the objects stay up through `Draining` — drain is routing-side, teardown
+/// happens at `archive_revision` (the B7 two-state model). So:
+///
+/// - `Warming` / `Ready` / `Draining` → present.
+/// - `Inactive` → absent. A post-drain revision's objects may still exist
+///   transiently until the operator archives it, but it is pending teardown,
+///   not desired.
+/// - `Staged` / `Failed` / `Archived` → absent (never applied, or torn down).
+///
+/// The single home for this policy: the renderer ([`super::render`]) emits a
+/// revision's workers iff present, and the reconcile path ([`super::deployer`])
+/// prunes a revision's workers iff NOT present — applying the same predicate
+/// from both sides guarantees the two never disagree.
+pub(crate) fn has_cluster_presence(lifecycle: RevisionLifecycle) -> bool {
+    matches!(
+        lifecycle,
+        RevisionLifecycle::Warming | RevisionLifecycle::Ready | RevisionLifecycle::Draining
+    )
+}
+
 /// The stable router Deployment (plan step 5): ≥2 replicas, topology
 /// spread, runtime-config ConfigMap mounted read-only. The router is
 /// authoritative for `TrafficSplit` enforcement in the Zain v1 pilot.
@@ -718,6 +758,26 @@ mod tests {
         let env = build_fixture_env();
         let params = K8sParams::for_env(&env);
         (env, params)
+    }
+
+    #[test]
+    fn presence_policy_matches_the_b7_two_state_model() {
+        use RevisionLifecycle::*;
+        for (lifecycle, present) in [
+            (Inactive, false),
+            (Staged, false),
+            (Warming, true),
+            (Ready, true),
+            (Draining, true),
+            (Failed, false),
+            (Archived, false),
+        ] {
+            assert_eq!(
+                has_cluster_presence(lifecycle),
+                present,
+                "{lifecycle:?} presence policy drifted"
+            );
+        }
     }
 
     #[test]

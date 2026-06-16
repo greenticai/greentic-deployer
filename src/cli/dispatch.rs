@@ -321,6 +321,11 @@ pub enum EnvVerb {
     /// step 10). With `--output` writes one YAML file per object in apply
     /// order; otherwise embeds the manifests in the JSON outcome.
     Render(EnvRenderArgs),
+    /// Apply the env's declarative desired state to its live cluster and
+    /// prune the workers of revisions no longer present (the apply-side
+    /// counterpart of `render`). K8s deployer env-pack only today; connects
+    /// through the binding's `kubeconfig_context` answer.
+    Reconcile(EnvReconcileArgs),
     Destroy {
         env_id: String,
         #[arg(long)]
@@ -536,6 +541,20 @@ pub struct EnvRenderArgs {
     /// manifests are embedded in the JSON outcome instead.
     #[arg(long)]
     pub output: Option<PathBuf>,
+}
+
+/// Args for `op env reconcile`. Applies desired state to the live cluster —
+/// the apply-side counterpart of `render` (use `render` for a no-side-effect
+/// preview).
+#[derive(Args, Debug)]
+pub struct EnvReconcileArgs {
+    /// Environment id (e.g. `zain-prod`).
+    pub env_id: String,
+    /// Deployer env-pack kind to reconcile with — a full `<path>@<version>`
+    /// descriptor, or a bare path matching the env's deployer binding.
+    /// Defaults to the env's Deployer-slot binding.
+    #[arg(long)]
+    pub kind: Option<String>,
 }
 
 /// Args for `op env set-public-url <env_id> <URL>`. Both fields are
@@ -870,6 +889,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 EnvVerb::Doctor { .. } => "doctor",
                 EnvVerb::ToolCheck { .. } => "tool-check",
                 EnvVerb::Render(_) => "render",
+                EnvVerb::Reconcile(_) => "reconcile",
                 EnvVerb::Destroy { .. } => "destroy",
                 EnvVerb::MigrateDev { .. } => "migrate-dev",
                 EnvVerb::MigrateState { .. } => "migrate-state",
@@ -1004,6 +1024,7 @@ fn dispatch_env(
         EnvVerb::Doctor { env_id } => super::env::doctor(store, flags, &env_id)?,
         EnvVerb::ToolCheck { env_id } => super::env::tool_check(store, flags, &env_id)?,
         EnvVerb::Render(args) => super::env::render(store, registry, flags, args)?,
+        EnvVerb::Reconcile(args) => super::env::reconcile(store, registry, flags, args)?,
         EnvVerb::Destroy { env_id, confirm } => {
             super::env::destroy(store, flags, &env_id, confirm)?
         }

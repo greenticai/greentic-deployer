@@ -46,6 +46,7 @@ use crate::credentials::{
     CapabilityStatus, DeployerCredentials, RequirementsReport, ValidationContext,
 };
 
+use super::async_bridge::run_k8s_async;
 use super::bootstrap::{K8sRulesPackInput, render_min_rbac_rules_pack};
 use super::manifests::namespace_for_env;
 
@@ -372,29 +373,6 @@ fn all_failed(caps: &[Capability], reason: &str) -> RequirementsReport {
             })
             .collect(),
     )
-}
-
-/// Sync→async bridge: dedicated thread + fresh current-thread runtime.
-/// Same rationale as the AWS validator (B12a precedent): `block_in_place`
-/// panics on a current-thread parent runtime and `Handle::block_on`
-/// self-deadlocks inside any runtime.
-fn run_k8s_async<F, T>(fut: F) -> T
-where
-    F: std::future::Future<Output = T> + Send,
-    T: Send,
-{
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("build current-thread tokio runtime");
-                rt.block_on(fut)
-            })
-            .join()
-            .expect("K8s validate thread did not panic")
-    })
 }
 
 #[cfg(test)]

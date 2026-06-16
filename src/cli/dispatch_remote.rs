@@ -113,6 +113,7 @@ fn route_remote(
             EnvVerb::Doctor { .. } => Err(not_supported("env doctor")),
             EnvVerb::ToolCheck { .. } => Err(not_supported("env tool-check")),
             EnvVerb::Render(_) => Err(not_supported("env render")),
+            EnvVerb::Reconcile(_) => Err(not_supported("env reconcile")),
             EnvVerb::Destroy { .. } => Err(not_supported("env destroy")),
             EnvVerb::MigrateDev { .. } => Err(not_supported("env migrate-dev")),
             EnvVerb::MigrateState { .. } => Err(not_supported("env migrate-state")),
