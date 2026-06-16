@@ -1137,8 +1137,19 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                 .expect("validate_shape already validated listen_addr");
             env.host_config.listen_addr != Some(parsed)
         });
+        // Compares against the RAW stored value (like every other host-config
+        // field) — declaring a value always persists it; the env-id default
+        // (on for local) is resolved by the runtime only when unset.
+        let gui_enabled_differs = me
+            .gui_enabled
+            .is_some_and(|g| env.host_config.gui_enabled != Some(g));
 
-        if name_differs || region_differs || tenant_org_differs || listen_addr_differs {
+        if name_differs
+            || region_differs
+            || tenant_org_differs
+            || listen_addr_differs
+            || gui_enabled_differs
+        {
             let mut fields = Vec::new();
             if name_differs {
                 fields.push("name");
@@ -1152,11 +1163,15 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
             if listen_addr_differs {
                 fields.push("listen_addr");
             }
+            if gui_enabled_differs {
+                fields.push("gui_enabled");
+            }
             let desired_hash = hash_json(&json!({
                 "name": me.name,
                 "region": me.region,
                 "tenant_org_id": me.tenant_org_id,
                 "listen_addr": me.listen_addr,
+                "gui_enabled": me.gui_enabled,
             }));
             let ikey = derive_idempotency_key(
                 &ctx.env_id,
@@ -1177,13 +1192,15 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     tenant_org_id: me.tenant_org_id.clone(),
                     listen_addr: me.listen_addr.clone(),
                     public_base_url: None, // public_base_url is handled by SetPublicUrl
+                    gui_enabled: me.gui_enabled,
                 })),
             });
         } else {
             let has_declared_host_config = me.name.is_some()
                 || me.region.is_some()
                 || me.tenant_org_id.is_some()
-                || me.listen_addr.is_some();
+                || me.listen_addr.is_some()
+                || me.gui_enabled.is_some();
             if has_declared_host_config {
                 steps.push(ApplyStep::no_op(
                     ApplyStepKind::UpdateHostConfig,
@@ -1201,7 +1218,8 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
         let has_host_config = me.name.is_some()
             || me.region.is_some()
             || me.tenant_org_id.is_some()
-            || me.listen_addr.is_some();
+            || me.listen_addr.is_some()
+            || me.gui_enabled.is_some();
         if has_host_config {
             steps.push(ApplyStep {
                 kind: ApplyStepKind::UpdateHostConfig,
@@ -1216,6 +1234,7 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     tenant_org_id: me.tenant_org_id.clone(),
                     listen_addr: me.listen_addr.clone(),
                     public_base_url: None,
+                    gui_enabled: me.gui_enabled,
                 })),
             });
         }
@@ -2137,6 +2156,15 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
                 failures.push(format!(
                     "listen_addr is `{:?}`, expected `{parsed}`",
                     env.host_config.listen_addr
+                ));
+            }
+        }
+        if let Some(gui_enabled) = me.gui_enabled {
+            checked += 1;
+            if env.host_config.gui_enabled != Some(gui_enabled) {
+                failures.push(format!(
+                    "gui_enabled is `{:?}`, expected `{gui_enabled}`",
+                    env.host_config.gui_enabled
                 ));
             }
         }
@@ -4803,6 +4831,38 @@ mod tests {
         assert_eq!(
             env.host_config.listen_addr,
             Some("0.0.0.0:9090".parse().unwrap())
+        );
+
+        // Idempotent re-apply.
+        let second = run_apply(&store, &manifest_path).expect("re-apply");
+        assert_eq!(second.result["changed"], 0, "{}", second.result);
+    }
+
+    #[test]
+    fn gui_enabled_reconcile_then_idempotent() {
+        let (dir, store) = seeded_store();
+        // `local` resolves GUI-on by default; declaring `false` is an explicit
+        // override that must persist and survive a re-apply as a no-op.
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {
+                "id": "local",
+                "gui_enabled": false
+            }
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let outcome = run_apply(&store, &manifest_path).expect("gui apply");
+        let actions = step_actions(&outcome.result);
+        assert!(
+            actions.contains(&("update-host-config".to_string(), "update".to_string())),
+            "must plan update-host-config for gui_enabled: {actions:?}"
+        );
+
+        let env = load_local(&store);
+        assert_eq!(env.host_config.gui_enabled, Some(false));
+        assert!(
+            !env.host_config.resolved_gui_enabled(),
+            "explicit false overrides the local default-on"
         );
 
         // Idempotent re-apply.

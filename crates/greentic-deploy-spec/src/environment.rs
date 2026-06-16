@@ -55,7 +55,20 @@ pub struct EnvironmentHostConfig {
     /// only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_base_url: Option<String>,
+    /// Whether the runtime serves the built-in webchat GUI for this env.
+    /// `None` = unset → resolved by [`EnvironmentHostConfig::resolved_gui_enabled`]
+    /// (on for `local`, off elsewhere — the chat path is loopback-only and
+    /// unauthenticated, so it stays off public envs unless explicitly enabled).
+    /// `Some(b)` is an explicit operator/wizard choice that overrides the
+    /// env-id default either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gui_enabled: Option<bool>,
 }
+
+/// Env id whose runtime serves the built-in webchat GUI by default. Other
+/// envs default off because the chat path is loopback-only and unauthenticated
+/// — exposing it on a public env is an explicit opt-in.
+pub const GUI_DEFAULT_ENV_ID: &str = "local";
 
 impl EnvironmentHostConfig {
     /// Resolves the bind address using `self.listen_addr` falling back to
@@ -64,6 +77,16 @@ impl EnvironmentHostConfig {
     /// resolution only.
     pub fn resolved_listen_addr(&self) -> SocketAddr {
         self.listen_addr.unwrap_or(DEFAULT_LISTEN_ADDR)
+    }
+
+    /// Resolves whether the runtime should serve the built-in webchat GUI.
+    /// Explicit [`gui_enabled`](Self::gui_enabled) wins; when unset the GUI is
+    /// on only for [`GUI_DEFAULT_ENV_ID`] (`local`). Both the deployer's apply
+    /// engine and `greentic-start`'s boot path read through this helper so the
+    /// default lives in exactly one place.
+    pub fn resolved_gui_enabled(&self) -> bool {
+        self.gui_enabled
+            .unwrap_or(self.env_id.as_str() == GUI_DEFAULT_ENV_ID)
     }
 }
 
@@ -609,5 +632,41 @@ mod public_base_url_tests {
             validate_public_base_url("https://[::1]:8080").unwrap(),
             "https://[::1]:8080"
         );
+    }
+}
+
+#[cfg(test)]
+mod gui_enabled_tests {
+    use super::{EnvironmentHostConfig, GUI_DEFAULT_ENV_ID};
+    use greentic_types::EnvId;
+
+    fn host_config(env_id: &str, gui_enabled: Option<bool>) -> EnvironmentHostConfig {
+        EnvironmentHostConfig {
+            env_id: EnvId::try_from(env_id).unwrap(),
+            region: None,
+            tenant_org_id: None,
+            listen_addr: None,
+            public_base_url: None,
+            gui_enabled,
+        }
+    }
+
+    #[test]
+    fn unset_defaults_on_for_local() {
+        assert_eq!(GUI_DEFAULT_ENV_ID, "local");
+        assert!(host_config("local", None).resolved_gui_enabled());
+    }
+
+    #[test]
+    fn unset_defaults_off_for_non_local() {
+        assert!(!host_config("staging", None).resolved_gui_enabled());
+    }
+
+    #[test]
+    fn explicit_value_overrides_env_id_default() {
+        // Off on local (the wizard "no" case) ...
+        assert!(!host_config("local", Some(false)).resolved_gui_enabled());
+        // ... and on for a non-local env (explicit opt-in).
+        assert!(host_config("staging", Some(true)).resolved_gui_enabled());
     }
 }

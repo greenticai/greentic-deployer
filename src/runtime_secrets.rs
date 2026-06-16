@@ -1714,6 +1714,7 @@ questions:
                 tenant_org_id: None,
                 listen_addr: None,
                 public_base_url: None,
+                gui_enabled: None,
             },
             packs: Vec::new(),
             credentials_ref: None,

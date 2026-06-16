@@ -96,11 +96,18 @@ pub struct ConfigSetPayload {
     /// unchanged — same semantics as `region`/`tenant_org_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_base_url: Option<String>,
+    /// Whether the runtime serves the built-in webchat GUI. `None` leaves the
+    /// existing value unchanged — same semantics as `region`/`tenant_org_id`.
+    /// `Some(b)` is an explicit choice; the env-id default (on for `local`) is
+    /// resolved by [`EnvironmentHostConfig::resolved_gui_enabled`](greentic_deploy_spec::EnvironmentHostConfig::resolved_gui_enabled)
+    /// only when this is unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gui_enabled: Option<bool>,
 }
 
 /// `op config set`. Mutates `host_config` fields (region, tenant_org_id,
-/// listen_addr) and the env's display `name`. To change anything inside an
-/// env-pack's answers, use `op env-packs update`.
+/// listen_addr, gui_enabled) and the env's display `name`. To change anything
+/// inside an env-pack's answers, use `op env-packs update`.
 pub fn set(
     store: &LocalFsStore,
     flags: &OpFlags,
@@ -144,6 +151,9 @@ pub fn set(
     if parsed_public_base_url.is_some() {
         fields.push("public_base_url");
     }
+    if payload.gui_enabled.is_some() {
+        fields.push("gui_enabled");
+    }
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -161,6 +171,7 @@ pub fn set(
                     tenant_org_id: FieldUpdate::from_option(payload.tenant_org_id),
                     listen_addr: FieldUpdate::from_option(parsed_listen_addr),
                     public_base_url: FieldUpdate::from_option(parsed_public_base_url),
+                    gui_enabled: FieldUpdate::from_option(payload.gui_enabled),
                 },
             )
             .map_err(map_store_err_preserving_noun)?;
@@ -234,7 +245,8 @@ fn set_schema() -> Value {
                 "type": ["string", "null"],
                 "description": "Bind address for the runtime's local HTTP listener (e.g. 127.0.0.1:8080, 0.0.0.0:9090, [::1]:8443). Parsed as SocketAddr; malformed values are rejected."
             },
-            "public_base_url": {"type": ["string", "null"], "description": "origin-only URL (https://host[:port])"}
+            "public_base_url": {"type": ["string", "null"], "description": "origin-only URL (https://host[:port])"},
+            "gui_enabled": {"type": ["boolean", "null"], "description": "serve the built-in webchat GUI; null leaves the value unchanged (env-id default applies: on for local)"}
         }
     })
 }
@@ -308,6 +320,7 @@ mod tests {
                 tenant_org_id: Some("acme".to_string()),
                 listen_addr: None,
                 public_base_url: None,
+                gui_enabled: None,
             }),
         )
         .unwrap();
@@ -335,6 +348,7 @@ mod tests {
                 tenant_org_id: None,
                 listen_addr: Some("127.0.0.1:8080".to_string()),
                 public_base_url: None,
+                gui_enabled: None,
             }),
         )
         .unwrap();
@@ -359,6 +373,7 @@ mod tests {
                 tenant_org_id: None,
                 listen_addr: Some("0.0.0.0:9090".to_string()),
                 public_base_url: None,
+                gui_enabled: None,
             }),
         )
         .unwrap();
@@ -382,6 +397,7 @@ mod tests {
                 tenant_org_id: None,
                 listen_addr: Some("not-a-socket-addr".to_string()),
                 public_base_url: None,
+                gui_enabled: None,
             }),
         )
         .expect_err("malformed listen_addr must be rejected");
@@ -412,6 +428,7 @@ mod tests {
                 tenant_org_id: None,
                 listen_addr: Some(hostile.to_string()),
                 public_base_url: None,
+                gui_enabled: None,
             }),
         )
         .expect_err("hostile listen_addr must still be rejected");
@@ -448,6 +465,7 @@ mod tests {
             "tenant_org_id",
             "listen_addr",
             "public_base_url",
+            "gui_enabled",
         ]
         .into_iter()
         .collect();

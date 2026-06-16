@@ -89,6 +89,11 @@ pub struct ManifestEnvironment {
     /// `SocketAddr` during shape validation). Absent = leave untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<String>,
+    /// Whether the runtime serves the built-in webchat GUI. Absent = leave
+    /// untouched (the env-id default applies — on for `local`, off otherwise).
+    /// `true`/`false` is an explicit choice reconciled via `op config set`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gui_enabled: Option<bool>,
 }
 
 /// v1 accepts only the string `"bootstrap"`. A future
@@ -661,7 +666,8 @@ pub fn manifest_schema() -> Value {
                     "name": {"type": ["string", "null"], "description": "display name; absent = leave untouched (or default to id on create)"},
                     "region": {"type": ["string", "null"], "description": "cloud region tag; absent = leave untouched"},
                     "tenant_org_id": {"type": ["string", "null"], "description": "tenant organization id; absent = leave untouched"},
-                    "listen_addr": {"type": ["string", "null"], "description": "bind address (SocketAddr); absent = leave untouched"}
+                    "listen_addr": {"type": ["string", "null"], "description": "bind address (SocketAddr); absent = leave untouched"},
+                    "gui_enabled": {"type": ["boolean", "null"], "description": "serve the built-in webchat GUI; absent = env-id default (on for local, off elsewhere)"}
                 }
             },
             "trust_root": {"enum": ["bootstrap", null], "description": "`bootstrap` seeds the operator key (idempotent)"},
@@ -858,6 +864,19 @@ pub fn manifest_form_spec() -> FormSpec {
         true,
     );
     trust_root_bootstrap.default_value = Some("true".to_string());
+
+    let mut webchat_gui = question(
+        "webchat_gui",
+        QuestionType::Boolean,
+        "Add a webchat GUI?",
+        "Serve the built-in webchat console so you can chat with this \
+         environment by opening its URL in a browser. On by default for \
+         `local`; the chat path is loopback-only and unauthenticated, so \
+         keep it off for environments exposed on a public URL unless you \
+         intend it.",
+        true,
+    );
+    webchat_gui.default_value = Some("true".to_string());
 
     let mut secrets = question(
         "secrets",
@@ -1125,6 +1144,7 @@ pub fn manifest_form_spec() -> FormSpec {
             environment_id,
             public_base_url,
             trust_root_bootstrap,
+            webchat_gui,
             bundles,
             messaging_endpoints,
             secrets,
@@ -1207,6 +1227,18 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
         Some(other) => {
             return Err(OpError::InvalidArgument(format!(
                 "answers: trust_root_bootstrap must be a boolean, got {other}"
+            )));
+        }
+    };
+    // Absent ⇒ `None` (leave the env-id default to resolve); the wizard always
+    // supplies this (required, default `true`), so a missing value only comes
+    // from a minimal hand-written answers file.
+    let gui_enabled = match map.get("webchat_gui") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(other) => {
+            return Err(OpError::InvalidArgument(format!(
+                "answers: webchat_gui must be a boolean, got {other}"
             )));
         }
     };
@@ -1336,6 +1368,7 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
             region: None,
             tenant_org_id: None,
             listen_addr: None,
+            gui_enabled,
         },
         trust_root,
         secrets,
@@ -1881,6 +1914,7 @@ mod tests {
         let expected: BTreeSet<String> = [
             "environment_id",
             "trust_root_bootstrap",
+            "webchat_gui",
             // `secrets.from_env` is no longer required (a paste secret omits
             // it); `secrets.source` defaults to `env`, so it is not required
             // either.
@@ -1989,6 +2023,7 @@ mod tests {
             ("environment.region", ""),
             ("environment.tenant_org_id", ""),
             ("environment.listen_addr", ""),
+            ("environment.gui_enabled", "webchat_gui"),
             ("trust_root", "trust_root_bootstrap"),
             ("secrets[].path", "secrets.path"),
             ("secrets[].from_env", "secrets.from_env"),
@@ -2113,6 +2148,7 @@ mod tests {
             "environment_id": "local",
             "public_base_url": "https://bots.example.com",
             "trust_root_bootstrap": true,
+            "webchat_gui": true,
             "secrets": [
                 {
                     "path": "legal/_/messaging-telegram/telegram_bot_token",
@@ -2216,7 +2252,8 @@ mod tests {
             &manifest_form_spec(),
             &serde_json::json!({
                 "environment_id": "local",
-                "trust_root_bootstrap": true
+                "trust_root_bootstrap": true,
+                "webchat_gui": true
             }),
         );
         assert!(

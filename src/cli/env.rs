@@ -129,6 +129,7 @@ pub fn create(
                     tenant_org_id: payload.tenant_org_id,
                     listen_addr: parsed_listen_addr,
                     public_base_url: parsed_public_base_url,
+                    gui_enabled: None,
                 },
             )
             .map_err(map_store_err_preserving_noun)?;
@@ -186,6 +187,7 @@ pub fn update(
                     tenant_org_id: FieldUpdate::from_option(payload.tenant_org_id),
                     listen_addr: FieldUpdate::Keep,
                     public_base_url: FieldUpdate::from_option(parsed_public_base_url),
+                    gui_enabled: FieldUpdate::Keep,
                 },
             )
             .map_err(map_store_err_preserving_noun)?;
@@ -1806,6 +1808,7 @@ mod tests {
                     tenant_org_id: FieldUpdate::Clear,
                     listen_addr: FieldUpdate::Clear,
                     public_base_url: FieldUpdate::Clear,
+                    gui_enabled: FieldUpdate::Keep,
                 },
             )
             .unwrap();
@@ -1850,6 +1853,7 @@ mod tests {
                     tenant_org_id: FieldUpdate::Set("new-org".to_string()), // overwrite
                     listen_addr: FieldUpdate::Clear, // clear
                     public_base_url: FieldUpdate::Set("https://new.example.com".to_string()),
+                    gui_enabled: FieldUpdate::Keep,
                 },
             )
             .unwrap();
@@ -1897,6 +1901,7 @@ mod tests {
                     tenant_org_id: FieldUpdate::Clear,
                     listen_addr: FieldUpdate::Clear,
                     public_base_url: FieldUpdate::Clear,
+                    gui_enabled: FieldUpdate::Keep,
                 },
             )
             .unwrap();
