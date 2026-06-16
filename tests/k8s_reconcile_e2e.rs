@@ -1,30 +1,34 @@
-//! Live-cluster E2E for `op env reconcile` (Phase D PR-5.3).
+//! Live-cluster E2E for `op env reconcile` + `op env apply-revision` (Phase D
+//! PR-5.3).
 //!
-//! `reconcile` is the first deployer verb that drives a *connected* cluster:
-//! it applies the rendered desired state and prunes the workers of revisions
-//! that no longer have cluster presence. The unit tests in
-//! `env_packs::k8s::deployer` exercise that logic against an in-memory fake
-//! and the kube-client tests drive a pre-built `kube::Client` over a
-//! `tower-test` mock — neither opens a socket, so the *success path against a
-//! real API server* (TLS, server-side apply, real delete) has zero coverage.
-//! This test closes that gap end-to-end against a kind cluster.
+//! These are the first deployer verbs that drive a *connected* cluster:
+//! `reconcile` converges the whole env (apply desired state + prune absent
+//! revisions' workers); `apply-revision` is the surgical single-revision
+//! counterpart (apply OR tear down one revision's worker pair via the Deployer
+//! trait verbs). The unit tests in `env_packs::k8s::deployer` exercise that
+//! logic against an in-memory fake and the kube-client tests drive a pre-built
+//! `kube::Client` over a `tower-test` mock — neither opens a socket, so the
+//! *success path against a real API server* (TLS, server-side apply, real
+//! delete) has zero coverage. These tests close that gap end-to-end against a
+//! kind cluster.
 //!
-//! It is gated twice so it never runs in the normal suite:
+//! They are gated twice so they never run in the normal suite:
 //!   - the whole module needs `GREENTIC_K8S_E2E=1` (set only by the CI
-//!     `k8s-e2e` job, which stands up kind first), otherwise it no-ops; and
-//!   - it shells out to `kubectl` and the cargo-built binary, talking to the
+//!     `k8s-e2e` job, which stands up kind first), otherwise they no-op; and
+//!   - they shell out to `kubectl` and the cargo-built binary, talking to the
 //!     ambient kubeconfig current-context (kind in CI).
 //!
-//! The ceremony mirrors a real deployment: create env → bind the K8s
-//! deployer → bootstrap the trust root → add a bundle → stage + warm a
-//! revision → reconcile (apply) → archive → reconcile (prune).
+//! Both tests share one env id (`local` → namespace `gtc-local`) on the one
+//! kind cluster, so each resets the namespace at the start (best-effort, waits
+//! for any prior Terminating to finish) to stay order-independent. The CI job
+//! also runs them with `--test-threads=1`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::Value;
 
-/// Env that arms the test. Unset (the default in `cargo test`) → skip.
+/// Env that arms the tests. Unset (the default in `cargo test`) → skip.
 const E2E_GATE: &str = "GREENTIC_K8S_E2E";
 
 /// `local` is the only env id the LocalFsStore CLI accepts without RBAC;
@@ -35,6 +39,17 @@ const ROUTER_DEPLOY: &str = "gtc-router";
 
 fn deployer_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_greentic-deployer"))
+}
+
+/// `true` when the tests are armed. Unset → the caller returns early.
+fn armed() -> bool {
+    if std::env::var(E2E_GATE).is_err() {
+        eprintln!(
+            "skipping live-cluster E2E: set {E2E_GATE}=1 (needs a kind cluster on the ambient kubeconfig)"
+        );
+        return false;
+    }
+    true
 }
 
 /// Run `op … <args>` (optionally with `--answers <file>`) against `store`,
@@ -81,31 +96,20 @@ fn object_exists(kind: &str, name: &str, namespace: Option<&str>) -> bool {
     kubectl(&args).status.success()
 }
 
-/// `reconcile`'s self-reported `(applied_count, pruned_count)`.
-fn reconcile(store: &Path) -> (u64, u64) {
-    let env = op(store, None, &["env", "reconcile", ENV_ID]);
-    let result = &env["result"];
-    assert_eq!(
-        result["identity"], "ambient",
-        "reconcile runs as ambient identity until the secrets sink lands"
-    );
-    (
-        result["applied_count"].as_u64().expect("applied_count"),
-        result["pruned_count"].as_u64().expect("pruned_count"),
-    )
+/// Delete the test namespace and WAIT for it to be gone, so a test starts from
+/// a clean slate regardless of what a prior test left Terminating. Best-effort:
+/// a missing namespace is a no-op (`--ignore-not-found`).
+fn reset_namespace() {
+    let _ = kubectl(&["delete", "namespace", NAMESPACE, "--ignore-not-found"]);
 }
 
-#[test]
-fn reconcile_applies_then_prunes_against_a_live_cluster() {
-    if std::env::var(E2E_GATE).is_err() {
-        eprintln!(
-            "skipping live-cluster E2E: set {E2E_GATE}=1 (needs a kind cluster on the ambient kubeconfig)"
-        );
-        return;
-    }
-    let store = tempfile::tempdir().expect("tempdir");
-    let store = store.path();
-
+/// Run the full setup ceremony (create env → bind the K8s deployer →
+/// bootstrap the trust root → add a bundle → stage + warm a revision) and
+/// return the warmed revision id. The revision ends up `Ready` (cluster
+/// presence) but nothing has touched the cluster yet — stage/warm are
+/// desired-state-only; `reconcile` / `apply-revision` are the first verbs to
+/// reach the API server.
+fn provision_ready_revision(store: &Path) -> String {
     // 1. Create the env and bind the K8s deployer (namespace → gtc-local).
     let create = payload(
         store,
@@ -129,9 +133,7 @@ fn reconcile_applies_then_prunes_against_a_live_cluster() {
     //    refuses to sign without the operator key trusted for this env).
     op(store, None, &["trust-root", "bootstrap", ENV_ID]);
 
-    // 3. Add a bundle, then stage + warm a revision so it has cluster
-    //    presence. Stage/warm are desired-state-only (no cluster contact) —
-    //    `reconcile` is the first verb to touch the API server.
+    // 3. Add a bundle, then stage + warm a revision so it has cluster presence.
     let add = payload(
         store,
         "add.json",
@@ -166,12 +168,63 @@ fn reconcile_applies_then_prunes_against_a_live_cluster() {
         warmed["result"]["lifecycle"], "ready",
         "revision warmed to Ready"
     );
+    revision_id
+}
 
+/// Archive a revision (desired-state-only — no cluster contact).
+fn archive(store: &Path, revision_id: &str) {
+    let rev = payload(
+        store,
+        "archive.json",
+        serde_json::json!({"environment_id": ENV_ID, "revision_id": revision_id}),
+    );
+    let archived = op(store, Some(&rev), &["revisions", "archive"]);
+    assert_eq!(
+        archived["result"]["lifecycle"], "archived",
+        "revision archived"
+    );
+}
+
+/// `reconcile`'s self-reported `(applied_count, pruned_count)`.
+fn reconcile(store: &Path) -> (u64, u64) {
+    let env = op(store, None, &["env", "reconcile", ENV_ID]);
+    let result = &env["result"];
+    assert_eq!(
+        result["identity"], "ambient",
+        "reconcile runs as ambient identity until the secrets sink lands"
+    );
+    (
+        result["applied_count"].as_u64().expect("applied_count"),
+        result["pruned_count"].as_u64().expect("pruned_count"),
+    )
+}
+
+/// `apply-revision`'s self-reported action (`"warmed"` / `"archived"`).
+fn apply_revision(store: &Path, revision_id: &str) -> String {
+    let env = op(store, None, &["env", "apply-revision", ENV_ID, revision_id]);
+    let result = &env["result"];
+    assert_eq!(
+        result["identity"], "ambient",
+        "apply-revision runs as ambient identity until the secrets sink lands"
+    );
+    result["action"].as_str().expect("action").to_string()
+}
+
+#[test]
+fn reconcile_applies_then_prunes_against_a_live_cluster() {
+    if !armed() {
+        return;
+    }
+    reset_namespace();
+    let store = tempfile::tempdir().expect("tempdir");
+    let store = store.path();
+
+    let revision_id = provision_ready_revision(store);
     // Worker objects are named after the lowercased revision ULID.
     let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
 
-    // 4. Reconcile → applies the env-level set (9) + the warmed revision's
-    //    worker pair (2). Verify both the verb's self-report and ground truth.
+    // Reconcile → applies the env-level set (9) + the warmed revision's worker
+    // pair (2). Verify both the verb's self-report and ground truth.
     let (applied, pruned) = reconcile(store);
     assert_eq!(
         (applied, pruned),
@@ -195,8 +248,8 @@ fn reconcile_applies_then_prunes_against_a_live_cluster() {
         "worker service applied"
     );
 
-    // 5. Reconcile again → declarative upsert is idempotent: same applied
-    //    set, nothing pruned, worker still present.
+    // Reconcile again → declarative upsert is idempotent: same applied set,
+    // nothing pruned, worker still present.
     let (applied2, pruned2) = reconcile(store);
     assert_eq!((applied2, pruned2), (11, 0), "reconcile is idempotent");
     assert!(
@@ -204,14 +257,10 @@ fn reconcile_applies_then_prunes_against_a_live_cluster() {
         "worker survives idempotent reconcile"
     );
 
-    // 6. Archive the revision (→ no cluster presence), reconcile → prunes the
-    //    worker pair, leaves the env-level set. Env-level objects are NEVER
-    //    pruned (that would be env destruction, a separate verb).
-    let archived = op(store, Some(&rev), &["revisions", "archive"]);
-    assert_eq!(
-        archived["result"]["lifecycle"], "archived",
-        "revision archived"
-    );
+    // Archive the revision (→ no cluster presence), reconcile → prunes the
+    // worker pair, leaves the env-level set. Env-level objects are NEVER pruned
+    // (that would be env destruction, a separate verb).
+    archive(store, &revision_id);
 
     let (applied3, pruned3) = reconcile(store);
     assert_eq!(
@@ -232,8 +281,70 @@ fn reconcile_applies_then_prunes_against_a_live_cluster() {
         "env-level router survives prune"
     );
 
-    // Best-effort cleanup so reruns against a persistent cluster start clean.
-    // (CI's kind cluster is torn down with the job, so this is a local nicety.)
+    // Best-effort cleanup (the next test's reset also waits, so --wait=false).
+    let _ = kubectl(&[
+        "delete",
+        "namespace",
+        NAMESPACE,
+        "--ignore-not-found",
+        "--wait=false",
+    ]);
+}
+
+#[test]
+fn apply_revision_warms_then_archives_a_single_revision_against_a_live_cluster() {
+    if !armed() {
+        return;
+    }
+    reset_namespace();
+    let store = tempfile::tempdir().expect("tempdir");
+    let store = store.path();
+
+    let revision_id = provision_ready_revision(store);
+    let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
+
+    // Establish the env-level set (namespace + router) so the surgical
+    // apply-revision has somewhere to land. apply-revision only touches the
+    // one revision's worker pair — it assumes the env already exists.
+    let (applied, _) = reconcile(store);
+    assert_eq!(applied, 11, "reconcile establishes env-level + worker pair");
+
+    // apply-revision on the Ready (present) revision → warm branch. Idempotent
+    // over reconcile's apply: same worker pair, still present.
+    let action = apply_revision(store, &revision_id);
+    assert_eq!(action, "warmed", "Ready revision drives the warm branch");
+    assert!(
+        object_exists("deployment", &worker, Some(NAMESPACE)),
+        "worker deployment present after warm"
+    );
+    assert!(
+        object_exists("service", &worker, Some(NAMESPACE)),
+        "worker service present after warm"
+    );
+
+    // Archive the revision's recorded state, then apply-revision on the now
+    // absent revision → archive branch tears the worker pair down (a real
+    // present → absent deletion, distinct from reconcile's bulk prune).
+    archive(store, &revision_id);
+    let action2 = apply_revision(store, &revision_id);
+    assert_eq!(
+        action2, "archived",
+        "archived revision drives the archive branch"
+    );
+    assert!(
+        !object_exists("deployment", &worker, Some(NAMESPACE)),
+        "worker deployment torn down by apply-revision"
+    );
+    assert!(
+        !object_exists("service", &worker, Some(NAMESPACE)),
+        "worker service torn down by apply-revision"
+    );
+    // Env-level objects are untouched — apply-revision only owns the worker pair.
+    assert!(
+        object_exists("deployment", ROUTER_DEPLOY, Some(NAMESPACE)),
+        "env-level router survives apply-revision archive"
+    );
+
     let _ = kubectl(&[
         "delete",
         "namespace",

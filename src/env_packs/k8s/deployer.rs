@@ -6,12 +6,13 @@
 //! desired state, hand it to the [`K8sCluster`](super::cluster::K8sCluster)
 //! seam".
 //!
-//! **Note:** the Deployer verbs use [`K8sParams::for_env`] sandbox
-//! defaults — they have no env-dir access on the trait, so the binding's
-//! `answers_ref` is not available here. Threading answers into
-//! `warm_revision` / `apply_traffic_split` rides the PR-5.3 orchestration
-//! wiring. `op env render` already consumes answers via
-//! [`K8sParams::from_answers`].
+//! **Answers:** `warm_revision` / `archive_revision` / `apply_traffic_split`
+//! take the binding's wizard answers and render through
+//! [`K8sParams::from_answers`] (`None` → [`K8sParams::for_env`] sandbox
+//! defaults), so a verb lands the same namespace / image / replicas
+//! `op env render` and `op env reconcile` show. The CLI passes the answers
+//! it loads from the deployer binding; the per-revision dispatch entry point
+//! is `op env apply-revision`.
 //!
 //! | Verb | Provider side-effect |
 //! |---|---|
@@ -47,6 +48,19 @@ use crate::env_packs::render::ManifestRenderer;
 /// preconditions have already passed by the time the seam is touched.
 fn provider(err: K8sClusterError) -> DeployerError {
     DeployerError::Provider(err.to_string())
+}
+
+/// Build render params from the binding's wizard answers (namespace / image
+/// / replicas), so a verb lands the same objects `op env render` shows. `None`
+/// → sandbox defaults. A malformed answers blob fails here — before any
+/// cluster call, so no partial state — surfaced as a provider error (there is
+/// no typed answers-rejection variant; this mirrors `reconcile`).
+fn params_from_answers(
+    env: &Environment,
+    answers: Option<&Value>,
+) -> Result<K8sParams, DeployerError> {
+    K8sParams::from_answers(env, answers)
+        .map_err(|e| DeployerError::Provider(format!("invalid answers: {e}")))
 }
 
 impl K8sDeployerHandler {
@@ -158,18 +172,19 @@ impl Deployer for K8sDeployerHandler {
         &self,
         env: &Environment,
         revision_id: RevisionId,
+        answers: Option<&Value>,
     ) -> Result<WarmOutcome, DeployerError> {
         require_revision(env, revision_id)?;
         let revision = Self::revision(env, revision_id).expect("require_revision passed");
-        let params = K8sParams::for_env(env);
+        let params = params_from_answers(env, answers)?;
         self.apply_all(&render_worker_manifests(env, revision, &params))
             .await?;
         // warm returns once the API server has accepted the worker manifests.
         // The live-cluster readiness wait (observed `.status.observedGeneration`
         // + available replicas + the per-revision `/healthz/<revision_id>`
-        // probe before the revision is promoted Warming → Ready) rides PR-5.3
-        // alongside Deployer-verb dispatch and the RevisionHealthGate seam —
-        // it is intentionally NOT performed inside the upsert primitive.
+        // probe before the revision is promoted Warming → Ready) is a later
+        // PR-5.3 slice via the RevisionHealthGate seam (cross-repo) — it is
+        // intentionally NOT performed inside the upsert primitive.
         Ok(WarmOutcome::default())
     }
 
@@ -188,10 +203,11 @@ impl Deployer for K8sDeployerHandler {
         &self,
         env: &Environment,
         revision_id: RevisionId,
+        answers: Option<&Value>,
     ) -> Result<ArchiveOutcome, DeployerError> {
         require_revision(env, revision_id)?;
         let revision = Self::revision(env, revision_id).expect("require_revision passed");
-        let params = K8sParams::for_env(env);
+        let params = params_from_answers(env, answers)?;
         for manifest in render_worker_manifests(env, revision, &params) {
             let object = ObjectRef::from_manifest(&manifest).map_err(provider)?;
             self.cluster.delete(&object).await.map_err(provider)?;
@@ -203,10 +219,11 @@ impl Deployer for K8sDeployerHandler {
         &self,
         env: &Environment,
         deployment_id: DeploymentId,
+        answers: Option<&Value>,
     ) -> Result<TrafficSplitOutcome, DeployerError> {
         // Preconditions + outcome construction BEFORE any cluster call.
         let outcome = enforce_split_invariants(env, deployment_id)?;
-        let params = K8sParams::for_env(env);
+        let params = params_from_answers(env, answers)?;
         self.cluster
             .apply(&render_runtime_config_map(env, &params))
             .await
@@ -247,7 +264,10 @@ mod tests {
         let env = build_fixture_env();
         let rev = &env.revisions[0];
 
-        handler.warm_revision(&env, rev.revision_id).await.unwrap();
+        handler
+            .warm_revision(&env, rev.revision_id, None)
+            .await
+            .unwrap();
 
         let objects = cluster.objects();
         assert_eq!(objects.len(), 2, "Deployment + Service");
@@ -260,8 +280,60 @@ mod tests {
         assert!(kinds.contains(&("Service".into(), name)));
 
         // Warm again: declarative upsert, still exactly two objects.
-        handler.warm_revision(&env, rev.revision_id).await.unwrap();
+        handler
+            .warm_revision(&env, rev.revision_id, None)
+            .await
+            .unwrap();
         assert_eq!(cluster.objects().len(), 2);
+    }
+
+    /// Answers thread through to the rendered objects: a custom `namespace`
+    /// answer lands the worker pair in that namespace, not the sandbox
+    /// default — render↔apply parity with `op env render`/`reconcile`.
+    #[tokio::test]
+    async fn warm_honors_the_namespace_answer() {
+        let (handler, cluster) = handler_with_fake();
+        let env = build_fixture_env();
+        let rev = &env.revisions[0];
+        let answers = serde_json::json!({ "namespace": "custom-ns" });
+
+        handler
+            .warm_revision(&env, rev.revision_id, Some(&answers))
+            .await
+            .unwrap();
+
+        let namespaces: Vec<String> = cluster
+            .objects()
+            .keys()
+            .filter_map(|o| o.namespace.clone())
+            .collect();
+        assert!(
+            !namespaces.is_empty() && namespaces.iter().all(|ns| ns == "custom-ns"),
+            "worker objects land in the answer namespace, got {namespaces:?}"
+        );
+    }
+
+    /// A malformed answers blob fails before any cluster call (no partial
+    /// state), surfaced as a provider error.
+    #[tokio::test]
+    async fn warm_rejects_invalid_answers_before_touching_the_cluster() {
+        let (handler, cluster) = handler_with_fake();
+        let env = build_fixture_env();
+        let rev = &env.revisions[0];
+        let answers = serde_json::json!({ "unknown_key": "x" });
+
+        let err = handler
+            .warm_revision(&env, rev.revision_id, Some(&answers))
+            .await
+            .unwrap_err();
+        match err {
+            DeployerError::Provider(msg) => assert!(msg.contains("invalid answers"), "msg: {msg}"),
+            other => panic!("expected Provider, got {other:?}"),
+        }
+        assert!(
+            cluster.objects().is_empty(),
+            "invalid answers must not touch the cluster"
+        );
     }
 
     #[tokio::test]
@@ -270,18 +342,21 @@ mod tests {
         let env = build_fixture_env();
         let rev = &env.revisions[0];
 
-        handler.warm_revision(&env, rev.revision_id).await.unwrap();
+        handler
+            .warm_revision(&env, rev.revision_id, None)
+            .await
+            .unwrap();
         assert_eq!(cluster.objects().len(), 2);
 
         handler
-            .archive_revision(&env, rev.revision_id)
+            .archive_revision(&env, rev.revision_id, None)
             .await
             .unwrap();
         assert!(cluster.objects().is_empty());
 
         // Retried archive against already-torn-down resources is Ok.
         handler
-            .archive_revision(&env, rev.revision_id)
+            .archive_revision(&env, rev.revision_id, None)
             .await
             .unwrap();
     }
@@ -292,7 +367,7 @@ mod tests {
         let env = build_fixture_env();
         let dep = env.bundles[0].deployment_id;
 
-        let outcome = handler.apply_traffic_split(&env, dep).await.unwrap();
+        let outcome = handler.apply_traffic_split(&env, dep, None).await.unwrap();
         assert_eq!(outcome.applied_deployment_id, dep);
 
         let objects = cluster.objects();
@@ -375,13 +450,19 @@ mod tests {
         let mut env = build_fixture_env();
         let unknown = RevisionId(ulid::Ulid::from(0xFFFF_u128));
 
-        let err = handler.warm_revision(&env, unknown).await.unwrap_err();
+        let err = handler
+            .warm_revision(&env, unknown, None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, DeployerError::RevisionNotFound { .. }));
 
         // Invalid split (sum != 10000) on deployment A.
         env.traffic_splits[0].entries[0].weight_bps = 1;
         let dep = env.bundles[0].deployment_id;
-        let err = handler.apply_traffic_split(&env, dep).await.unwrap_err();
+        let err = handler
+            .apply_traffic_split(&env, dep, None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, DeployerError::InvalidSplit { .. }));
 
         assert!(
@@ -397,7 +478,7 @@ mod tests {
         let handler = K8sDeployerHandler::default();
         let env = build_fixture_env();
         let err = handler
-            .warm_revision(&env, env.revisions[0].revision_id)
+            .warm_revision(&env, env.revisions[0].revision_id, None)
             .await
             .unwrap_err();
         match err {
@@ -409,7 +490,10 @@ mod tests {
         // Pure preconditions still come first even unconfigured.
         let unknown = RevisionId(ulid::Ulid::from(0xFFFF_u128));
         assert!(matches!(
-            handler.warm_revision(&env, unknown).await.unwrap_err(),
+            handler
+                .warm_revision(&env, unknown, None)
+                .await
+                .unwrap_err(),
             DeployerError::RevisionNotFound { .. }
         ));
     }

@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use greentic_deploy_spec::{DeploymentId, Environment, RevisionId, RuntimeConfig};
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::environment::runtime_config::materialize_runtime_config;
@@ -159,6 +160,18 @@ pub fn enforce_split_invariants(
 /// no split for the deployment) MUST be checked BEFORE any provider call
 /// and surfaced via the typed [`DeployerError`] variants — never as
 /// [`DeployerError::Provider`]. Provider-side failures use `Provider(...)`.
+///
+/// ## Provider answers
+///
+/// The verbs that materialize parametrized infrastructure — `warm_revision`,
+/// `archive_revision`, `apply_traffic_split` — take `answers: Option<&Value>`:
+/// the deployer binding's recorded wizard answers (flat JSON keyed by question
+/// id, the qa-spec convention). `None` means "use the env-pack's sandbox
+/// defaults". K8s reads namespace / image / replica overrides from it so an
+/// operator's custom binding lands the same objects `op env render` /
+/// `op env reconcile` show. `stage_revision` / `drain_revision` are no-ops that
+/// render nothing, so they carry no answers; a future provider whose stage
+/// uploads to an answer-derived registry adds the param when it grows a body.
 #[async_trait]
 pub trait Deployer: std::fmt::Debug + Send + Sync {
     /// Stage-time side effects: upload bundle to registry/storage,
@@ -177,10 +190,13 @@ pub trait Deployer: std::fmt::Debug + Send + Sync {
     /// until reachable.
     ///
     /// Returns once the revision can transition `Staged → Warming → Ready`.
+    /// `answers` carries the binding's wizard answers (see the trait-level
+    /// "Provider answers" note); `None` uses sandbox defaults.
     async fn warm_revision(
         &self,
         env: &Environment,
         revision_id: RevisionId,
+        answers: Option<&Value>,
     ) -> Result<WarmOutcome, DeployerError>;
 
     /// Drain-time side effects: stop accepting new sessions and wait up
@@ -202,10 +218,13 @@ pub trait Deployer: std::fmt::Debug + Send + Sync {
     /// the storage layer; the deployer is only responsible for the
     /// provider side. Impls MUST be idempotent against an already-torn-
     /// down revision so a retried archive is safe.
+    /// `answers` carries the binding's wizard answers (see the trait-level
+    /// "Provider answers" note); `None` uses sandbox defaults.
     async fn archive_revision(
         &self,
         env: &Environment,
         revision_id: RevisionId,
+        answers: Option<&Value>,
     ) -> Result<ArchiveOutcome, DeployerError>;
 
     /// Project the env's `TrafficSplit` for `deployment_id` into a
@@ -216,10 +235,13 @@ pub trait Deployer: std::fmt::Debug + Send + Sync {
     /// BEFORE any provider call. MUST treat splits for sibling
     /// deployments as independent — applying a split for deployment A
     /// MUST NOT perturb deployment B's recorded or enforced split.
+    /// `answers` carries the binding's wizard answers (see the trait-level
+    /// "Provider answers" note); `None` uses sandbox defaults.
     async fn apply_traffic_split(
         &self,
         env: &Environment,
         deployment_id: DeploymentId,
+        answers: Option<&Value>,
     ) -> Result<TrafficSplitOutcome, DeployerError>;
 
     /// The deployer's view of the runtime-config projection.

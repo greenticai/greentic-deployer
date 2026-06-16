@@ -15,6 +15,7 @@
 
 use async_trait::async_trait;
 use greentic_deploy_spec::{DeploymentId, Environment, RevisionId};
+use serde_json::Value;
 
 use super::LocalProcessDeployerHandler;
 use crate::env_packs::deployer::{
@@ -37,6 +38,7 @@ impl Deployer for LocalProcessDeployerHandler {
         &self,
         env: &Environment,
         revision_id: RevisionId,
+        _answers: Option<&Value>,
     ) -> Result<WarmOutcome, DeployerError> {
         require_revision(env, revision_id)?;
         Ok(WarmOutcome::default())
@@ -55,6 +57,7 @@ impl Deployer for LocalProcessDeployerHandler {
         &self,
         env: &Environment,
         revision_id: RevisionId,
+        _answers: Option<&Value>,
     ) -> Result<ArchiveOutcome, DeployerError> {
         require_revision(env, revision_id)?;
         Ok(ArchiveOutcome::default())
@@ -64,6 +67,7 @@ impl Deployer for LocalProcessDeployerHandler {
         &self,
         env: &Environment,
         deployment_id: DeploymentId,
+        _answers: Option<&Value>,
     ) -> Result<TrafficSplitOutcome, DeployerError> {
         // No provider side — the in-process dispatcher reads the
         // runtime-config materialization on its own. The shared helper
