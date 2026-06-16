@@ -4161,7 +4161,10 @@ mod tests {
             envs.get("AWS_ACCESS_KEY_ID").map(String::as_str),
             Some("AKIA_TEST")
         );
-        assert_eq!(envs.get("AWS_REGION").map(String::as_str), Some("us-east-1"));
+        assert_eq!(
+            envs.get("AWS_REGION").map(String::as_str),
+            Some("us-east-1")
+        );
     }
     use crate::deployment::{EXECUTOR_TEST_LOCK, clear_deployment_executor};
     use greentic_types::cbor::encode_pack_manifest;

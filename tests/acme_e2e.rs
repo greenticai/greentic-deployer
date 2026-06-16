@@ -197,6 +197,7 @@ fn default_config(pack_path: PathBuf) -> DeployerConfig {
             .config,
         provenance: greentic_config::ProvenanceMap::new(),
         config_warnings: Vec::new(),
+        extra_env: std::collections::BTreeMap::new(),
         deploy_pack_id_override: None,
         deploy_flow_id_override: None,
         bundle_source: None,
