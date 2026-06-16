@@ -110,6 +110,7 @@ fn host_config(raw: &str) -> EnvironmentHostConfig {
         tenant_org_id: None,
         listen_addr: None,
         public_base_url: None,
+        gui_enabled: None,
     }
 }
 
@@ -172,6 +173,7 @@ async fn remote_env_lifecycle_end_to_end() {
                     tenant_org_id: FieldUpdate::Set("org-1".to_string()),
                     listen_addr: FieldUpdate::Keep,
                     public_base_url: FieldUpdate::Keep,
+                    gui_enabled: FieldUpdate::Keep,
                 },
             )
             .expect("update environment");
@@ -795,6 +797,7 @@ async fn backup_restore_end_to_end() {
                     tenant_org_id: FieldUpdate::Keep,
                     listen_addr: FieldUpdate::Keep,
                     public_base_url: FieldUpdate::Keep,
+                    gui_enabled: FieldUpdate::Keep,
                 },
             )
             .expect("update environment");

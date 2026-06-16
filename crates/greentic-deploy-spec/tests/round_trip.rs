@@ -28,6 +28,7 @@ fn sample_environment() -> Environment {
             tenant_org_id: None,
             listen_addr: None,
             public_base_url: None,
+            gui_enabled: None,
         },
         packs: vec![EnvPackBinding {
             slot: CapabilitySlot::Deployer,

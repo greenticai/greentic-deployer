@@ -357,6 +357,7 @@ fn remote_env_create(
                 tenant_org_id: payload.tenant_org_id,
                 listen_addr: parsed_listen_addr,
                 public_base_url: parsed_public_base_url,
+                gui_enabled: None,
             },
         )
         .map_err(map_store_err_preserving_noun)?;
@@ -385,6 +386,7 @@ fn remote_env_update(
                 tenant_org_id: FieldUpdate::from_option(payload.tenant_org_id),
                 listen_addr: FieldUpdate::Keep,
                 public_base_url: FieldUpdate::from_option(parsed_public_base_url),
+                gui_enabled: FieldUpdate::Keep,
             },
         )
         .map_err(map_store_err_preserving_noun)?;
@@ -1292,6 +1294,7 @@ mod tests {
                 tenant_org_id: None,
                 listen_addr: None,
                 public_base_url: None,
+                gui_enabled: None,
             },
         );
         assert!(

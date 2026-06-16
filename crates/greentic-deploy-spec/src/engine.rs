@@ -243,6 +243,11 @@ pub struct UpdateEnvironmentPayload {
     pub listen_addr: FieldUpdate<std::net::SocketAddr>,
     #[serde(default, skip_serializing_if = "FieldUpdate::is_keep")]
     pub public_base_url: FieldUpdate<String>,
+    /// Webchat GUI toggle. `Keep` leaves the existing value; `Set(b)` writes an
+    /// explicit choice; `Clear` reverts to the env-id default (see
+    /// [`EnvironmentHostConfig::resolved_gui_enabled`]).
+    #[serde(default, skip_serializing_if = "FieldUpdate::is_keep")]
+    pub gui_enabled: FieldUpdate<bool>,
 }
 
 /// Optional seed payload for `EnvironmentMutations::migrate_merge_bindings`.
@@ -412,6 +417,7 @@ pub fn apply_environment_update(env: &mut Environment, patch: UpdateEnvironmentP
     patch
         .public_base_url
         .apply_to(&mut env.host_config.public_base_url);
+    patch.gui_enabled.apply_to(&mut env.host_config.gui_enabled);
 }
 
 /// Resolve the migrate-bindings target: an existing env passes through; a
@@ -490,6 +496,7 @@ mod tests {
             tenant_org_id: None,
             listen_addr: None,
             public_base_url: None,
+            gui_enabled: None,
         }
     }
 
@@ -591,6 +598,7 @@ mod tests {
             tenant_org_id: FieldUpdate::Clear,
             listen_addr: FieldUpdate::Keep,
             public_base_url: FieldUpdate::Keep,
+            gui_enabled: FieldUpdate::Keep,
         };
         assert_eq!(
             serde_json::to_value(&payload).unwrap(),
@@ -712,6 +720,7 @@ mod tests {
                 tenant_org_id: FieldUpdate::Set("org-1".to_string()),
                 listen_addr: FieldUpdate::Keep,
                 public_base_url: FieldUpdate::Keep,
+                gui_enabled: FieldUpdate::Keep,
             },
         );
         assert_eq!(env.name, "renamed");

@@ -1704,6 +1704,7 @@ mod tests {
                 tenant_org_id: None,
                 listen_addr: None,
                 public_base_url: None,
+                gui_enabled: None,
             },
         );
         assert!(result.is_ok());
@@ -1726,6 +1727,7 @@ mod tests {
                 tenant_org_id: None,
                 listen_addr: None,
                 public_base_url: None,
+                gui_enabled: None,
             },
         );
         assert!(matches!(result, Err(StoreError::Conflict(_))));
@@ -2669,6 +2671,7 @@ mod tests {
                 tenant_org_id: None,
                 listen_addr: None,
                 public_base_url: None,
+                gui_enabled: None,
             },
         );
         assert!(result.is_ok());
@@ -2736,6 +2739,7 @@ mod tests {
                 tenant_org_id: None,
                 listen_addr: None,
                 public_base_url: None,
+                gui_enabled: None,
             },
         );
     }
