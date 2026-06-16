@@ -42,8 +42,11 @@ runtime-secrets-aws = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "dep:aws-
 creds-aws = ["dep:aws-sdk-sts", "dep:aws-sdk-iam", "dep:aws-config", "dep:aws-smithy-runtime-api"]
 # Phase D K8s slice (PR-5.2): typed Kubernetes API client behind the
 # `K8sCluster` / `K8sValidatorClient` seams. Default-on alongside the AWS
-# deps; kube's defaults are client + rustls-tls + ring (no openssl).
-k8s-client = ["dep:kube", "dep:k8s-openapi"]
+# deps; kube's defaults are client + rustls-tls + ring (no openssl). The
+# direct `rustls` dep is only for pinning the process-default CryptoProvider
+# at `connect()` — both `ring` (kube) and `aws-lc-rs` (AWS SDK) are linked,
+# so rustls 0.23 cannot auto-select one and the first TLS handshake panics.
+k8s-client = ["dep:kube", "dep:k8s-openapi", "dep:rustls"]
 bundle-upload-gcp = []
 bundle-upload-azure = []
 
@@ -224,6 +227,14 @@ features = [
 [dependencies.kube]
 version = "3.1"
 optional = true
+
+# Only used to install a process-default rustls CryptoProvider before the
+# first cluster connection (see `kube_client::connect`). `ring` matches
+# kube's bundled provider; version unifies with kube's transitive rustls.
+[dependencies.rustls]
+version = "0.23"
+optional = true
+features = ["ring"]
 
 [dependencies.k8s-openapi]
 # Version feature pins the generated API types, not the cluster we can

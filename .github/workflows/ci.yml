@@ -54,3 +54,31 @@ jobs:
 
       - name: Build (no default features)
         run: cargo build --no-default-features
+
+  # Live-cluster gate for `op env reconcile`: stand up a throwaway kind
+  # cluster and drive the full apply→prune ceremony against a real API
+  # server. This is the only coverage of reconcile's success path — the unit
+  # tests never open a socket. Gated by GREENTIC_K8S_E2E so the test no-ops
+  # everywhere else.
+  k8s-e2e:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      GREENTIC_K8S_E2E: "1"
+    steps:
+      - name: Free disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: gtc-e2e
+      - name: Reconcile apply+prune E2E
+        run: cargo test --features k8s-client --test k8s_reconcile_e2e -- --nocapture
