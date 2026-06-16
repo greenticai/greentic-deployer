@@ -246,7 +246,7 @@ fn set_schema() -> Value {
                 "description": "Bind address for the runtime's local HTTP listener (e.g. 127.0.0.1:8080, 0.0.0.0:9090, [::1]:8443). Parsed as SocketAddr; malformed values are rejected."
             },
             "public_base_url": {"type": ["string", "null"], "description": "origin-only URL (https://host[:port])"},
-            "gui_enabled": {"type": ["boolean", "null"], "description": "serve the built-in webchat GUI; null leaves the value unchanged (env-id default applies: on for local)"}
+            "gui_enabled": {"type": ["boolean", "null"], "description": "serve the built-in webchat GUI; null leaves the stored value unchanged (the env-id default — on for local — applies only when unset)"}
         }
     })
 }

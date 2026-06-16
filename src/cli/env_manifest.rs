@@ -89,9 +89,11 @@ pub struct ManifestEnvironment {
     /// `SocketAddr` during shape validation). Absent = leave untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<String>,
-    /// Whether the runtime serves the built-in webchat GUI. Absent = leave
-    /// untouched (the env-id default applies — on for `local`, off otherwise).
-    /// `true`/`false` is an explicit choice reconciled via `op config set`.
+    /// Whether the runtime serves the built-in webchat GUI. Absent = leave the
+    /// stored value unchanged (upsert, like the other host-config fields); the
+    /// env-id default — on for `local`, off otherwise — applies only when the
+    /// stored value is unset. `true`/`false` is an explicit choice reconciled
+    /// via `op config set`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gui_enabled: Option<bool>,
 }
@@ -667,7 +669,7 @@ pub fn manifest_schema() -> Value {
                     "region": {"type": ["string", "null"], "description": "cloud region tag; absent = leave untouched"},
                     "tenant_org_id": {"type": ["string", "null"], "description": "tenant organization id; absent = leave untouched"},
                     "listen_addr": {"type": ["string", "null"], "description": "bind address (SocketAddr); absent = leave untouched"},
-                    "gui_enabled": {"type": ["boolean", "null"], "description": "serve the built-in webchat GUI; absent = env-id default (on for local, off elsewhere)"}
+                    "gui_enabled": {"type": ["boolean", "null"], "description": "serve the built-in webchat GUI; absent/null = leave the stored value unchanged (upsert) — the env-id default (on for local, off elsewhere) applies only when the stored value is unset"}
                 }
             },
             "trust_root": {"enum": ["bootstrap", null], "description": "`bootstrap` seeds the operator key (idempotent)"},
