@@ -121,17 +121,20 @@ pub struct RuntimeSecretContext {
     pub extra_dev_store_roots: Vec<PathBuf>,
 }
 
-pub async fn resolve_for_cloud_apply(
-    config: &DeployerConfig,
-) -> Result<Option<RuntimeSecretResolution>> {
-    if !matches!(
-        config.provider,
-        Provider::Aws | Provider::Azure | Provider::Gcp
-    ) || config.capability != DeployerCapability::Apply
-        || !config.execute_local
-    {
-        return Ok(None);
-    }
+/// Shared cloud-apply secret inputs: resolves the bundle root + pack paths,
+/// best-effort loads the operator `Environment`, and returns the resolution
+/// context plus the pack-declared and per-endpoint (webhook) requirements.
+/// Endpoint requirements are deduped against pack URIs HERE — the single place
+/// that "pack wins on URI collision" policy lives — so the promote path and the
+/// env-map both see exactly one remote name per URI. `Ok(None)` when there is
+/// no bundle root to scan; callers map that to their own empty result.
+struct CloudSecretInputs {
+    ctx: RuntimeSecretContext,
+    pack_requirements: Vec<RuntimeSecretRequirement>,
+    endpoint_requirements: Vec<RuntimeSecretRequirement>,
+}
+
+fn collect_cloud_secret_inputs(config: &DeployerConfig) -> Result<Option<CloudSecretInputs>> {
     let Some(bundle_root) = config
         .bundle_root
         .clone()
@@ -160,23 +163,55 @@ pub async fn resolve_for_cloud_apply(
         team: None,
         extra_dev_store_roots,
     };
-    let mut requirements = collect_requirements(&ctx)?;
-    if let Some((env, _)) = loaded_env.as_ref() {
-        // Per-endpoint webhook secrets aren't pack-declared, so `collect_requirements`
-        // never sees them. Merge them in (dedup by URI) so they are resolved from
-        // the env dev-store and promoted to the cloud secret manager.
-        let existing: BTreeSet<String> = requirements.iter().map(|r| r.uri.clone()).collect();
-        for requirement in collect_endpoint_webhook_requirements(env)? {
-            if !existing.contains(&requirement.uri) {
-                requirements.push(requirement);
-            }
-        }
+
+    let pack_requirements = collect_requirements(&ctx)?;
+    let mut endpoint_requirements = match loaded_env.as_ref() {
+        Some((env, _)) => collect_endpoint_webhook_requirements(env)?,
+        None => Vec::new(),
+    };
+    // Pack-declared requirements win on any URI collision: drop a per-endpoint
+    // requirement whose URI a pack already declares so promotion and the env-map
+    // never disagree on which remote name backs a URI.
+    if !endpoint_requirements.is_empty() {
+        let pack_uris: BTreeSet<&str> = pack_requirements.iter().map(|r| r.uri.as_str()).collect();
+        endpoint_requirements.retain(|r| !pack_uris.contains(r.uri.as_str()));
     }
-    if requirements.is_empty() {
+
+    Ok(Some(CloudSecretInputs {
+        ctx,
+        pack_requirements,
+        endpoint_requirements,
+    }))
+}
+
+pub async fn resolve_for_cloud_apply(
+    config: &DeployerConfig,
+) -> Result<Option<RuntimeSecretResolution>> {
+    if !matches!(
+        config.provider,
+        Provider::Aws | Provider::Azure | Provider::Gcp
+    ) || config.capability != DeployerCapability::Apply
+        || !config.execute_local
+    {
+        return Ok(None);
+    }
+    let Some(CloudSecretInputs {
+        ctx,
+        mut pack_requirements,
+        endpoint_requirements,
+    }) = collect_cloud_secret_inputs(config)?
+    else {
+        return Ok(None);
+    };
+    // Endpoint requirements are already deduped against pack URIs, so merging is
+    // a plain extend. Per-endpoint webhook secrets aren't pack-declared, so this
+    // is how they get resolved from the env dev-store and promoted.
+    pack_requirements.extend(endpoint_requirements);
+    if pack_requirements.is_empty() {
         return Ok(None);
     }
 
-    let resolution = resolve_runtime_secrets(&ctx, &requirements).await;
+    let resolution = resolve_runtime_secrets(&ctx, &pack_requirements).await;
     if !resolution.missing.is_empty() {
         return Err(DeployerError::Config(format_missing_runtime_secrets(
             &resolution.missing,
@@ -312,10 +347,9 @@ fn build_cloud_env_map(
     }
     // Per-endpoint webhook secrets key the env-map by URI ONLY (every
     // endpoint's `key` is the literal `webhook_secret`, so a bare-key alias
-    // would collide across endpoints). Skip any URI a pack already claimed:
-    // `resolve_for_cloud_apply` drops the duplicate endpoint requirement, so
-    // promotion writes the pack's remote name — the env-map must point
-    // Terraform at that SAME name, never overwrite it with the endpoint's.
+    // would collide across endpoints). The `contains_key` guard is defensive:
+    // `collect_cloud_secret_inputs` already drops endpoint URIs a pack declares,
+    // but keeping it makes this pure helper correct on any input (pack wins).
     for requirement in endpoint_requirements {
         if env_map.contains_key(&requirement.uri) {
             continue;
@@ -428,40 +462,15 @@ pub fn runtime_secret_env_map_for_cloud(
     ) {
         return Ok(BTreeMap::new());
     }
-    let Some(bundle_root) = config
-        .bundle_root
-        .clone()
-        .or_else(|| infer_bundle_root_from_pack_path(&config.pack_path))
+    let Some(CloudSecretInputs {
+        ctx,
+        pack_requirements,
+        endpoint_requirements,
+    }) = collect_cloud_secret_inputs(config)?
     else {
         return Ok(BTreeMap::new());
     };
-
-    let mut pack_paths = vec![config.pack_path.clone()];
-    if let Some(provider_pack) = config.provider_pack.as_ref() {
-        pack_paths.push(provider_pack.clone());
-    }
-    pack_paths.extend(discover_bundle_pack_paths(&bundle_root)?);
-    pack_paths = dedup_paths(pack_paths);
-
-    let loaded_env = load_environment_for_config(config)?;
-    let extra_dev_store_roots = loaded_env
-        .as_ref()
-        .map(|(_, env_dir)| vec![env_dir.clone()])
-        .unwrap_or_default();
-    let ctx = RuntimeSecretContext {
-        bundle_root,
-        pack_paths,
-        environment: config.environment.clone(),
-        tenant: config.tenant.clone(),
-        team: None,
-        extra_dev_store_roots,
-    };
     let prefix = default_cloud_secret_prefix(&config.environment, &config.tenant, None);
-    let pack_requirements = collect_requirements(&ctx)?;
-    let endpoint_requirements = match loaded_env.as_ref() {
-        Some((env, _)) => collect_endpoint_webhook_requirements(env)?,
-        None => Vec::new(),
-    };
 
     // Unify env-map generation with the resolution that the cloud-secret
     // promotion path uses. `resolve_runtime_secrets` consults env vars AND
@@ -1648,6 +1657,21 @@ questions:
         assert_eq!(resolution.resolved[0].value.expose(), "team-scoped-value");
     }
 
+    /// A required, operator-supplied-shaped requirement — the common test shape
+    /// (no default, no aliases, not generated).
+    fn req(uri: &str, provider_id: &str, key: &str) -> RuntimeSecretRequirement {
+        RuntimeSecretRequirement {
+            uri: uri.into(),
+            provider_id: provider_id.into(),
+            key: key.into(),
+            required: true,
+            default_value: None,
+            aliases: Vec::new(),
+            generated: None,
+            source: PathBuf::from("environment.json"),
+        }
+    }
+
     fn env_with_webhook_endpoint(
         env_id: &str,
         eid: MessagingEndpointId,
@@ -1755,16 +1779,11 @@ questions:
 
     #[test]
     fn cloud_remote_name_for_webhook_is_endpoint_scoped() {
-        let req = RuntimeSecretRequirement {
-            uri: "secrets://prod/default/_/messaging-abc/webhook_secret".into(),
-            provider_id: "messaging-abc".into(),
-            key: WEBHOOK_SECRET_KEY.into(),
-            required: true,
-            default_value: None,
-            aliases: Vec::new(),
-            generated: None,
-            source: PathBuf::from("environment.json"),
-        };
+        let req = req(
+            "secrets://prod/default/_/messaging-abc/webhook_secret",
+            "messaging-abc",
+            WEBHOOK_SECRET_KEY,
+        );
         let prefix = default_cloud_secret_prefix("prod", "acme", None);
         // `cloud_secret_name` canonicalizes the provider/key segments (hyphen →
         // underscore). This is the internal cloud-SM resource name; the runtime
@@ -1808,16 +1827,7 @@ questions:
             team: None,
             extra_dev_store_roots: vec![env_dir.path().to_path_buf()],
         };
-        let requirement = RuntimeSecretRequirement {
-            uri: uri.to_string(),
-            provider_id: "messaging-abc".into(),
-            key: WEBHOOK_SECRET_KEY.into(),
-            required: true,
-            default_value: None,
-            aliases: Vec::new(),
-            generated: None,
-            source: PathBuf::from("environment.json"),
-        };
+        let requirement = req(uri, "messaging-abc", WEBHOOK_SECRET_KEY);
         let resolution = resolve_runtime_secrets(&ctx, std::slice::from_ref(&requirement)).await;
         assert!(resolution.missing.is_empty(), "{:?}", resolution.missing);
         assert_eq!(resolution.resolved.len(), 1);
@@ -1849,16 +1859,7 @@ questions:
             team: None,
             extra_dev_store_roots: Vec::new(),
         };
-        let requirement = RuntimeSecretRequirement {
-            uri: uri.to_string(),
-            provider_id: "messaging-abc".into(),
-            key: WEBHOOK_SECRET_KEY.into(),
-            required: true,
-            default_value: None,
-            aliases: Vec::new(),
-            generated: None,
-            source: PathBuf::from("environment.json"),
-        };
+        let requirement = req(uri, "messaging-abc", WEBHOOK_SECRET_KEY);
         let resolution = resolve_runtime_secrets(&ctx, std::slice::from_ref(&requirement)).await;
         assert_eq!(resolution.missing.len(), 1);
     }
@@ -1889,36 +1890,13 @@ questions:
     #[test]
     fn build_cloud_env_map_pack_wins_on_uri_collision() {
         let uri = "secrets://prod/default/_/messaging-abc/webhook_secret".to_string();
-        let pack = RuntimeSecretRequirement {
-            uri: uri.clone(),
-            provider_id: "packprov".into(),
-            key: "api_key".into(),
-            required: true,
-            default_value: None,
-            aliases: Vec::new(),
-            generated: None,
-            source: PathBuf::from("pack"),
-        };
-        let ep_collide = RuntimeSecretRequirement {
-            uri: uri.clone(),
-            provider_id: "messaging-abc".into(),
-            key: WEBHOOK_SECRET_KEY.into(),
-            required: true,
-            default_value: None,
-            aliases: Vec::new(),
-            generated: None,
-            source: PathBuf::from("environment.json"),
-        };
-        let ep_other = RuntimeSecretRequirement {
-            uri: "secrets://prod/default/_/messaging-xyz/webhook_secret".into(),
-            provider_id: "messaging-xyz".into(),
-            key: WEBHOOK_SECRET_KEY.into(),
-            required: true,
-            default_value: None,
-            aliases: Vec::new(),
-            generated: None,
-            source: PathBuf::from("environment.json"),
-        };
+        let pack = req(&uri, "packprov", "api_key");
+        let ep_collide = req(&uri, "messaging-abc", WEBHOOK_SECRET_KEY);
+        let ep_other = req(
+            "secrets://prod/default/_/messaging-xyz/webhook_secret",
+            "messaging-xyz",
+            WEBHOOK_SECRET_KEY,
+        );
         let resolved: BTreeSet<String> = [
             uri.clone(),
             "secrets://prod/default/_/messaging-xyz/webhook_secret".to_string(),
