@@ -60,6 +60,10 @@ pub struct GeneratedSecretScope {
 pub struct SecretValue(String);
 
 impl SecretValue {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -83,7 +87,6 @@ pub enum SecretValueSource {
     Env { key: String },
     DevStore { path: PathBuf },
     SetupAnswers { path: PathBuf },
-    SetupDefault,
     Generated,
 }
 
@@ -325,25 +328,29 @@ pub async fn resolve_runtime_secrets(
                 value: SecretValue(value),
                 source: SecretValueSource::SetupAnswers { path },
             });
-        } else if let Some(value) = requirement
-            .default_value
-            .as_ref()
-            .filter(|value| !value.is_empty())
-        {
-            checked_sources.push("assets/setup.yaml default".to_string());
-            resolved.push(ResolvedRuntimeSecret {
-                requirement: requirement.clone(),
-                value: SecretValue(value.clone()),
-                source: SecretValueSource::SetupDefault,
-            });
         } else if let Some(generated) = &requirement.generated {
+            // Transitional fallback. `greentic setup` is now the single place
+            // that introduces secrets — including generated ones — into the
+            // local secrets manager, and `gtc start` only *moves* them to the
+            // target. A value should therefore already have resolved above.
+            // Generating here means an older bundle (built before setup-side
+            // generation) was deployed: warn loudly and generate so the deploy
+            // still succeeds, rather than synthesising a placeholder/default.
             checked_sources.push("generated secret metadata".to_string());
             match generated_secret_value(generated) {
-                Ok(value) => resolved.push(ResolvedRuntimeSecret {
-                    requirement: requirement.clone(),
-                    value: SecretValue(value),
-                    source: SecretValueSource::Generated,
-                }),
+                Ok(value) => {
+                    tracing::warn!(
+                        secret_uri = %requirement.uri,
+                        secret_key = %requirement.key,
+                        "generated runtime secret was absent from the local secrets manager; \
+                         generating at deploy as a transitional fallback (setup should introduce it)"
+                    );
+                    resolved.push(ResolvedRuntimeSecret {
+                        requirement: requirement.clone(),
+                        value: SecretValue(value),
+                        source: SecretValueSource::Generated,
+                    });
+                }
                 Err(err) if requirement.required => {
                     checked_sources.push(format!("generation failed: {err}"));
                     tracing::warn!(
@@ -363,12 +370,22 @@ pub async fn resolve_runtime_secrets(
                 secret_uri = %requirement.uri,
                 secret_key = %requirement.key,
                 checked_sources = ?checked_sources,
-                "required runtime secret is not available"
+                "required runtime secret is not available in the local secrets manager"
             );
             missing.push(MissingRuntimeSecret {
                 requirement: requirement.clone(),
                 checked_sources,
             });
+        } else {
+            // Optional secret (for example a value acquired at runtime such as
+            // an OAuth token) is absent from the local secrets manager. Warn
+            // and let it slide rather than promoting a synthesised value.
+            tracing::warn!(
+                secret_uri = %requirement.uri,
+                secret_key = %requirement.key,
+                "optional runtime secret not found in the local secrets manager; \
+                 leaving unset for runtime resolution"
+            );
         }
     }
 
@@ -1549,6 +1566,106 @@ mod tests {
         assert!(matches!(
             resolution.resolved[0].source,
             SecretValueSource::Generated
+        ));
+    }
+
+    #[tokio::test]
+    async fn cloud_apply_resolution_slides_optional_secret_without_local_value() {
+        // An optional secret with only a setup.yaml default must NOT promote
+        // that default to the cloud secrets manager (the silent-wrong-value
+        // path is gone). With no value in the local secrets manager it is
+        // neither resolved nor reported missing — it is left to slide.
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("packs/deep-research-demo");
+        std::fs::create_dir_all(pack.join("assets")).unwrap();
+        std::fs::write(
+            pack.join("assets/setup.yaml"),
+            r#"
+questions:
+  - name: api_key_secret
+    secret_key: api_key_secret
+    secret: true
+    required: false
+    default: ollama-placeholder
+"#,
+        )
+        .unwrap();
+
+        let ctx = RuntimeSecretContext {
+            bundle_root: dir.path().to_path_buf(),
+            pack_paths: vec![pack],
+            environment: "dev".into(),
+            tenant: "demo".into(),
+            team: None,
+        };
+        let requirements = collect_requirements(&ctx).unwrap();
+        let resolution = resolve_runtime_secrets(&ctx, &requirements).await;
+
+        assert!(
+            resolution.resolved.is_empty(),
+            "optional secret must not resolve from a setup.yaml default: {:?}",
+            resolution.resolved
+        );
+        assert!(
+            resolution.missing.is_empty(),
+            "optional secret must not be reported missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_apply_resolution_moves_generated_secret_from_local_store() {
+        // When setup has already introduced the generated secret into the local
+        // store, the deployer MOVES that exact value (DevStore source) rather
+        // than generating a fresh, divergent one.
+        use greentic_secrets_lib::{DevStore, SecretFormat};
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("packs/messaging-webchat-gui");
+        std::fs::create_dir_all(pack.join("assets")).unwrap();
+        std::fs::write(
+            pack.join("assets/secret-requirements.json"),
+            r#"[{
+                "key":"jwt_signing_key",
+                "required":true,
+                "generated":{
+                    "policy":"random",
+                    "length":20,
+                    "encoding":"raw_text",
+                    "scope":{"level":"tenant","team":"_"},
+                    "regenerate_if_present":false
+                }
+            }]"#,
+        )
+        .unwrap();
+
+        let uri = "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key";
+        let store_path = dir.path().join(".greentic/state/dev/.dev.secrets.env");
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        let store = DevStore::with_path(&store_path).unwrap();
+        store
+            .put(uri, SecretFormat::Text, b"setup-introduced-key")
+            .await
+            .unwrap();
+
+        let ctx = RuntimeSecretContext {
+            bundle_root: dir.path().to_path_buf(),
+            pack_paths: vec![pack],
+            environment: "dev".into(),
+            tenant: "demo".into(),
+            team: None,
+        };
+        let requirements = collect_requirements(&ctx).unwrap();
+        let resolution = resolve_runtime_secrets(&ctx, &requirements).await;
+
+        assert!(resolution.missing.is_empty());
+        assert_eq!(resolution.resolved.len(), 1);
+        assert_eq!(
+            resolution.resolved[0].value.expose(),
+            "setup-introduced-key",
+            "the local-store value must be moved, not regenerated"
+        );
+        assert!(matches!(
+            resolution.resolved[0].source,
+            SecretValueSource::DevStore { .. }
         ));
     }
 
