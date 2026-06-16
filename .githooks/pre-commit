@@ -11,9 +11,26 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
+# Make cargo reachable from GUI git clients / stripped shells that don't source
+# the user's profile.
+if ! command -v cargo >/dev/null 2>&1; then
+    if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+    command -v cargo >/dev/null 2>&1 || export PATH="$HOME/.cargo/bin:$PATH"
+fi
+
 # Skip if no Rust files staged.
 if ! git diff --cached --name-only --diff-filter=ACM | grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$'; then
     exit 0
+fi
+
+# Keep Cargo.lock in sync with the manifests (e.g. after a version bump) so
+# that --locked builds in CI / pre-push do not fail. Only workspace members
+# are touched; external dependencies are left as-is.
+echo "pre-commit: cargo update --workspace"
+cargo update --workspace
+if ! git diff --quiet -- Cargo.lock; then
+    git add Cargo.lock
+    echo "pre-commit: re-staged Cargo.lock"
 fi
 
 echo "pre-commit: cargo fmt --all --check"
