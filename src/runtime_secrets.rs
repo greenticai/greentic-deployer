@@ -147,7 +147,7 @@ pub async fn resolve_for_cloud_apply(
     pack_paths.extend(discover_bundle_pack_paths(&bundle_root)?);
     pack_paths = dedup_paths(pack_paths);
 
-    let loaded_env = load_environment_for_config(config);
+    let loaded_env = load_environment_for_config(config)?;
     let extra_dev_store_roots = loaded_env
         .as_ref()
         .map(|(_, env_dir)| vec![env_dir.clone()])
@@ -185,21 +185,41 @@ pub async fn resolve_for_cloud_apply(
     Ok(Some(resolution))
 }
 
-/// Best-effort load of the operator [`Environment`] (and its on-disk dir) for
-/// this deploy. Returns `None` for a raw bundle deploy with no env, or when the
-/// env can't be read from the per-user default store root
-/// (`~/.greentic/environments`) — callers then keep the pack-only behavior. A
-/// non-default `--store-root` isn't visible from [`DeployerConfig`], so such
-/// deploys don't auto-promote per-endpoint webhook secrets.
-fn load_environment_for_config(config: &DeployerConfig) -> Option<(Environment, PathBuf)> {
-    let env_id = EnvId::try_from(config.environment.as_str()).ok()?;
-    let store = LocalFsStore::new(LocalFsStore::default_root()?);
-    if !store.exists(&env_id).unwrap_or(false) {
-        return None;
+fn load_environment_for_config(config: &DeployerConfig) -> Result<Option<(Environment, PathBuf)>> {
+    // Not a valid env id, or no per-user store root to look under → no
+    // operator environment to enumerate; the pack-only path is unaffected.
+    // A non-default `--store-root` is not visible from `DeployerConfig`, so
+    // such deploys also land here (documented limitation).
+    let Ok(env_id) = EnvId::try_from(config.environment.as_str()) else {
+        return Ok(None);
+    };
+    let Some(root) = LocalFsStore::default_root() else {
+        return Ok(None);
+    };
+    load_environment_from_store(&LocalFsStore::new(root), &env_id)
+}
+
+/// Load an environment, failing CLOSED once we know it exists: a present-but
+/// unreadable `environment.json` (or an `env_dir` failure) must surface, not
+/// be silently treated as "no env" — that would drop required endpoint
+/// secrets from promotion with no deploy-time signal.
+fn load_environment_from_store(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+) -> Result<Option<(Environment, PathBuf)>> {
+    if !store
+        .exists(env_id)
+        .map_err(|e| DeployerError::Config(format!("environment store: {e}")))?
+    {
+        return Ok(None);
     }
-    let env = store.load(&env_id).ok()?;
-    let env_dir = store.env_dir(&env_id).ok()?;
-    Some((env, env_dir))
+    let env = store
+        .load(env_id)
+        .map_err(|e| DeployerError::Config(format!("load environment {env_id}: {e}")))?;
+    let env_dir = store
+        .env_dir(env_id)
+        .map_err(|e| DeployerError::Config(format!("environment dir {env_id}: {e}")))?;
+    Ok(Some((env, env_dir)))
 }
 
 const WEBHOOK_SECRET_KEY: &str = "webhook_secret";
@@ -270,6 +290,45 @@ fn cloud_remote_name(
         )),
         _ => None,
     }
+}
+
+fn build_cloud_env_map(
+    provider: Provider,
+    prefix: &str,
+    pack_requirements: &[RuntimeSecretRequirement],
+    endpoint_requirements: &[RuntimeSecretRequirement],
+    resolved_uris: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let mut env_map = BTreeMap::new();
+    for requirement in pack_requirements {
+        if !requirement.required && !resolved_uris.contains(&requirement.uri) {
+            continue;
+        }
+        let Some(remote_name) = cloud_remote_name(provider, prefix, requirement) else {
+            continue;
+        };
+        env_map.insert(requirement.uri.clone(), remote_name.clone());
+        env_map.insert(requirement.key.clone(), remote_name);
+    }
+    // Per-endpoint webhook secrets key the env-map by URI ONLY (every
+    // endpoint's `key` is the literal `webhook_secret`, so a bare-key alias
+    // would collide across endpoints). Skip any URI a pack already claimed:
+    // `resolve_for_cloud_apply` drops the duplicate endpoint requirement, so
+    // promotion writes the pack's remote name — the env-map must point
+    // Terraform at that SAME name, never overwrite it with the endpoint's.
+    for requirement in endpoint_requirements {
+        if env_map.contains_key(&requirement.uri) {
+            continue;
+        }
+        if !requirement.required && !resolved_uris.contains(&requirement.uri) {
+            continue;
+        }
+        let Some(remote_name) = cloud_remote_name(provider, prefix, requirement) else {
+            continue;
+        };
+        env_map.insert(requirement.uri.clone(), remote_name);
+    }
+    env_map
 }
 
 pub fn default_cloud_secret_prefix(environment: &str, tenant: &str, team: Option<&str>) -> String {
@@ -384,7 +443,7 @@ pub fn runtime_secret_env_map_for_cloud(
     pack_paths.extend(discover_bundle_pack_paths(&bundle_root)?);
     pack_paths = dedup_paths(pack_paths);
 
-    let loaded_env = load_environment_for_config(config);
+    let loaded_env = load_environment_for_config(config)?;
     let extra_dev_store_roots = loaded_env
         .as_ref()
         .map(|(_, env_dir)| vec![env_dir.clone()])
@@ -423,30 +482,13 @@ pub fn runtime_secret_env_map_for_cloud(
         .map(|r| r.requirement.uri)
         .collect();
 
-    let mut env_map = BTreeMap::new();
-    for requirement in &pack_requirements {
-        if !requirement.required && !resolved_uris.contains(&requirement.uri) {
-            continue;
-        }
-        let Some(remote_name) = cloud_remote_name(config.provider, &prefix, requirement) else {
-            continue;
-        };
-        env_map.insert(requirement.uri.clone(), remote_name.clone());
-        env_map.insert(requirement.key.clone(), remote_name);
-    }
-    // Per-endpoint webhook secrets key the env-map by URI ONLY. Every
-    // endpoint's `key` is the literal `webhook_secret`, so emitting a bare-key
-    // alias would collide across endpoints (last-writer-wins, dropping URIs);
-    // the runtime resolves these by their `secrets://…` URI regardless.
-    for requirement in &endpoint_requirements {
-        if !requirement.required && !resolved_uris.contains(&requirement.uri) {
-            continue;
-        }
-        let Some(remote_name) = cloud_remote_name(config.provider, &prefix, requirement) else {
-            continue;
-        };
-        env_map.insert(requirement.uri.clone(), remote_name);
-    }
+    let env_map = build_cloud_env_map(
+        config.provider,
+        &prefix,
+        &pack_requirements,
+        &endpoint_requirements,
+        &resolved_uris,
+    );
     Ok(env_map)
 }
 
@@ -1819,5 +1861,84 @@ questions:
         };
         let resolution = resolve_runtime_secrets(&ctx, std::slice::from_ref(&requirement)).await;
         assert_eq!(resolution.missing.len(), 1);
+    }
+
+    #[test]
+    fn load_environment_from_store_returns_none_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env_id = EnvId::try_from("prod").unwrap();
+        assert!(
+            load_environment_from_store(&store, &env_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn load_environment_from_store_fails_closed_on_corrupt_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env_id = EnvId::try_from("prod").unwrap();
+        let env_path = dir.path().join("prod/environment.json");
+        std::fs::create_dir_all(env_path.parent().unwrap()).unwrap();
+        std::fs::write(&env_path, b"{ not valid json").unwrap();
+        assert!(load_environment_from_store(&store, &env_id).is_err());
+    }
+
+    #[test]
+    fn build_cloud_env_map_pack_wins_on_uri_collision() {
+        let uri = "secrets://prod/default/_/messaging-abc/webhook_secret".to_string();
+        let pack = RuntimeSecretRequirement {
+            uri: uri.clone(),
+            provider_id: "packprov".into(),
+            key: "api_key".into(),
+            required: true,
+            default_value: None,
+            aliases: Vec::new(),
+            generated: None,
+            source: PathBuf::from("pack"),
+        };
+        let ep_collide = RuntimeSecretRequirement {
+            uri: uri.clone(),
+            provider_id: "messaging-abc".into(),
+            key: WEBHOOK_SECRET_KEY.into(),
+            required: true,
+            default_value: None,
+            aliases: Vec::new(),
+            generated: None,
+            source: PathBuf::from("environment.json"),
+        };
+        let ep_other = RuntimeSecretRequirement {
+            uri: "secrets://prod/default/_/messaging-xyz/webhook_secret".into(),
+            provider_id: "messaging-xyz".into(),
+            key: WEBHOOK_SECRET_KEY.into(),
+            required: true,
+            default_value: None,
+            aliases: Vec::new(),
+            generated: None,
+            source: PathBuf::from("environment.json"),
+        };
+        let resolved: BTreeSet<String> = [
+            uri.clone(),
+            "secrets://prod/default/_/messaging-xyz/webhook_secret".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let prefix = default_cloud_secret_prefix("prod", "acme", None);
+        let map = build_cloud_env_map(
+            Provider::Aws,
+            &prefix,
+            std::slice::from_ref(&pack),
+            &[ep_collide, ep_other],
+            &resolved,
+        );
+        // Collision URI keeps the PACK remote name (built from packprov/api_key),
+        // not the endpoint's.
+        assert_eq!(
+            map.get(&uri).unwrap(),
+            &cloud_remote_name(Provider::Aws, &prefix, &pack).unwrap()
+        );
+        assert!(map.contains_key("secrets://prod/default/_/messaging-xyz/webhook_secret"));
     }
 }
