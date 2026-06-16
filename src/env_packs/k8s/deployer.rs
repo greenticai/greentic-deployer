@@ -130,8 +130,7 @@ impl K8sDeployerHandler {
 
         // `params` is recomputed (pure, cheap) only to render the prune set;
         // the present set already came from `render_environment` above.
-        let params = K8sParams::from_answers(env, answers)
-            .map_err(|e| DeployerError::Provider(format!("invalid answers: {e}")))?;
+        let params = params_from_answers(env, answers)?;
         let mut pruned = Vec::new();
         for revision in &env.revisions {
             if !has_cluster_presence(revision.lifecycle) {
