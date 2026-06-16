@@ -629,6 +629,12 @@ pub fn reconcile(
             "environment_id": env.environment_id.as_str(),
             "kind": descriptor.as_str(),
             "answers_ref": answers_ref_wire,
+            // Identity the cluster was mutated as. "ambient" = the CLI's
+            // kubeconfig / in-cluster identity; resolving the env's bound
+            // deployer credential to a ServiceAccount bearer rides the
+            // Phase D secrets sink. Surfaced so the live mutation is never
+            // silent about which identity it ran as.
+            "identity": "ambient",
             "applied_count": report.applied.len(),
             "pruned_count": report.pruned.len(),
             "applied": report.applied,

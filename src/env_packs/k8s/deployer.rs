@@ -83,6 +83,23 @@ impl K8sDeployerHandler {
     /// Env-level objects are never pruned here — tearing down the namespace /
     /// router is env destruction, a separate verb. Reconcile only converges a
     /// live env.
+    ///
+    /// # Known gaps (Phase D later slices)
+    ///
+    /// - **Identity / Namespace RBAC.** The applied set includes the
+    ///   cluster-scoped `Namespace`, so reconcile assumes an identity with
+    ///   namespace-create authority — true for today's ambient identity, but
+    ///   the bound-ServiceAccount model (Phase D secrets sink) must reconcile
+    ///   Namespace handling with the bootstrap pack's namespaced-only RBAC.
+    /// - **Adoption of unlabeled objects.** [`KubeCluster::apply`](super::kube_client::KubeCluster)'s
+    ///   ownership guard only conflicts on a *differing* env label; a
+    ///   preexisting object with a managed name but no label is force-adopted.
+    ///   The fresh namespace reconcile creates never hits this — hardening
+    ///   adoption in a customer-provided namespace rides the real-cluster slice.
+    /// - **Prune scope.** Pruning iterates `env.revisions`, so the workers of a
+    ///   revision already compacted out of the Vec (`remove_bundle` after
+    ///   archive) are not reachable here — reclaiming those orphans needs
+    ///   label-based GC via a future `K8sCluster::list` seam.
     pub async fn reconcile(
         &self,
         env: &Environment,
