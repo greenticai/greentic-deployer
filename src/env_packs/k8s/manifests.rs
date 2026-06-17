@@ -405,6 +405,7 @@ fn pod_security_context() -> Value {
         "runAsNonRoot": true,
         "runAsUser": 65532,
         "runAsGroup": 65532,
+        "fsGroup": 65532,
         "seccompProfile": {"type": "RuntimeDefault"},
     })
 }
@@ -1063,6 +1064,7 @@ mod tests {
             let pod = &d["spec"]["template"]["spec"];
             assert_eq!(pod["securityContext"]["runAsNonRoot"], true);
             assert_eq!(pod["securityContext"]["runAsUser"], 65532);
+            assert_eq!(pod["securityContext"]["fsGroup"], 65532);
             assert_eq!(
                 pod["securityContext"]["seccompProfile"]["type"],
                 "RuntimeDefault"
