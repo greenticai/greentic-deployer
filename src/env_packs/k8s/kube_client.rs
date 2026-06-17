@@ -131,18 +131,15 @@ fn install_default_crypto_provider() {
 /// untouched.
 fn apply_bound_token(config: &mut kube::Config, token: Option<&str>) {
     if let Some(tok) = token {
-        config.auth_info.token = Some(tok.into());
-        config.auth_info.token_file = None;
-        config.auth_info.client_certificate = None;
-        config.auth_info.client_certificate_data = None;
-        config.auth_info.client_key = None;
-        config.auth_info.client_key_data = None;
-        config.auth_info.username = None;
-        config.auth_info.password = None;
-        config.auth_info.exec = None;
-        config.auth_info.auth_provider = None;
-        config.auth_info.impersonate = None;
-        config.auth_info.impersonate_groups = None;
+        // Wholesale reset via struct-spread (not field-by-field clears): any
+        // auth field a future kube-rs adds is reset to its default too, so a
+        // new auth method can't silently survive and shadow the token —
+        // reviving this very bug class. Endpoint + cluster CA live on `Config`,
+        // not `auth_info`, so they are untouched.
+        config.auth_info = kube::config::AuthInfo {
+            token: Some(tok.into()),
+            ..Default::default()
+        };
     }
 }
 
