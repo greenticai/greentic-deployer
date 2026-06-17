@@ -66,7 +66,7 @@ pub mod trust_root;
 // pub mod secrets;
 
 #[cfg(test)]
-mod tests_common;
+pub(crate) mod tests_common;
 
 use serde::Serialize;
 use serde_json::Value;

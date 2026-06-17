@@ -49,9 +49,11 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::credentials::{
-    RunBootstrapError, ValidateError, ZeroizedAdmin, run_bootstrap, validate_requirements,
+    DeployerCredentials, RunBootstrapError, ValidateError, ZeroizedAdmin, run_bootstrap,
+    validate_requirements,
 };
 use crate::env_packs::EnvPackRegistry;
+use crate::env_packs::k8s::K8sDeployerCredentials;
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
 use super::{AuditCtx, AuditGens, OpError, OpFlags, OpOutcome, audit_and_record};
@@ -120,8 +122,18 @@ pub fn requirements(
     let payload = resolve_payload::<CredentialsRequirementsPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
 
-    let (doc, report) =
-        validate_requirements(store, registry, &env_id).map_err(map_validate_err)?;
+    // For a K8s-bound env, connect a live validator client so the SSAR
+    // probes run against the cluster the deployer actually targets. Other
+    // deployers (and `--no-default-features` builds) get `None` and fall
+    // back to the handler's own credentials probe inside the runner.
+    let connected = connected_k8s_credentials(store, &env_id)?;
+    let (doc, report) = validate_requirements(
+        store,
+        registry,
+        &env_id,
+        connected.as_ref().map(|c| c as &dyn DeployerCredentials),
+    )
+    .map_err(map_validate_err)?;
 
     Ok(OpOutcome::new(
         NOUN,
@@ -336,6 +348,65 @@ fn map_validate_err(e: ValidateError) -> OpError {
     }
 }
 
+/// Connect a live [`K8sValidatorClient`](crate::env_packs::k8s::K8sValidatorClient)
+/// for a K8s-bound env so `op credentials requirements` runs its
+/// `SelfSubjectAccessReview` probes against the cluster the deployer
+/// actually targets.
+///
+/// Returns `Ok(None)` for any non-K8s deployer (the runner falls back to
+/// the handler's own credentials) and for `--no-default-features` builds
+/// that lack the `k8s-client` feature. Fails closed (`Conflict`) when the
+/// binding's answers are unreadable or the cluster cannot be reached — the
+/// same posture as `op env reconcile`. `bound_token = None`: the deployer
+/// authenticates with the ambient kubeconfig / in-cluster identity,
+/// identical to `reconcile` / `apply-revision`; resolving `credentials_ref`
+/// → bearer is the Phase D secrets-sink change, not a seam change here.
+#[cfg(feature = "k8s-client")]
+fn connected_k8s_credentials(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+) -> Result<Option<K8sDeployerCredentials>, OpError> {
+    use crate::cli::env::load_render_answers;
+    use crate::env_packs::k8s::K8sDeployerHandler;
+    use crate::env_packs::k8s::async_bridge::run_k8s_async;
+    use crate::env_packs::k8s::kube_client::{KubeValidatorClient, connect};
+    use crate::env_packs::k8s::manifests::kubeconfig_context_from_answers;
+    use std::sync::Arc;
+
+    // If the env can't even be loaded, leave it to the runner to surface
+    // the proper NotFound / store error.
+    let Ok(env) = store.load(env_id) else {
+        return Ok(None);
+    };
+    let Some(binding) = env.pack_for_slot(greentic_deploy_spec::CapabilitySlot::Deployer) else {
+        return Ok(None);
+    };
+    if binding.kind.path() != K8sDeployerHandler::DESCRIPTOR_PATH {
+        return Ok(None);
+    }
+
+    // Fail closed if the recorded answers are broken (mirrors render /
+    // reconcile); a K8s env with no answers connects to the ambient
+    // context.
+    let (answers, _wire) = load_render_answers(store, &env, &binding.kind)?;
+    let kubeconfig_context = kubeconfig_context_from_answers(answers.as_ref());
+    let client = run_k8s_async(connect(kubeconfig_context.as_deref(), None))
+        .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
+    Ok(Some(K8sDeployerCredentials::with_client(Arc::new(
+        KubeValidatorClient::new(client),
+    ))))
+}
+
+/// `k8s-client`-less builds cannot connect a validator; the runner falls
+/// back to the handler's (fail-closed) default credentials.
+#[cfg(not(feature = "k8s-client"))]
+fn connected_k8s_credentials(
+    _store: &LocalFsStore,
+    _env_id: &EnvId,
+) -> Result<Option<K8sDeployerCredentials>, OpError> {
+    Ok(None)
+}
+
 fn map_bootstrap_err(e: RunBootstrapError) -> OpError {
     use crate::credentials::BootstrapError;
     match e {
@@ -498,6 +569,29 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.result["mode"], "requirements");
         assert_eq!(outcome.result["result"], "pass");
+    }
+
+    /// The live-validator wiring only fires for a K8s-bound deployer: any
+    /// other deployer yields `None` and the runner falls back to the
+    /// handler's own probe (so this path never opens a socket for, e.g.,
+    /// local-process).
+    #[cfg(feature = "k8s-client")]
+    #[test]
+    fn connected_k8s_credentials_is_none_for_non_k8s_deployer() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.local-process@0.1.0",
+        ));
+        store.save(&env).unwrap();
+        let got = connected_k8s_credentials(&store, &EnvId::try_from("local").unwrap())
+            .expect("non-K8s detection never errors");
+        assert!(
+            got.is_none(),
+            "non-K8s deployer must not connect a validator client"
+        );
     }
 
     /// With no native credentials handler registered for the bound

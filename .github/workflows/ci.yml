@@ -80,7 +80,8 @@ jobs:
         uses: helm/kind-action@v1
         with:
           cluster_name: gtc-e2e
-      # `--test-threads=1`: both tests drive env `local` (namespace
-      # `gtc-local`) on the one kind cluster, so they must not run concurrently.
-      - name: Reconcile + apply-revision E2E
+      # `--test-threads=1`: the reconcile/apply-revision tests drive env `local`
+      # (namespace `gtc-local`) on the one kind cluster, so they must not run
+      # concurrently; the credentials test is read-only SSAR but shares the run.
+      - name: Reconcile + apply-revision + credentials E2E
         run: cargo test --features k8s-client --test k8s_reconcile_e2e -- --nocapture --test-threads=1

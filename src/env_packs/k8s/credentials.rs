@@ -15,9 +15,12 @@
 //!
 //! The typed Kubernetes API client exists
 //! ([`KubeValidatorClient`](super::kube_client::KubeValidatorClient),
-//! `k8s-client` feature), but constructing it from the binding's answers
-//! and handing it to this handler is the PR-5.3 orchestration wiring.
-//! Until then [`K8sDeployerCredentials::default`] holds no client and
+//! `k8s-client` feature); the `op credentials requirements` CLI connects
+//! it from the binding's answers (ambient identity, like `reconcile`) and
+//! injects it via [`with_client`](K8sDeployerCredentials::with_client) — the
+//! runner's `creds_override` seam. [`K8sDeployerCredentials::default`] holds
+//! no client (the fail-closed posture for any caller that doesn't inject one,
+//! e.g. a `--no-default-features` build) and
 //! every probe reports [`CapabilityStatus::Fail`] — NOT `Skipped`,
 //! because `RequirementsReport::passed()` treats `Skipped` as non-
 //! blocking (it only checks for `Fail`), so an all-`Skipped` report
@@ -254,10 +257,10 @@ impl DeployerCredentials for K8sDeployerCredentials {
                     .map(|capability| CapabilityCheck {
                         capability,
                         status: CapabilityStatus::Fail {
-                            reason: "no Kubernetes API client is bound to the K8s \
-                                     deployer env-pack (binding one rides the Phase D \
-                                     orchestration wiring, PR-5.3); credentials cannot \
-                                     be validated — failing closed"
+                            reason: "no Kubernetes API client is bound to these \
+                                     credentials; `gtc op credentials requirements` \
+                                     connects a live client when built with the \
+                                     `k8s-client` feature — failing closed"
                                 .to_string(),
                         },
                     })

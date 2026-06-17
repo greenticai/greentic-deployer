@@ -267,3 +267,9 @@ greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "
 # against a real operator-store-server listener.
 greentic-operator-store-server = { path = "crates/greentic-operator-store-server" }
 axum = "0.8"
+# Path-only (no version) like the store-server above: lets the live-cluster
+# E2E set a `credentials_ref` through the public `EnvironmentStore` API
+# (the K8s deployer requires credential material and there is no CLI setter).
+# Resolves to the same path crate the lib uses, so the `Environment` types
+# unify across the test/lib boundary.
+greentic-deploy-spec = { path = "crates/greentic-deploy-spec" }
