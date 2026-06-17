@@ -29,12 +29,15 @@
 //! ([`KubeCluster`](super::kube_client::KubeCluster)) inherits the same
 //! verbs unchanged once the PR-5.3 wiring binds it.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use greentic_deploy_spec::{DeploymentId, Environment, Revision, RevisionId};
 use serde_json::Value;
+use tokio::time::{Instant, sleep};
 
 use super::K8sDeployerHandler;
-use super::cluster::{K8sClusterError, ObjectRef};
+use super::cluster::{K8sCluster, K8sClusterError, ObjectRef};
 use super::manifests::{
     K8sParams, has_cluster_presence, render_runtime_config_map, render_worker_manifests,
 };
@@ -61,6 +64,76 @@ fn params_from_answers(
 ) -> Result<K8sParams, DeployerError> {
     K8sParams::from_answers(env, answers)
         .map_err(|e| DeployerError::Provider(format!("invalid answers: {e}")))
+}
+
+/// Default upper bound on the warm readiness wait. A worker that has not
+/// rolled out within this window fails the warm rather than letting a
+/// revision promote `Warming → Ready` over a pod that never became available.
+const WARM_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Env override for [`WARM_ROLLOUT_TIMEOUT`] (whole seconds). Operators tune
+/// the readiness window per workload; the kind E2E sets a short value so the
+/// gate's failure path is observable without a multi-minute hang. An unset or
+/// unparseable value falls back to the default.
+const WARM_ROLLOUT_TIMEOUT_ENV: &str = "GREENTIC_K8S_WARM_READY_TIMEOUT_SECS";
+
+/// Poll cadence while waiting for the worker Deployment to roll out.
+const WARM_ROLLOUT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Resolve the warm readiness timeout: [`WARM_ROLLOUT_TIMEOUT_ENV`] when set
+/// to a parseable seconds value, otherwise [`WARM_ROLLOUT_TIMEOUT`].
+fn warm_rollout_timeout() -> Duration {
+    std::env::var(WARM_ROLLOUT_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(WARM_ROLLOUT_TIMEOUT)
+}
+
+/// Block until the worker Deployment has rolled out, or fail on timeout.
+///
+/// "Rolled out" = the Deployment controller has observed the latest spec
+/// generation AND at least `desired_replicas` are available (see
+/// [`RolloutStatus::is_complete`](super::cluster::RolloutStatus::is_complete)).
+/// Availability is gated by the worker pod's `/healthz` readiness probe, so
+/// this one kube-level signal also covers application health — no separate
+/// HTTP probe is needed here.
+///
+/// `timeout` / `poll_interval` are parameters (not the module consts) so the
+/// unit tests can drive the loop deterministically under a paused clock.
+async fn wait_for_worker_rollout(
+    cluster: &dyn K8sCluster,
+    deployment: &ObjectRef,
+    desired_replicas: i32,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(), DeployerError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = cluster
+            .get_rollout_status(deployment)
+            .await
+            .map_err(provider)?;
+        if status.is_complete(desired_replicas) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(DeployerError::Provider(format!(
+                "worker `{deployment}` did not become ready within {}s \
+                 (observedGeneration {:?}/{}, updatedReplicas {}/{}, \
+                 availableReplicas {}/{}, lingering old replicas {})",
+                timeout.as_secs(),
+                status.observed_generation,
+                status.generation,
+                status.updated_replicas,
+                desired_replicas,
+                status.available_replicas,
+                desired_replicas,
+                (status.replicas - status.updated_replicas).max(0),
+            )));
+        }
+        sleep(poll_interval).await;
+    }
 }
 
 impl K8sDeployerHandler {
@@ -176,14 +249,38 @@ impl Deployer for K8sDeployerHandler {
         require_revision(env, revision_id)?;
         let revision = Self::revision(env, revision_id).expect("require_revision passed");
         let params = params_from_answers(env, answers)?;
-        self.apply_all(&render_worker_manifests(env, revision, &params))
-            .await?;
-        // warm returns once the API server has accepted the worker manifests.
-        // The live-cluster readiness wait (observed `.status.observedGeneration`
-        // + available replicas + the per-revision `/healthz/<revision_id>`
-        // probe before the revision is promoted Warming → Ready) is a later
-        // PR-5.3 slice via the RevisionHealthGate seam (cross-repo) — it is
-        // intentionally NOT performed inside the upsert primitive.
+        let manifests = render_worker_manifests(env, revision, &params);
+        self.apply_all(&manifests).await?;
+
+        // The API server has accepted the worker manifests; the revision is
+        // only Ready once the Deployment has actually rolled out. Wait on the
+        // worker Deployment's status — observed generation caught up + the pod
+        // available (which means it passed its `/healthz` readiness probe) —
+        // before reporting warm complete. A worker that never becomes
+        // available fails the warm, so the operator sees the rollout stall
+        // instead of a revision silently promoted Warming → Ready over a
+        // non-serving pod. `op env reconcile` and `op env apply-revision` both
+        // inherit this wait through the verb.
+        // `render_worker_manifests` yields the worker Deployment first, then
+        // its Service (its documented, tested order), so index 0 is the
+        // rollout-bearing object.
+        let deployment = &manifests[0];
+        // The worker Deployment renders a fixed replica count; a Deployment
+        // with no `spec.replicas` defaults to 1 under K8s semantics.
+        let desired_replicas = deployment
+            .pointer("/spec/replicas")
+            .and_then(Value::as_i64)
+            .unwrap_or(1) as i32;
+        let deployment_ref = ObjectRef::from_manifest(deployment).map_err(provider)?;
+        wait_for_worker_rollout(
+            self.cluster.as_ref(),
+            &deployment_ref,
+            desired_replicas,
+            warm_rollout_timeout(),
+            WARM_ROLLOUT_POLL_INTERVAL,
+        )
+        .await?;
+
         Ok(WarmOutcome::default())
     }
 
@@ -238,12 +335,103 @@ mod tests {
     use super::*;
     use crate::env_packs::deployer::conformance::build_fixture_env;
     use crate::env_packs::deployer::run_conformance;
-    use crate::env_packs::k8s::cluster::{InMemoryCluster, K8sCluster};
+    use crate::env_packs::k8s::cluster::{InMemoryCluster, K8sCluster, RolloutStatus};
     use crate::env_packs::k8s::manifests::{RUNTIME_CONFIG_MAP_NAME, worker_name};
 
     fn handler_with_fake() -> (K8sDeployerHandler, Arc<InMemoryCluster>) {
         let cluster = Arc::new(InMemoryCluster::default());
         (K8sDeployerHandler::with_cluster(cluster.clone()), cluster)
+    }
+
+    /// A cluster fake whose rollout reports "not ready" for the first
+    /// `ready_after` polls of `get_rollout_status`, then complete. apply /
+    /// delete are no-ops — these tests exercise only the readiness wait.
+    #[derive(Debug)]
+    struct ScriptedRolloutCluster {
+        ready_after: usize,
+        polls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl K8sCluster for ScriptedRolloutCluster {
+        async fn apply(&self, _manifest: &Value) -> Result<(), K8sClusterError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _object: &ObjectRef) -> Result<(), K8sClusterError> {
+            Ok(())
+        }
+
+        async fn get_rollout_status(
+            &self,
+            _deployment: &ObjectRef,
+        ) -> Result<RolloutStatus, K8sClusterError> {
+            let n = self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // The new worker pod is created (updated == 1, no old replicas
+            // linger); it only flips to available after `ready_after` polls.
+            let available = if n >= self.ready_after { 1 } else { 0 };
+            Ok(RolloutStatus {
+                generation: 1,
+                observed_generation: Some(1),
+                replicas: 1,
+                updated_replicas: 1,
+                available_replicas: available,
+            })
+        }
+    }
+
+    fn worker_deployment_ref() -> ObjectRef {
+        ObjectRef {
+            api_version: "apps/v1".into(),
+            kind: "Deployment".into(),
+            namespace: Some("gtc-local".into()),
+            name: "gtc-worker-x".into(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn warm_rollout_wait_resolves_once_the_worker_becomes_available() {
+        let cluster = ScriptedRolloutCluster {
+            ready_after: 3,
+            polls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        wait_for_worker_rollout(
+            &cluster,
+            &worker_deployment_ref(),
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("rollout completes once the replica is available");
+        assert!(
+            cluster.polls.load(std::sync::atomic::Ordering::SeqCst) >= 4,
+            "must keep polling until the worker reports available"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn warm_rollout_wait_fails_when_the_worker_never_becomes_ready() {
+        let cluster = ScriptedRolloutCluster {
+            ready_after: usize::MAX,
+            polls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let err = wait_for_worker_rollout(
+            &cluster,
+            &worker_deployment_ref(),
+            1,
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            DeployerError::Provider(msg) => {
+                assert!(msg.contains("did not become ready"), "msg: {msg}");
+                assert!(msg.contains("availableReplicas 0/1"), "msg: {msg}");
+            }
+            other => panic!("expected a Provider timeout error, got {other:?}"),
+        }
     }
 
     /// The Phase D entry gate: the K8s impl satisfies the shared

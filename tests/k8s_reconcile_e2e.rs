@@ -240,6 +240,29 @@ fn apply_revision(store: &Path, revision_id: &str) -> String {
     result["action"].as_str().expect("action").to_string()
 }
 
+/// Drive `op env apply-revision` expecting the warm readiness gate to FAIL,
+/// returning the parsed error JSON.
+///
+/// In kind the placeholder worker image never serves `/healthz`, so the pod
+/// never becomes available and `warm_revision`'s readiness wait times out. A
+/// short `GREENTIC_K8S_WARM_READY_TIMEOUT_SECS` keeps the gate observable
+/// without a multi-minute hang (the default is 5 minutes).
+fn apply_revision_expect_not_ready(store: &Path, revision_id: &str) -> Value {
+    let mut cmd = Command::new(deployer_bin());
+    cmd.arg("op").arg("--store-root").arg(store);
+    cmd.args(["env", "apply-revision", ENV_ID, revision_id]);
+    cmd.env("GREENTIC_K8S_WARM_READY_TIMEOUT_SECS", "20");
+    let out = cmd.output().expect("spawn greentic-deployer");
+    assert!(
+        !out.status.success(),
+        "apply-revision warm must fail when the worker never becomes ready:\nstdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    serde_json::from_str(stderr.trim())
+        .unwrap_or_else(|e| panic!("apply-revision stderr is not json ({e}):\n{stderr}"))
+}
+
 #[test]
 fn reconcile_applies_then_prunes_against_a_live_cluster() {
     if !armed() {
@@ -373,7 +396,7 @@ fn credentials_requirements_passes_against_a_live_cluster() {
 }
 
 #[test]
-fn apply_revision_warms_then_archives_a_single_revision_against_a_live_cluster() {
+fn apply_revision_warm_gate_blocks_unready_worker_then_archives_against_a_live_cluster() {
     if !armed() {
         return;
     }
@@ -390,17 +413,32 @@ fn apply_revision_warms_then_archives_a_single_revision_against_a_live_cluster()
     let (applied, _) = reconcile(store);
     assert_eq!(applied, 11, "reconcile establishes env-level + worker pair");
 
-    // apply-revision on the Ready (present) revision → warm branch. Idempotent
-    // over reconcile's apply: same worker pair, still present.
-    let action = apply_revision(store, &revision_id);
-    assert_eq!(action, "warmed", "Ready revision drives the warm branch");
+    // apply-revision on the Ready (present) revision → warm branch. warm
+    // re-upserts the worker pair, then waits for the rollout. The placeholder
+    // distroless image never serves `/healthz`, so the pod never becomes
+    // available and the readiness gate FAILS the warm rather than promoting a
+    // non-serving worker — the live-cluster proof that the gate reads real
+    // Deployment status (`observedGeneration` + `availableReplicas`) and blocks.
+    let err = apply_revision_expect_not_ready(store, &revision_id);
+    assert_eq!(
+        err["error"]["kind"], "conflict",
+        "the gate failure surfaces as a conflict: {err}"
+    );
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("did not become ready")),
+        "the readiness gate must report the rollout stall: {err}"
+    );
+    // The worker pair stays present — apply upserts BEFORE the wait, so a gate
+    // failure does not roll back the applied objects.
     assert!(
         object_exists("deployment", &worker, Some(NAMESPACE)),
-        "worker deployment present after warm"
+        "worker deployment applied before the readiness gate"
     );
     assert!(
         object_exists("service", &worker, Some(NAMESPACE)),
-        "worker service present after warm"
+        "worker service applied before the readiness gate"
     );
 
     // Archive the revision's recorded state, then apply-revision on the now

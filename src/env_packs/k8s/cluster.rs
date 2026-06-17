@@ -119,6 +119,57 @@ pub enum K8sClusterError {
     },
 }
 
+/// A worker Deployment's rollout progress, read for the warm readiness wait.
+///
+/// The fields mirror what `kubectl rollout status` inspects: the controller
+/// must have observed the latest spec generation, the NEW pod template must
+/// have produced and made available enough replicas, and no old-ReplicaSet
+/// replicas may linger. Availability is the count of pods passing their
+/// readiness probe — for the worker pod that probe is its `/healthz`
+/// endpoint, so this kube-level signal also covers application health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RolloutStatus {
+    /// `.metadata.generation` — the spec generation the API server persisted.
+    pub generation: i64,
+    /// `.status.observedGeneration` — the generation the Deployment
+    /// controller has reconciled up to. `None` until it first writes status.
+    pub observed_generation: Option<i64>,
+    /// `.status.replicas` — total non-terminated pods the Deployment manages,
+    /// across the old and new ReplicaSets. An absent field reads as `0`.
+    pub replicas: i32,
+    /// `.status.updatedReplicas` — pods produced by the CURRENT pod template.
+    /// During a rolling update this lags `replicas` until the new ReplicaSet
+    /// has fully scaled up; it is what proves a changed worker spec is live.
+    /// An absent field reads as `0`.
+    pub updated_replicas: i32,
+    /// `.status.availableReplicas` — replicas passing their readiness probe.
+    /// An absent field reads as `0`.
+    pub available_replicas: i32,
+}
+
+impl RolloutStatus {
+    /// A rollout is complete on the same terms as `kubectl rollout status`:
+    /// - the controller has observed the latest spec generation (a status
+    ///   with no `observedGeneration` yet is never complete),
+    /// - the new pod template has produced at least `desired` replicas
+    ///   (`updated_replicas`), so a changed image/template is actually live,
+    /// - no old-ReplicaSet replicas linger (`replicas <= updated_replicas`),
+    ///   so `available_replicas` cannot be satisfied by stale pods, and
+    /// - at least `desired` replicas are available (readiness-probe-passing).
+    ///
+    /// The `updated_replicas` / `replicas` checks are what stop a re-warm with
+    /// a changed worker spec from reporting success while the old ReplicaSet is
+    /// still the only thing serving (surge brings the new pod up before the old
+    /// one is torn down, so `available_replicas` alone is not enough).
+    pub fn is_complete(&self, desired: i32) -> bool {
+        self.observed_generation
+            .is_some_and(|observed| observed >= self.generation)
+            && self.updated_replicas >= desired
+            && self.replicas <= self.updated_replicas
+            && self.available_replicas >= desired
+    }
+}
+
 /// Declarative mutation surface against one cluster.
 ///
 /// ## Idempotency contract
@@ -137,6 +188,14 @@ pub trait K8sCluster: std::fmt::Debug + Send + Sync {
 
     /// Delete one object; absent is `Ok`.
     async fn delete(&self, object: &ObjectRef) -> Result<(), K8sClusterError>;
+
+    /// Read a worker Deployment's [`RolloutStatus`] for the warm readiness
+    /// wait. Called only after [`apply`](Self::apply) has accepted the
+    /// Deployment, so the object is expected to exist.
+    async fn get_rollout_status(
+        &self,
+        deployment: &ObjectRef,
+    ) -> Result<RolloutStatus, K8sClusterError>;
 }
 
 /// The scaffold default: no client wired, every call fails honestly.
@@ -150,6 +209,13 @@ impl K8sCluster for UnconfiguredCluster {
     }
 
     async fn delete(&self, _object: &ObjectRef) -> Result<(), K8sClusterError> {
+        Err(K8sClusterError::Unconfigured)
+    }
+
+    async fn get_rollout_status(
+        &self,
+        _deployment: &ObjectRef,
+    ) -> Result<RolloutStatus, K8sClusterError> {
         Err(K8sClusterError::Unconfigured)
     }
 }
@@ -190,6 +256,23 @@ impl K8sCluster for InMemoryCluster {
             .remove(object);
         Ok(())
     }
+
+    async fn get_rollout_status(
+        &self,
+        _deployment: &ObjectRef,
+    ) -> Result<RolloutStatus, K8sClusterError> {
+        // The fake has no rollout controller; report a fully-rolled-out
+        // Deployment (all replicas updated and available, none lingering) so
+        // warm's readiness wait resolves on the first poll for any desired
+        // count.
+        Ok(RolloutStatus {
+            generation: 0,
+            observed_generation: Some(0),
+            replicas: i32::MAX,
+            updated_replicas: i32::MAX,
+            available_replicas: i32::MAX,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +286,86 @@ mod tests {
             "kind": "Service",
             "metadata": {"name": "svc-a", "namespace": "ns-a"},
         })
+    }
+
+    #[test]
+    fn rollout_complete_when_observed_and_replicas_meet_desired() {
+        let s = RolloutStatus {
+            generation: 3,
+            observed_generation: Some(3),
+            replicas: 1,
+            updated_replicas: 1,
+            available_replicas: 1,
+        };
+        assert!(s.is_complete(1));
+    }
+
+    #[test]
+    fn rollout_incomplete_until_controller_observes_latest_generation() {
+        // A fresh apply bumped generation to 4; the controller is still on 3.
+        let s = RolloutStatus {
+            generation: 4,
+            observed_generation: Some(3),
+            replicas: 1,
+            updated_replicas: 1,
+            available_replicas: 1,
+        };
+        assert!(!s.is_complete(1));
+    }
+
+    #[test]
+    fn rollout_incomplete_when_no_status_written_yet() {
+        let s = RolloutStatus {
+            generation: 1,
+            observed_generation: None,
+            replicas: 0,
+            updated_replicas: 0,
+            available_replicas: 0,
+        };
+        assert!(!s.is_complete(1));
+    }
+
+    #[test]
+    fn rollout_incomplete_when_available_replicas_below_desired() {
+        let s = RolloutStatus {
+            generation: 2,
+            observed_generation: Some(2),
+            replicas: 1,
+            updated_replicas: 1,
+            available_replicas: 0,
+        };
+        assert!(!s.is_complete(1));
+    }
+
+    #[test]
+    fn rollout_incomplete_when_only_old_replicaset_is_available() {
+        // Rolling update in flight: the controller is current and one OLD-RS
+        // pod is still available, but the new template has produced no replicas
+        // (`updated_replicas == 0`). Availability from the old ReplicaSet must
+        // NOT pass the gate — the new worker spec is not live yet.
+        let s = RolloutStatus {
+            generation: 2,
+            observed_generation: Some(2),
+            replicas: 1,
+            updated_replicas: 0,
+            available_replicas: 1,
+        };
+        assert!(!s.is_complete(1));
+    }
+
+    #[test]
+    fn rollout_incomplete_while_old_replicas_linger_during_surge() {
+        // maxSurge brought the new pod up (updated + available) but the old pod
+        // has not been torn down yet (`replicas` 2 > `updated_replicas` 1), so
+        // some availability is still stale capacity.
+        let s = RolloutStatus {
+            generation: 3,
+            observed_generation: Some(3),
+            replicas: 2,
+            updated_replicas: 1,
+            available_replicas: 2,
+        };
+        assert!(!s.is_complete(1));
     }
 
     #[test]

@@ -86,7 +86,7 @@ use semver::VersionReq;
 use super::slot::EnvPackHandler;
 use crate::tool_check::ToolCheck;
 
-pub use cluster::{K8sCluster, K8sClusterError, ObjectRef, UnconfiguredCluster};
+pub use cluster::{K8sCluster, K8sClusterError, ObjectRef, RolloutStatus, UnconfiguredCluster};
 pub use credentials::{K8sDeployerCredentials, K8sValidatorClient};
 pub use deployer::ReconcileReport;
 #[cfg(feature = "k8s-client")]
