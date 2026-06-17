@@ -119,6 +119,38 @@ pub enum K8sClusterError {
     },
 }
 
+/// A worker Deployment's rollout progress, read for the warm readiness wait.
+///
+/// The three fields are exactly what decides whether a `kubectl rollout`
+/// has converged: the controller must have observed the latest spec
+/// generation, and enough replicas must be available. Availability is the
+/// count of pods passing their readiness probe — for the worker pod that
+/// probe is its `/healthz` endpoint, so this single kube-level signal also
+/// covers application health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RolloutStatus {
+    /// `.metadata.generation` — the spec generation the API server persisted.
+    pub generation: i64,
+    /// `.status.observedGeneration` — the generation the Deployment
+    /// controller has reconciled up to. `None` until it first writes status.
+    pub observed_generation: Option<i64>,
+    /// `.status.availableReplicas` — replicas passing their readiness probe.
+    /// An absent field reads as `0`.
+    pub available_replicas: i32,
+}
+
+impl RolloutStatus {
+    /// A rollout is complete when the controller has observed the latest
+    /// spec generation AND at least `desired` replicas are available. A
+    /// status with no `observedGeneration` yet is never complete (the
+    /// controller has not started reconciling the applied spec).
+    pub fn is_complete(&self, desired: i32) -> bool {
+        self.observed_generation
+            .is_some_and(|observed| observed >= self.generation)
+            && self.available_replicas >= desired
+    }
+}
+
 /// Declarative mutation surface against one cluster.
 ///
 /// ## Idempotency contract
@@ -137,6 +169,14 @@ pub trait K8sCluster: std::fmt::Debug + Send + Sync {
 
     /// Delete one object; absent is `Ok`.
     async fn delete(&self, object: &ObjectRef) -> Result<(), K8sClusterError>;
+
+    /// Read a worker Deployment's [`RolloutStatus`] for the warm readiness
+    /// wait. Called only after [`apply`](Self::apply) has accepted the
+    /// Deployment, so the object is expected to exist.
+    async fn get_rollout_status(
+        &self,
+        deployment: &ObjectRef,
+    ) -> Result<RolloutStatus, K8sClusterError>;
 }
 
 /// The scaffold default: no client wired, every call fails honestly.
@@ -150,6 +190,13 @@ impl K8sCluster for UnconfiguredCluster {
     }
 
     async fn delete(&self, _object: &ObjectRef) -> Result<(), K8sClusterError> {
+        Err(K8sClusterError::Unconfigured)
+    }
+
+    async fn get_rollout_status(
+        &self,
+        _deployment: &ObjectRef,
+    ) -> Result<RolloutStatus, K8sClusterError> {
         Err(K8sClusterError::Unconfigured)
     }
 }
@@ -190,6 +237,20 @@ impl K8sCluster for InMemoryCluster {
             .remove(object);
         Ok(())
     }
+
+    async fn get_rollout_status(
+        &self,
+        _deployment: &ObjectRef,
+    ) -> Result<RolloutStatus, K8sClusterError> {
+        // The fake has no rollout controller; report a complete rollout
+        // (`i32::MAX` available is "all replicas ready" for any desired
+        // count) so warm's readiness wait resolves on the first poll.
+        Ok(RolloutStatus {
+            generation: 0,
+            observed_generation: Some(0),
+            available_replicas: i32::MAX,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +264,47 @@ mod tests {
             "kind": "Service",
             "metadata": {"name": "svc-a", "namespace": "ns-a"},
         })
+    }
+
+    #[test]
+    fn rollout_complete_when_observed_and_replicas_meet_desired() {
+        let s = RolloutStatus {
+            generation: 3,
+            observed_generation: Some(3),
+            available_replicas: 1,
+        };
+        assert!(s.is_complete(1));
+    }
+
+    #[test]
+    fn rollout_incomplete_until_controller_observes_latest_generation() {
+        // A fresh apply bumped generation to 4; the controller is still on 3.
+        let s = RolloutStatus {
+            generation: 4,
+            observed_generation: Some(3),
+            available_replicas: 1,
+        };
+        assert!(!s.is_complete(1));
+    }
+
+    #[test]
+    fn rollout_incomplete_when_no_status_written_yet() {
+        let s = RolloutStatus {
+            generation: 1,
+            observed_generation: None,
+            available_replicas: 0,
+        };
+        assert!(!s.is_complete(1));
+    }
+
+    #[test]
+    fn rollout_incomplete_when_available_replicas_below_desired() {
+        let s = RolloutStatus {
+            generation: 2,
+            observed_generation: Some(2),
+            available_replicas: 0,
+        };
+        assert!(!s.is_complete(1));
     }
 
     #[test]

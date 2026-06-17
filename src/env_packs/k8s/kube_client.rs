@@ -29,6 +29,7 @@
 //! render bug and surfaces as `InvalidManifest`, never a guessed request.
 
 use async_trait::async_trait;
+use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::authentication::v1::SelfSubjectReview;
 use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
@@ -37,7 +38,7 @@ use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParam
 use kube::config::KubeConfigOptions;
 use serde_json::Value;
 
-use super::cluster::{K8sCluster, K8sClusterError, ObjectRef, manifest_field};
+use super::cluster::{K8sCluster, K8sClusterError, ObjectRef, RolloutStatus, manifest_field};
 use super::credentials::{
     AccessDecision, ClusterIdentity, K8sClientError, K8sOperation, K8sValidatorClient,
     OperationDecision,
@@ -288,6 +289,23 @@ impl K8sCluster for KubeCluster {
             Err(kube::Error::Api(status)) if status.code == 404 => Ok(()),
             Err(e) => Err(map_cluster_error(e)),
         }
+    }
+
+    async fn get_rollout_status(
+        &self,
+        deployment: &ObjectRef,
+    ) -> Result<RolloutStatus, K8sClusterError> {
+        // The worker Deployment is namespaced; read it through the typed
+        // apps/v1 API so `.status` parses without a hand-written schema.
+        let namespace = deployment.namespace.as_deref().unwrap_or_default();
+        let api: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+        let dep = api.get(&deployment.name).await.map_err(map_cluster_error)?;
+        let status = dep.status.as_ref();
+        Ok(RolloutStatus {
+            generation: dep.metadata.generation.unwrap_or(0),
+            observed_generation: status.and_then(|s| s.observed_generation),
+            available_replicas: status.and_then(|s| s.available_replicas).unwrap_or(0),
+        })
     }
 }
 
@@ -665,6 +683,67 @@ mod tests {
         assert!(
             matches!(err, K8sClusterError::Api(ref msg) if msg.contains("forbidden")),
             "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_rollout_status_reads_generation_and_available_replicas() {
+        let (client, mut handle) = mock_client();
+        let cluster = KubeCluster::new(client);
+        let object = worker_object_ref();
+        let (result, request) = tokio::join!(
+            cluster.get_rollout_status(&object),
+            respond_json(
+                &mut handle,
+                200,
+                json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {"name": "gtc-worker-a", "namespace": "gtc-zain", "generation": 3},
+                    "spec": {"replicas": 1},
+                    "status": {"observedGeneration": 3, "availableReplicas": 1},
+                }),
+            ),
+        );
+        let status = result.unwrap();
+        assert_eq!(status.generation, 3);
+        assert_eq!(status.observed_generation, Some(3));
+        assert_eq!(status.available_replicas, 1);
+        assert!(
+            status.is_complete(1),
+            "observed caught up + the replica available"
+        );
+        assert_eq!(request.method(), http::Method::GET);
+        assert_eq!(
+            request.uri().path(),
+            "/apis/apps/v1/namespaces/gtc-zain/deployments/gtc-worker-a"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_rollout_status_treats_missing_status_as_not_yet_available() {
+        let (client, mut handle) = mock_client();
+        let cluster = KubeCluster::new(client);
+        let object = worker_object_ref();
+        let (result, _request) = tokio::join!(
+            cluster.get_rollout_status(&object),
+            respond_json(
+                &mut handle,
+                200,
+                json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {"name": "gtc-worker-a", "namespace": "gtc-zain", "generation": 1},
+                    "spec": {"replicas": 1},
+                }),
+            ),
+        );
+        let status = result.unwrap();
+        assert_eq!(status.observed_generation, None);
+        assert_eq!(status.available_replicas, 0);
+        assert!(
+            !status.is_complete(1),
+            "a Deployment with no status yet is not ready"
         );
     }
 
