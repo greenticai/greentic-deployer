@@ -120,12 +120,16 @@ async fn wait_for_worker_rollout(
         if Instant::now() >= deadline {
             return Err(DeployerError::Provider(format!(
                 "worker `{deployment}` did not become ready within {}s \
-                 (observedGeneration {:?}/{}, availableReplicas {}/{})",
+                 (observedGeneration {:?}/{}, updatedReplicas {}/{}, \
+                 availableReplicas {}/{}, lingering old replicas {})",
                 timeout.as_secs(),
                 status.observed_generation,
                 status.generation,
+                status.updated_replicas,
+                desired_replicas,
                 status.available_replicas,
                 desired_replicas,
+                (status.replicas - status.updated_replicas).max(0),
             )));
         }
         sleep(poll_interval).await;
@@ -365,10 +369,14 @@ mod tests {
             _deployment: &ObjectRef,
         ) -> Result<RolloutStatus, K8sClusterError> {
             let n = self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // The new worker pod is created (updated == 1, no old replicas
+            // linger); it only flips to available after `ready_after` polls.
             let available = if n >= self.ready_after { 1 } else { 0 };
             Ok(RolloutStatus {
                 generation: 1,
                 observed_generation: Some(1),
+                replicas: 1,
+                updated_replicas: 1,
                 available_replicas: available,
             })
         }

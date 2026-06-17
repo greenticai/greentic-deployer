@@ -304,6 +304,8 @@ impl K8sCluster for KubeCluster {
         Ok(RolloutStatus {
             generation: dep.metadata.generation.unwrap_or(0),
             observed_generation: status.and_then(|s| s.observed_generation),
+            replicas: status.and_then(|s| s.replicas).unwrap_or(0),
+            updated_replicas: status.and_then(|s| s.updated_replicas).unwrap_or(0),
             available_replicas: status.and_then(|s| s.available_replicas).unwrap_or(0),
         })
     }
@@ -701,17 +703,24 @@ mod tests {
                     "kind": "Deployment",
                     "metadata": {"name": "gtc-worker-a", "namespace": "gtc-zain", "generation": 3},
                     "spec": {"replicas": 1},
-                    "status": {"observedGeneration": 3, "availableReplicas": 1},
+                    "status": {
+                        "observedGeneration": 3,
+                        "replicas": 1,
+                        "updatedReplicas": 1,
+                        "availableReplicas": 1,
+                    },
                 }),
             ),
         );
         let status = result.unwrap();
         assert_eq!(status.generation, 3);
         assert_eq!(status.observed_generation, Some(3));
+        assert_eq!(status.replicas, 1);
+        assert_eq!(status.updated_replicas, 1);
         assert_eq!(status.available_replicas, 1);
         assert!(
             status.is_complete(1),
-            "observed caught up + the replica available"
+            "observed caught up + the updated replica available, none lingering"
         );
         assert_eq!(request.method(), http::Method::GET);
         assert_eq!(
@@ -740,6 +749,8 @@ mod tests {
         );
         let status = result.unwrap();
         assert_eq!(status.observed_generation, None);
+        assert_eq!(status.replicas, 0);
+        assert_eq!(status.updated_replicas, 0);
         assert_eq!(status.available_replicas, 0);
         assert!(
             !status.is_complete(1),
