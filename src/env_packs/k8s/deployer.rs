@@ -261,12 +261,10 @@ impl Deployer for K8sDeployerHandler {
         // instead of a revision silently promoted Warming → Ready over a
         // non-serving pod. `op env reconcile` and `op env apply-revision` both
         // inherit this wait through the verb.
-        let deployment = manifests
-            .iter()
-            .find(|m| m.get("kind").and_then(Value::as_str) == Some("Deployment"))
-            .ok_or_else(|| {
-                DeployerError::Provider("worker render produced no Deployment".to_string())
-            })?;
+        // `render_worker_manifests` yields the worker Deployment first, then
+        // its Service (its documented, tested order), so index 0 is the
+        // rollout-bearing object.
+        let deployment = &manifests[0];
         // The worker Deployment renders a fixed replica count; a Deployment
         // with no `spec.replicas` defaults to 1 under K8s semantics.
         let desired_replicas = deployment
