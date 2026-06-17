@@ -273,3 +273,8 @@ axum = "0.8"
 # Resolves to the same path crate the lib uses, so the `Environment` types
 # unify across the test/lib boundary.
 greentic-deploy-spec = { path = "crates/greentic-deploy-spec" }
+# Re-declared (same registry version the lib already pins) so the live-cluster
+# E2E can derive the canonical store-key the bound-credential resolver reads,
+# and seed a ServiceAccount token via env var. Already in the lockfile via the
+# normal dep, so no resolution change.
+greentic-secrets-lib = ">=1.1.0-dev.27563392344, <1.2.0-0"
