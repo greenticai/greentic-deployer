@@ -20,8 +20,8 @@
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use greentic_deploy_spec::{CapabilitySlot, EnvId, EnvPackBinding, SecretRef};
-use greentic_secrets_lib::{DevStore, SecretFormat, SecretsStore};
+use greentic_deploy_spec::{CapabilitySlot, EnvId, EnvPackBinding, Environment, SecretRef};
+use greentic_secrets_lib::{DevStore, SecretFormat, SecretsStore, canonical_secret_store_key};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -452,12 +452,19 @@ pub(super) fn dev_store_has(
     dev_store_contains(&dev_path, &uri)
 }
 
-/// Read one key from a dev store, reporting only presence. Same
-/// dedicated-thread runtime hop as [`dev_store_put`] (the caller may sit on a
-/// current-thread runtime where `block_in_place` panics). A backend `get`
-/// error (missing key / unreadable) maps to `false` — absence, not a hard
-/// failure — so apply re-collects the value rather than aborting.
+/// Read one key from a dev store, reporting only presence. Delegates to
+/// [`dev_store_get_value`] — a `get` error (missing key / unreadable) maps to
+/// `false` (absence), so apply re-collects the value rather than aborting.
 fn dev_store_contains(path: &Path, uri: &str) -> Result<bool, OpError> {
+    Ok(dev_store_get_value(path, uri)?.is_some())
+}
+
+/// Read one key's value from a dev store, returning `None` when the key is
+/// absent / empty / not valid UTF-8 (a missing secret is absence, not a hard
+/// error — the only hard failure is being unable to open the store file). Same
+/// dedicated-thread runtime hop as [`dev_store_put`] (the caller may sit on a
+/// current-thread runtime where `block_in_place` panics).
+fn dev_store_get_value(path: &Path, uri: &str) -> Result<Option<String>, OpError> {
     let io_err = |message: String| OpError::Io {
         path: path.to_path_buf(),
         source: std::io::Error::other(message),
@@ -471,14 +478,74 @@ fn dev_store_contains(path: &Path, uri: &str) -> Result<bool, OpError> {
                     .enable_all()
                     .build()
                     .map_err(|e| io_err(format!("build runtime: {e}")))?;
-                let present = rt.block_on(async {
-                    matches!(store.get(uri).await, Ok(bytes) if !bytes.is_empty())
-                });
-                Ok(present)
+                Ok(rt.block_on(async {
+                    match store.get(uri).await {
+                        Ok(bytes) if !bytes.is_empty() => String::from_utf8(bytes).ok(),
+                        _ => None,
+                    }
+                }))
             })
             .join()
             .expect("dev-store read thread panicked")
     })
+}
+
+/// Resolve an environment's bound `credentials_ref` to the deployer's bearer
+/// token for live cluster verbs (`op env reconcile` / `apply-revision` /
+/// `credentials requirements`).
+///
+/// Mirrors `runtime_secrets::resolve_runtime_secrets` precedence so an operator
+/// supplies the deployer's ServiceAccount token exactly the way every other
+/// secret is supplied — environment variable first (keyed by the canonical
+/// store key), then the env's dev store (the same file [`put`] writes):
+///
+/// - `Ok(None)` — no `credentials_ref` is bound. The caller connects with the
+///   ambient kubeconfig / in-cluster identity (the pre-closure behaviour).
+/// - `Ok(Some(token))` — the ref resolves to a non-empty value; the caller
+///   binds it onto the kube config (overriding the ambient identity).
+/// - `Err(Conflict)` — a ref IS bound but no material is found. Fail closed:
+///   silently falling back to the ambient (often broader-privileged) identity
+///   when an env explicitly declares a bound credential would be a
+///   privilege-escalation surprise.
+pub(crate) fn resolve_credentials_token(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+) -> Result<Option<String>, OpError> {
+    let Some(secret_ref) = env.credentials_ref.as_ref() else {
+        return Ok(None);
+    };
+    let store_uri = secret_ref_to_store_uri(secret_ref)?;
+    let mut checked: Vec<String> = Vec::new();
+
+    if let Some(env_key) = canonical_secret_store_key(&store_uri) {
+        checked.push(format!("env {env_key}"));
+        if let Ok(value) = std::env::var(&env_key)
+            && !value.is_empty()
+        {
+            return Ok(Some(value));
+        }
+    }
+
+    let dev_path = resolve_dev_store_path(
+        &store.env_dir(env_id)?,
+        std::env::var_os(DEV_SECRETS_PATH_ENV).map(PathBuf::from),
+    );
+    checked.push(dev_path.display().to_string());
+    if dev_path.exists()
+        && let Some(value) = dev_store_get_value(&dev_path, &store_uri)?
+    {
+        return Ok(Some(value));
+    }
+
+    Err(OpError::Conflict(format!(
+        "environment `{}` declares credentials_ref `{}` but no secret material was \
+         found (looked in: {}); supply it via `op secrets put` or the corresponding \
+         environment variable before running live cluster verbs",
+        env_id.as_str(),
+        secret_ref.as_str(),
+        checked.join(", "),
+    )))
 }
 
 /// Sidecar lock path for a dev store file: the full path with `.lock`
@@ -586,6 +653,85 @@ mod tests {
 
     fn env_with_secrets() -> greentic_deploy_spec::Environment {
         env_with_secrets_kind("greentic.secrets.dev-store@1.0.0")
+    }
+
+    /// A store-aligned credentials ref (`secret://<env>/<tenant>/<team>/<pack>/<name>`)
+    /// and its `secrets://` store URI — the deployer's bound ServiceAccount token.
+    const CREDS_REF: &str = "secret://local/default/_/k8s-deployer/sa_token";
+    const CREDS_STORE_URI: &str = "secrets://local/default/_/k8s-deployer/sa_token";
+
+    fn env_with_credentials_ref(ref_str: &str) -> greentic_deploy_spec::Environment {
+        let mut env = make_env("local");
+        env.credentials_ref = Some(SecretRef::try_new(ref_str).expect("well-formed ref"));
+        env
+    }
+
+    #[test]
+    fn resolve_credentials_token_none_when_no_ref() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = make_env("local");
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        assert_eq!(
+            resolve_credentials_token(&store, &env, &env_id).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_credentials_token_reads_from_env_dev_store() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = env_with_credentials_ref(CREDS_REF);
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        // Seed the token where `op secrets put` would write it, then resolve it.
+        let dev_path = resolve_dev_store_path(&store.env_dir(&env_id).unwrap(), None);
+        dev_store_put(&dev_path, CREDS_STORE_URI, "sa-bearer-xyz").unwrap();
+        assert_eq!(
+            resolve_credentials_token(&store, &env, &env_id).unwrap(),
+            Some("sa-bearer-xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_credentials_token_fails_closed_when_ref_present_but_unresolved() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = env_with_credentials_ref(CREDS_REF);
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        // No material seeded anywhere → fail closed rather than silently
+        // falling back to ambient identity.
+        let err = resolve_credentials_token(&store, &env, &env_id).unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn resolve_credentials_token_accepts_the_bootstrap_advertised_ref_shape() {
+        // The K8s bootstrap README tells operators to bind
+        // `secret://<env>/<DEPLOYER_TOKEN_STORE_PATH>`. That exact shape must be
+        // store-aligned so the resolver can read it — regression for a ref that
+        // `SecretRef::to_store_uri` would reject (e.g. the old `…/k8s/deployer-token`).
+        use crate::env_packs::k8s::bootstrap::DEPLOYER_TOKEN_STORE_PATH;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let ref_str = format!("secret://local/{DEPLOYER_TOKEN_STORE_PATH}");
+        let secret_ref = SecretRef::try_new(&ref_str).expect("documented ref must be well-formed");
+        let env = env_with_credentials_ref(&ref_str);
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        // Seed at the store URI the documented ref maps to (this conversion is
+        // exactly what the resolver does — and what the old shape failed).
+        let store_uri =
+            secret_ref_to_store_uri(&secret_ref).expect("documented ref is store-aligned");
+        let dev_path = resolve_dev_store_path(&store.env_dir(&env_id).unwrap(), None);
+        dev_store_put(&dev_path, &store_uri, "sa-bearer-doc").unwrap();
+        assert_eq!(
+            resolve_credentials_token(&store, &env, &env_id).unwrap(),
+            Some("sa-bearer-doc".to_string())
+        );
     }
 
     #[test]

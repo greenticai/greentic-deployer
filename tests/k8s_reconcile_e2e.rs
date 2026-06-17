@@ -39,6 +39,15 @@ const ENV_ID: &str = "local";
 const NAMESPACE: &str = "gtc-local";
 const ROUTER_DEPLOY: &str = "gtc-router";
 
+/// Store-aligned credentials ref for the deployer's bound ServiceAccount token
+/// (`secret://<env>/<tenant>/<team>/<pack>/<name>`). The resolver derives the
+/// env-var store-key from this, so seeding that var supplies the token.
+const CREDS_REF: &str = "secret://local/default/_/k8s-deployer/sa_token";
+/// Dedicated namespace holding the identity-flip test's ServiceAccounts —
+/// separate from the env's `gtc-local` so it never collides with the
+/// reconcile/apply-revision tests' namespace churn.
+const CREDS_SA_NS: &str = "gtc-creds-e2e";
+
 fn deployer_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_greentic-deployer"))
 }
@@ -128,15 +137,15 @@ fn bind_k8s_env(store: &Path) {
     op(store, Some(&bind), &["env-packs", "add"]);
 }
 
-/// Stamp a `credentials_ref` on the stored env through the public
+/// Stamp a store-aligned `credentials_ref` on the stored env through the public
 /// [`EnvironmentStore`](greentic_deployer::environment::EnvironmentStore) API.
 ///
 /// The K8s deployer reports `requires_credentials_material() == true`, so the
-/// requirements runner rejects an env without one — but there is no CLI verb
-/// to supply it (it normally arrives via the setup wizard). The ambient-identity
-/// probe (`bound_token = None`) ignores the ref's value; it validates the
-/// kubeconfig identity, so any well-formed ref unblocks the check.
-fn set_credentials_ref(store: &Path) {
+/// requirements runner rejects an env without one — and there is no CLI verb to
+/// set it (it normally arrives via the setup wizard). The live verbs now resolve
+/// this ref to a bearer token, so it must be store-aligned and have its material
+/// seeded (here: via the env var the resolver reads) before use.
+fn set_credentials_ref(store: &Path, ref_str: &str) {
     use greentic_deploy_spec::{EnvId, SecretRef};
     use greentic_deployer::environment::{EnvironmentStore, LocalFsStore};
 
@@ -144,9 +153,62 @@ fn set_credentials_ref(store: &Path) {
     let mut env = api
         .load(&EnvId::try_from(ENV_ID).expect("env id"))
         .expect("load env to stamp credentials_ref");
-    env.credentials_ref =
-        Some(SecretRef::try_new("secret://local/k8s/ambient").expect("well-formed ref"));
+    env.credentials_ref = Some(SecretRef::try_new(ref_str).expect("well-formed ref"));
     api.save(&env).expect("save env with credentials_ref");
+}
+
+/// The canonical env-var key the bound-credential resolver reads for `CREDS_REF`.
+/// The deployer derives the same key from the ref's `secrets://` store URI, so
+/// setting this var on the spawned `op` process supplies the SA token
+/// cross-process — the same env-var source `resolve_runtime_secrets` honors.
+fn creds_token_env_key() -> String {
+    use greentic_deploy_spec::SecretRef;
+    use greentic_secrets_lib::canonical_secret_store_key;
+    let store_uri = SecretRef::try_new(CREDS_REF)
+        .expect("ref")
+        .to_store_uri()
+        .expect("store-aligned uri")
+        .to_string();
+    canonical_secret_store_key(&store_uri).expect("canonical store key")
+}
+
+/// Run kubectl, asserting success, returning trimmed stdout.
+fn kubectl_ok(args: &[&str]) -> String {
+    let out = kubectl(args);
+    assert!(
+        out.status.success(),
+        "kubectl {args:?} failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// `op credentials requirements` with the bound ServiceAccount token seeded via
+/// the env var the resolver reads. Returns the parsed envelope.
+fn requirements_with_token(store: &Path, token: &str) -> Value {
+    let req = payload(
+        store,
+        "creds_req.json",
+        serde_json::json!({"environment_id": ENV_ID}),
+    );
+    let mut cmd = Command::new(deployer_bin());
+    cmd.arg("op")
+        .arg("--store-root")
+        .arg(store)
+        .arg("--answers")
+        .arg(&req);
+    cmd.args(["credentials", "requirements"]);
+    cmd.env(creds_token_env_key(), token);
+    let out = cmd.output().expect("spawn greentic-deployer");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "`op credentials requirements` failed:\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("requirements stdout is not json ({e}):\n{stdout}"))
 }
 
 /// Run the full setup ceremony (create env → bind the K8s deployer →
@@ -221,7 +283,7 @@ fn reconcile(store: &Path) -> (u64, u64) {
     let result = &env["result"];
     assert_eq!(
         result["identity"], "ambient",
-        "reconcile runs as ambient identity until the secrets sink lands"
+        "reconcile runs as ambient identity when no credentials_ref is bound"
     );
     (
         result["applied_count"].as_u64().expect("applied_count"),
@@ -235,7 +297,7 @@ fn apply_revision(store: &Path, revision_id: &str) -> String {
     let result = &env["result"];
     assert_eq!(
         result["identity"], "ambient",
-        "apply-revision runs as ambient identity until the secrets sink lands"
+        "apply-revision runs as ambient identity when no credentials_ref is bound"
     );
     result["action"].as_str().expect("action").to_string()
 }
@@ -344,17 +406,27 @@ fn reconcile_applies_then_prunes_against_a_live_cluster() {
     ]);
 }
 
-/// `op credentials requirements` against a live cluster: the wiring connects a
-/// real `KubeValidatorClient` and runs `SelfSubjectReview` (identity) plus one
-/// `SelfSubjectAccessReview` per validated operation. kind's default kubeconfig
-/// is cluster-admin, so identity resolves and every op is Allowed → overall
-/// `pass`. This is the only coverage of the SSAR sweep against a real API
-/// server — the unit tests drive a `tower-test` mock and never open a socket.
+/// `op credentials requirements` against a live cluster, proving the bound
+/// `credentials_ref` actually drives the probe identity — not the ambient
+/// kubeconfig admin. The deployer resolves the ref to a ServiceAccount bearer,
+/// clears the kubeconfig's client cert (so the token is the sole credential),
+/// and runs `SelfSubjectReview` (identity) + one `SelfSubjectAccessReview` per
+/// validated operation AS that ServiceAccount:
 ///
-/// SSAR is a read-only permission check: it touches no namespace state, so this
-/// test needs no reset/cleanup and is independent of the reconcile tests.
+///   - bound to a cluster-admin SA token → every validated op is Allowed → pass;
+///   - bound to a no-RBAC SA token → the same ops are Denied → fail.
+///
+/// Under the ambient kind admin BOTH would pass, so the `fail` in the second
+/// case is the live proof the bound token took effect (and that the cert clear
+/// in `apply_bound_token` works — without it the kind client cert would shadow
+/// the token and both cases would pass). This is also the only coverage of the
+/// SSAR sweep against a real API server — the unit tests drive a `tower-test`
+/// mock and never open a socket.
+///
+/// Creates two ServiceAccounts + a ClusterRoleBinding, so it cleans them up; it
+/// uses a dedicated namespace and is independent of the reconcile tests.
 #[test]
-fn credentials_requirements_passes_against_a_live_cluster() {
+fn credentials_requirements_reflects_the_bound_serviceaccount_identity() {
     if !armed() {
         return;
     }
@@ -362,25 +434,48 @@ fn credentials_requirements_passes_against_a_live_cluster() {
     let store = store.path();
 
     bind_k8s_env(store);
-    set_credentials_ref(store);
+    set_credentials_ref(store, CREDS_REF);
 
-    // `credentials requirements` takes the env via the `--answers` payload
-    // (a unit clap verb), unlike reconcile / apply-revision's positional env.
-    let req = payload(
-        store,
-        "creds_req.json",
-        serde_json::json!({"environment_id": ENV_ID}),
-    );
-    let out = op(store, Some(&req), &["credentials", "requirements"]);
+    // Stand up the two ServiceAccounts in a dedicated namespace (best-effort
+    // clean slate first — a prior run's CRB/namespace may linger).
+    let crb = "gtc-creds-e2e-admin";
+    let _ = kubectl(&["delete", "clusterrolebinding", crb, "--ignore-not-found"]);
+    let _ = kubectl(&["delete", "namespace", CREDS_SA_NS, "--ignore-not-found"]);
+    kubectl_ok(&["create", "namespace", CREDS_SA_NS]);
+    kubectl_ok(&[
+        "create",
+        "serviceaccount",
+        "deployer-admin",
+        "-n",
+        CREDS_SA_NS,
+    ]);
+    kubectl_ok(&[
+        "create",
+        "serviceaccount",
+        "deployer-norbac",
+        "-n",
+        CREDS_SA_NS,
+    ]);
+    kubectl_ok(&[
+        "create",
+        "clusterrolebinding",
+        crb,
+        "--clusterrole=cluster-admin",
+        &format!("--serviceaccount={CREDS_SA_NS}:deployer-admin"),
+    ]);
+
+    // 1. Bind the cluster-admin SA token → every validated op Allowed → pass.
+    let admin_token = kubectl_ok(&["create", "token", "deployer-admin", "-n", CREDS_SA_NS]);
+    let out = requirements_with_token(store, &admin_token);
     let result = &out["result"];
     assert_eq!(
         result["result"], "pass",
-        "kind admin resolves identity and is allowed every validated op: {result}"
+        "the cluster-admin-bound SA is allowed every validated op: {result}"
     );
     assert_eq!(
         result["missing_capabilities"].as_array().map(Vec::len),
         Some(0),
-        "no capability is missing under cluster-admin: {result}"
+        "no capability is missing for the admin-bound SA: {result}"
     );
     let checks = result["checks"].as_array().expect("checks array");
     assert!(
@@ -393,6 +488,32 @@ fn credentials_requirements_passes_against_a_live_cluster() {
         checks.len() > 1,
         "reachable + one SSAR check per validated operation: {result}"
     );
+
+    // 2. Re-bind the no-RBAC SA token → the SAME probe now fails. Ambient admin
+    //    would pass, so a `fail` here proves the bound token drives the identity.
+    let norbac_token = kubectl_ok(&["create", "token", "deployer-norbac", "-n", CREDS_SA_NS]);
+    let out = requirements_with_token(store, &norbac_token);
+    let result = &out["result"];
+    assert_eq!(
+        result["result"], "fail",
+        "the no-RBAC SA is denied the validated ops (ambient admin would pass): {result}"
+    );
+    assert!(
+        result["missing_capabilities"]
+            .as_array()
+            .is_some_and(|m| !m.is_empty()),
+        "the denied ops surface as missing capabilities: {result}"
+    );
+
+    // Cleanup the cluster-scoped artifacts this test created.
+    let _ = kubectl(&["delete", "clusterrolebinding", crb, "--ignore-not-found"]);
+    let _ = kubectl(&[
+        "delete",
+        "namespace",
+        CREDS_SA_NS,
+        "--ignore-not-found",
+        "--wait=false",
+    ]);
 }
 
 #[test]

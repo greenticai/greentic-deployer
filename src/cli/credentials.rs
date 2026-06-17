@@ -357,10 +357,11 @@ fn map_validate_err(e: ValidateError) -> OpError {
 /// the handler's own credentials) and for `--no-default-features` builds
 /// that lack the `k8s-client` feature. Fails closed (`Conflict`) when the
 /// binding's answers are unreadable or the cluster cannot be reached — the
-/// same posture as `op env reconcile`. `bound_token = None`: the deployer
-/// authenticates with the ambient kubeconfig / in-cluster identity,
-/// identical to `reconcile` / `apply-revision`; resolving `credentials_ref`
-/// → bearer is the Phase D secrets-sink change, not a seam change here.
+/// same posture as `op env reconcile`. The env's `credentials_ref` is
+/// resolved to a ServiceAccount bearer (identical to `reconcile` /
+/// `apply-revision`): a bound token authenticates the probe as that
+/// ServiceAccount, so the SSAR sweep reflects the deployer's real RBAC, not
+/// the ambient admin's; `None` → the ambient kubeconfig / in-cluster identity.
 #[cfg(feature = "k8s-client")]
 fn connected_k8s_credentials(
     store: &LocalFsStore,
@@ -397,6 +398,11 @@ fn connected_k8s_credentials(
     let namespace = K8sParams::from_answers(&env, answers.as_ref())
         .map_err(|e| OpError::Conflict(format!("invalid K8s answers: {e}")))?
         .namespace;
+    // Resolve the env's bound deployer credential to a ServiceAccount bearer so
+    // the probe authenticates as the deployer's identity, not the ambient
+    // admin. `None` → ambient (no bound credential); fail-closed if a ref is
+    // bound but unresolvable.
+    let bound_token = crate::cli::secrets::resolve_credentials_token(store, &env, env_id)?;
     // Defer the connect into the probe runtime instead of connecting here: a
     // kube::Client's tower Buffer worker is bound to the runtime that spawned
     // it, and `run_k8s_async` drops its runtime after each call, so a client
@@ -404,8 +410,9 @@ fn connected_k8s_credentials(
     // dead worker. The connector runs connect + probes on one runtime.
     let connector: K8sValidatorConnector = Arc::new(move || -> K8sValidatorConnectFut {
         let kubeconfig_context = kubeconfig_context.clone();
+        let bound_token = bound_token.clone();
         Box::pin(async move {
-            let client = connect(kubeconfig_context.as_deref(), None).await?;
+            let client = connect(kubeconfig_context.as_deref(), bound_token.as_deref()).await?;
             Ok(Arc::new(KubeValidatorClient::new(client)) as Arc<dyn K8sValidatorClient>)
         })
     });

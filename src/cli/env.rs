@@ -622,7 +622,17 @@ pub fn reconcile(
         .map_err(|e| OpError::Conflict(e.to_string()))?;
 
     let (answers, answers_ref_wire) = load_render_answers(store, &env, &descriptor)?;
-    let report = reconcile_k8s_cluster(&env, answers.as_ref())?;
+    // Resolve the env's bound deployer credential to a ServiceAccount bearer
+    // token; `None` → connect with the ambient kubeconfig / in-cluster
+    // identity (the pre-closure behaviour). Fail-closed if a ref is bound but
+    // unresolvable.
+    let bound_token = crate::cli::secrets::resolve_credentials_token(store, &env, &env_id)?;
+    let identity = if bound_token.is_some() {
+        "bound"
+    } else {
+        "ambient"
+    };
+    let report = reconcile_k8s_cluster(&env, answers.as_ref(), bound_token)?;
 
     Ok(OpOutcome::new(
         NOUN,
@@ -631,12 +641,12 @@ pub fn reconcile(
             "environment_id": env.environment_id.as_str(),
             "kind": descriptor.as_str(),
             "answers_ref": answers_ref_wire,
-            // Identity the cluster was mutated as. "ambient" = the CLI's
-            // kubeconfig / in-cluster identity; resolving the env's bound
-            // deployer credential to a ServiceAccount bearer rides the
-            // Phase D secrets sink. Surfaced so the live mutation is never
-            // silent about which identity it ran as.
-            "identity": "ambient",
+            // Identity the cluster was mutated as: "bound" = the env's
+            // credentials_ref resolved to a ServiceAccount bearer; "ambient" =
+            // the CLI's kubeconfig / in-cluster identity (no bound credential).
+            // Surfaced so a live mutation is never silent about which identity
+            // it ran as.
+            "identity": identity,
             "applied_count": report.applied.len(),
             "pruned_count": report.pruned.len(),
             "applied": report.applied,
@@ -645,12 +655,14 @@ pub fn reconcile(
     ))
 }
 
-/// Connect to the cluster (binding's `kubeconfig_context`, ambient/in-cluster
-/// identity) and converge desired state. Requires the `k8s-client` feature.
+/// Connect to the cluster (binding's `kubeconfig_context`, with `bound_token`
+/// overriding the ambient identity when the env has a resolved credential) and
+/// converge desired state. Requires the `k8s-client` feature.
 #[cfg(feature = "k8s-client")]
 fn reconcile_k8s_cluster(
     env: &Environment,
     answers: Option<&Value>,
+    bound_token: Option<String>,
 ) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
     use crate::env_packs::k8s::async_bridge::run_k8s_async;
     use crate::env_packs::k8s::kube_client::connect;
@@ -660,11 +672,10 @@ fn reconcile_k8s_cluster(
 
     let kubeconfig_context = kubeconfig_context_from_answers(answers);
     run_k8s_async(async move {
-        // bound_token = None: the deployer uses the ambient kubeconfig /
-        // in-cluster identity today. `connect` already takes the bound token,
-        // so resolving `credentials_ref` → bearer is a caller-side change for
-        // the Phase D secrets sink — not a seam change here.
-        let client = connect(kubeconfig_context.as_deref(), None)
+        // `bound_token`: the env's credentials_ref resolved to a ServiceAccount
+        // bearer (overrides the context's auth); `None` → the ambient
+        // kubeconfig / in-cluster identity.
+        let client = connect(kubeconfig_context.as_deref(), bound_token.as_deref())
             .await
             .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
         let handler = K8sDeployerHandler::with_cluster(Arc::new(KubeCluster::new(client)));
@@ -680,6 +691,7 @@ fn reconcile_k8s_cluster(
 fn reconcile_k8s_cluster(
     _env: &Environment,
     _answers: Option<&Value>,
+    _bound_token: Option<String>,
 ) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `k8s-client` feature; \
@@ -781,7 +793,17 @@ pub fn apply_revision(
     let worker_name = crate::env_packs::k8s::manifests::worker_name(revision);
     let lifecycle = revision.lifecycle;
 
-    apply_revision_k8s_cluster(&env, revision_id, present, answers.as_ref())?;
+    // Same credential resolution as `reconcile`: bound ServiceAccount bearer
+    // when the env declares one, else the ambient identity (fail-closed if a
+    // ref is bound but unresolvable).
+    let bound_token = crate::cli::secrets::resolve_credentials_token(store, &env, &env_id)?;
+    let identity = if bound_token.is_some() {
+        "bound"
+    } else {
+        "ambient"
+    };
+
+    apply_revision_k8s_cluster(&env, revision_id, present, answers.as_ref(), bound_token)?;
 
     Ok(OpOutcome::new(
         NOUN,
@@ -796,7 +818,7 @@ pub fn apply_revision(
             "worker_name": worker_name,
             "answers_ref": answers_ref_wire,
             // Identity the cluster was mutated as — see `reconcile`.
-            "identity": "ambient",
+            "identity": identity,
         }),
     ))
 }
@@ -810,6 +832,7 @@ fn apply_revision_k8s_cluster(
     revision_id: RevisionId,
     present: bool,
     answers: Option<&Value>,
+    bound_token: Option<String>,
 ) -> Result<(), OpError> {
     use crate::env_packs::deployer::Deployer;
     use crate::env_packs::k8s::async_bridge::run_k8s_async;
@@ -820,8 +843,9 @@ fn apply_revision_k8s_cluster(
 
     let kubeconfig_context = kubeconfig_context_from_answers(answers);
     run_k8s_async(async move {
-        // bound_token = None: ambient identity today (same as reconcile).
-        let client = connect(kubeconfig_context.as_deref(), None)
+        // `bound_token`: resolved ServiceAccount bearer (overrides the
+        // context's auth); `None` → ambient identity (same as reconcile).
+        let client = connect(kubeconfig_context.as_deref(), bound_token.as_deref())
             .await
             .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
         let handler = K8sDeployerHandler::with_cluster(Arc::new(KubeCluster::new(client)));
@@ -847,6 +871,7 @@ fn apply_revision_k8s_cluster(
     _revision_id: RevisionId,
     _present: bool,
     _answers: Option<&Value>,
+    _bound_token: Option<String>,
 ) -> Result<(), OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `k8s-client` feature; \

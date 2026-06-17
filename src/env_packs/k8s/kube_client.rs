@@ -108,11 +108,38 @@ fn install_default_crypto_provider() {
 
 /// Override the resolved config's auth with a bound ServiceAccount token.
 ///
-/// Pure helper — unit-testable without a live cluster.  When `token` is
-/// `None` the config is left unchanged (ambient identity fallback).
+/// Pure helper — unit-testable without a live cluster. When `token` is `None`
+/// the config is left unchanged (ambient identity fallback).
+///
+/// When `Some`, the bearer token becomes the *sole* client credential AND the
+/// effective identity. Two things are cleared:
+///
+/// 1. Every competing **authentication** method the context supplied (client
+///    cert/key, exec plugin, auth provider, basic auth, token file) — so the
+///    API server authenticates as the ServiceAccount, not the kubeconfig
+///    identity. Without this, a context whose client credential is a TLS cert
+///    (e.g. kind's default kubeconfig) would present that cert at the handshake
+///    and the API server would authenticate as the cert identity, silently
+///    ignoring the bearer token — the bound credential would be a no-op.
+/// 2. Any **impersonation** (`impersonate` / `impersonate_groups`) the context
+///    carried — kube-rs sends those as `Impersonate-*` headers on every
+///    request, so leaving them would re-attribute calls to the impersonated
+///    user (or fail if the SA cannot impersonate) while the verb still reports
+///    `identity: bound`, hiding the drift.
+///
+/// The endpoint + cluster CA (server trust) come from the context and are
+/// untouched.
 fn apply_bound_token(config: &mut kube::Config, token: Option<&str>) {
     if let Some(tok) = token {
-        config.auth_info.token = Some(tok.into());
+        // Wholesale reset via struct-spread (not field-by-field clears): any
+        // auth field a future kube-rs adds is reset to its default too, so a
+        // new auth method can't silently survive and shadow the token —
+        // reviving this very bug class. Endpoint + cluster CA live on `Config`,
+        // not `auth_info`, so they are untouched.
+        config.auth_info = kube::config::AuthInfo {
+            token: Some(tok.into()),
+            ..Default::default()
+        };
     }
 }
 
@@ -952,6 +979,25 @@ mod tests {
         assert!(cfg.auth_info.token.is_none());
         apply_bound_token(&mut cfg, Some("tok"));
         assert!(cfg.auth_info.token.is_some());
+    }
+
+    #[test]
+    fn apply_bound_token_clears_competing_auth_and_impersonation() {
+        // A cert-based context (kind's default) that also impersonates: the
+        // bound token must become the sole credential AND the effective
+        // identity — else the cert shadows the bearer at the handshake, or the
+        // Impersonate-* headers re-attribute the request to another user.
+        let mut cfg = kube::Config::new("https://example.invalid/".parse().unwrap());
+        cfg.auth_info.client_certificate_data = Some("cert".to_string());
+        cfg.auth_info.client_key_data = Some("key".to_string().into());
+        cfg.auth_info.impersonate = Some("admin-user".to_string());
+        cfg.auth_info.impersonate_groups = Some(vec!["system:masters".to_string()]);
+        apply_bound_token(&mut cfg, Some("tok"));
+        assert!(cfg.auth_info.token.is_some());
+        assert!(cfg.auth_info.client_certificate_data.is_none());
+        assert!(cfg.auth_info.client_key_data.is_none());
+        assert!(cfg.auth_info.impersonate.is_none());
+        assert!(cfg.auth_info.impersonate_groups.is_none());
     }
 
     #[test]
