@@ -17,10 +17,10 @@ pub const EXT_DEPLOYER_CONTRACT_V1: &str = "greentic.deployer.contract.v1";
 pub const EXT_DEPLOY_AWS: &str = "greentic.deploy-aws";
 pub const EXT_DEPLOY_AZURE: &str = "greentic.deploy-azure";
 pub const EXT_DEPLOY_GCP: &str = "greentic.deploy-gcp";
-pub const DEFAULT_GHCR_OPERATOR_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless@sha256:570b83b5ba9e999ef34a752f1a5061c3ff3f2d8d5fac40dc58ee00d39164e12e";
+pub const DEFAULT_GHCR_OPERATOR_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless@sha256:80bb2967429d39f96c665a900c496d15daad380d48918166606884a6fbb11efe";
 pub const DEFAULT_GCP_OPERATOR_IMAGE: &str = "europe-west1-docker.pkg.dev/x-plateau-483512-p6/greentic-images/greentic-start-distroless@sha256:5f7e4b70271c09b2a099e2c6d5c8641cbdb5a20698dcbba0e3b0f90a0f3e0e48";
 pub const DEFAULT_OPERATOR_IMAGE_DIGEST: &str =
-    "sha256:570b83b5ba9e999ef34a752f1a5061c3ff3f2d8d5fac40dc58ee00d39164e12e";
+    "sha256:80bb2967429d39f96c665a900c496d15daad380d48918166606884a6fbb11efe";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
