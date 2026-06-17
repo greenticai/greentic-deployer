@@ -709,6 +709,32 @@ mod tests {
     }
 
     #[test]
+    fn resolve_credentials_token_accepts_the_bootstrap_advertised_ref_shape() {
+        // The K8s bootstrap README tells operators to bind
+        // `secret://<env>/<DEPLOYER_TOKEN_STORE_PATH>`. That exact shape must be
+        // store-aligned so the resolver can read it — regression for a ref that
+        // `SecretRef::to_store_uri` would reject (e.g. the old `…/k8s/deployer-token`).
+        use crate::env_packs::k8s::bootstrap::DEPLOYER_TOKEN_STORE_PATH;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let ref_str = format!("secret://local/{DEPLOYER_TOKEN_STORE_PATH}");
+        let secret_ref = SecretRef::try_new(&ref_str).expect("documented ref must be well-formed");
+        let env = env_with_credentials_ref(&ref_str);
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        // Seed at the store URI the documented ref maps to (this conversion is
+        // exactly what the resolver does — and what the old shape failed).
+        let store_uri =
+            secret_ref_to_store_uri(&secret_ref).expect("documented ref is store-aligned");
+        let dev_path = resolve_dev_store_path(&store.env_dir(&env_id).unwrap(), None);
+        dev_store_put(&dev_path, &store_uri, "sa-bearer-doc").unwrap();
+        assert_eq!(
+            resolve_credentials_token(&store, &env, &env_id).unwrap(),
+            Some("sa-bearer-doc".to_string())
+        );
+    }
+
+    #[test]
     fn list_reports_namespace_and_kind() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());

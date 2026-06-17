@@ -29,6 +29,15 @@ use super::credentials::K8sOperation;
 /// Name of the ServiceAccount the rules pack provisions.
 pub const DEPLOYER_SERVICE_ACCOUNT: &str = "greentic-deployer";
 
+/// Store-aligned path (under `secret://<env>/…`) where the deployer's bound
+/// ServiceAccount token lives: `<tenant>/<team>/<category>/<name>`. It MUST be
+/// store-aligned so `op secrets put` can write it and the resolver
+/// (`cli::secrets::resolve_credentials_token`) can read it back via
+/// `SecretRef::to_store_uri` — a non-aligned ref (e.g. `…/k8s/deployer-token`)
+/// has no store location and fails to resolve. The bootstrap README advertises
+/// `secret://<env>/{this}` so the documented binding matches what resolves.
+pub(crate) const DEPLOYER_TOKEN_STORE_PATH: &str = "default/_/k8s-deployer/deployer_token";
+
 /// Input shape for [`render_min_rbac_rules_pack`]. Borrowed; no heap cost.
 pub struct K8sRulesPackInput<'a> {
     /// Env this pack is scoped to (names + labels).
@@ -226,7 +235,7 @@ requirements converges to green.
 
    ```sh
    gtc op credentials rotate {env_id} --provided-credentials-ref \
-     "secret://{env_id}/k8s/deployer-token"
+     "secret://{env_id}/{store_path}"
    ```
 
 5. Re-run requirements:
@@ -251,6 +260,7 @@ env-packs.
         sa = DEPLOYER_SERVICE_ACCOUNT,
         admin_hint = input.admin_context_hint,
         op_bullets = op_bullets,
+        store_path = DEPLOYER_TOKEN_STORE_PATH,
     )
 }
 
