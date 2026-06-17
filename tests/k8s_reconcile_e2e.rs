@@ -341,7 +341,14 @@ fn credentials_requirements_passes_against_a_live_cluster() {
     bind_k8s_env(store);
     set_credentials_ref(store);
 
-    let out = op(store, None, &["credentials", "requirements", ENV_ID]);
+    // `credentials requirements` takes the env via the `--answers` payload
+    // (a unit clap verb), unlike reconcile / apply-revision's positional env.
+    let req = payload(
+        store,
+        "creds_req.json",
+        serde_json::json!({"environment_id": ENV_ID}),
+    );
+    let out = op(store, Some(&req), &["credentials", "requirements"]);
     let result = &out["result"];
     assert_eq!(
         result["result"], "pass",
