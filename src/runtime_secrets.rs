@@ -466,12 +466,16 @@ pub fn canonical_secret_uri(
     key: &str,
 ) -> String {
     let team = normalize_team(team);
+    // Normalize the provider segment the same way as the key (and as the cloud
+    // secret name / env-bridge key already do), so a value written under a
+    // provider id like `messaging-webchat-gui` resolves when a component fetches
+    // it under `messaging.webchat-gui` — both collapse to `messaging_webchat_gui`.
     format!(
         "secrets://{}/{}/{}/{}/{}",
         env,
         tenant,
         team.as_deref().unwrap_or(TEAM_PLACEHOLDER),
-        provider,
+        canonical_secret_name(provider),
         canonical_secret_name(key)
     )
 }
@@ -1208,7 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn requirement_uri_preserves_pack_provider_id_hyphens() {
+    fn requirement_uri_normalizes_provider_segment() {
         let dir = tempfile::tempdir().unwrap();
         let pack_dir = dir.path().join("packs/messaging-webchat-gui/assets");
         std::fs::create_dir_all(&pack_dir).unwrap();
@@ -1231,7 +1235,7 @@ mod tests {
         assert_eq!(requirements[0].provider_id, "messaging-webchat-gui");
         assert_eq!(
             requirements[0].uri,
-            "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key"
+            "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key"
         );
         assert_eq!(
             cloud_secret_name(
@@ -1315,7 +1319,7 @@ mod tests {
         assert_eq!(requirements.len(), 1);
         assert_eq!(
             requirements[0].uri,
-            "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key"
+            "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key"
         );
         assert_eq!(requirements[0].key, "jwt_signing_key");
         assert!(requirements[0].generated.is_some());
@@ -1365,7 +1369,7 @@ mod tests {
         assert_eq!(requirements.len(), 1);
         assert_eq!(
             requirements[0].uri,
-            "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key"
+            "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key"
         );
         assert!(requirements[0].generated.is_some());
     }
@@ -1574,7 +1578,7 @@ questions:
         )
         .unwrap();
 
-        let uri = "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key";
+        let uri = "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key";
         let store_path = dir.path().join(".greentic/state/dev/.dev.secrets.env");
         std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
         let store = DevStore::with_path(&store_path).unwrap();
@@ -1836,7 +1840,7 @@ questions:
 
         assert_eq!(
             resolved_uris,
-            vec!["secrets://dev/demo/_/aws-sm/aws_runtime_probe"]
+            vec!["secrets://dev/demo/_/aws_sm/aws_runtime_probe"]
         );
         assert!(resolution.missing.is_empty());
     }

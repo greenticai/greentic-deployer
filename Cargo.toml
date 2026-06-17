@@ -1,6 +1,6 @@
 [package]
 name = "greentic-deployer"
-version = "0.5.18"
+version = "0.5.19"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic deployer runtime for plan construction and deployment-pack dispatch"
