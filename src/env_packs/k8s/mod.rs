@@ -8,10 +8,11 @@
 //! constructs that client from the binding's answers and applies the
 //! rendered desired state through it
 //! ([`K8sDeployerHandler::reconcile`](deployer::K8sDeployerHandler::reconcile)).
-//! Lighting up `gtc op credentials requirements` against the live cluster
-//! (binding the validator client), per-revision Deployer-verb dispatch, and
-//! the kind/real-cluster E2E remain later PR-5.3 slices. Zain's
-//! infrastructure answers (`plans/zain-k8s-alignment.md`) gate the
+//! `gtc op credentials requirements` now connects a live validator client
+//! (the CLI's credentials path injects it via `K8sDeployerCredentials::with_client`)
+//! and per-revision Deployer-verb dispatch (`op env apply-revision`) has
+//! shipped; the live-cluster readiness wait is the remaining PR-5.3 slice.
+//! Zain's infrastructure answers (`plans/zain-k8s-alignment.md`) gate the
 //! real-cluster and production acceptance, not this scaffold — sandbox
 //! defaults per that doc.
 //!
@@ -22,9 +23,10 @@
 //! so operator overrides (namespace, runtime image, router replicas) reach
 //! the rendered manifests; reconcile additionally reads `kubeconfig_context`
 //! to target the cluster. The per-revision Deployer verbs (`warm_revision`,
-//! `apply_traffic_split`) still use `K8sParams::for_env` sandbox defaults —
-//! they have no env-dir access on the trait; threading answers into them
-//! rides the per-revision Deployer-verb dispatch slice.
+//! `archive_revision`, `apply_traffic_split`) take the binding's `answers`
+//! as a trait parameter (PR-5.3) and feed the same `from_answers`
+//! projection; `op env apply-revision` and `op credentials requirements`
+//! resolve and thread it in.
 //!
 //! ## Operator CLI verb disclaimer
 //!
@@ -33,8 +35,9 @@
 //! per-revision lifecycle verbs (`gtc op revision warm`, `gtc op traffic
 //! set`, etc.) remain storage-layer only — they record desired state and
 //! do not invoke `Deployer` impls, true for every registered deployer
-//! (including AWS-ECS since C3). Per-revision Deployer-verb dispatch and the
-//! live-cluster readiness wait are later PR-5.3 slices.
+//! (including AWS-ECS since C3). Per-revision Deployer-verb dispatch
+//! (`op env apply-revision`) has shipped; the live-cluster readiness wait
+//! is the remaining PR-5.3 slice.
 //!
 //! Module layout (mirrors the local-process / AWS-ECS reference shape):
 //!

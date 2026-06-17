@@ -863,7 +863,11 @@ fn apply_revision_k8s_cluster(
 /// Errors (fail-closed) when `answers_ref` is set but the file is missing,
 /// unreadable, or contains invalid JSON — never silently falls back to
 /// defaults.
-fn load_render_answers(
+///
+/// `pub(crate)` so the credentials CLI path can read the same binding
+/// answers when connecting a live validator client for `op credentials
+/// requirements` (it needs `kubeconfig_context`).
+pub(crate) fn load_render_answers(
     store: &LocalFsStore,
     env: &greentic_deploy_spec::Environment,
     descriptor: &greentic_deploy_spec::PackDescriptor,

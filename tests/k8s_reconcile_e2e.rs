@@ -1,5 +1,5 @@
-//! Live-cluster E2E for `op env reconcile` + `op env apply-revision` (Phase D
-//! PR-5.3).
+//! Live-cluster E2E for `op env reconcile`, `op env apply-revision`, and
+//! `op credentials requirements` (Phase D PR-5.3).
 //!
 //! These are the first deployer verbs that drive a *connected* cluster:
 //! `reconcile` converges the whole env (apply desired state + prune absent
@@ -18,10 +18,12 @@
 //!   - they shell out to `kubectl` and the cargo-built binary, talking to the
 //!     ambient kubeconfig current-context (kind in CI).
 //!
-//! Both tests share one env id (`local` → namespace `gtc-local`) on the one
-//! kind cluster, so each resets the namespace at the start (best-effort, waits
-//! for any prior Terminating to finish) to stay order-independent. The CI job
-//! also runs them with `--test-threads=1`.
+//! All three use the env id `local` (→ namespace `gtc-local`). The two
+//! reconcile/apply-revision tests mutate that namespace on the one kind
+//! cluster, so each resets it at the start (best-effort, waits for any prior
+//! Terminating to finish) to stay order-independent; the credentials test is a
+//! read-only SSAR permission check that touches no namespace state. The CI job
+//! runs them with `--test-threads=1`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -103,14 +105,10 @@ fn reset_namespace() {
     let _ = kubectl(&["delete", "namespace", NAMESPACE, "--ignore-not-found"]);
 }
 
-/// Run the full setup ceremony (create env → bind the K8s deployer →
-/// bootstrap the trust root → add a bundle → stage + warm a revision) and
-/// return the warmed revision id. The revision ends up `Ready` (cluster
-/// presence) but nothing has touched the cluster yet — stage/warm are
-/// desired-state-only; `reconcile` / `apply-revision` are the first verbs to
-/// reach the API server.
-fn provision_ready_revision(store: &Path) -> String {
-    // 1. Create the env and bind the K8s deployer (namespace → gtc-local).
+/// Create the env and bind the K8s deployer (namespace → `gtc-local`). The
+/// minimum setup before any cluster-touching verb — shared by the reconcile /
+/// apply-revision ceremony and the credentials probe.
+fn bind_k8s_env(store: &Path) {
     let create = payload(
         store,
         "create.json",
@@ -128,6 +126,38 @@ fn provision_ready_revision(store: &Path) -> String {
         }),
     );
     op(store, Some(&bind), &["env-packs", "add"]);
+}
+
+/// Stamp a `credentials_ref` on the stored env through the public
+/// [`EnvironmentStore`](greentic_deployer::environment::EnvironmentStore) API.
+///
+/// The K8s deployer reports `requires_credentials_material() == true`, so the
+/// requirements runner rejects an env without one — but there is no CLI verb
+/// to supply it (it normally arrives via the setup wizard). The ambient-identity
+/// probe (`bound_token = None`) ignores the ref's value; it validates the
+/// kubeconfig identity, so any well-formed ref unblocks the check.
+fn set_credentials_ref(store: &Path) {
+    use greentic_deploy_spec::{EnvId, SecretRef};
+    use greentic_deployer::environment::{EnvironmentStore, LocalFsStore};
+
+    let api = LocalFsStore::new(store);
+    let mut env = api
+        .load(&EnvId::try_from(ENV_ID).expect("env id"))
+        .expect("load env to stamp credentials_ref");
+    env.credentials_ref =
+        Some(SecretRef::try_new("secret://local/k8s/ambient").expect("well-formed ref"));
+    api.save(&env).expect("save env with credentials_ref");
+}
+
+/// Run the full setup ceremony (create env → bind the K8s deployer →
+/// bootstrap the trust root → add a bundle → stage + warm a revision) and
+/// return the warmed revision id. The revision ends up `Ready` (cluster
+/// presence) but nothing has touched the cluster yet — stage/warm are
+/// desired-state-only; `reconcile` / `apply-revision` are the first verbs to
+/// reach the API server.
+fn provision_ready_revision(store: &Path) -> String {
+    // 1. Create the env and bind the K8s deployer (namespace → gtc-local).
+    bind_k8s_env(store);
 
     // 2. Bootstrap the trust root (the revenue-policy writer in `bundles add`
     //    refuses to sign without the operator key trusted for this env).
@@ -289,6 +319,57 @@ fn reconcile_applies_then_prunes_against_a_live_cluster() {
         "--ignore-not-found",
         "--wait=false",
     ]);
+}
+
+/// `op credentials requirements` against a live cluster: the wiring connects a
+/// real `KubeValidatorClient` and runs `SelfSubjectReview` (identity) plus one
+/// `SelfSubjectAccessReview` per validated operation. kind's default kubeconfig
+/// is cluster-admin, so identity resolves and every op is Allowed → overall
+/// `pass`. This is the only coverage of the SSAR sweep against a real API
+/// server — the unit tests drive a `tower-test` mock and never open a socket.
+///
+/// SSAR is a read-only permission check: it touches no namespace state, so this
+/// test needs no reset/cleanup and is independent of the reconcile tests.
+#[test]
+fn credentials_requirements_passes_against_a_live_cluster() {
+    if !armed() {
+        return;
+    }
+    let store = tempfile::tempdir().expect("tempdir");
+    let store = store.path();
+
+    bind_k8s_env(store);
+    set_credentials_ref(store);
+
+    // `credentials requirements` takes the env via the `--answers` payload
+    // (a unit clap verb), unlike reconcile / apply-revision's positional env.
+    let req = payload(
+        store,
+        "creds_req.json",
+        serde_json::json!({"environment_id": ENV_ID}),
+    );
+    let out = op(store, Some(&req), &["credentials", "requirements"]);
+    let result = &out["result"];
+    assert_eq!(
+        result["result"], "pass",
+        "kind admin resolves identity and is allowed every validated op: {result}"
+    );
+    assert_eq!(
+        result["missing_capabilities"].as_array().map(Vec::len),
+        Some(0),
+        "no capability is missing under cluster-admin: {result}"
+    );
+    let checks = result["checks"].as_array().expect("checks array");
+    assert!(
+        checks
+            .iter()
+            .any(|c| c["capability"]["id"] == "k8s.api.reachable" && c["status"] == "pass"),
+        "the reachability probe ran and passed: {result}"
+    );
+    assert!(
+        checks.len() > 1,
+        "reachable + one SSAR check per validated operation: {result}"
+    );
 }
 
 #[test]
