@@ -54,7 +54,13 @@ use crate::environment::runtime_config::materialize_runtime_config;
 /// Sandbox-default runtime image (S1). Tag-pinned for the sandbox only —
 /// production requires a digest-pinned ref supplied via the env-pack
 /// wizard (`runtime_image`).
-pub const DEFAULT_RUNTIME_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless:latest";
+///
+/// Develop-lane value: `:develop` is the next-dev image (published by
+/// greentic-start's `distroless-dev.yml`) that ships the `start --env` serve
+/// boot, so sandbox pods actually serve `/healthz`. The stable `main` lane
+/// uses `:latest`; keep these in sync when forward-porting — `:develop` must
+/// not land on `main`.
+pub const DEFAULT_RUNTIME_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless:develop";
 
 /// Stable name of the router Deployment / Service / PDB.
 pub const ROUTER_NAME: &str = "gtc-router";
