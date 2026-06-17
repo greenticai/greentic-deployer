@@ -42,6 +42,8 @@
 //! (`kubectl create token`, per the plan's no-long-lived-bearer-token
 //! rule), and binds it via `op credentials rotate`.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::credentials::{
@@ -178,15 +180,32 @@ pub trait K8sValidatorClient: std::fmt::Debug + Send + Sync {
     ) -> Result<Vec<OperationDecision>, K8sClientError>;
 }
 
+/// Future yielded by a [`K8sValidatorConnector`].
+pub type K8sValidatorConnectFut =
+    Pin<Box<dyn Future<Output = Result<Arc<dyn K8sValidatorClient>, K8sClientError>> + Send>>;
+
+/// Lazily produces a connected validator client INSIDE the probe runtime.
+///
+/// A `kube::Client`'s tower `Buffer` worker is spawned on whichever runtime
+/// first drives the connect future and is aborted when that runtime is
+/// dropped. [`run_k8s_async`] runs each future on a dedicated thread with its
+/// own current-thread runtime and drops it on return, so the connect and the
+/// probes MUST share a single `run_k8s_async` call — a client connected in an
+/// earlier bridge call would hand `validate` a dead worker (`buffer's worker
+/// closed unexpectedly`). The connector defers the connect into the probe
+/// runtime; tests supply one that just returns a mock.
+pub type K8sValidatorConnector = Arc<dyn Fn() -> K8sValidatorConnectFut + Send + Sync>;
+
 /// K8s deployer credentials handler.
 ///
-/// `Default` holds no client (every probe fails closed);
-/// [`with_client`](Self::with_client) injects a mock in tests and a
-/// connected [`KubeValidatorClient`](super::kube_client::KubeValidatorClient)
-/// once the PR-5.3 wiring constructs one.
-#[derive(Debug, Default)]
+/// `Default` holds no connector (every probe fails closed);
+/// [`with_client`](Self::with_client) injects a mock in tests and
+/// [`with_connector`](Self::with_connector) defers a live
+/// [`KubeValidatorClient`](super::kube_client::KubeValidatorClient) connect
+/// into the probe runtime.
+#[derive(Default)]
 pub struct K8sDeployerCredentials {
-    client: Option<Arc<dyn K8sValidatorClient>>,
+    connect: Option<K8sValidatorConnector>,
     /// Namespace the SSAR sweep is scoped to. `None` ⇒ the env-derived
     /// `namespace_for_env`; the CLI sets it from the binding answers'
     /// resolved `K8sParams::namespace` so requirements probes the EXACT
@@ -195,10 +214,33 @@ pub struct K8sDeployerCredentials {
     namespace: Option<String>,
 }
 
+impl std::fmt::Debug for K8sDeployerCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The connector is a closure (no `Debug`); surface only whether one
+        // is bound — that's all any caller diagnoses on.
+        f.debug_struct("K8sDeployerCredentials")
+            .field("connect", &self.connect.is_some())
+            .field("namespace", &self.namespace)
+            .finish()
+    }
+}
+
 impl K8sDeployerCredentials {
+    /// Inject an already-connected validator (tests / mock). The connector
+    /// simply hands it back inside the probe runtime.
     pub fn with_client(client: Arc<dyn K8sValidatorClient>) -> Self {
+        Self::with_connector(Arc::new(move || -> K8sValidatorConnectFut {
+            let client = client.clone();
+            Box::pin(async move { Ok(client) })
+        }))
+    }
+
+    /// Connect a live validator lazily, inside the probe runtime. See
+    /// [`K8sValidatorConnector`] for why connect + probes must share a
+    /// runtime.
+    pub fn with_connector(connect: K8sValidatorConnector) -> Self {
         Self {
-            client: Some(client),
+            connect: Some(connect),
             namespace: None,
         }
     }
@@ -266,8 +308,8 @@ impl DeployerCredentials for K8sDeployerCredentials {
     fn validate(&self, ctx: &ValidationContext<'_>) -> RequirementsReport {
         let caps = self.required_capabilities();
 
-        let Some(client) = self.client.as_ref() else {
-            // No client bound — Fail, not Skipped.
+        let Some(connect) = self.connect.as_ref() else {
+            // No connector bound — Fail, not Skipped.
             // `RequirementsReport::passed()` treats Skipped as
             // non-blocking, so an all-Skipped report would persist
             // `result: pass` even though zero capabilities were actually
@@ -290,13 +332,6 @@ impl DeployerCredentials for K8sDeployerCredentials {
             );
         };
 
-        if let Err(e) = run_k8s_async(client.who_am_i()) {
-            // No usable identity — fail every cap (a deployer that
-            // requires credential material treats this as auth failure,
-            // not a skip), mirroring the AWS chain-missing posture.
-            return all_failed(&caps, &format!("SelfSubjectReview failed: {e}"));
-        }
-
         // Scope the SSARs to the namespace reconcile actually deploys into
         // (the binding answers' resolved namespace), falling back to the
         // env-derived default when the caller did not supply one.
@@ -304,15 +339,40 @@ impl DeployerCredentials for K8sDeployerCredentials {
             .namespace
             .clone()
             .unwrap_or_else(|| namespace_for_env(ctx.env_id));
-        let decisions =
-            match run_k8s_async(client.review_access(&namespace, VALIDATED_K8S_OPERATIONS)) {
-                Ok(v) => v,
-                Err(e) => {
-                    return self.reachable_pass_ops_failed(&format!(
-                        "SelfSubjectAccessReview failed: {e}"
-                    ));
-                }
-            };
+
+        // Connect + identity + access probes all run on ONE runtime. A
+        // kube::Client's tower Buffer worker is bound to the runtime that
+        // spawned it, and `run_k8s_async` drops its runtime after each call —
+        // connecting in a separate bridge call would hand us a dead worker
+        // (`buffer's worker closed unexpectedly`). See `K8sValidatorConnector`.
+        let connector = Arc::clone(connect);
+        let decisions = match run_k8s_async(async move {
+            let connect_fn = connector.as_ref();
+            let client = connect_fn().await.map_err(K8sProbeError::Connect)?;
+            client.who_am_i().await.map_err(K8sProbeError::Identity)?;
+            client
+                .review_access(&namespace, VALIDATED_K8S_OPERATIONS)
+                .await
+                .map_err(K8sProbeError::Access)
+        }) {
+            Ok(v) => v,
+            Err(K8sProbeError::Connect(e)) => {
+                // Couldn't even reach/authenticate — the reachability cap
+                // (and every op) fails closed, same posture as a failed
+                // identity probe.
+                return all_failed(&caps, &format!("Kubernetes API unreachable: {e}"));
+            }
+            Err(K8sProbeError::Identity(e)) => {
+                // No usable identity — fail every cap (a deployer that
+                // requires credential material treats this as auth failure,
+                // not a skip), mirroring the AWS chain-missing posture.
+                return all_failed(&caps, &format!("SelfSubjectReview failed: {e}"));
+            }
+            Err(K8sProbeError::Access(e)) => {
+                return self
+                    .reachable_pass_ops_failed(&format!("SelfSubjectAccessReview failed: {e}"));
+            }
+        };
 
         // Validate response shape BEFORE building per-op checks: a
         // partial or mis-ordered response must never authorize.
@@ -390,6 +450,16 @@ impl DeployerCredentials for K8sDeployerCredentials {
             bound_credentials_ref: None,
         })
     }
+}
+
+/// Where the live K8s probe sequence failed. `Connect`/`Identity` mean the
+/// API was unreachable or the credential resolves to no identity → every cap
+/// fails closed; `Access` means reachability passed but the SSAR sweep itself
+/// errored → reachability passes, ops fail.
+enum K8sProbeError {
+    Connect(K8sClientError),
+    Identity(K8sClientError),
+    Access(K8sClientError),
 }
 
 /// Every-capability-failed report with one shared reason.

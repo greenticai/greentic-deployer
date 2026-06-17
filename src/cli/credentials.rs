@@ -368,7 +368,9 @@ fn connected_k8s_credentials(
 ) -> Result<Option<K8sDeployerCredentials>, OpError> {
     use crate::cli::env::load_render_answers;
     use crate::env_packs::k8s::K8sDeployerHandler;
-    use crate::env_packs::k8s::async_bridge::run_k8s_async;
+    use crate::env_packs::k8s::credentials::{
+        K8sValidatorClient, K8sValidatorConnectFut, K8sValidatorConnector,
+    };
     use crate::env_packs::k8s::kube_client::{KubeValidatorClient, connect};
     use crate::env_packs::k8s::manifests::{K8sParams, kubeconfig_context_from_answers};
     use std::sync::Arc;
@@ -395,11 +397,20 @@ fn connected_k8s_credentials(
     let namespace = K8sParams::from_answers(&env, answers.as_ref())
         .map_err(|e| OpError::Conflict(format!("invalid K8s answers: {e}")))?
         .namespace;
-    let client = run_k8s_async(connect(kubeconfig_context.as_deref(), None))
-        .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
+    // Defer the connect into the probe runtime instead of connecting here: a
+    // kube::Client's tower Buffer worker is bound to the runtime that spawned
+    // it, and `run_k8s_async` drops its runtime after each call, so a client
+    // connected in this (separate) bridge call would reach `validate` with a
+    // dead worker. The connector runs connect + probes on one runtime.
+    let connector: K8sValidatorConnector = Arc::new(move || -> K8sValidatorConnectFut {
+        let kubeconfig_context = kubeconfig_context.clone();
+        Box::pin(async move {
+            let client = connect(kubeconfig_context.as_deref(), None).await?;
+            Ok(Arc::new(KubeValidatorClient::new(client)) as Arc<dyn K8sValidatorClient>)
+        })
+    });
     Ok(Some(
-        K8sDeployerCredentials::with_client(Arc::new(KubeValidatorClient::new(client)))
-            .in_namespace(namespace),
+        K8sDeployerCredentials::with_connector(connector).in_namespace(namespace),
     ))
 }
 
