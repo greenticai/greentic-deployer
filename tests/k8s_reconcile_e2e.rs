@@ -116,24 +116,37 @@ fn reset_namespace() {
 
 /// Create the env and bind the K8s deployer (namespace → `gtc-local`). The
 /// minimum setup before any cluster-touching verb — shared by the reconcile /
-/// apply-revision ceremony and the credentials probe.
-fn bind_k8s_env(store: &Path) {
+/// apply-revision ceremony and the credentials probe. When `runtime_image` is
+/// `Some`, it is recorded as the deployer-slot `runtime_image` answer (via
+/// `answers_ref`) so the rendered worker/router pods use it instead of the
+/// default published image.
+fn bind_k8s_env(store: &Path, runtime_image: Option<&str>) {
     let create = payload(
         store,
         "create.json",
         serde_json::json!({"environment_id": ENV_ID, "name": ENV_ID}),
     );
     op(store, Some(&create), &["env", "create"]);
-    let bind = payload(
-        store,
-        "bind.json",
-        serde_json::json!({
-            "environment_id": ENV_ID,
-            "slot": "deployer",
-            "kind": "greentic.deployer.k8s@1.0.0",
-            "pack_ref": "builtin",
-        }),
-    );
+    let mut bind_doc = serde_json::json!({
+        "environment_id": ENV_ID,
+        "slot": "deployer",
+        "kind": "greentic.deployer.k8s@1.0.0",
+        "pack_ref": "builtin",
+    });
+    if let Some(image) = runtime_image {
+        // The render/reconcile path reads the deployer-slot answers from the
+        // binding's `answers_ref` — a file under the env dir (which `env
+        // create` just made).
+        let answers_rel = "deployer-answers.json";
+        std::fs::write(
+            store.join(ENV_ID).join(answers_rel),
+            serde_json::to_vec(&serde_json::json!({"runtime_image": image}))
+                .expect("answers serialize"),
+        )
+        .expect("write deployer answers");
+        bind_doc["answers_ref"] = serde_json::json!(answers_rel);
+    }
+    let bind = payload(store, "bind.json", bind_doc);
     op(store, Some(&bind), &["env-packs", "add"]);
 }
 
@@ -217,9 +230,9 @@ fn requirements_with_token(store: &Path, token: &str) -> Value {
 /// presence) but nothing has touched the cluster yet — stage/warm are
 /// desired-state-only; `reconcile` / `apply-revision` are the first verbs to
 /// reach the API server.
-fn provision_ready_revision(store: &Path) -> String {
+fn provision_ready_revision(store: &Path, runtime_image: Option<&str>) -> String {
     // 1. Create the env and bind the K8s deployer (namespace → gtc-local).
-    bind_k8s_env(store);
+    bind_k8s_env(store, runtime_image);
 
     // 2. Bootstrap the trust root (the revenue-policy writer in `bundles add`
     //    refuses to sign without the operator key trusted for this env).
@@ -305,10 +318,17 @@ fn apply_revision(store: &Path, revision_id: &str) -> String {
 /// Drive `op env apply-revision` expecting the warm readiness gate to FAIL,
 /// returning the parsed error JSON.
 ///
-/// In kind the placeholder worker image never serves `/healthz`, so the pod
-/// never becomes available and `warm_revision`'s readiness wait times out. A
-/// short `GREENTIC_K8S_WARM_READY_TIMEOUT_SECS` keeps the gate observable
-/// without a multi-minute hang (the default is 5 minutes).
+/// This exercises the BLOCK path: the worker never becomes ready, so
+/// `warm_revision`'s readiness wait times out. It relies on the DEFAULT
+/// runtime image ([`DEFAULT_RUNTIME_IMAGE`], the published `:latest`) not
+/// serving `/healthz` under the new `start --env` boot — that image predates
+/// the bundle-less serve path and exits immediately. The positive path (a
+/// real serving image reaches Ready) is covered by
+/// `worker_reaches_ready_and_serves_healthz_with_a_serving_image`. NOTE: once
+/// a serving `:latest` is published, point this test at a deliberately-unready
+/// image (via a `runtime_image` answer) so it keeps testing the gate, not the
+/// image. A short `GREENTIC_K8S_WARM_READY_TIMEOUT_SECS` keeps the gate
+/// observable without a multi-minute hang (the default is 5 minutes).
 fn apply_revision_expect_not_ready(store: &Path, revision_id: &str) -> Value {
     let mut cmd = Command::new(deployer_bin());
     cmd.arg("op").arg("--store-root").arg(store);
@@ -334,16 +354,18 @@ fn reconcile_applies_then_prunes_against_a_live_cluster() {
     let store = tempfile::tempdir().expect("tempdir");
     let store = store.path();
 
-    let revision_id = provision_ready_revision(store);
+    let revision_id = provision_ready_revision(store, None);
     // Worker objects are named after the lowercased revision ULID.
     let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
 
-    // Reconcile → applies the env-level set (9) + the warmed revision's worker
-    // pair (2). Verify both the verb's self-report and ground truth.
+    // Reconcile → applies the env-level set (10: namespace, env-store +
+    // runtime-config ConfigMaps, router Deployment/Service/PDB, 4 NetworkPolicies)
+    // + the warmed revision's worker pair (2). Verify both the verb's self-report
+    // and ground truth.
     let (applied, pruned) = reconcile(store);
     assert_eq!(
         (applied, pruned),
-        (11, 0),
+        (12, 0),
         "first reconcile applies env-level + worker pair, prunes nothing"
     );
     assert!(
@@ -366,7 +388,7 @@ fn reconcile_applies_then_prunes_against_a_live_cluster() {
     // Reconcile again → declarative upsert is idempotent: same applied set,
     // nothing pruned, worker still present.
     let (applied2, pruned2) = reconcile(store);
-    assert_eq!((applied2, pruned2), (11, 0), "reconcile is idempotent");
+    assert_eq!((applied2, pruned2), (12, 0), "reconcile is idempotent");
     assert!(
         object_exists("deployment", &worker, Some(NAMESPACE)),
         "worker survives idempotent reconcile"
@@ -380,7 +402,7 @@ fn reconcile_applies_then_prunes_against_a_live_cluster() {
     let (applied3, pruned3) = reconcile(store);
     assert_eq!(
         (applied3, pruned3),
-        (9, 2),
+        (10, 2),
         "reconcile prunes the now-absent revision's worker pair"
     );
     assert!(
@@ -433,7 +455,7 @@ fn credentials_requirements_reflects_the_bound_serviceaccount_identity() {
     let store = tempfile::tempdir().expect("tempdir");
     let store = store.path();
 
-    bind_k8s_env(store);
+    bind_k8s_env(store, None);
     set_credentials_ref(store, CREDS_REF);
 
     // Stand up the two ServiceAccounts in a dedicated namespace (best-effort
@@ -525,21 +547,22 @@ fn apply_revision_warm_gate_blocks_unready_worker_then_archives_against_a_live_c
     let store = tempfile::tempdir().expect("tempdir");
     let store = store.path();
 
-    let revision_id = provision_ready_revision(store);
+    let revision_id = provision_ready_revision(store, None);
     let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
 
     // Establish the env-level set (namespace + router) so the surgical
     // apply-revision has somewhere to land. apply-revision only touches the
     // one revision's worker pair — it assumes the env already exists.
     let (applied, _) = reconcile(store);
-    assert_eq!(applied, 11, "reconcile establishes env-level + worker pair");
+    assert_eq!(applied, 12, "reconcile establishes env-level + worker pair");
 
     // apply-revision on the Ready (present) revision → warm branch. warm
-    // re-upserts the worker pair, then waits for the rollout. The placeholder
-    // distroless image never serves `/healthz`, so the pod never becomes
-    // available and the readiness gate FAILS the warm rather than promoting a
-    // non-serving worker — the live-cluster proof that the gate reads real
-    // Deployment status (`observedGeneration` + `availableReplicas`) and blocks.
+    // re-upserts the worker pair, then waits for the rollout. The DEFAULT image
+    // (`:latest`) predates the `start --env` serve boot and exits immediately,
+    // so the pod never becomes available and the readiness gate FAILS the warm
+    // rather than promoting a non-serving worker — the live-cluster proof that
+    // the gate reads real Deployment status (`observedGeneration` +
+    // `availableReplicas`) and blocks.
     let err = apply_revision_expect_not_ready(store, &revision_id);
     assert_eq!(
         err["error"]["kind"], "conflict",
@@ -583,6 +606,92 @@ fn apply_revision_warm_gate_blocks_unready_worker_then_archives_against_a_live_c
     assert!(
         object_exists("deployment", ROUTER_DEPLOY, Some(NAMESPACE)),
         "env-level router survives apply-revision archive"
+    );
+
+    let _ = kubectl(&[
+        "delete",
+        "namespace",
+        NAMESPACE,
+        "--ignore-not-found",
+        "--wait=false",
+    ]);
+}
+
+/// The positive path: given a runtime image that actually serves `/healthz`
+/// under the `start --env` boot, the worker Deployment becomes Ready (its
+/// readiness probe passes) and `apply-revision` warm SUCCEEDS — the inverse of
+/// the warm-gate-blocks test above.
+///
+/// Gated on `GREENTIC_K8S_SERVING_IMAGE` (a serving image already loaded into
+/// the cluster, e.g. `kind load docker-image greentic-start-distroless:<tag>`)
+/// ON TOP OF the usual `GREENTIC_K8S_E2E` gate. Normal CI has no fresh serving
+/// image — the published `:latest` ([`DEFAULT_RUNTIME_IMAGE`]) predates the
+/// bundle-less serve boot — so this test skips there until a serving `:latest`
+/// is published.
+#[test]
+fn worker_reaches_ready_and_serves_healthz_with_a_serving_image() {
+    if !armed() {
+        return;
+    }
+    let image = match std::env::var("GREENTIC_K8S_SERVING_IMAGE") {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => {
+            eprintln!(
+                "skipping serving test: set GREENTIC_K8S_SERVING_IMAGE to a serving image \
+                 already loaded into the cluster (e.g. greentic-start-distroless:<tag>)"
+            );
+            return;
+        }
+    };
+    reset_namespace();
+    let store = tempfile::tempdir().expect("tempdir");
+    let store = store.path();
+
+    // Provision with the worker/router image pinned to the serving image.
+    let revision_id = provision_ready_revision(store, Some(&image));
+    let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
+
+    let (applied, _) = reconcile(store);
+    assert_eq!(applied, 12, "reconcile applies env-level + worker pair");
+
+    // The worker's readiness probe hits `/healthz`, so "rollout complete" ==
+    // "the bundle-less boot is serving `/healthz` on the pod IP". This is the
+    // first live proof a Greentic worker actually serves over HTTP in K8s.
+    let status = kubectl(&[
+        "rollout",
+        "status",
+        &format!("deployment/{worker}"),
+        "-n",
+        NAMESPACE,
+        "--timeout=120s",
+    ]);
+    assert!(
+        status.status.success(),
+        "worker rollout must complete (serving image reaches Ready):\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr),
+    );
+
+    // The router (same image) likewise becomes Available.
+    let router_status = kubectl(&[
+        "rollout",
+        "status",
+        &format!("deployment/{ROUTER_DEPLOY}"),
+        "-n",
+        NAMESPACE,
+        "--timeout=120s",
+    ]);
+    assert!(
+        router_status.status.success(),
+        "router rollout must complete with the serving image"
+    );
+
+    // And the warm readiness gate now SUCCEEDS where it blocked the
+    // non-serving default — apply-revision promotes the Ready worker.
+    let action = apply_revision(store, &revision_id);
+    assert_eq!(
+        action, "warmed",
+        "apply-revision warms the now-serving worker"
     );
 
     let _ = kubectl(&[

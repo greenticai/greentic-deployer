@@ -65,6 +65,32 @@ pub const RUNTIME_CONFIG_MAP_NAME: &str = "gtc-runtime-config";
 /// Port every Greentic pod serves on; Services expose the same port.
 const SERVE_PORT: u16 = 8080;
 
+/// Writable in-pod path mounted as `$HOME`. `greentic-start`'s bundle-less
+/// boot roots its env store at `$HOME/.greentic/environments/<env_id>/`, so
+/// the init container stages `environment.json` there and every runtime write
+/// (logs, `.lock`, watcher state) lands on this volume — required because the
+/// container runs with `readOnlyRootFilesystem`.
+const STAGE_HOME: &str = "/var/greentic";
+
+/// Read-only mount of the env-store ConfigMap the init container copies from.
+const ENV_STORE_SRC: &str = "/etc/greentic/env-store";
+
+/// Pod volume names: the writable HOME, a writable `/tmp`, and the read-only
+/// env-store source.
+const HOME_VOLUME: &str = "greentic-home";
+const TMP_VOLUME: &str = "tmp";
+const ENV_STORE_SRC_VOLUME: &str = "env-store-src";
+
+/// Name of the ConfigMap carrying the serialized `environment.json` the init
+/// container stages into the env store.
+pub const ENV_STORE_CONFIG_MAP_NAME: &str = "gtc-env-store";
+
+/// Minimal init image (ships `sh`/`cp`/`mkdir`) used to stage the env store
+/// into the writable HOME volume — the runtime image is distroless (no shell).
+/// M1 scaffold: M2 replaces this with the distributor-pull init container that
+/// also stages the runtime-config and the revision's packs.
+const STAGE_INIT_IMAGE: &str = "busybox:1.36.1";
+
 /// Operator-tunable knobs for the rendered manifests.
 ///
 /// [`K8sParams::for_env`] derives the sandbox defaults from the env
@@ -413,14 +439,84 @@ pub fn render_namespace(env: &Environment, params: &K8sParams) -> Value {
     })
 }
 
+/// Runtime entrypoint args shared by router + worker: the new-model
+/// bundle-less serve boot (`greentic-start start --env <id>`). The image
+/// ENTRYPOINT is `greentic-start`; these become its arguments. The boot reads
+/// the env store staged under `$HOME` and binds [`SERVE_PORT`], answering
+/// `/healthz` once up.
+fn runtime_boot_args(env: &Environment) -> Value {
+    json!(["start", "--env", env.environment_id.as_str()])
+}
+
+/// Boot env shared by router + worker. `GREENTIC_GATEWAY_LISTEN_ADDR=0.0.0.0`
+/// binds all interfaces (the kubelet probes the pod IP, not loopback, so the
+/// runtime's `127.0.0.1` default would make every probe fail); `HOME` roots
+/// the env store on the writable staging volume.
+fn runtime_boot_env(env: &Environment) -> Vec<Value> {
+    vec![
+        json!({"name": "GREENTIC_ENV_ID", "value": env.environment_id.as_str()}),
+        json!({"name": "HOME", "value": STAGE_HOME}),
+        json!({"name": "GREENTIC_GATEWAY_LISTEN_ADDR", "value": "0.0.0.0"}),
+    ]
+}
+
+/// Main-container volume mounts shared by router + worker: the writable HOME
+/// (env store + runtime writes) and a writable `/tmp` (the root filesystem is
+/// read-only).
+fn runtime_volume_mounts() -> Value {
+    json!([
+        {"name": HOME_VOLUME, "mountPath": STAGE_HOME},
+        {"name": TMP_VOLUME, "mountPath": "/tmp"},
+    ])
+}
+
+/// Pod volumes shared by router + worker: writable HOME + `/tmp` emptyDirs and
+/// the read-only env-store ConfigMap the init container copies from.
+fn runtime_pod_volumes() -> Value {
+    json!([
+        {"name": HOME_VOLUME, "emptyDir": {}},
+        {"name": TMP_VOLUME, "emptyDir": {}},
+        {"name": ENV_STORE_SRC_VOLUME, "configMap": {"name": ENV_STORE_CONFIG_MAP_NAME}},
+    ])
+}
+
+/// Init container that stages the env store into the writable HOME volume at
+/// the path `greentic-start` reads (`$HOME/.greentic/environments/<env_id>/`).
+/// M1 stages only `environment.json` (→ an empty runtime-config → the
+/// "serving probes only" boot). M2 replaces this with the distributor-pull
+/// container that also stages the runtime-config and the revision's packs.
+///
+/// Assumes a simple (RFC 1123-ish) env id so the path segment matches the
+/// store's; the sandbox env ids the wizard accepts satisfy this.
+fn env_store_init_container(env: &Environment) -> Value {
+    let dst = format!(
+        "{STAGE_HOME}/.greentic/environments/{}",
+        env.environment_id.as_str()
+    );
+    json!({
+        "name": "stage-env-store",
+        "image": STAGE_INIT_IMAGE,
+        "securityContext": container_security_context(),
+        "command": [
+            "sh",
+            "-c",
+            format!("set -eu; mkdir -p '{dst}'; cp {ENV_STORE_SRC}/environment.json '{dst}/environment.json'"),
+        ],
+        "volumeMounts": [
+            {"name": ENV_STORE_SRC_VOLUME, "mountPath": ENV_STORE_SRC, "readOnly": true},
+            {"name": HOME_VOLUME, "mountPath": STAGE_HOME},
+        ],
+    })
+}
+
 /// One revision's worker Deployment (plan step 4).
 ///
 /// The pod carries its full revision identity as environment variables
 /// (`GREENTIC_ENV_ID` / `GREENTIC_REVISION_ID` / `GREENTIC_DEPLOYMENT_ID`
-/// / `GREENTIC_BUNDLE_ID` / `GREENTIC_BUNDLE_DIGEST`) so the runtime
-/// entrypoint can resolve and verify its bundle. Bundle DELIVERY into the
-/// pod (distributor-pull init container vs. baked image) is decided in
-/// PR-5.3; the identity contract here is delivery-agnostic.
+/// / `GREENTIC_BUNDLE_ID` / `GREENTIC_BUNDLE_DIGEST`) — the serve process
+/// boots from the staged env store, while the revision-identity vars are the
+/// contract the M2 distributor-pull init container reads to fetch the
+/// revision's packs.
 ///
 /// Readiness probes `/healthz` today; the per-revision
 /// `/healthz/<revision_id>` route is the acceptance-gate target once
@@ -431,6 +527,13 @@ pub fn render_worker_deployment(
     params: &K8sParams,
 ) -> Value {
     let labels = worker_selector_labels(env, revision);
+    let mut env_vars = runtime_boot_env(env);
+    env_vars.extend([
+        json!({"name": "GREENTIC_REVISION_ID", "value": revision.revision_id.0.to_string()}),
+        json!({"name": "GREENTIC_DEPLOYMENT_ID", "value": revision.deployment_id.0.to_string()}),
+        json!({"name": "GREENTIC_BUNDLE_ID", "value": revision.bundle_id.as_str()}),
+        json!({"name": "GREENTIC_BUNDLE_DIGEST", "value": revision.bundle_digest}),
+    ]);
     json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -448,25 +551,23 @@ pub fn render_worker_deployment(
                 "metadata": {"labels": labels},
                 "spec": {
                     "securityContext": pod_security_context(),
+                    "initContainers": [env_store_init_container(env)],
                     "containers": [{
                         "name": "worker",
                         "image": params.runtime_image,
+                        "args": runtime_boot_args(env),
                         "securityContext": container_security_context(),
                         "resources": resource_baseline(),
                         "ports": [{"name": "http", "containerPort": SERVE_PORT}],
-                        "env": [
-                            {"name": "GREENTIC_ENV_ID", "value": env.environment_id.as_str()},
-                            {"name": "GREENTIC_REVISION_ID", "value": revision.revision_id.0.to_string()},
-                            {"name": "GREENTIC_DEPLOYMENT_ID", "value": revision.deployment_id.0.to_string()},
-                            {"name": "GREENTIC_BUNDLE_ID", "value": revision.bundle_id.as_str()},
-                            {"name": "GREENTIC_BUNDLE_DIGEST", "value": revision.bundle_digest},
-                        ],
+                        "env": Value::Array(env_vars),
+                        "volumeMounts": runtime_volume_mounts(),
                         "readinessProbe": {
                             "httpGet": {"path": "/healthz", "port": SERVE_PORT},
                             "initialDelaySeconds": 2,
                             "periodSeconds": 5,
                         },
                     }],
+                    "volumes": runtime_pod_volumes(),
                 },
             },
         },
@@ -558,34 +659,23 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
                         "whenUnsatisfiable": "ScheduleAnyway",
                         "labelSelector": {"matchLabels": labels},
                     }],
+                    "initContainers": [env_store_init_container(env)],
                     "containers": [{
                         "name": "router",
                         "image": params.runtime_image,
+                        "args": runtime_boot_args(env),
                         "securityContext": container_security_context(),
                         "resources": resource_baseline(),
                         "ports": [{"name": "http", "containerPort": SERVE_PORT}],
-                        "env": [
-                            {"name": "GREENTIC_ENV_ID", "value": env.environment_id.as_str()},
-                            {
-                                "name": "GREENTIC_RUNTIME_CONFIG",
-                                "value": "/etc/greentic/runtime-config/runtime-config.json",
-                            },
-                        ],
-                        "volumeMounts": [{
-                            "name": "runtime-config",
-                            "mountPath": "/etc/greentic/runtime-config",
-                            "readOnly": true,
-                        }],
+                        "env": Value::Array(runtime_boot_env(env)),
+                        "volumeMounts": runtime_volume_mounts(),
                         "readinessProbe": {
                             "httpGet": {"path": "/healthz", "port": SERVE_PORT},
                             "initialDelaySeconds": 2,
                             "periodSeconds": 5,
                         },
                     }],
-                    "volumes": [{
-                        "name": "runtime-config",
-                        "configMap": {"name": RUNTIME_CONFIG_MAP_NAME},
-                    }],
+                    "volumes": runtime_pod_volumes(),
                 },
             },
         },
@@ -648,6 +738,29 @@ pub fn render_runtime_config_map(env: &Environment, params: &K8sParams) -> Value
             "labels": common_labels(env, "router"),
         },
         "data": {"runtime-config.json": payload},
+    })
+}
+
+/// The env-store ConfigMap: the serialized `environment.json` the init
+/// container stages into `$HOME/.greentic/environments/<env_id>/` so
+/// `greentic-start`'s bundle-less boot can `EnvironmentStore::load` it. On
+/// disk the store reads `environment.json` back as a plain [`Environment`]
+/// (`read_json::<Environment>` + `validate`), so re-serializing the same
+/// value round-trips. M1 stages only this document (no runtime-config → the
+/// "serving probes only" boot); M2 extends staging to the runtime-config and
+/// the revision's packs.
+pub fn render_env_store_config_map(env: &Environment, params: &K8sParams) -> Value {
+    let environment_json =
+        serde_json::to_string(env).expect("Environment serializes (pure spec types)");
+    json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": ENV_STORE_CONFIG_MAP_NAME,
+            "namespace": params.namespace,
+            "labels": common_labels(env, "env-store"),
+        },
+        "data": {"environment.json": environment_json},
     })
 }
 
@@ -730,16 +843,17 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
     ]
 }
 
-/// Every environment-level object, in apply order: Namespace, runtime
-/// ConfigMap (the router mounts it — must exist first), router
-/// Deployment + Service + PDB, NetworkPolicies. Per-revision worker
-/// objects are NOT included — they ride the revision lifecycle verbs.
+/// Every environment-level object, in apply order: Namespace, env-store
+/// ConfigMap + runtime ConfigMap (the pods stage / mount them — must exist
+/// first), router Deployment + Service + PDB, NetworkPolicies. Per-revision
+/// worker objects are NOT included — they ride the revision lifecycle verbs.
 /// `gtc op env render` emits this set (plus present-revision workers)
 /// through the [`ManifestRenderer`](crate::env_packs::render::ManifestRenderer)
 /// impl in [`super::render`].
 pub fn render_environment_manifests(env: &Environment, params: &K8sParams) -> Vec<Value> {
     let mut manifests = vec![
         render_namespace(env, params),
+        render_env_store_config_map(env, params),
         render_runtime_config_map(env, params),
         render_router_deployment(env, params),
         render_router_service(env, params),
@@ -960,6 +1074,11 @@ mod tests {
             assert!(c["resources"]["requests"]["cpu"].is_string());
             assert!(c["resources"]["limits"]["memory"].is_string());
             assert!(c["readinessProbe"]["httpGet"]["path"].is_string());
+            // The staging init container rides the same restricted profile.
+            let ic = &pod["initContainers"][0];
+            assert_eq!(ic["securityContext"]["allowPrivilegeEscalation"], false);
+            assert_eq!(ic["securityContext"]["readOnlyRootFilesystem"], true);
+            assert_eq!(ic["securityContext"]["capabilities"]["drop"][0], "ALL");
         }
     }
 
@@ -974,12 +1093,22 @@ mod tests {
         );
         let pdb = render_router_pdb(&env, &params);
         assert_eq!(pdb["spec"]["minAvailable"], 1);
-        // The router mounts the runtime-config ConfigMap read-only.
-        let mount = &d["spec"]["template"]["spec"]["containers"][0]["volumeMounts"][0];
-        assert_eq!(mount["readOnly"], true);
+        // The router boots the bundle-less serve path and stages the env store
+        // via the init container before the main container starts.
+        let pod = &d["spec"]["template"]["spec"];
         assert_eq!(
-            d["spec"]["template"]["spec"]["volumes"][0]["configMap"]["name"],
-            RUNTIME_CONFIG_MAP_NAME
+            pod["containers"][0]["args"],
+            serde_json::json!(["start", "--env", env.environment_id.as_str()])
+        );
+        assert_eq!(pod["initContainers"][0]["name"], "stage-env-store");
+        let cm_volume = pod["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["configMap"]["name"] == ENV_STORE_CONFIG_MAP_NAME);
+        assert!(
+            cm_volume.is_some(),
+            "router mounts the env-store ConfigMap as the init source"
         );
     }
 
@@ -990,6 +1119,55 @@ mod tests {
         let payload = cm["data"]["runtime-config.json"].as_str().unwrap();
         let expected = serde_json::to_string(&materialize_runtime_config(&env)).unwrap();
         assert_eq!(payload, expected, "the ConfigMap IS the projection");
+    }
+
+    #[test]
+    fn env_store_config_map_round_trips_to_a_loadable_environment() {
+        let (env, params) = fixture();
+        let cm = render_env_store_config_map(&env, &params);
+        assert_eq!(cm["metadata"]["name"], ENV_STORE_CONFIG_MAP_NAME);
+        let json = cm["data"]["environment.json"]
+            .as_str()
+            .expect("environment.json key");
+        // The init container drops this verbatim where greentic-start's
+        // bundle-less boot reads it; the store loads it back as a plain
+        // Environment, so it must deserialize, validate, and keep its id.
+        let parsed: Environment = serde_json::from_str(json).expect("environment.json parses");
+        parsed.validate().expect("staged environment validates");
+        assert_eq!(parsed.environment_id, env.environment_id);
+    }
+
+    #[test]
+    fn both_pods_boot_the_bundle_less_serve_path() {
+        let (env, params) = fixture();
+        let pods = [
+            render_worker_deployment(&env, &env.revisions[0], &params),
+            render_router_deployment(&env, &params),
+        ];
+        for d in &pods {
+            let pod = &d["spec"]["template"]["spec"];
+            // `greentic-start start --env <id>` — the new-model serve boot.
+            assert_eq!(
+                pod["containers"][0]["args"],
+                serde_json::json!(["start", "--env", env.environment_id.as_str()])
+            );
+            let envs = pod["containers"][0]["env"].as_array().unwrap();
+            let find = |name: &str| envs.iter().find(|e| e["name"] == name).map(|e| &e["value"]);
+            // Bind the pod IP, not the runtime's 127.0.0.1 default, or the
+            // kubelet readiness probe never reaches /healthz.
+            assert_eq!(find("GREENTIC_GATEWAY_LISTEN_ADDR").unwrap(), "0.0.0.0");
+            assert_eq!(find("HOME").unwrap(), STAGE_HOME);
+            // The init container stages environment.json into the env store.
+            let script = pod["initContainers"][0]["command"][2].as_str().unwrap();
+            assert!(
+                script.contains("environment.json"),
+                "init stages environment.json"
+            );
+            assert!(
+                script.contains(env.environment_id.as_str()),
+                "into the env's store dir"
+            );
+        }
     }
 
     #[test]
@@ -1020,11 +1198,14 @@ mod tests {
     fn environment_manifests_land_in_the_env_namespace_in_apply_order() {
         let (env, params) = fixture();
         let manifests = render_environment_manifests(&env, &params);
-        // Namespace first, ConfigMap before the router Deployment that
-        // mounts it.
+        // Namespace first, then both ConfigMaps (env-store + runtime-config)
+        // before the router Deployment that stages / mounts them.
         assert_eq!(manifests[0]["kind"], "Namespace");
         assert_eq!(manifests[1]["kind"], "ConfigMap");
-        assert_eq!(manifests[2]["kind"], "Deployment");
+        assert_eq!(manifests[1]["metadata"]["name"], ENV_STORE_CONFIG_MAP_NAME);
+        assert_eq!(manifests[2]["kind"], "ConfigMap");
+        assert_eq!(manifests[2]["metadata"]["name"], RUNTIME_CONFIG_MAP_NAME);
+        assert_eq!(manifests[3]["kind"], "Deployment");
         for m in &manifests[1..] {
             assert_eq!(
                 m["metadata"]["namespace"],
