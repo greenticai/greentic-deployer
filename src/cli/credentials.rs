@@ -370,7 +370,7 @@ fn connected_k8s_credentials(
     use crate::env_packs::k8s::K8sDeployerHandler;
     use crate::env_packs::k8s::async_bridge::run_k8s_async;
     use crate::env_packs::k8s::kube_client::{KubeValidatorClient, connect};
-    use crate::env_packs::k8s::manifests::kubeconfig_context_from_answers;
+    use crate::env_packs::k8s::manifests::{K8sParams, kubeconfig_context_from_answers};
     use std::sync::Arc;
 
     // If the env can't even be loaded, leave it to the runner to surface
@@ -390,11 +390,17 @@ fn connected_k8s_credentials(
     // context.
     let (answers, _wire) = load_render_answers(store, &env, &binding.kind)?;
     let kubeconfig_context = kubeconfig_context_from_answers(answers.as_ref());
+    // Probe the SAME namespace reconcile / apply-revision deploy into — the
+    // answers may override the env-derived default.
+    let namespace = K8sParams::from_answers(&env, answers.as_ref())
+        .map_err(|e| OpError::Conflict(format!("invalid K8s answers: {e}")))?
+        .namespace;
     let client = run_k8s_async(connect(kubeconfig_context.as_deref(), None))
         .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
-    Ok(Some(K8sDeployerCredentials::with_client(Arc::new(
-        KubeValidatorClient::new(client),
-    ))))
+    Ok(Some(
+        K8sDeployerCredentials::with_client(Arc::new(KubeValidatorClient::new(client)))
+            .in_namespace(namespace),
+    ))
 }
 
 /// `k8s-client`-less builds cannot connect a validator; the runner falls

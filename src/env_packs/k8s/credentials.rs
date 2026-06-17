@@ -95,6 +95,14 @@ const fn op(group: &'static str, resource: &'static str, verb: &'static str) -> 
 /// Deployments/Services carry `delete` (archive tears workers down);
 /// ConfigMaps/PDBs/NetworkPolicies are env-lifetime objects the deployer
 /// only upserts.
+///
+/// KNOWN GAP: this list is namespaced-only, but `reconcile` also applies the
+/// cluster-scoped Namespace object. A namespace-scoped deployer identity can
+/// therefore pass `requirements` yet fail `op env reconcile` on the Namespace
+/// get/patch. Closing it requires either dropping the deployer's steady-state
+/// Namespace apply (the bootstrap pack already creates it) or adding
+/// cluster-scoped Namespace validation + matching bootstrap RBAC — a separate
+/// slice spanning the credential contract and the namespace-apply trust model.
 pub const VALIDATED_K8S_OPERATIONS: &[K8sOperation] = &[
     op("apps", "deployments", "get"),
     op("apps", "deployments", "create"),
@@ -179,13 +187,27 @@ pub trait K8sValidatorClient: std::fmt::Debug + Send + Sync {
 #[derive(Debug, Default)]
 pub struct K8sDeployerCredentials {
     client: Option<Arc<dyn K8sValidatorClient>>,
+    /// Namespace the SSAR sweep is scoped to. `None` ⇒ the env-derived
+    /// `namespace_for_env`; the CLI sets it from the binding answers'
+    /// resolved `K8sParams::namespace` so requirements probes the EXACT
+    /// namespace reconcile / apply-revision deploy into (a custom
+    /// `namespace` answer would otherwise be probed at `gtc-<env>`).
+    namespace: Option<String>,
 }
 
 impl K8sDeployerCredentials {
     pub fn with_client(client: Arc<dyn K8sValidatorClient>) -> Self {
         Self {
             client: Some(client),
+            namespace: None,
         }
+    }
+
+    /// Scope the SSAR sweep to `namespace` instead of the env-derived
+    /// default — the namespace reconcile actually deploys into.
+    pub fn in_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = Some(namespace.into());
+        self
     }
 
     fn reachable_capability(&self) -> Capability {
@@ -275,7 +297,13 @@ impl DeployerCredentials for K8sDeployerCredentials {
             return all_failed(&caps, &format!("SelfSubjectReview failed: {e}"));
         }
 
-        let namespace = namespace_for_env(ctx.env_id);
+        // Scope the SSARs to the namespace reconcile actually deploys into
+        // (the binding answers' resolved namespace), falling back to the
+        // env-derived default when the caller did not supply one.
+        let namespace = self
+            .namespace
+            .clone()
+            .unwrap_or_else(|| namespace_for_env(ctx.env_id));
         let decisions =
             match run_k8s_async(client.review_access(&namespace, VALIDATED_K8S_OPERATIONS)) {
                 Ok(v) => v,
@@ -539,6 +567,30 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "gtc-zain-prod");
         assert_eq!(calls[0].1, VALIDATED_K8S_OPERATIONS.len());
+    }
+
+    /// `in_namespace` scopes the SSAR sweep to the binding answers' resolved
+    /// namespace (what reconcile deploys into), not the env-derived default —
+    /// otherwise a custom-namespace env probes the wrong namespace.
+    #[test]
+    fn validate_scopes_ssars_to_the_overridden_namespace() {
+        let mock = Arc::new(
+            MockK8sClient::default()
+                .with_identity(Ok(identity()))
+                .with_review(Ok(all_allowed())),
+        );
+        let creds = K8sDeployerCredentials::with_client(mock.clone()).in_namespace("custom-ns");
+        let env_id = EnvId::try_from("zain-prod").unwrap();
+        let hc = default_host_config(&env_id);
+        let dir = tempdir().unwrap();
+        let report = creds.validate(&ctx(dir.path(), &env_id, &hc));
+        assert!(report.passed(), "report: {report:?}");
+        let calls = mock.review_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].0, "custom-ns",
+            "SSARs must target the deploy namespace, not gtc-zain-prod"
+        );
     }
 
     #[test]
