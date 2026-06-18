@@ -59,10 +59,27 @@ pub struct RouteRow {
     /// Whether this row may currently receive traffic. Only `routable == true`
     /// rows are resolvable.
     pub routable: bool,
-    /// Traffic weight (0..=100). Carried through for parity with the SoRX
-    /// contract; weighted split across multiple routable rows for the same
-    /// alias is a follow-up (v1 picks the first routable row).
-    pub traffic: u32,
+    /// Traffic split for this row, mirrored from the SoRX contract (SoRX emits
+    /// `traffic` as an object, e.g. `{"mode":"all"}`, or omits it). Carried
+    /// through for parity; weighted split across multiple routable rows for the
+    /// same alias is a follow-up (v1 picks the first routable row). Optional and
+    /// `#[serde(default)]` so an absent/`null`/extended traffic shape from a
+    /// SoRX schema bump does not break alias resolution.
+    #[serde(default)]
+    pub traffic: Option<TrafficSplit>,
+}
+
+/// Traffic split descriptor mirrored from the SoRX routing-table contract
+/// (`{ "mode": "all" | "percent" | …, "percent"?: u8, … }`). All fields are
+/// `#[serde(default)]` and unknown ones are ignored, so SoRX can evolve the
+/// traffic shape without breaking the deployer's decode. The deployer's v1
+/// router does not yet act on the split (it picks the first routable row).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TrafficSplit {
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u8>,
 }
 
 /// Wire envelope for `GET /v1/sorx/routing-table`.
@@ -531,7 +548,10 @@ mod tests {
             state_namespace: "ns".to_string(),
             visibility: "public".to_string(),
             routable,
-            traffic: 100,
+            traffic: Some(TrafficSplit {
+                mode: "all".to_string(),
+                percent: None,
+            }),
         }
     }
 
@@ -896,7 +916,7 @@ mod tests {
                     "state_namespace": "ns",
                     "visibility": "public",
                     "routable": true,
-                    "traffic": 100,
+                    "traffic": {"mode": "all"},
                     "future_field": "ignored"
                 }
             ]
@@ -904,5 +924,78 @@ mod tests {
         let table: RoutingTable = serde_json::from_str(raw).unwrap();
         assert_eq!(table.routes.len(), 1);
         assert_eq!(table.routes[0].deployment_id, "dep-1");
+    }
+
+    #[test]
+    fn routing_table_decodes_real_sorx_traffic_shapes() {
+        // Regression: SoRX emits `traffic` as an OBJECT (`{"mode":"all"}`), not
+        // a number, and may omit it or send `null`. The decoder must accept all
+        // three; a previous `traffic: u32` field silently failed to decode the
+        // real wire shape, which collapsed the routing-table to zero rows and
+        // turned every Forward into a 404. Caught by a live e2e against a real
+        // SoRX instance (the FakeSource unit tests fed a hand-built `u32`).
+        let raw = r#"{
+            "schema": "greentic.sorx.public-routes.v1",
+            "routes": [
+                {
+                    "tenant_id": "acme", "sor_name": "landlord", "alias": "stable",
+                    "deployment_id": "dep-obj", "pack_name": "p", "pack_version": "0.1.0",
+                    "base_path": "/acme/landlord", "state_namespace": "ns",
+                    "visibility": "private", "routable": true,
+                    "traffic": {"mode": "all"}
+                },
+                {
+                    "tenant_id": "acme", "sor_name": "landlord", "alias": "canary",
+                    "deployment_id": "dep-null", "pack_name": "p", "pack_version": "0.2.0",
+                    "base_path": "/acme/landlord", "state_namespace": "ns",
+                    "visibility": "private", "routable": false,
+                    "traffic": null
+                },
+                {
+                    "tenant_id": "acme", "sor_name": "landlord", "alias": "absent",
+                    "deployment_id": "dep-absent", "pack_name": "p", "pack_version": "0.3.0",
+                    "base_path": "/acme/landlord", "state_namespace": "ns",
+                    "visibility": "private", "routable": false
+                }
+            ]
+        }"#;
+        let table: RoutingTable = serde_json::from_str(raw).unwrap();
+        assert_eq!(table.routes.len(), 3);
+        assert_eq!(
+            table.routes[0].traffic,
+            Some(TrafficSplit {
+                mode: "all".to_string(),
+                percent: None
+            })
+        );
+        assert_eq!(table.routes[1].traffic, None, "null traffic -> None");
+        assert_eq!(table.routes[2].traffic, None, "absent traffic -> None");
+
+        // And the row still resolves + forwards end-to-end.
+        let source = FakeSource {
+            rows: table.routes.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let resolver = AliasResolver::new(Box::new(source), Duration::from_secs(60));
+        let reg = upstreams(&[("dep-obj", "127.0.0.1:9090")]);
+        match route_request(
+            &resolver,
+            &reg,
+            "http://sorx",
+            "GET",
+            "/acme/landlord/stable/v1/agent/tenancies/t-1",
+            &[],
+            &[],
+        ) {
+            ProxyOutcome::Forward {
+                upstream,
+                deployment_id,
+                ..
+            } => {
+                assert_eq!(upstream, "127.0.0.1:9090");
+                assert_eq!(deployment_id, "dep-obj");
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
     }
 }
