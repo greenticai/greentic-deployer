@@ -163,7 +163,7 @@ impl Revision {
 mod tests {
     use super::*;
 
-    fn minimal(bundle_source_uri: Option<String>) -> Revision {
+    fn minimal() -> Revision {
         Revision {
             schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
             revision_id: RevisionId::new(),
@@ -173,7 +173,7 @@ mod tests {
             sequence: 1,
             created_at: Utc::now(),
             bundle_digest: "sha256:00".to_string(),
-            bundle_source_uri,
+            bundle_source_uri: None,
             pack_list: Vec::new(),
             pack_list_lock_ref: PathBuf::from("pack-list.lock"),
             pack_config_refs: Vec::new(),
@@ -193,7 +193,7 @@ mod tests {
     /// deserialize back to `None`. A distributor-sourced ref survives intact.
     #[test]
     fn bundle_source_uri_is_omitted_when_none_and_round_trips_when_some() {
-        let none = minimal(None);
+        let none = minimal();
         let json = serde_json::to_value(&none).unwrap();
         assert!(
             json.get("bundle_source_uri").is_none(),
@@ -201,9 +201,10 @@ mod tests {
         );
         assert_eq!(serde_json::from_value::<Revision>(json).unwrap(), none);
 
-        let some = minimal(Some(
-            "oci://ghcr.io/greenticai/bundles/demo@sha256:abc".to_string(),
-        ));
+        let some = Revision {
+            bundle_source_uri: Some("oci://ghcr.io/greenticai/bundles/demo@sha256:abc".to_string()),
+            ..minimal()
+        };
         let rt: Revision = serde_json::from_str(&serde_json::to_string(&some).unwrap()).unwrap();
         assert_eq!(rt, some);
     }
