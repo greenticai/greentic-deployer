@@ -1616,6 +1616,7 @@ mod warm_revision_tests {
                 sequence: 1,
                 created_at: Utc.with_ymd_and_hms(2026, 6, 9, 12, 0, 0).unwrap(),
                 bundle_digest: "sha256:00".to_string(),
+                bundle_source_uri: None,
                 pack_list: Vec::new(),
                 pack_list_lock_ref: PathBuf::new(),
                 pack_config_refs: Vec::new(),

@@ -2475,6 +2475,7 @@ fn deploy_payload(
         bundle_id: rb.spec.bundle_id.clone(),
         customer_id: rb.spec.customer_id.clone(),
         bundle_path: Some(rb.revisions[0].resolved_path.clone()),
+        bundle_source_uri: None,
         idempotency_key: None,
         config_overrides: rb.spec.config_overrides.clone(),
         route_binding,
@@ -2578,6 +2579,12 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
             deployment_id: deployment_id.clone(),
             bundle_path: Some(rev.resolved_path.clone()),
             bundle_digest: super::revisions::default_bundle_digest(),
+            // Env-manifest revisions are local-serve only for now: threading
+            // the manifest's declared bundle source (`rev.spec.bundle_path`,
+            // which may be an `oci://`/`repo://`/`store://` ref) into
+            // `bundle_source_uri` so manifest-applied K8s workers can pull is a
+            // follow-up.
+            bundle_source_uri: None,
             pack_list: Vec::new(),
             pack_list_lock_ref: PathBuf::new(),
             config_digest: super::revisions::default_config_digest(),
@@ -3536,6 +3543,7 @@ mod tests {
                 bundle_id: "preexisting".to_string(),
                 customer_id: None,
                 bundle_path: Some(fixture()),
+                bundle_source_uri: None,
                 idempotency_key: None,
                 config_overrides: None,
                 route_binding: None,
@@ -4560,6 +4568,7 @@ mod tests {
             bundle_id: "quickstart".to_string(),
             customer_id: None,
             bundle_path: Some(fixture()),
+            bundle_source_uri: None,
             idempotency_key: None,
             config_overrides: None,
             route_binding: Some(super::super::bundles::RouteBindingPayload {

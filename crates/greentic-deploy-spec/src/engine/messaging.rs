@@ -1061,6 +1061,7 @@ mod tests {
             sequence: 1,
             created_at: fixed_now(),
             bundle_digest: "sha256:deadbeef".to_string(),
+            bundle_source_uri: None,
             pack_list: vec![PackListEntry {
                 pack_id: PackId::new("known-pack"),
                 version: "1.0.0".parse().unwrap(),

@@ -359,6 +359,7 @@ mod tests {
             sequence: 1,
             created_at: fixed_now(),
             bundle_digest: "sha256:00".to_string(),
+            bundle_source_uri: None,
             pack_list: vec![PackListEntry {
                 pack_id: PackId::new("greentic.test.pack"),
                 version: SemVer::new(1, 0, 0),

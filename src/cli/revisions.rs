@@ -60,6 +60,15 @@ pub struct RevisionStagePayload {
     pub bundle_path: Option<PathBuf>,
     #[serde(default = "default_bundle_digest")]
     pub bundle_digest: String,
+    /// Registry reference the bundle was resolved from (`oci://…`, `repo://…`,
+    /// `store://…`), asserted by the caller that resolved it. Recorded on the
+    /// revision so a remote worker can pull the bundle at boot; `None` for a
+    /// locally-staged bundle. The deployer never derives this — by the time
+    /// `stage` runs the `--bundle` path already holds a local file — so the
+    /// caller threads it through. `bundle_digest` is the integrity backstop on
+    /// whatever the worker pulls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_source_uri: Option<String>,
     #[serde(default)]
     pub pack_list: Vec<PackListEntryPayload>,
     /// Env-relative pack-list lockfile. Empty (the default) means "no lock
@@ -189,6 +198,7 @@ pub fn stage(
     let RevisionStagePayload {
         bundle_path,
         bundle_digest: payload_bundle_digest,
+        bundle_source_uri,
         pack_list_lock_ref: payload_pack_list_lock_ref,
         config_digest,
         signature_sidecar_ref,
@@ -289,6 +299,7 @@ pub fn stage(
             revision_id,
             deployment_id,
             bundle_digest,
+            bundle_source_uri,
             pack_list: revision_pack_list,
             pack_list_lock_ref,
             pack_config_refs,
@@ -725,6 +736,10 @@ pub fn payload_from_stage_args(
         deployment_id,
         bundle_path: Some(bundle_path),
         bundle_digest: default_bundle_digest(),
+        // Direct CLI staging takes a local `.gtbundle`; there is no registry
+        // coordinate to record, so the revision is local-serve only. Pass
+        // `bundle_source_uri` via `--answers` to make it remotely pullable.
+        bundle_source_uri: None,
         pack_list: Vec::new(),
         pack_list_lock_ref: PathBuf::new(),
         config_digest: default_config_digest(),
@@ -849,6 +864,7 @@ mod tests {
             deployment_id: deployment_id.to_string(),
             bundle_path: None,
             bundle_digest: "sha256:00".to_string(),
+            bundle_source_uri: None,
             pack_list: vec![PackListEntryPayload {
                 pack_id: "greentic.test.pack".to_string(),
                 version: "1.0.0".to_string(),
@@ -875,6 +891,29 @@ mod tests {
         assert_eq!(
             outcome.result.get("sequence").and_then(|v| v.as_u64()),
             Some(1)
+        );
+    }
+
+    /// A stage payload that asserts the bundle's registry source records
+    /// `bundle_source_uri` on the stored revision (threaded
+    /// `RevisionStagePayload` → `StageRevisionPayload` → `Revision`), so a
+    /// remote worker can pull the bundle at boot. The default local stage
+    /// leaves it `None`.
+    #[test]
+    fn stage_records_bundle_source_uri_on_the_revision() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let did = seed_env_with_deployment(&store);
+
+        let mut payload = stage_payload(&did);
+        payload.bundle_source_uri =
+            Some("oci://ghcr.io/greenticai/bundles/demo@sha256:abc".to_string());
+        stage(&store, &OpFlags::default(), Some(payload)).unwrap();
+
+        let env = store.load(&parse_env_id("local").unwrap()).unwrap();
+        assert_eq!(
+            env.revisions[0].bundle_source_uri.as_deref(),
+            Some("oci://ghcr.io/greenticai/bundles/demo@sha256:abc")
         );
     }
 

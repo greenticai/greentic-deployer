@@ -440,6 +440,7 @@ fn make_revision(
         created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).single().unwrap(),
         bundle_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
             .to_string(),
+        bundle_source_uri: None,
         pack_list: vec![PackListEntry::from_lock_primitives(
             PackId::new("greentic.fixture.pack"),
             "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
