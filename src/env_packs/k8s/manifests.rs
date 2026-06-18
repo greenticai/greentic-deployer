@@ -791,14 +791,19 @@ fn env_has_pullable_routed_revision(env: &Environment) -> bool {
 /// Gateway/Ingress data-plane peer is refined per Q4), router→worker on
 /// the serve port, and worker ingress from the router only.
 ///
-/// When the environment routes a pullable revision (M2 worker-boot bundle
-/// pull), a fifth policy opens worker egress so the bundle-less worker can
-/// reach its OCI registry at boot — the default-deny otherwise leaves the
-/// worker DNS-only and the pull fails closed under a NetworkPolicy-enforcing
-/// CNI. Gated on a pullable routed revision being present, so a probe-only env
-/// keeps the tighter posture. (kind's default CNI does not enforce
-/// NetworkPolicy, so this is a production-correctness knob the kind E2E can't
-/// exercise; it is covered by the render unit tests.)
+/// A fifth policy, `gtc-allow-worker-egress`, governs worker egress for the M2
+/// worker-boot bundle pull. It is ALWAYS rendered — so reconcile's plain upsert
+/// converges it both ways without env-level pruning — and its egress rule
+/// toggles by pullability: allow-all while a routed revision carries a
+/// `bundle_source_uri` (the bundle-less worker must reach its OCI registry at
+/// boot, or the default-deny leaves it DNS-only and the pull fails closed under
+/// a NetworkPolicy-enforcing CNI), and an empty deny rule otherwise (so an env
+/// that stops pulling closes the opening on the next reconcile rather than
+/// leaving a stale allow-all hole). The selector is scoped to THIS env's worker
+/// pods, so one env's pullable revision never grants egress to a sibling env
+/// sharing the namespace. (kind's default CNI does not enforce NetworkPolicy,
+/// so this is a production-correctness knob the kind E2E can't exercise; it is
+/// covered by the render unit tests.)
 pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Value> {
     let router_labels = common_labels(env, "router");
     let worker_component = json!({"app.kubernetes.io/component": "worker"});
@@ -872,27 +877,33 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
             },
         }),
     ];
-    // M2: open worker egress for the boot-time bundle pull when a routed
-    // revision is pullable. Allow-all egress — the worker pulls its own packs
-    // and the pull is integrity-gated against the revision's `bundle_digest`,
-    // so breadth is not a pack-injection vector; a per-destination allow-list
-    // is a tracked hardening follow-up. DNS egress is already granted above.
-    if env_has_pullable_routed_revision(env) {
-        policies.push(json!({
-            "apiVersion": "networking.k8s.io/v1",
-            "kind": "NetworkPolicy",
-            "metadata": {
-                "name": "gtc-allow-worker-egress",
-                "namespace": params.namespace,
-                "labels": common_labels(env, "network-policy"),
-            },
-            "spec": {
-                "podSelector": {"matchLabels": worker_component},
-                "policyTypes": ["Egress"],
-                "egress": [{}],
-            },
-        }));
-    }
+    // M2 worker-boot bundle pull: govern worker egress with a stable,
+    // env-scoped policy. Allow-all egress while a routed revision is pullable
+    // (the worker fetches its own packs, integrity-gated against the revision's
+    // `bundle_digest`, so breadth is not a pack-injection vector; a
+    // per-destination allow-list is a tracked hardening follow-up); an empty
+    // deny rule otherwise. Always rendered so reconcile converges allow→deny
+    // without env-level pruning, closing the opening once the env stops
+    // pulling. DNS egress stays granted by `gtc-allow-dns` regardless.
+    let worker_egress = if env_has_pullable_routed_revision(env) {
+        json!([{}])
+    } else {
+        json!([])
+    };
+    policies.push(json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+            "name": "gtc-allow-worker-egress",
+            "namespace": params.namespace,
+            "labels": common_labels(env, "network-policy"),
+        },
+        "spec": {
+            "podSelector": {"matchLabels": common_labels(env, "worker")},
+            "policyTypes": ["Egress"],
+            "egress": worker_egress,
+        },
+    }));
     policies
 }
 
@@ -1243,8 +1254,18 @@ mod tests {
                 "gtc-default-deny",
                 "gtc-allow-dns",
                 "gtc-allow-router",
-                "gtc-allow-workers"
+                "gtc-allow-workers",
+                "gtc-allow-worker-egress",
             ]
+        );
+        // The worker-egress policy is always rendered; with no pullable routed
+        // revision (the plain fixture) its egress is an empty deny rule and its
+        // selector is scoped to this env's workers.
+        let egress = policies.last().unwrap();
+        assert_eq!(egress["spec"]["egress"], serde_json::json!([]));
+        assert_eq!(
+            egress["spec"]["podSelector"]["matchLabels"][ENV_LABEL],
+            env.environment_id.as_str()
         );
     }
 
@@ -1278,9 +1299,15 @@ mod tests {
             "a pullable routed revision adds the worker-egress allowance"
         );
         let egress = policies.last().unwrap();
+        let selector = &egress["spec"]["podSelector"]["matchLabels"];
         assert_eq!(
-            egress["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/component"], "worker",
+            selector["app.kubernetes.io/component"], "worker",
             "the allowance targets worker pods only"
+        );
+        assert_eq!(
+            selector[ENV_LABEL],
+            env.environment_id.as_str(),
+            "scoped to this env's workers — not a sibling env sharing the namespace"
         );
         assert_eq!(egress["spec"]["policyTypes"], serde_json::json!(["Egress"]));
         // One egress rule with no `to`/`ports` == allow-all egress, so the
@@ -1289,42 +1316,48 @@ mod tests {
     }
 
     #[test]
-    fn worker_egress_absent_when_the_pullable_revision_is_not_routed() {
+    fn worker_egress_denies_when_the_pullable_revision_is_not_routed() {
         let (mut env, params) = fixture();
         // A revision carries a source uri but no traffic split routes it — the
-        // worker never pulls it, so no egress allowance is opened (mirrors
-        // greentic-start's routed-only boot pull).
+        // worker never pulls it (mirrors greentic-start's routed-only boot
+        // pull), so the always-rendered policy stays in its deny shape.
         env.traffic_splits.clear();
         env.revisions[0].bundle_source_uri =
             Some("oci://registry.example/bundles/demo@sha256:abc123".to_string());
         let policies = render_network_policies(&env, &params);
-        let names: Vec<&str> = policies
+        let egress = policies
             .iter()
-            .map(|p| p["metadata"]["name"].as_str().unwrap())
-            .collect();
-        assert!(
-            !names.contains(&"gtc-allow-worker-egress"),
-            "an unrouted pullable revision must not open worker egress"
+            .find(|p| p["metadata"]["name"] == "gtc-allow-worker-egress")
+            .expect("the worker-egress policy is always rendered");
+        assert_eq!(
+            egress["spec"]["egress"],
+            serde_json::json!([]),
+            "an unrouted pullable revision leaves egress denied"
         );
     }
 
     #[test]
-    fn pullable_env_renders_one_extra_env_level_object() {
-        let (env, params) = pullable_fixture();
+    fn worker_egress_policy_is_a_stable_env_level_object() {
+        // Always rendered regardless of pullability, so the env-level object
+        // count does not change when a revision becomes pullable — reconcile
+        // converges the egress rule in place rather than adding/removing the
+        // object (it cannot prune env-level objects).
+        let (pullable_env, params) = pullable_fixture();
         let (plain_env, _) = fixture();
-        let pullable = render_environment_manifests(&env, &params);
+        let pullable = render_environment_manifests(&pullable_env, &params);
         let plain = render_environment_manifests(&plain_env, &params);
         assert_eq!(
             pullable.len(),
-            plain.len() + 1,
-            "the worker-egress policy is the only extra env-level object"
+            plain.len(),
+            "object count is stable across pullability"
         );
-        assert!(
-            pullable
-                .iter()
-                .any(|m| m["metadata"]["name"] == "gtc-allow-worker-egress"),
-            "the extra object is the worker-egress NetworkPolicy"
-        );
+        for set in [&pullable, &plain] {
+            assert!(
+                set.iter()
+                    .any(|m| m["metadata"]["name"] == "gtc-allow-worker-egress"),
+                "the worker-egress policy is always present"
+            );
+        }
     }
 
     #[test]
