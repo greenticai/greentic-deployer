@@ -710,14 +710,15 @@ fn reconcile_applies_then_prunes_against_a_live_cluster() {
     // Worker objects are named after the lowercased revision ULID.
     let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
 
-    // Reconcile → applies the env-level set (11: namespace, env-store +
-    // runtime-config ConfigMaps, router Deployment/Service/PDB, 5 NetworkPolicies
-    // incl. the always-rendered worker-egress policy) + the warmed revision's
-    // worker pair (2). Verify both the verb's self-report and ground truth.
+    // Reconcile → applies the env-level set (12: namespace, env-store +
+    // runtime-config ConfigMaps, router Deployment/Service/PDB, 6 NetworkPolicies
+    // incl. the always-rendered worker- and router-egress policies) + the warmed
+    // revision's worker pair (2). Verify both the verb's self-report and ground
+    // truth.
     let (applied, pruned) = reconcile(store);
     assert_eq!(
         (applied, pruned),
-        (13, 0),
+        (14, 0),
         "first reconcile applies env-level + worker pair, prunes nothing"
     );
     assert!(
@@ -740,7 +741,7 @@ fn reconcile_applies_then_prunes_against_a_live_cluster() {
     // Reconcile again → declarative upsert is idempotent: same applied set,
     // nothing pruned, worker still present.
     let (applied2, pruned2) = reconcile(store);
-    assert_eq!((applied2, pruned2), (13, 0), "reconcile is idempotent");
+    assert_eq!((applied2, pruned2), (14, 0), "reconcile is idempotent");
     assert!(
         object_exists("deployment", &worker, Some(NAMESPACE)),
         "worker survives idempotent reconcile"
@@ -754,7 +755,7 @@ fn reconcile_applies_then_prunes_against_a_live_cluster() {
     let (applied3, pruned3) = reconcile(store);
     assert_eq!(
         (applied3, pruned3),
-        (11, 2),
+        (12, 2),
         "reconcile prunes the now-absent revision's worker pair"
     );
     assert!(
@@ -906,7 +907,7 @@ fn apply_revision_warm_gate_blocks_unready_worker_then_archives_against_a_live_c
     // apply-revision has somewhere to land. apply-revision only touches the
     // one revision's worker pair — it assumes the env already exists.
     let (applied, _) = reconcile(store);
-    assert_eq!(applied, 13, "reconcile establishes env-level + worker pair");
+    assert_eq!(applied, 14, "reconcile establishes env-level + worker pair");
 
     // apply-revision on the Ready (present) revision → warm branch. warm
     // re-upserts the worker pair, then waits for the rollout. The pinned
@@ -997,7 +998,7 @@ fn worker_reaches_ready_and_serves_healthz_with_a_serving_image() {
     let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
 
     let (applied, _) = reconcile(store);
-    assert_eq!(applied, 13, "reconcile applies env-level + worker pair");
+    assert_eq!(applied, 14, "reconcile applies env-level + worker pair");
 
     // The worker's readiness probe hits `/healthz`, so "rollout complete" ==
     // "the bundle-less boot is serving `/healthz` on the pod IP". This is the
@@ -1096,7 +1097,7 @@ fn worker_pulls_http_bundle_and_serves_the_real_revision() {
     // reconcile renders the env-store ConfigMap (carrying `environment.json`
     // with the routed revision + its `bundle_source_uri`) and the worker pair.
     let (applied, _) = reconcile(store);
-    assert_eq!(applied, 13, "reconcile applies env-level + worker pair");
+    assert_eq!(applied, 14, "reconcile applies env-level + worker pair");
 
     // A completed rollout proves the full boot chain ran: pull → digest gate →
     // materialize → activate → serve. The HTTP server is the only bundle
