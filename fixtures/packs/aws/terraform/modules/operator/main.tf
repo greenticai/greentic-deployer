@@ -496,6 +496,35 @@ resource "aws_ecs_task_definition" "this" {
   }
 
   container_definitions = jsonencode(concat(
+    [
+      {
+        # Init container: chown the ephemeral scratch volume to the operator's
+        # non-root uid so it can write logs/state at /tmp under a read-only root
+        # filesystem (ECS volumes mount root-owned by default).
+        name       = "scratch-init"
+        image      = "public.ecr.aws/aws-cli/aws-cli:latest"
+        essential  = false
+        entryPoint = ["/bin/sh", "-c"]
+        command = [
+          "mkdir -p /scratch/greentic-start && chown -R 65532:65532 /scratch"
+        ]
+        mountPoints = [
+          {
+            sourceVolume  = "greentic-scratch"
+            containerPath = "/scratch"
+            readOnly      = false
+          }
+        ]
+        logConfiguration = {
+          logDriver = "awslogs"
+          options = {
+            awslogs-group         = aws_cloudwatch_log_group.this.name
+            awslogs-region        = data.aws_region.current.name
+            awslogs-stream-prefix = "scratch-init"
+          }
+        }
+      }
+    ],
     local.bundle_fetcher_enabled ? [
       {
         name      = "bundle-fetcher"
@@ -543,12 +572,20 @@ resource "aws_ecs_task_definition" "this" {
           "--admin-port",
           tostring(local.admin_port)
         ]
-        dependsOn = local.bundle_fetcher_enabled ? [
-          {
-            containerName = "bundle-fetcher"
-            condition     = "SUCCESS"
-          }
-        ] : []
+        dependsOn = concat(
+          [
+            {
+              containerName = "scratch-init"
+              condition     = "SUCCESS"
+            }
+          ],
+          local.bundle_fetcher_enabled ? [
+            {
+              containerName = "bundle-fetcher"
+              condition     = "SUCCESS"
+            }
+          ] : []
+        )
         # Harden the operator with a read-only root filesystem; it gets its only
         # writable area from the ephemeral scratch volume mounted at /tmp (log dir,
         # bundle unpack, cache, dev-store all live under /tmp/greentic-start/...).
@@ -578,6 +615,19 @@ resource "aws_ecs_task_definition" "this" {
         ]
         environment = concat(
           [
+            {
+              # Route temp files (log dir, bundle unpack, cache) to the writable
+              # scratch mount under a read-only root filesystem.
+              name  = "TMPDIR"
+              value = "/tmp"
+            },
+            {
+              # Route $HOME-relative writes (e.g. ~/.cache used by the WASM/
+              # wasmtime invoke path) to the writable scratch mount too; otherwise
+              # they hit the read-only rootfs and the /token path hangs.
+              name  = "HOME"
+              value = "/tmp"
+            },
             {
               name  = "GREENTIC_BUNDLE_SOURCE"
               value = local.operator_bundle_source
