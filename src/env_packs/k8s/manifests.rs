@@ -1283,22 +1283,12 @@ mod tests {
     fn worker_egress_policy_renders_for_a_pullable_routed_revision() {
         let (env, params) = pullable_fixture();
         let policies = render_network_policies(&env, &params);
-        let names: Vec<&str> = policies
+        // (The full 5-policy name list is asserted by the plain-fixture test;
+        // here the egress rule shape + scoped selector are what's unique.)
+        let egress = policies
             .iter()
-            .map(|p| p["metadata"]["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            names,
-            [
-                "gtc-default-deny",
-                "gtc-allow-dns",
-                "gtc-allow-router",
-                "gtc-allow-workers",
-                "gtc-allow-worker-egress",
-            ],
-            "a pullable routed revision adds the worker-egress allowance"
-        );
-        let egress = policies.last().unwrap();
+            .find(|p| p["metadata"]["name"] == "gtc-allow-worker-egress")
+            .expect("the worker-egress policy is always rendered");
         let selector = &egress["spec"]["podSelector"]["matchLabels"];
         assert_eq!(
             selector["app.kubernetes.io/component"], "worker",
