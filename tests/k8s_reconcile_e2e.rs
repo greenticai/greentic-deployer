@@ -477,6 +477,16 @@ fn kubectl_apply_stdin(manifest: &str) {
 /// `busybox httpd` pod's docroot. Idempotent: clears any prior run first. The
 /// env namespace is created here (before `reconcile`) so the server precedes
 /// the worker.
+///
+/// Also applies an ingress-allow NetworkPolicy for the server: the env pack's
+/// `gtc-default-deny` (empty podSelector) denies ingress to EVERY pod in the
+/// namespace, and modern kindnet (kindest/node v1.31+) ENFORCES NetworkPolicy,
+/// so without this allow the worker's pull is dropped and the boot fails closed
+/// (~127 s TCP timeout → CrashLoop). In production the bundle source is an
+/// external registry, outside the namespace and unaffected by these policies;
+/// only this in-cluster test fixture is caught by the env's default-deny, so the
+/// allow lives here in the test, not in the production render. The worker's
+/// matching egress is already granted by `gtc-allow-worker-egress`.
 fn start_bundle_server() {
     // Clean slate, then (re)create the env namespace the server shares with the
     // worker. `reset_namespace` (a blocking delete) ran first, so the namespace
@@ -553,6 +563,20 @@ spec:
   ports:
     - port: {BUNDLE_SERVER_PORT}
       targetPort: {BUNDLE_SERVER_PORT}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gtc-bundle-server-allow-ingress
+  namespace: {NAMESPACE}
+spec:
+  podSelector:
+    matchLabels:
+      app: {BUNDLE_SERVER}
+  policyTypes:
+    - Ingress
+  ingress:
+    - {{}}
 "
     );
     kubectl_apply_stdin(&manifest);
@@ -600,7 +624,7 @@ fn provision_pullable_revision(store: &Path, image: &str, source_uri: &str) -> S
 fn worker_failure_diagnostics(worker: &str) -> String {
     let worker_dep = format!("deployment/{worker}");
     let server_dep = format!("deployment/{BUNDLE_SERVER}");
-    let probes: [(&str, Vec<&str>); 7] = [
+    let probes: [(&str, Vec<&str>); 8] = [
         (
             "pods (wide)",
             vec!["get", "pods", "-n", NAMESPACE, "-o", "wide"],
@@ -608,6 +632,13 @@ fn worker_failure_diagnostics(worker: &str) -> String {
         (
             "namespace events",
             vec!["get", "events", "-n", NAMESPACE, "--sort-by=.lastTimestamp"],
+        ),
+        // NetworkPolicies gate pod-to-pod reachability under an enforcing CNI
+        // (kindnet on v1.31+): if the worker's pull is dropped, the missing
+        // allow shows up here.
+        (
+            "network policies",
+            vec!["get", "networkpolicies", "-n", NAMESPACE, "-o", "wide"],
         ),
         ("pods describe", vec!["describe", "pods", "-n", NAMESPACE]),
         (
@@ -622,13 +653,17 @@ fn worker_failure_diagnostics(worker: &str) -> String {
             ],
         ),
         (
-            "worker logs (previous)",
+            // Target the main `worker` container by name: `--all-containers
+            // --previous` errors on the init container (which has no previous
+            // instance) and aborts before reaching the crash logs we want.
+            "worker logs (previous crash)",
             vec![
                 "logs",
                 &worker_dep,
+                "-c",
+                "worker",
                 "-n",
                 NAMESPACE,
-                "--all-containers",
                 "--previous",
                 "--tail=150",
             ],
