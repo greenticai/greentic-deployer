@@ -588,6 +588,80 @@ fn provision_pullable_revision(store: &Path, image: &str, source_uri: &str) -> S
     )
 }
 
+/// Dump everything needed to root-cause a worker that never reached Ready: pod
+/// state, namespace events, and the worker's own logs (current and, if it
+/// crash-looped, the previous container) — plus the bundle server's endpoints
+/// and access log. The single fact that bisects the failure is whether the
+/// worker's pull request reached the server: a GET in the server's log means
+/// network + DNS worked and the failure is downstream (materialize / activate /
+/// digest); no GET means the worker never connected (DNS or pod-to-pod). The
+/// boot pull is fail-closed, so this only runs on a failed rollout — the live
+/// cluster is still up at that point, so the queries return real state.
+fn worker_failure_diagnostics(worker: &str) -> String {
+    let worker_dep = format!("deployment/{worker}");
+    let server_dep = format!("deployment/{BUNDLE_SERVER}");
+    let probes: [(&str, Vec<&str>); 7] = [
+        (
+            "pods (wide)",
+            vec!["get", "pods", "-n", NAMESPACE, "-o", "wide"],
+        ),
+        (
+            "namespace events",
+            vec!["get", "events", "-n", NAMESPACE, "--sort-by=.lastTimestamp"],
+        ),
+        ("pods describe", vec!["describe", "pods", "-n", NAMESPACE]),
+        (
+            "worker logs",
+            vec![
+                "logs",
+                &worker_dep,
+                "-n",
+                NAMESPACE,
+                "--all-containers",
+                "--tail=150",
+            ],
+        ),
+        (
+            "worker logs (previous)",
+            vec![
+                "logs",
+                &worker_dep,
+                "-n",
+                NAMESPACE,
+                "--all-containers",
+                "--previous",
+                "--tail=150",
+            ],
+        ),
+        (
+            "bundle-server endpoints",
+            vec![
+                "get",
+                "endpoints",
+                BUNDLE_SERVER,
+                "-n",
+                NAMESPACE,
+                "-o",
+                "wide",
+            ],
+        ),
+        (
+            "bundle-server logs (did the pull arrive?)",
+            vec!["logs", &server_dep, "-n", NAMESPACE, "--tail=60"],
+        ),
+    ];
+    let mut out = String::new();
+    for (label, args) in probes {
+        let res = kubectl(&args);
+        out.push_str(&format!(
+            "\n--- {label} ---\n{}{}",
+            String::from_utf8_lossy(&res.stdout),
+            String::from_utf8_lossy(&res.stderr),
+        ));
+    }
+    out
+}
+
 #[test]
 fn reconcile_applies_then_prunes_against_a_live_cluster() {
     if !armed() {
@@ -1000,12 +1074,18 @@ fn worker_pulls_http_bundle_and_serves_the_real_revision() {
         NAMESPACE,
         "--timeout=180s",
     ]);
-    assert!(
-        status.status.success(),
-        "worker must reach Ready by pulling + serving the http bundle:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&status.stdout),
-        String::from_utf8_lossy(&status.stderr),
-    );
+    if !status.status.success() {
+        // Fail-closed boot means a stuck rollout hides the real cause (a failed
+        // pull, a digest mismatch, an unreachable server). Dump the live cluster
+        // state into the panic so CI surfaces *why* the worker never went Ready.
+        let diag = worker_failure_diagnostics(&worker);
+        panic!(
+            "worker must reach Ready by pulling + serving the http bundle:\n\
+             stdout: {}\nstderr: {}\n\n=== diagnostics ==={diag}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr),
+        );
+    }
 
     // Distinguish a REAL activated revision from a probes-only boot: the worker
     // logs `serving N revision(s) for env …` only when packs activated, vs
