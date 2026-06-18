@@ -80,6 +80,12 @@ pub struct BundleDeployPayload {
     /// deserialization error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_path: Option<PathBuf>,
+    /// Registry reference the bundle was resolved from, recorded on the staged
+    /// revision so a remote worker can pull it at boot. `None` (default) keeps
+    /// the revision local-serve only. `op deploy` still stages from the local
+    /// `--bundle` file; this only records where the worker can re-fetch it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_source_uri: Option<String>,
     /// Idempotency key for the traffic cut-over. Defaults to a value derived
     /// from the freshly-minted revision id, so each deploy is a distinct
     /// (non-replay) cut-over.
@@ -330,6 +336,7 @@ pub fn deploy(
         deployment_id: deployment_id.clone(),
         bundle_path: Some(bundle_path),
         bundle_digest: super::revisions::default_bundle_digest(),
+        bundle_source_uri: payload.bundle_source_uri.clone(),
         pack_list: Vec::new(),
         pack_list_lock_ref: PathBuf::new(),
         config_digest: super::revisions::default_config_digest(),
@@ -489,6 +496,7 @@ pub fn payload_from_deploy_args(
         bundle_id,
         customer_id,
         bundle_path: Some(bundle_path),
+        bundle_source_uri: None,
         idempotency_key,
         config_overrides,
         route_binding,
@@ -670,6 +678,7 @@ fn deploy_schema() -> Value {
             "bundle_id": {"type": "string"},
             "customer_id": {"type": "string"},
             "bundle_path": {"type": "string", "description": "local .gtbundle path (required)"},
+            "bundle_source_uri": {"type": "string", "description": "oci:// / repo:// / store:// ref the bundle was resolved from; makes the staged revision pullable by a remote worker. Omit for local-serve-only"},
             "idempotency_key": {"type": "string", "description": "supply to make retries idempotent"},
             "config_overrides": {
                 "type": "object",
@@ -701,6 +710,20 @@ mod tests {
     use crate::cli::tests_common::{bootstrap_env_trust_root, make_env};
     use tempfile::tempdir;
 
+    /// Schema-drift regression: `deploy_schema()` declares
+    /// `additionalProperties: false`, so a `--schema`-driven `--answers` caller
+    /// that supplies `bundle_source_uri` (the remote-pull coordinate) would be
+    /// rejected unless the schema advertises the field.
+    #[test]
+    fn deploy_schema_lists_bundle_source_uri() {
+        let schema = deploy_schema();
+        assert!(
+            schema.pointer("/properties/bundle_source_uri").is_some(),
+            "deploy_schema must list `bundle_source_uri` so --schema-driven \
+             callers can record the bundle's registry source (schema: {schema:#})"
+        );
+    }
+
     fn seeded_store() -> (tempfile::TempDir, LocalFsStore) {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
@@ -724,6 +747,7 @@ mod tests {
             bundle_id: bundle_id.to_string(),
             customer_id: None,
             bundle_path: Some(fixture()),
+            bundle_source_uri: None,
             idempotency_key: None,
             config_overrides: None,
             route_binding: None,

@@ -392,6 +392,7 @@ mod tests {
             sequence: 1,
             created_at: fixed_now(),
             bundle_digest: "sha256:deadbeef".to_string(),
+            bundle_source_uri: None,
             pack_list: Vec::new(),
             pack_list_lock_ref: PathBuf::from("pack-list.lock"),
             pack_config_refs: Vec::new(),

@@ -201,6 +201,11 @@ pub struct StageRevisionPayload {
     pub revision_id: RevisionId,
     pub deployment_id: DeploymentId,
     pub bundle_digest: String,
+    /// Registry reference the bundle was resolved from, recorded on the
+    /// revision so a remote worker can pull it at boot. `None` for a
+    /// locally-staged bundle. See [`Revision::bundle_source_uri`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_source_uri: Option<String>,
     pub pack_list: Vec<PackListEntry>,
     pub pack_list_lock_ref: PathBuf,
     pub pack_config_refs: Vec<PathBuf>,
@@ -520,6 +525,7 @@ pub fn stage_revision(
         sequence: next_sequence,
         created_at: now,
         bundle_digest: payload.bundle_digest,
+        bundle_source_uri: payload.bundle_source_uri,
         pack_list: payload.pack_list,
         pack_list_lock_ref: payload.pack_list_lock_ref,
         pack_config_refs: payload.pack_config_refs,
@@ -693,6 +699,7 @@ mod tests {
             revision_id: RevisionId::new(),
             deployment_id,
             bundle_digest: "sha256:00".to_string(),
+            bundle_source_uri: None,
             pack_list: vec![PackListEntry {
                 pack_id: PackId::new("greentic.test.pack"),
                 version: SemVer::new(1, 0, 0),
@@ -731,6 +738,27 @@ mod tests {
         let second = stage_revision(&mut env, stage_payload(deployment_id), fixed_now()).unwrap();
         assert_eq!(second.sequence, 2);
         assert_eq!(env.revisions.len(), 2);
+    }
+
+    /// A distributor-sourced revision pins the registry ref a remote worker
+    /// pulls the bundle from; a locally-staged one leaves it `None`.
+    #[test]
+    fn stage_records_bundle_source_uri_when_supplied() {
+        let deployment_id = DeploymentId::new();
+        let mut env = env_with_deployment(deployment_id);
+
+        let local = stage_revision(&mut env, stage_payload(deployment_id), fixed_now()).unwrap();
+        assert_eq!(local.bundle_source_uri, None);
+
+        let pullable = StageRevisionPayload {
+            bundle_source_uri: Some("oci://ghcr.io/greenticai/bundles/demo@sha256:abc".to_string()),
+            ..stage_payload(deployment_id)
+        };
+        let staged = stage_revision(&mut env, pullable, fixed_now()).unwrap();
+        assert_eq!(
+            staged.bundle_source_uri.as_deref(),
+            Some("oci://ghcr.io/greenticai/bundles/demo@sha256:abc")
+        );
     }
 
     #[test]

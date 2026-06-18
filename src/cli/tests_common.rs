@@ -110,6 +110,7 @@ pub fn make_revision(
         sequence,
         created_at: Utc.with_ymd_and_hms(2026, 5, 18, 12, 0, 0).unwrap(),
         bundle_digest: "sha256:00".to_string(),
+        bundle_source_uri: None,
         pack_list: vec![PackListEntry {
             pack_id: PackId::new("greentic.test.pack"),
             version: SemVer::new(1, 0, 0),

@@ -106,6 +106,15 @@ pub struct Revision {
     pub created_at: DateTime<Utc>,
     /// Digest of the `.gtbundle` archive.
     pub bundle_digest: String,
+    /// Registry reference the `.gtbundle` was resolved from (e.g.
+    /// `oci://…`, `repo://…`, `store://…`), when it came from a registry.
+    /// `None` for a locally-staged bundle — a local `.gtbundle` has no
+    /// registry coordinate, so such a revision serves locally only and is
+    /// not pullable by a remote worker. A remote worker (e.g. a K8s pod)
+    /// uses this to pull the bundle at boot; `bundle_digest` is the
+    /// integrity check on whatever it pulls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_source_uri: Option<String>,
     pub pack_list: Vec<PackListEntry>,
     /// Env-relative path to the pinned pack-list lockfile.
     pub pack_list_lock_ref: PathBuf,
@@ -147,5 +156,56 @@ impl Revision {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal() -> Revision {
+        Revision {
+            schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
+            revision_id: RevisionId::new(),
+            env_id: EnvId::try_from("local").unwrap(),
+            bundle_id: BundleId::new("demo"),
+            deployment_id: DeploymentId::new(),
+            sequence: 1,
+            created_at: Utc::now(),
+            bundle_digest: "sha256:00".to_string(),
+            bundle_source_uri: None,
+            pack_list: Vec::new(),
+            pack_list_lock_ref: PathBuf::from("pack-list.lock"),
+            pack_config_refs: Vec::new(),
+            config_digest: "sha256:00".to_string(),
+            signature_sidecar_ref: PathBuf::from("rev.sig"),
+            lifecycle: RevisionLifecycle::Staged,
+            staged_at: None,
+            warmed_at: None,
+            drain_seconds: 0,
+            abort_metrics: Vec::new(),
+        }
+    }
+
+    /// `bundle_source_uri` is `skip_serializing_if = "Option::is_none"`, so a
+    /// locally-staged revision serializes WITHOUT the key: `environment.json`
+    /// documents written before the field existed round-trip unchanged and
+    /// deserialize back to `None`. A distributor-sourced ref survives intact.
+    #[test]
+    fn bundle_source_uri_is_omitted_when_none_and_round_trips_when_some() {
+        let none = minimal();
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(
+            json.get("bundle_source_uri").is_none(),
+            "None must omit the key for wire compatibility: {json}"
+        );
+        assert_eq!(serde_json::from_value::<Revision>(json).unwrap(), none);
+
+        let some = Revision {
+            bundle_source_uri: Some("oci://ghcr.io/greenticai/bundles/demo@sha256:abc".to_string()),
+            ..minimal()
+        };
+        let rt: Revision = serde_json::from_str(&serde_json::to_string(&some).unwrap()).unwrap();
+        assert_eq!(rt, some);
     }
 }

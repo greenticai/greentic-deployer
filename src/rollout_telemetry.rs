@@ -229,6 +229,7 @@ mod tests {
             sequence: 1,
             created_at: Utc.timestamp_opt(0, 0).unwrap(),
             bundle_digest: "sha256:00".into(),
+            bundle_source_uri: None,
             pack_list: vec![PackListEntry {
                 pack_id: PackId::new("greentic.support.pack"),
                 version: SemVer::new(1, 0, 0),
