@@ -1,5 +1,7 @@
-//! Local `.gtbundle` resolution for `op revisions stage --bundle` (PR-2 of the
-//! local-deployment train).
+//! Local `.gtbundle` staging into an env's revision directory. Two callers:
+//! the deployer's `op revisions stage --bundle` ([`stage_local_bundle`]), and a
+//! remote worker re-materializing an already-staged revision at boot
+//! ([`materialize_revision_from_bundle`]).
 //!
 //! Extracts a local `.gtbundle` under the env's revision directory, derives a
 //! pinned pack list from the embedded `.gtpack` artifacts (sha256 over the
@@ -113,7 +115,7 @@ pub fn materialize_revision_from_bundle(
             .bundles
             .iter()
             .find(|b| b.deployment_id == revision.deployment_id)
-            .map(|b| b.bundle_id.clone())
+            .map(|b| &b.bundle_id)
             .ok_or_else(|| {
                 OpError::NotFound(format!(
                     "deployment `{}` for revision `{revision_id}` has no bundle in env `{env_id}`",
@@ -143,15 +145,9 @@ pub fn materialize_revision_from_bundle(
 
         // Materialize into the now-empty `rev_dir`, then project runtime-config.
         // Any error rolls back; only an all-green run is promoted.
-        let outcome = materialize_into_rev_dir(
-            &env_dir,
-            &rev_dir,
-            env_id,
-            &bundle_id,
-            bundle_path,
-            revision,
-        )
-        .and_then(|()| locked.refresh_runtime_config(&env).map_err(OpError::from));
+        let outcome =
+            materialize_into_rev_dir(&env_dir, &rev_dir, env_id, bundle_id, bundle_path, revision)
+                .and_then(|()| locked.refresh_runtime_config(&env).map_err(OpError::from));
 
         match outcome {
             Ok(()) => {
@@ -455,6 +451,25 @@ mod materialize_tests {
             .join("testdata/bundles/perf-smoke-bundle.gtbundle")
     }
 
+    /// Repin a revision's `bundle_digest` to a value the real fixture cannot
+    /// reproduce (all-zero sha256), under the env flock, so the next
+    /// materialization fails the integrity gate.
+    fn repin_to_unmatchable_digest(store: &LocalFsStore, env_id: &EnvId, revision_id: RevisionId) {
+        store
+            .transact(env_id, |locked| {
+                let mut env = locked.load()?;
+                env.revisions
+                    .iter_mut()
+                    .find(|r| r.revision_id == revision_id)
+                    .unwrap()
+                    .bundle_digest =
+                    "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                        .to_string();
+                locked.save(&env)
+            })
+            .unwrap();
+    }
+
     /// Build an env with a deployment and a revision staged from the fixture
     /// bundle (the deployer side), so `environment.json` records the real digest
     /// and lock ref a remote worker would receive, then return the ids and env
@@ -553,20 +568,7 @@ mod materialize_tests {
         let rev_dir = env_dir.join("revisions").join(revision_id.to_string());
 
         // Repin the revision to a digest the real fixture cannot reproduce.
-        store
-            .transact(&env_id, |locked| {
-                let mut env = locked.load()?;
-                let r = env
-                    .revisions
-                    .iter_mut()
-                    .find(|r| r.revision_id == revision_id)
-                    .unwrap();
-                r.bundle_digest =
-                    "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                        .to_string();
-                locked.save(&env)
-            })
-            .unwrap();
+        repin_to_unmatchable_digest(&store, &env_id, revision_id);
         std::fs::remove_dir_all(&rev_dir).unwrap();
 
         let err = materialize_revision_from_bundle(&store, &env_id, revision_id, &fixture_bundle())
@@ -605,19 +607,7 @@ mod materialize_tests {
         // Repin the revision to a digest the fixture cannot reproduce, so the
         // next materialize fails the integrity gate AFTER moving the good dir
         // aside.
-        store
-            .transact(&env_id, |locked| {
-                let mut env = locked.load()?;
-                env.revisions
-                    .iter_mut()
-                    .find(|r| r.revision_id == revision_id)
-                    .unwrap()
-                    .bundle_digest =
-                    "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                        .to_string();
-                locked.save(&env)
-            })
-            .unwrap();
+        repin_to_unmatchable_digest(&store, &env_id, revision_id);
 
         let err = materialize_revision_from_bundle(&store, &env_id, revision_id, &fixture_bundle())
             .unwrap_err();
