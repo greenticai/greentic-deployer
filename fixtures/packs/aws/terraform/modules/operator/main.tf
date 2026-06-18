@@ -495,6 +495,16 @@ resource "aws_ecs_task_definition" "this" {
     name = "greentic-scratch"
   }
 
+  # Writable scratch for the ECS Exec SSM agent so `aws ecs execute-command`
+  # keeps working under readonlyRootFilesystem (debugging hardened tasks).
+  volume {
+    name = "ssm-state"
+  }
+
+  volume {
+    name = "ssm-log"
+  }
+
   container_definitions = jsonencode(concat(
     [
       {
@@ -595,6 +605,16 @@ resource "aws_ecs_task_definition" "this" {
             {
               sourceVolume  = "greentic-scratch"
               containerPath = "/tmp"
+              readOnly      = false
+            },
+            {
+              sourceVolume  = "ssm-state"
+              containerPath = "/var/lib/amazon/ssm"
+              readOnly      = false
+            },
+            {
+              sourceVolume  = "ssm-log"
+              containerPath = "/var/log/amazon"
               readOnly      = false
             }
           ],
