@@ -56,6 +56,20 @@ const CREDS_REF: &str = "secret://local/default/_/k8s-deployer/sa_token";
 /// reconcile/apply-revision tests' namespace churn.
 const CREDS_SA_NS: &str = "gtc-creds-e2e";
 
+/// In-cluster plain-HTTP server (busybox `httpd`) that serves the fixture
+/// `.gtbundle` for the M2 boot-time pull test. The worker pulls over `http://`,
+/// which greentic-start's bundle-ref path fetches with `ureq` — bypassing the
+/// OCI client (HTTPS-only, no insecure escape hatch), so kind needs no registry
+/// or TLS. Lives in the env's own `gtc-local` namespace for one-shot cleanup.
+const BUNDLE_SERVER: &str = "gtc-bundle-server";
+/// ConfigMap carrying the fixture bundle's bytes (the 4 KiB fixture is far
+/// under the 1 MiB ConfigMap limit), mounted into the httpd pod's docroot.
+const BUNDLE_BLOB_CM: &str = "gtc-bundle-blob";
+/// The file name the bundle is served (and pulled) under.
+const BUNDLE_FILE: &str = "bundle.gtbundle";
+/// The port the in-cluster httpd listens on (and the Service exposes).
+const BUNDLE_SERVER_PORT: u16 = 8080;
+
 fn deployer_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_greentic-deployer"))
 }
@@ -232,13 +246,23 @@ fn requirements_with_token(store: &Path, token: &str) -> Value {
         .unwrap_or_else(|e| panic!("requirements stdout is not json ({e}):\n{stdout}"))
 }
 
-/// Run the full setup ceremony (create env → bind the K8s deployer →
-/// bootstrap the trust root → add a bundle → stage + warm a revision) and
-/// return the warmed revision id. The revision ends up `Ready` (cluster
-/// presence) but nothing has touched the cluster yet — stage/warm are
-/// desired-state-only; `reconcile` / `apply-revision` are the first verbs to
-/// reach the API server.
-fn provision_ready_revision(store: &Path, runtime_image: Option<&str>) -> String {
+/// Shared provisioning ceremony for the cluster E2Es: create env (optionally
+/// pinning `runtime_image`) → bind the K8s deployer (namespace → gtc-local) →
+/// bootstrap the trust root → add a bundle → stage + warm a revision to
+/// `Ready`. When `bundle_path` is set, stage hashes the real bundle (recording
+/// its sha256 as `bundle_digest`); when `source_uri` is set, it rides on the
+/// stage payload as the worker's boot-pull source; when `route` is set, 100 %
+/// of traffic is pointed at the revision afterward. Nothing touches the cluster
+/// yet — stage/warm/traffic are desired-state-only; `reconcile` /
+/// `apply-revision` are the first verbs to reach the API server. Returns the
+/// warmed revision id.
+fn provision_revision(
+    store: &Path,
+    runtime_image: Option<&str>,
+    bundle_path: Option<&Path>,
+    source_uri: Option<&str>,
+    route: bool,
+) -> String {
     // 1. Create the env and bind the K8s deployer (namespace → gtc-local).
     bind_k8s_env(store, runtime_image);
 
@@ -261,11 +285,20 @@ fn provision_ready_revision(store: &Path, runtime_image: Option<&str>) -> String
         .expect("deployment_id")
         .to_string();
 
-    let stage = payload(
-        store,
-        "stage.json",
-        serde_json::json!({"environment_id": ENV_ID, "deployment_id": deployment_id}),
-    );
+    // `bundle_path` makes stage hash the real fixture (→ the same sha256 the
+    // worker recomputes on the pulled bytes); `bundle_source_uri` is what the
+    // worker reads from `environment.json` to pull.
+    let mut stage_doc = serde_json::json!({
+        "environment_id": ENV_ID,
+        "deployment_id": deployment_id,
+    });
+    if let Some(path) = bundle_path {
+        stage_doc["bundle_path"] = serde_json::json!(path.to_string_lossy());
+    }
+    if let Some(uri) = source_uri {
+        stage_doc["bundle_source_uri"] = serde_json::json!(uri);
+    }
+    let stage = payload(store, "stage.json", stage_doc);
     let revision_id = op(store, Some(&stage), &["revisions", "stage"])["result"]["revision_id"]
         .as_str()
         .expect("revision_id")
@@ -281,7 +314,32 @@ fn provision_ready_revision(store: &Path, runtime_image: Option<&str>) -> String
         warmed["result"]["lifecycle"], "ready",
         "revision warmed to Ready"
     );
+
+    // Route 100 % of traffic to the revision so the worker's boot pull (which
+    // only pulls traffic-routed revisions) fires.
+    if route {
+        let traffic = payload(
+            store,
+            "traffic.json",
+            serde_json::json!({
+                "environment_id": ENV_ID,
+                "deployment_id": deployment_id,
+                "entries": [{"revision_id": revision_id, "weight_bps": 10000}],
+                "idempotency_key": format!("e2e-traffic-{revision_id}"),
+            }),
+        );
+        op(store, Some(&traffic), &["traffic", "set"]);
+    }
+
     revision_id
+}
+
+/// The desired-state-only ceremony with no bundle bytes and no routing — the
+/// revision reaches `Ready` (cluster presence) but a worker booting it serves
+/// probes only (no `bundle_source_uri` to pull). Used by the reconcile /
+/// apply-revision / warm-serving tests.
+fn provision_ready_revision(store: &Path, runtime_image: Option<&str>) -> String {
+    provision_revision(store, runtime_image, None, None, false)
 }
 
 /// Archive a revision (desired-state-only — no cluster contact).
@@ -352,6 +410,293 @@ fn apply_revision_expect_not_ready(store: &Path, revision_id: &str) -> Value {
         .unwrap_or_else(|e| panic!("apply-revision stderr is not json ({e}):\n{stderr}"))
 }
 
+/// The serving runtime image the worker/router pods boot, or `None` (with a
+/// skip notice) when `GREENTIC_K8S_SERVING_IMAGE` is unset — the
+/// `:develop`-publish-dependent gate the serving tests share on top of
+/// [`armed`].
+fn serving_image() -> Option<String> {
+    match std::env::var("GREENTIC_K8S_SERVING_IMAGE") {
+        Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+        _ => {
+            eprintln!(
+                "skipping serving test: set GREENTIC_K8S_SERVING_IMAGE to a serving image \
+                 already loaded into the cluster (e.g. greentic-start-distroless:<tag>)"
+            );
+            None
+        }
+    }
+}
+
+/// Path to the only ready-made valid `.gtbundle` fixture in the repo. Its pack
+/// carries no `.wasm` (manifest/lock/sbom only), so it ACTIVATES and serves
+/// `/healthz` but a real request would 500 at flow execution — exactly enough
+/// to prove the worker pulled, digest-verified, materialized, and activated a
+/// real revision without standing up a component runtime.
+fn fixture_bundle() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/bundles/perf-smoke-bundle.gtbundle")
+}
+
+/// The in-cluster URL the worker pulls its bundle from (plain HTTP, in the env
+/// namespace).
+fn bundle_source_uri() -> String {
+    format!(
+        "http://{BUNDLE_SERVER}.{NAMESPACE}.svc.cluster.local:{BUNDLE_SERVER_PORT}/{BUNDLE_FILE}"
+    )
+}
+
+/// `kubectl apply -f -`, piping `manifest` on stdin; asserts success.
+fn kubectl_apply_stdin(manifest: &str) {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new("kubectl")
+        .args(["apply", "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn kubectl apply -f -");
+    child
+        .stdin
+        .take()
+        .expect("kubectl stdin")
+        .write_all(manifest.as_bytes())
+        .expect("write manifest to kubectl");
+    let out = child.wait_with_output().expect("kubectl apply -f -");
+    assert!(
+        out.status.success(),
+        "kubectl apply -f - failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// Stand up an in-cluster plain-HTTP server that serves the fixture bundle at
+/// `/{BUNDLE_FILE}` and WAIT for it to be ready, so the worker can pull the
+/// moment it boots. The bundle bytes ride in a ConfigMap mounted into a
+/// `busybox httpd` pod's docroot. Idempotent: clears any prior run first. The
+/// env namespace is created here (before `reconcile`) so the server precedes
+/// the worker.
+///
+/// Also applies an ingress-allow NetworkPolicy for the server: the env pack's
+/// `gtc-default-deny` (empty podSelector) denies ingress to EVERY pod in the
+/// namespace, and modern kindnet (kindest/node v1.31+) ENFORCES NetworkPolicy,
+/// so without this allow the worker's pull is dropped and the boot fails closed
+/// (~127 s TCP timeout → CrashLoop). In production the bundle source is an
+/// external registry, outside the namespace and unaffected by these policies;
+/// only this in-cluster test fixture is caught by the env's default-deny, so the
+/// allow lives here in the test, not in the production render. The worker's
+/// matching egress is already granted by `gtc-allow-worker-egress`.
+fn start_bundle_server() {
+    // Clean slate, then (re)create the env namespace the server shares with the
+    // worker. `reset_namespace` (a blocking delete) ran first, so the namespace
+    // is gone; tolerate "already exists" defensively.
+    let _ = kubectl(&["create", "namespace", NAMESPACE]);
+    let _ = kubectl(&[
+        "delete",
+        "configmap",
+        BUNDLE_BLOB_CM,
+        "-n",
+        NAMESPACE,
+        "--ignore-not-found",
+    ]);
+
+    // Bundle bytes → ConfigMap (kubectl auto-detects binary → binaryData).
+    let fixture = fixture_bundle();
+    kubectl_ok(&[
+        "create",
+        "configmap",
+        BUNDLE_BLOB_CM,
+        "-n",
+        NAMESPACE,
+        &format!("--from-file={BUNDLE_FILE}={}", fixture.to_string_lossy()),
+    ]);
+
+    // busybox httpd Deployment + Service serving the mounted bundle. Readiness
+    // is the bundle itself returning 200, so a completed rollout means the
+    // worker's pull will succeed.
+    let manifest = format!(
+        "apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {BUNDLE_SERVER}
+  namespace: {NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {BUNDLE_SERVER}
+  template:
+    metadata:
+      labels:
+        app: {BUNDLE_SERVER}
+    spec:
+      containers:
+        - name: httpd
+          image: busybox:1.36
+          command: [\"httpd\", \"-f\", \"-v\", \"-p\", \"{BUNDLE_SERVER_PORT}\", \"-h\", \"/www\"]
+          ports:
+            - containerPort: {BUNDLE_SERVER_PORT}
+          readinessProbe:
+            httpGet:
+              path: /{BUNDLE_FILE}
+              port: {BUNDLE_SERVER_PORT}
+            initialDelaySeconds: 1
+            periodSeconds: 2
+          volumeMounts:
+            - name: blob
+              mountPath: /www
+              readOnly: true
+      volumes:
+        - name: blob
+          configMap:
+            name: {BUNDLE_BLOB_CM}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {BUNDLE_SERVER}
+  namespace: {NAMESPACE}
+spec:
+  selector:
+    app: {BUNDLE_SERVER}
+  ports:
+    - port: {BUNDLE_SERVER_PORT}
+      targetPort: {BUNDLE_SERVER_PORT}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gtc-bundle-server-allow-ingress
+  namespace: {NAMESPACE}
+spec:
+  podSelector:
+    matchLabels:
+      app: {BUNDLE_SERVER}
+  policyTypes:
+    - Ingress
+  ingress:
+    - {{}}
+"
+    );
+    kubectl_apply_stdin(&manifest);
+
+    let status = kubectl(&[
+        "rollout",
+        "status",
+        &format!("deployment/{BUNDLE_SERVER}"),
+        "-n",
+        NAMESPACE,
+        "--timeout=120s",
+    ]);
+    assert!(
+        status.status.success(),
+        "in-cluster bundle server must come up before the worker boots:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr),
+    );
+}
+
+/// Provision a revision the worker will PULL at boot: stage the FIXTURE bundle
+/// (so the revision records its real sha256 as `bundle_digest`) WITH the
+/// `bundle_source_uri` the worker fetches, warm to Ready, and route 100 % of
+/// traffic to it (boot-time pull only fires for traffic-routed revisions).
+/// Returns the revision id.
+fn provision_pullable_revision(store: &Path, image: &str, source_uri: &str) -> String {
+    provision_revision(
+        store,
+        Some(image),
+        Some(&fixture_bundle()),
+        Some(source_uri),
+        true,
+    )
+}
+
+/// Dump everything needed to root-cause a worker that never reached Ready: pod
+/// state, namespace events, and the worker's own logs (current and, if it
+/// crash-looped, the previous container) — plus the bundle server's endpoints
+/// and access log. The single fact that bisects the failure is whether the
+/// worker's pull request reached the server: a GET in the server's log means
+/// network + DNS worked and the failure is downstream (materialize / activate /
+/// digest); no GET means the worker never connected (DNS or pod-to-pod). The
+/// boot pull is fail-closed, so this only runs on a failed rollout — the live
+/// cluster is still up at that point, so the queries return real state.
+fn worker_failure_diagnostics(worker: &str) -> String {
+    let worker_dep = format!("deployment/{worker}");
+    let server_dep = format!("deployment/{BUNDLE_SERVER}");
+    let probes: [(&str, Vec<&str>); 8] = [
+        (
+            "pods (wide)",
+            vec!["get", "pods", "-n", NAMESPACE, "-o", "wide"],
+        ),
+        (
+            "namespace events",
+            vec!["get", "events", "-n", NAMESPACE, "--sort-by=.lastTimestamp"],
+        ),
+        // NetworkPolicies gate pod-to-pod reachability under an enforcing CNI
+        // (kindnet on v1.31+): if the worker's pull is dropped, the missing
+        // allow shows up here.
+        (
+            "network policies",
+            vec!["get", "networkpolicies", "-n", NAMESPACE, "-o", "wide"],
+        ),
+        ("pods describe", vec!["describe", "pods", "-n", NAMESPACE]),
+        (
+            "worker logs",
+            vec![
+                "logs",
+                &worker_dep,
+                "-n",
+                NAMESPACE,
+                "--all-containers",
+                "--tail=150",
+            ],
+        ),
+        (
+            // Target the main `worker` container by name: `--all-containers
+            // --previous` errors on the init container (which has no previous
+            // instance) and aborts before reaching the crash logs we want.
+            "worker logs (previous crash)",
+            vec![
+                "logs",
+                &worker_dep,
+                "-c",
+                "worker",
+                "-n",
+                NAMESPACE,
+                "--previous",
+                "--tail=150",
+            ],
+        ),
+        (
+            "bundle-server endpoints",
+            vec![
+                "get",
+                "endpoints",
+                BUNDLE_SERVER,
+                "-n",
+                NAMESPACE,
+                "-o",
+                "wide",
+            ],
+        ),
+        (
+            "bundle-server logs (did the pull arrive?)",
+            vec!["logs", &server_dep, "-n", NAMESPACE, "--tail=60"],
+        ),
+    ];
+    let mut out = String::new();
+    for (label, args) in probes {
+        let res = kubectl(&args);
+        out.push_str(&format!(
+            "\n--- {label} ---\n{}{}",
+            String::from_utf8_lossy(&res.stdout),
+            String::from_utf8_lossy(&res.stderr),
+        ));
+    }
+    out
+}
+
 #[test]
 fn reconcile_applies_then_prunes_against_a_live_cluster() {
     if !armed() {
@@ -365,14 +710,15 @@ fn reconcile_applies_then_prunes_against_a_live_cluster() {
     // Worker objects are named after the lowercased revision ULID.
     let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
 
-    // Reconcile → applies the env-level set (11: namespace, env-store +
-    // runtime-config ConfigMaps, router Deployment/Service/PDB, 5 NetworkPolicies
-    // incl. the always-rendered worker-egress policy) + the warmed revision's
-    // worker pair (2). Verify both the verb's self-report and ground truth.
+    // Reconcile → applies the env-level set (12: namespace, env-store +
+    // runtime-config ConfigMaps, router Deployment/Service/PDB, 6 NetworkPolicies
+    // incl. the always-rendered worker- and router-egress policies) + the warmed
+    // revision's worker pair (2). Verify both the verb's self-report and ground
+    // truth.
     let (applied, pruned) = reconcile(store);
     assert_eq!(
         (applied, pruned),
-        (13, 0),
+        (14, 0),
         "first reconcile applies env-level + worker pair, prunes nothing"
     );
     assert!(
@@ -395,7 +741,7 @@ fn reconcile_applies_then_prunes_against_a_live_cluster() {
     // Reconcile again → declarative upsert is idempotent: same applied set,
     // nothing pruned, worker still present.
     let (applied2, pruned2) = reconcile(store);
-    assert_eq!((applied2, pruned2), (13, 0), "reconcile is idempotent");
+    assert_eq!((applied2, pruned2), (14, 0), "reconcile is idempotent");
     assert!(
         object_exists("deployment", &worker, Some(NAMESPACE)),
         "worker survives idempotent reconcile"
@@ -409,7 +755,7 @@ fn reconcile_applies_then_prunes_against_a_live_cluster() {
     let (applied3, pruned3) = reconcile(store);
     assert_eq!(
         (applied3, pruned3),
-        (11, 2),
+        (12, 2),
         "reconcile prunes the now-absent revision's worker pair"
     );
     assert!(
@@ -561,7 +907,7 @@ fn apply_revision_warm_gate_blocks_unready_worker_then_archives_against_a_live_c
     // apply-revision has somewhere to land. apply-revision only touches the
     // one revision's worker pair — it assumes the env already exists.
     let (applied, _) = reconcile(store);
-    assert_eq!(applied, 13, "reconcile establishes env-level + worker pair");
+    assert_eq!(applied, 14, "reconcile establishes env-level + worker pair");
 
     // apply-revision on the Ready (present) revision → warm branch. warm
     // re-upserts the worker pair, then waits for the rollout. The pinned
@@ -640,15 +986,8 @@ fn worker_reaches_ready_and_serves_healthz_with_a_serving_image() {
     if !armed() {
         return;
     }
-    let image = match std::env::var("GREENTIC_K8S_SERVING_IMAGE") {
-        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ => {
-            eprintln!(
-                "skipping serving test: set GREENTIC_K8S_SERVING_IMAGE to a serving image \
-                 already loaded into the cluster (e.g. greentic-start-distroless:<tag>)"
-            );
-            return;
-        }
+    let Some(image) = serving_image() else {
+        return;
     };
     reset_namespace();
     let store = tempfile::tempdir().expect("tempdir");
@@ -659,7 +998,7 @@ fn worker_reaches_ready_and_serves_healthz_with_a_serving_image() {
     let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
 
     let (applied, _) = reconcile(store);
-    assert_eq!(applied, 13, "reconcile applies env-level + worker pair");
+    assert_eq!(applied, 14, "reconcile applies env-level + worker pair");
 
     // The worker's readiness probe hits `/healthz`, so "rollout complete" ==
     // "the bundle-less boot is serving `/healthz` on the pod IP". This is the
@@ -701,6 +1040,99 @@ fn worker_reaches_ready_and_serves_healthz_with_a_serving_image() {
         "apply-revision warms the now-serving worker"
     );
 
+    let _ = kubectl(&[
+        "delete",
+        "namespace",
+        NAMESPACE,
+        "--ignore-not-found",
+        "--wait=false",
+    ]);
+}
+
+/// M2 end-to-end: a freshly-seeded worker PULLS its bundle at boot and serves
+/// the real revision — the first live proof of the distributor-pull path.
+///
+/// The env-store ConfigMap ships only `environment.json` (M1), so the worker
+/// boots `start --env` with an empty runtime-config. Because the routed
+/// revision carries a `bundle_source_uri`, the bundle-less boot fetches the
+/// `.gtbundle` over HTTP from the in-cluster server, materializes it
+/// (digest-gated: the pulled bytes' sha256 must equal the sha256 the deployer
+/// pinned when it staged the same fixture), activates it, and serves.
+///
+/// The proof is layered:
+///   - The HTTP server, the worker's `/healthz` probe, and `reconcile`'s
+///     readiness are all gated, so a completed worker rollout means the worker
+///     pulled, digest-verified, materialized, AND activated — a failed pull or
+///     a digest mismatch aborts the boot fail-closed (→ CrashLoop, never Ready).
+///   - But probes-only M1 workers also reach Ready, so the boot banner on the
+///     worker's stdout is asserted to name a REAL revision
+///     (`serving N revision(s) for env …`) rather than the probes-only line
+///     (`… serving probes only`) — the direct proof the pulled bundle became a
+///     live revision.
+///
+/// Gated on `GREENTIC_K8S_SERVING_IMAGE` (a `:develop` worker image that
+/// supports the boot pull + serve) on top of `GREENTIC_K8S_E2E`; self-skips
+/// when unset, exactly like the warm-serving test above. The pull rides the
+/// `http://` bundle-ref path (plain HTTP via `ureq`), so kind needs no OCI
+/// registry or TLS.
+#[test]
+fn worker_pulls_http_bundle_and_serves_the_real_revision() {
+    if !armed() {
+        return;
+    }
+    let Some(image) = serving_image() else {
+        return;
+    };
+    reset_namespace();
+    let store = tempfile::tempdir().expect("tempdir");
+    let store = store.path();
+
+    // Serve the fixture bundle in-cluster BEFORE the worker boots (its rollout
+    // waits, so the pull can't race the server coming up).
+    start_bundle_server();
+
+    let revision_id = provision_pullable_revision(store, &image, &bundle_source_uri());
+    let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
+
+    // reconcile renders the env-store ConfigMap (carrying `environment.json`
+    // with the routed revision + its `bundle_source_uri`) and the worker pair.
+    let (applied, _) = reconcile(store);
+    assert_eq!(applied, 14, "reconcile applies env-level + worker pair");
+
+    // A completed rollout proves the full boot chain ran: pull → digest gate →
+    // materialize → activate → serve. The HTTP server is the only bundle
+    // source, so Ready here is impossible without a successful pull.
+    let status = kubectl(&[
+        "rollout",
+        "status",
+        &format!("deployment/{worker}"),
+        "-n",
+        NAMESPACE,
+        "--timeout=180s",
+    ]);
+    if !status.status.success() {
+        // Fail-closed boot means a stuck rollout hides the real cause (a failed
+        // pull, a digest mismatch, an unreachable server). Dump the live cluster
+        // state into the panic so CI surfaces *why* the worker never went Ready.
+        let diag = worker_failure_diagnostics(&worker);
+        panic!(
+            "worker must reach Ready by pulling + serving the http bundle:\n\
+             stdout: {}\nstderr: {}\n\n=== diagnostics ==={diag}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr),
+        );
+    }
+
+    // Distinguish a REAL activated revision from a probes-only boot: the worker
+    // logs `serving N revision(s) for env …` only when packs activated, vs
+    // `… serving probes only` when no bundle attached.
+    let logs = kubectl_ok(&["logs", &format!("deployment/{worker}"), "-n", NAMESPACE]);
+    assert!(
+        logs.contains("revision(s) for env"),
+        "the worker must log the real-revision serve banner (not probes-only):\n{logs}"
+    );
+
+    // Cleanup (deletes the bundle server + its ConfigMap with the namespace).
     let _ = kubectl(&[
         "delete",
         "namespace",

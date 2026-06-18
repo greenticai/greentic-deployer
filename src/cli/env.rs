@@ -2953,11 +2953,11 @@ mod tests {
     use std::path::PathBuf;
 
     /// `K8sParams::for_env` env-level set: Namespace, env-store ConfigMap,
-    /// runtime-config ConfigMap, router Deployment + Service + PDB, 5
-    /// NetworkPolicies (the worker-egress policy is always rendered; its egress
-    /// rule toggles allow-all/deny by pullability — see the manifests-crate
-    /// render tests). Every env renders exactly these.
-    const K8S_ENV_LEVEL_OBJECT_COUNT: usize = 11;
+    /// runtime-config ConfigMap, router Deployment + Service + PDB, 6
+    /// NetworkPolicies (the worker- and router-egress policies are always
+    /// rendered; their egress rule toggles allow-all/deny by pullability — see
+    /// the manifests-crate render tests). Every env renders exactly these.
+    const K8S_ENV_LEVEL_OBJECT_COUNT: usize = 12;
 
     fn render_args(env_id: &str, kind: Option<&str>, output: Option<PathBuf>) -> EnvRenderArgs {
         EnvRenderArgs {
