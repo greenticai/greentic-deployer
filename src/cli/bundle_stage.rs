@@ -15,7 +15,9 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use greentic_deploy_spec::{EnvId, LockedPack, PackId, PackListLock, RevisionId, SchemaVersion};
+use greentic_deploy_spec::{
+    BundleId, EnvId, LockedPack, PackId, PackListLock, Revision, RevisionId, SchemaVersion,
+};
 use sha2::{Digest, Sha256};
 
 use crate::environment::LocalFsStore;
@@ -103,7 +105,9 @@ pub fn materialize_revision_from_bundle(
             .iter()
             .find(|r| r.revision_id == revision_id)
             .ok_or_else(|| {
-                OpError::NotFound(format!("revision `{revision_id}` not found in env `{env_id}`"))
+                OpError::NotFound(format!(
+                    "revision `{revision_id}` not found in env `{env_id}`"
+                ))
             })?;
         let bundle_id = env
             .bundles
@@ -119,65 +123,115 @@ pub fn materialize_revision_from_bundle(
 
         let env_dir = store.env_dir(env_id)?;
         let rev_dir = env_dir.join("revisions").join(revision_id.to_string());
-        let drop_rev_dir = || {
-            let _ = std::fs::remove_dir_all(&rev_dir);
-        };
 
-        // 1. Extract + pin packs under `<env_dir>/revisions/<rev>/`.
-        let staged = stage_local_bundle(&env_dir, revision_id, bundle_path)?;
-
-        // 2. Integrity gate: the bytes the worker pulled MUST match what the
-        //    deployer pinned on the revision. `stage_local_bundle` binds the
-        //    digest to the immutable staged copy, so this compares like for
-        //    like. Fail closed — a mismatch is a supply-chain signal, not a
-        //    recoverable condition.
-        if staged.bundle_digest != revision.bundle_digest {
-            drop_rev_dir();
-            return Err(OpError::Conflict(format!(
-                "pulled bundle digest `{}` does not match revision `{revision_id}`'s pinned \
-                 `{}`; refusing to serve unpinned bytes",
-                staged.bundle_digest, revision.bundle_digest
-            )));
-        }
-        // The lock ref is a pure function of the revision id, so re-staging the
-        // same revision must reproduce the ref the revision already records. A
-        // divergence means the two stage paths drifted — guard against it.
-        if staged.pack_list_lock_ref != revision.pack_list_lock_ref {
-            drop_rev_dir();
-            return Err(OpError::Conflict(format!(
-                "materialized pack-list lock ref `{}` diverges from revision `{revision_id}`'s `{}`",
-                staged.pack_list_lock_ref.display(),
-                revision.pack_list_lock_ref.display()
-            )));
+        // Move any existing extraction aside BEFORE re-staging, so a failed
+        // (re)materialization — a corrupt/wrong pull, a digest or lock-ref
+        // mismatch, a pack-config rejection, or a transient unpack error inside
+        // `stage_local_bundle` (which clears its own extract dir up front) —
+        // rolls back to the prior good state instead of bricking a revision the
+        // env still routes traffic to. The whole op holds the env flock, so the
+        // move/restore can't race another writer.
+        let backup_dir = env_dir.join("revisions").join(format!("{revision_id}.bak"));
+        let _ = std::fs::remove_dir_all(&backup_dir); // clear a stale backup from an interrupted run
+        let had_existing = rev_dir.exists();
+        if had_existing {
+            std::fs::rename(&rev_dir, &backup_dir).map_err(|source| OpError::Io {
+                path: rev_dir.clone(),
+                source,
+            })?;
         }
 
-        // 3. Materialize pack-config docs from the extracted bundle inputs. The
-        //    refs are deterministic for a given (revision id, bundle), so they
-        //    line up with what the revision already records — re-derive the
-        //    files rather than trust the (absent) on-disk copies.
-        let pinned_pack_ids: HashSet<String> = staged
-            .lock
-            .packs
-            .iter()
-            .map(|p| p.pack_id.as_str().to_string())
-            .collect();
-        super::pack_config_stage::materialize_pack_configs(
+        // Materialize into the now-empty `rev_dir`, then project runtime-config.
+        // Any error rolls back; only an all-green run is promoted.
+        let outcome = materialize_into_rev_dir(
             &env_dir,
             &rev_dir,
-            revision_id,
             env_id,
             &bundle_id,
-            &pinned_pack_ids,
+            bundle_path,
+            revision,
         )
-        .inspect_err(|_| drop_rev_dir())?;
+        .and_then(|()| locked.refresh_runtime_config(&env).map_err(OpError::from));
 
-        // 4. (Re)write `runtime-config.json` so the next boot activates this
-        //    revision. Projects from the env's traffic splits; if no split
-        //    routes the revision yet, the file is removed and the worker serves
-        //    probes-only until traffic lands (B0 rejects an empty config).
-        locked.refresh_runtime_config(&env)?;
-        Ok(())
+        match outcome {
+            Ok(()) => {
+                // Promote: the fresh extraction passed every check; drop the
+                // saved copy.
+                let _ = std::fs::remove_dir_all(&backup_dir);
+                Ok(())
+            }
+            Err(err) => {
+                // Roll back: discard the partial new attempt and restore the
+                // prior good extraction so the worker can still serve.
+                let _ = std::fs::remove_dir_all(&rev_dir);
+                if had_existing {
+                    let _ = std::fs::rename(&backup_dir, &rev_dir);
+                }
+                Err(err)
+            }
+        }
     })
+}
+
+/// Steps 1–3 of [`materialize_revision_from_bundle`], writing only under
+/// `rev_dir`: extract + pin packs, integrity-gate the staged bundle's digest
+/// and lock ref against what `revision` recorded, then materialize the
+/// pack-config docs. The caller owns the move-aside/rollback that keeps a prior
+/// good extraction recoverable when any step here fails.
+fn materialize_into_rev_dir(
+    env_dir: &Path,
+    rev_dir: &Path,
+    env_id: &EnvId,
+    bundle_id: &BundleId,
+    bundle_path: &Path,
+    revision: &Revision,
+) -> Result<(), OpError> {
+    let revision_id = revision.revision_id;
+
+    // 1. Extract + pin packs under `<env_dir>/revisions/<rev>/`.
+    let staged = stage_local_bundle(env_dir, revision_id, bundle_path)?;
+
+    // 2. Integrity gate: the bytes the worker pulled MUST match what the deployer
+    //    pinned on the revision. `stage_local_bundle` binds the digest to the
+    //    immutable staged copy, so this compares like for like. Fail closed — a
+    //    mismatch is a supply-chain signal, not a recoverable condition.
+    if staged.bundle_digest != revision.bundle_digest {
+        return Err(OpError::Conflict(format!(
+            "pulled bundle digest `{}` does not match revision `{revision_id}`'s pinned `{}`; \
+             refusing to serve unpinned bytes",
+            staged.bundle_digest, revision.bundle_digest
+        )));
+    }
+    // The lock ref is a pure function of the revision id, so re-staging the same
+    // revision must reproduce the ref the revision already records. A divergence
+    // means the two stage paths drifted — guard against it.
+    if staged.pack_list_lock_ref != revision.pack_list_lock_ref {
+        return Err(OpError::Conflict(format!(
+            "materialized pack-list lock ref `{}` diverges from revision `{revision_id}`'s `{}`",
+            staged.pack_list_lock_ref.display(),
+            revision.pack_list_lock_ref.display()
+        )));
+    }
+
+    // 3. Materialize pack-config docs from the extracted bundle inputs. The refs
+    //    are deterministic for a given (revision id, bundle), so they line up
+    //    with what the revision already records — re-derive the files rather than
+    //    trust the (absent) on-disk copies.
+    let pinned_pack_ids: HashSet<String> = staged
+        .lock
+        .packs
+        .iter()
+        .map(|p| p.pack_id.as_str().to_string())
+        .collect();
+    super::pack_config_stage::materialize_pack_configs(
+        env_dir,
+        rev_dir,
+        revision_id,
+        env_id,
+        bundle_id,
+        &pinned_pack_ids,
+    )?;
+    Ok(())
 }
 
 fn stage_into(
@@ -525,6 +579,66 @@ mod materialize_tests {
         assert!(
             !rev_dir.exists(),
             "a rejected materialization must not leave a partial extraction"
+        );
+    }
+
+    /// Failure atomicity: when a revision dir is already materialized and a
+    /// second materialization fails the integrity gate (a bad re-pull), the
+    /// prior good extraction must survive intact and no backup may leak — a
+    /// transient bad pull must not brick a revision the env still routes to.
+    #[test]
+    fn preserves_existing_revision_dir_when_re_materialization_fails() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (env_id, revision_id, env_dir) = seed_staged_env(&store, true);
+        let rev_dir = env_dir.join("revisions").join(revision_id.to_string());
+        let lock_path = rev_dir.join("pack-list.lock");
+
+        // The seed already materialized a good rev_dir; capture the lock bytes so
+        // we can prove they survive a failed re-materialization.
+        assert!(
+            lock_path.is_file(),
+            "seed must leave a materialized rev dir"
+        );
+        let good_lock = std::fs::read(&lock_path).unwrap();
+
+        // Repin the revision to a digest the fixture cannot reproduce, so the
+        // next materialize fails the integrity gate AFTER moving the good dir
+        // aside.
+        store
+            .transact(&env_id, |locked| {
+                let mut env = locked.load()?;
+                env.revisions
+                    .iter_mut()
+                    .find(|r| r.revision_id == revision_id)
+                    .unwrap()
+                    .bundle_digest =
+                    "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                        .to_string();
+                locked.save(&env)
+            })
+            .unwrap();
+
+        let err = materialize_revision_from_bundle(&store, &env_id, revision_id, &fixture_bundle())
+            .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)), "got: {err}");
+
+        // The prior good extraction survives intact, and the backup is cleaned up.
+        assert!(
+            lock_path.is_file(),
+            "existing pack-list.lock must survive a failed re-materialize"
+        );
+        assert_eq!(
+            std::fs::read(&lock_path).unwrap(),
+            good_lock,
+            "the restored lock must be byte-identical to the original"
+        );
+        assert!(
+            !env_dir
+                .join("revisions")
+                .join(format!("{revision_id}.bak"))
+                .exists(),
+            "the rollback backup must not leak"
         );
     }
 
