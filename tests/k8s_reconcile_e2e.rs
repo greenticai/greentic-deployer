@@ -246,13 +246,23 @@ fn requirements_with_token(store: &Path, token: &str) -> Value {
         .unwrap_or_else(|e| panic!("requirements stdout is not json ({e}):\n{stdout}"))
 }
 
-/// Run the full setup ceremony (create env → bind the K8s deployer →
-/// bootstrap the trust root → add a bundle → stage + warm a revision) and
-/// return the warmed revision id. The revision ends up `Ready` (cluster
-/// presence) but nothing has touched the cluster yet — stage/warm are
-/// desired-state-only; `reconcile` / `apply-revision` are the first verbs to
-/// reach the API server.
-fn provision_ready_revision(store: &Path, runtime_image: Option<&str>) -> String {
+/// Shared provisioning ceremony for the cluster E2Es: create env (optionally
+/// pinning `runtime_image`) → bind the K8s deployer (namespace → gtc-local) →
+/// bootstrap the trust root → add a bundle → stage + warm a revision to
+/// `Ready`. When `bundle_path` is set, stage hashes the real bundle (recording
+/// its sha256 as `bundle_digest`); when `source_uri` is set, it rides on the
+/// stage payload as the worker's boot-pull source; when `route` is set, 100 %
+/// of traffic is pointed at the revision afterward. Nothing touches the cluster
+/// yet — stage/warm/traffic are desired-state-only; `reconcile` /
+/// `apply-revision` are the first verbs to reach the API server. Returns the
+/// warmed revision id.
+fn provision_revision(
+    store: &Path,
+    runtime_image: Option<&str>,
+    bundle_path: Option<&Path>,
+    source_uri: Option<&str>,
+    route: bool,
+) -> String {
     // 1. Create the env and bind the K8s deployer (namespace → gtc-local).
     bind_k8s_env(store, runtime_image);
 
@@ -275,11 +285,20 @@ fn provision_ready_revision(store: &Path, runtime_image: Option<&str>) -> String
         .expect("deployment_id")
         .to_string();
 
-    let stage = payload(
-        store,
-        "stage.json",
-        serde_json::json!({"environment_id": ENV_ID, "deployment_id": deployment_id}),
-    );
+    // `bundle_path` makes stage hash the real fixture (→ the same sha256 the
+    // worker recomputes on the pulled bytes); `bundle_source_uri` is what the
+    // worker reads from `environment.json` to pull.
+    let mut stage_doc = serde_json::json!({
+        "environment_id": ENV_ID,
+        "deployment_id": deployment_id,
+    });
+    if let Some(path) = bundle_path {
+        stage_doc["bundle_path"] = serde_json::json!(path.to_string_lossy());
+    }
+    if let Some(uri) = source_uri {
+        stage_doc["bundle_source_uri"] = serde_json::json!(uri);
+    }
+    let stage = payload(store, "stage.json", stage_doc);
     let revision_id = op(store, Some(&stage), &["revisions", "stage"])["result"]["revision_id"]
         .as_str()
         .expect("revision_id")
@@ -295,7 +314,32 @@ fn provision_ready_revision(store: &Path, runtime_image: Option<&str>) -> String
         warmed["result"]["lifecycle"], "ready",
         "revision warmed to Ready"
     );
+
+    // Route 100 % of traffic to the revision so the worker's boot pull (which
+    // only pulls traffic-routed revisions) fires.
+    if route {
+        let traffic = payload(
+            store,
+            "traffic.json",
+            serde_json::json!({
+                "environment_id": ENV_ID,
+                "deployment_id": deployment_id,
+                "entries": [{"revision_id": revision_id, "weight_bps": 10000}],
+                "idempotency_key": format!("e2e-traffic-{revision_id}"),
+            }),
+        );
+        op(store, Some(&traffic), &["traffic", "set"]);
+    }
+
     revision_id
+}
+
+/// The desired-state-only ceremony with no bundle bytes and no routing — the
+/// revision reaches `Ready` (cluster presence) but a worker booting it serves
+/// probes only (no `bundle_source_uri` to pull). Used by the reconcile /
+/// apply-revision / warm-serving tests.
+fn provision_ready_revision(store: &Path, runtime_image: Option<&str>) -> String {
+    provision_revision(store, runtime_image, None, None, false)
 }
 
 /// Archive a revision (desired-state-only — no cluster contact).
@@ -529,72 +573,19 @@ spec:
     );
 }
 
-/// Provision a revision the worker will PULL at boot: bind the env to the
-/// serving image, bootstrap the trust root, add a bundle, stage the FIXTURE
-/// bundle (so the revision records its real sha256 as `bundle_digest`) WITH the
+/// Provision a revision the worker will PULL at boot: stage the FIXTURE bundle
+/// (so the revision records its real sha256 as `bundle_digest`) WITH the
 /// `bundle_source_uri` the worker fetches, warm to Ready, and route 100 % of
 /// traffic to it (boot-time pull only fires for traffic-routed revisions).
 /// Returns the revision id.
 fn provision_pullable_revision(store: &Path, image: &str, source_uri: &str) -> String {
-    bind_k8s_env(store, Some(image));
-    op(store, None, &["trust-root", "bootstrap", ENV_ID]);
-
-    let add = payload(
+    provision_revision(
         store,
-        "add.json",
-        serde_json::json!({
-            "environment_id": ENV_ID,
-            "bundle_id": "e2e-bundle",
-            "route_binding": {"path_prefixes": ["/e2e"]},
-        }),
-    );
-    let deployment_id = op(store, Some(&add), &["bundles", "add"])["result"]["deployment_id"]
-        .as_str()
-        .expect("deployment_id")
-        .to_string();
-
-    // `bundle_path` makes stage hash the real fixture (→ the same sha256 the
-    // worker recomputes on the pulled bytes); `bundle_source_uri` is what the
-    // worker reads from `environment.json` to pull.
-    let stage = payload(
-        store,
-        "stage.json",
-        serde_json::json!({
-            "environment_id": ENV_ID,
-            "deployment_id": deployment_id,
-            "bundle_path": fixture_bundle().to_string_lossy(),
-            "bundle_source_uri": source_uri,
-        }),
-    );
-    let revision_id = op(store, Some(&stage), &["revisions", "stage"])["result"]["revision_id"]
-        .as_str()
-        .expect("revision_id")
-        .to_string();
-
-    let rev = payload(
-        store,
-        "rev.json",
-        serde_json::json!({"environment_id": ENV_ID, "revision_id": revision_id}),
-    );
-    let warmed = op(store, Some(&rev), &["revisions", "warm"]);
-    assert_eq!(
-        warmed["result"]["lifecycle"], "ready",
-        "revision warmed to Ready"
-    );
-
-    let traffic = payload(
-        store,
-        "traffic.json",
-        serde_json::json!({
-            "environment_id": ENV_ID,
-            "deployment_id": deployment_id,
-            "entries": [{"revision_id": revision_id, "weight_bps": 10000}],
-            "idempotency_key": format!("e2e-traffic-{revision_id}"),
-        }),
-    );
-    op(store, Some(&traffic), &["traffic", "set"]);
-
-    revision_id
+        Some(image),
+        Some(&fixture_bundle()),
+        Some(source_uri),
+        true,
+    )
 }
 
 #[test]
