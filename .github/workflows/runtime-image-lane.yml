@@ -1,0 +1,89 @@
+name: Runtime Image Lane
+
+# Deployer-local branch invariant: the sandbox-default runtime image tag must
+# match the branch lane.
+#
+#   develop -> :develop  (greentic-start's next-dev distroless image, the only
+#                         tag that carries the `start --env` serve boot — see
+#                         distroless-dev.yml in greentic-start)
+#   main    -> :latest   (stable distroless image)
+#
+# Nothing reconciles these across a develop<->main promotion or forward-port:
+# the central crate-name bifurcation guard rewrites CRATE names, not image
+# tags. So `:develop` would silently ride a stable promotion onto `main`
+# (sandbox pods on stable pointing at a moving dev image), and the inverse
+# forward-port would clobber develop's `:develop` back to `:latest` (breaking
+# the kind serving E2E). This job fails the PR/push when the tag does not match
+# the target lane, forcing a human to flip it. The check parses the actual
+# DEFAULT_RUNTIME_IMAGE const value (manifests.rs) — NOT the doc-comment, which
+# deliberately names both tags — plus the wizard help text.
+#
+# This guard is deployer-specific (it references deployer source paths), so it
+# lives here rather than in greenticai/.github's fleet-wide
+# assert-branch-invariants reusable.
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+jobs:
+  image-tag-matches-lane:
+    name: Runtime image tag matches lane
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Assert DEFAULT_RUNTIME_IMAGE tag matches the branch lane
+        env:
+          # PRs: target branch. Push: the branch itself.
+          LANE: ${{ github.base_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          MANIFEST="src/env_packs/k8s/manifests.rs"
+          QASPEC="src/env_packs/k8s/wizard.qaspec.yaml"
+
+          case "$LANE" in
+            main)    expected=latest ;;
+            develop) expected=develop ;;
+            *) echo "Lane '$LANE' has no runtime-image invariant; nothing to check."; exit 0 ;;
+          esac
+
+          # Authoritative value is the Rust const, NOT the doc-comment above it
+          # (the comment deliberately names both ':develop' and ':latest', so a
+          # blanket grep would false-fail). Extract the quoted string only.
+          const_line=$(grep -nE 'pub const DEFAULT_RUNTIME_IMAGE' "$MANIFEST" || true)
+          if [ -z "$const_line" ]; then
+            echo "::error file=$MANIFEST::DEFAULT_RUNTIME_IMAGE const not found — this guard is stale and must be updated."
+            exit 1
+          fi
+          const_lineno=${const_line%%:*}
+          const_value=$(printf '%s\n' "$const_line" | sed -E 's/.*"([^"]*)".*/\1/')
+          const_tag=${const_value##*:}
+
+          # The wizard help text references the same default image; it carries
+          # no deliberate dual-tag prose, so a token grep is safe here.
+          qaspec_ref=$(grep -oE 'greentic-start-distroless:[a-z0-9._-]+' "$QASPEC" | head -n1 || true)
+          qaspec_tag=${qaspec_ref##*:}
+
+          fail=0
+          if [ "$const_tag" != "$expected" ]; then
+            echo "::error file=$MANIFEST,line=$const_lineno::DEFAULT_RUNTIME_IMAGE tag is ':$const_tag' but the '$LANE' lane requires ':$expected'. ':develop' must never land on main — flip it to ':latest' before promoting (and the reverse on forward-port)."
+            fail=1
+          fi
+          if [ -n "$qaspec_ref" ] && [ "$qaspec_tag" != "$expected" ]; then
+            echo "::error file=$QASPEC::runtime_image help text references ':$qaspec_tag' but the '$LANE' lane requires ':$expected'. Keep it in sync with DEFAULT_RUNTIME_IMAGE."
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+          echo "OK: runtime image tag ':$expected' matches the '$LANE' lane (const $MANIFEST:$const_lineno, wizard ref ':$qaspec_tag')."
