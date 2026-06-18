@@ -2952,10 +2952,10 @@ mod tests {
     use crate::cli::dispatch::EnvRenderArgs;
     use std::path::PathBuf;
 
-    /// `K8sParams::for_env` env-level set: Namespace, ConfigMap, router
-    /// Deployment + Service + PDB, 4 NetworkPolicies. An env with no
-    /// present revisions renders exactly these.
-    const K8S_ENV_LEVEL_OBJECT_COUNT: usize = 9;
+    /// `K8sParams::for_env` env-level set: Namespace, env-store ConfigMap,
+    /// runtime-config ConfigMap, router Deployment + Service + PDB, 4
+    /// NetworkPolicies. An env with no present revisions renders exactly these.
+    const K8S_ENV_LEVEL_OBJECT_COUNT: usize = 10;
 
     fn render_args(env_id: &str, kind: Option<&str>, output: Option<PathBuf>) -> EnvRenderArgs {
         EnvRenderArgs {

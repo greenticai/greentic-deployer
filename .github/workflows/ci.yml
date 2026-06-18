@@ -80,6 +80,21 @@ jobs:
         uses: helm/kind-action@v1
         with:
           cluster_name: gtc-e2e
+      # Best-effort load the develop runtime image so the serving E2E
+      # (`worker_reaches_ready_and_serves_healthz_with_a_serving_image`) runs
+      # against a pod that actually serves `/healthz`. Skipped gracefully until
+      # greentic-start's `distroless-dev.yml` publishes `:develop`: if the pull
+      # fails the env var stays unset and that one test self-skips.
+      - name: Load the develop runtime image for the serving E2E (best-effort)
+        run: |
+          IMG=ghcr.io/greenticai/greentic-start-distroless:develop
+          if docker pull "$IMG"; then
+            kind load docker-image "$IMG" --name gtc-e2e
+            echo "GREENTIC_K8S_SERVING_IMAGE=$IMG" >> "$GITHUB_ENV"
+            echo "::notice::loaded $IMG; the serving E2E will run"
+          else
+            echo "::notice::$IMG not pullable yet; the serving E2E will self-skip"
+          fi
       # `--test-threads=1`: the reconcile/apply-revision tests drive env `local`
       # (namespace `gtc-local`) on the one kind cluster, so they must not run
       # concurrently; the credentials test is read-only SSAR but shares the run.
