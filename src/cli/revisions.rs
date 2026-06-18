@@ -800,6 +800,7 @@ fn stage_schema() -> Value {
             "deployment_id": {"type": "string", "description": "ULID"},
             "bundle_path": {"type": "string", "description": "Local .gtbundle to extract + pin; derives bundle_digest/pack_list/pack_list_lock_ref"},
             "bundle_digest": {"type": "string"},
+            "bundle_source_uri": {"type": "string", "description": "oci:// / repo:// / store:// ref the bundle was resolved from; makes the revision pullable by a remote worker. Omit for local-serve-only"},
             "pack_list": {"type": "array"},
             "pack_list_lock_ref": {"type": "string"},
             "config_digest": {"type": "string"},
@@ -846,6 +847,21 @@ mod tests {
             schema.pointer("/properties/idempotency_key").is_some(),
             "transition_schema must list `idempotency_key` so --schema-driven \
              callers can supply the A8 retry key (schema: {schema:#})"
+        );
+    }
+
+    /// Schema-drift regression: `stage_schema()` declares
+    /// `additionalProperties: false`, so a `--schema`-driven `--answers` caller
+    /// that supplies `bundle_source_uri` (the remote-pull coordinate) would be
+    /// rejected unless the schema advertises the field. Without this the env
+    /// store records a non-pullable revision.
+    #[test]
+    fn stage_schema_lists_bundle_source_uri() {
+        let schema = stage_schema();
+        assert!(
+            schema.pointer("/properties/bundle_source_uri").is_some(),
+            "stage_schema must list `bundle_source_uri` so --schema-driven \
+             callers can record the bundle's registry source (schema: {schema:#})"
         );
     }
 

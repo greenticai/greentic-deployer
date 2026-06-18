@@ -678,6 +678,7 @@ fn deploy_schema() -> Value {
             "bundle_id": {"type": "string"},
             "customer_id": {"type": "string"},
             "bundle_path": {"type": "string", "description": "local .gtbundle path (required)"},
+            "bundle_source_uri": {"type": "string", "description": "oci:// / repo:// / store:// ref the bundle was resolved from; makes the staged revision pullable by a remote worker. Omit for local-serve-only"},
             "idempotency_key": {"type": "string", "description": "supply to make retries idempotent"},
             "config_overrides": {
                 "type": "object",
@@ -708,6 +709,20 @@ mod tests {
     use super::*;
     use crate::cli::tests_common::{bootstrap_env_trust_root, make_env};
     use tempfile::tempdir;
+
+    /// Schema-drift regression: `deploy_schema()` declares
+    /// `additionalProperties: false`, so a `--schema`-driven `--answers` caller
+    /// that supplies `bundle_source_uri` (the remote-pull coordinate) would be
+    /// rejected unless the schema advertises the field.
+    #[test]
+    fn deploy_schema_lists_bundle_source_uri() {
+        let schema = deploy_schema();
+        assert!(
+            schema.pointer("/properties/bundle_source_uri").is_some(),
+            "deploy_schema must list `bundle_source_uri` so --schema-driven \
+             callers can record the bundle's registry source (schema: {schema:#})"
+        );
+    }
 
     fn seeded_store() -> (tempfile::TempDir, LocalFsStore) {
         let dir = tempdir().unwrap();
