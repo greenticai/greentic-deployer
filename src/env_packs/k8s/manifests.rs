@@ -455,15 +455,29 @@ fn runtime_boot_args(env: &Environment) -> Value {
     json!(["start", "--env", env.environment_id.as_str()])
 }
 
+/// Fixed rayon thread-pool size for the runtime pods. The bundle unpacker
+/// (backhand's `parallel` reader, reached on the M2 boot pull) sizes rayon to
+/// the HOST core count, ignoring the pod's `cpu` cgroup quota. With the
+/// host-sized pool throttled to the pod's limit it starves and silently yields
+/// a 0-byte file — a truncated `.gtpack` that fails activation with "Could not
+/// find EOCD". A small fixed pool avoids the host-core over-subscription (1
+/// thread is its own failure mode for the parallel reader; values 2–8 extract
+/// correctly even under a 10% CPU quota — verified empirically). The deeper fix
+/// is dropping backhand's `parallel` feature in greentic-bundle; this guards
+/// every already-published runtime image regardless.
+const RAYON_THREADS: &str = "4";
+
 /// Boot env shared by router + worker. `GREENTIC_GATEWAY_LISTEN_ADDR=0.0.0.0`
 /// binds all interfaces (the kubelet probes the pod IP, not loopback, so the
 /// runtime's `127.0.0.1` default would make every probe fail); `HOME` roots
-/// the env store on the writable staging volume.
+/// the env store on the writable staging volume; `RAYON_NUM_THREADS` caps the
+/// bundle-unpack thread pool (see [`RAYON_THREADS`]).
 fn runtime_boot_env(env: &Environment) -> Vec<Value> {
     vec![
         json!({"name": "GREENTIC_ENV_ID", "value": env.environment_id.as_str()}),
         json!({"name": "HOME", "value": STAGE_HOME}),
         json!({"name": "GREENTIC_GATEWAY_LISTEN_ADDR", "value": "0.0.0.0"}),
+        json!({"name": "RAYON_NUM_THREADS", "value": RAYON_THREADS}),
     ]
 }
 
@@ -1228,6 +1242,9 @@ mod tests {
             // kubelet readiness probe never reaches /healthz.
             assert_eq!(find("GREENTIC_GATEWAY_LISTEN_ADDR").unwrap(), "0.0.0.0");
             assert_eq!(find("HOME").unwrap(), STAGE_HOME);
+            // Cap the bundle-unpack rayon pool so backhand's parallel reader
+            // doesn't starve under the pod's cpu quota (→ truncated `.gtpack`).
+            assert_eq!(find("RAYON_NUM_THREADS").unwrap(), RAYON_THREADS);
             // The init container stages environment.json into the env store.
             let script = pod["initContainers"][0]["command"][2].as_str().unwrap();
             assert!(
