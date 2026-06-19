@@ -1335,6 +1335,22 @@ fn worker_executes_a_real_flow_over_workers_invoke() {
         "the flow must execute and return the templates component's echo \
          (the greentic-runner#466 fix); body: {body}"
     );
+    // Prove the flow GRAPH ran, not just that the component is reachable. The
+    // `render` node feeds the component a literal input ("M3 hello from
+    // templates"); the runtime echoes that node input back inside the activity
+    // payload as a byte sequence, whose prefix `34,77,51,32,104,101,108,108,111`
+    // is `"M3 hello`. Its presence means the runner loaded the flow, resolved
+    // the dotted `ai.greentic.component-templates` symbol (the #466 fix), and
+    // ran the node with its configured input — a canned or direct-component
+    // success could clear the prefix check above but not this. (The request
+    // `payload` is not echoed: the node input is flow-configured, not
+    // request-derived, so the fixture's node input is the value to require.)
+    assert!(
+        body.contains("34,77,51,32,104,101,108,108,111"),
+        "the flow's render-node input (bytes of \"M3 hello...\") must appear in \
+         the echoed activity payload, proving graph execution rather than only \
+         component reachability; body: {body}"
+    );
     assert!(
         !body.contains("not found in pack"),
         "flow execution must not fail with a component-resolution error; body: {body}"
