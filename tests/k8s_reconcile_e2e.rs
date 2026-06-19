@@ -1177,7 +1177,9 @@ fn worker_pulls_http_bundle_and_serves_the_real_revision() {
 /// hit, since the hop is kubelet→pod, not pod→pod. kubectl picks the local port
 /// (`:8080`) and we read it off its first `Forwarding from 127.0.0.1:<port>`
 /// line, so a lingering forward can't collide on a fixed port; `curl` (on the CI
-/// runner alongside kubectl) does the POST.
+/// runner alongside kubectl) does the POST. port-forward stderr is inherited so
+/// any forwarding error lands in the `--nocapture` CI log, and `curl -S`
+/// surfaces transport failures the same way.
 fn worker_invoke(worker: &str, payload: &Value) -> (u16, String) {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
@@ -1192,21 +1194,26 @@ fn worker_invoke(worker: &str, payload: &Value) -> (u16, String) {
             NAMESPACE,
         ])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn kubectl port-forward");
 
-    // Read the announced local port off the child's stdout on a side thread so a
-    // forward that never comes up can't block the test forever.
+    // Drain the child's stdout on a side thread for its WHOLE lifetime, sending
+    // the announced local port back once seen. We must keep reading (not stop at
+    // the announce line): kubectl writes a `Handling connection for <port>` line
+    // per request, so closing the read end mid-run would EPIPE those writes and
+    // tear the forward down — making every curl below get no response.
     let stdout = pf.stdout.take().expect("port-forward stdout");
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
+        let mut tx = Some(tx);
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             if let Some(rest) = line.split("127.0.0.1:").nth(1) {
                 let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-                if let Ok(port) = digits.parse::<u16>() {
+                if let Ok(port) = digits.parse::<u16>()
+                    && let Some(tx) = tx.take()
+                {
                     let _ = tx.send(port);
-                    break;
                 }
             }
         }
@@ -1216,6 +1223,7 @@ fn worker_invoke(worker: &str, payload: &Value) -> (u16, String) {
         Err(_) => {
             let _ = pf.kill();
             let _ = pf.wait();
+            let _ = reader.join();
             panic!("kubectl port-forward never announced a local port within 30s");
         }
     };
@@ -1225,10 +1233,11 @@ fn worker_invoke(worker: &str, payload: &Value) -> (u16, String) {
     let url = format!("http://127.0.0.1:{local_port}/workers/invoke");
     let body = serde_json::to_string(payload).expect("serialize HostWorkerRequest");
     let mut result = (0u16, String::new());
+    let mut last_curl_err = String::new();
     for _ in 0..20 {
         let out = Command::new("curl")
             .args([
-                "-s",
+                "-sS",
                 "-m",
                 "20",
                 "-w",
@@ -1243,6 +1252,7 @@ fn worker_invoke(worker: &str, payload: &Value) -> (u16, String) {
             ])
             .output()
             .expect("spawn curl");
+        last_curl_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         let raw = String::from_utf8_lossy(&out.stdout);
         if let Some((resp_body, code)) = raw.rsplit_once('\n')
             && let Ok(status) = code.trim().parse::<u16>()
@@ -1256,6 +1266,13 @@ fn worker_invoke(worker: &str, payload: &Value) -> (u16, String) {
     }
     let _ = pf.kill();
     let _ = pf.wait();
+    let _ = reader.join();
+    // Make a transport failure actionable instead of a bare "body: ".
+    if result.0 == 0 && result.1.is_empty() {
+        result.1 = format!(
+            "(no HTTP response via port-forward 127.0.0.1:{local_port}; last curl stderr: {last_curl_err})"
+        );
+    }
     result
 }
 
@@ -1304,10 +1321,15 @@ fn worker_executes_a_real_flow_over_workers_invoke() {
             "payload": {"text": "m3"}
         }),
     );
-    assert_eq!(
-        http_status, 200,
-        "POST /workers/invoke must return 200; body: {body}"
-    );
+    if http_status != 200 {
+        // Dump live pod/log state so a non-200 (or no-response) is diagnosable
+        // from the CI log rather than a bare status + body.
+        let diag = worker_failure_diagnostics(&worker);
+        panic!(
+            "POST /workers/invoke must return 200, got {http_status}; body: {body}\n\n\
+             === diagnostics ==={diag}"
+        );
+    }
     assert!(
         body.contains("component-templates::handle_message =>"),
         "the flow must execute and return the templates component's echo \
