@@ -1275,9 +1275,7 @@ fn boot_worker_pulling_revision(
     assert_eq!(applied, 14, "reconcile applies env-level + worker pair");
 
     if !pull_env.is_empty() {
-        for deployment in [worker.as_str(), ROUTER_DEPLOY] {
-            set_deployment_env(deployment, pull_env);
-        }
+        set_deployments_env(&[worker.as_str(), ROUTER_DEPLOY], pull_env);
     }
 
     let status = kubectl(&[
@@ -1347,19 +1345,20 @@ fn boot_worker_pulling_revision(
     worker
 }
 
-/// `kubectl set env deployment/<name> K=V …` in the env namespace, asserting
-/// success. Patching the deployment rolls a fresh pod that boots with the vars.
-fn set_deployment_env(deployment: &str, vars: &[(&str, &str)]) {
-    let mut args = vec![
-        "set".to_string(),
-        "env".to_string(),
-        format!("deployment/{deployment}"),
-        "-n".to_string(),
-        NAMESPACE.to_string(),
-    ];
-    args.extend(vars.iter().map(|(k, v)| format!("{k}={v}")));
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    kubectl_ok(&arg_refs);
+/// `kubectl set env deployment/<a> deployment/<b> … K=V …` in the env namespace,
+/// asserting success. One invocation patches every target (a single API
+/// round-trip); patching a deployment rolls a fresh pod that boots with the vars.
+fn set_deployments_env(deployments: &[&str], vars: &[(&str, &str)]) {
+    let targets: Vec<String> = deployments
+        .iter()
+        .map(|d| format!("deployment/{d}"))
+        .collect();
+    let assignments: Vec<String> = vars.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let mut args: Vec<&str> = vec!["set", "env"];
+    args.extend(targets.iter().map(String::as_str));
+    args.extend(["-n", NAMESPACE]);
+    args.extend(assignments.iter().map(String::as_str));
+    kubectl_ok(&args);
 }
 
 /// M2 end-to-end: a freshly-seeded worker PULLS its bundle at boot and serves
@@ -1682,12 +1681,13 @@ fn worker_pulls_oci_bundle_and_serves_the_real_revision() {
 
     // Stand up the registry + push the fixture BEFORE the worker boots (the
     // worker's rollout waits, so the pull can't race the registry coming up).
-    start_oci_registry(&fixture_bundle());
+    let fixture = fixture_bundle();
+    start_oci_registry(&fixture);
     let authority = oci_registry_authority();
     boot_worker_pulling_revision(
         store,
         &image,
-        &fixture_bundle(),
+        &fixture,
         &oci_bundle_source_uri(),
         &[("GREENTIC_OCI_INSECURE_REGISTRIES", &authority)],
     );
