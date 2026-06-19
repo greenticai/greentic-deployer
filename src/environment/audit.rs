@@ -26,13 +26,23 @@ use thiserror::Error;
 use super::file_lock::LockError;
 use super::store::{LocalFsStore, StoreError};
 
-pub use greentic_deploy_spec::{
-    Actor, AuditDecision, AuditEvent, AuditResult, POLICY_LOCAL_ONLY,
-    POLICY_LOCAL_ONLY_DEV_OVERRIDE,
-};
+pub use greentic_deploy_spec::{Actor, AuditDecision, AuditEvent, AuditResult, POLICY_LOCAL_ONLY};
+
+/// Dev-only relaxation of [`POLICY_LOCAL_ONLY`]: a non-local env was allowed
+/// because [`DEV_OVERRIDE_ENV`] is set. A distinct policy string keeps the
+/// audit trail honest — this is NOT the A8 RBAC decision. It is a local
+/// deployer concept (the A8 remote store never emits it), so it lives here
+/// rather than in the `greentic-deploy-spec` wire contract.
+pub const POLICY_LOCAL_ONLY_DEV_OVERRIDE: &str = "local-only:dev-override";
 
 /// Env var that opts a local checkout out of the `local`-only authz gate so
 /// every env id is allowed (dev/demo only — see [`authorize_local_only`]).
+///
+/// This lifts ONLY the audit authorization gate. Independent non-local guards
+/// are NOT affected and still apply: the `customer_id` requirement in
+/// `bundles`/`deploy` (a billing-principal data gate), and the `env apply`
+/// non-local-create guard (`cli::env_apply`). A non-local env still needs an
+/// explicit `customer_id`, and `env apply` still cannot create one locally.
 pub const DEV_OVERRIDE_ENV: &str = "GREENTIC_DEPLOYER_ALLOW_ANY_ENV";
 
 pub const AUDIT_EVENT_SCHEMA_V1: &str = SchemaVersion::AUDIT_EVENT_V1;

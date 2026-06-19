@@ -35,10 +35,7 @@ pub mod version;
 #[cfg(feature = "schemars")]
 pub mod json_schema;
 
-pub use audit::{
-    Actor, AuditDecision, AuditEvent, AuditResult, POLICY_LOCAL_ONLY,
-    POLICY_LOCAL_ONLY_DEV_OVERRIDE,
-};
+pub use audit::{Actor, AuditDecision, AuditEvent, AuditResult, POLICY_LOCAL_ONLY};
 pub use bundle_deployment::{
     BundleDeployment, BundleDeploymentStatus, RevenueShareEntry, RouteBinding, TenantSelector,
     UsageMeter,
