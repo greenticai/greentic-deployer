@@ -753,9 +753,17 @@ fn oci_push_fixture(fixture: &Path) {
     );
     // `<path>:<mediaType>` is oras's file-ref form (see the gtpack publish
     // workflows); the path has no colon, so the trailing media type parses clean.
+    // `--disable-path-validation` because `fixture` is absolute (CARGO_MANIFEST_DIR)
+    // and oras otherwise refuses an absolute file ref ("absolute file path detected").
     let file_ref = format!("{}:application/octet-stream", fixture.to_string_lossy());
     let out = Command::new("oras")
-        .args(["push", "--plain-http", &target, &file_ref])
+        .args([
+            "push",
+            "--plain-http",
+            "--disable-path-validation",
+            &target,
+            &file_ref,
+        ])
         .output()
         .expect(
             "spawn oras — is it on PATH? (the CI `k8s-e2e` job installs oras-project/setup-oras)",
