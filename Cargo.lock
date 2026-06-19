@@ -743,7 +743,6 @@ dependencies = [
  "liblzma",
  "lz4_flex",
  "no_std_io2",
- "rayon",
  "solana-nohash-hasher",
  "thiserror 2.0.18",
  "tracing",
@@ -1409,25 +1408,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "crossbeam-deque"
-version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dd111b7b7f7d55b72c0a6ae361660ee5853c9af73f70c3c2ef6858b950e2e51"
-dependencies = [
- "crossbeam-epoch",
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-epoch"
-version = "0.9.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
-dependencies = [
- "crossbeam-utils",
 ]
 
 [[package]]
@@ -2301,9 +2281,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-bundle"
-version = "1.2.0-dev.27526177406"
+version = "1.1.0-dev.27812212358"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69525de4b067fa582932fa78690bdadbb28cfc29bc6e3648c8f48393d5666f59"
+checksum = "5a61b433dc401a2ebd53b951147fe4f65d824ed5993ffaba041757a0769fce3a"
 dependencies = [
  "anyhow",
  "backhand",
@@ -2335,9 +2315,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-bundle-reader"
-version = "1.2.0-dev.27526177406"
+version = "1.1.0-dev.27812212358"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d7f7e1e0ba3ad8f4fe54d1f38cdbdf7450670fbaab3d4dc5c26d281ae5bf4cf"
+checksum = "56044b2ba987803201b2ebe4e7a3540789b6e4d60e4ac3d78c411ea884a4109a"
 dependencies = [
  "backhand",
  "serde",
@@ -4596,26 +4576,6 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
-
-[[package]]
-name = "rayon"
-version = "1.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
-dependencies = [
- "either",
- "rayon-core",
-]
-
-[[package]]
-name = "rayon-core"
-version = "1.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
-dependencies = [
- "crossbeam-deque",
- "crossbeam-utils",
-]
 
 [[package]]
 name = "redox_syscall"
