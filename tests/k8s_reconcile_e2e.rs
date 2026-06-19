@@ -1059,6 +1059,64 @@ fn worker_reaches_ready_and_serves_healthz_with_a_serving_image() {
     ]);
 }
 
+/// Boot a worker that PULLS `fixture` over HTTP and serves it, returning the
+/// worker deployment name. Shared by the M2 pull test and the M3 flow-execution
+/// test — the only thing that varies is the fixture bundle.
+///
+/// Serves the fixture in-cluster, provisions a pullable + 100%-routed revision
+/// on the given serving `image`, reconciles, and waits for the worker rollout
+/// to reach Ready. A completed rollout proves the full boot chain ran (pull →
+/// digest gate → materialize → activate → serve) — the HTTP server is the only
+/// bundle source, so Ready is impossible without a successful pull. Then asserts
+/// the worker logged the REAL-revision serve banner (`serving N revision(s) for
+/// env …`) rather than the probes-only line, so a probes-only M1 boot can't
+/// masquerade as success.
+fn boot_worker_serving_bundle(store: &Path, image: &str, fixture: &Path) -> String {
+    // Serve the fixture bundle in-cluster BEFORE the worker boots (its rollout
+    // waits, so the pull can't race the server coming up).
+    start_bundle_server(fixture);
+
+    let revision_id = provision_pullable_revision(store, image, &bundle_source_uri(), fixture);
+    let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
+
+    // reconcile renders the env-store ConfigMap (carrying `environment.json`
+    // with the routed revision + its `bundle_source_uri`) and the worker pair.
+    let (applied, _) = reconcile(store);
+    assert_eq!(applied, 14, "reconcile applies env-level + worker pair");
+
+    let status = kubectl(&[
+        "rollout",
+        "status",
+        &format!("deployment/{worker}"),
+        "-n",
+        NAMESPACE,
+        "--timeout=180s",
+    ]);
+    if !status.status.success() {
+        // Fail-closed boot means a stuck rollout hides the real cause (a failed
+        // pull, a digest mismatch, an unreachable server). Dump the live cluster
+        // state into the panic so CI surfaces *why* the worker never went Ready.
+        let diag = worker_failure_diagnostics(&worker);
+        panic!(
+            "worker must reach Ready by pulling + serving the bundle:\n\
+             stdout: {}\nstderr: {}\n\n=== diagnostics ==={diag}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr),
+        );
+    }
+
+    // Distinguish a REAL activated revision from a probes-only boot: the worker
+    // logs `serving N revision(s) for env …` only when packs activated, vs
+    // `… serving probes only` when no bundle attached.
+    let logs = kubectl_ok(&["logs", &format!("deployment/{worker}"), "-n", NAMESPACE]);
+    assert!(
+        logs.contains("revision(s) for env"),
+        "the worker must log the real-revision serve banner (not probes-only):\n{logs}"
+    );
+
+    worker
+}
+
 /// M2 end-to-end: a freshly-seeded worker PULLS its bundle at boot and serves
 /// the real revision — the first live proof of the distributor-pull path.
 ///
@@ -1097,51 +1155,7 @@ fn worker_pulls_http_bundle_and_serves_the_real_revision() {
     let store = tempfile::tempdir().expect("tempdir");
     let store = store.path();
 
-    // Serve the fixture bundle in-cluster BEFORE the worker boots (its rollout
-    // waits, so the pull can't race the server coming up).
-    start_bundle_server(&fixture_bundle());
-
-    let revision_id =
-        provision_pullable_revision(store, &image, &bundle_source_uri(), &fixture_bundle());
-    let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
-
-    // reconcile renders the env-store ConfigMap (carrying `environment.json`
-    // with the routed revision + its `bundle_source_uri`) and the worker pair.
-    let (applied, _) = reconcile(store);
-    assert_eq!(applied, 14, "reconcile applies env-level + worker pair");
-
-    // A completed rollout proves the full boot chain ran: pull → digest gate →
-    // materialize → activate → serve. The HTTP server is the only bundle
-    // source, so Ready here is impossible without a successful pull.
-    let status = kubectl(&[
-        "rollout",
-        "status",
-        &format!("deployment/{worker}"),
-        "-n",
-        NAMESPACE,
-        "--timeout=180s",
-    ]);
-    if !status.status.success() {
-        // Fail-closed boot means a stuck rollout hides the real cause (a failed
-        // pull, a digest mismatch, an unreachable server). Dump the live cluster
-        // state into the panic so CI surfaces *why* the worker never went Ready.
-        let diag = worker_failure_diagnostics(&worker);
-        panic!(
-            "worker must reach Ready by pulling + serving the http bundle:\n\
-             stdout: {}\nstderr: {}\n\n=== diagnostics ==={diag}",
-            String::from_utf8_lossy(&status.stdout),
-            String::from_utf8_lossy(&status.stderr),
-        );
-    }
-
-    // Distinguish a REAL activated revision from a probes-only boot: the worker
-    // logs `serving N revision(s) for env …` only when packs activated, vs
-    // `… serving probes only` when no bundle attached.
-    let logs = kubectl_ok(&["logs", &format!("deployment/{worker}"), "-n", NAMESPACE]);
-    assert!(
-        logs.contains("revision(s) for env"),
-        "the worker must log the real-revision serve banner (not probes-only):\n{logs}"
-    );
+    boot_worker_serving_bundle(store, &image, &fixture_bundle());
 
     // Cleanup (deletes the bundle server + its ConfigMap with the namespace).
     let _ = kubectl(&[
@@ -1270,43 +1284,7 @@ fn worker_executes_a_real_flow_over_workers_invoke() {
     let store = tempfile::tempdir().expect("tempdir");
     let store = store.path();
 
-    // Serve the templates bundle in-cluster before the worker boots.
-    start_bundle_server(&templates_fixture_bundle());
-
-    let revision_id = provision_pullable_revision(
-        store,
-        &image,
-        &bundle_source_uri(),
-        &templates_fixture_bundle(),
-    );
-    let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
-
-    let (applied, _) = reconcile(store);
-    assert_eq!(applied, 14, "reconcile applies env-level + worker pair");
-
-    // Ready == the full pull → digest gate → materialize → activate boot ran.
-    let status = kubectl(&[
-        "rollout",
-        "status",
-        &format!("deployment/{worker}"),
-        "-n",
-        NAMESPACE,
-        "--timeout=180s",
-    ]);
-    if !status.status.success() {
-        let diag = worker_failure_diagnostics(&worker);
-        panic!(
-            "worker must reach Ready by pulling + serving the templates bundle:\n\
-             stdout: {}\nstderr: {}\n\n=== diagnostics ==={diag}",
-            String::from_utf8_lossy(&status.stdout),
-            String::from_utf8_lossy(&status.stderr),
-        );
-    }
-    let logs = kubectl_ok(&["logs", &format!("deployment/{worker}"), "-n", NAMESPACE]);
-    assert!(
-        logs.contains("revision(s) for env"),
-        "the worker must log the real-revision serve banner (not probes-only):\n{logs}"
-    );
+    let worker = boot_worker_serving_bundle(store, &image, &templates_fixture_bundle());
 
     // The M3 assertion: run the flow. Its single node invokes
     // `ai.greentic.component-templates` (a dotted resolved symbol) with
