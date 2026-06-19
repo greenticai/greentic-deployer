@@ -487,10 +487,17 @@ pub trait EnvironmentStorage: Send + Sync {
     /// Load the composite environment snapshot for a backup: the environment
     /// document, the runtime sidecar (if any), and all pack-answers sidecars.
     /// Used by `create_backup` to build the [`EnvSnapshot`] atomically.
+    ///
+    /// Returns the captured snapshot together with the environment
+    /// [`EnvRevision`] read in the SAME transaction. `create_backup` must use
+    /// this revision for the manifest's `generation` and the envelope CAS — a
+    /// separate `load_env` read could observe a different generation than the
+    /// snapshot content, producing a backup whose metadata lies about what it
+    /// captured.
     fn load_env_snapshot(
         &self,
         env_id: &EnvId,
-    ) -> impl Future<Output = Result<EnvSnapshot, StorageError>> + Send;
+    ) -> impl Future<Output = Result<(EnvSnapshot, EnvRevision), StorageError>> + Send;
 
     /// Restore a composite [`EnvSnapshot`] atomically: replace the
     /// environment row, upsert/delete the runtime sidecar, and upsert/delete

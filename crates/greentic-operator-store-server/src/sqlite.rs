@@ -851,21 +851,30 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         Ok(true)
     }
 
-    async fn load_env_snapshot(&self, env_id: &EnvId) -> Result<EnvSnapshot, StorageError> {
+    async fn load_env_snapshot(
+        &self,
+        env_id: &EnvId,
+    ) -> Result<(EnvSnapshot, EnvRevision), StorageError> {
         // One transaction so the capture cannot be torn by an interleaved
         // mutation (the single-connection pool serializes statements but
         // NOT multi-statement sequences outside a tx).
         let mut tx = self.pool.begin().await?;
 
         // Environment row (required — callers already verified existence).
-        let env_row = sqlx::query("SELECT data FROM environments WHERE env_id = $1")
-            .bind(env_id.as_str())
-            .fetch_optional(&mut *tx)
-            .await?;
+        // Read the revision (generation + etag) in the SAME transaction as the
+        // content so the caller can stamp the backup manifest with a generation
+        // that provably matches the captured bytes.
+        let env_row = sqlx::query(
+            "SELECT generation, etag, data, integrity_digest \
+             FROM environments WHERE env_id = $1",
+        )
+        .bind(env_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
         let Some(env_row) = env_row else {
             return Err(StorageError::NotFound(env_id.clone()));
         };
-        let environment: Value = env_row.try_get("data")?;
+        let (revision, environment, _digest) = decode_revision_with_data(&env_row)?;
 
         // Runtime sidecar (optional).
         let runtime_row = sqlx::query("SELECT data FROM environment_runtimes WHERE env_id = $1")
@@ -891,11 +900,14 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         }
 
         tx.commit().await?;
-        Ok(EnvSnapshot {
-            environment,
-            runtime,
-            pack_answers,
-        })
+        Ok((
+            EnvSnapshot {
+                environment,
+                runtime,
+                pack_answers,
+            },
+            revision,
+        ))
     }
 
     async fn restore_env_journaled(

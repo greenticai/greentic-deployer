@@ -1502,9 +1502,14 @@ async fn restore_preserves_sidecar_generation_sequences_and_tombstones() {
     assert_eq!(pa_rev1.generation, 1);
 
     // --- Take a backup (snapshot has Deployer slot + runtime). ---
-    let snapshot = store.load_env_snapshot(&id).await.expect("snapshot");
+    let (snapshot, snap_rev) = store.load_env_snapshot(&id).await.expect("snapshot");
     assert!(snapshot.runtime.is_some());
     assert!(snapshot.pack_answers.contains_key("deployer"));
+    // The captured revision is read in the same tx as the content, so it must
+    // match the env row's current generation (what create_backup stamps onto
+    // the manifest).
+    let env_now = store.load_env(&id).await.expect("load env for revision");
+    assert_eq!(snap_rev.generation, env_now.revision.generation);
 
     // --- Advance Deployer to gen 2 (post-backup mutation). ---
     let deployer_v2 = json!({"region": "us-east-1"});
