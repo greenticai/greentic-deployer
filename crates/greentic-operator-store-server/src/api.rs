@@ -3090,13 +3090,12 @@ pub(crate) async fn create_backup<S: EnvironmentStorage>(
     }
     let recheck_key = idem_key.clone();
     let outcome = async {
-        let loaded = state
-            .storage
-            .load_env(&env_id)
-            .await
-            .map_err(load_storage_error)?;
-        // Build the composite snapshot: env + runtime + pack_answers.
-        let snapshot = state
+        // Capture the composite snapshot (env + runtime + pack_answers) AND the
+        // environment revision it was read at, atomically in one transaction.
+        // Sourcing the generation from a separate load_env could race a
+        // concurrent mutation and stamp the manifest with a generation that
+        // does not match the captured content.
+        let (snapshot, revision) = state
             .storage
             .load_env_snapshot(&env_id)
             .await
@@ -3127,7 +3126,7 @@ pub(crate) async fn create_backup<S: EnvironmentStorage>(
             backup_id: ulid::Ulid::new().to_string(),
             env_id: env_id.clone(),
             created_at: Utc::now(),
-            generation: loaded.revision.generation,
+            generation: revision.generation,
             integrity,
             size_bytes,
         };
@@ -3145,8 +3144,8 @@ pub(crate) async fn create_backup<S: EnvironmentStorage>(
             idem_key,
             &fingerprint,
             &auth,
-            Some(loaded.revision.generation),
-            loaded.revision.clone(),
+            Some(revision.generation),
+            revision,
         )?;
         state
             .storage
