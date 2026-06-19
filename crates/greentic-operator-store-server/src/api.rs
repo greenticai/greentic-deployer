@@ -3145,7 +3145,7 @@ pub(crate) async fn create_backup<S: EnvironmentStorage>(
             &fingerprint,
             &auth,
             Some(revision.generation),
-            revision.clone(),
+            revision,
         )?;
         state
             .storage

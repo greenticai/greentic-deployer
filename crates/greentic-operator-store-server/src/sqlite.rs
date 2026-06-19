@@ -863,18 +863,18 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         // Environment row (required — callers already verified existence).
         // Read the revision (generation + etag) in the SAME transaction as the
         // content so the caller can stamp the backup manifest with a generation
-        // that provably matches the captured bytes.
-        let env_row = sqlx::query(
-            "SELECT generation, etag, data, integrity_digest \
-             FROM environments WHERE env_id = $1",
-        )
-        .bind(env_id.as_str())
-        .fetch_optional(&mut *tx)
-        .await?;
+        // that provably matches the captured bytes. (No integrity re-check here
+        // — create_backup recomputes its own digest over the captured value.)
+        let env_row =
+            sqlx::query("SELECT generation, etag, data FROM environments WHERE env_id = $1")
+                .bind(env_id.as_str())
+                .fetch_optional(&mut *tx)
+                .await?;
         let Some(env_row) = env_row else {
             return Err(StorageError::NotFound(env_id.clone()));
         };
-        let (revision, environment, _digest) = decode_revision_with_data(&env_row)?;
+        let revision = decode_revision(&env_row)?;
+        let environment: Value = env_row.try_get("data")?;
 
         // Runtime sidecar (optional).
         let runtime_row = sqlx::query("SELECT data FROM environment_runtimes WHERE env_id = $1")
