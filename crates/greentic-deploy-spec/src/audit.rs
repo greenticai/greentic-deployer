@@ -16,6 +16,11 @@ use crate::version::SchemaVersion;
 /// Phase A authorization policy identifier (`AuditDecision.policy`).
 pub const POLICY_LOCAL_ONLY: &str = "local-only";
 
+/// Dev-only relaxation of [`POLICY_LOCAL_ONLY`]: a non-local env was allowed
+/// because `GREENTIC_DEPLOYER_ALLOW_ANY_ENV` is set. A distinct policy string
+/// keeps the audit trail honest — this is NOT the A8 RBAC decision.
+pub const POLICY_LOCAL_ONLY_DEV_OVERRIDE: &str = "local-only:dev-override";
+
 /// One append-only audit record. Covers every field plan §389 requires.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {

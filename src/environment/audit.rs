@@ -3,7 +3,8 @@
 //! Every mutating `op` verb passes through [`authorize_local_only`] and
 //! emits an [`AuditEvent`] into `<store_root>/<env_id>/audit/events.jsonl`.
 //! Phase A posture: `env_id == "local"` → allow; anything else → deny with
-//! [`OpError::Unauthorized`](crate::cli::OpError::Unauthorized). Remote RBAC
+//! [`OpError::Unauthorized`](crate::cli::OpError::Unauthorized) unless the
+//! `GREENTIC_DEPLOYER_ALLOW_ANY_ENV` dev escape hatch is set. Remote RBAC
 //! is A8.
 //!
 //! The append uses a per-file `fs4` flock on the audit file itself (not the
@@ -25,7 +26,14 @@ use thiserror::Error;
 use super::file_lock::LockError;
 use super::store::{LocalFsStore, StoreError};
 
-pub use greentic_deploy_spec::{Actor, AuditDecision, AuditEvent, AuditResult, POLICY_LOCAL_ONLY};
+pub use greentic_deploy_spec::{
+    Actor, AuditDecision, AuditEvent, AuditResult, POLICY_LOCAL_ONLY,
+    POLICY_LOCAL_ONLY_DEV_OVERRIDE,
+};
+
+/// Env var that opts a local checkout out of the `local`-only authz gate so
+/// every env id is allowed (dev/demo only — see [`authorize_local_only`]).
+pub const DEV_OVERRIDE_ENV: &str = "GREENTIC_DEPLOYER_ALLOW_ANY_ENV";
 
 pub const AUDIT_EVENT_SCHEMA_V1: &str = SchemaVersion::AUDIT_EVENT_V1;
 
@@ -45,13 +53,39 @@ pub enum AuditError {
     Store(#[from] StoreError),
 }
 
-/// Local-mode authorization gate per plan §389 + §991. Returns `Allow` iff
-/// the env id matches [`crate::defaults::LOCAL_ENV_ID`].
+/// Local-mode authorization gate per plan §389 + §991. Returns `Allow` for
+/// the env id matching [`crate::defaults::LOCAL_ENV_ID`]; any other id is
+/// denied (A8 ships the production RBAC policy) UNLESS the [`DEV_OVERRIDE_ENV`]
+/// escape hatch is set, in which case it is allowed under the distinct
+/// [`POLICY_LOCAL_ONLY_DEV_OVERRIDE`] policy so the audit trail stays honest.
+///
+/// The escape hatch is read here (process env) and forwarded to the pure
+/// [`authorize_with_override`] core so the decision logic stays unit-testable
+/// without mutating process-global state.
 pub fn authorize_local_only(env_id: &EnvId) -> AuditDecision {
+    authorize_with_override(env_id, dev_override_enabled())
+}
+
+/// Whether the dev-only [`DEV_OVERRIDE_ENV`] escape hatch is set.
+fn dev_override_enabled() -> bool {
+    std::env::var_os(DEV_OVERRIDE_ENV).is_some()
+}
+
+/// Pure authorization core: `local` always allows; non-local allows only when
+/// `dev_override` is true (and then under [`POLICY_LOCAL_ONLY_DEV_OVERRIDE`]).
+fn authorize_with_override(env_id: &EnvId, dev_override: bool) -> AuditDecision {
     if env_id.as_str() == crate::defaults::LOCAL_ENV_ID {
         AuditDecision::Allow {
             policy: POLICY_LOCAL_ONLY.to_string(),
             reason: format!("env `{env_id}` is the local env"),
+        }
+    } else if dev_override {
+        AuditDecision::Allow {
+            policy: POLICY_LOCAL_ONLY_DEV_OVERRIDE.to_string(),
+            reason: format!(
+                "non-local env `{env_id}` permitted by {DEV_OVERRIDE_ENV} \
+                 (dev override; A8 RBAC not enforced)"
+            ),
         }
     } else {
         AuditDecision::Deny {
@@ -188,14 +222,40 @@ mod tests {
 
     #[test]
     fn authorize_non_local_env_id_denies() {
+        // Pure core with the override OFF — deterministic regardless of the
+        // ambient GREENTIC_DEPLOYER_ALLOW_ANY_ENV value in the test process.
         let env_id = EnvId::try_from("prod").unwrap();
-        match authorize_local_only(&env_id) {
+        match authorize_with_override(&env_id, false) {
             AuditDecision::Deny { policy, reason } => {
                 assert_eq!(policy, POLICY_LOCAL_ONLY);
                 assert!(reason.contains("prod"));
                 assert!(reason.contains("RBAC"));
             }
             other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authorize_non_local_env_id_allows_under_dev_override() {
+        let env_id = EnvId::try_from("k8s").unwrap();
+        match authorize_with_override(&env_id, true) {
+            AuditDecision::Allow { policy, reason } => {
+                assert_eq!(policy, POLICY_LOCAL_ONLY_DEV_OVERRIDE);
+                assert!(reason.contains("k8s"));
+                assert!(reason.contains(DEV_OVERRIDE_ENV));
+            }
+            other => panic!("expected Allow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dev_override_does_not_change_local_policy() {
+        // The local env is allowed under the canonical policy even with the
+        // override on — it never borrows the dev-override label.
+        let env_id = EnvId::try_from("local").unwrap();
+        match authorize_with_override(&env_id, true) {
+            AuditDecision::Allow { policy, .. } => assert_eq!(policy, POLICY_LOCAL_ONLY),
+            other => panic!("expected Allow, got {other:?}"),
         }
     }
 
