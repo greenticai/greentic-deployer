@@ -979,9 +979,9 @@ checksum = "b4ce8d3bd5823c7504d3f579f13e7b2f3da252fcb938c594d5680ee508bf846f"
 
 [[package]]
 name = "cc"
-version = "1.2.64"
+version = "1.2.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dad887fd958be91b5098c0248def011f4523ab786cd411be668777e55063501f"
+checksum = "e228eec9be7c17ccb640b59b36a5cd805ea2a564a4c5e162c2f659fea30d3b96"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -2293,7 +2293,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "greentic-bundle-reader",
- "greentic-deploy-spec 0.1.27785617238",
+ "greentic-deploy-spec 0.1.27829268457",
  "greentic-distributor-client",
  "greentic-qa-lib",
  "hex",
@@ -2379,9 +2379,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deploy-spec"
-version = "0.1.27785617238"
+version = "0.1.27829268457"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "733aa248fee7ef8297310fee10aa759769efd989f4ccd5929beb5b0393ef6d37"
+checksum = "6e4ab54c9b800d4b776df9db966348f596e07f082c8f961f1c5a7f558307c113"
 dependencies = [
  "chrono",
  "greentic-config-types",
@@ -2464,9 +2464,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-distributor-client"
-version = "1.1.0-dev.27455515902"
+version = "1.1.0-dev.27832309681"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7741745c54c826595e5ebd77d5e3f6edcc154b64c485a6cb0cb6ebba4d166c9c"
+checksum = "8ea23aae7a04e3adcf1bbf74adbf98f5fda29d3ba1c267216d2340b9ad85842b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2705,9 +2705,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-types"
-version = "1.1.0-dev.27625781127"
+version = "1.1.0-dev.27836473437"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a836d5ef65b66cb1d103fae43f5873831a15007b7b823413f6277fde7d3c93e7"
+checksum = "a8c40256c6908985ab2bfc60026cab7a3971bbbb5f18d7303f2fffb070f14f39"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2736,9 +2736,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-types-macros"
-version = "1.1.0-dev.27625781127"
+version = "1.1.0-dev.27836473437"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa87cd1efdba8de4dc83ee1b1f55ef0c1da0eb494228e378065114e8fe92bc9f"
+checksum = "c77bca98e27a1872390fe70566920ad0d080e7cc6e8972ac7fa949a27b8aa71e"
 dependencies = [
  "proc-macro2",
  "quote",

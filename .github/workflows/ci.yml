@@ -95,6 +95,10 @@ jobs:
           kind load docker-image "$IMG" --name gtc-e2e
           echo "GREENTIC_K8S_SERVING_IMAGE=$IMG" >> "$GITHUB_ENV"
           echo "::notice::loaded $IMG; the serving E2Es will run"
+      # `oras` loads the fixture bundle into the in-cluster registry for the OCI
+      # boot-pull test (`worker_pulls_oci_bundle_and_serves_the_real_revision`);
+      # `registry:2` itself is pulled on-demand by kind, like `busybox`.
+      - uses: oras-project/setup-oras@v1
       # `--test-threads=1`: the reconcile/apply-revision tests drive env `local`
       # (namespace `gtc-local`) on the one kind cluster, so they must not run
       # concurrently; the credentials test is read-only SSAR but shares the run.

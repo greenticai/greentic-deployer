@@ -70,6 +70,21 @@ const BUNDLE_FILE: &str = "bundle.gtbundle";
 /// The port the in-cluster httpd listens on (and the Service exposes).
 const BUNDLE_SERVER_PORT: u16 = 8080;
 
+/// In-cluster OCI registry (`registry:2`) for the M2 OCI-transport boot-pull
+/// test. Unlike the plain-HTTP bundle server, the worker pulls this over the OCI
+/// client, which is HTTPS-only UNLESS the registry authority is allow-listed in
+/// `GREENTIC_OCI_INSECURE_REGISTRIES` — the escape hatch greentic-start#283
+/// added (`ClientProtocol::HttpsExcept`). The registry serves plain HTTP, so the
+/// worker reaches it only with that allow-list set (injected post-reconcile,
+/// test-only). Lives in the env's own `gtc-local` namespace for one-shot
+/// cleanup, exactly like the bundle server.
+const OCI_REGISTRY: &str = "gtc-oci-registry";
+/// The port `registry:2` listens on (and the Service exposes).
+const OCI_REGISTRY_PORT: u16 = 5000;
+/// Repository + tag the fixture bundle is pushed and pulled under.
+const OCI_BUNDLE_REPO: &str = "bundles/e2e";
+const OCI_BUNDLE_TAG: &str = "latest";
+
 fn deployer_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_greentic-deployer"))
 }
@@ -456,6 +471,24 @@ fn bundle_source_uri() -> String {
     )
 }
 
+/// The in-cluster authority the worker dials for the OCI pull. This is also the
+/// exact string the insecure-registry allow-list must carry:
+/// `oci_distribution` matches `ClientProtocol::HttpsExcept` against the pull
+/// reference's `host:port`, so the env var and the `oci://` ref must agree.
+fn oci_registry_authority() -> String {
+    format!("{OCI_REGISTRY}.{NAMESPACE}.svc.cluster.local:{OCI_REGISTRY_PORT}")
+}
+
+/// The `oci://` ref the worker pulls its bundle from. Tag-based (no digest):
+/// greentic-start's boot-pull enables tags, and the revision's pinned
+/// `bundle_digest` is the integrity authority regardless of how the ref resolves.
+fn oci_bundle_source_uri() -> String {
+    format!(
+        "oci://{}/{OCI_BUNDLE_REPO}:{OCI_BUNDLE_TAG}",
+        oci_registry_authority()
+    )
+}
+
 /// `kubectl apply -f -`, piping `manifest` on stdin; asserts success.
 fn kubectl_apply_stdin(manifest: &str) {
     use std::io::Write;
@@ -605,6 +638,141 @@ spec:
         "in-cluster bundle server must come up before the worker boots:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&status.stdout),
         String::from_utf8_lossy(&status.stderr),
+    );
+}
+
+/// Stand up an in-cluster `registry:2` (plain HTTP) in the env namespace, wait
+/// for it to be ready, and push `fixture` into it as the OCI artifact the worker
+/// pulls at boot. The OCI sibling of [`start_bundle_server`].
+///
+/// Mirrors the bundle server's ingress-allow NetworkPolicy reasoning: the env
+/// pack's `gtc-default-deny` denies ingress to EVERY pod in the namespace and
+/// modern kindnet ENFORCES NetworkPolicy, so without an allow the worker's pull
+/// is dropped and the boot fails closed. In production the registry is external
+/// (outside the namespace, unaffected by these policies); only this in-cluster
+/// fixture is caught by the env's default-deny, so the allow lives here in the
+/// test, not in the production render.
+///
+/// The fixture is pushed by a host-side `oras push` over a `kubectl
+/// port-forward` (kubelet→pod), NOT an in-cluster pusher: a pod pushing to the
+/// registry Service would be a *client* and hit the namespace's default-deny
+/// EGRESS (only worker pods are egress-allowed), whereas a port-forward reaches
+/// the registry pod's already-allowed ingress.
+fn start_oci_registry(fixture: &Path) {
+    // (Re)create the env namespace the registry shares with the worker;
+    // `reset_namespace` ran first, so tolerate "already exists" defensively.
+    let _ = kubectl(&["create", "namespace", NAMESPACE]);
+
+    let manifest = format!(
+        "apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {OCI_REGISTRY}
+  namespace: {NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {OCI_REGISTRY}
+  template:
+    metadata:
+      labels:
+        app: {OCI_REGISTRY}
+    spec:
+      containers:
+        - name: registry
+          image: registry:2
+          ports:
+            - containerPort: {OCI_REGISTRY_PORT}
+          readinessProbe:
+            httpGet:
+              path: /v2/
+              port: {OCI_REGISTRY_PORT}
+            initialDelaySeconds: 1
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {OCI_REGISTRY}
+  namespace: {NAMESPACE}
+spec:
+  selector:
+    app: {OCI_REGISTRY}
+  ports:
+    - port: {OCI_REGISTRY_PORT}
+      targetPort: {OCI_REGISTRY_PORT}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gtc-oci-registry-allow-ingress
+  namespace: {NAMESPACE}
+spec:
+  podSelector:
+    matchLabels:
+      app: {OCI_REGISTRY}
+  policyTypes:
+    - Ingress
+  ingress:
+    - {{}}
+"
+    );
+    kubectl_apply_stdin(&manifest);
+
+    let status = kubectl(&[
+        "rollout",
+        "status",
+        &format!("deployment/{OCI_REGISTRY}"),
+        "-n",
+        NAMESPACE,
+        "--timeout=120s",
+    ]);
+    assert!(
+        status.status.success(),
+        "in-cluster OCI registry must come up before the fixture push:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr),
+    );
+
+    oci_push_fixture(fixture);
+}
+
+/// Push `fixture` to the in-cluster registry as `{OCI_BUNDLE_REPO}:{OCI_BUNDLE_TAG}`
+/// via a host-side `oras push` over a port-forward. The artifact's single
+/// `application/octet-stream` layer is the raw `.gtbundle`, so greentic-start's
+/// OCI boot-pull writes the layer back byte-identically and the revision's
+/// `bundle_digest` gate (the deployer re-hashes the pulled bytes) passes — the
+/// same integrity authority the HTTP path relies on. `--plain-http` because the
+/// registry terminates HTTP, matching the worker's insecure-registry allow-list.
+fn oci_push_fixture(fixture: &Path) {
+    let pf = PortForward::open(&format!("deployment/{OCI_REGISTRY}"), OCI_REGISTRY_PORT);
+    let target = format!(
+        "localhost:{}/{OCI_BUNDLE_REPO}:{OCI_BUNDLE_TAG}",
+        pf.local_port
+    );
+    // `<path>:<mediaType>` is oras's file-ref form (see the gtpack publish
+    // workflows); the path has no colon, so the trailing media type parses clean.
+    // `--disable-path-validation` because `fixture` is absolute (CARGO_MANIFEST_DIR)
+    // and oras otherwise refuses an absolute file ref ("absolute file path detected").
+    let file_ref = format!("{}:application/octet-stream", fixture.to_string_lossy());
+    let out = Command::new("oras")
+        .args([
+            "push",
+            "--plain-http",
+            "--disable-path-validation",
+            &target,
+            &file_ref,
+        ])
+        .output()
+        .expect(
+            "spawn oras — is it on PATH? (the CI `k8s-e2e` job installs oras-project/setup-oras)",
+        );
+    assert!(
+        out.status.success(),
+        "oras push of the fixture bundle must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
     );
 }
 
@@ -1063,26 +1231,60 @@ fn worker_reaches_ready_and_serves_healthz_with_a_serving_image() {
 /// worker deployment name. Shared by the M2 pull test and the M3 flow-execution
 /// test — the only thing that varies is the fixture bundle.
 ///
-/// Serves the fixture in-cluster, provisions a pullable + 100%-routed revision
-/// on the given serving `image`, reconciles, and waits for the worker rollout
-/// to reach Ready. A completed rollout proves the full boot chain ran (pull →
-/// digest gate → materialize → activate → serve) — the HTTP server is the only
-/// bundle source, so Ready is impossible without a successful pull. Then asserts
-/// the worker logged the REAL-revision serve banner (`serving N revision(s) for
-/// env …`) rather than the probes-only line, so a probes-only M1 boot can't
-/// masquerade as success.
+/// Serves the fixture in-cluster over plain HTTP, then defers to
+/// [`boot_worker_pulling_revision`] (no extra boot env: the `http://` ref rides
+/// greentic-start's `ureq` path, which needs no insecure-registry allow-list).
 fn boot_worker_serving_bundle(store: &Path, image: &str, fixture: &Path) -> String {
     // Serve the fixture bundle in-cluster BEFORE the worker boots (its rollout
     // waits, so the pull can't race the server coming up).
     start_bundle_server(fixture);
+    boot_worker_pulling_revision(store, image, fixture, &bundle_source_uri(), &[])
+}
 
-    let revision_id = provision_pullable_revision(store, image, &bundle_source_uri(), fixture);
+/// Shared boot-and-serve tail for the M2/M3 pull tests: provision a pullable +
+/// 100%-routed revision on `source_uri` (whatever the caller stood up), apply
+/// the desired state, wait for the worker rollout to reach Ready, and assert the
+/// REAL-revision serve banner. Returns the worker deployment name.
+///
+/// A completed rollout proves the full boot chain ran (pull → digest gate →
+/// materialize → activate → serve) — the in-cluster source is the only bundle
+/// source, so Ready is impossible without a successful pull. The banner assertion
+/// (`serving N revision(s) for env …` rather than the probes-only line) then
+/// keeps a probes-only M1 boot from masquerading as success.
+///
+/// `pull_env` carries boot env the production render deliberately omits — the
+/// OCI path's `GREENTIC_OCI_INSECURE_REGISTRIES` allow-list. It is applied AFTER
+/// reconcile (so it never enters the rendered manifests) and BEFORE the rollout
+/// wait (so the rolled pods boot with it); the first pre-set-env pods fail closed
+/// on the OCI pull and are superseded, and `rollout status` tracks the new
+/// ReplicaSets.
+///
+/// It goes to BOTH the worker AND the router: both boot `start --env` and pull
+/// the same routed bundle-sourced revision (each has its own egress allow —
+/// `gtc-allow-{worker,router}-egress`), so an unpatched router would fail its OCI
+/// pull and CrashLoop. When `pull_env` is set the router rollout is therefore a
+/// success criterion too — otherwise a broken router (a dead ingress serve path)
+/// would hide behind the worker-only banner. The HTTP path passes `&[]`: its
+/// router already pulls over `http://`, so it is neither patched nor waited here,
+/// exactly as before.
+fn boot_worker_pulling_revision(
+    store: &Path,
+    image: &str,
+    fixture: &Path,
+    source_uri: &str,
+    pull_env: &[(&str, &str)],
+) -> String {
+    let revision_id = provision_pullable_revision(store, image, source_uri, fixture);
     let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
 
     // reconcile renders the env-store ConfigMap (carrying `environment.json`
     // with the routed revision + its `bundle_source_uri`) and the worker pair.
     let (applied, _) = reconcile(store);
     assert_eq!(applied, 14, "reconcile applies env-level + worker pair");
+
+    if !pull_env.is_empty() {
+        set_deployments_env(&[worker.as_str(), ROUTER_DEPLOY], pull_env);
+    }
 
     let status = kubectl(&[
         "rollout",
@@ -1114,7 +1316,57 @@ fn boot_worker_serving_bundle(store: &Path, image: &str, fixture: &Path) -> Stri
         "the worker must log the real-revision serve banner (not probes-only):\n{logs}"
     );
 
+    // The router pulls the SAME revision over the SAME (insecure) transport, so
+    // with `pull_env` set its rollout must complete too — boot is fail-closed, so
+    // a Ready router proves its pull succeeded. Skipped for the HTTP path (empty
+    // `pull_env`), whose router already pulls over `http://` and is left unwaited
+    // as before.
+    if !pull_env.is_empty() {
+        let router_status = kubectl(&[
+            "rollout",
+            "status",
+            &format!("deployment/{ROUTER_DEPLOY}"),
+            "-n",
+            NAMESPACE,
+            "--timeout=180s",
+        ]);
+        if !router_status.status.success() {
+            let router_logs = kubectl(&[
+                "logs",
+                &format!("deployment/{ROUTER_DEPLOY}"),
+                "-n",
+                NAMESPACE,
+                "--all-containers",
+                "--tail=150",
+            ]);
+            panic!(
+                "router must also reach Ready by pulling the bundle over the same transport:\n\
+                 stdout: {}\nstderr: {}\n\n=== router logs ===\n{}{}",
+                String::from_utf8_lossy(&router_status.stdout),
+                String::from_utf8_lossy(&router_status.stderr),
+                String::from_utf8_lossy(&router_logs.stdout),
+                String::from_utf8_lossy(&router_logs.stderr),
+            );
+        }
+    }
+
     worker
+}
+
+/// `kubectl set env deployment/<a> deployment/<b> … K=V …` in the env namespace,
+/// asserting success. One invocation patches every target (a single API
+/// round-trip); patching a deployment rolls a fresh pod that boots with the vars.
+fn set_deployments_env(deployments: &[&str], vars: &[(&str, &str)]) {
+    let targets: Vec<String> = deployments
+        .iter()
+        .map(|d| format!("deployment/{d}"))
+        .collect();
+    let assignments: Vec<String> = vars.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let mut args: Vec<&str> = vec!["set", "env"];
+    args.extend(targets.iter().map(String::as_str));
+    args.extend(["-n", NAMESPACE]);
+    args.extend(assignments.iter().map(String::as_str));
+    kubectl_ok(&args);
 }
 
 /// M2 end-to-end: a freshly-seeded worker PULLS its bundle at boot and serves
@@ -1167,6 +1419,83 @@ fn worker_pulls_http_bundle_and_serves_the_real_revision() {
     ]);
 }
 
+/// A live `kubectl port-forward` to `target` (e.g. `deployment/foo`), bound to an
+/// OS-chosen local port read off kubectl's `Forwarding from 127.0.0.1:<port>`
+/// line (so a lingering forward can't collide on a fixed port). Its stdout is
+/// drained on a side thread for the forward's WHOLE lifetime: kubectl writes a
+/// `Handling connection for <port>` line per forwarded request, and closing the
+/// read end mid-run would EPIPE those writes and tear the tunnel down — fatal
+/// when the caller makes several requests over one forward (a curl retry loop, an
+/// `oras push`'s blob + manifest uploads). Killed on drop. Shared by
+/// [`worker_invoke`] and [`oci_push_fixture`].
+struct PortForward {
+    child: std::process::Child,
+    reader: Option<std::thread::JoinHandle<()>>,
+    local_port: u16,
+}
+
+impl PortForward {
+    /// Open a forward from an OS-chosen local port to `target`'s `remote_port`,
+    /// blocking until kubectl announces the local port (panics on a 30 s timeout).
+    fn open(target: &str, remote_port: u16) -> PortForward {
+        use std::io::{BufRead, BufReader};
+        use std::process::Stdio;
+        use std::sync::mpsc;
+
+        let mut child = Command::new("kubectl")
+            .args([
+                "port-forward",
+                target,
+                &format!(":{remote_port}"),
+                "-n",
+                NAMESPACE,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn kubectl port-forward");
+
+        let stdout = child.stdout.take().expect("port-forward stdout");
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut tx = Some(tx);
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(rest) = line.split("127.0.0.1:").nth(1) {
+                    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                    if let Ok(port) = digits.parse::<u16>()
+                        && let Some(tx) = tx.take()
+                    {
+                        let _ = tx.send(port);
+                    }
+                }
+            }
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(local_port) => PortForward {
+                child,
+                reader: Some(reader),
+                local_port,
+            },
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                panic!("kubectl port-forward never announced a local port within 30s");
+            }
+        }
+    }
+}
+
+impl Drop for PortForward {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
 /// POST a `HostWorkerRequest` to the worker's loopback-only `/workers/invoke`
 /// via `kubectl port-forward`, returning `(http_status, response_body)`.
 ///
@@ -1181,52 +1510,8 @@ fn worker_pulls_http_bundle_and_serves_the_real_revision() {
 /// any forwarding error lands in the `--nocapture` CI log, and `curl -S`
 /// surfaces transport failures the same way.
 fn worker_invoke(worker: &str, payload: &Value) -> (u16, String) {
-    use std::io::{BufRead, BufReader};
-    use std::process::Stdio;
-    use std::sync::mpsc;
-
-    let mut pf = Command::new("kubectl")
-        .args([
-            "port-forward",
-            &format!("deployment/{worker}"),
-            ":8080",
-            "-n",
-            NAMESPACE,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn kubectl port-forward");
-
-    // Drain the child's stdout on a side thread for its WHOLE lifetime, sending
-    // the announced local port back once seen. We must keep reading (not stop at
-    // the announce line): kubectl writes a `Handling connection for <port>` line
-    // per request, so closing the read end mid-run would EPIPE those writes and
-    // tear the forward down — making every curl below get no response.
-    let stdout = pf.stdout.take().expect("port-forward stdout");
-    let (tx, rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let mut tx = Some(tx);
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Some(rest) = line.split("127.0.0.1:").nth(1) {
-                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-                if let Ok(port) = digits.parse::<u16>()
-                    && let Some(tx) = tx.take()
-                {
-                    let _ = tx.send(port);
-                }
-            }
-        }
-    });
-    let local_port = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-        Ok(port) => port,
-        Err(_) => {
-            let _ = pf.kill();
-            let _ = pf.wait();
-            let _ = reader.join();
-            panic!("kubectl port-forward never announced a local port within 30s");
-        }
-    };
+    let pf = PortForward::open(&format!("deployment/{worker}"), 8080);
+    let local_port = pf.local_port;
 
     // The announce line can precede the pod connection by a beat, so retry the
     // POST until the tunnel carries it (`http_code` 0 == curl couldn't connect).
@@ -1264,9 +1549,7 @@ fn worker_invoke(worker: &str, payload: &Value) -> (u16, String) {
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    let _ = pf.kill();
-    let _ = pf.wait();
-    let _ = reader.join();
+    drop(pf);
     // Make a transport failure actionable instead of a bare "body: ".
     if result.0 == 0 && result.1.is_empty() {
         result.1 = format!(
@@ -1357,6 +1640,67 @@ fn worker_executes_a_real_flow_over_workers_invoke() {
     );
 
     // Cleanup (deletes the bundle server + its ConfigMap with the namespace).
+    let _ = kubectl(&[
+        "delete",
+        "namespace",
+        NAMESPACE,
+        "--ignore-not-found",
+        "--wait=false",
+    ]);
+}
+
+/// M2 OCI-transport sibling of
+/// [`worker_pulls_http_bundle_and_serves_the_real_revision`]: the worker pulls
+/// its bundle from an in-cluster **OCI registry** over greentic-start's OCI
+/// client (not the plain-HTTP `ureq` path), proving the `oci://` boot-pull end to
+/// end.
+///
+/// The registry serves plain HTTP, and the OCI client is HTTPS-only by default,
+/// so the pull succeeds ONLY because the worker is launched with
+/// `GREENTIC_OCI_INSECURE_REGISTRIES` listing the registry authority — the escape
+/// hatch greentic-start#283 added (`ClientProtocol::HttpsExcept`). That env is
+/// injected post-reconcile (test-only — `set_deployment_env`, never the
+/// production render), so production OCI pulls stay HTTPS-only. The `#283` fix
+/// also scopes the hatch to the digest-gated boot-pull, which this test's pinned
+/// `:develop` serving image must carry.
+///
+/// Same proof structure as the HTTP test: the registry rollout, the worker's
+/// `/healthz` probe, and `reconcile`'s readiness are all gated, so a completed
+/// worker rollout means the worker pulled over OCI, digest-verified (the pulled
+/// layer's sha256 must equal the sha256 the deployer pinned when it staged the
+/// same fixture), materialized, and activated; the real-revision serve banner
+/// then rules out a probes-only boot.
+///
+/// Gated on `GREENTIC_K8S_SERVING_IMAGE` (a `:develop` image carrying the #283
+/// hatch) on top of `GREENTIC_K8S_E2E`; self-skips when unset, like the other
+/// serving tests. Needs `oras` on PATH (the CI `k8s-e2e` job installs it) to load
+/// the fixture into the registry.
+#[test]
+fn worker_pulls_oci_bundle_and_serves_the_real_revision() {
+    if !armed() {
+        return;
+    }
+    let Some(image) = serving_image() else {
+        return;
+    };
+    reset_namespace();
+    let store = tempfile::tempdir().expect("tempdir");
+    let store = store.path();
+
+    // Stand up the registry + push the fixture BEFORE the worker boots (the
+    // worker's rollout waits, so the pull can't race the registry coming up).
+    let fixture = fixture_bundle();
+    start_oci_registry(&fixture);
+    let authority = oci_registry_authority();
+    boot_worker_pulling_revision(
+        store,
+        &image,
+        &fixture,
+        &oci_bundle_source_uri(),
+        &[("GREENTIC_OCI_INSECURE_REGISTRIES", &authority)],
+    );
+
+    // Cleanup (deletes the registry + its objects with the namespace).
     let _ = kubectl(&[
         "delete",
         "namespace",
