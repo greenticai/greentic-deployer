@@ -436,6 +436,18 @@ fn fixture_bundle() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/bundles/perf-smoke-bundle.gtbundle")
 }
 
+/// Path to the M3 fixture: a `.gtbundle` whose pack carries a real
+/// `component-templates@0.6.0` WASM component plus a one-node flow that invokes
+/// it (`operation: handle_message`). Unlike [`fixture_bundle`] this proves the
+/// worker not only pulls + activates but *executes a real flow* on
+/// `/workers/invoke` — the end-to-end check for the greentic-runner#466
+/// flow-node component-id resolution fix (a dotted resolved symbol like
+/// `ai.greentic.component-templates` must not be split into a bogus
+/// `ai.greentic` component).
+fn templates_fixture_bundle() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/bundles/templates-bundle.gtbundle")
+}
+
 /// The in-cluster URL the worker pulls its bundle from (plain HTTP, in the env
 /// namespace).
 fn bundle_source_uri() -> String {
@@ -471,10 +483,10 @@ fn kubectl_apply_stdin(manifest: &str) {
     );
 }
 
-/// Stand up an in-cluster plain-HTTP server that serves the fixture bundle at
-/// `/{BUNDLE_FILE}` and WAIT for it to be ready, so the worker can pull the
-/// moment it boots. The bundle bytes ride in a ConfigMap mounted into a
-/// `busybox httpd` pod's docroot. Idempotent: clears any prior run first. The
+/// Stand up an in-cluster plain-HTTP server that serves the given fixture
+/// bundle at `/{BUNDLE_FILE}` and WAIT for it to be ready, so the worker can
+/// pull the moment it boots. The bundle bytes ride in a ConfigMap mounted into
+/// a `busybox httpd` pod's docroot. Idempotent: clears any prior run first. The
 /// env namespace is created here (before `reconcile`) so the server precedes
 /// the worker.
 ///
@@ -487,7 +499,7 @@ fn kubectl_apply_stdin(manifest: &str) {
 /// only this in-cluster test fixture is caught by the env's default-deny, so the
 /// allow lives here in the test, not in the production render. The worker's
 /// matching egress is already granted by `gtc-allow-worker-egress`.
-fn start_bundle_server() {
+fn start_bundle_server(fixture: &Path) {
     // Clean slate, then (re)create the env namespace the server shares with the
     // worker. `reset_namespace` (a blocking delete) ran first, so the namespace
     // is gone; tolerate "already exists" defensively.
@@ -502,7 +514,6 @@ fn start_bundle_server() {
     ]);
 
     // Bundle bytes → ConfigMap (kubectl auto-detects binary → binaryData).
-    let fixture = fixture_bundle();
     kubectl_ok(&[
         "create",
         "configmap",
@@ -597,19 +608,18 @@ spec:
     );
 }
 
-/// Provision a revision the worker will PULL at boot: stage the FIXTURE bundle
+/// Provision a revision the worker will PULL at boot: stage the given bundle
 /// (so the revision records its real sha256 as `bundle_digest`) WITH the
 /// `bundle_source_uri` the worker fetches, warm to Ready, and route 100 % of
 /// traffic to it (boot-time pull only fires for traffic-routed revisions).
 /// Returns the revision id.
-fn provision_pullable_revision(store: &Path, image: &str, source_uri: &str) -> String {
-    provision_revision(
-        store,
-        Some(image),
-        Some(&fixture_bundle()),
-        Some(source_uri),
-        true,
-    )
+fn provision_pullable_revision(
+    store: &Path,
+    image: &str,
+    source_uri: &str,
+    bundle: &Path,
+) -> String {
+    provision_revision(store, Some(image), Some(bundle), Some(source_uri), true)
 }
 
 /// Dump everything needed to root-cause a worker that never reached Ready: pod
@@ -1049,6 +1059,64 @@ fn worker_reaches_ready_and_serves_healthz_with_a_serving_image() {
     ]);
 }
 
+/// Boot a worker that PULLS `fixture` over HTTP and serves it, returning the
+/// worker deployment name. Shared by the M2 pull test and the M3 flow-execution
+/// test — the only thing that varies is the fixture bundle.
+///
+/// Serves the fixture in-cluster, provisions a pullable + 100%-routed revision
+/// on the given serving `image`, reconciles, and waits for the worker rollout
+/// to reach Ready. A completed rollout proves the full boot chain ran (pull →
+/// digest gate → materialize → activate → serve) — the HTTP server is the only
+/// bundle source, so Ready is impossible without a successful pull. Then asserts
+/// the worker logged the REAL-revision serve banner (`serving N revision(s) for
+/// env …`) rather than the probes-only line, so a probes-only M1 boot can't
+/// masquerade as success.
+fn boot_worker_serving_bundle(store: &Path, image: &str, fixture: &Path) -> String {
+    // Serve the fixture bundle in-cluster BEFORE the worker boots (its rollout
+    // waits, so the pull can't race the server coming up).
+    start_bundle_server(fixture);
+
+    let revision_id = provision_pullable_revision(store, image, &bundle_source_uri(), fixture);
+    let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
+
+    // reconcile renders the env-store ConfigMap (carrying `environment.json`
+    // with the routed revision + its `bundle_source_uri`) and the worker pair.
+    let (applied, _) = reconcile(store);
+    assert_eq!(applied, 14, "reconcile applies env-level + worker pair");
+
+    let status = kubectl(&[
+        "rollout",
+        "status",
+        &format!("deployment/{worker}"),
+        "-n",
+        NAMESPACE,
+        "--timeout=180s",
+    ]);
+    if !status.status.success() {
+        // Fail-closed boot means a stuck rollout hides the real cause (a failed
+        // pull, a digest mismatch, an unreachable server). Dump the live cluster
+        // state into the panic so CI surfaces *why* the worker never went Ready.
+        let diag = worker_failure_diagnostics(&worker);
+        panic!(
+            "worker must reach Ready by pulling + serving the bundle:\n\
+             stdout: {}\nstderr: {}\n\n=== diagnostics ==={diag}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr),
+        );
+    }
+
+    // Distinguish a REAL activated revision from a probes-only boot: the worker
+    // logs `serving N revision(s) for env …` only when packs activated, vs
+    // `… serving probes only` when no bundle attached.
+    let logs = kubectl_ok(&["logs", &format!("deployment/{worker}"), "-n", NAMESPACE]);
+    assert!(
+        logs.contains("revision(s) for env"),
+        "the worker must log the real-revision serve banner (not probes-only):\n{logs}"
+    );
+
+    worker
+}
+
 /// M2 end-to-end: a freshly-seeded worker PULLS its bundle at boot and serves
 /// the real revision — the first live proof of the distributor-pull path.
 ///
@@ -1087,49 +1155,205 @@ fn worker_pulls_http_bundle_and_serves_the_real_revision() {
     let store = tempfile::tempdir().expect("tempdir");
     let store = store.path();
 
-    // Serve the fixture bundle in-cluster BEFORE the worker boots (its rollout
-    // waits, so the pull can't race the server coming up).
-    start_bundle_server();
+    boot_worker_serving_bundle(store, &image, &fixture_bundle());
 
-    let revision_id = provision_pullable_revision(store, &image, &bundle_source_uri());
-    let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
-
-    // reconcile renders the env-store ConfigMap (carrying `environment.json`
-    // with the routed revision + its `bundle_source_uri`) and the worker pair.
-    let (applied, _) = reconcile(store);
-    assert_eq!(applied, 14, "reconcile applies env-level + worker pair");
-
-    // A completed rollout proves the full boot chain ran: pull → digest gate →
-    // materialize → activate → serve. The HTTP server is the only bundle
-    // source, so Ready here is impossible without a successful pull.
-    let status = kubectl(&[
-        "rollout",
-        "status",
-        &format!("deployment/{worker}"),
-        "-n",
+    // Cleanup (deletes the bundle server + its ConfigMap with the namespace).
+    let _ = kubectl(&[
+        "delete",
+        "namespace",
         NAMESPACE,
-        "--timeout=180s",
+        "--ignore-not-found",
+        "--wait=false",
     ]);
-    if !status.status.success() {
-        // Fail-closed boot means a stuck rollout hides the real cause (a failed
-        // pull, a digest mismatch, an unreachable server). Dump the live cluster
-        // state into the panic so CI surfaces *why* the worker never went Ready.
-        let diag = worker_failure_diagnostics(&worker);
-        panic!(
-            "worker must reach Ready by pulling + serving the http bundle:\n\
-             stdout: {}\nstderr: {}\n\n=== diagnostics ==={diag}",
-            String::from_utf8_lossy(&status.stdout),
-            String::from_utf8_lossy(&status.stderr),
+}
+
+/// POST a `HostWorkerRequest` to the worker's loopback-only `/workers/invoke`
+/// via `kubectl port-forward`, returning `(http_status, response_body)`.
+///
+/// `/workers/invoke` trusts the caller-asserted tenant only from loopback peers
+/// (`revision_serve.rs`), so `kubectl port-forward` (which tunnels through the
+/// kubelet → the request reaches the pod from `127.0.0.1`) is what satisfies the
+/// gate. It also sidesteps the same-node pod-to-pod CNI quirks some kind hosts
+/// hit, since the hop is kubelet→pod, not pod→pod. kubectl picks the local port
+/// (`:8080`) and we read it off its first `Forwarding from 127.0.0.1:<port>`
+/// line, so a lingering forward can't collide on a fixed port; `curl` (on the CI
+/// runner alongside kubectl) does the POST. port-forward stderr is inherited so
+/// any forwarding error lands in the `--nocapture` CI log, and `curl -S`
+/// surfaces transport failures the same way.
+fn worker_invoke(worker: &str, payload: &Value) -> (u16, String) {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
+    let mut pf = Command::new("kubectl")
+        .args([
+            "port-forward",
+            &format!("deployment/{worker}"),
+            ":8080",
+            "-n",
+            NAMESPACE,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn kubectl port-forward");
+
+    // Drain the child's stdout on a side thread for its WHOLE lifetime, sending
+    // the announced local port back once seen. We must keep reading (not stop at
+    // the announce line): kubectl writes a `Handling connection for <port>` line
+    // per request, so closing the read end mid-run would EPIPE those writes and
+    // tear the forward down — making every curl below get no response.
+    let stdout = pf.stdout.take().expect("port-forward stdout");
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut tx = Some(tx);
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(rest) = line.split("127.0.0.1:").nth(1) {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                if let Ok(port) = digits.parse::<u16>()
+                    && let Some(tx) = tx.take()
+                {
+                    let _ = tx.send(port);
+                }
+            }
+        }
+    });
+    let local_port = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(port) => port,
+        Err(_) => {
+            let _ = pf.kill();
+            let _ = pf.wait();
+            let _ = reader.join();
+            panic!("kubectl port-forward never announced a local port within 30s");
+        }
+    };
+
+    // The announce line can precede the pod connection by a beat, so retry the
+    // POST until the tunnel carries it (`http_code` 0 == curl couldn't connect).
+    let url = format!("http://127.0.0.1:{local_port}/workers/invoke");
+    let body = serde_json::to_string(payload).expect("serialize HostWorkerRequest");
+    let mut result = (0u16, String::new());
+    let mut last_curl_err = String::new();
+    for _ in 0..20 {
+        let out = Command::new("curl")
+            .args([
+                "-sS",
+                "-m",
+                "20",
+                "-w",
+                "\n%{http_code}",
+                "-X",
+                "POST",
+                &url,
+                "-H",
+                "content-type: application/json",
+                "-d",
+                &body,
+            ])
+            .output()
+            .expect("spawn curl");
+        last_curl_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let raw = String::from_utf8_lossy(&out.stdout);
+        if let Some((resp_body, code)) = raw.rsplit_once('\n')
+            && let Ok(status) = code.trim().parse::<u16>()
+        {
+            result = (status, resp_body.to_string());
+            if status != 0 {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let _ = pf.kill();
+    let _ = pf.wait();
+    let _ = reader.join();
+    // Make a transport failure actionable instead of a bare "body: ".
+    if result.0 == 0 && result.1.is_empty() {
+        result.1 = format!(
+            "(no HTTP response via port-forward 127.0.0.1:{local_port}; last curl stderr: {last_curl_err})"
         );
     }
+    result
+}
 
-    // Distinguish a REAL activated revision from a probes-only boot: the worker
-    // logs `serving N revision(s) for env …` only when packs activated, vs
-    // `… serving probes only` when no bundle attached.
-    let logs = kubectl_ok(&["logs", &format!("deployment/{worker}"), "-n", NAMESPACE]);
+/// M3: the worker not only pulls + activates a real revision but EXECUTES a flow
+/// on it. The fixture bundle carries a real `component-templates@0.6.0` WASM
+/// component and a one-node flow that invokes it; a POST to the loopback-only
+/// `/workers/invoke` must run that flow and echo the templated message — the
+/// end-to-end proof of the greentic-runner#466 flow-node component-id resolution
+/// fix (before it, the dotted resolved symbol `ai.greentic.component-templates`
+/// was split into a bogus `ai.greentic` component and execution failed with
+/// "component '…' not found in pack").
+///
+/// Builds on `worker_pulls_http_bundle_and_serves_the_real_revision`: same
+/// pull-over-HTTP boot and the same Ready + real-revision-banner gates, then the
+/// extra invoke hop. Gated on `GREENTIC_K8S_SERVING_IMAGE` (a `:develop` worker
+/// image new enough to carry the #466 fix) on top of `GREENTIC_K8S_E2E`.
+#[test]
+fn worker_executes_a_real_flow_over_workers_invoke() {
+    if !armed() {
+        return;
+    }
+    let Some(image) = serving_image() else {
+        return;
+    };
+    reset_namespace();
+    let store = tempfile::tempdir().expect("tempdir");
+    let store = store.path();
+
+    let worker = boot_worker_serving_bundle(store, &image, &templates_fixture_bundle());
+
+    // The M3 assertion: run the flow. Its single node invokes
+    // `ai.greentic.component-templates` (a dotted resolved symbol) with
+    // `operation: handle_message`; #466 keeps that symbol intact instead of
+    // splitting it, so execution succeeds and the component echoes its input.
+    let (http_status, body) = worker_invoke(
+        &worker,
+        &serde_json::json!({
+            "version": "1.0.0",
+            "tenant": {
+                "env": ENV_ID,
+                "tenant": "default",
+                "tenant_id": "default",
+                "attempt": 0
+            },
+            "worker_id": "templates-bundle",
+            "payload": {"text": "m3"}
+        }),
+    );
+    if http_status != 200 {
+        // Dump live pod/log state so a non-200 (or no-response) is diagnosable
+        // from the CI log rather than a bare status + body.
+        let diag = worker_failure_diagnostics(&worker);
+        panic!(
+            "POST /workers/invoke must return 200, got {http_status}; body: {body}\n\n\
+             === diagnostics ==={diag}"
+        );
+    }
     assert!(
-        logs.contains("revision(s) for env"),
-        "the worker must log the real-revision serve banner (not probes-only):\n{logs}"
+        body.contains("component-templates::handle_message =>"),
+        "the flow must execute and return the templates component's echo \
+         (the greentic-runner#466 fix); body: {body}"
+    );
+    // Prove the flow GRAPH ran, not just that the component is reachable. The
+    // `render` node feeds the component a literal input ("M3 hello from
+    // templates"); the runtime echoes that node input back inside the activity
+    // payload as a byte sequence, whose prefix `34,77,51,32,104,101,108,108,111`
+    // is `"M3 hello`. Its presence means the runner loaded the flow, resolved
+    // the dotted `ai.greentic.component-templates` symbol (the #466 fix), and
+    // ran the node with its configured input — a canned or direct-component
+    // success could clear the prefix check above but not this. (The request
+    // `payload` is not echoed: the node input is flow-configured, not
+    // request-derived, so the fixture's node input is the value to require.)
+    assert!(
+        body.contains("34,77,51,32,104,101,108,108,111"),
+        "the flow's render-node input (bytes of \"M3 hello...\") must appear in \
+         the echoed activity payload, proving graph execution rather than only \
+         component reachability; body: {body}"
+    );
+    assert!(
+        !body.contains("not found in pack"),
+        "flow execution must not fail with a component-resolution error; body: {body}"
     );
 
     // Cleanup (deletes the bundle server + its ConfigMap with the namespace).
