@@ -1244,19 +1244,27 @@ fn boot_worker_serving_bundle(store: &Path, image: &str, fixture: &Path) -> Stri
 /// (`serving N revision(s) for env …` rather than the probes-only line) then
 /// keeps a probes-only M1 boot from masquerading as success.
 ///
-/// `worker_env` carries boot env the production render deliberately omits — the
+/// `pull_env` carries boot env the production render deliberately omits — the
 /// OCI path's `GREENTIC_OCI_INSECURE_REGISTRIES` allow-list. It is applied AFTER
 /// reconcile (so it never enters the rendered manifests) and BEFORE the rollout
-/// wait (so the rolled pod boots with it); the first pre-set-env pod fails closed
-/// on the OCI pull and is superseded, and `rollout status` tracks the new
-/// ReplicaSet. Only the worker is patched + asserted, exactly as in the HTTP path
-/// (the router's boot pull is out of scope here).
+/// wait (so the rolled pods boot with it); the first pre-set-env pods fail closed
+/// on the OCI pull and are superseded, and `rollout status` tracks the new
+/// ReplicaSets.
+///
+/// It goes to BOTH the worker AND the router: both boot `start --env` and pull
+/// the same routed bundle-sourced revision (each has its own egress allow —
+/// `gtc-allow-{worker,router}-egress`), so an unpatched router would fail its OCI
+/// pull and CrashLoop. When `pull_env` is set the router rollout is therefore a
+/// success criterion too — otherwise a broken router (a dead ingress serve path)
+/// would hide behind the worker-only banner. The HTTP path passes `&[]`: its
+/// router already pulls over `http://`, so it is neither patched nor waited here,
+/// exactly as before.
 fn boot_worker_pulling_revision(
     store: &Path,
     image: &str,
     fixture: &Path,
     source_uri: &str,
-    worker_env: &[(&str, &str)],
+    pull_env: &[(&str, &str)],
 ) -> String {
     let revision_id = provision_pullable_revision(store, image, source_uri, fixture);
     let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
@@ -1266,8 +1274,10 @@ fn boot_worker_pulling_revision(
     let (applied, _) = reconcile(store);
     assert_eq!(applied, 14, "reconcile applies env-level + worker pair");
 
-    if !worker_env.is_empty() {
-        set_deployment_env(&worker, worker_env);
+    if !pull_env.is_empty() {
+        for deployment in [worker.as_str(), ROUTER_DEPLOY] {
+            set_deployment_env(deployment, pull_env);
+        }
     }
 
     let status = kubectl(&[
@@ -1299,6 +1309,40 @@ fn boot_worker_pulling_revision(
         logs.contains("revision(s) for env"),
         "the worker must log the real-revision serve banner (not probes-only):\n{logs}"
     );
+
+    // The router pulls the SAME revision over the SAME (insecure) transport, so
+    // with `pull_env` set its rollout must complete too — boot is fail-closed, so
+    // a Ready router proves its pull succeeded. Skipped for the HTTP path (empty
+    // `pull_env`), whose router already pulls over `http://` and is left unwaited
+    // as before.
+    if !pull_env.is_empty() {
+        let router_status = kubectl(&[
+            "rollout",
+            "status",
+            &format!("deployment/{ROUTER_DEPLOY}"),
+            "-n",
+            NAMESPACE,
+            "--timeout=180s",
+        ]);
+        if !router_status.status.success() {
+            let router_logs = kubectl(&[
+                "logs",
+                &format!("deployment/{ROUTER_DEPLOY}"),
+                "-n",
+                NAMESPACE,
+                "--all-containers",
+                "--tail=150",
+            ]);
+            panic!(
+                "router must also reach Ready by pulling the bundle over the same transport:\n\
+                 stdout: {}\nstderr: {}\n\n=== router logs ===\n{}{}",
+                String::from_utf8_lossy(&router_status.stdout),
+                String::from_utf8_lossy(&router_status.stderr),
+                String::from_utf8_lossy(&router_logs.stdout),
+                String::from_utf8_lossy(&router_logs.stderr),
+            );
+        }
+    }
 
     worker
 }
