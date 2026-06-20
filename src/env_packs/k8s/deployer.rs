@@ -199,6 +199,19 @@ impl K8sDeployerHandler {
     /// the namespace (its RBAC pack carries the Namespace doc). This closes the
     /// previously-documented namespace-apply-trust gap.
     ///
+    /// Dropping the Namespace apply also forgoes *its* `KubeCluster::apply`
+    /// ownership guard (the per-object `greentic.ai/env` label check). That is
+    /// not the env's only owner check, so a bound reconcile does not fail open:
+    /// the bound credential can only exist because `bootstrap --bind` already
+    /// applied the Namespace through the same guard (a cross-env target
+    /// fail-closes there), the minted token's RBAC confines writes to that one
+    /// namespace, and every namespaced object reconcile applies still runs the
+    /// guard (the bound Role grants `get`). The residual — a bound credential
+    /// hand-pointed at another env's not-yet-populated namespace, bypassing
+    /// `bootstrap --bind` — would need a bound-readable owner signal (e.g. a
+    /// bootstrap-created ConfigMap) to preflight; that is a separate hardening
+    /// slice, since the bound SA cannot read the cluster-scoped Namespace label.
+    ///
     /// # Known gaps (Phase D later slices)
     ///
     /// - **Adoption of unlabeled objects.** [`KubeCluster::apply`](super::kube_client::KubeCluster)'s
