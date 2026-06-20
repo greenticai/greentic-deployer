@@ -157,6 +157,19 @@ fn object_exists(kind: &str, name: &str, namespace: Option<&str>) -> bool {
     kubectl(&args).status.success()
 }
 
+/// `true` when `subject` is authorized for `auth can-i <args>`. Runs the check
+/// via impersonation (`--as <subject>`) as the ambient admin, so the API server
+/// evaluates the subject's effective RBAC — no token minted, no bound credential
+/// handled. `kubectl auth can-i` exits 0 for "yes" and non-zero for "no", so the
+/// exit code is the decision (robust to stdout warnings on cluster-scoped
+/// resources). The ambient kind admin is cluster-admin and may impersonate.
+fn subject_can(subject: &str, args: &[&str]) -> bool {
+    let mut full = vec!["auth", "can-i"];
+    full.extend_from_slice(args);
+    full.extend_from_slice(&["--as", subject]);
+    kubectl(&full).status.success()
+}
+
 /// Delete the test namespace and WAIT for it to be gone, so a test starts from
 /// a clean slate regardless of what a prior test left Terminating. Best-effort:
 /// a missing namespace is a no-op (`--ignore-not-found`).
@@ -1855,6 +1868,38 @@ fn bind_provisions_rbac_and_resolves_the_bound_identity() {
         req_result["missing_capabilities"].as_array().map(Vec::len),
         Some(0),
         "no validated capability is missing for the bound SA: {req_result}"
+    );
+
+    // 5. Minimum-privilege confinement — the NEGATIVE complement to step 4. The
+    //    requirements sweep only proves the needed verbs are PRESENT, so an
+    //    over-grant regression (a ClusterRoleBinding, cluster-admin, a wider
+    //    Role) would pass it while quietly breaking the security boundary. These
+    //    denials make "bound only to the rendered minimal Role" a checked claim
+    //    rather than a doc comment. Impersonating the SA evaluates its effective
+    //    RBAC, so it also catches an unexpected ClusterRole/CRB behaviorally
+    //    (any of those would flip a denial below to allowed).
+    let sa_subject = format!("system:serviceaccount:{NAMESPACE}:{DEPLOYER_SA}");
+    // Positive control: the in-namespace verb the Role grants is allowed — proves
+    // the impersonation path resolves the binding, so the denials below are real
+    // denials, not a broken `--as`.
+    assert!(
+        subject_can(&sa_subject, &["get", "deployments", "-n", NAMESPACE]),
+        "the bound SA can get deployments in its own namespace (Role grant)"
+    );
+    // Cluster-scoped Namespace op is DENIED — a namespaced Role cannot reach
+    // cluster scope. This is exactly the reconcile-time gap (reconcile re-applies
+    // the cluster-scoped Namespace, which this SA cannot), so a regression that
+    // granted it (e.g. a cluster-admin binding) would flip this assertion.
+    assert!(
+        !subject_can(&sa_subject, &["create", "namespaces"]),
+        "the bound SA must NOT create cluster-scoped namespaces (over-grant guard)"
+    );
+    // Cross-namespace: the RoleBinding confines the grant to gtc-local, so the
+    // same verb in another namespace is denied. A cluster-wide binding regression
+    // would flip this.
+    assert!(
+        !subject_can(&sa_subject, &["get", "deployments", "-n", "default"]),
+        "the bound SA must NOT get deployments outside its namespace (confinement)"
     );
 
     let _ = kubectl(&[
