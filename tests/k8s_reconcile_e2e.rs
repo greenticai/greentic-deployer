@@ -213,6 +213,29 @@ fn bind_k8s_env(store: &Path, runtime_image: Option<&str>) {
     op(store, Some(&bind), &["env-packs", "add"]);
 }
 
+/// Bind the K8s env and mint the bound deployer ServiceAccount via `--bind`:
+/// creates the env namespace + minimal RBAC, mints the SA token, and records the
+/// env's credential ref + bearer in the dev store. Returns the bootstrap verb's
+/// full JSON envelope (callers read `["result"]`). Shared by the bind producer
+/// test and the bound-reconcile test. The K8s bind path authenticates via the
+/// ambient kubeconfig CONTEXT, not via admin material, but the bootstrap loader
+/// still requires *some* material — a placeholder it never reads on this path.
+fn bind_k8s_env_and_bootstrap_bound_sa(store: &Path) -> Value {
+    bind_k8s_env(store, None);
+    let admin_context = kubectl_ok(&["config", "current-context"]);
+    let bootstrap = payload(
+        store,
+        "bootstrap.json",
+        serde_json::json!({
+            "environment_id": ENV_ID,
+            "admin_profile": admin_context,
+            "admin_material_inline": "ambient-kubeconfig",
+            "bind": true,
+        }),
+    );
+    op(store, Some(&bootstrap), &["credentials", "bootstrap"])
+}
+
 /// Stamp a store-aligned `credentials_ref` on the stored env through the public
 /// [`EnvironmentStore`](greentic_deployer::environment::EnvironmentStore) API.
 ///
@@ -1774,28 +1797,11 @@ fn bind_provisions_rbac_and_resolves_the_bound_identity() {
     let store = tempfile::tempdir().expect("tempdir");
     let store = store.path();
 
-    // Create the env + bind the K8s deployer (namespace → gtc-local). Unlike the
-    // bundle-server tests no namespace pre-create is needed: the rendered RBAC
-    // pack carries the Namespace object and the admin applies it as part of
-    // `--bind`.
-    bind_k8s_env(store, None);
-
-    // Bootstrap as the ambient kubeconfig admin (kind's current-context in CI).
-    // The K8s bind path authenticates via that context, not via admin material,
-    // but the bootstrap loader still requires *some* material — pass a
-    // placeholder it never reads on the bind path.
-    let admin_context = kubectl_ok(&["config", "current-context"]);
-    let bootstrap = payload(
-        store,
-        "bootstrap.json",
-        serde_json::json!({
-            "environment_id": ENV_ID,
-            "admin_profile": admin_context,
-            "admin_material_inline": "ambient-kubeconfig",
-            "bind": true,
-        }),
-    );
-    let out = op(store, Some(&bootstrap), &["credentials", "bootstrap"]);
+    // Bind the K8s env (namespace → gtc-local) + mint the bound deployer SA via
+    // `--bind`. No namespace pre-create is needed (unlike the bundle-server
+    // tests): the rendered RBAC pack carries the Namespace object and the admin
+    // applies it as part of `--bind`.
+    let out = bind_k8s_env_and_bootstrap_bound_sa(store);
     let result = &out["result"];
 
     // 1. The verb self-reports a bound credential, the store-aligned ref, and a
@@ -1937,23 +1943,11 @@ fn bound_identity_drives_reconcile_without_the_cluster_scoped_namespace() {
     let store = tempfile::tempdir().expect("tempdir");
     let store = store.path();
 
-    // Bind the K8s env, then mint the bound ServiceAccount via `--bind` (creates
-    // the namespace + minimal RBAC and records the env's credential ref + bearer
-    // in the dev store). After this, `op env reconcile` resolves that bearer and
-    // connects AS the bound SA instead of the ambient admin.
-    bind_k8s_env(store, None);
-    let admin_context = kubectl_ok(&["config", "current-context"]);
-    let bootstrap = payload(
-        store,
-        "bootstrap.json",
-        serde_json::json!({
-            "environment_id": ENV_ID,
-            "admin_profile": admin_context,
-            "admin_material_inline": "ambient-kubeconfig",
-            "bind": true,
-        }),
-    );
-    let boot = op(store, Some(&bootstrap), &["credentials", "bootstrap"]);
+    // Mint the bound ServiceAccount via `--bind` (creates the namespace + minimal
+    // RBAC and records the env's credential ref + bearer in the dev store). After
+    // this, `op env reconcile` resolves that bearer and connects AS the bound SA
+    // instead of the ambient admin.
+    let boot = bind_k8s_env_and_bootstrap_bound_sa(store);
     assert_eq!(
         boot["result"]["bound"], true,
         "precondition: --bind minted the bound SA: {}",

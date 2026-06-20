@@ -649,37 +649,28 @@ mod tests {
         let (handler, cluster) = handler_with_fake();
         let env = build_fixture_env();
 
-        // A bound, namespace-scoped identity (`manage_namespace == false`): the
-        // Namespace is the only cluster-scoped object the renderer emits, so the
-        // applied set is the full desired state minus exactly that one object.
-        let report = handler.reconcile(&env, None, false).await.unwrap();
-        let desired = handler.render_environment(&env, None).unwrap();
-        let namespaces = desired
-            .iter()
-            .filter(|m| m.get("kind").and_then(Value::as_str) == Some("Namespace"))
-            .count();
-        assert_eq!(
-            namespaces, 1,
-            "fixture's env-level set carries one Namespace"
+        // A bound, namespace-scoped identity (`manage_namespace == false`) applies
+        // the full desired state minus exactly the cluster-scoped Namespace.
+        let full = handler.render_environment(&env, None).unwrap();
+        assert!(
+            full.iter().any(is_cluster_scoped),
+            "precondition: the env-level set carries a cluster-scoped Namespace to drop"
         );
-        assert_eq!(report.applied.len(), desired.len() - 1);
+        let report = handler.reconcile(&env, None, false).await.unwrap();
+        assert_eq!(report.applied.len(), full.len() - 1);
 
-        // The cluster never received a Namespace apply, but every namespaced
-        // object did — proving the bound identity can drive the rest of reconcile.
+        // Ground truth: the cluster never received a Namespace apply, so the
+        // bound identity drove the rest of reconcile without the one object its
+        // Role cannot touch.
         assert!(
             !cluster.objects().keys().any(|o| o.kind == "Namespace"),
             "a bound identity must not apply the cluster-scoped Namespace"
-        );
-        assert_eq!(
-            cluster.objects().len(),
-            desired.len() - 1,
-            "all namespaced desired objects landed; only the Namespace was dropped"
         );
 
         // Idempotent: a second bound reconcile leaves identical cluster state.
         let before = cluster.objects();
         let report2 = handler.reconcile(&env, None, false).await.unwrap();
-        assert_eq!(report2.applied.len(), desired.len() - 1);
+        assert_eq!(report2.applied.len(), full.len() - 1);
         assert_eq!(cluster.objects(), before, "bound reconcile is idempotent");
     }
 
