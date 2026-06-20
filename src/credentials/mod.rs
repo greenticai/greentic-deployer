@@ -30,8 +30,8 @@ pub mod rules_export;
 pub mod validate;
 
 pub use bootstrap::{
-    BootstrapError, BootstrapInput, BootstrapOutcome, RunBootstrapError, ZeroizedAdmin,
-    run_bootstrap,
+    BootstrapError, BootstrapInput, BootstrapOutcome, BoundSecretSink, RunBootstrapError,
+    ZeroizedAdmin, run_bootstrap,
 };
 pub use rules_export::{RulesExportError, RulesPack, RulesPackEntry, write_rules_pack};
 pub use validate::{

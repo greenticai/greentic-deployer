@@ -29,6 +29,13 @@ use super::credentials::K8sOperation;
 /// Name of the ServiceAccount the rules pack provisions.
 pub const DEPLOYER_SERVICE_ACCOUNT: &str = "greentic-deployer";
 
+/// Filename of the RBAC manifest entry in the rendered rules pack. The
+/// `--bind` path (`K8sDeployerCredentials::bootstrap`) extracts this exact
+/// entry and applies it live, so the live apply and the offline
+/// `kubectl apply -f` stay byte-identical — keep the renderer and the
+/// extractor referencing this one constant.
+pub(crate) const K8S_RBAC_MANIFEST_FILENAME: &str = "k8s-min-rbac.yaml";
+
 /// Store-aligned path (under `secret://<env>/…`) where the deployer's bound
 /// ServiceAccount token lives: `<tenant>/<team>/<category>/<name>`. It MUST be
 /// store-aligned so `op secrets put` can write it and the resolver
@@ -60,7 +67,7 @@ pub fn render_min_rbac_rules_pack(input: &K8sRulesPackInput<'_>) -> RulesPack {
     RulesPack {
         entries: vec![
             RulesPackEntry {
-                filename: "k8s-min-rbac.yaml".into(),
+                filename: K8S_RBAC_MANIFEST_FILENAME.into(),
                 content: render_rbac_yaml(input),
                 description: Some(format!(
                     "Namespace + minimum-privilege ServiceAccount/Role/RoleBinding for \

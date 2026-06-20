@@ -82,6 +82,14 @@ pub struct CredentialsBootstrapPayload {
     /// persisted by the CLI. Mutually exclusive with `admin_material_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin_material_inline: Option<String>,
+    /// When `true`, the K8s deployer connects AS THE ADMIN (the
+    /// `admin_profile` kubeconfig context), applies the rendered RBAC live,
+    /// mints the deployer ServiceAccount's token, and binds it — instead of
+    /// emitting a render-only rules pack for offline `kubectl apply`. K8s
+    /// only this round; rejected for other deployers and for builds without
+    /// the `k8s-client` feature.
+    #[serde(default)]
+    pub bind: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +170,7 @@ pub fn bootstrap(
     }
     let mut payload = resolve_payload::<CredentialsBootstrapPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
+    let bind_requested = payload.bind;
 
     let admin = load_admin_credential(&mut payload).map_err(|e| {
         // Keep the admin-loader's specific error visible to the operator
@@ -170,20 +179,57 @@ pub fn bootstrap(
         OpError::Conflict(e.to_string())
     })?;
 
+    // `bind: true` ⇒ connect AS THE ADMIN and mint+bind the deployer's
+    // ServiceAccount credential live (K8s only this round). Built before the
+    // audit scope so the override outlives the `run_bootstrap` call.
+    let bind_creds: Option<Box<dyn DeployerCredentials>> = if bind_requested {
+        Some(
+            admin_bind_k8s_credentials(store, &env_id, admin.profile())?.ok_or_else(|| {
+                OpError::Conflict(
+                    "`bind: true` is only supported for K8s-bound environments this round; \
+                     other deployers still bootstrap a render-only rules pack — drop `bind` \
+                     and apply the pack offline, then `op credentials rotate`"
+                        .to_string(),
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+
+    // Sink that persists minted secret material into the env dev store at
+    // the location `resolve_credentials_token` reads it back from. Invoked
+    // inside `run_bootstrap`'s flock, before `credentials_ref` is recorded.
+    let secret_sink = |env_root: &std::path::Path,
+                       secret_ref: &greentic_deploy_spec::SecretRef,
+                       value: &str|
+     -> Result<(), String> {
+        super::secrets::put_credential_material(env_root, secret_ref, value)
+            .map_err(|e| e.to_string())
+    };
+
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "bootstrap",
         // admin material is NEVER recorded — only the user-supplied
-        // profile handle (which is not a secret).
-        target: json!({"admin_profile": payload.admin_profile}),
+        // profile handle (which is not a secret) and the bind mode.
+        target: json!({"admin_profile": payload.admin_profile, "bind": bind_requested}),
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |committed| {
         // `run_bootstrap` holds the env flock for the entire flow:
         // load → absence check → handler.bootstrap → rules-pack write →
-        // credentials_ref persist. No separate `transact` needed here.
-        let doc = match run_bootstrap(store, registry, &env_id, &admin) {
+        // secret-material write → credentials_ref persist. No separate
+        // `transact` needed here.
+        let doc = match run_bootstrap(
+            store,
+            registry,
+            &env_id,
+            &admin,
+            bind_creds.as_deref(),
+            &secret_sink,
+        ) {
             Ok(d) => d,
             Err(e) => return Err(map_bootstrap_err(e)),
         };
@@ -197,7 +243,9 @@ pub fn bootstrap(
                     "environment_id": env_id.as_str(),
                     "deployer_kind": doc.deployer_kind.as_str(),
                     "mode": "bootstrap",
+                    "bound": bind_requested,
                     "credentials_ref": doc.provided_credentials_ref.as_str(),
+                    "expires_at": doc.expiry.as_ref().map(|e| e.expires_at),
                     "rules_pack_ref": doc.bootstrap.as_ref().map(|b| b.rules_pack_ref.display().to_string()),
                     "admin_credential_consumed_at": doc.bootstrap.as_ref().map(|b| b.admin_credential_consumed_at),
                 }),
@@ -431,6 +479,80 @@ fn connected_k8s_credentials(
     Ok(None)
 }
 
+/// Build admin-connected K8s credentials for the `--bind` bootstrap path:
+/// a bootstrap connector that authenticates AS THE ADMIN (the
+/// `admin_profile` kubeconfig context, no bound SA token) and applies the
+/// rendered RBAC + mints the deployer ServiceAccount's token. Returns
+/// `None` when the env is not K8s-bound (the caller rejects `--bind` for
+/// other deployers). Boxed as `dyn DeployerCredentials` so the runner's
+/// `creds_override` seam stays deployer-agnostic.
+#[cfg(feature = "k8s-client")]
+fn admin_bind_k8s_credentials(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    admin_profile: &str,
+) -> Result<Option<Box<dyn DeployerCredentials>>, OpError> {
+    use crate::cli::env::load_render_answers;
+    use crate::env_packs::k8s::K8sDeployerHandler;
+    use crate::env_packs::k8s::credentials::{
+        K8sBootstrapClient, K8sBootstrapConnectFut, K8sBootstrapConnector, K8sDeployerCredentials,
+    };
+    use crate::env_packs::k8s::kube_client::{KubeBootstrapClient, connect};
+    use crate::env_packs::k8s::manifests::K8sParams;
+    use std::sync::Arc;
+
+    // Not loadable / no deployer bound / non-K8s ⇒ `None`; the runner (or
+    // the caller's `--bind` guard) surfaces the proper error.
+    let Ok(env) = store.load(env_id) else {
+        return Ok(None);
+    };
+    let Some(binding) = env.pack_for_slot(greentic_deploy_spec::CapabilitySlot::Deployer) else {
+        return Ok(None);
+    };
+    if binding.kind.path() != K8sDeployerHandler::DESCRIPTOR_PATH {
+        return Ok(None);
+    }
+
+    // Resolve the namespace reconcile / requirements actually use (the
+    // binding answers' `K8sParams::namespace`, falling back to the
+    // env-derived default) and scope the bind there — applying RBAC + minting
+    // the token in `gtc-<env>` while reconcile deploys into a custom namespace
+    // would RoleBind the token in the wrong place. Same resolution as
+    // `connected_k8s_credentials`.
+    let (answers, _wire) = load_render_answers(store, &env, &binding.kind)?;
+    let namespace = K8sParams::from_answers(&env, answers.as_ref())
+        .map_err(|e| OpError::Conflict(format!("invalid K8s answers: {e}")))?
+        .namespace;
+
+    let admin_context = admin_profile.to_string();
+    let connector: K8sBootstrapConnector = Arc::new(move || -> K8sBootstrapConnectFut {
+        let admin_context = admin_context.clone();
+        Box::pin(async move {
+            // Authenticate as the admin kubeconfig context (no bound token);
+            // that identity must hold rights to create the SA/Role/
+            // RoleBinding and call the TokenRequest subresource.
+            let client = connect(Some(&admin_context), None).await?;
+            Ok(Arc::new(KubeBootstrapClient::new(client)) as Arc<dyn K8sBootstrapClient>)
+        })
+    });
+    Ok(Some(Box::new(
+        K8sDeployerCredentials::with_bootstrap_connector(connector).in_namespace(namespace),
+    )))
+}
+
+/// `k8s-client`-less builds cannot connect a bind client — `--bind` is a
+/// hard error rather than a silent fall-through to render-only.
+#[cfg(not(feature = "k8s-client"))]
+fn admin_bind_k8s_credentials(
+    _store: &LocalFsStore,
+    _env_id: &EnvId,
+    _admin_profile: &str,
+) -> Result<Option<Box<dyn DeployerCredentials>>, OpError> {
+    Err(OpError::Conflict(
+        "`bind: true` requires a build with the `k8s-client` feature".to_string(),
+    ))
+}
+
 fn map_bootstrap_err(e: RunBootstrapError) -> OpError {
     use crate::credentials::BootstrapError;
     match e {
@@ -453,6 +575,9 @@ fn map_bootstrap_err(e: RunBootstrapError) -> OpError {
             OpError::Conflict(format!("bootstrap failed during {step}: {message}"))
         }
         RunBootstrapError::RulesExport(r) => OpError::Conflict(format!("rules export: {r}")),
+        RunBootstrapError::SecretWrite(msg) => OpError::Conflict(format!(
+            "failed to persist bound credential material: {msg}"
+        )),
     }
 }
 
@@ -497,7 +622,8 @@ fn bootstrap_schema() -> Value {
             "environment_id": {"type": "string"},
             "admin_profile": {"type": "string"},
             "admin_material_path": {"type": "string", "description": "path to a file holding the admin credential material (zeroized on drop)"},
-            "admin_material_inline": {"type": "string", "description": "inline admin credential material (zeroized on drop); mutually exclusive with admin_material_path"}
+            "admin_material_inline": {"type": "string", "description": "inline admin credential material (zeroized on drop); mutually exclusive with admin_material_path"},
+            "bind": {"type": "boolean", "description": "K8s only: connect as the admin (admin_profile kubeconfig context), apply the RBAC live, mint + bind the ServiceAccount token instead of emitting a render-only rules pack"}
         }
     })
 }
@@ -672,6 +798,7 @@ mod tests {
                 admin_profile: "admin".to_string(),
                 admin_material_path: None,
                 admin_material_inline: Some("ADMIN_TOKEN".to_string()),
+                bind: false,
             }),
         )
         .unwrap_err();
@@ -696,6 +823,7 @@ mod tests {
                 admin_profile: "admin".to_string(),
                 admin_material_path: None,
                 admin_material_inline: None,
+                bind: false,
             }),
         )
         .unwrap_err();
@@ -723,6 +851,7 @@ mod tests {
                 admin_profile: "admin".to_string(),
                 admin_material_path: Some("/tmp/x".into()),
                 admin_material_inline: Some("y".into()),
+                bind: false,
             }),
         )
         .unwrap_err();
@@ -808,6 +937,7 @@ mod tests {
                 admin_profile: "admin".to_string(),
                 admin_material_path: None,
                 admin_material_inline: Some("any-admin-token".to_string()),
+                bind: false,
             }),
         )
         .unwrap_err();
@@ -1000,6 +1130,183 @@ mod tests {
                 .contains("no-material-required"),
             "expected sentinel ref, got {:?}",
             outcome.result["credentials_ref"]
+        );
+    }
+
+    /// A minimal resolvable deployer so `run_bootstrap`'s A9 resolve passes;
+    /// its own credentials are never used — these tests pass an override.
+    #[derive(Debug)]
+    struct BindResolveHandler;
+
+    impl crate::env_packs::EnvPackHandler for BindResolveHandler {
+        fn slot(&self) -> CapabilitySlot {
+            CapabilitySlot::Deployer
+        }
+        fn descriptor_path(&self) -> &str {
+            "test.deployer.bind"
+        }
+        fn supported_versions(&self) -> semver::VersionReq {
+            "^0.1.0".parse().unwrap()
+        }
+        fn deployer_credentials(&self) -> Option<&dyn crate::credentials::DeployerCredentials> {
+            // Registration requires a deployer handler to declare credentials;
+            // this placeholder is never invoked — `run_bootstrap` is called
+            // with an override that replaces it.
+            Some(&BindPlaceholderCreds)
+        }
+    }
+
+    /// Placeholder so `BindResolveHandler` registers; its `bootstrap` is never
+    /// reached because the tests pass a `creds_override`.
+    #[derive(Debug)]
+    struct BindPlaceholderCreds;
+
+    impl crate::credentials::DeployerCredentials for BindPlaceholderCreds {
+        fn required_capabilities(&self) -> Vec<crate::credentials::Capability> {
+            Vec::new()
+        }
+        fn validate(
+            &self,
+            _ctx: &crate::credentials::ValidationContext<'_>,
+        ) -> crate::credentials::RequirementsReport {
+            crate::credentials::RequirementsReport::new(Vec::new())
+        }
+        fn bootstrap(
+            &self,
+            _input: &crate::credentials::BootstrapInput<'_>,
+        ) -> Result<crate::credentials::BootstrapOutcome, crate::credentials::BootstrapError>
+        {
+            Err(crate::credentials::BootstrapError::NotApplicable(
+                "placeholder creds are never invoked".to_string(),
+            ))
+        }
+    }
+
+    /// `creds_override` that "mints" a credential: returns material + granted
+    /// expiry + the store-aligned bound ref, mirroring the K8s `--bind` path
+    /// without a live cluster.
+    #[derive(Debug)]
+    struct MintingCreds {
+        secret_ref: String,
+        token: String,
+        expiry: chrono::DateTime<chrono::Utc>,
+    }
+
+    impl crate::credentials::DeployerCredentials for MintingCreds {
+        fn required_capabilities(&self) -> Vec<crate::credentials::Capability> {
+            Vec::new()
+        }
+        fn validate(
+            &self,
+            _ctx: &crate::credentials::ValidationContext<'_>,
+        ) -> crate::credentials::RequirementsReport {
+            crate::credentials::RequirementsReport::new(Vec::new())
+        }
+        fn bootstrap(
+            &self,
+            _input: &crate::credentials::BootstrapInput<'_>,
+        ) -> Result<crate::credentials::BootstrapOutcome, crate::credentials::BootstrapError>
+        {
+            Ok(crate::credentials::BootstrapOutcome {
+                rules_pack: crate::credentials::RulesPack {
+                    entries: Vec::new(),
+                },
+                bound_credentials_ref: Some(SecretRef::try_new(self.secret_ref.clone()).unwrap()),
+                bound_expiry: Some(self.expiry),
+                bound_secret_material: Some(zeroize::Zeroizing::new(self.token.clone())),
+            })
+        }
+    }
+
+    fn bind_fixture(dir: &std::path::Path) -> (LocalFsStore, EnvPackRegistry, EnvId) {
+        let store = LocalFsStore::new(dir);
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "test.deployer.bind@0.1.0",
+        ));
+        store.save(&env).unwrap();
+        let mut registry = EnvPackRegistry::new();
+        registry.register(Box::new(BindResolveHandler)).unwrap();
+        (store, registry, EnvId::try_from("local").unwrap())
+    }
+
+    #[test]
+    fn run_bootstrap_writes_material_then_persists_ref_and_expiry() {
+        let dir = tempdir().unwrap();
+        let (store, registry, env_id) = bind_fixture(dir.path());
+        let admin = crate::credentials::ZeroizedAdmin::new("admin-ctx", String::new());
+        let expiry = chrono::DateTime::from_timestamp(2_000_000_000, 0).unwrap();
+        let bind = MintingCreds {
+            secret_ref: "secret://local/default/_/k8s-deployer/deployer_token".to_string(),
+            token: "MINTED".to_string(),
+            expiry,
+        };
+
+        let captured = std::sync::Mutex::new(None);
+        let sink =
+            |_root: &std::path::Path, secret_ref: &SecretRef, value: &str| -> Result<(), String> {
+                *captured.lock().unwrap() =
+                    Some((secret_ref.as_str().to_string(), value.to_string()));
+                Ok(())
+            };
+
+        let doc = crate::credentials::run_bootstrap(
+            &store,
+            &registry,
+            &env_id,
+            &admin,
+            Some(&bind),
+            &sink,
+        )
+        .expect("bind succeeds");
+
+        // Granted expiry stamped into the doc.
+        assert_eq!(doc.expiry.as_ref().map(|e| e.expires_at), Some(expiry));
+        // Material written to the sink at the bound ref, BEFORE persisting.
+        let (uri, value) = captured.lock().unwrap().clone().expect("sink invoked");
+        assert_eq!(uri, "secret://local/default/_/k8s-deployer/deployer_token");
+        assert_eq!(value, "MINTED");
+        // credentials_ref persisted on the env.
+        let reloaded = store.load(&env_id).unwrap();
+        assert_eq!(
+            reloaded.credentials_ref.as_ref().map(|r| r.as_str()),
+            Some("secret://local/default/_/k8s-deployer/deployer_token")
+        );
+    }
+
+    #[test]
+    fn run_bootstrap_aborts_without_persisting_ref_when_the_sink_fails() {
+        let dir = tempdir().unwrap();
+        let (store, registry, env_id) = bind_fixture(dir.path());
+        let admin = crate::credentials::ZeroizedAdmin::new("admin-ctx", String::new());
+        let bind = MintingCreds {
+            secret_ref: "secret://local/default/_/k8s-deployer/deployer_token".to_string(),
+            token: "MINTED".to_string(),
+            expiry: chrono::DateTime::from_timestamp(2_000_000_000, 0).unwrap(),
+        };
+        let sink = |_root: &std::path::Path, _r: &SecretRef, _v: &str| -> Result<(), String> {
+            Err("backend unavailable".to_string())
+        };
+
+        let err = crate::credentials::run_bootstrap(
+            &store,
+            &registry,
+            &env_id,
+            &admin,
+            Some(&bind),
+            &sink,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RunBootstrapError::SecretWrite(_)),
+            "got {err:?}"
+        );
+        // Re-runnable: credentials_ref must NOT persist when the write fails.
+        let reloaded = store.load(&env_id).unwrap();
+        assert!(
+            reloaded.credentials_ref.is_none(),
+            "credentials_ref must not persist on sink failure"
         );
     }
 }
