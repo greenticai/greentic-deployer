@@ -524,7 +524,17 @@ impl DeployerCredentials for K8sDeployerCredentials {
             ));
         }
 
-        let namespace = namespace_for_env(input.env_id);
+        // Scope the RBAC + token mint to the namespace the deployer actually
+        // deploys into — the binding answers' resolved `K8sParams::namespace`
+        // when set (the CLI threads it via `in_namespace`), else the
+        // env-derived default. This MUST match the namespace `requirements`
+        // probes and `reconcile` deploys into (both use `K8sParams`), or the
+        // bound token would be RoleBound in the wrong namespace. Mirrors the
+        // `self.namespace` fallback in `validate`.
+        let namespace = self
+            .namespace
+            .clone()
+            .unwrap_or_else(|| namespace_for_env(input.env_id));
         let rules_pack = render_min_rbac_rules_pack(&K8sRulesPackInput {
             env_id: input.env_id.as_str(),
             namespace: &namespace,
@@ -1055,10 +1065,12 @@ mod tests {
         assert!(combined.contains("gtc-zain-prod"));
     }
 
-    /// Records what `apply_rbac` was handed and hands back a canned token.
+    /// Records what `apply_rbac` was handed and the namespace the mint
+    /// targeted, and hands back a canned token.
     #[derive(Debug, Default)]
     struct MockBootstrapClient {
         applied_manifests: Mutex<Vec<String>>,
+        minted_namespace: Mutex<Option<String>>,
         mint_response: Mutex<Option<Result<MintedToken, K8sClientError>>>,
     }
 
@@ -1081,10 +1093,11 @@ mod tests {
 
         async fn mint_service_account_token(
             &self,
-            _namespace: &str,
+            namespace: &str,
             _service_account: &str,
             _expiration_seconds: i64,
         ) -> Result<MintedToken, K8sClientError> {
+            *self.minted_namespace.lock().unwrap() = Some(namespace.to_string());
             self.mint_response
                 .lock()
                 .unwrap()
@@ -1142,6 +1155,52 @@ mod tests {
         );
         assert!(applied[0].contains("kind: ServiceAccount"));
         assert!(applied[0].contains(DEPLOYER_SERVICE_ACCOUNT));
+        // With no namespace override, the mint targets the env-derived default.
+        assert_eq!(
+            mock.minted_namespace.lock().unwrap().as_deref(),
+            Some("gtc-zain-prod")
+        );
+    }
+
+    #[test]
+    fn bind_scopes_rbac_and_mint_to_the_configured_namespace() {
+        let mock = Arc::new(MockBootstrapClient::default().with_mint(Ok(MintedToken {
+            token: "MINTED_SA_TOKEN".to_string(),
+            expiration: None,
+        })));
+        // The CLI threads the answers-resolved namespace via `in_namespace`;
+        // bind must apply RBAC + mint THERE, not in the env-derived default —
+        // else the token is RoleBound where reconcile never deploys.
+        let creds = bind_creds(mock.clone()).in_namespace("custom-ns");
+
+        let env_id = EnvId::try_from("zain-prod").unwrap();
+        let dir = tempdir().unwrap();
+        let admin = ZeroizedAdmin::new("zain-admin@cluster", String::new());
+        let input = BootstrapInput {
+            env_id: &env_id,
+            env_root: dir.path(),
+            admin: &admin,
+        };
+        let outcome = creds.bootstrap(&input).expect("bind succeeds");
+
+        // RBAC rendered + applied in the custom namespace, not `gtc-zain-prod`.
+        let applied = mock.applied_manifests.lock().unwrap();
+        assert!(
+            applied[0].contains("namespace: custom-ns"),
+            "applied: {}",
+            applied[0]
+        );
+        assert!(!applied[0].contains("namespace: gtc-zain-prod"));
+        // Token minted in the same namespace.
+        assert_eq!(
+            mock.minted_namespace.lock().unwrap().as_deref(),
+            Some("custom-ns")
+        );
+        // The bound secret ref stays env-scoped (its store path is env-derived).
+        assert_eq!(
+            outcome.bound_credentials_ref.as_ref().map(|r| r.as_str()),
+            Some("secret://zain-prod/default/_/k8s-deployer/deployer_token")
+        );
     }
 
     #[test]

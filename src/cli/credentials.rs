@@ -492,11 +492,13 @@ fn admin_bind_k8s_credentials(
     env_id: &EnvId,
     admin_profile: &str,
 ) -> Result<Option<Box<dyn DeployerCredentials>>, OpError> {
+    use crate::cli::env::load_render_answers;
     use crate::env_packs::k8s::K8sDeployerHandler;
     use crate::env_packs::k8s::credentials::{
         K8sBootstrapClient, K8sBootstrapConnectFut, K8sBootstrapConnector, K8sDeployerCredentials,
     };
     use crate::env_packs::k8s::kube_client::{KubeBootstrapClient, connect};
+    use crate::env_packs::k8s::manifests::K8sParams;
     use std::sync::Arc;
 
     // Not loadable / no deployer bound / non-K8s ⇒ `None`; the runner (or
@@ -511,6 +513,17 @@ fn admin_bind_k8s_credentials(
         return Ok(None);
     }
 
+    // Resolve the namespace reconcile / requirements actually use (the
+    // binding answers' `K8sParams::namespace`, falling back to the
+    // env-derived default) and scope the bind there — applying RBAC + minting
+    // the token in `gtc-<env>` while reconcile deploys into a custom namespace
+    // would RoleBind the token in the wrong place. Same resolution as
+    // `connected_k8s_credentials`.
+    let (answers, _wire) = load_render_answers(store, &env, &binding.kind)?;
+    let namespace = K8sParams::from_answers(&env, answers.as_ref())
+        .map_err(|e| OpError::Conflict(format!("invalid K8s answers: {e}")))?
+        .namespace;
+
     let admin_context = admin_profile.to_string();
     let connector: K8sBootstrapConnector = Arc::new(move || -> K8sBootstrapConnectFut {
         let admin_context = admin_context.clone();
@@ -523,7 +536,7 @@ fn admin_bind_k8s_credentials(
         })
     });
     Ok(Some(Box::new(
-        K8sDeployerCredentials::with_bootstrap_connector(connector),
+        K8sDeployerCredentials::with_bootstrap_connector(connector).in_namespace(namespace),
     )))
 }
 
