@@ -449,6 +449,8 @@ impl DeployerCredentials for AwsDeployerCredentials {
         Ok(BootstrapOutcome {
             rules_pack,
             bound_credentials_ref: None,
+            bound_expiry: None,
+            bound_secret_material: None,
         })
     }
 }

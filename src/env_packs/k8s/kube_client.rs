@@ -30,18 +30,19 @@
 
 use async_trait::async_trait;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::authentication::v1::SelfSubjectReview;
+use k8s_openapi::api::authentication::v1::{SelfSubjectReview, TokenRequest, TokenRequestSpec};
 use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
 };
+use k8s_openapi::api::core::v1::ServiceAccount;
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams};
 use kube::config::KubeConfigOptions;
 use serde_json::Value;
 
 use super::cluster::{K8sCluster, K8sClusterError, ObjectRef, RolloutStatus, manifest_field};
 use super::credentials::{
-    AccessDecision, ClusterIdentity, K8sClientError, K8sOperation, K8sValidatorClient,
-    OperationDecision,
+    AccessDecision, ClusterIdentity, K8sBootstrapClient, K8sClientError, K8sOperation,
+    K8sValidatorClient, MintedToken, OperationDecision,
 };
 use super::manifests::ENV_LABEL;
 
@@ -161,9 +162,15 @@ fn api_route_for(api_version: &str, kind: &str) -> Result<(ApiResource, Scope), 
         ("v1", "Namespace") => ("namespaces", Scope::Cluster),
         ("v1", "Service") => ("services", Scope::Namespaced),
         ("v1", "ConfigMap") => ("configmaps", Scope::Namespaced),
+        ("v1", "ServiceAccount") => ("serviceaccounts", Scope::Namespaced),
         ("apps/v1", "Deployment") => ("deployments", Scope::Namespaced),
         ("policy/v1", "PodDisruptionBudget") => ("poddisruptionbudgets", Scope::Namespaced),
         ("networking.k8s.io/v1", "NetworkPolicy") => ("networkpolicies", Scope::Namespaced),
+        // RBAC kinds the bootstrap `--bind` path applies (via
+        // `KubeBootstrapClient::apply_rbac` → `KubeCluster::apply`); the
+        // steady-state reconcile renderer does not emit these.
+        ("rbac.authorization.k8s.io/v1", "Role") => ("roles", Scope::Namespaced),
+        ("rbac.authorization.k8s.io/v1", "RoleBinding") => ("rolebindings", Scope::Namespaced),
         _ => {
             return Err(K8sClusterError::InvalidManifest(format!(
                 "unsupported object `{api_version}/{kind}` — the deployer's routing table \
@@ -437,6 +444,91 @@ impl K8sValidatorClient for KubeValidatorClient {
             });
         }
         Ok(decisions)
+    }
+}
+
+/// Production [`K8sBootstrapClient`]: applies the rendered RBAC and mints
+/// the deployer ServiceAccount's token through a typed [`kube::Client`]
+/// connected AS THE ADMIN — the identity with rights to create the SA/Role/
+/// RoleBinding and call the TokenRequest subresource.
+pub struct KubeBootstrapClient {
+    client: kube::Client,
+}
+
+impl KubeBootstrapClient {
+    pub fn new(client: kube::Client) -> Self {
+        Self { client }
+    }
+}
+
+impl std::fmt::Debug for KubeBootstrapClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KubeBootstrapClient")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl K8sBootstrapClient for KubeBootstrapClient {
+    async fn apply_rbac(&self, manifest_yaml: &str) -> Result<(), K8sClientError> {
+        // The rendered RBAC pack is a multi-document YAML (Namespace + SA +
+        // Role + RoleBinding). Parse each document and server-side-apply it
+        // through the SAME `KubeCluster::apply` reconcile uses — the
+        // env-ownership guard and forced field-manager apply come for free,
+        // and a re-bind converges (idempotent).
+        let docs: Vec<Value> = serde_yaml_bw::from_multiple(manifest_yaml).map_err(|e| {
+            K8sClientError::ApiRejected(format!("rendered RBAC manifest is not valid YAML: {e}"))
+        })?;
+        let cluster = KubeCluster::new(self.client.clone());
+        for doc in &docs {
+            cluster
+                .apply(doc)
+                .await
+                .map_err(|e| K8sClientError::ApiRejected(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn mint_service_account_token(
+        &self,
+        namespace: &str,
+        service_account: &str,
+        expiration_seconds: i64,
+    ) -> Result<MintedToken, K8sClientError> {
+        let api: Api<ServiceAccount> = Api::namespaced(self.client.clone(), namespace);
+        // Empty `audiences` ⇒ the API server's default audience (the
+        // apiserver itself), so the token authenticates the SA back to the
+        // cluster. The server clamps `expiration_seconds` to its configured
+        // max; the GRANTED expiry is read back from the status.
+        let request = TokenRequest {
+            spec: TokenRequestSpec {
+                expiration_seconds: Some(expiration_seconds),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let created = api
+            .create_token_request(service_account, &PostParams::default(), &request)
+            .await
+            .map_err(map_validator_error)?;
+        let status = created.status.ok_or_else(|| {
+            K8sClientError::ApiRejected(
+                "TokenRequest succeeded but returned no status/token".to_string(),
+            )
+        })?;
+        // k8s-openapi 0.27's time backend is `jiff::Timestamp`; the
+        // deployer's domain types (`CredentialsExpiry`) use
+        // `chrono::DateTime<Utc>`, so convert at this boundary. `None` only
+        // on an out-of-chrono-range timestamp, which a real cluster never
+        // returns for a token expiry.
+        let granted = status.expiration_timestamp.0;
+        Ok(MintedToken {
+            token: status.token,
+            expiration: chrono::DateTime::from_timestamp(
+                granted.as_second(),
+                granted.subsec_nanosecond() as u32,
+            ),
+        })
     }
 }
 
@@ -1071,5 +1163,90 @@ mod tests {
         result.unwrap();
         // The PATCH was actually sent.
         assert_eq!(patch_request.method(), http::Method::PATCH);
+    }
+
+    #[tokio::test]
+    async fn mint_service_account_token_posts_tokenrequest_and_reads_back_status() {
+        let (client, mut handle) = mock_client();
+        let bootstrap = KubeBootstrapClient::new(client);
+
+        // The API server answers the TokenRequest subresource POST with a
+        // populated status (token + granted expiry, RFC3339).
+        let body = json!({
+            "apiVersion": "authentication.k8s.io/v1",
+            "kind": "TokenRequest",
+            "metadata": {},
+            "spec": {"expirationSeconds": 3600},
+            "status": {"token": "MINTED_SA_TOKEN", "expirationTimestamp": "2033-05-18T03:33:20Z"}
+        });
+        let respond = respond_json(&mut handle, 201, body);
+        let (result, request) = tokio::join!(
+            bootstrap.mint_service_account_token("gtc-local", "greentic-deployer", 3600),
+            respond
+        );
+        let minted = result.expect("mint ok");
+
+        assert_eq!(minted.token, "MINTED_SA_TOKEN");
+        // The granted expiry round-trips through the jiff→chrono conversion.
+        assert!(
+            minted
+                .expiration
+                .expect("expiry present")
+                .to_rfc3339()
+                .starts_with("2033-05-18T03:33:20"),
+            "unexpected expiry: {:?}",
+            minted.expiration
+        );
+        // POST to the ServiceAccount's `token` subresource.
+        assert_eq!(request.method(), http::Method::POST);
+        assert!(
+            request
+                .uri()
+                .path()
+                .ends_with("/namespaces/gtc-local/serviceaccounts/greentic-deployer/token"),
+            "unexpected path: {}",
+            request.uri().path()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_rbac_applies_each_rendered_document() {
+        let (client, mut handle) = mock_client();
+        let bootstrap = KubeBootstrapClient::new(client);
+
+        // A two-document RBAC manifest (ServiceAccount + Role) — exercises
+        // the new SA/Role routing rows and the multi-document YAML split.
+        let manifest = "\
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: greentic-deployer
+  namespace: gtc-local
+  labels:
+    greentic.ai/env: \"local\"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: greentic-deployer-min
+  namespace: gtc-local
+  labels:
+    greentic.ai/env: \"local\"
+rules:
+  - apiGroups: [\"apps\"]
+    resources: [\"deployments\"]
+    verbs: [get]
+";
+        // Each document applies as ownership GET (404 ⇒ create) then a forced
+        // PATCH; two documents ⇒ four requests, in order.
+        let respond = async {
+            for _ in 0..2 {
+                let applied = json!({"apiVersion": "v1", "kind": "ServiceAccount", "metadata": {"name": "x"}});
+                let _get = respond_json(&mut handle, 404, not_found_status()).await;
+                let _patch = respond_json(&mut handle, 200, applied).await;
+            }
+        };
+        let (result, ()) = tokio::join!(bootstrap.apply_rbac(manifest), respond);
+        result.expect("apply_rbac applies both documents");
     }
 }

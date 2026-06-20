@@ -46,14 +46,28 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use greentic_deploy_spec::SecretRef;
+use zeroize::Zeroizing;
+
 use crate::credentials::{
     BootstrapError, BootstrapInput, BootstrapOutcome, Capability, CapabilityCheck,
-    CapabilityStatus, DeployerCredentials, RequirementsReport, ValidationContext,
+    CapabilityStatus, DeployerCredentials, RequirementsReport, RulesPack, ValidationContext,
 };
 
 use super::async_bridge::run_k8s_async;
-use super::bootstrap::{K8sRulesPackInput, render_min_rbac_rules_pack};
+use super::bootstrap::{
+    DEPLOYER_SERVICE_ACCOUNT, DEPLOYER_TOKEN_STORE_PATH, K8S_RBAC_MANIFEST_FILENAME,
+    K8sRulesPackInput, render_min_rbac_rules_pack,
+};
 use super::manifests::namespace_for_env;
+
+/// Lifetime requested for the bound ServiceAccount token (1 year). The API
+/// server clamps this to its `--service-account-max-token-expiration`, so
+/// the GRANTED expiry (read back from the TokenRequest status) may be
+/// sooner — the runner records it as the re-bind deadline. Auto-rotation
+/// before expiry is a deferred follow-up; until then the env's
+/// `credentials_ref` must be re-bound before this lapses.
+const BIND_TOKEN_EXPIRATION_SECONDS: i64 = 365 * 24 * 60 * 60;
 
 /// Stable ID for the API-reachability probe (identity resolves against
 /// the cluster — the K8s analogue of `aws.sts.caller-identity`).
@@ -196,6 +210,60 @@ pub type K8sValidatorConnectFut =
 /// runtime; tests supply one that just returns a mock.
 pub type K8sValidatorConnector = Arc<dyn Fn() -> K8sValidatorConnectFut + Send + Sync>;
 
+/// A freshly minted ServiceAccount token and the absolute expiry the
+/// cluster granted. The API server clamps the requested lifetime to its
+/// `--service-account-max-token-expiration`, so `expiration` (read back
+/// from the TokenRequest status) is the authoritative re-bind deadline —
+/// it may be sooner than requested.
+pub struct MintedToken {
+    pub token: String,
+    pub expiration: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl std::fmt::Debug for MintedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never render `token` — it is live bearer material.
+        f.debug_struct("MintedToken")
+            .field("token", &"<redacted>")
+            .field("expiration", &self.expiration)
+            .finish()
+    }
+}
+
+/// Future yielded by a [`K8sBootstrapConnector`].
+pub type K8sBootstrapConnectFut =
+    Pin<Box<dyn Future<Output = Result<Arc<dyn K8sBootstrapClient>, K8sClientError>> + Send>>;
+
+/// Lazily produces a connected bootstrap client INSIDE the bind runtime —
+/// same `kube::Client` Buffer-worker runtime constraint as
+/// [`K8sValidatorConnector`] (connect + apply + mint MUST share one
+/// [`run_k8s_async`] call).
+pub type K8sBootstrapConnector = Arc<dyn Fn() -> K8sBootstrapConnectFut + Send + Sync>;
+
+/// Provider-side client for the `--bind` bootstrap path: applies the
+/// rendered RBAC and mints the deployer ServiceAccount's token, connected
+/// AS THE ADMIN identity (the one with rights to create the SA/Role/
+/// RoleBinding and call TokenRequest). The production impl is
+/// [`KubeBootstrapClient`](super::kube_client::KubeBootstrapClient); unit
+/// tests mock it.
+#[async_trait::async_trait]
+pub trait K8sBootstrapClient: std::fmt::Debug + Send + Sync {
+    /// Server-side-apply the rendered RBAC manifest (a multi-document YAML
+    /// of Namespace + ServiceAccount + Role + RoleBinding). Idempotent —
+    /// re-applying the same manifest converges, so a retried bind is safe.
+    async fn apply_rbac(&self, manifest_yaml: &str) -> Result<(), K8sClientError>;
+
+    /// Mint a ServiceAccount token via the TokenRequest subresource,
+    /// scoped to `namespace`/`service_account`, requesting
+    /// `expiration_seconds` of lifetime (the cluster may grant less).
+    async fn mint_service_account_token(
+        &self,
+        namespace: &str,
+        service_account: &str,
+        expiration_seconds: i64,
+    ) -> Result<MintedToken, K8sClientError>;
+}
+
 /// K8s deployer credentials handler.
 ///
 /// `Default` holds no connector (every probe fails closed);
@@ -212,6 +280,13 @@ pub struct K8sDeployerCredentials {
     /// namespace reconcile / apply-revision deploy into (a custom
     /// `namespace` answer would otherwise be probed at `gtc-<env>`).
     namespace: Option<String>,
+    /// Bootstrap (`--bind`) connector: when `Some`, `bootstrap` applies the
+    /// rendered RBAC live and mints the ServiceAccount token instead of
+    /// emitting a render-only pack. The CLI wires this (admin-connected)
+    /// only for `op credentials bootstrap … bind: true`; it is independent
+    /// of `connect` (the validator probe seam) — the two paths never run
+    /// together.
+    bind: Option<K8sBootstrapConnector>,
 }
 
 impl std::fmt::Debug for K8sDeployerCredentials {
@@ -221,6 +296,7 @@ impl std::fmt::Debug for K8sDeployerCredentials {
         f.debug_struct("K8sDeployerCredentials")
             .field("connect", &self.connect.is_some())
             .field("namespace", &self.namespace)
+            .field("bind", &self.bind.is_some())
             .finish()
     }
 }
@@ -242,6 +318,20 @@ impl K8sDeployerCredentials {
         Self {
             connect: Some(connect),
             namespace: None,
+            bind: None,
+        }
+    }
+
+    /// Build credentials wired for the `--bind` bootstrap path: a connector
+    /// that connects AS THE ADMIN (no bound SA token) and applies the
+    /// rendered RBAC + mints the deployer ServiceAccount's token. Holds no
+    /// validator connector — `validate` is not the bind path's concern, and
+    /// the two never run on the same instance.
+    pub fn with_bootstrap_connector(bind: K8sBootstrapConnector) -> Self {
+        Self {
+            connect: None,
+            namespace: None,
+            bind: Some(bind),
         }
     }
 
@@ -423,8 +513,8 @@ impl DeployerCredentials for K8sDeployerCredentials {
 
     fn bootstrap(&self, input: &BootstrapInput<'_>) -> Result<BootstrapOutcome, BootstrapError> {
         // The admin "profile" is the kubeconfig context / admin identity
-        // hint recorded in the rules pack's README. No live cluster calls
-        // here — the customer's admin reviews and applies the YAML.
+        // hint recorded in the rules pack's README — and, on the `--bind`
+        // path, the context the bind connector authenticates as.
         let admin_context = input.admin.profile();
         if admin_context.is_empty() {
             return Err(BootstrapError::AdminRejected(
@@ -442,14 +532,78 @@ impl DeployerCredentials for K8sDeployerCredentials {
             operations: VALIDATED_K8S_OPERATIONS,
         });
 
-        // The admin applies the pack offline, mints a short-lived token
-        // for the ServiceAccount, and binds it via `op credentials
-        // rotate` — no credentials are minted here.
+        // Render-only (default): no live cluster calls. The admin reviews
+        // and applies the pack offline, mints a token for the
+        // ServiceAccount, and binds it via `op credentials rotate`.
+        let Some(bind) = self.bind.as_ref() else {
+            return Ok(BootstrapOutcome {
+                rules_pack,
+                bound_credentials_ref: None,
+                bound_expiry: None,
+                bound_secret_material: None,
+            });
+        };
+
+        // `--bind`: apply the SAME rendered RBAC live (one source of truth —
+        // the live apply and the offline `kubectl apply -f` can never
+        // diverge) AS THE ADMIN, then mint the deployer ServiceAccount's
+        // token. Connect + apply + mint share one `run_k8s_async` call (the
+        // `kube::Client` Buffer-worker runtime constraint — see
+        // `K8sBootstrapConnector`).
+        let manifest_yaml = rbac_manifest_from_pack(&rules_pack).ok_or_else(|| {
+            BootstrapError::ProvisioningFailed {
+                step: "render-rbac".to_string(),
+                message: format!(
+                    "rendered rules pack is missing the `{K8S_RBAC_MANIFEST_FILENAME}` entry"
+                ),
+            }
+        })?;
+        let connector = Arc::clone(bind);
+        let ns = namespace.clone();
+        let minted = run_k8s_async(async move {
+            let client = connector().await?;
+            client.apply_rbac(&manifest_yaml).await?;
+            client
+                .mint_service_account_token(
+                    &ns,
+                    DEPLOYER_SERVICE_ACCOUNT,
+                    BIND_TOKEN_EXPIRATION_SECONDS,
+                )
+                .await
+        })
+        .map_err(|e: K8sClientError| BootstrapError::ProvisioningFailed {
+            step: "k8s-bind".to_string(),
+            message: e.to_string(),
+        })?;
+
+        let bound_ref = SecretRef::try_new(format!(
+            "secret://{}/{}",
+            input.env_id.as_str(),
+            DEPLOYER_TOKEN_STORE_PATH
+        ))
+        .map_err(|e| BootstrapError::ProvisioningFailed {
+            step: "bind-ref".to_string(),
+            message: format!("bound credentials ref is not well-formed: {e}"),
+        })?;
+
         Ok(BootstrapOutcome {
             rules_pack,
-            bound_credentials_ref: None,
+            bound_credentials_ref: Some(bound_ref),
+            bound_expiry: minted.expiration,
+            bound_secret_material: Some(Zeroizing::new(minted.token)),
         })
     }
+}
+
+/// Extract the RBAC YAML entry from a rendered rules pack — the exact bytes
+/// the `--bind` path applies live, so the live apply and the offline
+/// `kubectl apply -f` stay byte-identical.
+fn rbac_manifest_from_pack(rules_pack: &RulesPack) -> Option<String> {
+    rules_pack
+        .entries
+        .iter()
+        .find(|entry| entry.filename == K8S_RBAC_MANIFEST_FILENAME)
+        .map(|entry| entry.content.clone())
 }
 
 /// Where the live K8s probe sequence failed. `Connect`/`Identity` mean the
@@ -899,5 +1053,119 @@ mod tests {
         }
         assert!(combined.contains("zain-admin@nonprod-cluster"));
         assert!(combined.contains("gtc-zain-prod"));
+    }
+
+    /// Records what `apply_rbac` was handed and hands back a canned token.
+    #[derive(Debug, Default)]
+    struct MockBootstrapClient {
+        applied_manifests: Mutex<Vec<String>>,
+        mint_response: Mutex<Option<Result<MintedToken, K8sClientError>>>,
+    }
+
+    impl MockBootstrapClient {
+        fn with_mint(self, r: Result<MintedToken, K8sClientError>) -> Self {
+            *self.mint_response.lock().unwrap() = Some(r);
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl K8sBootstrapClient for MockBootstrapClient {
+        async fn apply_rbac(&self, manifest_yaml: &str) -> Result<(), K8sClientError> {
+            self.applied_manifests
+                .lock()
+                .unwrap()
+                .push(manifest_yaml.to_string());
+            Ok(())
+        }
+
+        async fn mint_service_account_token(
+            &self,
+            _namespace: &str,
+            _service_account: &str,
+            _expiration_seconds: i64,
+        ) -> Result<MintedToken, K8sClientError> {
+            self.mint_response
+                .lock()
+                .unwrap()
+                .take()
+                .expect("test must wire mint_response")
+        }
+    }
+
+    fn bind_creds(mock: Arc<MockBootstrapClient>) -> K8sDeployerCredentials {
+        let connector: K8sBootstrapConnector = Arc::new(move || -> K8sBootstrapConnectFut {
+            let client = mock.clone();
+            Box::pin(async move { Ok(client as Arc<dyn K8sBootstrapClient>) })
+        });
+        K8sDeployerCredentials::with_bootstrap_connector(connector)
+    }
+
+    #[test]
+    fn bind_applies_the_rendered_rbac_and_returns_the_minted_credential() {
+        let expiry = chrono::DateTime::from_timestamp(2_000_000_000, 0).unwrap();
+        let mock = Arc::new(MockBootstrapClient::default().with_mint(Ok(MintedToken {
+            token: "MINTED_SA_TOKEN".to_string(),
+            expiration: Some(expiry),
+        })));
+        let creds = bind_creds(mock.clone());
+
+        let env_id = EnvId::try_from("zain-prod").unwrap();
+        let dir = tempdir().unwrap();
+        let admin = ZeroizedAdmin::new("zain-admin@cluster", String::new());
+        let input = BootstrapInput {
+            env_id: &env_id,
+            env_root: dir.path(),
+            admin: &admin,
+        };
+        let outcome = creds.bootstrap(&input).expect("bind succeeds");
+
+        // The credential is bound at the store-aligned deployer token path.
+        assert_eq!(
+            outcome.bound_credentials_ref.as_ref().map(|r| r.as_str()),
+            Some("secret://zain-prod/default/_/k8s-deployer/deployer_token")
+        );
+        // Granted expiry + minted material flow back to the runner.
+        assert_eq!(outcome.bound_expiry, Some(expiry));
+        assert_eq!(
+            outcome.bound_secret_material.as_ref().map(|m| m.as_str()),
+            Some("MINTED_SA_TOKEN")
+        );
+
+        // The bytes applied live are EXACTLY the rules-pack RBAC entry — no
+        // drift between the live apply and the offline `kubectl apply -f`.
+        let applied = mock.applied_manifests.lock().unwrap();
+        assert_eq!(applied.len(), 1, "RBAC applied exactly once");
+        assert_eq!(
+            applied[0],
+            rbac_manifest_from_pack(&outcome.rules_pack).expect("pack has the RBAC entry")
+        );
+        assert!(applied[0].contains("kind: ServiceAccount"));
+        assert!(applied[0].contains(DEPLOYER_SERVICE_ACCOUNT));
+    }
+
+    #[test]
+    fn bind_surfaces_a_mint_failure_as_provisioning_failed_without_binding() {
+        let mock = Arc::new(MockBootstrapClient::default().with_mint(Err(
+            K8sClientError::ApiRejected("forbidden: cannot create tokenrequests".to_string()),
+        )));
+        let creds = bind_creds(mock);
+
+        let env_id = EnvId::try_from("zain-prod").unwrap();
+        let dir = tempdir().unwrap();
+        let admin = ZeroizedAdmin::new("zain-admin@cluster", String::new());
+        let input = BootstrapInput {
+            env_id: &env_id,
+            env_root: dir.path(),
+            admin: &admin,
+        };
+        let err = creds.bootstrap(&input).unwrap_err();
+        match err {
+            BootstrapError::ProvisioningFailed { step, message } => {
+                assert_eq!(step, "k8s-bind");
+                assert!(message.contains("forbidden"), "message: {message}");
+            }
+            other => panic!("expected ProvisioningFailed, got {other:?}"),
+        }
     }
 }

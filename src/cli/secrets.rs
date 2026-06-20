@@ -426,6 +426,25 @@ pub(super) fn dev_store_put(path: &Path, uri: &str, value: &str) -> Result<(), O
     })
 }
 
+/// Persist a bound credential's material into the env dev store at the
+/// location [`resolve_credentials_token`] reads it back from — the
+/// secret-backend write the credentials-bootstrap runner drives through its
+/// secret sink. Mirrors `op secrets put`'s dev-store write exactly so a
+/// bound token resolves identically on later live verbs (reconcile /
+/// apply-revision / requirements).
+pub(super) fn put_credential_material(
+    env_dir: &Path,
+    secret_ref: &SecretRef,
+    value: &str,
+) -> Result<(), OpError> {
+    let store_uri = secret_ref_to_store_uri(secret_ref)?;
+    let dev_path = resolve_dev_store_path(
+        env_dir,
+        std::env::var_os(DEV_SECRETS_PATH_ENV).map(PathBuf::from),
+    );
+    dev_store_put(&dev_path, &store_uri, value)
+}
+
 /// Whether the env's dev store already holds a non-empty value at `rel_path`
 /// (`<tenant>/<team>/<pack>/<name>`). `env apply` uses this so a paste-sourced
 /// secret (`from_env` absent) that is already stored is treated as satisfied —
