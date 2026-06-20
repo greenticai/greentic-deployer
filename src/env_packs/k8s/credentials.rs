@@ -569,13 +569,12 @@ impl DeployerCredentials for K8sDeployerCredentials {
             }
         })?;
         let connector = Arc::clone(bind);
-        let ns = namespace.clone();
         let minted = run_k8s_async(async move {
             let client = connector().await?;
             client.apply_rbac(&manifest_yaml).await?;
             client
                 .mint_service_account_token(
-                    &ns,
+                    &namespace,
                     DEPLOYER_SERVICE_ACCOUNT,
                     BIND_TOKEN_EXPIRATION_SECONDS,
                 )
