@@ -56,6 +56,19 @@ const CREDS_REF: &str = "secret://local/default/_/k8s-deployer/sa_token";
 /// reconcile/apply-revision tests' namespace churn.
 const CREDS_SA_NS: &str = "gtc-creds-e2e";
 
+/// ServiceAccount the `--bind` producer provisions (mirrors
+/// `bootstrap::DEPLOYER_SERVICE_ACCOUNT`). Hardcoded so a rename in the producer
+/// surfaces as an E2E failure — the live-cluster counterpart of the renderer's
+/// offline unit-test name guard.
+const DEPLOYER_SA: &str = "greentic-deployer";
+/// Namespaced Role + RoleBinding the producer renders (both named `<sa>-min`).
+const DEPLOYER_RBAC_NAME: &str = "greentic-deployer-min";
+/// Store-aligned ref the `--bind` producer records on the env (env `local` +
+/// `bootstrap::DEPLOYER_TOKEN_STORE_PATH`). Distinct from [`CREDS_REF`] (the
+/// resolver-side identity-flip test stamps that one by hand); `--bind` owns the
+/// `deployer_token` name end to end.
+const BIND_REF: &str = "secret://local/default/_/k8s-deployer/deployer_token";
+
 /// In-cluster plain-HTTP server (busybox `httpd`) that serves the fixture
 /// `.gtbundle` for the M2 boot-time pull test. The worker pulls over `http://`,
 /// which greentic-start's bundle-ref path fetches with `ureq` — bypassing the
@@ -1701,6 +1714,149 @@ fn worker_pulls_oci_bundle_and_serves_the_real_revision() {
     );
 
     // Cleanup (deletes the registry + its objects with the namespace).
+    let _ = kubectl(&[
+        "delete",
+        "namespace",
+        NAMESPACE,
+        "--ignore-not-found",
+        "--wait=false",
+    ]);
+}
+
+/// `op credentials bootstrap --bind` against a live cluster: the deployer
+/// connects AS THE ADMIN (the ambient kubeconfig context), applies the rendered
+/// minimum-privilege RBAC (Namespace + ServiceAccount + Role + RoleBinding),
+/// mints the ServiceAccount's token via the TokenRequest subresource, writes it
+/// into the env dev store, and records `credentials_ref` + the granted expiry on
+/// the env — the PRODUCER side of the bound-credential contract.
+///
+/// Inverse-complete of
+/// [`credentials_requirements_reflects_the_bound_serviceaccount_identity`]: that
+/// test hand-rolls a cluster-admin SA to prove the *resolver* honours a bound
+/// token; this one drives the *producer* and proves the RBAC it renders is
+/// self-consistent — the minted token, bound ONLY to the rendered minimal Role,
+/// passes the very `requirements` SSAR sweep that probes `VALIDATED_K8S_OPERATIONS`.
+/// No env var is seeded, so the only token source is what `--bind` wrote to the
+/// dev store; a `pass` therefore exercises the full produce → persist → resolve →
+/// authorize loop against a real API server (TokenRequest + server-side RBAC
+/// apply — the mock unit tests drive a `tower-test` mock and never open a socket).
+///
+/// Scoped deliberately to `requirements` (namespaced ops), NOT `reconcile`: the
+/// rendered Role is namespaced, so the bound SA is sufficient for the validated
+/// op sweep but cannot yet drive `reconcile` (which re-applies the cluster-scoped
+/// Namespace) — the known namespace-apply-trust gap, tracked as a separate slice.
+///
+/// Touches no pod-to-pod networking (only kubectl→API-server and the deployer's
+/// own apply/mint/SSAR calls), so unlike the bundle-pull tests it is not blocked
+/// by an unenforced-CNI / same-node-routing environment. Mutates `gtc-local`
+/// (bind creates the namespace + RBAC), so it resets the namespace up front and
+/// tears it down after, staying order-independent with the reconcile /
+/// apply-revision tests that share it.
+#[test]
+fn bind_provisions_rbac_and_resolves_the_bound_identity() {
+    if !armed() {
+        return;
+    }
+    reset_namespace();
+    let store = tempfile::tempdir().expect("tempdir");
+    let store = store.path();
+
+    // Create the env + bind the K8s deployer (namespace → gtc-local). Unlike the
+    // bundle-server tests no namespace pre-create is needed: the rendered RBAC
+    // pack carries the Namespace object and the admin applies it as part of
+    // `--bind`.
+    bind_k8s_env(store, None);
+
+    // Bootstrap as the ambient kubeconfig admin (kind's current-context in CI).
+    // The K8s bind path authenticates via that context, not via admin material,
+    // but the bootstrap loader still requires *some* material — pass a
+    // placeholder it never reads on the bind path.
+    let admin_context = kubectl_ok(&["config", "current-context"]);
+    let bootstrap = payload(
+        store,
+        "bootstrap.json",
+        serde_json::json!({
+            "environment_id": ENV_ID,
+            "admin_profile": admin_context,
+            "admin_material_inline": "ambient-kubeconfig",
+            "bind": true,
+        }),
+    );
+    let out = op(store, Some(&bootstrap), &["credentials", "bootstrap"]);
+    let result = &out["result"];
+
+    // 1. The verb self-reports a bound credential, the store-aligned ref, and a
+    //    (cluster-clamped) expiry read back from the granted TokenRequest.
+    assert_eq!(
+        result["bound"], true,
+        "bootstrap --bind reports a bound credential: {result}"
+    );
+    assert_eq!(
+        result["credentials_ref"], BIND_REF,
+        "the recorded ref is the store-aligned deployer-token path: {result}"
+    );
+    assert!(
+        result["expires_at"].as_str().is_some_and(|s| !s.is_empty()),
+        "the minted token carries the granted (cluster-clamped) expiry: {result}"
+    );
+
+    // 2. Ground truth: the rendered RBAC objects exist, scoped to the namespace
+    //    the producer targeted. The Namespace is the only cluster-scoped object;
+    //    the Role/RoleBinding confine the deployer to it.
+    assert!(
+        object_exists("namespace", NAMESPACE, None),
+        "bind created the env namespace"
+    );
+    assert!(
+        object_exists("serviceaccount", DEPLOYER_SA, Some(NAMESPACE)),
+        "bind created the deployer ServiceAccount"
+    );
+    assert!(
+        object_exists("role", DEPLOYER_RBAC_NAME, Some(NAMESPACE)),
+        "bind created the minimal Role"
+    );
+    assert!(
+        object_exists("rolebinding", DEPLOYER_RBAC_NAME, Some(NAMESPACE)),
+        "bind created the RoleBinding"
+    );
+
+    // 3. The env persisted the bound ref — read straight back through the store,
+    //    independent of the verb's self-report.
+    {
+        use greentic_deploy_spec::{EnvId, SecretRef};
+        use greentic_deployer::environment::{EnvironmentStore, LocalFsStore};
+        let env = LocalFsStore::new(store)
+            .load(&EnvId::try_from(ENV_ID).expect("env id"))
+            .expect("reload env after bind");
+        assert_eq!(
+            env.credentials_ref.as_ref().map(SecretRef::as_str),
+            Some(BIND_REF),
+            "the producer persisted credentials_ref on the env"
+        );
+    }
+
+    // 4. The minted token resolves from the dev store (NO env var seeded) and
+    //    PASSES the validated-ops sweep AS the bound SA. The rendered minimal
+    //    Role grants exactly `VALIDATED_K8S_OPERATIONS`, so every SSAR is
+    //    Allowed — the live proof the produced RBAC is self-consistent with the
+    //    probe (and that the dev-store write/read line up cross-process).
+    let req = payload(
+        store,
+        "creds_req.json",
+        serde_json::json!({"environment_id": ENV_ID}),
+    );
+    let req_out = op(store, Some(&req), &["credentials", "requirements"]);
+    let req_result = &req_out["result"];
+    assert_eq!(
+        req_result["result"], "pass",
+        "the bound SA is allowed every validated op via the rendered Role: {req_result}"
+    );
+    assert_eq!(
+        req_result["missing_capabilities"].as_array().map(Vec::len),
+        Some(0),
+        "no validated capability is missing for the bound SA: {req_result}"
+    );
+
     let _ = kubectl(&[
         "delete",
         "namespace",
