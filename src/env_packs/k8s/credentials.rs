@@ -112,13 +112,14 @@ const fn op(group: &'static str, resource: &'static str, verb: &'static str) -> 
 /// ConfigMaps/PDBs/NetworkPolicies are env-lifetime objects the deployer
 /// only upserts.
 ///
-/// KNOWN GAP: this list is namespaced-only, but `reconcile` also applies the
-/// cluster-scoped Namespace object. A namespace-scoped deployer identity can
-/// therefore pass `requirements` yet fail `op env reconcile` on the Namespace
-/// get/patch. Closing it requires either dropping the deployer's steady-state
-/// Namespace apply (the bootstrap pack already creates it) or adding
-/// cluster-scoped Namespace validation + matching bootstrap RBAC — a separate
-/// slice spanning the credential contract and the namespace-apply trust model.
+/// This list is namespaced-only and aggregates exactly the verbs a bound
+/// (namespace-scoped) deployer ServiceAccount needs to drive `op env reconcile`.
+/// The one object reconcile would otherwise apply outside this scope — the
+/// cluster-scoped Namespace — is dropped from the applied set for a bound
+/// identity (`K8sDeployerHandler::reconcile`'s `manage_namespace`), since
+/// `bootstrap --bind` already creates the namespace. So passing `requirements`
+/// now implies a bound identity can also reconcile; the earlier namespace-apply
+/// trust gap is closed.
 pub const VALIDATED_K8S_OPERATIONS: &[K8sOperation] = &[
     op("apps", "deployments", "get"),
     op("apps", "deployments", "create"),

@@ -53,6 +53,17 @@ fn provider(err: K8sClusterError) -> DeployerError {
     DeployerError::Provider(err.to_string())
 }
 
+/// True for the env-level objects a namespace-scoped (bound ServiceAccount)
+/// identity must not apply during reconcile: today only the cluster-scoped
+/// `Namespace`. The bound deployer Role aggregates the namespaced
+/// [`VALIDATED_K8S_OPERATIONS`](super::credentials::VALIDATED_K8S_OPERATIONS)
+/// and grants no cluster-scoped verbs, so applying these would 403 — yet the
+/// bootstrap pack already created the namespace, so dropping them is correct,
+/// not a loss of desired state.
+fn is_cluster_scoped(manifest: &Value) -> bool {
+    manifest.get("kind").and_then(Value::as_str) == Some("Namespace")
+}
+
 /// Build render params from the binding's wizard answers (namespace / image
 /// / replicas), so a verb lands the same objects `op env render` shows. `None`
 /// → sandbox defaults. A malformed answers blob fails here — before any
@@ -161,7 +172,10 @@ impl K8sDeployerHandler {
     ///    pair of every revision with cluster presence. The manifest set comes
     ///    from [`render_environment`](crate::env_packs::render::ManifestRenderer::render_environment),
     ///    so reconcile applies EXACTLY what `op env render` shows — render and
-    ///    apply converge by construction.
+    ///    apply converge by construction. The one exception is the
+    ///    cluster-scoped `Namespace`: it is dropped from the applied set when
+    ///    `manage_namespace` is false (a bound, namespace-scoped identity), see
+    ///    below.
     /// 2. **Prune** the worker pair of every revision WITHOUT cluster presence
     ///    (archived / failed / post-drain inactive). `delete` of an absent
     ///    object is `Ok`, so pruning is idempotent and safe against a partial
@@ -171,13 +185,22 @@ impl K8sDeployerHandler {
     /// router is env destruction, a separate verb. Reconcile only converges a
     /// live env.
     ///
+    /// # Identity / Namespace RBAC (`manage_namespace`)
+    ///
+    /// The env-level set leads with the cluster-scoped `Namespace`. An ambient
+    /// admin identity (`manage_namespace == true`) upserts it like everything
+    /// else — the historical behaviour, so reconcile bootstraps a fresh env. A
+    /// **bound** deployer identity (`op credentials bootstrap --bind`) carries a
+    /// namespace-scoped Role that grants no cluster-scoped verbs, so it passes
+    /// `op credentials requirements` yet would 403 on the Namespace. The CLI
+    /// passes `manage_namespace == bound_token.is_none()`: when bound, the
+    /// Namespace is dropped from the applied set, which is safe because a
+    /// resolvable bound credential implies `bootstrap --bind` already created
+    /// the namespace (its RBAC pack carries the Namespace doc). This closes the
+    /// previously-documented namespace-apply-trust gap.
+    ///
     /// # Known gaps (Phase D later slices)
     ///
-    /// - **Identity / Namespace RBAC.** The applied set includes the
-    ///   cluster-scoped `Namespace`, so reconcile assumes an identity with
-    ///   namespace-create authority — true for today's ambient identity, but
-    ///   the bound-ServiceAccount model (Phase D secrets sink) must reconcile
-    ///   Namespace handling with the bootstrap pack's namespaced-only RBAC.
     /// - **Adoption of unlabeled objects.** [`KubeCluster::apply`](super::kube_client::KubeCluster)'s
     ///   ownership guard only conflicts on a *differing* env label; a
     ///   preexisting object with a managed name but no label is force-adopted.
@@ -191,10 +214,19 @@ impl K8sDeployerHandler {
         &self,
         env: &Environment,
         answers: Option<&Value>,
+        manage_namespace: bool,
     ) -> Result<ReconcileReport, DeployerError> {
-        let desired = self
+        let mut desired = self
             .render_environment(env, answers)
             .map_err(|e| DeployerError::Provider(e.to_string()))?;
+        // A bound, namespace-scoped identity cannot — and need not — apply the
+        // cluster-scoped Namespace (`bootstrap --bind` already created it). Drop
+        // it so the bound identity can drive reconcile; the ambient admin keeps
+        // upserting it. `render_environment` itself stays whole, so `op env
+        // render` (GitOps handoff) still emits the full desired state.
+        if !manage_namespace {
+            desired.retain(|manifest| !is_cluster_scoped(manifest));
+        }
         let mut applied = Vec::with_capacity(desired.len());
         for manifest in &desired {
             self.cluster.apply(manifest).await.map_err(provider)?;
@@ -576,7 +608,7 @@ mod tests {
         let (handler, cluster) = handler_with_fake();
         let env = build_fixture_env();
 
-        let report = handler.reconcile(&env, None).await.unwrap();
+        let report = handler.reconcile(&env, None, true).await.unwrap();
 
         // The applied set IS the renderer's desired state (render↔apply
         // convergence) and every object landed in the cluster.
@@ -594,9 +626,48 @@ mod tests {
 
         // Reconcile again: declarative upsert leaves identical cluster state.
         let before = cluster.objects();
-        let report2 = handler.reconcile(&env, None).await.unwrap();
+        let report2 = handler.reconcile(&env, None, true).await.unwrap();
         assert_eq!(report2.applied.len(), desired.len());
         assert_eq!(cluster.objects(), before, "reconcile is idempotent");
+    }
+
+    #[tokio::test]
+    async fn reconcile_bound_identity_skips_the_cluster_scoped_namespace() {
+        let (handler, cluster) = handler_with_fake();
+        let env = build_fixture_env();
+
+        // A bound, namespace-scoped identity (`manage_namespace == false`): the
+        // Namespace is the only cluster-scoped object the renderer emits, so the
+        // applied set is the full desired state minus exactly that one object.
+        let report = handler.reconcile(&env, None, false).await.unwrap();
+        let desired = handler.render_environment(&env, None).unwrap();
+        let namespaces = desired
+            .iter()
+            .filter(|m| m.get("kind").and_then(Value::as_str) == Some("Namespace"))
+            .count();
+        assert_eq!(
+            namespaces, 1,
+            "fixture's env-level set carries one Namespace"
+        );
+        assert_eq!(report.applied.len(), desired.len() - 1);
+
+        // The cluster never received a Namespace apply, but every namespaced
+        // object did — proving the bound identity can drive the rest of reconcile.
+        assert!(
+            !cluster.objects().keys().any(|o| o.kind == "Namespace"),
+            "a bound identity must not apply the cluster-scoped Namespace"
+        );
+        assert_eq!(
+            cluster.objects().len(),
+            desired.len() - 1,
+            "all namespaced desired objects landed; only the Namespace was dropped"
+        );
+
+        // Idempotent: a second bound reconcile leaves identical cluster state.
+        let before = cluster.objects();
+        let report2 = handler.reconcile(&env, None, false).await.unwrap();
+        assert_eq!(report2.applied.len(), desired.len() - 1);
+        assert_eq!(cluster.objects(), before, "bound reconcile is idempotent");
     }
 
     #[tokio::test]
@@ -621,7 +692,7 @@ mod tests {
             "precondition: the absent revision's workers are on the cluster"
         );
 
-        handler.reconcile(&env, None).await.unwrap();
+        handler.reconcile(&env, None, true).await.unwrap();
 
         assert!(
             !cluster.objects().keys().any(|o| o.name == lingering),

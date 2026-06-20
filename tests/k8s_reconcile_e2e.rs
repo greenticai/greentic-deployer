@@ -1908,3 +1908,104 @@ fn bind_provisions_rbac_and_resolves_the_bound_identity() {
         "--wait=false",
     ]);
 }
+
+/// The companion to [`bind_provisions_rbac_and_resolves_the_bound_identity`]:
+/// having minted the bound ServiceAccount, prove it can actually drive
+/// `op env reconcile` — the production blocker for `--bind` on Zain. Before this
+/// slice the rendered env-level set led with the cluster-scoped `Namespace`,
+/// which a namespaced Role cannot apply, so a bound reconcile 403'd on its very
+/// first object: the bound SA passed `requirements` yet could not reconcile.
+///
+/// `reconcile` now drops the Namespace from the applied set for a bound identity
+/// (`manage_namespace == bound_token.is_none()`). The `--bind` bootstrap already
+/// created the namespace, and the bound Role grants every namespaced verb
+/// (`VALIDATED_K8S_OPERATIONS`), so the rest applies cleanly. The proof is that
+/// the verb SUCCEEDS as the bound SA — `op` asserts a zero exit, so a 403 would
+/// panic this call — and self-reports `identity == "bound"` with no Namespace in
+/// the applied set.
+///
+/// Like the bind test this touches only kubectl→API-server and the deployer's
+/// own apply calls (no pod-to-pod networking), so it runs on any kind host,
+/// including ones whose CNI breaks same-node pod-to-pod. Shares `gtc-local`, so
+/// it resets up front and tears down after.
+#[test]
+fn bound_identity_drives_reconcile_without_the_cluster_scoped_namespace() {
+    if !armed() {
+        return;
+    }
+    reset_namespace();
+    let store = tempfile::tempdir().expect("tempdir");
+    let store = store.path();
+
+    // Bind the K8s env, then mint the bound ServiceAccount via `--bind` (creates
+    // the namespace + minimal RBAC and records the env's credential ref + bearer
+    // in the dev store). After this, `op env reconcile` resolves that bearer and
+    // connects AS the bound SA instead of the ambient admin.
+    bind_k8s_env(store, None);
+    let admin_context = kubectl_ok(&["config", "current-context"]);
+    let bootstrap = payload(
+        store,
+        "bootstrap.json",
+        serde_json::json!({
+            "environment_id": ENV_ID,
+            "admin_profile": admin_context,
+            "admin_material_inline": "ambient-kubeconfig",
+            "bind": true,
+        }),
+    );
+    let boot = op(store, Some(&bootstrap), &["credentials", "bootstrap"]);
+    assert_eq!(
+        boot["result"]["bound"], true,
+        "precondition: --bind minted the bound SA: {}",
+        boot["result"]
+    );
+
+    // The payoff: reconcile AS the bound SA. `op` asserts a zero exit, so whether
+    // this call panics is itself the gate — before the fix the bound Role's
+    // missing cluster-scoped Namespace verb 403'd the first apply.
+    let out = op(store, None, &["env", "reconcile", ENV_ID]);
+    let result = &out["result"];
+
+    // Ran as the bound ServiceAccount, not the ambient admin.
+    assert_eq!(
+        result["identity"], "bound",
+        "reconcile resolved the env's bound credential and ran as the SA: {result}"
+    );
+
+    // The cluster-scoped Namespace is absent from the applied set — the one
+    // object the bound Role cannot touch was dropped; everything else applied.
+    let applied = result["applied"].as_array().expect("applied is an array");
+    assert!(
+        !applied
+            .iter()
+            .any(|o| o["kind"].as_str() == Some("Namespace")),
+        "a bound reconcile must not apply the cluster-scoped Namespace: {result}"
+    );
+    // ...but the namespaced env-level objects DID apply: the router Deployment is
+    // in the applied set and present on the cluster, proving the bound SA drove a
+    // real apply rather than no-oping.
+    assert!(
+        applied
+            .iter()
+            .any(|o| o["kind"].as_str() == Some("Deployment")),
+        "the bound reconcile applied the namespaced router Deployment: {result}"
+    );
+    assert!(
+        object_exists("deployment", ROUTER_DEPLOY, Some(NAMESPACE)),
+        "the router Deployment the bound SA applied is on the cluster"
+    );
+    // The namespace `--bind` created survives: reconcile never deletes env-level
+    // objects, and a bound reconcile never re-applies it either.
+    assert!(
+        object_exists("namespace", NAMESPACE, None),
+        "the bootstrap-created namespace is intact after a bound reconcile"
+    );
+
+    let _ = kubectl(&[
+        "delete",
+        "namespace",
+        NAMESPACE,
+        "--ignore-not-found",
+        "--wait=false",
+    ]);
+}

@@ -671,6 +671,12 @@ fn reconcile_k8s_cluster(
     use std::sync::Arc;
 
     let kubeconfig_context = kubeconfig_context_from_answers(answers);
+    // A bound (namespace-scoped) identity must not apply the cluster-scoped
+    // Namespace — `bootstrap --bind` already created it, and the bound Role
+    // grants no cluster-scoped verbs. The ambient kubeconfig / in-cluster
+    // identity (`None`) keeps managing the Namespace, so reconcile still
+    // bootstraps a fresh env unchanged.
+    let manage_namespace = bound_token.is_none();
     run_k8s_async(async move {
         // `bound_token`: the env's credentials_ref resolved to a ServiceAccount
         // bearer (overrides the context's auth); `None` → the ambient
@@ -680,7 +686,7 @@ fn reconcile_k8s_cluster(
             .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
         let handler = K8sDeployerHandler::with_cluster(Arc::new(KubeCluster::new(client)));
         handler
-            .reconcile(env, answers)
+            .reconcile(env, answers, manage_namespace)
             .await
             .map_err(|e| OpError::Conflict(e.to_string()))
     })

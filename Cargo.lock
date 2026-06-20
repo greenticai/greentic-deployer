@@ -2293,7 +2293,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "greentic-bundle-reader",
- "greentic-deploy-spec 0.1.27829268457",
+ "greentic-deploy-spec 0.1.27868587054",
  "greentic-distributor-client",
  "greentic-qa-lib",
  "hex",
@@ -2379,9 +2379,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deploy-spec"
-version = "0.1.27829268457"
+version = "0.1.27868587054"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e4ab54c9b800d4b776df9db966348f596e07f082c8f961f1c5a7f558307c113"
+checksum = "f733ef2a7f066a17d27adfdf0c087dc2714e005071238a62a633fe7b2e9fad4f"
 dependencies = [
  "chrono",
  "greentic-config-types",
