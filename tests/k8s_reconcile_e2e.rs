@@ -1835,18 +1835,16 @@ fn bind_provisions_rbac_and_resolves_the_bound_identity() {
 
     // 3. The env persisted the bound ref — read straight back through the store,
     //    independent of the verb's self-report.
-    {
-        use greentic_deploy_spec::{EnvId, SecretRef};
-        use greentic_deployer::environment::{EnvironmentStore, LocalFsStore};
-        let env = LocalFsStore::new(store)
-            .load(&EnvId::try_from(ENV_ID).expect("env id"))
-            .expect("reload env after bind");
-        assert_eq!(
-            env.credentials_ref.as_ref().map(SecretRef::as_str),
-            Some(BIND_REF),
-            "the producer persisted credentials_ref on the env"
-        );
-    }
+    use greentic_deploy_spec::{EnvId, SecretRef};
+    use greentic_deployer::environment::{EnvironmentStore, LocalFsStore};
+    let env = LocalFsStore::new(store)
+        .load(&EnvId::try_from(ENV_ID).expect("env id"))
+        .expect("reload env after bind");
+    assert_eq!(
+        env.credentials_ref.as_ref().map(SecretRef::as_str),
+        Some(BIND_REF),
+        "the producer persisted credentials_ref on the env"
+    );
 
     // 4. The minted token resolves from the dev store (NO env var seeded) and
     //    PASSES the validated-ops sweep AS the bound SA. The rendered minimal
