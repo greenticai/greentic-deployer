@@ -70,8 +70,27 @@ All 12 packs built and validated (no regressions).
 ## Extension-list Output
 
 ```
-6 capabilities: generate, plan, apply, destroy, status, rollback
+{
+  "source": "pack",
+  "extension": {
+    "id": "greentic.deploy.tenant-manager-gcp",
+    "kind": "pack",
+    "target": { "family": "multi_target", "target": "gcp" },
+    "summary": "Deployment extension contract loaded from dist/tenant-manager-gcp.gtpack"
+  },
+  "provider": "Gcp",
+  "aliases": ["greentic.deploy.tenant-manager-gcp", "gcp"],
+  "handlers": [
+    {
+      "id": "pack.greentic.deploy.tenant-manager-gcp",
+      "execution_kind": "executable",
+      "supported_capabilities": ["generate", "plan", "apply", "destroy", "status", "rollback"]
+    }
+  ]
+}
 ```
+
+6 capabilities confirmed: generate, plan, apply, destroy, status, rollback.
 
 ## Terraform Validate
 
