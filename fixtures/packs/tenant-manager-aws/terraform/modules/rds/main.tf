@@ -14,13 +14,13 @@ resource "random_password" "db" {
   special = false
 }
 
-resource "aws_secretsmanager_secret" "db" {
-  name = "${var.name}-db-password"
+resource "aws_secretsmanager_secret" "db_url" {
+  name = "${var.name}-db-url"
 }
 
-resource "aws_secretsmanager_secret_version" "db" {
-  secret_id     = aws_secretsmanager_secret.db.id
-  secret_string = random_password.db.result
+resource "aws_secretsmanager_secret_version" "db_url" {
+  secret_id     = aws_secretsmanager_secret.db_url.id
+  secret_string = "postgres://${aws_db_instance.this.username}:${random_password.db.result}@${aws_db_instance.this.endpoint}/${aws_db_instance.this.db_name}?sslmode=require"
 }
 
 resource "aws_db_subnet_group" "this" {

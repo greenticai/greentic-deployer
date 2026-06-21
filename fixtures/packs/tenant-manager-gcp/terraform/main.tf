@@ -17,9 +17,7 @@ module "service" {
   gcp_region                     = var.gcp_region
   image_uri                      = var.image_uri
   db_connection_name             = module.cloudsql.connection_name
-  db_name                        = module.cloudsql.db_name
-  db_user                        = module.cloudsql.db_user
-  db_password_secret_id          = module.cloudsql.db_password_secret_id
+  database_url_secret_id         = module.cloudsql.database_url_secret_id
   master_key_secret_id           = var.master_key_secret_id
   platform_secret_hash_secret_id = var.platform_secret_hash_secret_id
 }
