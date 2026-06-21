@@ -1799,6 +1799,8 @@ spec:
     );
     kubectl_apply_stdin(&manifest);
 
+    let job_ref = format!("job/{INGRESS_CLIENT_JOB}");
+
     // The host deadline (180s) EXCEEDS the in-container retry budget (15 attempts
     // × (≤6s wget + 2s sleep) ≤ 120s) by design: when this wait returns — at the
     // Job completing OR at the timeout — the client has already run its loop to a
@@ -1809,20 +1811,14 @@ spec:
     let completed = kubectl(&[
         "wait",
         "--for=condition=complete",
-        &format!("job/{INGRESS_CLIENT_JOB}"),
+        &job_ref,
         "-n",
         CLIENT_NS,
         "--timeout=180s",
     ])
     .status
     .success();
-    let logs = kubectl(&[
-        "logs",
-        &format!("job/{INGRESS_CLIENT_JOB}"),
-        "-n",
-        CLIENT_NS,
-        "--tail=-1",
-    ]);
+    let logs = kubectl(&["logs", &job_ref, "-n", CLIENT_NS, "--tail=-1"]);
     let out = String::from_utf8_lossy(&logs.stdout).to_string();
     let ok = out.contains(INGRESS_OK_MARKER);
     let body = if ok {
@@ -1833,12 +1829,7 @@ spec:
         // No 2xx: dump the client Job/pod/events alongside its log so a failure
         // shows whether the client connected, image-pulled, or just exhausted its
         // retries — not a bare missing marker.
-        let describe = kubectl(&[
-            "describe",
-            &format!("job/{INGRESS_CLIENT_JOB}"),
-            "-n",
-            CLIENT_NS,
-        ]);
+        let describe = kubectl(&["describe", &job_ref, "-n", CLIENT_NS]);
         let pods = kubectl(&["get", "pods", "-n", CLIENT_NS, "-o", "wide"]);
         let events = kubectl(&["get", "events", "-n", CLIENT_NS, "--sort-by=.lastTimestamp"]);
         format!(
@@ -1891,6 +1882,20 @@ fn router_serves_an_external_request_to_a_real_component() {
 
     let worker = boot_worker_serving_bundle(store, &image, &templates_fixture_bundle());
 
+    // Shared by the two failure paths below (router-never-Ready and
+    // request-failed-after-Ready); they are mutually exclusive, so this only ever
+    // runs on the one that fires.
+    let dump_router_logs = || {
+        kubectl(&[
+            "logs",
+            &format!("deployment/{ROUTER_DEPLOY}"),
+            "-n",
+            NAMESPACE,
+            "--all-containers",
+            "--tail=150",
+        ])
+    };
+
     // The router is the external ingress target; the HTTP-path boot waits only on
     // the worker, so wait for the router rollout here. It pulls + activates the
     // SAME routed revision over `http://`, and boot is fail-closed, so a Ready
@@ -1904,14 +1909,7 @@ fn router_serves_an_external_request_to_a_real_component() {
         "--timeout=180s",
     ]);
     if !router_status.status.success() {
-        let router_logs = kubectl(&[
-            "logs",
-            &format!("deployment/{ROUTER_DEPLOY}"),
-            "-n",
-            NAMESPACE,
-            "--all-containers",
-            "--tail=150",
-        ]);
+        let router_logs = dump_router_logs();
         panic!(
             "router must reach Ready to serve the external route:\n\
              stdout: {}\nstderr: {}\n\n=== router logs ===\n{}{}",
@@ -1931,14 +1929,7 @@ fn router_serves_an_external_request_to_a_real_component() {
         // A non-2xx (or unreachable router) is opaque from busybox `wget`; dump
         // the router's own logs plus the standard worker/server diagnostics so CI
         // shows whether the request reached the router and how it failed.
-        let router_logs = kubectl(&[
-            "logs",
-            &format!("deployment/{ROUTER_DEPLOY}"),
-            "-n",
-            NAMESPACE,
-            "--all-containers",
-            "--tail=150",
-        ]);
+        let router_logs = dump_router_logs();
         let diag = worker_failure_diagnostics(&worker);
         panic!(
             "external POST /e2e via the router must return 2xx; {body}\n\n\
