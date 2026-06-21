@@ -122,3 +122,44 @@ No existing files were deleted. No unreferenced example files were created (cont
 - `terraform plan` was NOT run — the google provider needs real GCP project credentials. `terraform validate` confirms the HCL is syntactically correct and all references resolve.
 - The `db_host` output (public IP) is captured but not used in the `TENANT_DATABASE_URL` since Cloud Run uses the unix socket path (`/cloudsql/<connection_name>`) via the Cloud SQL annotation pattern. The `db_host` is available as an output for operators who need the IP directly.
 - Domain mapping requires the domain to be verified in Google Search Console before `terraform apply` — documented in README.
+
+---
+
+## Fix Report — 2026-06-21
+
+### Fix 1: Remove dead `db_host` plumbing
+
+Removed `variable "db_host"` from `modules/service/variables.tf` and the corresponding `db_host = module.cloudsql.db_host` line from the `module "service"` block in root `main.tf`. The `cloudsql` module's `db_host` output (public IP address) was left in place — it is a harmless informational output not referenced by anything after the service variable was dropped.
+
+Confirmed via grep: only three locations referenced `db_host` before the fix (root main.tf pass-through, cloudsql outputs.tf, service variables.tf). No other consumers.
+
+### Fix 2: `service_url` output honors `create_dns_record`
+
+The route module does not receive the Cloud Run service URI as a variable, so the cleanest fix was at the root `outputs.tf` level. Changed root `output "service_url"` from a plain delegation to `module.route.service_url` to a conditional:
+
+```hcl
+output "service_url" {
+  value = var.create_dns_record ? module.route.service_url : module.service.service_uri
+}
+```
+
+`var.create_dns_record` is already declared in root `variables.tf` (bool, default true). `module.service.service_uri` is the `google_cloud_run_v2_service.this.uri` attribute, already exported by the service module. The route module's `outputs.tf` (`"https://${var.domain_name}"`) is left unchanged — it is only reached when `create_dns_record = true`.
+
+No count-gated resource is referenced directly in the output (the count-gated `google_cloud_run_domain_mapping` is inside the route module; the output value itself is a plain string interpolation from a variable, not the resource attribute), so no Terraform error from referencing a count-gated resource.
+
+### Optional Minor: `deletion_protection` comment
+
+Added `# TODO: set deletion_protection = true for production deployments` above `deletion_protection = false` in `modules/cloudsql/main.tf`.
+
+### Verification
+
+```
+terraform init -backend=false  →  "Terraform has been successfully initialized!"
+terraform validate             →  "Success! The configuration is valid."
+```
+
+```
+cargo run --features internal-tools --bin build_fixture_gtpacks
+→ All 12 packs built and validated (no regressions)
+   including: PACK  greentic.deploy.tenant-manager-gcp  1.1.0-dev.0  dist/tenant-manager-gcp.gtpack
+```

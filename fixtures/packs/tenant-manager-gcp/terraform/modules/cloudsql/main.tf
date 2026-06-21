@@ -48,6 +48,7 @@ resource "google_sql_database_instance" "this" {
     }
   }
 
+  # TODO: set deletion_protection = true for production deployments
   deletion_protection = false
 }
 
