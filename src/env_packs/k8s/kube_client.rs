@@ -34,11 +34,12 @@ use k8s_openapi::api::authentication::v1::{SelfSubjectReview, TokenRequest, Toke
 use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
 };
-use k8s_openapi::api::core::v1::ServiceAccount;
+use k8s_openapi::api::core::v1::{Secret, ServiceAccount};
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams};
 use kube::config::KubeConfigOptions;
 use serde_json::Value;
 
+use super::bootstrap::DEPLOYER_IDENTITY_BEARER_KEY;
 use super::cluster::{K8sCluster, K8sClusterError, ObjectRef, RolloutStatus, manifest_field};
 use super::credentials::{
     AccessDecision, ClusterIdentity, K8sBootstrapClient, K8sClientError, K8sOperation,
@@ -162,6 +163,9 @@ fn api_route_for(api_version: &str, kind: &str) -> Result<(ApiResource, Scope), 
         ("v1", "Namespace") => ("namespaces", Scope::Cluster),
         ("v1", "Service") => ("services", Scope::Namespaced),
         ("v1", "ConfigMap") => ("configmaps", Scope::Namespaced),
+        // The `--bind` path stores the deployer's bound bearer in a Secret
+        // (via `KubeBootstrapClient::apply_identity_secret` → `KubeCluster::apply`).
+        ("v1", "Secret") => ("secrets", Scope::Namespaced),
         ("v1", "ServiceAccount") => ("serviceaccounts", Scope::Namespaced),
         ("apps/v1", "Deployment") => ("deployments", Scope::Namespaced),
         ("policy/v1", "PodDisruptionBudget") => ("poddisruptionbudgets", Scope::Namespaced),
@@ -530,6 +534,79 @@ impl K8sBootstrapClient for KubeBootstrapClient {
             ),
         })
     }
+
+    async fn apply_identity_secret(
+        &self,
+        namespace: &str,
+        name: &str,
+        env_id: &str,
+        bearer: &str,
+    ) -> Result<(), K8sClientError> {
+        // Apply the `core/v1 Secret` through the SAME guarded
+        // `KubeCluster::apply` as the RBAC: the env-ownership label fail-
+        // closes against another env's Secret of this name, the forced
+        // field-manager apply overwrites our own field, and a re-bind
+        // converges in place. `stringData` lets the apiserver own the
+        // base64 encoding; `read_deployer_identity_bearer` reads it back
+        // through `data`.
+        let manifest = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "labels": {
+                    "app.kubernetes.io/managed-by": "greentic",
+                    "app.kubernetes.io/component": "deployer-identity",
+                    ENV_LABEL: env_id,
+                },
+            },
+            "type": "Opaque",
+            "stringData": { DEPLOYER_IDENTITY_BEARER_KEY: bearer },
+        });
+        KubeCluster::new(self.client.clone())
+            .apply(&manifest)
+            .await
+            .map_err(|e| K8sClientError::ApiRejected(e.to_string()))
+    }
+}
+
+/// Read the deployer's bound bearer back from its in-cluster Secret using an
+/// **ambient** connection (`bound_token = None`) — the credential resolver's
+/// last-resort source when no local (env-var / dev-store) material is
+/// present, e.g. on a fresh operator machine that did not run `--bind`.
+///
+/// `Ok(None)` when the Secret is absent or carries no non-empty bearer key
+/// (treated as "not stored" — the caller fails closed on the original
+/// unresolved-credential error). Connection / transport errors propagate so
+/// a real cluster-access problem is never silently swallowed.
+pub async fn read_deployer_identity_bearer(
+    kubeconfig_context: Option<&str>,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<String>, K8sClientError> {
+    let client = connect(kubeconfig_context, None).await?;
+    read_identity_bearer_with(&client, namespace, name).await
+}
+
+/// Read + decode the bearer from an already-connected client. Split from
+/// [`read_deployer_identity_bearer`] so the get / base64-decode / empty-filter
+/// path is wire-testable against a mocked client without a kubeconfig.
+async fn read_identity_bearer_with(
+    client: &kube::Client,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<String>, K8sClientError> {
+    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let Some(secret) = api.get_opt(name).await.map_err(map_validator_error)? else {
+        return Ok(None);
+    };
+    let bearer = secret
+        .data
+        .and_then(|mut data| data.remove(DEPLOYER_IDENTITY_BEARER_KEY))
+        .and_then(|bytes| String::from_utf8(bytes.0).ok())
+        .filter(|value| !value.is_empty());
+    Ok(bearer)
 }
 
 #[cfg(test)]
@@ -1248,5 +1325,96 @@ rules:
         };
         let (result, ()) = tokio::join!(bootstrap.apply_rbac(manifest), respond);
         result.expect("apply_rbac applies both documents");
+    }
+
+    #[tokio::test]
+    async fn apply_identity_secret_applies_a_labelled_namespaced_secret() {
+        let (client, mut handle) = mock_client();
+        let bootstrap = KubeBootstrapClient::new(client);
+
+        // `KubeCluster::apply` does ownership GET (404 ⇒ create) then forced
+        // PATCH — assert the PATCH targets the namespaced Secret and carries
+        // the env-ownership label + the bearer in `stringData`.
+        let respond = async {
+            let _get = respond_json(&mut handle, 404, not_found_status()).await;
+            let applied = json!({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "x"}});
+            respond_json(&mut handle, 200, applied).await
+        };
+        let (result, patch_request) = tokio::join!(
+            bootstrap.apply_identity_secret(
+                "gtc-local",
+                "greentic-deployer-identity",
+                "local",
+                "MINTED_SA_TOKEN",
+            ),
+            respond
+        );
+        result.expect("apply_identity_secret applies the Secret");
+
+        assert_eq!(patch_request.method(), http::Method::PATCH);
+        assert!(
+            patch_request
+                .uri()
+                .path()
+                .ends_with("/namespaces/gtc-local/secrets/greentic-deployer-identity"),
+            "unexpected path: {}",
+            patch_request.uri().path()
+        );
+        let body = request_body_json(patch_request).await;
+        assert_eq!(
+            body["metadata"]["labels"]["greentic.ai/env"],
+            json!("local")
+        );
+        assert_eq!(body["stringData"]["bearer"], json!("MINTED_SA_TOKEN"));
+        // The bearer must NOT leak into a plaintext `data` field on the wire.
+        assert!(
+            body.get("data").is_none(),
+            "bearer should ride in stringData"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_identity_bearer_with_decodes_the_stored_bearer() {
+        let (client, mut handle) = mock_client();
+        // k8s returns Secret `data` base64-encoded; kube-rs decodes to bytes.
+        let encoded = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            "MINTED_SA_TOKEN",
+        );
+        let body = json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": "greentic-deployer-identity", "namespace": "gtc-local"},
+            "data": {"bearer": encoded},
+        });
+        let respond = respond_json(&mut handle, 200, body);
+        let (result, request) = tokio::join!(
+            read_identity_bearer_with(&client, "gtc-local", "greentic-deployer-identity"),
+            respond
+        );
+        assert_eq!(
+            result.expect("read ok"),
+            Some("MINTED_SA_TOKEN".to_string())
+        );
+        assert_eq!(request.method(), http::Method::GET);
+        assert!(
+            request
+                .uri()
+                .path()
+                .ends_with("/namespaces/gtc-local/secrets/greentic-deployer-identity"),
+            "unexpected path: {}",
+            request.uri().path()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_identity_bearer_with_is_none_when_the_secret_is_absent() {
+        let (client, mut handle) = mock_client();
+        let respond = respond_json(&mut handle, 404, not_found_status());
+        let (result, _request) = tokio::join!(
+            read_identity_bearer_with(&client, "gtc-local", "greentic-deployer-identity"),
+            respond
+        );
+        assert_eq!(result.expect("absent secret is Ok(None)"), None);
     }
 }

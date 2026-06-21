@@ -69,6 +69,13 @@ const DEPLOYER_RBAC_NAME: &str = "greentic-deployer-min";
 /// `deployer_token` name end to end.
 const BIND_REF: &str = "secret://local/default/_/k8s-deployer/deployer_token";
 
+/// In-cluster `core/v1 Secret` (in [`NAMESPACE`]) the `--bind` path writes the
+/// minted bearer into — the durable, portable home for the bound identity.
+/// Mirrors `bootstrap::DEPLOYER_IDENTITY_SECRET_NAME` (that const is
+/// `pub(crate)`, so the integration test pins the name by hand, like
+/// [`BIND_REF`]).
+const IDENTITY_SECRET: &str = "greentic-deployer-identity";
+
 /// In-cluster plain-HTTP server (busybox `httpd`) that serves the fixture
 /// `.gtbundle` for the M2 boot-time pull test. The worker pulls over `http://`,
 /// which greentic-start's bundle-ref path fetches with `ureq` — bypassing the
@@ -1993,6 +2000,78 @@ fn bound_identity_drives_reconcile_without_the_cluster_scoped_namespace() {
     assert!(
         object_exists("namespace", NAMESPACE, None),
         "the bootstrap-created namespace is intact after a bound reconcile"
+    );
+
+    let _ = kubectl(&[
+        "delete",
+        "namespace",
+        NAMESPACE,
+        "--ignore-not-found",
+        "--wait=false",
+    ]);
+}
+
+/// The Kubernetes-Secret backend for the bound deployer identity: `--bind`
+/// writes the minted bearer into a durable in-cluster `Secret`, and the
+/// credential resolver reads it BACK FROM THE CLUSTER when no local material
+/// is present — making `--bind` durable and portable across operator machines
+/// (the local dev-store is only the bootstrapping machine's cache).
+///
+/// The proof deletes the dev-store the bootstrap sink wrote, so the env-var
+/// and dev-store sources both miss; reconcile can only run as the bound SA
+/// (`identity == "bound"`) if the resolver fetched the bearer from the cluster
+/// Secret over an ambient connection. A no-op fallback would instead leave the
+/// base resolver's fail-closed `Conflict` and panic the zero-exit `op` call.
+///
+/// Host→API-server only (kubectl + the deployer's own apply/get calls, no
+/// pod-to-pod), so it runs on any kind host. Shares `gtc-local` — resets up
+/// front, tears down after.
+#[test]
+fn bound_identity_resolves_from_the_in_cluster_secret_after_local_material_is_gone() {
+    if !armed() {
+        return;
+    }
+    reset_namespace();
+    let store = tempfile::tempdir().expect("tempdir");
+    let store = store.path();
+
+    // `--bind` mints the SA, records the bearer in the dev store, AND writes it
+    // into the durable in-cluster Secret.
+    let boot = bind_k8s_env_and_bootstrap_bound_sa(store);
+    assert_eq!(
+        boot["result"]["bound"], true,
+        "precondition: --bind minted the bound SA: {}",
+        boot["result"]
+    );
+    // The new write landed: the bearer's durable home exists in the namespace.
+    assert!(
+        object_exists("secret", IDENTITY_SECRET, Some(NAMESPACE)),
+        "`--bind` stored the bearer in its in-cluster Secret"
+    );
+
+    // Remove the bootstrapping machine's local cache. After this the bearer
+    // exists ONLY in the cluster Secret — exactly a fresh operator machine that
+    // never ran `--bind` but has ambient cluster read access. The dev store the
+    // sink wrote lives under the env dir; delete the whole `.greentic/dev` dir
+    // so both the primary and state-fallback candidates are gone.
+    let dev_dir = store.join(ENV_ID).join(".greentic").join("dev");
+    if dev_dir.exists() {
+        std::fs::remove_dir_all(&dev_dir).expect("wipe the local dev-store cache");
+    }
+
+    // The payoff: reconcile still runs AS the bound SA. The only place left to
+    // find the bearer is the in-cluster Secret (ambient read) — a zero exit
+    // here means the resolver fetched it from the cluster.
+    let out = op(store, None, &["env", "reconcile", ENV_ID]);
+    let result = &out["result"];
+    assert_eq!(
+        result["identity"], "bound",
+        "reconcile resolved the bearer from the in-cluster Secret and ran as the SA: {result}"
+    );
+    // It drove a real apply as that identity (the namespaced router Deployment).
+    assert!(
+        object_exists("deployment", ROUTER_DEPLOY, Some(NAMESPACE)),
+        "the bound reconcile (bearer from the cluster Secret) applied the router Deployment"
     );
 
     let _ = kubectl(&[

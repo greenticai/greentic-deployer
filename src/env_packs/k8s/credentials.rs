@@ -56,8 +56,8 @@ use crate::credentials::{
 
 use super::async_bridge::run_k8s_async;
 use super::bootstrap::{
-    DEPLOYER_SERVICE_ACCOUNT, DEPLOYER_TOKEN_STORE_PATH, K8S_RBAC_MANIFEST_FILENAME,
-    K8sRulesPackInput, render_min_rbac_rules_pack,
+    DEPLOYER_IDENTITY_SECRET_NAME, DEPLOYER_SERVICE_ACCOUNT, DEPLOYER_TOKEN_STORE_PATH,
+    K8S_RBAC_MANIFEST_FILENAME, K8sRulesPackInput, render_min_rbac_rules_pack,
 };
 use super::manifests::namespace_for_env;
 
@@ -263,6 +263,20 @@ pub trait K8sBootstrapClient: std::fmt::Debug + Send + Sync {
         service_account: &str,
         expiration_seconds: i64,
     ) -> Result<MintedToken, K8sClientError>;
+
+    /// Server-side-apply a `core/v1 Secret` (named `name`, env-ownership
+    /// labelled `env_id`) holding the minted `bearer` in `namespace` — the
+    /// durable in-cluster home for the bound identity. Goes through the SAME
+    /// guarded `KubeCluster::apply` as `apply_rbac`, so the ownership guard
+    /// fail-closes against a different env's Secret of this name and a
+    /// re-bind overwrites the bearer in place (idempotent).
+    async fn apply_identity_secret(
+        &self,
+        namespace: &str,
+        name: &str,
+        env_id: &str,
+        bearer: &str,
+    ) -> Result<(), K8sClientError>;
 }
 
 /// K8s deployer credentials handler.
@@ -570,16 +584,30 @@ impl DeployerCredentials for K8sDeployerCredentials {
             }
         })?;
         let connector = Arc::clone(bind);
+        let env_id_label = input.env_id.as_str().to_string();
         let minted = run_k8s_async(async move {
             let client = connector().await?;
             client.apply_rbac(&manifest_yaml).await?;
-            client
+            let minted = client
                 .mint_service_account_token(
                     &namespace,
                     DEPLOYER_SERVICE_ACCOUNT,
                     BIND_TOKEN_EXPIRATION_SECONDS,
                 )
-                .await
+                .await?;
+            // Persist the bearer into its durable in-cluster Secret on the
+            // same connection (so a fresh operator machine can resolve it
+            // from the cluster). The dev-store write the CLI sink performs
+            // stays as the bootstrapping machine's fast local cache.
+            client
+                .apply_identity_secret(
+                    &namespace,
+                    DEPLOYER_IDENTITY_SECRET_NAME,
+                    &env_id_label,
+                    &minted.token,
+                )
+                .await?;
+            Ok(minted)
         })
         .map_err(|e: K8sClientError| BootstrapError::ProvisioningFailed {
             step: "k8s-bind".to_string(),
@@ -1072,6 +1100,9 @@ mod tests {
         applied_manifests: Mutex<Vec<String>>,
         minted_namespace: Mutex<Option<String>>,
         mint_response: Mutex<Option<Result<MintedToken, K8sClientError>>>,
+        /// `(namespace, name, env_id, bearer)` captured from
+        /// `apply_identity_secret` — `None` until the bind path stores it.
+        identity_secret: Mutex<Option<(String, String, String, String)>>,
     }
 
     impl MockBootstrapClient {
@@ -1103,6 +1134,22 @@ mod tests {
                 .unwrap()
                 .take()
                 .expect("test must wire mint_response")
+        }
+
+        async fn apply_identity_secret(
+            &self,
+            namespace: &str,
+            name: &str,
+            env_id: &str,
+            bearer: &str,
+        ) -> Result<(), K8sClientError> {
+            *self.identity_secret.lock().unwrap() = Some((
+                namespace.to_string(),
+                name.to_string(),
+                env_id.to_string(),
+                bearer.to_string(),
+            ));
+            Ok(())
         }
     }
 
@@ -1160,6 +1207,16 @@ mod tests {
             mock.minted_namespace.lock().unwrap().as_deref(),
             Some("gtc-zain-prod")
         );
+
+        // The minted bearer is ALSO persisted into its durable in-cluster
+        // Secret: same namespace as the mint, the env-ownership label, and the
+        // bearer verbatim — so a fresh operator machine resolves it.
+        let identity = mock.identity_secret.lock().unwrap();
+        let (ns, name, env_label, bearer) = identity.as_ref().expect("identity Secret was stored");
+        assert_eq!(ns, "gtc-zain-prod");
+        assert_eq!(name, DEPLOYER_IDENTITY_SECRET_NAME);
+        assert_eq!(env_label, "zain-prod");
+        assert_eq!(bearer, "MINTED_SA_TOKEN");
     }
 
     #[test]

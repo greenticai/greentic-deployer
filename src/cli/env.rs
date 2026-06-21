@@ -625,8 +625,11 @@ pub fn reconcile(
     // Resolve the env's bound deployer credential to a ServiceAccount bearer
     // token; `None` → connect with the ambient kubeconfig / in-cluster
     // identity (the pre-closure behaviour). Fail-closed if a ref is bound but
-    // unresolvable.
-    let bound_token = crate::cli::secrets::resolve_credentials_token(store, &env, &env_id)?;
+    // unresolvable. Beyond env-var / dev-store, this also reads the durable
+    // in-cluster identity Secret (ambient) so a fresh operator machine
+    // resolves a `--bind` credential it never wrote locally.
+    let bound_token =
+        crate::env_packs::k8s::resolve_bound_identity(store, &env, &env_id, answers.as_ref())?;
     let identity = if bound_token.is_some() {
         "bound"
     } else {
@@ -801,8 +804,10 @@ pub fn apply_revision(
 
     // Same credential resolution as `reconcile`: bound ServiceAccount bearer
     // when the env declares one, else the ambient identity (fail-closed if a
-    // ref is bound but unresolvable).
-    let bound_token = crate::cli::secrets::resolve_credentials_token(store, &env, &env_id)?;
+    // ref is bound but unresolvable). Includes the in-cluster identity-Secret
+    // fallback for a fresh operator machine.
+    let bound_token =
+        crate::env_packs::k8s::resolve_bound_identity(store, &env, &env_id, answers.as_ref())?;
     let identity = if bound_token.is_some() {
         "bound"
     } else {
