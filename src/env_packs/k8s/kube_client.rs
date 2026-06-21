@@ -569,6 +569,20 @@ impl K8sBootstrapClient for KubeBootstrapClient {
             .await
             .map_err(|e| K8sClientError::ApiRejected(e.to_string()))
     }
+
+    async fn delete_identity_secret(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), K8sClientError> {
+        let api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        match api.delete(name, &DeleteParams::default()).await {
+            Ok(_) => Ok(()),
+            // Already gone (never written, or a prior cleanup) — idempotent.
+            Err(kube::Error::Api(status)) if status.code == 404 => Ok(()),
+            Err(e) => Err(map_validator_error(e)),
+        }
+    }
 }
 
 /// Read the deployer's bound bearer back from its in-cluster Secret using an
@@ -578,29 +592,51 @@ impl K8sBootstrapClient for KubeBootstrapClient {
 ///
 /// `Ok(None)` when the Secret is absent or carries no non-empty bearer key
 /// (treated as "not stored" — the caller fails closed on the original
-/// unresolved-credential error). Connection / transport errors propagate so
-/// a real cluster-access problem is never silently swallowed.
+/// unresolved-credential error). A Secret whose `greentic.ai/env` ownership
+/// label is missing or names a DIFFERENT env is a foreign/stale credential and
+/// fails closed with [`K8sClientError::IdentityMismatch`] — never trusted.
+/// Connection / transport errors propagate so a real cluster-access problem is
+/// never silently swallowed.
 pub async fn read_deployer_identity_bearer(
     kubeconfig_context: Option<&str>,
     namespace: &str,
     name: &str,
+    expected_env: &str,
 ) -> Result<Option<String>, K8sClientError> {
     let client = connect(kubeconfig_context, None).await?;
-    read_identity_bearer_with(&client, namespace, name).await
+    read_identity_bearer_with(&client, namespace, name, expected_env).await
 }
 
 /// Read + decode the bearer from an already-connected client. Split from
-/// [`read_deployer_identity_bearer`] so the get / base64-decode / empty-filter
+/// [`read_deployer_identity_bearer`] so the get / label-check / base64-decode
 /// path is wire-testable against a mocked client without a kubeconfig.
 async fn read_identity_bearer_with(
     client: &kube::Client,
     namespace: &str,
     name: &str,
+    expected_env: &str,
 ) -> Result<Option<String>, K8sClientError> {
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let Some(secret) = api.get_opt(name).await.map_err(map_validator_error)? else {
         return Ok(None);
     };
+    // Trust boundary: the Secret MUST carry our env-ownership label and name
+    // THIS env, or it is a foreign/stale credential we refuse to bind to (the
+    // read mirrors the same `ENV_LABEL` check `KubeCluster::apply` enforces on
+    // write). A mismatch is a hard error, not absence, so drift is surfaced
+    // rather than silently selecting the wrong identity.
+    let owner = secret
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(ENV_LABEL))
+        .map(String::as_str);
+    if owner != Some(expected_env) {
+        return Err(K8sClientError::IdentityMismatch(format!(
+            "Secret `{name}` in `{namespace}` is labelled `{ENV_LABEL}={}`, not `{expected_env}`",
+            owner.unwrap_or("<unset>")
+        )));
+    }
     let bearer = secret
         .data
         .and_then(|mut data| data.remove(DEPLOYER_IDENTITY_BEARER_KEY))
@@ -1384,12 +1420,16 @@ rules:
         let body = json!({
             "apiVersion": "v1",
             "kind": "Secret",
-            "metadata": {"name": "greentic-deployer-identity", "namespace": "gtc-local"},
+            "metadata": {
+                "name": "greentic-deployer-identity",
+                "namespace": "gtc-local",
+                "labels": {"greentic.ai/env": "local"},
+            },
             "data": {"bearer": encoded},
         });
         let respond = respond_json(&mut handle, 200, body);
         let (result, request) = tokio::join!(
-            read_identity_bearer_with(&client, "gtc-local", "greentic-deployer-identity"),
+            read_identity_bearer_with(&client, "gtc-local", "greentic-deployer-identity", "local"),
             respond
         );
         assert_eq!(
@@ -1408,11 +1448,39 @@ rules:
     }
 
     #[tokio::test]
+    async fn read_identity_bearer_with_rejects_a_foreign_env_labelled_secret() {
+        let (client, mut handle) = mock_client();
+        // A Secret of the right name but labelled for a DIFFERENT env (or
+        // unlabelled) is a foreign/stale credential — fail closed, never trust.
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "FOREIGN_TOKEN");
+        let body = json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": "greentic-deployer-identity",
+                "namespace": "gtc-local",
+                "labels": {"greentic.ai/env": "other-env"},
+            },
+            "data": {"bearer": encoded},
+        });
+        let respond = respond_json(&mut handle, 200, body);
+        let (result, _request) = tokio::join!(
+            read_identity_bearer_with(&client, "gtc-local", "greentic-deployer-identity", "local"),
+            respond
+        );
+        assert!(
+            matches!(result, Err(K8sClientError::IdentityMismatch(_))),
+            "a wrong-env-labelled Secret must fail closed, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn read_identity_bearer_with_is_none_when_the_secret_is_absent() {
         let (client, mut handle) = mock_client();
         let respond = respond_json(&mut handle, 404, not_found_status());
         let (result, _request) = tokio::join!(
-            read_identity_bearer_with(&client, "gtc-local", "greentic-deployer-identity"),
+            read_identity_bearer_with(&client, "gtc-local", "greentic-deployer-identity", "local"),
             respond
         );
         assert_eq!(result.expect("absent secret is Ok(None)"), None);

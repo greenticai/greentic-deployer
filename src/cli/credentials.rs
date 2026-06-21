@@ -231,7 +231,18 @@ pub fn bootstrap(
             &secret_sink,
         ) {
             Ok(d) => d,
-            Err(e) => return Err(map_bootstrap_err(e)),
+            Err(e) => {
+                // Best-effort compensating cleanup: a `--bind` bootstrap may
+                // have already written the durable in-cluster identity Secret
+                // before a later persistence step failed. Delete it so a FAILED
+                // bootstrap never leaves a live bearer in the cluster while the
+                // env stays unbound. Idempotent + a no-op for non-bind/non-K8s
+                // deployers (default trait impl).
+                if let Some(creds) = bind_creds.as_deref() {
+                    creds.rollback_bound_material(&env_id);
+                }
+                return Err(map_bootstrap_err(e));
+            }
         };
         committed.mark_committed();
 

@@ -79,6 +79,7 @@ fn read_from_cluster(
         context.as_deref(),
         &namespace,
         DEPLOYER_IDENTITY_SECRET_NAME,
+        env_id.as_str(),
     ))
     .map_err(|e| e.to_string())
 }

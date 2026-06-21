@@ -174,6 +174,11 @@ pub enum K8sClientError {
     ApiRejected(String),
     #[error("Kubernetes API transport error: {0}")]
     Transport(String),
+    /// A cluster object claimed to hold a credential but its env-ownership
+    /// label does not match the env resolving it — refuse to trust a
+    /// foreign/stale identity Secret rather than silently binding to it.
+    #[error("in-cluster identity mismatch: {0}")]
+    IdentityMismatch(String),
 }
 
 /// Pluggable validator client. Unit tests mock this; the production
@@ -276,6 +281,15 @@ pub trait K8sBootstrapClient: std::fmt::Debug + Send + Sync {
         name: &str,
         env_id: &str,
         bearer: &str,
+    ) -> Result<(), K8sClientError>;
+
+    /// Delete the bound identity Secret — the compensating-cleanup path when a
+    /// `--bind` bootstrap fails after the Secret was written. Idempotent: a
+    /// missing Secret (404) is `Ok(())`.
+    async fn delete_identity_secret(
+        &self,
+        namespace: &str,
+        name: &str,
     ) -> Result<(), K8sClientError>;
 }
 
@@ -630,6 +644,30 @@ impl DeployerCredentials for K8sDeployerCredentials {
             bound_expiry: minted.expiration,
             bound_secret_material: Some(Zeroizing::new(minted.token)),
         })
+    }
+
+    fn rollback_bound_material(&self, env_id: &greentic_deploy_spec::EnvId) {
+        // Only the `--bind` path writes a remote Secret; nothing else to undo.
+        let Some(bind) = self.bind.as_ref() else {
+            return;
+        };
+        // The namespace the bind path wrote into: the binding's resolved
+        // override, else the env-derived default (mirrors `bootstrap`).
+        let namespace = self
+            .namespace
+            .clone()
+            .unwrap_or_else(|| namespace_for_env(env_id));
+        let connector = Arc::clone(bind);
+        // Best-effort: reconnect (the bootstrap connection is long gone) and
+        // delete. EVERY error is swallowed — the caller already has a bootstrap
+        // failure to report, and cleanup must never mask it or panic. The
+        // delete is idempotent (a never-written Secret 404s harmlessly).
+        let _ = run_k8s_async(async move {
+            let client = connector().await?;
+            client
+                .delete_identity_secret(&namespace, DEPLOYER_IDENTITY_SECRET_NAME)
+                .await
+        });
     }
 }
 
@@ -1103,6 +1141,9 @@ mod tests {
         /// `(namespace, name, env_id, bearer)` captured from
         /// `apply_identity_secret` — `None` until the bind path stores it.
         identity_secret: Mutex<Option<(String, String, String, String)>>,
+        /// `(namespace, name)` captured from `delete_identity_secret` — `None`
+        /// until the compensating-cleanup path deletes it.
+        deleted_identity_secret: Mutex<Option<(String, String)>>,
     }
 
     impl MockBootstrapClient {
@@ -1149,6 +1190,16 @@ mod tests {
                 env_id.to_string(),
                 bearer.to_string(),
             ));
+            Ok(())
+        }
+
+        async fn delete_identity_secret(
+            &self,
+            namespace: &str,
+            name: &str,
+        ) -> Result<(), K8sClientError> {
+            *self.deleted_identity_secret.lock().unwrap() =
+                Some((namespace.to_string(), name.to_string()));
             Ok(())
         }
     }
@@ -1217,6 +1268,31 @@ mod tests {
         assert_eq!(name, DEPLOYER_IDENTITY_SECRET_NAME);
         assert_eq!(env_label, "zain-prod");
         assert_eq!(bearer, "MINTED_SA_TOKEN");
+    }
+
+    #[test]
+    fn rollback_bound_material_deletes_the_in_cluster_identity_secret() {
+        let mock = Arc::new(MockBootstrapClient::default());
+        let creds = bind_creds(mock.clone());
+        let env_id = EnvId::try_from("zain-prod").unwrap();
+        // The CLI calls this on a FAILED `--bind` bootstrap; it must delete the
+        // durable Secret (in the env-derived namespace, no override here) so no
+        // live bearer is left behind.
+        creds.rollback_bound_material(&env_id);
+        let deleted = mock.deleted_identity_secret.lock().unwrap();
+        let (ns, name) = deleted
+            .as_ref()
+            .expect("cleanup deleted the identity Secret");
+        assert_eq!(ns, "gtc-zain-prod");
+        assert_eq!(name, DEPLOYER_IDENTITY_SECRET_NAME);
+    }
+
+    #[test]
+    fn rollback_bound_material_is_a_noop_without_a_bind_connector() {
+        // A non-bind K8s credentials instance (the validator path) wrote no
+        // remote Secret — cleanup must do nothing and never panic.
+        let env_id = EnvId::try_from("zain-prod").unwrap();
+        K8sDeployerCredentials::default().rollback_bound_material(&env_id);
     }
 
     #[test]
