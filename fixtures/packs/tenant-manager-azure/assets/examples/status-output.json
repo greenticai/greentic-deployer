@@ -1,0 +1,8 @@
+{
+  "kind": "status",
+  "capability": "status",
+  "provider": "azure",
+  "strategy": "terraform",
+  "pack_id": "greentic.deploy.tenant-manager-azure",
+  "flow_id": "status_terraform"
+}
