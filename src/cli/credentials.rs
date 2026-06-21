@@ -231,7 +231,16 @@ pub fn bootstrap(
             &secret_sink,
         ) {
             Ok(d) => d,
-            Err(e) => return Err(map_bootstrap_err(e)),
+            Err(e) => {
+                // Compensating cleanup on the bootstrap error path: undo any
+                // durable bound material written before a later step failed
+                // (idempotent; no-op for non-bind deployers). See
+                // `DeployerCredentials::rollback_bound_material`.
+                if let Some(creds) = bind_creds.as_deref() {
+                    creds.rollback_bound_material(&env_id);
+                }
+                return Err(map_bootstrap_err(e));
+            }
         };
         committed.mark_committed();
 
@@ -449,8 +458,10 @@ fn connected_k8s_credentials(
     // Resolve the env's bound deployer credential to a ServiceAccount bearer so
     // the probe authenticates as the deployer's identity, not the ambient
     // admin. `None` → ambient (no bound credential); fail-closed if a ref is
-    // bound but unresolvable.
-    let bound_token = crate::cli::secrets::resolve_credentials_token(store, &env, env_id)?;
+    // bound but unresolvable. Beyond env-var / dev-store, the resolver reads
+    // the durable in-cluster identity Secret (ambient) as a last resort.
+    let bound_token =
+        crate::env_packs::k8s::resolve_bound_identity(store, &env, env_id, answers.as_ref())?;
     // Defer the connect into the probe runtime instead of connecting here: a
     // kube::Client's tower Buffer worker is bound to the runtime that spawned
     // it, and `run_k8s_async` drops its runtime after each call, so a client

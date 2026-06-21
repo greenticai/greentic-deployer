@@ -45,6 +45,21 @@ pub(crate) const K8S_RBAC_MANIFEST_FILENAME: &str = "k8s-min-rbac.yaml";
 /// `secret://<env>/{this}` so the documented binding matches what resolves.
 pub(crate) const DEPLOYER_TOKEN_STORE_PATH: &str = "default/_/k8s-deployer/deployer_token";
 
+/// Name of the in-cluster `core/v1 Secret` the `--bind` path writes the
+/// minted ServiceAccount bearer into, in the deployer namespace. This is the
+/// durable, portable home for the bound identity: the local dev-store is a
+/// per-machine cache, whereas a different operator machine with ambient
+/// cluster read access resolves the bearer from this Secret. The write goes
+/// through the same guarded `KubeCluster::apply` as the RBAC objects, so it
+/// carries the env-ownership label and a re-bind converges in place.
+pub(crate) const DEPLOYER_IDENTITY_SECRET_NAME: &str = "greentic-deployer-identity";
+
+/// `data` key under [`DEPLOYER_IDENTITY_SECRET_NAME`] holding the bearer. Only
+/// the `k8s-client` kube layer reads/writes it (the `--bind` Secret round-trip);
+/// gated to avoid a dead-code warning in feature-less builds.
+#[cfg(feature = "k8s-client")]
+pub(crate) const DEPLOYER_IDENTITY_BEARER_KEY: &str = "bearer";
+
 /// Input shape for [`render_min_rbac_rules_pack`]. Borrowed; no heap cost.
 pub struct K8sRulesPackInput<'a> {
     /// Env this pack is scoped to (names + labels).

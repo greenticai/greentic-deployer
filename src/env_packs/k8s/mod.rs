@@ -70,6 +70,7 @@
 
 pub(crate) mod async_bridge;
 pub mod bootstrap;
+pub mod bound_identity;
 pub mod cluster;
 pub mod credentials;
 pub mod deployer;
@@ -86,6 +87,7 @@ use semver::VersionReq;
 use super::slot::EnvPackHandler;
 use crate::tool_check::ToolCheck;
 
+pub use bound_identity::resolve_bound_identity;
 pub use cluster::{K8sCluster, K8sClusterError, ObjectRef, RolloutStatus, UnconfiguredCluster};
 pub use credentials::{K8sDeployerCredentials, K8sValidatorClient};
 pub use deployer::ReconcileReport;

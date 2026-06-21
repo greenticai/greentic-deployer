@@ -84,4 +84,20 @@ pub trait DeployerCredentials: std::fmt::Debug + Send + Sync {
     /// actually consumed) and would leave a sentinel `credentials_ref`
     /// pointing at nothing.
     fn bootstrap(&self, input: &BootstrapInput<'_>) -> Result<BootstrapOutcome, BootstrapError>;
+
+    /// Best-effort compensating cleanup for a bootstrap that wrote durable
+    /// credential material to a REMOTE backend (e.g. the K8s `--bind` path
+    /// writes the minted bearer into an in-cluster Secret) but then failed a
+    /// later persistence step. Without this a failed bootstrap could leave a
+    /// live bearer in the backend while the env stays unbound. The CLI calls it
+    /// on the bootstrap error path; the delete is idempotent (a never-written
+    /// Secret 404s harmlessly), so an unconditional call is safe.
+    ///
+    /// Default is a no-op — deployers that bind no remote material (the
+    /// local-process / render-only paths) have nothing to undo. Implementations
+    /// MUST NOT panic; cleanup failures are swallowed (the caller already has a
+    /// bootstrap error to report). It does NOT cover a hard process crash
+    /// between the remote write and the local commit — short-lived bound tokens
+    /// + rotation are the systemic mitigation for that residual window.
+    fn rollback_bound_material(&self, _env_id: &greentic_deploy_spec::EnvId) {}
 }
