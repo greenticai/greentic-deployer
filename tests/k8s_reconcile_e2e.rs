@@ -105,6 +105,21 @@ const OCI_REGISTRY_PORT: u16 = 5000;
 const OCI_BUNDLE_REPO: &str = "bundles/e2e";
 const OCI_BUNDLE_TAG: &str = "latest";
 
+/// Namespace the M4 external-ingress client runs in — deliberately SEPARATE from
+/// the env's `gtc-local`. The env pack's `gtc-default-deny` denies EGRESS for
+/// every pod in `gtc-local`, so a client there could not reach the router; a pod
+/// in this sibling namespace has unrestricted egress, and the router's
+/// `gtc-allow-router` ingress admits TCP `8080` from ANY peer, so the
+/// cross-namespace hop is allowed. This also models the real topology: the
+/// Gateway/Ingress that fronts the env lives OUTSIDE its namespace.
+const CLIENT_NS: &str = "gtc-ext-ingress";
+/// The external-ingress client Job's name.
+const INGRESS_CLIENT_JOB: &str = "gtc-ingress-client";
+/// Markers the client prints so the host can read the outcome off the Job log
+/// (busybox `wget` cannot surface the numeric HTTP code on an error).
+const INGRESS_OK_MARKER: &str = "GTC_M4_HTTP_2XX";
+const INGRESS_FAIL_MARKER: &str = "GTC_M4_HTTP_UNREACHABLE";
+
 fn deployer_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_greentic-deployer"))
 }
@@ -1696,6 +1711,242 @@ fn worker_executes_a_real_flow_over_workers_invoke() {
     );
 
     // Cleanup (deletes the bundle server + its ConfigMap with the namespace).
+    let _ = kubectl(&[
+        "delete",
+        "namespace",
+        NAMESPACE,
+        "--ignore-not-found",
+        "--wait=false",
+    ]);
+}
+
+/// Issue a genuinely EXTERNAL (non-loopback) request to the env's router and
+/// return `(http_2xx, response_body)`.
+///
+/// Unlike [`worker_invoke`] — a host-side `kubectl port-forward` that tunnels
+/// through the kubelet, so the pod sees `127.0.0.1` and the loopback-trusted
+/// `/workers/invoke` path admits it — this runs an in-cluster client pod in a
+/// SEPARATE namespace that POSTs to the router's ClusterIP Service. The router
+/// therefore sees a real non-loopback peer and must resolve the request by
+/// `(host, path)` through its `DeploymentRouteTable` (the production front-door
+/// path), then run the flow synchronously and return its reply activities.
+///
+/// The client lives outside `gtc-local` on purpose: the env pack's
+/// `gtc-default-deny` denies egress for every pod IN `gtc-local`, whereas a
+/// sibling-namespace pod has unrestricted egress and the router's
+/// `gtc-allow-router` ingress admits TCP `8080` from any peer. That hop is
+/// same-node pod→pod, which some kind CNIs drop (exactly like the serving boot's
+/// own bundle pull), so this — like every serving E2E here — is exercised in CI.
+///
+/// busybox `wget` (already pulled for the bundle server) keeps a new client image
+/// out of the suite: a 2xx writes the body and exits 0, and the in-container
+/// retry loop rides out the brief gap between the router reporting Ready and its
+/// Service endpoints being programmed. busybox `wget` can't print the numeric
+/// code on an error, so the outcome is reported coarsely (2xx vs not) via a log
+/// marker; a non-2xx falls through to the caller's diagnostics dump.
+fn external_ingress_request(path: &str, body: &Value) -> (bool, String) {
+    let url =
+        format!("http://{ROUTER_DEPLOY}.{NAMESPACE}.svc.cluster.local:{BUNDLE_SERVER_PORT}{path}");
+    let body_json = serde_json::to_string(body).expect("serialize ingress body");
+
+    // Fresh client namespace + Job (idempotent across reruns under -test-threads=1).
+    let _ = kubectl(&["create", "namespace", CLIENT_NS]);
+    let _ = kubectl(&[
+        "delete",
+        "job",
+        INGRESS_CLIENT_JOB,
+        "-n",
+        CLIENT_NS,
+        "--ignore-not-found",
+    ]);
+
+    // No Job-level retry (`backoffLimit: 0`): the in-container loop IS the retry,
+    // so a single pod's log carries the whole outcome and the host wait can't
+    // race two pods.
+    let manifest = format!(
+        "apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {INGRESS_CLIENT_JOB}
+  namespace: {CLIENT_NS}
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: client
+          image: busybox:1.36
+          command: [\"/bin/sh\", \"-c\"]
+          args:
+            - |
+              i=0
+              while [ $i -lt 40 ]; do
+                if wget -q -T 20 -O /tmp/resp --header='Content-Type: application/json' --post-data='{body_json}' '{url}'; then
+                  echo '{INGRESS_OK_MARKER}'
+                  cat /tmp/resp
+                  exit 0
+                fi
+                i=$((i + 1))
+                sleep 2
+              done
+              echo '{INGRESS_FAIL_MARKER}'
+              exit 1
+"
+    );
+    kubectl_apply_stdin(&manifest);
+
+    // Wait for the Job to finish (complete OR backoff-exhausted); read the log
+    // either way — the client prints a status marker on both paths.
+    let _ = kubectl(&[
+        "wait",
+        "--for=condition=complete",
+        &format!("job/{INGRESS_CLIENT_JOB}"),
+        "-n",
+        CLIENT_NS,
+        "--timeout=150s",
+    ]);
+    let logs = kubectl(&[
+        "logs",
+        &format!("job/{INGRESS_CLIENT_JOB}"),
+        "-n",
+        CLIENT_NS,
+        "--tail=-1",
+    ]);
+    let out = String::from_utf8_lossy(&logs.stdout).to_string();
+    let ok = out.contains(INGRESS_OK_MARKER);
+    let body = out
+        .split_once(INGRESS_OK_MARKER)
+        .map(|(_, rest)| rest.trim().to_string())
+        .unwrap_or_else(|| format!("(no 2xx from router via {url}; client log: {})", out.trim()));
+    (ok, body)
+}
+
+/// M4: a genuinely EXTERNAL request reaches a real component THROUGH THE ROUTER.
+///
+/// M3 proved flow execution over the loopback-only `/workers/invoke` (a
+/// kubelet-tunnelled port-forward → the pod sees `127.0.0.1`). M4 proves the
+/// production FRONT DOOR: an in-cluster client in a separate namespace POSTs to
+/// the router's Service on the deployment's route-bound path (`/e2e`), and the
+/// router resolves `(host, path) → deployment → revision` through its
+/// `DeploymentRouteTable`, runs the SAME templates flow, and returns its reply
+/// activities synchronously — a different handler and a different resolution than
+/// the loopback worker-id path, on the router pod (the operational ingress
+/// target), not a worker pod reached over loopback.
+///
+/// Reuses the M2/M3 pull-over-HTTP boot (bundle server → 100%-routed pullable
+/// revision → reconcile → worker Ready + real-revision banner). The router pulls
+/// and activates the SAME revision over `http://`, and boot is fail-closed, so its
+/// rollout reaching Ready means it can serve the route; the external POST then
+/// asserts the templates component's echo in the response body — the proof the
+/// route table resolved the deployment and ran the flow over the external path.
+///
+/// Gated on `GREENTIC_K8S_SERVING_IMAGE` (the `:develop` image carrying the
+/// boot-pull + the #466 flow-resolution fix) on top of `GREENTIC_K8S_E2E`. The
+/// external hop is same-node pod→pod, which some kind CNIs drop (like the boot
+/// pull itself), so this is exercised in the CI `k8s-e2e` job and self-skips
+/// otherwise, exactly like the other serving tests.
+#[test]
+fn router_serves_an_external_request_to_a_real_component() {
+    if !armed() {
+        return;
+    }
+    let Some(image) = serving_image() else {
+        return;
+    };
+    reset_namespace();
+    let store = tempfile::tempdir().expect("tempdir");
+    let store = store.path();
+
+    let worker = boot_worker_serving_bundle(store, &image, &templates_fixture_bundle());
+
+    // The router is the external ingress target; the HTTP-path boot waits only on
+    // the worker, so wait for the router rollout here. It pulls + activates the
+    // SAME routed revision over `http://`, and boot is fail-closed, so a Ready
+    // router proves it can serve the route.
+    let router_status = kubectl(&[
+        "rollout",
+        "status",
+        &format!("deployment/{ROUTER_DEPLOY}"),
+        "-n",
+        NAMESPACE,
+        "--timeout=180s",
+    ]);
+    if !router_status.status.success() {
+        let router_logs = kubectl(&[
+            "logs",
+            &format!("deployment/{ROUTER_DEPLOY}"),
+            "-n",
+            NAMESPACE,
+            "--all-containers",
+            "--tail=150",
+        ]);
+        panic!(
+            "router must reach Ready to serve the external route:\n\
+             stdout: {}\nstderr: {}\n\n=== router logs ===\n{}{}",
+            String::from_utf8_lossy(&router_status.stdout),
+            String::from_utf8_lossy(&router_status.stderr),
+            String::from_utf8_lossy(&router_logs.stdout),
+            String::from_utf8_lossy(&router_logs.stderr),
+        );
+    }
+
+    // The external request: a sibling-namespace client POSTs the deployment's
+    // route-bound path on the router Service. A 2xx means the route table
+    // resolved `(host, path) → deployment → revision` and the flow ran; the body
+    // carries the templates component's echo.
+    let (ok, body) = external_ingress_request("/e2e", &serde_json::json!({"text": "m4"}));
+    if !ok {
+        // A non-2xx (or unreachable router) is opaque from busybox `wget`; dump
+        // the router's own logs plus the standard worker/server diagnostics so CI
+        // shows whether the request reached the router and how it failed.
+        let router_logs = kubectl(&[
+            "logs",
+            &format!("deployment/{ROUTER_DEPLOY}"),
+            "-n",
+            NAMESPACE,
+            "--all-containers",
+            "--tail=150",
+        ]);
+        let diag = worker_failure_diagnostics(&worker);
+        panic!(
+            "external POST /e2e via the router must return 2xx; {body}\n\n\
+             === router logs ===\n{}{}\n=== diagnostics ==={diag}",
+            String::from_utf8_lossy(&router_logs.stdout),
+            String::from_utf8_lossy(&router_logs.stderr),
+        );
+    }
+    assert!(
+        body.contains("component-templates::handle_message =>"),
+        "the router-routed flow must execute and return the templates component's \
+         echo; body: {body}"
+    );
+    // Prove the flow GRAPH ran (not just that the component is reachable): the
+    // render node feeds the component a literal input ("M3 hello from templates"),
+    // echoed back as a byte sequence whose prefix `34,77,51,32,104,101,108,108,111`
+    // is `"M3 hello`. The router serializes the raw reply activities
+    // (`serde_json::to_vec(&replies)`), the same payload `/workers/invoke` carries
+    // in M3, so the same byte prefix appears — here proving `(host, path)`
+    // route-table resolution drove the flow, not the loopback worker-id path.
+    assert!(
+        body.contains("34,77,51,32,104,101,108,108,111"),
+        "the flow's render-node input (bytes of \"M3 hello...\") must appear in the \
+         router's response, proving route-table-driven graph execution rather than \
+         only component reachability; body: {body}"
+    );
+    assert!(
+        !body.contains("not found in pack"),
+        "router-routed flow execution must not fail with a component-resolution error; body: {body}"
+    );
+
+    // Cleanup: drop the external-client namespace and the env namespace.
+    let _ = kubectl(&[
+        "delete",
+        "namespace",
+        CLIENT_NS,
+        "--ignore-not-found",
+        "--wait=false",
+    ]);
     let _ = kubectl(&[
         "delete",
         "namespace",
