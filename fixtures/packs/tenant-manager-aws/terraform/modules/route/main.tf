@@ -62,12 +62,14 @@ resource "aws_lb_listener" "https" {
 }
 
 data "aws_route53_zone" "this" {
+  count        = var.create_dns_record ? 1 : 0
   name         = "${join(".", slice(split(".", var.domain_name), 1, length(split(".", var.domain_name))))}."
   private_zone = false
 }
 
 resource "aws_route53_record" "this" {
-  zone_id = data.aws_route53_zone.this.zone_id
+  count   = var.create_dns_record ? 1 : 0
+  zone_id = data.aws_route53_zone.this[0].zone_id
   name    = var.domain_name
   type    = "A"
 

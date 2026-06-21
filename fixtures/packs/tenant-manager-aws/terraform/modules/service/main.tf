@@ -6,8 +6,6 @@ terraform {
   }
 }
 
-data "aws_region" "current" {}
-
 resource "aws_ecs_cluster" "this" {
   name = var.name
 }
@@ -120,7 +118,7 @@ resource "aws_ecs_task_definition" "this" {
         logDriver = "awslogs"
         options = {
           "awslogs-group"         = "/ecs/${var.name}"
-          "awslogs-region"        = data.aws_region.current.name
+          "awslogs-region"        = var.aws_region
           "awslogs-stream-prefix" = "tm"
         }
       }

@@ -28,3 +28,13 @@ variable "vpc_id" { type = string }
 variable "subnet_ids" { type = list(string) }
 variable "master_key_secret_arn" { type = string }
 variable "platform_secret_hash_arn" { type = string }
+
+variable "offline_plan" {
+  type    = bool
+  default = false
+}
+
+variable "create_dns_record" {
+  type    = bool
+  default = true
+}
