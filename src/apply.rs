@@ -1960,7 +1960,7 @@ fn persist_runtime_artifacts(
     let invoke_file = fs::File::create(&invoke_path)?;
     serde_json::to_writer_pretty(invoke_file, &invocation)?;
 
-    materialize_adapter_handoff_assets(config, selection, deploy_dir)?;
+    materialize_adapter_handoff_assets(config, plan, selection, deploy_dir)?;
     let handoff = write_runner_diagnostics(config, deploy_dir, selection, &plan_path)?;
 
     Ok(RuntimeArtifacts {
@@ -1975,11 +1975,12 @@ fn persist_runtime_artifacts(
 
 fn materialize_adapter_handoff_assets(
     config: &DeployerConfig,
+    plan: &PlanContext,
     selection: &DeploymentPackSelection,
     deploy_dir: &Path,
 ) -> Result<()> {
     if uses_terraform_handoff(config) {
-        materialize_terraform_handoff_assets(config, selection, deploy_dir)?;
+        materialize_terraform_handoff_assets(config, plan, selection, deploy_dir)?;
     } else if config.provider == crate::config::Provider::K8s && config.strategy == "raw-manifests"
     {
         materialize_k8s_raw_handoff_assets(config, selection, deploy_dir)?;
@@ -2003,6 +2004,7 @@ fn materialize_adapter_handoff_assets(
 
 fn materialize_terraform_handoff_assets(
     config: &DeployerConfig,
+    plan: &PlanContext,
     selection: &DeploymentPackSelection,
     deploy_dir: &Path,
 ) -> Result<()> {
@@ -2020,15 +2022,15 @@ fn materialize_terraform_handoff_assets(
     // standard `operator` module. A self-contained service pack ships its own
     // complete terraform (its own `main.tf` plus bespoke modules) and has no
     // `operator` module, so rewriting would both clobber the pack's terraform
-    // and fail writing into a non-existent module directory. When there is no
-    // app bundle (`pack_path` is `None`), treat the pack's terraform as
-    // authoritative and only apply the generic backend rewrite.
-    if config.pack_path.is_some() {
+    // and fail writing into a non-existent module directory. Serviceless plans
+    // (no app bundle) treat the pack's terraform as authoritative and skip the
+    // operator rewrite; only the generic backend rewrite applies.
+    if !plan.serviceless {
         prune_generated_terraform_root(config, &terraform_root)?;
-    }
-    configure_terraform_backend(config, &terraform_root, deploy_dir)?;
-    if config.pack_path.is_some() {
+        configure_terraform_backend(config, &terraform_root, deploy_dir)?;
         normalize_terraform_main_tf(config, &terraform_root)?;
+    } else {
+        configure_terraform_backend(config, &terraform_root, deploy_dir)?;
     }
 
     let tfvars_example = resolve_tfvars_example_name(&terraform_root, &config.environment)?;

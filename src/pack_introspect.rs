@@ -91,7 +91,9 @@ fn build_serviceless_plan(config: &DeployerConfig) -> PlanContext {
         extra: JsonValue::Null,
     };
 
-    assemble_plan(plan, config, deployment, Vec::new(), Vec::new())
+    let mut ctx = assemble_plan(plan, config, deployment, Vec::new(), Vec::new());
+    ctx.serviceless = true;
+    ctx
 }
 
 /// Build a plan using an explicitly provided pack source (e.g., registry).
