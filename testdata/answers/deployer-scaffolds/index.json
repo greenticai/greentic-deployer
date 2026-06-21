@@ -11,6 +11,8 @@
     "examples/answers/deployer-scaffolds/serverless.json",
     "examples/answers/deployer-scaffolds/snap.json",
     "examples/answers/deployer-scaffolds/tenant-manager-aws.json",
+    "examples/answers/deployer-scaffolds/tenant-manager-azure.json",
+    "examples/answers/deployer-scaffolds/tenant-manager-gcp.json",
     "examples/answers/deployer-scaffolds/terraform.json"
   ]
 }

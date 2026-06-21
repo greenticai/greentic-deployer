@@ -2015,9 +2015,21 @@ fn materialize_terraform_handoff_assets(
     if local_terraform.exists() {
         set_executable_if_unix(&local_terraform)?;
     }
-    prune_generated_terraform_root(config, &terraform_root)?;
+    // The operator-module rewriting (`prune_generated_terraform_root` /
+    // `normalize_terraform_main_tf`) wires a Greentic app bundle into the
+    // standard `operator` module. A self-contained service pack ships its own
+    // complete terraform (its own `main.tf` plus bespoke modules) and has no
+    // `operator` module, so rewriting would both clobber the pack's terraform
+    // and fail writing into a non-existent module directory. When there is no
+    // app bundle (`pack_path` is `None`), treat the pack's terraform as
+    // authoritative and only apply the generic backend rewrite.
+    if config.pack_path.is_some() {
+        prune_generated_terraform_root(config, &terraform_root)?;
+    }
     configure_terraform_backend(config, &terraform_root, deploy_dir)?;
-    normalize_terraform_main_tf(config, &terraform_root)?;
+    if config.pack_path.is_some() {
+        normalize_terraform_main_tf(config, &terraform_root)?;
+    }
 
     let tfvars_example = resolve_tfvars_example_name(&terraform_root, &config.environment)?;
     let generated_tfvars = materialize_generated_tfvars(config, &terraform_root, &tfvars_example)?;
@@ -4150,7 +4162,7 @@ mod tests {
             strategy: "iac-only".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: pack_path.clone(),
+            pack_path: Some(pack_path.clone()),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -4803,7 +4815,7 @@ kind: Deployment
             strategy: "terraform".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: pack_path.clone(),
+            pack_path: Some(pack_path.clone()),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -4874,7 +4886,7 @@ kind: Deployment
             strategy: "terraform".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: pack_path.clone(),
+            pack_path: Some(pack_path.clone()),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -4960,7 +4972,7 @@ kind: Deployment
             strategy: "terraform".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: pack_path.clone(),
+            pack_path: Some(pack_path.clone()),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -5310,7 +5322,7 @@ data "aws_region" "current" {}
             strategy: "iac-only".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: pack_path.clone(),
+            pack_path: Some(pack_path.clone()),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -5421,7 +5433,7 @@ data "aws_region" "current" {}
             strategy: "iac-only".into(),
             tenant: "acme".into(),
             environment: "dev".into(),
-            pack_path: pack_path.clone(),
+            pack_path: Some(pack_path.clone()),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -5534,7 +5546,7 @@ data "aws_region" "current" {}
             strategy: "iac-only".into(),
             tenant: "acme".into(),
             environment: "dev".into(),
-            pack_path: dir.path().join("bundle"),
+            pack_path: Some(dir.path().join("bundle")),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -5793,7 +5805,7 @@ data "aws_region" "current" {}
             strategy: "raw-manifests".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: pack_path.clone(),
+            pack_path: Some(pack_path.clone()),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -5886,7 +5898,7 @@ data "aws_region" "current" {}
             strategy: "helm".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: pack_path.clone(),
+            pack_path: Some(pack_path.clone()),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),

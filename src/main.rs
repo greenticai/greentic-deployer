@@ -484,7 +484,7 @@ struct MultiTargetArgs {
         visible_alias = "pack",
         help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
     )]
-    pack: std::path::PathBuf,
+    pack: Option<std::path::PathBuf>,
     #[arg(long)]
     environment: Option<String>,
     #[arg(long)]
@@ -524,7 +524,7 @@ struct TerraformArgs {
         visible_alias = "pack",
         help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
     )]
-    pack: std::path::PathBuf,
+    pack: Option<std::path::PathBuf>,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
     #[arg(long)]
@@ -566,7 +566,7 @@ struct K8sRawArgs {
         visible_alias = "pack",
         help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
     )]
-    pack: std::path::PathBuf,
+    pack: Option<std::path::PathBuf>,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
     #[arg(long)]
@@ -606,7 +606,7 @@ struct HelmArgs {
         visible_alias = "pack",
         help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
     )]
-    pack: std::path::PathBuf,
+    pack: Option<std::path::PathBuf>,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
     #[arg(long)]
@@ -646,7 +646,7 @@ struct AwsArgs {
         visible_alias = "pack",
         help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
     )]
-    pack: std::path::PathBuf,
+    pack: Option<std::path::PathBuf>,
     #[arg(long)]
     bundle_root: Option<std::path::PathBuf>,
     #[arg(long)]
@@ -716,7 +716,7 @@ struct AzureArgs {
         visible_alias = "pack",
         help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
     )]
-    pack: std::path::PathBuf,
+    pack: Option<std::path::PathBuf>,
     #[arg(long)]
     bundle_root: Option<std::path::PathBuf>,
     #[arg(long)]
@@ -768,7 +768,7 @@ struct GcpArgs {
         visible_alias = "pack",
         help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
     )]
-    pack: std::path::PathBuf,
+    pack: Option<std::path::PathBuf>,
     #[arg(long)]
     bundle_root: Option<std::path::PathBuf>,
     #[arg(long)]
@@ -820,7 +820,7 @@ struct JujuK8sArgs {
         visible_alias = "pack",
         help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
     )]
-    pack: std::path::PathBuf,
+    pack: Option<std::path::PathBuf>,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
     #[arg(long)]
@@ -862,7 +862,7 @@ struct JujuMachineArgs {
         visible_alias = "pack",
         help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
     )]
-    pack: std::path::PathBuf,
+    pack: Option<std::path::PathBuf>,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
     #[arg(long)]
@@ -904,7 +904,7 @@ struct OperatorArgs {
         visible_alias = "pack",
         help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
     )]
-    pack: std::path::PathBuf,
+    pack: Option<std::path::PathBuf>,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
     #[arg(long)]
@@ -946,7 +946,7 @@ struct ServerlessArgs {
         visible_alias = "pack",
         help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
     )]
-    pack: std::path::PathBuf,
+    pack: Option<std::path::PathBuf>,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
     #[arg(long)]
@@ -988,7 +988,7 @@ struct SnapArgs {
         visible_alias = "pack",
         help = "Path to the canonical app pack selected from the bundle for deployment dispatch"
     )]
-    pack: std::path::PathBuf,
+    pack: Option<std::path::PathBuf>,
     #[arg(long)]
     provider_pack: Option<std::path::PathBuf>,
     #[arg(long)]
@@ -1064,7 +1064,7 @@ impl From<CliProvider> for Provider {
 #[derive(Clone)]
 struct CommonRequestData {
     tenant: String,
-    pack_path: PathBuf,
+    pack_path: Option<PathBuf>,
     provider_pack: Option<PathBuf>,
     deploy_pack_id_override: Option<String>,
     deploy_flow_id_override: Option<String>,
@@ -1099,7 +1099,7 @@ struct CloudRequestData {
 
 trait HasCommonRequestArgs {
     fn tenant(&self) -> &str;
-    fn pack(&self) -> &PathBuf;
+    fn pack(&self) -> Option<PathBuf>;
     fn provider_pack(&self) -> Option<PathBuf>;
     fn deploy_pack_id(&self) -> Option<String>;
     fn deploy_flow_id(&self) -> Option<String>;
@@ -1133,7 +1133,7 @@ macro_rules! impl_common_request_args {
         $(
             impl HasCommonRequestArgs for $ty {
                 fn tenant(&self) -> &str { &self.tenant }
-                fn pack(&self) -> &PathBuf { &self.pack }
+                fn pack(&self) -> Option<PathBuf> { self.pack.clone() }
                 fn provider_pack(&self) -> Option<PathBuf> { self.provider_pack.clone() }
                 fn deploy_pack_id(&self) -> Option<String> { self.deploy_pack_id.clone() }
                 fn deploy_flow_id(&self) -> Option<String> { self.deploy_flow_id.clone() }
@@ -1209,7 +1209,7 @@ impl_cloud_request_args!(AwsArgs, AzureArgs, GcpArgs,);
 fn common_request_data(args: &impl HasCommonRequestArgs) -> CommonRequestData {
     CommonRequestData {
         tenant: args.tenant().to_string(),
-        pack_path: args.pack().clone(),
+        pack_path: args.pack(),
         provider_pack: args.provider_pack(),
         deploy_pack_id_override: args.deploy_pack_id(),
         deploy_flow_id_override: args.deploy_flow_id(),

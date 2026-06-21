@@ -1,0 +1,15 @@
+{
+  "kind": "apply",
+  "deployment_id": "greentic-staging",
+  "state": "applied",
+  "provider": "azure",
+  "strategy": "iac-only",
+  "endpoints": [
+    "https://id.example.com"
+  ],
+  "output_refs": {
+    "cloud_provider": "azure",
+    "service_url": "https://id.example.com",
+    "db_fqdn": "greentic-tm-prod-postgres.postgres.database.azure.com"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "kind": "plan",
+  "capability": "plan",
+  "provider": "gcp",
+  "strategy": "terraform",
+  "terraform_init_command": "terraform init -backend-config=backend.hcl",
+  "terraform_plan_command": "terraform plan -var-file=staging.tfvars.example",
+  "expected_variables": [
+    "image_uri",
+    "gcp_project_id",
+    "gcp_region",
+    "domain_name",
+    "master_key_secret_id",
+    "platform_secret_hash_secret_id"
+  ]
+}
