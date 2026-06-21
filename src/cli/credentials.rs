@@ -232,12 +232,10 @@ pub fn bootstrap(
         ) {
             Ok(d) => d,
             Err(e) => {
-                // Best-effort compensating cleanup: a `--bind` bootstrap may
-                // have already written the durable in-cluster identity Secret
-                // before a later persistence step failed. Delete it so a FAILED
-                // bootstrap never leaves a live bearer in the cluster while the
-                // env stays unbound. Idempotent + a no-op for non-bind/non-K8s
-                // deployers (default trait impl).
+                // Compensating cleanup on the bootstrap error path: undo any
+                // durable bound material written before a later step failed
+                // (idempotent; no-op for non-bind deployers). See
+                // `DeployerCredentials::rollback_bound_material`.
                 if let Some(creds) = bind_creds.as_deref() {
                     creds.rollback_bound_material(&env_id);
                 }
