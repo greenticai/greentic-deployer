@@ -694,7 +694,7 @@ mod tests {
             strategy: "iac-only".to_string(),
             tenant: "demo".to_string(),
             environment: Some("dev".to_string()),
-            pack_path: dir.path().to_path_buf(),
+            pack_path: Some(dir.path().to_path_buf()),
             bundle_root: None,
             bundle_source: None,
             bundle_digest: None,

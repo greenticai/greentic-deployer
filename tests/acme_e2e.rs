@@ -179,7 +179,7 @@ fn default_config(pack_path: PathBuf) -> DeployerConfig {
         strategy: "iac-only".into(),
         tenant: "acme".into(),
         environment: "dev".into(),
-        pack_path,
+        pack_path: Some(pack_path),
         bundle_root: None,
         providers_dir: PathBuf::from("providers/deployer"),
         packs_dir: PathBuf::from("packs"),

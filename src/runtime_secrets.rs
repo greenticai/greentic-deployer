@@ -135,15 +135,16 @@ struct CloudSecretInputs {
 }
 
 fn collect_cloud_secret_inputs(config: &DeployerConfig) -> Result<Option<CloudSecretInputs>> {
-    let Some(bundle_root) = config
-        .bundle_root
-        .clone()
-        .or_else(|| infer_bundle_root_from_pack_path(&config.pack_path))
-    else {
+    let Some(bundle_root) = config.bundle_root.clone().or_else(|| {
+        config
+            .pack_path
+            .as_deref()
+            .and_then(infer_bundle_root_from_pack_path)
+    }) else {
         return Ok(None);
     };
 
-    let mut pack_paths = vec![config.pack_path.clone()];
+    let mut pack_paths: Vec<PathBuf> = config.pack_path.clone().into_iter().collect();
     if let Some(provider_pack) = config.provider_pack.as_ref() {
         pack_paths.push(provider_pack.clone());
     }
@@ -1431,7 +1432,7 @@ questions:
             strategy: "iac-only".into(),
             tenant: "demo".into(),
             environment: "dev".into(),
-            pack_path,
+            pack_path: Some(pack_path),
             bundle_root: Some(bundle_root.to_path_buf()),
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
