@@ -26,7 +26,6 @@ module "service" {
 
 module "route" {
   source            = "./modules/route"
-  name              = local.name
   gcp_project       = var.gcp_project_id
   gcp_region        = var.gcp_region
   domain_name       = var.domain_name

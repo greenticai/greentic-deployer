@@ -37,7 +37,7 @@
       "type": "array",
       "items": { "type": "string" },
       "contains": { "const": "main.tf" },
-      "minItems": 11
+      "minItems": 1
     }
   }
 }

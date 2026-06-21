@@ -6,6 +6,7 @@ terraform {
   }
 }
 
+# offline_plan is AWS-only — google and azurerm providers have no equivalent credential-skip flags.
 provider "aws" {
   region                      = var.aws_region
   skip_credentials_validation = var.offline_plan
