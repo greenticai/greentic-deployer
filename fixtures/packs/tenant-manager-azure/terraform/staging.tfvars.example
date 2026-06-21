@@ -8,4 +8,3 @@ key_vault_id                   = "/subscriptions/00000000-0000-0000-0000-0000000
 master_key_secret_id           = "https://greentic-kv.vault.azure.net/secrets/tm-master-key"
 platform_secret_hash_secret_id = "https://greentic-kv.vault.azure.net/secrets/tm-platform-hash"
 create_dns_record              = false
-offline_plan                   = true

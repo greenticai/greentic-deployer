@@ -11,6 +11,7 @@
     "azure_resource_group",
     "azure_location",
     "domain_name",
+    "key_vault_id",
     "master_key_secret_id",
     "platform_secret_hash_secret_id"
   ]

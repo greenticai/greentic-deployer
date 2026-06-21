@@ -30,7 +30,6 @@ module "route" {
   name                = local.name
   resource_group_name = var.azure_resource_group
   domain_name         = var.domain_name
-  container_app_name  = module.service.app_name
   container_app_id    = module.service.app_id
   create_dns_record   = var.create_dns_record
 }

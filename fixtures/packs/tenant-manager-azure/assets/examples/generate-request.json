@@ -4,6 +4,7 @@
   "azure_location": "eastus",
   "image_uri": "greentic.azurecr.io/tenant-manager@sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "domain_name": "id.example.com",
+  "key_vault_id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/tm-kv",
   "db_sku_name": "B_Standard_B1ms",
   "master_key_secret_id": "https://greentic-kv.vault.azure.net/secrets/tm-master-key",
   "platform_secret_hash_secret_id": "https://greentic-kv.vault.azure.net/secrets/tm-platform-hash"
