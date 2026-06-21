@@ -1,0 +1,17 @@
+{
+  "kind": "apply",
+  "deployment_id": "greentic-staging",
+  "state": "applied",
+  "provider": "aws",
+  "strategy": "iac-only",
+  "endpoints": [
+    "https://operator.greentic.example.com"
+  ],
+  "output_refs": {
+    "admin_ca_secret_ref": "arn:aws:secretsmanager:eu-north-1:123456789012:secret:greentic/acme/staging/admin/ca",
+    "admin_server_cert_secret_ref": "arn:aws:secretsmanager:eu-north-1:123456789012:secret:greentic/acme/staging/admin/server-cert",
+    "admin_server_key_secret_ref": "arn:aws:secretsmanager:eu-north-1:123456789012:secret:greentic/acme/staging/admin/server-key",
+    "cloud_provider": "aws",
+    "operator_endpoint": "https://operator.greentic.example.com"
+  }
+}
