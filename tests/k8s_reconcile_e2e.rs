@@ -1741,9 +1741,12 @@ fn worker_executes_a_real_flow_over_workers_invoke() {
 /// busybox `wget` (already pulled for the bundle server) keeps a new client image
 /// out of the suite: a 2xx writes the body and exits 0, and the in-container
 /// retry loop rides out the brief gap between the router reporting Ready and its
-/// Service endpoints being programmed. busybox `wget` can't print the numeric
-/// code on an error, so the outcome is reported coarsely (2xx vs not) via a log
-/// marker; a non-2xx falls through to the caller's diagnostics dump.
+/// Service endpoints being programmed. That loop's budget is bounded to fit
+/// inside the host-side wait below, so a slow path can't make the host read the
+/// log mid-run and misread "still retrying" as a non-2xx. busybox `wget` can't
+/// print the numeric code on an error, so the outcome is reported coarsely (2xx
+/// vs not) via a log marker; on a non-2xx the returned body carries the client
+/// Job/pod/events for diagnosis.
 fn external_ingress_request(path: &str, body: &Value) -> (bool, String) {
     let url =
         format!("http://{ROUTER_DEPLOY}.{NAMESPACE}.svc.cluster.local:{BUNDLE_SERVER_PORT}{path}");
@@ -1781,8 +1784,8 @@ spec:
           args:
             - |
               i=0
-              while [ $i -lt 40 ]; do
-                if wget -q -T 20 -O /tmp/resp --header='Content-Type: application/json' --post-data='{body_json}' '{url}'; then
+              while [ $i -lt 15 ]; do
+                if wget -q -T 6 -O /tmp/resp --header='Content-Type: application/json' --post-data='{body_json}' '{url}'; then
                   echo '{INGRESS_OK_MARKER}'
                   cat /tmp/resp
                   exit 0
@@ -1796,16 +1799,23 @@ spec:
     );
     kubectl_apply_stdin(&manifest);
 
-    // Wait for the Job to finish (complete OR backoff-exhausted); read the log
-    // either way — the client prints a status marker on both paths.
-    let _ = kubectl(&[
+    // The host deadline (180s) EXCEEDS the in-container retry budget (15 attempts
+    // × (≤6s wget + 2s sleep) ≤ 120s) by design: when this wait returns — at the
+    // Job completing OR at the timeout — the client has already run its loop to a
+    // terminal marker (`*_2XX` on a 2xx, `*_UNREACHABLE` after exhausting retries),
+    // so the log read below sees a real outcome, never a mid-run snapshot. A
+    // non-`completed` result therefore means the Job FAILED (printed the failure
+    // marker), not that it is still running.
+    let completed = kubectl(&[
         "wait",
         "--for=condition=complete",
         &format!("job/{INGRESS_CLIENT_JOB}"),
         "-n",
         CLIENT_NS,
-        "--timeout=150s",
-    ]);
+        "--timeout=180s",
+    ])
+    .status
+    .success();
     let logs = kubectl(&[
         "logs",
         &format!("job/{INGRESS_CLIENT_JOB}"),
@@ -1815,10 +1825,31 @@ spec:
     ]);
     let out = String::from_utf8_lossy(&logs.stdout).to_string();
     let ok = out.contains(INGRESS_OK_MARKER);
-    let body = out
-        .split_once(INGRESS_OK_MARKER)
-        .map(|(_, rest)| rest.trim().to_string())
-        .unwrap_or_else(|| format!("(no 2xx from router via {url}; client log: {})", out.trim()));
+    let body = if ok {
+        out.split_once(INGRESS_OK_MARKER)
+            .map(|(_, rest)| rest.trim().to_string())
+            .unwrap_or_default()
+    } else {
+        // No 2xx: dump the client Job/pod/events alongside its log so a failure
+        // shows whether the client connected, image-pulled, or just exhausted its
+        // retries — not a bare missing marker.
+        let describe = kubectl(&[
+            "describe",
+            &format!("job/{INGRESS_CLIENT_JOB}"),
+            "-n",
+            CLIENT_NS,
+        ]);
+        let pods = kubectl(&["get", "pods", "-n", CLIENT_NS, "-o", "wide"]);
+        let events = kubectl(&["get", "events", "-n", CLIENT_NS, "--sort-by=.lastTimestamp"]);
+        format!(
+            "(no 2xx from router via {url}; job completed: {completed})\n\
+             --- client log ---\n{}\n--- client job ---\n{}\n--- client pods ---\n{}\n--- client events ---\n{}",
+            out.trim(),
+            String::from_utf8_lossy(&describe.stdout).trim(),
+            String::from_utf8_lossy(&pods.stdout).trim(),
+            String::from_utf8_lossy(&events.stdout).trim(),
+        )
+    };
     (ok, body)
 }
 
