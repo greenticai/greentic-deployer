@@ -14,18 +14,18 @@ resource "random_password" "db" {
   special = false
 }
 
-resource "google_secret_manager_secret" "db_password" {
+resource "google_secret_manager_secret" "db_url" {
   project   = var.gcp_project
-  secret_id = "${var.name}-db-password"
+  secret_id = "${var.name}-db-url"
 
   replication {
     auto {}
   }
 }
 
-resource "google_secret_manager_secret_version" "db_password" {
-  secret      = google_secret_manager_secret.db_password.id
-  secret_data = random_password.db.result
+resource "google_secret_manager_secret_version" "db_url" {
+  secret      = google_secret_manager_secret.db_url.id
+  secret_data = "postgres://${google_sql_user.this.name}:${random_password.db.result}@/${google_sql_database.this.name}?host=/cloudsql/${google_sql_database_instance.this.connection_name}"
 }
 
 resource "google_sql_database_instance" "this" {

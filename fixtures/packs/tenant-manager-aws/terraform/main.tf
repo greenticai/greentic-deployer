@@ -27,10 +27,7 @@ module "service" {
   vpc_id                   = var.vpc_id
   subnet_ids               = var.subnet_ids
   image_uri                = var.image_uri
-  db_endpoint              = module.rds.db_endpoint
-  db_name                  = module.rds.db_name
-  db_username              = module.rds.db_username
-  db_password_secret_arn   = module.rds.db_password_secret_arn
+  database_url_secret_arn  = module.rds.database_url_secret_arn
   master_key_secret_arn    = var.master_key_secret_arn
   platform_secret_hash_arn = var.platform_secret_hash_arn
   target_group_arn         = module.route.target_group_arn

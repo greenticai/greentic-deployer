@@ -24,15 +24,10 @@ resource "google_cloud_run_v2_service" "this" {
       }
 
       env {
-        name  = "TENANT_DATABASE_URL"
-        value = "postgres://${var.db_user}@/${var.db_name}?host=/cloudsql/${var.db_connection_name}"
-      }
-
-      env {
-        name = "TENANT_DATABASE_PASSWORD"
+        name = "TENANT_DATABASE_URL"
         value_source {
           secret_key_ref {
-            secret  = var.db_password_secret_id
+            secret  = var.database_url_secret_id
             version = "latest"
           }
         }

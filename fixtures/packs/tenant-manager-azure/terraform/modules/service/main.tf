@@ -23,8 +23,8 @@ resource "azurerm_container_app" "this" {
   }
 
   secret {
-    name                = "db-password"
-    key_vault_secret_id = var.db_password_secret_id
+    name                = "db-url"
+    key_vault_secret_id = var.database_url_secret_id
     identity            = "System"
   }
 
@@ -48,13 +48,8 @@ resource "azurerm_container_app" "this" {
       memory = "1Gi"
 
       env {
-        name  = "TENANT_DATABASE_URL"
-        value = "postgres://${var.db_user}@${var.db_fqdn}/${var.db_name}?sslmode=require"
-      }
-
-      env {
-        name        = "TENANT_DATABASE_PASSWORD"
-        secret_name = "db-password"
+        name        = "TENANT_DATABASE_URL"
+        secret_name = "db-url"
       }
 
       env {

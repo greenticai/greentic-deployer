@@ -14,21 +14,9 @@ variable "image_uri" {
   type = string
 }
 
-variable "db_fqdn" {
-  type = string
-}
-
-variable "db_name" {
-  type = string
-}
-
-variable "db_user" {
-  type = string
-}
-
-variable "db_password_secret_id" {
+variable "database_url_secret_id" {
   type        = string
-  description = "Azure Key Vault secret ID for the DB password"
+  description = "Azure Key Vault secret versionless ID for the full DB connection URL"
 }
 
 variable "master_key_secret_id" {

@@ -58,7 +58,7 @@ resource "aws_iam_role_policy" "secrets" {
         Effect   = "Allow"
         Action   = ["secretsmanager:GetSecretValue"]
         Resource = [
-          var.db_password_secret_arn,
+          var.database_url_secret_arn,
           var.master_key_secret_arn,
           var.platform_secret_hash_arn
         ]
@@ -70,10 +70,6 @@ resource "aws_iam_role_policy" "secrets" {
 resource "aws_cloudwatch_log_group" "this" {
   name              = "/ecs/${var.name}"
   retention_in_days = 14
-}
-
-locals {
-  db_host = replace(var.db_endpoint, ":5432", "")
 }
 
 resource "aws_ecs_task_definition" "this" {
@@ -94,16 +90,11 @@ resource "aws_ecs_task_definition" "this" {
           protocol      = "tcp"
         }
       ]
-      environment = [
-        {
-          name  = "TENANT_DATABASE_URL"
-          value = "postgres://${var.db_username}@${local.db_host}:5432/${var.db_name}"
-        }
-      ]
+      environment = []
       secrets = [
         {
-          name      = "TENANT_DATABASE_PASSWORD"
-          valueFrom = var.db_password_secret_arn
+          name      = "TENANT_DATABASE_URL"
+          valueFrom = var.database_url_secret_arn
         },
         {
           name      = "GREENTIC_TM_MASTER_KEY"

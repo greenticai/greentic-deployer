@@ -35,8 +35,8 @@ resource "azurerm_postgresql_flexible_server_database" "this" {
   charset   = "utf8"
 }
 
-resource "azurerm_key_vault_secret" "db_password" {
-  name         = "${var.name}-db-password"
-  value        = random_password.db.result
+resource "azurerm_key_vault_secret" "db_url" {
+  name         = "${var.name}-db-url"
+  value        = "postgres://${azurerm_postgresql_flexible_server.this.administrator_login}:${random_password.db.result}@${azurerm_postgresql_flexible_server.this.fqdn}:5432/${azurerm_postgresql_flexible_server_database.this.name}?sslmode=require"
   key_vault_id = var.key_vault_id
 }

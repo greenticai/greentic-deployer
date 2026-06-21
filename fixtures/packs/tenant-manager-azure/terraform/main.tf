@@ -17,10 +17,7 @@ module "service" {
   resource_group_name            = var.azure_resource_group
   location                       = var.azure_location
   image_uri                      = var.image_uri
-  db_fqdn                        = module.postgres.db_fqdn
-  db_name                        = module.postgres.db_name
-  db_user                        = module.postgres.db_user
-  db_password_secret_id          = module.postgres.db_password_secret_id
+  database_url_secret_id         = module.postgres.database_url_secret_id
   master_key_secret_id           = var.master_key_secret_id
   platform_secret_hash_secret_id = var.platform_secret_hash_secret_id
 }
