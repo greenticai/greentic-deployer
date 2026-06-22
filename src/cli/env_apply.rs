@@ -1302,16 +1302,27 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
             Some(b) => {
                 let kind_differs = b.kind.to_string() != mp.kind;
                 let pack_ref_differs = b.pack_ref.as_str() != mp.pack_ref;
-                // Content-aware: the stored ref is the env-relative staged path
-                // (rewritten on apply), so a raw string compare against the
-                // manifest-relative ref would always differ. Compare the staged
-                // file's bytes to the manifest source instead — missing or
-                // changed content triggers a re-stage; identical content is a
-                // no-op. (A manifest that drops answers_ref is left as-is here,
-                // matching the prior behaviour.)
+                // Content-aware + ref-aware: the stored ref is the env-relative
+                // staged path (rewritten on apply), so a raw string compare
+                // against the manifest-relative ref would always differ.
+                // Compare the staged file's bytes to the manifest source AND
+                // verify the binding's `answers_ref` points at the canonical
+                // staged path — a prior interrupted apply could have staged the
+                // file but failed to persist the ref on the binding, so checking
+                // bytes alone would miss that drift. (A manifest that drops
+                // answers_ref is left as-is here, matching the prior behaviour.)
                 let answers_ref_differs = match &mp.answers_ref {
                     Some(ar) => {
-                        staged_answers_outdated(store, &ctx.env_id, &ctx.manifest_dir, mp.slot, ar)?
+                        let content_outdated = staged_answers_outdated(
+                            store,
+                            &ctx.env_id,
+                            &ctx.manifest_dir,
+                            mp.slot,
+                            ar,
+                        )?;
+                        let ref_wrong =
+                            b.answers_ref.as_deref() != Some(staged_answers_rel(mp.slot).as_path());
+                        content_outdated || ref_wrong
                     }
                     None => false,
                 };
@@ -1553,7 +1564,12 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     .as_ref()
                     .is_some_and(|o| *o != dep.config_overrides);
                 let env = ctx.env.as_ref().expect("existing deployment implies env");
-                let converged = deployment_converged(env, dep.deployment_id, &primary_digest());
+                let converged = deployment_converged(
+                    env,
+                    dep.deployment_id,
+                    &primary_digest(),
+                    rb.spec.bundle_source_uri.as_deref(),
+                );
                 let needs_deploy = !converged;
                 let live = live_revision_digest(env, dep.deployment_id);
 
@@ -2220,6 +2236,16 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
                 mp.pack_ref
             ));
         }
+        if mp.answers_ref.is_some()
+            && b.answers_ref.as_deref() != Some(staged_answers_rel(mp.slot).as_path())
+        {
+            failures.push(format!(
+                "pack slot `{}`: answers_ref is `{:?}`, expected `{:?}`",
+                mp.slot,
+                b.answers_ref,
+                staged_answers_rel(mp.slot)
+            ));
+        }
     }
 
     // Extensions.
@@ -2281,7 +2307,12 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
             }
         } else {
             let primary_digest = &rb.revisions[0].digest;
-            if !deployment_converged(&env, dep.deployment_id, primary_digest) {
+            if !deployment_converged(
+                &env,
+                dep.deployment_id,
+                primary_digest,
+                rb.spec.bundle_source_uri.as_deref(),
+            ) {
                 failures.push(format!(
                     "bundle `{}`: live revision digest is `{}`, expected `{}`",
                     rb.spec.bundle_id,
@@ -2819,12 +2850,15 @@ fn digest_is_real(digest: &str) -> bool {
 
 /// Strict convergence: the deployment's traffic split has EXACTLY ONE entry
 /// at full weight (10,000 bps), that entry's revision exists, carries a real
-/// digest, and the digest matches `expected_digest`. A mixed split (e.g.
-/// 60/40 blue-green) or a degenerate placeholder digest is NOT converged.
+/// digest, the digest matches `expected_digest`, and `bundle_source_uri`
+/// matches (`None` vs `Some` counts as a difference — a K8s worker needs
+/// the pull ref to boot). A mixed split (e.g. 60/40 blue-green) or a
+/// degenerate placeholder digest is NOT converged.
 fn deployment_converged(
     env: &Environment,
     deployment_id: DeploymentId,
     expected_digest: &str,
+    expected_source_uri: Option<&str>,
 ) -> bool {
     let Some(split) = env
         .traffic_splits
@@ -2840,17 +2874,22 @@ fn deployment_converged(
     env.revisions
         .iter()
         .find(|r| r.revision_id == entry.revision_id)
-        .is_some_and(|r| digest_is_real(&r.bundle_digest) && r.bundle_digest == expected_digest)
+        .is_some_and(|r| {
+            digest_is_real(&r.bundle_digest)
+                && r.bundle_digest == expected_digest
+                && r.bundle_source_uri.as_deref() == expected_source_uri
+        })
 }
 
 /// Multi-revision convergence: the deployment's traffic split is the exact
-/// `(digest, weight_bps)` multiset declared by `expected` — every live entry
-/// resolves to a real-digest revision, and the live `(digest, weight)` bag
-/// equals the expected bag. Order-independent (both bags are sorted before
-/// comparison) and duplicate-safe: two expected revisions that share the same
-/// artifact AND weight require two matching live entries, not one. A false
-/// "converged" is the dangerous direction — it would silently skip applying
-/// the desired split — so this is multiset equality, not set containment.
+/// `(digest, weight_bps, bundle_source_uri)` multiset declared by `expected`
+/// — every live entry resolves to a real-digest revision, and the live
+/// `(digest, weight, source_uri)` bag equals the expected bag.
+/// Order-independent (both bags are sorted before comparison) and
+/// duplicate-safe: two expected revisions that share the same artifact AND
+/// weight require two matching live entries, not one. A false "converged" is
+/// the dangerous direction — it would silently skip applying the desired
+/// split — so this is multiset equality, not set containment.
 fn split_converged(
     env: &Environment,
     deployment_id: DeploymentId,
@@ -2866,9 +2905,9 @@ fn split_converged(
     if split.entries.len() != expected.len() {
         return false;
     }
-    // Live `(digest, weight_bps)` bag. Any entry pointing at a missing or
-    // placeholder-digest revision fails convergence outright.
-    let mut live_bag: Vec<(&str, u32)> = Vec::with_capacity(split.entries.len());
+    // Live `(digest, weight_bps, source_uri)` bag. Any entry pointing at a
+    // missing or placeholder-digest revision fails convergence outright.
+    let mut live_bag: Vec<(&str, u32, Option<&str>)> = Vec::with_capacity(split.entries.len());
     for entry in &split.entries {
         let Some(rev) = env
             .revisions
@@ -2880,12 +2919,22 @@ fn split_converged(
         if !digest_is_real(&rev.bundle_digest) {
             return false;
         }
-        live_bag.push((rev.bundle_digest.as_str(), entry.weight_bps));
+        live_bag.push((
+            rev.bundle_digest.as_str(),
+            entry.weight_bps,
+            rev.bundle_source_uri.as_deref(),
+        ));
     }
-    // Expected `(digest, weight_bps)` bag.
-    let mut expected_bag: Vec<(&str, u32)> = expected
+    // Expected `(digest, weight_bps, source_uri)` bag.
+    let mut expected_bag: Vec<(&str, u32, Option<&str>)> = expected
         .iter()
-        .map(|rr| (rr.digest.as_str(), rr.weight_bps))
+        .map(|rr| {
+            (
+                rr.digest.as_str(),
+                rr.weight_bps,
+                rr.spec.bundle_source_uri.as_deref(),
+            )
+        })
         .collect();
     // Multiset equality via sort-and-compare (counts already match).
     live_bag.sort_unstable();
@@ -3811,8 +3860,8 @@ mod tests {
 
     // --- split_converged is multiset equality, not set containment ---
 
-    /// Build a `ResolvedRevision` with the given digest + weight (the only
-    /// two fields `split_converged` reads).
+    /// Build a `ResolvedRevision` with the given digest + weight
+    /// (`bundle_source_uri` defaults to `None`).
     fn resolved_rev(name: &str, digest: &str, weight_bps: u32) -> ResolvedRevision {
         ResolvedRevision {
             spec: ManifestRevision {
