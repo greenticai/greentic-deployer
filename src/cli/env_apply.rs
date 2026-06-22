@@ -4978,6 +4978,97 @@ mod tests {
     }
 
     #[test]
+    fn adding_bundle_source_uri_to_converged_deployment_redeploys_and_sets_it() {
+        let (dir, store) = seeded_store();
+        // Deploy the bundle with NO OCI source — local-serve only.
+        let m1 = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "b", "bundle_path": fixture()}]
+        });
+        let p1 = write_manifest(dir.path(), &m1);
+        run_apply(&store, &p1).expect("first apply");
+        assert!(
+            load_local(&store)
+                .revisions
+                .iter()
+                .all(|r| r.bundle_source_uri.is_none()),
+            "baseline revision must have no pull ref"
+        );
+
+        // Re-apply the SAME artifact (same digest) but now declaring an OCI
+        // source. Digest-only convergence would treat this as a no-op; the fix
+        // must re-deploy so the live revision records the pull ref a K8s worker
+        // needs to boot.
+        let m2 = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "b", "bundle_path": fixture(),
+                         "bundle_source_uri": "oci://ex/b:v1"}]
+        });
+        let p2 = write_manifest(dir.path(), &m2);
+        run_apply(&store, &p2).expect("re-apply with oci source");
+        let env = load_local(&store);
+        assert!(
+            env.revisions
+                .iter()
+                .any(|r| r.bundle_source_uri.as_deref() == Some("oci://ex/b:v1")),
+            "adding bundle_source_uri to a same-digest deployment must (re)deploy a \
+             revision carrying it; saw: {:?}",
+            env.revisions
+                .iter()
+                .map(|r| r.bundle_source_uri.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn answers_ref_drift_on_binding_is_repaired_even_when_staged_file_matches() {
+        let (dir, store) = seeded_store();
+        std::fs::write(dir.path().join("deployer-answers.json"), br#"{"x":1}"#).unwrap();
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "deployer",
+                "kind": "greentic.deployer.local@1.0.0",
+                "pack_ref": "builtin:deployer-local",
+                "answers_ref": "deployer-answers.json"
+            }]
+        });
+        let mp = write_manifest(dir.path(), &manifest);
+        run_apply(&store, &mp).expect("first apply stages file + canonical ref");
+
+        // Simulate an interrupted prior apply: the file is staged (content still
+        // matches the manifest) but the binding never persisted its
+        // `answers_ref`. Content-only drift detection would miss this.
+        let mut env = load_local(&store);
+        for b in &mut env.packs {
+            if b.slot == CapabilitySlot::Deployer {
+                b.answers_ref = None;
+            }
+        }
+        store.save(&env).expect("save drifted env");
+
+        // Re-apply: the ref mismatch must replan an update that restores the
+        // canonical staged ref, even though the staged file content is unchanged.
+        let plan = run_dry(&store, &mp).expect("dry-run on drifted binding");
+        let actions = step_actions(&plan.result);
+        assert!(
+            actions.contains(&("update-pack-binding".to_string(), "update".to_string())),
+            "a wrong/missing answers_ref must replan update-pack-binding: {actions:?}"
+        );
+        run_apply(&store, &mp).expect("re-apply repairs the ref");
+        let env = load_local(&store);
+        let b = env.pack_for_slot(CapabilitySlot::Deployer).expect("bound");
+        assert_eq!(
+            b.answers_ref.as_deref(),
+            Some(Path::new("env-packs/deployer/answers.json")),
+            "re-apply must restore the canonical staged answers_ref"
+        );
+    }
+
+    #[test]
     fn pack_binding_rejects_messaging_slot() {
         let dir = tempdir().unwrap();
         let manifest = json!({
