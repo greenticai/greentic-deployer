@@ -101,6 +101,11 @@ pub struct K8sDeployerHandler {
     /// Cluster side-effect seam the [`Deployer`](crate::env_packs::deployer::Deployer)
     /// verbs mutate through. Crate-visible so `deployer.rs` reaches it.
     pub(crate) cluster: Arc<dyn K8sCluster>,
+    /// Base64 of the env's local dev-store, supplied by the reconcile call site
+    /// (which owns the filesystem read). The [`ManifestRenderer`] impl injects
+    /// it into the rendered dev-store Secret. `None` keeps the rendering pure
+    /// (the preview path and the per-revision verbs render no secret material).
+    dev_secrets_data: Option<String>,
 }
 
 impl Default for K8sDeployerHandler {
@@ -108,6 +113,7 @@ impl Default for K8sDeployerHandler {
         Self {
             creds: K8sDeployerCredentials::default(),
             cluster: Arc::new(UnconfiguredCluster),
+            dev_secrets_data: None,
         }
     }
 }
@@ -129,6 +135,22 @@ impl K8sDeployerHandler {
         Self {
             creds: K8sDeployerCredentials::default(),
             cluster,
+            dev_secrets_data: None,
+        }
+    }
+
+    /// Construct with a cluster seam plus the env's dev-store bytes (base64),
+    /// so `reconcile` renders the dev-store Secret carrying the operator's
+    /// secrets. The reconcile CLI reads the dev-store file (it owns the
+    /// filesystem) and passes it here; `None` renders an empty Secret.
+    pub fn with_cluster_and_dev_secrets(
+        cluster: Arc<dyn K8sCluster>,
+        dev_secrets_data: Option<String>,
+    ) -> Self {
+        Self {
+            creds: K8sDeployerCredentials::default(),
+            cluster,
+            dev_secrets_data,
         }
     }
 }

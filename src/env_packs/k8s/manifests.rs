@@ -45,7 +45,7 @@
 //! uppercase in label VALUES (`greentic.ai/revision: <ULID>`) to match
 //! the spec's canonical ULID rendering.
 
-use greentic_deploy_spec::{EnvId, Environment, Revision, RevisionLifecycle};
+use greentic_deploy_spec::{CapabilitySlot, EnvId, Environment, Revision, RevisionLifecycle};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -97,6 +97,25 @@ pub const ENV_STORE_CONFIG_MAP_NAME: &str = "gtc-env-store";
 /// also stages the runtime-config and the revision's packs.
 const STAGE_INIT_IMAGE: &str = "busybox:1.36.1";
 
+/// Name of the Secret carrying the env's local dev-store (the operator's
+/// `.dev.secrets.env`). Rendered only for envs that bind a secrets pack; the
+/// worker's `stage-dev-secrets` init container copies it into the writable HOME
+/// so `secret://` refs (messaging bot tokens, webhook secrets) resolve in-pod —
+/// closing the K8s "no runtime secrets" gap without a cloud secret-store.
+pub const DEV_SECRETS_SECRET_NAME: &str = "gtc-dev-secrets";
+
+/// Read-only mount of the dev-store Secret the staging init container copies from.
+const DEV_SECRETS_SRC: &str = "/etc/greentic/dev-secrets";
+
+/// Pod volume name for the read-only dev-store Secret source.
+const DEV_SECRETS_VOLUME: &str = "dev-secrets-src";
+
+/// Absolute path to the cloudflared binary baked into the runtime image. The
+/// worker boots with `--cloudflared on --cloudflared-binary <this>` when
+/// [`TunnelMode::Cloudflared`] is selected; greentic-start spawns it via direct
+/// exec (no shell, distroless-safe).
+const CLOUDFLARED_BINARY: &str = "/usr/local/bin/cloudflared";
+
 /// Operator-tunable knobs for the rendered manifests.
 ///
 /// [`K8sParams::for_env`] derives the sandbox defaults from the env
@@ -105,6 +124,19 @@ const STAGE_INIT_IMAGE: &str = "busybox:1.36.1";
 /// those defaults — `op env render` calls this path. The Deployer verbs
 /// still use `for_env` until the PR-5.3 orchestration wiring threads
 /// answers into them.
+/// How the worker is exposed publicly (deployer answer `tunnel`). A public
+/// URL is what lets greentic-start auto-register messaging webhooks at boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelMode {
+    /// No tunnel — the worker is reachable only in-cluster (default). Messaging
+    /// webhooks won't register (no public URL).
+    Off,
+    /// greentic-start spawns a cloudflared quick tunnel for a public
+    /// `*.trycloudflare.com` URL. Single-revision only — each worker pod gets
+    /// its own tunnel, so a traffic split would register N competing webhooks.
+    Cloudflared,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct K8sParams {
     /// Namespace every rendered object lands in. One namespace per
@@ -114,6 +146,15 @@ pub struct K8sParams {
     pub runtime_image: String,
     /// Router replica count. Plan step 11 mandates ≥ 2 for HA.
     pub router_replicas: u32,
+    /// Worker public-exposure mode. From the `tunnel` deployer answer.
+    pub tunnel: TunnelMode,
+    /// Base64 of the env's local dev-store, set at reconcile time so the
+    /// rendered [`DEV_SECRETS_SECRET_NAME`] Secret carries the operator's
+    /// secrets. `None` on the pure preview path (`op env render`) and for the
+    /// per-revision verbs — they never render the env-level Secret. The staging
+    /// init container's copy is guarded on the file existing, so a `None`/empty
+    /// Secret is a no-op rather than a boot failure.
+    pub dev_secrets_data: Option<String>,
 }
 
 impl K8sParams {
@@ -124,6 +165,8 @@ impl K8sParams {
             namespace: namespace_for_env(&env.environment_id),
             runtime_image: DEFAULT_RUNTIME_IMAGE.to_string(),
             router_replicas: 2,
+            tunnel: TunnelMode::Off,
+            dev_secrets_data: None,
         }
     }
 
@@ -167,6 +210,7 @@ impl K8sParams {
             "namespace",
             "runtime_image",
             "router_replicas",
+            "tunnel",
         ];
         for key in obj.keys() {
             if !KNOWN_KEYS.contains(&key.as_str()) {
@@ -224,12 +268,29 @@ impl K8sParams {
             }
         };
 
+        let tunnel = match answer_string(obj, "tunnel") {
+            Some(s) => match s.as_str() {
+                "cloudflared" => TunnelMode::Cloudflared,
+                "off" | "none" => TunnelMode::Off,
+                other => {
+                    return Err(format!(
+                        "tunnel `{other}` is not valid (expected `cloudflared` or `off`)"
+                    ));
+                }
+            },
+            None => defaults.tunnel,
+        };
+
         // kubeconfig_context: silently accepted and ignored.
 
         Ok(Self {
             namespace,
             runtime_image,
             router_replicas,
+            tunnel,
+            // Reconcile injects the dev-store bytes after this pure parse (it
+            // owns the filesystem read); the preview path leaves it unset.
+            dev_secrets_data: defaults.dev_secrets_data,
         })
     }
 }
@@ -455,6 +516,84 @@ fn runtime_boot_args(env: &Environment) -> Value {
     json!(["start", "--env", env.environment_id.as_str()])
 }
 
+/// Worker boot args: the shared bundle-less serve boot, plus the cloudflared
+/// quick-tunnel flags when [`TunnelMode::Cloudflared`] is selected. The tunnel
+/// gives the worker a public `*.trycloudflare.com` URL so greentic-start
+/// auto-registers messaging webhooks at boot; the cloudflared binary is baked
+/// into the runtime image at [`CLOUDFLARED_BINARY`]. The router never tunnels.
+fn worker_boot_args(env: &Environment, params: &K8sParams) -> Value {
+    let mut args = vec![
+        Value::from("start"),
+        Value::from("--env"),
+        Value::from(env.environment_id.as_str()),
+    ];
+    if params.tunnel == TunnelMode::Cloudflared {
+        args.extend([
+            Value::from("--cloudflared"),
+            Value::from("on"),
+            Value::from("--cloudflared-binary"),
+            Value::from(CLOUDFLARED_BINARY),
+        ]);
+    }
+    Value::Array(args)
+}
+
+/// True when the env binds a secrets capability pack (the dev-store). Gates the
+/// worker's secret staging and the env-level dev-store Secret so only
+/// secrets-using envs carry them. Pure on `env`, so the worker pod spec is
+/// identical whether rendered by reconcile or `apply-revision` — no flap.
+fn env_uses_dev_secrets(env: &Environment) -> bool {
+    env.packs.iter().any(|p| p.slot == CapabilitySlot::Secrets)
+}
+
+/// Non-secret content hash of the dev-store data. Placed on the worker pod
+/// template so K8s triggers a rolling restart when reconcile updates the
+/// Secret — the init-container copies at pod startup, so stale pods would run
+/// with old credentials indefinitely without this. `None` (preview / no data
+/// yet) hashes to a sentinel so the annotation is stable.
+fn dev_secrets_content_hash(data: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    match data {
+        Some(b64) => hasher.update(b64.as_bytes()),
+        None => hasher.update(b"<empty>"),
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Init container that copies the dev-store Secret into the worker's writable
+/// HOME at the path greentic-start's dev-store backend reads
+/// (`$HOME/.greentic/environments/<env_id>/.greentic/dev/.dev.secrets.env`). The
+/// copy is guarded on the source existing, so an empty/absent Secret is a no-op
+/// rather than a boot failure; the dev-store is opened read-write under a flock
+/// at runtime, so it must land on the writable volume, not the read-only mount.
+fn stage_dev_secrets_init_container(env: &Environment) -> Value {
+    let dev_dir = format!(
+        "{STAGE_HOME}/.greentic/environments/{}/.greentic/dev",
+        env.environment_id.as_str()
+    );
+    let src = format!("{DEV_SECRETS_SRC}/.dev.secrets.env");
+    json!({
+        "name": "stage-dev-secrets",
+        "image": STAGE_INIT_IMAGE,
+        "securityContext": container_security_context(),
+        "command": [
+            "sh",
+            "-c",
+            format!("set -eu; mkdir -p '{dev_dir}'; if [ -f '{src}' ]; then cp '{src}' '{dev_dir}/.dev.secrets.env'; fi"),
+        ],
+        "volumeMounts": [
+            {"name": DEV_SECRETS_VOLUME, "mountPath": DEV_SECRETS_SRC, "readOnly": true},
+            {"name": HOME_VOLUME, "mountPath": STAGE_HOME},
+        ],
+    })
+}
+
 /// Fixed rayon thread-pool size for the runtime pods. The bundle unpacker
 /// (backhand's `parallel` reader, reached on the M2 boot pull) sizes rayon to
 /// the HOST core count, ignoring the pod's `cpu` cgroup quota. With the
@@ -492,13 +631,14 @@ fn runtime_volume_mounts() -> Value {
 }
 
 /// Pod volumes shared by router + worker: writable HOME + `/tmp` emptyDirs and
-/// the read-only env-store ConfigMap the init container copies from.
-fn runtime_pod_volumes() -> Value {
-    json!([
-        {"name": HOME_VOLUME, "emptyDir": {}},
-        {"name": TMP_VOLUME, "emptyDir": {}},
-        {"name": ENV_STORE_SRC_VOLUME, "configMap": {"name": ENV_STORE_CONFIG_MAP_NAME}},
-    ])
+/// the read-only env-store ConfigMap the init container copies from. Returned as
+/// a `Vec` so the worker can append the optional dev-store Secret volume.
+fn runtime_pod_volumes() -> Vec<Value> {
+    vec![
+        json!({"name": HOME_VOLUME, "emptyDir": {}}),
+        json!({"name": TMP_VOLUME, "emptyDir": {}}),
+        json!({"name": ENV_STORE_SRC_VOLUME, "configMap": {"name": ENV_STORE_CONFIG_MAP_NAME}}),
+    ]
 }
 
 /// Init container that stages the env store into the writable HOME volume at
@@ -555,6 +695,42 @@ pub fn render_worker_deployment(
         json!({"name": "GREENTIC_BUNDLE_ID", "value": revision.bundle_id.as_str()}),
         json!({"name": "GREENTIC_BUNDLE_DIGEST", "value": revision.bundle_digest}),
     ]);
+
+    // Envs that bind a secrets pack stage the operator's dev-store into the
+    // worker's writable HOME (the `secret://` refs — messaging bot tokens,
+    // webhook secrets — resolve there). The Secret volume is `optional` and the
+    // init copy is guarded on the file existing, so an env with no secrets yet
+    // boots cleanly. Pure on `env` so reconcile and `apply-revision` agree.
+    let mut init_containers = vec![env_store_init_container(env)];
+    let mut volumes = runtime_pod_volumes();
+    let uses_dev_secrets = env_uses_dev_secrets(env);
+    if uses_dev_secrets {
+        init_containers.push(stage_dev_secrets_init_container(env));
+        volumes.push(json!({
+            "name": DEV_SECRETS_VOLUME,
+            "secret": {"secretName": DEV_SECRETS_SECRET_NAME, "optional": true},
+        }));
+    }
+
+    // Pod-template annotations: when the env stages dev-store material, a
+    // content hash triggers a rolling restart on `reconcile` whenever the
+    // operator rotates a credential. The preview path (`None`) omits the
+    // annotation so `op env render` stays pure. `apply-revision` also
+    // renders `None`, so the annotation is stable across verb paths.
+    let mut pod_annotations = serde_json::Map::new();
+    if uses_dev_secrets {
+        let hash = dev_secrets_content_hash(params.dev_secrets_data.as_deref());
+        pod_annotations.insert(
+            "greentic.ai/dev-store-hash".to_string(),
+            Value::String(hash),
+        );
+    }
+    let pod_metadata = if pod_annotations.is_empty() {
+        json!({"labels": labels})
+    } else {
+        json!({"labels": labels, "annotations": Value::Object(pod_annotations)})
+    };
+
     json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -569,14 +745,14 @@ pub fn render_worker_deployment(
                 "greentic.ai/revision": revision.revision_id.0.to_string(),
             }},
             "template": {
-                "metadata": {"labels": labels},
+                "metadata": pod_metadata,
                 "spec": {
                     "securityContext": pod_security_context(),
-                    "initContainers": [env_store_init_container(env)],
+                    "initContainers": Value::Array(init_containers),
                     "containers": [{
                         "name": "worker",
                         "image": params.runtime_image,
-                        "args": runtime_boot_args(env),
+                        "args": worker_boot_args(env, params),
                         "securityContext": container_security_context(),
                         "resources": resource_baseline(),
                         "ports": [{"name": "http", "containerPort": SERVE_PORT}],
@@ -588,7 +764,7 @@ pub fn render_worker_deployment(
                             "periodSeconds": 5,
                         },
                     }],
-                    "volumes": runtime_pod_volumes(),
+                    "volumes": Value::Array(volumes),
                 },
             },
         },
@@ -696,7 +872,7 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
                             "periodSeconds": 5,
                         },
                     }],
-                    "volumes": runtime_pod_volumes(),
+                    "volumes": Value::Array(runtime_pod_volumes()),
                 },
             },
         },
@@ -782,6 +958,32 @@ pub fn render_env_store_config_map(env: &Environment, params: &K8sParams) -> Val
             "labels": common_labels(env, "env-store"),
         },
         "data": {"environment.json": environment_json},
+    })
+}
+
+/// The dev-store Secret: the operator's local `.dev.secrets.env` delivered into
+/// the cluster so the worker resolves `secret://` refs in-pod (the K8s "no
+/// runtime secrets" gap, bridged without a cloud secret-store). `data` carries
+/// the base64 dev-store when reconcile read it ([`K8sParams::dev_secrets_data`]);
+/// an empty `data` (the pure preview path, or an env with no secrets put yet)
+/// renders a structurally-complete Secret with no material — the staging init
+/// container's copy is guarded on the file existing. Only emitted for envs that
+/// bind a secrets pack ([`env_uses_dev_secrets`]).
+fn render_dev_secrets_secret(env: &Environment, params: &K8sParams) -> Value {
+    let mut data = serde_json::Map::new();
+    if let Some(b64) = &params.dev_secrets_data {
+        data.insert(".dev.secrets.env".to_string(), Value::String(b64.clone()));
+    }
+    json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "type": "Opaque",
+        "metadata": {
+            "name": DEV_SECRETS_SECRET_NAME,
+            "namespace": params.namespace,
+            "labels": common_labels(env, "dev-secrets"),
+        },
+        "data": Value::Object(data),
     })
 }
 
@@ -944,6 +1146,13 @@ pub fn render_environment_manifests(env: &Environment, params: &K8sParams) -> Ve
         render_router_pdb(env, params),
     ];
     manifests.extend(render_network_policies(env, params));
+    // Dev-store Secret last (env-level, never pruned). Appended after the
+    // NetworkPolicies so it never shifts the index-pinned env-level objects;
+    // reconcile applies it before the workers (the trait impl extends with
+    // workers after this set), so the worker's secret volume mounts cleanly.
+    if env_uses_dev_secrets(env) {
+        manifests.push(render_dev_secrets_secret(env, params));
+    }
     manifests
 }
 
@@ -1614,5 +1823,199 @@ mod tests {
         assert!(!is_dns1123_label("ABC"));
         assert!(!is_dns1123_label("a.b"));
         assert!(!is_dns1123_label(&"a".repeat(64)));
+    }
+
+    /// Fixture env that binds a dev-store secrets pack (the predicate that
+    /// turns on worker secret-staging + the env-level dev-store Secret).
+    fn secrets_env() -> Environment {
+        use greentic_deploy_spec::{EnvPackBinding, PackDescriptor, PackId};
+        let mut env = build_fixture_env();
+        env.packs.push(EnvPackBinding {
+            slot: CapabilitySlot::Secrets,
+            kind: PackDescriptor::try_new("greentic.secrets.dev-store@1.0.0").unwrap(),
+            pack_ref: PackId::new("greentic.secrets.dev-store"),
+            answers_ref: None,
+            generation: 0,
+            previous_binding_ref: None,
+        });
+        env
+    }
+
+    #[test]
+    fn non_secrets_env_renders_no_dev_secret_or_staging() {
+        let (env, params) = fixture();
+        // No secrets pack → no dev-store Secret in the env-level set.
+        let env_level = render_environment_manifests(&env, &params);
+        assert!(
+            env_level.iter().all(|o| o["kind"] != "Secret"),
+            "a non-secrets env must not render a dev-store Secret"
+        );
+        // Worker keeps the single env-store init container, no dev-secrets volume.
+        let d = render_worker_deployment(&env, &env.revisions[0], &params);
+        let init = d["spec"]["template"]["spec"]["initContainers"]
+            .as_array()
+            .unwrap();
+        assert_eq!(init.len(), 1);
+        assert_eq!(init[0]["name"], "stage-env-store");
+        let vols = d["spec"]["template"]["spec"]["volumes"].as_array().unwrap();
+        assert!(vols.iter().all(|v| v["name"] != DEV_SECRETS_VOLUME));
+    }
+
+    #[test]
+    fn secrets_env_renders_dev_secrets_secret_and_staging() {
+        let env = secrets_env();
+        let params = K8sParams::for_env(&env);
+
+        // Env-level set gains exactly one Secret, appended after the policies.
+        let env_level = render_environment_manifests(&env, &params);
+        let secrets: Vec<&Value> = env_level.iter().filter(|o| o["kind"] == "Secret").collect();
+        assert_eq!(secrets.len(), 1, "exactly one dev-store Secret");
+        assert_eq!(secrets[0]["metadata"]["name"], DEV_SECRETS_SECRET_NAME);
+        assert_eq!(
+            env_level.last().unwrap()["kind"],
+            "Secret",
+            "Secret is appended last so it never shifts the index-pinned objects"
+        );
+
+        // Worker stages it: a second init container + the optional secret volume.
+        let d = render_worker_deployment(&env, &env.revisions[0], &params);
+        let init = d["spec"]["template"]["spec"]["initContainers"]
+            .as_array()
+            .unwrap();
+        let names: Vec<&str> = init.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["stage-env-store", "stage-dev-secrets"]);
+        // The staging copy lands in the dev-store path greentic-start reads.
+        let cmd = init[1]["command"][2].as_str().unwrap();
+        assert!(
+            cmd.contains(".greentic/dev/.dev.secrets.env"),
+            "stages into the dev-store path: {cmd}"
+        );
+
+        let vols = d["spec"]["template"]["spec"]["volumes"].as_array().unwrap();
+        let sv = vols
+            .iter()
+            .find(|v| v["name"] == DEV_SECRETS_VOLUME)
+            .expect("dev-secrets volume present");
+        assert_eq!(sv["secret"]["secretName"], DEV_SECRETS_SECRET_NAME);
+        assert_eq!(
+            sv["secret"]["optional"], true,
+            "an absent Secret must not block worker boot"
+        );
+
+        // The worker pod template carries a content-hash annotation so K8s
+        // rolls pods when the dev-store changes on a subsequent reconcile.
+        let ann = &d["spec"]["template"]["metadata"]["annotations"];
+        assert!(
+            ann["greentic.ai/dev-store-hash"].is_string(),
+            "secrets env worker must carry dev-store hash annotation"
+        );
+    }
+
+    #[test]
+    fn dev_store_hash_changes_trigger_rolling_restart() {
+        let env = secrets_env();
+        let mut params = K8sParams::for_env(&env);
+
+        // No data → sentinel hash.
+        let d1 = render_worker_deployment(&env, &env.revisions[0], &params);
+        let h1 = d1["spec"]["template"]["metadata"]["annotations"]["greentic.ai/dev-store-hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // With data → different hash.
+        params.dev_secrets_data = Some("Zm9vYmFy".to_string());
+        let d2 = render_worker_deployment(&env, &env.revisions[0], &params);
+        let h2 = d2["spec"]["template"]["metadata"]["annotations"]["greentic.ai/dev-store-hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(h1, h2, "changing dev-store data must change the hash");
+
+        // Same data → same hash (idempotent).
+        let d3 = render_worker_deployment(&env, &env.revisions[0], &params);
+        let h3 = d3["spec"]["template"]["metadata"]["annotations"]["greentic.ai/dev-store-hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(h2, h3, "same data must produce the same hash");
+    }
+
+    #[test]
+    fn non_secrets_env_has_no_dev_store_hash_annotation() {
+        let (env, params) = fixture();
+        let d = render_worker_deployment(&env, &env.revisions[0], &params);
+        let ann = &d["spec"]["template"]["metadata"]["annotations"];
+        assert!(
+            ann.is_null(),
+            "non-secrets env worker must not carry annotations"
+        );
+    }
+
+    #[test]
+    fn dev_secrets_secret_carries_data_only_when_provided() {
+        let env = secrets_env();
+        let mut params = K8sParams::for_env(&env);
+
+        // Preview path (no bytes): structurally-complete Secret, empty data.
+        let empty = render_dev_secrets_secret(&env, &params);
+        assert_eq!(empty["data"].as_object().unwrap().len(), 0);
+        assert_eq!(empty["type"], "Opaque");
+
+        // Reconcile path: the base64 dev-store is carried under `.dev.secrets.env`.
+        params.dev_secrets_data = Some("Zm9vYmFy".to_string());
+        let filled = render_dev_secrets_secret(&env, &params);
+        assert_eq!(filled["data"][".dev.secrets.env"], "Zm9vYmFy");
+    }
+
+    #[test]
+    fn worker_tunnel_flags_only_when_cloudflared() {
+        let (env, mut params) = fixture();
+        let id = env.environment_id.as_str();
+
+        // Default: no tunnel flags — args match the shared bundle-less boot.
+        assert_eq!(params.tunnel, TunnelMode::Off);
+        let d = render_worker_deployment(&env, &env.revisions[0], &params);
+        assert_eq!(
+            d["spec"]["template"]["spec"]["containers"][0]["args"],
+            json!(["start", "--env", id])
+        );
+
+        // Cloudflared: the worker spawns the in-image quick tunnel.
+        params.tunnel = TunnelMode::Cloudflared;
+        let d = render_worker_deployment(&env, &env.revisions[0], &params);
+        assert_eq!(
+            d["spec"]["template"]["spec"]["containers"][0]["args"],
+            json!([
+                "start",
+                "--env",
+                id,
+                "--cloudflared",
+                "on",
+                "--cloudflared-binary",
+                CLOUDFLARED_BINARY
+            ])
+        );
+
+        // The router never tunnels, regardless of the answer.
+        let r = render_router_deployment(&env, &params);
+        assert_eq!(
+            r["spec"]["template"]["spec"]["containers"][0]["args"],
+            json!(["start", "--env", id])
+        );
+    }
+
+    #[test]
+    fn from_answers_parses_tunnel() {
+        let env = build_fixture_env();
+        let cf = K8sParams::from_answers(&env, Some(&json!({"tunnel": "cloudflared"}))).unwrap();
+        assert_eq!(cf.tunnel, TunnelMode::Cloudflared);
+        let off = K8sParams::from_answers(&env, Some(&json!({"tunnel": "off"}))).unwrap();
+        assert_eq!(off.tunnel, TunnelMode::Off);
+        // Absent → default off.
+        let none = K8sParams::from_answers(&env, Some(&json!({}))).unwrap();
+        assert_eq!(none.tunnel, TunnelMode::Off);
+        // Invalid → fail closed.
+        assert!(K8sParams::from_answers(&env, Some(&json!({"tunnel": "ngrok"}))).is_err());
     }
 }

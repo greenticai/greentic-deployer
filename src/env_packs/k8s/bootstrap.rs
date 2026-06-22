@@ -333,8 +333,8 @@ mod tests {
     fn role_rules_aggregate_one_rule_per_group_resource_with_every_verb() {
         let pack = render_min_rbac_rules_pack(&input());
         let yaml = &pack.entries[0].content;
-        // One rule per (group, resource) — 5 distinct pairs in the list.
-        assert_eq!(yaml.matches("- apiGroups:").count(), 5);
+        // One rule per (group, resource) — 6 distinct pairs in the list.
+        assert_eq!(yaml.matches("- apiGroups:").count(), 6);
         assert!(yaml.contains("resources: [\"deployments\"]"));
         assert!(yaml.contains("verbs: [get, create, patch, delete]"));
         // Env-lifetime objects carry no delete.
