@@ -546,6 +546,26 @@ fn env_uses_dev_secrets(env: &Environment) -> bool {
     env.packs.iter().any(|p| p.slot == CapabilitySlot::Secrets)
 }
 
+/// Non-secret content hash of the dev-store data. Placed on the worker pod
+/// template so K8s triggers a rolling restart when reconcile updates the
+/// Secret — the init-container copies at pod startup, so stale pods would run
+/// with old credentials indefinitely without this. `None` (preview / no data
+/// yet) hashes to a sentinel so the annotation is stable.
+fn dev_secrets_content_hash(data: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    match data {
+        Some(b64) => hasher.update(b64.as_bytes()),
+        None => hasher.update(b"<empty>"),
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// Init container that copies the dev-store Secret into the worker's writable
 /// HOME at the path greentic-start's dev-store backend reads
 /// (`$HOME/.greentic/environments/<env_id>/.greentic/dev/.dev.secrets.env`). The
@@ -683,13 +703,33 @@ pub fn render_worker_deployment(
     // boots cleanly. Pure on `env` so reconcile and `apply-revision` agree.
     let mut init_containers = vec![env_store_init_container(env)];
     let mut volumes = runtime_pod_volumes();
-    if env_uses_dev_secrets(env) {
+    let uses_dev_secrets = env_uses_dev_secrets(env);
+    if uses_dev_secrets {
         init_containers.push(stage_dev_secrets_init_container(env));
         volumes.push(json!({
             "name": DEV_SECRETS_VOLUME,
             "secret": {"secretName": DEV_SECRETS_SECRET_NAME, "optional": true},
         }));
     }
+
+    // Pod-template annotations: when the env stages dev-store material, a
+    // content hash triggers a rolling restart on `reconcile` whenever the
+    // operator rotates a credential. The preview path (`None`) omits the
+    // annotation so `op env render` stays pure. `apply-revision` also
+    // renders `None`, so the annotation is stable across verb paths.
+    let mut pod_annotations = serde_json::Map::new();
+    if uses_dev_secrets {
+        let hash = dev_secrets_content_hash(params.dev_secrets_data.as_deref());
+        pod_annotations.insert(
+            "greentic.ai/dev-store-hash".to_string(),
+            Value::String(hash),
+        );
+    }
+    let pod_metadata = if pod_annotations.is_empty() {
+        json!({"labels": labels})
+    } else {
+        json!({"labels": labels, "annotations": Value::Object(pod_annotations)})
+    };
 
     json!({
         "apiVersion": "apps/v1",
@@ -705,7 +745,7 @@ pub fn render_worker_deployment(
                 "greentic.ai/revision": revision.revision_id.0.to_string(),
             }},
             "template": {
-                "metadata": {"labels": labels},
+                "metadata": pod_metadata,
                 "spec": {
                     "securityContext": pod_security_context(),
                     "initContainers": Value::Array(init_containers),
@@ -1860,6 +1900,55 @@ mod tests {
         assert_eq!(
             sv["secret"]["optional"], true,
             "an absent Secret must not block worker boot"
+        );
+
+        // The worker pod template carries a content-hash annotation so K8s
+        // rolls pods when the dev-store changes on a subsequent reconcile.
+        let ann = &d["spec"]["template"]["metadata"]["annotations"];
+        assert!(
+            ann["greentic.ai/dev-store-hash"].is_string(),
+            "secrets env worker must carry dev-store hash annotation"
+        );
+    }
+
+    #[test]
+    fn dev_store_hash_changes_trigger_rolling_restart() {
+        let env = secrets_env();
+        let mut params = K8sParams::for_env(&env);
+
+        // No data → sentinel hash.
+        let d1 = render_worker_deployment(&env, &env.revisions[0], &params);
+        let h1 = d1["spec"]["template"]["metadata"]["annotations"]["greentic.ai/dev-store-hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // With data → different hash.
+        params.dev_secrets_data = Some("Zm9vYmFy".to_string());
+        let d2 = render_worker_deployment(&env, &env.revisions[0], &params);
+        let h2 = d2["spec"]["template"]["metadata"]["annotations"]["greentic.ai/dev-store-hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(h1, h2, "changing dev-store data must change the hash");
+
+        // Same data → same hash (idempotent).
+        let d3 = render_worker_deployment(&env, &env.revisions[0], &params);
+        let h3 = d3["spec"]["template"]["metadata"]["annotations"]["greentic.ai/dev-store-hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(h2, h3, "same data must produce the same hash");
+    }
+
+    #[test]
+    fn non_secrets_env_has_no_dev_store_hash_annotation() {
+        let (env, params) = fixture();
+        let d = render_worker_deployment(&env, &env.revisions[0], &params);
+        let ann = &d["spec"]["template"]["metadata"]["annotations"];
+        assert!(
+            ann.is_null(),
+            "non-secrets env worker must not carry annotations"
         );
     }
 
