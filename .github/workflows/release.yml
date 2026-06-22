@@ -8,6 +8,14 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      include_macos_intel:
+        description: >-
+          Also build the Intel macOS binary (x86_64-apple-darwin) on the costly
+          macos-15-intel runner. OFF by default; enable for a final release that
+          must ship every binary.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -20,46 +28,47 @@ jobs:
   ci:
     uses: ./.github/workflows/ci.yml
 
+  # The Intel macOS leg (x86_64-apple-darwin on the costly macos-15-intel
+  # runner — bills ~10x Linux) is OFF by default: most consumers are on Apple
+  # Silicon. Re-enable it for a final all-binary release by running this
+  # workflow manually with `include_macos_intel: true`. Every other target
+  # always builds.
+  setup:
+    name: Resolve build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Resolve target matrix
+        id: matrix
+        shell: bash
+        env:
+          INCLUDE_INTEL: ${{ github.event_name == 'workflow_dispatch' && inputs.include_macos_intel }}
+        run: |
+          set -euo pipefail
+          targets='[
+            {"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","archive_ext":"tar.gz","asset_suffix":"linux-amd64","binary_name":"greentic-deployer"},
+            {"os":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","archive_ext":"tar.gz","asset_suffix":"linux-arm64","binary_name":"greentic-deployer"},
+            {"os":"windows-latest","target":"x86_64-pc-windows-msvc","archive_ext":"zip","asset_suffix":"windows-amd64","binary_name":"greentic-deployer.exe"},
+            {"os":"windows-11-arm","target":"aarch64-pc-windows-msvc","archive_ext":"zip","asset_suffix":"windows-arm64","binary_name":"greentic-deployer.exe"},
+            {"os":"macos-15","target":"aarch64-apple-darwin","archive_ext":"tar.gz","asset_suffix":"macos-arm64","binary_name":"greentic-deployer"}
+          ]'
+          if [ "$INCLUDE_INTEL" = "true" ]; then
+            targets="$(printf '%s' "$targets" | jq -c '. + [{"os":"macos-15-intel","target":"x86_64-apple-darwin","archive_ext":"tar.gz","asset_suffix":"macos-amd64","binary_name":"greentic-deployer"}]')"
+          else
+            targets="$(printf '%s' "$targets" | jq -c '.')"
+          fi
+          echo "matrix={\"include\":${targets}}" >> "$GITHUB_OUTPUT"
+
   binary-release-assets:
     name: Build binary release assets
     runs-on: ${{ matrix.os }}
-    needs: ci
+    needs: [ci, setup]
     permissions:
       contents: write
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            archive_ext: tar.gz
-            asset_suffix: linux-amd64
-            binary_name: greentic-deployer
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            archive_ext: tar.gz
-            asset_suffix: linux-arm64
-            binary_name: greentic-deployer
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive_ext: zip
-            asset_suffix: windows-amd64
-            binary_name: greentic-deployer.exe
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            archive_ext: zip
-            asset_suffix: windows-arm64
-            binary_name: greentic-deployer.exe
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            archive_ext: tar.gz
-            asset_suffix: macos-amd64
-            binary_name: greentic-deployer
-          - os: macos-15
-            target: aarch64-apple-darwin
-            archive_ext: tar.gz
-            asset_suffix: macos-arm64
-            binary_name: greentic-deployer
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
       - name: Read crate version
