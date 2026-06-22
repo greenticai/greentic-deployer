@@ -26,7 +26,12 @@ impl ManifestRenderer for K8sDeployerHandler {
         env: &Environment,
         answers: Option<&serde_json::Value>,
     ) -> Result<Vec<Value>, RenderError> {
-        let params = K8sParams::from_answers(env, answers).map_err(RenderError::InvalidAnswers)?;
+        let mut params =
+            K8sParams::from_answers(env, answers).map_err(RenderError::InvalidAnswers)?;
+        // The reconcile call site owns the filesystem read; inject the dev-store
+        // bytes it captured so the env-level Secret carries the operator's
+        // secrets. `None` on the preview path → an empty Secret.
+        params.dev_secrets_data = self.dev_secrets_data.clone();
         let mut objects = manifests::render_environment_manifests(env, &params);
         for revision in &env.revisions {
             if has_cluster_presence(revision.lifecycle) {

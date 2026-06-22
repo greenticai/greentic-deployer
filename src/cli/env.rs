@@ -635,7 +635,11 @@ pub fn reconcile(
     } else {
         "ambient"
     };
-    let report = reconcile_k8s_cluster(&env, answers.as_ref(), bound_token)?;
+    // Capture the env's local dev-store so reconcile delivers the operator's
+    // secrets to the worker (the K8s "no runtime secrets" gap). `None` when the
+    // env has no dev-store file yet — the worker's staging init is then a no-op.
+    let dev_secrets = read_dev_secrets_b64(store, &env_id)?;
+    let report = reconcile_k8s_cluster(&env, answers.as_ref(), bound_token, dev_secrets)?;
 
     Ok(OpOutcome::new(
         NOUN,
@@ -666,6 +670,7 @@ fn reconcile_k8s_cluster(
     env: &Environment,
     answers: Option<&Value>,
     bound_token: Option<String>,
+    dev_secrets: Option<String>,
 ) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
     use crate::env_packs::k8s::async_bridge::run_k8s_async;
     use crate::env_packs::k8s::kube_client::connect;
@@ -687,7 +692,10 @@ fn reconcile_k8s_cluster(
         let client = connect(kubeconfig_context.as_deref(), bound_token.as_deref())
             .await
             .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
-        let handler = K8sDeployerHandler::with_cluster(Arc::new(KubeCluster::new(client)));
+        let handler = K8sDeployerHandler::with_cluster_and_dev_secrets(
+            Arc::new(KubeCluster::new(client)),
+            dev_secrets,
+        );
         handler
             .reconcile(env, answers, manage_namespace)
             .await
@@ -701,12 +709,36 @@ fn reconcile_k8s_cluster(
     _env: &Environment,
     _answers: Option<&Value>,
     _bound_token: Option<String>,
+    _dev_secrets: Option<String>,
 ) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `k8s-client` feature; \
          `op env reconcile` needs it to connect to a cluster"
             .to_string(),
     ))
+}
+
+/// Read the env's local dev-store and base64-encode it for the reconcile-time
+/// dev-store Secret. `Ok(None)` when no dev-store file exists yet (the worker's
+/// staging init is then a guarded no-op). A read error other than not-found is
+/// surfaced — a present-but-unreadable store should fail the reconcile rather
+/// than silently ship an empty Secret.
+fn read_dev_secrets_b64(store: &LocalFsStore, env_id: &EnvId) -> Result<Option<String>, OpError> {
+    use base64::Engine as _;
+    let env_dir = store
+        .env_dir(env_id)
+        .map_err(|e| OpError::Conflict(format!("resolving env dir: {e}")))?;
+    let path = super::secrets::resolve_dev_store_path(&env_dir, None);
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(Some(
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(OpError::Conflict(format!(
+            "reading dev-store at {}: {e}",
+            path.display()
+        ))),
+    }
 }
 
 /// `op env apply-revision <env_id> <revision_id> [--kind <descriptor>]` — bring

@@ -71,6 +71,7 @@ required-features = [
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+base64 = "0.22"
 fs4 = "0.13"
 greentic-bundle = ">=1.1.0-dev, <1.2.0-0"
 greentic-config = ">=1.1.0-dev, <1.2.0-0"
@@ -252,7 +253,6 @@ version = "3"
 
 [dev-dependencies]
 wat = "1"
-base64 = "0.22"
 # kube-client mock harness (PR-5.2): drive a real `kube::Client` against
 # a `tower_test::mock` service so the K8sCluster / K8sValidatorClient
 # impls are asserted at the HTTP layer without a cluster.
