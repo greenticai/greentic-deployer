@@ -38,6 +38,7 @@
 use std::path::PathBuf;
 
 pub mod bootstrap;
+pub mod bundle_fetch;
 pub mod bundle_stage;
 pub mod bundles;
 pub mod config;
@@ -103,6 +104,11 @@ pub enum OpError {
     NotYetImplemented(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    /// A remote `bundle_source_uri` could not be fetched (registry unreachable,
+    /// auth/transport failure, or the artifact is missing). The fetched bytes
+    /// are gated against the manifest `bundle_digest` separately by the caller.
+    #[error("bundle fetch failed: {0}")]
+    Fetch(String),
     #[error("unauthorized: {policy} — {reason}")]
     Unauthorized { policy: String, reason: String },
     #[error("audit log write failed after the mutation committed: {0}")]
@@ -194,6 +200,7 @@ impl OpError {
             OpError::NotFound(_) => "not-found",
             OpError::NotYetImplemented(_) => "not-yet-implemented",
             OpError::Conflict(_) => "conflict",
+            OpError::Fetch(_) => "fetch",
             OpError::Unauthorized { .. } => "unauthorized",
             OpError::Audit(_) => "audit",
             OpError::RevenuePolicy(_) => "revenue-policy",
