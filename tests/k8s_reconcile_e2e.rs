@@ -82,9 +82,15 @@ const IDENTITY_SECRET: &str = "greentic-deployer-identity";
 /// OCI client (HTTPS-only, no insecure escape hatch), so kind needs no registry
 /// or TLS. Lives in the env's own `gtc-local` namespace for one-shot cleanup.
 const BUNDLE_SERVER: &str = "gtc-bundle-server";
-/// ConfigMap carrying the fixture bundle's bytes (the 4 KiB fixture is far
-/// under the 1 MiB ConfigMap limit), mounted into the httpd pod's docroot.
+/// Name prefix for the ConfigMaps carrying the fixture bundle's bytes. A
+/// ConfigMap is capped at 1 MiB, so a fixture larger than [`BUNDLE_CHUNK_BYTES`]
+/// (e.g. the 1.4 MB telegram bundle) is split across `gtc-bundle-blob-{0,1,…}`
+/// and reassembled by an init container into the httpd pod's docroot.
 const BUNDLE_BLOB_CM: &str = "gtc-bundle-blob";
+/// Max raw bytes per bundle-blob ConfigMap chunk. K8s caps a ConfigMap at 1 MiB
+/// (and the base64-inflated API request at ~1.5 MiB); 512 KiB raw clears both
+/// with margin. Small fixtures collapse to a single chunk.
+const BUNDLE_CHUNK_BYTES: usize = 512 * 1024;
 /// The file name the bundle is served (and pulled) under.
 const BUNDLE_FILE: &str = "bundle.gtbundle";
 /// The port the in-cluster httpd listens on (and the Service exposes).
@@ -608,26 +614,67 @@ fn start_bundle_server(fixture: &Path) {
     // worker. `reset_namespace` (a blocking delete) ran first, so the namespace
     // is gone; tolerate "already exists" defensively.
     let _ = kubectl(&["create", "namespace", NAMESPACE]);
-    let _ = kubectl(&[
-        "delete",
-        "configmap",
-        BUNDLE_BLOB_CM,
-        "-n",
-        NAMESPACE,
-        "--ignore-not-found",
-    ]);
 
-    // Bundle bytes → ConfigMap (kubectl auto-detects binary → binaryData).
-    kubectl_ok(&[
-        "create",
-        "configmap",
-        BUNDLE_BLOB_CM,
-        "-n",
-        NAMESPACE,
-        &format!("--from-file={BUNDLE_FILE}={}", fixture.to_string_lossy()),
-    ]);
+    // A ConfigMap is capped at 1 MiB, so the fixture is split into <1 MiB chunks
+    // (one ConfigMap each) and an init container reassembles them into the docroot
+    // emptyDir the httpd serves. Small fixtures collapse to a single chunk; the
+    // 1.4 MB telegram bundle needs several.
+    let bytes = std::fs::read(fixture).expect("read bundle fixture");
+    let chunks: Vec<&[u8]> = if bytes.is_empty() {
+        vec![&[][..]]
+    } else {
+        bytes.chunks(BUNDLE_CHUNK_BYTES).collect()
+    };
 
-    // busybox httpd Deployment + Service serving the mounted bundle. Readiness
+    // Defensive: clear any chunk ConfigMaps left by a prior run in this namespace.
+    let mut del: Vec<String> = ["delete", "configmap", "-n", NAMESPACE, "--ignore-not-found"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    del.extend((0..16).map(|i| format!("{BUNDLE_BLOB_CM}-{i}")));
+    let del_refs: Vec<&str> = del.iter().map(String::as_str).collect();
+    let _ = kubectl(&del_refs);
+
+    // Each chunk → its own ConfigMap (kubectl auto-detects binary → binaryData).
+    let dir = tempfile::tempdir().expect("chunk tempdir");
+    for (i, chunk) in chunks.iter().enumerate() {
+        let part = dir.path().join(format!("part{i}"));
+        std::fs::write(&part, chunk).expect("write bundle chunk");
+        kubectl_ok(&[
+            "create",
+            "configmap",
+            &format!("{BUNDLE_BLOB_CM}-{i}"),
+            "-n",
+            NAMESPACE,
+            &format!("--from-file=part={}", part.to_string_lossy()),
+        ]);
+    }
+
+    // YAML fragments built from the chunk count: the init container cats the
+    // mounted chunks in order into the shared emptyDir, fed by one volume per
+    // chunk ConfigMap.
+    let cat_inputs = (0..chunks.len())
+        .map(|i| format!("/chunks/part{i}/part"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let init_mounts = (0..chunks.len())
+        .map(|i| {
+            format!(
+                "            - name: chunk{i}\n              mountPath: /chunks/part{i}\n              readOnly: true"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let chunk_volumes = (0..chunks.len())
+        .map(|i| {
+            format!(
+                "        - name: chunk{i}\n          configMap:\n            name: {BUNDLE_BLOB_CM}-{i}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // busybox httpd Deployment + Service serving the reassembled bundle. Readiness
     // is the bundle itself returning 200, so a completed rollout means the
     // worker's pull will succeed.
     let manifest = format!(
@@ -646,6 +693,14 @@ spec:
       labels:
         app: {BUNDLE_SERVER}
     spec:
+      initContainers:
+        - name: assemble
+          image: busybox:1.36
+          command: [\"sh\", \"-c\", \"cat {cat_inputs} > /www/{BUNDLE_FILE}\"]
+          volumeMounts:
+            - name: www
+              mountPath: /www
+{init_mounts}
       containers:
         - name: httpd
           image: busybox:1.36
@@ -659,13 +714,13 @@ spec:
             initialDelaySeconds: 1
             periodSeconds: 2
           volumeMounts:
-            - name: blob
+            - name: www
               mountPath: /www
               readOnly: true
       volumes:
-        - name: blob
-          configMap:
-            name: {BUNDLE_BLOB_CM}
+        - name: www
+          emptyDir: {{}}
+{chunk_volumes}
 ---
 apiVersion: v1
 kind: Service
@@ -2404,9 +2459,10 @@ const TG_SINK_MARKER: &str = "GTC_M5_SENDMSG";
 const TG_REPLY_NEEDLE: &str = "What would you like to explore";
 
 /// Minimal fake Telegram Bot API: answers every path with an `ok:true` body
-/// (shaped to satisfy both `getMe` and `sendMessage` parsers) and prints
-/// `GTC_M5_SENDMSG <path> <body>` to stdout so `kubectl logs` surfaces the
-/// captured outbound `sendMessage` for assertion.
+/// (shaped to satisfy both `getMe` and `sendMessage` parsers), and prints
+/// `GTC_M5_SENDMSG <path> <body>` to stdout ONLY for `sendMessage` requests so
+/// `kubectl logs` surfaces the captured outbound reply for assertion — without
+/// the readiness `GET /` probe or `getMe` racing the detached egress.
 const FAKE_TELEGRAM_SINK_PY: &str = r#"import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -2418,8 +2474,12 @@ class H(BaseHTTPRequestHandler):
     def _handle(self):
         n = int(self.headers.get("Content-Length", "0") or "0")
         body = self.rfile.read(n) if n else b""
-        sys.stdout.write("GTC_M5_SENDMSG " + self.path + " " + body.decode("utf-8", "replace") + "\n")
-        sys.stdout.flush()
+        # Capture ONLY the bot's outbound reply (`sendMessage`) — not the readiness
+        # `GET /` probe or the provider's `getMe`, which would let `wait_for_sink_capture`
+        # return before the detached egress actually lands.
+        if "sendMessage" in self.path:
+            sys.stdout.write("GTC_M5_SENDMSG " + self.path + " " + body.decode("utf-8", "replace") + "\n")
+            sys.stdout.flush()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(OK)))
