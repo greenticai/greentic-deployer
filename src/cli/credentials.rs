@@ -354,7 +354,7 @@ pub fn rotate(
         if if_needed
             && let Ok(Some(bearer)) =
                 super::secrets::resolve_credentials_token(store, &env, &env_id)
-            && !crate::credentials::rotation_due(&bearer, chrono::Utc::now())
+            && !bind_creds.rotation_due(&bearer, chrono::Utc::now())
         {
             return Ok((
                 OpOutcome::new(

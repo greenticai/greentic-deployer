@@ -34,12 +34,14 @@ pub use bootstrap::{
     BootstrapError, BootstrapInput, BootstrapOutcome, BoundSecretSink, RunBootstrapError,
     ZeroizedAdmin, run_bootstrap,
 };
-pub use rotate::{RotateOutcome, RunRotateError, rotation_due, run_rotate};
+pub use rotate::{RotateOutcome, RunRotateError, run_rotate};
 pub use rules_export::{RulesExportError, RulesPack, RulesPackEntry, write_rules_pack};
 pub use validate::{
     Capability, CapabilityCheck, CapabilityStatus, RequirementsReport, ValidateError,
     ValidationContext, validate_requirements,
 };
+
+use chrono::{DateTime, Utc};
 
 /// Contract a deployer env-pack handler implements to surface its
 /// credentials story to the `gtc op credentials` CLI.
@@ -102,4 +104,34 @@ pub trait DeployerCredentials: std::fmt::Debug + Send + Sync {
     /// between the remote write and the local commit — short-lived bound tokens
     /// + rotation are the systemic mitigation for that residual window.
     fn rollback_bound_material(&self, _env_id: &greentic_deploy_spec::EnvId) {}
+
+    /// The absolute time the given bound credential *material* should be
+    /// rotated, derived from the material's own self-reported lifetime (e.g.
+    /// the K8s projected-ServiceAccount-token JWT's `iat`/`exp` claims).
+    /// Returns `None` when the lifetime can't be determined.
+    ///
+    /// Default is `None`: deployers that mint no time-bounded material (the
+    /// render-only / local paths, and AWS until its STS producer lands) have
+    /// no rotation point to compute. Backends that mint bounded credentials
+    /// override this to decode their own material format — the rotation
+    /// *policy* (rotate at 80% of lifetime) stays shared in
+    /// [`rotate::rotate_at_from_window`], only the decode varies.
+    fn rotate_at(&self, _material: &str) -> Option<DateTime<Utc>> {
+        None
+    }
+
+    /// Whether the given bound material is at/past its rotation point.
+    ///
+    /// Fails OPEN: material whose lifetime can't be decoded
+    /// ([`rotate_at`](Self::rotate_at) returns `None`) is treated as due, so
+    /// `op credentials rotate --if-needed` errs toward rotating rather than
+    /// letting an opaque token silently lapse. The policy lives here; only the
+    /// per-backend `rotate_at` decode is overridden, so impls should not need
+    /// to override this.
+    fn rotation_due(&self, material: &str, now: DateTime<Utc>) -> bool {
+        match self.rotate_at(material) {
+            Some(rotate_at) => now >= rotate_at,
+            None => true,
+        }
+    }
 }

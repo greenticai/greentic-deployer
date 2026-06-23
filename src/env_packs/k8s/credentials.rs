@@ -46,6 +46,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chrono::{DateTime, Utc};
 use greentic_deploy_spec::SecretRef;
 use zeroize::Zeroizing;
 
@@ -417,9 +420,32 @@ impl K8sDeployerCredentials {
     }
 }
 
+/// Decode a JWT bearer's `iat`/`exp` claims (the projected ServiceAccount
+/// token is a signed JWT). Signature is NOT verified — this reads the token's
+/// self-reported lifetime to schedule a proactive re-mint, never to authorize
+/// anything. Returns `None` on any structural failure.
+fn decode_token_lifetime(bearer: &str) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let payload_b64 = bearer.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let iat = DateTime::from_timestamp(claims.get("iat")?.as_i64()?, 0)?;
+    let exp = DateTime::from_timestamp(claims.get("exp")?.as_i64()?, 0)?;
+    Some((iat, exp))
+}
+
 impl DeployerCredentials for K8sDeployerCredentials {
     fn requires_credentials_material(&self) -> bool {
         true
+    }
+
+    /// The projected ServiceAccount token is a JWT; decode its self-reported
+    /// `iat`/`exp` and schedule the re-mint at 80% of lifetime (the shared
+    /// policy in [`rotate_at_from_window`](crate::credentials::rotate)).
+    /// `None` for material that isn't a JWT with both claims — the caller then
+    /// fails open and rotates.
+    fn rotate_at(&self, material: &str) -> Option<DateTime<Utc>> {
+        let (iat, exp) = decode_token_lifetime(material)?;
+        Some(crate::credentials::rotate::rotate_at_from_window(iat, exp))
     }
 
     fn required_capabilities(&self) -> Vec<Capability> {
@@ -1365,6 +1391,58 @@ mod tests {
                 assert!(message.contains("forbidden"), "message: {message}");
             }
             other => panic!("expected ProvisioningFailed, got {other:?}"),
+        }
+    }
+
+    /// Build a JWT-shaped bearer carrying the given `iat`/`exp` unix seconds
+    /// (header + signature are inert — only the payload is decoded).
+    fn fake_jwt(iat: i64, exp: i64) -> String {
+        let payload = serde_json::json!({ "iat": iat, "exp": exp, "sub": "system:serviceaccount" });
+        let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        format!("aGVhZGVy.{body}.c2ln")
+    }
+
+    #[test]
+    fn rotate_at_decodes_the_jwt_and_lands_at_eighty_percent() {
+        // 1000s lifetime ⇒ rotate at iat + 800s, read from the token's claims.
+        let iat = 1_000_000;
+        let creds = K8sDeployerCredentials::default();
+        let rotate_at = creds
+            .rotate_at(&fake_jwt(iat, iat + 1000))
+            .expect("decodable JWT");
+        assert_eq!(rotate_at, DateTime::from_timestamp(iat + 800, 0).unwrap());
+    }
+
+    #[test]
+    fn rotation_due_tracks_the_eighty_percent_threshold() {
+        let iat = 2_000_000;
+        let creds = K8sDeployerCredentials::default();
+        let bearer = fake_jwt(iat, iat + 1000); // rotate_at = iat + 800
+        let before = DateTime::from_timestamp(iat + 799, 0).unwrap();
+        let at = DateTime::from_timestamp(iat + 800, 0).unwrap();
+        assert!(!creds.rotation_due(&bearer, before), "799s in: not due");
+        assert!(
+            creds.rotation_due(&bearer, at),
+            "800s in: due (>= threshold)"
+        );
+    }
+
+    #[test]
+    fn rotate_at_is_none_and_rotation_due_fails_open_for_opaque_material() {
+        // Not a JWT, empty, or a non-base64 payload — `rotate_at` can't decode
+        // a lifetime, so `rotation_due` treats every shape as due and
+        // `--if-needed` never silently skips an undecodable token.
+        let creds = K8sDeployerCredentials::default();
+        let now = Utc::now();
+        for material in ["not-a-jwt", "", "a.b.c"] {
+            assert!(
+                creds.rotate_at(material).is_none(),
+                "{material:?} is undecodable"
+            );
+            assert!(
+                creds.rotation_due(material, now),
+                "{material:?} fails open to due"
+            );
         }
     }
 }

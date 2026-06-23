@@ -862,4 +862,15 @@ mod tests {
             "rules pack must mention the admin trust principal; content:\n{combined}"
         );
     }
+
+    #[test]
+    fn rotate_at_is_none_until_the_sts_producer_lands() {
+        // AWS bootstrap is render-only today (mints no bound material), so it
+        // inherits the default `rotate_at` => None. The STS session-token
+        // producer will override this with the credential's STS expiry window.
+        let creds = AwsDeployerCredentials::default();
+        assert!(creds.rotate_at("any-material").is_none());
+        // Fail-open: with no decodable lifetime, the material is treated as due.
+        assert!(creds.rotation_due("any-material", chrono::Utc::now()));
+    }
 }
