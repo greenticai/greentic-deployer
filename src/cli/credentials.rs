@@ -8,9 +8,12 @@
 //! - **bootstrap**: run the deployer env-pack's bootstrap pack against
 //!   ephemeral admin credentials; produce low-privilege output + a
 //!   reviewable rules pack.
-//! - **rotate**: re-validate; rotate session tokens where the deployer
-//!   supports it (Phase D — today this re-runs requirements and surfaces
-//!   the up-to-date report).
+//! - **rotate**: re-mint the env's bound deployer credential in place
+//!   (K8s `--bind` only this round) and re-persist the fresh material,
+//!   leaving `credentials_ref` unchanged. `--if-needed` makes it the
+//!   idempotent, schedulable form — a no-op until the current token is at
+//!   80% of its lifetime — so a cron/CronJob refreshes the bound token
+//!   before it lapses instead of a full re-bind.
 //!
 //! All three resolve the env's bound deployer env-pack through the A9
 //! registry and invoke the
@@ -40,7 +43,7 @@
 //! needing stronger guarantees should run bootstrap on a short-lived
 //! process (CI runner, dedicated VM).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use greentic_deploy_spec::EnvId;
 use serde::{Deserialize, Serialize};
@@ -95,6 +98,27 @@ pub struct CredentialsBootstrapPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialsRotatePayload {
     pub environment_id: String,
+    /// Local profile / kubeconfig context for the one-time admin connection
+    /// that re-mints the bound credential. Rotation always re-mints AS THE
+    /// ADMIN (the bound identity itself cannot create its own tokens by
+    /// design). Never written to the env's storage.
+    pub admin_profile: String,
+    /// Path to a file holding the admin credential material (loaded into a
+    /// [`ZeroizedAdmin`] and zeroized before this call returns). Mutually
+    /// exclusive with `admin_material_inline`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_material_path: Option<PathBuf>,
+    /// Inline admin credential material — never persisted. Mutually exclusive
+    /// with `admin_material_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_material_inline: Option<String>,
+    /// When `true`, rotate ONLY if the current bound token is at/past 80% of
+    /// its lifetime (kubelet's projected-token refresh point). A no-op
+    /// otherwise — the idempotent form a scheduler calls on a cadence
+    /// shorter than the token lifetime. When `false` (default), rotate
+    /// unconditionally.
+    #[serde(default)]
+    pub if_needed: bool,
 }
 
 #[derive(Debug, Error)]
@@ -172,7 +196,12 @@ pub fn bootstrap(
     let env_id = parse_env_id(&payload.environment_id)?;
     let bind_requested = payload.bind;
 
-    let admin = load_admin_credential(&mut payload).map_err(|e| {
+    let admin = load_admin_credential(
+        &payload.admin_profile,
+        payload.admin_material_path.as_deref(),
+        &mut payload.admin_material_inline,
+    )
+    .map_err(|e| {
         // Keep the admin-loader's specific error visible to the operator
         // — `Conflict` is the right kind for "you supplied the wrong
         // combination of options" / "the file you pointed at is empty".
@@ -266,18 +295,20 @@ pub fn bootstrap(
 
 pub fn rotate(
     store: &LocalFsStore,
-    _registry: &EnvPackRegistry,
+    registry: &EnvPackRegistry,
     flags: &OpFlags,
     payload: Option<CredentialsRotatePayload>,
 ) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(NOUN, "rotate", rotate_schema()));
     }
-    let payload = resolve_payload::<CredentialsRotatePayload>(flags, payload)?;
+    let mut payload = resolve_payload::<CredentialsRotatePayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
+    let if_needed = payload.if_needed;
 
-    // Pre-flight: reject envs that have no credentials_ref at all
-    // (same precondition as the old validate_requirements path).
+    // Pre-flight (before consuming admin material): the env must exist, have a
+    // deployer bound, and already be bootstrapped — rotation refreshes an
+    // existing bound credential, it never creates one.
     let env = store.load(&env_id).map_err(|e| match e {
         crate::environment::StoreError::NotFound(_) => {
             OpError::NotFound(format!("environment `{env_id}`"))
@@ -298,24 +329,91 @@ pub fn rotate(
         )));
     }
 
+    // Build the admin-connected re-mint path. Rotation always re-mints AS THE
+    // ADMIN — the bound identity cannot create its own tokens by design — so a
+    // non-K8s (render-only) deployer has nothing to rotate live. This only
+    // constructs the connector (no connection yet), so it is cheap to run
+    // before the `--if-needed` short-circuit.
+    let bind_creds = admin_bind_k8s_credentials(store, &env_id, &payload.admin_profile)?
+        .ok_or_else(|| {
+            OpError::Conflict(
+                "live rotation is only supported for K8s-bound environments this round; \
+                 other deployers re-bind via `op credentials bootstrap` against a freshly \
+                 applied rules pack"
+                    .to_string(),
+            )
+        })?;
+
+    // `--if-needed`: skip the re-mint (and never touch admin material) unless
+    // the current bound token is at/past 80% of its lifetime. Resolves the
+    // bearer from env-var / dev-store (no cluster round-trip); an unresolvable
+    // token falls through to rotate (fail-open).
+    if if_needed
+        && let Ok(Some(bearer)) = super::secrets::resolve_credentials_token(store, &env, &env_id)
+        && !crate::credentials::rotation_due(&bearer, chrono::Utc::now())
+    {
+        return Ok(OpOutcome::new(
+            NOUN,
+            "rotate",
+            json!({
+                "environment_id": env_id.as_str(),
+                "rotated": false,
+                "reason": "current token has not reached its rotation threshold (80% of lifetime)",
+            }),
+        ));
+    }
+
+    let admin = load_admin_credential(
+        &payload.admin_profile,
+        payload.admin_material_path.as_deref(),
+        &mut payload.admin_material_inline,
+    )
+    .map_err(|e| OpError::Conflict(e.to_string()))?;
+
+    // Sink that overwrites the minted bearer in the env dev store at the
+    // location `resolve_credentials_token` reads it back from. Invoked inside
+    // `run_rotate`'s flock.
+    let secret_sink = |env_root: &std::path::Path,
+                       secret_ref: &greentic_deploy_spec::SecretRef,
+                       value: &str|
+     -> Result<(), String> {
+        super::secrets::put_credential_material(env_root, secret_ref, value)
+            .map_err(|e| e.to_string())
+    };
+
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "rotate",
-        target: json!({}),
+        // Admin material is NEVER recorded — only the (non-secret) profile
+        // handle and the mode.
+        target: json!({"admin_profile": payload.admin_profile, "if_needed": if_needed}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, |_committed| {
-        // Session-token rotation hooks (AWS STS, GCP impersonation) are
-        // deployer-specific behavior that lands in Phase D. Returning
-        // NotYetImplemented ensures the audit log does NOT record a
-        // successful rotation when no material actually changed —
-        // operators watching for leaked-credential remediation won't
-        // get a false "rotated" signal.
-        Err(OpError::NotYetImplemented(
-            "session-token rotation hooks are Phase D \
-             — use `op credentials requirements` for re-validation today"
-                .to_string(),
+    audit_and_record(store, ctx, |committed| {
+        let outcome = crate::credentials::run_rotate(
+            store,
+            registry,
+            &env_id,
+            &admin,
+            bind_creds.as_ref(),
+            &secret_sink,
+        )
+        .map_err(map_rotate_err)?;
+        committed.mark_committed();
+        Ok((
+            OpOutcome::new(
+                NOUN,
+                "rotate",
+                json!({
+                    "environment_id": env_id.as_str(),
+                    "rotated": true,
+                    "credentials_ref": outcome.credentials_ref.as_str(),
+                    "expires_at": outcome.expiry.as_ref().map(|e| e.expires_at),
+                    "rotate_at": outcome.expiry.as_ref().and_then(|e| e.rotate_at),
+                }),
+            ),
+            AuditGens::NONE,
         ))
     })
 }
@@ -339,15 +437,17 @@ fn result_label(r: &greentic_deploy_spec::CredentialsValidationResult) -> &'stat
 /// `String::from_utf8` (not lossy — lossy substitution silently corrupts
 /// credentials). The intermediate `Vec<u8>` is zeroized on drop.
 fn load_admin_credential(
-    payload: &mut CredentialsBootstrapPayload,
+    admin_profile: &str,
+    admin_material_path: Option<&Path>,
+    admin_material_inline: &mut Option<String>,
 ) -> Result<ZeroizedAdmin, AdminLoadError> {
-    match (&payload.admin_material_path, &payload.admin_material_inline) {
+    match (admin_material_path, admin_material_inline.as_ref()) {
         (None, None) => Err(AdminLoadError::Missing),
         (Some(_), Some(_)) => Err(AdminLoadError::Both),
         (Some(path), None) => {
             let mut bytes =
                 Zeroizing::new(std::fs::read(path).map_err(|source| AdminLoadError::Io {
-                    path: path.clone(),
+                    path: path.to_path_buf(),
                     source,
                 })?);
             // Take the raw bytes out of the Zeroizing wrapper. The
@@ -356,22 +456,24 @@ fn load_admin_credential(
             // String takes ownership of the same allocation; on failure
             // the bytes are returned inside the error and dropped here.
             let raw = std::mem::take(&mut *bytes);
-            let material = String::from_utf8(raw)
-                .map_err(|_| AdminLoadError::NonUtf8 { path: path.clone() })?;
+            let material = String::from_utf8(raw).map_err(|_| AdminLoadError::NonUtf8 {
+                path: path.to_path_buf(),
+            })?;
             if material.trim().is_empty() {
                 return Err(AdminLoadError::Empty);
             }
-            Ok(ZeroizedAdmin::new(&payload.admin_profile, material))
+            Ok(ZeroizedAdmin::new(admin_profile, material))
         }
         (None, Some(_)) => {
-            // Take the inline material out of the payload — the field
-            // becomes `None` after extraction, enforcing single-use.
-            let taken = std::mem::take(&mut payload.admin_material_inline)
+            // Take the inline material out of the option — it becomes
+            // `None` after extraction, enforcing single-use.
+            let taken = admin_material_inline
+                .take()
                 .expect("matched Some branch; take cannot be None");
             if taken.trim().is_empty() {
                 return Err(AdminLoadError::Empty);
             }
-            Ok(ZeroizedAdmin::new(&payload.admin_profile, taken))
+            Ok(ZeroizedAdmin::new(admin_profile, taken))
         }
     }
 }
@@ -592,6 +694,30 @@ fn map_bootstrap_err(e: RunBootstrapError) -> OpError {
     }
 }
 
+fn map_rotate_err(e: crate::credentials::RunRotateError) -> OpError {
+    use crate::credentials::{BootstrapError, RunRotateError as E};
+    match e {
+        E::NoDeployerBound(env_id) => OpError::Conflict(no_deployer_bound_msg(&env_id)),
+        E::NotBootstrapped(env_id) => OpError::Conflict(format!(
+            "env `{env_id}` has no credentials_ref; run `op credentials bootstrap` first"
+        )),
+        E::HandlerNotRegistered { kind } => OpError::Conflict(handler_not_registered_msg(&kind)),
+        E::RotationUnsupported(msg) => OpError::Conflict(msg),
+        E::Store(s) => OpError::Store(s),
+        E::Registry(r) => OpError::Conflict(r.to_string()),
+        E::Bootstrap(BootstrapError::NotApplicable(msg)) => OpError::Conflict(msg),
+        E::Bootstrap(BootstrapError::AdminRejected(msg)) => {
+            OpError::Conflict(format!("admin credential rejected: {msg}"))
+        }
+        E::Bootstrap(BootstrapError::ProvisioningFailed { step, message }) => {
+            OpError::Conflict(format!("rotation failed during {step}: {message}"))
+        }
+        E::SecretWrite(msg) => OpError::Conflict(format!(
+            "failed to persist rotated credential material: {msg}"
+        )),
+    }
+}
+
 fn resolve_payload<T: serde::de::DeserializeOwned>(
     flags: &OpFlags,
     payload: Option<T>,
@@ -644,9 +770,15 @@ fn rotate_schema() -> Value {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "CredentialsRotatePayload",
         "type": "object",
-        "required": ["environment_id"],
+        "required": ["environment_id", "admin_profile"],
         "additionalProperties": false,
-        "properties": {"environment_id": {"type": "string"}}
+        "properties": {
+            "environment_id": {"type": "string"},
+            "admin_profile": {"type": "string", "description": "kubeconfig context / admin identity that re-mints the bound credential (never persisted)"},
+            "admin_material_path": {"type": "string", "description": "path to a file holding the admin credential material (zeroized on drop); mutually exclusive with admin_material_inline"},
+            "admin_material_inline": {"type": "string", "description": "inline admin credential material (zeroized on drop); mutually exclusive with admin_material_path"},
+            "if_needed": {"type": "boolean", "description": "rotate only if the current bound token is at/past 80% of its lifetime; a no-op otherwise (the idempotent form a scheduler calls)"}
+        }
     })
 }
 
@@ -966,6 +1098,19 @@ mod tests {
         assert!(reloaded.credentials_ref.is_none());
     }
 
+    /// Build a rotate payload with the admin handle filled in (rotation
+    /// always re-mints as the admin); material is omitted because the
+    /// rejection paths under test short-circuit before it is consumed.
+    fn rotate_payload(env_id: &str) -> CredentialsRotatePayload {
+        CredentialsRotatePayload {
+            environment_id: env_id.to_string(),
+            admin_profile: "admin-ctx".to_string(),
+            admin_material_path: None,
+            admin_material_inline: None,
+            if_needed: false,
+        }
+    }
+
     #[test]
     fn rotate_rejects_env_without_credentials_ref() {
         let dir = tempdir().unwrap();
@@ -976,20 +1121,16 @@ mod tests {
             "greentic.deployer.aws-ecs@1.0.0",
         ));
         store.save(&env).unwrap();
-        let err = rotate_default(
-            &store,
-            &OpFlags::default(),
-            Some(CredentialsRotatePayload {
-                environment_id: "local".to_string(),
-            }),
-        )
-        .unwrap_err();
+        let err =
+            rotate_default(&store, &OpFlags::default(), Some(rotate_payload("local"))).unwrap_err();
         assert!(matches!(err, OpError::Conflict(_)), "got {err:?}");
     }
 
-    /// Rotate returns `NotYetImplemented` (not a misleading success).
+    /// Live rotation is K8s-only: a non-K8s (render-only) deployer that IS
+    /// bootstrapped is rejected with a Conflict directing the operator to
+    /// re-bind via `bootstrap` (no misleading success, no re-mint attempt).
     #[test]
-    fn rotate_returns_not_yet_implemented() {
+    fn rotate_rejects_non_k8s_deployer() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let mut env = make_env("local");
@@ -999,17 +1140,11 @@ mod tests {
         ));
         env.credentials_ref = Some(SecretRef::try_new("secret://local/credentials/test").unwrap());
         store.save(&env).unwrap();
-        let err = rotate_default(
-            &store,
-            &OpFlags::default(),
-            Some(CredentialsRotatePayload {
-                environment_id: "local".to_string(),
-            }),
-        )
-        .unwrap_err();
+        let err =
+            rotate_default(&store, &OpFlags::default(), Some(rotate_payload("local"))).unwrap_err();
         assert!(
-            matches!(err, OpError::NotYetImplemented(_)),
-            "rotate should return NotYetImplemented, got {err:?}"
+            matches!(err, OpError::Conflict(_)),
+            "non-K8s rotation must be a Conflict, got {err:?}"
         );
     }
 

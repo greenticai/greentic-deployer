@@ -26,6 +26,7 @@
 //! credential material at all (C2).
 
 pub mod bootstrap;
+pub mod rotate;
 pub mod rules_export;
 pub mod validate;
 
@@ -33,6 +34,7 @@ pub use bootstrap::{
     BootstrapError, BootstrapInput, BootstrapOutcome, BoundSecretSink, RunBootstrapError,
     ZeroizedAdmin, run_bootstrap,
 };
+pub use rotate::{RotateOutcome, RunRotateError, rotation_due, run_rotate};
 pub use rules_export::{RulesExportError, RulesPack, RulesPackEntry, write_rules_pack};
 pub use validate::{
     Capability, CapabilityCheck, CapabilityStatus, RequirementsReport, ValidateError,
