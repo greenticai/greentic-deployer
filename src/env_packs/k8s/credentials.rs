@@ -64,9 +64,10 @@ use super::manifests::namespace_for_env;
 /// Lifetime requested for the bound ServiceAccount token (1 year). The API
 /// server clamps this to its `--service-account-max-token-expiration`, so
 /// the GRANTED expiry (read back from the TokenRequest status) may be
-/// sooner — the runner records it as the re-bind deadline. Auto-rotation
-/// before expiry is a deferred follow-up; until then the env's
-/// `credentials_ref` must be re-bound before this lapses.
+/// sooner — the runner records it as the re-bind deadline. `op credentials
+/// rotate --if-needed` re-mints in place once the token passes 80% of its
+/// (clamped) lifetime, so a scheduled job keeps it fresh without a full
+/// re-bind.
 const BIND_TOKEN_EXPIRATION_SECONDS: i64 = 365 * 24 * 60 * 60;
 
 /// Stable ID for the API-reachability probe (identity resolves against
