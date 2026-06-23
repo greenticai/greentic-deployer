@@ -626,12 +626,14 @@ fn start_bundle_server(fixture: &Path) {
         bytes.chunks(BUNDLE_CHUNK_BYTES).collect()
     };
 
-    // Defensive: clear any chunk ConfigMaps left by a prior run in this namespace.
+    // Defensive: clear this run's chunk ConfigMap names before recreating them
+    // (the namespace was just reset, so deleting exactly what we re-create is
+    // enough — and collision-free for any fixture size, unlike a fixed bound).
     let mut del: Vec<String> = ["delete", "configmap", "-n", NAMESPACE, "--ignore-not-found"]
         .iter()
         .map(|s| s.to_string())
         .collect();
-    del.extend((0..16).map(|i| format!("{BUNDLE_BLOB_CM}-{i}")));
+    del.extend((0..chunks.len()).map(|i| format!("{BUNDLE_BLOB_CM}-{i}")));
     let del_refs: Vec<&str> = del.iter().map(String::as_str).collect();
     let _ = kubectl(&del_refs);
 
