@@ -27,8 +27,6 @@
 //! Calling [`rollback_bound_material`](super::DeployerCredentials::rollback_bound_material)
 //! here would wrongly DELETE the live identity Secret.
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use greentic_deploy_spec::{CapabilitySlot, CredentialsExpiry, EnvId, SecretRef};
 use thiserror::Error;
@@ -148,7 +146,7 @@ pub fn run_rotate(
 
         let expiry = outcome.bound_expiry.map(|expires_at| CredentialsExpiry {
             expires_at,
-            rotate_at: rotate_at_for(material.as_str()),
+            rotate_at: bind_creds.rotate_at(material.as_str()),
         });
 
         Ok(RotateOutcome {
@@ -158,93 +156,47 @@ pub fn run_rotate(
     })
 }
 
-/// Whether a bound bearer is at/past its rotation point (≥ 80% of lifetime
-/// elapsed). Fails OPEN: a token whose lifetime claims can't be decoded is
-/// treated as due, so `--if-needed` errs toward rotating rather than letting
-/// an opaque token silently lapse.
-pub fn rotation_due(bearer: &str, now: DateTime<Utc>) -> bool {
-    match rotate_at_for(bearer) {
-        Some(rotate_at) => now >= rotate_at,
-        None => true,
-    }
-}
-
-/// The absolute time a bound bearer should be rotated: `iat + lifetime*0.8`,
-/// derived from the token's own `iat`/`exp` claims. `None` when the bearer
-/// is not a decodable JWT with both claims.
-fn rotate_at_for(bearer: &str) -> Option<DateTime<Utc>> {
-    let (iat, exp) = decode_token_lifetime(bearer)?;
+/// The absolute time a bound credential should be rotated, from its lifetime
+/// window: `iat + (exp - iat) * 0.8`. A degenerate / already-expired window
+/// (`exp <= iat`) returns `iat` (rotate now).
+///
+/// Shared rotation *policy* across backends: each
+/// [`super::DeployerCredentials::rotate_at`] impl decodes its own material
+/// into the `(iat, exp)` window, then calls this. Keeping the 80% fraction in
+/// one place means K8s and any future backend rotate on the same schedule.
+pub(crate) fn rotate_at_from_window(iat: DateTime<Utc>, exp: DateTime<Utc>) -> DateTime<Utc> {
     let lifetime_secs = (exp - iat).num_seconds();
     if lifetime_secs <= 0 {
-        // Degenerate / already-expired window — rotate now.
-        return Some(iat);
+        return iat;
     }
     let offset = (lifetime_secs as f64 * ROTATE_AT_LIFETIME_FRACTION) as i64;
-    Some(iat + chrono::Duration::seconds(offset))
-}
-
-/// Decode a JWT bearer's `iat`/`exp` claims (the projected ServiceAccount
-/// token is a signed JWT). Signature is NOT verified — this reads OUR OWN
-/// token's self-reported lifetime to schedule a proactive re-mint, never to
-/// authorize anything. Returns `None` on any structural failure.
-fn decode_token_lifetime(bearer: &str) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
-    let payload_b64 = bearer.split('.').nth(1)?;
-    let bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let iat = DateTime::from_timestamp(claims.get("iat")?.as_i64()?, 0)?;
-    let exp = DateTime::from_timestamp(claims.get("exp")?.as_i64()?, 0)?;
-    Some((iat, exp))
+    iat + chrono::Duration::seconds(offset)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Build a JWT-shaped bearer carrying the given `iat`/`exp` unix seconds
-    /// (header + signature are inert — only the payload is decoded).
-    fn fake_jwt(iat: i64, exp: i64) -> String {
-        let payload = serde_json::json!({ "iat": iat, "exp": exp, "sub": "system:serviceaccount" });
-        let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
-        format!("aGVhZGVy.{body}.c2ln")
+    fn ts(unix: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(unix, 0).unwrap()
     }
 
     #[test]
-    fn rotate_at_is_eighty_percent_through_the_lifetime() {
+    fn rotate_at_from_window_is_eighty_percent_through_the_lifetime() {
         // 1000s lifetime ⇒ rotate at iat + 800s.
         let iat = 1_000_000;
-        let bearer = fake_jwt(iat, iat + 1000);
-        let rotate_at = rotate_at_for(&bearer).expect("decodable");
-        assert_eq!(rotate_at, DateTime::from_timestamp(iat + 800, 0).unwrap());
-    }
-
-    #[test]
-    fn rotation_due_false_before_threshold_true_after() {
-        let iat = 2_000_000;
-        let bearer = fake_jwt(iat, iat + 1000); // rotate_at = iat + 800
-        let before = DateTime::from_timestamp(iat + 799, 0).unwrap();
-        let at = DateTime::from_timestamp(iat + 800, 0).unwrap();
-        assert!(!rotation_due(&bearer, before), "799s in: not due");
-        assert!(rotation_due(&bearer, at), "800s in: due (>= threshold)");
-    }
-
-    #[test]
-    fn rotation_due_fails_open_for_an_opaque_token() {
-        // Not a JWT, no claims, empty — every shape must be treated as due
-        // so `--if-needed` never silently skips an undecodable token.
-        let now = Utc::now();
-        assert!(rotation_due("not-a-jwt", now));
-        assert!(rotation_due("", now));
-        assert!(rotation_due("a.b.c", now), "non-base64 payload");
-    }
-
-    #[test]
-    fn rotate_at_for_degenerate_lifetime_is_iat() {
-        let iat = 3_000_000;
-        let bearer = fake_jwt(iat, iat); // zero lifetime
         assert_eq!(
-            rotate_at_for(&bearer),
-            Some(DateTime::from_timestamp(iat, 0).unwrap())
+            rotate_at_from_window(ts(iat), ts(iat + 1000)),
+            ts(iat + 800)
         );
+    }
+
+    #[test]
+    fn rotate_at_from_window_degenerate_lifetime_is_iat() {
+        // Zero / negative window ⇒ rotate now (at iat).
+        let iat = 3_000_000;
+        assert_eq!(rotate_at_from_window(ts(iat), ts(iat)), ts(iat));
+        assert_eq!(rotate_at_from_window(ts(iat), ts(iat - 500)), ts(iat));
     }
 
     use crate::credentials::{
@@ -255,12 +207,15 @@ mod tests {
     use greentic_deploy_spec::{CapabilitySlot, SecretRef};
 
     /// A deployer credentials fake that mints a (configurable) bearer +
-    /// expiry on `bootstrap` — the re-mint engine `run_rotate` drives.
+    /// expiry on `bootstrap` — the re-mint engine `run_rotate` drives. Its
+    /// `rotate_at` is a plain field, decoupling the engine's rotate-point
+    /// wiring from any backend's material-decode format.
     #[derive(Debug)]
     struct MintingCreds {
         bearer: Option<String>,
         expiry: Option<DateTime<Utc>>,
         bound_ref: Option<String>,
+        rotate_at: Option<DateTime<Utc>>,
     }
 
     impl DeployerCredentials for MintingCreds {
@@ -269,6 +224,9 @@ mod tests {
         }
         fn validate(&self, _ctx: &ValidationContext<'_>) -> RequirementsReport {
             unreachable!("rotation never validates")
+        }
+        fn rotate_at(&self, _material: &str) -> Option<DateTime<Utc>> {
+            self.rotate_at
         }
         fn bootstrap(
             &self,
@@ -310,11 +268,12 @@ mod tests {
 
         let (_dir, store, ref_uri) = bootstrapped_env_store();
         let iat = 5_000_000;
-        let bearer = fake_jwt(iat, iat + 1000); // rotate_at = iat + 800
+        let bearer = "bound-token-material".to_string();
         let creds = MintingCreds {
             bearer: Some(bearer.clone()),
-            expiry: Some(DateTime::from_timestamp(iat + 1000, 0).unwrap()),
+            expiry: Some(ts(iat + 1000)),
             bound_ref: Some(ref_uri.to_string()),
+            rotate_at: Some(ts(iat + 800)),
         };
         let written: RefCell<Option<(String, String)>> = RefCell::new(None);
         let sink = |_root: &std::path::Path, r: &SecretRef, v: &str| -> Result<(), String> {
@@ -378,11 +337,12 @@ mod tests {
         store.save(&env).unwrap();
 
         let iat = 7_000_000;
-        let bearer = fake_jwt(iat, iat + 1000);
+        let bearer = "bound-token-material".to_string();
         let creds = MintingCreds {
             bearer: Some(bearer.clone()),
-            expiry: Some(DateTime::from_timestamp(iat + 1000, 0).unwrap()),
+            expiry: Some(ts(iat + 1000)),
             bound_ref: Some(minted_ref.to_string()), // deployer mints at its default
+            rotate_at: None,
         };
         let written: RefCell<Option<(String, String)>> = RefCell::new(None);
         let sink = |_root: &std::path::Path, r: &SecretRef, v: &str| -> Result<(), String> {
@@ -417,6 +377,7 @@ mod tests {
             bearer: None,
             expiry: None,
             bound_ref: None,
+            rotate_at: None,
         };
         let sink = |_root: &std::path::Path, _r: &SecretRef, _v: &str| -> Result<(), String> {
             panic!("sink must not be called when there is no material to persist")
@@ -451,6 +412,7 @@ mod tests {
             bearer: None,
             expiry: None,
             bound_ref: None,
+            rotate_at: None,
         };
         let sink = |_root: &std::path::Path, _r: &SecretRef, _v: &str| -> Result<(), String> {
             unreachable!("precondition fails before any persist")
@@ -468,5 +430,41 @@ mod tests {
             matches!(err, RunRotateError::NotBootstrapped(_)),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn rotation_due_is_false_before_threshold_and_true_at_or_after() {
+        let creds = MintingCreds {
+            bearer: None,
+            expiry: None,
+            bound_ref: None,
+            rotate_at: Some(ts(2_000_800)),
+        };
+        assert!(
+            !creds.rotation_due("material", ts(2_000_799)),
+            "before threshold: not due"
+        );
+        assert!(
+            creds.rotation_due("material", ts(2_000_800)),
+            "at threshold: due"
+        );
+        assert!(
+            creds.rotation_due("material", ts(2_000_801)),
+            "after threshold: due"
+        );
+    }
+
+    #[test]
+    fn rotation_due_fails_open_when_rotate_at_is_none() {
+        // A deployer whose material carries no decodable lifetime is always
+        // treated as due, so `--if-needed` never silently skips it.
+        let creds = MintingCreds {
+            bearer: None,
+            expiry: None,
+            bound_ref: None,
+            rotate_at: None,
+        };
+        assert!(creds.rotation_due("opaque", ts(0)));
+        assert!(creds.rotation_due("", ts(1_000_000)));
     }
 }
