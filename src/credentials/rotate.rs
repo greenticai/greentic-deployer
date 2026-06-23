@@ -59,10 +59,6 @@ pub enum RunRotateError {
     NoDeployerBound(EnvId),
     #[error("env `{0}` has no credentials_ref; run `op credentials bootstrap` first")]
     NotBootstrapped(EnvId),
-    #[error(
-        "deployer env-pack `{kind}` has no native credentials handler registered (Phase D plug-in)"
-    )]
-    HandlerNotRegistered { kind: String },
     /// The deployer minted no bound material (e.g. a render-only bootstrap),
     /// so there is no live token to re-mint.
     #[error("{0}")]
@@ -113,7 +109,6 @@ pub fn run_rotate(
         // still runs; the admin-connected override then provides the actual
         // re-mint path (mirrors `run_bootstrap`).
         let _handler = registry.resolve_for_slot(CapabilitySlot::Deployer, &deployer.kind)?;
-        let deployer_kind = deployer.kind.clone();
 
         let env_root = store.env_dir(env_id)?;
         let input = BootstrapInput {
@@ -135,7 +130,7 @@ pub fn run_rotate(
             return Err(RunRotateError::RotationUnsupported(format!(
                 "deployer env-pack `{}` minted no bound material to rotate; live rotation is \
                  supported only for the K8s `--bind` credential",
-                deployer_kind.as_str()
+                deployer.kind.as_str()
             )));
         };
 

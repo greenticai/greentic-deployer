@@ -226,17 +226,6 @@ pub fn bootstrap(
         None
     };
 
-    // Sink that persists minted secret material into the env dev store at
-    // the location `resolve_credentials_token` reads it back from. Invoked
-    // inside `run_bootstrap`'s flock, before `credentials_ref` is recorded.
-    let secret_sink = |env_root: &std::path::Path,
-                       secret_ref: &greentic_deploy_spec::SecretRef,
-                       value: &str|
-     -> Result<(), String> {
-        super::secrets::put_credential_material(env_root, secret_ref, value)
-            .map_err(|e| e.to_string())
-    };
-
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -257,7 +246,7 @@ pub fn bootstrap(
             &env_id,
             &admin,
             bind_creds.as_deref(),
-            &secret_sink,
+            &dev_store_secret_sink,
         ) {
             Ok(d) => d,
             Err(e) => {
@@ -344,17 +333,6 @@ pub fn rotate(
             )
         })?;
 
-    // Sink that overwrites the bearer in the env dev store at the location
-    // `resolve_credentials_token` reads it back from. Invoked inside
-    // `run_rotate`'s flock.
-    let secret_sink = |env_root: &std::path::Path,
-                       secret_ref: &greentic_deploy_spec::SecretRef,
-                       value: &str|
-     -> Result<(), String> {
-        super::secrets::put_credential_material(env_root, secret_ref, value)
-            .map_err(|e| e.to_string())
-    };
-
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -405,7 +383,7 @@ pub fn rotate(
             &env_id,
             &admin,
             bind_creds.as_ref(),
-            &secret_sink,
+            &dev_store_secret_sink,
         )
         .map_err(map_rotate_err)?;
         committed.mark_committed();
@@ -674,6 +652,18 @@ fn admin_bind_k8s_credentials(
     ))
 }
 
+/// Dev-store sink shared by `bootstrap` and `rotate`: persists minted bearer
+/// material at the location `resolve_credentials_token` reads it back from.
+/// Passed as the [`BoundSecretSink`](crate::credentials::BoundSecretSink) the
+/// runner invokes inside the env flock.
+fn dev_store_secret_sink(
+    env_root: &Path,
+    secret_ref: &greentic_deploy_spec::SecretRef,
+    value: &str,
+) -> Result<(), String> {
+    super::secrets::put_credential_material(env_root, secret_ref, value).map_err(|e| e.to_string())
+}
+
 fn map_bootstrap_err(e: RunBootstrapError) -> OpError {
     use crate::credentials::BootstrapError;
     match e {
@@ -709,7 +699,6 @@ fn map_rotate_err(e: crate::credentials::RunRotateError) -> OpError {
         E::NotBootstrapped(env_id) => OpError::Conflict(format!(
             "env `{env_id}` has no credentials_ref; run `op credentials bootstrap` first"
         )),
-        E::HandlerNotRegistered { kind } => OpError::Conflict(handler_not_registered_msg(&kind)),
         E::RotationUnsupported(msg) => OpError::Conflict(msg),
         E::Store(s) => OpError::Store(s),
         E::Registry(r) => OpError::Conflict(r.to_string()),
