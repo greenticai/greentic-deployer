@@ -82,9 +82,15 @@ const IDENTITY_SECRET: &str = "greentic-deployer-identity";
 /// OCI client (HTTPS-only, no insecure escape hatch), so kind needs no registry
 /// or TLS. Lives in the env's own `gtc-local` namespace for one-shot cleanup.
 const BUNDLE_SERVER: &str = "gtc-bundle-server";
-/// ConfigMap carrying the fixture bundle's bytes (the 4 KiB fixture is far
-/// under the 1 MiB ConfigMap limit), mounted into the httpd pod's docroot.
+/// Name prefix for the ConfigMaps carrying the fixture bundle's bytes. A
+/// ConfigMap is capped at 1 MiB, so a fixture larger than [`BUNDLE_CHUNK_BYTES`]
+/// (e.g. the 1.4 MB telegram bundle) is split across `gtc-bundle-blob-{0,1,…}`
+/// and reassembled by an init container into the httpd pod's docroot.
 const BUNDLE_BLOB_CM: &str = "gtc-bundle-blob";
+/// Max raw bytes per bundle-blob ConfigMap chunk. K8s caps a ConfigMap at 1 MiB
+/// (and the base64-inflated API request at ~1.5 MiB); 512 KiB raw clears both
+/// with margin. Small fixtures collapse to a single chunk.
+const BUNDLE_CHUNK_BYTES: usize = 512 * 1024;
 /// The file name the bundle is served (and pulled) under.
 const BUNDLE_FILE: &str = "bundle.gtbundle";
 /// The port the in-cluster httpd listens on (and the Service exposes).
@@ -608,26 +614,69 @@ fn start_bundle_server(fixture: &Path) {
     // worker. `reset_namespace` (a blocking delete) ran first, so the namespace
     // is gone; tolerate "already exists" defensively.
     let _ = kubectl(&["create", "namespace", NAMESPACE]);
-    let _ = kubectl(&[
-        "delete",
-        "configmap",
-        BUNDLE_BLOB_CM,
-        "-n",
-        NAMESPACE,
-        "--ignore-not-found",
-    ]);
 
-    // Bundle bytes → ConfigMap (kubectl auto-detects binary → binaryData).
-    kubectl_ok(&[
-        "create",
-        "configmap",
-        BUNDLE_BLOB_CM,
-        "-n",
-        NAMESPACE,
-        &format!("--from-file={BUNDLE_FILE}={}", fixture.to_string_lossy()),
-    ]);
+    // A ConfigMap is capped at 1 MiB, so the fixture is split into <1 MiB chunks
+    // (one ConfigMap each) and an init container reassembles them into the docroot
+    // emptyDir the httpd serves. Small fixtures collapse to a single chunk; the
+    // 1.4 MB telegram bundle needs several.
+    let bytes = std::fs::read(fixture).expect("read bundle fixture");
+    let chunks: Vec<&[u8]> = if bytes.is_empty() {
+        vec![&[][..]]
+    } else {
+        bytes.chunks(BUNDLE_CHUNK_BYTES).collect()
+    };
 
-    // busybox httpd Deployment + Service serving the mounted bundle. Readiness
+    // Defensive: clear this run's chunk ConfigMap names before recreating them
+    // (the namespace was just reset, so deleting exactly what we re-create is
+    // enough — and collision-free for any fixture size, unlike a fixed bound).
+    let mut del: Vec<String> = ["delete", "configmap", "-n", NAMESPACE, "--ignore-not-found"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    del.extend((0..chunks.len()).map(|i| format!("{BUNDLE_BLOB_CM}-{i}")));
+    let del_refs: Vec<&str> = del.iter().map(String::as_str).collect();
+    let _ = kubectl(&del_refs);
+
+    // Each chunk → its own ConfigMap (kubectl auto-detects binary → binaryData).
+    let dir = tempfile::tempdir().expect("chunk tempdir");
+    for (i, chunk) in chunks.iter().enumerate() {
+        let part = dir.path().join(format!("part{i}"));
+        std::fs::write(&part, chunk).expect("write bundle chunk");
+        kubectl_ok(&[
+            "create",
+            "configmap",
+            &format!("{BUNDLE_BLOB_CM}-{i}"),
+            "-n",
+            NAMESPACE,
+            &format!("--from-file=part={}", part.to_string_lossy()),
+        ]);
+    }
+
+    // YAML fragments built from the chunk count: the init container cats the
+    // mounted chunks in order into the shared emptyDir, fed by one volume per
+    // chunk ConfigMap.
+    let cat_inputs = (0..chunks.len())
+        .map(|i| format!("/chunks/part{i}/part"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let init_mounts = (0..chunks.len())
+        .map(|i| {
+            format!(
+                "            - name: chunk{i}\n              mountPath: /chunks/part{i}\n              readOnly: true"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let chunk_volumes = (0..chunks.len())
+        .map(|i| {
+            format!(
+                "        - name: chunk{i}\n          configMap:\n            name: {BUNDLE_BLOB_CM}-{i}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // busybox httpd Deployment + Service serving the reassembled bundle. Readiness
     // is the bundle itself returning 200, so a completed rollout means the
     // worker's pull will succeed.
     let manifest = format!(
@@ -646,6 +695,14 @@ spec:
       labels:
         app: {BUNDLE_SERVER}
     spec:
+      initContainers:
+        - name: assemble
+          image: busybox:1.36
+          command: [\"sh\", \"-c\", \"cat {cat_inputs} > /www/{BUNDLE_FILE}\"]
+          volumeMounts:
+            - name: www
+              mountPath: /www
+{init_mounts}
       containers:
         - name: httpd
           image: busybox:1.36
@@ -659,13 +716,13 @@ spec:
             initialDelaySeconds: 1
             periodSeconds: 2
           volumeMounts:
-            - name: blob
+            - name: www
               mountPath: /www
               readOnly: true
       volumes:
-        - name: blob
-          configMap:
-            name: {BUNDLE_BLOB_CM}
+        - name: www
+          emptyDir: {{}}
+{chunk_volumes}
 ---
 apiVersion: v1
 kind: Service
@@ -2351,6 +2408,537 @@ fn bound_identity_resolves_from_the_in_cluster_secret_after_local_material_is_go
         "delete",
         "namespace",
         NAMESPACE,
+        "--ignore-not-found",
+        "--wait=false",
+    ]);
+}
+
+// ===========================================================================
+// M5 — provider-webhook → flow → reply, the real tenant ingress path.
+//
+// M3/M4 proved a request reaches a real component over `/workers/invoke` and
+// through the router. M5 proves the genuine messaging path a tenant hits: a
+// real Telegram provider webhook (auth-gated) drives the flow, and the bot's
+// reply goes OUT-OF-BAND via the provider's egress (`render_plan` → `encode` →
+// `send_payload`). The reply normally POSTs `api.telegram.org`; here a
+// `BundleDeployment.config_overrides` entry redirects the provider's
+// `api_base_url` (and the required `public_base_url`) to a plain-HTTP fake
+// Telegram sink in a sibling namespace, which records the outbound
+// `sendMessage` so the test can assert the round-trip end to end.
+//
+// CI-only locally: the worker's boot-pull (in-cluster httpd) and its egress to
+// the sink are same-node pod→pod, which some kind hosts drop — the same ceiling
+// the M2 OCI (#346) and M4 (#341) serving tests already carry. The inbound hop
+// is `kubectl port-forward` (kubelet→pod), so the 200/401 auth assertions run
+// anywhere. The full path is exercised by the `k8s-e2e` CI job.
+//
+// FIXTURE: `testdata/bundles/telegram-bundle.gtbundle` (1.4 MB) = the quickstart
+// welcome-card flow + a TELEGRAM PROVIDER PACK STRIPPED to its two runtime
+// components (`messaging-provider-telegram` + `messaging-ingress-telegram`),
+// dropping ~13 MB of QA/diagnostics sub-components the runtime never loads on
+// this path. Regenerate by trimming `manifest.components` of a built
+// `messaging-telegram.gtpack` to those two ids, then composing it with the
+// quickstart pack via `gtc-dev dev bundle build`.
+
+const SINK_NS: &str = "gtc-tg-sink";
+const SINK_DEPLOY: &str = "gtc-tg-sink";
+const SINK_PORT: u16 = 8080;
+const SINK_SCRIPT_CM: &str = "gtc-tg-sink-script";
+const TG_BUNDLE_ID: &str = "m5-telegram";
+const TG_PROVIDER_ID: &str = "m5bot";
+const TG_PROVIDER_TYPE: &str = "messaging.telegram.bot";
+/// The telegram provider pack id — the key the runtime uses when it looks up
+/// `BundleDeployment.config_overrides` for the egress provider config.
+const TG_PACK_ID: &str = "messaging-telegram";
+const TG_PATH_PREFIX: &str = "/bot";
+/// A known value seeded as the endpoint's webhook secret so the test can present
+/// it on the inbound header; the host gate constant-time-compares against it.
+const TG_INBOUND_AUTH_VALUE: &str = "m5-known-inbound-value";
+const TG_SINK_MARKER: &str = "GTC_M5_SENDMSG";
+/// A distinctive fragment of the quickstart welcome card — proves the reply
+/// carries the real flow output, not the provider's "universal telegram
+/// payload" placeholder.
+const TG_REPLY_NEEDLE: &str = "What would you like to explore";
+
+/// Minimal fake Telegram Bot API: answers every path with an `ok:true` body
+/// (shaped to satisfy both `getMe` and `sendMessage` parsers), and prints
+/// `GTC_M5_SENDMSG <path> <body>` to stdout ONLY for `sendMessage` requests so
+/// `kubectl logs` surfaces the captured outbound reply for assertion — without
+/// the readiness `GET /` probe or `getMe` racing the detached egress.
+const FAKE_TELEGRAM_SINK_PY: &str = r#"import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+OK = (b'{"ok":true,"result":{"id":1,"is_bot":true,"first_name":"sink",'
+      b'"username":"sink_bot","message_id":1,"chat":{"id":100},"text":"ok"}}')
+
+
+class H(BaseHTTPRequestHandler):
+    def _handle(self):
+        n = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(n) if n else b""
+        # Capture ONLY the bot's outbound reply (`sendMessage`) — not the readiness
+        # `GET /` probe or the provider's `getMe`, which would let `wait_for_sink_capture`
+        # return before the detached egress actually lands.
+        if "sendMessage" in self.path:
+            sys.stdout.write("GTC_M5_SENDMSG " + self.path + " " + body.decode("utf-8", "replace") + "\n")
+            sys.stdout.flush()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(OK)))
+        self.end_headers()
+        self.wfile.write(OK)
+
+    do_POST = _handle
+    do_GET = _handle
+
+    def log_message(self, *a):
+        pass
+
+
+HTTPServer(("0.0.0.0", int(sys.argv[1])), H).serve_forever()
+"#;
+
+fn telegram_fixture_bundle() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/bundles/telegram-bundle.gtbundle")
+}
+
+/// In-cluster DNS of the fake sink, used as the provider's redirected API base.
+/// Plain HTTP: the runner-host HTTP capability passes the URL to reqwest
+/// verbatim (no HTTPS-only enforcement, no egress allow-list), so an `http://`
+/// base to an arbitrary cluster host works.
+fn sink_base_url() -> String {
+    format!("http://{SINK_DEPLOY}.{SINK_NS}.svc.cluster.local:{SINK_PORT}")
+}
+
+/// A synthetic inbound Telegram `Update` (a `message` with `text`), whose
+/// `chat.id` (100) is the destination the reply must come back to.
+fn telegram_update() -> Value {
+    serde_json::json!({
+        "update_id": 1,
+        "message": {
+            "message_id": 1,
+            "date": 1,
+            "chat": {"id": 100, "type": "private"},
+            "from": {"id": 100, "is_bot": false, "first_name": "demo"},
+            "text": "hi"
+        }
+    })
+}
+
+/// Stand up the fake Telegram sink in a SIBLING namespace and wait for it to be
+/// ready. A sibling namespace (not `gtc-local`) deliberately avoids the env
+/// pack's `gtc-default-deny`, and the worker's `gtc-allow-worker-egress`
+/// (allow-all for a routed+pullable revision) lets the reply egress reach it —
+/// this also models the real topology, where the messaging provider's API lives
+/// outside the env namespace.
+fn start_fake_telegram_sink() {
+    let _ = kubectl(&["delete", "namespace", SINK_NS, "--ignore-not-found"]);
+    kubectl_ok(&["create", "namespace", SINK_NS]);
+
+    // Sink script → ConfigMap (kept alive in a tempdir until kubectl create runs).
+    let dir = tempfile::tempdir().expect("sink script tempdir");
+    let script = dir.path().join("sink.py");
+    std::fs::write(&script, FAKE_TELEGRAM_SINK_PY).expect("write sink script");
+    kubectl_ok(&[
+        "create",
+        "configmap",
+        SINK_SCRIPT_CM,
+        "-n",
+        SINK_NS,
+        &format!("--from-file=sink.py={}", script.to_string_lossy()),
+    ]);
+
+    let manifest = format!(
+        "apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {SINK_DEPLOY}
+  namespace: {SINK_NS}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {SINK_DEPLOY}
+  template:
+    metadata:
+      labels:
+        app: {SINK_DEPLOY}
+    spec:
+      containers:
+        - name: sink
+          image: python:3.12-alpine
+          command: [\"python3\", \"/app/sink.py\", \"{SINK_PORT}\"]
+          ports:
+            - containerPort: {SINK_PORT}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: {SINK_PORT}
+            initialDelaySeconds: 1
+            periodSeconds: 2
+          volumeMounts:
+            - name: script
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: script
+          configMap:
+            name: {SINK_SCRIPT_CM}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {SINK_DEPLOY}
+  namespace: {SINK_NS}
+spec:
+  selector:
+    app: {SINK_DEPLOY}
+  ports:
+    - port: {SINK_PORT}
+      targetPort: {SINK_PORT}
+"
+    );
+    kubectl_apply_stdin(&manifest);
+
+    let status = kubectl(&[
+        "rollout",
+        "status",
+        &format!("deployment/{SINK_DEPLOY}"),
+        "-n",
+        SINK_NS,
+        "--timeout=120s",
+    ]);
+    assert!(
+        status.status.success(),
+        "fake telegram sink must come up before the worker boots:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr),
+    );
+}
+
+/// Desired-state ceremony for the M5 revision: create env → bind the K8s
+/// deployer AND a dev-store secrets pack (lights up the #357 secrets→pod
+/// bridge) → bootstrap the trust root → seed the bot token → add the telegram
+/// bundle with a `config_overrides` entry redirecting the provider's API base
+/// to the sink → stage + warm + route a pullable revision → mint a messaging
+/// endpoint linked to the bundle → seed a known webhook secret at the endpoint's
+/// ref. Everything is desired-state-only; `reconcile` is the first cluster
+/// contact. Returns the warmed revision id.
+fn provision_telegram_revision(store: &Path, image: &str) -> String {
+    bind_k8s_env(store, Some(image));
+
+    // Bind the dev-store secrets pack so reconcile renders the bot token +
+    // webhook secret into the worker pod (the #357 dev-secrets bridge).
+    let secpack = payload(
+        store,
+        "secpack.json",
+        serde_json::json!({
+            "environment_id": ENV_ID,
+            "slot": "secrets",
+            "kind": "greentic.secrets.dev-store@1.0.0",
+            "pack_ref": "greentic.secrets.dev-store",
+        }),
+    );
+    op(store, Some(&secpack), &["env-packs", "add"]);
+
+    op(store, None, &["trust-root", "bootstrap", ENV_ID]);
+
+    // Seed the bot token under both the route tenant and `default` so the
+    // provider resolves it regardless of the scope the flow runs under. The
+    // token is fake — the sink never validates it.
+    for tenant in ["default", "tenant-default"] {
+        let tok = payload(
+            store,
+            "tokput.json",
+            serde_json::json!({
+                "environment_id": ENV_ID,
+                "path": format!("{tenant}/_/messaging-telegram/telegram_bot_token"),
+                "value": "111:fake",
+            }),
+        );
+        op(store, Some(&tok), &["secrets", "put"]);
+    }
+
+    // Add the bundle WITH the egress redirect override. Both `api_base_url` and
+    // `public_base_url` are required: the telegram provider's `ProviderConfig`
+    // makes `public_base_url` mandatory, so an override carrying only
+    // `api_base_url` fails config deserialization and `send_payload` bails
+    // before it ever calls out (the reply silently never ships).
+    let sink = sink_base_url();
+    let add = payload(
+        store,
+        "tg-add.json",
+        serde_json::json!({
+            "environment_id": ENV_ID,
+            "bundle_id": TG_BUNDLE_ID,
+            "route_binding": {
+                "path_prefixes": [TG_PATH_PREFIX],
+                "tenant_selector": {"tenant": "default", "team": "default"},
+            },
+            "config_overrides": {
+                TG_PACK_ID: {"api_base_url": sink, "public_base_url": sink},
+            },
+        }),
+    );
+    let deployment_id = op(store, Some(&add), &["bundles", "add"])["result"]["deployment_id"]
+        .as_str()
+        .expect("deployment_id")
+        .to_string();
+
+    let stage = payload(
+        store,
+        "tg-stage.json",
+        serde_json::json!({
+            "environment_id": ENV_ID,
+            "deployment_id": deployment_id,
+            "bundle_path": telegram_fixture_bundle().to_string_lossy(),
+            "bundle_source_uri": bundle_source_uri(),
+        }),
+    );
+    let revision_id = op(store, Some(&stage), &["revisions", "stage"])["result"]["revision_id"]
+        .as_str()
+        .expect("revision_id")
+        .to_string();
+
+    let rev = payload(
+        store,
+        "tg-rev.json",
+        serde_json::json!({"environment_id": ENV_ID, "revision_id": revision_id}),
+    );
+    let warmed = op(store, Some(&rev), &["revisions", "warm"]);
+    assert_eq!(warmed["result"]["lifecycle"], "ready", "revision warmed");
+
+    let traffic = payload(
+        store,
+        "tg-traffic.json",
+        serde_json::json!({
+            "environment_id": ENV_ID,
+            "deployment_id": deployment_id,
+            "entries": [{"revision_id": revision_id, "weight_bps": 10000}],
+            "idempotency_key": format!("m5-traffic-{revision_id}"),
+        }),
+    );
+    op(store, Some(&traffic), &["traffic", "set"]);
+
+    // Mint the messaging endpoint and link it to the bundle (the inbound auth
+    // gate + ACL admission both key off a linked endpoint).
+    let ep_add = payload(
+        store,
+        "tg-ep-add.json",
+        serde_json::json!({
+            "environment_id": ENV_ID,
+            "provider_id": TG_PROVIDER_ID,
+            "provider_type": TG_PROVIDER_TYPE,
+            "display_name": "m5",
+            "secret_refs": [],
+            "updated_by": "m5",
+        }),
+    );
+    let endpoint_id =
+        op(store, Some(&ep_add), &["messaging", "endpoint", "add"])["result"]["endpoint_id"]
+            .as_str()
+            .expect("endpoint_id")
+            .to_string();
+    let link = payload(
+        store,
+        "tg-ep-link.json",
+        serde_json::json!({
+            "environment_id": ENV_ID,
+            "endpoint_id": endpoint_id,
+            "bundle_id": TG_BUNDLE_ID,
+            "updated_by": "m5",
+        }),
+    );
+    op(
+        store,
+        Some(&link),
+        &["messaging", "endpoint", "link-bundle"],
+    );
+
+    // Overwrite the auto-provisioned webhook secret with a known value at the
+    // endpoint's ref path (`op secrets get` can't read the auto-gen one back),
+    // so the test can present it on the inbound header.
+    let wh = payload(
+        store,
+        "tg-wh.json",
+        serde_json::json!({
+            "environment_id": ENV_ID,
+            "path": format!("default/_/messaging-{}/webhook_secret", endpoint_id.to_lowercase()),
+            "value": TG_INBOUND_AUTH_VALUE,
+        }),
+    );
+    op(store, Some(&wh), &["secrets", "put"]);
+
+    revision_id
+}
+
+/// POST a Telegram `Update` to the worker's `{prefix}/webhook/telegram`
+/// endpoint via `kubectl port-forward` (kubelet→pod, so it dodges the same-node
+/// pod-to-pod CNI quirk), returning the HTTP status. The
+/// `x-telegram-bot-api-secret-token` header carries `secret_token`; the host's
+/// `provider_auth` gate constant-time-compares it against the endpoint's
+/// webhook secret (200 on match, 401 on mismatch) before any envelope is
+/// emitted. Retries until the port-forward announces (curl `000` = not yet up).
+fn post_telegram_webhook(worker: &str, secret_token: &str, body: &Value) -> u16 {
+    let pf = PortForward::open(&format!("deployment/{worker}"), 8080);
+    let url = format!(
+        "http://127.0.0.1:{}{TG_PATH_PREFIX}/webhook/telegram",
+        pf.local_port
+    );
+    let body = serde_json::to_string(body).expect("serialize telegram update");
+    let header = format!("x-telegram-bot-api-secret-token: {secret_token}");
+    let mut status = 0u16;
+    for _ in 0..20 {
+        let out = Command::new("curl")
+            .args([
+                "-sS",
+                "-m",
+                "20",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "-X",
+                "POST",
+                &url,
+                "-H",
+                "content-type: application/json",
+                "-H",
+                &header,
+                "-d",
+                &body,
+            ])
+            .output()
+            .expect("spawn curl");
+        if let Ok(code) = String::from_utf8_lossy(&out.stdout).trim().parse::<u16>() {
+            status = code;
+            if status != 0 {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    drop(pf);
+    status
+}
+
+/// Poll the sink's logs until it records the bot's outbound `sendMessage` — the
+/// reply egress is detached from the webhook ack, so it lands a beat later — up
+/// to ~40 s. Returns the last log read so the caller can assert on the captured
+/// reply content even on the timeout path.
+fn wait_for_sink_capture() -> String {
+    let mut last = String::new();
+    for _ in 0..20 {
+        let out = kubectl(&[
+            "logs",
+            &format!("deployment/{SINK_DEPLOY}"),
+            "-n",
+            SINK_NS,
+            "--tail=-1",
+        ]);
+        last = String::from_utf8_lossy(&out.stdout).to_string();
+        if last.contains(TG_SINK_MARKER) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    last
+}
+
+/// M5: a real Telegram provider webhook drives the flow and the bot's
+/// out-of-band reply is captured at an in-cluster fake Telegram sink. Proves the
+/// genuine messaging tenant path: inbound auth gate (200/401) → dispatch → flow
+/// → `render_plan`/`encode`/`send_payload` egress → delivery to the inbound
+/// chat with the real welcome-card content.
+#[test]
+fn telegram_inbound_drives_flow_and_delivers_reply() {
+    if !armed() {
+        return;
+    }
+    let Some(image) = serving_image() else {
+        return;
+    };
+    reset_namespace();
+    let store = tempfile::tempdir().expect("tempdir");
+    let store = store.path();
+
+    // Fake telegram API sink (sibling namespace) + the in-cluster bundle server,
+    // both up before the worker boots so neither the reply egress nor the boot
+    // pull races them.
+    start_fake_telegram_sink();
+    start_bundle_server(&telegram_fixture_bundle());
+
+    let revision_id = provision_telegram_revision(store, &image);
+    let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
+
+    let (applied, _) = reconcile(store);
+    assert!(applied > 0, "reconcile applied env-level + worker objects");
+
+    // A completed rollout proves the full boot chain (pull → digest gate →
+    // materialize → activate → serve); the in-cluster httpd is the only bundle
+    // source, so Ready is impossible without a successful pull.
+    let status = kubectl(&[
+        "rollout",
+        "status",
+        &format!("deployment/{worker}"),
+        "-n",
+        NAMESPACE,
+        "--timeout=180s",
+    ]);
+    if !status.status.success() {
+        let diag = worker_failure_diagnostics(&worker);
+        panic!(
+            "worker must reach Ready by pulling + serving the telegram bundle:\n\
+             stdout: {}\nstderr: {}\n\n=== diagnostics ==={diag}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr),
+        );
+    }
+    let logs = kubectl_ok(&["logs", &format!("deployment/{worker}"), "-n", NAMESPACE]);
+    assert!(
+        logs.contains("revision(s) for env"),
+        "the worker must serve the real revision (not probes-only):\n{logs}"
+    );
+
+    // Negative: a wrong secret-token is rejected by the host auth gate, no
+    // envelope emitted.
+    let wrong = post_telegram_webhook(&worker, "wrong-value", &telegram_update());
+    assert_eq!(
+        wrong, 401,
+        "a wrong x-telegram-bot-api-secret-token must be rejected by the host gate"
+    );
+
+    // Positive: the correct token drives the flow; the detached reply egress
+    // ships the bot's reply to the fake sink (redirected via the api_base_url
+    // override).
+    let ok = post_telegram_webhook(&worker, TG_INBOUND_AUTH_VALUE, &telegram_update());
+    assert_eq!(ok, 200, "the correct secret-token must ack with 200");
+
+    let captured = wait_for_sink_capture();
+    assert!(
+        captured.contains(TG_SINK_MARKER),
+        "the sink must capture the bot's outbound sendMessage:\n{captured}"
+    );
+    assert!(
+        captured.contains("\"chat_id\":\"100\""),
+        "the reply must route back to the inbound chat (id 100):\n{captured}"
+    );
+    assert!(
+        captured.contains(TG_REPLY_NEEDLE),
+        "the reply must carry the real welcome-card content, not the placeholder:\n{captured}"
+    );
+
+    let _ = kubectl(&[
+        "delete",
+        "namespace",
+        NAMESPACE,
+        "--ignore-not-found",
+        "--wait=false",
+    ]);
+    let _ = kubectl(&[
+        "delete",
+        "namespace",
+        SINK_NS,
         "--ignore-not-found",
         "--wait=false",
     ]);
