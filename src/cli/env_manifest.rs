@@ -207,6 +207,14 @@ pub struct ManifestBundle {
     /// on re-deploy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_binding: Option<RouteBindingPayload>,
+    /// Optional `oci://`/`repo://`/`store://` pull ref recorded on the staged
+    /// revision so a K8s worker can fetch the bundle at boot. `bundle_path`
+    /// stays required — it supplies the local artifact and the integrity
+    /// digest; this rides alongside it. Single-revision form only;
+    /// multi-revision carries the ref per `revisions[]` entry. Absent =
+    /// local-serve only (the pre-existing behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_source_uri: Option<String>,
 }
 
 /// One revision in a multi-revision bundle entry. Each carries its own
@@ -235,6 +243,11 @@ pub struct ManifestRevision {
     /// canary-evaluation engine (not consumed by apply today).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub abort_metrics: Vec<String>,
+    /// Optional `oci://`/`repo://`/`store://` pull ref recorded on this staged
+    /// revision so a K8s worker can fetch it at boot. `bundle_path` stays
+    /// required (integrity digest). Absent = local-serve only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_source_uri: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -737,7 +750,8 @@ pub fn manifest_schema() -> Value {
                                     "weight_percent": {"type": ["integer", "null"], "description": "0..100; mutually exclusive with weight_bps"},
                                     "weight_bps": {"type": ["integer", "null"], "description": "0..10000; mutually exclusive with weight_percent"},
                                     "drain_seconds": {"type": ["integer", "null"], "description": "per-revision drain window override"},
-                                    "abort_metrics": {"type": "array", "items": {"type": "string"}, "description": "reserved for canary evaluation"}
+                                    "abort_metrics": {"type": "array", "items": {"type": "string"}, "description": "reserved for canary evaluation"},
+                                    "bundle_source_uri": {"type": ["string", "null"], "description": "oci://repo://store:// pull ref for K8s boot; rides alongside bundle_path (digest source); absent = local-serve only"}
                                 }
                             }
                         },
@@ -768,7 +782,8 @@ pub fn manifest_schema() -> Value {
                                     "properties": {"tenant": {"type": "string"}, "team": {"type": "string"}}
                                 }
                             }
-                        }
+                        },
+                        "bundle_source_uri": {"type": ["string", "null"], "description": "single-revision oci://repo://store:// pull ref for K8s boot; rides alongside bundle_path (digest source); absent = local-serve only"}
                     }
                 }
             },
@@ -1352,6 +1367,9 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
             status: None,
             config_overrides,
             route_binding,
+            // The wizard authors local-serve bundles; OCI pull refs are
+            // JSON-first (hand-authored for K8s deployments).
+            bundle_source_uri: None,
         });
     }
 
@@ -2092,6 +2110,8 @@ mod tests {
             ("packs[].answers_ref", ""),
             ("bundles[].bundle_id", "bundles.bundle_id"),
             ("bundles[].bundle_path", "bundles.bundle_path"),
+            // OCI/repo/store pull ref is JSON-first (no form question).
+            ("bundles[].bundle_source_uri", ""),
             // Multi-revision fields are JSON-first (no form question).
             ("bundles[].revisions[].name", ""),
             ("bundles[].revisions[].bundle_path", ""),
@@ -2099,6 +2119,7 @@ mod tests {
             ("bundles[].revisions[].weight_bps", ""),
             ("bundles[].revisions[].drain_seconds", ""),
             ("bundles[].revisions[].abort_metrics", ""),
+            ("bundles[].revisions[].bundle_source_uri", ""),
             ("bundles[].customer_id", "bundles.customer_id"),
             // revenue_share / status are JSON-first (no form question).
             ("bundles[].revenue_share[].party_id", ""),
@@ -2521,6 +2542,41 @@ mod tests {
         .unwrap();
         let err = manifest.validate_shape().unwrap_err();
         assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn bundle_source_uri_round_trips_single_and_multi() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [
+                {"bundle_id": "single", "bundle_path": "x.gtbundle",
+                 "bundle_source_uri": "oci://ex/single:v1"},
+                {"bundle_id": "multi", "revisions": [
+                    {"name": "a", "bundle_path": "a.gtbundle",
+                     "bundle_source_uri": "oci://ex/multi:a"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        manifest.validate_shape().unwrap();
+        assert_eq!(
+            manifest.bundles[0].bundle_source_uri.as_deref(),
+            Some("oci://ex/single:v1")
+        );
+        assert_eq!(
+            manifest.bundles[1].revisions.as_ref().unwrap()[0]
+                .bundle_source_uri
+                .as_deref(),
+            Some("oci://ex/multi:a")
+        );
+        // Survives a serialize round-trip.
+        let back: EnvManifest =
+            serde_json::from_value(serde_json::to_value(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            back.bundles[0].bundle_source_uri.as_deref(),
+            Some("oci://ex/single:v1")
+        );
     }
 
     #[test]
