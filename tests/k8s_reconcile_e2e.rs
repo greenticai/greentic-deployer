@@ -2413,6 +2413,211 @@ fn bound_identity_resolves_from_the_in_cluster_secret_after_local_material_is_go
     ]);
 }
 
+/// Re-mint the bound deployer SA via `op credentials rotate`, AS THE ADMIN
+/// (the ambient kubeconfig CONTEXT — the same connection model `--bind` uses;
+/// the loader still wants *some* admin material, a placeholder it never reads
+/// on this path). When `if_needed` is set the verb decodes the current bound
+/// token's own JWT lifetime and skips the re-mint unless it has crossed its
+/// 80%-of-lifetime rotation threshold. Returns the verb's JSON envelope
+/// (callers read `["result"]`).
+fn rotate_bound_sa(store: &Path, if_needed: bool) -> Value {
+    let admin_context = kubectl_ok(&["config", "current-context"]);
+    let rotate = payload(
+        store,
+        "rotate.json",
+        serde_json::json!({
+            "environment_id": ENV_ID,
+            "admin_profile": admin_context,
+            "admin_material_inline": "ambient-kubeconfig",
+            "if_needed": if_needed,
+        }),
+    );
+    op(store, Some(&rotate), &["credentials", "rotate"])
+}
+
+/// Read the bound deployer bearer straight out of the durable in-cluster
+/// Secret ([`IDENTITY_SECRET`] in [`NAMESPACE`]). A K8s Secret stores values
+/// base64-encoded under `.data`, so decode `.data.bearer`. This is the
+/// ground-truth view the rotation tests diff before/after — a fresh
+/// TokenRequest mints a new signed JWT, so an in-place re-mint must change it.
+fn bound_bearer_in_cluster_secret() -> String {
+    use base64::Engine as _;
+    let b64 = kubectl_ok(&[
+        "get",
+        "secret",
+        IDENTITY_SECRET,
+        "-n",
+        NAMESPACE,
+        "-o",
+        "jsonpath={.data.bearer}",
+    ]);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .expect("the identity Secret's bearer value is base64");
+    String::from_utf8(bytes).expect("the bound bearer is valid UTF-8")
+}
+
+/// `op credentials rotate` against a live cluster — the runtime fix for the
+/// bound-token expiry residual `--bind` flagged. Rotation re-mints AS THE ADMIN
+/// (the bound identity cannot create its own tokens by design), overwrites both
+/// the dev store and the durable in-cluster Secret IN PLACE, and leaves
+/// `credentials_ref` pinned (the resolver reads the same ref, now backed by a
+/// fresh bearer). This proves the full re-mint → persist (both backends) →
+/// resolve → authorize loop against a real API server: the unit tests in
+/// `credentials::rotate` drive a minting fake and never open a socket, so the
+/// live TokenRequest + the fact that the rotated bearer actually passes RBAC
+/// have zero coverage without this.
+///
+/// Inverse-complete of
+/// [`bind_provisions_rbac_and_resolves_the_bound_identity`]: that proves the
+/// FIRST mint is self-consistent; this proves a SUBSEQUENT re-mint replaces it
+/// without breaking the contract. Host→API-server only (kubectl + the
+/// deployer's own mint/apply calls, no pod-to-pod), so it runs on any kind host
+/// — the same ceiling the other bound-identity tests clear. Shares `gtc-local`
+/// (rotate re-applies nothing cluster-scoped, but `--bind` creates the
+/// namespace + RBAC), so it resets up front and tears down after.
+#[test]
+fn rotate_remints_the_bound_bearer_in_place_and_it_authorizes() {
+    if !armed() {
+        return;
+    }
+    reset_namespace();
+    let store = tempfile::tempdir().expect("tempdir");
+    let store = store.path();
+
+    // `--bind` mints the SA, records the bearer in the dev store AND the durable
+    // in-cluster Secret, and stamps `credentials_ref` on the env.
+    let boot = bind_k8s_env_and_bootstrap_bound_sa(store);
+    assert_eq!(
+        boot["result"]["bound"], true,
+        "precondition: --bind minted the bound SA: {}",
+        boot["result"]
+    );
+    let bearer_before = bound_bearer_in_cluster_secret();
+
+    // Rotate AS THE ADMIN. A fresh TokenRequest mints a brand-new JWT and the
+    // re-mint overwrites both backends in place; `credentials_ref` is unchanged.
+    let out = rotate_bound_sa(store, false);
+    let result = &out["result"];
+    assert_eq!(
+        result["rotated"], true,
+        "rotate re-minted the bound credential: {result}"
+    );
+    assert_eq!(
+        result["credentials_ref"], BIND_REF,
+        "rotate left credentials_ref pinned to the bound deployer-token path: {result}"
+    );
+    assert!(
+        result["expires_at"].as_str().is_some_and(|s| !s.is_empty()),
+        "the re-minted token carries a fresh (cluster-clamped) expiry: {result}"
+    );
+
+    // Ground truth #1 — the in-cluster Secret now holds a DIFFERENT bearer. The
+    // TokenRequest subresource signs a new JWT on every call, so an in-place
+    // overwrite must change the stored value.
+    let bearer_after = bound_bearer_in_cluster_secret();
+    assert_ne!(
+        bearer_before, bearer_after,
+        "rotate overwrote the in-cluster Secret with a freshly minted bearer"
+    );
+
+    // Ground truth #2 — the dev-store copy is a WORKING token. With the local
+    // dev cache intact and no env var seeded, the resolver reads the dev store
+    // first; a bound reconcile (zero exit, `identity == "bound"`) proves the
+    // post-rotate dev-store token authorizes against the real API server (a dead
+    // token would fail closed and panic this zero-exit `op` call).
+    let dev_reconcile = op(store, None, &["env", "reconcile", ENV_ID]);
+    assert_eq!(
+        dev_reconcile["result"]["identity"], "bound",
+        "reconcile ran as the bound SA on the rotated dev-store token: {}",
+        dev_reconcile["result"]
+    );
+
+    // Ground truth #3 — the in-cluster Secret copy is ALSO a working token. Wipe
+    // the dev cache so the only source left is the cluster Secret
+    // (`bearer_after`); a second bound reconcile that applies the router proves
+    // the rotated CLUSTER bearer authorizes too — the portability path a fresh
+    // operator machine takes.
+    let dev_dir = store.join(ENV_ID).join(".greentic").join("dev");
+    if dev_dir.exists() {
+        std::fs::remove_dir_all(&dev_dir).expect("wipe the local dev-store cache");
+    }
+    let cluster_reconcile = op(store, None, &["env", "reconcile", ENV_ID]);
+    assert_eq!(
+        cluster_reconcile["result"]["identity"], "bound",
+        "reconcile resolved the rotated bearer from the in-cluster Secret: {}",
+        cluster_reconcile["result"]
+    );
+    assert!(
+        object_exists("deployment", ROUTER_DEPLOY, Some(NAMESPACE)),
+        "the bound reconcile on the rotated cluster bearer applied the router Deployment"
+    );
+
+    let _ = kubectl(&[
+        "delete",
+        "namespace",
+        NAMESPACE,
+        "--ignore-not-found",
+        "--wait=false",
+    ]);
+}
+
+/// The negative complement to
+/// [`rotate_remints_the_bound_bearer_in_place_and_it_authorizes`]: `--if-needed`
+/// is the idempotent form a scheduled job calls, and on a freshly minted token
+/// it must be a no-op. The verb decodes the bound token's own JWT `iat`/`exp`
+/// and rotates only past 80% of its lifetime; a token minted moments ago sits
+/// at ~0% elapsed, so no TokenRequest fires and the bearer is left untouched.
+/// This pins the cheap-skip behavior end to end (the unit tests cover the JWT
+/// math; this proves the live token a real `--bind` mints is actually decodable
+/// and lands under the threshold).
+///
+/// Host→API-server only; shares `gtc-local`, resets up front and tears down
+/// after.
+#[test]
+fn rotate_if_needed_is_a_noop_on_a_freshly_minted_token() {
+    if !armed() {
+        return;
+    }
+    reset_namespace();
+    let store = tempfile::tempdir().expect("tempdir");
+    let store = store.path();
+
+    let boot = bind_k8s_env_and_bootstrap_bound_sa(store);
+    assert_eq!(
+        boot["result"]["bound"], true,
+        "precondition: --bind minted the bound SA: {}",
+        boot["result"]
+    );
+    let bearer_before = bound_bearer_in_cluster_secret();
+
+    // `--if-needed` resolves the bound token (dev store, no cluster round-trip),
+    // decodes its lifetime, and short-circuits: the token is brand new, so it is
+    // well under the 80% rotation threshold.
+    let out = rotate_bound_sa(store, true);
+    let result = &out["result"];
+    assert_eq!(
+        result["rotated"], false,
+        "a freshly minted token is below the 80% rotation threshold: {result}"
+    );
+
+    // No TokenRequest fired, so the durable Secret still holds the original
+    // bearer — the cheap-skip really skipped.
+    let bearer_after = bound_bearer_in_cluster_secret();
+    assert_eq!(
+        bearer_before, bearer_after,
+        "the no-op left the in-cluster Secret bearer unchanged"
+    );
+
+    let _ = kubectl(&[
+        "delete",
+        "namespace",
+        NAMESPACE,
+        "--ignore-not-found",
+        "--wait=false",
+    ]);
+}
+
 // ===========================================================================
 // M5 — provider-webhook → flow → reply, the real tenant ingress path.
 //
