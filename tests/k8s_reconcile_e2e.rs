@@ -1380,39 +1380,38 @@ fn boot_worker_serving_bundle(store: &Path, image: &str, fixture: &Path) -> Stri
 /// (`serving N revision(s) for env …` rather than the probes-only line) then
 /// keeps a probes-only M1 boot from masquerading as success.
 ///
-/// `pull_env` carries boot env the production render deliberately omits — the
-/// OCI path's `GREENTIC_OCI_INSECURE_REGISTRIES` allow-list. It is applied AFTER
-/// reconcile (so it never enters the rendered manifests) and BEFORE the rollout
-/// wait (so the rolled pods boot with it); the first pre-set-env pods fail closed
-/// on the OCI pull and are superseded, and `rollout status` tracks the new
-/// ReplicaSets.
+/// `oci_insecure_registries`, when non-empty, is recorded as the
+/// `oci_insecure_registries` deployer answer BEFORE reconcile, so the rendered
+/// worker + router pods carry `GREENTIC_OCI_INSECURE_REGISTRIES` from their first
+/// boot — the declarative operator knob, not a post-reconcile `kubectl set env`.
 ///
-/// It goes to BOTH the worker AND the router: both boot `start --env` and pull
+/// It applies to BOTH the worker AND the router: both boot `start --env` and pull
 /// the same routed bundle-sourced revision (each has its own egress allow —
-/// `gtc-allow-{worker,router}-egress`), so an unpatched router would fail its OCI
-/// pull and CrashLoop. When `pull_env` is set the router rollout is therefore a
-/// success criterion too — otherwise a broken router (a dead ingress serve path)
-/// would hide behind the worker-only banner. The HTTP path passes `&[]`: its
-/// router already pulls over `http://`, so it is neither patched nor waited here,
-/// exactly as before.
+/// `gtc-allow-{worker,router}-egress`), so a router missing the allow-list would
+/// fail its OCI pull and CrashLoop. When the list is set the router rollout is
+/// therefore a success criterion too — otherwise a broken router (a dead ingress
+/// serve path) would hide behind the worker-only banner. The HTTP path passes
+/// `&[]`: its router already pulls over `http://`, so the knob is unused there.
 fn boot_worker_pulling_revision(
     store: &Path,
     image: &str,
     fixture: &Path,
     source_uri: &str,
-    pull_env: &[(&str, &str)],
+    oci_insecure_registries: &[&str],
 ) -> String {
     let revision_id = provision_pullable_revision(store, image, source_uri, fixture);
     let worker = format!("gtc-worker-{}", revision_id.to_lowercase());
+
+    // Declarative insecure-registry knob: recorded as a deployer answer BEFORE
+    // reconcile so the rendered worker + router carry the allow-list from boot.
+    if !oci_insecure_registries.is_empty() {
+        add_oci_insecure_registries_answer(store, oci_insecure_registries);
+    }
 
     // reconcile renders the env-store ConfigMap (carrying `environment.json`
     // with the routed revision + its `bundle_source_uri`) and the worker pair.
     let (applied, _) = reconcile(store);
     assert_eq!(applied, 14, "reconcile applies env-level + worker pair");
-
-    if !pull_env.is_empty() {
-        set_deployments_env(&[worker.as_str(), ROUTER_DEPLOY], pull_env);
-    }
 
     let status = kubectl(&[
         "rollout",
@@ -1445,11 +1444,10 @@ fn boot_worker_pulling_revision(
     );
 
     // The router pulls the SAME revision over the SAME (insecure) transport, so
-    // with `pull_env` set its rollout must complete too — boot is fail-closed, so
-    // a Ready router proves its pull succeeded. Skipped for the HTTP path (empty
-    // `pull_env`), whose router already pulls over `http://` and is left unwaited
-    // as before.
-    if !pull_env.is_empty() {
+    // with the allow-list set its rollout must complete too — boot is fail-closed,
+    // so a Ready router proves its pull succeeded. Skipped for the HTTP path
+    // (empty list), whose router already pulls over `http://` and is left unwaited.
+    if !oci_insecure_registries.is_empty() {
         let router_status = kubectl(&[
             "rollout",
             "status",
@@ -1481,20 +1479,26 @@ fn boot_worker_pulling_revision(
     worker
 }
 
-/// `kubectl set env deployment/<a> deployment/<b> … K=V …` in the env namespace,
-/// asserting success. One invocation patches every target (a single API
-/// round-trip); patching a deployment rolls a fresh pod that boots with the vars.
-fn set_deployments_env(deployments: &[&str], vars: &[(&str, &str)]) {
-    let targets: Vec<String> = deployments
-        .iter()
-        .map(|d| format!("deployment/{d}"))
-        .collect();
-    let assignments: Vec<String> = vars.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let mut args: Vec<&str> = vec!["set", "env"];
-    args.extend(targets.iter().map(String::as_str));
-    args.extend(["-n", NAMESPACE]);
-    args.extend(assignments.iter().map(String::as_str));
-    kubectl_ok(&args);
+/// Record the `oci_insecure_registries` deployer answer on the env's
+/// already-written `deployer-answers.json` (the bind path wrote it with
+/// `runtime_image`). `reconcile` then renders `GREENTIC_OCI_INSECURE_REGISTRIES`
+/// into the worker + router — the operator knob a real deployment sets, in place
+/// of a post-reconcile `kubectl set env` patch.
+fn add_oci_insecure_registries_answer(store: &Path, registries: &[&str]) {
+    let path = store.join(ENV_ID).join("deployer-answers.json");
+    let mut answers: serde_json::Map<String, Value> = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    answers.insert(
+        "oci_insecure_registries".to_string(),
+        Value::String(registries.join(",")),
+    );
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&answers).expect("serialize deployer answers"),
+    )
+    .expect("write deployer answers with oci_insecure_registries");
 }
 
 /// M2 end-to-end: a freshly-seeded worker PULLS its bundle at boot and serves
@@ -2044,11 +2048,13 @@ fn router_serves_an_external_request_to_a_real_component() {
 /// The registry serves plain HTTP, and the OCI client is HTTPS-only by default,
 /// so the pull succeeds ONLY because the worker is launched with
 /// `GREENTIC_OCI_INSECURE_REGISTRIES` listing the registry authority — the escape
-/// hatch greentic-start#283 added (`ClientProtocol::HttpsExcept`). That env is
-/// injected post-reconcile (test-only — `set_deployment_env`, never the
-/// production render), so production OCI pulls stay HTTPS-only. The `#283` fix
-/// also scopes the hatch to the digest-gated boot-pull, which this test's pinned
-/// `:develop` serving image must carry.
+/// hatch greentic-start#283 added (`ClientProtocol::HttpsExcept`). That env now
+/// reaches the pods declaratively: the `oci_insecure_registries` deployer answer
+/// is rendered into the worker + router by `reconcile` (HTTPS stays the default
+/// when the answer is unset). A completed rollout therefore also proves the new
+/// operator knob plumbs end to end. The `#283` fix scopes the hatch to the
+/// digest-gated boot-pull, which this test's pinned `:develop` serving image
+/// must carry.
 ///
 /// Same proof structure as the HTTP test: the registry rollout, the worker's
 /// `/healthz` probe, and `reconcile`'s readiness are all gated, so a completed
@@ -2083,7 +2089,7 @@ fn worker_pulls_oci_bundle_and_serves_the_real_revision() {
         &image,
         &fixture,
         &oci_bundle_source_uri(),
-        &[("GREENTIC_OCI_INSECURE_REGISTRIES", &authority)],
+        &[authority.as_str()],
     );
 
     // Cleanup (deletes the registry + its objects with the namespace).
