@@ -792,6 +792,62 @@ fn resolve_and_validate(
     for b in &manifest.bundles {
         let customer_id = super::bundles::resolve_customer_id(&env_id, b.customer_id.clone())?;
 
+        // Single-revision, remote-only source: no local `bundle_path`. Fetch the
+        // artifact from `bundle_source_uri` so it stages exactly like a local
+        // bundle, then verify any declared digest. (Multi-revision remote-only
+        // is a follow-up; `validate_shape` permits URI-only for the
+        // single-revision form only.)
+        if b.bundle_path.is_none() && b.revisions.is_none() {
+            let uri = b
+                .bundle_source_uri
+                .as_deref()
+                .expect("validate_shape: single-revision URI-only carries bundle_source_uri");
+            let fetched = match super::bundle_fetch::fetch_bundle_uri_to_local(uri) {
+                Ok(path) => path,
+                // Unreachable registry / missing artifact is an input gap,
+                // reported like an absent local file (skippable, not fatal).
+                Err(OpError::Fetch(message)) => {
+                    missing.push(MissingItem {
+                        kind: MissingKind::BundleArtifact,
+                        key: b.bundle_id.clone(),
+                        source: format!("uri:{uri} ({message})"),
+                    });
+                    continue;
+                }
+                // A malformed / unsupported URI is a manifest bug — fail fast.
+                Err(other) => return Err(other),
+            };
+            let digest = resolved_artifact_digest(
+                &fetched,
+                b.bundle_digest.as_deref(),
+                &format!("bundle `{}`", b.bundle_id),
+            )?;
+            resolved_bundles.push(ResolvedBundle {
+                spec: b.clone(),
+                customer_id,
+                revisions: vec![ResolvedRevision {
+                    spec: ManifestRevision {
+                        name: "default".to_string(),
+                        // Vestigial: `deploy_payload` reads `resolved_path`, not
+                        // this. The fetched cache file is the local location.
+                        bundle_path: fetched.clone(),
+                        weight_percent: None,
+                        weight_bps: Some(super::deploy::FULL_TRAFFIC_BPS),
+                        drain_seconds: None,
+                        abort_metrics: Vec::new(),
+                        // The single-revision pull ref lives on the bundle
+                        // (`rb.spec.bundle_source_uri`, read by `deploy_payload`).
+                        bundle_source_uri: None,
+                        bundle_digest: None,
+                    },
+                    resolved_path: fetched,
+                    digest,
+                    weight_bps: super::deploy::FULL_TRAFFIC_BPS,
+                }],
+            });
+            continue;
+        }
+
         // Resolve each artifact path (single-revision or multi-revision).
         let artifact_specs: Vec<(&std::path::Path, Option<&ManifestRevision>)> =
             if let Some(bp) = &b.bundle_path {
@@ -835,11 +891,15 @@ fn resolve_and_validate(
                 any_missing = true;
                 continue;
             }
-            let digest =
-                super::bundle_stage::sha256_file(&resolved_path).map_err(|source| OpError::Io {
-                    path: resolved_path.clone(),
-                    source,
-                })?;
+            let declared_digest = match rev_spec {
+                Some(r) => r.bundle_digest.as_deref(),
+                None => b.bundle_digest.as_deref(),
+            };
+            let location = match rev_spec {
+                Some(r) => format!("bundle `{}`, revision `{}`", b.bundle_id, r.name),
+                None => format!("bundle `{}`", b.bundle_id),
+            };
+            let digest = resolved_artifact_digest(&resolved_path, declared_digest, &location)?;
             let spec = rev_spec.cloned().unwrap_or_else(|| {
                 // Synthesize a ManifestRevision for single-revision entries.
                 ManifestRevision {
@@ -856,6 +916,7 @@ fn resolve_and_validate(
                     // (`rb.spec.bundle_source_uri`, read by `deploy_payload`),
                     // not on this synthetic revision.
                     bundle_source_uri: None,
+                    bundle_digest: None,
                 }
             });
             resolved_revs.push(ResolvedRevision {
@@ -2610,6 +2671,31 @@ fn stage_binding_answers(
     Ok(payload)
 }
 
+/// Hash a resolved bundle artifact and, when the manifest pins a `bundle_digest`,
+/// fail closed unless the file matches. Returns the computed `sha256:` digest
+/// recorded on the revision. `location` labels the bundle (and revision, for a
+/// split) in the mismatch error. Applies uniformly to local `bundle_path`
+/// artifacts and to ones fetched from a `bundle_source_uri`.
+fn resolved_artifact_digest(
+    path: &std::path::Path,
+    declared: Option<&str>,
+    location: &str,
+) -> Result<String, OpError> {
+    let digest = super::bundle_stage::sha256_file(path).map_err(|source| OpError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if let Some(declared) = declared
+        && declared != digest
+    {
+        return Err(OpError::Conflict(format!(
+            "{location}: declared bundle_digest `{declared}` does not match the resolved \
+             artifact digest `{digest}`"
+        )));
+    }
+    Ok(digest)
+}
+
 /// Build a [`BundleDeployPayload`] from a resolved single-revision bundle.
 /// The primary (first) resolved revision supplies the artifact path.
 fn deploy_payload(
@@ -3120,6 +3206,78 @@ mod tests {
         let path = dir.join("manifest.json");
         std::fs::write(&path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
         path
+    }
+
+    #[test]
+    fn resolved_artifact_digest_records_computed_when_undeclared() {
+        let path = fixture();
+        let digest = resolved_artifact_digest(&path, None, "bundle `x`").unwrap();
+        assert_eq!(
+            digest,
+            super::super::bundle_stage::sha256_file(&path).unwrap()
+        );
+    }
+
+    #[test]
+    fn resolved_artifact_digest_passes_when_declared_matches() {
+        let path = fixture();
+        let real = super::super::bundle_stage::sha256_file(&path).unwrap();
+        let digest = resolved_artifact_digest(&path, Some(&real), "bundle `x`").unwrap();
+        assert_eq!(digest, real);
+    }
+
+    #[test]
+    fn resolved_artifact_digest_rejects_declared_mismatch() {
+        let path = fixture();
+        let err =
+            resolved_artifact_digest(&path, Some("sha256:deadbeef"), "bundle `x`").unwrap_err();
+        assert_eq!(err.kind(), "conflict");
+        assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    /// Full URI-only apply: no local `bundle_path`, just a `bundle_source_uri`.
+    /// Apply fetches the bundle from ghcr, stages it, and records a revision
+    /// carrying the OCI pull ref + a real digest a K8s worker boots from.
+    /// Ignored by default (network + ghcr reachability).
+    #[test]
+    #[ignore = "network: applies a URI-only manifest that pulls from ghcr"]
+    fn uri_only_apply_pulls_and_records_a_pullable_revision() {
+        const URI: &str = "oci://ghcr.io/greenticai/greentic-demo-bundles/webchat-bot:v1";
+        let (dir, store) = seeded_store();
+        let manifest = serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "remote",
+                "bundle_source_uri": URI
+            }]
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let outcome = run_apply(&store, &manifest_path).expect("uri-only apply succeeds");
+        assert_eq!(
+            outcome.result["missing"].as_array().unwrap().len(),
+            0,
+            "no missing inputs: {}",
+            outcome.result
+        );
+        let env = load_local(&store);
+        assert_eq!(env.bundles.len(), 1);
+        let dep = &env.bundles[0];
+        let digest = live_revision_digest(&env, dep.deployment_id).expect("live revision");
+        assert!(
+            digest.starts_with("sha256:") && digest != "sha256:00",
+            "real digest recorded: {digest}"
+        );
+        let rev = env
+            .revisions
+            .iter()
+            .find(|r| r.deployment_id == dep.deployment_id)
+            .expect("revision recorded");
+        assert_eq!(
+            rev.bundle_source_uri.as_deref(),
+            Some(URI),
+            "K8s worker pull ref recorded on the revision"
+        );
     }
 
     fn run_mode(
@@ -3872,6 +4030,7 @@ mod tests {
                 drain_seconds: None,
                 abort_metrics: Vec::new(),
                 bundle_source_uri: None,
+                bundle_digest: None,
             },
             resolved_path: PathBuf::from(format!("{name}.gtbundle")),
             digest: digest.to_string(),

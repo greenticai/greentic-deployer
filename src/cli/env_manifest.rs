@@ -207,14 +207,22 @@ pub struct ManifestBundle {
     /// on re-deploy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_binding: Option<RouteBindingPayload>,
-    /// Optional `oci://`/`repo://`/`store://` pull ref recorded on the staged
-    /// revision so a K8s worker can fetch the bundle at boot. `bundle_path`
-    /// stays required — it supplies the local artifact and the integrity
-    /// digest; this rides alongside it. Single-revision form only;
-    /// multi-revision carries the ref per `revisions[]` entry. Absent =
-    /// local-serve only (the pre-existing behaviour).
+    /// Optional `oci://` pull ref recorded on the staged revision so a K8s
+    /// worker can fetch the bundle at boot. May stand alone (URI-only): apply
+    /// fetches it once to derive the integrity digest, so no local `bundle_path`
+    /// is needed on the apply host. When it rides alongside a local
+    /// `bundle_path`, the path supplies the artifact and any scheme the worker
+    /// understands is fine here; URI-only requires `oci://` (the only scheme
+    /// apply fetches today). Single-revision form only; multi-revision carries
+    /// the ref per `revisions[]` entry. Absent = local `bundle_path` required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_source_uri: Option<String>,
+    /// Optional `sha256:<hex>` integrity pin for the resolved artifact. When
+    /// set, apply fails closed unless the artifact (local or fetched) hashes to
+    /// this; when absent, apply records the computed digest (trust-on-first-use).
+    /// Recommended for a `bundle_source_uri`-only bundle so the pull is pinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_digest: Option<String>,
 }
 
 /// One revision in a multi-revision bundle entry. Each carries its own
@@ -248,6 +256,11 @@ pub struct ManifestRevision {
     /// required (integrity digest). Absent = local-serve only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_source_uri: Option<String>,
+    /// Optional `sha256:<hex>` integrity pin for `bundle_path`. When set, apply
+    /// fails closed unless the artifact hashes to this; absent = record the
+    /// computed digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -409,9 +422,11 @@ impl EnvManifest {
                     b.bundle_id
                 )));
             }
-            // XOR: exactly one of `bundle_path` / `revisions` must be set.
+            // A bundle entry is single-revision (a `bundle_path` and/or a
+            // `bundle_source_uri`, 100 % traffic) XOR multi-revision
+            // (`revisions[]`). A single-revision entry needs at least one
+            // source; a remote-only source must be a `bundle_source_uri`.
             match (&b.bundle_path, &b.revisions) {
-                (Some(_), None) | (None, Some(_)) => {}
                 (Some(_), Some(_)) => {
                     return Err(OpError::InvalidArgument(format!(
                         "bundle `{}`: `bundle_path` and `revisions` are mutually exclusive \
@@ -420,13 +435,34 @@ impl EnvManifest {
                         b.bundle_id
                     )));
                 }
+                (None, Some(_)) => {
+                    // Multi-revision: the bundle-level `bundle_source_uri` is a
+                    // single-revision-only field — a split carries its pull ref
+                    // per `revisions[]` entry.
+                    if b.bundle_source_uri.is_some() {
+                        return Err(OpError::InvalidArgument(format!(
+                            "bundle `{}`: bundle-level `bundle_source_uri` is for the \
+                             single-revision form — declare a per-revision \
+                             `bundle_source_uri` inside `revisions[]` for a traffic split",
+                            b.bundle_id
+                        )));
+                    }
+                }
+                (Some(_), None) => {}
                 (None, None) => {
-                    return Err(OpError::InvalidArgument(format!(
-                        "bundle `{}`: either `bundle_path` or `revisions` must be set",
-                        b.bundle_id
-                    )));
+                    // Single-revision with no local artifact: a remote
+                    // `bundle_source_uri` is the only remaining source.
+                    if b.bundle_source_uri.is_none() {
+                        return Err(OpError::InvalidArgument(format!(
+                            "bundle `{}`: a single-revision bundle needs a `bundle_path` \
+                             or a `bundle_source_uri`",
+                            b.bundle_id
+                        )));
+                    }
                 }
             }
+            // Integrity pin format (when declared): a `sha256:<hex>` string.
+            validate_digest_pin(&b.bundle_id, None, b.bundle_digest.as_deref())?;
 
             // Per-revision validation (multi-revision form only).
             if let Some(revisions) = &b.revisions {
@@ -458,6 +494,12 @@ impl EnvManifest {
                             b.bundle_id, rev.name
                         )));
                     }
+                    // Integrity pin format (when declared): a `sha256:<hex>` string.
+                    validate_digest_pin(
+                        &b.bundle_id,
+                        Some(&rev.name),
+                        rev.bundle_digest.as_deref(),
+                    )?;
                 }
                 // Weight consistency: all-set must sum to FULL_TRAFFIC_BPS;
                 // all-unset = equal split (computed at resolve time); mixed = error.
@@ -550,6 +592,29 @@ impl EnvManifest {
 
 /// Full traffic in basis points (10 000 bps = 100 %).
 pub(crate) const FULL_TRAFFIC_BPS: u32 = 10_000;
+
+/// Validate an optional `sha256:<hex>` integrity pin. `None` = no pin (always
+/// ok). A present digest must be a non-empty `sha256:`-prefixed string; the
+/// byte-exact comparison against the resolved artifact happens at apply time.
+fn validate_digest_pin(
+    bundle_id: &str,
+    revision: Option<&str>,
+    digest: Option<&str>,
+) -> Result<(), OpError> {
+    let Some(digest) = digest else {
+        return Ok(());
+    };
+    if digest.starts_with("sha256:") && digest.len() > "sha256:".len() {
+        return Ok(());
+    }
+    let location = match revision {
+        Some(name) => format!("bundle `{bundle_id}`, revision `{name}`"),
+        None => format!("bundle `{bundle_id}`"),
+    };
+    Err(OpError::InvalidArgument(format!(
+        "{location}: bundle_digest `{digest}` must be a `sha256:<hex>` string"
+    )))
+}
 
 /// Validate the weight consistency of a multi-revision bundle entry.
 ///
@@ -751,7 +816,8 @@ pub fn manifest_schema() -> Value {
                                     "weight_bps": {"type": ["integer", "null"], "description": "0..10000; mutually exclusive with weight_percent"},
                                     "drain_seconds": {"type": ["integer", "null"], "description": "per-revision drain window override"},
                                     "abort_metrics": {"type": "array", "items": {"type": "string"}, "description": "reserved for canary evaluation"},
-                                    "bundle_source_uri": {"type": ["string", "null"], "description": "oci://repo://store:// pull ref for K8s boot; rides alongside bundle_path (digest source); absent = local-serve only"}
+                                    "bundle_source_uri": {"type": ["string", "null"], "description": "oci://repo://store:// pull ref for K8s boot; rides alongside bundle_path (digest source); absent = local-serve only"},
+                                    "bundle_digest": {"type": ["string", "null"], "description": "optional sha256:<hex> integrity pin for bundle_path; verified at apply"}
                                 }
                             }
                         },
@@ -783,7 +849,8 @@ pub fn manifest_schema() -> Value {
                                 }
                             }
                         },
-                        "bundle_source_uri": {"type": ["string", "null"], "description": "single-revision oci://repo://store:// pull ref for K8s boot; rides alongside bundle_path (digest source); absent = local-serve only"}
+                        "bundle_source_uri": {"type": ["string", "null"], "description": "single-revision oci:// pull ref for K8s boot; may stand alone (apply fetches it once for the digest) or ride alongside bundle_path; absent = local bundle_path required"},
+                        "bundle_digest": {"type": ["string", "null"], "description": "optional sha256:<hex> integrity pin for the resolved artifact; verified at apply, else the computed digest is recorded"}
                     }
                 }
             },
@@ -1367,9 +1434,10 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
             status: None,
             config_overrides,
             route_binding,
-            // The wizard authors local-serve bundles; OCI pull refs are
-            // JSON-first (hand-authored for K8s deployments).
+            // The wizard authors local-serve bundles; OCI pull refs and digest
+            // pins are JSON-first (hand-authored for K8s deployments).
             bundle_source_uri: None,
+            bundle_digest: None,
         });
     }
 
@@ -2110,8 +2178,9 @@ mod tests {
             ("packs[].answers_ref", ""),
             ("bundles[].bundle_id", "bundles.bundle_id"),
             ("bundles[].bundle_path", "bundles.bundle_path"),
-            // OCI/repo/store pull ref is JSON-first (no form question).
+            // OCI/repo/store pull ref + digest pin are JSON-first (no form question).
             ("bundles[].bundle_source_uri", ""),
+            ("bundles[].bundle_digest", ""),
             // Multi-revision fields are JSON-first (no form question).
             ("bundles[].revisions[].name", ""),
             ("bundles[].revisions[].bundle_path", ""),
@@ -2120,6 +2189,7 @@ mod tests {
             ("bundles[].revisions[].drain_seconds", ""),
             ("bundles[].revisions[].abort_metrics", ""),
             ("bundles[].revisions[].bundle_source_uri", ""),
+            ("bundles[].revisions[].bundle_digest", ""),
             ("bundles[].customer_id", "bundles.customer_id"),
             // revenue_share / status are JSON-first (no form question).
             ("bundles[].revenue_share[].party_id", ""),
@@ -2580,7 +2650,7 @@ mod tests {
     }
 
     #[test]
-    fn neither_bundle_path_nor_revisions_fails() {
+    fn bundle_with_no_path_no_uri_no_revisions_fails() {
         let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
             "schema": ENV_MANIFEST_SCHEMA_V1,
             "environment": {"id": "local"},
@@ -2590,7 +2660,99 @@ mod tests {
         }))
         .unwrap();
         let err = manifest.validate_shape().unwrap_err();
-        assert!(err.to_string().contains("must be set"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("needs a `bundle_path` or a `bundle_source_uri`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn single_revision_bundle_source_uri_only_is_valid() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "remote-only",
+                "bundle_source_uri": "oci://ex/remote-only:v1",
+                "bundle_digest": "sha256:abc123"
+            }]
+        }))
+        .unwrap();
+        manifest.validate_shape().unwrap();
+        assert!(manifest.bundles[0].bundle_path.is_none());
+        assert_eq!(
+            manifest.bundles[0].bundle_source_uri.as_deref(),
+            Some("oci://ex/remote-only:v1")
+        );
+        assert_eq!(
+            manifest.bundles[0].bundle_digest.as_deref(),
+            Some("sha256:abc123")
+        );
+        // Survives a serialize round-trip.
+        let back: EnvManifest =
+            serde_json::from_value(serde_json::to_value(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            back.bundles[0].bundle_digest.as_deref(),
+            Some("sha256:abc123")
+        );
+    }
+
+    #[test]
+    fn bundle_level_source_uri_with_revisions_fails() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "split",
+                "bundle_source_uri": "oci://ex/split:v1",
+                "revisions": [
+                    {"name": "a", "bundle_path": "a.gtbundle"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("single-revision form"), "{err}");
+    }
+
+    #[test]
+    fn malformed_bundle_digest_fails() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "bad-digest",
+                "bundle_path": "x.gtbundle",
+                "bundle_digest": "deadbeef"
+            }]
+        }))
+        .unwrap();
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(
+            err.to_string().contains("must be a `sha256:<hex>` string"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn malformed_per_revision_bundle_digest_fails() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "split-bad-digest",
+                "revisions": [
+                    {"name": "a", "bundle_path": "a.gtbundle", "bundle_digest": "nope"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(
+            err.to_string().contains("must be a `sha256:<hex>` string"),
+            "{err}"
+        );
     }
 
     #[test]
