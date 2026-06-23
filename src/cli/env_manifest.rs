@@ -436,14 +436,22 @@ impl EnvManifest {
                     )));
                 }
                 (None, Some(_)) => {
-                    // Multi-revision: the bundle-level `bundle_source_uri` is a
-                    // single-revision-only field — a split carries its pull ref
-                    // per `revisions[]` entry.
+                    // Multi-revision: the bundle-level `bundle_source_uri` and
+                    // `bundle_digest` are single-revision-only fields — a split
+                    // carries them per `revisions[]` entry.
                     if b.bundle_source_uri.is_some() {
                         return Err(OpError::InvalidArgument(format!(
                             "bundle `{}`: bundle-level `bundle_source_uri` is for the \
                              single-revision form — declare a per-revision \
                              `bundle_source_uri` inside `revisions[]` for a traffic split",
+                            b.bundle_id
+                        )));
+                    }
+                    if b.bundle_digest.is_some() {
+                        return Err(OpError::InvalidArgument(format!(
+                            "bundle `{}`: bundle-level `bundle_digest` is for the \
+                             single-revision form — declare a per-revision \
+                             `bundle_digest` inside `revisions[]` for a traffic split",
                             b.bundle_id
                         )));
                     }
@@ -2706,6 +2714,24 @@ mod tests {
             "bundles": [{
                 "bundle_id": "split",
                 "bundle_source_uri": "oci://ex/split:v1",
+                "revisions": [
+                    {"name": "a", "bundle_path": "a.gtbundle"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("single-revision form"), "{err}");
+    }
+
+    #[test]
+    fn bundle_level_digest_with_revisions_fails() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "split-digest",
+                "bundle_digest": "sha256:abc123",
                 "revisions": [
                     {"name": "a", "bundle_path": "a.gtbundle"}
                 ]
