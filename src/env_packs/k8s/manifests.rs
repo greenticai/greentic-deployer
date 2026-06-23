@@ -148,6 +148,10 @@ pub struct K8sParams {
     pub router_replicas: u32,
     /// Worker public-exposure mode. From the `tunnel` deployer answer.
     pub tunnel: TunnelMode,
+    /// OCI registry authorities (`host[:port]`) the worker/router may pull
+    /// bundles from over plain HTTP. From the `oci_insecure_registries` answer;
+    /// rendered as `GREENTIC_OCI_INSECURE_REGISTRIES`. Empty → HTTPS only.
+    pub oci_insecure_registries: Vec<String>,
     /// Base64 of the env's local dev-store, set at reconcile time so the
     /// rendered [`DEV_SECRETS_SECRET_NAME`] Secret carries the operator's
     /// secrets. `None` on the pure preview path (`op env render`) and for the
@@ -166,6 +170,7 @@ impl K8sParams {
             runtime_image: DEFAULT_RUNTIME_IMAGE.to_string(),
             router_replicas: 2,
             tunnel: TunnelMode::Off,
+            oci_insecure_registries: Vec::new(),
             dev_secrets_data: None,
         }
     }
@@ -211,6 +216,7 @@ impl K8sParams {
             "runtime_image",
             "router_replicas",
             "tunnel",
+            "oci_insecure_registries",
         ];
         for key in obj.keys() {
             if !KNOWN_KEYS.contains(&key.as_str()) {
@@ -281,6 +287,35 @@ impl K8sParams {
             None => defaults.tunnel,
         };
 
+        // Accepts a comma-separated string (the wizard form) or a JSON array of
+        // strings (declarative env-manifest authors). Blank → no registries.
+        let oci_insecure_registries = match obj.get("oci_insecure_registries") {
+            None | Some(serde_json::Value::Null) => defaults.oci_insecure_registries,
+            Some(serde_json::Value::String(s)) => parse_insecure_registries(s),
+            Some(serde_json::Value::Array(items)) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        serde_json::Value::String(s) if !s.trim().is_empty() => {
+                            out.push(s.trim().to_string());
+                        }
+                        serde_json::Value::String(_) => {}
+                        other => {
+                            return Err(format!(
+                                "oci_insecure_registries entries must be strings, got {other}"
+                            ));
+                        }
+                    }
+                }
+                out
+            }
+            Some(other) => {
+                return Err(format!(
+                    "oci_insecure_registries must be a comma-separated string or array of strings, got {other}"
+                ));
+            }
+        };
+
         // kubeconfig_context: silently accepted and ignored.
 
         Ok(Self {
@@ -288,11 +323,23 @@ impl K8sParams {
             runtime_image,
             router_replicas,
             tunnel,
+            oci_insecure_registries,
             // Reconcile injects the dev-store bytes after this pure parse (it
             // owns the filesystem read); the preview path leaves it unset.
             dev_secrets_data: defaults.dev_secrets_data,
         })
     }
+}
+
+/// Split the comma-separated `oci_insecure_registries` answer into `host[:port]`
+/// authorities, trimming whitespace and dropping blanks. Mirrors greentic-start's
+/// `GREENTIC_OCI_INSECURE_REGISTRIES` parser so the round-trip is lossless.
+fn parse_insecure_registries(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Extract a non-empty string answer, treating JSON `null` and empty
@@ -611,13 +658,22 @@ const RAYON_THREADS: &str = "4";
 /// runtime's `127.0.0.1` default would make every probe fail); `HOME` roots
 /// the env store on the writable staging volume; `RAYON_NUM_THREADS` caps the
 /// bundle-unpack thread pool (see [`RAYON_THREADS`]).
-fn runtime_boot_env(env: &Environment) -> Vec<Value> {
-    vec![
+fn runtime_boot_env(env: &Environment, oci_insecure_registries: &[String]) -> Vec<Value> {
+    let mut vars = vec![
         json!({"name": "GREENTIC_ENV_ID", "value": env.environment_id.as_str()}),
         json!({"name": "HOME", "value": STAGE_HOME}),
         json!({"name": "GREENTIC_GATEWAY_LISTEN_ADDR", "value": "0.0.0.0"}),
         json!({"name": "RAYON_NUM_THREADS", "value": RAYON_THREADS}),
-    ]
+    ];
+    // greentic-start honors this only on the digest-gated OCI boot-pull; emitting
+    // it when unset would be a harmless no-op, but skip it to keep the pod spec lean.
+    if !oci_insecure_registries.is_empty() {
+        vars.push(json!({
+            "name": "GREENTIC_OCI_INSECURE_REGISTRIES",
+            "value": oci_insecure_registries.join(","),
+        }));
+    }
+    vars
 }
 
 /// Main-container volume mounts shared by router + worker: the writable HOME
@@ -688,7 +744,7 @@ pub fn render_worker_deployment(
     params: &K8sParams,
 ) -> Value {
     let labels = worker_selector_labels(env, revision);
-    let mut env_vars = runtime_boot_env(env);
+    let mut env_vars = runtime_boot_env(env, &params.oci_insecure_registries);
     env_vars.extend([
         json!({"name": "GREENTIC_REVISION_ID", "value": revision.revision_id.0.to_string()}),
         json!({"name": "GREENTIC_DEPLOYMENT_ID", "value": revision.deployment_id.0.to_string()}),
@@ -864,7 +920,7 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
                         "securityContext": container_security_context(),
                         "resources": resource_baseline(),
                         "ports": [{"name": "http", "containerPort": SERVE_PORT}],
-                        "env": Value::Array(runtime_boot_env(env)),
+                        "env": Value::Array(runtime_boot_env(env, &params.oci_insecure_registries)),
                         "volumeMounts": runtime_volume_mounts(),
                         "readinessProbe": {
                             "httpGet": {"path": "/healthz", "port": SERVE_PORT},
@@ -1346,6 +1402,48 @@ mod tests {
     }
 
     #[test]
+    fn insecure_oci_registries_render_into_worker_and_router_pods() {
+        let (env, mut params) = fixture();
+        params.oci_insecure_registries = vec![
+            "localhost:5000".to_string(),
+            "reg.internal:5000".to_string(),
+        ];
+
+        for d in [
+            render_worker_deployment(&env, &env.revisions[0], &params),
+            render_router_deployment(&env, &params),
+        ] {
+            let envs = d["spec"]["template"]["spec"]["containers"][0]["env"]
+                .as_array()
+                .unwrap();
+            let var = envs
+                .iter()
+                .find(|e| e["name"] == "GREENTIC_OCI_INSECURE_REGISTRIES")
+                .expect("the insecure-registries env var is rendered on both pods");
+            assert_eq!(var["value"], "localhost:5000,reg.internal:5000");
+        }
+    }
+
+    #[test]
+    fn no_insecure_oci_registries_env_var_by_default() {
+        let (env, params) = fixture();
+        for d in [
+            render_worker_deployment(&env, &env.revisions[0], &params),
+            render_router_deployment(&env, &params),
+        ] {
+            let envs = d["spec"]["template"]["spec"]["containers"][0]["env"]
+                .as_array()
+                .unwrap();
+            assert!(
+                !envs
+                    .iter()
+                    .any(|e| e["name"] == "GREENTIC_OCI_INSECURE_REGISTRIES"),
+                "the HTTPS-only default must not emit the insecure-registries var"
+            );
+        }
+    }
+
+    #[test]
     fn every_pod_spec_passes_the_restricted_hardening_gate() {
         let (env, params) = fixture();
         let pods = [
@@ -1732,6 +1830,45 @@ mod tests {
         let answers = serde_json::json!({"router_replicas": "1"});
         let err = K8sParams::from_answers(&env, Some(&answers)).unwrap_err();
         assert!(err.contains("must be >= 2"), "got: {err}");
+    }
+
+    #[test]
+    fn from_answers_oci_insecure_registries_comma_string() {
+        let env = build_fixture_env();
+        let answers =
+            serde_json::json!({"oci_insecure_registries": " localhost:5000 , reg.internal:5000 ,"});
+        let params = K8sParams::from_answers(&env, Some(&answers)).unwrap();
+        assert_eq!(
+            params.oci_insecure_registries,
+            vec![
+                "localhost:5000".to_string(),
+                "reg.internal:5000".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn from_answers_oci_insecure_registries_array() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "oci_insecure_registries": ["localhost:5000", "  ", "reg.internal:5000"]
+        });
+        let params = K8sParams::from_answers(&env, Some(&answers)).unwrap();
+        assert_eq!(
+            params.oci_insecure_registries,
+            vec![
+                "localhost:5000".to_string(),
+                "reg.internal:5000".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn from_answers_oci_insecure_registries_non_string_entry_rejected() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"oci_insecure_registries": ["localhost:5000", 5000]});
+        let err = K8sParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(err.contains("must be strings"), "got: {err}");
     }
 
     #[test]

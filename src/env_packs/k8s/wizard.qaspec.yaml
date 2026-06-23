@@ -92,3 +92,15 @@ questions:
     default_value: "2"
     constraint:
       pattern: '^[0-9]+$'
+
+  - id: oci_insecure_registries
+    type: string
+    title: Insecure OCI registries (optional)
+    description: >-
+      Comma-separated registry authorities (`host:port`) the worker and
+      router may pull bundles from over plain HTTP instead of HTTPS — for
+      an internal/air-gapped registry without TLS. Leave blank (the
+      default) to require HTTPS for every registry. Rendered into the pods
+      as `GREENTIC_OCI_INSECURE_REGISTRIES`; honored only on the
+      digest-pinned OCI boot-pull path.
+    required: false
