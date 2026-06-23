@@ -101,10 +101,13 @@ pub fn run_rotate(
             .ok_or_else(|| RunRotateError::NoDeployerBound(env_id.clone()))?;
         // Authoritative inside-the-flock precondition: rotation refreshes an
         // EXISTING bound credential (the inverse of bootstrap's absence
-        // check). Without a ref there is nothing to rotate.
-        if env.credentials_ref.is_none() {
-            return Err(RunRotateError::NotBootstrapped(env_id.clone()));
-        }
+        // check). The env resolves its credential from `credentials_ref`, so
+        // that — not the deployer's default minted ref — is where the fresh
+        // material must land for live verbs to pick it up.
+        let active_ref = env
+            .credentials_ref
+            .clone()
+            .ok_or_else(|| RunRotateError::NotBootstrapped(env_id.clone()))?;
 
         // Resolve the handler unconditionally so the A9 slot/version match
         // still runs; the admin-connected override then provides the actual
@@ -123,7 +126,9 @@ pub fn run_rotate(
         // identity Secret in place.
         let outcome = bind_creds.bootstrap(&input)?;
 
-        let (Some(bound_ref), Some(material)) = (
+        // `bound_credentials_ref` being `Some` is the proof the deployer
+        // actually minted material (render-only bootstraps return `None`).
+        let (Some(_minted_ref), Some(material)) = (
             outcome.bound_credentials_ref.as_ref(),
             outcome.bound_secret_material.as_ref(),
         ) else {
@@ -134,10 +139,16 @@ pub fn run_rotate(
             )));
         };
 
-        // Overwrite the dev-store material BEFORE returning success (the
-        // in-cluster Secret was already overwritten inside `bootstrap`). The
-        // ref URI is unchanged, so `env.credentials_ref` is NOT rewritten.
-        secret_sink(&env_root, bound_ref, material.as_str())
+        // Overwrite the material at the env's ACTIVE `credentials_ref` — the
+        // location the resolver reads — BEFORE returning success (the
+        // in-cluster identity Secret was already overwritten inside
+        // `bootstrap`). In the canonical `bootstrap --bind` flow the active ref
+        // equals the deployer's minted ref, so this is unchanged; when an
+        // operator bound a different same-env ref out of band, writing here
+        // (not at the minted ref) is what keeps live verbs from resolving the
+        // stale token. `env.credentials_ref` itself is NOT rewritten (the URI
+        // is stable; only the material behind it changes).
+        secret_sink(&env_root, &active_ref, material.as_str())
             .map_err(RunRotateError::SecretWrite)?;
 
         let expiry = outcome.bound_expiry.map(|expires_at| CredentialsExpiry {
@@ -146,7 +157,7 @@ pub fn run_rotate(
         });
 
         Ok(RotateOutcome {
-            credentials_ref: bound_ref.clone(),
+            credentials_ref: active_ref,
             expiry,
         })
     })
@@ -348,6 +359,59 @@ mod tests {
             reloaded.credentials_ref.as_ref().map(|r| r.as_str()),
             Some(ref_uri)
         );
+    }
+
+    #[test]
+    fn run_rotate_writes_to_the_active_ref_not_the_minted_ref() {
+        use crate::cli::tests_common::{make_binding, make_env};
+        use std::cell::RefCell;
+
+        // Env's active `credentials_ref` differs from the deployer's default
+        // minted ref (an out-of-band binding). Rotation must write the fresh
+        // token where the RESOLVER reads (the active ref), not where the
+        // deployer minted — otherwise live verbs keep the stale token.
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.local-process@0.1.0",
+        ));
+        let active_ref = "secret://local/default/_/custom/active-token";
+        let minted_ref = "secret://local/default/_/k8s-deployer/deployer_token";
+        env.credentials_ref = Some(SecretRef::try_new(active_ref).unwrap());
+        store.save(&env).unwrap();
+
+        let iat = 7_000_000;
+        let bearer = fake_jwt(iat, iat + 1000);
+        let creds = MintingCreds {
+            bearer: Some(bearer.clone()),
+            expiry: Some(DateTime::from_timestamp(iat + 1000, 0).unwrap()),
+            bound_ref: Some(minted_ref.to_string()), // deployer mints at its default
+        };
+        let written: RefCell<Option<(String, String)>> = RefCell::new(None);
+        let sink = |_root: &std::path::Path, r: &SecretRef, v: &str| -> Result<(), String> {
+            *written.borrow_mut() = Some((r.as_str().to_string(), v.to_string()));
+            Ok(())
+        };
+
+        let outcome = run_rotate(
+            &store,
+            &EnvPackRegistry::with_builtins(),
+            &"local".try_into().unwrap(),
+            &ZeroizedAdmin::new("admin-ctx", "material".to_string()),
+            &creds,
+            &sink,
+        )
+        .expect("rotate succeeds");
+
+        let (wrote_ref, wrote_val) = written.into_inner().expect("sink invoked");
+        assert_eq!(
+            wrote_ref, active_ref,
+            "fresh token must land at the env's active ref, not the deployer's minted ref"
+        );
+        assert_eq!(wrote_val, bearer);
+        assert_eq!(outcome.credentials_ref.as_str(), active_ref);
     }
 
     #[test]

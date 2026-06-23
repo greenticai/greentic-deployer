@@ -344,34 +344,8 @@ pub fn rotate(
             )
         })?;
 
-    // `--if-needed`: skip the re-mint (and never touch admin material) unless
-    // the current bound token is at/past 80% of its lifetime. Resolves the
-    // bearer from env-var / dev-store (no cluster round-trip); an unresolvable
-    // token falls through to rotate (fail-open).
-    if if_needed
-        && let Ok(Some(bearer)) = super::secrets::resolve_credentials_token(store, &env, &env_id)
-        && !crate::credentials::rotation_due(&bearer, chrono::Utc::now())
-    {
-        return Ok(OpOutcome::new(
-            NOUN,
-            "rotate",
-            json!({
-                "environment_id": env_id.as_str(),
-                "rotated": false,
-                "reason": "current token has not reached its rotation threshold (80% of lifetime)",
-            }),
-        ));
-    }
-
-    let admin = load_admin_credential(
-        &payload.admin_profile,
-        payload.admin_material_path.as_deref(),
-        &mut payload.admin_material_inline,
-    )
-    .map_err(|e| OpError::Conflict(e.to_string()))?;
-
-    // Sink that overwrites the minted bearer in the env dev store at the
-    // location `resolve_credentials_token` reads it back from. Invoked inside
+    // Sink that overwrites the bearer in the env dev store at the location
+    // `resolve_credentials_token` reads it back from. Invoked inside
     // `run_rotate`'s flock.
     let secret_sink = |env_root: &std::path::Path,
                        secret_ref: &greentic_deploy_spec::SecretRef,
@@ -390,7 +364,41 @@ pub fn rotate(
         target: json!({"admin_profile": payload.admin_profile, "if_needed": if_needed}),
         idempotency_key: None,
     };
+    // EVERY outcome — including the `--if-needed` no-op — runs inside
+    // `audit_and_record` so the local-only authorization gate AND the audit
+    // append cover all of them. Returning the no-op before this boundary would
+    // let a non-local env probe token freshness unauthorized and unaudited.
     audit_and_record(store, ctx, |committed| {
+        // `--if-needed`: skip the re-mint (and never load admin material)
+        // unless the current bound token is at/past 80% of its lifetime.
+        // Resolves the bearer from env-var / dev-store (no cluster round-trip);
+        // an unresolvable token falls through to rotate (fail-open).
+        if if_needed
+            && let Ok(Some(bearer)) =
+                super::secrets::resolve_credentials_token(store, &env, &env_id)
+            && !crate::credentials::rotation_due(&bearer, chrono::Utc::now())
+        {
+            return Ok((
+                OpOutcome::new(
+                    NOUN,
+                    "rotate",
+                    json!({
+                        "environment_id": env_id.as_str(),
+                        "rotated": false,
+                        "reason": "current token has not reached its rotation threshold (80% of lifetime)",
+                    }),
+                ),
+                AuditGens::NONE,
+            ));
+        }
+
+        let admin = load_admin_credential(
+            &payload.admin_profile,
+            payload.admin_material_path.as_deref(),
+            &mut payload.admin_material_inline,
+        )
+        .map_err(|e| OpError::Conflict(e.to_string()))?;
+
         let outcome = crate::credentials::run_rotate(
             store,
             registry,
