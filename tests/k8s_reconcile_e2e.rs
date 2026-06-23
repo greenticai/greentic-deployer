@@ -2731,6 +2731,7 @@ fn provision_telegram_revision(store: &Path, image: &str) -> String {
             "provider_type": TG_PROVIDER_TYPE,
             "display_name": "m5",
             "secret_refs": [],
+            "updated_by": "m5",
         }),
     );
     let endpoint_id =
@@ -2745,6 +2746,7 @@ fn provision_telegram_revision(store: &Path, image: &str) -> String {
             "environment_id": ENV_ID,
             "endpoint_id": endpoint_id,
             "bundle_id": TG_BUNDLE_ID,
+            "updated_by": "m5",
         }),
     );
     op(
