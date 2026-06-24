@@ -77,6 +77,10 @@ pub struct TaskSetRef {
     pub deployment_id: DeploymentId,
     pub revision_id: RevisionId,
     pub cluster: String,
+    /// AWS region the task set lives in. ECS is regional, so describe /
+    /// delete must carry it — a fresh process cannot reconstruct the region
+    /// from the other identifiers. Populated from `AwsEcsParams::region`.
+    pub region: String,
 }
 
 /// What [`EcsDeployTarget::create_task_set`] returns: the created (or existing,
@@ -98,12 +102,14 @@ pub struct TaskSetStability {
     pub desired: u32,
 }
 
-/// Identity of the ALB listener rule whose forward weights mirror a
-/// deployment's `TrafficSplit`.
+/// Identity of the ALB listener whose weighted forward action mirrors a
+/// deployment's `TrafficSplit`. Carries the operator-supplied listener ARN
+/// (the wizard's `alb_listener_arn`); the verbs build this only when an ALB
+/// mirror is configured.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListenerRuleRef {
+pub struct ListenerRef {
     pub deployment_id: DeploymentId,
-    pub rule_arn: String,
+    pub listener_arn: String,
 }
 
 /// One weighted target group in a listener rule's forward action.
@@ -143,11 +149,11 @@ pub trait EcsDeployTarget: std::fmt::Debug + Send + Sync {
     /// against an already-absent set.
     async fn delete_task_set(&self, task_set: &TaskSetRef) -> Result<(), EcsTargetError>;
 
-    /// Set the listener rule's weighted forward action across the deployment's
+    /// Set the listener's weighted forward action across the deployment's
     /// task-set target groups (the ALB mirror of the env's `TrafficSplit`).
     async fn apply_listener_weights(
         &self,
-        rule: &ListenerRuleRef,
+        listener: &ListenerRef,
         weights: &[TargetGroupWeight],
     ) -> Result<(), EcsTargetError>;
 }
@@ -176,7 +182,7 @@ impl EcsDeployTarget for UnconfiguredEcsTarget {
     }
     async fn apply_listener_weights(
         &self,
-        _rule: &ListenerRuleRef,
+        _listener: &ListenerRef,
         _weights: &[TargetGroupWeight],
     ) -> Result<(), EcsTargetError> {
         Err(EcsTargetError::Unconfigured)
@@ -271,13 +277,13 @@ impl EcsDeployTarget for InMemoryEcs {
 
     async fn apply_listener_weights(
         &self,
-        rule: &ListenerRuleRef,
+        listener: &ListenerRef,
         weights: &[TargetGroupWeight],
     ) -> Result<(), EcsTargetError> {
         self.weights
             .lock()
             .expect("mutex not poisoned")
-            .insert(rule.deployment_id, weights.to_vec());
+            .insert(listener.deployment_id, weights.to_vec());
         Ok(())
     }
 }

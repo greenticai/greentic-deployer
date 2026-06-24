@@ -61,7 +61,7 @@ AwsEcsDeployerHandler {
 | `create_task_set(TaskSetSpec) -> TaskSetHandle` (idempotent; registers task-def + creates set) | warm |
 | `task_set_stability(TaskSetRef) -> TaskSetStability` | warm wait |
 | `delete_task_set(TaskSetRef)` (idempotent; deletes set + deregisters task-def) | archive |
-| `apply_listener_weights(ListenerRuleRef, &[TargetGroupWeight])` | apply_traffic_split |
+| `apply_listener_weights(ListenerRef, &[TargetGroupWeight])` | apply_traffic_split |
 
 Implementations: `InMemoryEcs` (unit tests + conformance), `UnconfiguredEcsTarget`
 (default; fails honestly), `RealEcsTarget` (aws-sdk; PR-2).
@@ -69,10 +69,11 @@ Implementations: `InMemoryEcs` (unit tests + conformance), `UnconfiguredEcsTarge
 ### `AwsEcsParams::from_answers(env, answers)`
 
 Reads `region` / `ecs_cluster_name` / `alb_listener_arn` / `ecr_repository_prefix`
-from the binding's wizard answers (`None` → sandbox defaults). Unknown keys are
-rejected (deny-by-default); credential-scoping knobs (`aws_profile`,
-`assume_role_arn`) are accepted-and-ignored (consumed by the client builder in
-PR-2/PR-3). A malformed blob fails **before any AWS call**.
+/ `container_image_tag_prefix` from the binding's wizard answers (`None` →
+sandbox defaults). Unknown keys are rejected (deny-by-default); credential-
+scoping knobs (`aws_profile`, `assume_role_arn`) are accepted-and-ignored
+(consumed by the client builder in PR-2/PR-3). A malformed blob fails **before
+any AWS call**.
 
 ### Verb → side-effect
 
@@ -82,7 +83,7 @@ PR-2/PR-3). A malformed blob fails **before any AWS call**.
 | `warm_revision` | `ensure_service` + `create_task_set`; wait until the task set stabilizes (steady state + healthy targets), bounded by `GREENTIC_AWS_ECS_WARM_READY_TIMEOUT_SECS`. |
 | `drain_revision` | no-op (routing-side; weight shift is `apply_traffic_split`). |
 | `archive_revision` | `delete_task_set` (idempotent against absent). |
-| `apply_traffic_split` | `enforce_split_invariants` first → `apply_listener_weights` across the deployment's task-set target groups. Sibling-deployment independence. |
+| `apply_traffic_split` | `enforce_split_invariants` first → when an `alb_listener_arn` is bound, `apply_listener_weights` across the deployment's task-set target groups; with no listener bound the ALB is skipped (dispatcher authoritative). Sibling-deployment independence. |
 | `report_runtime_config` | default `materialize_runtime_config`. |
 
 ## PR train

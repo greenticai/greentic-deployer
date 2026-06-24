@@ -33,7 +33,7 @@ use tokio::time::{Instant, sleep};
 
 use super::AwsEcsDeployerHandler;
 use super::deploy_target::{
-    EcsDeployTarget, EcsTargetError, ListenerRuleRef, ServiceSpec, TargetGroupWeight, TaskSetRef,
+    EcsDeployTarget, EcsTargetError, ListenerRef, ServiceSpec, TargetGroupWeight, TaskSetRef,
     TaskSetSpec,
 };
 use crate::env_packs::deployer::{
@@ -45,6 +45,10 @@ use crate::env_packs::deployer::{
 /// `ecr_repository_prefix`. The in-memory path never pulls it; the real target
 /// requires the operator to scope `ecr_repository_prefix` to their account.
 const DEFAULT_IMAGE_BASE: &str = "greentic/operator";
+
+/// Default image-tag prefix when the binding supplies no
+/// `container_image_tag_prefix`. Matches the wizard's `default_value`.
+const DEFAULT_IMAGE_TAG_PREFIX: &str = "rev-";
 
 /// Seam failures surface as provider failures — the verb's preconditions have
 /// already passed by the time the target is touched.
@@ -64,9 +68,12 @@ pub struct AwsEcsParams {
     pub cluster: String,
     /// Container image base every revision's image is built from.
     pub image_base: String,
-    /// ALB listener ARN the weighted forward rules are written to. `None`
-    /// derives a deterministic per-deployment placeholder (the runtime
-    /// dispatcher stays authoritative when no ALB mirror is configured).
+    /// Prefix the revision's image tag is built from (wizard default `rev-`).
+    /// Blank tags with the raw revision ULID.
+    pub image_tag_prefix: String,
+    /// ALB listener ARN the weighted forward action is written to. `None`
+    /// means no ALB mirror is configured: `apply_traffic_split` skips the
+    /// listener update and the runtime dispatcher stays authoritative.
     pub listener_arn: Option<String>,
 }
 
@@ -99,6 +106,7 @@ impl AwsEcsParams {
                 .unwrap_or_else(|| "us-east-1".to_string()),
             cluster: format!("greentic-{}", env.environment_id.as_str()),
             image_base: DEFAULT_IMAGE_BASE.to_string(),
+            image_tag_prefix: DEFAULT_IMAGE_TAG_PREFIX.to_string(),
             listener_arn: None,
         }
     }
@@ -108,9 +116,9 @@ impl AwsEcsParams {
     /// Keys mirror `wizard.qaspec.yaml`. Unknown keys are rejected (deny-by-
     /// default, so an operator typo fails loudly rather than being silently
     /// dropped). Credential-scoping knobs (`aws_profile`, `assume_role_arn`)
-    /// and image-tag knobs are validated as strings and accepted so a full
-    /// binding's answers deserialize; they are consumed by the SDK client
-    /// builder / image tagging in later slices, not by these verbs.
+    /// are validated as strings and accepted so a full binding's answers
+    /// deserialize; they are consumed by the SDK client builder in later
+    /// slices, not by these verbs.
     pub fn from_answers(
         env: &Environment,
         answers: Option<&Value>,
@@ -125,8 +133,11 @@ impl AwsEcsParams {
                 "region" => params.region = answer_string(key, value)?,
                 "ecs_cluster_name" => params.cluster = answer_string(key, value)?,
                 "ecr_repository_prefix" => params.image_base = answer_string(key, value)?,
+                "container_image_tag_prefix" => {
+                    params.image_tag_prefix = answer_string(key, value)?
+                }
                 "alb_listener_arn" => params.listener_arn = Some(answer_string(key, value)?),
-                "container_image_tag_prefix" | "aws_profile" | "assume_role_arn" => {
+                "aws_profile" | "assume_role_arn" => {
                     answer_string(key, value)?;
                 }
                 other => return Err(AwsEcsParamsError::UnknownKey(other.to_string())),
@@ -135,22 +146,18 @@ impl AwsEcsParams {
         Ok(params)
     }
 
-    /// Image the revision's Fargate task runs.
+    /// Image the revision's Fargate task runs (image base + the configured
+    /// tag prefix + the revision ULID).
     fn image_for(&self, revision_id: RevisionId) -> String {
-        format!("{}:rev-{}", self.image_base, revision_id.0)
+        format!(
+            "{}:{}{}",
+            self.image_base, self.image_tag_prefix, revision_id.0
+        )
     }
 
     /// Deterministic target-group name for a revision's task set.
     fn target_group(&self, deployment_id: DeploymentId, revision_id: RevisionId) -> String {
         format!("gtc-tg-{}-{}", deployment_id.0, revision_id.0)
-    }
-
-    /// Listener rule the deployment's weighted forward action is written to —
-    /// the operator-supplied ARN, or a deterministic per-deployment placeholder.
-    fn listener_rule_arn(&self, deployment_id: DeploymentId) -> String {
-        self.listener_arn
-            .clone()
-            .unwrap_or_else(|| format!("gtc-rule-{}", deployment_id.0))
     }
 }
 
@@ -282,6 +289,7 @@ impl Deployer for AwsEcsDeployerHandler {
                 deployment_id,
                 revision_id,
                 cluster: params.cluster.clone(),
+                region: params.region.clone(),
             },
             warm_stabilize_timeout(),
             WARM_STABILIZE_POLL_INTERVAL,
@@ -316,6 +324,7 @@ impl Deployer for AwsEcsDeployerHandler {
                 deployment_id: revision.deployment_id,
                 revision_id,
                 cluster: params.cluster,
+                region: params.region,
             })
             .await
             .map_err(provider)?;
@@ -331,25 +340,30 @@ impl Deployer for AwsEcsDeployerHandler {
         // Preconditions + outcome construction BEFORE any AWS call.
         let outcome = enforce_split_invariants(env, deployment_id)?;
         let params = params_from_answers(env, answers)?;
-        let weights: Vec<TargetGroupWeight> = outcome
-            .applied_entries
-            .iter()
-            .map(|entry| TargetGroupWeight {
-                revision_id: entry.revision_id,
-                weight_bps: entry.weight_bps,
-                target_group: params.target_group(deployment_id, entry.revision_id),
-            })
-            .collect();
-        self.target
-            .apply_listener_weights(
-                &ListenerRuleRef {
-                    deployment_id,
-                    rule_arn: params.listener_rule_arn(deployment_id),
-                },
-                &weights,
-            )
-            .await
-            .map_err(provider)?;
+        // Only touch the ALB when a listener is configured; with no
+        // `alb_listener_arn` the runtime dispatcher stays authoritative for
+        // traffic splitting, so there is no listener to write.
+        if let Some(listener_arn) = &params.listener_arn {
+            let weights: Vec<TargetGroupWeight> = outcome
+                .applied_entries
+                .iter()
+                .map(|entry| TargetGroupWeight {
+                    revision_id: entry.revision_id,
+                    weight_bps: entry.weight_bps,
+                    target_group: params.target_group(deployment_id, entry.revision_id),
+                })
+                .collect();
+            self.target
+                .apply_listener_weights(
+                    &ListenerRef {
+                        deployment_id,
+                        listener_arn: listener_arn.clone(),
+                    },
+                    &weights,
+                )
+                .await
+                .map_err(provider)?;
+        }
         Ok(outcome)
     }
 }
@@ -488,13 +502,22 @@ mod tests {
             .unwrap();
     }
 
+    /// A valid ALB listener ARN (passes the wizard's `^arn:...:listener/.+$`
+    /// constraint) to drive the ALB-mirror path in the split tests.
+    const TEST_LISTENER_ARN: &str =
+        "arn:aws:elasticloadbalancing:us-east-1:111122223333:listener/app/x/y/z";
+
     #[tokio::test]
     async fn traffic_split_applies_weights_mirroring_the_split() {
         let (handler, target) = handler_with_fake();
         let env = build_fixture_env();
         let dep = env.bundles[0].deployment_id;
+        let answers = serde_json::json!({ "alb_listener_arn": TEST_LISTENER_ARN });
 
-        let outcome = handler.apply_traffic_split(&env, dep, None).await.unwrap();
+        let outcome = handler
+            .apply_traffic_split(&env, dep, Some(&answers))
+            .await
+            .unwrap();
         assert_eq!(outcome.applied_deployment_id, dep);
 
         let weights = target.weights_for(dep).expect("weights applied");
@@ -523,9 +546,10 @@ mod tests {
         let env = build_fixture_env();
         let dep_a = env.bundles[0].deployment_id;
         let dep_b = env.bundles[1].deployment_id;
+        let answers = serde_json::json!({ "alb_listener_arn": TEST_LISTENER_ARN });
 
         handler
-            .apply_traffic_split(&env, dep_a, None)
+            .apply_traffic_split(&env, dep_a, Some(&answers))
             .await
             .unwrap();
         assert!(
@@ -533,7 +557,7 @@ mod tests {
             "applying A's split must not write B's weights"
         );
         handler
-            .apply_traffic_split(&env, dep_b, None)
+            .apply_traffic_split(&env, dep_b, Some(&answers))
             .await
             .unwrap();
         // A's weights are still its own.
@@ -545,6 +569,23 @@ mod tests {
         assert_eq!(
             target.weights_for(dep_a).unwrap().len(),
             split_a.entries.len()
+        );
+    }
+
+    /// With no `alb_listener_arn` configured, the split still produces the
+    /// right outcome but the deployer leaves the ALB untouched — the runtime
+    /// dispatcher stays authoritative for traffic splitting.
+    #[tokio::test]
+    async fn traffic_split_without_a_listener_skips_the_alb() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let dep = env.bundles[0].deployment_id;
+
+        let outcome = handler.apply_traffic_split(&env, dep, None).await.unwrap();
+        assert_eq!(outcome.applied_deployment_id, dep);
+        assert!(
+            target.weights_for(dep).is_none(),
+            "no listener configured: the ALB must be left untouched"
         );
     }
 
@@ -646,7 +687,7 @@ mod tests {
         }
         async fn apply_listener_weights(
             &self,
-            _rule: &ListenerRuleRef,
+            _listener: &ListenerRef,
             _weights: &[TargetGroupWeight],
         ) -> Result<(), EcsTargetError> {
             Ok(())
@@ -658,6 +699,7 @@ mod tests {
             deployment_id: DeploymentId(Ulid::from(0x01_u128)),
             revision_id: RevisionId(Ulid::from(0x10_u128)),
             cluster: "greentic-test".into(),
+            region: "us-east-1".into(),
         }
     }
 
@@ -722,6 +764,7 @@ mod tests {
             "region": "eu-west-1",
             "ecs_cluster_name": "prod",
             "ecr_repository_prefix": "123.dkr.ecr/greentic/",
+            "container_image_tag_prefix": "v",
             "alb_listener_arn": "arn:aws:elasticloadbalancing:eu-west-1:111122223333:listener/app/x/y/z",
             "aws_profile": "prod-admin",
         });
@@ -729,7 +772,33 @@ mod tests {
         assert_eq!(params.region, "eu-west-1");
         assert_eq!(params.cluster, "prod");
         assert_eq!(params.image_base, "123.dkr.ecr/greentic/");
+        assert_eq!(params.image_tag_prefix, "v");
         assert!(params.listener_arn.is_some());
+    }
+
+    #[test]
+    fn image_for_honors_the_configured_tag_prefix() {
+        let env = build_fixture_env();
+        let rev = env.revisions[0].revision_id;
+
+        // Default prefix → `<base>:rev-<ulid>`.
+        let default = AwsEcsParams::for_env(&env);
+        assert_eq!(
+            default.image_for(rev),
+            format!("{}:rev-{}", default.image_base, rev.0)
+        );
+
+        // Blank prefix → raw revision ULID tag (`<base>:<ulid>`), matching the
+        // wizard's "leave blank to tag with the raw revision ULID".
+        let blank = AwsEcsParams::from_answers(
+            &env,
+            Some(&serde_json::json!({ "container_image_tag_prefix": "" })),
+        )
+        .unwrap();
+        assert_eq!(
+            blank.image_for(rev),
+            format!("{}:{}", blank.image_base, rev.0)
+        );
     }
 
     #[test]
