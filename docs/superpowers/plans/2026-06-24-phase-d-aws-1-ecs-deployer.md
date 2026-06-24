@@ -95,17 +95,42 @@ Seam + `InMemoryEcs` + `UnconfiguredEcsTarget` + `AwsEcsParams` + the full
 in-memory fake — **zero new crate deps**, default `UnconfiguredEcsTarget` keeps
 `op deploy` honest until a real target lands. ~3 files, conformance-green.
 
-### PR-2 — `RealEcsTarget` (aws-sdk-backed)
-New `deploy-aws-ecs` feature + `aws-sdk-ecs` / `aws-sdk-elasticloadbalancingv2`.
-`RealEcsTarget` implements `EcsDeployTarget`, built lazily from the AWS chain
-(mirrors `RealAwsClient::resolve`). Response-parsing unit-tested with mocked SDK
-shapes; **no real AWS in CI.** `--no-default-features` + `creds-aws`-only builds
-stay green.
+### PR-2 — `RealEcsTarget` (aws-sdk-backed) — DONE in this branch
+New default-on `deploy-aws-ecs` feature + `aws-sdk-ecs` /
+`aws-sdk-elasticloadbalancingv2` (region-pinned clients via
+`aws_config::defaults(..).region(..)`, mirroring `RealAwsClient::resolve`).
+`RealEcsTarget` (in `aws/real_target.rs`, `#[cfg(feature = "deploy-aws-ecs")]`)
+implements all five `EcsDeployTarget` methods over the SDK: service
+describe/create (EXTERNAL controller), `RegisterTaskDefinition` +
+`CreateTaskSet`, `DescribeTaskSets` stability, `DeleteTaskSet` +
+`DeregisterTaskDefinition`, and ELBv2 `ModifyListener` weighted forward actions.
 
-### PR-3 — STS AssumeRole session minter (deferred half-b)
+**Design — launch config lives on the target, not the seam.** A real
+`RegisterTaskDefinition` needs the Fargate launch config (execution/task role
+ARNs, subnets, security groups, CPU/memory, container port). That config is
+**stable per binding**, not per revision, so it sits on `FargateLaunchConfig`
+held by the target — the per-revision seam specs + the `InMemoryEcs` fake stay
+untouched. The seam's `(deployment, revision)` identity bridges to ECS's opaque
+task-set id via a deterministic `externalId` (set at create, matched on
+describe/delete). Target groups route by **name** through the seam; the target
+resolves names→ARNs (`DescribeTargetGroups`). `TrafficSplit` basis points
+(0–10000) scale to the ELBv2 forward-weight range (0–999), ratio-preserving.
+
+Every request-build + response-parse step is a **pure free function**,
+unit-tested with SDK types built via their own builders — **no real AWS in CI**
+and **no SDK-HTTP mock dependency** (13 tests). `--no-default-features` +
+`creds-aws`-only and the zero-feature baseline stay green (the module is
+feature-gated out). `RealEcsTarget::resolve` / `FargateLaunchConfig` are public
+API; the default handler target stays `UnconfiguredEcsTarget`.
+
+### PR-3 — STS AssumeRole session minter + construction wiring (deferred half-b)
 `bootstrap` assumes the bound deployer role → returns `Some(bound_*)`; override
 `rotate_at` to decode the STS session expiry via #366's `rotate_at_from_window`.
-**Consumer:** `RealEcsTarget` builds its client from the bound session.
+**Consumer:** the construction path builds `RealEcsTarget` from the binding —
+`FargateLaunchConfig` sourced from new wizard answers (subnets / security groups
+/ exec+task role ARNs / cpu / memory / container port, extending
+`wizard.qaspec.yaml` + `AwsEcsParams::from_answers`) and the client from the
+bound STS session — then injects it via `AwsEcsDeployerHandler::with_target`.
 
 ### PR-4 — Live-account proving ground (gated/manual E2E)
 Analogue of #364: bootstrap → warm on Fargate → traffic split → archive against a

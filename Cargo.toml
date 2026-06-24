@@ -30,7 +30,7 @@ categories = [
 ]
 
 [features]
-default = ["bundle-upload-aws", "runtime-secrets-aws", "creds-aws", "k8s-client"]
+default = ["bundle-upload-aws", "runtime-secrets-aws", "creds-aws", "deploy-aws-ecs", "k8s-client"]
 internal-tools = []
 test-utils = []
 bundle-upload-aws = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime-api"]
@@ -40,6 +40,12 @@ runtime-secrets-aws = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "dep:aws-
 # alongside the other AWS deps; the env-pack registers only when this is
 # enabled.
 creds-aws = ["dep:aws-sdk-sts", "dep:aws-sdk-iam", "dep:aws-config", "dep:aws-smithy-runtime-api"]
+# Phase D D-AWS-1 (PR-2): the aws-sdk-backed `RealEcsTarget` impl of the
+# `EcsDeployTarget` seam — drives ECS task sets + ELBv2 weighted forward
+# actions. Default-on alongside the other AWS deps. The seam / fake / verbs
+# from PR-1 are SDK-free under `creds-aws`; this feature only adds the real
+# client, so `--no-default-features --features creds-aws` still builds.
+deploy-aws-ecs = ["dep:aws-sdk-ecs", "dep:aws-sdk-elasticloadbalancingv2", "dep:aws-config", "dep:aws-smithy-runtime-api"]
 # Phase D K8s slice (PR-5.2): typed Kubernetes API client behind the
 # `K8sCluster` / `K8sValidatorClient` seams. Default-on alongside the AWS
 # deps; kube's defaults are client + rustls-tls + ring (no openssl). The
@@ -217,6 +223,24 @@ features = [
 ]
 
 [dependencies.aws-sdk-iam]
+version = "1"
+optional = true
+default-features = false
+features = [
+    "default-https-client",
+    "rt-tokio",
+]
+
+[dependencies.aws-sdk-ecs]
+version = "1"
+optional = true
+default-features = false
+features = [
+    "default-https-client",
+    "rt-tokio",
+]
+
+[dependencies.aws-sdk-elasticloadbalancingv2]
 version = "1"
 optional = true
 default-features = false

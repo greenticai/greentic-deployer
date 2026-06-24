@@ -29,6 +29,8 @@ pub mod bootstrap;
 pub mod credentials;
 pub mod deploy_target;
 pub mod deployer;
+#[cfg(feature = "deploy-aws-ecs")]
+pub mod real_target;
 
 use greentic_deploy_spec::CapabilitySlot;
 use semver::VersionReq;
