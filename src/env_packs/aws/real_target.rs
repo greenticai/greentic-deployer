@@ -375,14 +375,8 @@ impl EcsDeployTarget for RealEcsTarget {
         // of the assignment model. Per-deployment pools are a tracked follow-up;
         // until then one binding = one deployment.
         let siblings = self.sibling_pool_bindings(&spec.cluster, &service).await?;
-        if let Some((owner, shared)) = conflicting_pool_owner(&siblings, &pool) {
-            return Err(EcsTargetError::Api(format!(
-                "the AWS-ECS target-group pool for this environment is already owned by \
-                 deployment service `{owner}` (bound to `{shared}`); one pool serves a single \
-                 deployment's blue/green pair. Per-deployment pools are not supported yet — roll \
-                 this revision out under the existing deployment, or give this deployment its own \
-                 environment binding with a distinct `target_group_arns` pool"
-            )));
+        if let Some((owner, shared_tg)) = conflicting_pool_owner(&siblings, &pool) {
+            return Err(EcsTargetError::PoolConflict { owner, shared_tg });
         }
 
         let taken = assigned_pool_members(&existing);
