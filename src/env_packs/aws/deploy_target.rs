@@ -43,6 +43,17 @@ pub enum EcsTargetError {
     /// the response detail) so operators can act.
     #[error("ECS API error: {0}")]
     Api(String),
+    /// A deployer *policy* refusal from the single-owner pool guard: the env's
+    /// one target-group pool is already owned by another deployment. Distinct
+    /// from [`Api`](Self::Api) so the operator message isn't mislabeled as an AWS
+    /// API failure — this is a configuration boundary, not a broken call.
+    #[error(
+        "target-group pool already owned by deployment service `{owner}` (bound to `{shared_tg}`); \
+         one pool serves a single deployment's blue/green pair. Per-deployment pools are not \
+         supported yet — roll this revision out under the existing deployment, or give this \
+         deployment its own environment binding with a distinct `target_group_arns` pool"
+    )]
+    PoolConflict { owner: String, shared_tg: String },
     /// The handler has no real ECS client wired (the default
     /// [`UnconfiguredEcsTarget`]). The operator must bind AWS credentials and
     /// rebuild the handler with a connected client.

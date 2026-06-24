@@ -90,6 +90,7 @@ pub const VALIDATED_IAM_VERBS: &[&str] = &[
     // ECS service + task-set lifecycle driven by `RealEcsTarget` (one
     // EXTERNAL-controller service per deployment, one task set per revision).
     "ecs:DescribeServices",
+    "ecs:ListServices",
     "ecs:CreateService",
     "ecs:UpdateService",
     "ecs:RegisterTaskDefinition",

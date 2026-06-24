@@ -33,17 +33,29 @@
 //! TG, so the binding on the task set is the single source of truth.
 //!
 //! **Exclusivity boundary.** `assigned_pool_members` reads `describe_task_sets`,
-//! which is scoped to one deployment's service, so assignment is exclusive
-//! *within a deployment* — each revision sees its siblings' bindings and skips
-//! them. It does NOT span deployments: two deployments drawing from the same
-//! pool through different ECS services cannot see each other's assignments, so a
-//! shared pool could hand both the same target group. The pool must therefore be
-//! sized/scoped so deployments don't contend; enforcing a deployment-scoped pool
-//! is a wiring-time concern handled where the pool meets a deployment
-//! (a follow-up wiring slice), not at this stateless mechanism. A *duplicate*
-//! target group
-//! within one pool is a config error that guarantees a self-collision and is
-//! rejected at resolve time (`pool_arns_from`). The same-service
+//! which is scoped to one deployment's service, so the free-member *assignment*
+//! is exclusive only *within a deployment* — each revision sees its siblings'
+//! bindings and skips them. It does NOT span deployments: two deployments
+//! drawing from the same pool through different ECS services cannot see each
+//! other's assignments, so a shared pool could otherwise hand both the same
+//! target group. Because the env binding declares ONE pool, a pool serves a
+//! single deployment's blue/green pair; the **single-owner guard** enforces
+//! that. Before assigning, `create_task_set` calls `sibling_pool_bindings` —
+//! the cluster's other `gtc-svc-*` services and their bound pool members — and
+//! `conflicting_pool_owner` fails the warm closed if any sibling already holds a
+//! pool member, naming the owner. This is a **read-then-create** check, so it
+//! closes the **steady-state** collision — a sibling deployment already
+//! established in the pool, the realistic case since the deploy path warms
+//! sequentially. It is deliberately NOT atomic: two deployments' *first* warms
+//! interleaving inside the read→create window could both still pick a free
+//! member (the cross-deployment form of the same-service concurrent-warm race
+//! below). Closing that durably would need the CAS/lease the stateless design
+//! rules out, so it stays a PR-4 live-verify note, not a guarantee this guard
+//! makes. Stateless like the assignment itself (re-derived from live services
+//! each call). Per-deployment pools (a distinct pool per deployment, lifting the
+//! one-deployment limit) are a tracked follow-up. A *duplicate* target group
+//! within one pool is a separate config error that guarantees a self-collision
+//! and is rejected at resolve time (`pool_arns_from`). The same-service
 //! concurrent-warm race (two distinct revisions both seeing a TG free) is
 //! inherent to the stateless model — the deploy path warms a deployment's
 //! revisions sequentially; closing it durably would require a claim/lease that
@@ -119,6 +131,7 @@ pub struct RealEcsTarget {
 /// than the customer's first warm / traffic-shift / archive.
 pub const REAL_ECS_TARGET_IAM_ACTIONS: &[&str] = &[
     "ecs:DescribeServices",       // ensure_service
+    "ecs:ListServices",           // create_task_set (single-owner pool guard)
     "ecs:CreateService",          // ensure_service
     "ecs:RegisterTaskDefinition", // create_task_set
     "ecs:CreateTaskSet",          // create_task_set
@@ -203,6 +216,56 @@ impl RealEcsTarget {
             target_group_arns_from(&out)
         };
         pool_arns_from(&self.target_group_pool, &resolved)
+    }
+
+    /// Enumerate this cluster's other deployment services (`gtc-svc-*` other than
+    /// `me`) and read each one's bound pool target groups. Feeds the single-owner
+    /// pool guard in [`create_task_set`](EcsDeployTarget::create_task_set). Thin
+    /// async glue — paginated `ListServices` plus a `DescribeTaskSets` per
+    /// greentic service — so it is PR-4 live-verified like the rest of the
+    /// `.send()` surface; the fail-closed decision is the pure
+    /// [`conflicting_pool_owner`]. Services with no pool binding are skipped, and
+    /// non-greentic services in the cluster (no `gtc-svc-` prefix) are ignored.
+    async fn sibling_pool_bindings(
+        &self,
+        cluster: &str,
+        me: &str,
+    ) -> Result<Vec<(String, Vec<String>)>, EcsTargetError> {
+        let mut bindings = Vec::new();
+        let mut next_token = None;
+        loop {
+            let page = self
+                .ecs
+                .list_services()
+                .cluster(cluster)
+                .set_next_token(next_token)
+                .send()
+                .await
+                .map_err(|e| api("list_services", e))?;
+            for arn in page.service_arns() {
+                let name = service_name_from_arn(arn);
+                if name == me || !name.starts_with(SERVICE_NAME_PREFIX) {
+                    continue;
+                }
+                let task_sets = self
+                    .ecs
+                    .describe_task_sets()
+                    .cluster(cluster)
+                    .service(name)
+                    .send()
+                    .await
+                    .map_err(|e| api("describe_task_sets", e))?;
+                let bound: Vec<String> = assigned_pool_members(&task_sets).into_iter().collect();
+                if !bound.is_empty() {
+                    bindings.push((name.to_string(), bound));
+                }
+            }
+            match page.next_token() {
+                Some(token) => next_token = Some(token.to_string()),
+                None => break,
+            }
+        }
+        Ok(bindings)
     }
 }
 
@@ -295,6 +358,27 @@ impl EcsDeployTarget for RealEcsTarget {
         // are taken; pick the first free one. Stateless — re-derived from the
         // live task sets every call, so a fresh process recovers the mapping.
         let pool = self.resolve_pool_arns().await?;
+
+        // Single-owner pool guard. This env binding declares ONE target-group
+        // pool, so it may serve exactly one deployment's blue/green pair. The
+        // within-service `taken` set below is blind to sibling deployments (each
+        // deployment is its own ECS service), so before assigning we check
+        // whether another `gtc-svc-*` service in this cluster already holds a
+        // pool member. If so, refuse rather than silently double-bind the same
+        // target group across deployments. This is a read-then-create check: it
+        // closes the steady-state case (a sibling already established) — the
+        // realistic one, since the deploy path warms sequentially. Two
+        // deployments' first warms racing inside this read→create window are the
+        // cross-deployment form of the same-service warm race (a PR-4 live-verify
+        // note), deliberately not closed with a CAS/lease. Stateless —
+        // re-derived from the live services each call, consistent with the rest
+        // of the assignment model. Per-deployment pools are a tracked follow-up;
+        // until then one binding = one deployment.
+        let siblings = self.sibling_pool_bindings(&spec.cluster, &service).await?;
+        if let Some((owner, shared_tg)) = conflicting_pool_owner(&siblings, &pool) {
+            return Err(EcsTargetError::PoolConflict { owner, shared_tg });
+        }
+
         let taken = assigned_pool_members(&existing);
         let target_group_arn = pick_free_pool_member(&pool, &taken).ok_or_else(|| {
             EcsTargetError::Api(if pool.is_empty() {
@@ -460,12 +544,18 @@ fn api<E: std::fmt::Display>(op: &str, err: E) -> EcsTargetError {
     EcsTargetError::Api(format!("ecs {op}: {err}"))
 }
 
+/// Prefix shared by every deployment's ECS service name. Filters `ListServices`
+/// output to greentic-managed deployment services in the single-owner pool
+/// guard (`sibling_pool_bindings`), so unrelated services in the cluster are
+/// ignored.
+const SERVICE_NAME_PREFIX: &str = "gtc-svc-";
+
 /// Deterministic ECS service name for a deployment (one EXTERNAL-controller
 /// service per `deployment_id`). `pub(crate)` so the CLI deploy path can report
 /// the live service name in the `op env apply-revision` outcome without
 /// re-deriving the format.
 pub(crate) fn service_name(deployment_id: &DeploymentId) -> String {
-    format!("gtc-svc-{}", deployment_id.0)
+    format!("{SERVICE_NAME_PREFIX}{}", deployment_id.0)
 }
 
 /// Render a 128-bit id as a UUID-form (36-char) string for use as an ECS
@@ -682,6 +772,33 @@ fn pick_free_pool_member(
     taken: &std::collections::HashSet<String>,
 ) -> Option<String> {
     pool_arns.iter().find(|arn| !taken.contains(*arn)).cloned()
+}
+
+/// Extract the service name from an ECS service ARN — the segment after the
+/// final `/` (`arn:aws:ecs:<region>:<acct>:service/<cluster>/<name>`). A value
+/// with no `/` (already a bare name) is returned unchanged.
+fn service_name_from_arn(arn: &str) -> &str {
+    arn.rsplit('/').next().unwrap_or(arn)
+}
+
+/// Whether a sibling deployment already owns this binding's single target-group
+/// pool. Returns the first `(service_name, target_group)` where a sibling's
+/// bound target group is also a configured pool member — proof another
+/// deployment holds the shared pool, so assignment must fail closed. `None`
+/// means no sibling contends and the current deployment may claim the pool. Pure
+/// (the live read is [`RealEcsTarget::sibling_pool_bindings`]), so the
+/// fail-closed decision is unit-tested directly.
+fn conflicting_pool_owner(
+    siblings: &[(String, Vec<String>)],
+    pool: &[String],
+) -> Option<(String, String)> {
+    let pool_set: std::collections::HashSet<&str> = pool.iter().map(String::as_str).collect();
+    siblings.iter().find_map(|(service, bound)| {
+        bound
+            .iter()
+            .find(|tg| pool_set.contains(tg.as_str()))
+            .map(|tg| (service.clone(), tg.clone()))
+    })
 }
 
 /// Map a configured pool to ARNs in order: ARN-form entries (prefix `arn:`)
@@ -1119,6 +1236,52 @@ mod tests {
             None,
             "empty pool → None"
         );
+    }
+
+    /// `service_name_from_arn` takes the segment after the final `/`, and passes
+    /// a bare name (no `/`) through unchanged — so the single-owner guard can
+    /// prefix-filter `ListServices` ARNs against [`SERVICE_NAME_PREFIX`].
+    #[test]
+    fn service_name_from_arn_takes_the_segment_after_the_final_slash() {
+        assert_eq!(
+            service_name_from_arn(
+                "arn:aws:ecs:eu-west-1:123456789012:service/greentic-prod/gtc-svc-01ABC"
+            ),
+            "gtc-svc-01ABC"
+        );
+        assert_eq!(service_name_from_arn("gtc-svc-01ABC"), "gtc-svc-01ABC");
+    }
+
+    /// `conflicting_pool_owner` fails closed when a sibling deployment already
+    /// holds a pool member, names that owner + the shared TG, and stays silent
+    /// when no sibling contends or a sibling holds an out-of-pool TG (a different
+    /// binding's pool).
+    #[test]
+    fn conflicting_pool_owner_flags_only_a_sibling_holding_a_pool_member() {
+        let pool = vec!["tg-blue".to_string(), "tg-green".to_string()];
+
+        // A sibling deployment already bound `tg-blue` from the shared pool.
+        let owner = vec![("gtc-svc-other".to_string(), vec!["tg-blue".to_string()])];
+        assert_eq!(
+            conflicting_pool_owner(&owner, &pool),
+            Some(("gtc-svc-other".to_string(), "tg-blue".to_string())),
+            "a sibling holding a pool member fails closed and names the owner",
+        );
+
+        // Sibling holds a TG outside this env's pool (a different binding) — not
+        // a conflict.
+        let unrelated = vec![(
+            "gtc-svc-other".to_string(),
+            vec!["tg-unrelated".to_string()],
+        )];
+        assert_eq!(
+            conflicting_pool_owner(&unrelated, &pool),
+            None,
+            "an out-of-pool sibling binding does not contend",
+        );
+
+        // No siblings → free to claim.
+        assert_eq!(conflicting_pool_owner(&[], &pool), None);
     }
 
     /// `pool_arns_from` passes ARN-form entries through, resolves name-form ones

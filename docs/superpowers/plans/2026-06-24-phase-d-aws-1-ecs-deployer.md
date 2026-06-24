@@ -200,19 +200,41 @@ target-group pool, F1 = per-deployment `ModifyRule`):**
     from its in-process runtime router); `op traffic set` stays spec-only. AWS
     is imperative — NOT reconcile. All AWS construction is behind
     `all(creds-aws, deploy-aws-ecs)` with honest stubs on the off combos.
-  - **PR-3c-2c (DEFERRED — cross-deployment pool exclusivity, PR-3c-2a codex
-    finding, high).** The stateless allocator reads `describe_task_sets` per ECS
-    service, so it is exclusive *within* a deployment but blind across
-    deployments sharing one binding pool — two deployments could be handed the
-    same target group. PR-3c-2a already rejects a *duplicate* TG within one pool
-    (`pool_arns_from`) and documents the boundary. The open design gap (surfaced
-    in PR-3c-2b): the config has ONE shared `target_group_arns` pool per env, so
-    no deployment "owns" a subset — enforcing "no sibling draws from it" needs
-    either a deterministic pool partition or a new per-deployment pool config
-    (likely a wizard answer). A CAS/persisted lease is explicitly OUT — it
-    contradicts the user's stateless F2 choice. The same-service concurrent-warm
-    race stays a PR-4 live-verify note (the deploy path warms a deployment's
-    revisions sequentially).
+  - **PR-3c-2c (cross-deployment pool exclusivity, PR-3c-2a codex finding,
+    high) — ✅ SHIPPED as a fail-closed single-owner guard.** The stateless
+    allocator reads `describe_task_sets` per ECS service, so it is exclusive
+    *within* a deployment but blind across deployments sharing one binding pool —
+    two deployments could be handed the same target group. PR-3c-2a already
+    rejects a *duplicate* TG within one pool (`pool_arns_from`). **Design
+    decision (industry-standard alignment, 2026-06-24):** ECS blue/green target
+    groups are per-service resources (CodeDeploy uses a dedicated TG pair per
+    service; CDK/Terraform provision per-service TGs) — a *shared fungible pool*
+    (env-wide free-list or hash partition) is an AWS anti-pattern, and true
+    per-deployment pools are the standard end-state but the env model has no
+    authoring-time deployment name to key one on (deployments are runtime ULIDs;
+    the pool is one per-binding answer). So PR-3c-2c does NOT introduce sharing or
+    speculative named deployments. Instead it makes the single per-binding pool
+    **explicitly single-owner**: `create_task_set` calls `sibling_pool_bindings`
+    (paginated `ListServices` on the env cluster → per `gtc-svc-*` service
+    `DescribeTaskSets`, skipping `me` and non-greentic services), and the pure
+    `conflicting_pool_owner` fails the warm closed with an actionable `Conflict`
+    if any sibling already holds a pool member (naming the owning service + TG).
+    Within-deployment blue/green is untouched (the two revisions share one
+    service, never counted as a sibling). Stateless — re-derived from live
+    services each call (no CAS/lease; consistent with the F2 choice). Added IAM
+    verb `ecs:ListServices` to `VALIDATED_IAM_VERBS` +
+    `REAL_ECS_TARGET_IAM_ACTIONS` (subset test holds; bootstrap rules-pack covers
+    it). When multi-deployment-per-env becomes real, the clean follow-up is true
+    per-deployment pools (+ named deployments) and this guard is what relaxes.
+    **Scope (codex PR-3c-2c review, high — accepted as a documented residual, not
+    fixed):** the guard is a read-then-create check, so it closes the
+    *steady-state* collision (a sibling deployment already established in the
+    pool) but is not atomic — two deployments' *first* warms interleaving inside
+    the read→create window could both pick a free member. That cross-deployment
+    race, like the same-service concurrent-warm race, stays a PR-4 live-verify
+    note (the deploy path warms sequentially; closing it durably needs the
+    CAS/lease the stateless F2 choice rules out). The docs/comment now scope the
+    guard to "steady-state" rather than claiming total closure.
 - **PR-3c-3:** the **F1 fix** — per-deployment ALB `ModifyRule` (host/path
   condition from a new wizard routing answer), preserving the default action +
   sibling rules so multiple deployments coexist behind one listener.
