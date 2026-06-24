@@ -59,6 +59,11 @@ pub struct ServiceSpec {
 }
 
 /// Desired state of one revision's task set.
+///
+/// The ALB target group this revision binds to is **not** on the spec: the
+/// real target assigns it statelessly from its operator-supplied pool (reading
+/// which pool members are already bound to live task sets), so the deployer
+/// never computes or carries a target-group name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSetSpec {
     pub deployment_id: DeploymentId,
@@ -67,8 +72,6 @@ pub struct TaskSetSpec {
     pub region: String,
     /// Container image the Fargate task runs.
     pub image: String,
-    /// ALB target group this revision's tasks register into.
-    pub target_group: String,
 }
 
 /// Identity of a task set for describe / delete.
@@ -110,14 +113,20 @@ pub struct TaskSetStability {
 pub struct ListenerRef {
     pub deployment_id: DeploymentId,
     pub listener_arn: String,
+    /// ECS cluster the deployment's task sets live in — the target reads their
+    /// load-balancer bindings to map each weighted revision to its target
+    /// group, and `describe_task_sets` is cluster-scoped.
+    pub cluster: String,
 }
 
-/// One weighted target group in a listener rule's forward action.
+/// One weighted revision in a listener rule's forward action. The revision's
+/// target group is **not** carried here: the real target maps each revision to
+/// the TG its task set is bound to (read from the live task sets), so the
+/// deployer passes only the routing weight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetGroupWeight {
     pub revision_id: RevisionId,
     pub weight_bps: u32,
-    pub target_group: String,
 }
 
 /// The side-effect seam the AWS-ECS deployer verbs drive.

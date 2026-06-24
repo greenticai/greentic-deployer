@@ -373,11 +373,6 @@ impl AwsEcsParams {
             self.image_base, self.image_tag_prefix, revision_id.0
         )
     }
-
-    /// Deterministic target-group name for a revision's task set.
-    fn target_group(&self, deployment_id: DeploymentId, revision_id: RevisionId) -> String {
-        format!("gtc-tg-{}-{}", deployment_id.0, revision_id.0)
-    }
 }
 
 /// Build params from the binding's answers, mapping a malformed blob to a
@@ -492,7 +487,6 @@ impl Deployer for AwsEcsDeployerHandler {
                 cluster: params.cluster.clone(),
                 region: params.region.clone(),
                 image: params.image_for(revision_id),
-                target_group: params.target_group(deployment_id, revision_id),
             })
             .await
             .map_err(provider)?;
@@ -569,7 +563,6 @@ impl Deployer for AwsEcsDeployerHandler {
                 .map(|entry| TargetGroupWeight {
                     revision_id: entry.revision_id,
                     weight_bps: entry.weight_bps,
-                    target_group: params.target_group(deployment_id, entry.revision_id),
                 })
                 .collect();
             self.target
@@ -577,6 +570,7 @@ impl Deployer for AwsEcsDeployerHandler {
                     &ListenerRef {
                         deployment_id,
                         listener_arn: listener_arn.clone(),
+                        cluster: params.cluster.clone(),
                     },
                     &weights,
                 )

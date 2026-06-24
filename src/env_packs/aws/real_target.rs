@@ -9,14 +9,44 @@
 //! ## What the seam carries vs. what Fargate needs
 //!
 //! The per-revision seam specs ([`TaskSetSpec`] etc.) carry only the identity +
-//! image + target-group **name** — the things that vary per revision. A real
-//! Fargate `RegisterTaskDefinition` / `CreateTaskSet` also needs the
-//! launch-time compute + network config (execution role, subnets, security
-//! groups, CPU / memory, container port). That config is **stable per binding**
-//! (one VPC / role set per env-pack binding), not per revision, so it lives on
-//! [`FargateLaunchConfig`] held by the target — not on the seam specs. This
-//! keeps the seam (and the [`InMemoryEcs`] fake) minimal while letting the real
-//! target stand up a complete task definition.
+//! image — the things that vary per revision. A real Fargate
+//! `RegisterTaskDefinition` / `CreateTaskSet` also needs the launch-time
+//! compute + network config (execution role, subnets, security groups, CPU /
+//! memory, container port) **and** an ALB target group to register into. Both
+//! are **stable per binding** (one VPC / role set / target-group pool per
+//! env-pack binding), not per revision, so they live on the target —
+//! [`FargateLaunchConfig`] and the `target_group_pool` — not on the seam specs.
+//! This keeps the seam (and the [`InMemoryEcs`] fake) minimal while letting the
+//! real target stand up a complete task definition.
+//!
+//! ## Target-group assignment (stateless pool)
+//!
+//! The deployer never computes a per-revision target-group name. The operator
+//! supplies a **pool** of ≥2 ALB target groups (blue/green needs each live
+//! revision in its own TG); the target assigns each revision a free pool member
+//! at `create_task_set` by reading which pool members are already bound to live
+//! task sets (`assigned_pool_members`) and picking a free one
+//! (`pick_free_pool_member`). The assignment is **not persisted** — it is
+//! re-derived from the live task sets' load-balancer bindings on every call, so
+//! a fresh process recovers the same mapping. `apply_listener_weights` reads the
+//! same bindings (`bound_target_group`) to route each weighted revision to its
+//! TG, so the binding on the task set is the single source of truth.
+//!
+//! **Exclusivity boundary.** `assigned_pool_members` reads `describe_task_sets`,
+//! which is scoped to one deployment's service, so assignment is exclusive
+//! *within a deployment* — each revision sees its siblings' bindings and skips
+//! them. It does NOT span deployments: two deployments drawing from the same
+//! pool through different ECS services cannot see each other's assignments, so a
+//! shared pool could hand both the same target group. The pool must therefore be
+//! sized/scoped so deployments don't contend; enforcing a deployment-scoped pool
+//! is a wiring-time concern handled where the pool meets a deployment
+//! (PR-3c-2b), not at this stateless mechanism. A *duplicate* target group
+//! within one pool is a config error that guarantees a self-collision and is
+//! rejected at resolve time (`pool_arns_from`). The same-service
+//! concurrent-warm race (two distinct revisions both seeing a TG free) is
+//! inherent to the stateless model — the deploy path warms a deployment's
+//! revisions sequentially; closing it durably would require a claim/lease that
+//! contradicts the stateless design (a PR-4 live-verify note).
 //!
 //! ## Identity bridge
 //!
@@ -73,6 +103,10 @@ pub struct RealEcsTarget {
     ecs: aws_sdk_ecs::Client,
     elb: aws_sdk_elasticloadbalancingv2::Client,
     launch: FargateLaunchConfig,
+    /// Operator-supplied ALB target groups (ARNs or names) the target assigns
+    /// revisions to, one per live revision. Blue/green needs ≥2; assignment is
+    /// stateless (see the module-level "Target-group assignment" note).
+    target_group_pool: Vec<String>,
 }
 
 /// The IAM actions [`RealEcsTarget`]'s five methods call at deploy time — the
@@ -82,15 +116,17 @@ pub struct RealEcsTarget {
 /// adding an SDK call here without the matching validated verb fails CI rather
 /// than the customer's first warm / traffic-shift / archive.
 pub const REAL_ECS_TARGET_IAM_ACTIONS: &[&str] = &[
-    "ecs:DescribeServices",                      // ensure_service
-    "ecs:CreateService",                         // ensure_service
-    "ecs:RegisterTaskDefinition",                // create_task_set
-    "ecs:CreateTaskSet",                         // create_task_set
-    "ecs:DescribeTaskSets", // create_task_set / task_set_stability / delete_task_set
-    "ecs:DeleteTaskSet",    // delete_task_set
-    "ecs:DeregisterTaskDefinition", // delete_task_set
-    "elasticloadbalancing:DescribeTargetGroups", // create_task_set / apply_listener_weights
-    "elasticloadbalancing:ModifyListener", // apply_listener_weights
+    "ecs:DescribeServices",       // ensure_service
+    "ecs:CreateService",          // ensure_service
+    "ecs:RegisterTaskDefinition", // create_task_set
+    "ecs:CreateTaskSet",          // create_task_set
+    // create_task_set / task_set_stability / delete_task_set / apply_listener_weights
+    // (apply_listener_weights reads each revision's target-group binding here)
+    "ecs:DescribeTaskSets",
+    "ecs:DeleteTaskSet",                         // delete_task_set
+    "ecs:DeregisterTaskDefinition",              // delete_task_set
+    "elasticloadbalancing:DescribeTargetGroups", // create_task_set (resolve_pool_arns, name→ARN)
+    "elasticloadbalancing:ModifyListener",       // apply_listener_weights
 ];
 
 impl RealEcsTarget {
@@ -102,6 +138,7 @@ impl RealEcsTarget {
     pub async fn resolve(
         region: &str,
         launch: FargateLaunchConfig,
+        target_group_pool: Vec<String>,
     ) -> Result<Self, EcsTargetError> {
         let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(aws_config::Region::new(region.to_string()))
@@ -118,27 +155,40 @@ impl RealEcsTarget {
             ecs: aws_sdk_ecs::Client::new(&config),
             elb: aws_sdk_elasticloadbalancingv2::Client::new(&config),
             launch,
+            target_group_pool,
         })
     }
 
-    /// DescribeTargetGroups by name → ARN. The seam routes by target-group
-    /// **name**; ECS task-set load balancers and ELBv2 forward actions need the
-    /// **ARN**, so the real target resolves it.
-    async fn target_group_arns(
-        &self,
-        names: &[String],
-    ) -> Result<HashMap<String, String>, EcsTargetError> {
-        if names.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let out = self
-            .elb
-            .describe_target_groups()
-            .set_names(Some(names.to_vec()))
-            .send()
-            .await
-            .map_err(|e| api("describe_target_groups", e))?;
-        Ok(target_group_arns_from(&out))
+    /// Normalize the configured pool to ARNs. Pool entries are ARNs or names
+    /// (the wizard accepts both); task-set load-balancer bindings are always
+    /// ARNs, so assignment compares in ARN space. ARN-form entries pass
+    /// through; name-form entries are resolved via DescribeTargetGroups. Order
+    /// is preserved so assignment is deterministic. A name that resolves to no
+    /// target group is an error (a typo'd pool member must not silently shrink
+    /// the pool).
+    async fn resolve_pool_arns(&self) -> Result<Vec<String>, EcsTargetError> {
+        // Only name-form entries need a DescribeTargetGroups lookup; ARN-form
+        // entries pass through. Resolve the names, then map the whole pool to
+        // ARNs in order (`pool_arns_from`).
+        let names: Vec<String> = self
+            .target_group_pool
+            .iter()
+            .filter(|e| !e.starts_with("arn:"))
+            .cloned()
+            .collect();
+        let resolved = if names.is_empty() {
+            HashMap::new()
+        } else {
+            let out = self
+                .elb
+                .describe_target_groups()
+                .set_names(Some(names))
+                .send()
+                .await
+                .map_err(|e| api("describe_target_groups", e))?;
+            target_group_arns_from(&out)
+        };
+        pool_arns_from(&self.target_group_pool, &resolved)
     }
 }
 
@@ -208,16 +258,25 @@ impl EcsDeployTarget for RealEcsTarget {
             return Ok(handle);
         }
 
-        let target_group_arn = self
-            .target_group_arns(std::slice::from_ref(&spec.target_group))
-            .await?
-            .remove(&spec.target_group)
-            .ok_or_else(|| {
-                EcsTargetError::Api(format!(
-                    "target group `{}` not found in this account/region",
-                    spec.target_group
-                ))
-            })?;
+        // Assign this revision a free target group from the pool. The members
+        // already bound to live task sets (read from the same describe above)
+        // are taken; pick the first free one. Stateless — re-derived from the
+        // live task sets every call, so a fresh process recovers the mapping.
+        let pool = self.resolve_pool_arns().await?;
+        let taken = assigned_pool_members(&existing);
+        let target_group_arn = pick_free_pool_member(&pool, &taken).ok_or_else(|| {
+            EcsTargetError::Api(if pool.is_empty() {
+                "the AWS-ECS binding configures no ALB target groups — set \
+                 `target_group_arns` (≥2 for blue/green) so warm can place the revision"
+                    .to_string()
+            } else {
+                format!(
+                    "target-group pool exhausted: all {} configured target group(s) are bound \
+                     to live task sets; add more to `target_group_arns` to warm another revision",
+                    pool.len()
+                )
+            })
+        })?;
 
         let registered = self
             .ecs
@@ -334,9 +393,22 @@ impl EcsDeployTarget for RealEcsTarget {
         listener: &ListenerRef,
         weights: &[TargetGroupWeight],
     ) -> Result<(), EcsTargetError> {
-        let names: Vec<String> = weights.iter().map(|w| w.target_group.clone()).collect();
-        let arns = self.target_group_arns(&names).await?;
-        let action = forward_action(weights, &arns)?;
+        // Each weighted revision routes to the target group its task set is
+        // bound to. That binding (recorded by the pool assignment at warm time)
+        // is the single source of truth, so the weights carry only the routing
+        // weight and the ARN is read back from the live task sets here — no
+        // name lookup, and no deployer-computed target-group name.
+        let service = service_name(&listener.deployment_id);
+        let out = self
+            .ecs
+            .describe_task_sets()
+            .cluster(&listener.cluster)
+            .service(&service)
+            .send()
+            .await
+            .map_err(|e| api("describe_task_sets", e))?;
+        let tuples = weighted_target_groups(weights, &out)?;
+        let action = forward_action(&tuples)?;
         self.elb
             .modify_listener()
             .listener_arn(&listener.listener_arn)
@@ -544,6 +616,86 @@ fn find_task_set<'a>(out: &'a DescribeTaskSetsOutput, external_id: &str) -> Opti
         .find(|ts| ts.external_id() == Some(external_id))
 }
 
+/// The target-group ARN the task set tagged with `external_id` is bound to (its
+/// first load-balancer binding). `None` when the task set is absent or carries
+/// no load-balancer binding. This binding — written at `create_task_set` — is
+/// the source of truth for both pool assignment and traffic routing, so the
+/// deployer never needs to recompute or persist a per-revision target group.
+fn bound_target_group(out: &DescribeTaskSetsOutput, external_id: &str) -> Option<String> {
+    find_task_set(out, external_id)?
+        .load_balancers()
+        .iter()
+        .find_map(|lb| lb.target_group_arn().map(str::to_string))
+}
+
+/// Every target-group ARN currently bound to a live task set — the "taken"
+/// members of the pool. Pool assignment subtracts this set from the configured
+/// pool to find a free target group. Stateless: derived from the live task sets
+/// each call, never persisted.
+fn assigned_pool_members(out: &DescribeTaskSetsOutput) -> std::collections::HashSet<String> {
+    out.task_sets()
+        .iter()
+        .flat_map(|ts| ts.load_balancers())
+        .filter_map(|lb| lb.target_group_arn().map(str::to_string))
+        .collect()
+}
+
+/// The first pool member (in configured order, so assignment is deterministic)
+/// not already bound to a live task set. `None` when the pool is empty or every
+/// member is taken — the caller turns that into an actionable error.
+fn pick_free_pool_member(
+    pool_arns: &[String],
+    taken: &std::collections::HashSet<String>,
+) -> Option<String> {
+    pool_arns.iter().find(|arn| !taken.contains(*arn)).cloned()
+}
+
+/// Map a configured pool to ARNs in order: ARN-form entries (prefix `arn:`)
+/// pass through; name-form entries are looked up in `resolved` (a `name → ARN`
+/// map from DescribeTargetGroups). A name absent from `resolved` is an error —
+/// a typo'd pool member must not silently shrink the pool. Pure so the mapping
+/// is unit-tested; the async glue that builds `resolved` is
+/// [`RealEcsTarget::resolve_pool_arns`].
+fn pool_arns_from(
+    pool: &[String],
+    resolved: &HashMap<String, String>,
+) -> Result<Vec<String>, EcsTargetError> {
+    let arns: Vec<String> = pool
+        .iter()
+        .map(|entry| {
+            if entry.starts_with("arn:") {
+                Ok(entry.clone())
+            } else {
+                resolved.get(entry).cloned().ok_or_else(|| {
+                    EcsTargetError::Api(format!(
+                        "target group pool member `{entry}` not found in this account/region"
+                    ))
+                })
+            }
+        })
+        .collect::<Result<_, _>>()?;
+    // A target group repeated in the pool (the same ARN twice, or a name that
+    // resolves to an already-listed ARN) guarantees two revisions get assigned
+    // the same TG — defeating the blue/green isolation the split relies on.
+    // Reject it as a config error rather than silently halving the usable pool.
+    if let Some(dup) = first_duplicate(&arns) {
+        return Err(EcsTargetError::Api(format!(
+            "target group `{dup}` appears more than once in the pool; each pool member \
+             must be a distinct target group"
+        )));
+    }
+    Ok(arns)
+}
+
+/// The first value that repeats in `arns` (in order), or `None` when every
+/// entry is distinct.
+fn first_duplicate(arns: &[String]) -> Option<&str> {
+    let mut seen = std::collections::HashSet::new();
+    arns.iter()
+        .find(|a| !seen.insert(a.as_str()))
+        .map(String::as_str)
+}
+
 /// Map DescribeTargetGroups → `name → ARN`. Skips entries missing either field.
 fn target_group_arns_from(out: &DescribeTargetGroupsOutput) -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -555,24 +707,41 @@ fn target_group_arns_from(out: &DescribeTargetGroupsOutput) -> HashMap<String, S
     map
 }
 
-/// Build the weighted forward [`Action`] mirroring the `TrafficSplit`: one
-/// target-group tuple per weight, ARN resolved from `arns`.
-fn forward_action(
+/// Resolve each weighted revision to the target-group ARN its task set is bound
+/// to (`bound_target_group`), yielding `(weight_bps, arn)` pairs for the forward
+/// action. A weighted revision with no live task set / load-balancer binding is
+/// an error: a split can only route to revisions that have been warmed (the
+/// caller's `enforce_split_invariants` guarantees the revisions exist, but warm
+/// is a separate step).
+fn weighted_target_groups(
     weights: &[TargetGroupWeight],
-    arns: &HashMap<String, String>,
-) -> Result<Action, EcsTargetError> {
+    task_sets: &DescribeTaskSetsOutput,
+) -> Result<Vec<(u32, String)>, EcsTargetError> {
+    weights
+        .iter()
+        .map(|w| {
+            let external_id = task_set_external_id(&w.revision_id);
+            let arn = bound_target_group(task_sets, &external_id).ok_or_else(|| {
+                EcsTargetError::Api(format!(
+                    "revision `{}` has no live task set with a target-group binding to route \
+                     traffic to — warm it before shifting traffic",
+                    w.revision_id.0
+                ))
+            })?;
+            Ok((w.weight_bps, arn))
+        })
+        .collect()
+}
+
+/// Build the weighted forward [`Action`] mirroring the `TrafficSplit`: one
+/// target-group tuple per `(weight_bps, arn)` pair.
+fn forward_action(tuples: &[(u32, String)]) -> Result<Action, EcsTargetError> {
     let mut forward = ForwardActionConfig::builder();
-    for w in weights {
-        let arn = arns.get(&w.target_group).ok_or_else(|| {
-            EcsTargetError::Api(format!(
-                "target group `{}` not found in this account/region",
-                w.target_group
-            ))
-        })?;
+    for (weight_bps, arn) in tuples {
         forward = forward.target_groups(
             TargetGroupTuple::builder()
                 .target_group_arn(arn)
-                .weight(elb_weight(w.weight_bps))
+                .weight(elb_weight(*weight_bps))
                 .build(),
         );
     }
@@ -821,24 +990,12 @@ mod tests {
     }
 
     #[test]
-    fn forward_action_mirrors_weights_and_resolves_arns() {
-        let arns = HashMap::from([
-            ("tg-a".to_string(), "arn-a".to_string()),
-            ("tg-b".to_string(), "arn-b".to_string()),
-        ]);
-        let weights = vec![
-            TargetGroupWeight {
-                revision_id: RevisionId(Ulid::from(0xa_u128)),
-                weight_bps: 7000,
-                target_group: "tg-a".to_string(),
-            },
-            TargetGroupWeight {
-                revision_id: RevisionId(Ulid::from(0xb_u128)),
-                weight_bps: 3000,
-                target_group: "tg-b".to_string(),
-            },
+    fn forward_action_mirrors_weight_arn_tuples() {
+        let tuples = vec![
+            (7000u32, "arn-a".to_string()),
+            (3000u32, "arn-b".to_string()),
         ];
-        let action = forward_action(&weights, &arns).unwrap();
+        let action = forward_action(&tuples).unwrap();
         assert_eq!(action.r#type(), Some(&ActionTypeEnum::Forward));
         let tgs = action.forward_config().unwrap().target_groups();
         assert_eq!(tgs.len(), 2);
@@ -848,14 +1005,171 @@ mod tests {
         assert_eq!(tgs[1].weight(), Some(300));
     }
 
+    /// `bound_target_group` reads the TG ARN bound to a task set; assignment +
+    /// routing both rely on it being the source of truth.
     #[test]
-    fn forward_action_errors_on_unresolved_target_group() {
-        let weights = vec![TargetGroupWeight {
-            revision_id: RevisionId(Ulid::from(0xa_u128)),
-            weight_bps: 10000,
-            target_group: "tg-missing".to_string(),
-        }];
-        assert!(forward_action(&weights, &HashMap::new()).is_err());
+    fn bound_target_group_reads_the_load_balancer_binding() {
+        let out = DescribeTaskSetsOutput::builder()
+            .task_sets(
+                TaskSet::builder()
+                    .external_id("gtc-rev-blue")
+                    .load_balancers(LoadBalancer::builder().target_group_arn("arn-blue").build())
+                    .build(),
+            )
+            .task_sets(
+                // A task set with no LB binding yields None (not yet routable).
+                TaskSet::builder().external_id("gtc-rev-bare").build(),
+            )
+            .build();
+        assert_eq!(
+            bound_target_group(&out, "gtc-rev-blue").as_deref(),
+            Some("arn-blue")
+        );
+        assert_eq!(bound_target_group(&out, "gtc-rev-bare"), None);
+        assert_eq!(bound_target_group(&out, "gtc-rev-absent"), None);
+    }
+
+    /// `assigned_pool_members` collects every TG ARN bound to a live task set —
+    /// the "taken" set pool assignment subtracts from the pool.
+    #[test]
+    fn assigned_pool_members_collects_every_bound_target_group() {
+        let out = DescribeTaskSetsOutput::builder()
+            .task_sets(
+                TaskSet::builder()
+                    .external_id("gtc-rev-blue")
+                    .load_balancers(LoadBalancer::builder().target_group_arn("arn-blue").build())
+                    .build(),
+            )
+            .task_sets(
+                TaskSet::builder()
+                    .external_id("gtc-rev-green")
+                    .load_balancers(
+                        LoadBalancer::builder()
+                            .target_group_arn("arn-green")
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build();
+        let taken = assigned_pool_members(&out);
+        assert!(taken.contains("arn-blue") && taken.contains("arn-green"));
+        assert_eq!(taken.len(), 2);
+        assert!(assigned_pool_members(&DescribeTaskSetsOutput::builder().build()).is_empty());
+    }
+
+    /// `pick_free_pool_member` returns the first pool member (in order) not
+    /// already bound, so blue/green lands a fresh revision in a free TG; `None`
+    /// when the pool is exhausted or empty.
+    #[test]
+    fn pick_free_pool_member_picks_the_first_free_in_order() {
+        let pool = vec![
+            "arn-blue".to_string(),
+            "arn-green".to_string(),
+            "arn-amber".to_string(),
+        ];
+        let taken = std::collections::HashSet::from(["arn-blue".to_string()]);
+        assert_eq!(
+            pick_free_pool_member(&pool, &taken).as_deref(),
+            Some("arn-green"),
+            "skips the bound member, picks the next in configured order"
+        );
+
+        let all_taken = pool.iter().cloned().collect();
+        assert_eq!(
+            pick_free_pool_member(&pool, &all_taken),
+            None,
+            "pool exhausted → None (caller errors)"
+        );
+        assert_eq!(
+            pick_free_pool_member(&[], &std::collections::HashSet::new()),
+            None,
+            "empty pool → None"
+        );
+    }
+
+    /// `pool_arns_from` passes ARN-form entries through, resolves name-form ones
+    /// against the lookup map (preserving order), and errors on an unknown name.
+    #[test]
+    fn pool_arns_from_resolves_names_passes_arns_and_errors_on_unknown() {
+        const BLUE: &str = "arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/blue/1";
+        const GREEN: &str =
+            "arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/green/2";
+        let resolved = HashMap::from([("green-tg".to_string(), GREEN.to_string())]);
+
+        // ARN passes through; name resolves; order preserved.
+        assert_eq!(
+            pool_arns_from(&[BLUE.to_string(), "green-tg".to_string()], &resolved).unwrap(),
+            vec![BLUE.to_string(), GREEN.to_string()],
+        );
+
+        let missing = vec!["typo-tg".to_string()];
+        assert!(
+            pool_arns_from(&missing, &resolved).is_err(),
+            "an unresolved name must error, not silently shrink the pool"
+        );
+
+        // A duplicate target group (here a name resolving to an already-listed
+        // ARN) is a config error — it would assign two revisions the same TG.
+        let dup = vec![GREEN.to_string(), "green-tg".to_string()];
+        assert!(
+            pool_arns_from(&dup, &resolved).is_err(),
+            "a target group repeated in the pool must be rejected"
+        );
+        assert!(
+            pool_arns_from(&[BLUE.to_string(), GREEN.to_string()], &resolved).is_ok(),
+            "a pool of distinct ARNs is accepted"
+        );
+    }
+
+    #[test]
+    fn first_duplicate_finds_the_first_repeat_in_order() {
+        assert_eq!(
+            first_duplicate(&["a".to_string(), "b".to_string(), "a".to_string()]),
+            Some("a")
+        );
+        assert_eq!(
+            first_duplicate(&["a".to_string(), "b".to_string(), "c".to_string()]),
+            None
+        );
+        assert_eq!(first_duplicate(&[]), None);
+    }
+
+    /// `weighted_target_groups` maps each weighted revision to its task set's
+    /// bound TG ARN; a revision with no live task set is an error.
+    #[test]
+    fn weighted_target_groups_maps_revisions_to_bound_arns() {
+        let blue = RevisionId(Ulid::from(0xb1u128));
+        let out = DescribeTaskSetsOutput::builder()
+            .task_sets(
+                TaskSet::builder()
+                    .external_id(task_set_external_id(&blue))
+                    .load_balancers(LoadBalancer::builder().target_group_arn("arn-blue").build())
+                    .build(),
+            )
+            .build();
+
+        let tuples = weighted_target_groups(
+            &[TargetGroupWeight {
+                revision_id: blue,
+                weight_bps: 10000,
+            }],
+            &out,
+        )
+        .unwrap();
+        assert_eq!(tuples, vec![(10000u32, "arn-blue".to_string())]);
+
+        // A weighted revision with no warmed task set is an error.
+        let unwarmed = RevisionId(Ulid::from(0xddu128));
+        assert!(
+            weighted_target_groups(
+                &[TargetGroupWeight {
+                    revision_id: unwarmed,
+                    weight_bps: 10000,
+                }],
+                &out,
+            )
+            .is_err()
+        );
     }
 
     #[test]
