@@ -1071,6 +1071,30 @@ fn aws_ecs_target_inputs(
     ))
 }
 
+/// Resolve the region-pinned AWS clients (with the bound session injected) and
+/// wrap them in a handler. Shared by the AWS verb dispatchers so the
+/// resolve + `with_target` boilerplate (and its error message) lives once.
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+async fn resolve_ecs_handler(
+    region: &str,
+    launch: crate::env_packs::aws::real_target::FargateLaunchConfig,
+    pool: Vec<String>,
+    session: Option<crate::env_packs::aws::credentials::AssumedSession>,
+) -> Result<crate::env_packs::aws::AwsEcsDeployerHandler, OpError> {
+    use crate::env_packs::aws::AwsEcsDeployerHandler;
+    use crate::env_packs::aws::real_target::RealEcsTarget;
+    use std::sync::Arc;
+
+    let target = RealEcsTarget::resolve(region, launch, pool, session)
+        .await
+        .map_err(|e| {
+            OpError::Conflict(format!(
+                "cannot initialize the AWS ECS deployer client: {e}"
+            ))
+        })?;
+    Ok(AwsEcsDeployerHandler::with_target(Arc::new(target)))
+}
+
 /// Connect to AWS and drive the single revision's ECS verb: `warm_revision`
 /// when present, `archive_revision` when absent (mirrors
 /// `apply_revision_k8s_cluster`). Returns `(identity, ECS service name)`.
@@ -1084,11 +1108,9 @@ fn apply_revision_aws_ecs(
     present: bool,
     answers: Option<&Value>,
 ) -> Result<(&'static str, String), OpError> {
-    use crate::env_packs::aws::AwsEcsDeployerHandler;
     use crate::env_packs::aws::credentials::run_aws_async;
-    use crate::env_packs::aws::real_target::{RealEcsTarget, service_name};
+    use crate::env_packs::aws::real_target::service_name;
     use crate::env_packs::deployer::Deployer;
-    use std::sync::Arc;
 
     let revision = env
         .revisions
@@ -1100,14 +1122,7 @@ fn apply_revision_aws_ecs(
         aws_ecs_target_inputs(store, env, env_id, answers)?;
 
     run_aws_async(async move {
-        let target = RealEcsTarget::resolve(&region, launch, pool, session)
-            .await
-            .map_err(|e| {
-                OpError::Conflict(format!(
-                    "cannot initialize the AWS ECS deployer client: {e}"
-                ))
-            })?;
-        let handler = AwsEcsDeployerHandler::with_target(Arc::new(target));
+        let handler = resolve_ecs_handler(&region, launch, pool, session).await?;
         if present {
             handler
                 .warm_revision(env, revision_id, answers)
@@ -1175,12 +1190,13 @@ pub fn apply_traffic(
     // AWS-ECS only: the ALB listener is the live router, so the split must be
     // pushed to it. K8s serves splits from its in-process router (runtime
     // config), so there is no listener to write — `op traffic set` suffices.
-    let aws_path = "greentic.deployer.aws-ecs";
-    if descriptor.path() != aws_path {
+    // Gate on the typed-const-backed helper (not a literal) so the path can't
+    // drift from `AwsEcsDeployerHandler::DESCRIPTOR_PATH`.
+    if !is_aws_ecs_kind(&descriptor) {
         return Err(OpError::Conflict(format!(
-            "env apply-traffic is only supported for the `{aws_path}` (AWS-ECS) deployer \
-             env-pack; `{}` serves traffic splits from its runtime router — record the split \
-             with `op traffic set` and the runtime applies it",
+            "env apply-traffic is only supported for the `greentic.deployer.aws-ecs` (AWS-ECS) \
+             deployer env-pack; `{}` serves traffic splits from its runtime router — record the \
+             split with `op traffic set` and the runtime applies it",
             descriptor.path()
         )));
     }
@@ -1248,24 +1264,14 @@ fn apply_traffic_aws_ecs(
     ),
     OpError,
 > {
-    use crate::env_packs::aws::AwsEcsDeployerHandler;
     use crate::env_packs::aws::credentials::run_aws_async;
-    use crate::env_packs::aws::real_target::RealEcsTarget;
     use crate::env_packs::deployer::Deployer;
-    use std::sync::Arc;
 
     let (identity, session, launch, region, pool) =
         aws_ecs_target_inputs(store, env, env_id, answers)?;
 
     let outcome = run_aws_async(async move {
-        let target = RealEcsTarget::resolve(&region, launch, pool, session)
-            .await
-            .map_err(|e| {
-                OpError::Conflict(format!(
-                    "cannot initialize the AWS ECS deployer client: {e}"
-                ))
-            })?;
-        let handler = AwsEcsDeployerHandler::with_target(Arc::new(target));
+        let handler = resolve_ecs_handler(&region, launch, pool, session).await?;
         handler
             .apply_traffic_split(env, deployment_id, answers)
             .await
