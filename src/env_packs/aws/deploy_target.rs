@@ -54,6 +54,20 @@ pub enum EcsTargetError {
          deployment its own environment binding with a distinct `target_group_arns` pool"
     )]
     PoolConflict { owner: String, shared_tg: String },
+    /// A deployer *policy* refusal from the per-deployment listener-rule write:
+    /// a non-default rule already carries this deployment's routing condition but
+    /// is NOT owned by this deployment (no matching owner tag) — a sibling
+    /// deployment's rule or an operator-managed auth/redirect rule sharing the
+    /// host/path. The deployer refuses to rewrite a rule it did not create rather
+    /// than silently strip its actions. Distinct from [`Api`](Self::Api): a
+    /// configuration boundary, not a broken call.
+    #[error(
+        "listener rule `{rule_arn}` already serves {condition} but is owned by another deployment \
+         or is operator-managed; refusing to rewrite a rule this deployment did not create. Give \
+         this deployment a distinct `alb_routing_host` / `alb_routing_path`, or remove the \
+         conflicting rule"
+    )]
+    ListenerRuleConflict { rule_arn: String, condition: String },
     /// The handler has no real ECS client wired (the default
     /// [`UnconfiguredEcsTarget`]). The operator must bind AWS credentials and
     /// rebuild the handler with a connected client.

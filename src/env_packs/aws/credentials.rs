@@ -12,7 +12,8 @@
 //!   RegisterTaskDefinition / CreateTaskSet / DescribeTaskSets, DeleteTaskSet /
 //!   DeregisterTaskDefinition, DescribeTargetGroups, and the ELB traffic-shift
 //!   verbs — ModifyListener for the legacy default-action path,
-//!   DescribeRules / CreateRule / ModifyRule for per-deployment listener rules)
+//!   DescribeRules / CreateRule / ModifyRule plus AddTags / DescribeTags
+//!   (owner-tagging) for per-deployment listener rules)
 //!   plus this
 //!   handler's STS/IAM self-probes, `iam:PassRole`, and `ecr:PutImage` staging.
 //!   Keeping the list in parity with the real target's runtime calls means a
@@ -112,6 +113,8 @@ pub const VALIDATED_IAM_VERBS: &[&str] = &[
     "elasticloadbalancing:DescribeRules",
     "elasticloadbalancing:CreateRule",
     "elasticloadbalancing:ModifyRule",
+    "elasticloadbalancing:AddTags",
+    "elasticloadbalancing:DescribeTags",
 ];
 
 /// Returns the canonical capability ID for an IAM verb.

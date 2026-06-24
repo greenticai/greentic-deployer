@@ -76,8 +76,14 @@
 //!   rules intact, so deployments coexist behind one listener. The rule is
 //!   found-or-created idempotently — the routing condition is the rule's natural
 //!   key (`match_rule`), so re-applying updates the rule rather than stacking
-//!   duplicates. Like the pool assignment this is a read-then-write against live
-//!   AWS state (no persisted rule map); concurrent first-applies of two distinct
+//!   duplicates. **Ownership is proven before mutation:** a condition match alone
+//!   does not authorize a write — a sibling deployment or an operator may hold a
+//!   rule with the same host/path (carrying auth/redirect actions). Each created
+//!   rule is stamped with an owner tag (`RULE_OWNER_TAG_KEY` → the deployment
+//!   ULID); before `ModifyRule` the rule's tags are read (`DescribeTags`) and a
+//!   non-owned match is refused (`ListenerRuleConflict`) rather than hijacked.
+//!   Like the pool assignment this is a read-then-write against live AWS state
+//!   (no persisted rule map); concurrent first-applies of two distinct
 //!   deployments are a PR-4 live-verify note, not a guarantee here.
 //!
 //! ## Identity bridge
@@ -116,7 +122,7 @@ use aws_sdk_ecs::types::{
 use aws_sdk_elasticloadbalancingv2::operation::describe_target_groups::DescribeTargetGroupsOutput;
 use aws_sdk_elasticloadbalancingv2::types::{
     Action, ActionTypeEnum, ForwardActionConfig, HostHeaderConditionConfig,
-    PathPatternConditionConfig, Rule, RuleCondition, TargetGroupTuple,
+    PathPatternConditionConfig, Rule, RuleCondition, Tag, TagDescription, TargetGroupTuple,
 };
 use greentic_deploy_spec::{DeploymentId, RevisionId};
 
@@ -165,6 +171,8 @@ pub const REAL_ECS_TARGET_IAM_ACTIONS: &[&str] = &[
     "elasticloadbalancing:DescribeRules",  // apply_listener_weights (find this deployment's rule)
     "elasticloadbalancing:CreateRule",     // apply_listener_weights (first per-deployment rule)
     "elasticloadbalancing:ModifyRule",     // apply_listener_weights (update per-deployment rule)
+    "elasticloadbalancing:AddTags", // apply_listener_weights (stamp rule owner tag on create)
+    "elasticloadbalancing:DescribeTags", // apply_listener_weights (prove rule ownership before modify)
 ];
 
 impl RealEcsTarget {
@@ -583,9 +591,18 @@ impl RealEcsTarget {
     }
 
     /// Per-deployment rule write: find this deployment's rule on the listener by
-    /// its routing condition and update its action, or create the rule when it
-    /// is absent. The default action and every sibling deployment's rule are
-    /// left untouched.
+    /// its routing condition and update its action, or create the rule (stamped
+    /// with this deployment's owner tag) when it is absent. The default action
+    /// and every sibling/operator rule are left untouched.
+    ///
+    /// **Ownership is proven, not assumed.** A condition match alone is not
+    /// enough to mutate a rule — a sibling deployment or an operator may have a
+    /// rule with the same host/path (carrying auth/redirect actions). Before
+    /// `ModifyRule` the rule's tags are read (`DescribeTags`) and the write is
+    /// refused ([`EcsTargetError::ListenerRuleConflict`]) unless the rule carries
+    /// THIS deployment's owner tag — so the deployer only ever rewrites a rule it
+    /// created. Re-applying a split (the rule already tagged ours) updates it
+    /// idempotently.
     async fn write_listener_rule(
         &self,
         listener: &ListenerRef,
@@ -602,9 +619,18 @@ impl RealEcsTarget {
         let rules = existing.rules();
         match match_rule(rules, routing) {
             Some(rule_arn) => {
+                if !self
+                    .rule_owned_by_deployment(&rule_arn, &listener.deployment_id)
+                    .await?
+                {
+                    return Err(EcsTargetError::ListenerRuleConflict {
+                        rule_arn,
+                        condition: routing_summary(routing),
+                    });
+                }
                 self.elb
                     .modify_rule()
-                    .rule_arn(rule_arn)
+                    .rule_arn(&rule_arn)
                     .actions(action)
                     .send()
                     .await
@@ -617,12 +643,34 @@ impl RealEcsTarget {
                     .priority(next_rule_priority(rules))
                     .set_conditions(Some(routing_conditions(routing)))
                     .actions(action)
+                    .tags(owner_tag(&listener.deployment_id))
                     .send()
                     .await
                     .map_err(|e| api("create_rule", e))?;
             }
         }
         Ok(())
+    }
+
+    /// Read a rule's tags and decide whether THIS deployment created it (carries
+    /// the [`RULE_OWNER_TAG_KEY`] tag with this deployment's ULID). `DescribeRules`
+    /// does not return tags, so ownership needs this extra read.
+    async fn rule_owned_by_deployment(
+        &self,
+        rule_arn: &str,
+        deployment_id: &DeploymentId,
+    ) -> Result<bool, EcsTargetError> {
+        let out = self
+            .elb
+            .describe_tags()
+            .resource_arns(rule_arn)
+            .send()
+            .await
+            .map_err(|e| api("describe_tags", e))?;
+        Ok(tag_descriptions_owned_by(
+            out.tag_descriptions(),
+            deployment_id,
+        ))
     }
 }
 
@@ -1086,6 +1134,45 @@ fn next_rule_priority(rules: &[Rule]) -> i32 {
         .filter_map(|r| r.priority().and_then(|p| p.parse::<i32>().ok()))
         .max()
         .map_or(1, |m| m + 1)
+}
+
+/// Tag key stamped on every listener rule this deployer creates, carrying the
+/// owning deployment's ULID. Read back (`DescribeTags`) before `ModifyRule` so
+/// the deployer only rewrites a rule it created — never a sibling deployment's
+/// or an operator-managed rule that happens to share the host/path condition.
+const RULE_OWNER_TAG_KEY: &str = "greentic:deployment-id";
+
+/// The owner tag a rule this deployment creates carries (`RULE_OWNER_TAG_KEY` →
+/// the deployment ULID).
+fn owner_tag(deployment_id: &DeploymentId) -> Tag {
+    Tag::builder()
+        .key(RULE_OWNER_TAG_KEY)
+        .value(deployment_id.0.to_string())
+        .build()
+}
+
+/// True iff some tag description carries this deployment's owner tag — i.e. the
+/// rule was created by this deployment and may be rewritten.
+fn tag_descriptions_owned_by(
+    descriptions: &[TagDescription],
+    deployment_id: &DeploymentId,
+) -> bool {
+    let want = deployment_id.0.to_string();
+    descriptions.iter().any(|d| {
+        d.tags()
+            .iter()
+            .any(|t| t.key() == Some(RULE_OWNER_TAG_KEY) && t.value() == Some(want.as_str()))
+    })
+}
+
+/// Human-readable summary of a routing condition for the conflict error message.
+fn routing_summary(routing: &ListenerRouting) -> String {
+    match (&routing.host, &routing.path) {
+        (Some(h), Some(p)) => format!("host `{h}` + path `{p}`"),
+        (Some(h), None) => format!("host `{h}`"),
+        (None, Some(p)) => format!("path `{p}`"),
+        (None, None) => "<no condition>".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1760,5 +1847,73 @@ mod tests {
         ];
         assert_eq!(next_rule_priority(&rules), 13);
         assert_eq!(next_rule_priority(&[]), 1);
+    }
+
+    /// `tag_descriptions_owned_by` recognizes only a rule carrying THIS
+    /// deployment's owner tag — a sibling's tag, a foreign key, or no tags at
+    /// all (an operator-managed rule) all read as not-owned, so the caller fails
+    /// closed instead of hijacking the rule.
+    #[test]
+    fn tag_descriptions_owned_by_matches_only_this_deployments_owner_tag() {
+        let dep = DeploymentId(Ulid::from(0x01_u128));
+        let owner_value = dep.0.to_string();
+
+        let descriptions_with = |tags: Vec<Tag>| {
+            vec![
+                TagDescription::builder()
+                    .resource_arn("arn:rule/x")
+                    .set_tags(Some(tags))
+                    .build(),
+            ]
+        };
+
+        // Our owner tag → owned.
+        let ours = descriptions_with(vec![owner_tag(&dep)]);
+        assert!(tag_descriptions_owned_by(&ours, &dep));
+
+        // A sibling deployment's owner tag → not ours.
+        let sibling = descriptions_with(vec![
+            Tag::builder()
+                .key(RULE_OWNER_TAG_KEY)
+                .value(DeploymentId(Ulid::from(0x02_u128)).0.to_string())
+                .build(),
+        ]);
+        assert!(!tag_descriptions_owned_by(&sibling, &dep));
+
+        // Right value but a different key → not ours.
+        let wrong_key = descriptions_with(vec![
+            Tag::builder().key("other").value(&owner_value).build(),
+        ]);
+        assert!(!tag_descriptions_owned_by(&wrong_key, &dep));
+
+        // No tags (operator-managed rule) → not ours.
+        assert!(!tag_descriptions_owned_by(&descriptions_with(vec![]), &dep));
+        assert!(!tag_descriptions_owned_by(&[], &dep));
+    }
+
+    /// `routing_summary` renders host, path, or both for the conflict message.
+    #[test]
+    fn routing_summary_renders_host_path_or_both() {
+        assert_eq!(
+            routing_summary(&ListenerRouting {
+                host: Some("h".into()),
+                path: Some("/p".into()),
+            }),
+            "host `h` + path `/p`"
+        );
+        assert_eq!(
+            routing_summary(&ListenerRouting {
+                host: Some("h".into()),
+                path: None,
+            }),
+            "host `h`"
+        );
+        assert_eq!(
+            routing_summary(&ListenerRouting {
+                host: None,
+                path: Some("/p".into()),
+            }),
+            "path `/p`"
+        );
     }
 }

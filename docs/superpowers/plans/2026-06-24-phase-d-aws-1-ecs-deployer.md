@@ -260,6 +260,20 @@ target-group pool, F1 = per-deployment `ModifyRule`):**
   `routing` but models no listener rules, so per-deployment rule **isolation**
   (two deployments' rules coexisting live) stays a PR-4 live-verify note, like
   the pool-ownership concurrent-cold-start window.
+  **pr-harden (codex HIGH — rule ownership):** `match_rule` matched a rule by
+  host/path condition alone, so `ModifyRule` could rewrite a rule the deployer
+  did not create — a sibling deployment's rule (largely mitigated already by the
+  PR-3c-2c single-owner pool guard, which fails a second deployment's warm
+  closed) or, the live residual, an **operator-managed auth/redirect rule**
+  sharing the condition, contradicting the "preserve sibling rules" promise.
+  Fixed with **tag-based ownership** (Codex's recommendation): each created rule
+  is stamped `greentic:deployment-id` = the deployment ULID; before `ModifyRule`
+  the rule's tags are read (`DescribeTags`) and a non-owned match is refused
+  (`EcsTargetError::ListenerRuleConflict`, fail-closed) rather than hijacked.
+  Idempotent re-apply still updates the deployment's own (tagged) rule. IAM +=
+  `AddTags` / `DescribeTags`. This also turns the two-deployments-same-condition
+  case into a clean conflict instead of a silent hijack (belt-and-suspenders with
+  the pool guard).
 
 **Must also fix (PR-2 codex adversarial review, all valid — deferred here
 because the real fixes need PR-3's wizard/bootstrap data, not surface patches):**
