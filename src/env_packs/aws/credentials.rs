@@ -6,12 +6,15 @@
 //! - **`aws.sts.caller-identity`** — `STS::GetCallerIdentity`. Proves the
 //!   ambient AWS credential chain resolves to a usable principal.
 //! - **One capability per validated IAM verb**, evaluated via
-//!   `IAM::SimulatePrincipalPolicy` against the resolved caller ARN. Eight
-//!   verbs cover the minimum ECS-rollout + self-validation surface:
-//!   `sts:GetCallerIdentity`, `iam:SimulatePrincipalPolicy`,
-//!   `ecs:CreateService`, `ecs:UpdateService`, `ecs:CreateTaskSet`,
-//!   `ecr:PutImage`, `elasticloadbalancing:ModifyListener`, `iam:PassRole`.
-//!   Phase D D-AWS-1 may extend the verb list as ECR/ALB/IAM Terraform lands.
+//!   `IAM::SimulatePrincipalPolicy` against the resolved caller ARN. The verb
+//!   list ([`VALIDATED_IAM_VERBS`]) covers the full ECS task-set rollout
+//!   surface that `RealEcsTarget` exercises (DescribeServices / CreateService,
+//!   RegisterTaskDefinition / CreateTaskSet / DescribeTaskSets, DeleteTaskSet /
+//!   DeregisterTaskDefinition, DescribeTargetGroups / ModifyListener) plus this
+//!   handler's STS/IAM self-probes, `iam:PassRole`, and `ecr:PutImage` staging.
+//!   Keeping the list in parity with the real target's runtime calls means a
+//!   role that passes `gtc op credentials requirements` does not then fail on
+//!   the first live warm / traffic-shift / archive.
 //!
 //! ## Sync trait + async SDK
 //!
@@ -57,20 +60,37 @@ use super::bootstrap::{IamRulesPackInput, render_min_iam_rules_pack};
 /// Stable ID for the STS caller-identity probe.
 pub const AWS_STS_CALLER_IDENTITY_CAP: &str = "aws.sts.caller-identity";
 
-/// IAM verbs the C3 stub validates. Order is stable — `required_capabilities`
-/// renders them in this order, and tests assert on the IDs.
+/// IAM verbs this handler validates (one capability each, rendered by
+/// `required_capabilities` in this order; tests derive their expectations from
+/// this slice, so the grouping is free to change).
 ///
-/// Minimum surface for an ECS rollout managed through the C3 → Phase D
-/// pipeline. Each verb maps to a capability ID `aws.iam.allow:<verb>`.
+/// Covers the full ECS task-set rollout surface `RealEcsTarget` exercises at
+/// deploy time, this handler's own STS/IAM self-probes, image-push staging, and
+/// `iam:PassRole`. The runtime subset the real target actually calls is listed
+/// in `real_target::REAL_ECS_TARGET_IAM_ACTIONS`; a test pins it ⊆ this list, so
+/// adding an SDK call to the real target without a matching verb here fails CI
+/// rather than the customer's first live deploy. Each verb maps to a capability
+/// ID `aws.iam.allow:<verb>`.
 pub const VALIDATED_IAM_VERBS: &[&str] = &[
+    // Self-validation: this handler's own STS identity + IAM policy probes.
     "sts:GetCallerIdentity",
     "iam:SimulatePrincipalPolicy",
+    // ECS service + task-set lifecycle driven by `RealEcsTarget` (one
+    // EXTERNAL-controller service per deployment, one task set per revision).
+    "ecs:DescribeServices",
     "ecs:CreateService",
     "ecs:UpdateService",
+    "ecs:RegisterTaskDefinition",
     "ecs:CreateTaskSet",
+    "ecs:DescribeTaskSets",
+    "ecs:DeleteTaskSet",
+    "ecs:DeregisterTaskDefinition",
+    // Image-push staging + passing the task execution/task roles to ECS.
     "ecr:PutImage",
-    "elasticloadbalancing:ModifyListener",
     "iam:PassRole",
+    // ELBv2 weighted traffic shifting across the revisions' target groups.
+    "elasticloadbalancing:DescribeTargetGroups",
+    "elasticloadbalancing:ModifyListener",
 ];
 
 /// Returns the canonical capability ID for an IAM verb.

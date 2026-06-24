@@ -100,6 +100,24 @@ pub struct RealEcsTarget {
     launch: FargateLaunchConfig,
 }
 
+/// The IAM actions [`RealEcsTarget`]'s five methods call at deploy time — the
+/// authoritative ECS / ELBv2 runtime surface. A test pins this ⊆
+/// [`VALIDATED_IAM_VERBS`](super::credentials::VALIDATED_IAM_VERBS) so the
+/// credentials preflight can never under-declare what a live deploy needs:
+/// adding an SDK call here without the matching validated verb fails CI rather
+/// than the customer's first warm / traffic-shift / archive.
+pub const REAL_ECS_TARGET_IAM_ACTIONS: &[&str] = &[
+    "ecs:DescribeServices",                      // ensure_service
+    "ecs:CreateService",                         // ensure_service
+    "ecs:RegisterTaskDefinition",                // create_task_set
+    "ecs:CreateTaskSet",                         // create_task_set
+    "ecs:DescribeTaskSets", // create_task_set / task_set_stability / delete_task_set
+    "ecs:DeleteTaskSet",    // delete_task_set
+    "ecs:DeregisterTaskDefinition", // delete_task_set
+    "elasticloadbalancing:DescribeTargetGroups", // create_task_set / apply_listener_weights
+    "elasticloadbalancing:ModifyListener", // apply_listener_weights
+];
+
 impl RealEcsTarget {
     /// Resolve the AWS credential chain (region-pinned) and build the ECS +
     /// ELBv2 clients. Mirrors `RealAwsClient::resolve` in `credentials.rs`: the
@@ -164,10 +182,20 @@ impl EcsDeployTarget for RealEcsTarget {
         if active_service_exists(&described, &service) {
             return Ok(());
         }
+        // The describe-then-create above is a TOCTOU window: two concurrent
+        // `warm_revision` callers for the same deployment can both observe an
+        // absent service and both reach this create. A deterministic
+        // `clientToken` keyed on the deployment closes it — ECS dedupes
+        // same-token creates within its idempotency window, so the loser of the
+        // race gets the original service back instead of an error (CreateService
+        // has no dedicated already-exists error; a naked duplicate surfaces as
+        // `InvalidParameterException`). The describe stays as a fast path that
+        // skips the create entirely once the service is ACTIVE.
         self.ecs
             .create_service()
             .cluster(&spec.cluster)
             .service_name(&service)
+            .client_token(service_client_token(&spec.deployment_id))
             .deployment_controller(
                 DeploymentController::builder()
                     .r#type(DeploymentControllerType::External)
@@ -350,6 +378,24 @@ fn api<E: std::fmt::Display>(op: &str, err: E) -> EcsTargetError {
 /// service per `deployment_id`).
 fn service_name(deployment_id: &DeploymentId) -> String {
     format!("gtc-svc-{}", deployment_id.0)
+}
+
+/// Deterministic ECS `CreateService` idempotency token for a deployment. Two
+/// concurrent `ensure_service` calls for the same deployment present the same
+/// token, so ECS dedupes the racing creates instead of erroring on the loser.
+/// Rendered UUID-shaped (the `clientToken` field accepts up to 36 ASCII
+/// characters "in the form of a UUID") from the deployment ULID's 128 bits —
+/// deterministic per deployment and collision-free across deployments.
+fn service_client_token(deployment_id: &DeploymentId) -> String {
+    let bits: u128 = deployment_id.0.into();
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (bits >> 96) as u32,
+        (bits >> 80) as u16,
+        (bits >> 64) as u16,
+        (bits >> 48) as u16,
+        (bits & 0xffff_ffff_ffff) as u64,
+    )
 }
 
 /// Deterministic task-definition family for a revision.
@@ -826,5 +872,48 @@ mod tests {
         assert_eq!(elb_weight(5000), 500);
         // A lone 100% revision (10000bps) clamps to the ELBv2 999 ceiling.
         assert_eq!(elb_weight(10000), 999);
+    }
+
+    #[test]
+    fn service_client_token_is_deterministic_uuid_shaped_and_per_deployment() {
+        let d = dep();
+        let token = service_client_token(&d);
+        assert_eq!(
+            token,
+            service_client_token(&d),
+            "same deployment must yield the same idempotency token so concurrent \
+             ensure_service calls dedupe"
+        );
+        // UUID shape: 36 chars with dashes at 8/13/18/23, hex elsewhere.
+        assert_eq!(
+            token.len(),
+            36,
+            "ECS clientToken is a 36-char UUID-form string"
+        );
+        let dashes: Vec<usize> = token.match_indices('-').map(|(i, _)| i).collect();
+        assert_eq!(dashes, vec![8, 13, 18, 23], "dash positions: {token}");
+        assert!(
+            token.chars().all(|c| c == '-' || c.is_ascii_hexdigit()),
+            "token is lowercase-hex + dashes only; got {token}"
+        );
+        // Distinct deployments get distinct tokens — no cross-deployment dedupe.
+        let other = DeploymentId(Ulid::from(0xbeef_u128));
+        assert_ne!(service_client_token(&other), token);
+    }
+
+    /// Parity guard: every IAM action the real target calls must be in the
+    /// credentials preflight's validated verb list, so a role that passes
+    /// `gtc op credentials requirements` can actually warm / shift / archive.
+    #[test]
+    fn real_target_iam_actions_are_a_subset_of_validated_verbs() {
+        use crate::env_packs::aws::credentials::VALIDATED_IAM_VERBS;
+        for action in REAL_ECS_TARGET_IAM_ACTIONS {
+            assert!(
+                VALIDATED_IAM_VERBS.contains(action),
+                "RealEcsTarget calls `{action}` but the credentials preflight does \
+                 not validate it — add it to VALIDATED_IAM_VERBS so a validated \
+                 role does not fail on the first live deploy"
+            );
+        }
     }
 }
