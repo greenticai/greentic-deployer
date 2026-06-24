@@ -892,17 +892,9 @@ mod tests {
         assert_eq!(elb_weight(10000), 999);
     }
 
-    #[test]
-    fn service_client_token_is_deterministic_uuid_shaped_and_per_deployment() {
-        let d = dep();
-        let token = service_client_token(&d);
-        assert_eq!(
-            token,
-            service_client_token(&d),
-            "same deployment must yield the same idempotency token so concurrent \
-             ensure_service calls dedupe"
-        );
-        // UUID shape: 36 chars with dashes at 8/13/18/23, hex elsewhere.
+    /// Shared shape check for the UUID-form idempotency tokens: 36 chars, dashes
+    /// at 8/13/18/23, lowercase-hex elsewhere.
+    fn assert_uuid_form_shape(token: &str) {
         assert_eq!(
             token.len(),
             36,
@@ -914,36 +906,42 @@ mod tests {
             token.chars().all(|c| c == '-' || c.is_ascii_hexdigit()),
             "token is lowercase-hex + dashes only; got {token}"
         );
+    }
+
+    #[test]
+    fn service_client_token_is_deterministic_uuid_shaped_and_per_deployment() {
+        let d = dep();
+        let token = service_client_token(&d);
+        assert_eq!(
+            token,
+            service_client_token(&d),
+            "same deployment must yield the same idempotency token so concurrent \
+             ensure_service calls dedupe"
+        );
+        assert_uuid_form_shape(&token);
         // Distinct deployments get distinct tokens — no cross-deployment dedupe.
-        let other = DeploymentId(Ulid::from(0xbeef_u128));
-        assert_ne!(service_client_token(&other), token);
+        assert_ne!(
+            service_client_token(&DeploymentId(Ulid::from(0xbeef_u128))),
+            token
+        );
     }
 
     #[test]
     fn task_set_client_token_is_deterministic_uuid_shaped_and_per_revision() {
         let r = rev();
-        let tok = task_set_client_token(&r);
+        let token = task_set_client_token(&r);
         assert_eq!(
-            tok,
+            token,
             task_set_client_token(&r),
             "same revision must yield the same idempotency token so concurrent \
              create_task_set calls dedupe"
         );
-        // UUID shape: 36 chars with dashes at 8/13/18/23, hex elsewhere.
-        assert_eq!(
-            tok.len(),
-            36,
-            "ECS clientToken is a 36-char UUID-form string"
-        );
-        let dashes: Vec<usize> = tok.match_indices('-').map(|(i, _)| i).collect();
-        assert_eq!(dashes, vec![8, 13, 18, 23], "dash positions: {tok}");
-        assert!(
-            tok.chars().all(|c| c == '-' || c.is_ascii_hexdigit()),
-            "token is lowercase-hex + dashes only; got {tok}"
-        );
+        assert_uuid_form_shape(&token);
         // Distinct revisions get distinct tokens — no cross-revision dedupe.
-        let other = RevisionId(Ulid::from(0xbeef_u128));
-        assert_ne!(task_set_client_token(&other), tok);
+        assert_ne!(
+            task_set_client_token(&RevisionId(Ulid::from(0xbeef_u128))),
+            token
+        );
     }
 
     /// Parity guard: every IAM action the real target calls must be in the
