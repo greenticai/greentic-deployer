@@ -43,16 +43,23 @@
 //! that. Before assigning, `create_task_set` calls `sibling_pool_bindings` —
 //! the cluster's other `gtc-svc-*` services and their bound pool members — and
 //! `conflicting_pool_owner` fails the warm closed if any sibling already holds a
-//! pool member, naming the owner. Stateless like the assignment itself
-//! (re-derived from live services each call). Per-deployment pools (a distinct
-//! pool per deployment, lifting the one-deployment limit) are a tracked
-//! follow-up. A *duplicate* target group within one pool is a separate config
-//! error that guarantees a self-collision and is rejected at resolve time
-//! (`pool_arns_from`). The same-service concurrent-warm race (two distinct
-//! revisions both seeing a TG free) is inherent to the stateless model — the
-//! deploy path warms a deployment's revisions sequentially; closing it durably
-//! would require a claim/lease that contradicts the stateless design (a PR-4
-//! live-verify note).
+//! pool member, naming the owner. This is a **read-then-create** check, so it
+//! closes the **steady-state** collision — a sibling deployment already
+//! established in the pool, the realistic case since the deploy path warms
+//! sequentially. It is deliberately NOT atomic: two deployments' *first* warms
+//! interleaving inside the read→create window could both still pick a free
+//! member (the cross-deployment form of the same-service concurrent-warm race
+//! below). Closing that durably would need the CAS/lease the stateless design
+//! rules out, so it stays a PR-4 live-verify note, not a guarantee this guard
+//! makes. Stateless like the assignment itself (re-derived from live services
+//! each call). Per-deployment pools (a distinct pool per deployment, lifting the
+//! one-deployment limit) are a tracked follow-up. A *duplicate* target group
+//! within one pool is a separate config error that guarantees a self-collision
+//! and is rejected at resolve time (`pool_arns_from`). The same-service
+//! concurrent-warm race (two distinct revisions both seeing a TG free) is
+//! inherent to the stateless model — the deploy path warms a deployment's
+//! revisions sequentially; closing it durably would require a claim/lease that
+//! contradicts the stateless design (a PR-4 live-verify note).
 //!
 //! ## Identity bridge
 //!
@@ -358,10 +365,15 @@ impl EcsDeployTarget for RealEcsTarget {
         // deployment is its own ECS service), so before assigning we check
         // whether another `gtc-svc-*` service in this cluster already holds a
         // pool member. If so, refuse rather than silently double-bind the same
-        // target group across deployments. Stateless — re-derived from the live
-        // services each call, consistent with the rest of the assignment model.
-        // Per-deployment pools are a tracked follow-up; until then one binding =
-        // one deployment.
+        // target group across deployments. This is a read-then-create check: it
+        // closes the steady-state case (a sibling already established) — the
+        // realistic one, since the deploy path warms sequentially. Two
+        // deployments' first warms racing inside this read→create window are the
+        // cross-deployment form of the same-service warm race (a PR-4 live-verify
+        // note), deliberately not closed with a CAS/lease. Stateless —
+        // re-derived from the live services each call, consistent with the rest
+        // of the assignment model. Per-deployment pools are a tracked follow-up;
+        // until then one binding = one deployment.
         let siblings = self.sibling_pool_bindings(&spec.cluster, &service).await?;
         if let Some((owner, shared)) = conflicting_pool_owner(&siblings, &pool) {
             return Err(EcsTargetError::Api(format!(

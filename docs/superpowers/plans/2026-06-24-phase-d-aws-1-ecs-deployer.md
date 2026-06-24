@@ -225,9 +225,16 @@ target-group pool, F1 = per-deployment `ModifyRule`):**
     verb `ecs:ListServices` to `VALIDATED_IAM_VERBS` +
     `REAL_ECS_TARGET_IAM_ACTIONS` (subset test holds; bootstrap rules-pack covers
     it). When multi-deployment-per-env becomes real, the clean follow-up is true
-    per-deployment pools (+ named deployments) and this guard is what relaxes. The
-    same-service concurrent-warm race stays a PR-4 live-verify note (the deploy
-    path warms a deployment's revisions sequentially).
+    per-deployment pools (+ named deployments) and this guard is what relaxes.
+    **Scope (codex PR-3c-2c review, high — accepted as a documented residual, not
+    fixed):** the guard is a read-then-create check, so it closes the
+    *steady-state* collision (a sibling deployment already established in the
+    pool) but is not atomic — two deployments' *first* warms interleaving inside
+    the read→create window could both pick a free member. That cross-deployment
+    race, like the same-service concurrent-warm race, stays a PR-4 live-verify
+    note (the deploy path warms sequentially; closing it durably needs the
+    CAS/lease the stateless F2 choice rules out). The docs/comment now scope the
+    guard to "steady-state" rather than claiming total closure.
 - **PR-3c-3:** the **F1 fix** — per-deployment ALB `ModifyRule` (host/path
   condition from a new wizard routing answer), preserving the default action +
   sibling rules so multiple deployments coexist behind one listener.
