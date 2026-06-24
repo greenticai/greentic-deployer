@@ -336,6 +336,12 @@ pub enum EnvVerb {
     /// env-pack only — K8s serves splits from its in-process runtime router, so
     /// `op traffic set` alone suffices there. The split itself is recorded by
     /// `op traffic set`; this verb makes it observable in the live runtime.
+    ///
+    /// WARNING: today this REPLACES the listener's default action, so it assumes
+    /// the binding's `alb_listener_arn` is DEDICATED to this one deployment —
+    /// applying a split clobbers any sibling deployment routing / auth / redirect
+    /// on that listener. Per-deployment listener rules (so deployments coexist
+    /// behind one listener) land in a follow-up slice.
     ApplyTraffic(EnvApplyTrafficArgs),
     Destroy {
         env_id: String,

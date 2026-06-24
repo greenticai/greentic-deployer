@@ -979,17 +979,7 @@ fn apply_revision_non_k8s(
     if descriptor.path() != crate::env_packs::aws::AwsEcsDeployerHandler::DESCRIPTOR_PATH {
         return Err(unsupported_apply_kind(descriptor));
     }
-    // Bound STS session when the env declares one, else the ambient chain
-    // (fail-closed if a ref is bound but unreadable). AWS analogue of the K8s
-    // bound-ServiceAccount bearer.
-    let session = crate::env_packs::aws::bound_session::resolve_bound_session(store, env, env_id)?;
-    let identity = if session.is_some() {
-        "bound"
-    } else {
-        "ambient"
-    };
-    let worker_name = apply_revision_aws_ecs(env, revision_id, present, answers, session)?;
-    Ok((identity, worker_name))
+    apply_revision_aws_ecs(store, env, env_id, revision_id, present, answers)
 }
 
 #[cfg(not(feature = "creds-aws"))]
@@ -1006,16 +996,38 @@ fn apply_revision_non_k8s(
     Err(unsupported_apply_kind(descriptor))
 }
 
-/// Parse the AWS-ECS binding answers into the construction inputs
-/// `RealEcsTarget::resolve` needs: `(launch, region, target_group_pool)`. The
-/// Fargate launch config is required for a live deploy — a binding without it
-/// is rejected before any AWS call (deterministic, no network).
+/// Fail-closed identity guard: a binding that pins a deployer role to assume
+/// (`assume_role_arn`) MUST have a bound session, else the live call would
+/// silently run as the ambient AWS identity — a tenant/account-isolation
+/// footgun (the role was configured but never assumed, i.e. `op env bootstrap
+/// --bind` was not run). `true` ⇒ refuse. (`aws_profile` honoring at deploy
+/// time is a separate, still-deferred SDK client-builder slice — the binding
+/// parser validates it but the verbs do not consume it yet.)
 #[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
-fn aws_ecs_launch_params(
+fn pinned_role_without_session(assume_role_arn: Option<&str>, session_present: bool) -> bool {
+    assume_role_arn.is_some() && !session_present
+}
+
+/// Resolve the bound deployer session, parse the AWS-ECS construction inputs,
+/// and enforce the fail-closed preconditions. Returns
+/// `(identity_label, session, launch, region, target_group_pool)` — everything
+/// `RealEcsTarget::resolve` needs plus the outcome's identity label. Shared by
+/// `apply-revision` and `apply-traffic` so both honor the same guards.
+///
+/// Fails closed (before any AWS call) when the binding pins `assume_role_arn`
+/// but no session is bound (`pinned_role_without_session`), and when the Fargate
+/// launch config is absent.
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+#[allow(clippy::type_complexity)]
+fn aws_ecs_target_inputs(
+    store: &LocalFsStore,
     env: &Environment,
+    env_id: &EnvId,
     answers: Option<&Value>,
 ) -> Result<
     (
+        &'static str,
+        Option<crate::env_packs::aws::credentials::AssumedSession>,
         crate::env_packs::aws::real_target::FargateLaunchConfig,
         String,
         Vec<String>,
@@ -1023,8 +1035,26 @@ fn aws_ecs_launch_params(
     OpError,
 > {
     use crate::env_packs::aws::deployer::AwsEcsParams;
+
+    // Bound STS session when the env declares one, else the ambient chain
+    // (fail-closed if a ref is bound but unreadable). AWS analogue of the K8s
+    // bound-ServiceAccount bearer.
+    let session = crate::env_packs::aws::bound_session::resolve_bound_session(store, env, env_id)?;
+    let identity = if session.is_some() {
+        "bound"
+    } else {
+        "ambient"
+    };
     let params = AwsEcsParams::from_answers(env, answers)
         .map_err(|e| OpError::Conflict(format!("invalid aws-ecs binding answers: {e}")))?;
+    if pinned_role_without_session(params.assume_role_arn.as_deref(), session.is_some()) {
+        return Err(OpError::Conflict(
+            "the aws-ecs binding pins `assume_role_arn` (a deployer role to assume) but no bound \
+             deployer session was found — refusing to run as the ambient AWS identity. Mint the \
+             scoped session first with `op env bootstrap --bind` (or `op credentials rotate`)."
+                .to_string(),
+        ));
+    }
     let launch = params.launch.ok_or_else(|| {
         OpError::Conflict(
             "the aws-ecs deployer binding has no Fargate launch config (needs execution_role_arn \
@@ -1032,21 +1062,28 @@ fn aws_ecs_launch_params(
                 .to_string(),
         )
     })?;
-    Ok((launch, params.region, params.target_group_pool))
+    Ok((
+        identity,
+        session,
+        launch,
+        params.region,
+        params.target_group_pool,
+    ))
 }
 
 /// Connect to AWS and drive the single revision's ECS verb: `warm_revision`
 /// when present, `archive_revision` when absent (mirrors
-/// `apply_revision_k8s_cluster`). Returns the live ECS service name. Requires
-/// the `deploy-aws-ecs` feature.
+/// `apply_revision_k8s_cluster`). Returns `(identity, ECS service name)`.
+/// Requires the `deploy-aws-ecs` feature.
 #[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
 fn apply_revision_aws_ecs(
+    store: &LocalFsStore,
     env: &Environment,
+    env_id: &EnvId,
     revision_id: RevisionId,
     present: bool,
     answers: Option<&Value>,
-    session: Option<crate::env_packs::aws::credentials::AssumedSession>,
-) -> Result<String, OpError> {
+) -> Result<(&'static str, String), OpError> {
     use crate::env_packs::aws::AwsEcsDeployerHandler;
     use crate::env_packs::aws::credentials::run_aws_async;
     use crate::env_packs::aws::real_target::{RealEcsTarget, service_name};
@@ -1059,7 +1096,8 @@ fn apply_revision_aws_ecs(
         .find(|r| r.revision_id == revision_id)
         .expect("revision presence checked by the caller");
     let worker_name = service_name(&revision.deployment_id);
-    let (launch, region, pool) = aws_ecs_launch_params(env, answers)?;
+    let (identity, session, launch, region, pool) =
+        aws_ecs_target_inputs(store, env, env_id, answers)?;
 
     run_aws_async(async move {
         let target = RealEcsTarget::resolve(&region, launch, pool, session)
@@ -1083,17 +1121,18 @@ fn apply_revision_aws_ecs(
         }
         Ok::<(), OpError>(())
     })?;
-    Ok(worker_name)
+    Ok((identity, worker_name))
 }
 
 #[cfg(all(feature = "creds-aws", not(feature = "deploy-aws-ecs")))]
 fn apply_revision_aws_ecs(
+    _store: &LocalFsStore,
     _env: &Environment,
+    _env_id: &EnvId,
     _revision_id: RevisionId,
     _present: bool,
     _answers: Option<&Value>,
-    _session: Option<crate::env_packs::aws::credentials::AssumedSession>,
-) -> Result<String, OpError> {
+) -> Result<(&'static str, String), OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `deploy-aws-ecs` feature; \
          `op env apply-revision` for an aws-ecs env needs it to talk to AWS"
@@ -1158,6 +1197,11 @@ pub fn apply_traffic(
     };
     let (answers, _answers_ref_wire) = load_render_answers(store, &env, &descriptor)?;
 
+    // NOTE: `apply_traffic_split` currently REPLACES the listener's default
+    // action (whole-listener ownership), so this assumes the `alb_listener_arn`
+    // is dedicated to this deployment — see the `op env apply-traffic` help
+    // WARNING. Per-deployment ALB rules (so deployments coexist behind one
+    // listener) are a tracked follow-up (the F1 fix).
     let (identity, outcome) =
         apply_traffic_aws_ecs(store, &env, &env_id, deployment_id, answers.as_ref())?;
 
@@ -1205,19 +1249,13 @@ fn apply_traffic_aws_ecs(
     OpError,
 > {
     use crate::env_packs::aws::AwsEcsDeployerHandler;
-    use crate::env_packs::aws::bound_session::resolve_bound_session;
     use crate::env_packs::aws::credentials::run_aws_async;
     use crate::env_packs::aws::real_target::RealEcsTarget;
     use crate::env_packs::deployer::Deployer;
     use std::sync::Arc;
 
-    let session = resolve_bound_session(store, env, env_id)?;
-    let identity = if session.is_some() {
-        "bound"
-    } else {
-        "ambient"
-    };
-    let (launch, region, pool) = aws_ecs_launch_params(env, answers)?;
+    let (identity, session, launch, region, pool) =
+        aws_ecs_target_inputs(store, env, env_id, answers)?;
 
     let outcome = run_aws_async(async move {
         let target = RealEcsTarget::resolve(&region, launch, pool, session)
@@ -3841,6 +3879,28 @@ mod tests {
             OpError::Conflict(msg) => assert!(msg.contains("Fargate launch config"), "{msg}"),
             other => panic!("expected Conflict(launch config), got {other}"),
         }
+    }
+
+    /// Identity guard: a binding that pins `assume_role_arn` must have a bound
+    /// session, else the live AWS call would silently run as the ambient
+    /// identity (a tenant/account-isolation footgun). Only that exact case
+    /// refuses; an unpinned env legitimately falls back to ambient.
+    #[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+    #[test]
+    fn pinned_role_without_session_refuses_only_role_without_session() {
+        // role pinned + no session → refuse (the footgun)
+        assert!(pinned_role_without_session(
+            Some("arn:aws:iam::1:role/dep"),
+            false
+        ));
+        // role pinned + session present → ok (the session IS the assumed role)
+        assert!(!pinned_role_without_session(
+            Some("arn:aws:iam::1:role/dep"),
+            true
+        ));
+        // no role pinned → ambient fallback is intentional, never refuse
+        assert!(!pinned_role_without_session(None, false));
+        assert!(!pinned_role_without_session(None, true));
     }
 
     #[test]
