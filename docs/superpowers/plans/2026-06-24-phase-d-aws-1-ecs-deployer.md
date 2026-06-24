@@ -139,12 +139,35 @@ dispatched by deployer kind (K8s → AWS → reject) and requires `assume_role_a
 (unlike K8s, nothing is applied live — the role must pre-exist). The
 `AssumedSession` JSON is the forward contract PR-3c's runtime client parses.
 
-**PR-3c consumer (deferred):** the construction path builds `RealEcsTarget`
-from the binding — `FargateLaunchConfig` sourced from new wizard answers
-(subnets / security groups / exec+task role ARNs / cpu / memory / container
-port, extending `wizard.qaspec.yaml` + `AwsEcsParams::from_answers`) and the
-client from the bound STS session — then injects it via
-`AwsEcsDeployerHandler::with_target`.
+**PR-3c sliced again (2026-06-24, 3 sub-PRs; user decisions: F2 = stateless
+target-group pool, F1 = per-deployment `ModifyRule`):**
+
+- **PR-3c-1 (✅ SHIPPED, #371):** wizard + params plumbing, no live behavior
+  change. `wizard.qaspec.yaml` gains the Fargate launch config + the
+  `target_group_arns` pool (comma-separated string answers, matching the
+  all-string binding-wizard surface). `FargateLaunchConfig` moves out of the
+  feature-gated `real_target` into the always-compiled `deployer` module (pure
+  data; `pub use`-re-exported to keep its path) and `AwsEcsParams::from_answers`
+  becomes the single parsed home: `launch: Option<FargateLaunchConfig>`
+  (all-or-nothing: `execution_role_arn` + `subnets` + `security_groups`) +
+  `target_group_pool: Vec<String>` (ARN-or-≤32-char-name validated). Verbs
+  ignore both; the generated `target_group` name is untouched (replaced in
+  3c-2). Default target stays `UnconfiguredEcsTarget`.
+- **PR-3c-2 (NEXT):** construction wiring + the **F2 mechanism**. Build the
+  bound-session SDK client (read the `AssumedSession` PR-3b persisted at
+  `secret://<env>/…/deployer_session`, static-credentials provider, ambient
+  fallback when unbound — the AWS analogue of K8s `resolve_bound_identity`);
+  add the AWS branch to the CLI deploy path (`apply-revision` + traffic-split,
+  NOT reconcile — AWS is imperative) that builds `RealEcsTarget` from
+  `params.launch` + `params.target_group_pool` and injects it via
+  `with_target`. F2 mechanism: move the pool onto `RealEcsTarget` (next to
+  `FargateLaunchConfig`), drop the deployer-computed `target_group` from the
+  seam, and assign each revision a free pool member **statelessly** (read the
+  task sets' load-balancer bindings — like the `externalId` rediscovery), so
+  blue/green shifts across separate per-revision TGs.
+- **PR-3c-3:** the **F1 fix** — per-deployment ALB `ModifyRule` (host/path
+  condition from a new wizard routing answer), preserving the default action +
+  sibling rules so multiple deployments coexist behind one listener.
 
 **Must also fix (PR-2 codex adversarial review, all valid — deferred here
 because the real fixes need PR-3's wizard/bootstrap data, not surface patches):**
@@ -157,20 +180,22 @@ because the real fixes need PR-3's wizard/bootstrap data, not surface patches):*
    from the same list, so it is covered too. `real_target::REAL_ECS_TARGET_IAM_ACTIONS`
    is now the authoritative runtime surface, with a test pinning it ⊆
    `VALIDATED_IAM_VERBS` so a new SDK call without a matching verb fails CI.
-2. **Target-group identity, not a 60-char generated name.** `target_group`
-   (`deployer.rs`) renders `gtc-tg-<dep_ulid>-<rev_ulid>` = 60 chars, over
-   ELBv2's 32-char limit, AND nothing provisions a target group under a
-   deployer-generated name. Switch to operator-provided target groups (ARNs, or
-   AWS-valid names ≤32 chars from the wizard/bootstrap) that `RealEcsTarget`
-   references — don't just shorten the generated name.
-3. **Per-deployment ALB scoping.** `apply_listener_weights` replaces the
-   listener's *default* action (whole-listener ownership), so multiple
-   deployments behind one `alb_listener_arn` clobber each other and any
-   sibling/auth/redirect action is discarded. Scope the write to a
-   per-deployment `ModifyRule` (host/path condition from the wizard's routing
-   topology) and preserve unrelated actions — or enforce one-deployment-per-
-   listener when the ALB mirror is enabled. (PR-2 documents the current
-   ownership constraint on the method.)
+2. **Target-group identity, not a 60-char generated name (F2). Contract in
+   PR-3c-1; mechanism in PR-3c-2.** `target_group` (`deployer.rs`) renders
+   `gtc-tg-<dep_ulid>-<rev_ulid>` = 60 chars, over ELBv2's 32-char limit, AND
+   nothing provisions a target group under a deployer-generated name. Decision:
+   **operator-provided stateless pool** — the wizard collects
+   `target_group_arns` (ARNs or ≤32-char names; PR-3c-1), and `RealEcsTarget`
+   assigns each revision a free pool member, read back from the task sets'
+   load-balancer bindings (PR-3c-2). Not a shortened generated name.
+3. **Per-deployment ALB scoping (F1) → PR-3c-3.** `apply_listener_weights`
+   replaces the listener's *default* action (whole-listener ownership), so
+   multiple deployments behind one `alb_listener_arn` clobber each other and any
+   sibling/auth/redirect action is discarded. Decision: scope the write to a
+   per-deployment `ModifyRule` (host/path condition from a new wizard routing
+   answer), preserving the default action + sibling rules so deployments coexist
+   behind one listener. (PR-2 documents the current ownership constraint on the
+   method.)
 4. **Idempotency under concurrent deploy — ✅ SHIPPED in PR-3a.**
    `ensure_service` now passes a deterministic `clientToken` (UUID-form, derived
    from the deployment ULID) on `CreateService`, so two `warm_revision` callers
@@ -200,8 +225,10 @@ later PR keeps it green.
 - GCP / Azure deployers (separate trains).
 - Real AWS in default CI (gated/manual only, PR-4).
 
-## Open question (for PR-3)
+## Open question (for PR-3) — RESOLVED
 
 Should `RealEcsTarget` default to AssumeRole-the-bound-role, or keep the ambient
-chain as a dev fallback? Recommend: bound role when `credentials_ref` resolves,
-ambient fallback otherwise (mirrors K8s bound-vs-admin).
+chain as a dev fallback? **Resolved (PR-3c-2 design):** bound session when the
+env's `deployer_session` ref resolves (build the SDK client from the
+`AssumedSession` PR-3b minted), ambient chain otherwise — the AWS analogue of
+K8s `resolve_bound_identity` (bound bearer vs. ambient kubeconfig).
