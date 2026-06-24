@@ -61,35 +61,10 @@ use super::deploy_target::{
     EcsDeployTarget, EcsTargetError, ListenerRef, ServiceSpec, TargetGroupWeight, TaskSetHandle,
     TaskSetRef, TaskSetSpec, TaskSetStability,
 };
-
-/// Per-binding Fargate launch config the real target needs to stand up a task
-/// definition + task set, but which the per-revision seam specs deliberately do
-/// not carry (it is stable across a binding's revisions). Sourced from the
-/// binding's wizard answers by the construction path that wires this target
-/// (PR-3); the seam / fake stay unaware of it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FargateLaunchConfig {
-    /// IAM role the ECS agent assumes to pull the image + write logs.
-    pub execution_role_arn: String,
-    /// Optional IAM role the task's containers assume (app-level AWS access).
-    pub task_role_arn: Option<String>,
-    /// awsvpc subnets the Fargate ENIs attach to (at least one).
-    pub subnets: Vec<String>,
-    /// Security groups applied to the task ENIs.
-    pub security_groups: Vec<String>,
-    /// Whether tasks get a public IP (public subnets without a NAT need this to
-    /// reach ECR / the image registry).
-    pub assign_public_ip: bool,
-    /// Task-level CPU units (Fargate requires it at the task level), e.g. `256`.
-    pub cpu: String,
-    /// Task-level memory (MiB) as a string, e.g. `512`.
-    pub memory: String,
-    /// Logical container name in the task definition; also the `containerName`
-    /// the load balancer routes to.
-    pub container_name: String,
-    /// Port the container listens on / the target group forwards to.
-    pub container_port: i32,
-}
+// The launch config is pure data parsed by `AwsEcsParams::from_answers`, so it
+// lives in the always-compiled deployer module; re-exported here to keep the
+// `real_target::FargateLaunchConfig` public path stable.
+pub use super::deployer::FargateLaunchConfig;
 
 /// Production [`EcsDeployTarget`]: ECS task sets + ELBv2 weighted forward
 /// actions, region-pinned at construction.

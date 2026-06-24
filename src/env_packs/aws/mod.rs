@@ -203,5 +203,16 @@ mod tests {
             spec.questions.iter().any(|q| q.id == "region"),
             "aws-ecs wizard must collect the AWS region (no sensible default)",
         );
+        // PR-3c: the wizard collects the Fargate launch config (anchored by the
+        // required execution role) and the ALB target-group pool the real
+        // target consumes.
+        assert!(
+            spec.questions.iter().any(|q| q.id == "execution_role_arn"),
+            "aws-ecs wizard must collect the Fargate execution role ARN",
+        );
+        assert!(
+            spec.questions.iter().any(|q| q.id == "target_group_arns"),
+            "aws-ecs wizard must collect the target-group pool",
+        );
     }
 }
