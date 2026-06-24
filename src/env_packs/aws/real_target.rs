@@ -116,15 +116,17 @@ pub struct RealEcsTarget {
 /// adding an SDK call here without the matching validated verb fails CI rather
 /// than the customer's first warm / traffic-shift / archive.
 pub const REAL_ECS_TARGET_IAM_ACTIONS: &[&str] = &[
-    "ecs:DescribeServices",                      // ensure_service
-    "ecs:CreateService",                         // ensure_service
-    "ecs:RegisterTaskDefinition",                // create_task_set
-    "ecs:CreateTaskSet",                         // create_task_set
-    "ecs:DescribeTaskSets", // create_task_set / task_set_stability / delete_task_set
-    "ecs:DeleteTaskSet",    // delete_task_set
-    "ecs:DeregisterTaskDefinition", // delete_task_set
-    "elasticloadbalancing:DescribeTargetGroups", // create_task_set / apply_listener_weights
-    "elasticloadbalancing:ModifyListener", // apply_listener_weights
+    "ecs:DescribeServices",       // ensure_service
+    "ecs:CreateService",          // ensure_service
+    "ecs:RegisterTaskDefinition", // create_task_set
+    "ecs:CreateTaskSet",          // create_task_set
+    // create_task_set / task_set_stability / delete_task_set / apply_listener_weights
+    // (apply_listener_weights reads each revision's target-group binding here)
+    "ecs:DescribeTaskSets",
+    "ecs:DeleteTaskSet",                         // delete_task_set
+    "ecs:DeregisterTaskDefinition",              // delete_task_set
+    "elasticloadbalancing:DescribeTargetGroups", // create_task_set (resolve_pool_arns, name→ARN)
+    "elasticloadbalancing:ModifyListener",       // apply_listener_weights
 ];
 
 impl RealEcsTarget {
