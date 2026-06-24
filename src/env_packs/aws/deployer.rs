@@ -146,6 +146,17 @@ fn answer_string(key: &str, value: &Value) -> Result<String, AwsEcsParamsError> 
         .ok_or_else(|| AwsEcsParamsError::NotAString(key.to_string()))
 }
 
+/// Read an optional string answer, mapping a blank / whitespace-only value to
+/// `None`. Operators are told to "leave blank" optional fields, and
+/// `load_render_answers` loads staged answer JSON verbatim, so a persisted
+/// empty string is a plausible "unset" — not a real value. Without this a blank
+/// `Some("")` would reach the SDK (e.g. an empty `taskRoleArn`) or break the
+/// shared parser, which `--bind` reuses just to read `assume_role_arn`.
+fn optional_string(key: &str, value: &Value) -> Result<Option<String>, AwsEcsParamsError> {
+    let s = answer_string(key, value)?;
+    Ok(if s.trim().is_empty() { None } else { Some(s) })
+}
+
 /// Split a comma-separated string answer into trimmed, non-empty entries.
 fn csv_list(key: &str, value: &Value) -> Result<Vec<String>, AwsEcsParamsError> {
     Ok(answer_string(key, value)?
@@ -187,19 +198,16 @@ fn parse_port(key: &str, value: &Value) -> Result<i32, AwsEcsParamsError> {
 }
 
 /// Parse the `target_group_arns` pool: comma-separated entries, each an ELBv2
-/// target-group ARN or a name (≤32 chars, the ELBv2 name limit). The minimum
-/// pool size for blue/green and free-slot assignment is enforced by the real
-/// target (PR-3c construction wiring), not here — this only validates the
-/// per-entry identity shape so a malformed pool fails at parse time.
+/// target-group ARN or a name (≤32 chars, the ELBv2 name limit). A blank /
+/// whitespace-only answer means the optional pool is unset (operators leave it
+/// blank when no ALB mirror is configured) and parses to an empty pool, not an
+/// error. The minimum pool size for blue/green and free-slot assignment is
+/// enforced by the real target (PR-3c construction wiring), not here — this
+/// only validates the per-entry identity shape so a malformed pool fails at
+/// parse time.
 fn parse_target_group_pool(value: &Value) -> Result<Vec<String>, AwsEcsParamsError> {
     let key = "target_group_arns";
     let pool = csv_list(key, value)?;
-    if pool.is_empty() {
-        return Err(AwsEcsParamsError::Invalid {
-            key: key.to_string(),
-            detail: "target-group pool is present but empty".to_string(),
-        });
-    }
     for entry in &pool {
         if !valid_target_group_identity(entry) {
             return Err(AwsEcsParamsError::Invalid {
@@ -346,15 +354,13 @@ impl AwsEcsParams {
                 "container_image_tag_prefix" => {
                     params.image_tag_prefix = answer_string(key, value)?
                 }
-                "alb_listener_arn" => params.listener_arn = Some(answer_string(key, value)?),
-                "assume_role_arn" => params.assume_role_arn = Some(answer_string(key, value)?),
+                "alb_listener_arn" => params.listener_arn = optional_string(key, value)?,
+                "assume_role_arn" => params.assume_role_arn = optional_string(key, value)?,
                 "aws_profile" => {
                     answer_string(key, value)?;
                 }
-                "execution_role_arn" => {
-                    launch.execution_role_arn = Some(answer_string(key, value)?)
-                }
-                "task_role_arn" => launch.task_role_arn = Some(answer_string(key, value)?),
+                "execution_role_arn" => launch.execution_role_arn = optional_string(key, value)?,
+                "task_role_arn" => launch.task_role_arn = optional_string(key, value)?,
                 "subnets" => launch.subnets = Some(csv_list(key, value)?),
                 "security_groups" => launch.security_groups = Some(csv_list(key, value)?),
                 "assign_public_ip" => launch.assign_public_ip = Some(parse_bool(key, value)?),
@@ -1204,13 +1210,37 @@ mod tests {
     }
 
     #[test]
-    fn from_answers_rejects_empty_target_group_pool() {
+    fn from_answers_treats_blank_target_group_pool_as_unset() {
         let env = build_fixture_env();
         let answers = serde_json::json!({ "target_group_arns": "  ,  " });
-        let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
-        assert!(matches!(
-            err,
-            AwsEcsParamsError::Invalid { key, detail } if key == "target_group_arns" && detail.contains("empty")
-        ));
+        let params = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap();
+        assert!(
+            params.target_group_pool.is_empty(),
+            "a blank optional pool is unset, not an error"
+        );
+    }
+
+    /// Blank optional string answers (operators are told to leave them blank,
+    /// and staged answer JSON is loaded verbatim) parse to unset — not `Some("")`
+    /// and not an error — so the shared parser never sends an empty value to the
+    /// SDK and never breaks `--bind` (which reuses it to read `assume_role_arn`).
+    #[test]
+    fn from_answers_treats_blank_optional_strings_as_unset() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "assume_role_arn": "",
+            "alb_listener_arn": "",
+            "target_group_arns": "",
+            "execution_role_arn": "arn:aws:iam::111122223333:role/exec",
+            "task_role_arn": "",
+            "subnets": "subnet-aaaa",
+            "security_groups": "sg-1111",
+        });
+        let params = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap();
+        assert_eq!(params.assume_role_arn, None);
+        assert_eq!(params.listener_arn, None);
+        assert!(params.target_group_pool.is_empty());
+        let launch = params.launch.expect("required launch fields are present");
+        assert_eq!(launch.task_role_arn, None, "a blank task role ARN is unset");
     }
 }
