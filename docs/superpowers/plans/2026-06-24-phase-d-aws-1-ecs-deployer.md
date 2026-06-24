@@ -127,16 +127,24 @@ API; the default handler target stays `UnconfiguredEcsTarget`.
 
 **Sliced (2026-06-24):** the two codex findings with no wizard/bootstrap
 dependency front-load as **PR-3a** (IAM verb parity + concurrent-deploy
-idempotency — items 1 & 4 below, SHIPPED); the STS credentials half is PR-3b;
-construction wiring + the remaining ALB findings (items 2 & 3) is PR-3c.
+idempotency — items 1 & 4 below, SHIPPED); the STS credentials half is
+**PR-3b (SHIPPED, #370)**; construction wiring + the remaining ALB findings
+(items 2 & 3) is PR-3c.
 
-`bootstrap` assumes the bound deployer role → returns `Some(bound_*)`; override
-`rotate_at` to decode the STS session expiry via #366's `rotate_at_from_window`.
-**Consumer:** the construction path builds `RealEcsTarget` from the binding —
-`FargateLaunchConfig` sourced from new wizard answers (subnets / security groups
-/ exec+task role ARNs / cpu / memory / container port, extending
-`wizard.qaspec.yaml` + `AwsEcsParams::from_answers`) and the client from the
-bound STS session — then injects it via `AwsEcsDeployerHandler::with_target`.
+**PR-3b (✅ SHIPPED, #370):** `bootstrap` now assumes the bound deployer role
+(the binding answers' `assume_role_arn`) → returns `Some(bound_*)` as a
+serialized `AssumedSession` blob; `rotate_at` decodes the `issued_at`/expiration
+window via #366's `rotate_at_from_window` and re-mints at 80%. `--bind` is
+dispatched by deployer kind (K8s → AWS → reject) and requires `assume_role_arn`
+(unlike K8s, nothing is applied live — the role must pre-exist). The
+`AssumedSession` JSON is the forward contract PR-3c's runtime client parses.
+
+**PR-3c consumer (deferred):** the construction path builds `RealEcsTarget`
+from the binding — `FargateLaunchConfig` sourced from new wizard answers
+(subnets / security groups / exec+task role ARNs / cpu / memory / container
+port, extending `wizard.qaspec.yaml` + `AwsEcsParams::from_answers`) and the
+client from the bound STS session — then injects it via
+`AwsEcsDeployerHandler::with_target`.
 
 **Must also fix (PR-2 codex adversarial review, all valid — deferred here
 because the real fixes need PR-3's wizard/bootstrap data, not surface patches):**
