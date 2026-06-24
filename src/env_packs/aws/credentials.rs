@@ -775,7 +775,7 @@ fn all_failed(caps: &[Capability], reason: &str) -> RequirementsReport {
 /// is the pattern B12a settled on (see
 /// `project_next_gen_deployment_phase_b.md` precedents). ~10ms overhead
 /// per invocation — negligible against AWS round-trips.
-fn run_aws_async<F, T>(fut: F) -> T
+pub(crate) fn run_aws_async<F, T>(fut: F) -> T
 where
     F: std::future::Future<Output = T> + Send,
     T: Send,

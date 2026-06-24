@@ -26,6 +26,7 @@
 //! built without AWS support.
 
 pub mod bootstrap;
+pub mod bound_session;
 pub mod credentials;
 pub mod deploy_target;
 pub mod deployer;

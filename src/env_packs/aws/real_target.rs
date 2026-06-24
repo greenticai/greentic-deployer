@@ -40,7 +40,8 @@
 //! shared pool could hand both the same target group. The pool must therefore be
 //! sized/scoped so deployments don't contend; enforcing a deployment-scoped pool
 //! is a wiring-time concern handled where the pool meets a deployment
-//! (PR-3c-2b), not at this stateless mechanism. A *duplicate* target group
+//! (a follow-up wiring slice), not at this stateless mechanism. A *duplicate*
+//! target group
 //! within one pool is a config error that guarantees a self-collision and is
 //! rejected at resolve time (`pool_arns_from`). The same-service
 //! concurrent-warm race (two distinct revisions both seeing a TG free) is
@@ -94,6 +95,7 @@ use super::deploy_target::{
 // The launch config is pure data parsed by `AwsEcsParams::from_answers`, so it
 // lives in the always-compiled deployer module; re-exported here to keep the
 // `real_target::FargateLaunchConfig` public path stable.
+use super::credentials::AssumedSession;
 pub use super::deployer::FargateLaunchConfig;
 
 /// Production [`EcsDeployTarget`]: ECS task sets + ELBv2 weighted forward
@@ -133,21 +135,33 @@ impl RealEcsTarget {
     /// Resolve the AWS credential chain (region-pinned) and build the ECS +
     /// ELBv2 clients. Mirrors `RealAwsClient::resolve` in `credentials.rs`: the
     /// region comes from the binding (the env-pack binding is single-region, so
-    /// the per-spec `region` always equals this), and the credential chain is
-    /// the same one the rest of the AWS code walks.
+    /// the per-spec `region` always equals this).
+    ///
+    /// `session` is the env's bound deployer identity (the [`AssumedSession`]
+    /// the `--bind` STS minter persisted): `Some` injects it as a static
+    /// credentials provider so every ECS/ELBv2 call runs as the scoped deployer
+    /// role; `None` falls back to the ambient chain (`AWS_PROFILE` / env keys /
+    /// instance role) the rest of the AWS code walks. The AWS analogue of the
+    /// K8s bound-ServiceAccount bearer — fail-closed resolution happens upstream
+    /// (`resolve_bound_session`), so by here `None` genuinely means "no ref
+    /// bound", not "ref bound but unreadable".
     pub async fn resolve(
         region: &str,
         launch: FargateLaunchConfig,
         target_group_pool: Vec<String>,
+        session: Option<AssumedSession>,
     ) -> Result<Self, EcsTargetError> {
-        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(aws_config::Region::new(region.to_string()))
-            .load()
-            .await;
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new(region.to_string()));
+        if let Some(session) = session.as_ref() {
+            loader = loader.credentials_provider(session_credentials(session));
+        }
+        let config = loader.load().await;
         if config.credentials_provider().is_none() {
             return Err(EcsTargetError::Api(
-                "no AWS credentials provider in the resolved SDK config — set AWS_PROFILE or \
-                 AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY"
+                "no AWS credentials provider in the resolved SDK config — bind the deployer \
+                 identity (`op env bootstrap --bind` / `op credentials rotate`) or set AWS_PROFILE \
+                 / AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY"
                     .to_string(),
             ));
         }
@@ -190,6 +204,24 @@ impl RealEcsTarget {
         };
         pool_arns_from(&self.target_group_pool, &resolved)
     }
+}
+
+/// Build a static credentials provider from the bound [`AssumedSession`].
+///
+/// All three STS session parts (access key, secret key, session token) are
+/// required to sign requests; the session `expiration` is passed through so the
+/// SDK treats the credentials as expiring (a deploy that outlives the session
+/// surfaces an auth error rather than silently signing with stale creds — the
+/// rotation engine re-mints at 80% of the window before that). Pure (no
+/// network), so it is unit-tested directly.
+fn session_credentials(session: &AssumedSession) -> aws_sdk_ecs::config::Credentials {
+    aws_sdk_ecs::config::Credentials::new(
+        session.access_key_id.clone(),
+        session.secret_access_key.clone(),
+        Some(session.session_token.clone()),
+        Some(std::time::SystemTime::from(session.expiration)),
+        "greentic-bound-deployer-session",
+    )
 }
 
 #[async_trait]
@@ -429,8 +461,10 @@ fn api<E: std::fmt::Display>(op: &str, err: E) -> EcsTargetError {
 }
 
 /// Deterministic ECS service name for a deployment (one EXTERNAL-controller
-/// service per `deployment_id`).
-fn service_name(deployment_id: &DeploymentId) -> String {
+/// service per `deployment_id`). `pub(crate)` so the CLI deploy path can report
+/// the live service name in the `op env apply-revision` outcome without
+/// re-deriving the format.
+pub(crate) fn service_name(deployment_id: &DeploymentId) -> String {
     format!("gtc-svc-{}", deployment_id.0)
 }
 
@@ -1247,5 +1281,28 @@ mod tests {
                  role does not fail on the first live deploy"
             );
         }
+    }
+
+    /// The bound-session injection maps all three STS parts onto the static
+    /// provider and passes the session expiry through (so the SDK treats the
+    /// credentials as expiring rather than permanent).
+    #[test]
+    fn session_credentials_carry_all_three_parts_and_the_expiry() {
+        let expiration = chrono::DateTime::from_timestamp(1_900_000_000, 0).unwrap();
+        let session = AssumedSession {
+            access_key_id: "AKIAEXAMPLE".to_string(),
+            secret_access_key: "shh-the-key".to_string(),
+            session_token: "the-session-blob".to_string(),
+            expiration,
+            issued_at: chrono::DateTime::from_timestamp(1_899_000_000, 0).unwrap(),
+        };
+        let creds = session_credentials(&session);
+        assert_eq!(creds.access_key_id(), "AKIAEXAMPLE");
+        assert_eq!(creds.secret_access_key(), "shh-the-key");
+        assert_eq!(creds.session_token(), Some("the-session-blob"));
+        assert_eq!(
+            creds.expiry(),
+            Some(std::time::SystemTime::from(expiration))
+        );
     }
 }

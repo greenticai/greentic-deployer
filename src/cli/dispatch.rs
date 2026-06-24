@@ -331,6 +331,12 @@ pub enum EnvVerb {
     /// down) — the surgical counterpart of `reconcile`. K8s deployer env-pack
     /// only today; connects through the binding's `kubeconfig_context` answer.
     ApplyRevision(EnvApplyRevisionArgs),
+    /// Push one deployment's recorded traffic split to its live ALB listener
+    /// (the routing-side counterpart of `apply-revision`). AWS-ECS deployer
+    /// env-pack only — K8s serves splits from its in-process runtime router, so
+    /// `op traffic set` alone suffices there. The split itself is recorded by
+    /// `op traffic set`; this verb makes it observable in the live runtime.
+    ApplyTraffic(EnvApplyTrafficArgs),
     Destroy {
         env_id: String,
         #[arg(long)]
@@ -573,6 +579,22 @@ pub struct EnvApplyRevisionArgs {
     pub env_id: String,
     /// Revision id (ULID) to apply — must already exist in the env.
     pub revision_id: String,
+    /// Deployer env-pack kind to apply with — a full `<path>@<version>`
+    /// descriptor, or a bare path matching the env's deployer binding.
+    /// Defaults to the env's Deployer-slot binding.
+    #[arg(long)]
+    pub kind: Option<String>,
+}
+
+/// Args for `op env apply-traffic <env_id> <deployment_id> [--kind <descriptor>]`.
+/// Pushes the deployment's recorded traffic split to its live ALB listener
+/// (AWS-ECS only). Record the split first with `op traffic set`.
+#[derive(Args, Debug)]
+pub struct EnvApplyTrafficArgs {
+    /// Environment id (e.g. `zain-prod`).
+    pub env_id: String,
+    /// Deployment id (ULID) whose recorded split to apply.
+    pub deployment_id: String,
     /// Deployer env-pack kind to apply with — a full `<path>@<version>`
     /// descriptor, or a bare path matching the env's deployer binding.
     /// Defaults to the env's Deployer-slot binding.
@@ -914,6 +936,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 EnvVerb::Render(_) => "render",
                 EnvVerb::Reconcile(_) => "reconcile",
                 EnvVerb::ApplyRevision(_) => "apply-revision",
+                EnvVerb::ApplyTraffic(_) => "apply-traffic",
                 EnvVerb::Destroy { .. } => "destroy",
                 EnvVerb::MigrateDev { .. } => "migrate-dev",
                 EnvVerb::MigrateState { .. } => "migrate-state",
@@ -1050,6 +1073,7 @@ fn dispatch_env(
         EnvVerb::Render(args) => super::env::render(store, registry, flags, args)?,
         EnvVerb::Reconcile(args) => super::env::reconcile(store, registry, flags, args)?,
         EnvVerb::ApplyRevision(args) => super::env::apply_revision(store, registry, flags, args)?,
+        EnvVerb::ApplyTraffic(args) => super::env::apply_traffic(store, registry, flags, args)?,
         EnvVerb::Destroy { env_id, confirm } => {
             super::env::destroy(store, flags, &env_id, confirm)?
         }
