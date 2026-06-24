@@ -153,18 +153,44 @@ target-group pool, F1 = per-deployment `ModifyRule`):**
   `target_group_pool: Vec<String>` (ARN-or-≤32-char-name validated). Verbs
   ignore both; the generated `target_group` name is untouched (replaced in
   3c-2). Default target stays `UnconfiguredEcsTarget`.
-- **PR-3c-2 (NEXT):** construction wiring + the **F2 mechanism**. Build the
-  bound-session SDK client (read the `AssumedSession` PR-3b persisted at
-  `secret://<env>/…/deployer_session`, static-credentials provider, ambient
-  fallback when unbound — the AWS analogue of K8s `resolve_bound_identity`);
-  add the AWS branch to the CLI deploy path (`apply-revision` + traffic-split,
-  NOT reconcile — AWS is imperative) that builds `RealEcsTarget` from
-  `params.launch` + `params.target_group_pool` and injects it via
-  `with_target`. F2 mechanism: move the pool onto `RealEcsTarget` (next to
-  `FargateLaunchConfig`), drop the deployer-computed `target_group` from the
-  seam, and assign each revision a free pool member **statelessly** (read the
-  task sets' load-balancer bindings — like the `externalId` rediscovery), so
-  blue/green shifts across separate per-revision TGs.
+- **PR-3c-2 (NEXT — sub-sliced into 3c-2a then 3c-2b, 2026-06-24, user
+  decision):** construction wiring + the **F2 mechanism**, split into the
+  pure seam/provider half and the live-wiring half.
+  - **PR-3c-2a (the F2 seam + mechanism, no creds, no CLI, no live path):**
+    drop the deployer-computed `target_group` from the `EcsDeployTarget` seam
+    (`TaskSetSpec` + `TargetGroupWeight` lose the field; `AwsEcsParams::target_group`
+    is removed); the handler stops computing per-revision TG names. Move the
+    pool onto `RealEcsTarget` (next to `FargateLaunchConfig`; `resolve` gains a
+    `target_group_pool` arg). Assign each revision a free pool member
+    **statelessly** in `create_task_set` (read the live task sets'
+    load-balancer bindings via the `describe_task_sets` it already calls →
+    which pool ARNs are taken → pick a free one), and in `apply_listener_weights`
+    map each weighted revision → its task set's bound TG ARN (no name lookup —
+    the binding carries the ARN). The mechanism lives in pure free helpers
+    (`assigned_pool_members` / `bound_target_group` / `pick_free_pool_member` /
+    `split_pool_identities`) unit-tested against constructed `DescribeTaskSets`
+    outputs, same pattern as the existing `*_from` parsers. The `InMemoryEcs`
+    fake needs **no** LB-binding model — the seam no longer carries
+    `target_group` through the handler, so its `weights_for` round-trip is
+    unchanged (the binding-readback is RealEcsTarget-internal). Pool name→ARN
+    normalization (`resolve_pool_arns`, mixed names+ARNs) is thin async glue,
+    PR-4-verified like the rest of the `.send()` surface. Default target stays
+    `UnconfiguredEcsTarget`; nothing constructs `RealEcsTarget` with a real pool
+    yet (that is 3c-2b).
+  - **PR-3c-2b (bound-session client + the AWS CLI branch):** build the
+    bound-session SDK client (read the `AssumedSession` PR-3b persisted at
+    `secret://<env>/…/deployer_session` via `resolve_credentials_token`,
+    static-credentials provider, ambient fallback when unbound — the AWS
+    analogue of K8s `resolve_bound_identity`); add the AWS branch to the CLI
+    deploy path so `apply_revision` (env.rs) no longer hard-rejects the AWS-ECS
+    descriptor — it builds `RealEcsTarget::resolve(region, launch, pool,
+    session)` from `params.launch` + `params.target_group_pool` and injects it
+    via `with_target`, then dispatches warm/archive (mirrors
+    `apply_revision_k8s_cluster`). Live traffic-shift lands as a **new
+    `op env apply-traffic <env> <dep>` verb** (user decision, 2026-06-24) — a
+    surgical live verb mirroring `apply-revision` that reads the recorded split
+    and pushes ALB listener weights; `op traffic set` stays spec-only. AWS is
+    imperative — NOT reconcile.
 - **PR-3c-3:** the **F1 fix** — per-deployment ALB `ModifyRule` (host/path
   condition from a new wizard routing answer), preserving the default action +
   sibling rules so multiple deployments coexist behind one listener.
