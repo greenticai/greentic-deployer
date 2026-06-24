@@ -95,17 +95,74 @@ Seam + `InMemoryEcs` + `UnconfiguredEcsTarget` + `AwsEcsParams` + the full
 in-memory fake — **zero new crate deps**, default `UnconfiguredEcsTarget` keeps
 `op deploy` honest until a real target lands. ~3 files, conformance-green.
 
-### PR-2 — `RealEcsTarget` (aws-sdk-backed)
-New `deploy-aws-ecs` feature + `aws-sdk-ecs` / `aws-sdk-elasticloadbalancingv2`.
-`RealEcsTarget` implements `EcsDeployTarget`, built lazily from the AWS chain
-(mirrors `RealAwsClient::resolve`). Response-parsing unit-tested with mocked SDK
-shapes; **no real AWS in CI.** `--no-default-features` + `creds-aws`-only builds
-stay green.
+### PR-2 — `RealEcsTarget` (aws-sdk-backed) — DONE in this branch
+New default-on `deploy-aws-ecs` feature + `aws-sdk-ecs` /
+`aws-sdk-elasticloadbalancingv2` (region-pinned clients via
+`aws_config::defaults(..).region(..)`, mirroring `RealAwsClient::resolve`).
+`RealEcsTarget` (in `aws/real_target.rs`, `#[cfg(feature = "deploy-aws-ecs")]`)
+implements all five `EcsDeployTarget` methods over the SDK: service
+describe/create (EXTERNAL controller), `RegisterTaskDefinition` +
+`CreateTaskSet`, `DescribeTaskSets` stability, `DeleteTaskSet` +
+`DeregisterTaskDefinition`, and ELBv2 `ModifyListener` weighted forward actions.
 
-### PR-3 — STS AssumeRole session minter (deferred half-b)
+**Design — launch config lives on the target, not the seam.** A real
+`RegisterTaskDefinition` needs the Fargate launch config (execution/task role
+ARNs, subnets, security groups, CPU/memory, container port). That config is
+**stable per binding**, not per revision, so it sits on `FargateLaunchConfig`
+held by the target — the per-revision seam specs + the `InMemoryEcs` fake stay
+untouched. The seam's `(deployment, revision)` identity bridges to ECS's opaque
+task-set id via a deterministic `externalId` (set at create, matched on
+describe/delete). Target groups route by **name** through the seam; the target
+resolves names→ARNs (`DescribeTargetGroups`). `TrafficSplit` basis points
+(0–10000) scale to the ELBv2 forward-weight range (0–999), ratio-preserving.
+
+Every request-build + response-parse step is a **pure free function**,
+unit-tested with SDK types built via their own builders — **no real AWS in CI**
+and **no SDK-HTTP mock dependency** (13 tests). `--no-default-features` +
+`creds-aws`-only and the zero-feature baseline stay green (the module is
+feature-gated out). `RealEcsTarget::resolve` / `FargateLaunchConfig` are public
+API; the default handler target stays `UnconfiguredEcsTarget`.
+
+### PR-3 — STS AssumeRole session minter + construction wiring (deferred half-b)
 `bootstrap` assumes the bound deployer role → returns `Some(bound_*)`; override
 `rotate_at` to decode the STS session expiry via #366's `rotate_at_from_window`.
-**Consumer:** `RealEcsTarget` builds its client from the bound session.
+**Consumer:** the construction path builds `RealEcsTarget` from the binding —
+`FargateLaunchConfig` sourced from new wizard answers (subnets / security groups
+/ exec+task role ARNs / cpu / memory / container port, extending
+`wizard.qaspec.yaml` + `AwsEcsParams::from_answers`) and the client from the
+bound STS session — then injects it via `AwsEcsDeployerHandler::with_target`.
+
+**Must also fix (PR-2 codex adversarial review, all valid — deferred here
+because the real fixes need PR-3's wizard/bootstrap data, not surface patches):**
+
+1. **IAM preflight ↔ real-target verb parity.** `VALIDATED_IAM_VERBS`
+   (`credentials.rs`) + the bootstrap policy must cover every action
+   `RealEcsTarget` calls. Missing today: `ecs:DescribeServices`,
+   `ecs:RegisterTaskDefinition`, `ecs:DescribeTaskSets`, `ecs:DeleteTaskSet`,
+   `ecs:DeregisterTaskDefinition`, `elasticloadbalancing:DescribeTargetGroups`.
+   Otherwise a role passes `gtc op credentials requirements` yet fails on the
+   first real warm/cleanup. Add a test that the real-target operation list is a
+   subset of the validated/bootstrap verbs.
+2. **Target-group identity, not a 60-char generated name.** `target_group`
+   (`deployer.rs`) renders `gtc-tg-<dep_ulid>-<rev_ulid>` = 60 chars, over
+   ELBv2's 32-char limit, AND nothing provisions a target group under a
+   deployer-generated name. Switch to operator-provided target groups (ARNs, or
+   AWS-valid names ≤32 chars from the wizard/bootstrap) that `RealEcsTarget`
+   references — don't just shorten the generated name.
+3. **Per-deployment ALB scoping.** `apply_listener_weights` replaces the
+   listener's *default* action (whole-listener ownership), so multiple
+   deployments behind one `alb_listener_arn` clobber each other and any
+   sibling/auth/redirect action is discarded. Scope the write to a
+   per-deployment `ModifyRule` (host/path condition from the wizard's routing
+   topology) and preserve unrelated actions — or enforce one-deployment-per-
+   listener when the ALB mirror is enabled. (PR-2 documents the current
+   ownership constraint on the method.)
+4. **Idempotency under concurrent deploy.** `ensure_service` is describe-then-
+   create, a TOCTOU window: two `warm_revision` callers for the same deployment
+   race and one fails. ECS `CreateService` has no dedicated already-exists error
+   (a duplicate surfaces as `InvalidParameterException`), so honoring the seam's
+   idempotency contract means a `clientToken` on create (or matching that error)
+   — verify against real AWS in PR-4.
 
 ### PR-4 — Live-account proving ground (gated/manual E2E)
 Analogue of #364: bootstrap → warm on Fargate → traffic split → archive against a
