@@ -145,7 +145,7 @@ impl RealEcsTarget {
             .send()
             .await
             .map_err(|e| api("describe_target_groups", e))?;
-        target_group_arns_from(&out)
+        Ok(target_group_arns_from(&out))
     }
 }
 
@@ -290,8 +290,9 @@ impl EcsDeployTarget for RealEcsTarget {
             .await
             .map_err(|e| api("delete_task_set", e))?;
         // Deregister the revision's task definition so archived revisions don't
-        // accumulate ACTIVE task-def revisions. Best effort: a task set delete
-        // that succeeded is the durable outcome; surface a deregister failure.
+        // accumulate ACTIVE task-def revisions. A deregister failure is
+        // surfaced; the delete above already landed, so a retry finds no task
+        // set (idempotent Ok) and skips straight past this.
         if let Some(arn) = found.task_definition {
             self.ecs
                 .deregister_task_definition()
@@ -505,16 +506,14 @@ fn find_task_set<'a>(out: &'a DescribeTaskSetsOutput, external_id: &str) -> Opti
 }
 
 /// Map DescribeTargetGroups → `name → ARN`. Skips entries missing either field.
-fn target_group_arns_from(
-    out: &DescribeTargetGroupsOutput,
-) -> Result<HashMap<String, String>, EcsTargetError> {
+fn target_group_arns_from(out: &DescribeTargetGroupsOutput) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for tg in out.target_groups() {
         if let (Some(name), Some(arn)) = (tg.target_group_name(), tg.target_group_arn()) {
             map.insert(name.to_string(), arn.to_string());
         }
     }
-    Ok(map)
+    map
 }
 
 /// Build the weighted forward [`Action`] mirroring the `TrafficSplit`: one
@@ -777,7 +776,7 @@ mod tests {
                     .build(),
             )
             .build();
-        let map = target_group_arns_from(&out).unwrap();
+        let map = target_group_arns_from(&out);
         assert_eq!(map.get("tg-a").map(String::as_str), Some("arn-a"));
         assert!(!map.contains_key("tg-no-arn"));
     }

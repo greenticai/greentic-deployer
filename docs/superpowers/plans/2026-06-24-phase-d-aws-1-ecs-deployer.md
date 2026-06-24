@@ -157,6 +157,12 @@ because the real fixes need PR-3's wizard/bootstrap data, not surface patches):*
    topology) and preserve unrelated actions — or enforce one-deployment-per-
    listener when the ALB mirror is enabled. (PR-2 documents the current
    ownership constraint on the method.)
+4. **Idempotency under concurrent deploy.** `ensure_service` is describe-then-
+   create, a TOCTOU window: two `warm_revision` callers for the same deployment
+   race and one fails. ECS `CreateService` has no dedicated already-exists error
+   (a duplicate surfaces as `InvalidParameterException`), so honoring the seam's
+   idempotency contract means a `clientToken` on create (or matching that error)
+   — verify against real AWS in PR-4.
 
 ### PR-4 — Live-account proving ground (gated/manual E2E)
 Analogue of #364: bootstrap → warm on Fargate → traffic split → archive against a
