@@ -124,6 +124,12 @@ feature-gated out). `RealEcsTarget::resolve` / `FargateLaunchConfig` are public
 API; the default handler target stays `UnconfiguredEcsTarget`.
 
 ### PR-3 — STS AssumeRole session minter + construction wiring (deferred half-b)
+
+**Sliced (2026-06-24):** the two codex findings with no wizard/bootstrap
+dependency front-load as **PR-3a** (IAM verb parity + concurrent-deploy
+idempotency — items 1 & 4 below, SHIPPED); the STS credentials half is PR-3b;
+construction wiring + the remaining ALB findings (items 2 & 3) is PR-3c.
+
 `bootstrap` assumes the bound deployer role → returns `Some(bound_*)`; override
 `rotate_at` to decode the STS session expiry via #366's `rotate_at_from_window`.
 **Consumer:** the construction path builds `RealEcsTarget` from the binding —
@@ -135,14 +141,14 @@ bound STS session — then injects it via `AwsEcsDeployerHandler::with_target`.
 **Must also fix (PR-2 codex adversarial review, all valid — deferred here
 because the real fixes need PR-3's wizard/bootstrap data, not surface patches):**
 
-1. **IAM preflight ↔ real-target verb parity.** `VALIDATED_IAM_VERBS`
-   (`credentials.rs`) + the bootstrap policy must cover every action
-   `RealEcsTarget` calls. Missing today: `ecs:DescribeServices`,
-   `ecs:RegisterTaskDefinition`, `ecs:DescribeTaskSets`, `ecs:DeleteTaskSet`,
-   `ecs:DeregisterTaskDefinition`, `elasticloadbalancing:DescribeTargetGroups`.
-   Otherwise a role passes `gtc op credentials requirements` yet fails on the
-   first real warm/cleanup. Add a test that the real-target operation list is a
-   subset of the validated/bootstrap verbs.
+1. **IAM preflight ↔ real-target verb parity (F3) — ✅ SHIPPED in PR-3a.**
+   `VALIDATED_IAM_VERBS` (`credentials.rs`) gained the 6 missing verbs
+   (`ecs:DescribeServices`, `ecs:RegisterTaskDefinition`, `ecs:DescribeTaskSets`,
+   `ecs:DeleteTaskSet`, `ecs:DeregisterTaskDefinition`,
+   `elasticloadbalancing:DescribeTargetGroups`); the bootstrap rules-pack renders
+   from the same list, so it is covered too. `real_target::REAL_ECS_TARGET_IAM_ACTIONS`
+   is now the authoritative runtime surface, with a test pinning it ⊆
+   `VALIDATED_IAM_VERBS` so a new SDK call without a matching verb fails CI.
 2. **Target-group identity, not a 60-char generated name.** `target_group`
    (`deployer.rs`) renders `gtc-tg-<dep_ulid>-<rev_ulid>` = 60 chars, over
    ELBv2's 32-char limit, AND nothing provisions a target group under a
@@ -157,12 +163,14 @@ because the real fixes need PR-3's wizard/bootstrap data, not surface patches):*
    topology) and preserve unrelated actions — or enforce one-deployment-per-
    listener when the ALB mirror is enabled. (PR-2 documents the current
    ownership constraint on the method.)
-4. **Idempotency under concurrent deploy.** `ensure_service` is describe-then-
-   create, a TOCTOU window: two `warm_revision` callers for the same deployment
-   race and one fails. ECS `CreateService` has no dedicated already-exists error
-   (a duplicate surfaces as `InvalidParameterException`), so honoring the seam's
-   idempotency contract means a `clientToken` on create (or matching that error)
-   — verify against real AWS in PR-4.
+4. **Idempotency under concurrent deploy — ✅ SHIPPED in PR-3a.**
+   `ensure_service` now passes a deterministic `clientToken` (UUID-form, derived
+   from the deployment ULID) on `CreateService`, so two `warm_revision` callers
+   for the same deployment dedupe instead of one failing — ECS `CreateService`
+   has no dedicated already-exists error (a duplicate surfaces as
+   `InvalidParameterException`). The describe-then-create stays as a fast path.
+   Cross-deploy aliasing within the ECS idempotency window is a PR-4 live-verify
+   note.
 
 ### PR-4 — Live-account proving ground (gated/manual E2E)
 Analogue of #364: bootstrap → warm on Fargate → traffic split → archive against a
