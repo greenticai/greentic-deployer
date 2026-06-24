@@ -312,9 +312,27 @@ because the real fixes need PR-3's wizard/bootstrap data, not surface patches):*
    Cross-deploy aliasing within the ECS idempotency window is a PR-4 live-verify
    note.
 
-### PR-4 — Live-account proving ground (gated/manual E2E)
+### PR-4 — Live-account proving ground (gated/manual E2E) — ✅ SHIPPED (gated skeleton)
 Analogue of #364: bootstrap → warm on Fargate → traffic split → archive against a
 real account, behind an explicit env gate. Not in the default CI matrix.
+
+`tests/aws_ecs_e2e.rs`: one sequential `#[test]` gated on `GREENTIC_AWS_E2E=1`,
+driving the real CLI verbs (`env create` → `env-packs add` the AWS-ECS deployer
+→ `bundles add`/`revisions stage`+`warm`/`traffic set` desired-state ceremony →
+`env apply-revision` live Fargate warm → `env apply-traffic` live ALB split →
+`env apply-revision` live teardown). Scope comes from `GTC_AWS_E2E_*` env vars
+(never a hardcoded account); the operator pre-provisions the cluster / ECR image
+/ ALB+listener+target-group pool / subnets+SGs / IAM roles. Runs as the ambient
+AWS chain (leave `assume_role_arn` unset). **Decision (this session): manual /
+operator-run, no CI job** — unlike the K8s E2E's free `kind` substrate, Fargate +
+ALB target-health has no free CI substrate (LocalStack ECS/Fargate is Pro-only
+and shallow), so a CI run would test the mock, not reality. Verified here: the
+test compiles clean under default features and **no-ops** without the gate
+(`cargo test --test aws_ecs_e2e` passes by skipping). NOT yet executed against a
+live account (none was available at authoring) — the first operator run is the
+source of its real pass evidence and clears the accumulated PR-4 live-verify
+notes (pool cold-start TOCTOU, two-deployment rule isolation, cross-deploy
+idempotency aliasing).
 
 ## Conformance gate (every PR)
 
