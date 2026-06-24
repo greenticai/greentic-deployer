@@ -303,6 +303,21 @@ impl EcsDeployTarget for RealEcsTarget {
         Ok(())
     }
 
+    /// Mirror the deployment's `TrafficSplit` onto the ALB by **replacing the
+    /// listener's default action** with a weighted forward across the
+    /// revisions' target groups.
+    ///
+    /// **Ownership model — one deployment per listener.** This writes the
+    /// listener's *default* action, so binding an `alb_listener_arn` hands that
+    /// listener's routing to the deployer: any pre-existing default / auth /
+    /// redirect action is replaced. `deployment_id` is carried on
+    /// [`ListenerRef`] but not yet used to scope the write, so serving multiple
+    /// deployments behind one listener would clobber siblings. Per-deployment
+    /// scoping (a `ModifyRule` rule keyed by a host/path condition, preserving
+    /// unrelated listener actions) needs the operator's routing topology and
+    /// lands with the construction wiring in the next slice (PR-3).
+    ///
+    /// [`ListenerRef`]: super::deploy_target::ListenerRef
     async fn apply_listener_weights(
         &self,
         listener: &ListenerRef,

@@ -132,6 +132,32 @@ API; the default handler target stays `UnconfiguredEcsTarget`.
 `wizard.qaspec.yaml` + `AwsEcsParams::from_answers`) and the client from the
 bound STS session — then injects it via `AwsEcsDeployerHandler::with_target`.
 
+**Must also fix (PR-2 codex adversarial review, all valid — deferred here
+because the real fixes need PR-3's wizard/bootstrap data, not surface patches):**
+
+1. **IAM preflight ↔ real-target verb parity.** `VALIDATED_IAM_VERBS`
+   (`credentials.rs`) + the bootstrap policy must cover every action
+   `RealEcsTarget` calls. Missing today: `ecs:DescribeServices`,
+   `ecs:RegisterTaskDefinition`, `ecs:DescribeTaskSets`, `ecs:DeleteTaskSet`,
+   `ecs:DeregisterTaskDefinition`, `elasticloadbalancing:DescribeTargetGroups`.
+   Otherwise a role passes `gtc op credentials requirements` yet fails on the
+   first real warm/cleanup. Add a test that the real-target operation list is a
+   subset of the validated/bootstrap verbs.
+2. **Target-group identity, not a 60-char generated name.** `target_group`
+   (`deployer.rs`) renders `gtc-tg-<dep_ulid>-<rev_ulid>` = 60 chars, over
+   ELBv2's 32-char limit, AND nothing provisions a target group under a
+   deployer-generated name. Switch to operator-provided target groups (ARNs, or
+   AWS-valid names ≤32 chars from the wizard/bootstrap) that `RealEcsTarget`
+   references — don't just shorten the generated name.
+3. **Per-deployment ALB scoping.** `apply_listener_weights` replaces the
+   listener's *default* action (whole-listener ownership), so multiple
+   deployments behind one `alb_listener_arn` clobber each other and any
+   sibling/auth/redirect action is discarded. Scope the write to a
+   per-deployment `ModifyRule` (host/path condition from the wizard's routing
+   topology) and preserve unrelated actions — or enforce one-deployment-per-
+   listener when the ALB mirror is enabled. (PR-2 documents the current
+   ownership constraint on the method.)
+
 ### PR-4 — Live-account proving ground (gated/manual E2E)
 Analogue of #364: bootstrap → warm on Fargate → traffic split → archive against a
 real account, behind an explicit env gate. Not in the default CI matrix.
