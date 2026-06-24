@@ -56,10 +56,42 @@ fn provider(err: EcsTargetError) -> DeployerError {
     DeployerError::Provider(err.to_string())
 }
 
+/// Per-binding Fargate launch config the real ECS target needs to stand up a
+/// task definition + task set, but which the per-revision seam specs
+/// deliberately do not carry (it is stable across a binding's revisions, not
+/// per-revision). Pure data (no aws-sdk types) so it lives in the always-
+/// compiled deployer module and is parsed by [`AwsEcsParams::from_answers`];
+/// the feature-gated `real_target` re-exports it and consumes it at
+/// `create_task_set`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FargateLaunchConfig {
+    /// IAM role the ECS agent assumes to pull the image + write logs.
+    pub execution_role_arn: String,
+    /// Optional IAM role the task's containers assume (app-level AWS access).
+    pub task_role_arn: Option<String>,
+    /// awsvpc subnets the Fargate ENIs attach to (at least one).
+    pub subnets: Vec<String>,
+    /// Security groups applied to the task ENIs.
+    pub security_groups: Vec<String>,
+    /// Whether tasks get a public IP (public subnets without a NAT need this to
+    /// reach ECR / the image registry).
+    pub assign_public_ip: bool,
+    /// Task-level CPU units (Fargate requires it at the task level), e.g. `256`.
+    pub cpu: String,
+    /// Task-level memory (MiB) as a string, e.g. `512`.
+    pub memory: String,
+    /// Logical container name in the task definition; also the `containerName`
+    /// the load balancer routes to.
+    pub container_name: String,
+    /// Port the container listens on / the target group forwards to.
+    pub container_port: i32,
+}
+
 /// Resolved scope for the AWS-ECS verbs, built from the binding's wizard
 /// answers (`None` → sandbox defaults). Holds the non-secret identifiers the
-/// verbs need; credential MATERIAL is never here (it rides the AWS chain in the
-/// real target).
+/// verbs need plus the per-binding real-target config (launch + target-group
+/// pool) the construction path consumes; credential MATERIAL is never here (it
+/// rides the bound STS session in the real target).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AwsEcsParams {
     /// AWS region the cluster lives in.
@@ -80,6 +112,16 @@ pub struct AwsEcsParams {
     /// bootstrap, and `op credentials bootstrap --bind` is rejected for this
     /// env. Read by the `--bind` STS minter, not the deploy verbs.
     pub assume_role_arn: Option<String>,
+    /// Per-binding Fargate launch config for the real ECS target. `None` when
+    /// the binding records no launch answers (sandbox / verb-only paths);
+    /// `Some` only when the complete required set is present (all-or-nothing).
+    /// Consumed by the construction path (PR-3c), not the verbs here.
+    pub launch: Option<FargateLaunchConfig>,
+    /// Operator-provided pool of pre-provisioned ALB target groups (ARNs or
+    /// names ≤32 chars) the real target assigns revisions to for blue/green
+    /// traffic shifting. Empty when the binding records no pool. Consumed by
+    /// the construction path (PR-3c), not the verbs here.
+    pub target_group_pool: Vec<String>,
 }
 
 /// Why a wizard answers blob could not be read into [`AwsEcsParams`].
@@ -91,6 +133,10 @@ pub enum AwsEcsParamsError {
     NotAString(String),
     #[error("unknown answer key `{0}`")]
     UnknownKey(String),
+    #[error("answer `{key}` is invalid: {detail}")]
+    Invalid { key: String, detail: String },
+    #[error("launch config is incomplete: `{field}` is required")]
+    MissingLaunchField { field: String },
 }
 
 fn answer_string(key: &str, value: &Value) -> Result<String, AwsEcsParamsError> {
@@ -98,6 +144,151 @@ fn answer_string(key: &str, value: &Value) -> Result<String, AwsEcsParamsError> 
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| AwsEcsParamsError::NotAString(key.to_string()))
+}
+
+/// Split a comma-separated string answer into trimmed, non-empty entries.
+fn csv_list(key: &str, value: &Value) -> Result<Vec<String>, AwsEcsParamsError> {
+    Ok(answer_string(key, value)?
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Parse a `"true"` / `"false"` string answer (the `assign_public_ip` enum) to
+/// a bool.
+fn parse_bool(key: &str, value: &Value) -> Result<bool, AwsEcsParamsError> {
+    match answer_string(key, value)?.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(AwsEcsParamsError::Invalid {
+            key: key.to_string(),
+            detail: format!("expected `true` or `false`, got `{other}`"),
+        }),
+    }
+}
+
+/// Parse a container-port string answer to an `i32` in the valid TCP range.
+fn parse_port(key: &str, value: &Value) -> Result<i32, AwsEcsParamsError> {
+    let raw = answer_string(key, value)?;
+    let port: i32 = raw.parse().map_err(|_| AwsEcsParamsError::Invalid {
+        key: key.to_string(),
+        detail: format!("`{raw}` is not an integer"),
+    })?;
+    if (1..=65535).contains(&port) {
+        Ok(port)
+    } else {
+        Err(AwsEcsParamsError::Invalid {
+            key: key.to_string(),
+            detail: format!("port {port} is outside 1..=65535"),
+        })
+    }
+}
+
+/// Parse the `target_group_arns` pool: comma-separated entries, each an ELBv2
+/// target-group ARN or a name (≤32 chars, the ELBv2 name limit). The minimum
+/// pool size for blue/green and free-slot assignment is enforced by the real
+/// target (PR-3c construction wiring), not here — this only validates the
+/// per-entry identity shape so a malformed pool fails at parse time.
+fn parse_target_group_pool(value: &Value) -> Result<Vec<String>, AwsEcsParamsError> {
+    let key = "target_group_arns";
+    let pool = csv_list(key, value)?;
+    if pool.is_empty() {
+        return Err(AwsEcsParamsError::Invalid {
+            key: key.to_string(),
+            detail: "target-group pool is present but empty".to_string(),
+        });
+    }
+    for entry in &pool {
+        if !valid_target_group_identity(entry) {
+            return Err(AwsEcsParamsError::Invalid {
+                key: key.to_string(),
+                detail: format!(
+                    "`{entry}` is neither an ELBv2 target-group ARN nor a valid \
+                     name (≤32 chars, alphanumeric/hyphen, not starting with `-`)"
+                ),
+            });
+        }
+    }
+    Ok(pool)
+}
+
+/// True for an ELBv2 target-group ARN or a valid target-group name.
+fn valid_target_group_identity(s: &str) -> bool {
+    if s.starts_with("arn:aws:elasticloadbalancing:") && s.contains(":targetgroup/") {
+        return true;
+    }
+    !s.is_empty()
+        && s.len() <= 32
+        && !s.starts_with('-')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Optional launch-config fields gathered from the answers loop, assembled into
+/// a [`FargateLaunchConfig`] all-or-nothing by [`LaunchFields::build`].
+#[derive(Default)]
+struct LaunchFields {
+    execution_role_arn: Option<String>,
+    task_role_arn: Option<String>,
+    subnets: Option<Vec<String>>,
+    security_groups: Option<Vec<String>>,
+    assign_public_ip: Option<bool>,
+    cpu: Option<String>,
+    memory: Option<String>,
+    container_name: Option<String>,
+    container_port: Option<i32>,
+}
+
+impl LaunchFields {
+    /// Assemble the launch config. Returns `None` when no launch field was
+    /// supplied (verb-only blobs), `Some` when the required set
+    /// (`execution_role_arn` + `subnets` + `security_groups`) is complete, and
+    /// an error when only a partial set is present. CPU / memory / container
+    /// name / port / public-IP default to the wizard's defaults when omitted.
+    fn build(self) -> Result<Option<FargateLaunchConfig>, AwsEcsParamsError> {
+        let any = self.execution_role_arn.is_some()
+            || self.task_role_arn.is_some()
+            || self.subnets.is_some()
+            || self.security_groups.is_some()
+            || self.assign_public_ip.is_some()
+            || self.cpu.is_some()
+            || self.memory.is_some()
+            || self.container_name.is_some()
+            || self.container_port.is_some();
+        if !any {
+            return Ok(None);
+        }
+        let execution_role_arn = self
+            .execution_role_arn
+            .ok_or_else(missing("execution_role_arn"))?;
+        let subnets = self
+            .subnets
+            .filter(|s| !s.is_empty())
+            .ok_or_else(missing("subnets"))?;
+        let security_groups = self
+            .security_groups
+            .filter(|s| !s.is_empty())
+            .ok_or_else(missing("security_groups"))?;
+        Ok(Some(FargateLaunchConfig {
+            execution_role_arn,
+            task_role_arn: self.task_role_arn,
+            subnets,
+            security_groups,
+            assign_public_ip: self.assign_public_ip.unwrap_or(false),
+            cpu: self.cpu.unwrap_or_else(|| "256".to_string()),
+            memory: self.memory.unwrap_or_else(|| "512".to_string()),
+            container_name: self.container_name.unwrap_or_else(|| "worker".to_string()),
+            container_port: self.container_port.unwrap_or(8080),
+        }))
+    }
+}
+
+/// Closure building a [`AwsEcsParamsError::MissingLaunchField`] for `field`.
+fn missing(field: &'static str) -> impl Fn() -> AwsEcsParamsError {
+    move || AwsEcsParamsError::MissingLaunchField {
+        field: field.to_string(),
+    }
 }
 
 impl AwsEcsParams {
@@ -114,6 +305,8 @@ impl AwsEcsParams {
             image_tag_prefix: DEFAULT_IMAGE_TAG_PREFIX.to_string(),
             listener_arn: None,
             assume_role_arn: None,
+            launch: None,
+            target_group_pool: Vec::new(),
         }
     }
 
@@ -125,6 +318,14 @@ impl AwsEcsParams {
     /// reads it); `aws_profile` is validated as a string and accepted so a full
     /// binding's answers deserialize, but is consumed by the SDK client builder
     /// in a later slice, not by these verbs.
+    ///
+    /// The Fargate launch-config keys (`execution_role_arn`, `subnets`, …) and
+    /// the `target_group_arns` pool are parsed here too — every known key has
+    /// exactly one home so deny-by-default stays coherent across the verbs and
+    /// the construction path. The launch config is all-or-nothing: present only
+    /// when its complete required set is supplied (so verb-only blobs that omit
+    /// it parse to [`None`]); a partial set is an error rather than a silent
+    /// half-config.
     pub fn from_answers(
         env: &Environment,
         answers: Option<&Value>,
@@ -134,6 +335,9 @@ impl AwsEcsParams {
             return Ok(params);
         };
         let obj = answers.as_object().ok_or(AwsEcsParamsError::NotAnObject)?;
+        // Launch-config fields are gathered here and assembled after the loop
+        // (all-or-nothing — see `build_launch`).
+        let mut launch = LaunchFields::default();
         for (key, value) in obj {
             match key.as_str() {
                 "region" => params.region = answer_string(key, value)?,
@@ -147,9 +351,22 @@ impl AwsEcsParams {
                 "aws_profile" => {
                     answer_string(key, value)?;
                 }
+                "execution_role_arn" => {
+                    launch.execution_role_arn = Some(answer_string(key, value)?)
+                }
+                "task_role_arn" => launch.task_role_arn = Some(answer_string(key, value)?),
+                "subnets" => launch.subnets = Some(csv_list(key, value)?),
+                "security_groups" => launch.security_groups = Some(csv_list(key, value)?),
+                "assign_public_ip" => launch.assign_public_ip = Some(parse_bool(key, value)?),
+                "cpu" => launch.cpu = Some(answer_string(key, value)?),
+                "memory" => launch.memory = Some(answer_string(key, value)?),
+                "container_name" => launch.container_name = Some(answer_string(key, value)?),
+                "container_port" => launch.container_port = Some(parse_port(key, value)?),
+                "target_group_arns" => params.target_group_pool = parse_target_group_pool(value)?,
                 other => return Err(AwsEcsParamsError::UnknownKey(other.to_string())),
             }
         }
+        params.launch = launch.build()?;
         Ok(params)
     }
 
@@ -837,5 +1054,163 @@ mod tests {
         let answers = serde_json::json!("not an object");
         let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
         assert!(matches!(err, AwsEcsParamsError::NotAnObject));
+    }
+
+    // ---- Fargate launch config + target-group pool (PR-3c) --------------
+
+    /// A complete launch set parses into `Some(FargateLaunchConfig)`, splitting
+    /// the comma lists and parsing the typed fields; the pool is captured.
+    #[test]
+    fn from_answers_parses_full_launch_config_and_target_group_pool() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "execution_role_arn": "arn:aws:iam::111122223333:role/exec",
+            "task_role_arn": "arn:aws:iam::111122223333:role/task",
+            "subnets": "subnet-aaaa, subnet-bbbb",
+            "security_groups": "sg-1111,sg-2222",
+            "assign_public_ip": "true",
+            "cpu": "512",
+            "memory": "1024",
+            "container_name": "worker",
+            "container_port": "9090",
+            "target_group_arns": "tg-blue,tg-green",
+        });
+        let params = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap();
+        let launch = params.launch.expect("complete launch set parses to Some");
+        assert_eq!(
+            launch.execution_role_arn,
+            "arn:aws:iam::111122223333:role/exec"
+        );
+        assert_eq!(
+            launch.task_role_arn.as_deref(),
+            Some("arn:aws:iam::111122223333:role/task")
+        );
+        // Comma lists are split and trimmed.
+        assert_eq!(launch.subnets, ["subnet-aaaa", "subnet-bbbb"]);
+        assert_eq!(launch.security_groups, ["sg-1111", "sg-2222"]);
+        assert!(launch.assign_public_ip);
+        assert_eq!(launch.cpu, "512");
+        assert_eq!(launch.memory, "1024");
+        assert_eq!(launch.container_name, "worker");
+        assert_eq!(launch.container_port, 9090);
+        assert_eq!(params.target_group_pool, ["tg-blue", "tg-green"]);
+    }
+
+    /// The minimum required launch set yields the wizard's defaults for the
+    /// optional fields.
+    #[test]
+    fn from_answers_defaults_optional_launch_fields() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "execution_role_arn": "arn:aws:iam::111122223333:role/exec",
+            "subnets": "subnet-aaaa",
+            "security_groups": "sg-1111",
+        });
+        let launch = AwsEcsParams::from_answers(&env, Some(&answers))
+            .unwrap()
+            .launch
+            .expect("required launch set parses to Some");
+        assert_eq!(launch.task_role_arn, None);
+        assert!(!launch.assign_public_ip);
+        assert_eq!(launch.cpu, "256");
+        assert_eq!(launch.memory, "512");
+        assert_eq!(launch.container_name, "worker");
+        assert_eq!(launch.container_port, 8080);
+    }
+
+    /// A partial launch set (execution role without subnets) is an error, not a
+    /// silent half-config.
+    #[test]
+    fn from_answers_rejects_partial_launch_config() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "execution_role_arn": "arn:aws:iam::111122223333:role/exec",
+            "security_groups": "sg-1111",
+        });
+        let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(matches!(
+            err,
+            AwsEcsParamsError::MissingLaunchField { field } if field == "subnets"
+        ));
+    }
+
+    /// Launch fields without the anchor execution role fail loudly.
+    #[test]
+    fn from_answers_rejects_launch_fields_without_execution_role() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "subnets": "subnet-aaaa",
+            "security_groups": "sg-1111",
+        });
+        let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(matches!(
+            err,
+            AwsEcsParamsError::MissingLaunchField { field } if field == "execution_role_arn"
+        ));
+    }
+
+    #[test]
+    fn from_answers_rejects_out_of_range_container_port() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "execution_role_arn": "arn:aws:iam::111122223333:role/exec",
+            "subnets": "subnet-aaaa",
+            "security_groups": "sg-1111",
+            "container_port": "70000",
+        });
+        let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(matches!(
+            err,
+            AwsEcsParamsError::Invalid { key, .. } if key == "container_port"
+        ));
+    }
+
+    #[test]
+    fn from_answers_rejects_invalid_assign_public_ip() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "execution_role_arn": "arn:aws:iam::111122223333:role/exec",
+            "subnets": "subnet-aaaa",
+            "security_groups": "sg-1111",
+            "assign_public_ip": "yes",
+        });
+        let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(matches!(
+            err,
+            AwsEcsParamsError::Invalid { key, .. } if key == "assign_public_ip"
+        ));
+    }
+
+    /// The pool accepts ELBv2 ARNs and ≤32-char names, and rejects a malformed
+    /// entry.
+    #[test]
+    fn from_answers_validates_target_group_pool_entries() {
+        let env = build_fixture_env();
+        let arn = "arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/blue/abc123";
+        let ok = serde_json::json!({ "target_group_arns": format!("{arn},green-tg") });
+        let pool = AwsEcsParams::from_answers(&env, Some(&ok))
+            .unwrap()
+            .target_group_pool;
+        assert_eq!(pool, [arn, "green-tg"]);
+
+        // An entry that is neither an ARN nor a valid name (>32 chars) is rejected.
+        let too_long = "g".repeat(33);
+        let bad = serde_json::json!({ "target_group_arns": too_long });
+        let err = AwsEcsParams::from_answers(&env, Some(&bad)).unwrap_err();
+        assert!(matches!(
+            err,
+            AwsEcsParamsError::Invalid { key, .. } if key == "target_group_arns"
+        ));
+    }
+
+    #[test]
+    fn from_answers_rejects_empty_target_group_pool() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({ "target_group_arns": "  ,  " });
+        let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(matches!(
+            err,
+            AwsEcsParamsError::Invalid { key, detail } if key == "target_group_arns" && detail.contains("empty")
+        ));
     }
 }
