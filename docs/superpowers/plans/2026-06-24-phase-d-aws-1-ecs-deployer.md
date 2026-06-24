@@ -191,6 +191,17 @@ target-group pool, F1 = per-deployment `ModifyRule`):**
     surgical live verb mirroring `apply-revision` that reads the recorded split
     and pushes ALB listener weights; `op traffic set` stays spec-only. AWS is
     imperative — NOT reconcile.
+    - **Cross-deployment pool exclusivity (PR-3c-2a codex finding, high).** The
+      stateless allocator reads `describe_task_sets` per ECS service, so it is
+      exclusive *within* a deployment but blind across deployments sharing one
+      binding pool — two deployments could be handed the same target group.
+      PR-3c-2a already rejects a *duplicate* TG within one pool (`pool_arns_from`)
+      and documents the boundary; this wiring slice must enforce a
+      **deployment-scoped pool** (each deployment validates it owns ≥2 distinct
+      TGs no sibling draws from) when the pool meets a deployment. A
+      CAS/persisted lease is explicitly OUT — it contradicts the user's stateless
+      F2 choice. The same-service concurrent-warm race stays a PR-4 live-verify
+      note (the deploy path warms a deployment's revisions sequentially).
 - **PR-3c-3:** the **F1 fix** — per-deployment ALB `ModifyRule` (host/path
   condition from a new wizard routing answer), preserving the default action +
   sibling rules so multiple deployments coexist behind one listener.

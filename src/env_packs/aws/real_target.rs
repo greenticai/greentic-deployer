@@ -32,6 +32,22 @@
 //! same bindings (`bound_target_group`) to route each weighted revision to its
 //! TG, so the binding on the task set is the single source of truth.
 //!
+//! **Exclusivity boundary.** `assigned_pool_members` reads `describe_task_sets`,
+//! which is scoped to one deployment's service, so assignment is exclusive
+//! *within a deployment* — each revision sees its siblings' bindings and skips
+//! them. It does NOT span deployments: two deployments drawing from the same
+//! pool through different ECS services cannot see each other's assignments, so a
+//! shared pool could hand both the same target group. The pool must therefore be
+//! sized/scoped so deployments don't contend; enforcing a deployment-scoped pool
+//! is a wiring-time concern handled where the pool meets a deployment
+//! (PR-3c-2b), not at this stateless mechanism. A *duplicate* target group
+//! within one pool is a config error that guarantees a self-collision and is
+//! rejected at resolve time (`pool_arns_from`). The same-service
+//! concurrent-warm race (two distinct revisions both seeing a TG free) is
+//! inherent to the stateless model — the deploy path warms a deployment's
+//! revisions sequentially; closing it durably would require a claim/lease that
+//! contradicts the stateless design (a PR-4 live-verify note).
+//!
 //! ## Identity bridge
 //!
 //! The seam addresses task sets by `(deployment_id, revision_id)`; ECS assigns
@@ -642,7 +658,8 @@ fn pool_arns_from(
     pool: &[String],
     resolved: &HashMap<String, String>,
 ) -> Result<Vec<String>, EcsTargetError> {
-    pool.iter()
+    let arns: Vec<String> = pool
+        .iter()
         .map(|entry| {
             if entry.starts_with("arn:") {
                 Ok(entry.clone())
@@ -654,7 +671,27 @@ fn pool_arns_from(
                 })
             }
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    // A target group repeated in the pool (the same ARN twice, or a name that
+    // resolves to an already-listed ARN) guarantees two revisions get assigned
+    // the same TG — defeating the blue/green isolation the split relies on.
+    // Reject it as a config error rather than silently halving the usable pool.
+    if let Some(dup) = first_duplicate(&arns) {
+        return Err(EcsTargetError::Api(format!(
+            "target group `{dup}` appears more than once in the pool; each pool member \
+             must be a distinct target group"
+        )));
+    }
+    Ok(arns)
+}
+
+/// The first value that repeats in `arns` (in order), or `None` when every
+/// entry is distinct.
+fn first_duplicate(arns: &[String]) -> Option<&str> {
+    let mut seen = std::collections::HashSet::new();
+    arns.iter()
+        .find(|a| !seen.insert(a.as_str()))
+        .map(String::as_str)
 }
 
 /// Map DescribeTargetGroups → `name → ARN`. Skips entries missing either field.
@@ -1052,19 +1089,15 @@ mod tests {
     /// against the lookup map (preserving order), and errors on an unknown name.
     #[test]
     fn pool_arns_from_resolves_names_passes_arns_and_errors_on_unknown() {
-        let resolved = HashMap::from([("green-tg".to_string(), "arn-green".to_string())]);
-        let pool = vec![
-            "arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/blue/1".to_string(),
-            "green-tg".to_string(),
-        ];
+        const BLUE: &str = "arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/blue/1";
+        const GREEN: &str =
+            "arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/green/2";
+        let resolved = HashMap::from([("green-tg".to_string(), GREEN.to_string())]);
+
+        // ARN passes through; name resolves; order preserved.
         assert_eq!(
-            pool_arns_from(&pool, &resolved).unwrap(),
-            vec![
-                "arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/blue/1"
-                    .to_string(),
-                "arn-green".to_string(),
-            ],
-            "ARN passes through; name resolves; order preserved"
+            pool_arns_from(&[BLUE.to_string(), "green-tg".to_string()], &resolved).unwrap(),
+            vec![BLUE.to_string(), GREEN.to_string()],
         );
 
         let missing = vec!["typo-tg".to_string()];
@@ -1072,6 +1105,31 @@ mod tests {
             pool_arns_from(&missing, &resolved).is_err(),
             "an unresolved name must error, not silently shrink the pool"
         );
+
+        // A duplicate target group (here a name resolving to an already-listed
+        // ARN) is a config error — it would assign two revisions the same TG.
+        let dup = vec![GREEN.to_string(), "green-tg".to_string()];
+        assert!(
+            pool_arns_from(&dup, &resolved).is_err(),
+            "a target group repeated in the pool must be rejected"
+        );
+        assert!(
+            pool_arns_from(&[BLUE.to_string(), GREEN.to_string()], &resolved).is_ok(),
+            "a pool of distinct ARNs is accepted"
+        );
+    }
+
+    #[test]
+    fn first_duplicate_finds_the_first_repeat_in_order() {
+        assert_eq!(
+            first_duplicate(&["a".to_string(), "b".to_string(), "a".to_string()]),
+            Some("a")
+        );
+        assert_eq!(
+            first_duplicate(&["a".to_string(), "b".to_string(), "c".to_string()]),
+            None
+        );
+        assert_eq!(first_duplicate(&[]), None);
     }
 
     /// `weighted_target_groups` maps each weighted revision to its task set's
