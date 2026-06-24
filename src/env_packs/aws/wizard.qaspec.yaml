@@ -129,6 +129,31 @@ questions:
     constraint:
       pattern: '^arn:aws:elasticloadbalancing:[a-z0-9-]+:[0-9]{12}:listener/.+$'
 
+  - id: alb_routing_host
+    type: string
+    title: ALB routing — host header (optional)
+    description: >-
+      Host header that scopes this deployment to its own listener rule, so
+      several deployments coexist behind one `alb_listener_arn` instead of
+      fighting over the listener's default action (e.g. `app.example.com`).
+      Set this and/or the path pattern to route per deployment; leave both
+      blank to let this deployment own the listener's default action (one
+      deployment per listener — the legacy behaviour).
+    required: false
+    constraint:
+      min_len: 1
+
+  - id: alb_routing_path
+    type: string
+    title: ALB routing — path pattern (optional)
+    description: >-
+      URL path pattern that scopes this deployment to its own listener rule
+      (e.g. `/app/*`). AND-combined with the host header when both are set.
+      Leave both blank to own the listener's default action.
+    required: false
+    constraint:
+      pattern: '^/.*'
+
   - id: container_image_tag_prefix
     type: string
     title: Container image tag prefix

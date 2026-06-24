@@ -1213,11 +1213,12 @@ pub fn apply_traffic(
     };
     let (answers, _answers_ref_wire) = load_render_answers(store, &env, &descriptor)?;
 
-    // NOTE: `apply_traffic_split` currently REPLACES the listener's default
-    // action (whole-listener ownership), so this assumes the `alb_listener_arn`
-    // is dedicated to this deployment — see the `op env apply-traffic` help
-    // WARNING. Per-deployment ALB rules (so deployments coexist behind one
-    // listener) are a tracked follow-up (the F1 fix).
+    // NOTE: when the binding records an ALB routing condition
+    // (`alb_routing_host` / `alb_routing_path`), `apply_traffic_split` writes a
+    // per-deployment listener rule so deployments coexist behind one listener;
+    // with no routing condition it REPLACES the listener's default action
+    // (whole-listener ownership), assuming the `alb_listener_arn` is dedicated to
+    // this deployment — see the `op env apply-traffic` help WARNING.
     let (identity, outcome) =
         apply_traffic_aws_ecs(store, &env, &env_id, deployment_id, answers.as_ref())?;
 

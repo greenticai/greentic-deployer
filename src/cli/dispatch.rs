@@ -337,11 +337,14 @@ pub enum EnvVerb {
     /// `op traffic set` alone suffices there. The split itself is recorded by
     /// `op traffic set`; this verb makes it observable in the live runtime.
     ///
-    /// WARNING: today this REPLACES the listener's default action, so it assumes
-    /// the binding's `alb_listener_arn` is DEDICATED to this one deployment —
-    /// applying a split clobbers any sibling deployment routing / auth / redirect
-    /// on that listener. Per-deployment listener rules (so deployments coexist
-    /// behind one listener) land in a follow-up slice.
+    /// Routing depends on the binding's ALB routing answers. With a routing
+    /// condition set (`alb_routing_host` / `alb_routing_path`), this writes a
+    /// per-deployment listener RULE keyed by that host/path, leaving the default
+    /// action and sibling deployments' rules intact — deployments coexist behind
+    /// one listener. With NO routing condition, it falls back to REPLACING the
+    /// listener's default action, which assumes the `alb_listener_arn` is
+    /// DEDICATED to this one deployment (a split then clobbers any sibling
+    /// routing / auth / redirect on that listener).
     ApplyTraffic(EnvApplyTrafficArgs),
     Destroy {
         env_id: String,

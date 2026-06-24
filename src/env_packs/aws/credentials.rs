@@ -10,7 +10,10 @@
 //!   list ([`VALIDATED_IAM_VERBS`]) covers the full ECS task-set rollout
 //!   surface that `RealEcsTarget` exercises (DescribeServices / CreateService,
 //!   RegisterTaskDefinition / CreateTaskSet / DescribeTaskSets, DeleteTaskSet /
-//!   DeregisterTaskDefinition, DescribeTargetGroups / ModifyListener) plus this
+//!   DeregisterTaskDefinition, DescribeTargetGroups, and the ELB traffic-shift
+//!   verbs — ModifyListener for the legacy default-action path,
+//!   DescribeRules / CreateRule / ModifyRule for per-deployment listener rules)
+//!   plus this
 //!   handler's STS/IAM self-probes, `iam:PassRole`, and `ecr:PutImage` staging.
 //!   Keeping the list in parity with the real target's runtime calls means a
 //!   role that passes `gtc op credentials requirements` does not then fail on
@@ -102,8 +105,13 @@ pub const VALIDATED_IAM_VERBS: &[&str] = &[
     "ecr:PutImage",
     "iam:PassRole",
     // ELBv2 weighted traffic shifting across the revisions' target groups.
+    // ModifyListener serves the legacy default-action path (one deployment per
+    // listener); the rule verbs serve the per-deployment routing path.
     "elasticloadbalancing:DescribeTargetGroups",
     "elasticloadbalancing:ModifyListener",
+    "elasticloadbalancing:DescribeRules",
+    "elasticloadbalancing:CreateRule",
+    "elasticloadbalancing:ModifyRule",
 ];
 
 /// Returns the canonical capability ID for an IAM verb.
