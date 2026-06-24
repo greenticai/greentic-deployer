@@ -792,22 +792,20 @@ pub fn apply_revision(
 
     let descriptor = resolve_live_deployer_kind(&env, args.kind.as_deref())?;
 
-    // Same K8s-only gate as reconcile: applying manifests to a live cluster is
-    // K8s-specific today. This "is the verb applicable to this env" check runs
-    // before the per-revision lookup so a non-K8s env rejects regardless of the
-    // revision arg.
-    let k8s_path = crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
-    if descriptor.path() != k8s_path {
-        return Err(OpError::Conflict(format!(
-            "env apply-revision is only supported for the `{k8s_path}` deployer env-pack \
-             today; `{}` cannot be applied to a live cluster",
-            descriptor.path()
-        )));
-    }
-    // Parity with reconcile: confirm the kind is actually registered.
+    // Confirm the kind is actually registered (parity with reconcile).
     let _handler = registry
         .resolve_for_slot(CapabilitySlot::Deployer, &descriptor)
         .map_err(|e| OpError::Conflict(e.to_string()))?;
+
+    // Applicability gate, BEFORE the per-revision lookup so an unsupported
+    // deployer kind rejects regardless of the revision arg: K8s (applies
+    // manifests to a cluster) and AWS-ECS (drives task sets) have live apply
+    // paths; any other registered deployer (e.g. local-process) does not.
+    let k8s_path = crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
+    let is_k8s = descriptor.path() == k8s_path;
+    if !is_k8s && !is_aws_ecs_kind(&descriptor) {
+        return Err(unsupported_apply_kind(&descriptor));
+    }
 
     let revision_id = {
         use std::str::FromStr;
@@ -827,26 +825,40 @@ pub fn apply_revision(
 
     let (answers, answers_ref_wire) = load_render_answers(store, &env, &descriptor)?;
 
-    // Present → apply the worker pair (warm); absent → tear it down (archive).
-    // Same B7 two-state presence model the renderer and reconcile use.
+    // Present → apply the worker resources (warm); absent → tear them down
+    // (archive). Same B7 two-state presence model the renderer and reconcile
+    // use; the lifecycle→presence predicate is backend-agnostic.
     let present = crate::env_packs::k8s::manifests::has_cluster_presence(revision.lifecycle);
     let action = if present { "warmed" } else { "archived" };
-    let worker_name = crate::env_packs::k8s::manifests::worker_name(revision);
     let lifecycle = revision.lifecycle;
 
-    // Same credential resolution as `reconcile`: bound ServiceAccount bearer
-    // when the env declares one, else the ambient identity (fail-closed if a
-    // ref is bound but unresolvable). Includes the in-cluster identity-Secret
-    // fallback for a fresh operator machine.
-    let bound_token =
-        crate::env_packs::k8s::resolve_bound_identity(store, &env, &env_id, answers.as_ref())?;
-    let identity = if bound_token.is_some() {
-        "bound"
+    // Backend dispatch: connect as the bound identity (fail-closed when a ref is
+    // bound but unresolvable, never a silent ambient fall-back) and drive the
+    // single revision's verb. Returns the identity used + the live resource name
+    // (K8s worker Deployment / ECS service) for the outcome. The applicability
+    // gate above guarantees the `else` arm is AWS-ECS.
+    let (identity, worker_name): (&'static str, String) = if is_k8s {
+        let worker_name = crate::env_packs::k8s::manifests::worker_name(revision);
+        let bound_token =
+            crate::env_packs::k8s::resolve_bound_identity(store, &env, &env_id, answers.as_ref())?;
+        let identity = if bound_token.is_some() {
+            "bound"
+        } else {
+            "ambient"
+        };
+        apply_revision_k8s_cluster(&env, revision_id, present, answers.as_ref(), bound_token)?;
+        (identity, worker_name)
     } else {
-        "ambient"
+        apply_revision_non_k8s(
+            store,
+            &env,
+            &env_id,
+            revision_id,
+            present,
+            answers.as_ref(),
+            &descriptor,
+        )?
     };
-
-    apply_revision_k8s_cluster(&env, revision_id, present, answers.as_ref(), bound_token)?;
 
     Ok(OpOutcome::new(
         NOUN,
@@ -919,6 +931,372 @@ fn apply_revision_k8s_cluster(
     Err(OpError::Conflict(
         "this build was compiled without the `k8s-client` feature; \
          `op env apply-revision` needs it to connect to a cluster"
+            .to_string(),
+    ))
+}
+
+/// True when the descriptor is the AWS-ECS deployer kind. `false` on builds
+/// without the AWS env-pack compiled in (`creds-aws` off) — the kind cannot be
+/// served, so the applicability gate rejects it.
+#[cfg(feature = "creds-aws")]
+fn is_aws_ecs_kind(descriptor: &greentic_deploy_spec::PackDescriptor) -> bool {
+    descriptor.path() == crate::env_packs::aws::AwsEcsDeployerHandler::DESCRIPTOR_PATH
+}
+
+#[cfg(not(feature = "creds-aws"))]
+fn is_aws_ecs_kind(_descriptor: &greentic_deploy_spec::PackDescriptor) -> bool {
+    false
+}
+
+/// Conflict for a deployer kind with no live single-revision apply path
+/// (anything other than K8s / AWS-ECS — e.g. the local-process deployer, which
+/// runs in-process and has nothing to apply to a remote target).
+fn unsupported_apply_kind(descriptor: &greentic_deploy_spec::PackDescriptor) -> OpError {
+    OpError::Conflict(format!(
+        "env apply-revision is only supported for the `{}` (K8s) and \
+         `greentic.deployer.aws-ecs` (AWS-ECS) deployer env-packs today; `{}` has no live \
+         single-revision apply path",
+        crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH,
+        descriptor.path()
+    ))
+}
+
+/// Dispatch `apply-revision` for a non-K8s deployer. Today only the AWS-ECS
+/// env-pack has a live deploy path; every other registered kind is rejected.
+/// Returns `(identity, worker_name)` — the AWS analogue of the K8s
+/// `(bound|ambient, worker Deployment name)`.
+#[cfg(feature = "creds-aws")]
+#[allow(clippy::too_many_arguments)]
+fn apply_revision_non_k8s(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    revision_id: RevisionId,
+    present: bool,
+    answers: Option<&Value>,
+    descriptor: &greentic_deploy_spec::PackDescriptor,
+) -> Result<(&'static str, String), OpError> {
+    if descriptor.path() != crate::env_packs::aws::AwsEcsDeployerHandler::DESCRIPTOR_PATH {
+        return Err(unsupported_apply_kind(descriptor));
+    }
+    apply_revision_aws_ecs(store, env, env_id, revision_id, present, answers)
+}
+
+#[cfg(not(feature = "creds-aws"))]
+#[allow(clippy::too_many_arguments)]
+fn apply_revision_non_k8s(
+    _store: &LocalFsStore,
+    _env: &Environment,
+    _env_id: &EnvId,
+    _revision_id: RevisionId,
+    _present: bool,
+    _answers: Option<&Value>,
+    descriptor: &greentic_deploy_spec::PackDescriptor,
+) -> Result<(&'static str, String), OpError> {
+    Err(unsupported_apply_kind(descriptor))
+}
+
+/// Fail-closed identity guard: a binding that pins a deployer role to assume
+/// (`assume_role_arn`) MUST have a bound session, else the live call would
+/// silently run as the ambient AWS identity — a tenant/account-isolation
+/// footgun (the role was configured but never assumed, i.e. `op env bootstrap
+/// --bind` was not run). `true` ⇒ refuse. (`aws_profile` honoring at deploy
+/// time is a separate, still-deferred SDK client-builder slice — the binding
+/// parser validates it but the verbs do not consume it yet.)
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+fn pinned_role_without_session(assume_role_arn: Option<&str>, session_present: bool) -> bool {
+    assume_role_arn.is_some() && !session_present
+}
+
+/// Resolve the bound deployer session, parse the AWS-ECS construction inputs,
+/// and enforce the fail-closed preconditions. Returns
+/// `(identity_label, session, launch, region, target_group_pool)` — everything
+/// `RealEcsTarget::resolve` needs plus the outcome's identity label. Shared by
+/// `apply-revision` and `apply-traffic` so both honor the same guards.
+///
+/// Fails closed (before any AWS call) when the binding pins `assume_role_arn`
+/// but no session is bound (`pinned_role_without_session`), and when the Fargate
+/// launch config is absent.
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+#[allow(clippy::type_complexity)]
+fn aws_ecs_target_inputs(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    answers: Option<&Value>,
+) -> Result<
+    (
+        &'static str,
+        Option<crate::env_packs::aws::credentials::AssumedSession>,
+        crate::env_packs::aws::real_target::FargateLaunchConfig,
+        String,
+        Vec<String>,
+    ),
+    OpError,
+> {
+    use crate::env_packs::aws::deployer::AwsEcsParams;
+
+    // Bound STS session when the env declares one, else the ambient chain
+    // (fail-closed if a ref is bound but unreadable). AWS analogue of the K8s
+    // bound-ServiceAccount bearer.
+    let session = crate::env_packs::aws::bound_session::resolve_bound_session(store, env, env_id)?;
+    let identity = if session.is_some() {
+        "bound"
+    } else {
+        "ambient"
+    };
+    let params = AwsEcsParams::from_answers(env, answers)
+        .map_err(|e| OpError::Conflict(format!("invalid aws-ecs binding answers: {e}")))?;
+    if pinned_role_without_session(params.assume_role_arn.as_deref(), session.is_some()) {
+        return Err(OpError::Conflict(
+            "the aws-ecs binding pins `assume_role_arn` (a deployer role to assume) but no bound \
+             deployer session was found — refusing to run as the ambient AWS identity. Mint the \
+             scoped session first with `op env bootstrap --bind` (or `op credentials rotate`)."
+                .to_string(),
+        ));
+    }
+    let launch = params.launch.ok_or_else(|| {
+        OpError::Conflict(
+            "the aws-ecs deployer binding has no Fargate launch config (needs execution_role_arn \
+             + subnets + security_groups); re-run the binding wizard before applying"
+                .to_string(),
+        )
+    })?;
+    Ok((
+        identity,
+        session,
+        launch,
+        params.region,
+        params.target_group_pool,
+    ))
+}
+
+/// Resolve the region-pinned AWS clients (with the bound session injected) and
+/// wrap them in a handler. Shared by the AWS verb dispatchers so the
+/// resolve + `with_target` boilerplate (and its error message) lives once.
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+async fn resolve_ecs_handler(
+    region: &str,
+    launch: crate::env_packs::aws::real_target::FargateLaunchConfig,
+    pool: Vec<String>,
+    session: Option<crate::env_packs::aws::credentials::AssumedSession>,
+) -> Result<crate::env_packs::aws::AwsEcsDeployerHandler, OpError> {
+    use crate::env_packs::aws::AwsEcsDeployerHandler;
+    use crate::env_packs::aws::real_target::RealEcsTarget;
+    use std::sync::Arc;
+
+    let target = RealEcsTarget::resolve(region, launch, pool, session)
+        .await
+        .map_err(|e| {
+            OpError::Conflict(format!(
+                "cannot initialize the AWS ECS deployer client: {e}"
+            ))
+        })?;
+    Ok(AwsEcsDeployerHandler::with_target(Arc::new(target)))
+}
+
+/// Connect to AWS and drive the single revision's ECS verb: `warm_revision`
+/// when present, `archive_revision` when absent (mirrors
+/// `apply_revision_k8s_cluster`). Returns `(identity, ECS service name)`.
+/// Requires the `deploy-aws-ecs` feature.
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+fn apply_revision_aws_ecs(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    revision_id: RevisionId,
+    present: bool,
+    answers: Option<&Value>,
+) -> Result<(&'static str, String), OpError> {
+    use crate::env_packs::aws::credentials::run_aws_async;
+    use crate::env_packs::aws::real_target::service_name;
+    use crate::env_packs::deployer::Deployer;
+
+    let revision = env
+        .revisions
+        .iter()
+        .find(|r| r.revision_id == revision_id)
+        .expect("revision presence checked by the caller");
+    let worker_name = service_name(&revision.deployment_id);
+    let (identity, session, launch, region, pool) =
+        aws_ecs_target_inputs(store, env, env_id, answers)?;
+
+    run_aws_async(async move {
+        let handler = resolve_ecs_handler(&region, launch, pool, session).await?;
+        if present {
+            handler
+                .warm_revision(env, revision_id, answers)
+                .await
+                .map_err(|e| OpError::Conflict(e.to_string()))?;
+        } else {
+            handler
+                .archive_revision(env, revision_id, answers)
+                .await
+                .map_err(|e| OpError::Conflict(e.to_string()))?;
+        }
+        Ok::<(), OpError>(())
+    })?;
+    Ok((identity, worker_name))
+}
+
+#[cfg(all(feature = "creds-aws", not(feature = "deploy-aws-ecs")))]
+fn apply_revision_aws_ecs(
+    _store: &LocalFsStore,
+    _env: &Environment,
+    _env_id: &EnvId,
+    _revision_id: RevisionId,
+    _present: bool,
+    _answers: Option<&Value>,
+) -> Result<(&'static str, String), OpError> {
+    Err(OpError::Conflict(
+        "this build was compiled without the `deploy-aws-ecs` feature; \
+         `op env apply-revision` for an aws-ecs env needs it to talk to AWS"
+            .to_string(),
+    ))
+}
+
+/// `op env apply-traffic <env_id> <deployment_id> [--kind <descriptor>]`.
+///
+/// Pushes the env's recorded traffic split for one deployment to the live ALB
+/// listener (AWS-ECS only). The split is recorded spec-only by `op traffic set`;
+/// this verb makes it observable in the live runtime — the AWS analogue of
+/// `apply-revision` for the routing side. K8s needs no such verb: its
+/// in-process router reads the split from runtime-config, so the runtime applies
+/// it without a deployer round-trip.
+pub fn apply_traffic(
+    store: &LocalFsStore,
+    registry: &crate::env_packs::EnvPackRegistry,
+    flags: &OpFlags,
+    args: super::dispatch::EnvApplyTrafficArgs,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(
+            NOUN,
+            "apply-traffic",
+            json!({
+                "input_schema": "env_id + deployment_id positional; --kind <path[@version]> \
+                 optional (defaults to the env's deployer binding)"
+            }),
+        ));
+    }
+    let env_id = EnvId::try_from(args.env_id.as_str())
+        .map_err(|e| OpError::InvalidArgument(format!("env_id: {e}")))?;
+    if !store.exists(&env_id)? {
+        return Err(OpError::NotFound(format!("environment `{env_id}`")));
+    }
+    let env = store.load(&env_id)?;
+    let descriptor = resolve_live_deployer_kind(&env, args.kind.as_deref())?;
+
+    // AWS-ECS only: the ALB listener is the live router, so the split must be
+    // pushed to it. K8s serves splits from its in-process router (runtime
+    // config), so there is no listener to write — `op traffic set` suffices.
+    // Gate on the typed-const-backed helper (not a literal) so the path can't
+    // drift from `AwsEcsDeployerHandler::DESCRIPTOR_PATH`.
+    if !is_aws_ecs_kind(&descriptor) {
+        return Err(OpError::Conflict(format!(
+            "env apply-traffic is only supported for the `greentic.deployer.aws-ecs` (AWS-ECS) \
+             deployer env-pack; `{}` serves traffic splits from its runtime router — record the \
+             split with `op traffic set` and the runtime applies it",
+            descriptor.path()
+        )));
+    }
+    // Parity with apply-revision: confirm the kind is registered.
+    let _handler = registry
+        .resolve_for_slot(CapabilitySlot::Deployer, &descriptor)
+        .map_err(|e| OpError::Conflict(e.to_string()))?;
+
+    let deployment_id = {
+        use std::str::FromStr;
+        let ulid = ulid::Ulid::from_str(&args.deployment_id)
+            .map_err(|e| OpError::InvalidArgument(format!("deployment_id: {e}")))?;
+        greentic_deploy_spec::DeploymentId(ulid)
+    };
+    let (answers, _answers_ref_wire) = load_render_answers(store, &env, &descriptor)?;
+
+    // NOTE: `apply_traffic_split` currently REPLACES the listener's default
+    // action (whole-listener ownership), so this assumes the `alb_listener_arn`
+    // is dedicated to this deployment — see the `op env apply-traffic` help
+    // WARNING. Per-deployment ALB rules (so deployments coexist behind one
+    // listener) are a tracked follow-up (the F1 fix).
+    let (identity, outcome) =
+        apply_traffic_aws_ecs(store, &env, &env_id, deployment_id, answers.as_ref())?;
+
+    Ok(OpOutcome::new(
+        NOUN,
+        "apply-traffic",
+        json!({
+            "environment_id": env.environment_id.as_str(),
+            "kind": descriptor.as_str(),
+            "deployment_id": deployment_id.to_string(),
+            // Identity the ALB was mutated as (see apply-revision).
+            "identity": identity,
+            // The split this call enforced (mirrors the env's recorded entries).
+            "applied_entries": outcome
+                .applied_entries
+                .iter()
+                .map(|e| {
+                    json!({
+                        "revision_id": e.revision_id.to_string(),
+                        "weight_bps": e.weight_bps,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }),
+    ))
+}
+
+/// Connect to AWS and push one deployment's recorded traffic split to its ALB
+/// listener via `apply_traffic_split` (a no-op live when no `alb_listener_arn`
+/// is configured — the recorded split's invariants are still enforced). Returns
+/// the identity used + the enforced split. Requires the `deploy-aws-ecs`
+/// feature.
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+fn apply_traffic_aws_ecs(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    deployment_id: greentic_deploy_spec::DeploymentId,
+    answers: Option<&Value>,
+) -> Result<
+    (
+        &'static str,
+        crate::env_packs::deployer::TrafficSplitOutcome,
+    ),
+    OpError,
+> {
+    use crate::env_packs::aws::credentials::run_aws_async;
+    use crate::env_packs::deployer::Deployer;
+
+    let (identity, session, launch, region, pool) =
+        aws_ecs_target_inputs(store, env, env_id, answers)?;
+
+    let outcome = run_aws_async(async move {
+        let handler = resolve_ecs_handler(&region, launch, pool, session).await?;
+        handler
+            .apply_traffic_split(env, deployment_id, answers)
+            .await
+            .map_err(|e| OpError::Conflict(e.to_string()))
+    })?;
+    Ok((identity, outcome))
+}
+
+#[cfg(not(all(feature = "creds-aws", feature = "deploy-aws-ecs")))]
+fn apply_traffic_aws_ecs(
+    _store: &LocalFsStore,
+    _env: &Environment,
+    _env_id: &EnvId,
+    _deployment_id: greentic_deploy_spec::DeploymentId,
+    _answers: Option<&Value>,
+) -> Result<
+    (
+        &'static str,
+        crate::env_packs::deployer::TrafficSplitOutcome,
+    ),
+    OpError,
+> {
+    Err(OpError::Conflict(
+        "this build was compiled without the `deploy-aws-ecs` feature; \
+         `op env apply-traffic` needs it to talk to AWS"
             .to_string(),
     ))
 }
@@ -3357,11 +3735,11 @@ mod tests {
         }
     }
 
-    /// A non-K8s deployer kind cannot be applied to a cluster — the verb
-    /// rejects at the applicability gate, before the per-revision lookup (so a
-    /// bogus revision id is irrelevant here).
+    /// A deployer kind with no live apply path (here: local-process) is
+    /// rejected at the applicability gate, before the per-revision lookup (so a
+    /// bogus revision id is irrelevant here). K8s and AWS-ECS are admitted.
     #[test]
-    fn apply_revision_rejects_non_k8s_deployer_kind() {
+    fn apply_revision_rejects_unsupported_deployer_kind() {
         use crate::cli::tests_common::make_binding;
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
@@ -3383,6 +3761,152 @@ mod tests {
             OpError::Conflict(msg) => assert!(msg.contains("only supported for"), "{msg}"),
             other => panic!("expected Conflict, got {other}"),
         }
+    }
+
+    /// The AWS-ECS deployer kind IS admitted past the applicability gate (the
+    /// PR-3c-2b live-wiring change): with a bogus revision id the verb now falls
+    /// through to the per-revision lookup and returns `NotFound`, where it
+    /// previously rejected the whole kind with a `Conflict`. Proves the gate no
+    /// longer hard-rejects AWS — no AWS call is reached (revision lookup fails
+    /// first), so the test is deterministic without credentials.
+    #[test]
+    fn apply_revision_admits_aws_ecs_kind() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.aws-ecs@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let err = apply_revision(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_revision_args("local", "00000000000000000000000000", None),
+        )
+        .unwrap_err();
+        match err {
+            OpError::NotFound(msg) => assert!(msg.contains("revision"), "{msg}"),
+            other => panic!("expected NotFound(revision), got {other}"),
+        }
+    }
+
+    // -- apply-traffic ------------------------------------------------------
+
+    use crate::cli::dispatch::EnvApplyTrafficArgs;
+
+    fn apply_traffic_args(
+        env_id: &str,
+        deployment_id: &str,
+        kind: Option<&str>,
+    ) -> EnvApplyTrafficArgs {
+        EnvApplyTrafficArgs {
+            env_id: env_id.to_string(),
+            deployment_id: deployment_id.to_string(),
+            kind: kind.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn apply_traffic_schema_only_returns_input_schema() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let flags = OpFlags {
+            schema_only: true,
+            ..OpFlags::default()
+        };
+        let outcome = apply_traffic(
+            &store,
+            &reg,
+            &flags,
+            apply_traffic_args("zain", "00000000000000000000000000", None),
+        )
+        .unwrap();
+        assert_eq!(outcome.op, "apply-traffic");
+        assert!(outcome.result.get("input_schema").is_some());
+    }
+
+    /// A non-AWS deployer (here: local-process) is rejected — K8s and the local
+    /// deployer serve splits from their runtime router, so there is no listener
+    /// for `apply-traffic` to push to.
+    #[test]
+    fn apply_traffic_rejects_non_aws_deployer_kind() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            crate::defaults::LOCAL_DEPLOYER_PACK,
+        ));
+        store.save(&env).unwrap();
+        let err = apply_traffic(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_traffic_args("local", "00000000000000000000000000", None),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(msg.contains("only supported for"), "{msg}"),
+            other => panic!("expected Conflict, got {other}"),
+        }
+    }
+
+    /// An AWS-ECS env IS admitted past the gate, but a binding without a Fargate
+    /// launch config is rejected before any AWS call (deterministic, no creds).
+    /// Proves the AWS path is reached AND the launch precondition fires first.
+    #[cfg(feature = "deploy-aws-ecs")]
+    #[test]
+    fn apply_traffic_admits_aws_ecs_but_requires_launch_config() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.aws-ecs@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let err = apply_traffic(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_traffic_args("local", "00000000000000000000000000", None),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(msg.contains("Fargate launch config"), "{msg}"),
+            other => panic!("expected Conflict(launch config), got {other}"),
+        }
+    }
+
+    /// Identity guard: a binding that pins `assume_role_arn` must have a bound
+    /// session, else the live AWS call would silently run as the ambient
+    /// identity (a tenant/account-isolation footgun). Only that exact case
+    /// refuses; an unpinned env legitimately falls back to ambient.
+    #[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+    #[test]
+    fn pinned_role_without_session_refuses_only_role_without_session() {
+        // role pinned + no session → refuse (the footgun)
+        assert!(pinned_role_without_session(
+            Some("arn:aws:iam::1:role/dep"),
+            false
+        ));
+        // role pinned + session present → ok (the session IS the assumed role)
+        assert!(!pinned_role_without_session(
+            Some("arn:aws:iam::1:role/dep"),
+            true
+        ));
+        // no role pinned → ambient fallback is intentional, never refuse
+        assert!(!pinned_role_without_session(None, false));
+        assert!(!pinned_role_without_session(None, true));
     }
 
     #[test]

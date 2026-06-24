@@ -115,6 +115,7 @@ fn route_remote(
             EnvVerb::Render(_) => Err(not_supported("env render")),
             EnvVerb::Reconcile(_) => Err(not_supported("env reconcile")),
             EnvVerb::ApplyRevision(_) => Err(not_supported("env apply-revision")),
+            EnvVerb::ApplyTraffic(_) => Err(not_supported("env apply-traffic")),
             EnvVerb::Destroy { .. } => Err(not_supported("env destroy")),
             EnvVerb::MigrateDev { .. } => Err(not_supported("env migrate-dev")),
             EnvVerb::MigrateState { .. } => Err(not_supported("env migrate-state")),

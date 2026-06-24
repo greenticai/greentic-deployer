@@ -26,6 +26,11 @@
 //! built without AWS support.
 
 pub mod bootstrap;
+// Only the `deploy-aws-ecs` live-deploy path consumes the bound session
+// (`RealEcsTarget` injects it as a static credentials provider), so gate it the
+// same way `real_target` is — otherwise a `creds-aws`-only build has it dead.
+#[cfg(feature = "deploy-aws-ecs")]
+pub mod bound_session;
 pub mod credentials;
 pub mod deploy_target;
 pub mod deployer;

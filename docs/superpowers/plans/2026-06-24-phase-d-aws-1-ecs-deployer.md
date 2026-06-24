@@ -177,31 +177,42 @@ target-group pool, F1 = per-deployment `ModifyRule`):**
     PR-4-verified like the rest of the `.send()` surface. Default target stays
     `UnconfiguredEcsTarget`; nothing constructs `RealEcsTarget` with a real pool
     yet (that is 3c-2b).
-  - **PR-3c-2b (bound-session client + the AWS CLI branch):** build the
-    bound-session SDK client (read the `AssumedSession` PR-3b persisted at
-    `secret://<env>/…/deployer_session` via `resolve_credentials_token`,
-    static-credentials provider, ambient fallback when unbound — the AWS
-    analogue of K8s `resolve_bound_identity`); add the AWS branch to the CLI
-    deploy path so `apply_revision` (env.rs) no longer hard-rejects the AWS-ECS
-    descriptor — it builds `RealEcsTarget::resolve(region, launch, pool,
-    session)` from `params.launch` + `params.target_group_pool` and injects it
-    via `with_target`, then dispatches warm/archive (mirrors
-    `apply_revision_k8s_cluster`). Live traffic-shift lands as a **new
-    `op env apply-traffic <env> <dep>` verb** (user decision, 2026-06-24) — a
-    surgical live verb mirroring `apply-revision` that reads the recorded split
-    and pushes ALB listener weights; `op traffic set` stays spec-only. AWS is
-    imperative — NOT reconcile.
-    - **Cross-deployment pool exclusivity (PR-3c-2a codex finding, high).** The
-      stateless allocator reads `describe_task_sets` per ECS service, so it is
-      exclusive *within* a deployment but blind across deployments sharing one
-      binding pool — two deployments could be handed the same target group.
-      PR-3c-2a already rejects a *duplicate* TG within one pool (`pool_arns_from`)
-      and documents the boundary; this wiring slice must enforce a
-      **deployment-scoped pool** (each deployment validates it owns ≥2 distinct
-      TGs no sibling draws from) when the pool meets a deployment. A
-      CAS/persisted lease is explicitly OUT — it contradicts the user's stateless
-      F2 choice. The same-service concurrent-warm race stays a PR-4 live-verify
-      note (the deploy path warms a deployment's revisions sequentially).
+  - **PR-3c-2b (bound-session client + the AWS CLI branch) — ✅ SHIPPED
+    (core live-wiring; cross-deployment exclusivity deferred to PR-3c-2c per
+    user decision, 2026-06-24).** Built the bound-session SDK client: the new
+    `aws::bound_session::resolve_bound_session` reads the `AssumedSession` PR-3b
+    persisted at `secret://<env>/…/deployer_session` via
+    `resolve_credentials_token`, fail-closed parse, ambient fallback when
+    unbound (the AWS analogue of K8s `resolve_bound_identity`);
+    `RealEcsTarget::resolve` gained a `session` arg that injects it as a static
+    credentials provider (`session_credentials`, expiry passed through). Added
+    the AWS branch to the CLI deploy path: `apply_revision` (env.rs) no longer
+    hard-rejects the AWS-ECS descriptor — an applicability gate (before the
+    per-revision lookup, preserving the old "reject regardless of revision"
+    property) admits K8s + AWS-ECS; the AWS arm builds
+    `RealEcsTarget::resolve(region, launch, pool, session)` from
+    `aws_ecs_launch_params` (requires a Fargate launch config — rejected before
+    any AWS call), injects via `with_target`, and dispatches warm/archive
+    (mirrors `apply_revision_k8s_cluster`). Live traffic-shift shipped as the
+    **new `op env apply-traffic <env> <dep>` verb** — a surgical live verb
+    mirroring `apply-revision` that reads the recorded split and pushes ALB
+    listener weights via `apply_traffic_split`; AWS-ECS only (K8s serves splits
+    from its in-process runtime router); `op traffic set` stays spec-only. AWS
+    is imperative — NOT reconcile. All AWS construction is behind
+    `all(creds-aws, deploy-aws-ecs)` with honest stubs on the off combos.
+  - **PR-3c-2c (DEFERRED — cross-deployment pool exclusivity, PR-3c-2a codex
+    finding, high).** The stateless allocator reads `describe_task_sets` per ECS
+    service, so it is exclusive *within* a deployment but blind across
+    deployments sharing one binding pool — two deployments could be handed the
+    same target group. PR-3c-2a already rejects a *duplicate* TG within one pool
+    (`pool_arns_from`) and documents the boundary. The open design gap (surfaced
+    in PR-3c-2b): the config has ONE shared `target_group_arns` pool per env, so
+    no deployment "owns" a subset — enforcing "no sibling draws from it" needs
+    either a deterministic pool partition or a new per-deployment pool config
+    (likely a wizard answer). A CAS/persisted lease is explicitly OUT — it
+    contradicts the user's stateless F2 choice. The same-service concurrent-warm
+    race stays a PR-4 live-verify note (the deploy path warms a deployment's
+    revisions sequentially).
 - **PR-3c-3:** the **F1 fix** — per-deployment ALB `ModifyRule` (host/path
   condition from a new wizard routing answer), preserving the default action +
   sibling rules so multiple deployments coexist behind one listener.
