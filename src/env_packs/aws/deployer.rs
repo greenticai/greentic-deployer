@@ -75,6 +75,11 @@ pub struct AwsEcsParams {
     /// means no ALB mirror is configured: `apply_traffic_split` skips the
     /// listener update and the runtime dispatcher stays authoritative.
     pub listener_arn: Option<String>,
+    /// Scoped deployer role ARN to assume for a bound STS session (the role
+    /// the rules-pack Terraform creates). `None` means no role hop: render-only
+    /// bootstrap, and `op credentials bootstrap --bind` is rejected for this
+    /// env. Read by the `--bind` STS minter, not the deploy verbs.
+    pub assume_role_arn: Option<String>,
 }
 
 /// Why a wizard answers blob could not be read into [`AwsEcsParams`].
@@ -108,6 +113,7 @@ impl AwsEcsParams {
             image_base: DEFAULT_IMAGE_BASE.to_string(),
             image_tag_prefix: DEFAULT_IMAGE_TAG_PREFIX.to_string(),
             listener_arn: None,
+            assume_role_arn: None,
         }
     }
 
@@ -115,10 +121,10 @@ impl AwsEcsParams {
     ///
     /// Keys mirror `wizard.qaspec.yaml`. Unknown keys are rejected (deny-by-
     /// default, so an operator typo fails loudly rather than being silently
-    /// dropped). Credential-scoping knobs (`aws_profile`, `assume_role_arn`)
-    /// are validated as strings and accepted so a full binding's answers
-    /// deserialize; they are consumed by the SDK client builder in later
-    /// slices, not by these verbs.
+    /// dropped). `assume_role_arn` is captured here (the `--bind` STS minter
+    /// reads it); `aws_profile` is validated as a string and accepted so a full
+    /// binding's answers deserialize, but is consumed by the SDK client builder
+    /// in a later slice, not by these verbs.
     pub fn from_answers(
         env: &Environment,
         answers: Option<&Value>,
@@ -137,7 +143,8 @@ impl AwsEcsParams {
                     params.image_tag_prefix = answer_string(key, value)?
                 }
                 "alb_listener_arn" => params.listener_arn = Some(answer_string(key, value)?),
-                "aws_profile" | "assume_role_arn" => {
+                "assume_role_arn" => params.assume_role_arn = Some(answer_string(key, value)?),
+                "aws_profile" => {
                     answer_string(key, value)?;
                 }
                 other => return Err(AwsEcsParamsError::UnknownKey(other.to_string())),
@@ -767,6 +774,7 @@ mod tests {
             "container_image_tag_prefix": "v",
             "alb_listener_arn": "arn:aws:elasticloadbalancing:eu-west-1:111122223333:listener/app/x/y/z",
             "aws_profile": "prod-admin",
+            "assume_role_arn": "arn:aws:iam::111122223333:role/greentic-deployer",
         });
         let params = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap();
         assert_eq!(params.region, "eu-west-1");
@@ -774,6 +782,12 @@ mod tests {
         assert_eq!(params.image_base, "123.dkr.ecr/greentic/");
         assert_eq!(params.image_tag_prefix, "v");
         assert!(params.listener_arn.is_some());
+        // `assume_role_arn` is captured (the `--bind` STS minter reads it);
+        // `aws_profile` is still validated-but-dropped.
+        assert_eq!(
+            params.assume_role_arn.as_deref(),
+            Some("arn:aws:iam::111122223333:role/greentic-deployer")
+        );
     }
 
     #[test]

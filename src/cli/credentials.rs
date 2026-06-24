@@ -208,20 +208,25 @@ pub fn bootstrap(
         OpError::Conflict(e.to_string())
     })?;
 
-    // `bind: true` ⇒ connect AS THE ADMIN and mint+bind the deployer's
-    // ServiceAccount credential live (K8s only this round). Built before the
-    // audit scope so the override outlives the `run_bootstrap` call.
+    // `bind: true` ⇒ connect AS THE ADMIN and mint+bind the deployer credential
+    // live. Dispatched by the bound deployer kind: K8s mints a ServiceAccount
+    // token, AWS assumes the scoped deployer role for an STS session. Each
+    // builder returns `None` for a non-matching deployer; both `None` ⇒ the
+    // deployer has no bind path. Built before the audit scope so the override
+    // outlives the `run_bootstrap` call.
     let bind_creds: Option<Box<dyn DeployerCredentials>> = if bind_requested {
-        Some(
-            admin_bind_k8s_credentials(store, &env_id, admin.profile())?.ok_or_else(|| {
-                OpError::Conflict(
-                    "`bind: true` is only supported for K8s-bound environments this round; \
-                     other deployers still bootstrap a render-only rules pack — drop `bind` \
-                     and apply the pack offline, then `op credentials rotate`"
-                        .to_string(),
-                )
-            })?,
-        )
+        let creds = match admin_bind_k8s_credentials(store, &env_id, admin.profile())? {
+            Some(c) => Some(c),
+            None => admin_bind_aws_credentials(store, &env_id, admin.profile())?,
+        };
+        Some(creds.ok_or_else(|| {
+            OpError::Conflict(
+                "`bind: true` is supported only for K8s- and AWS-bound environments this round; \
+                 other deployers still bootstrap a render-only rules pack — drop `bind` and \
+                 apply the pack offline, then `op credentials rotate`"
+                    .to_string(),
+            )
+        })?)
     } else {
         None
     };
@@ -649,6 +654,82 @@ fn admin_bind_k8s_credentials(
 ) -> Result<Option<Box<dyn DeployerCredentials>>, OpError> {
     Err(OpError::Conflict(
         "`bind: true` requires a build with the `k8s-client` feature".to_string(),
+    ))
+}
+
+/// Build admin-connected AWS credentials for the `--bind` bootstrap path: a
+/// connector that resolves the `admin_profile` chain and assumes the scoped
+/// deployer role (the binding answers' `assume_role_arn`, created by the
+/// rules-pack Terraform the admin already applied) to mint a short-lived STS
+/// session. Returns `None` when the env is not AWS-bound (the caller then tries
+/// the next deployer / rejects `--bind`). Unlike K8s, nothing is applied live
+/// here — the role must pre-exist, so `assume_role_arn` is required.
+#[cfg(feature = "creds-aws")]
+fn admin_bind_aws_credentials(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    admin_profile: &str,
+) -> Result<Option<Box<dyn DeployerCredentials>>, OpError> {
+    use crate::cli::env::load_render_answers;
+    use crate::env_packs::aws::AwsEcsDeployerHandler;
+    use crate::env_packs::aws::credentials::{
+        AwsBootstrapClient, AwsBootstrapConnectFut, AwsBootstrapConnector, AwsDeployerCredentials,
+        RealAwsBootstrapClient,
+    };
+    use crate::env_packs::aws::deployer::AwsEcsParams;
+    use std::sync::Arc;
+
+    let Ok(env) = store.load(env_id) else {
+        return Ok(None);
+    };
+    let Some(binding) = env.pack_for_slot(greentic_deploy_spec::CapabilitySlot::Deployer) else {
+        return Ok(None);
+    };
+    if binding.kind.path() != AwsEcsDeployerHandler::DESCRIPTOR_PATH {
+        return Ok(None);
+    }
+
+    // The role to assume is the binding's `assume_role_arn`. Without it there
+    // is nothing to bind — fail loudly rather than minting an over-broad
+    // session from the base chain.
+    let (answers, _wire) = load_render_answers(store, &env, &binding.kind)?;
+    let role_arn = AwsEcsParams::from_answers(&env, answers.as_ref())
+        .map_err(|e| OpError::Conflict(format!("invalid AWS answers: {e}")))?
+        .assume_role_arn
+        .ok_or_else(|| {
+            OpError::Conflict(
+                "AWS `bind: true` requires the binding's `assume_role_arn` answer (the deployer \
+                 role the rules-pack Terraform creates); set it via the env wizard, or drop \
+                 `bind` and apply the pack offline, then `op credentials rotate`"
+                    .to_string(),
+            )
+        })?;
+
+    let profile = admin_profile.to_string();
+    let connector: AwsBootstrapConnector = Arc::new(move || -> AwsBootstrapConnectFut {
+        let profile = profile.clone();
+        Box::pin(async move {
+            // Authenticate as the admin profile (the identity allowed to
+            // assume the deployer role).
+            let client = RealAwsBootstrapClient::resolve(&profile).await?;
+            Ok(Arc::new(client) as Arc<dyn AwsBootstrapClient>)
+        })
+    });
+    Ok(Some(Box::new(
+        AwsDeployerCredentials::with_bootstrap_assume(role_arn, connector),
+    )))
+}
+
+/// `creds-aws`-less builds cannot assume a deployer role — `--bind` is a hard
+/// error rather than a silent fall-through to render-only.
+#[cfg(not(feature = "creds-aws"))]
+fn admin_bind_aws_credentials(
+    _store: &LocalFsStore,
+    _env_id: &EnvId,
+    _admin_profile: &str,
+) -> Result<Option<Box<dyn DeployerCredentials>>, OpError> {
+    Err(OpError::Conflict(
+        "`bind: true` for AWS requires a build with the `creds-aws` feature".to_string(),
     ))
 }
 
@@ -1372,6 +1453,53 @@ mod tests {
         let mut registry = EnvPackRegistry::new();
         registry.register(Box::new(BindResolveHandler)).unwrap();
         (store, registry, EnvId::try_from("local").unwrap())
+    }
+
+    #[cfg(feature = "creds-aws")]
+    #[test]
+    fn aws_bind_requires_assume_role_arn() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("prod-eu");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.aws-ecs@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("prod-eu").unwrap();
+
+        // AWS-bound but no `assume_role_arn` answer ⇒ a clear Conflict, not a
+        // silent fall-through to render-only nor an over-broad base-chain
+        // session.
+        let err = admin_bind_aws_credentials(&store, &env_id, "admin-profile").unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(
+                msg.contains("assume_role_arn"),
+                "expected an assume_role_arn hint, got: {msg}"
+            ),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "creds-aws")]
+    #[test]
+    fn aws_bind_returns_none_for_a_non_aws_deployer() {
+        use crate::defaults::LOCAL_DEPLOYER_PACK;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs
+            .push(make_binding(CapabilitySlot::Deployer, LOCAL_DEPLOYER_PACK));
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+
+        // Not AWS-bound ⇒ None, so the bootstrap dispatch falls through to the
+        // next builder / the unsupported-deployer rejection.
+        assert!(
+            admin_bind_aws_credentials(&store, &env_id, "admin-profile")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

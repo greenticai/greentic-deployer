@@ -40,15 +40,27 @@
 //! ## Bootstrap
 //!
 //! [`bootstrap`](DeployerCredentials::bootstrap) emits a minimum-privilege
-//! IAM role + inline policy Terraform module via [`super::bootstrap`].
-//! Returns a [`BootstrapOutcome`] with `bound_credentials_ref: None` —
-//! the admin applies the rules pack offline and binds the resulting role
-//! ARN via `op credentials rotate`. The rules pack lands under
-//! `rules/<env>/greentic.deployer.aws-ecs/aws-min-iam.tf` and the
-//! customer's admin applies it via `tofu apply` / `terraform apply`
-//! against their own state backend.
+//! IAM role + inline policy Terraform module via [`super::bootstrap`]. The
+//! rules pack lands under `rules/<env>/greentic.deployer.aws-ecs/aws-min-iam.tf`
+//! and the customer's admin applies it via `tofu apply` / `terraform apply`
+//! against their own state backend. Two paths:
+//!
+//! - **Render-only (default):** `bound_credentials_ref: None` — the admin
+//!   applies the pack offline, then binds the resulting role via `--bind`.
+//! - **`--bind`** (instance built via [`AwsDeployerCredentials::with_bootstrap_assume`]):
+//!   assume that already-applied deployer role AS THE ADMIN, minting a
+//!   short-lived STS session ([`AssumedSession`]) returned as the bound
+//!   material. The rotation engine re-mints it at 80% of lifetime
+//!   ([`rotate_at`](DeployerCredentials::rotate_at)).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+
+use chrono::{DateTime, Utc};
+use greentic_deploy_spec::SecretRef;
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::credentials::{
     BootstrapError, BootstrapInput, BootstrapOutcome, Capability, CapabilityCheck,
@@ -167,6 +179,81 @@ pub trait AwsValidatorClient: std::fmt::Debug + Send + Sync {
     ) -> Result<Vec<ActionDecision>, AwsClientError>;
 }
 
+/// Lifetime requested for the assumed deployer session (1 hour). STS clamps
+/// this to the role's `MaxSessionDuration`; 1h is below every role's floor
+/// (15min min, 1h default), so the request never fails on duration alone. The
+/// rotation engine re-mints at 80% of the GRANTED window via [`rotate_at`]
+/// (mirrors the K8s bind token's proactive re-mint).
+///
+/// [`rotate_at`]: AwsDeployerCredentials::rotate_at
+const STS_SESSION_DURATION_SECONDS: i32 = 3600;
+
+/// Tenant/team-scoped store path the assumed session lands at, mirroring the
+/// K8s deployer token's `default/_/<kind>/<artifact>` shape. The bound
+/// `secret://<env>/<this>` ref is what the runtime client resolves to sign
+/// ECS/ELB calls (the resolver lands in a follow-up slice).
+pub(crate) const DEPLOYER_SESSION_STORE_PATH: &str = "default/_/aws-deployer/deployer_session";
+
+/// A short-lived AWS session minted by assuming the scoped deployer role.
+///
+/// Serializes to JSON as the env's bound credential material. AWS needs all
+/// three session parts (not just a bearer, unlike K8s) to sign requests, so
+/// the material is a structured blob rather than an opaque string. `issued_at`
+/// is the assume-role call time (STS returns only `expiration`); the pair
+/// drives the 80% proactive-rotation point in [`rotate_at`]. This shape is the
+/// forward contract the runtime ECS/STS client parses in a follow-up slice.
+///
+/// [`rotate_at`]: AwsDeployerCredentials::rotate_at
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AssumedSession {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: String,
+    /// STS-reported session expiry.
+    pub expiration: DateTime<Utc>,
+    /// When the session was minted (assume-role call time).
+    pub issued_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for AssumedSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never log the secret access key or session token.
+        f.debug_struct("AssumedSession")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field("session_token", &"<redacted>")
+            .field("expiration", &self.expiration)
+            .field("issued_at", &self.issued_at)
+            .finish()
+    }
+}
+
+/// Future yielded by an [`AwsBootstrapConnector`].
+pub type AwsBootstrapConnectFut =
+    Pin<Box<dyn Future<Output = Result<Arc<dyn AwsBootstrapClient>, AwsClientError>> + Send>>;
+
+/// Lazily connect the admin-authenticated STS client the `--bind` bootstrap
+/// path assumes the deployer role with. Connect + assume share one
+/// `run_aws_async` call (the sync-trait → async-SDK bridge), mirroring the K8s
+/// bind connector.
+pub type AwsBootstrapConnector = Arc<dyn Fn() -> AwsBootstrapConnectFut + Send + Sync>;
+
+/// STS client used by the `--bind` bootstrap path. Tests mock this; production
+/// resolves [`RealAwsBootstrapClient`] from the admin profile's credential
+/// chain. Distinct from [`AwsValidatorClient`]: validate and bind never run on
+/// the same instance, and bind needs only `AssumeRole`.
+#[async_trait::async_trait]
+pub trait AwsBootstrapClient: std::fmt::Debug + Send + Sync {
+    /// Assume `role_arn` for `duration_seconds`, returning the minted session.
+    /// `session_name` tags the session in CloudTrail.
+    async fn assume_role(
+        &self,
+        role_arn: &str,
+        session_name: &str,
+        duration_seconds: i32,
+    ) -> Result<AssumedSession, AwsClientError>;
+}
+
 /// Production AWS client. Built lazily on first [`validate`] — the SDK
 /// credential chain resolution is ~50-200ms and we don't want to pay it
 /// for a no-op `requirements` call when AWS isn't configured.
@@ -281,15 +368,113 @@ impl AwsValidatorClient for RealAwsClient {
     }
 }
 
+/// Production STS client for the `--bind` bootstrap path. Resolves the named
+/// admin profile's credential chain (the identity allowed to assume the
+/// deployer role) and calls `AssumeRole`. Separate from [`RealAwsClient`]:
+/// bind authenticates AS THE ADMIN (an explicit profile), not via the ambient
+/// chain `validate` walks.
+#[derive(Debug)]
+pub(crate) struct RealAwsBootstrapClient {
+    sts: aws_sdk_sts::Client,
+}
+
+impl RealAwsBootstrapClient {
+    /// Resolve the SDK config for `admin_profile` and build the STS client.
+    /// Probes the chain up front (like [`RealAwsClient::resolve`]) so a
+    /// missing/empty profile fails here with a clear message rather than on
+    /// the `AssumeRole` call.
+    pub(crate) async fn resolve(admin_profile: &str) -> Result<Self, AwsClientError> {
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .profile_name(admin_profile)
+            .load()
+            .await;
+        let creds_provider = config.credentials_provider().ok_or_else(|| {
+            AwsClientError::NoCredentialChain(format!(
+                "AWS profile `{admin_profile}` resolved no credentials provider"
+            ))
+        })?;
+        use aws_sdk_sts::config::ProvideCredentials;
+        creds_provider
+            .provide_credentials()
+            .await
+            .map_err(|e| AwsClientError::NoCredentialChain(e.to_string()))?;
+        Ok(Self {
+            sts: aws_sdk_sts::Client::new(&config),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl AwsBootstrapClient for RealAwsBootstrapClient {
+    async fn assume_role(
+        &self,
+        role_arn: &str,
+        session_name: &str,
+        duration_seconds: i32,
+    ) -> Result<AssumedSession, AwsClientError> {
+        let out = self
+            .sts
+            .assume_role()
+            .role_arn(role_arn)
+            .role_session_name(session_name)
+            .duration_seconds(duration_seconds)
+            .send()
+            .await
+            .map_err(|e| AwsClientError::StsRejected(format!("AssumeRole failed: {e}")))?;
+        let creds = out.credentials().ok_or_else(|| {
+            AwsClientError::StsRejected("AssumeRole returned no credentials".to_string())
+        })?;
+        // STS reports expiry as an aws-smithy `DateTime`; convert to chrono.
+        let exp = creds.expiration();
+        let expiration =
+            DateTime::from_timestamp(exp.secs(), exp.subsec_nanos()).ok_or_else(|| {
+                AwsClientError::StsRejected(
+                    "AssumeRole returned an out-of-range expiration".to_string(),
+                )
+            })?;
+        Ok(AssumedSession {
+            access_key_id: creds.access_key_id().to_string(),
+            secret_access_key: creds.secret_access_key().to_string(),
+            session_token: creds.session_token().to_string(),
+            expiration,
+            issued_at: Utc::now(),
+        })
+    }
+}
+
+/// `--bind` configuration: the scoped deployer role to assume + the admin-
+/// authenticated STS connector that assumes it. Held only on instances the
+/// CLI builds for `op credentials bootstrap --bind`; the render-only
+/// `bootstrap` path and `validate` never touch it.
+struct AwsBootstrapBind {
+    /// The deployer role the admin created by applying the rules-pack
+    /// Terraform (the binding answers' `assume_role_arn`).
+    role_arn: String,
+    connect: AwsBootstrapConnector,
+}
+
 /// AWS-ECS deployer credentials handler.
 ///
-/// Holds a lazy-init client behind an `Arc<Mutex<...>>`. Tests inject a
-/// mock via [`with_client`](Self::with_client). The default constructor
-/// defers SDK setup until the first validate, so building the handler is
-/// free even on a host with no AWS credentials.
-#[derive(Debug, Default)]
+/// Holds a lazy-init validator client behind an `Arc<Mutex<...>>`. Tests
+/// inject a mock via [`with_client`](Self::with_client). The default
+/// constructor defers SDK setup until the first validate, so building the
+/// handler is free even on a host with no AWS credentials. The `--bind`
+/// bootstrap path is a separate instance built via
+/// [`with_bootstrap_assume`](Self::with_bootstrap_assume).
+#[derive(Default)]
 pub struct AwsDeployerCredentials {
     client: Mutex<Option<Arc<dyn AwsValidatorClient>>>,
+    bind: Option<AwsBootstrapBind>,
+}
+
+impl std::fmt::Debug for AwsDeployerCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The bind connector is a closure (no Debug); summarize its presence.
+        f.debug_struct("AwsDeployerCredentials")
+            .field("client", &"<lazy>")
+            .field("bind", &self.bind.as_ref().map(|b| &b.role_arn))
+            .finish()
+    }
 }
 
 impl AwsDeployerCredentials {
@@ -298,6 +483,24 @@ impl AwsDeployerCredentials {
     pub fn with_client(client: Arc<dyn AwsValidatorClient>) -> Self {
         Self {
             client: Mutex::new(Some(client)),
+            bind: None,
+        }
+    }
+
+    /// Build credentials wired for the `--bind` bootstrap path: assume
+    /// `role_arn` via `connect` (the admin's STS client) to mint a session.
+    /// Holds no validator client — `validate` is not the bind path's concern,
+    /// and the two never run on the same instance.
+    pub fn with_bootstrap_assume(
+        role_arn: impl Into<String>,
+        connect: AwsBootstrapConnector,
+    ) -> Self {
+        Self {
+            client: Mutex::new(None),
+            bind: Some(AwsBootstrapBind {
+                role_arn: role_arn.into(),
+                connect,
+            }),
         }
     }
 
@@ -365,6 +568,19 @@ impl AwsDeployerCredentials {
 impl DeployerCredentials for AwsDeployerCredentials {
     fn requires_credentials_material(&self) -> bool {
         true
+    }
+
+    /// The bound material is a serialized [`AssumedSession`]; decode its
+    /// `issued_at`/`expiration` and schedule the re-mint at 80% of lifetime
+    /// (the shared [`rotate_at_from_window`](crate::credentials::rotate)
+    /// policy K8s also uses). `None` for material that isn't a session blob —
+    /// the rotation engine then fails open and rotates.
+    fn rotate_at(&self, material: &str) -> Option<DateTime<Utc>> {
+        let session: AssumedSession = serde_json::from_str(material).ok()?;
+        Some(crate::credentials::rotate::rotate_at_from_window(
+            session.issued_at,
+            session.expiration,
+        ))
     }
 
     fn required_capabilities(&self) -> Vec<Capability> {
@@ -439,11 +655,10 @@ impl DeployerCredentials for AwsDeployerCredentials {
     }
 
     fn bootstrap(&self, input: &BootstrapInput<'_>) -> Result<BootstrapOutcome, BootstrapError> {
-        // C3 stub: emit Terraform; admin material is the named AWS profile
-        // (the customer's admin-IAM role to be referenced in the rules
-        // pack's `aws_iam_role.trust_policy.assume_role_policy`). No live
-        // AWS calls in C3 bootstrap — the customer's admin runs the
-        // Terraform against their own state backend (per Phase D plan).
+        // Admin material is the named AWS profile (the customer's admin-IAM
+        // role referenced in the rules pack's
+        // `aws_iam_role.trust_policy.assume_role_policy`, and — on the
+        // `--bind` path — the profile that assumes the deployer role).
         let admin_profile = input.admin.profile();
         if admin_profile.is_empty() {
             return Err(BootstrapError::AdminRejected(
@@ -460,19 +675,72 @@ impl DeployerCredentials for AwsDeployerCredentials {
             allowed_actions: VALIDATED_IAM_VERBS,
         });
 
-        // C3 stub: the admin applies the rules pack offline (Terraform),
-        // then binds the resulting role ARN via `op credentials rotate`.
-        // No credentials are minted here — `bound_credentials_ref: None`
-        // tells the runner NOT to mark the env as credentialed. Phase D
-        // AWS will return `Some` once the deployer can mint a session
-        // token directly.
+        // Render-only (default): the admin applies the rules pack offline
+        // (Terraform), then binds the resulting role via `--bind` / `rotate`.
+        // No credentials are minted here — `bound_credentials_ref: None` tells
+        // the runner NOT to mark the env as credentialed.
+        let Some(bind) = self.bind.as_ref() else {
+            return Ok(BootstrapOutcome {
+                rules_pack,
+                bound_credentials_ref: None,
+                bound_expiry: None,
+                bound_secret_material: None,
+            });
+        };
+
+        // `--bind`: assume the scoped deployer role (already created by the
+        // rules pack the admin applied) AS THE ADMIN, minting a short-lived
+        // STS session. Unlike K8s, nothing is applied live here — the role
+        // MUST pre-exist (the admin ran Terraform offline first). Connect +
+        // assume share one `run_aws_async` call (the sync→async bridge).
+        let connector = Arc::clone(&bind.connect);
+        let role_arn = bind.role_arn.clone();
+        let session_name = sts_session_name(input.env_id.as_str());
+        let session = run_aws_async(async move {
+            let client = connector().await?;
+            client
+                .assume_role(&role_arn, &session_name, STS_SESSION_DURATION_SECONDS)
+                .await
+        })
+        .map_err(|e: AwsClientError| BootstrapError::ProvisioningFailed {
+            step: "aws-assume-role".to_string(),
+            message: e.to_string(),
+        })?;
+
+        let bound_ref = SecretRef::try_new(format!(
+            "secret://{}/{}",
+            input.env_id.as_str(),
+            DEPLOYER_SESSION_STORE_PATH
+        ))
+        .map_err(|e| BootstrapError::ProvisioningFailed {
+            step: "bind-ref".to_string(),
+            message: format!("bound credentials ref is not well-formed: {e}"),
+        })?;
+
+        let bound_expiry = Some(session.expiration);
+        // Serialize the full session (the runtime client needs all three
+        // parts to sign requests). The secret sink writes it to the secret
+        // backend; `rotate_at` decodes the window back out of it.
+        let material =
+            serde_json::to_string(&session).map_err(|e| BootstrapError::ProvisioningFailed {
+                step: "serialize-session".to_string(),
+                message: format!("could not serialize the assumed session: {e}"),
+            })?;
+
         Ok(BootstrapOutcome {
             rules_pack,
-            bound_credentials_ref: None,
-            bound_expiry: None,
-            bound_secret_material: None,
+            bound_credentials_ref: Some(bound_ref),
+            bound_expiry,
+            bound_secret_material: Some(Zeroizing::new(material)),
         })
     }
+}
+
+/// STS `RoleSessionName` for the assumed deployer session: tags the session in
+/// CloudTrail. `env_id` is already DNS-safe (it derives K8s namespaces), so it
+/// fits the `[\w+=,.@-]{2,64}` role-session-name charset without sanitizing.
+fn sts_session_name(env_id: &str) -> String {
+    format!("greentic-deployer-{env_id}")
 }
 
 /// Build every-capability-failed report with the same reason. Used when
@@ -622,6 +890,61 @@ mod tests {
                 decision: IamDecision::Allowed,
             })
             .collect()
+    }
+
+    /// Bind-path test double: records the `assume_role` call and returns a
+    /// scripted result.
+    #[derive(Debug, Default)]
+    struct MockBootstrapClient {
+        response: Mutex<Option<Result<AssumedSession, AwsClientError>>>,
+        calls: Mutex<Vec<(String, String, i32)>>,
+    }
+
+    impl MockBootstrapClient {
+        fn with_session(self, r: Result<AssumedSession, AwsClientError>) -> Self {
+            *self.response.lock().unwrap() = Some(r);
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AwsBootstrapClient for MockBootstrapClient {
+        async fn assume_role(
+            &self,
+            role_arn: &str,
+            session_name: &str,
+            duration_seconds: i32,
+        ) -> Result<AssumedSession, AwsClientError> {
+            self.calls.lock().unwrap().push((
+                role_arn.to_string(),
+                session_name.to_string(),
+                duration_seconds,
+            ));
+            self.response
+                .lock()
+                .unwrap()
+                .take()
+                .expect("test must wire an assume_role response")
+        }
+    }
+
+    /// Wrap a mock bootstrap client in the connector closure `bootstrap` calls.
+    fn bootstrap_connector(client: Arc<MockBootstrapClient>) -> AwsBootstrapConnector {
+        Arc::new(move || -> AwsBootstrapConnectFut {
+            let client = client.clone();
+            Box::pin(async move { Ok(client as Arc<dyn AwsBootstrapClient>) })
+        })
+    }
+
+    /// A session with a known `[issued_at, expiration]` window for assertions.
+    fn sample_session(issued_at_unix: i64, expiration_unix: i64) -> AssumedSession {
+        AssumedSession {
+            access_key_id: "ASIAEXAMPLE".to_string(),
+            secret_access_key: "example-secret".to_string(),
+            session_token: "example-session".to_string(),
+            expiration: DateTime::from_timestamp(expiration_unix, 0).unwrap(),
+            issued_at: DateTime::from_timestamp(issued_at_unix, 0).unwrap(),
+        }
     }
 
     #[test]
@@ -850,11 +1173,11 @@ mod tests {
             admin: &admin,
         };
         let outcome = creds.bootstrap(&input).expect("bootstrap renders");
-        // C3 stub returns None — the admin applies Terraform offline,
-        // then binds via `op credentials rotate`.
+        // Render-only (no `--bind`): returns None — the admin applies the
+        // Terraform offline, then binds via `--bind` / `op credentials rotate`.
         assert!(
             outcome.bound_credentials_ref.is_none(),
-            "AWS C3 bootstrap must not bind credentials directly"
+            "render-only AWS bootstrap must not bind credentials directly"
         );
         assert!(
             !outcome.rules_pack.is_empty(),
@@ -884,13 +1207,109 @@ mod tests {
     }
 
     #[test]
-    fn rotate_at_is_none_until_the_sts_producer_lands() {
-        // AWS bootstrap is render-only today (mints no bound material), so it
-        // inherits the default `rotate_at` => None. The STS session-token
-        // producer will override this with the credential's STS expiry window.
+    fn bootstrap_with_bind_assumes_role_and_returns_session() {
+        // 1h window from a fixed issue time.
+        let session = sample_session(1_000_000, 1_000_000 + 3600);
+        let mock = Arc::new(MockBootstrapClient::default().with_session(Ok(session.clone())));
+        let creds = AwsDeployerCredentials::with_bootstrap_assume(
+            "arn:aws:iam::111122223333:role/greentic-deployer-prod-eu",
+            bootstrap_connector(mock.clone()),
+        );
+        let env_id = EnvId::try_from("prod-eu").unwrap();
+        let dir = tempdir().unwrap();
+        let admin = ZeroizedAdmin::new("admin-profile", String::new());
+        let input = BootstrapInput {
+            env_id: &env_id,
+            env_root: dir.path(),
+            admin: &admin,
+        };
+
+        let outcome = creds
+            .bootstrap(&input)
+            .expect("bind bootstrap mints a session");
+
+        // Bound ref + expiry come from the assumed session.
+        assert!(
+            outcome.bound_credentials_ref.is_some(),
+            "bind bootstrap must bind a credentials ref"
+        );
+        assert_eq!(outcome.bound_expiry, Some(session.expiration));
+        // Material round-trips back to the full session (all three parts +
+        // both timestamps), so the runtime client can rebuild a signer.
+        let material = outcome
+            .bound_secret_material
+            .expect("bind bootstrap must set material");
+        let parsed: AssumedSession =
+            serde_json::from_str(material.as_str()).expect("material is a session blob");
+        assert_eq!(parsed.access_key_id, session.access_key_id);
+        assert_eq!(parsed.secret_access_key, session.secret_access_key);
+        assert_eq!(parsed.session_token, session.session_token);
+        assert_eq!(parsed.expiration, session.expiration);
+        assert_eq!(parsed.issued_at, session.issued_at);
+        // The rules pack is still rendered on the bind path (the admin can
+        // re-audit the role's policy even when binding live).
+        assert!(!outcome.rules_pack.is_empty());
+
+        // assume_role was called once with the configured role, the env-derived
+        // session name, and the 1h duration constant.
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].0,
+            "arn:aws:iam::111122223333:role/greentic-deployer-prod-eu"
+        );
+        assert_eq!(calls[0].1, "greentic-deployer-prod-eu");
+        assert_eq!(calls[0].2, STS_SESSION_DURATION_SECONDS);
+    }
+
+    #[test]
+    fn bootstrap_surfaces_assume_failure_as_provisioning_failed() {
+        let mock = Arc::new(MockBootstrapClient::default().with_session(Err(
+            AwsClientError::StsRejected("AssumeRole denied".to_string()),
+        )));
+        let creds = AwsDeployerCredentials::with_bootstrap_assume(
+            "arn:aws:iam::111122223333:role/greentic-deployer-prod-eu",
+            bootstrap_connector(mock),
+        );
+        let env_id = EnvId::try_from("prod-eu").unwrap();
+        let dir = tempdir().unwrap();
+        let admin = ZeroizedAdmin::new("admin-profile", String::new());
+        let input = BootstrapInput {
+            env_id: &env_id,
+            env_root: dir.path(),
+            admin: &admin,
+        };
+        let err = creds.bootstrap(&input).unwrap_err();
+        match err {
+            BootstrapError::ProvisioningFailed { step, message } => {
+                assert_eq!(step, "aws-assume-role");
+                assert!(message.contains("AssumeRole denied"), "message: {message}");
+            }
+            other => panic!("expected ProvisioningFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rotate_at_lands_at_eighty_percent_of_the_session_window() {
+        // 1000s window ⇒ rotate at issued_at + 800s (the shared 80% policy).
+        let session = sample_session(2_000_000, 2_000_000 + 1000);
+        let material = serde_json::to_string(&session).unwrap();
         let creds = AwsDeployerCredentials::default();
-        assert!(creds.rotate_at("any-material").is_none());
-        // Fail-open: with no decodable lifetime, the material is treated as due.
-        assert!(creds.rotation_due("any-material", chrono::Utc::now()));
+        let rotate_at = creds
+            .rotate_at(&material)
+            .expect("a session blob decodes a rotation window");
+        assert_eq!(
+            rotate_at,
+            DateTime::from_timestamp(2_000_000 + 800, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn rotate_at_is_none_and_rotation_due_fails_open_for_non_session_material() {
+        // Opaque / non-JSON material has no decodable window, so the rotation
+        // engine fails open and treats it as due (mirrors the K8s opaque case).
+        let creds = AwsDeployerCredentials::default();
+        assert!(creds.rotate_at("not-a-session-blob").is_none());
+        assert!(creds.rotation_due("not-a-session-blob", chrono::Utc::now()));
     }
 }
