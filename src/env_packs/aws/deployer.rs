@@ -136,7 +136,7 @@ pub enum AwsEcsParamsError {
     #[error("answer `{key}` is invalid: {detail}")]
     Invalid { key: String, detail: String },
     #[error("launch config is incomplete: `{field}` is required")]
-    MissingLaunchField { field: String },
+    MissingLaunchField { field: &'static str },
 }
 
 fn answer_string(key: &str, value: &Value) -> Result<String, AwsEcsParamsError> {
@@ -205,8 +205,7 @@ fn parse_port(key: &str, value: &Value) -> Result<i32, AwsEcsParamsError> {
 /// enforced by the real target (PR-3c construction wiring), not here — this
 /// only validates the per-entry identity shape so a malformed pool fails at
 /// parse time.
-fn parse_target_group_pool(value: &Value) -> Result<Vec<String>, AwsEcsParamsError> {
-    let key = "target_group_arns";
+fn parse_target_group_pool(key: &str, value: &Value) -> Result<Vec<String>, AwsEcsParamsError> {
     let pool = csv_list(key, value)?;
     for entry in &pool {
         if !valid_target_group_identity(entry) {
@@ -235,7 +234,7 @@ fn valid_target_group_identity(s: &str) -> bool {
 
 /// Optional launch-config fields gathered from the answers loop, assembled into
 /// a [`FargateLaunchConfig`] all-or-nothing by [`LaunchFields::build`].
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq)]
 struct LaunchFields {
     execution_role_arn: Option<String>,
     task_role_arn: Option<String>,
@@ -255,29 +254,24 @@ impl LaunchFields {
     /// an error when only a partial set is present. CPU / memory / container
     /// name / port / public-IP default to the wizard's defaults when omitted.
     fn build(self) -> Result<Option<FargateLaunchConfig>, AwsEcsParamsError> {
-        let any = self.execution_role_arn.is_some()
-            || self.task_role_arn.is_some()
-            || self.subnets.is_some()
-            || self.security_groups.is_some()
-            || self.assign_public_ip.is_some()
-            || self.cpu.is_some()
-            || self.memory.is_some()
-            || self.container_name.is_some()
-            || self.container_port.is_some();
-        if !any {
+        // No launch field supplied (verb-only blob) → no launch config.
+        if self == LaunchFields::default() {
             return Ok(None);
         }
-        let execution_role_arn = self
-            .execution_role_arn
-            .ok_or_else(missing("execution_role_arn"))?;
+        let execution_role_arn =
+            self.execution_role_arn
+                .ok_or(AwsEcsParamsError::MissingLaunchField {
+                    field: "execution_role_arn",
+                })?;
         let subnets = self
             .subnets
             .filter(|s| !s.is_empty())
-            .ok_or_else(missing("subnets"))?;
-        let security_groups = self
-            .security_groups
-            .filter(|s| !s.is_empty())
-            .ok_or_else(missing("security_groups"))?;
+            .ok_or(AwsEcsParamsError::MissingLaunchField { field: "subnets" })?;
+        let security_groups = self.security_groups.filter(|s| !s.is_empty()).ok_or(
+            AwsEcsParamsError::MissingLaunchField {
+                field: "security_groups",
+            },
+        )?;
         Ok(Some(FargateLaunchConfig {
             execution_role_arn,
             task_role_arn: self.task_role_arn,
@@ -289,13 +283,6 @@ impl LaunchFields {
             container_name: self.container_name.unwrap_or_else(|| "worker".to_string()),
             container_port: self.container_port.unwrap_or(8080),
         }))
-    }
-}
-
-/// Closure building a [`AwsEcsParamsError::MissingLaunchField`] for `field`.
-fn missing(field: &'static str) -> impl Fn() -> AwsEcsParamsError {
-    move || AwsEcsParamsError::MissingLaunchField {
-        field: field.to_string(),
     }
 }
 
@@ -368,7 +355,9 @@ impl AwsEcsParams {
                 "memory" => launch.memory = Some(answer_string(key, value)?),
                 "container_name" => launch.container_name = Some(answer_string(key, value)?),
                 "container_port" => launch.container_port = Some(parse_port(key, value)?),
-                "target_group_arns" => params.target_group_pool = parse_target_group_pool(value)?,
+                "target_group_arns" => {
+                    params.target_group_pool = parse_target_group_pool(key, value)?
+                }
                 other => return Err(AwsEcsParamsError::UnknownKey(other.to_string())),
             }
         }
