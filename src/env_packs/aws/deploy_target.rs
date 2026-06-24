@@ -54,6 +54,20 @@ pub enum EcsTargetError {
          deployment its own environment binding with a distinct `target_group_arns` pool"
     )]
     PoolConflict { owner: String, shared_tg: String },
+    /// A deployer *policy* refusal from the per-deployment listener-rule write:
+    /// a non-default rule already carries this deployment's routing condition but
+    /// is NOT owned by this deployment (no matching owner tag) — a sibling
+    /// deployment's rule or an operator-managed auth/redirect rule sharing the
+    /// host/path. The deployer refuses to rewrite a rule it did not create rather
+    /// than silently strip its actions. Distinct from [`Api`](Self::Api): a
+    /// configuration boundary, not a broken call.
+    #[error(
+        "listener rule `{rule_arn}` already serves {condition} but is owned by another deployment \
+         or is operator-managed; refusing to rewrite a rule this deployment did not create. Give \
+         this deployment a distinct `alb_routing_host` / `alb_routing_path`, or remove the \
+         conflicting rule"
+    )]
+    ListenerRuleConflict { rule_arn: String, condition: String },
     /// The handler has no real ECS client wired (the default
     /// [`UnconfiguredEcsTarget`]). The operator must bind AWS credentials and
     /// rebuild the handler with a connected client.
@@ -116,6 +130,19 @@ pub struct TaskSetStability {
     pub desired: u32,
 }
 
+/// Per-deployment ALB routing condition: the host-header and/or path-pattern
+/// that scopes this deployment's weighted forward to its *own* listener rule,
+/// so several deployments coexist behind one `alb_listener_arn` instead of
+/// fighting over the listener's default action. At least one of `host` / `path`
+/// is set — an all-blank wizard answer parses to `None` routing, which keeps
+/// the legacy default-action write (one deployment per listener). Built from
+/// the wizard's `alb_routing_host` / `alb_routing_path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerRouting {
+    pub host: Option<String>,
+    pub path: Option<String>,
+}
+
 /// Identity of the ALB listener whose weighted forward action mirrors a
 /// deployment's `TrafficSplit`. Carries the operator-supplied listener ARN
 /// (the wizard's `alb_listener_arn`); the verbs build this only when an ALB
@@ -128,6 +155,11 @@ pub struct ListenerRef {
     /// load-balancer bindings to map each weighted revision to its target
     /// group, and `describe_task_sets` is cluster-scoped.
     pub cluster: String,
+    /// Per-deployment routing condition. `Some` scopes the weighted forward to
+    /// this deployment's own listener rule (host/path), preserving the default
+    /// action + sibling rules; `None` writes the listener's default action
+    /// (legacy single-deployment-per-listener behaviour).
+    pub routing: Option<ListenerRouting>,
 }
 
 /// One weighted revision in a listener rule's forward action. The revision's
@@ -223,6 +255,11 @@ pub struct InMemoryEcs {
         std::sync::Mutex<std::collections::BTreeMap<(DeploymentId, RevisionId), TaskSetHandle>>,
     /// Last-applied listener weights per deployment.
     weights: std::sync::Mutex<std::collections::BTreeMap<DeploymentId, Vec<TargetGroupWeight>>>,
+    /// Last-applied listener routing per deployment — the `ListenerRef::routing`
+    /// the verb carried (`None` inner = a default-action write, `Some` = a
+    /// per-deployment rule). Records the deployer's contract decision, which the
+    /// real target turns into a `ModifyListener` vs `CreateRule`/`ModifyRule`.
+    routing: std::sync::Mutex<std::collections::BTreeMap<DeploymentId, Option<ListenerRouting>>>,
 }
 
 impl InMemoryEcs {
@@ -241,6 +278,17 @@ impl InMemoryEcs {
     /// Snapshot of the last-applied weights for a deployment.
     pub fn weights_for(&self, deployment_id: DeploymentId) -> Option<Vec<TargetGroupWeight>> {
         self.weights
+            .lock()
+            .expect("mutex not poisoned")
+            .get(&deployment_id)
+            .cloned()
+    }
+
+    /// Snapshot of the routing the last `apply_listener_weights` carried for a
+    /// deployment. Outer `None` = no listener write recorded; inner `None` = a
+    /// default-action write; inner `Some` = a per-deployment rule.
+    pub fn routing_for(&self, deployment_id: DeploymentId) -> Option<Option<ListenerRouting>> {
+        self.routing
             .lock()
             .expect("mutex not poisoned")
             .get(&deployment_id)
@@ -304,6 +352,10 @@ impl EcsDeployTarget for InMemoryEcs {
             .lock()
             .expect("mutex not poisoned")
             .insert(listener.deployment_id, weights.to_vec());
+        self.routing
+            .lock()
+            .expect("mutex not poisoned")
+            .insert(listener.deployment_id, listener.routing.clone());
         Ok(())
     }
 }

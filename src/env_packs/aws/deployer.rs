@@ -33,8 +33,8 @@ use tokio::time::{Instant, sleep};
 
 use super::AwsEcsDeployerHandler;
 use super::deploy_target::{
-    EcsDeployTarget, EcsTargetError, ListenerRef, ServiceSpec, TargetGroupWeight, TaskSetRef,
-    TaskSetSpec,
+    EcsDeployTarget, EcsTargetError, ListenerRef, ListenerRouting, ServiceSpec, TargetGroupWeight,
+    TaskSetRef, TaskSetSpec,
 };
 use crate::env_packs::deployer::{
     ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome, TrafficSplitOutcome,
@@ -122,6 +122,12 @@ pub struct AwsEcsParams {
     /// traffic shifting. Empty when the binding records no pool. Consumed by
     /// the construction path (PR-3c), not the verbs here.
     pub target_group_pool: Vec<String>,
+    /// Per-deployment ALB routing condition (host/path) that scopes this
+    /// deployment's weighted forward to its own listener rule. `None` when the
+    /// binding records no routing answers — the listener's default action is
+    /// written instead (one deployment per listener). Consumed by
+    /// `apply_traffic_split`.
+    pub routing: Option<ListenerRouting>,
 }
 
 /// Why a wizard answers blob could not be read into [`AwsEcsParams`].
@@ -155,6 +161,24 @@ fn answer_string(key: &str, value: &Value) -> Result<String, AwsEcsParamsError> 
 fn optional_string(key: &str, value: &Value) -> Result<Option<String>, AwsEcsParamsError> {
     let s = answer_string(key, value)?;
     Ok(if s.trim().is_empty() { None } else { Some(s) })
+}
+
+/// Read the optional `alb_routing_path` answer. Blank → `None` (the routing
+/// condition is opt-in, like every other ALB answer). A present value must be
+/// an ELBv2 path pattern (leading `/`), validated here so a malformed answer
+/// fails at parse time rather than as an opaque `CreateRule` API error — the
+/// same fail-at-parse posture as `parse_target_group_pool`.
+fn parse_routing_path(key: &str, value: &Value) -> Result<Option<String>, AwsEcsParamsError> {
+    let Some(path) = optional_string(key, value)? else {
+        return Ok(None);
+    };
+    if !path.starts_with('/') {
+        return Err(AwsEcsParamsError::Invalid {
+            key: key.to_string(),
+            detail: format!("path pattern `{path}` must start with `/`"),
+        });
+    }
+    Ok(Some(path))
 }
 
 /// Split a comma-separated string answer into trimmed, non-empty entries.
@@ -302,6 +326,7 @@ impl AwsEcsParams {
             assume_role_arn: None,
             launch: None,
             target_group_pool: Vec::new(),
+            routing: None,
         }
     }
 
@@ -331,8 +356,11 @@ impl AwsEcsParams {
         };
         let obj = answers.as_object().ok_or(AwsEcsParamsError::NotAnObject)?;
         // Launch-config fields are gathered here and assembled after the loop
-        // (all-or-nothing — see `build_launch`).
+        // (all-or-nothing — see `build_launch`). The routing condition is two
+        // optional answers assembled the same way (≥1 set → `Some`).
         let mut launch = LaunchFields::default();
+        let mut routing_host = None;
+        let mut routing_path = None;
         for (key, value) in obj {
             match key.as_str() {
                 "region" => params.region = answer_string(key, value)?,
@@ -342,6 +370,8 @@ impl AwsEcsParams {
                     params.image_tag_prefix = answer_string(key, value)?
                 }
                 "alb_listener_arn" => params.listener_arn = optional_string(key, value)?,
+                "alb_routing_host" => routing_host = optional_string(key, value)?,
+                "alb_routing_path" => routing_path = parse_routing_path(key, value)?,
                 "assume_role_arn" => params.assume_role_arn = optional_string(key, value)?,
                 "aws_profile" => {
                     answer_string(key, value)?;
@@ -362,6 +392,10 @@ impl AwsEcsParams {
             }
         }
         params.launch = launch.build()?;
+        params.routing = match (routing_host, routing_path) {
+            (None, None) => None,
+            (host, path) => Some(ListenerRouting { host, path }),
+        };
         Ok(params)
     }
 
@@ -571,6 +605,7 @@ impl Deployer for AwsEcsDeployerHandler {
                         deployment_id,
                         listener_arn: listener_arn.clone(),
                         cluster: params.cluster.clone(),
+                        routing: params.routing.clone(),
                     },
                     &weights,
                 )
@@ -749,6 +784,46 @@ mod tests {
                 entry.revision_id.0
             );
         }
+    }
+
+    /// A binding's ALB routing answers flow through to the `ListenerRef` the
+    /// target receives: with a routing condition the verb carries `Some`
+    /// (the target writes a per-deployment rule); without one it carries the
+    /// legacy `None` (the target writes the listener default action).
+    #[tokio::test]
+    async fn traffic_split_carries_routing_to_the_listener() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let dep = env.bundles[0].deployment_id;
+
+        let routed = serde_json::json!({
+            "alb_listener_arn": TEST_LISTENER_ARN,
+            "alb_routing_host": "app.example.com",
+            "alb_routing_path": "/app/*",
+        });
+        handler
+            .apply_traffic_split(&env, dep, Some(&routed))
+            .await
+            .unwrap();
+        assert_eq!(
+            target.routing_for(dep),
+            Some(Some(ListenerRouting {
+                host: Some("app.example.com".into()),
+                path: Some("/app/*".into()),
+            })),
+            "a routing condition must reach the target as `Some`"
+        );
+
+        let unrouted = serde_json::json!({ "alb_listener_arn": TEST_LISTENER_ARN });
+        handler
+            .apply_traffic_split(&env, dep, Some(&unrouted))
+            .await
+            .unwrap();
+        assert_eq!(
+            target.routing_for(dep),
+            Some(None),
+            "no routing condition must reach the target as the legacy `None`"
+        );
     }
 
     /// A split for deployment A must not perturb deployment B's recorded
@@ -1083,6 +1158,75 @@ mod tests {
         assert_eq!(launch.container_name, "worker");
         assert_eq!(launch.container_port, 9090);
         assert_eq!(params.target_group_pool, ["tg-blue", "tg-green"]);
+    }
+
+    #[test]
+    fn from_answers_parses_routing_host_and_path() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "alb_routing_host": "app.example.com",
+            "alb_routing_path": "/app/*",
+        });
+        let params = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap();
+        assert_eq!(
+            params.routing,
+            Some(ListenerRouting {
+                host: Some("app.example.com".into()),
+                path: Some("/app/*".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn from_answers_routing_host_or_path_alone_is_some() {
+        let env = build_fixture_env();
+        let host_only =
+            AwsEcsParams::from_answers(&env, Some(&serde_json::json!({ "alb_routing_host": "h" })))
+                .unwrap();
+        assert_eq!(
+            host_only.routing,
+            Some(ListenerRouting {
+                host: Some("h".into()),
+                path: None,
+            })
+        );
+        let path_only = AwsEcsParams::from_answers(
+            &env,
+            Some(&serde_json::json!({ "alb_routing_path": "/p" })),
+        )
+        .unwrap();
+        assert_eq!(
+            path_only.routing,
+            Some(ListenerRouting {
+                host: None,
+                path: Some("/p".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn from_answers_blank_routing_is_none() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "alb_routing_host": "  ",
+            "alb_routing_path": "",
+        });
+        let params = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap();
+        assert_eq!(
+            params.routing, None,
+            "all-blank routing answers parse to None"
+        );
+    }
+
+    #[test]
+    fn from_answers_rejects_routing_path_without_leading_slash() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({ "alb_routing_path": "app/*" });
+        let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(
+            matches!(err, AwsEcsParamsError::Invalid { ref key, .. } if key == "alb_routing_path"),
+            "expected Invalid for alb_routing_path, got {err:?}"
+        );
     }
 
     /// The minimum required launch set yields the wizard's defaults for the

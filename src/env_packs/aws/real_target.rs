@@ -61,6 +61,31 @@
 //! revisions sequentially; closing it durably would require a claim/lease that
 //! contradicts the stateless design (a PR-4 live-verify note).
 //!
+//! ## Listener routing (default action vs per-deployment rule)
+//!
+//! `apply_listener_weights` mirrors the `TrafficSplit` onto the listener in one
+//! of two shapes, chosen by the binding's routing answers:
+//!
+//! - **No routing condition** (`alb_routing_host` / `alb_routing_path` both
+//!   blank): the listener's **default action** is written, so the listener
+//!   serves exactly this deployment. This is the original behaviour, kept for
+//!   single-deployment listeners; a second deployment behind the same listener
+//!   would clobber it.
+//! - **A routing condition is set**: a per-deployment listener **rule** keyed by
+//!   the host/path condition is written, leaving the default action and sibling
+//!   rules intact, so deployments coexist behind one listener. The rule is
+//!   found-or-created idempotently — the routing condition is the rule's natural
+//!   key (`match_rule`), so re-applying updates the rule rather than stacking
+//!   duplicates. **Ownership is proven before mutation:** a condition match alone
+//!   does not authorize a write — a sibling deployment or an operator may hold a
+//!   rule with the same host/path (carrying auth/redirect actions). Each created
+//!   rule is stamped with an owner tag (`RULE_OWNER_TAG_KEY` → the deployment
+//!   ULID); before `ModifyRule` the rule's tags are read (`DescribeTags`) and a
+//!   non-owned match is refused (`ListenerRuleConflict`) rather than hijacked.
+//!   Like the pool assignment this is a read-then-write against live AWS state
+//!   (no persisted rule map); concurrent first-applies of two distinct
+//!   deployments are a PR-4 live-verify note, not a guarantee here.
+//!
 //! ## Identity bridge
 //!
 //! The seam addresses task sets by `(deployment_id, revision_id)`; ECS assigns
@@ -96,13 +121,14 @@ use aws_sdk_ecs::types::{
 };
 use aws_sdk_elasticloadbalancingv2::operation::describe_target_groups::DescribeTargetGroupsOutput;
 use aws_sdk_elasticloadbalancingv2::types::{
-    Action, ActionTypeEnum, ForwardActionConfig, TargetGroupTuple,
+    Action, ActionTypeEnum, ForwardActionConfig, HostHeaderConditionConfig,
+    PathPatternConditionConfig, Rule, RuleCondition, Tag, TagDescription, TargetGroupTuple,
 };
 use greentic_deploy_spec::{DeploymentId, RevisionId};
 
 use super::deploy_target::{
-    EcsDeployTarget, EcsTargetError, ListenerRef, ServiceSpec, TargetGroupWeight, TaskSetHandle,
-    TaskSetRef, TaskSetSpec, TaskSetStability,
+    EcsDeployTarget, EcsTargetError, ListenerRef, ListenerRouting, ServiceSpec, TargetGroupWeight,
+    TaskSetHandle, TaskSetRef, TaskSetSpec, TaskSetStability,
 };
 // The launch config is pure data parsed by `AwsEcsParams::from_answers`, so it
 // lives in the always-compiled deployer module; re-exported here to keep the
@@ -141,7 +167,12 @@ pub const REAL_ECS_TARGET_IAM_ACTIONS: &[&str] = &[
     "ecs:DeleteTaskSet",                         // delete_task_set
     "ecs:DeregisterTaskDefinition",              // delete_task_set
     "elasticloadbalancing:DescribeTargetGroups", // create_task_set (resolve_pool_arns, name→ARN)
-    "elasticloadbalancing:ModifyListener",       // apply_listener_weights
+    "elasticloadbalancing:ModifyListener", // apply_listener_weights (default-action, no routing)
+    "elasticloadbalancing:DescribeRules",  // apply_listener_weights (find this deployment's rule)
+    "elasticloadbalancing:CreateRule",     // apply_listener_weights (first per-deployment rule)
+    "elasticloadbalancing:ModifyRule",     // apply_listener_weights (update per-deployment rule)
+    "elasticloadbalancing:AddTags", // apply_listener_weights (stamp rule owner tag on create)
+    "elasticloadbalancing:DescribeTags", // apply_listener_weights (prove rule ownership before modify)
 ];
 
 impl RealEcsTarget {
@@ -489,21 +520,26 @@ impl EcsDeployTarget for RealEcsTarget {
         Ok(())
     }
 
-    /// Mirror the deployment's `TrafficSplit` onto the ALB by **replacing the
-    /// listener's default action** with a weighted forward across the
-    /// revisions' target groups.
+    /// Mirror the deployment's `TrafficSplit` onto the ALB as a weighted forward
+    /// across the revisions' target groups.
     ///
-    /// **Ownership model — one deployment per listener.** This writes the
-    /// listener's *default* action, so binding an `alb_listener_arn` hands that
-    /// listener's routing to the deployer: any pre-existing default / auth /
-    /// redirect action is replaced. `deployment_id` is carried on
-    /// [`ListenerRef`] but not yet used to scope the write, so serving multiple
-    /// deployments behind one listener would clobber siblings. Per-deployment
-    /// scoping (a `ModifyRule` rule keyed by a host/path condition, preserving
-    /// unrelated listener actions) needs the operator's routing topology and
-    /// lands with the construction wiring in the next slice (PR-3).
+    /// **Two routing models, chosen by [`ListenerRef::routing`]:**
     ///
-    /// [`ListenerRef`]: super::deploy_target::ListenerRef
+    /// - `None` (legacy, one deployment per listener): writes the listener's
+    ///   *default* action, so binding an `alb_listener_arn` hands that listener's
+    ///   routing to the deployer — any pre-existing default / auth / redirect
+    ///   action is replaced, and a second deployment behind the same listener
+    ///   would clobber the first. This is the original behaviour, kept for
+    ///   bindings that record no routing answers.
+    /// - `Some(routing)` (per-deployment): writes a listener **rule** keyed by
+    ///   this deployment's host/path condition, leaving the default action and
+    ///   every sibling rule untouched, so multiple deployments coexist behind
+    ///   one listener. The rule is found-or-created idempotently: the deployment
+    ///   is identified on the listener by its routing condition (the same
+    ///   condition is the rule's natural key), so re-applying a split updates
+    ///   the existing rule rather than stacking duplicates.
+    ///
+    /// [`ListenerRef::routing`]: super::deploy_target::ListenerRef::routing
     async fn apply_listener_weights(
         &self,
         listener: &ListenerRef,
@@ -525,6 +561,25 @@ impl EcsDeployTarget for RealEcsTarget {
             .map_err(|e| api("describe_task_sets", e))?;
         let tuples = weighted_target_groups(weights, &out)?;
         let action = forward_action(&tuples)?;
+        match &listener.routing {
+            None => self.write_listener_default(listener, action).await,
+            Some(routing) => self.write_listener_rule(listener, routing, action).await,
+        }
+    }
+}
+
+#[cfg(feature = "deploy-aws-ecs")]
+impl RealEcsTarget {
+    /// Legacy default-action write (no routing condition): the listener serves
+    /// exactly this deployment. See [`apply_listener_weights`] for the ownership
+    /// caveat.
+    ///
+    /// [`apply_listener_weights`]: RealEcsTarget::apply_listener_weights
+    async fn write_listener_default(
+        &self,
+        listener: &ListenerRef,
+        action: Action,
+    ) -> Result<(), EcsTargetError> {
         self.elb
             .modify_listener()
             .listener_arn(&listener.listener_arn)
@@ -533,6 +588,89 @@ impl EcsDeployTarget for RealEcsTarget {
             .await
             .map_err(|e| api("modify_listener", e))?;
         Ok(())
+    }
+
+    /// Per-deployment rule write: find this deployment's rule on the listener by
+    /// its routing condition and update its action, or create the rule (stamped
+    /// with this deployment's owner tag) when it is absent. The default action
+    /// and every sibling/operator rule are left untouched.
+    ///
+    /// **Ownership is proven, not assumed.** A condition match alone is not
+    /// enough to mutate a rule — a sibling deployment or an operator may have a
+    /// rule with the same host/path (carrying auth/redirect actions). Before
+    /// `ModifyRule` the rule's tags are read (`DescribeTags`) and the write is
+    /// refused ([`EcsTargetError::ListenerRuleConflict`]) unless the rule carries
+    /// THIS deployment's owner tag — so the deployer only ever rewrites a rule it
+    /// created. Re-applying a split (the rule already tagged ours) updates it
+    /// idempotently.
+    async fn write_listener_rule(
+        &self,
+        listener: &ListenerRef,
+        routing: &ListenerRouting,
+        action: Action,
+    ) -> Result<(), EcsTargetError> {
+        let existing = self
+            .elb
+            .describe_rules()
+            .listener_arn(&listener.listener_arn)
+            .send()
+            .await
+            .map_err(|e| api("describe_rules", e))?;
+        let rules = existing.rules();
+        match match_rule(rules, routing) {
+            Some(rule_arn) => {
+                if !self
+                    .rule_owned_by_deployment(&rule_arn, &listener.deployment_id)
+                    .await?
+                {
+                    return Err(EcsTargetError::ListenerRuleConflict {
+                        rule_arn,
+                        condition: routing_summary(routing),
+                    });
+                }
+                self.elb
+                    .modify_rule()
+                    .rule_arn(&rule_arn)
+                    .actions(action)
+                    .send()
+                    .await
+                    .map_err(|e| api("modify_rule", e))?;
+            }
+            None => {
+                self.elb
+                    .create_rule()
+                    .listener_arn(&listener.listener_arn)
+                    .priority(next_rule_priority(rules))
+                    .set_conditions(Some(routing_conditions(routing)))
+                    .actions(action)
+                    .tags(owner_tag(&listener.deployment_id))
+                    .send()
+                    .await
+                    .map_err(|e| api("create_rule", e))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Read a rule's tags and decide whether THIS deployment created it (carries
+    /// the [`RULE_OWNER_TAG_KEY`] tag with this deployment's ULID). `DescribeRules`
+    /// does not return tags, so ownership needs this extra read.
+    async fn rule_owned_by_deployment(
+        &self,
+        rule_arn: &str,
+        deployment_id: &DeploymentId,
+    ) -> Result<bool, EcsTargetError> {
+        let out = self
+            .elb
+            .describe_tags()
+            .resource_arns(rule_arn)
+            .send()
+            .await
+            .map_err(|e| api("describe_tags", e))?;
+        Ok(tag_descriptions_owned_by(
+            out.tag_descriptions(),
+            deployment_id,
+        ))
     }
 }
 
@@ -909,6 +1047,132 @@ fn forward_action(tuples: &[(u32, String)]) -> Result<Action, EcsTargetError> {
 /// non-zero tuple takes all traffic regardless).
 fn elb_weight(weight_bps: u32) -> i32 {
     (weight_bps / 10).min(999) as i32
+}
+
+/// Build the ELBv2 rule conditions for a deployment's routing: a host-header
+/// condition and/or a path-pattern condition (ELBv2 AND-combines them when both
+/// are present). The parser guarantees a `Some` routing has a host or a path,
+/// so the returned vec is never empty.
+fn routing_conditions(routing: &ListenerRouting) -> Vec<RuleCondition> {
+    let mut conditions = Vec::with_capacity(2);
+    if let Some(host) = &routing.host {
+        conditions.push(
+            RuleCondition::builder()
+                .field("host-header")
+                .host_header_config(HostHeaderConditionConfig::builder().values(host).build())
+                .build(),
+        );
+    }
+    if let Some(path) = &routing.path {
+        conditions.push(
+            RuleCondition::builder()
+                .field("path-pattern")
+                .path_pattern_config(PathPatternConditionConfig::builder().values(path).build())
+                .build(),
+        );
+    }
+    conditions
+}
+
+/// The (host-header values, path-pattern values) a rule's conditions match on,
+/// as sorted sets — a deployment's identity on the listener. Reads the typed
+/// config ELBv2 returns for rules created through this API. A default rule (no
+/// conditions) yields two empty sets.
+fn rule_routing_key(
+    conditions: &[RuleCondition],
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    let mut hosts = std::collections::BTreeSet::new();
+    let mut paths = std::collections::BTreeSet::new();
+    for c in conditions {
+        if let Some(cfg) = c.host_header_config() {
+            hosts.extend(cfg.values().iter().cloned());
+        }
+        if let Some(cfg) = c.path_pattern_config() {
+            paths.extend(cfg.values().iter().cloned());
+        }
+    }
+    (hosts, paths)
+}
+
+/// The routing key for a [`ListenerRouting`], comparable to [`rule_routing_key`]
+/// — the same (host set, path set) shape so a deployment's desired routing and
+/// a live rule's conditions compare directly.
+fn routing_key(
+    routing: &ListenerRouting,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    (
+        routing.host.iter().cloned().collect(),
+        routing.path.iter().cloned().collect(),
+    )
+}
+
+/// Find the listener rule whose host/path condition matches this deployment's
+/// routing — the deployment's natural key on the listener, which makes the
+/// rule write idempotent. Skips the default rule (it carries no conditions).
+fn match_rule(rules: &[Rule], routing: &ListenerRouting) -> Option<String> {
+    let want = routing_key(routing);
+    rules
+        .iter()
+        .filter(|r| r.is_default() != Some(true))
+        .find(|r| rule_routing_key(r.conditions()) == want)
+        .and_then(|r| r.rule_arn().map(str::to_string))
+}
+
+/// The priority to assign a newly-created rule: one above the highest numeric
+/// priority already on the listener (`1` when none). ELBv2 rule priorities are
+/// unique `1..=50000` integers; the default rule's priority is the non-numeric
+/// `"default"` and is skipped.
+fn next_rule_priority(rules: &[Rule]) -> i32 {
+    rules
+        .iter()
+        .filter_map(|r| r.priority().and_then(|p| p.parse::<i32>().ok()))
+        .max()
+        .map_or(1, |m| m + 1)
+}
+
+/// Tag key stamped on every listener rule this deployer creates, carrying the
+/// owning deployment's ULID. Read back (`DescribeTags`) before `ModifyRule` so
+/// the deployer only rewrites a rule it created — never a sibling deployment's
+/// or an operator-managed rule that happens to share the host/path condition.
+const RULE_OWNER_TAG_KEY: &str = "greentic:deployment-id";
+
+/// The owner tag a rule this deployment creates carries (`RULE_OWNER_TAG_KEY` →
+/// the deployment ULID).
+fn owner_tag(deployment_id: &DeploymentId) -> Tag {
+    Tag::builder()
+        .key(RULE_OWNER_TAG_KEY)
+        .value(deployment_id.0.to_string())
+        .build()
+}
+
+/// True iff some tag description carries this deployment's owner tag — i.e. the
+/// rule was created by this deployment and may be rewritten.
+fn tag_descriptions_owned_by(
+    descriptions: &[TagDescription],
+    deployment_id: &DeploymentId,
+) -> bool {
+    let want = deployment_id.0.to_string();
+    descriptions.iter().any(|d| {
+        d.tags()
+            .iter()
+            .any(|t| t.key() == Some(RULE_OWNER_TAG_KEY) && t.value() == Some(want.as_str()))
+    })
+}
+
+/// Human-readable summary of a routing condition for the conflict error message.
+fn routing_summary(routing: &ListenerRouting) -> String {
+    match (&routing.host, &routing.path) {
+        (Some(h), Some(p)) => format!("host `{h}` + path `{p}`"),
+        (Some(h), None) => format!("host `{h}`"),
+        (None, Some(p)) => format!("path `{p}`"),
+        (None, None) => "<no condition>".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1466,6 +1730,190 @@ mod tests {
         assert_eq!(
             creds.expiry(),
             Some(std::time::SystemTime::from(expiration))
+        );
+    }
+
+    /// Build a non-default listener rule with the given host/path condition
+    /// values — the shape `describe_rules` returns for a per-deployment rule.
+    fn rule_with(rule_arn: &str, priority: &str, host: Option<&str>, path: Option<&str>) -> Rule {
+        let mut conditions = Vec::new();
+        if let Some(h) = host {
+            conditions.push(
+                RuleCondition::builder()
+                    .field("host-header")
+                    .host_header_config(HostHeaderConditionConfig::builder().values(h).build())
+                    .build(),
+            );
+        }
+        if let Some(p) = path {
+            conditions.push(
+                RuleCondition::builder()
+                    .field("path-pattern")
+                    .path_pattern_config(PathPatternConditionConfig::builder().values(p).build())
+                    .build(),
+            );
+        }
+        Rule::builder()
+            .rule_arn(rule_arn)
+            .priority(priority)
+            .is_default(false)
+            .set_conditions(Some(conditions))
+            .build()
+    }
+
+    /// `routing_conditions` emits one host-header and/or one path-pattern
+    /// condition, carrying the operator's values, and never an empty vec.
+    #[test]
+    fn routing_conditions_emits_host_and_path_conditions() {
+        let both = routing_conditions(&ListenerRouting {
+            host: Some("app.example.com".into()),
+            path: Some("/app/*".into()),
+        });
+        assert_eq!(both.len(), 2);
+        assert_eq!(
+            both[0].host_header_config().unwrap().values()[0],
+            "app.example.com"
+        );
+        assert_eq!(both[1].path_pattern_config().unwrap().values()[0], "/app/*");
+
+        let host_only = routing_conditions(&ListenerRouting {
+            host: Some("h".into()),
+            path: None,
+        });
+        assert_eq!(host_only.len(), 1);
+        assert!(host_only[0].host_header_config().is_some());
+
+        let path_only = routing_conditions(&ListenerRouting {
+            host: None,
+            path: Some("/p".into()),
+        });
+        assert_eq!(path_only.len(), 1);
+        assert!(path_only[0].path_pattern_config().is_some());
+    }
+
+    /// `match_rule` returns the rule whose host/path condition equals the
+    /// deployment's routing, skips the default rule and out-of-scope siblings,
+    /// and returns `None` when nothing matches (so the caller creates one).
+    #[test]
+    fn match_rule_finds_the_rule_with_matching_conditions() {
+        let want = ListenerRouting {
+            host: Some("app.example.com".into()),
+            path: Some("/app/*".into()),
+        };
+        let rules = vec![
+            // Default rule (no conditions) — never matched.
+            Rule::builder()
+                .rule_arn("arn:rule/default")
+                .priority("default")
+                .is_default(true)
+                .build(),
+            // A sibling deployment's rule — different host.
+            rule_with(
+                "arn:rule/sibling",
+                "10",
+                Some("other.example.com"),
+                Some("/app/*"),
+            ),
+            // Ours.
+            rule_with(
+                "arn:rule/ours",
+                "20",
+                Some("app.example.com"),
+                Some("/app/*"),
+            ),
+        ];
+        assert_eq!(match_rule(&rules, &want).as_deref(), Some("arn:rule/ours"));
+
+        // A routing with no live rule → create path.
+        let absent = ListenerRouting {
+            host: Some("nope.example.com".into()),
+            path: None,
+        };
+        assert_eq!(match_rule(&rules, &absent), None);
+    }
+
+    /// `next_rule_priority` is one above the highest numeric priority, ignores
+    /// the non-numeric `"default"`, and starts at 1 on an empty listener.
+    #[test]
+    fn next_rule_priority_is_one_above_the_max_numeric() {
+        let rules = vec![
+            Rule::builder()
+                .rule_arn("arn:rule/default")
+                .priority("default")
+                .is_default(true)
+                .build(),
+            rule_with("arn:rule/a", "5", Some("a"), None),
+            rule_with("arn:rule/b", "12", Some("b"), None),
+        ];
+        assert_eq!(next_rule_priority(&rules), 13);
+        assert_eq!(next_rule_priority(&[]), 1);
+    }
+
+    /// `tag_descriptions_owned_by` recognizes only a rule carrying THIS
+    /// deployment's owner tag — a sibling's tag, a foreign key, or no tags at
+    /// all (an operator-managed rule) all read as not-owned, so the caller fails
+    /// closed instead of hijacking the rule.
+    #[test]
+    fn tag_descriptions_owned_by_matches_only_this_deployments_owner_tag() {
+        let dep = DeploymentId(Ulid::from(0x01_u128));
+        let owner_value = dep.0.to_string();
+
+        let descriptions_with = |tags: Vec<Tag>| {
+            vec![
+                TagDescription::builder()
+                    .resource_arn("arn:rule/x")
+                    .set_tags(Some(tags))
+                    .build(),
+            ]
+        };
+
+        // Our owner tag → owned.
+        let ours = descriptions_with(vec![owner_tag(&dep)]);
+        assert!(tag_descriptions_owned_by(&ours, &dep));
+
+        // A sibling deployment's owner tag → not ours.
+        let sibling = descriptions_with(vec![
+            Tag::builder()
+                .key(RULE_OWNER_TAG_KEY)
+                .value(DeploymentId(Ulid::from(0x02_u128)).0.to_string())
+                .build(),
+        ]);
+        assert!(!tag_descriptions_owned_by(&sibling, &dep));
+
+        // Right value but a different key → not ours.
+        let wrong_key = descriptions_with(vec![
+            Tag::builder().key("other").value(&owner_value).build(),
+        ]);
+        assert!(!tag_descriptions_owned_by(&wrong_key, &dep));
+
+        // No tags (operator-managed rule) → not ours.
+        assert!(!tag_descriptions_owned_by(&descriptions_with(vec![]), &dep));
+        assert!(!tag_descriptions_owned_by(&[], &dep));
+    }
+
+    /// `routing_summary` renders host, path, or both for the conflict message.
+    #[test]
+    fn routing_summary_renders_host_path_or_both() {
+        assert_eq!(
+            routing_summary(&ListenerRouting {
+                host: Some("h".into()),
+                path: Some("/p".into()),
+            }),
+            "host `h` + path `/p`"
+        );
+        assert_eq!(
+            routing_summary(&ListenerRouting {
+                host: Some("h".into()),
+                path: None,
+            }),
+            "host `h`"
+        );
+        assert_eq!(
+            routing_summary(&ListenerRouting {
+                host: None,
+                path: Some("/p".into()),
+            }),
+            "path `/p`"
         );
     }
 }

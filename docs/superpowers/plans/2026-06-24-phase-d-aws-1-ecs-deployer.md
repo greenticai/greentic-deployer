@@ -235,9 +235,45 @@ target-group pool, F1 = per-deployment `ModifyRule`):**
     note (the deploy path warms sequentially; closing it durably needs the
     CAS/lease the stateless F2 choice rules out). The docs/comment now scope the
     guard to "steady-state" rather than claiming total closure.
-- **PR-3c-3:** the **F1 fix** — per-deployment ALB `ModifyRule` (host/path
-  condition from a new wizard routing answer), preserving the default action +
-  sibling rules so multiple deployments coexist behind one listener.
+- **PR-3c-3 — ✅ SHIPPED (the F1 fix).** Per-deployment ALB listener **rule**
+  (host/path condition from new wizard answers `alb_routing_host` /
+  `alb_routing_path`), preserving the default action + sibling rules so multiple
+  deployments coexist behind one listener. **Opt-in + backward-compatible:**
+  `ListenerRouting` (host and/or path, ≥1 to activate) rides on `ListenerRef`;
+  `apply_listener_weights` branches — `None` routing keeps the legacy
+  default-action write (`write_listener_default`, one deployment per listener),
+  `Some` writes a per-deployment rule (`write_listener_rule`). The rule is
+  **found-or-created idempotently by condition match**: `describe_rules` →
+  `match_rule` (the routing condition is the rule's natural key, skips the
+  default rule) → `modify_rule` if present, else `create_rule` at
+  `next_rule_priority` (max numeric + 1). Industry-standard shape — ALB
+  per-service routing uses host-header / path-pattern listener rules (AWS LB
+  Controller, CodeDeploy blue/green); both are first-class conditions so the
+  operator picks by topology (superset-safe). Pure helpers
+  (`routing_conditions`, `rule_routing_key`/`routing_key`, `match_rule`,
+  `next_rule_priority`) unit-tested; the `.send()` glue is PR-4-verified (the
+  pure-vs-glue seam). IAM gained `DescribeRules` / `CreateRule` / `ModifyRule`
+  (`REAL_ECS_TARGET_IAM_ACTIONS` + `VALIDATED_IAM_VERBS`, auto-bucketed in the
+  rules-pack); `ModifyListener` kept for the legacy path. Docs (apply-traffic
+  `--help` WARNING, `env.rs` NOTE, module doc) re-scoped — the clobber caveat now
+  applies only to the no-routing case. The in-memory conformance fake records
+  `routing` but models no listener rules, so per-deployment rule **isolation**
+  (two deployments' rules coexisting live) stays a PR-4 live-verify note, like
+  the pool-ownership concurrent-cold-start window.
+  **pr-harden (codex HIGH — rule ownership):** `match_rule` matched a rule by
+  host/path condition alone, so `ModifyRule` could rewrite a rule the deployer
+  did not create — a sibling deployment's rule (largely mitigated already by the
+  PR-3c-2c single-owner pool guard, which fails a second deployment's warm
+  closed) or, the live residual, an **operator-managed auth/redirect rule**
+  sharing the condition, contradicting the "preserve sibling rules" promise.
+  Fixed with **tag-based ownership** (Codex's recommendation): each created rule
+  is stamped `greentic:deployment-id` = the deployment ULID; before `ModifyRule`
+  the rule's tags are read (`DescribeTags`) and a non-owned match is refused
+  (`EcsTargetError::ListenerRuleConflict`, fail-closed) rather than hijacked.
+  Idempotent re-apply still updates the deployment's own (tagged) rule. IAM +=
+  `AddTags` / `DescribeTags`. This also turns the two-deployments-same-condition
+  case into a clean conflict instead of a silent hijack (belt-and-suspenders with
+  the pool guard).
 
 **Must also fix (PR-2 codex adversarial review, all valid — deferred here
 because the real fixes need PR-3's wizard/bootstrap data, not surface patches):**
@@ -258,14 +294,15 @@ because the real fixes need PR-3's wizard/bootstrap data, not surface patches):*
    `target_group_arns` (ARNs or ≤32-char names; PR-3c-1), and `RealEcsTarget`
    assigns each revision a free pool member, read back from the task sets'
    load-balancer bindings (PR-3c-2). Not a shortened generated name.
-3. **Per-deployment ALB scoping (F1) → PR-3c-3.** `apply_listener_weights`
-   replaces the listener's *default* action (whole-listener ownership), so
-   multiple deployments behind one `alb_listener_arn` clobber each other and any
-   sibling/auth/redirect action is discarded. Decision: scope the write to a
-   per-deployment `ModifyRule` (host/path condition from a new wizard routing
-   answer), preserving the default action + sibling rules so deployments coexist
-   behind one listener. (PR-2 documents the current ownership constraint on the
-   method.)
+3. **Per-deployment ALB scoping (F1) — ✅ SHIPPED in PR-3c-3.**
+   `apply_listener_weights` used to replace the listener's *default* action
+   (whole-listener ownership), so multiple deployments behind one
+   `alb_listener_arn` clobbered each other. Now the write is scoped to a
+   per-deployment listener **rule** (host/path condition from the new
+   `alb_routing_host` / `alb_routing_path` answers), found-or-created
+   idempotently and preserving the default action + sibling rules so deployments
+   coexist behind one listener. Opt-in: blank routing keeps the legacy
+   default-action write (backward compatible).
 4. **Idempotency under concurrent deploy — ✅ SHIPPED in PR-3a.**
    `ensure_service` now passes a deterministic `clientToken` (UUID-form, derived
    from the deployment ULID) on `CreateService`, so two `warm_revision` callers

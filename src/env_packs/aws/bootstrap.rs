@@ -382,8 +382,12 @@ The policy is split into multiple statements by sensitivity:
 - **ELB describe** (`elasticloadbalancing:DescribeTargetGroups`) —
   granted at `Resource = "*"` because AWS provides no resource-level
   scoping for describe actions.
-- **ALB listener mutation** (`elasticloadbalancing:ModifyListener`) —
-  replace `<REPLACE_WITH_ALB_LISTENER_ARNS>` with your listener ARN.
+- **ALB listener mutation** (`elasticloadbalancing:ModifyListener`,
+  `DescribeRules`, `CreateRule`, `ModifyRule`, `AddTags`, `DescribeTags`) —
+  `ModifyListener` writes the listener's default action; the rule verbs write
+  per-deployment listener rules, and the tag verbs stamp + verify each rule's
+  owning deployment so the deployer only rewrites rules it created. Replace
+  `<REPLACE_WITH_ALB_LISTENER_ARNS>` with your listener ARN.
 - **iam:PassRole** — replace `<REPLACE_WITH_ECS_TASK_ROLE_ARN>` with the
   ARN of the ECS task-execution role, e.g.
   `arn:aws:iam::<account>:role/greentic-{env_id}-task-execution`.
