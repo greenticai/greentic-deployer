@@ -6,9 +6,13 @@
 //! sockets. The thin `.send()` glue that drives the *real* AWS SDK
 //! (`RegisterTaskDefinition` / `CreateService` / `CreateTaskSet` /
 //! `ModifyListener` / `CreateRule` / `DescribeTags` / …) therefore has zero
-//! end-to-end coverage. This test closes that gap by driving the full
-//! `bootstrap → warm on Fargate → traffic split → archive` lifecycle through
-//! the real CLI verbs against a real AWS account.
+//! end-to-end coverage. This test closes that gap by driving a full blue/green
+//! lifecycle — `warm A on Fargate → route 100 % to A → warm B → SHIFT 100 % to
+//! B → archive + tear down the drained A` — through the real CLI verbs against a
+//! real AWS account. Two revisions because the engine refuses to archive a
+//! revision still in a live split, so a single-revision env can never drain
+//! itself; the shift is also the headline `apply-traffic` re-point this train
+//! adds.
 //!
 //! ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //! Why this is gated and operator-run (NOT in CI):
@@ -72,9 +76,22 @@
 //!   Also honored (read by the deployer itself, not this test):
 //!     GREENTIC_AWS_ECS_WARM_READY_TIMEOUT_SECS  bound the Fargate stabilize wait
 //!
-//! Run it (a real account is billed):
+//! Run it (a real account is billed; the gate must be `=1` exactly — `0`/unset
+//! skip):
 //!   GREENTIC_AWS_E2E=1 GTC_AWS_E2E_REGION=eu-west-1 GTC_AWS_E2E_CLUSTER=… \
 //!     … cargo test --test aws_ecs_e2e -- --nocapture
+//!
+//! ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//! Cleanup (operator-owned):
+//! ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//! On the happy path the test tears down the drained revision A; revision B
+//! stays as the live serving revision (the engine cannot archive a sole routed
+//! revision). Tearing down B's task set + the pre-provisioned scaffolding
+//! (cluster / ALB / ECR) is the operator's. A mid-run FAILURE may also leave the
+//! deployer-created task sets — reclaim them with `gtc op env apply-revision`
+//! after archiving, or tear them down in the account. (No in-test cleanup guard:
+//! it cannot reclaim the still-routed B regardless, and the operator owns and
+//! watches the account.)
 //!
 //! NOTE: this test has been written against the verified CLI/answer surface but
 //! has not itself been executed against a live account (no account was
@@ -102,16 +119,26 @@ fn deployer_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_greentic-deployer"))
 }
 
-/// `true` when the test is armed. Unset → the caller returns early.
+/// Exactly `Some("1")` arms the test; unset, `0`, `false`, or any other value
+/// skips. Stricter than the K8s E2E's mere-presence check ON PURPOSE: this path
+/// BILLS A REAL ACCOUNT, so `GREENTIC_AWS_E2E=0` (a common "disable it" reflex)
+/// must NOT arm it. Pure (takes the value) so the gate is unit-tested without
+/// touching the process env.
+fn gate_armed(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// `true` when the test is armed (see [`gate_armed`]). Unset / non-`1` → the
+/// caller returns early.
 fn armed() -> bool {
-    if std::env::var(E2E_GATE).is_err() {
-        eprintln!(
-            "skipping live-account AWS-ECS E2E: set {E2E_GATE}=1 (bills a real account; \
-             needs the GTC_AWS_E2E_* scope vars — see the module doc)"
-        );
-        return false;
+    if gate_armed(std::env::var(E2E_GATE).ok().as_deref()) {
+        return true;
     }
-    true
+    eprintln!(
+        "skipping live-account AWS-ECS E2E: set {E2E_GATE}=1 exactly (bills a real account; \
+         needs the GTC_AWS_E2E_* scope vars — see the module doc)"
+    );
+    false
 }
 
 /// A required scope var. Missing while armed is a hard failure with a precise
@@ -188,11 +215,112 @@ fn aws_answers() -> Value {
     answers
 }
 
-/// Full live lifecycle: bind the AWS-ECS deployer → desired-state ceremony
-/// (bundle/revision/traffic) → `env apply-revision` warms the revision on
-/// Fargate → `env apply-traffic` shifts the ALB split → `env apply-revision`
-/// (after archive) tears the task set down. Each `env apply-*` call is the
-/// first to reach AWS; the asserts confirm the real `.send()` glue round-trips.
+/// The gate is pure, so this runs in the NORMAL `cargo test` suite (no env, no
+/// AWS) — the one piece of CI-runnable coverage in this file. Locks in that a
+/// real-account run requires `GREENTIC_AWS_E2E=1` exactly and that `0`/`false`
+/// do NOT arm it.
+#[test]
+fn gate_arms_only_on_exact_1() {
+    assert!(gate_armed(Some("1")));
+    assert!(!gate_armed(None));
+    assert!(!gate_armed(Some("0")));
+    assert!(!gate_armed(Some("false")));
+    assert!(!gate_armed(Some("true")));
+    assert!(!gate_armed(Some("")));
+}
+
+/// Stage a revision from `deployment_id`, drive it to `Ready` (desired-state),
+/// then LIVE-warm it on Fargate via `env apply-revision`. Returns the revision
+/// id. `label` disambiguates the per-revision payload filenames.
+fn provision_warmed_revision(store: &Path, deployment_id: &str, label: &str) -> String {
+    let stage = payload(
+        store,
+        &format!("stage-{label}.json"),
+        json!({
+            "environment_id": ENV_ID,
+            "deployment_id": deployment_id,
+            "bundle_path": fixture_bundle().to_string_lossy(),
+        }),
+    );
+    let revision_id = op(store, Some(&stage), &["revisions", "stage"])["result"]["revision_id"]
+        .as_str()
+        .expect("revision_id")
+        .to_string();
+
+    let warm = payload(
+        store,
+        &format!("warm-{label}.json"),
+        json!({"environment_id": ENV_ID, "revision_id": revision_id}),
+    );
+    let warmed = op(store, Some(&warm), &["revisions", "warm"]);
+    assert_eq!(
+        warmed["result"]["lifecycle"], "ready",
+        "revision {label} reaches Ready (cluster presence) before the live warm"
+    );
+
+    // First AWS call for this revision: ensure the service + create the task set
+    // and wait for steady state.
+    let applied = op(
+        store,
+        None,
+        &["env", "apply-revision", ENV_ID, &revision_id],
+    );
+    assert_eq!(
+        applied["result"]["action"], "warmed",
+        "present revision {label} drives the live Fargate warm"
+    );
+    let identity = applied["result"]["identity"].as_str().expect("identity");
+    assert!(
+        identity == "ambient" || identity == "bound",
+        "identity is ambient (no bound session) or bound, got {identity:?}"
+    );
+    revision_id
+}
+
+/// Record a 100 % split to `revision_id` and push it LIVE to the ALB via
+/// `env apply-traffic`. A later call for the SAME deployment with a different
+/// revision REPLACES the deployment's split (`set_traffic_split` is replace-by-
+/// deployment), freeing the prior revision to be archived — the blue/green
+/// shift. Asserts the enforced split echoes the recorded one.
+fn route_all_traffic(store: &Path, deployment_id: &str, revision_id: &str) {
+    let traffic = payload(
+        store,
+        &format!("traffic-{revision_id}.json"),
+        json!({
+            "environment_id": ENV_ID,
+            "deployment_id": deployment_id,
+            "entries": [{"revision_id": revision_id, "weight_bps": 10000}],
+            "idempotency_key": format!("aws-ecs-e2e-{revision_id}"),
+        }),
+    );
+    op(store, Some(&traffic), &["traffic", "set"]);
+
+    let shifted = op(
+        store,
+        None,
+        &["env", "apply-traffic", ENV_ID, deployment_id],
+    );
+    let entries = shifted["result"]["applied_entries"]
+        .as_array()
+        .expect("applied_entries");
+    assert_eq!(entries.len(), 1, "single recorded entry shifted");
+    assert_eq!(
+        entries[0]["revision_id"], revision_id,
+        "shifted to the revision"
+    );
+    assert_eq!(entries[0]["weight_bps"], 10000, "shifted 100 %");
+}
+
+/// Full live lifecycle as a blue/green shift: bind the AWS-ECS deployer → warm
+/// revision A on Fargate + route 100 % to it → warm revision B + SHIFT 100 % to
+/// it (the headline `apply-traffic` re-point) → archive the now-drained A and
+/// tear its task set down. Each `env apply-*` call reaches AWS; the asserts
+/// confirm the real `.send()` glue round-trips.
+///
+/// Two revisions (not one) because the engine REFUSES to archive a revision
+/// still referenced by a live traffic split — a single-revision env can never
+/// drain its sole routed revision. Both stage from one deployment so a single
+/// ALB split shifts between them.
 ///
 /// One sequential test (not several) so the expensive real-account provisioning
 /// runs once; each step depends on the prior.
@@ -235,9 +363,8 @@ fn aws_ecs_full_lifecycle_against_real_account() {
     //    sign without the operator key trusted for this env.
     op(store, None, &["trust-root", "bootstrap", ENV_ID]);
 
-    // 3. Desired-state ceremony (provider-agnostic — records state, touches no
-    //    AWS): add a bundle → stage + warm a revision (→ cluster presence) →
-    //    route 100 % of traffic to it.
+    // 3. One bundle/deployment; BOTH revisions stage from it so a single ALB
+    //    split shifts between them (the blue/green proof).
     let add = payload(
         store,
         "add.json",
@@ -252,100 +379,39 @@ fn aws_ecs_full_lifecycle_against_real_account() {
         .expect("deployment_id")
         .to_string();
 
-    let stage = payload(
-        store,
-        "stage.json",
-        json!({
-            "environment_id": ENV_ID,
-            "deployment_id": deployment_id,
-            "bundle_path": fixture_bundle().to_string_lossy(),
-        }),
-    );
-    let revision_id = op(store, Some(&stage), &["revisions", "stage"])["result"]["revision_id"]
-        .as_str()
-        .expect("revision_id")
-        .to_string();
+    // 4. BLUE: warm revision A on Fargate, route 100 % of traffic to it.
+    let rev_a = provision_warmed_revision(store, &deployment_id, "a");
+    route_all_traffic(store, &deployment_id, &rev_a);
 
-    let warm = payload(
-        store,
-        "warm.json",
-        json!({"environment_id": ENV_ID, "revision_id": revision_id}),
-    );
-    let warmed = op(store, Some(&warm), &["revisions", "warm"]);
-    assert_eq!(
-        warmed["result"]["lifecycle"], "ready",
-        "revision reaches Ready (cluster presence) before the live warm"
-    );
+    // 5. GREEN: warm revision B, then SHIFT 100 % A→B. `traffic set` replaces the
+    //    deployment's split, so B becomes the sole routed revision and A is freed
+    //    to archive. Exercises the live ALB re-point + a second pool member.
+    let rev_b = provision_warmed_revision(store, &deployment_id, "b");
+    route_all_traffic(store, &deployment_id, &rev_b);
 
-    let traffic = payload(
-        store,
-        "traffic.json",
-        json!({
-            "environment_id": ENV_ID,
-            "deployment_id": deployment_id,
-            "entries": [{"revision_id": revision_id, "weight_bps": 10000}],
-            "idempotency_key": format!("aws-ecs-e2e-{revision_id}"),
-        }),
-    );
-    op(store, Some(&traffic), &["traffic", "set"]);
-
-    // 4. LIVE warm on Fargate: ensure the service + create the task set and wait
-    //    for steady state. First call to reach AWS.
-    let applied = op(
-        store,
-        None,
-        &["env", "apply-revision", ENV_ID, &revision_id],
-    );
-    assert_eq!(
-        applied["result"]["action"], "warmed",
-        "present revision drives the live Fargate warm"
-    );
-    let warm_identity = applied["result"]["identity"]
-        .as_str()
-        .expect("apply-revision identity");
-    assert!(
-        warm_identity == "ambient" || warm_identity == "bound",
-        "identity is ambient (no bound session) or bound, got {warm_identity:?}"
-    );
-
-    // 5. LIVE traffic shift: push the recorded split to the ALB listener (a
-    //    per-deployment rule when a routing condition is set, else the listener
-    //    default action). Asserts the enforced split echoes the recorded one.
-    let shifted = op(
-        store,
-        None,
-        &["env", "apply-traffic", ENV_ID, &deployment_id],
-    );
-    let entries = shifted["result"]["applied_entries"]
-        .as_array()
-        .expect("applied_entries");
-    assert_eq!(entries.len(), 1, "single recorded entry shifted");
-    assert_eq!(
-        entries[0]["revision_id"], revision_id,
-        "shifted the revision"
-    );
-    assert_eq!(entries[0]["weight_bps"], 10000, "shifted 100 %");
-
-    // 6. LIVE teardown: archive (desired-state) then apply-revision on the now
-    //    absent revision tears the task set down.
+    // 6. LIVE teardown of the drained BLUE revision: archive (desired-state — now
+    //    valid because no split references A) then apply-revision tears down A's
+    //    Fargate task set.
     let archive = payload(
         store,
-        "archive.json",
-        json!({"environment_id": ENV_ID, "revision_id": revision_id}),
+        "archive-a.json",
+        json!({"environment_id": ENV_ID, "revision_id": rev_a}),
     );
     let archived = op(store, Some(&archive), &["revisions", "archive"]);
     assert_eq!(
         archived["result"]["lifecycle"], "archived",
-        "revision archived (desired-state)"
+        "blue revision archived (desired-state) once drained"
     );
 
-    let torn_down = op(
-        store,
-        None,
-        &["env", "apply-revision", ENV_ID, &revision_id],
-    );
+    let torn_down = op(store, None, &["env", "apply-revision", ENV_ID, &rev_a]);
     assert_eq!(
         torn_down["result"]["action"], "archived",
-        "absent revision drives the live task-set teardown"
+        "absent blue revision drives the live task-set teardown"
     );
+
+    // Revision B remains the live serving revision (task set + ALB rule); the
+    // engine cannot archive a sole routed revision, so final teardown of B and
+    // the operator-pre-provisioned scaffolding (cluster / ALB / ECR) is the
+    // operator's — see the module-doc cleanup note. A mid-run panic likewise
+    // leaves the deployer-created task sets for manual cleanup.
 }
