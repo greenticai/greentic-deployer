@@ -212,9 +212,15 @@ impl EcsDeployTarget for RealEcsTarget {
         let service = service_name(&spec.deployment_id);
         let external_id = task_set_external_id(&spec.revision_id);
 
-        // Idempotent: a task set already tagged with our externalId means warm
-        // ran before — return the existing handle without registering a second
-        // task definition.
+        // Fast path: if a task set already tagged with our externalId exists,
+        // return its handle without registering another task definition. The
+        // `clientToken` on CreateTaskSet (below) is what actually closes the
+        // describe-then-(register+create) race — concurrent same-revision
+        // callers dedupe to one task set rather than creating duplicates. The
+        // loser's just-registered task definition is a minor orphan (an extra
+        // ACTIVE task-def revision); reclaiming it requires comparing the
+        // deduped response's task-def to the registered one and deregistering
+        // the loser's, which is a PR-4 live-verification item.
         let existing = self
             .ecs
             .describe_task_sets()
@@ -261,6 +267,7 @@ impl EcsDeployTarget for RealEcsTarget {
             .service(&service)
             .task_definition(&task_def_arn)
             .external_id(&external_id)
+            .client_token(task_set_client_token(&spec.revision_id))
             .network_configuration(network_config(&self.launch))
             .load_balancers(load_balancer(&self.launch, &target_group_arn))
             .scale(
@@ -380,14 +387,11 @@ fn service_name(deployment_id: &DeploymentId) -> String {
     format!("gtc-svc-{}", deployment_id.0)
 }
 
-/// Deterministic ECS `CreateService` idempotency token for a deployment. Two
-/// concurrent `ensure_service` calls for the same deployment present the same
-/// token, so ECS dedupes the racing creates instead of erroring on the loser.
-/// Rendered UUID-shaped (the `clientToken` field accepts up to 36 ASCII
-/// characters "in the form of a UUID") from the deployment ULID's 128 bits —
-/// deterministic per deployment and collision-free across deployments.
-fn service_client_token(deployment_id: &DeploymentId) -> String {
-    let bits: u128 = deployment_id.0.into();
+/// Render a 128-bit id as a UUID-form (36-char) string for use as an ECS
+/// idempotency `clientToken` (the field accepts "up to 36 ASCII characters in
+/// the form of a UUID"). Deterministic, so concurrent same-identity creates
+/// present the same token and ECS dedupes the race.
+fn uuid_form(bits: u128) -> String {
     format!(
         "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
         (bits >> 96) as u32,
@@ -396,6 +400,20 @@ fn service_client_token(deployment_id: &DeploymentId) -> String {
         (bits >> 48) as u16,
         (bits & 0xffff_ffff_ffff) as u64,
     )
+}
+
+/// Deterministic `CreateService` idempotency token for a deployment (one
+/// EXTERNAL-controller service per deployment, keyed on the deployment ULID).
+fn service_client_token(deployment_id: &DeploymentId) -> String {
+    uuid_form(deployment_id.0.into())
+}
+
+/// Deterministic `CreateTaskSet` idempotency token for a revision. One task
+/// set per revision, keyed on the revision ULID (globally unique, matching the
+/// `externalId` scheme), so two concurrent `create_task_set` calls for the same
+/// revision present the same token and ECS dedupes the duplicate create.
+fn task_set_client_token(revision_id: &RevisionId) -> String {
+    uuid_form(revision_id.0.into())
 }
 
 /// Deterministic task-definition family for a revision.
@@ -899,6 +917,33 @@ mod tests {
         // Distinct deployments get distinct tokens — no cross-deployment dedupe.
         let other = DeploymentId(Ulid::from(0xbeef_u128));
         assert_ne!(service_client_token(&other), token);
+    }
+
+    #[test]
+    fn task_set_client_token_is_deterministic_uuid_shaped_and_per_revision() {
+        let r = rev();
+        let tok = task_set_client_token(&r);
+        assert_eq!(
+            tok,
+            task_set_client_token(&r),
+            "same revision must yield the same idempotency token so concurrent \
+             create_task_set calls dedupe"
+        );
+        // UUID shape: 36 chars with dashes at 8/13/18/23, hex elsewhere.
+        assert_eq!(
+            tok.len(),
+            36,
+            "ECS clientToken is a 36-char UUID-form string"
+        );
+        let dashes: Vec<usize> = tok.match_indices('-').map(|(i, _)| i).collect();
+        assert_eq!(dashes, vec![8, 13, 18, 23], "dash positions: {tok}");
+        assert!(
+            tok.chars().all(|c| c == '-' || c.is_ascii_hexdigit()),
+            "token is lowercase-hex + dashes only; got {tok}"
+        );
+        // Distinct revisions get distinct tokens — no cross-revision dedupe.
+        let other = RevisionId(Ulid::from(0xbeef_u128));
+        assert_ne!(task_set_client_token(&other), tok);
     }
 
     /// Parity guard: every IAM action the real target calls must be in the
