@@ -105,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "audit-log retention enabled: pruning oldest audit rows beyond the \
              per-environment cap (recorded in the audit_retention watermark)"
         );
+        store.reconcile_audit_retention().await?;
     }
     let storage = Arc::new(store);
     let app = router_with_options(

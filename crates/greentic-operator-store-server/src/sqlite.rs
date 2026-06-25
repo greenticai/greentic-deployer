@@ -144,6 +144,34 @@ impl SqliteEnvironmentStore {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+
+    /// One-shot startup reconciliation of audit-log retention. When a cap
+    /// is configured, bring every environment that is already over the cap
+    /// down to it (writing its `audit_retention` watermark) — closing the
+    /// gap for environments that may never be appended to again (the
+    /// disk-pressure / compliance-rollout case the cap exists to serve).
+    /// No-op when retention is off; idempotent (a second run finds nothing
+    /// over the cap).
+    pub async fn reconcile_audit_retention(&self) -> Result<(), StorageError> {
+        let Some(cap) = self.audit_max_rows_per_env else {
+            return Ok(());
+        };
+        let over_cap =
+            sqlx::query("SELECT env_id FROM audit_log GROUP BY env_id HAVING COUNT(*) > $1")
+                .bind(cap)
+                .fetch_all(&self.pool)
+                .await?;
+        for row in over_cap {
+            let env_id_str: String = row.try_get("env_id")?;
+            let Ok(env_id) = EnvId::try_from(env_id_str.as_str()) else {
+                continue; // skip a malformed id defensively; should not occur
+            };
+            let mut tx = self.pool.begin().await?;
+            prune_audit_log(&mut tx, &env_id, cap).await?;
+            tx.commit().await?;
+        }
+        Ok(())
+    }
 }
 
 impl EnvironmentStorage for SqliteEnvironmentStore {

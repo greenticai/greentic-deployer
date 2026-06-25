@@ -1739,3 +1739,35 @@ async fn restore_preserves_sidecar_generation_sequences_and_tombstones() {
         "runtime generation must continue (2+1=3), not reset to 1"
     );
 }
+
+#[tokio::test]
+async fn audit_retention_reconciles_existing_over_cap_rows_at_startup() {
+    // Pre-existing audit history written with retention OFF.
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+    for i in 0..6 {
+        store
+            .record_journal(&journal(&id, &format!("k-{i}"), &format!("fp-{i}")))
+            .await
+            .expect("record journal");
+    }
+    assert_eq!(audit_event_ids(&store, &id).await.len(), 6);
+
+    // The operator enables the cap; startup reconciliation caps existing
+    // rows WITHOUT any new append.
+    let store = store.with_audit_max_rows_per_env(Some(4));
+    store
+        .reconcile_audit_retention()
+        .await
+        .expect("reconcile audit retention");
+
+    assert_eq!(
+        audit_event_ids(&store, &id).await,
+        vec!["evt-k-2", "evt-k-3", "evt-k-4", "evt-k-5"]
+    );
+    assert_eq!(audit_watermark(&store, &id).await, Some((2, 2, 4)));
+}
