@@ -2196,3 +2196,65 @@ async fn importing_two_envs_with_interleaved_audit_ids_loses_no_rows() {
         vec!["b-2", "b-4", "b-6", "evt-imp-b"],
     );
 }
+
+#[tokio::test]
+async fn restore_does_not_resurrect_rows_below_the_live_retention_watermark() {
+    // A backup taken BEFORE pruning carries early audit rows. If the live store
+    // has since pruned those ids (its watermark advanced past them), restore
+    // must NOT bring them back — resurrecting a row at or below
+    // `pruned_through_id` would make the forensic watermark lie.
+    let (_dir, store) = fresh_store_with_audit_cap(2).await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+    // Four mutations under cap=2 → rows 1,2 pruned, watermark (2, 2, 2); live
+    // rows are evt-k-2 (id 3) and evt-k-3 (id 4).
+    for i in 0..4 {
+        store
+            .record_journal(&journal(&id, &format!("k-{i}"), &format!("fp-{i}")))
+            .await
+            .expect("journal");
+    }
+    assert_eq!(audit_watermark(&store, &id).await, Some((2, 2, 2)));
+    assert_eq!(
+        audit_event_ids(&store, &id).await,
+        vec!["evt-k-2", "evt-k-3"]
+    );
+
+    // A pre-prune backup: its audit_log still holds the early rows 1..4.
+    let snapshot = EnvSnapshot {
+        environment: serde_json::to_value(minimal_environment(&id)).expect("env json"),
+        runtime: None,
+        pack_answers: BTreeMap::new(),
+        audit_log: (1..=4)
+            .map(|i| AuditEntry {
+                id: i,
+                event_id: format!("evt-k-{}", i - 1),
+                recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                event: json!({"verb": "update"}),
+            })
+            .collect(),
+        audit_retention: None,
+    };
+    let rev = store.load_env(&id).await.expect("load env").revision;
+    store
+        .restore_env_journaled(
+            &id,
+            &snapshot,
+            &Precondition::matching(rev.etag, rev.generation),
+            None,
+        )
+        .await
+        .expect("restore");
+
+    // Rows 1,2 (<= the live watermark) are NOT resurrected; 3,4 were already
+    // present (true duplicates). The watermark is unchanged.
+    assert_eq!(
+        audit_event_ids(&store, &id).await,
+        vec!["evt-k-2", "evt-k-3"],
+        "rows the live watermark covers must not come back"
+    );
+    assert_eq!(audit_watermark(&store, &id).await, Some((2, 2, 2)));
+}

@@ -3978,6 +3978,97 @@ async fn read_only_role_cannot_mutate_and_the_denial_names_the_actor() {
 }
 
 #[tokio::test]
+async fn read_only_token_cannot_export_a_backup() {
+    // Export returns the FULL recovery payload (env + sidecars + audit), so it
+    // is a backup-operator privilege — a read-only token (manifests only) must
+    // not exfiltrate it, even though it may read.
+    let (_d, app, store) = rbac_app().await;
+    let operator = bearer(OPERATOR_TOKEN);
+    let (status, _) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "EXP-1"), ("Authorization", &operator)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, backup) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+        &[("Idempotency-Key", "EXP-2"), ("Authorization", &operator)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {backup}");
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+
+    let reader = bearer(READER_TOKEN);
+    let (status, body) = send_custom(
+        app,
+        Method::GET,
+        &format!("/environments/local/backups/{backup_id}/export"),
+        None,
+        &[("Authorization", &reader)],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "read-only must not export: {body}"
+    );
+    assert!(
+        body["reason"].as_str().unwrap().contains("read-only"),
+        "reason names the role: {body}"
+    );
+
+    // The denied export attempt is audited as a privileged backup operation.
+    let events = audit_log_events(&store, "local").await;
+    let denial = events.last().expect("denial audited");
+    assert_eq!(denial["authorization"]["decision"], "deny");
+    assert_eq!(denial["noun"], "backup");
+    assert_eq!(denial["verb"], "export");
+    assert_eq!(denial["actor"]["user"], "viewer");
+}
+
+#[tokio::test]
+async fn operator_token_can_export_a_backup() {
+    let (_d, app, _store) = rbac_app().await;
+    let operator = bearer(OPERATOR_TOKEN);
+    let (status, _) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "EXP-3"), ("Authorization", &operator)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, backup) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+        &[("Idempotency-Key", "EXP-4"), ("Authorization", &operator)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+
+    let (status, artifact) = send_custom(
+        app,
+        Method::GET,
+        &format!("/environments/local/backups/{backup_id}/export"),
+        None,
+        &[("Authorization", &operator)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "operator may export: {artifact}");
+    assert_eq!(artifact["schema"], "greentic.backup-artifact.v1");
+}
+
+#[tokio::test]
 async fn operator_role_deploys_but_cannot_touch_trust_root_custody() {
     let (_d, app, _store) = rbac_app().await;
     let operator = bearer(OPERATOR_TOKEN);

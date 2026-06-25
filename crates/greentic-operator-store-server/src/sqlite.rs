@@ -1375,20 +1375,24 @@ async fn journal_in_tx(
 }
 
 /// Re-instate a snapshot's captured audit history into the caller's
-/// transaction (PR-4.4 restore/import). Audit is an append-only LEDGER, never
+/// transaction (the restore path). Audit is an append-only LEDGER, never
 /// rewound: each captured row is re-inserted preserving its original `id` and
-/// `recorded_at`, so a row that is still live is skipped and a row a fresh
-/// store never had (or that retention pruned) is reconstructed in place. LIVE
-/// rows are NEVER deleted — rolling back content must not erase forensic
-/// history; the only effect is the reconstruction of forgotten rows.
+/// `recorded_at`, so a row that is still live is skipped (a true duplicate)
+/// and a row that retention pruned is reconstructed in place. LIVE rows are
+/// NEVER deleted — rolling back content must not erase forensic history.
+///
+/// ONE exception preserves the watermark's meaning: a row at or below the LIVE
+/// `pruned_through_id` is NOT resurrected. That id range is forensically
+/// declared "forgotten"; re-inserting into it would make the watermark lie and
+/// let the next prune double-count the row. Captured rows above the live
+/// watermark — or all rows, when there is no live watermark — are eligible.
 ///
 /// `INSERT OR IGNORE` (not `ON CONFLICT(event_id)`) because re-inserting with
 /// the original `id` can collide on the `id` PRIMARY KEY as well as the
 /// `event_id` unique index, and a targeted upsert raises on a non-target
-/// conflict. In both real flows every ignored row is a true duplicate: a
-/// restore targets the SAME env (captured ids == live ids, append-only) and an
-/// import targets an ABSENT env in a store whose global id sequence has not
-/// reused the captured ids — so OR IGNORE never silently drops a distinct row.
+/// conflict. Restore targets the SAME env (captured ids == live ids,
+/// append-only), so every ignored row is a true duplicate — OR IGNORE never
+/// silently drops a distinct row.
 ///
 /// The retention watermark advances MONOTONICALLY: `pruned_through_id` and
 /// `pruned_total` reconcile by `max`, so a normal rollback keeps the (larger)
@@ -1402,7 +1406,24 @@ async fn replay_audit_in_tx(
     audit_log: &[AuditEntry],
     audit_retention: Option<&AuditRetention>,
 ) -> Result<(), StorageError> {
+    // Skip captured rows the LIVE watermark has already declared forgotten:
+    // resurrecting a row at or below `pruned_through_id` would make the
+    // watermark lie and let the next prune double-count it. No watermark →
+    // threshold 0 → every captured row is eligible.
+    let live_pruned_through: i64 =
+        match sqlx::query("SELECT pruned_through_id FROM audit_retention WHERE env_id = $1")
+            .bind(env_id.as_str())
+            .fetch_optional(&mut **tx)
+            .await?
+        {
+            Some(row) => row.try_get("pruned_through_id")?,
+            None => 0,
+        };
+
     for entry in audit_log {
+        if entry.id <= live_pruned_through {
+            continue;
+        }
         sqlx::query(
             "INSERT OR IGNORE INTO audit_log (id, env_id, event_id, recorded_at, event) \
              VALUES ($1, $2, $3, $4, $5)",
