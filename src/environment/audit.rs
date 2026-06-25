@@ -1,11 +1,12 @@
 //! Append-only audit log + local authorization policy (`A7`).
 //!
-//! Every mutating `op` verb passes through [`authorize_local_only`] and
+//! Every mutating `op` verb passes through [`authorize_local_owner`] and
 //! emits an [`AuditEvent`] into `<store_root>/<env_id>/audit/events.jsonl`.
-//! Phase A posture: `env_id == "local"` → allow; anything else → deny with
-//! [`OpError::Unauthorized`](crate::cli::OpError::Unauthorized) unless the
-//! `GREENTIC_DEPLOYER_ALLOW_ANY_ENV` dev escape hatch is set. Remote RBAC
-//! is A8.
+//! Local-store posture: the local filesystem store is single-operator (its
+//! authorization boundary is OS filesystem ownership), so every env id is
+//! authorized — the `local` env under [`POLICY_LOCAL_ONLY`], any named env
+//! under [`POLICY_LOCAL_OWNER`]. Shared/production stores enforce RBAC
+//! server-side on the remote dispatch path, which never reaches this gate.
 //!
 //! The append uses a per-file `fs4` flock on the audit file itself (not the
 //! env's `.lock` sentinel), so emit can happen INSIDE a `transact` closure
@@ -28,22 +29,16 @@ use super::store::{LocalFsStore, StoreError};
 
 pub use greentic_deploy_spec::{Actor, AuditDecision, AuditEvent, AuditResult, POLICY_LOCAL_ONLY};
 
-/// Dev-only relaxation of [`POLICY_LOCAL_ONLY`]: a non-local env was allowed
-/// because [`DEV_OVERRIDE_ENV`] is set. A distinct policy string keeps the
-/// audit trail honest — this is NOT the A8 RBAC decision. It is a local
-/// deployer concept (the A8 remote store never emits it), so it lives here
-/// rather than in the `greentic-deploy-spec` wire contract.
-pub const POLICY_LOCAL_ONLY_DEV_OVERRIDE: &str = "local-only:dev-override";
-
-/// Env var that opts a local checkout out of the `local`-only authz gate so
-/// every env id is allowed (dev/demo only — see [`authorize_local_only`]).
-///
-/// This lifts ONLY the audit authorization gate. Independent non-local guards
-/// are NOT affected and still apply: the `customer_id` requirement in
-/// `bundles`/`deploy` (a billing-principal data gate), and the `env apply`
-/// non-local-create guard (`cli::env_apply`). A non-local env still needs an
-/// explicit `customer_id`, and `env apply` still cannot create one locally.
-pub const DEV_OVERRIDE_ENV: &str = "GREENTIC_DEPLOYER_ALLOW_ANY_ENV";
+/// Audit policy string for a named (non-`local`) environment authorized on the
+/// local filesystem store. The local store's authorization boundary is OS
+/// filesystem ownership — whoever can write the store root owns every env in
+/// it, so there is no within-store tenant boundary to enforce. Named-env
+/// mutations are therefore allowed and recorded under this policy. This is NOT
+/// an A8 RBAC decision: shared/production stores gate via server-side RBAC on
+/// the remote dispatch path, which never reaches this gate. The constant is a
+/// local deployer concept (the A8 remote store never emits it), so it lives
+/// here rather than in the `greentic-deploy-spec` wire contract.
+pub const POLICY_LOCAL_OWNER: &str = "local-owner";
 
 pub const AUDIT_EVENT_SCHEMA_V1: &str = SchemaVersion::AUDIT_EVENT_V1;
 
@@ -63,47 +58,40 @@ pub enum AuditError {
     Store(#[from] StoreError),
 }
 
-/// Local-mode authorization gate per plan §389 + §991. Returns `Allow` for
-/// the env id matching [`crate::defaults::LOCAL_ENV_ID`]; any other id is
-/// denied (A8 ships the production RBAC policy) UNLESS the [`DEV_OVERRIDE_ENV`]
-/// escape hatch is set, in which case it is allowed under the distinct
-/// [`POLICY_LOCAL_ONLY_DEV_OVERRIDE`] policy so the audit trail stays honest.
+/// Local-store authorization gate. The local filesystem store is
+/// single-operator by construction — its authorization boundary is OS
+/// filesystem ownership — so every env id is authorized. The `local` env keeps
+/// the canonical [`POLICY_LOCAL_ONLY`] label for audit continuity; any named
+/// env is authorized under [`POLICY_LOCAL_OWNER`].
 ///
-/// The escape hatch is read here (process env) and forwarded to the pure
-/// [`authorize_with_override`] core so the decision logic stays unit-testable
-/// without mutating process-global state.
-pub fn authorize_local_only(env_id: &EnvId) -> AuditDecision {
-    authorize_with_override(env_id, dev_override_enabled())
-}
-
-/// Whether the dev-only [`DEV_OVERRIDE_ENV`] escape hatch is set.
-fn dev_override_enabled() -> bool {
-    std::env::var_os(DEV_OVERRIDE_ENV).is_some()
-}
-
-/// Pure authorization core: `local` always allows; non-local allows only when
-/// `dev_override` is true (and then under [`POLICY_LOCAL_ONLY_DEV_OVERRIDE`]).
-fn authorize_with_override(env_id: &EnvId, dev_override: bool) -> AuditDecision {
-    if env_id.as_str() == crate::defaults::LOCAL_ENV_ID {
-        AuditDecision::Allow {
-            policy: POLICY_LOCAL_ONLY.to_string(),
-            reason: format!("env `{env_id}` is the local env"),
-        }
-    } else if dev_override {
-        AuditDecision::Allow {
-            policy: POLICY_LOCAL_ONLY_DEV_OVERRIDE.to_string(),
-            reason: format!(
-                "non-local env `{env_id}` permitted by {DEV_OVERRIDE_ENV} \
-                 (dev override; A8 RBAC not enforced)"
-            ),
-        }
+/// This gate runs ONLY on the local-FS path ([`crate::cli::audit_and_record`]).
+/// Shared/production stores enforce RBAC server-side on the remote dispatch
+/// path, which never passes through here — so allowing named envs locally does
+/// not weaken the fail-closed posture for shared stores.
+///
+/// Independent non-local data gates are unaffected and still apply: the
+/// `customer_id` billing-principal requirement in `bundles`/`deploy`, and the
+/// `env apply` fresh-non-local guard (create the env explicitly via
+/// `op env create <id>` first — apply reconciles a named env, it does not
+/// bootstrap one).
+pub fn authorize_local_owner(env_id: &EnvId) -> AuditDecision {
+    let (policy, reason) = if env_id.as_str() == crate::defaults::LOCAL_ENV_ID {
+        (
+            POLICY_LOCAL_ONLY,
+            format!("env `{env_id}` is the local env"),
+        )
     } else {
-        AuditDecision::Deny {
-            policy: POLICY_LOCAL_ONLY.to_string(),
-            reason: format!(
-                "non-local env `{env_id}` requires RBAC; A8 ships the production policy"
+        (
+            POLICY_LOCAL_OWNER,
+            format!(
+                "named env `{env_id}` authorized by local store ownership \
+                 (single-operator; shared-store RBAC is enforced on the remote path)"
             ),
-        }
+        )
+    };
+    AuditDecision::Allow {
+        policy: policy.to_string(),
+        reason,
     }
 }
 
@@ -221,7 +209,7 @@ mod tests {
     #[test]
     fn authorize_local_env_id_allows() {
         let env_id = EnvId::try_from("local").unwrap();
-        match authorize_local_only(&env_id) {
+        match authorize_local_owner(&env_id) {
             AuditDecision::Allow { policy, reason } => {
                 assert_eq!(policy, POLICY_LOCAL_ONLY);
                 assert!(reason.contains("local"));
@@ -231,41 +219,20 @@ mod tests {
     }
 
     #[test]
-    fn authorize_non_local_env_id_denies() {
-        // Pure core with the override OFF — deterministic regardless of the
-        // ambient GREENTIC_DEPLOYER_ALLOW_ANY_ENV value in the test process.
-        let env_id = EnvId::try_from("prod").unwrap();
-        match authorize_with_override(&env_id, false) {
-            AuditDecision::Deny { policy, reason } => {
-                assert_eq!(policy, POLICY_LOCAL_ONLY);
-                assert!(reason.contains("prod"));
-                assert!(reason.contains("RBAC"));
+    fn authorize_named_env_id_allows_under_local_owner() {
+        // The local FS store is single-operator (fs-ownership IS the authz
+        // boundary), so a named env is authorized — recorded under the honest
+        // `local-owner` policy, NOT the `local` env's `local-only` label.
+        // Shared-store RBAC lives on the remote dispatch path, not here.
+        for id in ["prod", "k8s", "staging"] {
+            let env_id = EnvId::try_from(id).unwrap();
+            match authorize_local_owner(&env_id) {
+                AuditDecision::Allow { policy, reason } => {
+                    assert_eq!(policy, POLICY_LOCAL_OWNER);
+                    assert!(reason.contains(id));
+                }
+                other => panic!("expected Allow for `{id}`, got {other:?}"),
             }
-            other => panic!("expected Deny, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn authorize_non_local_env_id_allows_under_dev_override() {
-        let env_id = EnvId::try_from("k8s").unwrap();
-        match authorize_with_override(&env_id, true) {
-            AuditDecision::Allow { policy, reason } => {
-                assert_eq!(policy, POLICY_LOCAL_ONLY_DEV_OVERRIDE);
-                assert!(reason.contains("k8s"));
-                assert!(reason.contains(DEV_OVERRIDE_ENV));
-            }
-            other => panic!("expected Allow, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn dev_override_does_not_change_local_policy() {
-        // The local env is allowed under the canonical policy even with the
-        // override on — it never borrows the dev-override label.
-        let env_id = EnvId::try_from("local").unwrap();
-        match authorize_with_override(&env_id, true) {
-            AuditDecision::Allow { policy, .. } => assert_eq!(policy, POLICY_LOCAL_ONLY),
-            other => panic!("expected Allow, got {other:?}"),
         }
     }
 

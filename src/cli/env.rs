@@ -2944,10 +2944,14 @@ mod tests {
     }
 
     #[test]
-    fn create_non_local_env_refuses_and_audits_deny() {
+    fn create_non_local_env_succeeds_and_audits_under_local_owner() {
+        // Named (non-`local`) envs are first-class on the local FS store
+        // (fs-ownership is the authz boundary). `op env create prod` succeeds,
+        // persists the env, and audits the mutation under the `local-owner`
+        // policy. (Shared-store RBAC lives on the remote path, not here.)
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
-        let err = create(
+        create(
             &store,
             &OpFlags::default(),
             Some(EnvCreatePayload {
@@ -2959,34 +2963,24 @@ mod tests {
                 public_base_url: None,
             }),
         )
-        .unwrap_err();
-        assert!(
-            matches!(err, OpError::Unauthorized { .. }),
-            "got {err:?}; deny-path must surface as Unauthorized"
-        );
-        // No environment.json was created.
+        .expect("named env create must succeed on the local store");
+        // environment.json was persisted.
         let env_json = dir.path().join("prod").join("environment.json");
-        assert!(
-            !env_json.exists(),
-            "deny must not leave behind environment.json"
-        );
-        // Audit event was written under the denied env's audit dir.
+        assert!(env_json.exists(), "create must persist environment.json");
+        // The mutation was audited as an allowed `local-owner` decision.
         let log = dir.path().join("prod").join("audit").join("events.jsonl");
-        let raw = std::fs::read_to_string(&log).expect("audit log must exist on deny");
+        let raw = std::fs::read_to_string(&log).expect("audit log must exist after create");
         let event: crate::environment::AuditEvent = serde_json::from_str(raw.trim_end()).unwrap();
         assert_eq!(event.env_id, "prod");
         assert_eq!(event.noun, "env");
         assert_eq!(event.verb, "create");
-        matches!(
-            event.authorization,
-            crate::environment::AuditDecision::Deny { .. }
-        );
-        match event.result {
-            crate::environment::AuditResult::Error { kind, .. } => {
-                assert_eq!(kind, "unauthorized");
+        match event.authorization {
+            crate::environment::AuditDecision::Allow { policy, .. } => {
+                assert_eq!(policy, crate::environment::POLICY_LOCAL_OWNER);
             }
-            other => panic!("expected Error result, got {other:?}"),
+            other => panic!("expected Allow, got {other:?}"),
         }
+        assert!(matches!(event.result, crate::environment::AuditResult::Ok));
     }
 
     #[test]

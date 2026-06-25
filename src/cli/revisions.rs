@@ -933,21 +933,14 @@ mod tests {
         );
     }
 
-    /// `stage --bundle <local .gtbundle>` extracts the bundle, pins every
-    /// embedded `.gtpack` into a `pack-list.lock` under the revision dir, and
-    /// records the env-relative lock ref + a real bundle digest on the
-    /// revision. The lock's per-pack digest must equal the sha256 of the
-    /// extracted `.gtpack` on disk — the exact invariant greentic-start's
-    /// `load_revision` re-checks at boot.
-    /// Regression for PR-3a.5 Codex finding: bundle staging must NOT touch
-    /// the filesystem before `audit_and_record`'s authz gate. A `stage
-    /// --bundle` against a non-local env must return `Unauthorized` AND
-    /// leave the env's `revisions/` dir untouched.
+    /// Named (non-`local`) envs are first-class on the local store, so staging
+    /// a bundle into a named env is no longer authorization-denied. (The old
+    /// "no FS writes before the deny" invariant is moot locally — there is no
+    /// local deny path — and the remote RBAC path enforces it server-side.)
     #[test]
-    fn stage_with_bundle_on_non_local_env_rejects_before_writing_files() {
+    fn stage_with_bundle_on_named_env_is_not_authz_denied() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
-        // Seed a non-local env so `authorize_local_only` denies.
         let mut env = make_env("prod");
         let deployment = make_bundle_deployment("prod", "fast2flow");
         let did = deployment.deployment_id;
@@ -960,21 +953,10 @@ mod tests {
         payload.environment_id = "prod".to_string();
         payload.bundle_path = Some(fixture);
 
-        let err = stage(&store, &OpFlags::default(), Some(payload)).unwrap_err();
+        let result = stage(&store, &OpFlags::default(), Some(payload));
         assert!(
-            matches!(err, OpError::Unauthorized { .. }),
-            "non-local env stage must be denied, got: {err:?}"
-        );
-        // No revisions dir should have been created — bundle staging
-        // must run INSIDE the audit_and_record closure, not before.
-        let rev_root = dir.path().join("prod").join("revisions");
-        assert!(
-            !rev_root.exists()
-                || std::fs::read_dir(&rev_root)
-                    .map(|d| d.count() == 0)
-                    .unwrap_or(true),
-            "denied stage must not write under `{}`",
-            rev_root.display()
+            !matches!(result, Err(OpError::Unauthorized { .. })),
+            "named env stage must not be authz-denied; got {result:?}"
         );
     }
 

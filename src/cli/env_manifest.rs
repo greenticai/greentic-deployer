@@ -69,8 +69,8 @@ pub struct EnvManifest {
 pub struct ManifestEnvironment {
     /// Environment id. Apply bootstraps `local` (via `env init`, seeding the
     /// default env-pack bindings). Any other id must ALREADY exist — apply
-    /// reconciles a non-local env but cannot create one (non-local creation
-    /// is reserved for the remote operator store, A7).
+    /// reconciles a named env but does not create one; create it explicitly
+    /// first via `op env create <id>` (locally) or the remote operator store.
     pub id: String,
     /// When set, persisted via the `env set-public-url` path. Absent/`null`
     /// means "leave whatever is there" (upsert — apply never clears it).
