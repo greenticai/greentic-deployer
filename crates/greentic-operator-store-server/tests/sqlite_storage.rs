@@ -1417,6 +1417,8 @@ fn stored_backup(id: &EnvId, backup_id: &str, env: &Environment) -> StoredBackup
         environment: env_json,
         runtime: None,
         pack_answers: std::collections::BTreeMap::new(),
+        audit_log: Vec::new(),
+        audit_retention: None,
     };
     let state = serde_json::to_value(&snapshot).expect("snapshot json");
     let snapshot_digest = StateIntegrity::sha256_of(&state)
@@ -1770,4 +1772,72 @@ async fn audit_retention_reconciles_existing_over_cap_rows_at_startup() {
         vec!["evt-k-2", "evt-k-3", "evt-k-4", "evt-k-5"]
     );
     assert_eq!(audit_watermark(&store, &id).await, Some((2, 2, 4)));
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot audit capture (PR-4.4 archival, fresh-store DR foundation)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn load_env_snapshot_captures_audit_log_and_watermark() {
+    // Cap at 4; six journaled mutations prune the oldest two (mirrors the
+    // retention suite), so the snapshot must capture the surviving four audit
+    // rows AND the watermark that records the forgotten two.
+    let (_dir, store) = fresh_store_with_audit_cap(4).await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+    for i in 0..6 {
+        store
+            .record_journal(&journal(&id, &format!("k-{i}"), &format!("fp-{i}")))
+            .await
+            .expect("record journal");
+    }
+
+    let (snapshot, _rev) = store.load_env_snapshot(&id).await.expect("snapshot");
+
+    // The four surviving rows, oldest first, with ascending preserved ids.
+    let captured: Vec<&str> = snapshot
+        .audit_log
+        .iter()
+        .map(|e| e.event_id.as_str())
+        .collect();
+    assert_eq!(captured, vec!["evt-k-2", "evt-k-3", "evt-k-4", "evt-k-5"]);
+    assert!(
+        snapshot.audit_log.windows(2).all(|w| w[0].id < w[1].id),
+        "captured ids must be ascending append order"
+    );
+    assert_eq!(snapshot.audit_log[0].event["verb"], "update");
+
+    // The watermark records the two forgotten rows under the cap.
+    let wm = snapshot
+        .audit_retention
+        .as_ref()
+        .expect("watermark present after a prune");
+    assert_eq!(
+        (wm.pruned_through_id, wm.pruned_total, wm.policy_max_rows),
+        (2, 2, 4)
+    );
+
+    // The populated snapshot serde-round-trips (the `backups.state` blob form).
+    let blob = serde_json::to_value(&snapshot).expect("serialize snapshot");
+    let back: EnvSnapshot = serde_json::from_value(blob).expect("deserialize snapshot");
+    assert_eq!(back, snapshot);
+}
+
+#[test]
+fn env_snapshot_deserializes_pre_capture_shape_with_empty_audit() {
+    // A snapshot blob written before audit capture existed carries no
+    // audit_log / audit_retention keys; it must deserialize to an empty log
+    // and no watermark so backups taken before this change stay restorable.
+    let blob = json!({
+        "environment": {"name": "local"},
+        "pack_answers": {}
+    });
+    let snap: EnvSnapshot = serde_json::from_value(blob).expect("deserialize pre-capture snapshot");
+    assert!(snap.audit_log.is_empty());
+    assert!(snap.audit_retention.is_none());
+    assert!(snap.runtime.is_none());
 }

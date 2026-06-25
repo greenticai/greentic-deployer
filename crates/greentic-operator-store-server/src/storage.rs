@@ -158,9 +158,50 @@ pub const MAX_LEDGER_ROWS_PER_ENV: i64 = 4096;
 /// asking the operator to delete explicitly.
 pub const MAX_BACKUPS_PER_ENV: i64 = 256;
 
-/// Composite environment snapshot: the environment document plus any
-/// sidecar state (runtime, pack answers) captured at backup time.
-/// Restore reverts all three atomically.
+/// One captured `audit_log` row (PR-4.4 archival). The original `id` is
+/// preserved so a later restore can re-instate the row at its place in the
+/// append sequence and keep the [`AuditRetention`] watermark consistent.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AuditEntry {
+    /// `audit_log.id` — the append-order key. Preserved across backup/restore.
+    pub id: i64,
+    /// `audit_log.event_id` — the unique ULID of the audit record.
+    pub event_id: String,
+    /// `audit_log.recorded_at` — wall-clock the row was appended.
+    pub recorded_at: String,
+    /// The full `AuditEvent` JSON.
+    pub event: Value,
+}
+
+/// The captured `audit_retention` watermark (PR-4.4 archival): how far back
+/// retention has trimmed this env's audit history. Present only when the env
+/// has a watermark row (retention has pruned at least once).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AuditRetention {
+    /// Highest `audit_log.id` retention has removed (everything `<=` is gone).
+    pub pruned_through_id: i64,
+    /// Cumulative count of audit rows removed.
+    pub pruned_total: i64,
+    /// The cap in force at the last prune.
+    pub policy_max_rows: i64,
+    /// Wall-clock of the last prune.
+    pub last_pruned_at: String,
+}
+
+/// Composite environment snapshot: the environment document plus any sidecar
+/// state (runtime, pack answers) AND the durable audit history (`audit_log`
+/// rows + the `audit_retention` watermark) captured at backup time.
+///
+/// This type is the capture surface. `load_env_snapshot` populates every
+/// field; today's [`EnvironmentStorage::restore_env_journaled`] reverts only
+/// the content (environment + sidecars) — replaying the captured audit history
+/// on restore is a follow-up. The audit fields are captured now so a backup is
+/// already a complete archival point.
+///
+/// The `audit_log` / `audit_retention` fields are serde-defaulted and skipped
+/// when empty, so backups taken before audit capture existed deserialize to an
+/// empty log and no watermark (and the serialized form of an audit-free env is
+/// byte-identical to the pre-capture shape — no digest churn).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EnvSnapshot {
     /// The environment row (the `Environment` document).
@@ -171,6 +212,13 @@ pub struct EnvSnapshot {
     /// Pack-answers sidecars keyed by slot, if any were present.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub pack_answers: std::collections::BTreeMap<String, Value>,
+    /// The full `audit_log` for the env at backup time, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_log: Vec<AuditEntry>,
+    /// The `audit_retention` watermark at backup time, if retention has
+    /// trimmed this env's history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_retention: Option<AuditRetention>,
 }
 
 /// One stored backup: the contract's [`BackupManifest`] metadata plus the
