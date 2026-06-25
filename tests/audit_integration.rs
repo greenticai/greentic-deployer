@@ -94,10 +94,10 @@ fn audit_log_records_distinct_verbs_in_order() {
 }
 
 #[test]
-fn non_local_env_create_denies_and_audits() {
+fn non_local_env_create_succeeds_and_audits_under_local_owner() {
     let dir = tempdir().unwrap();
     let store = LocalFsStore::new(dir.path());
-    let err = create(
+    create(
         &store,
         &OpFlags::default(),
         Some(EnvCreatePayload {
@@ -109,53 +109,36 @@ fn non_local_env_create_denies_and_audits() {
             public_base_url: None,
         }),
     )
-    .unwrap_err();
-    assert!(matches!(err, OpError::Unauthorized { .. }));
+    .unwrap();
 
-    // No environment.json under prod/.
+    // Named env state is persisted under prod/.
     let env_json = dir.path().join("prod").join("environment.json");
-    assert!(!env_json.exists(), "deny must not create env state");
+    assert!(env_json.exists(), "named env create must persist env state");
 
-    // But audit/events.jsonl carries the denied attempt.
+    // audit/events.jsonl carries the allowed attempt under the local-owner policy.
     let events = read_events(dir.path(), "prod");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].env_id, "prod");
     assert_eq!(events[0].noun, "env");
     assert_eq!(events[0].verb, "create");
     match &events[0].authorization {
-        AuditDecision::Deny { policy, reason } => {
-            assert_eq!(policy, "local-only");
+        AuditDecision::Allow { policy, reason } => {
+            assert_eq!(policy, "local-owner");
             assert!(reason.contains("prod"));
         }
-        other => panic!("expected Deny, got {other:?}"),
+        other => panic!("expected Allow, got {other:?}"),
     }
-    match &events[0].result {
-        AuditResult::Error { kind, .. } => assert_eq!(kind, "unauthorized"),
-        other => panic!("expected Error, got {other:?}"),
-    }
+    assert!(
+        matches!(&events[0].result, AuditResult::Ok),
+        "expected Ok, got {:?}",
+        events[0].result
+    );
 
     // The schema field round-trips.
     assert_eq!(
         events[0].schema.as_str(),
         greentic_deployer::environment::AUDIT_EVENT_SCHEMA_V1
     );
-
-    // Subsequent attempts append, don't replace.
-    let _ = create(
-        &store,
-        &OpFlags::default(),
-        Some(EnvCreatePayload {
-            environment_id: "prod".to_string(),
-            name: "prod".to_string(),
-            region: None,
-            tenant_org_id: None,
-            listen_addr: None,
-            public_base_url: None,
-        }),
-    );
-    let events = read_events(dir.path(), "prod");
-    assert_eq!(events.len(), 2);
-    assert_ne!(events[0].event_id, events[1].event_id);
 }
 
 #[test]
@@ -260,10 +243,13 @@ fn committed_mutation_with_unwritable_audit_dir_fails_closed() {
 }
 
 #[test]
-fn denied_mutation_with_unwritable_audit_dir_still_returns_unauthorized() {
-    // Counterpart to the fail-closed test: a DENIED op commits no state, so an
-    // unwritable audit dir must not upgrade the error to OpError::Audit — the
-    // caller still sees the authorization denial.
+fn committed_named_env_mutation_with_unwritable_audit_dir_fails_closed() {
+    // Named (non-`local`) envs are authorized on the local store, so their create
+    // commits state. Like the `local` counterpart above, a committed named-env
+    // mutation whose audit event cannot be persisted must surface OpError::Audit
+    // rather than report success — the fail-closed invariant holds on the
+    // named-env path too. (The old deny-before-commit path no longer exists on
+    // the local store; it is enforced server-side on the remote RBAC path.)
     let dir = tempdir().unwrap();
     let store = LocalFsStore::new(dir.path());
     std::fs::create_dir_all(dir.path().join("prod")).unwrap();
@@ -283,11 +269,11 @@ fn denied_mutation_with_unwritable_audit_dir_still_returns_unauthorized() {
     )
     .unwrap_err();
     assert!(
-        matches!(err, OpError::Unauthorized { .. }),
-        "denied op must surface Unauthorized even when audit append fails, got {err:?}"
+        matches!(err, OpError::Audit(_)),
+        "committed named-env mutation with broken audit dir must surface OpError::Audit, got {err:?}"
     );
     assert!(
-        !dir.path().join("prod").join("environment.json").exists(),
-        "deny must not commit state"
+        dir.path().join("prod").join("environment.json").exists(),
+        "the mutation itself committed before the audit append was attempted"
     );
 }
