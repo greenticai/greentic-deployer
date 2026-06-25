@@ -3826,9 +3826,10 @@ mod tests {
 
     #[test]
     fn nonexistent_nonlocal_env_gives_clear_error() {
-        // `env apply` can reconcile an existing non-local env, but creating one
-        // is reserved for the remote operator store (A7) — a non-existent
-        // non-local env must fail at plan time with a clear message.
+        // `env apply` reconciles an existing named env but does not bootstrap
+        // one (only `local` is auto-created). Applying a manifest for a
+        // not-yet-created named env must fail at plan time with a clear message
+        // pointing the user at `op env create <id>`.
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let manifest = json!({
@@ -3845,7 +3846,9 @@ mod tests {
         match err {
             OpError::NotFound(msg) => {
                 assert!(
-                    msg.contains("cannot create one locally") && msg.contains("operator store"),
+                    msg.contains("not found")
+                        && msg.contains("op env create prod")
+                        && msg.contains("does not create one"),
                     "got: {msg}"
                 );
             }
