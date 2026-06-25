@@ -1156,6 +1156,135 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         Ok(revision)
     }
 
+    async fn import_env_journaled(
+        &self,
+        env_id: &EnvId,
+        snapshot: &EnvSnapshot,
+        journal: Option<&MutationJournal>,
+    ) -> Result<EnvRevision, StorageError> {
+        let env: Environment = serde_json::from_value(snapshot.environment.clone())?;
+        validate_environment(&env)?;
+        // The artifact names the env it captured; refuse to import it under a
+        // different key (sidecars are keyed by env_id, the env row by the
+        // doc's id — they must agree).
+        if env.environment_id != *env_id {
+            return Err(StorageError::EnvIdMismatch {
+                keyed: env_id.clone(),
+                payload: env.environment_id,
+            });
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        // 1. Create the environment row. Import is the FRESH-store path: a
+        //    conflict means the env already exists — refuse (409), never
+        //    clobber. Mirrors `create_env_journaled`'s if-absent insert.
+        let (etag, integrity, data) = serialize_for_write(&env)?;
+        let inserted = sqlx::query(
+            "INSERT INTO environments (env_id, generation, etag, data, integrity_digest) \
+             VALUES ($1, 1, $2, $3, $4) \
+             ON CONFLICT (env_id) DO NOTHING \
+             RETURNING generation, etag",
+        )
+        .bind(env_id.as_str())
+        .bind(&etag.0)
+        .bind(&data)
+        .bind(&integrity.digest)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = inserted else {
+            let existing = sqlx::query("SELECT generation FROM environments WHERE env_id = $1")
+                .bind(env_id.as_str())
+                .fetch_one(&mut *tx)
+                .await?;
+            let generation: i64 = existing.try_get("generation")?;
+            return Err(StorageError::AlreadyExists {
+                env_id: env_id.clone(),
+                generation: generation as u64,
+            });
+        };
+        let revision = decode_revision(&row)?;
+
+        // 2. Runtime sidecar: fresh insert at generation 1 if the snapshot
+        //    carried one (no existing row to continue — the store is empty).
+        if let Some(runtime_data) = &snapshot.runtime {
+            let (rt_etag, rt_integrity, rt_data) = serialize_for_write_value(runtime_data)?;
+            sqlx::query(
+                "INSERT INTO environment_runtimes \
+                 (env_id, generation, etag, data, integrity_digest) \
+                 VALUES ($1, 1, $2, $3, $4)",
+            )
+            .bind(env_id.as_str())
+            .bind(&rt_etag.0)
+            .bind(&rt_data)
+            .bind(&rt_integrity.digest)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 3. Pack-answers sidecars: fresh insert at generation 1 each.
+        for (slot, answers_data) in &snapshot.pack_answers {
+            let (pa_etag, pa_integrity, pa_data) = serialize_for_write_value(answers_data)?;
+            sqlx::query(
+                "INSERT INTO pack_answers \
+                 (env_id, slot, generation, etag, data, integrity_digest) \
+                 VALUES ($1, $2, 1, $3, $4, $5)",
+            )
+            .bind(env_id.as_str())
+            .bind(slot.as_str())
+            .bind(&pa_etag.0)
+            .bind(&pa_data)
+            .bind(&pa_integrity.digest)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 4. Audit ledger: reconstruct the captured history with FRESH ids.
+        //    Import does NOT preserve the captured `audit_log.id` (unlike the
+        //    same-env restore): the id is a global PRIMARY KEY shared across
+        //    every env and also consumed by the import event below and by any
+        //    OTHER env imported into this store. Preserving it would let one
+        //    env's import-event id land on another env's captured id and
+        //    silently drop that distinct row (`INSERT OR IGNORE`). The append
+        //    ORDER plus `event_id`/`recorded_at` are what matter forensically,
+        //    not the store-local numeric id, so each row is inserted in order
+        //    letting autoincrement assign a new id (`event_id` is globally
+        //    unique, so OR IGNORE here only guards a true re-import duplicate).
+        for entry in &snapshot.audit_log {
+            sqlx::query(
+                "INSERT OR IGNORE INTO audit_log (env_id, event_id, recorded_at, event) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(env_id.as_str())
+            .bind(&entry.event_id)
+            .bind(&entry.recorded_at)
+            .bind(&entry.event)
+            .execute(&mut *tx)
+            .await?;
+        }
+        // Carry the captured retention watermark verbatim — the historical
+        // record of what was pruned before the backup; a fresh store has no
+        // live watermark to reconcile against.
+        if let Some(watermark) = &snapshot.audit_retention {
+            sqlx::query(
+                "INSERT INTO audit_retention \
+                   (env_id, pruned_through_id, pruned_total, policy_max_rows, last_pruned_at) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(env_id.as_str())
+            .bind(watermark.pruned_through_id)
+            .bind(watermark.pruned_total)
+            .bind(watermark.policy_max_rows)
+            .bind(&watermark.last_pruned_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        journal_in_tx(&mut tx, journal, self.audit_max_rows_per_env).await?;
+        tx.commit().await?;
+        Ok(revision)
+    }
+
     async fn record_audit(
         &self,
         env_id: &EnvId,

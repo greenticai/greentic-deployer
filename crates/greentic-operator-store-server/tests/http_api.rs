@@ -4317,6 +4317,211 @@ async fn export_of_an_unknown_backup_is_404() {
 }
 
 #[tokio::test]
+async fn disaster_recovery_import_reproduces_environment_and_audit_in_a_fresh_store() {
+    // --- Store A: a live env with active routing (a traffic split) + audit. ---
+    let (_da, app_a, store_a) = app_with_store().await;
+    let deployment_id = seed_env_with_deployment(&store_a, "local").await;
+    let rid = ready_one(&app_a, deployment_id).await;
+    let (status, _) = send(
+        app_a.clone(),
+        Method::POST,
+        "/environments/local/traffic",
+        Some(traffic_body(deployment_id, &[(rid, 10_000)])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // A field change so reproduction proves more than just the routing.
+    let (status, _) = send(
+        app_a.clone(),
+        Method::PATCH,
+        "/environments/local",
+        Some(json!({"name": "renamed"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Back up the live doc, then export the portable artifact.
+    let (status, backup) = send(
+        app_a.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+    let (_, before) = send(app_a.clone(), Method::GET, "/environments/local", None).await;
+    let (status, artifact) = send(
+        app_a,
+        Method::GET,
+        &format!("/environments/local/backups/{backup_id}/export"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let captured: Vec<String> = artifact["snapshot"]["audit_log"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["event_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !captured.is_empty(),
+        "backup must have captured audit history"
+    );
+
+    // --- Total loss: a brand-new store that has never seen the env. ---
+    let (_db, app_b, store_b) = app_with_store().await;
+    let (status, imported) = send(
+        app_b.clone(),
+        Method::POST,
+        "/environments/local/import",
+        Some(json!({ "artifact": artifact })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {imported}");
+    assert_envelope(&imported, "local");
+    assert_eq!(imported["audit"]["verb"], "import");
+    assert_eq!(imported["result"]["imported_generation"], 1);
+    // The reconstructed content's strong validator IS the backup's digest.
+    assert_eq!(
+        imported["result"]["integrity"]["digest"],
+        artifact["manifest"]["integrity"]["digest"]
+    );
+    assert_eq!(
+        imported["etag"], artifact["manifest"]["integrity"]["digest"],
+        "imported etag must equal the snapshot's env digest"
+    );
+
+    // The full environment document is reproduced (name + active routing:
+    // revisions and traffic splits live in the env doc).
+    let (_, read_b) = send(app_b, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read_b["environment"], before["environment"],
+        "imported env doc must reproduce the backed-up one"
+    );
+
+    // Audit history reproduced, with the import event appended last.
+    let mut expected = captured;
+    expected.push(imported["audit"]["event_id"].as_str().unwrap().to_string());
+    assert_eq!(audit_log_event_ids(&store_b, "local").await, expected);
+}
+
+#[tokio::test]
+async fn import_into_an_existing_environment_is_409() {
+    let (_d, app) = app().await;
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, backup) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+    )
+    .await;
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+    let (_, artifact) = send(
+        app.clone(),
+        Method::GET,
+        &format!("/environments/local/backups/{backup_id}/export"),
+        None,
+    )
+    .await;
+    // The env still exists → import refuses, never clobbers.
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/environments/local/import",
+        Some(json!({ "artifact": artifact })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+}
+
+#[tokio::test]
+async fn import_of_a_tampered_artifact_is_422() {
+    let (_da, app_a) = app().await;
+    let (status, _) = send(
+        app_a.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, backup) = send(
+        app_a.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+    )
+    .await;
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+    let (_, mut artifact) = send(
+        app_a,
+        Method::GET,
+        &format!("/environments/local/backups/{backup_id}/export"),
+        None,
+    )
+    .await;
+    // Tamper the snapshot without fixing the digest.
+    artifact["snapshot"]["environment"]["name"] = json!("evil");
+    // A fresh store; the corruption is caught before anything is written.
+    let (_db, app_b) = app().await;
+    let (status, body) = send(
+        app_b,
+        Method::POST,
+        "/environments/local/import",
+        Some(json!({ "artifact": artifact })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+}
+
+#[tokio::test]
+async fn import_under_a_mismatched_env_id_is_400() {
+    let (_da, app_a) = app().await;
+    let (status, _) = send(
+        app_a.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, backup) = send(
+        app_a.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+    )
+    .await;
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+    let (_, artifact) = send(
+        app_a,
+        Method::GET,
+        &format!("/environments/local/backups/{backup_id}/export"),
+        None,
+    )
+    .await;
+    // The artifact names "local"; importing it under a different path is refused.
+    let (_db, app_b) = app().await;
+    let (status, body) = send(
+        app_b,
+        Method::POST,
+        "/environments/other/import",
+        Some(json!({ "artifact": artifact })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+}
+
+#[tokio::test]
 async fn restore_with_an_empty_precondition_is_428() {
     let (_d, app) = app().await;
     let (status, _) = send(

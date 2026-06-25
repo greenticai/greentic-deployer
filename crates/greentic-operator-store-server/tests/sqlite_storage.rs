@@ -2038,6 +2038,166 @@ async fn restore_reconciles_retention_watermark_monotonically() {
 }
 
 #[tokio::test]
+async fn import_creates_env_sidecars_and_audit_into_a_fresh_store() {
+    // The DR shape: build a complete env (content + runtime + pack_answers +
+    // audit) in one store, snapshot it, then import into a SEPARATE fresh store
+    // that has never seen the environment.
+    let (_da, store_a) = fresh_store().await;
+    let id = env_id("local");
+    store_a
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+    store_a
+        .upsert_runtime(&minimal_runtime(&id), None)
+        .await
+        .expect("runtime");
+    store_a
+        .upsert_pack_answers(
+            &id,
+            CapabilitySlot::Deployer,
+            &json!({"region": "eu"}),
+            None,
+        )
+        .await
+        .expect("pack answers");
+    for i in 0..3 {
+        store_a
+            .record_journal(&journal(&id, &format!("k-{i}"), &format!("fp-{i}")))
+            .await
+            .expect("journal");
+    }
+    let (snapshot, _rev) = store_a.load_env_snapshot(&id).await.expect("snapshot");
+    assert_eq!(snapshot.audit_log.len(), 3);
+
+    // Fresh store: the environment is absent.
+    let (_db, store_b) = fresh_store().await;
+    let rev = store_b
+        .import_env_journaled(&id, &snapshot, Some(&journal(&id, "import", "fp-import")))
+        .await
+        .expect("import");
+    assert_eq!(rev.generation, 1, "a fresh import creates at generation 1");
+
+    // Content + both sidecars reproduced.
+    let loaded = store_b.load_env(&id).await.expect("load env");
+    assert_eq!(loaded.value.environment_id, id);
+    assert_eq!(loaded.value.name, minimal_environment(&id).name);
+    assert!(
+        store_b.load_runtime(&id).await.expect("runtime").is_some(),
+        "runtime sidecar reproduced"
+    );
+    assert!(
+        store_b
+            .load_pack_answers(&id, CapabilitySlot::Deployer)
+            .await
+            .expect("pack answers")
+            .is_some(),
+        "pack-answers sidecar reproduced"
+    );
+    // Audit history reproduced, with the import event appended last.
+    assert_eq!(
+        audit_event_ids(&store_b, &id).await,
+        vec!["evt-k-0", "evt-k-1", "evt-k-2", "evt-import"],
+    );
+}
+
+#[tokio::test]
+async fn import_refuses_when_the_env_already_exists() {
+    // Import never clobbers a live environment.
+    let (_d, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+    let (snapshot, _) = store.load_env_snapshot(&id).await.expect("snapshot");
+    let err = store
+        .import_env_journaled(&id, &snapshot, None)
+        .await
+        .expect_err("import into an existing env must fail");
+    assert!(
+        matches!(err, StorageError::AlreadyExists { .. }),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn import_rejects_an_env_id_mismatch() {
+    // The snapshot names the env it captured; importing it under a different
+    // key is refused (it would mis-key the reconstructed sidecars).
+    let (_d, store) = fresh_store().await;
+    let other = env_id("other");
+    store
+        .create_env(&minimal_environment(&other))
+        .await
+        .expect("create env");
+    let (snapshot, _) = store.load_env_snapshot(&other).await.expect("snapshot");
+    let err = store
+        .import_env_journaled(&env_id("local"), &snapshot, None)
+        .await
+        .expect_err("env-id mismatch must fail");
+    assert!(
+        matches!(err, StorageError::EnvIdMismatch { .. }),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn importing_two_envs_with_interleaved_audit_ids_loses_no_rows() {
+    // Two envs whose captured audit ids interleave in the original global
+    // sequence (alpha: 1,3,5 ; beta: 2,4,6). Importing both into ONE fresh
+    // store must not let either env's preserved id collide with the other's
+    // import event and silently drop a row — import reconstructs audit with
+    // fresh ids, so every distinct event survives.
+    let (_db, store) = fresh_store().await;
+    let snapshot = |name: &str, rows: &[(i64, &str)]| EnvSnapshot {
+        environment: serde_json::to_value(minimal_environment(&env_id(name))).expect("env json"),
+        runtime: None,
+        pack_answers: BTreeMap::new(),
+        audit_log: rows
+            .iter()
+            .map(|(id, ev)| AuditEntry {
+                id: *id,
+                event_id: ev.to_string(),
+                recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                event: json!({"verb": "update"}),
+            })
+            .collect(),
+        audit_retention: None,
+    };
+    let alpha = snapshot("alpha", &[(1, "a-1"), (3, "a-3"), (5, "a-5")]);
+    let beta = snapshot("beta", &[(2, "b-2"), (4, "b-4"), (6, "b-6")]);
+
+    store
+        .import_env_journaled(
+            &env_id("alpha"),
+            &alpha,
+            Some(&journal(&env_id("alpha"), "imp-a", "fp-a")),
+        )
+        .await
+        .expect("import alpha");
+    store
+        .import_env_journaled(
+            &env_id("beta"),
+            &beta,
+            Some(&journal(&env_id("beta"), "imp-b", "fp-b")),
+        )
+        .await
+        .expect("import beta");
+
+    // Every captured event survives in its own env, plus that env's import
+    // event — nothing is lost to a cross-env global-id collision.
+    assert_eq!(
+        audit_event_ids(&store, &env_id("alpha")).await,
+        vec!["a-1", "a-3", "a-5", "evt-imp-a"],
+    );
+    assert_eq!(
+        audit_event_ids(&store, &env_id("beta")).await,
+        vec!["b-2", "b-4", "b-6", "evt-imp-b"],
+    );
+}
+
+#[tokio::test]
 async fn restore_does_not_resurrect_rows_below_the_live_retention_watermark() {
     // A backup taken BEFORE pruning carries early audit rows. If the live store
     // has since pruned those ids (its watermark advanced past them), restore

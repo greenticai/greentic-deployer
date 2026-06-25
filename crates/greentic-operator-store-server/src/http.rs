@@ -216,6 +216,10 @@ where
             "/environments/{env_id}/restore",
             post(api::restore_environment::<S>),
         )
+        .route(
+            "/environments/{env_id}/import",
+            post(api::import_environment::<S>),
+        )
         .with_state(AppState {
             storage,
             operator_key_path: options.operator_key_path.map(Arc::new),

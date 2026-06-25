@@ -283,6 +283,35 @@ pub struct BackupArtifact {
     pub snapshot_digest: String,
 }
 
+/// Request to import an environment from a portable [`BackupArtifact`] (#5,
+/// disaster recovery).
+///
+/// Import is the FRESH-store counterpart to the guarded [`RestoreRequest`]: it
+/// reconstructs an environment that the store does not have (after total loss),
+/// so it carries no precondition — there is no prior generation to pin. The
+/// server verifies the artifact's integrity and refuses if the environment
+/// already exists (a 409), so import can never clobber a live environment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportRequest {
+    pub artifact: BackupArtifact,
+}
+
+/// Outcome of a completed import (#5). Mirrors [`RestoreOutcome`]: the strong
+/// ETag derives from `integrity` (the same digest), so it is exposed via
+/// [`ImportOutcome::etag`] rather than stored as a second, divergeable field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportOutcome {
+    pub imported_generation: u64,
+    pub integrity: StateIntegrity,
+}
+
+impl ImportOutcome {
+    /// The strong ETag of the imported state (the integrity digest).
+    pub fn etag(&self) -> StateEtag {
+        StateEtag::from_integrity(&self.integrity)
+    }
+}
+
 /// Request to restore an environment from a named backup (#5).
 ///
 /// `precondition` is mandatory and must pin prior state: a restore is never a

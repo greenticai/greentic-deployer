@@ -575,6 +575,34 @@ pub trait EnvironmentStorage: Send + Sync {
         journal: Option<&MutationJournal>,
     ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
 
+    /// Import a composite [`EnvSnapshot`] into a store that does NOT yet have
+    /// the environment — disaster recovery from a portable backup. Unlike
+    /// [`Self::restore_env_journaled`] (a precondition-guarded rollback of an
+    /// EXISTING environment), import CREATES the environment row, failing
+    /// [`StorageError::AlreadyExists`] (409) if it is already present so it can
+    /// never clobber live state, and reconstructs every sidecar plus the
+    /// captured audit history from scratch — all inside ONE transaction with
+    /// the [`MutationJournal`] rows.
+    ///
+    /// The environment is created fresh at generation 1; the reproduced
+    /// deployment state (revisions + traffic splits — the active routing) lives
+    /// in the restored environment document, not in the row's CAS counter.
+    ///
+    /// Scope: import reconstructs exactly what an [`EnvSnapshot`] captures — the
+    /// environment document, runtime/pack-answers sidecars, and audit history.
+    /// Operator-level material kept OUTSIDE the snapshot (trust-root documents,
+    /// signed revenue-policy artifacts) is NOT reproduced — the same boundary
+    /// `restore` has — and must be re-established separately during recovery.
+    /// Audit rows are re-appended with FRESH ids (the captured global ids are
+    /// not preserved), since the id is store-wide and shared with other envs'
+    /// imports; `event_id`/`recorded_at`/order carry the forensic identity.
+    fn import_env_journaled(
+        &self,
+        env_id: &EnvId,
+        snapshot: &EnvSnapshot,
+        journal: Option<&MutationJournal>,
+    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
+
     /// Append ONE audit row with no idempotency-ledger row — the durable
     /// record of a DENIED mutation (A8 #3: "the rejected attempt is still
     /// audited"). Denials never consume the request's idempotency key, so
