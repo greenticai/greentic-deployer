@@ -128,6 +128,14 @@ pub trait EnvironmentMutations: Send + Sync {
     /// `LocalFsStore`.
     fn load_environment(&self, env_id: &EnvId) -> Result<Environment, StoreError>;
 
+    /// True when the env's trust root holds at least one operator key. Maps to
+    /// `GET /environments/{env_id}/trust-root` on the HTTP backend and to a
+    /// trust-root file read on `LocalFsStore`. A read-only probe (like
+    /// [`Self::load_environment`]) — remote `env apply --check` uses it to diff
+    /// a declared `trust_root` instead of assuming it is seeded (the env
+    /// document does not carry trust-root state).
+    fn trust_root_is_seeded(&self, env_id: &EnvId) -> Result<bool, StoreError>;
+
     // -------------------------------------------------------------
     // Migration
     //   `op env migrate-dev --apply`

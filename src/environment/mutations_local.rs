@@ -1263,6 +1263,14 @@ impl EnvironmentMutations for LocalFsStore {
         EnvironmentStore::load(self, env_id)
     }
 
+    /// A seeded env has the trust-root file present — the seed/add paths always
+    /// write ≥1 key, mirroring the `tr_path.exists()` check in
+    /// [`LocalFsStore::seed_trust_root_if_absent`].
+    fn trust_root_is_seeded(&self, env_id: &EnvId) -> Result<bool, StoreError> {
+        let env_dir = self.env_dir(env_id)?;
+        Ok(trust_root_path(&env_dir).exists())
+    }
+
     /// See [`LocalFsStore::migrate_merge_bindings`].
     fn migrate_merge_bindings(
         &self,
