@@ -28,7 +28,7 @@ use serde_json::json;
 use sqlx::Row;
 
 mod common;
-use common::fresh_store;
+use common::{fresh_store, fresh_store_with_audit_cap};
 
 fn env_id(s: &str) -> EnvId {
     EnvId::try_from(s).expect("valid env id")
@@ -1267,6 +1267,141 @@ async fn ledger_evicts_beyond_the_per_env_window() {
 }
 
 // ---------------------------------------------------------------------------
+// Audit-log retention (opt-in per-environment cap + watermark)
+// ---------------------------------------------------------------------------
+
+/// Read the `audit_retention` watermark for an env, if any prune happened.
+async fn audit_watermark(store: &SqliteEnvironmentStore, id: &EnvId) -> Option<(i64, i64, i64)> {
+    sqlx::query(
+        "SELECT pruned_through_id, pruned_total, policy_max_rows \
+         FROM audit_retention WHERE env_id = $1",
+    )
+    .bind(id.as_str())
+    .fetch_optional(store.pool())
+    .await
+    .expect("watermark query")
+    .map(|r| {
+        (
+            r.get::<i64, _>("pruned_through_id"),
+            r.get::<i64, _>("pruned_total"),
+            r.get::<i64, _>("policy_max_rows"),
+        )
+    })
+}
+
+#[tokio::test]
+async fn audit_log_is_unbounded_by_default() {
+    // No cap configured (the default): the audit log stays append-only.
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    for i in 0..10 {
+        store
+            .record_journal(&journal(&id, &format!("k-{i}"), &format!("fp-{i}")))
+            .await
+            .expect("record journal");
+    }
+
+    assert_eq!(audit_event_ids(&store, &id).await.len(), 10);
+    assert!(
+        audit_watermark(&store, &id).await.is_none(),
+        "no prune, so no watermark row"
+    );
+}
+
+#[tokio::test]
+async fn audit_retention_caps_rows_and_records_watermark() {
+    let (_dir, store) = fresh_store_with_audit_cap(4).await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    // 6 journaled audit rows (ids 1..=6) under a cap of 4.
+    for i in 0..6 {
+        store
+            .record_journal(&journal(&id, &format!("k-{i}"), &format!("fp-{i}")))
+            .await
+            .expect("record journal");
+    }
+
+    // The newest 4 survive; the oldest 2 (k-0/k-1) are pruned.
+    assert_eq!(
+        audit_event_ids(&store, &id).await,
+        vec!["evt-k-2", "evt-k-3", "evt-k-4", "evt-k-5"]
+    );
+    // Watermark: 2 rows removed, high-water at audit_log.id 2, cap 4.
+    assert_eq!(audit_watermark(&store, &id).await, Some((2, 2, 4)));
+}
+
+#[tokio::test]
+async fn audit_retention_applies_to_standalone_record_audit() {
+    // The RBAC-denied path appends via `record_audit`, not the journal —
+    // it must honor the cap too.
+    let (_dir, store) = fresh_store_with_audit_cap(3).await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    for i in 0..5 {
+        store
+            .record_audit(&id, &format!("evt-{i}"), &json!({"i": i}))
+            .await
+            .expect("record audit");
+    }
+
+    assert_eq!(
+        audit_event_ids(&store, &id).await,
+        vec!["evt-2", "evt-3", "evt-4"]
+    );
+    assert_eq!(audit_watermark(&store, &id).await, Some((2, 2, 3)));
+}
+
+#[tokio::test]
+async fn audit_watermark_accumulates_and_is_per_env() {
+    let (_dir, store) = fresh_store_with_audit_cap(2).await;
+    let a = env_id("local");
+    let b = env_id("other");
+    store
+        .create_env(&minimal_environment(&a))
+        .await
+        .expect("create a");
+    store
+        .create_env(&minimal_environment(&b))
+        .await
+        .expect("create b");
+
+    // 5 audit rows on env a, cap 2 → 3 pruned, newest 2 kept.
+    for i in 0..5 {
+        store
+            .record_audit(&a, &format!("a-{i}"), &json!({}))
+            .await
+            .expect("record a");
+    }
+    let (_through, total_a, policy_a) = audit_watermark(&store, &a).await.expect("a watermark");
+    assert_eq!((total_a, policy_a), (3, 2), "3 of env a's 5 rows pruned");
+    assert_eq!(audit_event_ids(&store, &a).await, vec!["a-3", "a-4"]);
+
+    // env b stays under its cap — never pruned, no watermark.
+    store
+        .record_audit(&b, "b-0", &json!({}))
+        .await
+        .expect("record b");
+    assert_eq!(audit_event_ids(&store, &b).await, vec!["b-0"]);
+    assert!(
+        audit_watermark(&store, &b).await.is_none(),
+        "env b never crossed its cap"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Backups + standalone audit append (A8 #3/#5, PR-4.4)
 // ---------------------------------------------------------------------------
 
@@ -1603,4 +1738,36 @@ async fn restore_preserves_sidecar_generation_sequences_and_tombstones() {
         rt_gen, 3,
         "runtime generation must continue (2+1=3), not reset to 1"
     );
+}
+
+#[tokio::test]
+async fn audit_retention_reconciles_existing_over_cap_rows_at_startup() {
+    // Pre-existing audit history written with retention OFF.
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+    for i in 0..6 {
+        store
+            .record_journal(&journal(&id, &format!("k-{i}"), &format!("fp-{i}")))
+            .await
+            .expect("record journal");
+    }
+    assert_eq!(audit_event_ids(&store, &id).await.len(), 6);
+
+    // The operator enables the cap; startup reconciliation caps existing
+    // rows WITHOUT any new append.
+    let store = store.with_audit_max_rows_per_env(Some(4));
+    store
+        .reconcile_audit_retention()
+        .await
+        .expect("reconcile audit retention");
+
+    assert_eq!(
+        audit_event_ids(&store, &id).await,
+        vec!["evt-k-2", "evt-k-3", "evt-k-4", "evt-k-5"]
+    );
+    assert_eq!(audit_watermark(&store, &id).await, Some((2, 2, 4)));
 }
