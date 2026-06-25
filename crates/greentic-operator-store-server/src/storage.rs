@@ -159,8 +159,8 @@ pub const MAX_LEDGER_ROWS_PER_ENV: i64 = 4096;
 pub const MAX_BACKUPS_PER_ENV: i64 = 256;
 
 /// One captured `audit_log` row (PR-4.4 archival). The original `id` is
-/// preserved so restore can re-instate the row at its place in the append
-/// sequence and the [`AuditRetention`] watermark stays consistent.
+/// preserved so a later restore can re-instate the row at its place in the
+/// append sequence and keep the [`AuditRetention`] watermark consistent.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AuditEntry {
     /// `audit_log.id` — the append-order key. Preserved across backup/restore.
@@ -190,8 +190,13 @@ pub struct AuditRetention {
 
 /// Composite environment snapshot: the environment document plus any sidecar
 /// state (runtime, pack answers) AND the durable audit history (`audit_log`
-/// rows + the `audit_retention` watermark) captured at backup time. Restore
-/// reverts the content atomically and re-instates the captured audit history.
+/// rows + the `audit_retention` watermark) captured at backup time.
+///
+/// This type is the capture surface. `load_env_snapshot` populates every
+/// field; today's [`EnvironmentStorage::restore_env_journaled`] reverts only
+/// the content (environment + sidecars) — replaying the captured audit history
+/// on restore is a follow-up. The audit fields are captured now so a backup is
+/// already a complete archival point.
 ///
 /// The `audit_log` / `audit_retention` fields are serde-defaulted and skipped
 /// when empty, so backups taken before audit capture existed deserialize to an
