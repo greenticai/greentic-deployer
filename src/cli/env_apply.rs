@@ -679,18 +679,16 @@ fn resolve_and_validate(
     let env = if store.exists(&env_id)? {
         Some(store.load(&env_id)?)
     } else {
-        // `env apply` reconciles an EXISTING non-local env, but it cannot
-        // CREATE one: the local store is authorization-gated to `local` only
-        // (A7 `authorize_local_only`), so non-local env creation is reserved
-        // for the remote operator store. Surface a clear error at plan time
-        // rather than letting execute hit a confusing `Unauthorized`.
+        // `env apply` bootstraps only the `local` env (its `env init` step
+        // seeds the default bindings). A named env is first-class on the local
+        // store but must be created explicitly first — `apply` reconciles an
+        // existing named env, it does not bootstrap one. Surface a clear error
+        // at plan time rather than failing mid-execute.
         if env_id.as_str() != crate::defaults::LOCAL_ENV_ID {
             return Err(OpError::NotFound(format!(
-                "environment `{env_id}` not found — `env apply` can reconcile an existing \
-                 non-local environment but cannot create one locally (the `local`-only \
-                 authorization policy reserves non-local env creation for the remote \
-                 operator store). Create `{env_id}` via the operator store first, or use \
-                 `local`."
+                "environment `{env_id}` not found — `env apply` reconciles an existing \
+                 named environment but does not create one. Run `op env create {env_id}` \
+                 first, then re-run apply (or use `local`, which apply bootstraps)."
             )));
         }
         None

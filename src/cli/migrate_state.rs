@@ -677,15 +677,17 @@ mod tests {
     }
 
     #[test]
-    fn apply_non_local_target_denies_before_store_probe() {
-        // Codex finding [medium]: a non-local target must be denied + audited
-        // by the authorization gate before `require_env_exists` probes the
-        // store. Otherwise an absent non-local env returns NotFound (an
-        // existence oracle) and the denied attempt goes unaudited.
+    fn apply_non_local_target_is_not_authz_denied() {
+        // Named envs are first-class on the local store, so a non-local target
+        // is no longer authz-denied: `apply` proceeds past the authorization
+        // gate to the store probe. (On a single-operator local store there is
+        // no cross-tenant existence-oracle concern; that protection lives on
+        // the remote RBAC path.) An absent env therefore surfaces as the
+        // store-probe error, NOT `Unauthorized`.
         let dir = tempdir().unwrap();
         let envs_root = dir.path().join("envs");
         let store = LocalFsStore::new(&envs_root);
-        // `prod` is never seeded — without the fix this returns NotFound.
+        // `prod` is never seeded.
         let state_dir = dir.path().join("state");
         write_file(
             &state_dir.join("deploy/aws/acme/prod/scope-xyz/plan.json"),
@@ -693,18 +695,11 @@ mod tests {
         );
         let err = apply(&store, &OpFlags::default(), "prod", Some(&state_dir)).unwrap_err();
         assert!(
-            matches!(err, OpError::Unauthorized { .. }),
-            "non-local target must be denied, not NotFound (no existence oracle); got {err:?}"
+            !matches!(err, OpError::Unauthorized { .. }),
+            "named env target must no longer be authz-denied; got {err:?}"
         );
-        // The legacy tree is untouched (closure never ran).
+        // The legacy tree is untouched (the absent env aborts before migration).
         assert!(state_dir.join("deploy").exists());
-        // The denied attempt was audited under the target env's audit dir.
-        let log = envs_root.join("prod").join("audit").join("events.jsonl");
-        let raw = std::fs::read_to_string(&log).expect("denied migrate-state must be audited");
-        assert!(
-            raw.contains("\"decision\":\"deny\"") && raw.contains("migrate-state"),
-            "audit event must record the migrate-state denial; got: {raw}"
-        );
     }
 
     #[test]

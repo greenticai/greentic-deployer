@@ -75,7 +75,7 @@ use thiserror::Error;
 
 use crate::environment::{
     AuditDecision, AuditEvent, AuditLog, AuditResult, LifecycleError, LocalFsStore, StoreError,
-    authorize_local_only, current_local_actor,
+    authorize_local_owner, current_local_actor,
 };
 use greentic_deploy_spec::{EnvId, SpecError};
 
@@ -353,7 +353,7 @@ impl AuditGens {
 
 /// Wrap a mutating verb body in local-only authorization + append-only audit.
 ///
-/// 1. Runs [`authorize_local_only`] against `ctx.env_id`.
+/// 1. Runs [`authorize_local_owner`] against `ctx.env_id`.
 /// 2. On `Deny`: returns `OpError::Unauthorized` without calling `mutate`.
 /// 3. On `Allow`: runs `mutate` and records the outcome.
 /// 4. Always appends an [`AuditEvent`] to `<store_root>/<env_id>/audit/events.jsonl`.
@@ -396,7 +396,7 @@ pub(crate) fn audit_and_record<F>(
 where
     F: FnOnce(&CommitMarker) -> Result<(OpOutcome, AuditGens), OpError>,
 {
-    let decision = authorize_local_only(&ctx.env_id);
+    let decision = authorize_local_owner(&ctx.env_id);
     let commit_marker = CommitMarker::new();
     let (result, gens) = match &decision {
         AuditDecision::Deny { policy, reason } => (

@@ -1072,18 +1072,23 @@ mod tests {
     }
 
     #[test]
-    fn add_non_local_with_customer_id_is_authz_denied() {
-        // With a billing principal supplied, the arg gate passes and the
-        // non-local env is rejected by the local-only authz policy (A8 ships
-        // real RBAC). Confirms the customer_id gate doesn't let non-local through.
+    fn add_non_local_with_customer_id_is_not_authz_denied() {
+        // Named envs are first-class on the local store: the `local`-only authz
+        // denial is gone. With the billing principal supplied (customer_id gate
+        // satisfied), `bundles add` on a non-local env is no longer rejected by
+        // the authorization gate. (Other preconditions may still apply; this
+        // pins only that the gate no longer blocks named envs.)
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("prod-eu")).unwrap();
         let mut p = payload("fast2flow");
         p.environment_id = "prod-eu".to_string();
         p.customer_id = Some("cust-acme".to_string());
-        let err = add(&store, &OpFlags::default(), Some(p)).unwrap_err();
-        assert!(matches!(err, OpError::Unauthorized { .. }), "got {err:?}");
+        let result = add(&store, &OpFlags::default(), Some(p));
+        assert!(
+            !matches!(result, Err(OpError::Unauthorized { .. })),
+            "named env must not be authz-denied; got {result:?}"
+        );
     }
 
     #[test]
