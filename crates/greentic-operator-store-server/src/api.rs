@@ -3261,18 +3261,23 @@ pub(crate) async fn delete_backup<S: EnvironmentStorage>(
 
 /// `GET /environments/{env_id}/backups/{backup_id}/export` — pull a backup
 /// OFFSITE as a portable, self-verifying [`BackupArtifact`] (A8 #5, disaster
-/// recovery). A read (no mutation, no idempotency key, no journal), gated like
-/// `list_backups`; an unknown `backup_id` is a 404. The returned artifact
-/// carries the manifest, the FULL composite snapshot (env + sidecars + audit),
-/// and the snapshot digest — the exact bytes a later import re-verifies and
-/// replays, so a backup survives total store loss.
+/// recovery). The artifact carries the manifest, the FULL composite snapshot
+/// (env + sidecars + audit), and the snapshot digest — the exact bytes a later
+/// import re-verifies and replays, so a backup survives total store loss.
+///
+/// Though it performs no mutation (no idempotency key, no journal), export is
+/// gated at BACKUP-OPERATOR privilege (`authorize_mutation` on
+/// `backup`/`export`), NOT generic read: the snapshot is the complete recovery
+/// payload — environment document, runtime, pack answers, and audit history —
+/// which a read-only actor (entitled only to manifests, via `list_backups`)
+/// must not be able to exfiltrate offsite. An unknown `backup_id` is a 404.
 pub(crate) async fn export_backup<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, backup_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<BackupArtifact>, ApiError> {
     let env_id = parse_env_id(&env_id)?;
-    authorize_read(&state, &headers, Some(&env_id))?;
+    authorize_mutation(&state, &headers, &env_id, "backup", "export").await?;
     let backup = state
         .storage
         .load_backup(&env_id, &backup_id)
