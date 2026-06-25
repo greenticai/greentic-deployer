@@ -2935,7 +2935,7 @@ fn live_revision_digest(env: &Environment, deployment_id: DeploymentId) -> Optio
 
 /// A digest the diff can trust: real `sha256:` material, not the
 /// `sha256:00` placeholder pre-digest revisions carry.
-fn digest_is_real(digest: &str) -> bool {
+pub(super) fn digest_is_real(digest: &str) -> bool {
     digest.starts_with("sha256:") && digest.len() > "sha256:".len() && digest != "sha256:00"
 }
 

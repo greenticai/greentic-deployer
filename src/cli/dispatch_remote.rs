@@ -1310,8 +1310,9 @@ fn reject_unsupported_remote_sections(manifest: &EnvManifest) -> Result<(), OpEr
 /// A `bundle_digest` a remote worker can verify: real `sha256:` material, not
 /// the local-serve placeholder (`sha256:00`).
 fn remote_pullable_digest(declared: Option<&str>) -> bool {
-    declared
-        .is_some_and(|d| d.starts_with("sha256:") && d.len() > "sha256:".len() && d != "sha256:00")
+    // Defers to the local pipeline's `digest_is_real` so the placeholder
+    // sentinel (`sha256:00`) has a single definition across both paths.
+    declared.is_some_and(super::env_apply::digest_is_real)
 }
 
 /// Require registry pull pointers on every revision of `b` (single- or
@@ -1353,32 +1354,25 @@ fn require_remote_bundle_pointers(b: &ManifestBundle) -> Result<(), OpError> {
     }
 }
 
-/// `gtc op env apply --answers <manifest> --store-url <url>`.
-///
-/// The remote peer of [`super::env_apply::apply`]. The local pipeline writes
-/// secret VALUES into the operator-local dev store and resolves bundle
-/// artifacts from local files; a control-plane store custodies only the env
-/// DOCUMENT, so this composes the already-remote typed verbs (env update,
-/// trust-root, bindings, bundle add, revision stage/warm, traffic, messaging)
-/// and FAIL-CLOSED refuses every section it cannot own (see
-/// [`reject_unsupported_remote_sections`]). The runtime ROLLOUT (pulling
-/// images, rolling pods) is a separate concern (`env reconcile` / the runtime
-/// consuming the store), not part of apply.
-///
-/// Re-runnability comes from CONVERGENCE, not from stable idempotency keys
-/// against the bounded server replay ledger: apply reads current env state and
-/// skips a deployment already at its desired revision set, an endpoint that
-/// already exists, and a binding already bound. Genuine stages mint FRESH
-/// revision ids — a stable id would collide (`DuplicateRevision`) on a re-apply
-/// once the ledger evicts the original key. Idempotency keys are minted per
-/// mutation (audit-replay metadata only). Remote apply is non-interactive: it
-/// never prompts (secrets are rejected, not collected) and executes without the
-/// local TTY confirmation — the `--store-url` + `--answers` invocation is the
-/// explicit intent.
+/// One desired revision for a bundle, resolved from the manifest: the traffic
+/// weight, the registry pull ref, the integrity digest, and the drain window.
+/// A named struct (vs a 5-tuple of three `String`s) keeps `source_uri` and
+/// `digest` from being transposed at the call sites.
+struct DesiredRevision {
+    name: String,
+    weight_bps: u32,
+    source_uri: String,
+    digest: String,
+    drain_seconds: u32,
+}
+
+/// True when the deployment's live traffic split already equals the desired
+/// revision set — the convergence skip that makes apply re-runnable without
+/// relying on the bounded server replay ledger.
 fn deployment_converged_remote(
     env: &greentic_deploy_spec::Environment,
     deployment_id: DeploymentId,
-    desired: &[(u32, &str, &str)],
+    desired: &[DesiredRevision],
 ) -> bool {
     // Multiset equality of `(weight_bps, source_uri, digest)` between the live
     // split and the desired set: every live entry must resolve to a real-digest
@@ -1414,7 +1408,7 @@ fn deployment_converged_remote(
     }
     let mut want: Vec<(u32, Option<&str>, &str)> = desired
         .iter()
-        .map(|(w, uri, dig)| (*w, Some(*uri), *dig))
+        .map(|d| (d.weight_bps, Some(d.source_uri.as_str()), d.digest.as_str()))
         .collect();
     live.sort_unstable();
     want.sort_unstable();
@@ -1463,6 +1457,28 @@ fn bundle_metadata_update(
     })
 }
 
+/// `gtc op env apply --answers <manifest> --store-url <url>`.
+///
+/// The remote peer of [`super::env_apply::apply`]. The local pipeline writes
+/// secret VALUES into the operator-local dev store and resolves bundle
+/// artifacts from local files; a control-plane store custodies only the env
+/// DOCUMENT, so this composes the already-remote typed verbs (env update,
+/// trust-root, bindings, bundle add, revision stage/warm, traffic, messaging)
+/// and FAIL-CLOSED refuses every section it cannot own (see
+/// [`reject_unsupported_remote_sections`]). The runtime ROLLOUT (pulling
+/// images, rolling pods) is a separate concern (`env reconcile` / the runtime
+/// consuming the store), not part of apply.
+///
+/// Re-runnability comes from CONVERGENCE, not from stable idempotency keys
+/// against the bounded server replay ledger: apply reads current env state and
+/// skips a deployment already at its desired revision set, an endpoint that
+/// already exists, and a binding already bound. Genuine stages mint FRESH
+/// revision ids — a stable id would collide (`DuplicateRevision`) on a re-apply
+/// once the ledger evicts the original key. Idempotency keys are minted per
+/// mutation (audit-replay metadata only). Remote apply is non-interactive: it
+/// never prompts (secrets are rejected, not collected) and executes without the
+/// local TTY confirmation — the `--store-url` + `--answers` invocation is the
+/// explicit intent.
 fn remote_env_apply(
     store: &dyn EnvironmentMutations,
     flags: &OpFlags,
@@ -1579,39 +1595,36 @@ fn remote_env_apply(
 
     // -- 4. bundles: reconcile metadata, then converge revisions -------------
     for b in &manifest.bundles {
-        let bundle_id = BundleId::new(&b.bundle_id);
         let customer_id = super::bundles::resolve_customer_id(&env_id, b.customer_id.clone())?;
         let existing = env
             .bundles
             .iter()
             .find(|d| d.bundle_id.as_str() == b.bundle_id && d.customer_id == customer_id);
 
-        // The desired revisions: (name, weight_bps, source_uri, digest, drain).
-        let revs: Vec<(String, u32, String, String, u32)> = match &b.revisions {
+        let revs: Vec<DesiredRevision> = match &b.revisions {
             Some(revisions) => {
                 let weights = super::env_manifest::compute_effective_weights_bps(revisions);
                 revisions
                     .iter()
                     .zip(weights)
-                    .map(|(r, w)| {
-                        (
-                            r.name.clone(),
-                            w,
-                            r.bundle_source_uri.clone().unwrap_or_default(),
-                            r.bundle_digest.clone().unwrap_or_default(),
-                            r.drain_seconds
-                                .unwrap_or_else(super::revisions::default_drain_seconds),
-                        )
+                    .map(|(r, weight_bps)| DesiredRevision {
+                        name: r.name.clone(),
+                        weight_bps,
+                        source_uri: r.bundle_source_uri.clone().unwrap_or_default(),
+                        digest: r.bundle_digest.clone().unwrap_or_default(),
+                        drain_seconds: r
+                            .drain_seconds
+                            .unwrap_or_else(super::revisions::default_drain_seconds),
                     })
                     .collect()
             }
-            None => vec![(
-                "default".to_string(),
-                super::deploy::FULL_TRAFFIC_BPS,
-                b.bundle_source_uri.clone().unwrap_or_default(),
-                b.bundle_digest.clone().unwrap_or_default(),
-                super::revisions::default_drain_seconds(),
-            )],
+            None => vec![DesiredRevision {
+                name: "default".to_string(),
+                weight_bps: super::deploy::FULL_TRAFFIC_BPS,
+                source_uri: b.bundle_source_uri.clone().unwrap_or_default(),
+                digest: b.bundle_digest.clone().unwrap_or_default(),
+                drain_seconds: super::revisions::default_drain_seconds(),
+            }],
         };
 
         let deployment_id: Option<DeploymentId> = match existing {
@@ -1656,7 +1669,7 @@ fn remote_env_apply(
                         .add_bundle(
                             &env_id,
                             AddBundlePayload {
-                                bundle_id: bundle_id.clone(),
+                                bundle_id: BundleId::new(&b.bundle_id),
                                 customer_id: customer_id.clone(),
                                 revenue_share,
                                 route_binding,
@@ -1677,12 +1690,8 @@ fn remote_env_apply(
 
         // Convergence: skip stage/warm/traffic when the live split already
         // matches the desired (weight, source_uri, digest) set.
-        let desired: Vec<(u32, &str, &str)> = revs
-            .iter()
-            .map(|(_, w, uri, dig, _)| (*w, uri.as_str(), dig.as_str()))
-            .collect();
         if let Some(dep_id) = deployment_id
-            && deployment_converged_remote(&env, dep_id, &desired)
+            && deployment_converged_remote(&env, dep_id, &revs)
         {
             steps.push(json!({
                 "section": "revision", "bundle_id": b.bundle_id, "action": "converged"
@@ -1691,10 +1700,10 @@ fn remote_env_apply(
         }
 
         let mut traffic_entries: Vec<TrafficSplitEntry> = Vec::with_capacity(revs.len());
-        for (name, weight_bps, source_uri, digest, drain_seconds) in revs {
+        for rev in revs {
             steps.push(json!({
-                "section": "revision", "bundle_id": b.bundle_id, "revision": name,
-                "action": "stage", "weight_bps": weight_bps
+                "section": "revision", "bundle_id": b.bundle_id, "revision": rev.name,
+                "action": "stage", "weight_bps": rev.weight_bps
             }));
             if !dry_run {
                 let deployment_id =
@@ -1709,8 +1718,8 @@ fn remote_env_apply(
                         StageRevisionPayload {
                             revision_id,
                             deployment_id,
-                            bundle_digest: digest.clone(),
-                            bundle_source_uri: Some(source_uri.clone()),
+                            bundle_digest: rev.digest,
+                            bundle_source_uri: Some(rev.source_uri),
                             // Pack metadata is derivable only from the local
                             // artifact; a remote pin-pointer stage records the
                             // pull coordinate + integrity pin and leaves it empty
@@ -1721,7 +1730,7 @@ fn remote_env_apply(
                             config_digest: super::revisions::default_config_digest(),
                             signature_sidecar_ref: super::revisions::default_signature_sidecar_ref(
                             ),
-                            drain_seconds,
+                            drain_seconds: rev.drain_seconds,
                         },
                         super::mint_idempotency_key(),
                     )
@@ -1739,7 +1748,7 @@ fn remote_env_apply(
                     .map_err(map_store_err_preserving_noun)?;
                 traffic_entries.push(TrafficSplitEntry {
                     revision_id,
-                    weight_bps,
+                    weight_bps: rev.weight_bps,
                 });
             }
         }
@@ -3101,13 +3110,23 @@ mod tests {
         parse_deployment_id(TEST_DEPLOYMENT_ID).unwrap()
     }
 
+    fn desired(weight_bps: u32, source_uri: &str, digest: &str) -> DesiredRevision {
+        DesiredRevision {
+            name: "r".to_string(),
+            weight_bps,
+            source_uri: source_uri.to_string(),
+            digest: digest.to_string(),
+            drain_seconds: 30,
+        }
+    }
+
     #[test]
     fn convergence_true_when_split_matches_desired() {
         let env = env_of(converged_env_json("sha256:abc123", "oci://r/app:1", 10000));
         assert!(deployment_converged_remote(
             &env,
             dep_id(),
-            &[(10000, "oci://r/app:1", "sha256:abc123")]
+            &[desired(10000, "oci://r/app:1", "sha256:abc123")]
         ));
     }
 
@@ -3118,13 +3137,13 @@ mod tests {
         assert!(!deployment_converged_remote(
             &env,
             dep_id(),
-            &[(10000, "oci://r/app:1", "sha256:def456")]
+            &[desired(10000, "oci://r/app:1", "sha256:def456")]
         ));
         // Changed pull ref (same digest) → still not converged.
         assert!(!deployment_converged_remote(
             &env,
             dep_id(),
-            &[(10000, "oci://r/app:2", "sha256:abc123")]
+            &[desired(10000, "oci://r/app:2", "sha256:abc123")]
         ));
     }
 
@@ -3136,7 +3155,7 @@ mod tests {
         assert!(!deployment_converged_remote(
             &env,
             dep_id(),
-            &[(10000, "oci://r/app:1", "sha256:00")]
+            &[desired(10000, "oci://r/app:1", "sha256:00")]
         ));
     }
 
