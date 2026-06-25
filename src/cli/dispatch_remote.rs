@@ -9,17 +9,24 @@
 //! Blocked mutation verbs (those that need a local read or local side-effect
 //! the HTTP store does not yet provide) also return `NotYetImplemented` with
 //! a clear message.
+//!
+//! `env apply` is the one composite verb: `remote_env_apply` reads a
+//! `greentic.env-manifest.v1` document and reconciles the whole env against
+//! the remote store by composing the typed verbs above (env update,
+//! trust-root, bindings, bundle add, revision stage/warm, traffic, messaging),
+//! fail-closing on the sections a control-plane store cannot own.
 
 use greentic_deploy_spec::{
     BundleId, DeploymentId, EnvId, EnvironmentHostConfig, IdempotencyKey, MessagingEndpointId,
-    PackId, RevenueShareEntry, RevisionId, StageRevisionPayload, WarmRevisionPayload,
+    PackId, RevenueShareEntry, RevisionId, SetTrafficSplitPayload, StageRevisionPayload,
+    TrafficSplitEntry, WarmRevisionPayload,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::environment::{
     AddBundlePayload, AddMessagingEndpointPayload, AuthMethod, EnvironmentMutations, FieldUpdate,
-    HttpEnvironmentStore, RemoveBundleOutcome, SetMessagingWelcomeFlowPayload, UpdateBundlePayload,
-    UpdateEnvironmentPayload,
+    HttpEnvironmentStore, RemoveBundleOutcome, SetMessagingWelcomeFlowPayload, StoreError,
+    UpdateBundlePayload, UpdateEnvironmentPayload,
 };
 
 use super::dispatch::{
@@ -27,6 +34,8 @@ use super::dispatch::{
     MessagingEndpointVerb, MessagingNoun, OpCommand, OpNoun, RevisionsVerb, SecretsVerb,
     TrafficVerb, TrustRootVerb, print_outcome,
 };
+use super::env_apply::{ApplyMode, ApplyOptions};
+use super::env_manifest::{EnvManifest, ManifestBundle};
 use super::{OpError, OpFlags, OpOutcome, map_store_err_preserving_noun};
 
 // ---------------------------------------------------------------------------
@@ -105,9 +114,16 @@ fn route_remote(
                 remote_env_set_public_url(store, &args.env_id, &args.url)
             }
             EnvVerb::Init(_) => Err(not_supported("env init")),
-            // Remote apply is blocked on remote artifact staging (A8), not
-            // on the manifest design — see plans/env-manifest-apply.md §9.
-            EnvVerb::Apply(_) => Err(not_supported("env apply")),
+            // Manifest-driven whole-env document reconcile over the remote
+            // store. `--emit-answers-template` is store-independent (a local
+            // template write), so it runs the same as on the local path.
+            EnvVerb::Apply(mut args) => {
+                if let Some(path) = args.emit_answers_template.take() {
+                    super::env_apply::emit_answers_template(&path)
+                } else {
+                    remote_env_apply(store, flags, args.into_options())
+                }
+            }
             EnvVerb::List => Err(not_supported("env list")),
             EnvVerb::Show { .. } => Err(not_supported("env show")),
             EnvVerb::Doctor { .. } => Err(not_supported("env doctor")),
@@ -1229,6 +1245,571 @@ fn remote_trust_root_remove(
 }
 
 // ===========================================================================
+// env apply: manifest-driven whole-env document reconcile over a remote store
+// ===========================================================================
+
+/// Fail-closed gate: refuse every manifest section a control-plane store
+/// cannot own, BEFORE any mutation, so the operator fixes them all in one
+/// round trip rather than discovering them mid-apply.
+fn reject_unsupported_remote_sections(manifest: &EnvManifest) -> Result<(), OpError> {
+    // Secret VALUES never reach a control-plane store: there is no server
+    // secrets plane (the value plane is operator-local, bridged into the
+    // runtime at reconcile). Provision them operator-side and omit `secrets[]`.
+    if !manifest.secrets.is_empty() {
+        return Err(OpError::InvalidArgument(
+            "`secrets[]` cannot be applied over a remote --store-url store: the \
+             control-plane store does not custody secret values. Provision them in your \
+             own secrets plane, then re-run with a manifest that omits `secrets[]`"
+                .to_string(),
+        ));
+    }
+    // Pack/extension binding answer files live on the apply host and cannot
+    // travel to a remote store. Bindings WITHOUT an `answers_ref` apply fine.
+    if let Some(p) = manifest.packs.iter().find(|p| p.answers_ref.is_some()) {
+        return Err(OpError::InvalidArgument(format!(
+            "pack binding for slot `{}` carries a local `answers_ref` that cannot be applied \
+             over a remote --store-url store. Apply the answer file operator-side, or drop \
+             `answers_ref` from the binding",
+            p.slot
+        )));
+    }
+    if let Some(e) = manifest.extensions.iter().find(|e| e.answers_ref.is_some()) {
+        return Err(OpError::InvalidArgument(format!(
+            "extension binding `{}` carries a local `answers_ref` that cannot be applied over \
+             a remote --store-url store. Apply the answer file operator-side, or drop \
+             `answers_ref` from the binding",
+            e.kind
+        )));
+    }
+    // Telegram-class endpoints need a webhook secret the manifest cannot carry
+    // (no `webhook_secret_ref` field) and the control-plane store never mints
+    // (R2). Add them explicitly with `op messaging endpoint add
+    // --webhook-secret-ref` against the remote store.
+    if let Some(ep) = manifest
+        .messaging_endpoints
+        .iter()
+        .find(|ep| greentic_deploy_spec::engine::messaging::is_telegram_class(&ep.provider_type))
+    {
+        return Err(OpError::InvalidArgument(format!(
+            "telegram-class endpoint `{}` cannot be applied over a remote --store-url store via \
+             manifest (the manifest carries no webhook_secret_ref, and the control-plane store \
+             never mints one). Add it explicitly with `op messaging endpoint add \
+             --webhook-secret-ref <ref>`",
+            ep.name
+        )));
+    }
+    // Every bundle revision must be pullable + verifiable by a remote worker: a
+    // registry `bundle_source_uri` plus a pinned, non-placeholder
+    // `bundle_digest`. A local `bundle_path` has no meaning server-side.
+    for b in &manifest.bundles {
+        require_remote_bundle_pointers(b)?;
+    }
+    Ok(())
+}
+
+/// A `bundle_digest` a remote worker can verify: real `sha256:` material, not
+/// the local-serve placeholder (`sha256:00`).
+fn remote_pullable_digest(declared: Option<&str>) -> bool {
+    declared
+        .is_some_and(|d| d.starts_with("sha256:") && d.len() > "sha256:".len() && d != "sha256:00")
+}
+
+/// Require registry pull pointers on every revision of `b` (single- or
+/// multi-revision form). Mirrors the constraint R1 enforced on remote
+/// `revisions stage`.
+fn require_remote_bundle_pointers(b: &ManifestBundle) -> Result<(), OpError> {
+    fn check(label: String, source_uri: Option<&str>, digest: Option<&str>) -> Result<(), OpError> {
+        if source_uri.map(str::trim).is_none_or(|u| u.is_empty()) {
+            return Err(OpError::InvalidArgument(format!(
+                "{label} needs a registry `bundle_source_uri` to apply over a remote \
+                 --store-url store (a local `bundle_path` cannot be extracted server-side): \
+                 push the bundle to a registry and pin its oci:// ref"
+            )));
+        }
+        if !remote_pullable_digest(digest) {
+            return Err(OpError::InvalidArgument(format!(
+                "{label} needs a real pinned `bundle_digest` (sha256:…) to apply over a remote \
+                 --store-url store — a remote worker cannot verify an unpinned pull"
+            )));
+        }
+        Ok(())
+    }
+    match &b.revisions {
+        Some(revisions) => {
+            for rev in revisions {
+                check(
+                    format!("bundle `{}` revision `{}`", b.bundle_id, rev.name),
+                    rev.bundle_source_uri.as_deref(),
+                    rev.bundle_digest.as_deref(),
+                )?;
+            }
+            Ok(())
+        }
+        None => check(
+            format!("bundle `{}`", b.bundle_id),
+            b.bundle_source_uri.as_deref(),
+            b.bundle_digest.as_deref(),
+        ),
+    }
+}
+
+/// `gtc op env apply --answers <manifest> --store-url <url>`.
+///
+/// The remote peer of [`super::env_apply::apply`]. The local pipeline writes
+/// secret VALUES into the operator-local dev store and resolves bundle
+/// artifacts from local files; a control-plane store custodies only the env
+/// DOCUMENT, so this composes the already-remote typed verbs (env update,
+/// trust-root, bindings, bundle add, revision stage/warm, traffic, messaging)
+/// and FAIL-CLOSED refuses every section it cannot own (see
+/// [`reject_unsupported_remote_sections`]). The runtime ROLLOUT (pulling
+/// images, rolling pods) is a separate concern (`env reconcile` / the runtime
+/// consuming the store), not part of apply.
+///
+/// Idempotency keys and the staged revision ids are DERIVED from the env id +
+/// manifest content (via [`super::env_apply::derive_idempotency_key`]), so
+/// re-running the same manifest replays server-side (PR-4.3 ledger) instead of
+/// churning duplicate revisions. Remote apply is non-interactive: it never
+/// prompts (secrets are rejected, not collected) and executes without the
+/// local TTY confirmation — the `--store-url` + `--answers` invocation is the
+/// explicit intent.
+fn remote_env_apply(
+    store: &dyn EnvironmentMutations,
+    flags: &OpFlags,
+    opts: ApplyOptions,
+) -> Result<OpOutcome, OpError> {
+    let manifest_path = flags.answers.clone().ok_or_else(|| {
+        OpError::InvalidArgument(
+            "env apply requires `--answers <manifest.json>` (a greentic.env-manifest.v1 \
+             document; see `gtc op env apply --schema`)"
+                .to_string(),
+        )
+    })?;
+    let manifest: EnvManifest = super::load_answers(&manifest_path)?;
+    manifest.validate_shape()?;
+    reject_unsupported_remote_sections(&manifest)?;
+
+    // `--check` has no remote no-op diff engine yet — refuse rather than fake a
+    // convergence verdict.
+    if opts.mode == ApplyMode::Check {
+        return Err(OpError::NotYetImplemented(
+            "`env apply --check` (convergence gate) is not supported against a remote \
+             --store-url store yet — run it against the local store, or use `--dry-run` for a \
+             non-failing preview"
+                .to_string(),
+        ));
+    }
+    let dry_run = opts.mode == ApplyMode::DryRun;
+
+    let env_id = parse_env_id(&manifest.environment.id)?;
+    let updated_by = opts
+        .updated_by
+        .clone()
+        .unwrap_or_else(|| "env-apply".to_string());
+
+    // A named env must already exist on the remote store — apply reconciles, it
+    // never creates (the local-only `local` bootstrap has no remote peer).
+    let env = store.load_environment(&env_id).map_err(|e| match e {
+        StoreError::NotFound(_) => OpError::NotFound(format!(
+            "environment `{env_id}` not found on the remote store — create it first \
+             (`gtc op env create {env_id} --store-url <url>`) before applying"
+        )),
+        other => map_store_err_preserving_noun(other),
+    })?;
+
+    // Deterministic key/id derivation from manifest content (replay-safe).
+    let derive = |kind: &str, natural: &str, hash: &str| {
+        super::env_apply::derive_idempotency_key(&env_id, kind, natural, hash)
+    };
+    let mut steps: Vec<Value> = Vec::new();
+
+    // -- 1. environment host config / public base url (upsert; never clears) --
+    let m = &manifest.environment;
+    if m.public_base_url.is_some() || m.declares_host_config() {
+        steps.push(json!({"section": "environment", "action": "reconcile", "id": env_id.as_str()}));
+        if !dry_run {
+            let public_base_url = match &m.public_base_url {
+                Some(raw) => FieldUpdate::Set(super::env::parse_public_base_url(raw)?),
+                None => FieldUpdate::Keep,
+            };
+            let listen_addr = match &m.listen_addr {
+                Some(raw) => {
+                    FieldUpdate::Set(raw.parse::<std::net::SocketAddr>().map_err(|e| {
+                        OpError::InvalidArgument(format!("listen_addr {raw:?}: {e}"))
+                    })?)
+                }
+                None => FieldUpdate::Keep,
+            };
+            store
+                .update_environment(
+                    &env_id,
+                    UpdateEnvironmentPayload {
+                        name: m.name.clone(),
+                        region: FieldUpdate::from_option(m.region.clone()),
+                        tenant_org_id: FieldUpdate::from_option(m.tenant_org_id.clone()),
+                        listen_addr,
+                        public_base_url,
+                        gui_enabled: FieldUpdate::from_option(m.gui_enabled),
+                    },
+                )
+                .map_err(map_store_err_preserving_noun)?;
+        }
+    }
+
+    // -- 2. trust root (idempotent seed-if-absent) ---------------------------
+    if manifest.trust_root.is_some() {
+        steps.push(json!({"section": "trust-root", "action": "seed-if-absent"}));
+        if !dry_run {
+            store
+                .seed_trust_root_if_absent(&env_id)
+                .map_err(map_store_err_preserving_noun)?;
+        }
+    }
+
+    // -- 3. env-pack bindings (answer-less; skip already-bound slots) ---------
+    for p in &manifest.packs {
+        if env.pack_for_slot(p.slot).is_some() {
+            steps.push(
+                json!({"section": "pack", "slot": p.slot.to_string(), "action": "skip-bound"}),
+            );
+            continue;
+        }
+        steps.push(json!({"section": "pack", "slot": p.slot.to_string(), "action": "add"}));
+        if !dry_run {
+            let payload = super::env_packs::EnvPackBindingPayload {
+                environment_id: env_id.as_str().to_string(),
+                slot: p.slot,
+                kind: p.kind.clone(),
+                pack_ref: p.pack_ref.clone(),
+                answers_ref: None,
+                idempotency_key: None,
+            };
+            let binding = super::env_packs::build_binding(&payload, 0, None)?;
+            let key = super::resolve_idempotency_key(Some(derive(
+                "pack-add",
+                &p.slot.to_string(),
+                &super::env_apply::hash_json(&json!({"kind": p.kind, "pack_ref": p.pack_ref})),
+            )))?;
+            store
+                .add_pack_binding(&env_id, binding, key)
+                .map_err(map_store_err_preserving_noun)?;
+        }
+    }
+
+    // -- 4. bundles: add (if new) → stage + warm each revision → set traffic --
+    for b in &manifest.bundles {
+        let bundle_id = BundleId::new(&b.bundle_id);
+        let customer_id = super::bundles::resolve_customer_id(&env_id, b.customer_id.clone())?;
+        let existing = env
+            .bundles
+            .iter()
+            .find(|d| d.bundle_id.as_str() == b.bundle_id && d.customer_id == customer_id);
+
+        // The revisions to stage: (name, weight_bps, source_uri, digest, drain).
+        let revs: Vec<(String, u32, String, String, u32)> = match &b.revisions {
+            Some(revisions) => {
+                let weights = super::env_manifest::compute_effective_weights_bps(revisions);
+                revisions
+                    .iter()
+                    .zip(weights)
+                    .map(|(r, w)| {
+                        (
+                            r.name.clone(),
+                            w,
+                            r.bundle_source_uri.clone().unwrap_or_default(),
+                            r.bundle_digest.clone().unwrap_or_default(),
+                            r.drain_seconds
+                                .unwrap_or_else(super::revisions::default_drain_seconds),
+                        )
+                    })
+                    .collect()
+            }
+            None => vec![(
+                "default".to_string(),
+                super::deploy::FULL_TRAFFIC_BPS,
+                b.bundle_source_uri.clone().unwrap_or_default(),
+                b.bundle_digest.clone().unwrap_or_default(),
+                super::revisions::default_drain_seconds(),
+            )],
+        };
+
+        let deployment_id: Option<DeploymentId> = match existing {
+            Some(d) => {
+                steps.push(json!({
+                    "section": "bundle", "bundle_id": b.bundle_id, "action": "reuse",
+                    "deployment_id": d.deployment_id.to_string()
+                }));
+                Some(d.deployment_id)
+            }
+            None => {
+                steps.push(json!({"section": "bundle", "bundle_id": b.bundle_id, "action": "add"}));
+                if dry_run {
+                    None
+                } else {
+                    let key = super::resolve_idempotency_key(Some(derive(
+                        "bundle-add",
+                        &b.bundle_id,
+                        &super::env_apply::hash_json(&json!({
+                            "customer_id": customer_id.as_str(),
+                            "revenue_share": b.revenue_share,
+                            "route_binding": b.route_binding,
+                            "config_overrides": b.config_overrides,
+                        })),
+                    )))?;
+                    let revenue_share = super::bundles::convert_revenue_share(
+                        &b.revenue_share
+                            .clone()
+                            .unwrap_or_else(super::bundles::default_revenue_share),
+                    );
+                    let route_binding = Some(super::bundles::into_route_binding(
+                        b.route_binding.clone().unwrap_or_default(),
+                    ));
+                    let dep = store
+                        .add_bundle(
+                            &env_id,
+                            AddBundlePayload {
+                                bundle_id: bundle_id.clone(),
+                                customer_id: customer_id.clone(),
+                                revenue_share,
+                                route_binding,
+                                authorization_ref: Some(
+                                    super::bundles::default_authorization_ref()
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                ),
+                                config_overrides: b.config_overrides.clone().unwrap_or_default(),
+                            },
+                            key,
+                        )
+                        .map_err(map_store_err_preserving_noun)?;
+                    Some(dep.deployment_id)
+                }
+            }
+        };
+
+        let mut traffic_entries: Vec<TrafficSplitEntry> = Vec::with_capacity(revs.len());
+        for (name, weight_bps, source_uri, digest, drain_seconds) in revs {
+            let revision_id_str =
+                derive("revision-id", &format!("{}:{}", b.bundle_id, name), &digest);
+            let revision_id = parse_revision_id(&revision_id_str)?;
+            steps.push(json!({
+                "section": "revision", "bundle_id": b.bundle_id, "revision": name,
+                "revision_id": revision_id.to_string(), "weight_bps": weight_bps
+            }));
+            if !dry_run {
+                let deployment_id =
+                    deployment_id.expect("apply mode resolves a deployment id before staging");
+                let stage_key = super::resolve_idempotency_key(Some(derive(
+                    "revision-stage",
+                    &revision_id_str,
+                    &digest,
+                )))?;
+                let staged = store
+                    .stage_revision(
+                        &env_id,
+                        StageRevisionPayload {
+                            revision_id,
+                            deployment_id,
+                            bundle_digest: digest.clone(),
+                            bundle_source_uri: Some(source_uri.clone()),
+                            // Pack metadata is derivable only from the local
+                            // artifact; a remote pin-pointer stage records the
+                            // pull coordinate + integrity pin and leaves it empty
+                            // (the bundle is self-describing once pulled).
+                            pack_list: Vec::new(),
+                            pack_list_lock_ref: std::path::PathBuf::new(),
+                            pack_config_refs: Vec::new(),
+                            config_digest: super::revisions::default_config_digest(),
+                            signature_sidecar_ref: super::revisions::default_signature_sidecar_ref(
+                            ),
+                            drain_seconds,
+                        },
+                        stage_key,
+                    )
+                    .map_err(map_store_err_preserving_noun)?;
+                let warm_key = super::resolve_idempotency_key(Some(derive(
+                    "revision-warm",
+                    &revision_id_str,
+                    "",
+                )))?;
+                store
+                    .warm_revision(
+                        &env_id,
+                        WarmRevisionPayload {
+                            revision_id,
+                            health_gate: Ok(()),
+                            expected_lifecycle: staged.lifecycle,
+                        },
+                        warm_key,
+                    )
+                    .map_err(map_store_err_preserving_noun)?;
+            }
+            traffic_entries.push(TrafficSplitEntry {
+                revision_id,
+                weight_bps,
+            });
+        }
+
+        steps.push(json!({
+            "section": "traffic", "bundle_id": b.bundle_id, "entries": traffic_entries.len()
+        }));
+        if !dry_run {
+            let deployment_id =
+                deployment_id.expect("apply mode resolves a deployment id before traffic");
+            let entries_hash = super::env_apply::hash_json(&json!(
+                traffic_entries
+                    .iter()
+                    .map(|e| (e.revision_id.to_string(), e.weight_bps))
+                    .collect::<Vec<_>>()
+            ));
+            let traffic_key = super::resolve_idempotency_key(Some(derive(
+                "traffic-set",
+                &deployment_id.to_string(),
+                &entries_hash,
+            )))?;
+            store
+                .set_traffic_split(
+                    &env_id,
+                    SetTrafficSplitPayload {
+                        deployment_id,
+                        entries: traffic_entries,
+                        updated_by: updated_by.clone(),
+                        authorization_ref: Some(
+                            super::traffic::default_authorization_ref()
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
+                    },
+                    traffic_key,
+                )
+                .map_err(super::traffic::map_traffic_store_err)?;
+        }
+    }
+
+    // -- 5. extension bindings (answer-less; skip already-bound) --------------
+    for e in &manifest.extensions {
+        let descriptor = greentic_deploy_spec::PackDescriptor::try_new(&e.kind).map_err(|err| {
+            OpError::InvalidArgument(format!("extensions[] kind `{}`: {err}", e.kind))
+        })?;
+        let already = env
+            .extensions
+            .iter()
+            .any(|b| b.kind.path() == descriptor.path() && b.instance_id == e.instance_id);
+        if already {
+            steps.push(json!({"section": "extension", "kind": e.kind, "action": "skip-bound"}));
+            continue;
+        }
+        steps.push(json!({"section": "extension", "kind": e.kind, "action": "add"}));
+        if !dry_run {
+            let payload = super::extensions::ExtensionBindingPayload {
+                environment_id: env_id.as_str().to_string(),
+                kind: e.kind.clone(),
+                pack_ref: e.pack_ref.clone(),
+                instance_id: e.instance_id.clone(),
+                answers_ref: None,
+                idempotency_key: None,
+            };
+            let binding = super::extensions::build_binding(&payload, 0, None)?;
+            let key = super::resolve_idempotency_key(Some(derive(
+                "ext-add",
+                &format!(
+                    "{}::{}",
+                    descriptor.path(),
+                    e.instance_id.as_deref().unwrap_or("")
+                ),
+                &super::env_apply::hash_json(&json!({"kind": e.kind, "pack_ref": e.pack_ref})),
+            )))?;
+            store
+                .add_extension_binding(&env_id, binding, key)
+                .map_err(map_store_err_preserving_noun)?;
+        }
+    }
+
+    // -- 6. messaging endpoints (non-telegram; add → link → welcome) ---------
+    for ep in &manifest.messaging_endpoints {
+        steps.push(json!({"section": "endpoint", "name": ep.name, "action": "add"}));
+        let endpoint_id: Option<MessagingEndpointId> = if dry_run {
+            None
+        } else {
+            let add_key = super::resolve_idempotency_key(Some(derive(
+                "endpoint-add",
+                &ep.name,
+                &super::env_apply::hash_json(&json!({
+                    "provider_type": ep.provider_type, "secret_refs": ep.secret_refs
+                })),
+            )))?;
+            let endpoint = store
+                .add_messaging_endpoint(
+                    &env_id,
+                    AddMessagingEndpointPayload {
+                        provider_id: ep.name.clone(),
+                        provider_type: ep.provider_type.clone(),
+                        display_name: ep.name.clone(),
+                        secret_refs: ep.secret_refs.clone(),
+                        webhook_secret_ref: None,
+                        updated_by: updated_by.clone(),
+                    },
+                    add_key,
+                )
+                .map_err(map_store_err_preserving_noun)?;
+            Some(endpoint.endpoint_id)
+        };
+
+        for link in &ep.links {
+            steps.push(json!({"section": "endpoint-link", "name": ep.name, "bundle_id": link}));
+            if !dry_run {
+                let endpoint_id = endpoint_id.expect("apply mode resolves an endpoint id");
+                let bundle_id = parse_bundle_id(link)?;
+                let key = super::resolve_idempotency_key(Some(derive(
+                    "endpoint-link",
+                    &format!("{}:{}", ep.name, link),
+                    "",
+                )))?;
+                store
+                    .link_messaging_bundle(&env_id, endpoint_id, bundle_id, updated_by.clone(), key)
+                    .map_err(map_store_err_preserving_noun)?;
+            }
+        }
+
+        if let Some(wf) = &ep.welcome_flow {
+            steps.push(json!({"section": "endpoint-welcome", "name": ep.name}));
+            if !dry_run {
+                let endpoint_id = endpoint_id.expect("apply mode resolves an endpoint id");
+                let key = super::resolve_idempotency_key(Some(derive(
+                    "endpoint-welcome",
+                    &ep.name,
+                    &super::env_apply::hash_json(&json!({
+                        "bundle_id": wf.bundle_id, "pack_id": wf.pack_id, "flow_id": wf.flow_id
+                    })),
+                )))?;
+                store
+                    .set_messaging_welcome_flow(
+                        &env_id,
+                        SetMessagingWelcomeFlowPayload {
+                            endpoint_id,
+                            bundle_id: parse_bundle_id(&wf.bundle_id)?,
+                            pack_id: PackId::new(&wf.pack_id),
+                            flow_id: wf.flow_id.clone(),
+                            updated_by: updated_by.clone(),
+                        },
+                        key,
+                    )
+                    .map_err(map_store_err_preserving_noun)?;
+            }
+        }
+    }
+
+    Ok(OpOutcome::new(
+        "env",
+        "apply",
+        json!({
+            "environment_id": env_id.as_str(),
+            "mode": if dry_run { "dry-run" } else { "apply" },
+            "steps": steps,
+        }),
+    ))
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -2093,5 +2674,250 @@ mod tests {
             AuthMethod::None,
         )
         .unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // env apply (remote): fail-closed validation, dry-run planning, execution
+    // -----------------------------------------------------------------------
+
+    fn env_json_for(id: &str) -> serde_json::Value {
+        let mut v = env_json();
+        v["environment_id"] = serde_json::json!(id);
+        v["host_config"] = serde_json::json!({"env_id": id});
+        v
+    }
+
+    fn manifest_from(json: serde_json::Value) -> EnvManifest {
+        serde_json::from_value(json).expect("valid manifest json")
+    }
+
+    fn base_manifest_json(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": id}
+        })
+    }
+
+    #[test]
+    fn reject_secrets_section() {
+        let mut j = base_manifest_json("prod");
+        j["secrets"] = serde_json::json!([{"path": "t/team/pack/api_key", "from_env": "API_KEY"}]);
+        let err = reject_unsupported_remote_sections(&manifest_from(j)).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("secrets[]")));
+    }
+
+    #[test]
+    fn reject_pack_binding_with_answers_ref() {
+        let mut j = base_manifest_json("prod");
+        j["packs"] = serde_json::json!([{
+            "slot": "deployer",
+            "kind": "greentic.deploy.deployer@1.0.0",
+            "pack_ref": "local-deployer",
+            "answers_ref": "deployer-answers.json"
+        }]);
+        let err = reject_unsupported_remote_sections(&manifest_from(j)).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("answers_ref")));
+    }
+
+    #[test]
+    fn reject_extension_binding_with_answers_ref() {
+        let mut j = base_manifest_json("prod");
+        j["extensions"] = serde_json::json!([{
+            "kind": "acme.oauth.auth0@1.0.0",
+            "pack_ref": "auth0-pack",
+            "answers_ref": "ext-answers.json"
+        }]);
+        let err = reject_unsupported_remote_sections(&manifest_from(j)).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("answers_ref")));
+    }
+
+    #[test]
+    fn reject_telegram_class_endpoint() {
+        let mut j = base_manifest_json("prod");
+        j["messaging_endpoints"] = serde_json::json!([{
+            "name": "support-bot",
+            "provider_type": "messaging.telegram.bot"
+        }]);
+        let err = reject_unsupported_remote_sections(&manifest_from(j)).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("webhook_secret_ref")));
+    }
+
+    #[test]
+    fn reject_bundle_without_source_uri() {
+        let mut j = base_manifest_json("prod");
+        j["bundles"] = serde_json::json!([{
+            "bundle_id": "app",
+            "bundle_path": "app.gtbundle",
+            "customer_id": "acme"
+        }]);
+        let err = reject_unsupported_remote_sections(&manifest_from(j)).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("bundle_source_uri")));
+    }
+
+    #[test]
+    fn reject_bundle_without_pinned_digest() {
+        let mut j = base_manifest_json("prod");
+        j["bundles"] = serde_json::json!([{
+            "bundle_id": "app",
+            "bundle_source_uri": "oci://registry.example/app:1",
+            "customer_id": "acme"
+        }]);
+        let err = reject_unsupported_remote_sections(&manifest_from(j)).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("bundle_digest")));
+    }
+
+    #[test]
+    fn reject_split_revision_without_pointers() {
+        let mut j = base_manifest_json("prod");
+        j["bundles"] = serde_json::json!([{
+            "bundle_id": "app",
+            "customer_id": "acme",
+            "revisions": [
+                {"name": "v1", "bundle_path": "v1.gtbundle", "weight_percent": 50,
+                 "bundle_source_uri": "oci://r/app:1", "bundle_digest": "sha256:aa"},
+                {"name": "v2", "bundle_path": "v2.gtbundle", "weight_percent": 50}
+            ]
+        }]);
+        let err = reject_unsupported_remote_sections(&manifest_from(j)).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("revision `v2`")));
+    }
+
+    #[test]
+    fn clean_manifest_passes_validation() {
+        let mut j = base_manifest_json("prod");
+        j["bundles"] = serde_json::json!([{
+            "bundle_id": "app",
+            "bundle_source_uri": "oci://registry.example/app:1",
+            "bundle_digest": "sha256:abc123",
+            "customer_id": "acme"
+        }]);
+        j["packs"] = serde_json::json!([{
+            "slot": "deployer", "kind": "greentic.deploy.deployer@1.0.0", "pack_ref": "local"
+        }]);
+        assert!(reject_unsupported_remote_sections(&manifest_from(j)).is_ok());
+    }
+
+    #[test]
+    fn remote_apply_dry_run_plans_without_mutating() {
+        // Exactly ONE mock response (the load): a dry run must issue no
+        // mutation calls (a second request would block on `accept` and hang).
+        let load = serde_json::json!({"environment": env_json_for("prod")}).to_string();
+        let mock = start_mock(vec![(200, &load)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+
+        let manifest = serde_json::json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "prod", "public_base_url": "https://prod.example"},
+            "bundles": [{
+                "bundle_id": "app",
+                "bundle_source_uri": "oci://registry.example/app:1",
+                "bundle_digest": "sha256:abc123",
+                "customer_id": "acme"
+            }],
+            "messaging_endpoints": [{
+                "name": "web", "provider_type": "messaging.webchat", "links": ["app"]
+            }]
+        });
+        let (_tmp, flags) = answers_flags(manifest);
+        let outcome = remote_env_apply(
+            &store,
+            &flags,
+            ApplyOptions {
+                mode: ApplyMode::DryRun,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.noun, "env");
+        assert_eq!(outcome.op, "apply");
+        assert_eq!(outcome.result["mode"], "dry-run");
+        let steps = outcome.result["steps"].as_array().unwrap();
+        assert!(steps.iter().any(|s| s["section"] == "environment"));
+        assert!(
+            steps
+                .iter()
+                .any(|s| s["section"] == "bundle" && s["action"] == "add")
+        );
+        assert!(steps.iter().any(|s| s["section"] == "revision"));
+        assert!(steps.iter().any(|s| s["section"] == "traffic"));
+        assert!(steps.iter().any(|s| s["section"] == "endpoint"));
+        assert!(steps.iter().any(|s| s["section"] == "endpoint-link"));
+    }
+
+    #[test]
+    fn remote_apply_reconciles_host_config() {
+        // load → update_environment (host config declared). Env id `local`
+        // matches `wrap_mutation`'s audit envelope, which the client correlates
+        // against the targeted env.
+        let load = serde_json::json!({"environment": env_json_for("local")}).to_string();
+        let updated = wrap_mutation(env_json_for("local"));
+        let mock = start_mock(vec![(200, &load), (200, &updated)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+
+        let manifest = serde_json::json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local", "public_base_url": "https://prod.example", "name": "Prod"}
+        });
+        let (_tmp, flags) = answers_flags(manifest);
+        let outcome = remote_env_apply(
+            &store,
+            &flags,
+            ApplyOptions {
+                mode: ApplyMode::Apply,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.result["mode"], "apply");
+        assert!(
+            outcome.result["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["section"] == "environment")
+        );
+    }
+
+    #[test]
+    fn remote_apply_requires_env_to_exist() {
+        // load → 404: a named env must be created on the remote store first.
+        let mock = start_mock(vec![(404, "{}")], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let manifest = serde_json::json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "ghost"}
+        });
+        let (_tmp, flags) = answers_flags(manifest);
+        let err = remote_env_apply(
+            &store,
+            &flags,
+            ApplyOptions {
+                mode: ApplyMode::Apply,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::NotFound(m) if m.contains("create it first")));
+    }
+
+    #[test]
+    fn remote_apply_check_mode_is_unsupported() {
+        let mock = start_mock(vec![], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let manifest = serde_json::json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "prod"}
+        });
+        let (_tmp, flags) = answers_flags(manifest);
+        let err = remote_env_apply(
+            &store,
+            &flags,
+            ApplyOptions {
+                mode: ApplyMode::Check,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::NotYetImplemented(m) if m.contains("--check")));
     }
 }

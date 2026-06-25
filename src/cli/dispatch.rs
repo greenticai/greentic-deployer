@@ -474,7 +474,7 @@ pub struct EnvApplyArgs {
 }
 
 impl EnvApplyArgs {
-    fn into_options(self) -> super::env_apply::ApplyOptions {
+    pub(crate) fn into_options(self) -> super::env_apply::ApplyOptions {
         use super::env_apply::ApplyMode;
         // clap's `conflicts_with` guarantees at most one of `--dry-run` /
         // `--check` is set.
