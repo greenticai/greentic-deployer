@@ -143,8 +143,12 @@ impl StorageError {
 /// are evicted inside the same transaction that inserts a new one; a
 /// retry of an evicted key simply re-executes, the same acceptance the
 /// replay contract already grants pre-ledger requests. The audit log is
-/// deliberately NOT bounded — it must never forget a committed mutation;
-/// archival is the PR-4.4 backup story.
+/// append-only WITHOUT bound by default — it must never forget a committed
+/// mutation; archival is the PR-4.4 backup story. An operator may opt in to
+/// a per-environment audit-row cap
+/// ([`crate::sqlite::SqliteEnvironmentStore::with_audit_max_rows_per_env`]),
+/// in which case the prune is recorded in the `audit_retention` watermark
+/// rather than dropped silently like the ledger.
 pub const MAX_LEDGER_ROWS_PER_ENV: i64 = 4096;
 
 /// Per-environment backup cap (A8 #5). Backups are operator-initiated
