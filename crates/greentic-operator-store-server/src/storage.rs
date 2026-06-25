@@ -192,11 +192,11 @@ pub struct AuditRetention {
 /// state (runtime, pack answers) AND the durable audit history (`audit_log`
 /// rows + the `audit_retention` watermark) captured at backup time.
 ///
-/// This type is the capture surface. `load_env_snapshot` populates every
-/// field; today's [`EnvironmentStorage::restore_env_journaled`] reverts only
-/// the content (environment + sidecars) — replaying the captured audit history
-/// on restore is a follow-up. The audit fields are captured now so a backup is
-/// already a complete archival point.
+/// `load_env_snapshot` populates every field;
+/// [`EnvironmentStorage::restore_env_journaled`] reverts the content
+/// (environment + sidecars) AND re-instates the captured audit history —
+/// merging the archived rows back by `event_id` without ever deleting a live
+/// row, so a backup is a complete, recoverable archival point.
 ///
 /// The `audit_log` / `audit_retention` fields are serde-defaulted and skipped
 /// when empty, so backups taken before audit capture existed deserialize to an
@@ -552,12 +552,21 @@ pub trait EnvironmentStorage: Send + Sync {
     ) -> impl Future<Output = Result<(EnvSnapshot, EnvRevision), StorageError>> + Send;
 
     /// Restore a composite [`EnvSnapshot`] atomically: replace the
-    /// environment row, upsert/delete the runtime sidecar, and upsert/delete
-    /// every pack-answers sidecar — all inside ONE transaction together with
-    /// the [`MutationJournal`] rows. The `precondition` guards the
-    /// environment row (the CAS target); the sidecars are replaced
-    /// unconditionally (their preconditions were not captured at backup time,
-    /// and restoring partial state is worse than restoring all of it).
+    /// environment row, upsert/delete the runtime sidecar, upsert/delete
+    /// every pack-answers sidecar, AND re-instate the captured audit history
+    /// — all inside ONE transaction together with the [`MutationJournal`]
+    /// rows. The `precondition` guards the environment row (the CAS target);
+    /// the sidecars are replaced unconditionally (their preconditions were not
+    /// captured at backup time, and restoring partial state is worse than
+    /// restoring all of it).
+    ///
+    /// Audit is a forward-only ledger, so its "restore" is a MERGE, not a
+    /// replacement: captured rows are re-inserted by `event_id` (preserving
+    /// their original `id`/`recorded_at`) and live rows are never deleted —
+    /// rolling content back must not erase forensic history. The retention
+    /// watermark only advances. A normal rollback into a live store is
+    /// therefore a no-op for audit; the merge matters when restoring into a
+    /// store that has lost (pruned) or never had those rows.
     fn restore_env_journaled(
         &self,
         env_id: &EnvId,
