@@ -55,6 +55,8 @@ enum TopLevelCommand {
     Op(greentic_deployer::cli::dispatch::OpCommand),
     /// SoRX alias-aware routing (S3-deployer, decision B1 / Option A).
     Sorx(SorxCommand),
+    /// Print the canonical requiredSecrets JSON for a deploy provider.
+    RequiredSecrets(RequiredSecretsCommand),
 }
 
 #[derive(Parser)]
@@ -1061,6 +1063,24 @@ impl From<CliProvider> for Provider {
     }
 }
 
+/// `greentic-deployer required-secrets <provider>` — print the canonical
+/// `requiredSecrets` JSON array derived from the provider's credential contract.
+#[derive(Parser, Debug)]
+struct RequiredSecretsCommand {
+    /// Cloud provider: aws | azure | gcp (others print an empty array).
+    #[arg(value_enum)]
+    provider: CliProvider,
+}
+
+/// Render the canonical `requiredSecrets` JSON array for a provider. A provider
+/// without cloud credential requirements yields `"[]"`.
+fn render_required_secrets(provider: Provider) -> String {
+    let reqs = CloudTargetRequirementsV1::for_provider(provider)
+        .map(|r| r.required_secrets())
+        .unwrap_or_default();
+    serde_json::to_string_pretty(&reqs).unwrap_or_else(|_| "[]".to_string())
+}
+
 #[derive(Clone)]
 struct CommonRequestData {
     tenant: String,
@@ -1315,6 +1335,10 @@ fn main() -> Result<()> {
             }
         }
         TopLevelCommand::Sorx(command) => run_sorx(command),
+        TopLevelCommand::RequiredSecrets(cmd) => {
+            println!("{}", render_required_secrets(cmd.provider.into()));
+            Ok(())
+        }
     }
 }
 
@@ -2248,6 +2272,33 @@ fn print_multi_target_operation_result(
     let rendered = render_operation_result(value, format)?;
     println!("{rendered}");
     Ok(())
+}
+
+#[cfg(test)]
+mod required_secrets_cli_tests {
+    use super::*;
+
+    #[test]
+    fn render_required_secrets_aws_is_canonical_json_array() {
+        let json = render_required_secrets(Provider::Aws);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json array");
+        let arr = parsed.as_array().expect("array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["key"], "aws/aws_secret_access_key");
+        assert_eq!(arr[0]["required"], false);
+        assert_eq!(arr[0]["format"], "text");
+    }
+
+    #[test]
+    fn render_required_secrets_non_cloud_is_empty_array() {
+        assert_eq!(render_required_secrets(Provider::Local), "[]");
+    }
+
+    #[test]
+    fn cli_provider_maps_to_provider() {
+        assert_eq!(Provider::from(CliProvider::Aws), Provider::Aws);
+        assert_eq!(Provider::from(CliProvider::Gcp), Provider::Gcp);
+    }
 }
 
 #[cfg(test)]

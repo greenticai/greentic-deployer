@@ -514,6 +514,68 @@ impl CloudTargetRequirementsV1 {
         apply_operator_image_defaults_for_provider(&mut requirements, provider);
         Some(requirements)
     }
+
+    /// Canonical `requiredSecrets` for this provider's credentials: the secret
+    /// (and optional-secret) prompt fields across every credential method, mapped
+    /// to `greentic_types::secrets::SecretRequirement` and deduped by key. Plain
+    /// config and static fields are excluded. The result is sorted by key and is
+    /// empty when no secret fields are declared. Never errors — a key that fails
+    /// `SecretKey::parse` is skipped.
+    ///
+    /// `required` is `true` only when this provider exposes a single credential
+    /// method and the field is a `Secret`; with alternative methods no single
+    /// secret is unconditionally required (any one method satisfies the target).
+    pub fn required_secrets(&self) -> Vec<greentic_types::secrets::SecretRequirement> {
+        use greentic_types::secrets::{SecretFormat, SecretKey, SecretRequirement};
+
+        let single_method = self.credential_requirements.len() == 1;
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut out: Vec<SecretRequirement> = Vec::new();
+
+        for method in &self.credential_requirements {
+            for field in &method.prompt_fields {
+                let is_secret = matches!(
+                    field.kind,
+                    PromptFieldKindV1::Secret | PromptFieldKindV1::OptionalSecret
+                );
+                if !is_secret {
+                    continue;
+                }
+                let key_str = format!("{}/{}", self.target, field.env_name.to_lowercase());
+                let Ok(key) = SecretKey::parse(&key_str) else {
+                    continue;
+                };
+                if !seen.insert(key.as_str().to_string()) {
+                    continue; // first occurrence wins
+                }
+
+                let base = {
+                    let trimmed = field.prompt.trim_end_matches(':').trim();
+                    if trimmed.is_empty() {
+                        field.env_name.as_str()
+                    } else {
+                        trimmed
+                    }
+                };
+
+                // SecretRequirement is #[non_exhaustive]: build via Default, then
+                // assign fields (struct-literal form would not compile here).
+                #[allow(clippy::field_reassign_with_default)]
+                let req = {
+                    let mut r = SecretRequirement::default();
+                    r.key = key;
+                    r.required = single_method && matches!(field.kind, PromptFieldKindV1::Secret);
+                    r.description = Some(format!("{base} ({})", method.label));
+                    r.format = Some(SecretFormat::Text);
+                    r
+                };
+                out.push(req);
+            }
+        }
+
+        out.sort_by(|a, b| a.key.as_str().cmp(b.key.as_str()));
+        out
+    }
 }
 
 impl CloudDeployerExtensionDescriptorV1 {
@@ -1087,6 +1149,151 @@ mod tests {
     use std::str::FromStr;
     use tar::Builder;
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn required_secrets_for_aws_emits_only_secret_keys_sorted() {
+        let reqs = CloudTargetRequirementsV1::aws().required_secrets();
+        let keys: Vec<&str> = reqs.iter().map(|r| r.key.as_str()).collect();
+        // Only Secret/OptionalSecret fields, sorted by key; non-secret
+        // (AWS_ACCESS_KEY_ID = Required, AWS_DEFAULT_REGION = Static) excluded.
+        assert_eq!(
+            keys,
+            vec!["aws/aws_secret_access_key", "aws/aws_session_token"]
+        );
+
+        let secret = &reqs[0];
+        assert_eq!(secret.key.as_str(), "aws/aws_secret_access_key");
+        // AWS has 3 credential methods → no single secret is unconditionally required.
+        assert!(!secret.required);
+        assert_eq!(
+            secret.format,
+            Some(greentic_types::secrets::SecretFormat::Text)
+        );
+        assert_eq!(
+            secret.description.as_deref(),
+            Some("AWS secret access key (Access key pair)")
+        );
+
+        let session = &reqs[1];
+        assert!(!session.required); // OptionalSecret → never required
+        assert_eq!(
+            session.description.as_deref(),
+            Some("AWS session token (optional) (Access key pair)")
+        );
+    }
+
+    #[test]
+    fn required_secrets_for_azure_emits_client_secret() {
+        let reqs = CloudTargetRequirementsV1::azure().required_secrets();
+        let keys: Vec<&str> = reqs.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, vec!["azure/arm_client_secret"]);
+        assert!(!reqs[0].required); // 2 methods (client-secret + OIDC)
+        assert_eq!(
+            reqs[0].description.as_deref(),
+            Some("Azure client secret (ARM service principal)")
+        );
+    }
+
+    #[test]
+    fn required_secrets_for_gcp_emits_access_token_only() {
+        let reqs = CloudTargetRequirementsV1::gcp().required_secrets();
+        let keys: Vec<&str> = reqs.iter().map(|r| r.key.as_str()).collect();
+        // GOOGLE_APPLICATION_CREDENTIALS is Required (not secret) → excluded.
+        assert_eq!(keys, vec!["gcp/cloudsdk_auth_access_token"]);
+        assert!(!reqs[0].required); // 2 methods
+        assert_eq!(
+            reqs[0].description.as_deref(),
+            Some("GCP access token (Access token)")
+        );
+    }
+
+    #[test]
+    fn required_secrets_single_method_secret_is_required_and_dedupes() {
+        // Synthetic single-method requirements: a Secret field is unconditionally
+        // required; an OptionalSecret is not; a duplicate key is emitted once;
+        // a non-secret field is excluded; output is sorted by key.
+        let reqs = CloudTargetRequirementsV1 {
+            target: "demo".to_string(),
+            target_label: "Demo".to_string(),
+            provider_pack_filename: "demo.gtpack".to_string(),
+            remote_bundle_source_required: false,
+            remote_bundle_source_help: None,
+            informational_notes: Vec::new(),
+            credential_requirements: vec![CredentialRequirementV1 {
+                kind: CloudCredentialKind::AwsAccessKey,
+                label: "Only method".to_string(),
+                env_vars: Vec::new(),
+                satisfaction_env_groups: Vec::new(),
+                prompt_fields: vec![
+                    PromptFieldSpecV1 {
+                        env_name: "TOKEN".to_string(),
+                        prompt: "Token:".to_string(),
+                        kind: PromptFieldKindV1::Secret,
+                        static_value: None,
+                    },
+                    PromptFieldSpecV1 {
+                        env_name: "TOKEN".to_string(), // duplicate key → deduped
+                        prompt: "Token again:".to_string(),
+                        kind: PromptFieldKindV1::Secret,
+                        static_value: None,
+                    },
+                    PromptFieldSpecV1 {
+                        env_name: "OPT".to_string(),
+                        prompt: "Optional:".to_string(),
+                        kind: PromptFieldKindV1::OptionalSecret,
+                        static_value: None,
+                    },
+                    PromptFieldSpecV1 {
+                        env_name: "PLAIN".to_string(),
+                        prompt: "Plain:".to_string(),
+                        kind: PromptFieldKindV1::Required,
+                        static_value: None,
+                    },
+                ],
+                help: String::new(),
+            }],
+            variable_requirements: Vec::new(),
+        }
+        .required_secrets();
+
+        let keys: Vec<&str> = reqs.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, vec!["demo/opt", "demo/token"]); // sorted, deduped, PLAIN excluded
+        let token = reqs
+            .iter()
+            .find(|r| r.key.as_str() == "demo/token")
+            .unwrap();
+        assert!(token.required); // single method + Secret
+        let opt = reqs.iter().find(|r| r.key.as_str() == "demo/opt").unwrap();
+        assert!(!opt.required); // OptionalSecret
+    }
+
+    #[test]
+    fn required_secrets_empty_prompt_falls_back_to_env_name() {
+        let reqs = CloudTargetRequirementsV1 {
+            target: "demo".to_string(),
+            target_label: "Demo".to_string(),
+            provider_pack_filename: "demo.gtpack".to_string(),
+            remote_bundle_source_required: false,
+            remote_bundle_source_help: None,
+            informational_notes: Vec::new(),
+            credential_requirements: vec![CredentialRequirementV1 {
+                kind: CloudCredentialKind::AwsAccessKey,
+                label: "M".to_string(),
+                env_vars: Vec::new(),
+                satisfaction_env_groups: Vec::new(),
+                prompt_fields: vec![PromptFieldSpecV1 {
+                    env_name: "RAW_TOKEN".to_string(),
+                    prompt: String::new(),
+                    kind: PromptFieldKindV1::Secret,
+                    static_value: None,
+                }],
+                help: String::new(),
+            }],
+            variable_requirements: Vec::new(),
+        }
+        .required_secrets();
+        assert_eq!(reqs[0].description.as_deref(), Some("RAW_TOKEN (M)"));
+    }
 
     fn sample_manifest() -> PackManifest {
         PackManifest {
