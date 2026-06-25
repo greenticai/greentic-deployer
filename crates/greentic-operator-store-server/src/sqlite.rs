@@ -1239,15 +1239,46 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
             .await?;
         }
 
-        // 4. Audit ledger: reconstruct the captured history into the empty
-        //    store (shared with restore; here every row is genuinely new).
-        replay_audit_in_tx(
-            &mut tx,
-            env_id,
-            &snapshot.audit_log,
-            snapshot.audit_retention.as_ref(),
-        )
-        .await?;
+        // 4. Audit ledger: reconstruct the captured history with FRESH ids.
+        //    Import does NOT preserve the captured `audit_log.id` (unlike the
+        //    same-env restore): the id is a global PRIMARY KEY shared across
+        //    every env and also consumed by the import event below and by any
+        //    OTHER env imported into this store. Preserving it would let one
+        //    env's import-event id land on another env's captured id and
+        //    silently drop that distinct row (`INSERT OR IGNORE`). The append
+        //    ORDER plus `event_id`/`recorded_at` are what matter forensically,
+        //    not the store-local numeric id, so each row is inserted in order
+        //    letting autoincrement assign a new id (`event_id` is globally
+        //    unique, so OR IGNORE here only guards a true re-import duplicate).
+        for entry in &snapshot.audit_log {
+            sqlx::query(
+                "INSERT OR IGNORE INTO audit_log (env_id, event_id, recorded_at, event) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(env_id.as_str())
+            .bind(&entry.event_id)
+            .bind(&entry.recorded_at)
+            .bind(&entry.event)
+            .execute(&mut *tx)
+            .await?;
+        }
+        // Carry the captured retention watermark verbatim — the historical
+        // record of what was pruned before the backup; a fresh store has no
+        // live watermark to reconcile against.
+        if let Some(watermark) = &snapshot.audit_retention {
+            sqlx::query(
+                "INSERT INTO audit_retention \
+                   (env_id, pruned_through_id, pruned_total, policy_max_rows, last_pruned_at) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(env_id.as_str())
+            .bind(watermark.pruned_through_id)
+            .bind(watermark.pruned_total)
+            .bind(watermark.policy_max_rows)
+            .bind(&watermark.last_pruned_at)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         journal_in_tx(&mut tx, journal, self.audit_max_rows_per_env).await?;
         tx.commit().await?;

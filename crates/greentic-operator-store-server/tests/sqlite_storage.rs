@@ -1408,7 +1408,7 @@ async fn audit_watermark_accumulates_and_is_per_env() {
 use greentic_deploy_spec::{BackupManifest, StateIntegrity};
 use greentic_operator_store_server::storage::{MAX_BACKUPS_PER_ENV, StoredBackup};
 
-use greentic_operator_store_server::storage::{AuditRetention, EnvSnapshot};
+use greentic_operator_store_server::storage::{AuditEntry, AuditRetention, EnvSnapshot};
 
 fn stored_backup(id: &EnvId, backup_id: &str, env: &Environment) -> StoredBackup {
     let env_json = serde_json::to_value(env).expect("env json");
@@ -2139,5 +2139,60 @@ async fn import_rejects_an_env_id_mismatch() {
     assert!(
         matches!(err, StorageError::EnvIdMismatch { .. }),
         "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn importing_two_envs_with_interleaved_audit_ids_loses_no_rows() {
+    // Two envs whose captured audit ids interleave in the original global
+    // sequence (alpha: 1,3,5 ; beta: 2,4,6). Importing both into ONE fresh
+    // store must not let either env's preserved id collide with the other's
+    // import event and silently drop a row — import reconstructs audit with
+    // fresh ids, so every distinct event survives.
+    let (_db, store) = fresh_store().await;
+    let snapshot = |name: &str, rows: &[(i64, &str)]| EnvSnapshot {
+        environment: serde_json::to_value(minimal_environment(&env_id(name))).expect("env json"),
+        runtime: None,
+        pack_answers: BTreeMap::new(),
+        audit_log: rows
+            .iter()
+            .map(|(id, ev)| AuditEntry {
+                id: *id,
+                event_id: ev.to_string(),
+                recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                event: json!({"verb": "update"}),
+            })
+            .collect(),
+        audit_retention: None,
+    };
+    let alpha = snapshot("alpha", &[(1, "a-1"), (3, "a-3"), (5, "a-5")]);
+    let beta = snapshot("beta", &[(2, "b-2"), (4, "b-4"), (6, "b-6")]);
+
+    store
+        .import_env_journaled(
+            &env_id("alpha"),
+            &alpha,
+            Some(&journal(&env_id("alpha"), "imp-a", "fp-a")),
+        )
+        .await
+        .expect("import alpha");
+    store
+        .import_env_journaled(
+            &env_id("beta"),
+            &beta,
+            Some(&journal(&env_id("beta"), "imp-b", "fp-b")),
+        )
+        .await
+        .expect("import beta");
+
+    // Every captured event survives in its own env, plus that env's import
+    // event — nothing is lost to a cross-env global-id collision.
+    assert_eq!(
+        audit_event_ids(&store, &env_id("alpha")).await,
+        vec!["a-1", "a-3", "a-5", "evt-imp-a"],
+    );
+    assert_eq!(
+        audit_event_ids(&store, &env_id("beta")).await,
+        vec!["b-2", "b-4", "b-6", "evt-imp-b"],
     );
 }

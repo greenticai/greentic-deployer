@@ -587,6 +587,15 @@ pub trait EnvironmentStorage: Send + Sync {
     /// The environment is created fresh at generation 1; the reproduced
     /// deployment state (revisions + traffic splits — the active routing) lives
     /// in the restored environment document, not in the row's CAS counter.
+    ///
+    /// Scope: import reconstructs exactly what an [`EnvSnapshot`] captures — the
+    /// environment document, runtime/pack-answers sidecars, and audit history.
+    /// Operator-level material kept OUTSIDE the snapshot (trust-root documents,
+    /// signed revenue-policy artifacts) is NOT reproduced — the same boundary
+    /// `restore` has — and must be re-established separately during recovery.
+    /// Audit rows are re-appended with FRESH ids (the captured global ids are
+    /// not preserved), since the id is store-wide and shared with other envs'
+    /// imports; `event_id`/`recorded_at`/order carry the forensic identity.
     fn import_env_journaled(
         &self,
         env_id: &EnvId,
