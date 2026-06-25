@@ -135,7 +135,8 @@ impl SqliteEnvironmentStore {
     /// rows per environment, pruning the oldest beyond that after each
     /// append. `None` (the default) leaves the audit log unbounded. A
     /// `Some(0)` is clamped to `Some(1)` so the just-appended row always
-    /// survives — the caller is expected to validate sane bounds upstream.
+    /// survives (the CLI already rejects 0; the clamp guards direct
+    /// callers).
     pub fn with_audit_max_rows_per_env(mut self, max_rows: Option<u32>) -> Self {
         self.audit_max_rows_per_env = max_rows.map(|n| (n as i64).max(1));
         self
@@ -1105,18 +1106,10 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         event_id: &str,
         event: &Value,
     ) -> Result<(), StorageError> {
-        // Append-only fast path when retention is off (the default).
-        let Some(cap) = self.audit_max_rows_per_env else {
-            sqlx::query("INSERT INTO audit_log (env_id, event_id, event) VALUES ($1, $2, $3)")
-                .bind(env_id.as_str())
-                .bind(event_id)
-                .bind(event)
-                .execute(&self.pool)
-                .await?;
-            return Ok(());
-        };
-        // With a cap, append and prune atomically so a crash can't leave
-        // the env over the cap with no watermark.
+        // Append and, when a cap is configured, prune in the same
+        // transaction so a crash can't leave the env over the cap with no
+        // watermark. (With retention off this is a single-statement tx —
+        // equivalent to a bare autocommit insert.)
         let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO audit_log (env_id, event_id, event) VALUES ($1, $2, $3)")
             .bind(env_id.as_str())
@@ -1124,7 +1117,9 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
             .bind(event)
             .execute(&mut *tx)
             .await?;
-        prune_audit_log(&mut tx, env_id, cap).await?;
+        if let Some(cap) = self.audit_max_rows_per_env {
+            prune_audit_log(&mut tx, env_id, cap).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -1209,32 +1204,28 @@ async fn prune_audit_log(
     env_id: &EnvId,
     cap: i64,
 ) -> Result<(), StorageError> {
-    // The rows that would be pruned = everything but the newest `cap`.
-    // COUNT is 0 (and MAX null) when nothing exceeds the cap.
-    let probe = sqlx::query(
-        "SELECT COUNT(*) AS n, MAX(id) AS hi FROM audit_log \
-         WHERE env_id = $1 AND id NOT IN ( \
-           SELECT id FROM audit_log WHERE env_id = $1 ORDER BY id DESC LIMIT $2)",
+    // `through` = the highest id to prune: the id of the (cap+1)-th newest
+    // row for this env, i.e. the new high-water of forgotten history. No
+    // row (nothing to prune) when the env is at or under the cap.
+    let cutoff = sqlx::query(
+        "SELECT id FROM audit_log WHERE env_id = $1 ORDER BY id DESC LIMIT 1 OFFSET $2",
     )
     .bind(env_id.as_str())
     .bind(cap)
-    .fetch_one(&mut *conn)
+    .fetch_optional(&mut *conn)
     .await?;
-    let pruned: i64 = probe.try_get("n")?;
-    if pruned == 0 {
+    let Some(cutoff) = cutoff else {
         return Ok(());
-    }
-    // Non-null because `pruned > 0`: the highest id we are about to remove,
-    // i.e. the new high-water of forgotten history.
-    let through: i64 = probe.try_get("hi")?;
-    sqlx::query(
-        "DELETE FROM audit_log WHERE env_id = $1 AND id NOT IN ( \
-           SELECT id FROM audit_log WHERE env_id = $1 ORDER BY id DESC LIMIT $2)",
-    )
-    .bind(env_id.as_str())
-    .bind(cap)
-    .execute(&mut *conn)
-    .await?;
+    };
+    let through: i64 = cutoff.try_get("id")?;
+    // A primary-key range delete: every row at or below the cutoff is older
+    // than the newest `cap`, so it is exactly the set to forget.
+    let deleted = sqlx::query("DELETE FROM audit_log WHERE env_id = $1 AND id <= $2")
+        .bind(env_id.as_str())
+        .bind(through)
+        .execute(&mut *conn)
+        .await?;
+    let pruned = deleted.rows_affected() as i64;
     // Upsert the monotonic watermark. `pruned_through_id` always advances
     // (we always remove the oldest under a single-writer store); the total
     // accumulates across prunes.
