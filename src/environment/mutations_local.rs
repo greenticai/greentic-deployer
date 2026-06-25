@@ -35,7 +35,7 @@ use super::mutations::{
     StageRevisionPayload, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
     UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
-use super::store::{LocalFsStore, StoreError};
+use super::store::{EnvironmentStore, LocalFsStore, StoreError};
 use super::trust_root::{self as store_trust_root, trust_root_path};
 
 /// Map a [`LifecycleError`] into `StoreError`, peeling `LifecycleError::Store`
@@ -1254,6 +1254,13 @@ impl EnvironmentMutations for LocalFsStore {
         patch: UpdateEnvironmentPayload,
     ) -> Result<Environment, StoreError> {
         self.update_environment(env_id, patch)
+    }
+
+    /// Reads the persisted env via [`EnvironmentStore::load`] — the trait's
+    /// one read verb, surfaced here so `&dyn EnvironmentMutations` callers
+    /// (the remote dispatch) can evaluate client-side preconditions.
+    fn load_environment(&self, env_id: &EnvId) -> Result<Environment, StoreError> {
+        EnvironmentStore::load(self, env_id)
     }
 
     /// See [`LocalFsStore::migrate_merge_bindings`].
