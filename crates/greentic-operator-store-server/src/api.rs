@@ -56,13 +56,14 @@ use greentic_deploy_spec::{
     AuditEvent, AuditResult, BackupArtifact, BackupManifest, BindingGenerationOutcome,
     BundleDeployment, CapabilitySlot, ConcurrencyConflict, CreateEnvironmentPayload, DeploymentId,
     EnvId, Environment, ExtensionBindingPayload, ExtensionKeyedPayload, HealthStatus,
-    IdempotencyKey, IdempotencyOutcome, IdempotencyRecord, MessagingBundleLinkPayload,
-    MessagingEndpointId, MigrateMergePayload, PackBindingPayload, Precondition, RemoteStoreError,
-    RestoreOutcome, RestoreRequest, RetentionPolicy, RevisionId, RevisionTransitionOutcome,
-    RevocationConfig, RollbackTrafficSplitOutcome, RollbackTrafficSplitPayload,
-    RotateWebhookSecretPayload, SchemaVersion, SecretRef, SetMessagingWelcomeFlowPayload,
-    SetTrafficSplitPayload, StageRevisionPayload, StateEtag, StateIntegrity, TrustRootAddOutcome,
-    TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload, WarmRevisionPayload,
+    IdempotencyKey, IdempotencyOutcome, IdempotencyRecord, ImportOutcome, ImportRequest,
+    MessagingBundleLinkPayload, MessagingEndpointId, MigrateMergePayload, PackBindingPayload,
+    Precondition, RemoteStoreError, RestoreOutcome, RestoreRequest, RetentionPolicy, RevisionId,
+    RevisionTransitionOutcome, RevocationConfig, RollbackTrafficSplitOutcome,
+    RollbackTrafficSplitPayload, RotateWebhookSecretPayload, SchemaVersion, SecretRef,
+    SetMessagingWelcomeFlowPayload, SetTrafficSplitPayload, StageRevisionPayload, StateEtag,
+    StateIntegrity, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
+    UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 use greentic_operator_trust::operator_key::{self, OperatorKey};
 use greentic_operator_trust::revenue_policy::{self, RevenuePolicyError};
@@ -3289,6 +3290,111 @@ pub(crate) async fn export_backup<S: EnvironmentStorage>(
         snapshot: backup.state,
         snapshot_digest: backup.snapshot_digest,
     }))
+}
+
+/// `POST /environments/{env_id}/import` — reconstruct an environment from a
+/// portable [`BackupArtifact`] (A8 #5, disaster recovery). Unlike `restore` (a
+/// precondition-guarded rollback of an EXISTING env), import is the FRESH-store
+/// path: it refuses if the environment already exists (409) and otherwise
+/// creates it at generation 1. The artifact carries no precondition — there is
+/// no prior generation to pin after total loss. The composite snapshot's
+/// integrity is verified (recompute the digest) BEFORE anything is written — a
+/// corrupted artifact is never reconstructed (the same #6 guard restore
+/// applies) — and the path `env_id` must match the artifact's manifest. The
+/// commit is the same journaled write as every mutation, so the import is
+/// audited and replay-protected.
+pub(crate) async fn import_environment<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(payload, fingerprint): ApiJson<ImportRequest>,
+) -> Result<Response, ApiError> {
+    let env_id = parse_env_id(&env_id)?;
+    let auth = authorize_mutation(&state, &headers, &env_id, "backup", "import").await?;
+    let idem_key = require_idempotency_key(&headers)?;
+    if let Some(replay) = replay_gate(&state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(replay);
+    }
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let artifact = payload.artifact;
+        // The artifact names the env it captured; importing it under a
+        // different path would mis-key the reconstructed sidecars.
+        if artifact.manifest.env_id != env_id {
+            return Err(ApiError(RemoteStoreError::InvalidRequest {
+                detail: format!(
+                    "artifact env_id `{}` does not match path `{env_id}`",
+                    artifact.manifest.env_id
+                ),
+            }));
+        }
+        // Verify the composite snapshot digest before importing — a corrupted
+        // or tampered artifact is never reconstructed.
+        let recomputed = StateIntegrity::sha256_of(&artifact.snapshot).map_err(|err| {
+            tracing::error!(error = %err, "import snapshot hashing failed");
+            ApiError(RemoteStoreError::Internal {
+                message: "import snapshot hashing failed".to_string(),
+            })
+        })?;
+        if recomputed.digest != artifact.snapshot_digest {
+            return Err(ApiError(RemoteStoreError::IntegrityMismatch {
+                expected: artifact.snapshot_digest.clone(),
+                actual: recomputed.digest,
+            }));
+        }
+        let snapshot: crate::storage::EnvSnapshot = serde_json::from_value(artifact.snapshot)
+            .map_err(|err| {
+                tracing::error!(error = %err, backup_id = %artifact.manifest.backup_id,
+                        "import snapshot failed to decode");
+                ApiError(RemoteStoreError::Internal {
+                    message: "import snapshot failed to decode".to_string(),
+                })
+            })?;
+        let imported_env: Environment = serde_json::from_value(snapshot.environment.clone())
+            .map_err(|err| {
+                tracing::error!(error = %err, backup_id = %artifact.manifest.backup_id,
+                        "import environment failed to decode");
+                ApiError(RemoteStoreError::Internal {
+                    message: "import environment failed to decode".to_string(),
+                })
+            })?;
+        // A fresh create: generation 1, no prior CAS state.
+        let next = created_revision(&imported_env)?;
+        let outcome = ImportOutcome {
+            imported_generation: next.generation,
+            integrity: artifact.manifest.integrity.clone(),
+        };
+        let target = json!({
+            "environment_id": env_id,
+            "backup_id": artifact.manifest.backup_id,
+            "backup_generation": artifact.manifest.generation,
+            "imported_generation": next.generation,
+        });
+        let prepared = prepare_mutation(
+            &outcome,
+            &env_id,
+            "backup",
+            "import",
+            target,
+            idem_key,
+            &fingerprint,
+            &auth,
+            None,
+            next,
+        )?;
+        // Existence is enforced by the storage layer's atomic create
+        // (`AlreadyExists` → 409) — no load-then-check race.
+        state
+            .storage
+            .import_env_journaled(&env_id, &snapshot, Some(&prepared.journal))
+            .await?;
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
 }
 
 /// `POST /environments/{env_id}/restore` — restore the environment from a
