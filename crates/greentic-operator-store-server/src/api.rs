@@ -2134,12 +2134,16 @@ pub(crate) async fn remove_bundle<S: EnvironmentStorage>(
 // - The derived `<env_dir>/messaging/` projection refresh — remote
 //   consumers read the environment via `GET` (the runtime-config
 //   projection precedent).
-// - The webhook-secret SINK: the server has no secrets store yet, so its
-//   `provision` closure refuses and telegram-class `add` /
-//   `rotate-webhook-secret` answer 501 `not-yet-implemented` until the
-//   Phase D secrets sink lands. The refusal fires exactly where the
-//   LocalFS sink would write — after replay/duplicate/ref validation —
-//   so every other path through the verbs behaves identically.
+// - The webhook-secret SINK: a control-plane store has no secrets plane and
+//   never mints or custodies secret material. Telegram-class `add` therefore
+//   requires a caller-supplied `webhook_secret_ref` (the operator provisions
+//   the value in its own secrets plane and the engine stamps the ref without
+//   touching the sink); `rotate-webhook-secret` echoes the existing ref and
+//   only bumps the endpoint generation (the value rotates operator-side). A
+//   fresh mint the server cannot perform — a telegram `add` with NO ref, or a
+//   `rotate` on a ref-less endpoint — answers 501 `not-yet-implemented`. The
+//   refusal fires exactly where the LocalFS sink would write — after
+//   replay/duplicate/ref validation — so every other path is identical.
 //
 // Persist rule: the engine reports `mutated == false` for idempotent
 // replays/no-ops — the handler then echoes the loaded CAS coordinates
@@ -2169,9 +2173,11 @@ impl From<MessagingError> for ApiError {
             | MessagingError::InvalidSecretRef { .. } => RemoteStoreError::InvalidRequest {
                 detail: err.to_string(),
             },
-            // Only the refusing server sink produces this variant here
-            // (LocalFS maps its dev-store sink failures to `Conflict`
-            // instead) — so 501 is the accurate wire rendering.
+            // The server sink produces this only on its refuse-to-mint path
+            // (a fresh telegram add with no caller-supplied ref, or a rotate
+            // on a ref-less endpoint); LocalFS maps its dev-store sink
+            // failures to `Conflict` instead. 501 is the accurate rendering —
+            // the control-plane store has no secrets plane.
             MessagingError::SecretProvision(detail) => {
                 RemoteStoreError::NotYetImplemented { detail }
             }
@@ -2191,15 +2197,28 @@ fn parse_endpoint_id(raw: &str) -> Result<MessagingEndpointId, ApiError> {
         })
 }
 
-/// The server's webhook-secret `provision` seam: refuse until the Phase D
-/// secrets sink lands (see the section comment).
-fn server_webhook_secret_sink(_existing: Option<&SecretRef>) -> Result<SecretRef, MessagingError> {
-    Err(MessagingError::SecretProvision(
-        "webhook-secret provisioning is not yet implemented on the operator store server \
-         (needs the Phase D secrets sink); telegram-class `add` and `rotate-webhook-secret` \
-         remain local-only until it lands"
-            .to_string(),
-    ))
+/// The server's webhook-secret `provision` seam. A control-plane operator
+/// store has NO secrets plane and never mints or custodies secret material:
+///
+/// - **rotate** (`existing = Some`): the ref is unchanged and the new VALUE
+///   is provisioned operator-side; the server only bumps the endpoint
+///   generation, so echo the existing ref back to the engine.
+/// - **fresh mint** (`existing = None`): refuse. A telegram-class `add` over
+///   a remote store must carry a caller-supplied `webhook_secret_ref` (the
+///   engine then bypasses this sink entirely); a `rotate` on a ref-less
+///   endpoint has nothing to echo. Both surface as 501 with a directive
+///   message.
+fn server_webhook_secret_sink(existing: Option<&SecretRef>) -> Result<SecretRef, MessagingError> {
+    match existing {
+        Some(r) => Ok(r.clone()),
+        None => Err(MessagingError::SecretProvision(
+            "the operator store server does not mint webhook secrets: supply \
+             `webhook_secret_ref` on a telegram-class `add` (the operator provisions the \
+             value in its own secrets plane), and ensure the endpoint already carries a \
+             ref before `rotate-webhook-secret`"
+                .to_string(),
+        )),
+    }
 }
 
 /// Shared load → pure-engine transform → persist-if-mutated → A8 envelope
@@ -2448,10 +2467,11 @@ pub(crate) async fn remove_messaging_endpoint<S: EnvironmentStorage>(
 }
 
 /// `POST /environments/{env_id}/messaging/{endpoint_id}/rotate-secret` —
-/// rotate the endpoint's webhook secret (A8 messaging route 6). Until the
-/// Phase D secrets sink lands this answers 501 wherever the LocalFS sink
-/// would mint a value (unknown endpoints still 404 first; a same-key
-/// replay still succeeds without re-minting).
+/// rotate the endpoint's webhook secret (A8 messaging route 6). The server
+/// echoes the existing ref and bumps the endpoint generation; the new VALUE
+/// is provisioned operator-side (the control-plane store has no secrets
+/// plane). Unknown endpoints 404 first; a same-key replay no-ops without
+/// re-stamping; a rotate on a ref-less endpoint answers 501.
 pub(crate) async fn rotate_messaging_webhook_secret<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, endpoint_id)): Path<(String, String)>,

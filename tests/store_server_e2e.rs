@@ -628,6 +628,7 @@ async fn remote_env_lifecycle_end_to_end() {
                     provider_type: "teams".to_string(),
                     display_name: "Legal".to_string(),
                     secret_refs: Vec::new(),
+                    webhook_secret_ref: None,
                     updated_by: "e2e".to_string(),
                 },
                 idem("k-msg-add"),
@@ -636,8 +637,9 @@ async fn remote_env_lifecycle_end_to_end() {
         assert_eq!(ep.provider_id, "legal-bot");
         assert_eq!(ep.updated_by, "e2e#idem=add:k-msg-add");
 
-        // Telegram-class add → the server's 501 maps onto the same
-        // `NotYetImplemented` noun PR-4.0 reserved for it.
+        // Telegram-class add with NO caller-supplied webhook_secret_ref → the
+        // control-plane store cannot mint, so the sink refuses and the 501
+        // maps onto the `NotYetImplemented` noun PR-4.0 reserved for it.
         let err = store
             .add_messaging_endpoint(
                 &id,
@@ -646,14 +648,38 @@ async fn remote_env_lifecycle_end_to_end() {
                     provider_type: "telegram".to_string(),
                     display_name: "Telegram".to_string(),
                     secret_refs: Vec::new(),
+                    webhook_secret_ref: None,
                     updated_by: "e2e".to_string(),
                 },
                 idem("k-msg-add-tg"),
             )
-            .expect_err("telegram-class add needs the Phase D secrets sink");
+            .expect_err("telegram-class add without a ref cannot be server-minted");
         assert!(
             matches!(err, StoreError::NotYetImplemented(_)),
             "unexpected error: {err:?}"
+        );
+
+        // Telegram-class add WITH a caller-supplied ref → the server stamps it
+        // (the operator owns value provisioning) and the endpoint persists.
+        let tg = store
+            .add_messaging_endpoint(
+                &id,
+                AddMessagingEndpointPayload {
+                    provider_id: "tg-bot".to_string(),
+                    provider_type: "telegram".to_string(),
+                    display_name: "Telegram".to_string(),
+                    secret_refs: Vec::new(),
+                    webhook_secret_ref: Some(
+                        "secret://local/default/_/messaging-byo/webhook_secret".to_string(),
+                    ),
+                    updated_by: "e2e".to_string(),
+                },
+                idem("k-msg-add-tg-ref"),
+            )
+            .expect("telegram-class add with a caller-supplied ref persists");
+        assert_eq!(
+            tg.webhook_secret_ref.as_ref().map(|r| r.as_str()),
+            Some("secret://local/default/_/messaging-byo/webhook_secret"),
         );
 
         // Link → welcome-flow → unlink-blocked-by-welcome → remove.

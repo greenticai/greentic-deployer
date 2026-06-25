@@ -996,6 +996,21 @@ fn remote_messaging_add(
     let provider_type = require_nonempty("provider_type", &payload.provider_type)?;
     let display_name = require_nonempty("display_name", &payload.display_name)?;
     let updated_by = require_nonempty("updated_by", &payload.updated_by)?;
+    // A control-plane store never mints webhook secrets, so a telegram-class
+    // endpoint must arrive with a caller-supplied ref (the operator provisions
+    // the value in its own secrets plane). Catch the omission locally with a
+    // clear directive instead of a 501 round-trip. Reuse the engine's canonical
+    // matcher so the rule cannot drift from the server's.
+    if greentic_deploy_spec::engine::messaging::is_telegram_class(&provider_type)
+        && payload.webhook_secret_ref.is_none()
+    {
+        return Err(OpError::InvalidArgument(
+            "telegram-class endpoints over a remote --store-url store require \
+             --webhook-secret-ref: the remote store does not mint webhook secrets, so \
+             provision the value in your own secrets plane and pass its secret:// ref"
+                .to_string(),
+        ));
+    }
     let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
     let ep = store
         .add_messaging_endpoint(
@@ -1005,6 +1020,7 @@ fn remote_messaging_add(
                 provider_type,
                 display_name,
                 secret_refs: payload.secret_refs,
+                webhook_secret_ref: payload.webhook_secret_ref,
                 updated_by,
             },
             idempotency_key,
@@ -1737,6 +1753,10 @@ mod tests {
                 provider_type: "telegram".to_string(),
                 display_name: "Test Bot".to_string(),
                 secret_refs: vec![],
+                // Telegram-class over a remote store requires a caller-supplied ref.
+                webhook_secret_ref: Some(
+                    "secret://local/default/_/messaging-byo/webhook_secret".to_string(),
+                ),
                 idempotency_key: None,
                 updated_by: "operator".to_string(),
             }),
@@ -1744,6 +1764,36 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.noun, "messaging.endpoint");
         assert_eq!(outcome.op, "add");
+    }
+
+    #[test]
+    fn messaging_add_telegram_without_ref_rejected_before_round_trip() {
+        // No mock responses queued: a telegram-class add with no
+        // webhook_secret_ref must fail locally, never reaching the server.
+        let mock = start_mock(vec![], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+
+        let err = remote_messaging_add(
+            &store,
+            &no_flags(),
+            Some(super::super::messaging::EndpointAddPayload {
+                environment_id: "local".to_string(),
+                provider_id: "telegram-bot".to_string(),
+                provider_type: "telegram".to_string(),
+                display_name: "Test Bot".to_string(),
+                secret_refs: vec![],
+                webhook_secret_ref: None,
+                idempotency_key: None,
+                updated_by: "operator".to_string(),
+            }),
+        )
+        .unwrap_err();
+        match err {
+            OpError::InvalidArgument(ref m) => {
+                assert!(m.contains("--webhook-secret-ref"), "got {err:?}")
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
     }
 
     #[test]
