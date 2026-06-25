@@ -25,9 +25,10 @@
 //! calling `provision`. Remote operator stores use this — the operator owns
 //! value provisioning in its own secrets plane and ships only the ref, so
 //! the control-plane store never custodies secret material. Its `provision`
-//! closure echoes the existing ref on rotate (the value rotates operator
-//! side) and refuses a fresh mint it cannot perform
-//! ([`MessagingError::SecretProvision`], mapped to 501 on the wire). The
+//! closure always refuses ([`MessagingError::SecretProvision`], mapped to
+//! 501): the server neither mints nor rotates secrets, so a telegram-class
+//! `add` over a remote store must supply the ref and `rotate-webhook-secret`
+//! is unsupported there (the server cannot prove a value rotated). The
 //! closure / supplied-ref step runs AFTER replay/duplicate/ref validation,
 //! so it never fires on a replay and never leaves a half-validated
 //! mutation.

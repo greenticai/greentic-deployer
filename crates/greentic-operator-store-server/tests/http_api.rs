@@ -3050,13 +3050,14 @@ async fn messaging_rotate_refless_endpoint_is_501_no_server_minting() {
 }
 
 #[tokio::test]
-async fn messaging_rotate_ref_bearing_endpoint_echoes_and_bumps_generation() {
+async fn messaging_rotate_ref_bearing_endpoint_is_501_not_falsely_succeeded() {
     let (_d, app) = app().await;
     create_local_env(&app).await;
 
-    // A telegram endpoint added with a caller-supplied ref CAN be rotated:
-    // the server echoes the unchanged ref and bumps the endpoint generation
-    // (the new VALUE is rotated operator-side, off the control-plane store).
+    // Even a telegram endpoint added with a caller-supplied ref CANNOT be
+    // rotated on a remote store: the value lives operator-side, so the server
+    // cannot prove a rotation occurred and refuses rather than journal a
+    // misleading success (it never echoes the ref + bumps the generation).
     let supplied = "secret://local/default/_/messaging-byo/webhook_secret";
     let (status, add_body) = send_custom(
         app.clone(),
@@ -3079,20 +3080,19 @@ async fn messaging_rotate_ref_bearing_endpoint_echoes_and_bumps_generation() {
         &[("Idempotency-Key", "k-rotate-tg")],
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "rotate body: {body}");
-    assert_eq!(
-        body["result"]["webhook_secret_ref"], supplied,
-        "rotate echoes the unchanged ref"
-    );
-    assert_eq!(
-        body["result"]["generation"], 1,
-        "rotate bumps the endpoint generation"
-    );
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "rotate body: {body}");
+    assert_eq!(body["kind"], "not-yet-implemented");
 
+    // The refused rotate must NOT have touched the endpoint — ref unchanged,
+    // generation still 0 (no false rotation recorded).
     let (_, read) = send(app, Method::GET, "/environments/local", None).await;
     assert_eq!(
         read["environment"]["messaging_endpoints"][0]["webhook_secret_ref"],
         supplied
+    );
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["generation"], 0,
+        "a refused rotate must not bump the endpoint generation"
     );
 }
 
