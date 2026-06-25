@@ -12,8 +12,7 @@
 
 use greentic_deploy_spec::{
     BundleId, DeploymentId, EnvId, EnvironmentHostConfig, IdempotencyKey, MessagingEndpointId,
-    PackId, PackListEntry, RevenueShareEntry, RevisionId, SemVer, StageRevisionPayload,
-    WarmRevisionPayload,
+    PackId, RevenueShareEntry, RevisionId, StageRevisionPayload, WarmRevisionPayload,
 };
 use serde_json::json;
 
@@ -901,21 +900,7 @@ fn remote_revision_stage(
     };
     let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
 
-    let pack_list = payload
-        .pack_list
-        .into_iter()
-        .map(|e| {
-            Ok::<_, OpError>(PackListEntry {
-                pack_id: PackId::new(e.pack_id),
-                version: e
-                    .version
-                    .parse::<SemVer>()
-                    .map_err(|err| OpError::InvalidArgument(format!("pack version: {err}")))?,
-                digest: e.digest,
-                source_uri: e.source_uri,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let pack_list = super::revisions::parse_pack_list(payload.pack_list)?;
     let store_payload = StageRevisionPayload {
         revision_id,
         deployment_id,

@@ -114,6 +114,28 @@ pub(super) fn default_drain_seconds() -> u32 {
     30
 }
 
+/// Convert wire-shaped [`PackListEntryPayload`]s into pinned [`PackListEntry`]s,
+/// validating each version string. Shared by the local stage (`--answers`
+/// legacy path) and the remote `--store-url` dispatch.
+pub(super) fn parse_pack_list(
+    entries: Vec<PackListEntryPayload>,
+) -> Result<Vec<PackListEntry>, OpError> {
+    entries
+        .into_iter()
+        .map(|e| {
+            Ok::<_, OpError>(PackListEntry {
+                pack_id: PackId::new(e.pack_id),
+                version: e
+                    .version
+                    .parse::<SemVer>()
+                    .map_err(|err| OpError::InvalidArgument(format!("pack version: {err}")))?,
+                digest: e.digest,
+                source_uri: e.source_uri,
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackListEntryPayload {
     pub pack_id: String,
@@ -179,21 +201,7 @@ pub fn stage(
     let pack_list = if payload.bundle_path.is_some() {
         Vec::new()
     } else {
-        payload
-            .pack_list
-            .into_iter()
-            .map(|e| {
-                Ok::<_, OpError>(PackListEntry {
-                    pack_id: PackId::new(e.pack_id),
-                    version: e
-                        .version
-                        .parse::<SemVer>()
-                        .map_err(|err| OpError::InvalidArgument(format!("pack version: {err}")))?,
-                    digest: e.digest,
-                    source_uri: e.source_uri,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?
+        parse_pack_list(payload.pack_list)?
     };
     if !is_valid_transition(RevisionLifecycle::Inactive, RevisionLifecycle::Staged) {
         return Err(OpError::Conflict(
