@@ -76,9 +76,9 @@ pub use refs::{
     SecretRefParseError,
 };
 pub use remote::{
-    BackupManifest, ConcurrencyConflict, IdempotencyKey, IdempotencyOutcome, IdempotencyRecord,
-    IdempotencyReplay, MutationResponse, Precondition, PreconditionError, RbacRequest,
-    RemoteContractError, RemoteStoreError, RestoreOutcome, RestoreRequest, StateEtag,
+    BackupArtifact, BackupManifest, ConcurrencyConflict, IdempotencyKey, IdempotencyOutcome,
+    IdempotencyRecord, IdempotencyReplay, MutationResponse, Precondition, PreconditionError,
+    RbacRequest, RemoteContractError, RemoteStoreError, RestoreOutcome, RestoreRequest, StateEtag,
 };
 pub use retention::{HealthState, HealthStatus, RetentionPolicy, RevocationConfig};
 pub use revenue_policy::RevenuePolicyDocument;

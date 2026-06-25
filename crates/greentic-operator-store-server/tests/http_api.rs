@@ -16,6 +16,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use greentic_deploy_spec::StateIntegrity;
 use greentic_operator_store_server::http::{router, router_with_operator_key};
 use greentic_operator_store_server::sqlite::SqliteEnvironmentStore;
 use greentic_operator_store_server::storage::EnvironmentStorage;
@@ -3977,6 +3978,97 @@ async fn read_only_role_cannot_mutate_and_the_denial_names_the_actor() {
 }
 
 #[tokio::test]
+async fn read_only_token_cannot_export_a_backup() {
+    // Export returns the FULL recovery payload (env + sidecars + audit), so it
+    // is a backup-operator privilege — a read-only token (manifests only) must
+    // not exfiltrate it, even though it may read.
+    let (_d, app, store) = rbac_app().await;
+    let operator = bearer(OPERATOR_TOKEN);
+    let (status, _) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "EXP-1"), ("Authorization", &operator)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, backup) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+        &[("Idempotency-Key", "EXP-2"), ("Authorization", &operator)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {backup}");
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+
+    let reader = bearer(READER_TOKEN);
+    let (status, body) = send_custom(
+        app,
+        Method::GET,
+        &format!("/environments/local/backups/{backup_id}/export"),
+        None,
+        &[("Authorization", &reader)],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "read-only must not export: {body}"
+    );
+    assert!(
+        body["reason"].as_str().unwrap().contains("read-only"),
+        "reason names the role: {body}"
+    );
+
+    // The denied export attempt is audited as a privileged backup operation.
+    let events = audit_log_events(&store, "local").await;
+    let denial = events.last().expect("denial audited");
+    assert_eq!(denial["authorization"]["decision"], "deny");
+    assert_eq!(denial["noun"], "backup");
+    assert_eq!(denial["verb"], "export");
+    assert_eq!(denial["actor"]["user"], "viewer");
+}
+
+#[tokio::test]
+async fn operator_token_can_export_a_backup() {
+    let (_d, app, _store) = rbac_app().await;
+    let operator = bearer(OPERATOR_TOKEN);
+    let (status, _) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "EXP-3"), ("Authorization", &operator)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, backup) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+        &[("Idempotency-Key", "EXP-4"), ("Authorization", &operator)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+
+    let (status, artifact) = send_custom(
+        app,
+        Method::GET,
+        &format!("/environments/local/backups/{backup_id}/export"),
+        None,
+        &[("Authorization", &operator)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "operator may export: {artifact}");
+    assert_eq!(artifact["schema"], "greentic.backup-artifact.v1");
+}
+
+#[tokio::test]
 async fn operator_role_deploys_but_cannot_touch_trust_root_custody() {
     let (_d, app, _store) = rbac_app().await;
     let operator = bearer(OPERATOR_TOKEN);
@@ -4151,6 +4243,77 @@ async fn backup_then_restore_reverts_content_and_advances_generation() {
 
     // create + patch + backup + restore all audited durably.
     assert_eq!(audit_log_event_ids(&store, "local").await.len(), 4);
+}
+
+#[tokio::test]
+async fn export_backup_returns_a_self_verifying_artifact() {
+    let (_d, app) = app().await;
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, backup) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+
+    let (status, artifact) = send(
+        app,
+        Method::GET,
+        &format!("/environments/local/backups/{backup_id}/export"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {artifact}");
+
+    // Self-describing, and the manifest echoes the backup we created.
+    assert_eq!(artifact["schema"], "greentic.backup-artifact.v1");
+    assert_eq!(artifact["manifest"]["backup_id"], backup_id);
+    assert_eq!(artifact["manifest"]["env_id"], "local");
+    assert_eq!(artifact["manifest"]["generation"], 1);
+
+    // The artifact verifies OFFLINE: its digest recomputes over the snapshot,
+    // and the snapshot carries the captured environment document.
+    let recomputed = StateIntegrity::sha256_of(&artifact["snapshot"])
+        .expect("hash")
+        .digest;
+    assert_eq!(
+        artifact["snapshot_digest"].as_str().unwrap(),
+        recomputed,
+        "snapshot digest must verify against the snapshot bytes"
+    );
+    assert_eq!(artifact["snapshot"]["environment"]["name"], "local");
+}
+
+#[tokio::test]
+async fn export_of_an_unknown_backup_is_404() {
+    let (_d, app) = app().await;
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(
+        app,
+        Method::GET,
+        "/environments/local/backups/01JTKW5B4W4Q5Y1CQW93F7S5VH/export",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
 }
 
 #[tokio::test]

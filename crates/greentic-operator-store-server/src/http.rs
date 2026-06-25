@@ -209,6 +209,10 @@ where
             delete(api::delete_backup::<S>),
         )
         .route(
+            "/environments/{env_id}/backups/{backup_id}/export",
+            get(api::export_backup::<S>),
+        )
+        .route(
             "/environments/{env_id}/restore",
             post(api::restore_environment::<S>),
         )

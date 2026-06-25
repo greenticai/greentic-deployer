@@ -261,6 +261,28 @@ pub struct BackupManifest {
     pub size_bytes: u64,
 }
 
+/// A portable, self-verifying export of one stored backup (#5, disaster
+/// recovery).
+///
+/// Unlike the in-database stored backup, this is the form an operator pulls
+/// OFFSITE so a recovery point survives total store loss. It carries the
+/// [`BackupManifest`], the full composite snapshot JSON (the environment
+/// document plus its sidecars and captured audit history), and the snapshot
+/// digest — so a later import can verify integrity (recompute the SHA-256 over
+/// `snapshot` and compare it to `snapshot_digest`) and reconstruct the
+/// environment WITHOUT the database it came from. The `snapshot` is opaque to
+/// the contract (the server's composite `EnvSnapshot` shape); the artifact
+/// only commits to its digest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupArtifact {
+    pub schema: SchemaVersion,
+    pub manifest: BackupManifest,
+    /// The composite snapshot as canonical JSON (env + sidecars + audit).
+    pub snapshot: Value,
+    /// SHA-256 over `snapshot`; re-verified on import.
+    pub snapshot_digest: String,
+}
+
 /// Request to restore an environment from a named backup (#5).
 ///
 /// `precondition` is mandatory and must pin prior state: a restore is never a
