@@ -207,22 +207,23 @@ fn audit_log_uses_safe_env_segment_rejecting_dotdot() {
     assert!(result.is_err(), "audit log must reject unsafe env segments");
 }
 
-#[test]
-fn committed_mutation_with_unwritable_audit_dir_fails_closed() {
-    // Codex finding [high]: a committed mutation must not report success when
-    // the audit event cannot be persisted. Inject failure by occupying the
-    // audit dir path with a regular file so `create_dir_all` fails.
+/// Drive `create` for `env_id` with its audit dir occupied by a regular file so
+/// the audit append fails. A committed mutation must surface `OpError::Audit`
+/// (fail-closed) rather than report success without a durable audit record. The
+/// invariant is policy-agnostic, so it must hold identically for the `local` and
+/// named-env paths.
+fn assert_create_fails_closed_when_audit_unwritable(env_id: &str) {
     let dir = tempdir().unwrap();
     let store = LocalFsStore::new(dir.path());
-    std::fs::create_dir_all(dir.path().join("local")).unwrap();
-    std::fs::write(dir.path().join("local").join("audit"), b"not a dir").unwrap();
+    std::fs::create_dir_all(dir.path().join(env_id)).unwrap();
+    std::fs::write(dir.path().join(env_id).join("audit"), b"not a dir").unwrap();
 
     let err = create(
         &store,
         &OpFlags::default(),
         Some(EnvCreatePayload {
-            environment_id: "local".to_string(),
-            name: "local".to_string(),
+            environment_id: env_id.to_string(),
+            name: env_id.to_string(),
             region: None,
             tenant_org_id: None,
             listen_addr: None,
@@ -237,43 +238,23 @@ fn committed_mutation_with_unwritable_audit_dir_fails_closed() {
     // The state did commit (we cannot un-commit a flushed transact); the point
     // is that the call does NOT report success without a durable audit record.
     assert!(
-        dir.path().join("local").join("environment.json").exists(),
+        dir.path().join(env_id).join("environment.json").exists(),
         "the mutation itself committed before the audit append was attempted"
     );
 }
 
 #[test]
+fn committed_mutation_with_unwritable_audit_dir_fails_closed() {
+    // Codex finding [high]: a committed mutation must not report success when the
+    // audit event cannot be persisted. The `local` env is the baseline case.
+    assert_create_fails_closed_when_audit_unwritable("local");
+}
+
+#[test]
 fn committed_named_env_mutation_with_unwritable_audit_dir_fails_closed() {
     // Named (non-`local`) envs are authorized on the local store, so their create
-    // commits state. Like the `local` counterpart above, a committed named-env
-    // mutation whose audit event cannot be persisted must surface OpError::Audit
-    // rather than report success — the fail-closed invariant holds on the
-    // named-env path too. (The old deny-before-commit path no longer exists on
-    // the local store; it is enforced server-side on the remote RBAC path.)
-    let dir = tempdir().unwrap();
-    let store = LocalFsStore::new(dir.path());
-    std::fs::create_dir_all(dir.path().join("prod")).unwrap();
-    std::fs::write(dir.path().join("prod").join("audit"), b"not a dir").unwrap();
-
-    let err = create(
-        &store,
-        &OpFlags::default(),
-        Some(EnvCreatePayload {
-            environment_id: "prod".to_string(),
-            name: "prod".to_string(),
-            region: None,
-            tenant_org_id: None,
-            listen_addr: None,
-            public_base_url: None,
-        }),
-    )
-    .unwrap_err();
-    assert!(
-        matches!(err, OpError::Audit(_)),
-        "committed named-env mutation with broken audit dir must surface OpError::Audit, got {err:?}"
-    );
-    assert!(
-        dir.path().join("prod").join("environment.json").exists(),
-        "the mutation itself committed before the audit append was attempted"
-    );
+    // commits state — the fail-closed invariant must hold on the named-env path
+    // too. (The old deny-before-commit path no longer exists on the local store;
+    // it is enforced server-side on the remote RBAC path.)
+    assert_create_fails_closed_when_audit_unwritable("prod");
 }

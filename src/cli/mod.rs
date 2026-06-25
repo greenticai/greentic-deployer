@@ -351,7 +351,7 @@ impl AuditGens {
     };
 }
 
-/// Wrap a mutating verb body in local-only authorization + append-only audit.
+/// Wrap a mutating verb body in local-store authorization + append-only audit.
 ///
 /// 1. Runs [`authorize_local_owner`] against `ctx.env_id`.
 /// 2. On `Deny`: returns `OpError::Unauthorized` without calling `mutate`.

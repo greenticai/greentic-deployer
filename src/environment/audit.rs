@@ -75,19 +75,23 @@ pub enum AuditError {
 /// `op env create <id>` first — apply reconciles a named env, it does not
 /// bootstrap one).
 pub fn authorize_local_owner(env_id: &EnvId) -> AuditDecision {
-    if env_id.as_str() == crate::defaults::LOCAL_ENV_ID {
-        AuditDecision::Allow {
-            policy: POLICY_LOCAL_ONLY.to_string(),
-            reason: format!("env `{env_id}` is the local env"),
-        }
+    let (policy, reason) = if env_id.as_str() == crate::defaults::LOCAL_ENV_ID {
+        (
+            POLICY_LOCAL_ONLY,
+            format!("env `{env_id}` is the local env"),
+        )
     } else {
-        AuditDecision::Allow {
-            policy: POLICY_LOCAL_OWNER.to_string(),
-            reason: format!(
+        (
+            POLICY_LOCAL_OWNER,
+            format!(
                 "named env `{env_id}` authorized by local store ownership \
                  (single-operator; shared-store RBAC is enforced on the remote path)"
             ),
-        }
+        )
+    };
+    AuditDecision::Allow {
+        policy: policy.to_string(),
+        reason,
     }
 }
 
