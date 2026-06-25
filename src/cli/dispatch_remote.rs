@@ -1365,13 +1365,104 @@ fn require_remote_bundle_pointers(b: &ManifestBundle) -> Result<(), OpError> {
 /// images, rolling pods) is a separate concern (`env reconcile` / the runtime
 /// consuming the store), not part of apply.
 ///
-/// Idempotency keys and the staged revision ids are DERIVED from the env id +
-/// manifest content (via [`super::env_apply::derive_idempotency_key`]), so
-/// re-running the same manifest replays server-side (PR-4.3 ledger) instead of
-/// churning duplicate revisions. Remote apply is non-interactive: it never
-/// prompts (secrets are rejected, not collected) and executes without the
+/// Re-runnability comes from CONVERGENCE, not from stable idempotency keys
+/// against the bounded server replay ledger: apply reads current env state and
+/// skips a deployment already at its desired revision set, an endpoint that
+/// already exists, and a binding already bound. Genuine stages mint FRESH
+/// revision ids — a stable id would collide (`DuplicateRevision`) on a re-apply
+/// once the ledger evicts the original key. Idempotency keys are minted per
+/// mutation (audit-replay metadata only). Remote apply is non-interactive: it
+/// never prompts (secrets are rejected, not collected) and executes without the
 /// local TTY confirmation — the `--store-url` + `--answers` invocation is the
 /// explicit intent.
+fn deployment_converged_remote(
+    env: &greentic_deploy_spec::Environment,
+    deployment_id: DeploymentId,
+    desired: &[(u32, &str, &str)],
+) -> bool {
+    // Multiset equality of `(weight_bps, source_uri, digest)` between the live
+    // split and the desired set: every live entry must resolve to a real-digest
+    // revision, and a missing/placeholder digest fails convergence (a false
+    // "converged" is the dangerous direction — it would skip applying the split).
+    let Some(split) = env
+        .traffic_splits
+        .iter()
+        .find(|s| s.deployment_id == deployment_id)
+    else {
+        return false;
+    };
+    if split.entries.len() != desired.len() {
+        return false;
+    }
+    let mut live: Vec<(u32, Option<&str>, &str)> = Vec::with_capacity(split.entries.len());
+    for entry in &split.entries {
+        let Some(rev) = env
+            .revisions
+            .iter()
+            .find(|r| r.revision_id == entry.revision_id)
+        else {
+            return false;
+        };
+        if !remote_pullable_digest(Some(rev.bundle_digest.as_str())) {
+            return false;
+        }
+        live.push((
+            entry.weight_bps,
+            rev.bundle_source_uri.as_deref(),
+            rev.bundle_digest.as_str(),
+        ));
+    }
+    let mut want: Vec<(u32, Option<&str>, &str)> = desired
+        .iter()
+        .map(|(w, uri, dig)| (*w, Some(*uri), *dig))
+        .collect();
+    live.sort_unstable();
+    want.sort_unstable();
+    live == want
+}
+
+/// Diff a manifest bundle entry against a live deployment; returns the
+/// `update_bundle` payload when any declared metadata (route binding, status,
+/// revenue share, config overrides) differs from the live deployment, or `None`
+/// when nothing changed. A manifest field left unset means "leave untouched"
+/// (never a diff). Without this, a route/tenant change on an existing deployment
+/// would be silently dropped while a new revision still shifted traffic — a
+/// success report serving stale routing.
+fn bundle_metadata_update(
+    b: &ManifestBundle,
+    dep: &greentic_deploy_spec::BundleDeployment,
+) -> Option<UpdateBundlePayload> {
+    let route_binding = b
+        .route_binding
+        .clone()
+        .map(super::bundles::into_route_binding)
+        .filter(|rb| *rb != dep.route_binding);
+    let status = b.status.filter(|s| *s != dep.status);
+    let revenue_share = b
+        .revenue_share
+        .as_ref()
+        .map(|s| super::bundles::convert_revenue_share(s))
+        .filter(|rs| *rs != dep.revenue_share);
+    let config_overrides = b
+        .config_overrides
+        .clone()
+        .filter(|co| *co != dep.config_overrides);
+    if route_binding.is_none()
+        && status.is_none()
+        && revenue_share.is_none()
+        && config_overrides.is_none()
+    {
+        return None;
+    }
+    Some(UpdateBundlePayload {
+        deployment_id: dep.deployment_id,
+        status,
+        route_binding,
+        revenue_share,
+        config_overrides,
+    })
+}
+
 fn remote_env_apply(
     store: &dyn EnvironmentMutations,
     flags: &OpFlags,
@@ -1416,10 +1507,6 @@ fn remote_env_apply(
         other => map_store_err_preserving_noun(other),
     })?;
 
-    // Deterministic key/id derivation from manifest content (replay-safe).
-    let derive = |kind: &str, natural: &str, hash: &str| {
-        super::env_apply::derive_idempotency_key(&env_id, kind, natural, hash)
-    };
     let mut steps: Vec<Value> = Vec::new();
 
     // -- 1. environment host config / public base url (upsert; never clears) --
@@ -1484,18 +1571,13 @@ fn remote_env_apply(
                 idempotency_key: None,
             };
             let binding = super::env_packs::build_binding(&payload, 0, None)?;
-            let key = super::resolve_idempotency_key(Some(derive(
-                "pack-add",
-                &p.slot.to_string(),
-                &super::env_apply::hash_json(&json!({"kind": p.kind, "pack_ref": p.pack_ref})),
-            )))?;
             store
-                .add_pack_binding(&env_id, binding, key)
+                .add_pack_binding(&env_id, binding, super::mint_idempotency_key())
                 .map_err(map_store_err_preserving_noun)?;
         }
     }
 
-    // -- 4. bundles: add (if new) → stage + warm each revision → set traffic --
+    // -- 4. bundles: reconcile metadata, then converge revisions -------------
     for b in &manifest.bundles {
         let bundle_id = BundleId::new(&b.bundle_id);
         let customer_id = super::bundles::resolve_customer_id(&env_id, b.customer_id.clone())?;
@@ -1504,7 +1586,7 @@ fn remote_env_apply(
             .iter()
             .find(|d| d.bundle_id.as_str() == b.bundle_id && d.customer_id == customer_id);
 
-        // The revisions to stage: (name, weight_bps, source_uri, digest, drain).
+        // The desired revisions: (name, weight_bps, source_uri, digest, drain).
         let revs: Vec<(String, u32, String, String, u32)> = match &b.revisions {
             Some(revisions) => {
                 let weights = super::env_manifest::compute_effective_weights_bps(revisions);
@@ -1534,10 +1616,27 @@ fn remote_env_apply(
 
         let deployment_id: Option<DeploymentId> = match existing {
             Some(d) => {
-                steps.push(json!({
-                    "section": "bundle", "bundle_id": b.bundle_id, "action": "reuse",
-                    "deployment_id": d.deployment_id.to_string()
-                }));
+                // Reconcile drifted deployment metadata (route / status /
+                // revenue-share / config); silently shifting a new revision
+                // through a stale route would be a misleading success.
+                match bundle_metadata_update(b, d) {
+                    Some(update) => {
+                        steps.push(json!({
+                            "section": "bundle", "bundle_id": b.bundle_id,
+                            "action": "update-metadata",
+                            "deployment_id": d.deployment_id.to_string()
+                        }));
+                        if !dry_run {
+                            store
+                                .update_bundle(&env_id, update, super::mint_idempotency_key())
+                                .map_err(map_store_err_preserving_noun)?;
+                        }
+                    }
+                    None => steps.push(json!({
+                        "section": "bundle", "bundle_id": b.bundle_id, "action": "reuse",
+                        "deployment_id": d.deployment_id.to_string()
+                    })),
+                }
                 Some(d.deployment_id)
             }
             None => {
@@ -1545,16 +1644,6 @@ fn remote_env_apply(
                 if dry_run {
                     None
                 } else {
-                    let key = super::resolve_idempotency_key(Some(derive(
-                        "bundle-add",
-                        &b.bundle_id,
-                        &super::env_apply::hash_json(&json!({
-                            "customer_id": customer_id.as_str(),
-                            "revenue_share": b.revenue_share,
-                            "route_binding": b.route_binding,
-                            "config_overrides": b.config_overrides,
-                        })),
-                    )))?;
                     let revenue_share = super::bundles::convert_revenue_share(
                         &b.revenue_share
                             .clone()
@@ -1578,7 +1667,7 @@ fn remote_env_apply(
                                 ),
                                 config_overrides: b.config_overrides.clone().unwrap_or_default(),
                             },
-                            key,
+                            super::mint_idempotency_key(),
                         )
                         .map_err(map_store_err_preserving_noun)?;
                     Some(dep.deployment_id)
@@ -1586,23 +1675,34 @@ fn remote_env_apply(
             }
         };
 
+        // Convergence: skip stage/warm/traffic when the live split already
+        // matches the desired (weight, source_uri, digest) set.
+        let desired: Vec<(u32, &str, &str)> = revs
+            .iter()
+            .map(|(_, w, uri, dig, _)| (*w, uri.as_str(), dig.as_str()))
+            .collect();
+        if let Some(dep_id) = deployment_id
+            && deployment_converged_remote(&env, dep_id, &desired)
+        {
+            steps.push(json!({
+                "section": "revision", "bundle_id": b.bundle_id, "action": "converged"
+            }));
+            continue;
+        }
+
         let mut traffic_entries: Vec<TrafficSplitEntry> = Vec::with_capacity(revs.len());
         for (name, weight_bps, source_uri, digest, drain_seconds) in revs {
-            let revision_id_str =
-                derive("revision-id", &format!("{}:{}", b.bundle_id, name), &digest);
-            let revision_id = parse_revision_id(&revision_id_str)?;
             steps.push(json!({
                 "section": "revision", "bundle_id": b.bundle_id, "revision": name,
-                "revision_id": revision_id.to_string(), "weight_bps": weight_bps
+                "action": "stage", "weight_bps": weight_bps
             }));
             if !dry_run {
                 let deployment_id =
                     deployment_id.expect("apply mode resolves a deployment id before staging");
-                let stage_key = super::resolve_idempotency_key(Some(derive(
-                    "revision-stage",
-                    &revision_id_str,
-                    &digest,
-                )))?;
+                // Mint a fresh revision id per genuine stage: a stable id would
+                // collide (`DuplicateRevision`) on re-apply once the server
+                // replay ledger evicts the original key.
+                let revision_id = crate::environment::mint_revision_id();
                 let staged = store
                     .stage_revision(
                         &env_id,
@@ -1623,14 +1723,9 @@ fn remote_env_apply(
                             ),
                             drain_seconds,
                         },
-                        stage_key,
+                        super::mint_idempotency_key(),
                     )
                     .map_err(map_store_err_preserving_noun)?;
-                let warm_key = super::resolve_idempotency_key(Some(derive(
-                    "revision-warm",
-                    &revision_id_str,
-                    "",
-                )))?;
                 store
                     .warm_revision(
                         &env_id,
@@ -1639,14 +1734,14 @@ fn remote_env_apply(
                             health_gate: Ok(()),
                             expected_lifecycle: staged.lifecycle,
                         },
-                        warm_key,
+                        super::mint_idempotency_key(),
                     )
                     .map_err(map_store_err_preserving_noun)?;
+                traffic_entries.push(TrafficSplitEntry {
+                    revision_id,
+                    weight_bps,
+                });
             }
-            traffic_entries.push(TrafficSplitEntry {
-                revision_id,
-                weight_bps,
-            });
         }
 
         steps.push(json!({
@@ -1655,17 +1750,6 @@ fn remote_env_apply(
         if !dry_run {
             let deployment_id =
                 deployment_id.expect("apply mode resolves a deployment id before traffic");
-            let entries_hash = super::env_apply::hash_json(&json!(
-                traffic_entries
-                    .iter()
-                    .map(|e| (e.revision_id.to_string(), e.weight_bps))
-                    .collect::<Vec<_>>()
-            ));
-            let traffic_key = super::resolve_idempotency_key(Some(derive(
-                "traffic-set",
-                &deployment_id.to_string(),
-                &entries_hash,
-            )))?;
             store
                 .set_traffic_split(
                     &env_id,
@@ -1679,7 +1763,7 @@ fn remote_env_apply(
                                 .into_owned(),
                         ),
                     },
-                    traffic_key,
+                    super::mint_idempotency_key(),
                 )
                 .map_err(super::traffic::map_traffic_store_err)?;
         }
@@ -1709,91 +1793,108 @@ fn remote_env_apply(
                 idempotency_key: None,
             };
             let binding = super::extensions::build_binding(&payload, 0, None)?;
-            let key = super::resolve_idempotency_key(Some(derive(
-                "ext-add",
-                &format!(
-                    "{}::{}",
-                    descriptor.path(),
-                    e.instance_id.as_deref().unwrap_or("")
-                ),
-                &super::env_apply::hash_json(&json!({"kind": e.kind, "pack_ref": e.pack_ref})),
-            )))?;
             store
-                .add_extension_binding(&env_id, binding, key)
+                .add_extension_binding(&env_id, binding, super::mint_idempotency_key())
                 .map_err(map_store_err_preserving_noun)?;
         }
     }
 
     // -- 6. messaging endpoints (non-telegram; add → link → welcome) ---------
     for ep in &manifest.messaging_endpoints {
-        steps.push(json!({"section": "endpoint", "name": ep.name, "action": "add"}));
-        let endpoint_id: Option<MessagingEndpointId> = if dry_run {
-            None
-        } else {
-            let add_key = super::resolve_idempotency_key(Some(derive(
-                "endpoint-add",
-                &ep.name,
-                &super::env_apply::hash_json(&json!({
-                    "provider_type": ep.provider_type, "secret_refs": ep.secret_refs
-                })),
-            )))?;
-            let endpoint = store
-                .add_messaging_endpoint(
-                    &env_id,
-                    AddMessagingEndpointPayload {
-                        provider_id: ep.name.clone(),
-                        provider_type: ep.provider_type.clone(),
-                        display_name: ep.name.clone(),
-                        secret_refs: ep.secret_refs.clone(),
-                        webhook_secret_ref: None,
-                        updated_by: updated_by.clone(),
-                    },
-                    add_key,
-                )
-                .map_err(map_store_err_preserving_noun)?;
-            Some(endpoint.endpoint_id)
+        // Reuse an existing endpoint by (provider_type, name): a re-add would
+        // hit `EndpointAlreadyExists`. Links are additive (link only un-linked
+        // bundles); welcome is set only when it differs from the live value.
+        let matched = env
+            .messaging_endpoints
+            .iter()
+            .find(|m| m.provider_type == ep.provider_type && m.display_name == ep.name);
+        let endpoint_id: Option<MessagingEndpointId> = match matched {
+            Some(m) => {
+                steps.push(json!({"section": "endpoint", "name": ep.name, "action": "reuse"}));
+                Some(m.endpoint_id)
+            }
+            None => {
+                steps.push(json!({"section": "endpoint", "name": ep.name, "action": "add"}));
+                if dry_run {
+                    None
+                } else {
+                    let endpoint = store
+                        .add_messaging_endpoint(
+                            &env_id,
+                            AddMessagingEndpointPayload {
+                                provider_id: ep.name.clone(),
+                                provider_type: ep.provider_type.clone(),
+                                display_name: ep.name.clone(),
+                                secret_refs: ep.secret_refs.clone(),
+                                webhook_secret_ref: None,
+                                updated_by: updated_by.clone(),
+                            },
+                            super::mint_idempotency_key(),
+                        )
+                        .map_err(map_store_err_preserving_noun)?;
+                    Some(endpoint.endpoint_id)
+                }
+            }
         };
 
         for link in &ep.links {
-            steps.push(json!({"section": "endpoint-link", "name": ep.name, "bundle_id": link}));
+            let already_linked = matched
+                .is_some_and(|m| m.linked_bundles.iter().any(|x| x.as_str() == link.as_str()));
+            if already_linked {
+                steps.push(json!({
+                    "section": "endpoint-link", "name": ep.name, "bundle_id": link,
+                    "action": "skip-linked"
+                }));
+                continue;
+            }
+            steps.push(json!({
+                "section": "endpoint-link", "name": ep.name, "bundle_id": link, "action": "link"
+            }));
             if !dry_run {
                 let endpoint_id = endpoint_id.expect("apply mode resolves an endpoint id");
-                let bundle_id = parse_bundle_id(link)?;
-                let key = super::resolve_idempotency_key(Some(derive(
-                    "endpoint-link",
-                    &format!("{}:{}", ep.name, link),
-                    "",
-                )))?;
                 store
-                    .link_messaging_bundle(&env_id, endpoint_id, bundle_id, updated_by.clone(), key)
+                    .link_messaging_bundle(
+                        &env_id,
+                        endpoint_id,
+                        parse_bundle_id(link)?,
+                        updated_by.clone(),
+                        super::mint_idempotency_key(),
+                    )
                     .map_err(map_store_err_preserving_noun)?;
             }
         }
 
         if let Some(wf) = &ep.welcome_flow {
-            steps.push(json!({"section": "endpoint-welcome", "name": ep.name}));
-            if !dry_run {
-                let endpoint_id = endpoint_id.expect("apply mode resolves an endpoint id");
-                let key = super::resolve_idempotency_key(Some(derive(
-                    "endpoint-welcome",
-                    &ep.name,
-                    &super::env_apply::hash_json(&json!({
-                        "bundle_id": wf.bundle_id, "pack_id": wf.pack_id, "flow_id": wf.flow_id
-                    })),
-                )))?;
-                store
-                    .set_messaging_welcome_flow(
-                        &env_id,
-                        SetMessagingWelcomeFlowPayload {
-                            endpoint_id,
-                            bundle_id: parse_bundle_id(&wf.bundle_id)?,
-                            pack_id: PackId::new(&wf.pack_id),
-                            flow_id: wf.flow_id.clone(),
-                            updated_by: updated_by.clone(),
-                        },
-                        key,
-                    )
-                    .map_err(map_store_err_preserving_noun)?;
+            let current_equal = matched.is_some_and(|m| {
+                m.welcome_flow.as_ref().is_some_and(|cur| {
+                    cur.bundle_id.as_str() == wf.bundle_id
+                        && cur.pack_id.as_str() == wf.pack_id
+                        && cur.flow_id == wf.flow_id
+                })
+            });
+            if current_equal {
+                steps.push(json!({
+                    "section": "endpoint-welcome", "name": ep.name, "action": "skip-current"
+                }));
+            } else {
+                steps
+                    .push(json!({"section": "endpoint-welcome", "name": ep.name, "action": "set"}));
+                if !dry_run {
+                    let endpoint_id = endpoint_id.expect("apply mode resolves an endpoint id");
+                    store
+                        .set_messaging_welcome_flow(
+                            &env_id,
+                            SetMessagingWelcomeFlowPayload {
+                                endpoint_id,
+                                bundle_id: parse_bundle_id(&wf.bundle_id)?,
+                                pack_id: PackId::new(&wf.pack_id),
+                                flow_id: wf.flow_id.clone(),
+                                updated_by: updated_by.clone(),
+                            },
+                            super::mint_idempotency_key(),
+                        )
+                        .map_err(map_store_err_preserving_noun)?;
+                }
             }
         }
     }
@@ -2919,5 +3020,151 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, OpError::NotYetImplemented(m) if m.contains("--check")));
+    }
+
+    // -- convergence + metadata-diff (the durable-reconcile core) -------------
+
+    const TEST_DEPLOYMENT_ID: &str = "01JABC000000000000000000ZZ";
+
+    fn converged_env_json(digest: &str, source_uri: &str, weight_bps: u32) -> serde_json::Value {
+        serde_json::json!({
+            "schema": "greentic.environment.v1",
+            "environment_id": "prod",
+            "name": "prod",
+            "host_config": {"env_id": "prod"},
+            "packs": [],
+            "bundles": [deployment_json(&[])],
+            "revisions": [{
+                "schema": "greentic.revision.v1",
+                "revision_id": TEST_REV_ID,
+                "env_id": "prod",
+                "bundle_id": "app",
+                "deployment_id": TEST_DEPLOYMENT_ID,
+                "sequence": 1,
+                "created_at": "2026-06-09T12:00:00Z",
+                "bundle_digest": digest,
+                "bundle_source_uri": source_uri,
+                "pack_list": [],
+                "pack_list_lock_ref": "",
+                "pack_config_refs": [],
+                "config_digest": "sha256:00",
+                "signature_sidecar_ref": "rev.sig",
+                "lifecycle": "ready",
+                "staged_at": "2026-06-09T12:00:00Z",
+                "drain_seconds": 30,
+                "abort_metrics": []
+            }],
+            "traffic_splits": [{
+                "schema": "greentic.traffic-split.v1",
+                "env_id": "prod",
+                "deployment_id": TEST_DEPLOYMENT_ID,
+                "bundle_id": "app",
+                "generation": 1,
+                "entries": [{"revision_id": TEST_REV_ID, "weight_bps": weight_bps}],
+                "updated_at": "2026-06-09T12:00:00Z",
+                "updated_by": "x",
+                "idempotency_key": "k",
+                "authorization_ref": "auth.json"
+            }],
+            "messaging_endpoints": [],
+            "extensions": [],
+            "revocation": {},
+            "retention": {},
+            "health": {}
+        })
+    }
+
+    fn deployment_json(route_hosts: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "schema": "greentic.bundle-deployment.v1",
+            "deployment_id": TEST_DEPLOYMENT_ID,
+            "env_id": "prod",
+            "bundle_id": "app",
+            "customer_id": "acme",
+            "status": "active",
+            "current_revisions": [],
+            "route_binding": {"hosts": route_hosts, "path_prefixes": [],
+                "tenant_selector": {"tenant": "default", "team": "default"}},
+            "revenue_share": [{"party_id": "greentic", "basis_points": 10000}],
+            "revenue_policy_ref": "revenue.json",
+            "created_at": "2026-06-09T12:00:00Z",
+            "authorization_ref": "auth.json",
+            "config_overrides": {}
+        })
+    }
+
+    fn env_of(json: serde_json::Value) -> greentic_deploy_spec::Environment {
+        serde_json::from_value(json).expect("valid environment json")
+    }
+
+    fn dep_id() -> greentic_deploy_spec::DeploymentId {
+        parse_deployment_id(TEST_DEPLOYMENT_ID).unwrap()
+    }
+
+    #[test]
+    fn convergence_true_when_split_matches_desired() {
+        let env = env_of(converged_env_json("sha256:abc123", "oci://r/app:1", 10000));
+        assert!(deployment_converged_remote(
+            &env,
+            dep_id(),
+            &[(10000, "oci://r/app:1", "sha256:abc123")]
+        ));
+    }
+
+    #[test]
+    fn convergence_false_on_digest_or_source_uri_drift() {
+        let env = env_of(converged_env_json("sha256:abc123", "oci://r/app:1", 10000));
+        // Changed digest → a new revision is owed.
+        assert!(!deployment_converged_remote(
+            &env,
+            dep_id(),
+            &[(10000, "oci://r/app:1", "sha256:def456")]
+        ));
+        // Changed pull ref (same digest) → still not converged.
+        assert!(!deployment_converged_remote(
+            &env,
+            dep_id(),
+            &[(10000, "oci://r/app:2", "sha256:abc123")]
+        ));
+    }
+
+    #[test]
+    fn convergence_false_on_placeholder_digest() {
+        // A live revision carrying the local-serve placeholder digest is never
+        // "converged" — a remote worker cannot verify it.
+        let env = env_of(converged_env_json("sha256:00", "oci://r/app:1", 10000));
+        assert!(!deployment_converged_remote(
+            &env,
+            dep_id(),
+            &[(10000, "oci://r/app:1", "sha256:00")]
+        ));
+    }
+
+    #[test]
+    fn metadata_update_none_when_nothing_declared() {
+        let b: ManifestBundle = serde_json::from_value(serde_json::json!({
+            "bundle_id": "app", "customer_id": "acme",
+            "bundle_source_uri": "oci://r/app:1", "bundle_digest": "sha256:abc123"
+        }))
+        .unwrap();
+        let dep: greentic_deploy_spec::BundleDeployment =
+            serde_json::from_value(deployment_json(&[])).unwrap();
+        assert!(bundle_metadata_update(&b, &dep).is_none());
+    }
+
+    #[test]
+    fn metadata_update_some_on_route_drift() {
+        let b: ManifestBundle = serde_json::from_value(serde_json::json!({
+            "bundle_id": "app", "customer_id": "acme",
+            "bundle_source_uri": "oci://r/app:1", "bundle_digest": "sha256:abc123",
+            "route_binding": {"hosts": ["app.example.com"], "path_prefixes": []}
+        }))
+        .unwrap();
+        let dep: greentic_deploy_spec::BundleDeployment =
+            serde_json::from_value(deployment_json(&[])).unwrap();
+        let update = bundle_metadata_update(&b, &dep).expect("route drift produces an update");
+        assert!(update.route_binding.is_some());
+        assert!(update.status.is_none());
+        assert!(update.revenue_share.is_none());
     }
 }

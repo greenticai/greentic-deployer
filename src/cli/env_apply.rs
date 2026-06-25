@@ -2886,7 +2886,7 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
 /// Same manifest → same keys (a retry replays); changed desired state → new
 /// keys (a real mutation). Rendered as a 26-char Crockford-base32 ULID so it
 /// satisfies the `greentic-deploy-spec` `IdempotencyKey` shape.
-pub(crate) fn derive_idempotency_key(
+fn derive_idempotency_key(
     env_id: &EnvId,
     step_kind: &str,
     natural_key: &str,
@@ -2912,7 +2912,7 @@ pub(crate) fn derive_idempotency_key(
 /// SHA-256 of the canonical JSON serialization (keys sorted by serde_json).
 /// The output feeds deterministic idempotency keys, so the serialization
 /// must stay canonical across builds (no `preserve_order` feature).
-pub(crate) fn hash_json(value: &Value) -> String {
+fn hash_json(value: &Value) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.to_string().as_bytes());
     hex::encode(hasher.finalize())
