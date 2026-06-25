@@ -1457,6 +1457,82 @@ fn bundle_metadata_update(
     })
 }
 
+/// The planned steps of a remote env apply plus a count of how many represent
+/// *drift* — a change apply would make. [`Plan::change`] records a mutating step
+/// (counts as drift), [`Plan::noop`] records an already-converged step (does
+/// not). The `--check` convergence verdict is simply `drift == 0`. Mirrors the
+/// local pipeline's [`super::env_apply::ApplyAction::counts_as_drift`] without
+/// coupling to its typed steps.
+#[derive(Default)]
+struct Plan {
+    steps: Vec<Value>,
+    drift: usize,
+}
+
+impl Plan {
+    /// Record a step that changes remote state (drift).
+    fn change(&mut self, detail: Value) {
+        self.drift += 1;
+        self.steps.push(detail);
+    }
+    /// Record an already-converged step (not drift).
+    fn noop(&mut self, detail: Value) {
+        self.steps.push(detail);
+    }
+}
+
+/// Resolve the manifest host-config into an [`UpdateEnvironmentPayload`] and
+/// report whether any declared field differs from the live env (the `--check`
+/// drift signal). Parsing runs in every mode, so a malformed `listen_addr` /
+/// `public_base_url` is caught by `--check` and `--dry-run`, not only by apply.
+/// A manifest field left unset means "leave untouched" (never a diff). Mirrors
+/// the local pipeline's host-config diff ([`super::env_apply`]), except the
+/// remote `update_environment` carries `public_base_url` in the same payload.
+fn resolve_host_config_update(
+    m: &super::env_manifest::ManifestEnvironment,
+    env: &greentic_deploy_spec::Environment,
+) -> Result<(UpdateEnvironmentPayload, bool), OpError> {
+    let public_base_url = match &m.public_base_url {
+        Some(raw) => Some(super::env::parse_public_base_url(raw)?),
+        None => None,
+    };
+    let listen_addr = match &m.listen_addr {
+        Some(raw) => Some(
+            raw.parse::<std::net::SocketAddr>()
+                .map_err(|e| OpError::InvalidArgument(format!("listen_addr {raw:?}: {e}")))?,
+        ),
+        None => None,
+    };
+    let hc = &env.host_config;
+    let differs = m.name.as_ref().is_some_and(|n| *n != env.name)
+        || m.region
+            .as_ref()
+            .is_some_and(|r| hc.region.as_deref() != Some(r.as_str()))
+        || m.tenant_org_id
+            .as_ref()
+            .is_some_and(|t| hc.tenant_org_id.as_deref() != Some(t.as_str()))
+        || listen_addr.is_some_and(|la| hc.listen_addr != Some(la))
+        || public_base_url
+            .as_deref()
+            .is_some_and(|u| hc.public_base_url.as_deref() != Some(u))
+        || m.gui_enabled.is_some_and(|g| hc.gui_enabled != Some(g));
+    let payload = UpdateEnvironmentPayload {
+        name: m.name.clone(),
+        region: FieldUpdate::from_option(m.region.clone()),
+        tenant_org_id: FieldUpdate::from_option(m.tenant_org_id.clone()),
+        listen_addr: match listen_addr {
+            Some(la) => FieldUpdate::Set(la),
+            None => FieldUpdate::Keep,
+        },
+        public_base_url: match public_base_url {
+            Some(u) => FieldUpdate::Set(u),
+            None => FieldUpdate::Keep,
+        },
+        gui_enabled: FieldUpdate::from_option(m.gui_enabled),
+    };
+    Ok((payload, differs))
+}
+
 /// `gtc op env apply --answers <manifest> --store-url <url>`.
 ///
 /// The remote peer of [`super::env_apply::apply`]. The local pipeline writes
@@ -1479,6 +1555,16 @@ fn bundle_metadata_update(
 /// never prompts (secrets are rejected, not collected) and executes without the
 /// local TTY confirmation — the `--store-url` + `--answers` invocation is the
 /// explicit intent.
+///
+/// Three modes (the [`ApplyMode`] from `opts`): `Apply` mutates; `DryRun` walks
+/// the same read-only plan and reports it without mutating (always succeeds);
+/// `Check` is the CI convergence gate — it walks the plan read-only and returns
+/// [`OpError::Conflict`] when any step is drift (a change apply would make),
+/// else success. Trust-root seeding is EXCLUDED from the `Check` verdict: the
+/// control-plane store exposes no read-only trust-root probe and the env
+/// document does not carry it, so a remote check can neither confirm nor deny a
+/// seeded root (apply seeds it idempotently regardless) — same principle as the
+/// local pipeline excluding undiffable always-put rows from its verdict.
 fn remote_env_apply(
     store: &dyn EnvironmentMutations,
     flags: &OpFlags,
@@ -1495,17 +1581,10 @@ fn remote_env_apply(
     manifest.validate_shape()?;
     reject_unsupported_remote_sections(&manifest)?;
 
-    // `--check` has no remote no-op diff engine yet — refuse rather than fake a
-    // convergence verdict.
-    if opts.mode == ApplyMode::Check {
-        return Err(OpError::NotYetImplemented(
-            "`env apply --check` (convergence gate) is not supported against a remote \
-             --store-url store yet — run it against the local store, or use `--dry-run` for a \
-             non-failing preview"
-                .to_string(),
-        ));
-    }
-    let dry_run = opts.mode == ApplyMode::DryRun;
+    // `Check` and `DryRun` both walk the plan without mutating; only `Apply`
+    // writes. `Check` additionally fails when any step is drift (see the verdict
+    // at the end).
+    let read_only = opts.mode != ApplyMode::Apply;
 
     let env_id = parse_env_id(&manifest.environment.id)?;
     let updated_by = opts
@@ -1523,45 +1602,37 @@ fn remote_env_apply(
         other => map_store_err_preserving_noun(other),
     })?;
 
-    let mut steps: Vec<Value> = Vec::new();
+    let mut plan = Plan::default();
 
     // -- 1. environment host config / public base url (upsert; never clears) --
+    // Diff against the live env so `--check` reports drift only on a real change
+    // (and apply skips a redundant no-op write + audit record).
     let m = &manifest.environment;
     if m.public_base_url.is_some() || m.declares_host_config() {
-        steps.push(json!({"section": "environment", "action": "reconcile", "id": env_id.as_str()}));
-        if !dry_run {
-            let public_base_url = match &m.public_base_url {
-                Some(raw) => FieldUpdate::Set(super::env::parse_public_base_url(raw)?),
-                None => FieldUpdate::Keep,
-            };
-            let listen_addr = match &m.listen_addr {
-                Some(raw) => {
-                    FieldUpdate::Set(raw.parse::<std::net::SocketAddr>().map_err(|e| {
-                        OpError::InvalidArgument(format!("listen_addr {raw:?}: {e}"))
-                    })?)
-                }
-                None => FieldUpdate::Keep,
-            };
-            store
-                .update_environment(
-                    &env_id,
-                    UpdateEnvironmentPayload {
-                        name: m.name.clone(),
-                        region: FieldUpdate::from_option(m.region.clone()),
-                        tenant_org_id: FieldUpdate::from_option(m.tenant_org_id.clone()),
-                        listen_addr,
-                        public_base_url,
-                        gui_enabled: FieldUpdate::from_option(m.gui_enabled),
-                    },
-                )
-                .map_err(map_store_err_preserving_noun)?;
+        let (payload, differs) = resolve_host_config_update(m, &env)?;
+        if differs {
+            plan.change(
+                json!({"section": "environment", "action": "reconcile", "id": env_id.as_str()}),
+            );
+            if !read_only {
+                store
+                    .update_environment(&env_id, payload)
+                    .map_err(map_store_err_preserving_noun)?;
+            }
+        } else {
+            plan.noop(
+                json!({"section": "environment", "action": "current", "id": env_id.as_str()}),
+            );
         }
     }
 
-    // -- 2. trust root (idempotent seed-if-absent) ---------------------------
+    // -- 2. trust root (idempotent seed-if-absent; excluded from --check) -----
+    // The control-plane store exposes no read-only trust-root probe, so a remote
+    // check cannot tell seeded from absent — record it but never count it as
+    // drift (apply seeds it idempotently).
     if manifest.trust_root.is_some() {
-        steps.push(json!({"section": "trust-root", "action": "seed-if-absent"}));
-        if !dry_run {
+        plan.noop(json!({"section": "trust-root", "action": "seed-if-absent"}));
+        if !read_only {
             store
                 .seed_trust_root_if_absent(&env_id)
                 .map_err(map_store_err_preserving_noun)?;
@@ -1571,13 +1642,13 @@ fn remote_env_apply(
     // -- 3. env-pack bindings (answer-less; skip already-bound slots) ---------
     for p in &manifest.packs {
         if env.pack_for_slot(p.slot).is_some() {
-            steps.push(
+            plan.noop(
                 json!({"section": "pack", "slot": p.slot.to_string(), "action": "skip-bound"}),
             );
             continue;
         }
-        steps.push(json!({"section": "pack", "slot": p.slot.to_string(), "action": "add"}));
-        if !dry_run {
+        plan.change(json!({"section": "pack", "slot": p.slot.to_string(), "action": "add"}));
+        if !read_only {
             let payload = super::env_packs::EnvPackBindingPayload {
                 environment_id: env_id.as_str().to_string(),
                 slot: p.slot,
@@ -1634,18 +1705,18 @@ fn remote_env_apply(
                 // through a stale route would be a misleading success.
                 match bundle_metadata_update(b, d) {
                     Some(update) => {
-                        steps.push(json!({
+                        plan.change(json!({
                             "section": "bundle", "bundle_id": b.bundle_id,
                             "action": "update-metadata",
                             "deployment_id": d.deployment_id.to_string()
                         }));
-                        if !dry_run {
+                        if !read_only {
                             store
                                 .update_bundle(&env_id, update, super::mint_idempotency_key())
                                 .map_err(map_store_err_preserving_noun)?;
                         }
                     }
-                    None => steps.push(json!({
+                    None => plan.noop(json!({
                         "section": "bundle", "bundle_id": b.bundle_id, "action": "reuse",
                         "deployment_id": d.deployment_id.to_string()
                     })),
@@ -1653,8 +1724,10 @@ fn remote_env_apply(
                 Some(d.deployment_id)
             }
             None => {
-                steps.push(json!({"section": "bundle", "bundle_id": b.bundle_id, "action": "add"}));
-                if dry_run {
+                plan.change(
+                    json!({"section": "bundle", "bundle_id": b.bundle_id, "action": "add"}),
+                );
+                if read_only {
                     None
                 } else {
                     let revenue_share = super::bundles::convert_revenue_share(
@@ -1693,7 +1766,7 @@ fn remote_env_apply(
         if let Some(dep_id) = deployment_id
             && deployment_converged_remote(&env, dep_id, &revs)
         {
-            steps.push(json!({
+            plan.noop(json!({
                 "section": "revision", "bundle_id": b.bundle_id, "action": "converged"
             }));
             continue;
@@ -1701,11 +1774,11 @@ fn remote_env_apply(
 
         let mut traffic_entries: Vec<TrafficSplitEntry> = Vec::with_capacity(revs.len());
         for rev in revs {
-            steps.push(json!({
+            plan.change(json!({
                 "section": "revision", "bundle_id": b.bundle_id, "revision": rev.name,
                 "action": "stage", "weight_bps": rev.weight_bps
             }));
-            if !dry_run {
+            if !read_only {
                 let deployment_id =
                     deployment_id.expect("apply mode resolves a deployment id before staging");
                 // Mint a fresh revision id per genuine stage: a stable id would
@@ -1753,10 +1826,10 @@ fn remote_env_apply(
             }
         }
 
-        steps.push(json!({
+        plan.change(json!({
             "section": "traffic", "bundle_id": b.bundle_id, "entries": traffic_entries.len()
         }));
-        if !dry_run {
+        if !read_only {
             let deployment_id =
                 deployment_id.expect("apply mode resolves a deployment id before traffic");
             store
@@ -1788,11 +1861,11 @@ fn remote_env_apply(
             .iter()
             .any(|b| b.kind.path() == descriptor.path() && b.instance_id == e.instance_id);
         if already {
-            steps.push(json!({"section": "extension", "kind": e.kind, "action": "skip-bound"}));
+            plan.noop(json!({"section": "extension", "kind": e.kind, "action": "skip-bound"}));
             continue;
         }
-        steps.push(json!({"section": "extension", "kind": e.kind, "action": "add"}));
-        if !dry_run {
+        plan.change(json!({"section": "extension", "kind": e.kind, "action": "add"}));
+        if !read_only {
             let payload = super::extensions::ExtensionBindingPayload {
                 environment_id: env_id.as_str().to_string(),
                 kind: e.kind.clone(),
@@ -1819,12 +1892,12 @@ fn remote_env_apply(
             .find(|m| m.provider_type == ep.provider_type && m.display_name == ep.name);
         let endpoint_id: Option<MessagingEndpointId> = match matched {
             Some(m) => {
-                steps.push(json!({"section": "endpoint", "name": ep.name, "action": "reuse"}));
+                plan.noop(json!({"section": "endpoint", "name": ep.name, "action": "reuse"}));
                 Some(m.endpoint_id)
             }
             None => {
-                steps.push(json!({"section": "endpoint", "name": ep.name, "action": "add"}));
-                if dry_run {
+                plan.change(json!({"section": "endpoint", "name": ep.name, "action": "add"}));
+                if read_only {
                     None
                 } else {
                     let endpoint = store
@@ -1850,16 +1923,16 @@ fn remote_env_apply(
             let already_linked = matched
                 .is_some_and(|m| m.linked_bundles.iter().any(|x| x.as_str() == link.as_str()));
             if already_linked {
-                steps.push(json!({
+                plan.noop(json!({
                     "section": "endpoint-link", "name": ep.name, "bundle_id": link,
                     "action": "skip-linked"
                 }));
                 continue;
             }
-            steps.push(json!({
+            plan.change(json!({
                 "section": "endpoint-link", "name": ep.name, "bundle_id": link, "action": "link"
             }));
-            if !dry_run {
+            if !read_only {
                 let endpoint_id = endpoint_id.expect("apply mode resolves an endpoint id");
                 store
                     .link_messaging_bundle(
@@ -1882,13 +1955,14 @@ fn remote_env_apply(
                 })
             });
             if current_equal {
-                steps.push(json!({
+                plan.noop(json!({
                     "section": "endpoint-welcome", "name": ep.name, "action": "skip-current"
                 }));
             } else {
-                steps
-                    .push(json!({"section": "endpoint-welcome", "name": ep.name, "action": "set"}));
-                if !dry_run {
+                plan.change(
+                    json!({"section": "endpoint-welcome", "name": ep.name, "action": "set"}),
+                );
+                if !read_only {
                     let endpoint_id = endpoint_id.expect("apply mode resolves an endpoint id");
                     store
                         .set_messaging_welcome_flow(
@@ -1908,13 +1982,26 @@ fn remote_env_apply(
         }
     }
 
+    // `--check` convergence verdict: fail (non-zero) when any step is drift.
+    // Trust-root is excluded (no read-only probe — see the fn doc).
+    if opts.mode == ApplyMode::Check && plan.drift > 0 {
+        return Err(OpError::Conflict(format!(
+            "environment `{}` is not converged: {} pending change(s) over the remote store — run \
+             `gtc op env apply --answers <manifest> --store-url <url>` to reconcile (see the step \
+             list; trust-root seeding is excluded from the verdict — the control-plane store \
+             exposes no read-only probe)",
+            env_id.as_str(),
+            plan.drift
+        )));
+    }
     Ok(OpOutcome::new(
         "env",
         "apply",
         json!({
             "environment_id": env_id.as_str(),
-            "mode": if dry_run { "dry-run" } else { "apply" },
-            "steps": steps,
+            "mode": opts.mode.as_str(),
+            "pending_changes": plan.drift,
+            "steps": plan.steps,
         }),
     ))
 }
@@ -3011,12 +3098,47 @@ mod tests {
     }
 
     #[test]
-    fn remote_apply_check_mode_is_unsupported() {
-        let mock = start_mock(vec![], None);
+    fn remote_apply_check_passes_when_converged() {
+        // A manifest declaring only the env id (no host-config, bundles, or
+        // endpoints) against an existing env is already converged: ONE load,
+        // no mutations, exit 0. A second request would block `accept` and hang.
+        let load = serde_json::json!({"environment": env_json_for("prod")}).to_string();
+        let mock = start_mock(vec![(200, &load)], None);
         let store = mock_store(mock.addr, AuthMethod::None);
         let manifest = serde_json::json!({
             "schema": "greentic.env-manifest.v1",
             "environment": {"id": "prod"}
+        });
+        let (_tmp, flags) = answers_flags(manifest);
+        let outcome = remote_env_apply(
+            &store,
+            &flags,
+            ApplyOptions {
+                mode: ApplyMode::Check,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.result["mode"], "check");
+        assert_eq!(outcome.result["pending_changes"], 0);
+    }
+
+    #[test]
+    fn remote_apply_check_reports_drift_as_conflict() {
+        // A manifest declaring a bundle the live env lacks is drift: check fails
+        // (non-zero) without mutating — ONE load only.
+        let load = serde_json::json!({"environment": env_json_for("prod")}).to_string();
+        let mock = start_mock(vec![(200, &load)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let manifest = serde_json::json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "prod"},
+            "bundles": [{
+                "bundle_id": "app",
+                "bundle_source_uri": "oci://registry.example/app:1",
+                "bundle_digest": "sha256:abc123",
+                "customer_id": "acme"
+            }]
         });
         let (_tmp, flags) = answers_flags(manifest);
         let err = remote_env_apply(
@@ -3028,7 +3150,82 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(matches!(err, OpError::NotYetImplemented(m) if m.contains("--check")));
+        assert!(matches!(err, OpError::Conflict(m) if m.contains("not converged")));
+    }
+
+    #[test]
+    fn remote_apply_check_host_config_match_is_noop() {
+        // Declaring a host-config field that already equals the live value is NOT
+        // drift — the env step reconciles only on a real difference, so check
+        // passes (the pre-diff code emitted an unconditional reconcile here).
+        let load = serde_json::json!({"environment": env_json_for("prod")}).to_string();
+        let mock = start_mock(vec![(200, &load)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        // env_json_for(..) carries name "test"; declaring the same is a no-op.
+        let manifest = serde_json::json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "prod", "name": "test"}
+        });
+        let (_tmp, flags) = answers_flags(manifest);
+        let outcome = remote_env_apply(
+            &store,
+            &flags,
+            ApplyOptions {
+                mode: ApplyMode::Check,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.result["pending_changes"], 0);
+        assert!(
+            outcome.result["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["section"] == "environment" && s["action"] == "current")
+        );
+    }
+
+    // -- host-config diff (pure) ---------------------------------------------
+
+    fn manifest_env(json: serde_json::Value) -> super::super::env_manifest::ManifestEnvironment {
+        manifest_from(serde_json::json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": json
+        }))
+        .environment
+    }
+
+    #[test]
+    fn host_config_no_drift_when_declared_matches_live() {
+        let env = env_of(env_json_for("prod")); // name "test", no public_base_url
+        let (_payload, differs) = resolve_host_config_update(
+            &manifest_env(serde_json::json!({"id": "prod", "name": "test"})),
+            &env,
+        )
+        .unwrap();
+        assert!(!differs);
+    }
+
+    #[test]
+    fn host_config_drift_on_changed_field() {
+        let env = env_of(env_json_for("prod"));
+        // name differs from live "test".
+        let (_p, differs) = resolve_host_config_update(
+            &manifest_env(serde_json::json!({"id": "prod", "name": "Prod"})),
+            &env,
+        )
+        .unwrap();
+        assert!(differs);
+        // public_base_url declared where live has none.
+        let (_p, differs) = resolve_host_config_update(
+            &manifest_env(
+                serde_json::json!({"id": "prod", "public_base_url": "https://prod.example"}),
+            ),
+            &env,
+        )
+        .unwrap();
+        assert!(differs);
     }
 
     // -- convergence + metadata-diff (the durable-reconcile core) -------------

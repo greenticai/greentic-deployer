@@ -417,7 +417,7 @@ pub enum ApplyMode {
 }
 
 impl ApplyMode {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             ApplyMode::Apply => "apply",
             ApplyMode::DryRun => "dry-run",
