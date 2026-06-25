@@ -1560,11 +1560,11 @@ fn resolve_host_config_update(
 /// the same read-only plan and reports it without mutating (always succeeds);
 /// `Check` is the CI convergence gate — it walks the plan read-only and returns
 /// [`OpError::Conflict`] when any step is drift (a change apply would make),
-/// else success. Trust-root seeding is EXCLUDED from the `Check` verdict: the
-/// control-plane store exposes no read-only trust-root probe and the env
-/// document does not carry it, so a remote check can neither confirm nor deny a
-/// seeded root (apply seeds it idempotently regardless) — same principle as the
-/// local pipeline excluding undiffable always-put rows from its verdict.
+/// else success. Every declared section is diffed against live state: pack and
+/// extension bindings by `kind` + `pack_ref` (a ref/version change is drift, not
+/// a converged `skip-bound`), and trust-root via the
+/// [`EnvironmentMutations::trust_root_is_seeded`] read probe (an unseeded env is
+/// drift, not a silent green).
 fn remote_env_apply(
     store: &dyn EnvironmentMutations,
     flags: &OpFlags,
@@ -1626,28 +1626,43 @@ fn remote_env_apply(
         }
     }
 
-    // -- 2. trust root (idempotent seed-if-absent; excluded from --check) -----
-    // The control-plane store exposes no read-only trust-root probe, so a remote
-    // check cannot tell seeded from absent — record it but never count it as
-    // drift (apply seeds it idempotently).
+    // -- 2. trust root (diff via the read probe; seed when absent) -----------
+    // `trust_root_is_seeded` reads the remote trust root so an unseeded env is
+    // real drift, not a silent green. Seeding is idempotent on apply.
     if manifest.trust_root.is_some() {
-        plan.noop(json!({"section": "trust-root", "action": "seed-if-absent"}));
-        if !read_only {
-            store
-                .seed_trust_root_if_absent(&env_id)
-                .map_err(map_store_err_preserving_noun)?;
+        if store
+            .trust_root_is_seeded(&env_id)
+            .map_err(map_store_err_preserving_noun)?
+        {
+            plan.noop(json!({"section": "trust-root", "action": "seeded"}));
+        } else {
+            plan.change(json!({"section": "trust-root", "action": "seed-if-absent"}));
+            if !read_only {
+                store
+                    .seed_trust_root_if_absent(&env_id)
+                    .map_err(map_store_err_preserving_noun)?;
+            }
         }
     }
 
-    // -- 3. env-pack bindings (answer-less; skip already-bound slots) ---------
+    // -- 3. env-pack bindings (answer-less; add / update / skip) -------------
+    // Diff `kind` + `pack_ref` against the live binding (mirrors the local
+    // pipeline): a changed ref/version is drift routed through `update`, not a
+    // converged `skip-bound`. `answers_ref` is always None here (rejected up
+    // front), so it never enters the diff.
     for p in &manifest.packs {
-        if env.pack_for_slot(p.slot).is_some() {
+        let existing = env.pack_for_slot(p.slot);
+        if let Some(b) = existing
+            && b.kind.to_string() == p.kind
+            && b.pack_ref.as_str() == p.pack_ref
+        {
             plan.noop(
                 json!({"section": "pack", "slot": p.slot.to_string(), "action": "skip-bound"}),
             );
             continue;
         }
-        plan.change(json!({"section": "pack", "slot": p.slot.to_string(), "action": "add"}));
+        let action = if existing.is_some() { "update" } else { "add" };
+        plan.change(json!({"section": "pack", "slot": p.slot.to_string(), "action": action}));
         if !read_only {
             let payload = super::env_packs::EnvPackBindingPayload {
                 environment_id: env_id.as_str().to_string(),
@@ -1658,9 +1673,15 @@ fn remote_env_apply(
                 idempotency_key: None,
             };
             let binding = super::env_packs::build_binding(&payload, 0, None)?;
-            store
-                .add_pack_binding(&env_id, binding, super::mint_idempotency_key())
-                .map_err(map_store_err_preserving_noun)?;
+            if existing.is_some() {
+                store
+                    .update_pack_binding(&env_id, p.slot, binding, super::mint_idempotency_key())
+                    .map_err(map_store_err_preserving_noun)?;
+            } else {
+                store
+                    .add_pack_binding(&env_id, binding, super::mint_idempotency_key())
+                    .map_err(map_store_err_preserving_noun)?;
+            }
         }
     }
 
@@ -1851,20 +1872,27 @@ fn remote_env_apply(
         }
     }
 
-    // -- 5. extension bindings (answer-less; skip already-bound) --------------
+    // -- 5. extension bindings (answer-less; add / update / skip) ------------
+    // Keyed by (kind.path(), instance_id); diff the full `kind` (path@version)
+    // + `pack_ref` (mirrors the local pipeline) so a version/ref change under
+    // the same path is drift routed through `update`, not a converged skip.
     for e in &manifest.extensions {
         let descriptor = greentic_deploy_spec::PackDescriptor::try_new(&e.kind).map_err(|err| {
             OpError::InvalidArgument(format!("extensions[] kind `{}`: {err}", e.kind))
         })?;
-        let already = env
+        let existing = env
             .extensions
             .iter()
-            .any(|b| b.kind.path() == descriptor.path() && b.instance_id == e.instance_id);
-        if already {
+            .find(|b| b.kind.path() == descriptor.path() && b.instance_id == e.instance_id);
+        if let Some(b) = existing
+            && b.kind.to_string() == e.kind
+            && b.pack_ref.as_str() == e.pack_ref
+        {
             plan.noop(json!({"section": "extension", "kind": e.kind, "action": "skip-bound"}));
             continue;
         }
-        plan.change(json!({"section": "extension", "kind": e.kind, "action": "add"}));
+        let action = if existing.is_some() { "update" } else { "add" };
+        plan.change(json!({"section": "extension", "kind": e.kind, "action": action}));
         if !read_only {
             let payload = super::extensions::ExtensionBindingPayload {
                 environment_id: env_id.as_str().to_string(),
@@ -1875,9 +1903,16 @@ fn remote_env_apply(
                 idempotency_key: None,
             };
             let binding = super::extensions::build_binding(&payload, 0, None)?;
-            store
-                .add_extension_binding(&env_id, binding, super::mint_idempotency_key())
-                .map_err(map_store_err_preserving_noun)?;
+            if existing.is_some() {
+                let key = super::extensions::build_key(&e.kind, &e.instance_id)?;
+                store
+                    .update_extension_binding(&env_id, key, binding, super::mint_idempotency_key())
+                    .map_err(map_store_err_preserving_noun)?;
+            } else {
+                store
+                    .add_extension_binding(&env_id, binding, super::mint_idempotency_key())
+                    .map_err(map_store_err_preserving_noun)?;
+            }
         }
     }
 
@@ -1983,13 +2018,11 @@ fn remote_env_apply(
     }
 
     // `--check` convergence verdict: fail (non-zero) when any step is drift.
-    // Trust-root is excluded (no read-only probe — see the fn doc).
     if opts.mode == ApplyMode::Check && plan.drift > 0 {
         return Err(OpError::Conflict(format!(
             "environment `{}` is not converged: {} pending change(s) over the remote store — run \
              `gtc op env apply --answers <manifest> --store-url <url>` to reconcile (see the step \
-             list; trust-root seeding is excluded from the verdict — the control-plane store \
-             exposes no read-only probe)",
+             list)",
             env_id.as_str(),
             plan.drift
         )));
@@ -3226,6 +3259,120 @@ mod tests {
         )
         .unwrap();
         assert!(differs);
+    }
+
+    // -- binding + trust-root drift in --check (codex hardening) -------------
+
+    #[test]
+    fn remote_apply_check_passes_when_trust_root_seeded() {
+        // load → trust-root GET (keys present). A seeded root is converged.
+        let load = serde_json::json!({"environment": env_json_for("prod")}).to_string();
+        let tr =
+            serde_json::json!({"environment_id": "prod", "keys": [{"key_id": "k"}]}).to_string();
+        let mock = start_mock(vec![(200, &load), (200, &tr)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let manifest = serde_json::json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "prod"},
+            "trust_root": "bootstrap"
+        });
+        let (_tmp, flags) = answers_flags(manifest);
+        let outcome = remote_env_apply(
+            &store,
+            &flags,
+            ApplyOptions {
+                mode: ApplyMode::Check,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.result["pending_changes"], 0);
+    }
+
+    #[test]
+    fn remote_apply_check_reports_unseeded_trust_root_as_drift() {
+        // load → trust-root GET (no keys). An unseeded root is drift, not a
+        // silent green (the bug the read probe fixes).
+        let load = serde_json::json!({"environment": env_json_for("prod")}).to_string();
+        let tr = serde_json::json!({"environment_id": "prod", "keys": []}).to_string();
+        let mock = start_mock(vec![(200, &load), (200, &tr)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let manifest = serde_json::json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "prod"},
+            "trust_root": "bootstrap"
+        });
+        let (_tmp, flags) = answers_flags(manifest);
+        let err = remote_env_apply(
+            &store,
+            &flags,
+            ApplyOptions {
+                mode: ApplyMode::Check,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(m) if m.contains("not converged")));
+    }
+
+    #[test]
+    fn remote_apply_check_reports_pack_ref_drift() {
+        // Slot bound to a different pack_ref → drift (update), not skip-bound.
+        let mut env = env_json_for("prod");
+        env["packs"] = serde_json::json!([{
+            "slot": "deployer", "kind": "greentic.deploy.deployer@1.0.0", "pack_ref": "oldref"
+        }]);
+        let load = serde_json::json!({"environment": env}).to_string();
+        let mock = start_mock(vec![(200, &load)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let manifest = serde_json::json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "prod"},
+            "packs": [{
+                "slot": "deployer", "kind": "greentic.deploy.deployer@1.0.0", "pack_ref": "newref"
+            }]
+        });
+        let (_tmp, flags) = answers_flags(manifest);
+        let err = remote_env_apply(
+            &store,
+            &flags,
+            ApplyOptions {
+                mode: ApplyMode::Check,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(m) if m.contains("not converged")));
+    }
+
+    #[test]
+    fn remote_apply_check_reports_extension_ref_drift() {
+        // Same (path, instance) bound to a different pack_ref → drift (update).
+        let mut env = env_json_for("prod");
+        env["extensions"] = serde_json::json!([{
+            "kind": "greentic.ext.memory@1.0.0", "pack_ref": "oldref", "instance_id": "default"
+        }]);
+        let load = serde_json::json!({"environment": env}).to_string();
+        let mock = start_mock(vec![(200, &load)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let manifest = serde_json::json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "prod"},
+            "extensions": [{
+                "kind": "greentic.ext.memory@1.0.0", "pack_ref": "newref", "instance_id": "default"
+            }]
+        });
+        let (_tmp, flags) = answers_flags(manifest);
+        let err = remote_env_apply(
+            &store,
+            &flags,
+            ApplyOptions {
+                mode: ApplyMode::Check,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(m) if m.contains("not converged")));
     }
 
     // -- convergence + metadata-diff (the durable-reconcile core) -------------

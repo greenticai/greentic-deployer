@@ -803,6 +803,23 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         Ok(resp.environment)
     }
 
+    fn trust_root_is_seeded(&self, env_id: &EnvId) -> Result<bool, StoreError> {
+        // `GET /environments/{env_id}/trust-root` → `{ keys: [...] }`. A read
+        // carries no A8 audit envelope, so use the plain `send` (the mutation
+        // helper would reject the correctly-absent audit record).
+        #[derive(serde::Deserialize)]
+        struct TrustRootView {
+            keys: Vec<serde_json::Value>,
+        }
+        let resp: TrustRootView = self.send::<(), _>(
+            reqwest::Method::GET,
+            &self.env_path(env_id, "/trust-root"),
+            None,
+            None,
+        )?;
+        Ok(!resp.keys.is_empty())
+    }
+
     fn migrate_merge_bindings(
         &self,
         target_env_id: &EnvId,
