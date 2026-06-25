@@ -117,8 +117,17 @@ Key facts about the rendered topology:
 
 - **`kubectl`** with a working context for the target cluster
   (`kubectl config get-contexts`).
-- **A built deployer binary** (or the `gtc op` router that embeds the deployer
-  library). Build from source with **default features** — the `k8s-client`
+- **The `gtc` CLI with an up-to-date deployer.** The recommended path is to
+  install (or refresh) the prebuilt `nextgen-deployer` toolchain release so the
+  `gtc op …` router and its embedded deployer/operator are current — this is what
+  ships the OCI-bundle (URI-only) support, the cloudflared-in-image runtime, and
+  the loopback-admin-listener split that this guide relies on:
+  ```bash
+  gtc-dev install --release nextgen-deployer
+  # add --force to overwrite an already-installed toolchain
+  ```
+  After installing, invoke the deployer as `gtc-dev op …` (or `gtc op …`).
+  **Build from source instead?** Use **default features** — the `k8s-client`
   feature is default-on and required by `reconcile`:
   ```bash
   cargo build -p greentic-deployer --bin greentic-deployer
@@ -135,6 +144,8 @@ Key facts about the rendered topology:
   carries it).
 
 The CLI surface is `<deployer> op [GLOBAL FLAGS] <noun> <verb> [ARGS]`. The
+examples below write `greentic-deployer op …` (the source binary name); if you
+installed the `nextgen-deployer` release, `gtc-dev op …` is equivalent. The
 global flags that matter here come **before** the noun:
 
 | Flag | Meaning |
@@ -151,8 +162,8 @@ The fastest path: **2 JSON files, 2 commands** (plus one-time cluster
 bring-up). Brings up **Webchat *and* Telegram**. This is the K8s analog of the
 local `setup --answers … && start --cloudflared on` two-liner.
 
-The two files (a complete, working set lives in
-`my_demos/k8s-deploy-demo/declarative/` in the workspace):
+Save the following two files into a directory of your choice (referred to below
+as `$HERE`):
 
 **`k8s.env.json`** — the env-manifest (`greentic.env-manifest.v1`):
 
@@ -200,7 +211,7 @@ Then:
 
 ```bash
 export STORE=/tmp/gtc-k8s-demo/.greentic/environments
-export HERE=$PWD/my_demos/k8s-deploy-demo/declarative   # adjust to where the files live
+export HERE=/path/to/dir/with/the/two/json/files   # where you saved them above
 mkdir -p "$STORE"
 
 # one-time cluster
@@ -463,22 +474,3 @@ limitation with a workaround.
 | **dev-store bridge** | The mechanism that gets operator secrets into the pod via a rendered Secret + init container (the Phase-E placeholder for a real backend). |
 | **loopback-trust** | The rule gating `/chat` + `/workers/invoke`: trusted only when the peer is loopback AND no tunnel fronts the listener. |
 | **admin listener** | A loopback-only listener (main port + 1) that serves the console while the main port is tunneled. |
-
----
-
-## 12. Runnable demos (workspace, not in this repo)
-
-End-to-end runnable demos with driver scripts live under `my_demos/` in the
-greentic workspace (not version-controlled in this repo):
-
-- `my_demos/k8s-deploy-demo/declarative/` — the 2-file / 2-command declarative
-  flow above (`k8s.env.json`, `deployer-answers.json`, `RUN.md`).
-- `my_demos/k8s-deploy-demo/real-cluster/` — the same flow targeting a real
-  remote cluster, with named-env and Ingress notes.
-- `my_demos/k8s-deploy-demo/demo.sh` — a scripted driver with `real-*` verbs
-  (prereqs/up/setup/serve/chat/telegram/status/down) wrapping the whole flow.
-- `my_demos/k8s-telegram-webchat-demo/` — a self-contained interactive demo
-  (webchat `/chat` + Telegram) in local kind, OCI-pulling from ghcr.
-
-These are the source material this guide generalizes; the commands here are the
-repo-canonical reference.
