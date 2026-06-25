@@ -48,6 +48,12 @@ pub struct EndpointAddPayload {
     pub display_name: String,
     #[serde(default)]
     pub secret_refs: Vec<String>,
+    /// Optional caller-supplied per-endpoint webhook secret ref. Only valid
+    /// for telegram-class providers. Required when adding such an endpoint
+    /// against a remote `--store-url` store (which never mints secrets); on
+    /// the local store it is optional (absent → the dev-store sink auto-mints).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret_ref: Option<String>,
     /// Caller-supplied A8 §2 idempotency key. Optional on the CLI
     /// surface; when absent, the verb mints one per invocation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -153,6 +159,7 @@ impl MessagingEndpointAddArgs {
             || self.provider_id.is_some()
             || self.display_name.is_some()
             || !self.secret_ref.is_empty()
+            || self.webhook_secret_ref.is_some()
             || self.idempotency_key.is_some()
             || self.updated_by.is_some()
     }
@@ -199,6 +206,7 @@ impl MessagingEndpointAddArgs {
             provider_type: self.provider_type.unwrap(),
             display_name: self.display_name.unwrap(),
             secret_refs: self.secret_ref,
+            webhook_secret_ref: self.webhook_secret_ref,
             idempotency_key: self.idempotency_key,
             updated_by: self.updated_by.unwrap(),
         }))
@@ -495,6 +503,7 @@ pub fn add(
                     provider_type,
                     display_name,
                     secret_refs: payload.secret_refs,
+                    webhook_secret_ref: payload.webhook_secret_ref,
                     updated_by,
                 },
                 idempotency_key,
@@ -987,6 +996,7 @@ fn add_schema() -> Value {
             "provider_type",
             "display_name",
             "secret_refs (array of secret:// URIs)",
+            "webhook_secret_ref (optional; telegram-class only; required on a remote --store-url store)",
             "idempotency_key",
             "updated_by",
         ],
@@ -1075,6 +1085,7 @@ mod tests {
             provider_type: provider_type.to_string(),
             display_name: format!("{provider_type} {provider_id}"),
             secret_refs: vec![],
+            webhook_secret_ref: None,
             idempotency_key: Some(key.to_string()),
             updated_by: "tester".to_string(),
         }
@@ -1679,6 +1690,7 @@ mod tests {
             provider_type: "teams".to_string(),
             display_name: "x".to_string(),
             secret_refs: vec![],
+            webhook_secret_ref: None,
             idempotency_key: Some("k1".to_string()),
             updated_by: "tester".to_string(),
         };
@@ -1748,6 +1760,29 @@ mod tests {
             value.len() >= 32,
             "dev-store secret must be ≥32 chars, got {}",
             value.len()
+        );
+    }
+
+    #[test]
+    fn add_telegram_with_supplied_ref_stamps_it_and_skips_auto_mint() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let supplied = "secret://local/default/_/messaging-byo/webhook_secret";
+        let outcome = add(
+            &store,
+            &OpFlags::default(),
+            Some(EndpointAddPayload {
+                webhook_secret_ref: Some(supplied.to_string()),
+                ..add_payload("telegram", "legal-bot", "k1")
+            }),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&outcome);
+        let ep = load_raw_endpoint(&store, &id);
+        // The supplied ref is stamped verbatim — NOT the eid-derived URI the
+        // auto-mint path would build.
+        assert_eq!(
+            ep.webhook_secret_ref.as_ref().map(|r| r.as_str()),
+            Some(supplied)
         );
     }
 
@@ -1937,6 +1972,7 @@ mod tests {
             provider_id: Some("legal-bot".into()),
             display_name: Some("Legal Bot".into()),
             secret_ref: vec![],
+            webhook_secret_ref: None,
             idempotency_key: Some("k1".into()),
             updated_by: Some("alice".into()),
         }
@@ -2009,6 +2045,7 @@ mod tests {
             provider_id: None,
             display_name: None,
             secret_ref: vec![],
+            webhook_secret_ref: None,
             idempotency_key: None,
             updated_by: None,
         };
@@ -2225,6 +2262,7 @@ mod tests {
             provider_id: None,
             display_name: None,
             secret_ref: vec![],
+            webhook_secret_ref: None,
             idempotency_key: None,
             updated_by: None,
         };
@@ -2417,6 +2455,7 @@ mod tests {
             provider_id: Some("cli-bot".into()),
             display_name: Some("CLI Bot".into()),
             secret_ref: vec![],
+            webhook_secret_ref: None,
             idempotency_key: Some("cli-add-1".into()),
             updated_by: Some("cli".into()),
         }

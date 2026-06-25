@@ -2599,6 +2599,18 @@ fn add_endpoint_body(provider_type: &str, provider_id: &str) -> Value {
     })
 }
 
+/// Add-endpoint body carrying a caller-supplied `webhook_secret_ref` — the
+/// remote BYO-ref path for telegram-class endpoints (the server never mints).
+fn add_endpoint_body_with_webhook_ref(
+    provider_type: &str,
+    provider_id: &str,
+    webhook_secret_ref: &str,
+) -> Value {
+    let mut body = add_endpoint_body(provider_type, provider_id);
+    body["webhook_secret_ref"] = json!(webhook_secret_ref);
+    body
+}
+
 /// Add an endpoint under an explicit idempotency key (the messaging group
 /// uses the key as replay-detection domain state, so tests that add more
 /// than one endpoint must vary it) and return the server-minted id.
@@ -2667,10 +2679,12 @@ async fn messaging_add_persists_endpoint_with_server_minted_id() {
 }
 
 #[tokio::test]
-async fn messaging_add_telegram_class_is_501_and_persists_nothing() {
+async fn messaging_add_telegram_class_without_ref_is_501_and_persists_nothing() {
     let (_d, app) = app().await;
     create_local_env(&app).await;
 
+    // A telegram-class add over a remote store MUST carry a caller-supplied
+    // webhook_secret_ref; without one the server cannot mint and refuses.
     let (status, body) = send(
         app.clone(),
         Method::POST,
@@ -2684,8 +2698,8 @@ async fn messaging_add_telegram_class_is_501_and_persists_nothing() {
         body["detail"]
             .as_str()
             .unwrap_or("")
-            .contains("secrets sink"),
-        "detail must point at the missing sink: {body}"
+            .contains("webhook_secret_ref"),
+        "detail must direct the caller to supply a ref: {body}"
     );
 
     let (_, read) = send(app, Method::GET, "/environments/local", None).await;
@@ -2695,6 +2709,35 @@ async fn messaging_add_telegram_class_is_501_and_persists_nothing() {
         "the refused add must not persist"
     );
     assert_eq!(read["generation"], 1, "env CAS must not advance");
+}
+
+#[tokio::test]
+async fn messaging_add_telegram_class_with_webhook_ref_persists() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+
+    let supplied = "secret://local/default/_/messaging-byo/webhook_secret";
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/messaging",
+        Some(add_endpoint_body_with_webhook_ref(
+            "telegram", "tg-bot", supplied,
+        )),
+        &[("Idempotency-Key", IDEM_KEY)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["audit"]["target"]["provider_type"], "telegram");
+    assert_eq!(body["result"]["webhook_secret_ref"], supplied);
+    // create=1 → endpoint add=2
+    assert_eq!(body["generation"], 2);
+
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["webhook_secret_ref"], supplied,
+        "the supplied ref is stamped onto the persisted endpoint"
+    );
 }
 
 #[tokio::test]
@@ -2973,12 +3016,14 @@ async fn messaging_remove_is_idempotent_without_second_cas_advance() {
 }
 
 #[tokio::test]
-async fn messaging_rotate_secret_is_501_until_the_secrets_sink_lands() {
+async fn messaging_rotate_refless_endpoint_is_501_no_server_minting() {
     let (_d, app) = app().await;
     create_local_env(&app).await;
+    // A non-telegram endpoint carries no webhook_secret_ref, so rotate hits
+    // the sink with `existing = None`. The control-plane store never mints, so
+    // it refuses — there is no ref to echo.
     let eid = add_one_endpoint(&app, "teams", "legal-bot", "k-add").await;
 
-    // Existing endpoint, fresh key → the refusing sink answers 501.
     let (status, body) = send_custom(
         app.clone(),
         Method::POST,
@@ -3002,6 +3047,53 @@ async fn messaging_rotate_secret_is_501_until_the_secrets_sink_lands() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
     assert_eq!(body["kind"], "dependent-not-found");
+}
+
+#[tokio::test]
+async fn messaging_rotate_ref_bearing_endpoint_is_501_not_falsely_succeeded() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+
+    // Even a telegram endpoint added with a caller-supplied ref CANNOT be
+    // rotated on a remote store: the value lives operator-side, so the server
+    // cannot prove a rotation occurred and refuses rather than journal a
+    // misleading success (it never echoes the ref + bumps the generation).
+    let supplied = "secret://local/default/_/messaging-byo/webhook_secret";
+    let (status, add_body) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/messaging",
+        Some(add_endpoint_body_with_webhook_ref(
+            "telegram", "tg-bot", supplied,
+        )),
+        &[("Idempotency-Key", "k-add-tg")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "add body: {add_body}");
+    let eid = add_body["result"]["endpoint_id"].as_str().expect("eid");
+
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/rotate-secret"),
+        Some(json!({"updated_by": "op"})),
+        &[("Idempotency-Key", "k-rotate-tg")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "rotate body: {body}");
+    assert_eq!(body["kind"], "not-yet-implemented");
+
+    // The refused rotate must NOT have touched the endpoint — ref unchanged,
+    // generation still 0 (no false rotation recorded).
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["webhook_secret_ref"],
+        supplied
+    );
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["generation"], 0,
+        "a refused rotate must not bump the endpoint generation"
+    );
 }
 
 /// Regression: add a (non-telegram) endpoint with key K, then POST

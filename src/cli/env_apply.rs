@@ -1854,6 +1854,10 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                         provider_type: ep.provider_type.clone(),
                         display_name: ep.name.clone(),
                         secret_refs: ep.secret_refs.clone(),
+                        // The env-manifest doesn't carry a webhook secret ref;
+                        // a manifest-applied telegram endpoint auto-mints via the
+                        // local dev-store sink (env apply is local-only).
+                        webhook_secret_ref: None,
                         idempotency_key: Some(ikey),
                         updated_by: ctx.updated_by.clone(),
                     })),
@@ -3698,6 +3702,7 @@ mod tests {
                     provider_type: "messaging.telegram.bot".to_string(),
                     display_name: "legal-bot".to_string(),
                     secret_refs: Vec::new(),
+                    webhook_secret_ref: None,
                     idempotency_key: None,
                     updated_by: "test".to_string(),
                 }),
@@ -3733,6 +3738,7 @@ mod tests {
                 provider_type: "messaging.teams.bot".to_string(),
                 display_name: "legal-bot".to_string(),
                 secret_refs: Vec::new(),
+                webhook_secret_ref: None,
                 idempotency_key: None,
                 updated_by: "test".to_string(),
             }),

@@ -2316,6 +2316,9 @@ mod tests {
                 provider_type: "telegram".to_string(),
                 display_name: "Telegram Bot".to_string(),
                 secret_refs: Vec::new(),
+                webhook_secret_ref: Some(
+                    "secret://local/default/_/messaging-byo/webhook_secret".to_string(),
+                ),
                 updated_by: "tester".to_string(),
             },
             idem(),

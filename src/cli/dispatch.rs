@@ -201,6 +201,12 @@ pub struct MessagingEndpointAddArgs {
     /// Repeating.
     #[arg(long = "secret-ref", value_name = "URI")]
     pub secret_ref: Vec<String>,
+    /// Per-endpoint webhook secret ref (telegram-class only). Required when
+    /// adding a telegram-class endpoint against a remote `--store-url` store
+    /// (which never mints secrets — the operator provisions the value and
+    /// passes the ref); omit on the local store to auto-mint into the dev-store.
+    #[arg(long = "webhook-secret-ref", value_name = "URI")]
+    pub webhook_secret_ref: Option<String>,
     /// Idempotency key. Required for safe retries; mutations replay no-op when
     /// the same key + identity is supplied.
     #[arg(long = "idempotency-key")]
