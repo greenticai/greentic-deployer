@@ -29,6 +29,7 @@ impl SchemaVersion {
     pub const PACK_LIST_LOCK_V1: &'static str = "greentic.pack-list-lock.v1";
     pub const AUDIT_EVENT_V1: &'static str = "greentic.audit.event.v1";
     pub const BACKUP_MANIFEST_V1: &'static str = "greentic.backup-manifest.v1";
+    pub const BACKUP_ARTIFACT_V1: &'static str = "greentic.backup-artifact.v1";
     pub const MESSAGING_ENDPOINT_V1: &'static str = "greentic.messaging-endpoint.v1";
 
     pub fn new(s: impl Into<String>) -> Self {

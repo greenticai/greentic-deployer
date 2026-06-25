@@ -53,16 +53,16 @@ use greentic_deploy_spec::engine::{
 };
 use greentic_deploy_spec::{
     AddMessagingEndpointPayload, AddTrustedKeyPayload, ApplyTrafficSplitOutcome, AuditDecision,
-    AuditEvent, AuditResult, BackupManifest, BindingGenerationOutcome, BundleDeployment,
-    CapabilitySlot, ConcurrencyConflict, CreateEnvironmentPayload, DeploymentId, EnvId,
-    Environment, ExtensionBindingPayload, ExtensionKeyedPayload, HealthStatus, IdempotencyKey,
-    IdempotencyOutcome, IdempotencyRecord, MessagingBundleLinkPayload, MessagingEndpointId,
-    MigrateMergePayload, PackBindingPayload, Precondition, RemoteStoreError, RestoreOutcome,
-    RestoreRequest, RetentionPolicy, RevisionId, RevisionTransitionOutcome, RevocationConfig,
-    RollbackTrafficSplitOutcome, RollbackTrafficSplitPayload, RotateWebhookSecretPayload,
-    SchemaVersion, SecretRef, SetMessagingWelcomeFlowPayload, SetTrafficSplitPayload,
-    StageRevisionPayload, StateEtag, StateIntegrity, TrustRootAddOutcome, TrustRootRemoveOutcome,
-    TrustRootSeed, UpdateEnvironmentPayload, WarmRevisionPayload,
+    AuditEvent, AuditResult, BackupArtifact, BackupManifest, BindingGenerationOutcome,
+    BundleDeployment, CapabilitySlot, ConcurrencyConflict, CreateEnvironmentPayload, DeploymentId,
+    EnvId, Environment, ExtensionBindingPayload, ExtensionKeyedPayload, HealthStatus,
+    IdempotencyKey, IdempotencyOutcome, IdempotencyRecord, MessagingBundleLinkPayload,
+    MessagingEndpointId, MigrateMergePayload, PackBindingPayload, Precondition, RemoteStoreError,
+    RestoreOutcome, RestoreRequest, RetentionPolicy, RevisionId, RevisionTransitionOutcome,
+    RevocationConfig, RollbackTrafficSplitOutcome, RollbackTrafficSplitPayload,
+    RotateWebhookSecretPayload, SchemaVersion, SecretRef, SetMessagingWelcomeFlowPayload,
+    SetTrafficSplitPayload, StageRevisionPayload, StateEtag, StateIntegrity, TrustRootAddOutcome,
+    TrustRootRemoveOutcome, TrustRootSeed, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 use greentic_operator_trust::operator_key::{self, OperatorKey};
 use greentic_operator_trust::revenue_policy::{self, RevenuePolicyError};
@@ -3257,6 +3257,38 @@ pub(crate) async fn delete_backup<S: EnvironmentStorage>(
         Ok(response) => Ok(response),
         Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
     }
+}
+
+/// `GET /environments/{env_id}/backups/{backup_id}/export` — pull a backup
+/// OFFSITE as a portable, self-verifying [`BackupArtifact`] (A8 #5, disaster
+/// recovery). A read (no mutation, no idempotency key, no journal), gated like
+/// `list_backups`; an unknown `backup_id` is a 404. The returned artifact
+/// carries the manifest, the FULL composite snapshot (env + sidecars + audit),
+/// and the snapshot digest — the exact bytes a later import re-verifies and
+/// replays, so a backup survives total store loss.
+pub(crate) async fn export_backup<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path((env_id, backup_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<BackupArtifact>, ApiError> {
+    let env_id = parse_env_id(&env_id)?;
+    authorize_read(&state, &headers, Some(&env_id))?;
+    let backup = state
+        .storage
+        .load_backup(&env_id, &backup_id)
+        .await
+        .map_err(load_storage_error)?
+        .ok_or_else(|| {
+            ApiError(RemoteStoreError::DependentNotFound {
+                detail: format!("backup `{backup_id}` not found in env `{env_id}`"),
+            })
+        })?;
+    Ok(Json(BackupArtifact {
+        schema: SchemaVersion::BACKUP_ARTIFACT_V1.into(),
+        manifest: backup.manifest,
+        snapshot: backup.state,
+        snapshot_digest: backup.snapshot_digest,
+    }))
 }
 
 /// `POST /environments/{env_id}/restore` — restore the environment from a

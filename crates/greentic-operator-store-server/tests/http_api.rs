@@ -16,6 +16,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use greentic_deploy_spec::StateIntegrity;
 use greentic_operator_store_server::http::{router, router_with_operator_key};
 use greentic_operator_store_server::sqlite::SqliteEnvironmentStore;
 use greentic_operator_store_server::storage::EnvironmentStorage;
@@ -4151,6 +4152,77 @@ async fn backup_then_restore_reverts_content_and_advances_generation() {
 
     // create + patch + backup + restore all audited durably.
     assert_eq!(audit_log_event_ids(&store, "local").await.len(), 4);
+}
+
+#[tokio::test]
+async fn export_backup_returns_a_self_verifying_artifact() {
+    let (_d, app) = app().await;
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, backup) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+
+    let (status, artifact) = send(
+        app,
+        Method::GET,
+        &format!("/environments/local/backups/{backup_id}/export"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {artifact}");
+
+    // Self-describing, and the manifest echoes the backup we created.
+    assert_eq!(artifact["schema"], "greentic.backup-artifact.v1");
+    assert_eq!(artifact["manifest"]["backup_id"], backup_id);
+    assert_eq!(artifact["manifest"]["env_id"], "local");
+    assert_eq!(artifact["manifest"]["generation"], 1);
+
+    // The artifact verifies OFFLINE: its digest recomputes over the snapshot,
+    // and the snapshot carries the captured environment document.
+    let recomputed = StateIntegrity::sha256_of(&artifact["snapshot"])
+        .expect("hash")
+        .digest;
+    assert_eq!(
+        artifact["snapshot_digest"].as_str().unwrap(),
+        recomputed,
+        "snapshot digest must verify against the snapshot bytes"
+    );
+    assert_eq!(artifact["snapshot"]["environment"]["name"], "local");
+}
+
+#[tokio::test]
+async fn export_of_an_unknown_backup_is_404() {
+    let (_d, app) = app().await;
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(
+        app,
+        Method::GET,
+        "/environments/local/backups/01JTKW5B4W4Q5Y1CQW93F7S5VH/export",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
 }
 
 #[tokio::test]
