@@ -12,7 +12,7 @@
 
 use greentic_deploy_spec::{
     BundleId, DeploymentId, EnvId, EnvironmentHostConfig, IdempotencyKey, MessagingEndpointId,
-    PackId, RevenueShareEntry, RevisionId,
+    PackId, RevenueShareEntry, RevisionId, StageRevisionPayload, WarmRevisionPayload,
 };
 use serde_json::json;
 
@@ -172,18 +172,8 @@ fn route_remote(
                     s.archive_revision(e, r, k)
                 })
             }
-            RevisionsVerb::Stage(_) => Err(OpError::NotYetImplemented(
-                "`revisions stage` against a remote --store-url store is not supported yet \
-                 (needs server-side bundle staging / a GET-env read endpoint; \
-                 tracked as PR-3c follow-up)"
-                    .to_string(),
-            )),
-            RevisionsVerb::Warm => Err(OpError::NotYetImplemented(
-                "`revisions warm` against a remote --store-url store is not supported yet \
-                 (needs a GET-env read endpoint for the health-gate precondition; \
-                 tracked as PR-3c follow-up)"
-                    .to_string(),
-            )),
+            RevisionsVerb::Stage(args) => remote_revision_stage(store, flags, args),
+            RevisionsVerb::Warm => remote_revision_warm(store, flags),
             RevisionsVerb::List { .. } => Err(not_supported("revisions list")),
         },
 
@@ -818,6 +808,174 @@ fn remote_revision_transition(
     Ok(OpOutcome::new(
         "revisions",
         verb,
+        serde_json::to_value(super::revisions::RevisionSummary::from(&outcome.revision))
+            .expect("RevisionSummary is json-safe"),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// revisions: stage, warm
+// ---------------------------------------------------------------------------
+
+/// Remote `revisions stage`. The store only persists the revision's pinned
+/// artifact pointers — the server's `stage_revision` runs a pure in-memory
+/// transform and never touches bundle bytes — so a remote stage works from
+/// caller-supplied pointers alone. The direct `--bundle <local.gtbundle>` CLI
+/// path extracts a LOCAL artifact and cannot run against a remote store, so it
+/// is rejected with a push-to-registry hint; the pin-pointer path (reachable
+/// via `--answers <file>`) maps onto [`StageRevisionPayload`].
+///
+/// Because a remote worker has no local disk to fall back to, the pin-pointer
+/// answers MUST carry a real `bundle_source_uri` + non-placeholder
+/// `bundle_digest` (else `warm` could promote a revision no worker can
+/// materialize). Supply a stable `revision_id` + `idempotency_key` to make a
+/// lost-response retry replay the original outcome instead of double-staging.
+fn remote_revision_stage(
+    store: &dyn EnvironmentMutations,
+    flags: &OpFlags,
+    args: super::dispatch::RevisionStageArgs,
+) -> Result<OpOutcome, OpError> {
+    // `payload_from_stage_args` returns `Some` only when positional args were
+    // given, and it always requires `--bundle` — so a `Some` here is the
+    // local-artifact path, which has no meaning against a remote store.
+    if super::revisions::payload_from_stage_args(args)?.is_some() {
+        return Err(OpError::InvalidArgument(
+            "`revisions stage <env> --bundle <local.gtbundle>` cannot run against a remote \
+             --store-url store: the local artifact can't be extracted server-side. Push the \
+             bundle to a registry, then stage with `--answers <file>` carrying pinned pointers \
+             (bundle_digest, bundle_source_uri, pack_list, pack_list_lock_ref)."
+                .to_string(),
+        ));
+    }
+    let payload = resolve_payload::<super::revisions::RevisionStagePayload>(flags, None)?;
+    if payload.bundle_path.is_some() {
+        return Err(OpError::InvalidArgument(
+            "remote `revisions stage` needs pinned pointers, not a local `bundle_path`: push the \
+             bundle to a registry and supply bundle_source_uri + bundle_digest + pack_list."
+                .to_string(),
+        ));
+    }
+    let env_id = parse_env_id(&payload.environment_id)?;
+    let deployment_id = parse_deployment_id(&payload.deployment_id)?;
+
+    // A remote store keeps no local artifact bytes — a revision is only
+    // servable if a remote worker can pull and verify its bundle. The local
+    // pin-pointer defaults (`bundle_source_uri: None`, `bundle_digest:
+    // "sha256:00"`) are local-serve placeholders that would strand a remote
+    // worker (and `warm` would then promote an unservable revision), so require
+    // real pointers here.
+    let bundle_source_uri = payload
+        .bundle_source_uri
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            OpError::InvalidArgument(
+                "remote `revisions stage` requires `bundle_source_uri` (oci://… / repo://… / \
+                 store://…) so a remote worker can pull the bundle at boot"
+                    .to_string(),
+            )
+        })?;
+    if payload.bundle_digest.trim().is_empty()
+        || payload.bundle_digest == super::revisions::default_bundle_digest()
+    {
+        return Err(OpError::InvalidArgument(
+            "remote `revisions stage` requires a real `bundle_digest` — the placeholder default \
+             cannot be verified by a remote worker"
+                .to_string(),
+        ));
+    }
+
+    // Honor a caller-pinned revision id + idempotency key so a lost-response
+    // retry replays the original outcome (A8 §2) instead of staging a second
+    // revision under the same deployment. BOTH must be stable: the server
+    // fingerprints the request body (which carries the revision id), so a fresh
+    // id would change the fingerprint and defeat replay even with a stable key.
+    // Absent either, mint — a one-shot remote stage is still correct, just not
+    // retry-safe.
+    let revision_id = match payload.revision_id.as_deref() {
+        Some(raw) => parse_revision_id(raw)?,
+        None => crate::environment::mint_revision_id(),
+    };
+    let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
+
+    let pack_list = super::revisions::parse_pack_list(payload.pack_list)?;
+    let store_payload = StageRevisionPayload {
+        revision_id,
+        deployment_id,
+        bundle_digest: payload.bundle_digest,
+        bundle_source_uri: Some(bundle_source_uri),
+        pack_list,
+        pack_list_lock_ref: payload.pack_list_lock_ref,
+        // Pack-config docs are materialized only on the local `--bundle` path;
+        // a remote pin-pointer stage references none.
+        pack_config_refs: Vec::new(),
+        config_digest: payload.config_digest,
+        signature_sidecar_ref: payload.signature_sidecar_ref,
+        drain_seconds: payload.drain_seconds,
+    };
+    let revision = store
+        .stage_revision(&env_id, store_payload, idempotency_key)
+        .map_err(map_store_err_preserving_noun)?;
+    Ok(OpOutcome::new(
+        "revisions",
+        "stage",
+        serde_json::to_value(super::revisions::RevisionSummary::from(&revision))
+            .expect("RevisionSummary is json-safe"),
+    ))
+}
+
+/// Remote `revisions warm`. Reads the env to capture the current revision
+/// lifecycle (the `expected_lifecycle` precondition the server re-checks), then
+/// ships the typed warm with a Noop health gate — matching the CLI default
+/// [`super::revisions::warm`], which warms behind an always-`Ok` gate.
+/// Producers that run a real warm/ready gate stay local-only for now.
+fn remote_revision_warm(
+    store: &dyn EnvironmentMutations,
+    flags: &OpFlags,
+) -> Result<OpOutcome, OpError> {
+    let payload = resolve_payload::<super::revisions::RevisionTransitionPayload>(flags, None)?;
+    let env_id = parse_env_id(&payload.environment_id)?;
+    let revision_id = parse_revision_id(&payload.revision_id)?;
+    let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
+    // Read the current lifecycle for the warm precondition (the local path
+    // reads it inline under its flock). The server re-checks it before applying
+    // the gate result, so a racing transition is rejected, not silently warmed.
+    let env = store
+        .load_environment(&env_id)
+        .map_err(map_store_err_preserving_noun)?;
+    let current_lifecycle = env
+        .revisions
+        .iter()
+        .find(|r| r.revision_id == revision_id)
+        .map(|r| r.lifecycle)
+        .ok_or_else(|| {
+            OpError::NotFound(format!(
+                "revision `{revision_id}` not found in env `{env_id}`"
+            ))
+        })?;
+    let outcome = store
+        .warm_revision(
+            &env_id,
+            WarmRevisionPayload {
+                revision_id,
+                health_gate: Ok(()),
+                expected_lifecycle: current_lifecycle,
+            },
+            idempotency_key,
+        )
+        .map_err(map_store_err_preserving_noun)?;
+    super::revisions::emit_for_op(
+        "warm",
+        false,
+        Some(outcome.starting_lifecycle),
+        &outcome.environment,
+        &outcome.revision,
+    );
+    Ok(OpOutcome::new(
+        "revisions",
+        "warm",
         serde_json::to_value(super::revisions::RevisionSummary::from(&outcome.revision))
             .expect("RevisionSummary is json-safe"),
     ))
@@ -1615,37 +1773,220 @@ mod tests {
     // 3. Blocked-verb gating
     // -----------------------------------------------------------------------
 
+    /// A `greentic.revision.v1` JSON value for `rev_id` at `lifecycle`, used to
+    /// seed both the `GET /environments` read and the warm transition outcome.
+    fn revision_json(rev_id: &str, lifecycle: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schema": "greentic.revision.v1",
+            "revision_id": rev_id,
+            "env_id": "local",
+            "bundle_id": "fast2flow",
+            "deployment_id": rev_id,
+            "sequence": 1,
+            "created_at": "2026-06-09T12:00:00Z",
+            "bundle_digest": "sha256:00",
+            "pack_list": [],
+            "pack_list_lock_ref": "",
+            "pack_config_refs": [],
+            "config_digest": "sha256:00",
+            "signature_sidecar_ref": "rev.sig",
+            "lifecycle": lifecycle,
+            "staged_at": "2026-06-09T12:00:00Z",
+            "drain_seconds": 30,
+            "abort_metrics": []
+        })
+    }
+
+    /// Write `payload` as a JSON answers file and return flags pointing at it.
+    fn answers_flags(payload: serde_json::Value) -> (tempfile::NamedTempFile, OpFlags) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), payload.to_string()).unwrap();
+        let flags = OpFlags {
+            schema_only: false,
+            answers: Some(tmp.path().to_path_buf()),
+        };
+        (tmp, flags)
+    }
+
+    const TEST_REV_ID: &str = "01JTKW5B4W4Q5Y1CQW93F7S5VH";
+
     #[test]
-    fn revisions_stage_blocked() {
+    fn revision_stage_pin_pointer_happy_path() {
+        // The `--answers` pin-pointer path maps straight onto the store verb;
+        // the server persists the pointers and returns the staged revision.
+        let body = wrap_mutation(revision_json(TEST_REV_ID, "staged"));
+        let mock = start_mock(vec![(201, &body)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "deployment_id": TEST_REV_ID,
+            "bundle_digest": "sha256:abc",
+            "bundle_source_uri": "oci://registry.example/bundle@sha256:abc",
+            "pack_list": [],
+            "pack_list_lock_ref": "revisions/r/pack-list.lock"
+        }));
+        let args = super::super::dispatch::RevisionStageArgs {
+            env_id: None,
+            deployment: None,
+            bundle: None,
+        };
+        let outcome = remote_revision_stage(&store, &flags, args).unwrap();
+        assert_eq!(outcome.noun, "revisions");
+        assert_eq!(outcome.op, "stage");
+    }
+
+    #[test]
+    fn revision_stage_local_bundle_rejected() {
+        // The direct `--bundle <local.gtbundle>` path can't run against a
+        // remote store; it must be rejected before any HTTP call (dummy store
+        // refuses connections).
         let result = route_remote(
-            // Pass a dummy store — the verb must reject before calling it.
-            // We use a mock server that will never be contacted.
             &build_dummy_store(),
             &no_flags(),
             OpNoun::Revisions {
                 verb: RevisionsVerb::Stage(super::super::dispatch::RevisionStageArgs {
                     env_id: Some("local".to_string()),
-                    deployment: None,
-                    bundle: None,
+                    deployment: Some(TEST_REV_ID.to_string()),
+                    bundle: Some(std::path::PathBuf::from("/tmp/never-read.gtbundle")),
                 }),
             },
         );
         assert!(
-            matches!(result, Err(OpError::NotYetImplemented(m)) if m.contains("revisions stage"))
+            matches!(result, Err(OpError::InvalidArgument(ref m)) if m.contains("remote") && m.contains("--bundle")),
+            "got {result:?}"
         );
     }
 
     #[test]
-    fn revisions_warm_blocked() {
-        let result = route_remote(
-            &build_dummy_store(),
-            &no_flags(),
-            OpNoun::Revisions {
-                verb: RevisionsVerb::Warm,
-            },
-        );
+    fn revision_stage_rejects_missing_source_uri() {
+        // No `bundle_source_uri` → a remote worker can't pull the bundle;
+        // reject before any HTTP call (dummy store refuses connections).
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "deployment_id": TEST_REV_ID,
+            "bundle_digest": "sha256:abc"
+        }));
+        let args = super::super::dispatch::RevisionStageArgs {
+            env_id: None,
+            deployment: None,
+            bundle: None,
+        };
+        let result = remote_revision_stage(&build_dummy_store(), &flags, args);
         assert!(
-            matches!(result, Err(OpError::NotYetImplemented(m)) if m.contains("revisions warm"))
+            matches!(result, Err(OpError::InvalidArgument(ref m)) if m.contains("bundle_source_uri")),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn revision_stage_rejects_placeholder_digest() {
+        // Real source URI but the placeholder digest default (bundle_digest
+        // omitted → "sha256:00") → reject: a remote worker can't verify it.
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "deployment_id": TEST_REV_ID,
+            "bundle_source_uri": "oci://registry.example/bundle@sha256:abc"
+        }));
+        let args = super::super::dispatch::RevisionStageArgs {
+            env_id: None,
+            deployment: None,
+            bundle: None,
+        };
+        let result = remote_revision_stage(&build_dummy_store(), &flags, args);
+        assert!(
+            matches!(result, Err(OpError::InvalidArgument(ref m)) if m.contains("bundle_digest")),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn revision_stage_honors_stable_idempotency_key_and_revision_id() {
+        // A pinned `revision_id` + `idempotency_key` must ride the request
+        // verbatim so a lost-response retry replays the original outcome.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stable_key = "01JABC000000000000000000ZZ";
+        let seen = Arc::new(AtomicBool::new(false));
+        let seen_c = seen.clone();
+        let check: CheckFn = Arc::new(move |_req, headers, body| {
+            let body_s = String::from_utf8_lossy(body);
+            // reqwest lowercases header NAMES; lowercase both sides so the ULID
+            // value compares case-insensitively too.
+            let needle = format!("idempotency-key: {}", stable_key.to_lowercase());
+            if headers.to_lowercase().contains(&needle) && body_s.contains(TEST_REV_ID) {
+                seen_c.store(true, Ordering::SeqCst);
+            }
+        });
+        let body = wrap_mutation(revision_json(TEST_REV_ID, "staged"));
+        let mock = start_mock(vec![(201, &body)], Some(check));
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "deployment_id": TEST_REV_ID,
+            "revision_id": TEST_REV_ID,
+            "idempotency_key": stable_key,
+            "bundle_digest": "sha256:abc",
+            "bundle_source_uri": "oci://registry.example/bundle@sha256:abc"
+        }));
+        let args = super::super::dispatch::RevisionStageArgs {
+            env_id: None,
+            deployment: None,
+            bundle: None,
+        };
+        remote_revision_stage(&store, &flags, args).unwrap();
+        assert!(
+            seen.load(Ordering::SeqCst),
+            "stage must send the caller's idempotency key + revision id verbatim"
+        );
+    }
+
+    #[test]
+    fn revision_warm_happy_path() {
+        // warm reads the env (GET) to capture the precondition lifecycle, then
+        // ships the typed warm (POST). Two sequential responses.
+        let mut env = env_json();
+        env["revisions"] = serde_json::json!([revision_json(TEST_REV_ID, "staged")]);
+        let get_body = serde_json::json!({
+            "environment": env,
+            "etag": "sha256:test",
+            "generation": 1
+        })
+        .to_string();
+        let warm_body = wrap_mutation(serde_json::json!({
+            "revision": revision_json(TEST_REV_ID, "ready"),
+            "environment": env_json(),
+            "starting_lifecycle": "staged"
+        }));
+        let mock = start_mock(vec![(200, &get_body), (200, &warm_body)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "revision_id": TEST_REV_ID
+        }));
+        let outcome = remote_revision_warm(&store, &flags).unwrap();
+        assert_eq!(outcome.noun, "revisions");
+        assert_eq!(outcome.op, "warm");
+    }
+
+    #[test]
+    fn revision_warm_revision_not_found() {
+        // The env read succeeds but the revision is absent → NotFound, and the
+        // warm POST is never sent (single GET response queued).
+        let get_body = serde_json::json!({
+            "environment": env_json(),
+            "etag": "sha256:test",
+            "generation": 1
+        })
+        .to_string();
+        let mock = start_mock(vec![(200, &get_body)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "revision_id": TEST_REV_ID
+        }));
+        let result = remote_revision_warm(&store, &flags);
+        assert!(
+            matches!(result, Err(OpError::NotFound(ref m)) if m.contains("not found")),
+            "got {result:?}"
         );
     }
 

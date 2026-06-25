@@ -45,6 +45,11 @@
 //! | `seed_trust_root_if_absent`   | POST   | `/environments/{env_id}/trust-root/seed`                  |
 //! | `add_trusted_key`             | POST   | `/environments/{env_id}/trust-root/keys`                  |
 //! | `remove_trusted_key`          | DELETE | `/environments/{env_id}/trust-root/keys/{key_id}`         |
+//! | `load_environment`            | GET    | `/environments/{env_id}`                                  |
+//!
+//! `load_environment` is the one READ verb (no idempotency key, no audit
+//! envelope) — the remote dispatch uses it to evaluate client-side
+//! preconditions such as the `warm` health-gate's expected lifecycle.
 //!
 //! The backup/restore group (A8 #5, PR-4.4) is server-only — `LocalFsStore`
 //! has no implementation, so these are inherent methods on
@@ -783,6 +788,19 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             Some(&idem_key),
             Some(&patch),
         )
+    }
+
+    fn load_environment(&self, env_id: &EnvId) -> Result<Environment, StoreError> {
+        // `GET /environments/{env_id}` → `GetEnvironmentResponse`. A read
+        // carries no A8 audit envelope, so use the plain `send` — the mutation
+        // helper would reject the (correctly) absent audit record.
+        #[derive(serde::Deserialize)]
+        struct GetEnvResponse {
+            environment: Environment,
+        }
+        let resp: GetEnvResponse =
+            self.send::<(), _>(reqwest::Method::GET, &self.env_path(env_id, ""), None, None)?;
+        Ok(resp.environment)
     }
 
     fn migrate_merge_bindings(
@@ -1946,6 +1964,44 @@ mod tests {
         let (_mock, store) = happy_store(200, &body);
         let result = store.archive_revision(&env_id(), RevisionId::new(), idem());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn load_environment_happy_path() {
+        // `GET /environments/{id}` → `GetEnvironmentResponse`: a plain read,
+        // NOT a mutation envelope (no audit record on the wire).
+        let body = serde_json::json!({
+            "environment": {
+                "schema": "greentic.environment.v1",
+                "environment_id": "local",
+                "name": "test",
+                "host_config": {"env_id": "local"},
+                "packs": [],
+                "bundles": [],
+                "revisions": [],
+                "traffic_splits": [],
+                "messaging_endpoints": [],
+                "extensions": [],
+                "revocation": {},
+                "retention": {},
+                "health": {}
+            },
+            "etag": "sha256:test",
+            "generation": 3
+        })
+        .to_string();
+        let (_mock, store) = happy_store(200, &body);
+        let env = store.load_environment(&env_id()).expect("load ok");
+        assert_eq!(env.environment_id.as_str(), "local");
+        assert_eq!(env.name, "test");
+    }
+
+    #[test]
+    fn load_environment_404_returns_not_found() {
+        let err_body = serde_json::json!({"kind": "not-found", "detail": "no such env"});
+        let (_mock, store) = happy_store(404, &err_body.to_string());
+        let result = store.load_environment(&env_id());
+        assert!(matches!(result, Err(StoreError::NotFound(_))));
     }
 
     // -----------------------------------------------------------------------
