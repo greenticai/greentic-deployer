@@ -33,9 +33,9 @@ use sqlx::{
 use greentic_operator_trust::trust_root::{TRUST_ROOT_SCHEMA_V1, TrustRootDocument};
 
 use crate::storage::{
-    EnvRevision, EnvSnapshot, EnvironmentStorage, Loaded, LoadedAnswers, LoadedEnv, LoadedRuntime,
-    LoadedTrustRoot, MutationJournal, RevenuePolicyArtifact, StorageError, StoredBackup,
-    StoredIdempotencyRecord,
+    AuditEntry, AuditRetention, EnvRevision, EnvSnapshot, EnvironmentStorage, Loaded,
+    LoadedAnswers, LoadedEnv, LoadedRuntime, LoadedTrustRoot, MutationJournal,
+    RevenuePolicyArtifact, StorageError, StoredBackup, StoredIdempotencyRecord,
 };
 
 impl From<sqlx::Error> for StorageError {
@@ -944,12 +944,52 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
             pack_answers.insert(slot, data);
         }
 
+        // Audit history (PR-4.4 archival): the full append-only log, oldest
+        // first, plus the retention watermark if retention has trimmed it.
+        // Captured in the same tx so the archived audit cannot be torn from
+        // the content it accompanies.
+        let audit_rows = sqlx::query(
+            "SELECT id, event_id, recorded_at, event FROM audit_log \
+             WHERE env_id = $1 ORDER BY id",
+        )
+        .bind(env_id.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut audit_log = Vec::with_capacity(audit_rows.len());
+        for row in &audit_rows {
+            audit_log.push(AuditEntry {
+                id: row.try_get("id")?,
+                event_id: row.try_get("event_id")?,
+                recorded_at: row.try_get("recorded_at")?,
+                event: row.try_get("event")?,
+            });
+        }
+
+        let watermark_row = sqlx::query(
+            "SELECT pruned_through_id, pruned_total, policy_max_rows, last_pruned_at \
+             FROM audit_retention WHERE env_id = $1",
+        )
+        .bind(env_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let audit_retention = match watermark_row {
+            Some(row) => Some(AuditRetention {
+                pruned_through_id: row.try_get("pruned_through_id")?,
+                pruned_total: row.try_get("pruned_total")?,
+                policy_max_rows: row.try_get("policy_max_rows")?,
+                last_pruned_at: row.try_get("last_pruned_at")?,
+            }),
+            None => None,
+        };
+
         tx.commit().await?;
         Ok((
             EnvSnapshot {
                 environment,
                 runtime,
                 pack_answers,
+                audit_log,
+                audit_retention,
             },
             revision,
         ))
