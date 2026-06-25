@@ -1063,38 +1063,13 @@ impl From<CliProvider> for Provider {
     }
 }
 
-/// Cloud provider selector for `required-secrets`. Mirrors `Provider`'s
-/// deploy targets; clap validates the value so an unknown string exits non-zero.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum ProviderArg {
-    Local,
-    Aws,
-    Azure,
-    Gcp,
-    K8s,
-    Generic,
-}
-
-impl ProviderArg {
-    fn to_provider(self) -> Provider {
-        match self {
-            ProviderArg::Local => Provider::Local,
-            ProviderArg::Aws => Provider::Aws,
-            ProviderArg::Azure => Provider::Azure,
-            ProviderArg::Gcp => Provider::Gcp,
-            ProviderArg::K8s => Provider::K8s,
-            ProviderArg::Generic => Provider::Generic,
-        }
-    }
-}
-
 /// `greentic-deployer required-secrets <provider>` — print the canonical
 /// `requiredSecrets` JSON array derived from the provider's credential contract.
 #[derive(Parser, Debug)]
 struct RequiredSecretsCommand {
     /// Cloud provider: aws | azure | gcp (others print an empty array).
     #[arg(value_enum)]
-    provider: ProviderArg,
+    provider: CliProvider,
 }
 
 /// Render the canonical `requiredSecrets` JSON array for a provider. A provider
@@ -1361,7 +1336,7 @@ fn main() -> Result<()> {
         }
         TopLevelCommand::Sorx(command) => run_sorx(command),
         TopLevelCommand::RequiredSecrets(cmd) => {
-            println!("{}", render_required_secrets(cmd.provider.to_provider()));
+            println!("{}", render_required_secrets(cmd.provider.into()));
             Ok(())
         }
     }
@@ -2320,9 +2295,9 @@ mod required_secrets_cli_tests {
     }
 
     #[test]
-    fn provider_arg_maps_to_provider() {
-        assert_eq!(ProviderArg::Aws.to_provider(), Provider::Aws);
-        assert_eq!(ProviderArg::Gcp.to_provider(), Provider::Gcp);
+    fn cli_provider_maps_to_provider() {
+        assert_eq!(Provider::from(CliProvider::Aws), Provider::Aws);
+        assert_eq!(Provider::from(CliProvider::Gcp), Provider::Gcp);
     }
 }
 
