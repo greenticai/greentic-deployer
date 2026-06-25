@@ -824,7 +824,13 @@ fn remote_revision_transition(
 /// caller-supplied pointers alone. The direct `--bundle <local.gtbundle>` CLI
 /// path extracts a LOCAL artifact and cannot run against a remote store, so it
 /// is rejected with a push-to-registry hint; the pin-pointer path (reachable
-/// via `--answers <file>`) maps straight onto [`StageRevisionPayload`].
+/// via `--answers <file>`) maps onto [`StageRevisionPayload`].
+///
+/// Because a remote worker has no local disk to fall back to, the pin-pointer
+/// answers MUST carry a real `bundle_source_uri` + non-placeholder
+/// `bundle_digest` (else `warm` could promote a revision no worker can
+/// materialize). Supply a stable `revision_id` + `idempotency_key` to make a
+/// lost-response retry replay the original outcome instead of double-staging.
 fn remote_revision_stage(
     store: &dyn EnvironmentMutations,
     flags: &OpFlags,
@@ -852,6 +858,49 @@ fn remote_revision_stage(
     }
     let env_id = parse_env_id(&payload.environment_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
+
+    // A remote store keeps no local artifact bytes — a revision is only
+    // servable if a remote worker can pull and verify its bundle. The local
+    // pin-pointer defaults (`bundle_source_uri: None`, `bundle_digest:
+    // "sha256:00"`) are local-serve placeholders that would strand a remote
+    // worker (and `warm` would then promote an unservable revision), so require
+    // real pointers here.
+    let bundle_source_uri = payload
+        .bundle_source_uri
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            OpError::InvalidArgument(
+                "remote `revisions stage` requires `bundle_source_uri` (oci://… / repo://… / \
+                 store://…) so a remote worker can pull the bundle at boot"
+                    .to_string(),
+            )
+        })?;
+    if payload.bundle_digest.trim().is_empty()
+        || payload.bundle_digest == super::revisions::default_bundle_digest()
+    {
+        return Err(OpError::InvalidArgument(
+            "remote `revisions stage` requires a real `bundle_digest` — the placeholder default \
+             cannot be verified by a remote worker"
+                .to_string(),
+        ));
+    }
+
+    // Honor a caller-pinned revision id + idempotency key so a lost-response
+    // retry replays the original outcome (A8 §2) instead of staging a second
+    // revision under the same deployment. BOTH must be stable: the server
+    // fingerprints the request body (which carries the revision id), so a fresh
+    // id would change the fingerprint and defeat replay even with a stable key.
+    // Absent either, mint — a one-shot remote stage is still correct, just not
+    // retry-safe.
+    let revision_id = match payload.revision_id.as_deref() {
+        Some(raw) => parse_revision_id(raw)?,
+        None => crate::environment::mint_revision_id(),
+    };
+    let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
+
     let pack_list = payload
         .pack_list
         .into_iter()
@@ -868,10 +917,10 @@ fn remote_revision_stage(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let store_payload = StageRevisionPayload {
-        revision_id: crate::environment::mint_revision_id(),
+        revision_id,
         deployment_id,
         bundle_digest: payload.bundle_digest,
-        bundle_source_uri: payload.bundle_source_uri,
+        bundle_source_uri: Some(bundle_source_uri),
         pack_list,
         pack_list_lock_ref: payload.pack_list_lock_ref,
         // Pack-config docs are materialized only on the local `--bundle` path;
@@ -882,7 +931,7 @@ fn remote_revision_stage(
         drain_seconds: payload.drain_seconds,
     };
     let revision = store
-        .stage_revision(&env_id, store_payload, super::mint_idempotency_key())
+        .stage_revision(&env_id, store_payload, idempotency_key)
         .map_err(map_store_err_preserving_noun)?;
     Ok(OpOutcome::new(
         "revisions",
@@ -1820,6 +1869,88 @@ mod tests {
         assert!(
             matches!(result, Err(OpError::InvalidArgument(ref m)) if m.contains("remote") && m.contains("--bundle")),
             "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn revision_stage_rejects_missing_source_uri() {
+        // No `bundle_source_uri` → a remote worker can't pull the bundle;
+        // reject before any HTTP call (dummy store refuses connections).
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "deployment_id": TEST_REV_ID,
+            "bundle_digest": "sha256:abc"
+        }));
+        let args = super::super::dispatch::RevisionStageArgs {
+            env_id: None,
+            deployment: None,
+            bundle: None,
+        };
+        let result = remote_revision_stage(&build_dummy_store(), &flags, args);
+        assert!(
+            matches!(result, Err(OpError::InvalidArgument(ref m)) if m.contains("bundle_source_uri")),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn revision_stage_rejects_placeholder_digest() {
+        // Real source URI but the placeholder digest default (bundle_digest
+        // omitted → "sha256:00") → reject: a remote worker can't verify it.
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "deployment_id": TEST_REV_ID,
+            "bundle_source_uri": "oci://registry.example/bundle@sha256:abc"
+        }));
+        let args = super::super::dispatch::RevisionStageArgs {
+            env_id: None,
+            deployment: None,
+            bundle: None,
+        };
+        let result = remote_revision_stage(&build_dummy_store(), &flags, args);
+        assert!(
+            matches!(result, Err(OpError::InvalidArgument(ref m)) if m.contains("bundle_digest")),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn revision_stage_honors_stable_idempotency_key_and_revision_id() {
+        // A pinned `revision_id` + `idempotency_key` must ride the request
+        // verbatim so a lost-response retry replays the original outcome.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stable_key = "01JABC000000000000000000ZZ";
+        let seen = Arc::new(AtomicBool::new(false));
+        let seen_c = seen.clone();
+        let check: CheckFn = Arc::new(move |_req, headers, body| {
+            let body_s = String::from_utf8_lossy(body);
+            // reqwest lowercases header NAMES; lowercase both sides so the ULID
+            // value compares case-insensitively too.
+            let needle = format!("idempotency-key: {}", stable_key.to_lowercase());
+            if headers.to_lowercase().contains(&needle) && body_s.contains(TEST_REV_ID) {
+                seen_c.store(true, Ordering::SeqCst);
+            }
+        });
+        let body = wrap_mutation(revision_json(TEST_REV_ID, "staged"));
+        let mock = start_mock(vec![(201, &body)], Some(check));
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "deployment_id": TEST_REV_ID,
+            "revision_id": TEST_REV_ID,
+            "idempotency_key": stable_key,
+            "bundle_digest": "sha256:abc",
+            "bundle_source_uri": "oci://registry.example/bundle@sha256:abc"
+        }));
+        let args = super::super::dispatch::RevisionStageArgs {
+            env_id: None,
+            deployment: None,
+            bundle: None,
+        };
+        remote_revision_stage(&store, &flags, args).unwrap();
+        assert!(
+            seen.load(Ordering::SeqCst),
+            "stage must send the caller's idempotency key + revision id verbatim"
         );
     }
 

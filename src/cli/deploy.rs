@@ -334,6 +334,9 @@ pub fn deploy(
     let stage_payload = RevisionStagePayload {
         environment_id: payload.environment_id.clone(),
         deployment_id: deployment_id.clone(),
+        // Local `--bundle` stage: the store mints the id + key.
+        revision_id: None,
+        idempotency_key: None,
         bundle_path: Some(bundle_path),
         bundle_digest: super::revisions::default_bundle_digest(),
         bundle_source_uri: payload.bundle_source_uri.clone(),

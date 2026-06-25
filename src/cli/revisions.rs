@@ -50,6 +50,21 @@ const NOUN: &str = "revisions";
 pub struct RevisionStagePayload {
     pub environment_id: String,
     pub deployment_id: String,
+    /// Stable revision id for safe lost-response retries against an HTTP store
+    /// (A8 §2). When absent, one is minted per invocation — fine for a one-shot
+    /// local stage, but a bare remote retry then mints a *different* id (and
+    /// key), changing the request fingerprint so the server's replay ledger
+    /// can't dedup it. Pin it together with `idempotency_key` for retry-safe
+    /// remote staging. Honored by the remote (`--store-url`) path; the local
+    /// path always mints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_id: Option<String>,
+    /// Caller-supplied A8 §2 idempotency key. Optional for back-compat; when
+    /// absent, one is minted per invocation. Supply a stable key (with
+    /// `revision_id`) for safe lost-response retries against the HTTP store.
+    /// Honored by the remote (`--store-url`) path; the local path always mints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     /// Local `.gtbundle` to resolve. When set, the bundle is extracted under
     /// the revision dir and its embedded `.gtpack`s are pinned into
     /// `pack-list.lock` — `bundle_digest` / `pack_list` / `pack_list_lock_ref`
@@ -734,6 +749,9 @@ pub fn payload_from_stage_args(
     Ok(Some(RevisionStagePayload {
         environment_id,
         deployment_id,
+        // Direct local `--bundle` stage: the store mints the id + key.
+        revision_id: None,
+        idempotency_key: None,
         bundle_path: Some(bundle_path),
         bundle_digest: default_bundle_digest(),
         // Direct CLI staging takes a local `.gtbundle`; there is no registry
@@ -878,6 +896,8 @@ mod tests {
         RevisionStagePayload {
             environment_id: "local".to_string(),
             deployment_id: deployment_id.to_string(),
+            revision_id: None,
+            idempotency_key: None,
             bundle_path: None,
             bundle_digest: "sha256:00".to_string(),
             bundle_source_uri: None,

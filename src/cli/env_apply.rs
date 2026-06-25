@@ -2811,6 +2811,9 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
         let stage_payload = RevisionStagePayload {
             environment_id: env_id.to_string(),
             deployment_id: deployment_id.clone(),
+            // Local `--bundle` stage: the store mints the id + key.
+            revision_id: None,
+            idempotency_key: None,
             bundle_path: Some(rev.resolved_path.clone()),
             bundle_digest: super::revisions::default_bundle_digest(),
             // Pull ref the manifest declared for this revision (`oci://` /
