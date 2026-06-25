@@ -1135,6 +1135,22 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
             }
         }
 
+        // 4. Audit ledger: re-instate the snapshot's captured history. A
+        //    normal rollback into a live store is a no-op here (the captured
+        //    rows are already present), but a backup taken before retention
+        //    pruned rows reconstructs the forgotten ones, and a fresh store
+        //    gets the whole archived history back. Live rows are never deleted.
+        //    Runs BEFORE the journal so the restore's own audit event lands
+        //    last (the newest row), and any configured cap re-prunes against
+        //    the reconstructed history inside `journal_in_tx`.
+        replay_audit_in_tx(
+            &mut tx,
+            env_id,
+            &snapshot.audit_log,
+            snapshot.audit_retention.as_ref(),
+        )
+        .await?;
+
         journal_in_tx(&mut tx, journal, self.audit_max_rows_per_env).await?;
         tx.commit().await?;
         Ok(revision)
@@ -1225,6 +1241,90 @@ async fn journal_in_tx(
         .await?;
     if let Some(cap) = audit_cap {
         prune_audit_log(tx, &journal.env_id, cap).await?;
+    }
+    Ok(())
+}
+
+/// Re-instate a snapshot's captured audit history into the caller's
+/// transaction (the restore path). Audit is an append-only LEDGER, never
+/// rewound: each captured row is re-inserted preserving its original `id` and
+/// `recorded_at`, so a row that is still live is skipped (a true duplicate)
+/// and a row that retention pruned is reconstructed in place. LIVE rows are
+/// NEVER deleted — rolling back content must not erase forensic history.
+///
+/// ONE exception preserves the watermark's meaning: a row at or below the LIVE
+/// `pruned_through_id` is NOT resurrected. That id range is forensically
+/// declared "forgotten"; re-inserting into it would make the watermark lie and
+/// let the next prune double-count the row. Captured rows above the live
+/// watermark — or all rows, when there is no live watermark — are eligible.
+///
+/// `INSERT OR IGNORE` (not `ON CONFLICT(event_id)`) because re-inserting with
+/// the original `id` can collide on the `id` PRIMARY KEY as well as the
+/// `event_id` unique index, and a targeted upsert raises on a non-target
+/// conflict. Restore targets the SAME env (captured ids == live ids,
+/// append-only), so every ignored row is a true duplicate — OR IGNORE never
+/// silently drops a distinct row.
+///
+/// The retention watermark advances MONOTONICALLY: `pruned_through_id` and
+/// `pruned_total` reconcile by `max`, so a normal rollback keeps the (larger)
+/// live watermark and a fresh store copies the captured one. `max` — NOT the
+/// `+` accumulation `prune_audit_log` uses — because reconciling is not a fresh
+/// prune and must not double-count. An absent captured watermark leaves any
+/// live watermark untouched (it reflects real pruning that happened).
+async fn replay_audit_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    env_id: &EnvId,
+    audit_log: &[AuditEntry],
+    audit_retention: Option<&AuditRetention>,
+) -> Result<(), StorageError> {
+    // Skip captured rows the LIVE watermark has already declared forgotten:
+    // resurrecting a row at or below `pruned_through_id` would make the
+    // watermark lie and let the next prune double-count it. No watermark →
+    // threshold 0 → every captured row is eligible.
+    let live_pruned_through: i64 =
+        match sqlx::query("SELECT pruned_through_id FROM audit_retention WHERE env_id = $1")
+            .bind(env_id.as_str())
+            .fetch_optional(&mut **tx)
+            .await?
+        {
+            Some(row) => row.try_get("pruned_through_id")?,
+            None => 0,
+        };
+
+    for entry in audit_log {
+        if entry.id <= live_pruned_through {
+            continue;
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO audit_log (id, env_id, event_id, recorded_at, event) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(entry.id)
+        .bind(env_id.as_str())
+        .bind(&entry.event_id)
+        .bind(&entry.recorded_at)
+        .bind(&entry.event)
+        .execute(&mut **tx)
+        .await?;
+    }
+    if let Some(watermark) = audit_retention {
+        sqlx::query(
+            "INSERT INTO audit_retention \
+               (env_id, pruned_through_id, pruned_total, policy_max_rows, last_pruned_at) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT(env_id) DO UPDATE SET \
+               pruned_through_id = max(audit_retention.pruned_through_id, excluded.pruned_through_id), \
+               pruned_total = max(audit_retention.pruned_total, excluded.pruned_total), \
+               policy_max_rows = excluded.policy_max_rows, \
+               last_pruned_at = excluded.last_pruned_at",
+        )
+        .bind(env_id.as_str())
+        .bind(watermark.pruned_through_id)
+        .bind(watermark.pruned_total)
+        .bind(watermark.policy_max_rows)
+        .bind(&watermark.last_pruned_at)
+        .execute(&mut **tx)
+        .await?;
     }
     Ok(())
 }
