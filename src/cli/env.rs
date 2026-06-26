@@ -551,9 +551,24 @@ pub fn render(
     // exists, its kind path matches the resolved descriptor, and
     // `answers_ref` is `Some`.
     let (answers, answers_ref_wire) = load_render_answers(store, &env, &descriptor)?;
-    let objects = renderer
-        .render_environment(&env, answers.as_ref())
-        .map_err(|e| OpError::Conflict(e.to_string()))?;
+    // The K8s renderer's worker secrets identity (dev-store Secret vs. Vault SA
+    // + `VAULT_*` env) depends on the env's `Secrets`-slot binding, which the
+    // registry handler doesn't carry — resolve it and render through a handler
+    // that does. Other deployers ignore the secrets slot, so they keep the
+    // registry handler.
+    use crate::env_packs::render::ManifestRenderer as _;
+    let objects = if descriptor.path() == crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH
+    {
+        let secrets_backend = resolve_secrets_backend(store, &env)?;
+        crate::env_packs::k8s::K8sDeployerHandler::default()
+            .with_secrets_backend(secrets_backend)
+            .render_environment(&env, answers.as_ref())
+            .map_err(|e| OpError::Conflict(e.to_string()))?
+    } else {
+        renderer
+            .render_environment(&env, answers.as_ref())
+            .map_err(|e| OpError::Conflict(e.to_string()))?
+    };
 
     let mut result = json!({
         "environment_id": env.environment_id.as_str(),
@@ -645,7 +660,17 @@ pub fn reconcile(
     // secrets to the worker (the K8s "no runtime secrets" gap). `None` when the
     // env has no dev-store file yet — the worker's staging init is then a no-op.
     let dev_secrets = read_dev_secrets_b64(store, &env_id)?;
-    let report = reconcile_k8s_cluster(&env, answers.as_ref(), bound_token, dev_secrets)?;
+    // Resolve the env's `Secrets`-slot binding into the backend the worker
+    // resolves `secret://` refs against — dev-store (values shipped in via the
+    // Secret above) or Vault (pod identity + `VAULT_*` env, no values shipped).
+    let secrets_backend = resolve_secrets_backend(store, &env)?;
+    let report = reconcile_k8s_cluster(
+        &env,
+        answers.as_ref(),
+        bound_token,
+        dev_secrets,
+        secrets_backend,
+    )?;
 
     Ok(OpOutcome::new(
         NOUN,
@@ -677,6 +702,7 @@ fn reconcile_k8s_cluster(
     answers: Option<&Value>,
     bound_token: Option<String>,
     dev_secrets: Option<String>,
+    secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
 ) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
     use crate::env_packs::k8s::async_bridge::run_k8s_async;
     use crate::env_packs::k8s::kube_client::connect;
@@ -701,7 +727,8 @@ fn reconcile_k8s_cluster(
         let handler = K8sDeployerHandler::with_cluster_and_dev_secrets(
             Arc::new(KubeCluster::new(client)),
             dev_secrets,
-        );
+        )
+        .with_secrets_backend(secrets_backend);
         handler
             .reconcile(env, answers, manage_namespace)
             .await
@@ -716,6 +743,7 @@ fn reconcile_k8s_cluster(
     _answers: Option<&Value>,
     _bound_token: Option<String>,
     _dev_secrets: Option<String>,
+    _secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
 ) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `k8s-client` feature; \
@@ -1333,6 +1361,20 @@ pub(crate) fn load_render_answers(
     let Some(rel_path) = answers_ref else {
         return Ok((None, Value::Null));
     };
+    let answers = read_binding_answers(store, env, rel_path)?;
+    let wire = json!(rel_path.to_string_lossy());
+    Ok((Some(answers), wire))
+}
+
+/// Read + parse a binding's `answers_ref` JSON file, enforcing that it lives
+/// under the env dir (fail-closed on path escape or a missing file). Shared by
+/// [`load_render_answers`] (Deployer slot) and [`load_secrets_answers`]
+/// (Secrets slot).
+fn read_binding_answers(
+    store: &LocalFsStore,
+    env: &greentic_deploy_spec::Environment,
+    rel_path: &std::path::Path,
+) -> Result<Value, OpError> {
     let env_dir = store.env_dir(&env.environment_id)?;
     // Containment check: the answers file must live under the env dir.
     // `normalize_under_root` canonicalizes, so it ALSO fails when the file
@@ -1361,14 +1403,110 @@ pub(crate) fn load_render_answers(
         path: abs_path.clone(),
         source: e,
     })?;
-    let answers: Value = serde_json::from_str(&raw).map_err(|e| {
+    serde_json::from_str(&raw).map_err(|e| {
         OpError::Conflict(format!(
             "answers_ref `{}` contains invalid JSON: {e}",
             rel_path.display()
         ))
-    })?;
-    let wire = json!(rel_path.to_string_lossy());
-    Ok((Some(answers), wire))
+    })
+}
+
+/// Resolve the env's `Secrets`-slot binding answers (the non-secret connection
+/// config for a real backend), if the binding records an `answers_ref`. Mirrors
+/// [`load_render_answers`] but for the `Secrets` slot.
+fn load_secrets_answers(
+    store: &LocalFsStore,
+    env: &greentic_deploy_spec::Environment,
+) -> Result<Option<Value>, OpError> {
+    let Some(binding) = env.pack_for_slot(CapabilitySlot::Secrets) else {
+        return Ok(None);
+    };
+    let Some(rel_path) = binding.answers_ref.as_ref() else {
+        return Ok(None);
+    };
+    Ok(Some(read_binding_answers(store, env, rel_path)?))
+}
+
+/// Resolve the env's `Secrets`-slot binding into the runtime secrets backend the
+/// K8s manifests render. No binding or the dev-store kind → `DevStore`; the
+/// Vault kind → a Vault backend whose non-secret connection config comes from
+/// the binding's answers (`addr` + `role` required; mounts / prefix / transit /
+/// namespace default to the provider's). An unknown secrets kind fails closed.
+pub(crate) fn resolve_secrets_backend(
+    store: &LocalFsStore,
+    env: &greentic_deploy_spec::Environment,
+) -> Result<crate::env_packs::k8s::manifests::SecretsBackend, OpError> {
+    use crate::env_packs::k8s::manifests::SecretsBackend;
+    let Some(binding) = env.pack_for_slot(CapabilitySlot::Secrets) else {
+        return Ok(SecretsBackend::DevStore);
+    };
+    let path = binding.kind.path();
+    if path == crate::defaults::DEV_STORE_SECRETS_PATH {
+        return Ok(SecretsBackend::DevStore);
+    }
+    if path != crate::defaults::VAULT_SECRETS_PATH {
+        return Err(OpError::Conflict(format!(
+            "unknown secrets backend kind `{path}`; expected `{}` or `{}`",
+            crate::defaults::DEV_STORE_SECRETS_PATH,
+            crate::defaults::VAULT_SECRETS_PATH
+        )));
+    }
+    secrets_backend_from_vault_answers(load_secrets_answers(store, env)?.as_ref())
+}
+
+/// Pure mapping of a Vault `Secrets`-binding's answers to a [`VaultBackend`]:
+/// `addr` + `role` are required; the rest default to the provider's. Factored
+/// out of [`resolve_secrets_backend`] so the field mapping + fail-closed
+/// validation is unit-tested without a store.
+fn secrets_backend_from_vault_answers(
+    answers: Option<&Value>,
+) -> Result<crate::env_packs::k8s::manifests::SecretsBackend, OpError> {
+    use crate::env_packs::k8s::manifests::{
+        SecretsBackend, VAULT_DEFAULT_AUTH_MOUNT, VAULT_DEFAULT_KV_MOUNT, VAULT_DEFAULT_KV_PREFIX,
+        VAULT_DEFAULT_TRANSIT_KEY, VAULT_DEFAULT_TRANSIT_MOUNT, VaultBackend,
+    };
+    let empty = serde_json::Map::new();
+    let obj = match answers {
+        Some(v) => v.as_object().ok_or_else(|| {
+            OpError::Conflict("vault secrets binding answers must be a JSON object".to_string())
+        })?,
+        None => &empty,
+    };
+    let required = |key: &str| -> Result<String, OpError> {
+        obj.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                OpError::Conflict(format!(
+                    "vault secrets backend requires a non-empty `{key}` answer"
+                ))
+            })
+    };
+    let optional = |key: &str, default: &str| -> String {
+        obj.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| default.to_string())
+    };
+    Ok(SecretsBackend::Vault(VaultBackend {
+        addr: required("addr")?,
+        k8s_role: required("role")?,
+        kv_mount: optional("kv_mount", VAULT_DEFAULT_KV_MOUNT),
+        kv_prefix: optional("kv_prefix", VAULT_DEFAULT_KV_PREFIX),
+        auth_mount: optional("auth_mount", VAULT_DEFAULT_AUTH_MOUNT),
+        transit_mount: optional("transit_mount", VAULT_DEFAULT_TRANSIT_MOUNT),
+        transit_key: optional("transit_key", VAULT_DEFAULT_TRANSIT_KEY),
+        namespace: obj
+            .get("namespace")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    }))
 }
 
 /// Resolve the `--kind` argument for `op env render` to a full
@@ -4286,5 +4424,132 @@ mod tests {
             Some("fake-rendered"),
             "the custom renderer's objects must come back"
         );
+    }
+
+    // ---- secrets backend resolution (Phase E.3) ----------------------------
+
+    use crate::cli::tests_common::make_binding;
+    use crate::env_packs::k8s::manifests::{SecretsBackend, VaultBackend};
+
+    #[test]
+    fn resolve_secrets_backend_defaults_to_dev_store() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        // No Secrets binding → dev-store (back-compat with sandbox envs).
+        let env = make_env("local");
+        assert!(matches!(
+            resolve_secrets_backend(&store, &env).unwrap(),
+            SecretsBackend::DevStore
+        ));
+        // An explicit dev-store binding → dev-store.
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            crate::defaults::LOCAL_SECRETS_PACK,
+        ));
+        assert!(matches!(
+            resolve_secrets_backend(&store, &env).unwrap(),
+            SecretsBackend::DevStore
+        ));
+    }
+
+    #[test]
+    fn resolve_secrets_backend_rejects_unknown_kind() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            "greentic.secrets.bogus@1.0.0",
+        ));
+        let OpError::Conflict(msg) = resolve_secrets_backend(&store, &env).unwrap_err() else {
+            panic!("expected Conflict");
+        };
+        assert!(msg.contains("unknown secrets backend kind"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_secrets_backend_vault_without_answers_fails_closed() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        // Vault binding with no `answers_ref` → the required addr is missing.
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            crate::defaults::VAULT_SECRETS_PACK,
+        ));
+        let OpError::Conflict(msg) = resolve_secrets_backend(&store, &env).unwrap_err() else {
+            panic!("expected Conflict");
+        };
+        assert!(msg.contains("requires a non-empty `addr`"), "got: {msg}");
+    }
+
+    #[test]
+    fn vault_answers_map_to_backend_with_provider_defaults() {
+        // addr is trimmed; the rest fall back to the provider defaults.
+        let answers = json!({"addr": " http://vault.vault.svc:8200 ", "role": "worker"});
+        let SecretsBackend::Vault(b) = secrets_backend_from_vault_answers(Some(&answers)).unwrap()
+        else {
+            panic!("expected Vault");
+        };
+        assert_eq!(
+            b,
+            VaultBackend {
+                addr: "http://vault.vault.svc:8200".to_string(),
+                k8s_role: "worker".to_string(),
+                kv_mount: "secret".to_string(),
+                kv_prefix: "greentic".to_string(),
+                auth_mount: "kubernetes".to_string(),
+                transit_mount: "transit".to_string(),
+                transit_key: "greentic".to_string(),
+                namespace: None,
+            }
+        );
+    }
+
+    #[test]
+    fn vault_answers_override_defaults_and_namespace() {
+        let answers = json!({
+            "addr": "https://vault.example:8200",
+            "role": "worker",
+            "kv_mount": "kv",
+            "kv_prefix": "tenant-a",
+            "auth_mount": "k8s-eu",
+            "transit_mount": "tr",
+            "transit_key": "rk",
+            "namespace": "admin/team",
+        });
+        let SecretsBackend::Vault(b) = secrets_backend_from_vault_answers(Some(&answers)).unwrap()
+        else {
+            panic!("expected Vault");
+        };
+        assert_eq!(b.kv_mount, "kv");
+        assert_eq!(b.kv_prefix, "tenant-a");
+        assert_eq!(b.auth_mount, "k8s-eu");
+        assert_eq!(b.transit_mount, "tr");
+        assert_eq!(b.transit_key, "rk");
+        assert_eq!(b.namespace.as_deref(), Some("admin/team"));
+    }
+
+    #[test]
+    fn vault_answers_missing_role_fails_closed() {
+        let answers = json!({"addr": "http://vault:8200"});
+        let OpError::Conflict(msg) =
+            secrets_backend_from_vault_answers(Some(&answers)).unwrap_err()
+        else {
+            panic!("expected Conflict");
+        };
+        assert!(msg.contains("`role`"), "got: {msg}");
+    }
+
+    #[test]
+    fn vault_answers_non_object_rejected() {
+        let answers = json!("not an object");
+        let OpError::Conflict(msg) =
+            secrets_backend_from_vault_answers(Some(&answers)).unwrap_err()
+        else {
+            panic!("expected Conflict");
+        };
+        assert!(msg.contains("must be a JSON object"), "got: {msg}");
     }
 }

@@ -106,6 +106,12 @@ pub struct K8sDeployerHandler {
     /// it into the rendered dev-store Secret. `None` keeps the rendering pure
     /// (the preview path and the per-revision verbs render no secret material).
     dev_secrets_data: Option<String>,
+    /// Which secrets backend the worker resolves `secret://` refs against, and
+    /// (for Vault) the non-secret connection config rendered into the pod. The
+    /// CLI resolves it from the env's `Secrets`-slot binding and injects it via
+    /// [`Self::with_secrets_backend`]; defaults to
+    /// [`SecretsBackend::DevStore`](manifests::SecretsBackend::DevStore).
+    secrets_backend: manifests::SecretsBackend,
 }
 
 impl Default for K8sDeployerHandler {
@@ -114,6 +120,7 @@ impl Default for K8sDeployerHandler {
             creds: K8sDeployerCredentials::default(),
             cluster: Arc::new(UnconfiguredCluster),
             dev_secrets_data: None,
+            secrets_backend: manifests::SecretsBackend::DevStore,
         }
     }
 }
@@ -136,6 +143,7 @@ impl K8sDeployerHandler {
             creds: K8sDeployerCredentials::default(),
             cluster,
             dev_secrets_data: None,
+            secrets_backend: manifests::SecretsBackend::DevStore,
         }
     }
 
@@ -151,7 +159,18 @@ impl K8sDeployerHandler {
             creds: K8sDeployerCredentials::default(),
             cluster,
             dev_secrets_data,
+            secrets_backend: manifests::SecretsBackend::DevStore,
         }
+    }
+
+    /// Overlay the env's resolved secrets backend (the CLI derives it from the
+    /// env's `Secrets`-slot binding). Builder-style so it composes with the
+    /// cluster / dev-store constructors; the [`ManifestRenderer`] impl reads it
+    /// to render the worker's secrets identity (dev-store Secret vs. Vault SA +
+    /// `VAULT_*` env).
+    pub fn with_secrets_backend(mut self, secrets_backend: manifests::SecretsBackend) -> Self {
+        self.secrets_backend = secrets_backend;
+        self
     }
 }
 
