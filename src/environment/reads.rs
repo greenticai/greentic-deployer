@@ -34,9 +34,9 @@ pub trait EnvironmentReads: Send + Sync {
     fn env_exists(&self, env_id: &EnvId) -> Result<bool, StoreError>;
     /// Load the environment document.
     fn load_env(&self, env_id: &EnvId) -> Result<Environment, StoreError>;
-    /// Load the runtime host-config sidecar, if present. The HTTP backend has
-    /// no runtime `GET` endpoint, so it returns `Ok(None)` — remote `env
-    /// show` therefore reports `runtime: null`.
+    /// Load the runtime host-config sidecar, or `None` when none has been
+    /// written. Both backends read it (the HTTP store via `GET
+    /// /environments/{env_id}/runtime`), so `None` means genuinely absent.
     fn read_runtime(&self, env_id: &EnvId) -> Result<Option<EnvironmentRuntime>, StoreError>;
 }
 

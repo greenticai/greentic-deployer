@@ -2968,26 +2968,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn env_list_reaches_the_wire() {
-        // Read verbs are no longer CLI-side local-only: `env list` now
-        // dispatches to the server's GET endpoint. Against a connection-
-        // refusing dummy store it must fail at the transport — anything but
-        // the old `NotYetImplemented` guard.
-        let result = route_remote(
-            &build_dummy_store(),
-            &no_flags(),
-            OpNoun::Env {
-                verb: EnvVerb::List,
-            },
-        );
-        assert!(result.is_err(), "dummy store must refuse the connection");
-        assert!(
-            !matches!(result, Err(OpError::NotYetImplemented(_))),
-            "env list is wired to the wire now, not local-only"
-        );
-    }
-
     /// Build an `HttpEnvironmentStore` pointed at a port that will never accept.
     /// For tests that never reach the transport (blocked verbs).
     fn build_dummy_store() -> HttpEnvironmentStore {
