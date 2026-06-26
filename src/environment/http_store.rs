@@ -514,11 +514,21 @@ impl EnvironmentReads for HttpEnvironmentStore {
         EnvironmentMutations::load_environment(self, env_id)
     }
 
-    /// The runtime host-config sidecar is not exposed over HTTP (the server
-    /// stores it but has no `GET` for it), so remote `env show` reports
-    /// `runtime: null`. Tracked as a read-verbs follow-up.
-    fn read_runtime(&self, _env_id: &EnvId) -> Result<Option<EnvironmentRuntime>, StoreError> {
-        Ok(None)
+    /// `GET /environments/{env_id}/runtime` → the runtime host-config sidecar
+    /// (`null` when none has been written) so remote `env show` reports the
+    /// real runtime instead of conflating "absent" with "not exposed".
+    fn read_runtime(&self, env_id: &EnvId) -> Result<Option<EnvironmentRuntime>, StoreError> {
+        #[derive(Deserialize)]
+        struct GetRuntimeResponse {
+            runtime: Option<EnvironmentRuntime>,
+        }
+        let response: GetRuntimeResponse = self.send::<(), _>(
+            reqwest::Method::GET,
+            &self.env_path(env_id, "/runtime"),
+            None,
+            None,
+        )?;
+        Ok(response.runtime)
     }
 }
 

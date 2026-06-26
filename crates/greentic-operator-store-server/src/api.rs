@@ -55,15 +55,15 @@ use greentic_deploy_spec::{
     AddMessagingEndpointPayload, AddTrustedKeyPayload, ApplyTrafficSplitOutcome, AuditDecision,
     AuditEvent, AuditResult, BackupArtifact, BackupManifest, BindingGenerationOutcome,
     BundleDeployment, CapabilitySlot, ConcurrencyConflict, CreateEnvironmentPayload, DeploymentId,
-    EnvId, Environment, ExtensionBindingPayload, ExtensionKeyedPayload, HealthStatus,
-    IdempotencyKey, IdempotencyOutcome, IdempotencyRecord, ImportOutcome, ImportRequest,
-    MessagingBundleLinkPayload, MessagingEndpointId, MigrateMergePayload, PackBindingPayload,
-    Precondition, RemoteStoreError, RestoreOutcome, RestoreRequest, RetentionPolicy, RevisionId,
-    RevisionTransitionOutcome, RevocationConfig, RollbackTrafficSplitOutcome,
-    RollbackTrafficSplitPayload, RotateWebhookSecretPayload, SchemaVersion, SecretRef,
-    SetMessagingWelcomeFlowPayload, SetTrafficSplitPayload, StageRevisionPayload, StateEtag,
-    StateIntegrity, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
-    UpdateEnvironmentPayload, WarmRevisionPayload,
+    EnvId, Environment, EnvironmentRuntime, ExtensionBindingPayload, ExtensionKeyedPayload,
+    HealthStatus, IdempotencyKey, IdempotencyOutcome, IdempotencyRecord, ImportOutcome,
+    ImportRequest, MessagingBundleLinkPayload, MessagingEndpointId, MigrateMergePayload,
+    PackBindingPayload, Precondition, RemoteStoreError, RestoreOutcome, RestoreRequest,
+    RetentionPolicy, RevisionId, RevisionTransitionOutcome, RevocationConfig,
+    RollbackTrafficSplitOutcome, RollbackTrafficSplitPayload, RotateWebhookSecretPayload,
+    SchemaVersion, SecretRef, SetMessagingWelcomeFlowPayload, SetTrafficSplitPayload,
+    StageRevisionPayload, StateEtag, StateIntegrity, TrustRootAddOutcome, TrustRootRemoveOutcome,
+    TrustRootSeed, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 use greentic_operator_trust::operator_key::{self, OperatorKey};
 use greentic_operator_trust::revenue_policy::{self, RevenuePolicyError};
@@ -3051,6 +3051,35 @@ pub struct GetEnvironmentResponse {
     pub environment: Environment,
     pub etag: StateEtag,
     pub generation: u64,
+}
+
+/// `GET /environments/{env_id}/runtime` — the runtime host-config sidecar, or
+/// `null` when none has been written. The deployer's `env show` over
+/// `--store-url` reads this so it can distinguish "no runtime" from "runtime
+/// not exposed over HTTP" (a missing ENV is still a 404).
+pub(crate) async fn get_runtime<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<GetRuntimeResponse>, ApiError> {
+    let env_id = parse_env_id(&env_id)?;
+    authorize_read(&state, &headers, Some(&env_id))?;
+    if !state.storage.exists(&env_id).await? {
+        return Err(ApiError(RemoteStoreError::NotFound));
+    }
+    let runtime = state
+        .storage
+        .load_runtime(&env_id)
+        .await
+        .map_err(load_storage_error)?
+        .map(|loaded| loaded.value);
+    Ok(Json(GetRuntimeResponse { runtime }))
+}
+
+/// `GET /environments/{env_id}/runtime` response body.
+#[derive(Debug, Serialize)]
+pub struct GetRuntimeResponse {
+    pub runtime: Option<EnvironmentRuntime>,
 }
 
 /// `GET /environments/{env_id}/trust-root` — list the env's trusted keys.
