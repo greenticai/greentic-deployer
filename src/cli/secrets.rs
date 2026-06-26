@@ -301,10 +301,7 @@ fn vault_seed_put(
     store_uri: &str,
     value: &str,
 ) -> Result<String, OpError> {
-    use crate::env_packs::k8s::manifests::{
-        SecretsBackend, VAULT_DEFAULT_KV_MOUNT, VAULT_DEFAULT_KV_PREFIX, VAULT_DEFAULT_TRANSIT_KEY,
-        VAULT_DEFAULT_TRANSIT_MOUNT,
-    };
+    use crate::env_packs::k8s::manifests::SecretsBackend;
     use greentic_secrets_lib::core::{CoreBuilder, rt};
 
     // A Vault-backed env is single-tenant at the runtime (greentic-start scopes
@@ -331,6 +328,11 @@ fn vault_seed_put(
     };
 
     // Admin credential + reachable address come from the operator's environment.
+    // The address is intentionally NOT matched against the binding's `addr`: the
+    // binding holds the in-cluster service DNS the worker pod dials, which the
+    // operator host generally cannot reach — it seeds via a port-forward or
+    // ingress. The seeded address is returned in the outcome for visibility, and
+    // a wrong target surfaces loudly as a missing-secret read at runtime.
     if std::env::var("VAULT_TOKEN")
         .map(|t| t.trim().is_empty())
         .unwrap_or(true)
@@ -352,47 +354,16 @@ fn vault_seed_put(
         }
     };
 
-    // The seed must land where the worker reads. `build_backend()` takes the
-    // mounts/prefix/transit from ambient env (or provider defaults); since this
-    // crate cannot set them, fail closed when the binding overrides a default the
-    // ambient env does not match.
-    let mount_checks = [
-        (
-            "VAULT_KV_MOUNT",
-            vault.kv_mount.as_str(),
-            VAULT_DEFAULT_KV_MOUNT,
-        ),
-        (
-            "VAULT_KV_PREFIX",
-            vault.kv_prefix.as_str(),
-            VAULT_DEFAULT_KV_PREFIX,
-        ),
-        (
-            "VAULT_TRANSIT_MOUNT",
-            vault.transit_mount.as_str(),
-            VAULT_DEFAULT_TRANSIT_MOUNT,
-        ),
-        (
-            "VAULT_TRANSIT_KEY",
-            vault.transit_key.as_str(),
-            VAULT_DEFAULT_TRANSIT_KEY,
-        ),
-    ];
-    for (var, binding_value, default) in mount_checks {
-        let ambient = std::env::var(var).ok();
-        let effective = ambient
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(default);
-        if effective != binding_value {
-            return Err(OpError::InvalidArgument(format!(
-                "the env's Vault binding sets {var}=`{binding_value}` but the seed would use \
-                 `{effective}`; export {var}=`{binding_value}` so the seeded path matches what \
-                 the worker reads"
-            )));
-        }
-    }
+    // The seed must land where the worker reads: `build_backend()` takes the
+    // mounts/prefix/transit/namespace from ambient env (or provider defaults), and
+    // this crate cannot set them, so fail closed when the operator's ambient env
+    // would not resolve to the binding's path-determining values.
+    vault_seed_path_consistency(&vault, |var| {
+        std::env::var(var).ok().and_then(|v| {
+            let trimmed = v.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+    })?;
 
     // Construct the embedded core over the env-driven Vault backend and write the
     // value verbatim (the broker envelope-encrypts). Driven through the secrets
@@ -414,6 +385,68 @@ fn vault_seed_put(
     })?;
 
     Ok(addr)
+}
+
+/// Fail closed when the operator's ambient Vault environment would not resolve
+/// to the binding's path-determining values, so a seed cannot silently land
+/// somewhere the worker will never read. `ambient(var)` returns the trimmed,
+/// non-empty value of a `VAULT_*` variable, else `None`.
+///
+/// Each tuple is `(env var, the binding's value, the provider default applied
+/// when the var is unset)`. The KV mount/prefix and transit mount/key choose the
+/// record location and envelope; the Enterprise **namespace** prefixes *every*
+/// path, so an absent binding namespace (default `""`) requires the ambient var
+/// to be absent too — a stray `VAULT_NAMESPACE` would otherwise seed a different
+/// namespace than the (namespace-less) worker reads. The k8s auth mount is
+/// deliberately excluded: it governs login, not where the record lands, and is
+/// unused here because seeding authenticates with a static `VAULT_TOKEN`.
+fn vault_seed_path_consistency(
+    vault: &crate::env_packs::k8s::manifests::VaultBackend,
+    ambient: impl Fn(&str) -> Option<String>,
+) -> Result<(), OpError> {
+    use crate::env_packs::k8s::manifests::{
+        VAULT_DEFAULT_KV_MOUNT, VAULT_DEFAULT_KV_PREFIX, VAULT_DEFAULT_TRANSIT_KEY,
+        VAULT_DEFAULT_TRANSIT_MOUNT,
+    };
+    let checks = [
+        (
+            "VAULT_KV_MOUNT",
+            vault.kv_mount.as_str(),
+            VAULT_DEFAULT_KV_MOUNT,
+        ),
+        (
+            "VAULT_KV_PREFIX",
+            vault.kv_prefix.as_str(),
+            VAULT_DEFAULT_KV_PREFIX,
+        ),
+        (
+            "VAULT_TRANSIT_MOUNT",
+            vault.transit_mount.as_str(),
+            VAULT_DEFAULT_TRANSIT_MOUNT,
+        ),
+        (
+            "VAULT_TRANSIT_KEY",
+            vault.transit_key.as_str(),
+            VAULT_DEFAULT_TRANSIT_KEY,
+        ),
+        (
+            "VAULT_NAMESPACE",
+            vault.namespace.as_deref().unwrap_or(""),
+            "",
+        ),
+    ];
+    for (var, binding_value, default) in checks {
+        let ambient_value = ambient(var);
+        let effective = ambient_value.as_deref().unwrap_or(default);
+        if effective != binding_value {
+            return Err(OpError::InvalidArgument(format!(
+                "the env's Vault binding requires {var}=`{binding_value}` but the seed would use \
+                 `{effective}`; export {var}=`{binding_value}` so the seeded record matches what \
+                 the worker reads"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Where the env's dev store lives, mirroring the runtime reader's chain
@@ -986,6 +1019,79 @@ mod tests {
             OpError::InvalidArgument(m) => assert!(m.contains("tenant-owned"), "msg: {m}"),
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
+    }
+
+    fn vault_backend_fixture(
+        namespace: Option<&str>,
+    ) -> crate::env_packs::k8s::manifests::VaultBackend {
+        use crate::env_packs::k8s::manifests::{
+            VAULT_DEFAULT_AUTH_MOUNT, VAULT_DEFAULT_KV_MOUNT, VAULT_DEFAULT_KV_PREFIX,
+            VAULT_DEFAULT_TRANSIT_KEY, VAULT_DEFAULT_TRANSIT_MOUNT, VaultBackend,
+        };
+        VaultBackend {
+            addr: "http://vault.example:8200".to_string(),
+            k8s_role: "gtc-worker".to_string(),
+            kv_mount: VAULT_DEFAULT_KV_MOUNT.to_string(),
+            kv_prefix: VAULT_DEFAULT_KV_PREFIX.to_string(),
+            auth_mount: VAULT_DEFAULT_AUTH_MOUNT.to_string(),
+            transit_mount: VAULT_DEFAULT_TRANSIT_MOUNT.to_string(),
+            transit_key: VAULT_DEFAULT_TRANSIT_KEY.to_string(),
+            namespace: namespace.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn vault_seed_path_consistency_accepts_defaults_with_no_ambient() {
+        // All-default binding + nothing exported ⇒ effective values == defaults.
+        let vault = vault_backend_fixture(None);
+        assert!(vault_seed_path_consistency(&vault, |_| None).is_ok());
+    }
+
+    #[test]
+    fn vault_seed_path_consistency_rejects_kv_prefix_mismatch() {
+        let mut vault = vault_backend_fixture(None);
+        vault.kv_prefix = "tenant-a".to_string();
+        // Ambient unset ⇒ effective prefix = default `greentic` != `tenant-a`.
+        let err = vault_seed_path_consistency(&vault, |_| None).unwrap_err();
+        match err {
+            OpError::InvalidArgument(m) => assert!(m.contains("VAULT_KV_PREFIX"), "msg: {m}"),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_seed_path_consistency_requires_ambient_namespace_when_binding_sets_one() {
+        let vault = vault_backend_fixture(Some("team-a"));
+        // Binding namespace `team-a`, ambient unset ⇒ effective `` != `team-a`.
+        let err = vault_seed_path_consistency(&vault, |_| None).unwrap_err();
+        match err {
+            OpError::InvalidArgument(m) => assert!(m.contains("VAULT_NAMESPACE"), "msg: {m}"),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_seed_path_consistency_rejects_stray_namespace_when_binding_has_none() {
+        let vault = vault_backend_fixture(None);
+        // Binding has no namespace, but the operator's env sets one ⇒ the seed
+        // would land in `team-b` while the (namespace-less) worker reads root.
+        let err = vault_seed_path_consistency(&vault, |var| {
+            (var == "VAULT_NAMESPACE").then(|| "team-b".to_string())
+        })
+        .unwrap_err();
+        match err {
+            OpError::InvalidArgument(m) => assert!(m.contains("VAULT_NAMESPACE"), "msg: {m}"),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_seed_path_consistency_accepts_matching_namespace() {
+        let vault = vault_backend_fixture(Some("team-a"));
+        let result = vault_seed_path_consistency(&vault, |var| {
+            (var == "VAULT_NAMESPACE").then(|| "team-a".to_string())
+        });
+        assert!(result.is_ok());
     }
 
     #[test]
