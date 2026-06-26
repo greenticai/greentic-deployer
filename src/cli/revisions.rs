@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::environment::{
-    EnvironmentStore, LocalFsStore, StageRevisionPayload, WarmRevisionPayload,
+    EnvironmentReads, EnvironmentStore, LocalFsStore, StageRevisionPayload, WarmRevisionPayload,
 };
 use crate::rollout_telemetry::emit_lifecycle_event;
 use greentic_deploy_spec::Environment;
@@ -569,7 +569,11 @@ pub fn archive(
 }
 
 /// `op revisions list <env>` (filterable by `--deployment <id>` later).
-pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOutcome, OpError> {
+pub fn list(
+    store: &dyn EnvironmentReads,
+    flags: &OpFlags,
+    env_id: &str,
+) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(
             NOUN,
@@ -578,10 +582,10 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
         ));
     }
     let env_id = parse_env_id(env_id)?;
-    if !store.exists(&env_id)? {
+    if !store.env_exists(&env_id)? {
         return Err(OpError::NotFound(format!("environment `{env_id}`")));
     }
-    let env = store.load(&env_id)?;
+    let env = store.load_env(&env_id)?;
     let revisions: Vec<RevisionSummary> = env.revisions.iter().map(RevisionSummary::from).collect();
     Ok(OpOutcome::new(
         NOUN,

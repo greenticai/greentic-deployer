@@ -94,8 +94,12 @@ pub(crate) fn dispatch_op_remote(
 // Router
 // ---------------------------------------------------------------------------
 
+// Takes the concrete `HttpEnvironmentStore` (not `&dyn EnvironmentMutations`)
+// so it can hand the store to BOTH the mutation helpers (`&dyn
+// EnvironmentMutations`) and the shared read verbs (`&dyn EnvironmentReads`)
+// by coercion — trait objects can't cross-cast between the two.
 fn route_remote(
-    store: &dyn EnvironmentMutations,
+    store: &HttpEnvironmentStore,
     flags: &OpFlags,
     noun: OpNoun,
 ) -> Result<OpOutcome, OpError> {
@@ -124,8 +128,8 @@ fn route_remote(
                     remote_env_apply(store, flags, args.into_options())
                 }
             }
-            EnvVerb::List => Err(not_supported("env list")),
-            EnvVerb::Show { .. } => Err(not_supported("env show")),
+            EnvVerb::List => super::env::list(store, flags),
+            EnvVerb::Show { env_id } => super::env::show(store, flags, &env_id),
             EnvVerb::Doctor { .. } => Err(not_supported("env doctor")),
             EnvVerb::ToolCheck { .. } => Err(not_supported("env tool-check")),
             EnvVerb::Render(_) => Err(not_supported("env render")),
@@ -143,7 +147,7 @@ fn route_remote(
             EnvPacksVerb::Update => remote_env_packs_update(store, flags),
             EnvPacksVerb::Remove => remote_env_packs_remove(store, flags),
             EnvPacksVerb::Rollback => remote_env_packs_rollback(store, flags),
-            EnvPacksVerb::List { .. } => Err(not_supported("env-packs list")),
+            EnvPacksVerb::List { env_id } => super::env_packs::list(store, flags, &env_id),
         },
 
         // -- extensions --------------------------------------------------------
@@ -152,7 +156,7 @@ fn route_remote(
             ExtensionsVerb::Update => remote_extensions_update(store, flags),
             ExtensionsVerb::Remove => remote_extensions_remove(store, flags),
             ExtensionsVerb::Rollback => remote_extensions_rollback(store, flags),
-            ExtensionsVerb::List { .. } => Err(not_supported("extensions list")),
+            ExtensionsVerb::List { env_id } => super::extensions::list(store, flags, &env_id),
         },
 
         // -- bundles -----------------------------------------------------------
@@ -160,7 +164,7 @@ fn route_remote(
             BundlesVerb::Add => remote_bundles_add(store, flags),
             BundlesVerb::Update => remote_bundles_update(store, flags),
             BundlesVerb::Remove => remote_bundles_remove(store, flags),
-            BundlesVerb::List { .. } => Err(not_supported("bundles list")),
+            BundlesVerb::List { env_id } => super::bundles::list(store, flags, &env_id),
         },
 
         // -- traffic -----------------------------------------------------------
@@ -169,7 +173,10 @@ fn route_remote(
                 let payload = super::traffic::payload_from_set_args(args)?;
                 remote_traffic_set(store, flags, payload)
             }
-            TrafficVerb::Show(_) => Err(not_supported("traffic show")),
+            TrafficVerb::Show(args) => {
+                let payload = super::traffic::payload_from_target_args(args)?;
+                super::traffic::show(store, flags, payload)
+            }
             TrafficVerb::Rollback(args) => {
                 let payload = super::traffic::payload_from_target_args(args)?;
                 remote_traffic_rollback(store, flags, payload)
@@ -190,7 +197,7 @@ fn route_remote(
             }
             RevisionsVerb::Stage(args) => remote_revision_stage(store, flags, args),
             RevisionsVerb::Warm => remote_revision_warm(store, flags),
-            RevisionsVerb::List { .. } => Err(not_supported("revisions list")),
+            RevisionsVerb::List { env_id } => super::revisions::list(store, flags, &env_id),
         },
 
         // -- messaging ---------------------------------------------------------
@@ -224,8 +231,13 @@ fn route_remote(
                     let payload = args.into_rotate_payload("rotate-webhook-secret", flags)?;
                     remote_messaging_rotate(store, flags, payload)
                 }
-                MessagingEndpointVerb::List { .. } => Err(not_supported("messaging.endpoint list")),
-                MessagingEndpointVerb::Show { .. } => Err(not_supported("messaging.endpoint show")),
+                MessagingEndpointVerb::List { env_id } => {
+                    super::messaging::list(store, flags, &env_id)
+                }
+                MessagingEndpointVerb::Show {
+                    env_id,
+                    endpoint_id,
+                } => super::messaging::show(store, flags, &env_id, &endpoint_id),
             },
         },
 
@@ -236,7 +248,7 @@ fn route_remote(
             }
             TrustRootVerb::Add(args) => remote_trust_root_add(store, flags, args),
             TrustRootVerb::Remove(args) => remote_trust_root_remove(store, flags, args),
-            TrustRootVerb::List { .. } => Err(not_supported("trust-root list")),
+            TrustRootVerb::List { env_id } => remote_trust_root_list(store, &env_id),
         },
 
         // -- local-only nouns --------------------------------------------------
@@ -1242,6 +1254,22 @@ fn remote_trust_root_remove(
         "remove",
         super::trust_root::trust_root_remove_outcome_to_wire(&env_id, &outcome),
     ))
+}
+
+/// Remote `env trust-root list`. The trusted-key set comes from
+/// `GET /environments/{env_id}/trust-root` (an inherent read on the HTTP
+/// store, not on [`EnvironmentMutations`], since trust roots are a separate
+/// document); the JSON projection is shared with the local path via
+/// [`super::trust_root::list_outcome`].
+fn remote_trust_root_list(
+    store: &HttpEnvironmentStore,
+    env_id: &str,
+) -> Result<OpOutcome, OpError> {
+    let env_id = parse_env_id(env_id)?;
+    let keys = store
+        .load_trust_root_keys(&env_id)
+        .map_err(map_store_err_preserving_noun)?;
+    Ok(super::trust_root::list_outcome(&env_id, &keys))
 }
 
 // ===========================================================================
@@ -2852,6 +2880,66 @@ mod tests {
     }
 
     #[test]
+    fn env_list_dispatches_to_the_wire() {
+        // `env list` reads the id set (GET /environments) then loads each env
+        // (GET /environments/{id}) to build its summary — 1 + N GETs.
+        let list_body = serde_json::json!({ "environments": ["local"] }).to_string();
+        let get_body = serde_json::json!({
+            "environment": env_json(),
+            "etag": "sha256:test",
+            "generation": 1
+        })
+        .to_string();
+        let mock = start_mock(vec![(200, &list_body), (200, &get_body)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let outcome = route_remote(
+            &store,
+            &no_flags(),
+            OpNoun::Env {
+                verb: EnvVerb::List,
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.noun, "env");
+        assert_eq!(outcome.op, "list");
+        let envs = outcome
+            .result
+            .get("environments")
+            .and_then(|v| v.as_array())
+            .expect("environments array");
+        assert_eq!(envs.len(), 1);
+    }
+
+    #[test]
+    fn trust_root_list_dispatches_to_the_wire() {
+        // `trust-root list` reads the key set from GET /trust-root and renders
+        // it through the shared `trust_root::list_outcome` projection.
+        let body = serde_json::json!({ "environment_id": "local", "keys": [] }).to_string();
+        let mock = start_mock(vec![(200, &body)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let outcome = route_remote(
+            &store,
+            &no_flags(),
+            OpNoun::TrustRoot {
+                verb: TrustRootVerb::List {
+                    env_id: "local".to_string(),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.noun, "trust-root");
+        assert_eq!(outcome.op, "list");
+        assert!(
+            outcome
+                .result
+                .get("keys")
+                .and_then(|v| v.as_array())
+                .expect("keys array")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn messaging_rotate_webhook_secret_dispatches_to_the_wire() {
         // PR-4.2h removed the CLI-side guard: rotate now reaches the HTTP
         // store (the SERVER answers 501 until its secrets sink lands). With
@@ -2878,18 +2966,6 @@ mod tests {
             !matches!(result, Err(OpError::NotYetImplemented(_))),
             "the CLI-side rotate guard must be gone"
         );
-    }
-
-    #[test]
-    fn env_list_is_local_only() {
-        let result = route_remote(
-            &build_dummy_store(),
-            &no_flags(),
-            OpNoun::Env {
-                verb: EnvVerb::List,
-            },
-        );
-        assert!(matches!(result, Err(OpError::NotYetImplemented(_))));
     }
 
     /// Build an `HttpEnvironmentStore` pointed at a port that will never accept.

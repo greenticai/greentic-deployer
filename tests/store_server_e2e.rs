@@ -16,9 +16,10 @@ use std::sync::Arc;
 use chrono::Utc;
 use greentic_deploy_spec::{
     BundleDeployment, BundleDeploymentStatus, BundleId, CapabilitySlot, CustomerId, DeploymentId,
-    EnvId, EnvPackBinding, EnvironmentHostConfig, ExtensionBinding, ExtensionKey, IdempotencyKey,
-    PackDescriptor, PackId, PackListEntry, PartyId, Precondition, RevenueShareEntry, RevisionId,
-    RevisionLifecycle, RouteBinding, SchemaVersion, SemVer, TenantSelector, TrafficSplitEntry,
+    EnvId, EnvPackBinding, EnvironmentHostConfig, EnvironmentRuntime, ExtensionBinding,
+    ExtensionKey, IdempotencyKey, PackDescriptor, PackId, PackListEntry, PartyId, Precondition,
+    RevenueShareEntry, RevisionId, RevisionLifecycle, RouteBinding, SchemaVersion, SemVer,
+    TenantSelector, TrafficSplitEntry,
 };
 use greentic_deployer::environment::{
     AddBundlePayload, AddMessagingEndpointPayload, FieldUpdate, MigrateMergePayload,
@@ -26,8 +27,8 @@ use greentic_deployer::environment::{
     UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 use greentic_deployer::environment::{
-    AuthMethod, EnvironmentMutations, HealthCheckId, HealthGateFailure, HttpEnvironmentStore,
-    LifecycleError, StoreError,
+    AuthMethod, EnvironmentMutations, EnvironmentReads, HealthCheckId, HealthGateFailure,
+    HttpEnvironmentStore, LifecycleError, StoreError,
 };
 use greentic_operator_store_server::http::router_with_operator_key;
 use greentic_operator_store_server::sqlite::SqliteEnvironmentStore;
@@ -102,6 +103,18 @@ async fn seed_deployment(backend: &SqliteEnvironmentStore, id: &EnvId) -> Deploy
         .await
         .expect("seed deployment");
     deployment_id
+}
+
+fn runtime_for(id: &EnvId) -> EnvironmentRuntime {
+    EnvironmentRuntime {
+        schema: SchemaVersion::from(SchemaVersion::ENVIRONMENT_RUNTIME_V1),
+        environment_id: id.clone(),
+        discovered: Default::default(),
+        generated_at: Utc::now(),
+        generated_by: PackDescriptor::try_new("greentic.deployer.local-process@1.0.0")
+            .expect("valid pack descriptor"),
+        generation: 1,
+    }
 }
 
 fn host_config(raw: &str) -> EnvironmentHostConfig {
@@ -982,6 +995,103 @@ async fn rbac_bearer_token_end_to_end() {
             .create_environment(&id, "local".to_string(), host_config("local"))
             .expect("authorized create");
         assert_eq!(created.environment_id, id);
+    })
+    .await
+    .expect("client task");
+}
+
+/// The read surface (`EnvironmentReads` + the inherent trust-root read) over
+/// the wire: `env list`/`show`, the per-env document projections, and
+/// `trust-root list` all read through the server's `GET` endpoints. This is
+/// the client half of the read-verb dispatch wired in `dispatch_remote`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_reads_end_to_end() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SqliteEnvironmentStore::open(&dir.path().join("store.sqlite"))
+        .await
+        .expect("open sqlite store");
+    let backend = Arc::new(store);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let serve_backend = Arc::clone(&backend);
+    let operator_key_path = dir.path().join("operator-key.pem");
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router_with_operator_key(serve_backend, operator_key_path),
+        )
+        .await
+        .expect("serve");
+    });
+
+    let base = Url::parse(&format!("http://{addr}/")).expect("base url");
+    let id = env_id("local");
+
+    // Create an env to read back (the client owns env creation).
+    {
+        let base = base.clone();
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = HttpEnvironmentStore::new(base, AuthMethod::None).expect("client");
+            store
+                .create_environment(&id, "local".to_string(), host_config("local"))
+                .expect("create environment");
+        })
+        .await
+        .expect("create task");
+    }
+
+    // Seed a runtime sidecar through the backend — the deployer client has no
+    // runtime-write verb (greentic-start writes it at boot), so this stands in
+    // for "a runtime has been applied" and proves the read is not a fake null.
+    backend
+        .upsert_runtime(&runtime_for(&id), None)
+        .await
+        .expect("seed runtime");
+
+    tokio::task::spawn_blocking(move || {
+        let store = HttpEnvironmentStore::new(base, AuthMethod::None).expect("client");
+
+        // `env list` → GET /environments.
+        let ids = store.list_env_ids().expect("list env ids");
+        assert_eq!(ids, vec![id.clone()]);
+
+        // `env_exists` maps the GET to a boolean: present vs absent.
+        assert!(store.env_exists(&id).expect("exists present"));
+        assert!(
+            !store
+                .env_exists(&env_id("ghost"))
+                .expect("exists absent is Ok(false), not an error")
+        );
+
+        // `env show` (and every per-env list/show verb) reads the document.
+        let env = store.load_env(&id).expect("load env");
+        assert_eq!(env.environment_id, id);
+
+        // The runtime sidecar IS exposed over HTTP now: a seeded runtime reads
+        // back (not a misleading `null`), and a missing env is a 404.
+        let runtime = store
+            .read_runtime(&id)
+            .expect("read runtime")
+            .expect("seeded runtime must read back over HTTP");
+        assert_eq!(runtime.environment_id, id);
+        let err = store
+            .read_runtime(&env_id("ghost"))
+            .expect_err("runtime read for a missing env must be NotFound");
+        assert!(matches!(err, StoreError::NotFound(_)), "got {err:?}");
+
+        // `trust-root list` → GET /trust-root: a fresh env is closed-by-default
+        // (empty key set), and a missing env is a 404.
+        let keys = store
+            .load_trust_root_keys(&id)
+            .expect("load trust-root keys");
+        assert!(keys.is_empty(), "fresh env has no trusted keys");
+        let err = store
+            .load_trust_root_keys(&env_id("ghost"))
+            .expect_err("trust-root for a missing env must be NotFound");
+        assert!(matches!(err, StoreError::NotFound(_)), "got {err:?}");
     })
     .await
     .expect("client task");

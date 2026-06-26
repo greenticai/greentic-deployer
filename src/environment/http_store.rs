@@ -92,15 +92,19 @@
 use greentic_deploy_spec::{
     AuditDecision, AuditEvent, AuditResult, BackupManifest, BindingGenerationOutcome,
     BundleDeployment, BundleId, CapabilitySlot, DeploymentId, EnvId, EnvPackBinding, Environment,
-    EnvironmentHostConfig, ExtensionBinding, ExtensionBindingPayload, ExtensionKeyedPayload,
-    IdempotencyKey, IdempotencyOutcome, MessagingBundleLinkPayload, MessagingEndpoint,
-    MessagingEndpointId, PackBindingPayload, RemoteStoreError, RestoreOutcome, RestoreRequest,
-    Revision, RevisionId, RollbackTrafficSplitPayload, RotateWebhookSecretPayload, StateEtag,
+    EnvironmentHostConfig, EnvironmentRuntime, ExtensionBinding, ExtensionBindingPayload,
+    ExtensionKeyedPayload, IdempotencyKey, IdempotencyOutcome, MessagingBundleLinkPayload,
+    MessagingEndpoint, MessagingEndpointId, PackBindingPayload, RemoteStoreError, RestoreOutcome,
+    RestoreRequest, Revision, RevisionId, RollbackTrafficSplitPayload, RotateWebhookSecretPayload,
+    StateEtag,
 };
+use greentic_distributor_client::signing::TrustedKey;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use url::Url;
+
+use super::reads::EnvironmentReads;
 
 use super::mutations::{
     AddBundlePayload, AddMessagingEndpointPayload, AddTrustedKeyPayload, ApplyTrafficSplitOutcome,
@@ -457,6 +461,74 @@ impl HttpEnvironmentStore {
             Some(idempotency_key.as_str()),
             Some(request),
         )
+    }
+
+    /// `GET /environments/{env_id}/trust-root` — the env's trusted-key set
+    /// (empty for an absent row, which the server treats as closed-by-default;
+    /// a missing ENV is still a 404 → [`StoreError::NotFound`]). Inherent
+    /// rather than on [`EnvironmentReads`] because trust roots are a separate
+    /// document with their own error type and have no `LocalFsStore`
+    /// equivalent on that trait.
+    pub fn load_trust_root_keys(&self, env_id: &EnvId) -> Result<Vec<TrustedKey>, StoreError> {
+        #[derive(Deserialize)]
+        struct TrustRootResponse {
+            keys: Vec<TrustedKey>,
+        }
+        let response: TrustRootResponse = self.send::<(), _>(
+            reqwest::Method::GET,
+            &self.env_path(env_id, "/trust-root"),
+            None,
+            None,
+        )?;
+        Ok(response.keys)
+    }
+}
+
+impl EnvironmentReads for HttpEnvironmentStore {
+    /// `GET /environments` → the sorted env-id set (RBAC read-scope filtering
+    /// is applied server-side).
+    fn list_env_ids(&self) -> Result<Vec<EnvId>, StoreError> {
+        #[derive(Deserialize)]
+        struct EnvsResponse {
+            environments: Vec<EnvId>,
+        }
+        let response: EnvsResponse =
+            self.send::<(), _>(reqwest::Method::GET, "environments", None, None)?;
+        Ok(response.environments)
+    }
+
+    /// A `GET` of the env mapped to a boolean: 200 → present, 404 → absent.
+    fn env_exists(&self, env_id: &EnvId) -> Result<bool, StoreError> {
+        match self.load_env(env_id) {
+            Ok(_) => Ok(true),
+            Err(StoreError::NotFound(_)) => Ok(false),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// The environment document. Delegates to the mutation-side read
+    /// [`EnvironmentMutations::load_environment`] (`GET
+    /// /environments/{env_id}`) so the env GET shape lives in one place; the
+    /// read verbs only project the returned document.
+    fn load_env(&self, env_id: &EnvId) -> Result<Environment, StoreError> {
+        EnvironmentMutations::load_environment(self, env_id)
+    }
+
+    /// `GET /environments/{env_id}/runtime` → the runtime host-config sidecar
+    /// (`null` when none has been written) so remote `env show` reports the
+    /// real runtime instead of conflating "absent" with "not exposed".
+    fn read_runtime(&self, env_id: &EnvId) -> Result<Option<EnvironmentRuntime>, StoreError> {
+        #[derive(Deserialize)]
+        struct GetRuntimeResponse {
+            runtime: Option<EnvironmentRuntime>,
+        }
+        let response: GetRuntimeResponse = self.send::<(), _>(
+            reqwest::Method::GET,
+            &self.env_path(env_id, "/runtime"),
+            None,
+            None,
+        )?;
+        Ok(response.runtime)
     }
 }
 

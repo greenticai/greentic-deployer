@@ -10,7 +10,9 @@ use greentic_deploy_spec::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{EnvironmentStore, FieldUpdate, LocalFsStore, UpdateEnvironmentPayload};
+use crate::environment::{
+    EnvironmentReads, EnvironmentStore, FieldUpdate, LocalFsStore, UpdateEnvironmentPayload,
+};
 
 use super::{
     AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
@@ -201,7 +203,7 @@ pub fn update(
 }
 
 /// `op env list`.
-pub fn list(store: &LocalFsStore, flags: &OpFlags) -> Result<OpOutcome, OpError> {
+pub fn list(store: &dyn EnvironmentReads, flags: &OpFlags) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         // `list` has no input; produce a null-input schema as a placeholder.
         return Ok(OpOutcome::new(
@@ -211,8 +213,8 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags) -> Result<OpOutcome, OpError>
         ));
     }
     let mut summaries = Vec::new();
-    for env_id in store.list()? {
-        let env = store.load(&env_id)?;
+    for env_id in store.list_env_ids()? {
+        let env = store.load_env(&env_id)?;
         summaries.push(EnvSummary::from(&env));
     }
     Ok(OpOutcome::new(
@@ -223,7 +225,11 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags) -> Result<OpOutcome, OpError>
 }
 
 /// `op env show <env_id>`.
-pub fn show(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOutcome, OpError> {
+pub fn show(
+    store: &dyn EnvironmentReads,
+    flags: &OpFlags,
+    env_id: &str,
+) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(
             NOUN,
@@ -233,11 +239,11 @@ pub fn show(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
     }
     let env_id =
         EnvId::try_from(env_id).map_err(|e| OpError::InvalidArgument(format!("env_id: {e}")))?;
-    if !store.exists(&env_id)? {
+    if !store.env_exists(&env_id)? {
         return Err(OpError::NotFound(format!("environment `{env_id}`")));
     }
-    let env = store.load(&env_id)?;
-    let runtime = store.load_runtime(&env_id)?;
+    let env = store.load_env(&env_id)?;
+    let runtime = store.read_runtime(&env_id)?;
     Ok(OpOutcome::new(
         NOUN,
         "show",

@@ -19,6 +19,7 @@ pub mod lifecycle;
 pub mod messaging;
 pub mod mutations;
 pub mod mutations_local;
+pub mod reads;
 pub mod runtime_config;
 pub mod store;
 pub mod trust_root;
@@ -47,6 +48,7 @@ pub use mutations::{
     SetTrafficSplitPayload, StageRevisionPayload, TrustRootAddOutcome, TrustRootRemoveOutcome,
     TrustRootSeed, UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
+pub use reads::EnvironmentReads;
 pub use runtime_config::materialize_runtime_config;
 pub use store::{EnvironmentStore, LocalFsStore, Locked, StoreError};
 pub use trust_root::{

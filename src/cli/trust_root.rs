@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use greentic_deploy_spec::EnvId;
+use greentic_distributor_client::signing::TrustedKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -135,18 +136,24 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
     let env_id = parse_env_id(env_id)?;
     let env_dir = store.env_dir(&env_id)?;
     let trust = store_trust_root::load(&env_dir)?;
-    Ok(OpOutcome::new(
+    Ok(list_outcome(&env_id, &trust.keys))
+}
+
+/// Render the `trust-root list` outcome from a key set. Shared by the local
+/// FS path above and the remote `--store-url` dispatch, which fetches the
+/// keys from `GET /environments/{env_id}/trust-root` instead of disk.
+pub(crate) fn list_outcome(env_id: &EnvId, keys: &[TrustedKey]) -> OpOutcome {
+    OpOutcome::new(
         NOUN,
         "list",
         json!({
             "environment_id": env_id.as_str(),
-            "keys": trust
-                .keys
+            "keys": keys
                 .iter()
                 .map(|k| json!({"key_id": k.key_id, "public_key_pem": k.public_key_pem}))
                 .collect::<Vec<_>>(),
         }),
-    ))
+    )
 }
 
 /// `op env trust-root add` — validate the (key_id, public_pem) pair and
