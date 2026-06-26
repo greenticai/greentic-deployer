@@ -168,34 +168,57 @@ pub fn put(
                 "value must not be empty".to_string(),
             ));
         }
-        if secrets.kind.path() != DEV_STORE_KIND_PATH {
-            return Err(OpError::NotYetImplemented(
-                "secrets backend dispatch beyond the dev-store lands in A9 (env-pack registry)"
+        let kind_path = secrets.kind.path();
+        if kind_path == DEV_STORE_KIND_PATH {
+            validate_dev_store_secret_path(rel_path)?;
+            let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
+            let dev_path = resolve_dev_store_path(
+                &store.env_dir(&env_id)?,
+                std::env::var_os(DEV_SECRETS_PATH_ENV).map(PathBuf::from),
+            );
+            dev_store_put(&dev_path, &store_uri, &payload.value)?;
+            Ok((
+                OpOutcome::new(
+                    NOUN,
+                    "put",
+                    json!({
+                        "environment_id": env_id.as_str(),
+                        "secret_ref": secret_uri,
+                        "store_uri": store_uri,
+                        "secrets_kind": secrets.kind.to_string(),
+                        "store_path": dev_path.display().to_string(),
+                        "written": true,
+                    }),
+                ),
+                AuditGens::NONE,
+            ))
+        } else if kind_path == crate::defaults::VAULT_SECRETS_PATH {
+            // Same ref shape as the dev store; the difference is the backend.
+            validate_dev_store_secret_path(rel_path)?;
+            let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
+            let vault_addr = vault_seed_put(store, &env, &store_uri, &payload.value)?;
+            Ok((
+                OpOutcome::new(
+                    NOUN,
+                    "put",
+                    json!({
+                        "environment_id": env_id.as_str(),
+                        "secret_ref": secret_uri,
+                        "store_uri": store_uri,
+                        "secrets_kind": secrets.kind.to_string(),
+                        "vault_addr": vault_addr,
+                        "written": true,
+                    }),
+                ),
+                AuditGens::NONE,
+            ))
+        } else {
+            Err(OpError::NotYetImplemented(
+                "secrets backend dispatch beyond the dev-store and Vault lands in A9 \
+                 (env-pack registry)"
                     .to_string(),
-            ));
+            ))
         }
-        validate_dev_store_secret_path(rel_path)?;
-        let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
-        let dev_path = resolve_dev_store_path(
-            &store.env_dir(&env_id)?,
-            std::env::var_os(DEV_SECRETS_PATH_ENV).map(PathBuf::from),
-        );
-        dev_store_put(&dev_path, &store_uri, &payload.value)?;
-        Ok((
-            OpOutcome::new(
-                NOUN,
-                "put",
-                json!({
-                    "environment_id": env_id.as_str(),
-                    "secret_ref": secret_uri,
-                    "store_uri": store_uri,
-                    "secrets_kind": secrets.kind.to_string(),
-                    "store_path": dev_path.display().to_string(),
-                    "written": true,
-                }),
-            ),
-            AuditGens::NONE,
-        ))
     })
 }
 
@@ -256,6 +279,142 @@ pub fn rotate(
 }
 
 // --- internals -----------------------------------------------------------
+
+/// Seed a Vault-backed secret through the embedded [`SecretsCore`]: the value is
+/// envelope-encrypted via `transit/encrypt` and written to the KV record the
+/// worker reads back (a raw `vault kv put` would not produce that envelope, so
+/// the runtime could not decrypt it).
+///
+/// The Vault *connection* is assembled from two sources. The env's Vault binding
+/// supplies the non-secret mounts/prefix/transit, so the seeded path matches
+/// exactly what the worker reads. The operator's ambient environment supplies the
+/// admin credential (`VAULT_TOKEN`, which must hold `transit/encrypt` + KV write)
+/// and a reachable `VAULT_ADDR` — seeding runs from the operator host, not the
+/// pod, so it authenticates with a token rather than the pod's Kubernetes-role
+/// identity. The provider exposes only an env-driven `build_backend()` and this
+/// crate is `#![forbid(unsafe_code)]`, so the deployer cannot inject the binding's
+/// mounts into the process env; it instead fails closed when the ambient env would
+/// not resolve to the binding's values. Returns the Vault address used.
+fn vault_seed_put(
+    store: &LocalFsStore,
+    env: &Environment,
+    store_uri: &str,
+    value: &str,
+) -> Result<String, OpError> {
+    use crate::env_packs::k8s::manifests::{
+        SecretsBackend, VAULT_DEFAULT_KV_MOUNT, VAULT_DEFAULT_KV_PREFIX, VAULT_DEFAULT_TRANSIT_KEY,
+        VAULT_DEFAULT_TRANSIT_MOUNT,
+    };
+    use greentic_secrets_lib::core::{CoreBuilder, rt};
+
+    // A Vault-backed env is single-tenant at the runtime (greentic-start scopes
+    // one SecretsCore to the env owner and fails closed otherwise), so seeding
+    // requires an owner and writes under it.
+    let tenant = env
+        .host_config
+        .tenant_org_id
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| {
+            OpError::InvalidArgument(
+                "a Vault-backed env must be tenant-owned before seeding; set the owner with \
+                 `op env update <env> --tenant-org <tenant>`"
+                    .to_string(),
+            )
+        })?;
+
+    // Non-secret connection config (mounts/prefix/transit) from the env binding.
+    let SecretsBackend::Vault(vault) = super::env::resolve_secrets_backend(store, env)? else {
+        return Err(OpError::Conflict(
+            "env secrets binding is not Vault-backed".to_string(),
+        ));
+    };
+
+    // Admin credential + reachable address come from the operator's environment.
+    if std::env::var("VAULT_TOKEN")
+        .map(|t| t.trim().is_empty())
+        .unwrap_or(true)
+    {
+        return Err(OpError::InvalidArgument(
+            "seeding a Vault-backed secret needs an admin `VAULT_TOKEN` (with `transit/encrypt` \
+             and KV write) exported in the environment"
+                .to_string(),
+        ));
+    }
+    let addr = match std::env::var("VAULT_ADDR") {
+        Ok(a) if !a.trim().is_empty() => a,
+        _ => {
+            return Err(OpError::InvalidArgument(
+                "seeding a Vault-backed secret needs `VAULT_ADDR` exported (a Vault address \
+                 reachable from here, e.g. a port-forward to the in-cluster Vault)"
+                    .to_string(),
+            ));
+        }
+    };
+
+    // The seed must land where the worker reads. `build_backend()` takes the
+    // mounts/prefix/transit from ambient env (or provider defaults); since this
+    // crate cannot set them, fail closed when the binding overrides a default the
+    // ambient env does not match.
+    let mount_checks = [
+        (
+            "VAULT_KV_MOUNT",
+            vault.kv_mount.as_str(),
+            VAULT_DEFAULT_KV_MOUNT,
+        ),
+        (
+            "VAULT_KV_PREFIX",
+            vault.kv_prefix.as_str(),
+            VAULT_DEFAULT_KV_PREFIX,
+        ),
+        (
+            "VAULT_TRANSIT_MOUNT",
+            vault.transit_mount.as_str(),
+            VAULT_DEFAULT_TRANSIT_MOUNT,
+        ),
+        (
+            "VAULT_TRANSIT_KEY",
+            vault.transit_key.as_str(),
+            VAULT_DEFAULT_TRANSIT_KEY,
+        ),
+    ];
+    for (var, binding_value, default) in mount_checks {
+        let ambient = std::env::var(var).ok();
+        let effective = ambient
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default);
+        if effective != binding_value {
+            return Err(OpError::InvalidArgument(format!(
+                "the env's Vault binding sets {var}=`{binding_value}` but the seed would use \
+                 `{effective}`; export {var}=`{binding_value}` so the seeded path matches what \
+                 the worker reads"
+            )));
+        }
+    }
+
+    // Construct the embedded core over the env-driven Vault backend and write the
+    // value verbatim (the broker envelope-encrypts). Driven through the secrets
+    // runtime so the async backend runs from this synchronous verb.
+    rt::sync_await(async {
+        let components = greentic_secrets_lib::vault::build_backend()
+            .await
+            .map_err(|e| OpError::Conflict(format!("vault backend init failed: {e}")))?;
+        let core = CoreBuilder::default()
+            .tenant(tenant.as_str())
+            .backend(components.backend, components.key_provider)
+            .build()
+            .await
+            .map_err(|e| OpError::Conflict(format!("vault secrets core build failed: {e}")))?;
+        core.put_text(store_uri, value)
+            .await
+            .map_err(|e| OpError::Conflict(format!("vault put failed: {e}")))?;
+        Ok::<(), OpError>(())
+    })?;
+
+    Ok(addr)
+}
 
 /// Where the env's dev store lives, mirroring the runtime reader's chain
 /// (greentic-start `dev_store_path`): explicit override env var, else the
@@ -800,6 +959,33 @@ mod tests {
 
     fn read_back(store_path: &str, uri: &str) -> Vec<u8> {
         crate::cli::tests_common::dev_store_read(Path::new(store_path), uri)
+    }
+
+    #[test]
+    fn put_vault_requires_tenant_owned_env() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        // A Vault-bound env with no tenant owner: seeding must fail closed
+        // before any Vault I/O, because the runtime scopes a Vault SecretsCore
+        // to the env owner (greentic-start #305).
+        store
+            .save(&env_with_secrets_kind("greentic.secrets.vault@0.1.0"))
+            .unwrap();
+        let err = put(
+            &store,
+            &OpFlags::default(),
+            Some(SecretsPutPayload {
+                environment_id: "local".to_string(),
+                path: "tenant-default/_/messaging-telegram/telegram_bot_token".to_string(),
+                value: "tok-dummy-123".to_string(),
+                idempotency_key: None,
+            }),
+        )
+        .unwrap_err();
+        match err {
+            OpError::InvalidArgument(m) => assert!(m.contains("tenant-owned"), "msg: {m}"),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
     }
 
     #[test]
