@@ -333,10 +333,29 @@ mod tests {
     fn role_rules_aggregate_one_rule_per_group_resource_with_every_verb() {
         let pack = render_min_rbac_rules_pack(&input());
         let yaml = &pack.entries[0].content;
-        // One rule per (group, resource) — 6 distinct pairs in the list.
-        assert_eq!(yaml.matches("- apiGroups:").count(), 6);
+        // One rule per (group, resource) — 7 distinct pairs in the list.
+        assert_eq!(yaml.matches("- apiGroups:").count(), 7);
         assert!(yaml.contains("resources: [\"deployments\"]"));
         assert!(yaml.contains("verbs: [get, create, patch, delete]"));
+        // The Vault worker ServiceAccount is grantable (env-lifetime, upsert).
+        assert!(yaml.contains("resources: [\"serviceaccounts\"]"));
+        let sa_rule = yaml
+            .split("- apiGroups:")
+            .find(|s| s.contains("serviceaccounts"))
+            .unwrap();
+        assert!(
+            sa_rule.contains("verbs: [get, create, patch]"),
+            "serviceaccounts is upsert-only:\n{sa_rule}"
+        );
+        // Secrets carry delete so a Vault reconcile clears the stale Secret.
+        let secrets_rule = yaml
+            .split("- apiGroups:")
+            .find(|s| s.contains("\"secrets\""))
+            .unwrap();
+        assert!(
+            secrets_rule.contains("verbs: [get, create, patch, delete]"),
+            "secrets must carry delete for DevStore→Vault cleanup:\n{secrets_rule}"
+        );
         // Env-lifetime objects carry no delete.
         assert!(yaml.contains("resources: [\"configmaps\"]"));
         let configmap_rule = yaml

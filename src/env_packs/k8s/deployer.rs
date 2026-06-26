@@ -39,7 +39,8 @@ use tokio::time::{Instant, sleep};
 use super::K8sDeployerHandler;
 use super::cluster::{K8sCluster, K8sClusterError, ObjectRef};
 use super::manifests::{
-    K8sParams, has_cluster_presence, render_runtime_config_map, render_worker_manifests,
+    DEV_SECRETS_SECRET_NAME, K8sParams, SecretsBackend, has_cluster_presence,
+    render_runtime_config_map, render_worker_manifests,
 };
 use crate::env_packs::deployer::{
     ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome, TrafficSplitOutcome,
@@ -250,6 +251,23 @@ impl K8sDeployerHandler {
         // the present set already came from `render_environment` above.
         let params = params_from_answers(env, answers)?;
         let mut pruned = Vec::new();
+        // A Vault-backed env ships no secret material into the cluster, so a
+        // DevStore→Vault migration must remove the stale `gtc-dev-secrets`
+        // Secret — env-level objects are otherwise never pruned. Idempotent:
+        // `delete` of an absent object is `Ok`, so a fresh Vault env is a no-op.
+        if matches!(self.secrets_backend, SecretsBackend::Vault(_)) {
+            let stale_secret = ObjectRef::from_manifest(&serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "name": DEV_SECRETS_SECRET_NAME,
+                    "namespace": params.namespace,
+                },
+            }))
+            .map_err(provider)?;
+            self.cluster.delete(&stale_secret).await.map_err(provider)?;
+            pruned.push(stale_secret);
+        }
         for revision in &env.revisions {
             if !has_cluster_presence(revision.lifecycle) {
                 for manifest in render_worker_manifests(env, revision, &params) {
@@ -293,7 +311,12 @@ impl Deployer for K8sDeployerHandler {
     ) -> Result<WarmOutcome, DeployerError> {
         require_revision(env, revision_id)?;
         let revision = Self::revision(env, revision_id).expect("require_revision passed");
-        let params = params_from_answers(env, answers)?;
+        let mut params = params_from_answers(env, answers)?;
+        // A single-revision warm renders the worker's secrets identity from the
+        // handler's resolved backend (the CLI injects it via
+        // `with_secrets_backend`), matching `reconcile` / `op env render` —
+        // otherwise a Vault env's warm would emit a DevStore-shaped worker.
+        params.secrets_backend = self.secrets_backend.clone();
         let manifests = render_worker_manifests(env, revision, &params);
         self.apply_all(&manifests).await?;
 
@@ -701,6 +724,99 @@ mod tests {
         assert!(
             !cluster.objects().keys().any(|o| o.name == lingering),
             "reconcile prunes the now-absent revision's workers"
+        );
+    }
+
+    /// A Vault backend whose connection config matches the provider defaults.
+    fn vault_secrets_backend() -> SecretsBackend {
+        use crate::env_packs::k8s::manifests::VaultBackend;
+        SecretsBackend::Vault(VaultBackend {
+            addr: "http://vault.vault.svc:8200".to_string(),
+            k8s_role: "greentic-worker".to_string(),
+            kv_mount: "secret".to_string(),
+            kv_prefix: "greentic".to_string(),
+            auth_mount: "kubernetes".to_string(),
+            transit_mount: "transit".to_string(),
+            transit_key: "greentic".to_string(),
+            namespace: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn warm_revision_renders_the_vault_worker_identity() {
+        let (handler, cluster) = handler_with_fake();
+        let handler = handler.with_secrets_backend(vault_secrets_backend());
+        let env = build_fixture_env();
+        let rev = &env.revisions[0];
+
+        handler
+            .warm_revision(&env, rev.revision_id, None)
+            .await
+            .unwrap();
+
+        // The single-revision warm must render the Vault worker (SA + selector),
+        // not a default DevStore-shaped worker.
+        let objects = cluster.objects();
+        let (_, deployment) = objects
+            .iter()
+            .find(|(o, _)| o.kind == "Deployment")
+            .expect("worker Deployment applied");
+        let pod = &deployment["spec"]["template"]["spec"];
+        assert_eq!(
+            pod["serviceAccountName"],
+            crate::env_packs::k8s::manifests::WORKER_SERVICE_ACCOUNT
+        );
+        let envs = pod["containers"][0]["env"].as_array().unwrap();
+        assert!(
+            envs.iter()
+                .any(|e| e["name"] == "GREENTIC_SECRETS_BACKEND" && e["value"] == "vault"),
+            "warm worker must carry the Vault backend selector"
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_reconcile_removes_a_stale_dev_store_secret() {
+        use crate::env_packs::k8s::manifests::DEV_SECRETS_SECRET_NAME;
+        let (handler, cluster) = handler_with_fake();
+        let handler = handler.with_secrets_backend(vault_secrets_backend());
+        let env = build_fixture_env();
+        let params = K8sParams::for_env(&env);
+
+        // Simulate a prior DevStore reconcile that left the dev-store Secret
+        // (with material) behind; migrating to Vault must remove it.
+        cluster
+            .apply(&serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "name": DEV_SECRETS_SECRET_NAME,
+                    "namespace": params.namespace,
+                    "labels": {"greentic.ai/env": env.environment_id.as_str()},
+                },
+                "data": {".dev.secrets.env": "c2VjcmV0"},
+            }))
+            .await
+            .unwrap();
+        assert!(
+            cluster
+                .objects()
+                .keys()
+                .any(|o| o.kind == "Secret" && o.name == DEV_SECRETS_SECRET_NAME),
+            "precondition: the stale dev-store Secret is on the cluster"
+        );
+
+        let report = handler.reconcile(&env, None, true).await.unwrap();
+
+        assert!(
+            !cluster.objects().keys().any(|o| o.kind == "Secret"),
+            "a Vault reconcile must remove the stale dev-store Secret (no material lingers)"
+        );
+        assert!(
+            report
+                .pruned
+                .iter()
+                .any(|o| o.kind == "Secret" && o.name == DEV_SECRETS_SECRET_NAME),
+            "the Secret deletion is reported in the prune set"
         );
     }
 

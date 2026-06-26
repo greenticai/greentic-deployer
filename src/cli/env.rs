@@ -880,7 +880,18 @@ pub fn apply_revision(
         } else {
             "ambient"
         };
-        apply_revision_k8s_cluster(&env, revision_id, present, answers.as_ref(), bound_token)?;
+        // Resolve the env's Secrets backend so a Vault env's single-revision
+        // warm renders the worker with its Vault identity + `VAULT_*` env, not a
+        // default DevStore worker (parity with `reconcile` / `op env render`).
+        let secrets_backend = resolve_secrets_backend(store, &env)?;
+        apply_revision_k8s_cluster(
+            &env,
+            revision_id,
+            present,
+            answers.as_ref(),
+            bound_token,
+            secrets_backend,
+        )?;
         (identity, worker_name)
     } else {
         apply_revision_non_k8s(
@@ -922,6 +933,7 @@ fn apply_revision_k8s_cluster(
     present: bool,
     answers: Option<&Value>,
     bound_token: Option<String>,
+    secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
 ) -> Result<(), OpError> {
     use crate::env_packs::deployer::Deployer;
     use crate::env_packs::k8s::async_bridge::run_k8s_async;
@@ -937,7 +949,8 @@ fn apply_revision_k8s_cluster(
         let client = connect(kubeconfig_context.as_deref(), bound_token.as_deref())
             .await
             .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
-        let handler = K8sDeployerHandler::with_cluster(Arc::new(KubeCluster::new(client)));
+        let handler = K8sDeployerHandler::with_cluster(Arc::new(KubeCluster::new(client)))
+            .with_secrets_backend(secrets_backend);
         let result = if present {
             handler
                 .warm_revision(env, revision_id, answers)
@@ -961,6 +974,7 @@ fn apply_revision_k8s_cluster(
     _present: bool,
     _answers: Option<&Value>,
     _bound_token: Option<String>,
+    _secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
 ) -> Result<(), OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `k8s-client` feature; \
