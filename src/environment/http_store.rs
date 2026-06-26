@@ -70,10 +70,32 @@
 //!
 //! # ETag / CAS
 //!
-//! Deferred to a follow-up (PR-3b-fu). Today the server is the source of
-//! truth and we use last-write-wins. [`Precondition`] types from
-//! `remote.rs` are ready but adding an optional precondition parameter to
-//! the trait changes the trait — out of scope for this PR.
+//! The store does **ETag-chained optimistic concurrency** entirely at the
+//! transport layer — no change to the [`EnvironmentMutations`] trait or any
+//! CLI call site. It remembers the last strong ETag it observed (from the
+//! [`MutationEnvelope`] of every successful mutation, and from
+//! [`load_environment`](EnvironmentMutations::load_environment)'s response)
+//! in [`Self::cached_etag`], and replays it as a quoted `If-Match` header on
+//! the next mutation. The server (A8 §1) then rejects the write with `412`
+//! if any other writer advanced the environment since that ETag.
+//!
+//! This catches the two windows a per-invocation CLI actually exposes:
+//! - **read-then-decide-then-write** within one command (e.g. `revisions
+//!   warm` reads the lifecycle, runs health checks, then writes) — the write
+//!   is pinned to the ETag the decision was based on;
+//! - **multi-write commands** (e.g. `op env apply`) — each write is pinned
+//!   to the ETag the previous write returned, so a concurrent writer slipping
+//!   between two of our writes is caught.
+//!
+//! A single-write command on a fresh store has no cached ETag, so it sends
+//! no `If-Match`; the server's own load-pinned generation (a torn-write
+//! guard) still applies. Cross-*invocation* lost-update protection (one
+//! operator overwriting another's separately-issued command) needs an
+//! explicit caller-supplied expectation and is a separate, opt-in follow-up.
+//! A `412`/`428` clears the cache so a stale ETag is never replayed.
+//!
+//! `LocalFsStore` needs none of this — its `flock` serialises writers — so
+//! CAS lives only here, not on the shared trait.
 //!
 //! # Error mapping
 //!
@@ -84,7 +106,7 @@
 //!
 //! # Follow-ups
 //!
-//! - ETag/CAS at the wire layer (PR-3b-fu)
+//! - Explicit cross-invocation CAS (caller-supplied `--expect-generation`)
 //! - `StoreError::Transport` variant
 //! - `AuthMethod::Mtls` for production (mTLS)
 //! - PR-3c wires dispatch between `LocalFsStore` and `HttpEnvironmentStore`
@@ -102,6 +124,7 @@ use greentic_distributor_client::signing::TrustedKey;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 use url::Url;
 
 use super::reads::EnvironmentReads;
@@ -186,6 +209,13 @@ pub struct HttpEnvironmentStore {
     /// Pre-rendered `Authorization: Bearer <token>` value, built once at
     /// construction. `None` when [`AuthMethod::None`].
     auth_header_value: Option<String>,
+    /// Last strong ETag observed from a successful mutation envelope or a
+    /// `load_environment` read — replayed as `If-Match` on the next mutation
+    /// to chain optimistic-concurrency checks across the calls of one CLI
+    /// invocation (see the module-level "ETag / CAS" doc). `Arc<Mutex<…>>`
+    /// so the store stays `Clone + Send + Sync`; in practice the deployer CLI
+    /// drives a single store on one thread, so the lock is uncontended.
+    cached_etag: Arc<Mutex<Option<StateEtag>>>,
 }
 
 /// Ensure `base_url`'s path ends with `/` so [`Url::join`] treats relative
@@ -261,7 +291,27 @@ impl HttpEnvironmentStore {
             client,
             base_url: normalize_base_url(base_url),
             auth_header_value,
+            cached_etag: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// The cached strong ETag rendered as a quoted `If-Match` header value
+    /// (RFC 7232 strong validator), or `None` when nothing has been observed
+    /// yet on this store. See the module-level "ETag / CAS" doc.
+    fn if_match_header(&self) -> Option<String> {
+        self.cached_etag
+            .lock()
+            .expect("cached_etag mutex poisoned")
+            .as_ref()
+            .map(|etag| format!("\"{}\"", etag.0))
+    }
+
+    /// Record (or clear) the ETag to replay on the next mutation. Called with
+    /// the envelope ETag after every successful mutation and with the GET
+    /// ETag after `load_environment`; called with `None` to drop a now-stale
+    /// ETag after a `412`/`428`.
+    fn remember_etag(&self, etag: Option<StateEtag>) {
+        *self.cached_etag.lock().expect("cached_etag mutex poisoned") = etag;
     }
 
     // -----------------------------------------------------------------------
@@ -293,13 +343,18 @@ impl HttpEnvironmentStore {
     /// - Sets `Content-Type` and `Accept` to `application/json`.
     /// - Adds `Authorization: Bearer` if configured.
     /// - Adds `Idempotency-Key` header when provided.
+    /// - Adds `If-Match` header when `if_match` is provided (the caller passes
+    ///   the cached strong ETag for mutations; reads pass `None`).
     /// - On success (2xx), deserializes the body as `R`.
-    /// - On error, maps the HTTP status + body to [`StoreError`].
+    /// - On error, maps the HTTP status + body to [`StoreError`]. The cached
+    ///   ETag is left untouched here — [`Self::send_mutation`] owns clearing it
+    ///   on a mutation error (a read error must not invalidate a valid ETag).
     fn send<P: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         method: reqwest::Method,
         path: &str,
         idempotency_key: Option<&str>,
+        if_match: Option<&str>,
         body: Option<&P>,
     ) -> Result<R, StoreError> {
         let url = self.url(path)?;
@@ -314,6 +369,9 @@ impl HttpEnvironmentStore {
         }
         if let Some(key) = idempotency_key {
             builder = builder.header("Idempotency-Key", key);
+        }
+        if let Some(etag) = if_match {
+            builder = builder.header("If-Match", etag);
         }
         if let Some(payload) = body {
             builder = builder.json(payload);
@@ -350,11 +408,12 @@ impl HttpEnvironmentStore {
 
     /// Send a mutating request whose A8 response is a [`MutationEnvelope`]
     /// wrapping the domain result alongside ETag/generation/idempotency
-    /// metadata. Enforces the A8 §4 audit invariant on the success envelope
-    /// (see [`MutationEnvelope::validated`]) against `expected_env` — the
-    /// env the request targeted — then returns only the domain `result`;
-    /// PR-3b-fu will surface the remaining envelope metadata via a
-    /// return-type extension.
+    /// metadata. Replays the cached strong ETag as `If-Match`, caches the
+    /// post-commit ETag for the next mutation, enforces the A8 §4 audit
+    /// invariant on the success envelope (see [`MutationEnvelope::validated`])
+    /// against `expected_env` — the env the request targeted — then returns
+    /// only the domain `result`. The `generation`/`idempotency` envelope
+    /// fields are not yet surfaced to callers (PR-3b-fu).
     fn send_mutation<P: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         expected_env: &EnvId,
@@ -363,8 +422,33 @@ impl HttpEnvironmentStore {
         idempotency_key: Option<&str>,
         body: Option<&P>,
     ) -> Result<R, StoreError> {
-        let envelope: MutationEnvelope<R> = self.send(method, path, idempotency_key, body)?;
-        envelope.validated(expected_env, idempotency_key)
+        let if_match = self.if_match_header();
+        match self.send::<P, MutationEnvelope<R>>(
+            method,
+            path,
+            idempotency_key,
+            if_match.as_deref(),
+            body,
+        ) {
+            Ok(envelope) => {
+                // Chain the post-commit ETag onto the next mutation in this
+                // invocation. `None` (envelope omitted it, e.g. a 204) clears
+                // the cache so the next write falls back to the server's
+                // load-pinned guard rather than replaying a stale validator.
+                self.remember_etag(envelope.etag.clone());
+                envelope.validated(expected_env, idempotency_key)
+            }
+            Err(err) => {
+                // A mutation error leaves the committed state uncertain — a
+                // rejected `If-Match` (412), but also a *committed-on-error*
+                // path like a failing `warm` health gate, which advances the
+                // server's state (and ETag) while returning an error. Drop the
+                // cached ETag so the next write re-pins via the server's
+                // load-pinned guard instead of replaying a now-stale validator.
+                self.remember_etag(None);
+                Err(err)
+            }
+        }
     }
 
     /// [`send_mutation`](Self::send_mutation) variant with no request body.
@@ -413,6 +497,7 @@ impl HttpEnvironmentStore {
         let response: BackupsResponse = self.send::<(), _>(
             reqwest::Method::GET,
             &self.env_path(env_id, "/backups"),
+            None,
             None,
             None,
         )?;
@@ -479,6 +564,7 @@ impl HttpEnvironmentStore {
             &self.env_path(env_id, "/trust-root"),
             None,
             None,
+            None,
         )?;
         Ok(response.keys)
     }
@@ -493,7 +579,7 @@ impl EnvironmentReads for HttpEnvironmentStore {
             environments: Vec<EnvId>,
         }
         let response: EnvsResponse =
-            self.send::<(), _>(reqwest::Method::GET, "environments", None, None)?;
+            self.send::<(), _>(reqwest::Method::GET, "environments", None, None, None)?;
         Ok(response.environments)
     }
 
@@ -525,6 +611,7 @@ impl EnvironmentReads for HttpEnvironmentStore {
         let response: GetRuntimeResponse = self.send::<(), _>(
             reqwest::Method::GET,
             &self.env_path(env_id, "/runtime"),
+            None,
             None,
             None,
         )?;
@@ -620,20 +707,22 @@ fn committed_after_save(message: String, idempotency_key: Option<&str>) -> Store
 /// `result` alongside CAS/idempotency/audit metadata defined in
 /// [`greentic_deploy_spec::remote::MutationResponse`].
 ///
-/// PR-3b parses the full envelope so that a future return-type extension
-/// (PR-3b-fu) can surface ETag/generation without re-parsing. Today the
-/// trait methods return bare domain types, so callers see only `result` —
-/// except `audit`, which [`validate_success_audit`] enforces on every
-/// success (PR-4.0/F2). It stays `Option` so a missing record is rejected
-/// with a precise contract-violation message instead of a generic serde
+/// PR-3b parses the full envelope. The `etag` drives wire-layer CAS (cached
+/// and replayed as `If-Match`); `generation` awaits a future return-type
+/// extension (PR-3b-fu). The trait methods return bare domain types, so
+/// callers see only `result` — except `audit`, which
+/// [`validate_success_audit`] enforces on every success (PR-4.0/F2). It stays
+/// `Option` so a missing record is rejected with a precise contract-violation
+/// message instead of a generic serde
 /// deserialize error.
 #[derive(Debug, Deserialize)]
 struct MutationEnvelope<T> {
     result: T,
-    // Fields present per A8 but not yet surfaced to callers (PR-3b-fu).
+    // The post-commit strong validator — chained onto the next mutation's
+    // `If-Match` (see the module-level "ETag / CAS" doc).
     #[serde(default)]
-    #[allow(dead_code)]
     etag: Option<StateEtag>,
+    // Present per A8 but not yet surfaced to callers (PR-3b-fu).
     #[serde(default)]
     #[allow(dead_code)]
     generation: Option<u64>,
@@ -869,9 +958,20 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         #[derive(serde::Deserialize)]
         struct GetEnvResponse {
             environment: Environment,
+            // The strong validator for the loaded state. Captured so a write
+            // later in the same invocation (e.g. the `warm` health gate that
+            // read this lifecycle) is pinned to what it observed.
+            #[serde(default)]
+            etag: Option<StateEtag>,
         }
-        let resp: GetEnvResponse =
-            self.send::<(), _>(reqwest::Method::GET, &self.env_path(env_id, ""), None, None)?;
+        let resp: GetEnvResponse = self.send::<(), _>(
+            reqwest::Method::GET,
+            &self.env_path(env_id, ""),
+            None,
+            None,
+            None,
+        )?;
+        self.remember_etag(resp.etag);
         Ok(resp.environment)
     }
 
@@ -886,6 +986,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         let resp: TrustRootView = self.send::<(), _>(
             reqwest::Method::GET,
             &self.env_path(env_id, "/trust-root"),
+            None,
             None,
             None,
         )?;
@@ -1445,7 +1546,7 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// Minimal mock server: binds an ephemeral port, accepts one request,
     /// validates it with `check`, and responds with the given status + body.
@@ -2604,6 +2705,149 @@ mod tests {
                 drain_seconds: 30,
             },
             idem(),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ETag-chained CAS (wire-layer If-Match)
+    // -----------------------------------------------------------------------
+
+    /// A [`CheckFn`] that records each request's (lower-cased) header block in
+    /// arrival order, so a test can assert per-request `If-Match` behaviour
+    /// after the calls complete.
+    fn header_recorder() -> (Arc<Mutex<Vec<String>>>, CheckFn) {
+        let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = recorded.clone();
+        let check: CheckFn = Arc::new(move |_req: &str, headers: &str, _body: &[u8]| {
+            sink.lock().unwrap().push(headers.to_lowercase());
+        });
+        (recorded, check)
+    }
+
+    /// A mutation envelope (`update_environment` shape) carrying a chosen ETag.
+    fn env_envelope_with_etag(etag: &str) -> String {
+        wrap_mutation_tweaked(sample_env_domain(), |env| {
+            env["etag"] = serde_json::json!(etag);
+        })
+    }
+
+    /// The `load_environment` GET body (plain read, not a mutation envelope).
+    fn get_env_body_with_etag(etag: &str) -> String {
+        serde_json::json!({
+            "environment": sample_env_domain(),
+            "etag": etag,
+            "generation": 1
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn first_mutation_sends_no_if_match_then_chains_next() {
+        // Fresh store has no cached ETag → first write omits If-Match; its
+        // response ETag is then replayed as If-Match on the second write.
+        let (recorded, check) = header_recorder();
+        let mock = start_mock(
+            vec![
+                (200, &env_envelope_with_etag("sha256:rev1")),
+                (200, &env_envelope_with_etag("sha256:rev2")),
+            ],
+            Some(check),
+        );
+        let store = mock_store(mock.addr, AuthMethod::None);
+        store
+            .update_environment(&env_id(), UpdateEnvironmentPayload::default())
+            .expect("first write ok");
+        store
+            .update_environment(&env_id(), UpdateEnvironmentPayload::default())
+            .expect("second write ok");
+
+        let headers = recorded.lock().unwrap();
+        assert_eq!(headers.len(), 2, "expected two requests");
+        assert!(
+            !headers[0].contains("if-match:"),
+            "first write must not send If-Match: {}",
+            headers[0]
+        );
+        assert!(
+            headers[1].contains("if-match: \"sha256:rev1\""),
+            "second write must replay the first response's ETag: {}",
+            headers[1]
+        );
+    }
+
+    #[test]
+    fn read_then_write_pins_the_read_etag() {
+        // `load_environment` captures the GET ETag; the following mutation
+        // (the read-then-decide-then-write shape, e.g. `warm`) pins it.
+        let (recorded, check) = header_recorder();
+        let mock = start_mock(
+            vec![
+                (200, &get_env_body_with_etag("sha256:loaded")),
+                (200, &env_envelope_with_etag("sha256:rev2")),
+            ],
+            Some(check),
+        );
+        let store = mock_store(mock.addr, AuthMethod::None);
+        store.load_environment(&env_id()).expect("load ok");
+        store
+            .update_environment(&env_id(), UpdateEnvironmentPayload::default())
+            .expect("write ok");
+
+        let headers = recorded.lock().unwrap();
+        assert!(
+            !headers[0].contains("if-match:"),
+            "the GET read must not send If-Match: {}",
+            headers[0]
+        );
+        assert!(
+            headers[1].contains("if-match: \"sha256:loaded\""),
+            "the write must pin the loaded ETag: {}",
+            headers[1]
+        );
+    }
+
+    #[test]
+    fn precondition_failed_surfaces_conflict_and_clears_cache() {
+        // write1 caches an ETag; write2 sends it and gets 412 → Conflict +
+        // cache cleared; write3 therefore sends no If-Match.
+        let (recorded, check) = header_recorder();
+        let mock = start_mock(
+            vec![
+                (200, &env_envelope_with_etag("sha256:rev1")),
+                (412, r#"{"detail":"stale"}"#),
+                (200, &env_envelope_with_etag("sha256:rev3")),
+            ],
+            Some(check),
+        );
+        let store = mock_store(mock.addr, AuthMethod::None);
+        store
+            .update_environment(&env_id(), UpdateEnvironmentPayload::default())
+            .expect("write1 ok");
+        let conflict = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
+        assert!(
+            matches!(conflict, Err(StoreError::Conflict(_))),
+            "412 must surface as Conflict, got {conflict:?}"
+        );
+        store
+            .update_environment(&env_id(), UpdateEnvironmentPayload::default())
+            .expect("write3 ok");
+
+        let headers = recorded.lock().unwrap();
+        assert_eq!(headers.len(), 3, "expected three requests");
+        assert!(
+            !headers[0].contains("if-match:"),
+            "write1 must not send If-Match: {}",
+            headers[0]
+        );
+        assert!(
+            headers[1].contains("if-match: \"sha256:rev1\""),
+            "write2 must replay write1's ETag: {}",
+            headers[1]
+        );
+        assert!(
+            !headers[2].contains("if-match:"),
+            "write3 must not replay a 412-invalidated ETag: {}",
+            headers[2]
         );
     }
 
