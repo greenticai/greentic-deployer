@@ -72,12 +72,14 @@
 //!
 //! The store does **ETag-chained optimistic concurrency** entirely at the
 //! transport layer — no change to the [`EnvironmentMutations`] trait or any
-//! CLI call site. It remembers the last strong ETag it observed (from the
-//! [`MutationEnvelope`] of every successful mutation, and from
-//! [`load_environment`](EnvironmentMutations::load_environment)'s response)
-//! in [`Self::cached_etag`], and replays it as a quoted `If-Match` header on
-//! the next mutation. The server (A8 §1) then rejects the write with `412`
-//! if any other writer advanced the environment since that ETag.
+//! CLI call site. Per environment, it remembers the last strong ETag it
+//! observed (from the [`MutationEnvelope`] of every successful mutation, and
+//! from [`load_environment`](EnvironmentMutations::load_environment)'s
+//! response) in [`Self::cached_etag`], and replays it as a quoted `If-Match`
+//! header on the next mutation against that env. The server (A8 §1) then
+//! rejects the write with `412` if any other writer advanced the environment
+//! since that ETag. The cache is keyed by env because one store represents a
+//! remote endpoint, not a single env.
 //!
 //! This catches the two windows a per-invocation CLI actually exposes:
 //! - **read-then-decide-then-write** within one command (e.g. `revisions
@@ -124,6 +126,7 @@ use greentic_distributor_client::signing::TrustedKey;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use url::Url;
 
@@ -209,13 +212,17 @@ pub struct HttpEnvironmentStore {
     /// Pre-rendered `Authorization: Bearer <token>` value, built once at
     /// construction. `None` when [`AuthMethod::None`].
     auth_header_value: Option<String>,
-    /// Last strong ETag observed from a successful mutation envelope or a
-    /// `load_environment` read — replayed as `If-Match` on the next mutation
-    /// to chain optimistic-concurrency checks across the calls of one CLI
-    /// invocation (see the module-level "ETag / CAS" doc). `Arc<Mutex<…>>`
-    /// so the store stays `Clone + Send + Sync`; in practice the deployer CLI
-    /// drives a single store on one thread, so the lock is uncontended.
-    cached_etag: Arc<Mutex<Option<StateEtag>>>,
+    /// Last strong ETag observed per environment — from a successful mutation
+    /// envelope or a `load_environment` read — replayed as `If-Match` on the
+    /// next mutation against the *same* environment to chain optimistic-
+    /// concurrency checks across the calls of one CLI invocation (see the
+    /// module-level "ETag / CAS" doc). Keyed by `EnvId` (as a string) because
+    /// one store represents a remote endpoint, not a single env: every trait
+    /// method is env-scoped, so a single store-wide ETag could otherwise pin
+    /// one env's write to another env's validator. `Arc<Mutex<…>>` so the
+    /// store stays `Clone + Send + Sync`; the deployer CLI drives a single
+    /// store on one thread, so the lock is uncontended.
+    cached_etag: Arc<Mutex<HashMap<String, StateEtag>>>,
 }
 
 /// Ensure `base_url`'s path ends with `/` so [`Url::join`] treats relative
@@ -291,27 +298,35 @@ impl HttpEnvironmentStore {
             client,
             base_url: normalize_base_url(base_url),
             auth_header_value,
-            cached_etag: Arc::new(Mutex::new(None)),
+            cached_etag: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    /// The cached strong ETag rendered as a quoted `If-Match` header value
-    /// (RFC 7232 strong validator), or `None` when nothing has been observed
-    /// yet on this store. See the module-level "ETag / CAS" doc.
-    fn if_match_header(&self) -> Option<String> {
+    /// The cached strong ETag for `env_id`, rendered as a quoted `If-Match`
+    /// header value (RFC 7232 strong validator), or `None` when nothing has
+    /// been observed yet for that env. See the module-level "ETag / CAS" doc.
+    fn if_match_header(&self, env_id: &EnvId) -> Option<String> {
         self.cached_etag
             .lock()
             .expect("cached_etag mutex poisoned")
-            .as_ref()
+            .get(env_id.as_str())
             .map(|etag| format!("\"{}\"", etag.0))
     }
 
-    /// Record (or clear) the ETag to replay on the next mutation. Called with
-    /// the envelope ETag after every successful mutation and with the GET
-    /// ETag after `load_environment`; called with `None` to drop a now-stale
-    /// ETag after a `412`/`428`.
-    fn remember_etag(&self, etag: Option<StateEtag>) {
-        *self.cached_etag.lock().expect("cached_etag mutex poisoned") = etag;
+    /// Record (or clear) `env_id`'s ETag to replay on its next mutation.
+    /// Called with the envelope ETag after every successful mutation and with
+    /// the GET ETag after `load_environment`; called with `None` to drop a
+    /// now-uncertain ETag after a mutation error.
+    fn remember_etag(&self, env_id: &EnvId, etag: Option<StateEtag>) {
+        let mut cache = self.cached_etag.lock().expect("cached_etag mutex poisoned");
+        match etag {
+            Some(etag) => {
+                cache.insert(env_id.as_str().to_string(), etag);
+            }
+            None => {
+                cache.remove(env_id.as_str());
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -422,7 +437,7 @@ impl HttpEnvironmentStore {
         idempotency_key: Option<&str>,
         body: Option<&P>,
     ) -> Result<R, StoreError> {
-        let if_match = self.if_match_header();
+        let if_match = self.if_match_header(expected_env);
         match self.send::<P, MutationEnvelope<R>>(
             method,
             path,
@@ -430,22 +445,35 @@ impl HttpEnvironmentStore {
             if_match.as_deref(),
             body,
         ) {
-            Ok(envelope) => {
-                // Chain the post-commit ETag onto the next mutation in this
-                // invocation. `None` (envelope omitted it, e.g. a 204) clears
-                // the cache so the next write falls back to the server's
-                // load-pinned guard rather than replaying a stale validator.
-                self.remember_etag(envelope.etag.clone());
-                envelope.validated(expected_env, idempotency_key)
-            }
+            Ok(envelope) => match envelope.etag.clone() {
+                // Chain the post-commit ETag onto the next mutation against
+                // this env in this invocation.
+                Some(etag) => {
+                    self.remember_etag(expected_env, Some(etag));
+                    envelope.validated(expected_env, idempotency_key)
+                }
+                // A8 makes `etag` non-optional on a mutation response
+                // (`MutationResponse.etag`); its absence on a 2xx is a contract
+                // violation. Because CAS now chains on it, silently continuing
+                // would disable lost-update protection — so reject loudly,
+                // mirroring the audit-record enforcement in `validated`. Drop
+                // any prior entry first so a later write re-pins from scratch.
+                None => {
+                    self.remember_etag(expected_env, None);
+                    Err(committed_after_save(
+                        "A8 mutation response omitted the required `etag`".to_string(),
+                        idempotency_key,
+                    ))
+                }
+            },
             Err(err) => {
                 // A mutation error leaves the committed state uncertain — a
                 // rejected `If-Match` (412), but also a *committed-on-error*
                 // path like a failing `warm` health gate, which advances the
-                // server's state (and ETag) while returning an error. Drop the
-                // cached ETag so the next write re-pins via the server's
+                // server's state (and ETag) while returning an error. Drop this
+                // env's cached ETag so the next write re-pins via the server's
                 // load-pinned guard instead of replaying a now-stale validator.
-                self.remember_etag(None);
+                self.remember_etag(expected_env, None);
                 Err(err)
             }
         }
@@ -971,7 +999,7 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             None,
             None,
         )?;
-        self.remember_etag(resp.etag);
+        self.remember_etag(env_id, resp.etag);
         Ok(resp.environment)
     }
 
@@ -2848,6 +2876,51 @@ mod tests {
             !headers[2].contains("if-match:"),
             "write3 must not replay a 412-invalidated ETag: {}",
             headers[2]
+        );
+    }
+
+    #[test]
+    fn etag_cache_is_scoped_per_environment() {
+        // One store represents an endpoint, not an env: a read of env A must
+        // not pin a write to env B. Load `staging`, then mutate `local` — the
+        // mutation must send no If-Match (the cache holds only `staging`).
+        let staging = EnvId::try_from("staging").unwrap();
+        let (recorded, check) = header_recorder();
+        let mock = start_mock(
+            vec![
+                (200, &get_env_body_with_etag("sha256:staging")),
+                (200, &env_envelope_with_etag("sha256:local")),
+            ],
+            Some(check),
+        );
+        let store = mock_store(mock.addr, AuthMethod::None);
+        store.load_environment(&staging).expect("load staging ok");
+        store
+            .update_environment(&env_id(), UpdateEnvironmentPayload::default())
+            .expect("write local ok");
+
+        let headers = recorded.lock().unwrap();
+        assert!(
+            !headers[1].contains("if-match:"),
+            "a write to `local` must not replay `staging`'s ETag: {}",
+            headers[1]
+        );
+    }
+
+    #[test]
+    fn mutation_response_without_etag_is_rejected() {
+        // A8 makes `etag` non-optional on a mutation response; CAS depends on
+        // it, so a 2xx envelope that omits it is a contract violation, not a
+        // silent fall-back to blind writes.
+        let body = wrap_mutation_tweaked(sample_env_domain(), |env| {
+            env.as_object_mut().unwrap().remove("etag");
+        });
+        let (_mock, store) = happy_store(200, &body);
+        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
+        let msg = unwrap_committed_conflict(result);
+        assert!(
+            msg.contains("etag"),
+            "expected a missing-etag contract violation, got: {msg}"
         );
     }
 
