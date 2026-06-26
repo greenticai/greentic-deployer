@@ -310,7 +310,7 @@ impl HttpEnvironmentStore {
             .lock()
             .expect("cached_etag mutex poisoned")
             .get(env_id.as_str())
-            .map(|etag| format!("\"{}\"", etag.0))
+            .map(StateEtag::header_value)
     }
 
     /// Record (or clear) `env_id`'s ETag to replay on its next mutation.
