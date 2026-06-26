@@ -20,7 +20,7 @@ use greentic_deploy_spec::{DeploymentId, EnvId, RevisionId, TrafficSplit, Traffi
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{EnvironmentStore, LocalFsStore};
+use crate::environment::{EnvironmentReads, EnvironmentStore, LocalFsStore};
 
 use super::dispatch::{TrafficSetArgs, TrafficTargetArgs};
 use super::{
@@ -376,7 +376,7 @@ pub struct TrafficShowPayload {
 }
 
 pub fn show(
-    store: &LocalFsStore,
+    store: &dyn EnvironmentReads,
     flags: &OpFlags,
     payload: Option<TrafficShowPayload>,
 ) -> Result<OpOutcome, OpError> {
@@ -385,7 +385,7 @@ pub fn show(
     }
     let payload = resolve_payload::<TrafficShowPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let env = store.load(&env_id)?;
+    let env = store.load_env(&env_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
     let split = env
         .traffic_splits

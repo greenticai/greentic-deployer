@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use crate::environment::mutations::UpdateBundlePayload as StoreUpdateBundlePayload;
 use crate::environment::{
-    AddBundlePayload as StoreAddBundlePayload, EnvironmentStore, LocalFsStore, RemoveBundleOutcome,
+    AddBundlePayload as StoreAddBundlePayload, EnvironmentReads, LocalFsStore, RemoveBundleOutcome,
 };
 
 use super::{
@@ -367,7 +367,11 @@ pub fn remove(
     })
 }
 
-pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOutcome, OpError> {
+pub fn list(
+    store: &dyn EnvironmentReads,
+    flags: &OpFlags,
+    env_id: &str,
+) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(
             NOUN,
@@ -376,10 +380,10 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
         ));
     }
     let env_id = parse_env_id(env_id)?;
-    if !store.exists(&env_id)? {
+    if !store.env_exists(&env_id)? {
         return Err(OpError::NotFound(format!("environment `{env_id}`")));
     }
-    let env = store.load(&env_id)?;
+    let env = store.load_env(&env_id)?;
     let deployments: Vec<BundleSummary> = env
         .bundles
         .iter()
@@ -563,6 +567,7 @@ fn remove_schema() -> Value {
 mod tests {
     use super::*;
     use crate::cli::tests_common::make_env;
+    use crate::environment::EnvironmentStore;
     use tempfile::tempdir;
 
     /// PR-3a.7 Codex regression: `BundleRemovePayload` accepts an

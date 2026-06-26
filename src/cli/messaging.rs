@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use std::str::FromStr;
 
 use crate::environment::{
-    AddMessagingEndpointPayload, EnvironmentStore, LocalFsStore, SetMessagingWelcomeFlowPayload,
+    AddMessagingEndpointPayload, EnvironmentReads, LocalFsStore, SetMessagingWelcomeFlowPayload,
 };
 
 use super::dispatch::{
@@ -527,7 +527,11 @@ pub fn add(
     })
 }
 
-pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOutcome, OpError> {
+pub fn list(
+    store: &dyn EnvironmentReads,
+    flags: &OpFlags,
+    env_id: &str,
+) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(
             NOUN,
@@ -536,10 +540,10 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
         ));
     }
     let env_id = parse_env_id(env_id)?;
-    if !store.exists(&env_id)? {
+    if !store.env_exists(&env_id)? {
         return Err(OpError::NotFound(format!("environment `{env_id}`")));
     }
-    let env = store.load(&env_id)?;
+    let env = store.load_env(&env_id)?;
     let endpoints: Vec<EndpointSummary> = env
         .messaging_endpoints
         .iter()
@@ -553,7 +557,7 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
 }
 
 pub fn show(
-    store: &LocalFsStore,
+    store: &dyn EnvironmentReads,
     flags: &OpFlags,
     env_id: &str,
     endpoint_id: &str,
@@ -567,10 +571,10 @@ pub fn show(
     }
     let env_id = parse_env_id(env_id)?;
     let endpoint_id = parse_endpoint_id(endpoint_id)?;
-    if !store.exists(&env_id)? {
+    if !store.env_exists(&env_id)? {
         return Err(OpError::NotFound(format!("environment `{env_id}`")));
     }
-    let env = store.load(&env_id)?;
+    let env = store.load_env(&env_id)?;
     let endpoint = env
         .messaging_endpoints
         .iter()
@@ -1059,6 +1063,7 @@ fn rotate_webhook_secret_schema() -> Value {
 mod tests {
     use super::*;
     use crate::cli::tests_common::{make_bundle_deployment, make_env};
+    use crate::environment::EnvironmentStore;
     use crate::environment::messaging::MessagingEndpointIndexEntry;
     use tempfile::tempdir;
 
