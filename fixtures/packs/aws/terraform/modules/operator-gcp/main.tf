@@ -343,43 +343,6 @@ resource "google_cloud_run_v2_service" "this" {
       }
 
       dynamic "env" {
-        for_each = trimspace(var.runtime_secret_prefix) != "" ? [trim(var.runtime_secret_prefix, "/")] : []
-        content {
-          name  = "GREENTIC_SECRETS_BACKEND"
-          value = "env"
-        }
-      }
-
-      dynamic "env" {
-        for_each = trimspace(var.runtime_secret_prefix) != "" ? ["1"] : []
-        content {
-          name  = "GREENTIC_ALLOW_ENV_SECRETS"
-          value = env.value
-        }
-      }
-
-      dynamic "env" {
-        for_each = trimspace(var.runtime_secret_prefix) != "" ? [trim(var.runtime_secret_prefix, "/")] : []
-        content {
-          name  = "GREENTIC_SECRETS_MANAGER_PACK"
-          value = "providers/deployer/gcp.gtpack"
-        }
-      }
-
-      dynamic "env" {
-        for_each = trimspace(var.runtime_secret_prefix) != "" ? var.runtime_secret_env : {}
-        content {
-          name = env.key
-          value_source {
-            secret_key_ref {
-              secret  = env.value
-              version = "latest"
-            }
-          }
-        }
-      }
-
-      dynamic "env" {
         for_each = var.secrets_map
         content {
           name = env.key

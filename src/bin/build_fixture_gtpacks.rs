@@ -37,20 +37,8 @@ fn main() -> Result<()> {
             .context("fixture name missing")?;
         let pack_root = scaffold_root.join(fixture_name);
         let output_path = output_root.join(format!("{fixture_name}.gtpack"));
-        build_fixture_gtpack(&pack_root, &output_path)?;
-        validate_fixture_gtpack(&fixture_dir, &output_path)?;
-        let manifest = read_manifest_from_gtpack(&output_path)
-            .with_context(|| format!("read manifest from {}", output_path.display()))?;
-        println!("built and validated {}", output_path.display());
-        let relative_output_path = output_path.strip_prefix(&root).with_context(|| {
-            format!("compute relative output path for {}", output_path.display())
-        })?;
-        println!(
-            "PACK\t{}\t{}\t{}",
-            manifest.pack_id,
-            manifest.version,
-            relative_output_path.display()
-        );
+        let built = ensure_fixture_gtpack(&fixture_dir, &pack_root, &output_path)?;
+        print_fixture_gtpack(&root, &output_path, built)?;
     }
 
     Ok(())
@@ -107,6 +95,83 @@ fn missing_replayed_scaffolds(
         }
     }
     Ok(missing)
+}
+
+fn ensure_fixture_gtpack(fixture_dir: &Path, pack_root: &Path, output_path: &Path) -> Result<bool> {
+    if output_path.is_file() {
+        match validate_fixture_gtpack(fixture_dir, output_path) {
+            Ok(()) if !tree_has_newer_file(fixture_dir, output_path)? => return Ok(false),
+            Ok(()) => {
+                eprintln!(
+                    "existing fixture gtpack {} is older than fixture sources; rebuilding",
+                    output_path.display()
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "existing fixture gtpack {} is invalid; rebuilding: {err:#}",
+                    output_path.display()
+                );
+            }
+        }
+    }
+
+    build_fixture_gtpack(pack_root, output_path)?;
+    validate_fixture_gtpack(fixture_dir, output_path)?;
+    Ok(true)
+}
+
+fn tree_has_newer_file(root: &Path, reference: &Path) -> Result<bool> {
+    let reference_modified = fs::metadata(reference)
+        .with_context(|| format!("read metadata for {}", reference.display()))?
+        .modified()
+        .with_context(|| format!("read modified time for {}", reference.display()))?;
+    tree_has_file_modified_after(root, reference_modified)
+}
+
+fn tree_has_file_modified_after(
+    root: &Path,
+    reference_modified: std::time::SystemTime,
+) -> Result<bool> {
+    for entry in fs::read_dir(root).with_context(|| format!("read {}", root.display()))? {
+        let entry = entry.with_context(|| format!("read entry under {}", root.display()))?;
+        let path = entry.path();
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("read metadata for {}", path.display()))?;
+        if metadata.is_dir() {
+            if tree_has_file_modified_after(&path, reference_modified)? {
+                return Ok(true);
+            }
+        } else if metadata
+            .modified()
+            .with_context(|| format!("read modified time for {}", path.display()))?
+            > reference_modified
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn print_fixture_gtpack(root: &Path, output_path: &Path, built: bool) -> Result<()> {
+    let manifest = read_manifest_from_gtpack(output_path)
+        .with_context(|| format!("read manifest from {}", output_path.display()))?;
+    if built {
+        println!("built and validated {}", output_path.display());
+    } else {
+        println!("existing and validated {}", output_path.display());
+    }
+    let relative_output_path = output_path
+        .strip_prefix(root)
+        .with_context(|| format!("compute relative output path for {}", output_path.display()))?;
+    println!(
+        "PACK\t{}\t{}\t{}",
+        manifest.pack_id,
+        manifest.version,
+        relative_output_path.display()
+    );
+    Ok(())
 }
 
 fn build_fixture_gtpack(pack_root: &Path, output_path: &Path) -> Result<()> {

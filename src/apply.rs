@@ -34,6 +34,9 @@ use greentic_telemetry::{TelemetryCtx, set_current_telemetry_ctx};
 use serde_json;
 use serde_yaml_bw as serde_yaml;
 
+const SECRETS_PROVIDER_BINDING_RELATIVE_PATH: &str = "state/config/platform/secrets-provider.json";
+const SECRETS_PROVIDER_BINDING_SCHEMA_VERSION: &str = "greentic.secrets.binding.v1";
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OperationPayload {
@@ -1930,6 +1933,14 @@ struct RuntimeArtifacts {
     runner_command_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SecretsProviderBinding {
+    schema_version: String,
+    provider_id: String,
+    pack: String,
+    config: BTreeMap<String, String>,
+}
+
 fn persist_runtime_artifacts(
     config: &DeployerConfig,
     plan: &PlanContext,
@@ -1961,6 +1972,7 @@ fn persist_runtime_artifacts(
     serde_json::to_writer_pretty(invoke_file, &invocation)?;
 
     materialize_adapter_handoff_assets(config, plan, selection, deploy_dir)?;
+    materialize_secrets_provider_binding(config, deploy_dir)?;
     let handoff = write_runner_diagnostics(config, deploy_dir, selection, &plan_path)?;
 
     Ok(RuntimeArtifacts {
@@ -1970,6 +1982,56 @@ fn persist_runtime_artifacts(
         handoff: handoff.invocation,
         handoff_path: handoff.handoff_path,
         runner_command_path: handoff.runner_command_path,
+    })
+}
+
+fn materialize_secrets_provider_binding(config: &DeployerConfig, deploy_dir: &Path) -> Result<()> {
+    let Some(binding) = secrets_provider_binding_for_target(config) else {
+        return Ok(());
+    };
+    let path = deploy_dir.join(SECRETS_PROVIDER_BINDING_RELATIVE_PATH);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&binding).map_err(|err| DeployerError::Other(err.to_string()))?,
+    )?;
+    Ok(())
+}
+
+fn secrets_provider_binding_for_target(config: &DeployerConfig) -> Option<SecretsProviderBinding> {
+    let (provider_id, pack) = match config.provider {
+        crate::config::Provider::Aws => {
+            ("greentic.secrets.aws-sm", "providers/secrets/aws-sm.gtpack")
+        }
+        crate::config::Provider::Gcp => {
+            ("greentic.secrets.gcp-sm", "providers/secrets/gcp-sm.gtpack")
+        }
+        crate::config::Provider::Azure => (
+            "greentic.secrets.azure-kv",
+            "providers/secrets/azure-kv.gtpack",
+        ),
+        crate::config::Provider::Local => ("greentic.secrets.dev", "providers/secrets/dev.gtpack"),
+        _ => return None,
+    };
+    let namespace_prefix = crate::runtime_secrets::default_cloud_secret_prefix(
+        &config.environment,
+        &config.tenant,
+        None,
+    );
+    let mut binding_config = BTreeMap::new();
+    binding_config.insert("environment".to_string(), config.environment.clone());
+    binding_config.insert("tenant".to_string(), config.tenant.clone());
+    binding_config.insert("team".to_string(), "_".to_string());
+    binding_config.insert("namespace_prefix".to_string(), namespace_prefix.clone());
+    binding_config.insert("prefix".to_string(), namespace_prefix);
+
+    Some(SecretsProviderBinding {
+        schema_version: SECRETS_PROVIDER_BINDING_SCHEMA_VERSION.to_string(),
+        provider_id: provider_id.to_string(),
+        pack: pack.to_string(),
+        config: binding_config,
     })
 }
 
@@ -2100,6 +2162,8 @@ fn materialize_terraform_handoff_assets(
         copied_files: copied.clone(),
         scripts,
         generated_tfvars: generated_tfvars.clone(),
+        secrets_provider_binding: secrets_provider_binding_for_target(config)
+            .map(|_| SECRETS_PROVIDER_BINDING_RELATIVE_PATH.to_string()),
         init_command: format!("./{init_script}"),
         plan_command: format!("./{plan_script}"),
         apply_command: format!("./{apply_script}"),
@@ -2123,6 +2187,14 @@ fn materialize_terraform_handoff_assets(
         note.push_str(&format!(
             "generated_tfvars={}\n",
             terraform_root.join(tfvars).display()
+        ));
+    }
+    if secrets_provider_binding_for_target(config).is_some() {
+        note.push_str(&format!(
+            "secrets_provider_binding={}\n",
+            deploy_dir
+                .join(SECRETS_PROVIDER_BINDING_RELATIVE_PATH)
+                .display()
         ));
     }
     note.push_str("terraform_env_override_prefix=GREENTIC_DEPLOY_TERRAFORM_VAR_\n");
@@ -2151,6 +2223,8 @@ fn prune_generated_terraform_root(config: &DeployerConfig, terraform_root: &Path
   deployment_name_prefix = var.deployment_name_prefix
   operator_image        = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}"
   bundle_source         = var.bundle_source
+  bundle_s3_object_ref  = var.bundle_s3_object_ref
+  bundle_s3_object_arn  = var.bundle_s3_object_arn
   bundle_digest         = var.bundle_digest
   repo_registry_base    = var.repo_registry_base
   store_registry_base   = var.store_registry_base
@@ -2267,6 +2341,18 @@ output "admin_client_key_secret_ref" {{
     )?;
     ensure_terraform_variable_declared(
         &terraform_root.join("variables.tf"),
+        "bundle_s3_object_ref",
+        "string",
+        Some(""),
+    )?;
+    ensure_terraform_variable_declared(
+        &terraform_root.join("variables.tf"),
+        "bundle_s3_object_arn",
+        "string",
+        Some(""),
+    )?;
+    ensure_terraform_variable_declared(
+        &terraform_root.join("variables.tf"),
         "runtime_secret_prefix",
         "string",
         Some(""),
@@ -2302,6 +2388,18 @@ output "admin_client_key_secret_ref" {{
         )?;
         ensure_terraform_variable_declared(
             &module_variables,
+            "bundle_s3_object_ref",
+            "string",
+            Some(""),
+        )?;
+        ensure_terraform_variable_declared(
+            &module_variables,
+            "bundle_s3_object_arn",
+            "string",
+            Some(""),
+        )?;
+        ensure_terraform_variable_declared(
+            &module_variables,
             "runtime_secret_prefix",
             "string",
             Some(""),
@@ -2331,10 +2429,9 @@ fn ensure_aws_runtime_secret_wiring(path: &Path) -> Result<()> {
         return Ok(());
     }
     let mut contents = fs::read_to_string(path)?;
-    if contents.contains("GREENTIC_SECRETS_BACKEND")
-        && contents.contains("GREENTIC_ALLOW_ENV_SECRETS")
-        && contents.contains("runtime_secret_env")
+    if contents.contains("runtime_secret_env")
         && contents.contains("task_runtime_secrets")
+        && contents.contains("task_bundle_s3_object")
     {
         return Ok(());
     }
@@ -2367,93 +2464,116 @@ fn ensure_aws_runtime_secret_wiring(path: &Path) -> Result<()> {
 "#;
         contents = contents.replacen(marker, &format!("{policy}{marker}"), 1);
     }
-    if !contents.contains(r#"data "aws_secretsmanager_secret" "runtime""#) {
+    if !contents.contains("task_bundle_s3_object") {
         let marker = r#"resource "aws_ecs_task_definition" "this" {"#;
-        let data_source = r#"data "aws_secretsmanager_secret" "runtime" {
-  for_each = var.runtime_secret_env
-  name     = each.value
+        let policy = r#"resource "aws_iam_role_policy" "task_bundle_s3_object" {
+  count = trimspace(var.bundle_s3_object_arn) != "" ? 1 : 0
+  name  = "${local.name_prefix}-task-bundle-s3-object"
+  role  = aws_iam_role.task_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject"
+        ]
+        Resource = var.bundle_s3_object_arn
+      }
+    ]
+  })
 }
 
 "#;
-        contents = contents.replacen(marker, &format!("{data_source}{marker}"), 1);
+        contents = contents.replacen(marker, &format!("{policy}{marker}"), 1);
     }
-    contents = contents.replace(
-        r#"            value = "aws-secrets-manager""#,
-        r#"            value = "env""#,
-    );
-    contents = contents.replace(
-        r#"          {
-            name  = "GREENTIC_SECRETS_AWS_REGION"
-            value = data.aws_region.current.name
-          },
-          {
-            name  = "GREENTIC_SECRETS_AWS_PREFIX"
-            value = trim(var.runtime_secret_prefix, "/")
-          }"#,
-        r#"          {
-            name  = "GREENTIC_ALLOW_ENV_SECRETS"
-            value = "1"
-          },
-          {
-            name  = "GREENTIC_SECRETS_MANAGER_PACK"
-            value = "providers/deployer/aws.gtpack"
-          }"#,
-    );
-    if !contents.contains("GREENTIC_SECRETS_BACKEND") {
-        let marker = r#"        ],
-        [
-          {
-            name  = "PUBLIC_BASE_URL""#;
-        let replacement = r#"        ],
-        trimspace(var.runtime_secret_prefix) != "" ? [
-          {
-            name  = "GREENTIC_SECRETS_BACKEND"
-            value = "env"
-          },
-          {
-            name  = "GREENTIC_ALLOW_ENV_SECRETS"
-            value = "1"
-          },
-          {
-            name  = "GREENTIC_SECRETS_MANAGER_PACK"
-            value = "providers/deployer/aws.gtpack"
-          }
-        ] : [],
-        [
-          {
-            name  = "PUBLIC_BASE_URL""#;
-        contents = contents.replacen(marker, replacement, 1);
-    }
-    if !contents.contains("for name, secret_name in var.runtime_secret_env") {
-        contents = contents.replace(
-            r#"      secrets = [
+    if !contents.contains("bundle_fetcher_enabled") {
+        if let Some(line) = contents
+            .lines()
+            .find(|line| line.trim_start().starts_with("admin_secret_prefix ="))
+            .map(str::to_string)
         {
-          name      = "GREENTIC_ADMIN_CA_PEM"
-          valueFrom = aws_secretsmanager_secret.admin_ca.arn
-        },"#,
-            r#"      secrets = concat(
-        [
-          {
-            name      = "GREENTIC_ADMIN_CA_PEM"
-            valueFrom = aws_secretsmanager_secret.admin_ca.arn
-          },"#,
-        );
+            let replacement = format!(
+                "{line}\n  bundle_fetcher_enabled = trimspace(var.bundle_s3_object_ref) != \"\"\n  operator_bundle_source = local.bundle_fetcher_enabled ? \"/greentic-bundle/bundle.gtbundle\" : var.bundle_source"
+            );
+            contents = contents.replacen(&line, &replacement, 1);
+        }
         contents = contents.replace(
-            r#"          name      = "GREENTIC_ADMIN_SERVER_KEY_PEM"
-          valueFrom = aws_secretsmanager_secret.admin_server_key.arn
-        }
-      ]"#,
-            r#"          name      = "GREENTIC_ADMIN_SERVER_KEY_PEM"
-          valueFrom = aws_secretsmanager_secret.admin_server_key.arn
-        }
-        ],
-        [
-          for name, secret_name in var.runtime_secret_env : {
-            name      = name
-            valueFrom = data.aws_secretsmanager_secret.runtime[name].arn
+            r#"  task_role_arn            = aws_iam_role.task_execution.arn
+
+  container_definitions = jsonencode(["#,
+            r#"  task_role_arn            = aws_iam_role.task_execution.arn
+
+  volume {
+    name = "greentic-bundle"
+  }
+
+  container_definitions = jsonencode(concat(
+    local.bundle_fetcher_enabled ? [
+      {
+        name      = "bundle-fetcher"
+        image     = "public.ecr.aws/aws-cli/aws-cli:latest"
+        essential = false
+        command = [
+          "s3",
+          "cp",
+          var.bundle_s3_object_ref,
+          local.operator_bundle_source
+        ]
+        mountPoints = [
+          {
+            sourceVolume  = "greentic-bundle"
+            containerPath = "/greentic-bundle"
+            readOnly      = false
           }
         ]
-      )"#,
+        logConfiguration = {
+          logDriver = "awslogs"
+          options = {
+            awslogs-group         = aws_cloudwatch_log_group.this.name
+            awslogs-region        = data.aws_region.current.name
+            awslogs-stream-prefix = "bundle-fetcher"
+          }
+        }
+      }
+    ] : [],
+    ["#,
+        );
+        contents = contents.replace("var.bundle_source,", "local.operator_bundle_source,");
+        contents = contents.replace(
+            r#"            name  = "GREENTIC_BUNDLE_SOURCE"
+            value = var.bundle_source"#,
+            r#"            name  = "GREENTIC_BUNDLE_SOURCE"
+            value = local.operator_bundle_source"#,
+        );
+        contents = contents.replace(
+            r#"      portMappings = ["#,
+            r#"      dependsOn = local.bundle_fetcher_enabled ? [
+        {
+          containerName = "bundle-fetcher"
+          condition     = "SUCCESS"
+        }
+      ] : []
+      mountPoints = local.bundle_fetcher_enabled ? [
+        {
+          sourceVolume  = "greentic-bundle"
+          containerPath = "/greentic-bundle"
+          readOnly      = true
+        }
+      ] : []
+      portMappings = ["#,
+        );
+        contents = contents.replace(
+            r#"    }
+  ])
+
+  tags = local.common_tags"#,
+            r#"    }
+    ]
+  ))
+
+  tags = local.common_tags"#,
         );
     }
     fs::write(path, contents)?;
@@ -2496,6 +2616,16 @@ fn ensure_terraform_variable_declared(
     Ok(())
 }
 
+fn aws_bundle_s3_object_arn(bundle_source: &str) -> Option<String> {
+    let rest = bundle_source.trim().strip_prefix("s3://")?;
+    let (bucket, key) = rest.split_once('/')?;
+    let key = key.trim_start_matches('/');
+    if bucket.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some(format!("arn:aws:s3:::{bucket}/{key}"))
+}
+
 fn materialize_generated_tfvars(
     config: &DeployerConfig,
     terraform_root: &Path,
@@ -2534,6 +2664,9 @@ fn materialize_generated_tfvars(
 
     if let Some(bundle_source) = config.bundle_source.as_ref() {
         replace_tfvars_assignment(&mut contents, "bundle_source", bundle_source);
+        if let Some(s3_arn) = aws_bundle_s3_object_arn(bundle_source) {
+            replace_tfvars_assignment(&mut contents, "bundle_s3_object_arn", &s3_arn);
+        }
     }
     if let Some(bundle_digest) = config.bundle_digest.as_ref() {
         replace_tfvars_assignment(&mut contents, "bundle_digest", bundle_digest);
@@ -3924,6 +4057,8 @@ struct TerraformRuntimeMetadata {
     scripts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     generated_tfvars: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secrets_provider_binding: Option<String>,
     init_command: String,
     plan_command: String,
     apply_command: String,
@@ -5072,6 +5207,176 @@ kind: Deployment
     }
 
     #[test]
+    fn secrets_provider_binding_maps_targets_to_provider_packs() {
+        let pack_path = PathBuf::from("/tmp/provider.gtpack");
+        let mut config = config_for(pack_path, DeployerCapability::Apply);
+        config.tenant = "demo".into();
+        config.environment = "dev".into();
+
+        let cases = [
+            (
+                Provider::Aws,
+                "greentic.secrets.aws-sm",
+                "providers/secrets/aws-sm.gtpack",
+            ),
+            (
+                Provider::Gcp,
+                "greentic.secrets.gcp-sm",
+                "providers/secrets/gcp-sm.gtpack",
+            ),
+            (
+                Provider::Azure,
+                "greentic.secrets.azure-kv",
+                "providers/secrets/azure-kv.gtpack",
+            ),
+            (
+                Provider::Local,
+                "greentic.secrets.dev",
+                "providers/secrets/dev.gtpack",
+            ),
+        ];
+
+        for (provider, provider_id, pack) in cases {
+            config.provider = provider;
+            let binding = secrets_provider_binding_for_target(&config).expect("binding for target");
+            assert_eq!(
+                binding.schema_version,
+                SECRETS_PROVIDER_BINDING_SCHEMA_VERSION
+            );
+            assert_eq!(binding.provider_id, provider_id);
+            assert_eq!(binding.pack, pack);
+            assert_eq!(
+                binding.config.get("environment").map(String::as_str),
+                Some("dev")
+            );
+            assert_eq!(
+                binding.config.get("tenant").map(String::as_str),
+                Some("demo")
+            );
+            assert_eq!(binding.config.get("team").map(String::as_str), Some("_"));
+            assert_eq!(
+                binding.config.get("namespace_prefix").map(String::as_str),
+                Some("greentic/dev/demo/_")
+            );
+            assert_eq!(
+                binding.config.get("prefix").map(String::as_str),
+                Some("greentic/dev/demo/_")
+            );
+        }
+
+        config.provider = Provider::Generic;
+        assert!(secrets_provider_binding_for_target(&config).is_none());
+    }
+
+    #[test]
+    fn persist_runtime_artifacts_materializes_aws_secrets_provider_binding() {
+        let base = std::env::current_dir()
+            .expect("cwd")
+            .join("target/tmp-tests");
+        std::fs::create_dir_all(&base).expect("create tmp base");
+        let dir = tempfile::tempdir_in(base).expect("temp dir");
+        let pack_path = write_test_pack(true);
+
+        let mut greentic = greentic_config::ConfigResolver::new()
+            .load()
+            .expect("load default config")
+            .config;
+        greentic.paths.state_dir = dir.path().join(".greentic-state");
+
+        let config = DeployerConfig {
+            capability: DeployerCapability::Plan,
+            provider: Provider::Aws,
+            strategy: "iac-only".into(),
+            tenant: "demo".into(),
+            environment: "dev".into(),
+            pack_path: Some(pack_path.clone()),
+            bundle_root: None,
+            providers_dir: PathBuf::from("providers/deployer"),
+            packs_dir: PathBuf::from("packs"),
+            provider_pack: Some(pack_path.clone()),
+            pack_ref: None,
+            distributor_url: None,
+            distributor_token: None,
+            preview: false,
+            dry_run: false,
+            execute_local: false,
+            output: crate::config::OutputFormat::Json,
+            greentic,
+            provenance: greentic_config::ProvenanceMap::new(),
+            config_warnings: Vec::new(),
+            deploy_pack_id_override: None,
+            deploy_flow_id_override: None,
+            bundle_source: Some("s3://bucket/bundle.gtbundle".into()),
+            bundle_digest: Some(
+                "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
+            ),
+            repo_registry_base: None,
+            store_registry_base: None,
+        };
+        let plan = pack_introspect::build_plan(&config).expect("build plan");
+        let deploy_dir = dir.path().join("output");
+        std::fs::create_dir_all(&deploy_dir).expect("create output dir");
+        let selection = DeploymentPackSelection {
+            dispatch: crate::deployment::DeploymentDispatch {
+                capability: DeployerCapability::Plan,
+                pack_id: "greentic.deploy.aws".into(),
+                flow_id: "plan_pack".into(),
+                handler_id: "builtin.aws".into(),
+            },
+            pack_path,
+            manifest: PackManifest {
+                schema_version: "pack-v1".to_string(),
+                pack_id: PackId::from_str("greentic.deploy.aws").unwrap(),
+                name: None,
+                version: Version::new(0, 1, 0),
+                kind: PackKind::Application,
+                publisher: "greentic".to_string(),
+                secret_requirements: Vec::new(),
+                components: Vec::new(),
+                flows: Vec::new(),
+                dependencies: Vec::new(),
+                capabilities: Vec::new(),
+                signatures: Default::default(),
+                bootstrap: None,
+                extensions: None,
+                agents: Default::default(),
+            },
+            origin: "test".into(),
+            candidates: Vec::new(),
+        };
+
+        let artifacts = persist_runtime_artifacts(&config, &plan, &selection, &deploy_dir)
+            .expect("persist runtime artifacts");
+        let binding_path = artifacts
+            .deploy_dir
+            .join(SECRETS_PROVIDER_BINDING_RELATIVE_PATH);
+        let binding: SecretsProviderBinding = serde_json::from_slice(
+            &std::fs::read(&binding_path).expect("read secrets provider binding"),
+        )
+        .expect("parse secrets provider binding");
+
+        assert_eq!(binding.schema_version, "greentic.secrets.binding.v1");
+        assert_eq!(binding.provider_id, "greentic.secrets.aws-sm");
+        assert_eq!(binding.pack, "providers/secrets/aws-sm.gtpack");
+        assert_eq!(
+            binding.config.get("namespace_prefix").map(String::as_str),
+            Some("greentic/dev/demo/_")
+        );
+        let metadata: TerraformRuntimeMetadata = serde_json::from_slice(
+            &std::fs::read(artifacts.deploy_dir.join("terraform-runtime.json"))
+                .expect("read terraform runtime metadata"),
+        )
+        .expect("parse terraform runtime metadata");
+        assert_eq!(
+            metadata.secrets_provider_binding.as_deref(),
+            Some(SECRETS_PROVIDER_BINDING_RELATIVE_PATH)
+        );
+        let note = std::fs::read_to_string(artifacts.deploy_dir.join("terraform-handoff.txt"))
+            .expect("read terraform handoff note");
+        assert!(note.contains("secrets_provider_binding="));
+    }
+
+    #[test]
     fn terraform_apply_script_for_azure_imports_existing_resources() {
         let rendered = terraform_plan_like_script(
             "apply",
@@ -5292,15 +5597,22 @@ data "aws_region" "current" {}
         assert!(rendered.contains(r#"tenant                = var.tenant"#));
         let variables =
             std::fs::read_to_string(terraform_root.join("variables.tf")).expect("read variables");
+        assert!(variables.contains(r#"variable "bundle_s3_object_ref""#));
+        assert!(variables.contains(r#"variable "bundle_s3_object_arn""#));
         assert!(variables.contains(r#"variable "runtime_secret_prefix""#));
         let module_variables =
             std::fs::read_to_string(terraform_root.join("modules/operator/variables.tf"))
                 .expect("read module variables");
+        assert!(module_variables.contains(r#"variable "bundle_s3_object_ref""#));
+        assert!(module_variables.contains(r#"variable "bundle_s3_object_arn""#));
         assert!(module_variables.contains(r#"variable "runtime_secret_prefix""#));
         let module_main = std::fs::read_to_string(terraform_root.join("modules/operator/main.tf"))
             .expect("read module main");
-        assert!(module_main.contains("GREENTIC_SECRETS_BACKEND"));
+        assert!(!module_main.contains("GREENTIC_SECRETS_BACKEND"));
+        assert!(!module_main.contains("GREENTIC_ALLOW_ENV_SECRETS"));
+        assert!(!module_main.contains("for name, secret_name in var.runtime_secret_env"));
         assert!(module_main.contains("task_runtime_secrets"));
+        assert!(module_main.contains("task_bundle_s3_object"));
     }
 
     #[test]
@@ -5594,6 +5906,77 @@ data "aws_region" "current" {}
     }
 
     #[test]
+    fn generated_aws_tfvars_omit_runtime_secret_env_when_provider_binding_exists() {
+        let base = std::env::current_dir()
+            .expect("cwd")
+            .join("target/tmp-tests");
+        std::fs::create_dir_all(&base).expect("create tmp base");
+        let dir = tempfile::tempdir_in(base).expect("temp dir");
+        let bundle_root = dir.path();
+        let terraform_root = bundle_root.join("terraform");
+        std::fs::create_dir_all(&terraform_root).expect("terraform root");
+        std::fs::write(
+            terraform_root.join("staging.tfvars.example"),
+            r#"
+cloud = "aws"
+tenant = "demo"
+environment = "dev"
+runtime_secret_env = {}
+"#,
+        )
+        .expect("write tfvars example");
+
+        let pack_path = bundle_root.join("packs/messaging-webchat-gui");
+        std::fs::create_dir_all(&pack_path).expect("pack dir");
+        std::fs::write(
+            pack_path.join("pack.manifest.json"),
+            r#"{
+  "extensions": {
+    "greentic.generated-secrets.v1": {
+      "inline": {
+        "secrets": [{
+          "key": "jwt_signing_key",
+          "required": true,
+          "policy": "random",
+          "length": 20,
+          "encoding": "raw_text",
+          "scope": {"level": "tenant", "team": "_"}
+        }]
+      }
+    }
+  }
+}"#,
+        )
+        .expect("write manifest");
+
+        let config = DeployerConfig {
+            provider: Provider::Aws,
+            tenant: "demo".into(),
+            environment: "dev".into(),
+            pack_path: Some(pack_path.clone()),
+            bundle_root: Some(bundle_root.to_path_buf()),
+            provider_pack: None,
+            bundle_source: Some("s3://bucket/bundle.gtbundle".into()),
+            ..config_for(pack_path, DeployerCapability::Apply)
+        };
+
+        let generated =
+            materialize_generated_tfvars(&config, &terraform_root, "staging.tfvars.example")
+                .expect("generate tfvars")
+                .expect("tfvars generated");
+        let contents =
+            std::fs::read_to_string(terraform_root.join(generated)).expect("read generated tfvars");
+
+        assert!(contents.contains("runtime_secret_env = {}"));
+        assert!(!contents.contains("GREENTIC_SECRET__"));
+        assert!(!contents.contains("\"jwt_signing_key\""));
+        assert!(
+            !contents.contains("\"secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key\""),
+            "runtime_secret_env must not include runtime secret aliases when provider binding is present: {contents}"
+        );
+    }
+
+    #[test]
     fn deployment_name_prefix_normalization_keeps_cloud_names_bounded() {
         assert_eq!(
             normalize_deployment_name_prefix(" Maarten/Deep Research Demo!!! "),
@@ -5621,6 +6004,7 @@ data "aws_region" "current" {}
                 copied_files: vec!["main.tf".into(), "modules/operator/main.tf".into()],
                 scripts: vec!["terraform-status.sh".into()],
                 generated_tfvars: None,
+                secrets_provider_binding: None,
                 init_command: "./terraform-init.sh".into(),
                 plan_command: "./terraform-plan.sh".into(),
                 apply_command: "./terraform-apply.sh".into(),
