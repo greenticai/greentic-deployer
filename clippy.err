@@ -1,0 +1,47 @@
+error[E0062]: field `agents` specified more than once
+    --> src/apply.rs:5163:17
+     |
+5148 |                 agents: Default::default(),
+     |                 -------------------------- first use of `agents`
+...
+5163 |                 agents: Default::default(),
+     |                 ^^^^^^ used more than once
+
+error[E0062]: field `agents` specified more than once
+    --> src/apply.rs:5691:17
+     |
+5676 |                 agents: Default::default(),
+     |                 -------------------------- first use of `agents`
+...
+5691 |                 agents: Default::default(),
+     |                 ^^^^^^ used more than once
+
+error[E0062]: field `agents` specified more than once
+    --> src/apply.rs:5803:17
+     |
+5788 |                 agents: Default::default(),
+     |                 -------------------------- first use of `agents`
+...
+5803 |                 agents: Default::default(),
+     |                 ^^^^^^ used more than once
+
+error[E0062]: field `agents` specified more than once
+    --> src/apply.rs:6246:17
+     |
+6231 |                 agents: Default::default(),
+     |                 -------------------------- first use of `agents`
+...
+6246 |                 agents: Default::default(),
+     |                 ^^^^^^ used more than once
+
+error[E0062]: field `agents` specified more than once
+    --> src/apply.rs:6340:17
+     |
+6325 |                 agents: Default::default(),
+     |                 -------------------------- first use of `agents`
+...
+6340 |                 agents: Default::default(),
+     |                 ^^^^^^ used more than once
+
+For more information about this error, try `rustc --explain E0062`.
+error: could not compile `greentic-deployer` (lib test) due to 5 previous errors
