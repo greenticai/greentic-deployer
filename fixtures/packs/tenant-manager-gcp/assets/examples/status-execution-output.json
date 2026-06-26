@@ -1,0 +1,20 @@
+{
+  "kind": "status",
+  "deployment_id": "deploy/gcp/acme/staging",
+  "state": "handoff_ready",
+  "provider": "gcp",
+  "strategy": "iac-only",
+  "status_source": "terraform_handoff",
+  "endpoints": [
+    "https://id.example.com"
+  ],
+  "health_checks": [
+    "terraform_root:present",
+    "script:terraform-status.sh:present"
+  ],
+  "output_refs": {
+    "cloud_provider": "gcp",
+    "service_url": "https://id.example.com",
+    "db_connection_name": "my-greentic-project:us-central1:greentic-tm-prod-db"
+  }
+}

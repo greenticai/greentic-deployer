@@ -1,0 +1,42 @@
+[package]
+name = "greentic-operator-trust"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Greentic operator signing-key management and trust-root document semantics"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/greenticai/greentic-deployer"
+homepage = "https://github.com/greenticai/greentic-deployer"
+documentation = "https://docs.greentic.ai/deployer/operator-trust"
+keywords = ["greentic", "deployer", "trust-root", "ed25519", "signing"]
+categories = ["development-tools"]
+
+[features]
+# Exposes `test_support` (deterministic keypair fixtures) to downstream
+# crates' dev-dependencies.
+test-utils = []
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "zeroize"] }
+greentic-deploy-spec = { path = "../greentic-deploy-spec", version = "0.1" }
+# Only the (ungated) `signing` module is used. `default-features = false`
+# would be the right spec, but distributor-client's `store_auth` module
+# references the optional `dirs_next` crate without a cfg gate, so the
+# minimal build does not compile — track upstream before slimming this.
+greentic-distributor-client = ">=1.1.0-dev, <1.2.0-0"
+hex = "0.4"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+serde_json = "1"

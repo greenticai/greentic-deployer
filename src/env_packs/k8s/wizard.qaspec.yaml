@@ -1,0 +1,106 @@
+# wizard.qaspec.yaml — K8s deployer env-pack (C6).
+#
+# Collects the operator-facing knobs the K8s deployer needs at bind time.
+# Kubernetes credential MATERIAL is not captured here — the deployer's
+# API identity is bound via `gtc op credentials rotate` after the
+# bootstrap rules pack is applied (see `bootstrap.rs`), and validation
+# runs typed `SelfSubjectAccessReview` probes against the operations in
+# `credentials.rs::VALIDATED_K8S_OPERATIONS`. Secrets stay on the secret
+# backend (B12a / `secret://` URI refs).
+#
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Trust-boundary disclosure (partial — rendering closed, probes still open):
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Manifest rendering (`gtc op env render`) NOW consumes these answers via
+# `K8sParams::from_answers` — namespace, runtime_image, and router_replicas
+# propagate into the rendered manifests. Credential probes still run
+# against the ambient environment (same gap as the AWS-ECS wizard);
+# threading answers into the Deployer verbs (warm/apply_traffic_split)
+# rides the PR-5.3 orchestration wiring.
+#
+# Versioning: this spec rides the env-pack handler's
+# `K8sDeployerHandler::VERSION_REQ` (`>=1.0.0-dev, <2.0.0`). A breaking
+# change to the question set means a Major bump on the env-pack
+# descriptor and a fresh `wizard.qaspec.yaml`.
+
+id: greentic.deployer.k8s.wizard
+title: Kubernetes deployer
+version: "0.1.0"
+description: >-
+  Records the cluster scope the K8s deployer env-pack will operate
+  against. Manifest rendering (`op env render`) consumes these answers
+  to override namespace, runtime image, and router replicas. Credential
+  probes still run against the ambient environment. Credential MATERIAL
+  is never collected here.
+presentation:
+  intro: >-
+    Bind a Kubernetes environment. Manifest rendering (`op env render`)
+    consumes these answers: namespace, runtime image, and router replicas
+    propagate into the rendered manifests. Credential probes and
+    Deployer verbs (warm, apply_traffic_split) still use sandbox
+    defaults until PR-5.3 orchestration wiring. Production requires a
+    digest-pinned runtime image. Note: env ids that require lossy
+    sanitization (uppercase, `.`, `_`) or exceed the 63-char RFC 1123
+    limit get a collision-proof hash suffix (`gtc-<prefix>-<hash8>`) —
+    see `manifests::namespace_for_env`.
+
+questions:
+  - id: kubeconfig_context
+    type: string
+    title: Kubeconfig context (optional)
+    description: >-
+      Context name from your kubeconfig the deployer should target.
+      Leave blank to use the current context resolved by the standard
+      kubeconfig chain (`$KUBECONFIG`, `~/.kube/config`, in-cluster).
+    required: false
+
+  - id: namespace
+    type: string
+    title: Namespace (optional)
+    description: >-
+      Namespace the env's objects land in. Leave blank for the default
+      `gtc-<env-id>` (clean ids) or `gtc-<prefix>-<hash8>` (lossy or
+      long ids — see `manifests::namespace_for_env`). One namespace
+      per (tenant, environment) pair; it must match the namespace the
+      bootstrap rules pack provisioned.
+    required: false
+    constraint:
+      max_len: 63
+      pattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+
+  - id: runtime_image
+    type: string
+    title: Runtime image (optional)
+    description: >-
+      Container image for the router and worker pods. Leave blank for
+      the sandbox default
+      (`ghcr.io/greenticai/greentic-start-distroless:develop`).
+      Production deployments MUST pin a digest
+      (`...@sha256:<digest>`) — the ship gate verifies it.
+    required: false
+    constraint:
+      pattern: '^[a-z0-9.\-_/:@]+$'
+
+  - id: router_replicas
+    type: string
+    title: Router replicas (optional)
+    description: >-
+      Replica count for the stable Greentic router Deployment. Leave
+      blank for the default of 2. The router must stay HA — values
+      below 2 are rejected at apply time.
+    required: false
+    default_value: "2"
+    constraint:
+      pattern: '^[0-9]+$'
+
+  - id: oci_insecure_registries
+    type: string
+    title: Insecure OCI registries (optional)
+    description: >-
+      Comma-separated registry authorities (`host:port`) the worker and
+      router may pull bundles from over plain HTTP instead of HTTPS — for
+      an internal/air-gapped registry without TLS. Leave blank (the
+      default) to require HTTPS for every registry. Rendered into the pods
+      as `GREENTIC_OCI_INSECURE_REGISTRIES`; honored only on the
+      digest-pinned OCI boot-pull path.
+    required: false

@@ -1,0 +1,211 @@
+//! `greentic.revision.v1` (`§5.2`).
+//!
+//! Revisions are per [`BundleDeployment`](crate::BundleDeployment); each
+//! customer-scoped deployment in an Env has its own revision sequence and its
+//! own [`TrafficSplit`](crate::TrafficSplit).
+
+use crate::ids::{BundleId, DeploymentId, PackId, RevisionId};
+use crate::version::{SchemaVersion, SemVer};
+use chrono::{DateTime, Utc};
+use greentic_types::EnvId;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Lifecycle state for a revision (`§5.2`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RevisionLifecycle {
+    Inactive,
+    Staged,
+    Warming,
+    Ready,
+    Draining,
+    Failed,
+    Archived,
+}
+
+/// Pure spec-level predicate for the state-transition matrix at `§5.2`.
+///
+/// ```text
+/// inactive → staged | failed | archived
+/// staged   → warming | failed | archived
+/// warming  → ready | failed | archived
+/// ready    → draining | failed | archived
+/// draining → inactive
+/// failed   → staged (retry) | archived
+/// archived → (terminal)
+/// ```
+///
+/// `Inactive → Archived` closes the drain-complete loop: a revision that
+/// reaches `Draining` (via the `ready → draining` operator action) is moved
+/// to `Inactive` by the runtime when drain completes (`draining → inactive`);
+/// the operator then archives the now-quiesced revision with `inactive → archived`.
+/// Without this edge, drained revisions are stranded behind a runtime-only
+/// transition because no `inactive → *` archival path exists.
+///
+/// A5 wraps this with the storage-level guard; consumers that need the predicate
+/// without depending on the deployer should use this function directly.
+pub fn is_valid_transition(from: RevisionLifecycle, to: RevisionLifecycle) -> bool {
+    use RevisionLifecycle::*;
+    matches!(
+        (from, to),
+        (Inactive, Staged)
+            | (Inactive, Failed)
+            | (Inactive, Archived)
+            | (Staged, Warming)
+            | (Staged, Failed)
+            | (Staged, Archived)
+            | (Warming, Ready)
+            | (Warming, Failed)
+            | (Warming, Archived)
+            | (Ready, Draining)
+            | (Ready, Failed)
+            | (Ready, Archived)
+            | (Draining, Inactive)
+            | (Failed, Staged)
+            | (Failed, Archived)
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackListEntry {
+    pub pack_id: PackId,
+    pub version: SemVer,
+    pub digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_uri: Option<String>,
+}
+
+impl PackListEntry {
+    /// Build from a bundle-stage lock entry's primitives.
+    ///
+    /// The lock file is the disk source of truth for resolved packs; this
+    /// projection carries `pack_id` and `digest` verbatim but uses a
+    /// sentinel version (`0.0.0`) because the lock doesn't carry semver.
+    /// The `Environment::validate` cross-ref relies only on `pack_id`;
+    /// runtime config materializers re-read the lock for the real version.
+    pub fn from_lock_primitives(pack_id: PackId, digest: String) -> Self {
+        Self {
+            pack_id,
+            version: SemVer::new(0, 0, 0),
+            digest,
+            source_uri: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revision {
+    pub schema: SchemaVersion,
+    pub revision_id: RevisionId,
+    pub env_id: EnvId,
+    pub bundle_id: BundleId,
+    pub deployment_id: DeploymentId,
+    /// Monotonic per `deployment_id`.
+    pub sequence: u64,
+    pub created_at: DateTime<Utc>,
+    /// Digest of the `.gtbundle` archive.
+    pub bundle_digest: String,
+    /// Registry reference the `.gtbundle` was resolved from (e.g.
+    /// `oci://…`, `repo://…`, `store://…`), when it came from a registry.
+    /// `None` for a locally-staged bundle — a local `.gtbundle` has no
+    /// registry coordinate, so such a revision serves locally only and is
+    /// not pullable by a remote worker. A remote worker (e.g. a K8s pod)
+    /// uses this to pull the bundle at boot; `bundle_digest` is the
+    /// integrity check on whatever it pulls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_source_uri: Option<String>,
+    pub pack_list: Vec<PackListEntry>,
+    /// Env-relative path to the pinned pack-list lockfile.
+    pub pack_list_lock_ref: PathBuf,
+    /// Env-relative paths to per-pack `pack-config.v1` documents written at
+    /// stage time (one per pack id that carried a `pack-config-input.v1` in
+    /// the bundle). Empty when the bundle had no inputs or when staging used
+    /// the legacy non-bundle path. Surfaces through the runtime-config
+    /// projection's `pack_config_refs` for `greentic-start` to load.
+    #[serde(default)]
+    pub pack_config_refs: Vec<PathBuf>,
+    /// Hash of (setup-answers + pack_list).
+    pub config_digest: String,
+    /// Env-relative path to the revision DSSE sidecar.
+    pub signature_sidecar_ref: PathBuf,
+    pub lifecycle: RevisionLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub drain_seconds: u32,
+    #[serde(default)]
+    pub abort_metrics: Vec<String>,
+}
+
+impl Revision {
+    pub fn schema_str() -> &'static str {
+        SchemaVersion::REVISION_V1
+    }
+
+    /// Schema-discriminator check. Called by [`Environment::validate`] for
+    /// every nested revision so a mixed-version document cannot survive a
+    /// round-trip through the env compose view.
+    pub fn validate(&self) -> Result<(), crate::error::SpecError> {
+        if self.schema.as_str() != SchemaVersion::REVISION_V1 {
+            return Err(crate::error::SpecError::SchemaMismatch {
+                expected: SchemaVersion::REVISION_V1,
+                actual: self.schema.as_str().to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal() -> Revision {
+        Revision {
+            schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
+            revision_id: RevisionId::new(),
+            env_id: EnvId::try_from("local").unwrap(),
+            bundle_id: BundleId::new("demo"),
+            deployment_id: DeploymentId::new(),
+            sequence: 1,
+            created_at: Utc::now(),
+            bundle_digest: "sha256:00".to_string(),
+            bundle_source_uri: None,
+            pack_list: Vec::new(),
+            pack_list_lock_ref: PathBuf::from("pack-list.lock"),
+            pack_config_refs: Vec::new(),
+            config_digest: "sha256:00".to_string(),
+            signature_sidecar_ref: PathBuf::from("rev.sig"),
+            lifecycle: RevisionLifecycle::Staged,
+            staged_at: None,
+            warmed_at: None,
+            drain_seconds: 0,
+            abort_metrics: Vec::new(),
+        }
+    }
+
+    /// `bundle_source_uri` is `skip_serializing_if = "Option::is_none"`, so a
+    /// locally-staged revision serializes WITHOUT the key: `environment.json`
+    /// documents written before the field existed round-trip unchanged and
+    /// deserialize back to `None`. A distributor-sourced ref survives intact.
+    #[test]
+    fn bundle_source_uri_is_omitted_when_none_and_round_trips_when_some() {
+        let none = minimal();
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(
+            json.get("bundle_source_uri").is_none(),
+            "None must omit the key for wire compatibility: {json}"
+        );
+        assert_eq!(serde_json::from_value::<Revision>(json).unwrap(), none);
+
+        let some = Revision {
+            bundle_source_uri: Some("oci://ghcr.io/greenticai/bundles/demo@sha256:abc".to_string()),
+            ..minimal()
+        };
+        let rt: Revision = serde_json::from_str(&serde_json::to_string(&some).unwrap()).unwrap();
+        assert_eq!(rt, some);
+    }
+}

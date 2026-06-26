@@ -212,6 +212,7 @@ mod tests {
     fn write_pack_dir_with_contract() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::try_from("greentic.deploy.external").expect("pack id"),
             name: None,
@@ -270,6 +271,7 @@ mod tests {
     fn pack_source_ignores_paths_without_deployer_contract() {
         let dir = tempfile::tempdir().expect("tempdir");
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::try_from("greentic.no.contract").expect("pack id"),
             name: None,
@@ -311,6 +313,7 @@ mod tests {
     fn pack_source_infers_provider_and_target_from_pack_id() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::try_from("greentic.deploy.aws").expect("pack id"),
             name: None,

@@ -737,7 +737,7 @@ mod tests {
             strategy: "iac-only".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path,
+            pack_path: Some(pack_path),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -811,6 +811,7 @@ mod tests {
         std::fs::create_dir_all(&base).expect("create tmp base");
         let dir = tempfile::tempdir_in(base).expect("temp dir");
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::try_from(pack_id).unwrap(),
             name: None,
@@ -906,7 +907,14 @@ mod tests {
 
     #[test]
     fn resolve_direct_pack_path_prefers_provider_specific_filename() {
-        let providers_dir = tempfile::tempdir().expect("tempdir");
+        // Same parent dir as `write_test_deployer_pack` so the rename below
+        // stays on a single filesystem; bare `tempfile::tempdir()` lands in
+        // $TMPDIR (often a separate tmpfs mount) and trips `EXDEV` on hosts
+        // where /tmp and the source tree sit on different volumes.
+        let providers_base = env::current_dir().expect("cwd").join("target/tmp-tests");
+        std::fs::create_dir_all(&providers_base).expect("create tmp base");
+        let providers_dir =
+            tempfile::tempdir_in(&providers_base).expect("tempdir in same fs as source pack");
         let aws_pack = providers_dir.path().join("aws.gtpack");
         std::fs::rename(
             write_test_deployer_pack(
@@ -924,7 +932,7 @@ mod tests {
             strategy: "iac-only".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: write_test_pack(),
+            pack_path: Some(write_test_pack()),
             bundle_root: None,
             providers_dir: providers_dir.path().to_path_buf(),
             packs_dir: PathBuf::from("packs"),
@@ -960,7 +968,12 @@ mod tests {
 
     #[test]
     fn resolve_deployment_pack_uses_provider_specific_filename_without_override() {
-        let providers_dir = tempfile::tempdir().expect("tempdir");
+        // Same-filesystem tempdir — see resolve_direct_pack_path_prefers_provider_specific_filename
+        // for the rationale.
+        let providers_base = env::current_dir().expect("cwd").join("target/tmp-tests");
+        std::fs::create_dir_all(&providers_base).expect("create tmp base");
+        let providers_dir =
+            tempfile::tempdir_in(&providers_base).expect("tempdir in same fs as source pack");
         let aws_pack = providers_dir.path().join("aws.gtpack");
         std::fs::rename(
             write_test_deployer_pack(
@@ -978,7 +991,7 @@ mod tests {
             strategy: "iac-only".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: write_test_pack(),
+            pack_path: Some(write_test_pack()),
             bundle_root: None,
             providers_dir: providers_dir.path().to_path_buf(),
             packs_dir: PathBuf::from("packs"),
@@ -1020,6 +1033,7 @@ mod tests {
     #[test]
     fn contract_owned_capability_flow_overrides_default_flow() {
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::try_from("greentic.deploy.aws").unwrap(),
             name: None,
@@ -1095,6 +1109,7 @@ mod tests {
     #[test]
     fn missing_contract_capability_errors() {
         let mut manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::try_from("greentic.deploy.aws").unwrap(),
             name: None,

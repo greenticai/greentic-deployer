@@ -1971,7 +1971,7 @@ fn persist_runtime_artifacts(
     let invoke_file = fs::File::create(&invoke_path)?;
     serde_json::to_writer_pretty(invoke_file, &invocation)?;
 
-    materialize_adapter_handoff_assets(config, selection, deploy_dir)?;
+    materialize_adapter_handoff_assets(config, plan, selection, deploy_dir)?;
     materialize_secrets_provider_binding(config, deploy_dir)?;
     let handoff = write_runner_diagnostics(config, deploy_dir, selection, &plan_path)?;
 
@@ -2037,11 +2037,12 @@ fn secrets_provider_binding_for_target(config: &DeployerConfig) -> Option<Secret
 
 fn materialize_adapter_handoff_assets(
     config: &DeployerConfig,
+    plan: &PlanContext,
     selection: &DeploymentPackSelection,
     deploy_dir: &Path,
 ) -> Result<()> {
     if uses_terraform_handoff(config) {
-        materialize_terraform_handoff_assets(config, selection, deploy_dir)?;
+        materialize_terraform_handoff_assets(config, plan, selection, deploy_dir)?;
     } else if config.provider == crate::config::Provider::K8s && config.strategy == "raw-manifests"
     {
         materialize_k8s_raw_handoff_assets(config, selection, deploy_dir)?;
@@ -2065,6 +2066,7 @@ fn materialize_adapter_handoff_assets(
 
 fn materialize_terraform_handoff_assets(
     config: &DeployerConfig,
+    plan: &PlanContext,
     selection: &DeploymentPackSelection,
     deploy_dir: &Path,
 ) -> Result<()> {
@@ -2077,9 +2079,21 @@ fn materialize_terraform_handoff_assets(
     if local_terraform.exists() {
         set_executable_if_unix(&local_terraform)?;
     }
-    prune_generated_terraform_root(config, &terraform_root)?;
-    configure_terraform_backend(config, &terraform_root, deploy_dir)?;
-    normalize_terraform_main_tf(config, &terraform_root)?;
+    // The operator-module rewriting (`prune_generated_terraform_root` /
+    // `normalize_terraform_main_tf`) wires a Greentic app bundle into the
+    // standard `operator` module. A self-contained service pack ships its own
+    // complete terraform (its own `main.tf` plus bespoke modules) and has no
+    // `operator` module, so rewriting would both clobber the pack's terraform
+    // and fail writing into a non-existent module directory. Serviceless plans
+    // (no app bundle) treat the pack's terraform as authoritative and skip the
+    // operator rewrite; only the generic backend rewrite applies.
+    if !plan.serviceless {
+        prune_generated_terraform_root(config, &terraform_root)?;
+        configure_terraform_backend(config, &terraform_root, deploy_dir)?;
+        normalize_terraform_main_tf(config, &terraform_root)?;
+    } else {
+        configure_terraform_backend(config, &terraform_root, deploy_dir)?;
+    }
 
     let tfvars_example = resolve_tfvars_example_name(&terraform_root, &config.environment)?;
     let generated_tfvars = materialize_generated_tfvars(config, &terraform_root, &tfvars_example)?;
@@ -4285,7 +4299,7 @@ mod tests {
             strategy: "iac-only".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: pack_path.clone(),
+            pack_path: Some(pack_path.clone()),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -4319,6 +4333,7 @@ mod tests {
         std::fs::create_dir_all(&base).expect("create tmp base");
         let dir = tempfile::tempdir_in(base).expect("temp dir");
         let mut manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::from_str("greentic.deploy.aws").unwrap(),
             name: None,
@@ -4937,7 +4952,7 @@ kind: Deployment
             strategy: "terraform".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: pack_path.clone(),
+            pack_path: Some(pack_path.clone()),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -5008,7 +5023,7 @@ kind: Deployment
             strategy: "terraform".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: pack_path.clone(),
+            pack_path: Some(pack_path.clone()),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -5094,7 +5109,7 @@ kind: Deployment
             strategy: "terraform".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: pack_path.clone(),
+            pack_path: Some(pack_path.clone()),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -5130,6 +5145,7 @@ kind: Deployment
             },
             pack_path,
             manifest: PackManifest {
+                agents: Default::default(),
                 schema_version: "pack-v1".to_string(),
                 pack_id: PackId::from_str("greentic.deploy.terraform").unwrap(),
                 name: None,
@@ -5619,7 +5635,7 @@ data "aws_region" "current" {}
             strategy: "iac-only".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: pack_path.clone(),
+            pack_path: Some(pack_path.clone()),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -5655,6 +5671,7 @@ data "aws_region" "current" {}
             },
             pack_path,
             manifest: PackManifest {
+                agents: Default::default(),
                 schema_version: "pack-v1".to_string(),
                 pack_id: PackId::from_str("greentic.deploy.terraform").unwrap(),
                 name: None,
@@ -5729,7 +5746,7 @@ data "aws_region" "current" {}
             strategy: "iac-only".into(),
             tenant: "acme".into(),
             environment: "dev".into(),
-            pack_path: pack_path.clone(),
+            pack_path: Some(pack_path.clone()),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -5765,6 +5782,7 @@ data "aws_region" "current" {}
             },
             pack_path,
             manifest: PackManifest {
+                agents: Default::default(),
                 schema_version: "pack-v1".to_string(),
                 pack_id: PackId::from_str("greentic.deploy.terraform").unwrap(),
                 name: None,
@@ -5841,7 +5859,7 @@ data "aws_region" "current" {}
             strategy: "iac-only".into(),
             tenant: "acme".into(),
             environment: "dev".into(),
-            pack_path: dir.path().join("bundle"),
+            pack_path: Some(dir.path().join("bundle")),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -6172,7 +6190,7 @@ runtime_secret_env = {}
             strategy: "raw-manifests".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: pack_path.clone(),
+            pack_path: Some(pack_path.clone()),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -6206,6 +6224,7 @@ runtime_secret_env = {}
             },
             pack_path,
             manifest: PackManifest {
+                agents: Default::default(),
                 schema_version: "pack-v1".to_string(),
                 pack_id: PackId::from_str("greentic.deploy.k8s").unwrap(),
                 name: None,
@@ -6264,7 +6283,7 @@ runtime_secret_env = {}
             strategy: "helm".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: pack_path.clone(),
+            pack_path: Some(pack_path.clone()),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -6298,6 +6317,7 @@ runtime_secret_env = {}
             },
             pack_path,
             manifest: PackManifest {
+                agents: Default::default(),
                 schema_version: "pack-v1".to_string(),
                 pack_id: PackId::from_str("greentic.deploy.helm").unwrap(),
                 name: None,
