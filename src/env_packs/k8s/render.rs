@@ -32,6 +32,10 @@ impl ManifestRenderer for K8sDeployerHandler {
         // bytes it captured so the env-level Secret carries the operator's
         // secrets. `None` on the preview path → an empty Secret.
         params.dev_secrets_data = self.dev_secrets_data.clone();
+        // The CLI resolves the env's `Secrets`-slot binding into a backend and
+        // injects it; render/reconcile both set it, so the rendered worker
+        // identity (dev-store Secret vs. Vault SA) matches the env's binding.
+        params.secrets_backend = self.secrets_backend.clone();
         let mut objects = manifests::render_environment_manifests(env, &params);
         for revision in &env.revisions {
             if has_cluster_presence(revision.lifecycle) {

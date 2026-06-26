@@ -137,6 +137,70 @@ pub enum TunnelMode {
     Cloudflared,
 }
 
+/// Name of the worker pod's ServiceAccount when the env resolves secrets under
+/// a workload identity ([`SecretsBackend::Vault`]). The pod's projected token
+/// for this SA is what Vault's Kubernetes auth exchanges for a Vault token; the
+/// SA→Vault-role binding is provisioned out-of-band by the Vault bootstrap
+/// (Phase E.4). One per namespace, env-level.
+pub const WORKER_SERVICE_ACCOUNT: &str = "gtc-worker";
+
+// Vault provider defaults (mirror `greentic-secrets-provider-vault-kv`). The
+// worker pod emits a `VAULT_*` var only when its value differs from the
+// provider's default, keeping the rendered pod spec lean — an absent var and
+// the default resolve identically at runtime.
+pub(crate) const VAULT_DEFAULT_KV_MOUNT: &str = "secret";
+pub(crate) const VAULT_DEFAULT_KV_PREFIX: &str = "greentic";
+pub(crate) const VAULT_DEFAULT_AUTH_MOUNT: &str = "kubernetes";
+pub(crate) const VAULT_DEFAULT_TRANSIT_MOUNT: &str = "transit";
+pub(crate) const VAULT_DEFAULT_TRANSIT_KEY: &str = "greentic";
+
+/// Which backend the worker resolves `secret://` references against at runtime,
+/// and the non-secret connection config the deployer renders into the pod so
+/// `greentic-start` can construct it. Selected from the env's bound
+/// `Secrets`-slot pack descriptor (resolved at the render/reconcile call site).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretsBackend {
+    /// The operator's local dev-store, delivered into the cluster as the
+    /// [`DEV_SECRETS_SECRET_NAME`] Secret and staged into the worker's HOME.
+    /// Ships secret *values* into the cluster — the default for `local` /
+    /// sandbox envs.
+    DevStore,
+    /// HashiCorp Vault resolved under the pod's ServiceAccount identity
+    /// (Kubernetes auth). No secret values enter the cluster — only the pod
+    /// identity ([`WORKER_SERVICE_ACCOUNT`]) plus non-secret connection config
+    /// rendered as `VAULT_*` pod env (Phase E).
+    Vault(VaultBackend),
+}
+
+/// Non-secret HashiCorp Vault connection config the deployer renders into the
+/// worker pod's environment. The provider reads these `VAULT_*` vars at boot;
+/// the pod's identity (and thus the Vault token) comes from its ServiceAccount,
+/// never from rendered material. Mirrors the env contract of
+/// `greentic-secrets-provider-vault-kv::VaultProviderConfig::from_env`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultBackend {
+    /// `VAULT_ADDR` — the Vault API address (e.g. `http://vault.vault.svc:8200`).
+    pub addr: String,
+    /// `VAULT_K8S_ROLE` — the Vault Kubernetes-auth role the pod's SA token is
+    /// exchanged for. The role's policy governs which paths resolve.
+    pub k8s_role: String,
+    /// `VAULT_KV_MOUNT` — the KV v2 mount (provider default `secret`).
+    pub kv_mount: String,
+    /// `VAULT_KV_PREFIX` — path prefix under the mount (provider default
+    /// `greentic`).
+    pub kv_prefix: String,
+    /// `VAULT_K8S_MOUNT` — the Kubernetes auth mount (provider default
+    /// `kubernetes`).
+    pub auth_mount: String,
+    /// `VAULT_TRANSIT_MOUNT` — the transit mount backing envelope decryption
+    /// (provider default `transit`).
+    pub transit_mount: String,
+    /// `VAULT_TRANSIT_KEY` — the transit key name (provider default `greentic`).
+    pub transit_key: String,
+    /// `VAULT_NAMESPACE` — Vault Enterprise namespace. `None` → omitted.
+    pub namespace: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct K8sParams {
     /// Namespace every rendered object lands in. One namespace per
@@ -159,6 +223,13 @@ pub struct K8sParams {
     /// init container's copy is guarded on the file existing, so a `None`/empty
     /// Secret is a no-op rather than a boot failure.
     pub dev_secrets_data: Option<String>,
+    /// Which secrets backend the worker resolves `secret://` refs against, and
+    /// (for [`SecretsBackend::Vault`]) the non-secret connection config rendered
+    /// into the pod. Defaults to [`SecretsBackend::DevStore`]; the
+    /// render/reconcile call site overlays the env's bound `Secrets`-slot
+    /// backend (it owns the binding-answers read, exactly like
+    /// [`Self::dev_secrets_data`]).
+    pub secrets_backend: SecretsBackend,
 }
 
 impl K8sParams {
@@ -172,6 +243,7 @@ impl K8sParams {
             tunnel: TunnelMode::Off,
             oci_insecure_registries: Vec::new(),
             dev_secrets_data: None,
+            secrets_backend: SecretsBackend::DevStore,
         }
     }
 
@@ -327,6 +399,10 @@ impl K8sParams {
             // Reconcile injects the dev-store bytes after this pure parse (it
             // owns the filesystem read); the preview path leaves it unset.
             dev_secrets_data: defaults.dev_secrets_data,
+            // The secrets backend is derived from the env's `Secrets`-slot
+            // binding, not the deployer wizard answers parsed here; the call
+            // site overlays it (like `dev_secrets_data`).
+            secrets_backend: defaults.secrets_backend,
         })
     }
 }
@@ -641,6 +717,67 @@ fn stage_dev_secrets_init_container(env: &Environment) -> Value {
     })
 }
 
+/// The backend selector + `VAULT_*` connection env the worker boots with under
+/// [`SecretsBackend::Vault`]. `GREENTIC_SECRETS_BACKEND=vault` tells
+/// greentic-start's serve boot to construct the Vault manager; the `VAULT_*`
+/// vars are the provider's non-secret connection config. Each optional `VAULT_*`
+/// is emitted only when it differs from the provider default, so the common case
+/// renders just the selector, `VAULT_ADDR`, and `VAULT_K8S_ROLE`. The pod's
+/// identity (and thus its Vault token) comes from the projected ServiceAccount
+/// token at the standard path — never from a rendered var.
+fn secrets_backend_env(vault: &VaultBackend) -> Vec<Value> {
+    let mut vars = vec![
+        json!({"name": "GREENTIC_SECRETS_BACKEND", "value": "vault"}),
+        json!({"name": "VAULT_ADDR", "value": vault.addr}),
+        json!({"name": "VAULT_K8S_ROLE", "value": vault.k8s_role}),
+    ];
+    for (name, value, default) in [
+        ("VAULT_KV_MOUNT", &vault.kv_mount, VAULT_DEFAULT_KV_MOUNT),
+        ("VAULT_KV_PREFIX", &vault.kv_prefix, VAULT_DEFAULT_KV_PREFIX),
+        (
+            "VAULT_K8S_MOUNT",
+            &vault.auth_mount,
+            VAULT_DEFAULT_AUTH_MOUNT,
+        ),
+        (
+            "VAULT_TRANSIT_MOUNT",
+            &vault.transit_mount,
+            VAULT_DEFAULT_TRANSIT_MOUNT,
+        ),
+        (
+            "VAULT_TRANSIT_KEY",
+            &vault.transit_key,
+            VAULT_DEFAULT_TRANSIT_KEY,
+        ),
+    ] {
+        if value.as_str() != default {
+            vars.push(json!({"name": name, "value": value}));
+        }
+    }
+    if let Some(ns) = &vault.namespace {
+        vars.push(json!({"name": "VAULT_NAMESPACE", "value": ns}));
+    }
+    vars
+}
+
+/// The worker's ServiceAccount — the pod identity Vault's Kubernetes auth
+/// authenticates ([`SecretsBackend::Vault`]). Env-level (one per namespace),
+/// rendered only for Vault envs. `automountServiceAccountToken` stays at the
+/// K8s default so the projected token mounts at the path the provider reads;
+/// the SA→Vault-role binding is provisioned by the Vault bootstrap (Phase E.4),
+/// not here.
+fn render_worker_service_account(env: &Environment, params: &K8sParams) -> Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {
+            "name": WORKER_SERVICE_ACCOUNT,
+            "namespace": params.namespace,
+            "labels": common_labels(env, "worker"),
+        },
+    })
+}
+
 /// Fixed rayon thread-pool size for the runtime pods. The bundle unpacker
 /// (backhand's `parallel` reader, reached on the M2 boot pull) sizes rayon to
 /// the HOST core count, ignoring the pod's `cpu` cgroup quota. With the
@@ -752,20 +889,38 @@ pub fn render_worker_deployment(
         json!({"name": "GREENTIC_BUNDLE_DIGEST", "value": revision.bundle_digest}),
     ]);
 
-    // Envs that bind a secrets pack stage the operator's dev-store into the
-    // worker's writable HOME (the `secret://` refs — messaging bot tokens,
-    // webhook secrets — resolve there). The Secret volume is `optional` and the
-    // init copy is guarded on the file existing, so an env with no secrets yet
-    // boots cleanly. Pure on `env` so reconcile and `apply-revision` agree.
+    // How the worker resolves `secret://` refs at runtime. Worker-only either
+    // way — the router never resolves secrets, mirroring the historical
+    // dev-store staging.
+    //
+    // - `DevStore`: stage the operator's dev-store into the worker's writable
+    //   HOME (messaging bot tokens, webhook secrets resolve there). The Secret
+    //   volume is `optional` and the init copy is guarded on the file existing,
+    //   so an env with no secrets yet boots cleanly.
+    // - `Vault`: no values cross into the cluster — the pod gets the Vault
+    //   ServiceAccount identity ([`WORKER_SERVICE_ACCOUNT`]) plus `VAULT_*`
+    //   connection env, and greentic-start resolves refs from Vault in-pod.
+    //
+    // Pure on `env` + `params` so reconcile and `apply-revision` agree.
     let mut init_containers = vec![env_store_init_container(env)];
     let mut volumes = runtime_pod_volumes();
-    let uses_dev_secrets = env_uses_dev_secrets(env);
-    if uses_dev_secrets {
-        init_containers.push(stage_dev_secrets_init_container(env));
-        volumes.push(json!({
-            "name": DEV_SECRETS_VOLUME,
-            "secret": {"secretName": DEV_SECRETS_SECRET_NAME, "optional": true},
-        }));
+    let mut service_account: Option<&str> = None;
+    let uses_dev_secrets =
+        matches!(params.secrets_backend, SecretsBackend::DevStore) && env_uses_dev_secrets(env);
+    match &params.secrets_backend {
+        SecretsBackend::DevStore => {
+            if uses_dev_secrets {
+                init_containers.push(stage_dev_secrets_init_container(env));
+                volumes.push(json!({
+                    "name": DEV_SECRETS_VOLUME,
+                    "secret": {"secretName": DEV_SECRETS_SECRET_NAME, "optional": true},
+                }));
+            }
+        }
+        SecretsBackend::Vault(vault) => {
+            env_vars.extend(secrets_backend_env(vault));
+            service_account = Some(WORKER_SERVICE_ACCOUNT);
+        }
     }
 
     // Pod-template annotations: when the env stages dev-store material, a
@@ -787,7 +942,7 @@ pub fn render_worker_deployment(
         json!({"labels": labels, "annotations": Value::Object(pod_annotations)})
     };
 
-    json!({
+    let mut deployment = json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
         "metadata": {
@@ -824,7 +979,14 @@ pub fn render_worker_deployment(
                 },
             },
         },
-    })
+    });
+    // The pod's identity under Vault: its projected SA token is what Vault's
+    // Kubernetes auth exchanges for a token. Injected here (rather than inline)
+    // so the DevStore path renders an identical pod spec to before.
+    if let Some(sa) = service_account {
+        deployment["spec"]["template"]["spec"]["serviceAccountName"] = Value::from(sa);
+    }
+    deployment
 }
 
 /// One revision's ClusterIP Service — the stable address the router
@@ -1151,22 +1313,25 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
             },
         }),
     ];
-    // M2 boot bundle pull: BOTH the worker AND the router boot `start --env`
-    // and materialize routed bundle-sourced revisions, so BOTH need egress to
-    // the bundle source. Render one stable, env-scoped policy per pulling role.
-    // Allow-all egress while a routed revision is pullable (the pod fetches its
-    // own packs, integrity-gated against the revision's `bundle_digest`, so
-    // breadth is not a pack-injection vector; a per-destination allow-list is a
-    // tracked hardening follow-up); an empty deny rule otherwise. Always
-    // rendered so reconcile converges allow→deny without env-level pruning,
-    // closing the opening once the env stops pulling. DNS egress stays granted
-    // by `gtc-allow-dns` regardless.
-    let pull_egress = if env_has_pullable_routed_revision(env) {
-        json!([{}])
-    } else {
-        json!([])
-    };
+    // M2 boot bundle pull AND the Vault secrets backend both need egress out of
+    // the default-deny namespace. BOTH the worker AND the router boot
+    // `start --env` and materialize routed bundle-sourced revisions, so BOTH
+    // need egress to the bundle source while a routed revision is pullable;
+    // additionally the WORKER needs egress to Vault when it resolves secrets
+    // there (`SecretsBackend::Vault`) — the router never resolves secrets.
+    // Render one stable, env-scoped policy per role: allow-all egress when that
+    // role has an opening (the pod fetches its own packs integrity-gated against
+    // the revision's `bundle_digest`, and the Vault token exchange is the
+    // worker's own outbound call, so breadth is not a pack-injection vector — a
+    // per-destination allow-list is a tracked hardening follow-up); an empty
+    // deny rule otherwise. Always rendered so reconcile converges allow→deny
+    // without env-level pruning, closing the opening once the env stops pulling
+    // or leaves Vault. DNS egress stays granted by `gtc-allow-dns` regardless.
+    let pullable = env_has_pullable_routed_revision(env);
+    let worker_uses_vault = matches!(params.secrets_backend, SecretsBackend::Vault(_));
     for role in ["worker", "router"] {
+        let allow_all = pullable || (role == "worker" && worker_uses_vault);
+        let egress = if allow_all { json!([{}]) } else { json!([]) };
         policies.push(json!({
             "apiVersion": "networking.k8s.io/v1",
             "kind": "NetworkPolicy",
@@ -1178,7 +1343,7 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
             "spec": {
                 "podSelector": {"matchLabels": common_labels(env, role)},
                 "policyTypes": ["Egress"],
-                "egress": pull_egress.clone(),
+                "egress": egress,
             },
         }));
     }
@@ -1202,12 +1367,24 @@ pub fn render_environment_manifests(env: &Environment, params: &K8sParams) -> Ve
         render_router_pdb(env, params),
     ];
     manifests.extend(render_network_policies(env, params));
-    // Dev-store Secret last (env-level, never pruned). Appended after the
+    // The env-level secrets object, last (never pruned; appended after the
     // NetworkPolicies so it never shifts the index-pinned env-level objects;
-    // reconcile applies it before the workers (the trait impl extends with
-    // workers after this set), so the worker's secret volume mounts cleanly.
-    if env_uses_dev_secrets(env) {
-        manifests.push(render_dev_secrets_secret(env, params));
+    // reconcile applies it before the workers — the trait impl extends with
+    // workers after this set — so the worker's volume/identity resolves
+    // cleanly):
+    // - `DevStore`: the dev-store Secret carrying the operator's values, only
+    //   when the env binds a secrets pack.
+    // - `Vault`: the worker ServiceAccount the pod authenticates to Vault as.
+    //   No secret material is rendered.
+    match &params.secrets_backend {
+        SecretsBackend::DevStore => {
+            if env_uses_dev_secrets(env) {
+                manifests.push(render_dev_secrets_secret(env, params));
+            }
+        }
+        SecretsBackend::Vault(_) => {
+            manifests.push(render_worker_service_account(env, params));
+        }
     }
     manifests
 }
@@ -2154,5 +2331,186 @@ mod tests {
         assert_eq!(none.tunnel, TunnelMode::Off);
         // Invalid → fail closed.
         assert!(K8sParams::from_answers(&env, Some(&json!({"tunnel": "ngrok"}))).is_err());
+    }
+
+    // ---- Vault workload-identity backend (Phase E.3) -----------------------
+
+    /// A Vault backend whose mounts/prefix/transit all match the provider
+    /// defaults — so only the selector, addr, and role render as pod env.
+    fn vault_backend() -> VaultBackend {
+        VaultBackend {
+            addr: "http://vault.vault.svc:8200".to_string(),
+            k8s_role: "greentic-worker".to_string(),
+            kv_mount: VAULT_DEFAULT_KV_MOUNT.to_string(),
+            kv_prefix: VAULT_DEFAULT_KV_PREFIX.to_string(),
+            auth_mount: VAULT_DEFAULT_AUTH_MOUNT.to_string(),
+            transit_mount: VAULT_DEFAULT_TRANSIT_MOUNT.to_string(),
+            transit_key: VAULT_DEFAULT_TRANSIT_KEY.to_string(),
+            namespace: None,
+        }
+    }
+
+    fn vault_params(env: &Environment) -> K8sParams {
+        K8sParams {
+            secrets_backend: SecretsBackend::Vault(vault_backend()),
+            ..K8sParams::for_env(env)
+        }
+    }
+
+    /// The worker pod's env var value for `name`, if present.
+    fn worker_env_value<'a>(d: &'a Value, name: &str) -> Option<&'a str> {
+        d["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .and_then(|e| e["value"].as_str())
+    }
+
+    #[test]
+    fn vault_worker_carries_identity_and_connection_env() {
+        let env = build_fixture_env();
+        let params = vault_params(&env);
+        let d = render_worker_deployment(&env, &env.revisions[0], &params);
+
+        // The pod authenticates to Vault as its ServiceAccount (no rendered
+        // material — the projected SA token is its credential).
+        assert_eq!(
+            d["spec"]["template"]["spec"]["serviceAccountName"],
+            WORKER_SERVICE_ACCOUNT
+        );
+        // Backend selector + the required connection vars greentic-start reads.
+        assert_eq!(
+            worker_env_value(&d, "GREENTIC_SECRETS_BACKEND"),
+            Some("vault")
+        );
+        assert_eq!(
+            worker_env_value(&d, "VAULT_ADDR"),
+            Some("http://vault.vault.svc:8200")
+        );
+        assert_eq!(
+            worker_env_value(&d, "VAULT_K8S_ROLE"),
+            Some("greentic-worker")
+        );
+
+        // No dev-store material crosses into the cluster: only the env-store
+        // init container, no dev-secrets volume, no dev-store-hash annotation.
+        let init = d["spec"]["template"]["spec"]["initContainers"]
+            .as_array()
+            .unwrap();
+        assert_eq!(init.len(), 1);
+        assert_eq!(init[0]["name"], "stage-env-store");
+        let vols = d["spec"]["template"]["spec"]["volumes"].as_array().unwrap();
+        assert!(vols.iter().all(|v| v["name"] != DEV_SECRETS_VOLUME));
+        assert!(
+            d["spec"]["template"]["metadata"]["annotations"].is_null(),
+            "vault worker carries no dev-store hash annotation"
+        );
+    }
+
+    #[test]
+    fn vault_default_connection_vars_are_omitted() {
+        let env = build_fixture_env();
+        let params = vault_params(&env); // all-default mounts/prefix/transit
+        let d = render_worker_deployment(&env, &env.revisions[0], &params);
+        // Defaults match the provider, so the worker omits them — an absent var
+        // and the provider default resolve identically at runtime.
+        for absent in [
+            "VAULT_KV_MOUNT",
+            "VAULT_KV_PREFIX",
+            "VAULT_K8S_MOUNT",
+            "VAULT_TRANSIT_MOUNT",
+            "VAULT_TRANSIT_KEY",
+            "VAULT_NAMESPACE",
+        ] {
+            assert_eq!(
+                worker_env_value(&d, absent),
+                None,
+                "{absent} default must be omitted"
+            );
+        }
+    }
+
+    #[test]
+    fn vault_non_default_connection_vars_are_emitted() {
+        let env = build_fixture_env();
+        let mut backend = vault_backend();
+        backend.kv_mount = "kv".to_string();
+        backend.kv_prefix = "tenant-a".to_string();
+        backend.auth_mount = "k8s-eu".to_string();
+        backend.transit_mount = "tr".to_string();
+        backend.transit_key = "rk".to_string();
+        backend.namespace = Some("admin/team".to_string());
+        let params = K8sParams {
+            secrets_backend: SecretsBackend::Vault(backend),
+            ..K8sParams::for_env(&env)
+        };
+        let d = render_worker_deployment(&env, &env.revisions[0], &params);
+        assert_eq!(worker_env_value(&d, "VAULT_KV_MOUNT"), Some("kv"));
+        assert_eq!(worker_env_value(&d, "VAULT_KV_PREFIX"), Some("tenant-a"));
+        assert_eq!(worker_env_value(&d, "VAULT_K8S_MOUNT"), Some("k8s-eu"));
+        assert_eq!(worker_env_value(&d, "VAULT_TRANSIT_MOUNT"), Some("tr"));
+        assert_eq!(worker_env_value(&d, "VAULT_TRANSIT_KEY"), Some("rk"));
+        assert_eq!(worker_env_value(&d, "VAULT_NAMESPACE"), Some("admin/team"));
+    }
+
+    #[test]
+    fn vault_router_has_no_secrets_identity() {
+        let env = build_fixture_env();
+        let params = vault_params(&env);
+        let r = render_router_deployment(&env, &params);
+        // The router routes traffic; it never resolves `secret://`, so it gets
+        // neither the Vault identity nor the connection env.
+        assert!(
+            r["spec"]["template"]["spec"]
+                .get("serviceAccountName")
+                .is_none(),
+            "router must not carry the Vault ServiceAccount"
+        );
+        let envs = r["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap();
+        assert!(
+            envs.iter()
+                .all(|e| e["name"] != "GREENTIC_SECRETS_BACKEND" && e["name"] != "VAULT_ADDR"),
+            "router carries no Vault connection env"
+        );
+    }
+
+    #[test]
+    fn vault_env_renders_service_account_and_no_secret() {
+        let env = build_fixture_env();
+        let params = vault_params(&env);
+        let manifests = render_environment_manifests(&env, &params);
+        // The worker ServiceAccount is the env-level secrets object under Vault.
+        let sa: Vec<&Value> = manifests
+            .iter()
+            .filter(|o| o["kind"] == "ServiceAccount")
+            .collect();
+        assert_eq!(sa.len(), 1, "exactly one worker ServiceAccount");
+        assert_eq!(sa[0]["metadata"]["name"], WORKER_SERVICE_ACCOUNT);
+        assert_eq!(sa[0]["metadata"]["namespace"], json!(params.namespace));
+        assert!(
+            manifests.iter().all(|o| o["kind"] != "Secret"),
+            "no secret values are rendered into the cluster under Vault"
+        );
+    }
+
+    #[test]
+    fn vault_opens_worker_egress_not_router() {
+        let env = build_fixture_env();
+        let params = vault_params(&env); // no pullable routed revision
+        let policies = render_network_policies(&env, &params);
+        let egress = |name: &str| {
+            policies
+                .iter()
+                .find(|p| p["metadata"]["name"] == name)
+                .map(|p| p["spec"]["egress"].clone())
+                .unwrap()
+        };
+        // The worker needs egress to reach Vault; the router does not resolve
+        // secrets, so its egress stays denied (no pullable revision either).
+        assert_eq!(egress("gtc-allow-worker-egress"), json!([{}]));
+        assert_eq!(egress("gtc-allow-router-egress"), json!([]));
     }
 }

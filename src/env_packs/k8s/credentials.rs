@@ -112,9 +112,10 @@ const fn op(group: &'static str, resource: &'static str, verb: &'static str) -> 
 /// the bootstrap Role rules aggregate from this list, and validate's
 /// SSAR probes iterate it 1:1.
 ///
-/// Deployments/Services carry `delete` (archive tears workers down);
-/// ConfigMaps/PDBs/NetworkPolicies/Secrets are env-lifetime objects the
-/// deployer only upserts.
+/// Deployments/Services carry `delete` (archive tears workers down); Secrets
+/// also carry `delete` (a DevStore→Vault reconcile removes the stale dev-store
+/// Secret). ConfigMaps/PDBs/NetworkPolicies/ServiceAccounts are env-lifetime
+/// objects the deployer only upserts.
 ///
 /// This list is namespaced-only and aggregates exactly the verbs a bound
 /// (namespace-scoped) deployer ServiceAccount needs to drive `op env reconcile`.
@@ -136,12 +137,22 @@ pub const VALIDATED_K8S_OPERATIONS: &[K8sOperation] = &[
     op("", "configmaps", "get"),
     op("", "configmaps", "create"),
     op("", "configmaps", "patch"),
-    // The dev-store Secret (env-lifetime, upsert-only) delivers the
-    // operator's `.dev.secrets.env` so workers resolve `secret://` refs
-    // in-pod. Without these verbs a bound identity 403s on reconcile.
+    // The dev-store Secret (env-lifetime) delivers the operator's
+    // `.dev.secrets.env` so workers resolve `secret://` refs in-pod. `delete`
+    // lets a DevStore→Vault reconcile remove the stale Secret so no secret
+    // material lingers once the env resolves under workload identity. Without
+    // these verbs a bound identity 403s on reconcile.
     op("", "secrets", "get"),
     op("", "secrets", "create"),
     op("", "secrets", "patch"),
+    op("", "secrets", "delete"),
+    // The worker ServiceAccount the Vault backend authenticates as
+    // (env-lifetime, upsert-only). Rendered only for Vault envs, but the bound
+    // Role grants these unconditionally so a Vault reconcile never 403s
+    // applying it.
+    op("", "serviceaccounts", "get"),
+    op("", "serviceaccounts", "create"),
+    op("", "serviceaccounts", "patch"),
     op("policy", "poddisruptionbudgets", "get"),
     op("policy", "poddisruptionbudgets", "create"),
     op("policy", "poddisruptionbudgets", "patch"),
