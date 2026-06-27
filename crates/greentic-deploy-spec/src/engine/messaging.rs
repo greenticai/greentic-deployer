@@ -221,6 +221,17 @@ pub struct SetMessagingWelcomeFlowPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RotateWebhookSecretPayload {
     pub updated_by: String,
+    /// Optional caller-supplied NEW webhook secret ref (raw `secret://` URI).
+    /// When present the transform stamps it WITHOUT calling `provision` — the
+    /// caller has already provisioned the value in its own secrets plane
+    /// (remote operator stores use this so the control-plane store never mints
+    /// or custodies secret material, mirroring [`AddMessagingEndpointPayload::
+    /// webhook_secret_ref`]). `None` keeps the backend-provision path (LocalFS
+    /// auto-mints; a control-plane store refuses, since it cannot prove a
+    /// rotation it did not perform). The field is omitted on the wire when
+    /// `None`, so the body stays byte-compatible with pre-new-ref clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret_ref: Option<String>,
 }
 
 /// What a messaging transform did, by index into
@@ -1518,6 +1529,23 @@ mod tests {
     }
 
     #[test]
+    fn rotate_payload_wire_encoding_carries_new_ref() {
+        let payload = RotateWebhookSecretPayload {
+            updated_by: "op".to_string(),
+            webhook_secret_ref: Some(
+                "secret://local/acme/_/messaging-tg/webhook_secret".to_string(),
+            ),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            json["webhook_secret_ref"],
+            "secret://local/acme/_/messaging-tg/webhook_secret"
+        );
+        let back: RotateWebhookSecretPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(back, payload);
+    }
+
+    #[test]
     fn link_payload_wire_encoding() {
         let payload = MessagingBundleLinkPayload {
             bundle_id: BundleId::new("legal-pack"),
@@ -1555,7 +1583,10 @@ mod tests {
     fn rotate_payload_wire_encoding() {
         let payload = RotateWebhookSecretPayload {
             updated_by: "op".to_string(),
+            webhook_secret_ref: None,
         };
+        // `webhook_secret_ref: None` is omitted (skip_serializing_if), so the
+        // body stays byte-compatible with a pre-new-ref client/server.
         assert_eq!(
             serde_json::to_value(&payload).unwrap(),
             serde_json::json!({"updated_by": "op"})

@@ -96,6 +96,15 @@ pub struct EndpointRotateWebhookSecretPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     pub updated_by: String,
+    /// Optional NEW webhook secret ref (raw `secret://` URI) for the
+    /// new-ref rotation variant on a remote `--store-url` store: the operator
+    /// provisions the value in its own secrets plane and passes its ref here,
+    /// so the control-plane store records it without ever minting or custodying
+    /// secret material. Supplied via `--answers` only (the inline-flag form
+    /// carries no ref). Honored ONLY by the remote dispatch — the local store
+    /// mints its own value and REJECTS a supplied ref.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,6 +421,9 @@ impl MessagingEndpointRemoveArgs {
                 endpoint_id: eid,
                 idempotency_key: ikey,
                 updated_by: by,
+                // The inline-flag form carries no new ref; the new-ref variant
+                // is supplied via `--answers` (a remote-only enhancement).
+                webhook_secret_ref: None,
             }))
     }
 }
@@ -802,6 +814,16 @@ pub fn rotate_webhook_secret(
         ));
     }
     let payload = resolve_payload(flags, payload)?;
+    // The new-ref variant is a remote-store-only enhancement: the local store
+    // custodies the value and mints its own ref, so a caller-supplied ref has
+    // no honest meaning here. Reject it rather than silently ignore it.
+    if payload.webhook_secret_ref.is_some() {
+        return Err(OpError::InvalidArgument(
+            "webhook_secret_ref is only honored by a remote `--store-url` store; the local \
+             store mints its own webhook secret value and ref"
+                .to_string(),
+        ));
+    }
     let env_id = parse_env_id(&payload.environment_id)?;
     let endpoint_id = parse_endpoint_id(&payload.endpoint_id)?;
     let updated_by = require_nonempty("updated_by", &payload.updated_by)?;
@@ -2007,6 +2029,7 @@ mod tests {
             endpoint_id: endpoint_id.to_string(),
             idempotency_key: Some(key.to_string()),
             updated_by: "tester".to_string(),
+            webhook_secret_ref: None,
         }
     }
 
@@ -2049,6 +2072,29 @@ mod tests {
             after.generation,
             before_gen + 1,
             "rotate must bump generation"
+        );
+    }
+
+    #[test]
+    fn local_rotate_rejects_supplied_webhook_ref() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let added = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("telegram", "legal-bot", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&added);
+        // The new-ref variant is remote-store-only: the local store mints its
+        // own value+ref, so a caller-supplied ref fails closed rather than
+        // being silently ignored.
+        let mut payload = rotate_payload(&id.to_string(), "k-rotate");
+        payload.webhook_secret_ref =
+            Some("secret://local/default/_/messaging-x/webhook_secret".to_string());
+        let err = rotate_webhook_secret(&store, &OpFlags::default(), Some(payload)).unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
         );
     }
 

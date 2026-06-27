@@ -3132,6 +3132,103 @@ async fn messaging_rotate_with_add_key_does_not_falsely_replay() {
     );
 }
 
+/// The new-ref variant (B2): a rotate carrying a NEW caller-supplied
+/// `webhook_secret_ref` is RECORDED — the operator provisioned the value in
+/// its own secrets plane, so the server stamps the asserted ref and bumps the
+/// generation without minting. A second rotation re-points again (no
+/// new-vs-existing equality guard), proving the same-ref case is also honest.
+#[tokio::test]
+async fn messaging_rotate_with_new_ref_records_and_bumps() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+
+    let old_ref = "secret://local/default/_/messaging-byo/webhook_secret";
+    let (status, add_body) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/messaging",
+        Some(add_endpoint_body_with_webhook_ref(
+            "telegram", "tg-bot", old_ref,
+        )),
+        &[("Idempotency-Key", "k-add-tg")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "add body: {add_body}");
+    let eid = add_body["result"]["endpoint_id"]
+        .as_str()
+        .expect("eid")
+        .to_string();
+
+    // Rotate to a NEW caller-provisioned ref → recorded (ref moves, gen 1).
+    let new_ref = "secret://local/default/_/messaging-byo/webhook_secret_v2";
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/rotate-secret"),
+        Some(json!({"updated_by": "op", "webhook_secret_ref": new_ref})),
+        &[("Idempotency-Key", "k-rotate-new")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "rotate body: {body}");
+    assert_eq!(body["result"]["webhook_secret_ref"], new_ref);
+
+    let (_, read) = send(app.clone(), Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["webhook_secret_ref"],
+        new_ref
+    );
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["generation"], 1,
+        "a recorded rotation bumps the endpoint generation"
+    );
+
+    // Re-rotate to the SAME ref under a fresh key: no equality guard, so it is
+    // still recorded (the operator may have rotated the value behind the same
+    // path and wants the generation bumped) → gen 2.
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/rotate-secret"),
+        Some(json!({"updated_by": "op", "webhook_secret_ref": new_ref})),
+        &[("Idempotency-Key", "k-rotate-again")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "re-rotate body: {body}");
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["generation"], 2,
+        "re-rotating to the same ref still bumps the generation"
+    );
+}
+
+/// A malformed `webhook_secret_ref` is rejected by the server's ref parse
+/// (the same validation a caller-ref `add` runs) as a typed 400 — BEFORE any
+/// state mutation.
+#[tokio::test]
+async fn messaging_rotate_with_malformed_ref_is_400() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+    let eid = add_one_endpoint(&app, "teams", "legal-bot", "k-add").await;
+
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/rotate-secret"),
+        Some(json!({"updated_by": "op", "webhook_secret_ref": "not-a-valid-uri"})),
+        &[("Idempotency-Key", "k-rotate-bad")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["kind"], "invalid-request");
+
+    // The rejected rotate did not bump the generation.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["generation"], 0,
+        "a rejected rotate must not bump the endpoint generation"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Idempotency replay ledger + durable audit log (PR-4.3)
 // ---------------------------------------------------------------------------

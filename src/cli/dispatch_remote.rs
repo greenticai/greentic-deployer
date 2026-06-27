@@ -225,10 +225,12 @@ fn route_remote(
                     remote_messaging_remove(store, flags, payload)
                 }
                 MessagingEndpointVerb::RotateWebhookSecret(args) => {
-                    // The route exists since PR-4.2h; the server itself
-                    // answers 501 `not-yet-implemented` until its Phase D
-                    // secrets sink lands, so the capability knowledge lives
-                    // server-side, not in a CLI guard.
+                    // The route exists since PR-4.2h. The server records a
+                    // rotation that carries a NEW caller-supplied
+                    // `webhook_secret_ref` (supplied via `--answers`) and
+                    // refuses a no-ref rotation with 501 — the capability
+                    // knowledge lives server-side, not in a CLI guard. The
+                    // inline-flag form carries no ref (so it stays refless).
                     let payload = args.into_rotate_payload("rotate-webhook-secret", flags)?;
                     remote_messaging_rotate(store, flags, payload)
                 }
@@ -1642,7 +1644,7 @@ fn remote_messaging_remove(
 }
 
 fn remote_messaging_rotate(
-    store: &dyn EnvironmentMutations,
+    store: &HttpEnvironmentStore,
     flags: &OpFlags,
     payload: Option<super::messaging::EndpointRotateWebhookSecretPayload>,
 ) -> Result<OpOutcome, OpError> {
@@ -1651,8 +1653,19 @@ fn remote_messaging_rotate(
     let endpoint_id = parse_endpoint_id(&payload.endpoint_id)?;
     let updated_by = require_nonempty("updated_by", &payload.updated_by)?;
     let idempotency_key = super::resolve_idempotency_key(payload.idempotency_key)?;
+    // New-ref variant: a caller-supplied NEW `webhook_secret_ref` (raw
+    // `secret://` URI, provisioned operator-side) is recorded by the server,
+    // which bumps the endpoint generation. With no ref the server refuses
+    // (501) — it neither mints nor can prove an operator-side rotation. The
+    // server validates the ref shape, so malformed input surfaces as a 400.
     let ep = store
-        .rotate_messaging_webhook_secret(&env_id, endpoint_id, updated_by, idempotency_key)
+        .rotate_messaging_webhook_secret_to_ref(
+            &env_id,
+            endpoint_id,
+            updated_by,
+            payload.webhook_secret_ref,
+            idempotency_key,
+        )
         .map_err(map_store_err_preserving_noun)?;
     Ok(OpOutcome::new(
         "messaging.endpoint",

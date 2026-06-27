@@ -2284,20 +2284,22 @@ fn parse_endpoint_id(raw: &str) -> Result<MessagingEndpointId, ApiError> {
 ///   caller-supplied `webhook_secret_ref` (the operator provisions the value
 ///   in its own secrets plane). The engine then bypasses this sink entirely,
 ///   so the only `add` that reaches it is one with no ref — which is refused.
-/// - **rotate**: the server cannot prove a value rotated (the value lives
-///   operator-side), so echoing the ref would journal a misleading success.
-///   Remote `rotate-webhook-secret` is therefore unsupported: re-provision
-///   the value operator-side and re-add the endpoint, or rotate on the local
-///   store. (A future API that takes a NEW ref could make it verifiable.)
+/// - **rotate (no new ref)**: the server cannot prove a value rotated (the
+///   value lives operator-side), so echoing the existing ref would journal a
+///   misleading success — refused here. A rotate that DOES carry a new
+///   caller-supplied `webhook_secret_ref` bypasses this sink entirely (the
+///   handler stamps the asserted ref directly), the same way a caller-ref
+///   `add` does.
 ///
-/// Both surface as 501 with a directive message.
+/// Both add-with-no-ref and rotate-with-no-ref surface as 501 with a
+/// directive message.
 fn server_webhook_secret_sink(_existing: Option<&SecretRef>) -> Result<SecretRef, MessagingError> {
     Err(MessagingError::SecretProvision(
         "the operator store server neither mints nor rotates webhook secrets: a telegram-class \
          `add` must carry a caller-supplied `webhook_secret_ref` (the operator provisions the \
-         value in its own secrets plane), and `rotate-webhook-secret` is unsupported on a remote \
-         store — re-provision the value operator-side and re-add the endpoint, or use the local \
-         store"
+         value in its own secrets plane), and `rotate-webhook-secret` requires a new \
+         caller-supplied `webhook_secret_ref` on a remote store — re-provision the value \
+         operator-side and pass its ref, or use the local store"
             .to_string(),
     ))
 }
@@ -2548,11 +2550,21 @@ pub(crate) async fn remove_messaging_endpoint<S: EnvironmentStorage>(
 }
 
 /// `POST /environments/{env_id}/messaging/{endpoint_id}/rotate-secret` —
-/// rotate the endpoint's webhook secret (A8 messaging route 6). Unsupported
-/// on a remote store: the value lives operator-side so the server cannot
-/// prove a rotation occurred, and journaling a generation bump would be a
-/// misleading success. Answers 501. Unknown endpoints still 404 first; a
-/// same-key replay still no-ops without re-stamping.
+/// rotate the endpoint's webhook secret (A8 messaging route 6).
+///
+/// Two modes, keyed on whether the body carries a NEW `webhook_secret_ref`:
+/// - **with a caller-supplied ref**: the operator has already provisioned the
+///   value in its own secrets plane, so the server records the asserted ref
+///   (the env doc's `webhook_secret_ref` moves to it) and bumps the
+///   generation — verifiable in the same sense a telegram-class `add` with a
+///   caller ref is, because the server only echoes what the caller asserts.
+/// - **without a ref**: the value lives operator-side, so the server cannot
+///   prove a rotation occurred and journaling a generation bump would be a
+///   misleading success — the always-refusing sink answers 501.
+///
+/// A malformed ref is a typed 400. Unknown endpoints still 404 first; a
+/// same-key replay still no-ops without re-stamping (the engine's replay gate
+/// fires before the sink, so the ref is never re-validated on replay).
 pub(crate) async fn rotate_messaging_webhook_secret<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, endpoint_id)): Path<(String, String)>,
@@ -2567,13 +2579,24 @@ pub(crate) async fn rotate_messaging_webhook_secret<S: EnvironmentStorage>(
         fingerprint,
         "rotate-webhook-secret",
         |env, key| {
+            // `Option<&str>` is `Copy`, so the provision closure below
+            // captures it without moving `payload`.
+            let new_ref = payload.webhook_secret_ref.as_deref();
             let applied = engine::rotate_messaging_webhook_secret(
                 env,
                 endpoint_id,
                 &payload.updated_by,
                 key,
                 Utc::now(),
-                server_webhook_secret_sink,
+                |existing| match new_ref {
+                    Some(raw) => {
+                        SecretRef::try_new(raw).map_err(|e| MessagingError::InvalidSecretRef {
+                            raw: raw.to_string(),
+                            message: e.to_string(),
+                        })
+                    }
+                    None => server_webhook_secret_sink(existing),
+                },
             )?;
             let ep = env.messaging_endpoints[applied.index].clone();
             let target = json!({"endpoint_id": endpoint_id.to_string()});
