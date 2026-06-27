@@ -1096,3 +1096,88 @@ async fn remote_reads_end_to_end() {
     .await
     .expect("client task");
 }
+
+/// PR-B: the client's `reconcile_environment` against the REAL store-server
+/// route — the wire-compat + CAS gate for server-mediated remote reconcile
+/// (codex pr-harden Finding 1: prove the POST targets a handler present in the
+/// same tree, the A8 envelope — audit record included, which `send_mutation`'s
+/// `validated` enforces — round-trips into `Environment`, and the mandatory
+/// `If-Match` refuses a stale snapshot). The live cluster apply is out of scope
+/// here; this gate is the client<->server authorization contract only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_reconcile_authorization_end_to_end() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SqliteEnvironmentStore::open(&dir.path().join("store.sqlite"))
+        .await
+        .expect("open sqlite store");
+    let backend = Arc::new(store);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let serve_backend = Arc::clone(&backend);
+    let operator_key_path = dir.path().join("operator-key.pem");
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router_with_operator_key(serve_backend, operator_key_path),
+        )
+        .await
+        .expect("serve");
+    });
+
+    let id = env_id("local");
+    let client_id = id.clone();
+    tokio::task::spawn_blocking(move || {
+        let base = Url::parse(&format!("http://{addr}/")).expect("base url");
+        let store_a = HttpEnvironmentStore::new(base.clone(), AuthMethod::None).expect("client a");
+        store_a
+            .create_environment(&client_id, "local".to_string(), host_config("local"))
+            .expect("create environment");
+
+        // Load pins the reviewed ETag; the reconcile then authorizes against it
+        // (replayed as the mandatory If-Match) and returns the authorized
+        // snapshot — proving the route exists and the A8 envelope round-trips.
+        let _loaded = store_a.load_environment(&client_id).expect("load");
+        let authorized = store_a
+            .reconcile_environment(&client_id, &idem("k-reconcile-1"))
+            .expect("reconcile authorized");
+        assert_eq!(authorized.environment_id, client_id);
+
+        // Mandatory-If-Match CAS: a second client advances the ETag behind
+        // store_a's back, so store_a's replayed (now-stale) ETag is refused 412.
+        let store_b = HttpEnvironmentStore::new(base, AuthMethod::None).expect("client b");
+        store_b.load_environment(&client_id).expect("load b");
+        store_b
+            .update_environment(
+                &client_id,
+                UpdateEnvironmentPayload {
+                    name: Some("advanced-by-another-operator".to_string()),
+                    region: FieldUpdate::Keep,
+                    tenant_org_id: FieldUpdate::Keep,
+                    listen_addr: FieldUpdate::Keep,
+                    public_base_url: FieldUpdate::Keep,
+                    gui_enabled: FieldUpdate::Keep,
+                },
+            )
+            .expect("advance the env out-of-band");
+        let err = store_a
+            .reconcile_environment(&client_id, &idem("k-reconcile-stale"))
+            .expect_err("stale reconcile must be refused");
+        assert!(
+            matches!(err, StoreError::Conflict(ref m) if m.contains("precondition")),
+            "stale If-Match must surface as a precondition Conflict: {err:?}"
+        );
+    })
+    .await
+    .expect("reconcile client task");
+
+    // The reconcile writes no desired state: the only generation bump is
+    // store_b's rename (create gen 1 -> update gen 2), NOT either reconcile.
+    let final_env = backend.load_env(&id).await.expect("load env");
+    assert_eq!(
+        final_env.revision.generation, 2,
+        "reconcile must not bump generation"
+    );
+    assert_eq!(final_env.value.name, "advanced-by-another-operator");
+}
