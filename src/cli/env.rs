@@ -697,7 +697,7 @@ pub fn reconcile(
 /// overriding the ambient identity when the env has a resolved credential) and
 /// converge desired state. Requires the `k8s-client` feature.
 #[cfg(feature = "k8s-client")]
-fn reconcile_k8s_cluster(
+pub(crate) fn reconcile_k8s_cluster(
     env: &Environment,
     answers: Option<&Value>,
     bound_token: Option<String>,
@@ -738,7 +738,7 @@ fn reconcile_k8s_cluster(
 
 /// `k8s-client`-less builds cannot talk to a cluster.
 #[cfg(not(feature = "k8s-client"))]
-fn reconcile_k8s_cluster(
+pub(crate) fn reconcile_k8s_cluster(
     _env: &Environment,
     _answers: Option<&Value>,
     _bound_token: Option<String>,
@@ -1486,7 +1486,7 @@ pub(crate) fn secrets_backend_is_dev_store(env: &greentic_deploy_spec::Environme
 /// `addr` + `role` are required; the rest default to the provider's. Factored
 /// out of [`resolve_secrets_backend`] so the field mapping + fail-closed
 /// validation is unit-tested without a store.
-fn secrets_backend_from_vault_answers(
+pub(crate) fn secrets_backend_from_vault_answers(
     answers: Option<&Value>,
 ) -> Result<crate::env_packs::k8s::manifests::SecretsBackend, OpError> {
     use crate::env_packs::k8s::manifests::{
@@ -1581,7 +1581,7 @@ fn resolve_render_kind(
 /// local-process env) nor apply to an env with no deployer binding at all.
 /// Without this, `--kind <full k8s descriptor>` would drive K8s apply/teardown
 /// against a cluster for an env that was never K8s-bound.
-fn resolve_live_deployer_kind(
+pub(crate) fn resolve_live_deployer_kind(
     env: &Environment,
     kind: Option<&str>,
 ) -> Result<greentic_deploy_spec::PackDescriptor, OpError> {
