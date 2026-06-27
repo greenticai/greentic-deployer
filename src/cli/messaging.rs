@@ -970,10 +970,14 @@ pub(crate) fn provision_webhook_secret(
     custodial: bool,
     existing_ref: Option<&SecretRef>,
 ) -> Result<SecretRef, OpError> {
-    let tenant = match (custodial, owner) {
-        (true, owner) => owner.unwrap_or("default"),
-        (false, Some(owner)) => owner,
-        (false, None) => {
+    // The tenant segment is the env owner when present. When it is absent, the
+    // dev-store (not tenant-scoped) falls back to the conventional `default`,
+    // while a non-custodial backend (tenant-scoped) fails closed rather than
+    // stamp an unresolvable ref.
+    let tenant = match owner {
+        Some(owner) => owner,
+        None if custodial => "default",
+        None => {
             return Err(OpError::Conflict(format!(
                 "a webhook secret on a non-dev-store secrets backend requires the environment to \
                  declare an owning tenant (`tenant_org_id`); env `{}` has none",
