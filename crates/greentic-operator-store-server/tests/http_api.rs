@@ -4903,3 +4903,444 @@ async fn env_scoped_token_can_only_access_its_environments() {
     assert_eq!(envs.len(), 1);
     assert_eq!(envs[0], "staging");
 }
+
+// ---------------------------------------------------------------------------
+// Reconcile (PR-A) — server-mediated reconcile authorization
+// ---------------------------------------------------------------------------
+//
+// The reconcile endpoint authorizes + audits + CAS-pins a reconcile and
+// returns the authorized env snapshot. No desired-state write; generation
+// and etag echo the loaded revision unchanged. If-Match is MANDATORY.
+
+/// Helper: create env "local" and return the etag from the create response.
+async fn create_env_and_etag(app: &Router) -> String {
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create env failed: {body}");
+    body["etag"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn reconcile_authz_allow() {
+    let (_d, app, store) = app_with_store().await;
+    let etag = create_env_and_etag(&app).await;
+    let if_match = format!("\"{etag}\"");
+
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-1"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Envelope shape.
+    assert!(body["etag"].is_string(), "etag missing: {body}");
+    assert!(body["generation"].is_u64(), "generation missing: {body}");
+    assert_eq!(body["idempotency"]["idempotency"], "applied");
+
+    // Result is the full Environment document.
+    assert_eq!(body["result"]["environment_id"], "local");
+
+    // Generation unchanged (create = 1, reconcile does not bump).
+    assert_eq!(body["generation"], 1);
+
+    // Audit record.
+    let audit = &body["audit"];
+    assert_eq!(audit["env_id"], "local");
+    assert_eq!(audit["noun"], "env");
+    assert_eq!(audit["verb"], "reconcile");
+    assert_eq!(audit["authorization"]["decision"], "allow");
+    assert_eq!(audit["result"]["outcome"], "ok");
+    assert_eq!(audit["idempotency_key"], "REC-1");
+
+    // One audit row in the log (the create's + reconcile's).
+    let events = audit_log_event_ids(&store, "local").await;
+    assert_eq!(events.len(), 2, "create + reconcile: {events:?}");
+}
+
+#[tokio::test]
+async fn reconcile_authz_deny_read_only_token() {
+    let (_d, app, store) = rbac_app().await;
+    let admin = bearer(ADMIN_TOKEN);
+    let (status, created) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "REC-D1"), ("Authorization", &admin)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let etag = created["etag"].as_str().unwrap();
+    let if_match = format!("\"{etag}\"");
+
+    let reader = bearer(READER_TOKEN);
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[
+            ("Idempotency-Key", "REC-D2"),
+            ("Authorization", &reader),
+            ("If-Match", &if_match),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["kind"], "unauthorized");
+    assert!(body["reason"].as_str().unwrap().contains("read-only"));
+
+    // Durable denial audit row was written (authenticated denial).
+    let events = audit_log_events(&store, "local").await;
+    let denial = events.last().expect("denial audited");
+    assert_eq!(denial["authorization"]["decision"], "deny");
+    assert_eq!(denial["noun"], "env");
+    assert_eq!(denial["verb"], "reconcile");
+    assert_eq!(
+        denial["result"]["kind"], "unauthorized",
+        "denial result: {denial}"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_authz_deny_env_scoped_token_wrong_env() {
+    let (_d, app, store) = rbac_app().await;
+    let admin = bearer(ADMIN_TOKEN);
+
+    // Create "prod" — the scoped token only covers "staging".
+    let (status, created) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("prod")),
+        &[("Idempotency-Key", "REC-S1"), ("Authorization", &admin)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let etag = created["etag"].as_str().unwrap();
+    let if_match = format!("\"{etag}\"");
+
+    let scoped = bearer(SCOPED_TOKEN);
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/prod/reconcile",
+        None,
+        &[
+            ("Idempotency-Key", "REC-S2"),
+            ("Authorization", &scoped),
+            ("If-Match", &if_match),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert!(body["reason"].as_str().unwrap().contains("not scoped"));
+
+    // Durable denial audit row.
+    let events = audit_log_events(&store, "prod").await;
+    let denial = events.last().expect("denial audited");
+    assert_eq!(denial["authorization"]["decision"], "deny");
+    assert_eq!(denial["actor"]["user"], "scoped-admin");
+}
+
+#[tokio::test]
+async fn reconcile_cas_conflict_412() {
+    let (_d, app) = app().await;
+    let etag = create_env_and_etag(&app).await;
+
+    // Mutate the env (bumps generation/etag).
+    let (status, _) = send(
+        app.clone(),
+        Method::PATCH,
+        "/environments/local",
+        Some(json!({"name": "renamed"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // POST reconcile with the ORIGINAL (stale) etag.
+    let stale_if_match = format!("\"{etag}\"");
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[
+            ("Idempotency-Key", "REC-CAS"),
+            ("If-Match", &stale_if_match),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "body: {body}");
+    assert_eq!(body["kind"], "precondition-failed");
+    // ConcurrencyConflict body contains the stale expected and current actual.
+    assert_eq!(body["expected_etag"], etag);
+    assert!(
+        body["actual_etag"].is_string(),
+        "actual_etag missing: {body}"
+    );
+    assert_ne!(body["actual_etag"], etag, "etags should differ: {body}");
+}
+
+#[tokio::test]
+async fn reconcile_cas_missing_if_match_428() {
+    let (_d, app) = app().await;
+    create_env_and_etag(&app).await;
+
+    // POST reconcile WITHOUT If-Match.
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-428")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_REQUIRED, "body: {body}");
+    assert_eq!(body["kind"], "precondition-required");
+    assert!(
+        body["detail"].as_str().unwrap_or("").contains("If-Match"),
+        "detail must mention If-Match: {body}"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_durable_audit_row_written() {
+    let (_d, app, store) = app_with_store().await;
+    let etag = create_env_and_etag(&app).await;
+    let if_match = format!("\"{etag}\"");
+
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-AUD"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Query the audit log directly.
+    let events = audit_log_events(&store, "local").await;
+    // create + reconcile = 2 audit rows.
+    assert_eq!(events.len(), 2, "create + reconcile: {events:?}");
+    let reconcile_event = &events[1];
+    assert_eq!(reconcile_event["noun"], "env");
+    assert_eq!(reconcile_event["verb"], "reconcile");
+    // Target records the snapshot identity.
+    assert_eq!(reconcile_event["target"]["environment_id"], "local");
+    assert_eq!(reconcile_event["target"]["generation"], 1);
+    assert!(
+        reconcile_event["target"]["etag"].is_string(),
+        "target.etag missing: {reconcile_event}"
+    );
+    // previous_generation == new_generation (no bump).
+    assert_eq!(
+        reconcile_event["previous_generation"], reconcile_event["new_generation"],
+        "generation should not change: {reconcile_event}"
+    );
+    assert_eq!(reconcile_event["result"]["outcome"], "ok");
+}
+
+#[tokio::test]
+async fn reconcile_idempotent_replay() {
+    let (_d, app, store) = app_with_store().await;
+    let etag = create_env_and_etag(&app).await;
+    let if_match = format!("\"{etag}\"");
+
+    // First request.
+    let (status, original) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-IDEM"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {original}");
+    assert_eq!(original["idempotency"]["idempotency"], "applied");
+
+    // Same key, same request → replay.
+    let (status, replayed) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-IDEM"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {replayed}");
+    assert_eq!(replayed["idempotency"]["idempotency"], "replayed");
+    // Same response body (original snapshot, original audit event).
+    assert_eq!(replayed["result"], original["result"]);
+    assert_eq!(replayed["audit"], original["audit"]);
+    assert_eq!(replayed["etag"], original["etag"]);
+    assert_eq!(replayed["generation"], original["generation"]);
+
+    // No second audit row.
+    let events = audit_log_event_ids(&store, "local").await;
+    assert_eq!(events.len(), 2, "create + reconcile only: {events:?}");
+}
+
+#[tokio::test]
+async fn reconcile_idempotency_conflict_different_fingerprint() {
+    let (_d, app) = app().await;
+    let etag = create_env_and_etag(&app).await;
+    let if_match = format!("\"{etag}\"");
+
+    // Reconcile env "local" with key K1.
+    let (status, _) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-FP"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Create a backup on the SAME env with the SAME key K1 — different
+    // path produces a different fingerprint → 409 idempotency-conflict.
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/backups",
+        None,
+        &[("Idempotency-Key", "REC-FP")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "idempotency-conflict");
+}
+
+#[tokio::test]
+async fn reconcile_generation_not_bumped() {
+    let (_d, app) = app().await;
+    let etag = create_env_and_etag(&app).await;
+    let if_match = format!("\"{etag}\"");
+
+    // GET env before reconcile.
+    let (status, before) = send(app.clone(), Method::GET, "/environments/local", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let gen_before = before["generation"].as_u64().unwrap();
+
+    // Reconcile.
+    let (status, _) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-GEN"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // GET env after reconcile.
+    let (status, after) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        after["generation"].as_u64().unwrap(),
+        gen_before,
+        "generation must not be bumped by reconcile"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_env_not_found_404() {
+    let (_d, app) = app().await;
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/nonexistent/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-404"), ("If-Match", "\"deadbeef\"")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["kind"], "not-found");
+}
+
+#[tokio::test]
+async fn reconcile_open_dev_posture_allows_with_honest_audit() {
+    // Open-dev (default) allows reconcile without any token.
+    let (_d, app, _store) = app_with_store().await;
+    let etag = create_env_and_etag(&app).await;
+    let if_match = format!("\"{etag}\"");
+
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-OD"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["audit"]["authorization"]["decision"], "allow");
+    assert_eq!(body["audit"]["authorization"]["policy"], "open-dev");
+
+    // If-Match was still mandatory (open-dev does not bypass CAS).
+    let (status, body) = send_custom(
+        app_with_store().await.1,
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-OD2")],
+    )
+    .await;
+    // This hits a fresh store with no "local" env, so it will be either 428
+    // (if If-Match check runs first) or 404. The 428 fires before loading
+    // state, so it wins.
+    assert_eq!(status, StatusCode::PRECONDITION_REQUIRED, "body: {body}");
+}
+
+#[tokio::test]
+async fn reconcile_concurrent_race_error_or_replay() {
+    // Simulate the concurrent race: first reconcile commits, then a second
+    // with the same key gets IdempotencyKeyCommitted from record_journal
+    // and falls through error_or_replay to replay the first.
+    //
+    // We cannot easily simulate true concurrency in a single-threaded test,
+    // but we can verify the replay path by issuing the same request twice
+    // (the first commits the key; the second replays via replay_gate).
+    let (_d, app, store) = app_with_store().await;
+    let etag = create_env_and_etag(&app).await;
+    let if_match = format!("\"{etag}\"");
+
+    let (status, first) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-RACE"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {first}");
+    assert_eq!(first["idempotency"]["idempotency"], "applied");
+
+    // Second identical request → replayed via the replay_gate.
+    let (status, second) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-RACE"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {second}");
+    assert_eq!(second["idempotency"]["idempotency"], "replayed");
+    assert_eq!(second["audit"]["event_id"], first["audit"]["event_id"]);
+
+    // Only one audit row was appended for reconcile.
+    let events = audit_log_event_ids(&store, "local").await;
+    assert_eq!(events.len(), 2, "create + reconcile: {events:?}");
+}

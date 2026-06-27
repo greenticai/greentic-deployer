@@ -960,6 +960,84 @@ pub(crate) async fn update_environment<S: EnvironmentStorage>(
     }
 }
 
+/// `POST /environments/{env_id}/reconcile` — server-mediated reconcile
+/// authorization (PR-A). The store authorizes + audits + CAS-pins the
+/// reconcile and hands back the authorized env snapshot; the operator
+/// still executes the k8s apply. No desired-state write — generation
+/// and etag echo the loaded revision unchanged.
+///
+/// `If-Match` is MANDATORY (defense-in-depth against TOCTOU): the operator
+/// must pin the reviewed state, and the server enforces it. Absent
+/// `If-Match` returns 428; a stale etag returns 412.
+pub(crate) async fn reconcile_environment<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+    Fingerprint(fingerprint): Fingerprint,
+) -> Result<Response, ApiError> {
+    let env_id = parse_env_id(&env_id)?;
+    let auth = authorize_mutation(&state, &headers, &env_id, "env", "reconcile").await?;
+    let idem_key = require_idempotency_key(&headers)?;
+    let client_etag = match parse_if_match(&headers)? {
+        Some(etag) => etag,
+        None => {
+            return Err(ApiError(RemoteStoreError::PreconditionRequired {
+                detail: "reconcile requires If-Match to pin the reviewed state".to_string(),
+            }));
+        }
+    };
+    if let Some(replay) = replay_gate(&state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(replay);
+    }
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let loaded = state
+            .storage
+            .load_env(&env_id)
+            .await
+            .map_err(load_storage_error)?;
+        // Manual CAS check: the handler never calls update_env_journaled
+        // (where resolve_precondition normally fires), so compare here.
+        if client_etag != loaded.revision.etag {
+            return Err(ApiError(RemoteStoreError::PreconditionFailed(
+                ConcurrencyConflict {
+                    expected_etag: Some(client_etag.0),
+                    actual_etag: loaded.revision.etag.0.clone(),
+                    expected_generation: None,
+                    actual_generation: loaded.revision.generation,
+                },
+            )));
+        }
+        let target = json!({
+            "environment_id": env_id,
+            "generation": loaded.revision.generation,
+            "etag": loaded.revision.etag.0,
+        });
+        let prepared = prepare_mutation(
+            &loaded.value,
+            &env_id,
+            "env",
+            "reconcile",
+            target,
+            idem_key,
+            &fingerprint,
+            &auth,
+            Some(loaded.revision.generation),
+            loaded.revision.clone(),
+        )?;
+        // No desired-state write — record_journal only (same pattern as
+        // set_traffic_split's no-mutation branch and seed_trust_root's
+        // no-op path).
+        state.storage.record_journal(&prepared.journal).await?;
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
+}
+
 /// `POST /environments/{env_id}/migrate-bindings` — merge pack/extension
 /// bindings, optionally seeding a missing target (A8 route 3).
 pub(crate) async fn migrate_bindings<S: EnvironmentStorage>(
