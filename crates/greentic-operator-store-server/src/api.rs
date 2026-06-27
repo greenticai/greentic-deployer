@@ -2214,15 +2214,16 @@ pub(crate) async fn remove_bundle<S: EnvironmentStorage>(
 //   consumers read the environment via `GET` (the runtime-config
 //   projection precedent).
 // - The webhook-secret SINK: a control-plane store has no secrets plane and
-//   never mints, rotates, or custodies secret material. Telegram-class `add`
-//   therefore requires a caller-supplied `webhook_secret_ref` (the operator
-//   provisions the value in its own secrets plane and the engine stamps the
-//   ref without touching the sink). The sink itself ALWAYS refuses, so the
-//   only paths that reach it — a telegram `add` with NO ref, or any
-//   `rotate-webhook-secret` (the server cannot prove a value rotated, so it
-//   will not journal a misleading success) — answer 501 `not-yet-implemented`.
-//   The refusal fires exactly where the LocalFS sink would write — after
-//   replay/duplicate/ref validation — so every other path is identical.
+//   never mints, rotates, or custodies secret material. A caller-supplied
+//   `webhook_secret_ref` (telegram `add`, or the new-ref `rotate`) is stamped
+//   by the engine without touching the sink — the operator provisions the
+//   value in its own secrets plane. The sink itself ALWAYS refuses, so the
+//   only paths that reach it — a telegram `add` with NO ref, or a
+//   `rotate-webhook-secret` with NO ref (the server cannot prove a value
+//   rotated, so it will not journal a misleading success) — answer 501
+//   `not-yet-implemented`. The refusal fires exactly where the LocalFS sink
+//   would write — after replay/duplicate/ref validation — so every other path
+//   is identical.
 //
 // Persist rule: the engine reports `mutated == false` for idempotent
 // replays/no-ops — the handler then echoes the loaded CAS coordinates
@@ -2582,42 +2583,18 @@ pub(crate) async fn rotate_messaging_webhook_secret<S: EnvironmentStorage>(
         fingerprint,
         "rotate-webhook-secret",
         |env, key| {
-            // `Option<&str>` is `Copy`, so the provision closure below
-            // captures it without moving `payload`.
-            let new_ref = payload.webhook_secret_ref.as_deref();
-            // Mirror the caller-ref `add` invariant: a `webhook_secret_ref` is
-            // only valid for a telegram-class endpoint. Resolved here as an
-            // immutable borrow that ends before the engine takes `env` mutably;
-            // `None` means the endpoint is absent, and the engine 404s before
-            // the sink runs, so the gate is moot in that case.
-            let target_is_telegram = env
-                .messaging_endpoints
-                .iter()
-                .find(|e| e.endpoint_id == endpoint_id)
-                .map(|e| engine::is_telegram_class(&e.provider_type));
+            // A caller-supplied new ref is validated + stamped by the engine
+            // (telegram-class gate + parse, mirroring `add`); with no ref the
+            // server sink refuses (501), since the control-plane store cannot
+            // mint or prove an operator-side rotation.
             let applied = engine::rotate_messaging_webhook_secret(
                 env,
                 endpoint_id,
                 &payload.updated_by,
                 key,
                 Utc::now(),
-                |existing| match new_ref {
-                    Some(raw) => {
-                        if target_is_telegram == Some(false) {
-                            return Err(MessagingError::InvalidSecretRef {
-                                raw: raw.to_string(),
-                                message: "webhook_secret_ref is only valid for telegram-class \
-                                          providers"
-                                    .to_string(),
-                            });
-                        }
-                        SecretRef::try_new(raw).map_err(|e| MessagingError::InvalidSecretRef {
-                            raw: raw.to_string(),
-                            message: e.to_string(),
-                        })
-                    }
-                    None => server_webhook_secret_sink(existing),
-                },
+                payload.webhook_secret_ref.as_deref(),
+                server_webhook_secret_sink,
             )?;
             let ep = env.messaging_endpoints[applied.index].clone();
             let target = json!({"endpoint_id": endpoint_id.to_string()});
