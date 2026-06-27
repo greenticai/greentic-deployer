@@ -1305,16 +1305,19 @@ struct RemoteReconcilePayload {
     secrets_answers: Value,
 }
 
-/// Remote `op env reconcile` over `--store-url`. Fetches the desired-state
-/// [`Environment`] from the control-plane store, then runs the SAME k8s
-/// convergence as local [`reconcile`](super::env::reconcile) — only the answer
-/// source differs. The store keeps no answer blobs, so the operator supplies the
-/// reconcile-time context via `--answers` ([`RemoteReconcilePayload`]); it is
-/// therefore Vault-secrets-only (no local dev-store to ship values from),
-/// k8s-only (same gate as local), and ships no dev-store Secret
-/// (`dev_secrets = None` — the worker resolves `secret://` under pod identity).
-/// Keep the gate/sequence in sync with local `reconcile` until a shared engine
-/// lands.
+/// Remote `op env reconcile` over `--store-url`. Reads the desired-state
+/// [`Environment`] to fail-fast on the structural gates, then runs the
+/// server-mediated `env.reconcile` op (`reconcile_environment`) — the store
+/// AUTHORIZEs + AUDITs + CAS-pins the reconcile and returns the authorized
+/// snapshot — before running the SAME k8s convergence as local
+/// [`reconcile`](super::env::reconcile) against it. Only the answer source and
+/// the store-side authorization step differ from local. The store keeps no
+/// answer blobs, so the operator supplies the reconcile-time context via
+/// `--answers` ([`RemoteReconcilePayload`]); it is therefore Vault-secrets-only
+/// (no local dev-store to ship values from), k8s-only (same gate as local), and
+/// ships no dev-store Secret (`dev_secrets = None` — the worker resolves
+/// `secret://` under pod identity). Keep the gate/sequence in sync with local
+/// `reconcile` until a shared engine lands.
 fn remote_reconcile(
     store: &HttpEnvironmentStore,
     flags: &OpFlags,
@@ -1400,6 +1403,33 @@ fn remote_reconcile(
     // kubeconfig context.
     let deployer_answers =
         (!payload.deployer_answers.is_null()).then(|| payload.deployer_answers.clone());
+
+    // Server-mediated authorization: the bare read above let us fail-fast on
+    // the structural gates (k8s-only, Vault-only, `--answers`); now ask the
+    // control-plane store to AUTHORIZE + AUDIT + CAS-pin the reconcile.
+    // `load_environment` cached the ETag we reviewed, which `reconcile_environment`
+    // replays as the mandatory `If-Match`, so a revision that advanced under us
+    // is refused (412) instead of silently reconciled. The store returns the
+    // authorized snapshot — apply exactly that. CAS guarantees it equals the
+    // gated `env`, so the descriptor/gates computed above still hold; rebind so
+    // the apply runs against the revision the store authorized.
+    let idempotency_key = super::mint_idempotency_key();
+    let env = store
+        .reconcile_environment(&env_id, &idempotency_key)
+        .map_err(|e| match e {
+            StoreError::NotFound(_) => OpError::NotFound(format!(
+                "environment `{env_id}` not found on the remote store"
+            )),
+            // The reconcile op's only conflict-class outcome is a CAS
+            // precondition failure (412): the env advanced between the read and
+            // the authorize. Append the actionable next step to the server's
+            // ETag-bearing message.
+            StoreError::Conflict(msg) => OpError::Conflict(format!(
+                "{msg}; the environment may have advanced on the store since it was \
+                 read — re-run `op env reconcile` to reconcile the current revision"
+            )),
+            other => map_store_err_preserving_noun(other),
+        })?;
 
     // Bound deployer identity: a remote env has no local dev-store, so resolve
     // against an empty scratch store — the dev-store source is then a guaranteed
@@ -4471,6 +4501,95 @@ mod tests {
         assert!(
             matches!(err, OpError::Conflict(ref m) if m.contains("addr")),
             "got {err:?}"
+        );
+    }
+
+    /// Once the gates pass, reconcile routes through the server-mediated
+    /// `env.reconcile` op: the GET-cached ETag MUST replay as `If-Match` on the
+    /// POST (CAS), and a 412 — the env advanced under us — surfaces as a
+    /// Conflict carrying the re-run guidance, never a silent stale apply.
+    #[test]
+    fn remote_reconcile_pins_if_match_and_maps_concurrent_advance() {
+        let env = k8s_vault_env();
+        let requests: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = requests.clone();
+        let check: CheckFn = Arc::new(move |req_line: &str, headers: &str, _body: &[u8]| {
+            recorder
+                .lock()
+                .unwrap()
+                .push((req_line.to_string(), headers.to_lowercase()));
+        });
+        let mock = start_mock(
+            vec![
+                (200, &get_env_response(&env)), // load_environment read
+                (412, r#"{"detail":"stale"}"#), // reconcile POST: env advanced
+            ],
+            Some(check),
+        );
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "secrets_answers": {"addr": "http://vault.local:8200", "role": "greentic-worker"}
+        }));
+        let err = remote_reconcile(&store, &flags, reconcile_args("prod")).unwrap_err();
+
+        assert!(
+            matches!(err, OpError::Conflict(ref m) if m.contains("re-run")),
+            "412 must surface as a re-run Conflict, got {err:?}"
+        );
+        let reqs = requests.lock().unwrap();
+        assert_eq!(
+            reqs.len(),
+            2,
+            "expected GET then reconcile POST, got {reqs:?}"
+        );
+        assert!(
+            reqs[0].0.starts_with("GET "),
+            "first request is the read: {}",
+            reqs[0].0
+        );
+        assert!(
+            reqs[1].0.starts_with("POST ") && reqs[1].0.contains("/reconcile"),
+            "second request is the reconcile POST: {}",
+            reqs[1].0
+        );
+        assert!(
+            reqs[1].1.contains("if-match: \"sha256:test\""),
+            "reconcile POST must replay the reviewed ETag as If-Match: {}",
+            reqs[1].1
+        );
+        assert!(
+            reqs[1].1.contains("idempotency-key:"),
+            "reconcile POST must carry an idempotency key: {}",
+            reqs[1].1
+        );
+    }
+
+    /// The whole point of routing reconcile through the store: a denial
+    /// (e.g. a read-only token) is refused server-side and surfaces with the
+    /// typed `unauthorized` noun — not as a silent local apply that bypassed
+    /// the control plane's authorization boundary.
+    #[test]
+    fn remote_reconcile_surfaces_server_authz_denial() {
+        let env = k8s_vault_env();
+        let mock = start_mock(
+            vec![
+                (200, &get_env_response(&env)),
+                (
+                    403,
+                    r#"{"kind":"unauthorized","policy":"rbac-v1","reason":"read-only token"}"#,
+                ),
+            ],
+            None,
+        );
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "secrets_answers": {"addr": "http://vault.local:8200", "role": "greentic-worker"}
+        }));
+        let err = remote_reconcile(&store, &flags, reconcile_args("prod")).unwrap_err();
+        assert!(
+            matches!(err, OpError::Unauthorized { ref reason, .. } if reason.contains("read-only")),
+            "server authz denial must surface as Unauthorized, got {err:?}"
         );
     }
 }
