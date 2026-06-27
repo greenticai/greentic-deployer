@@ -2558,13 +2558,16 @@ pub(crate) async fn remove_messaging_endpoint<S: EnvironmentStorage>(
 ///   (the env doc's `webhook_secret_ref` moves to it) and bumps the
 ///   generation — verifiable in the same sense a telegram-class `add` with a
 ///   caller ref is, because the server only echoes what the caller asserts.
+///   The target endpoint MUST be telegram-class (the same invariant `add`
+///   enforces) — a ref on a non-telegram endpoint is a 400.
 /// - **without a ref**: the value lives operator-side, so the server cannot
 ///   prove a rotation occurred and journaling a generation bump would be a
 ///   misleading success — the always-refusing sink answers 501.
 ///
-/// A malformed ref is a typed 400. Unknown endpoints still 404 first; a
-/// same-key replay still no-ops without re-stamping (the engine's replay gate
-/// fires before the sink, so the ref is never re-validated on replay).
+/// A malformed ref, or a ref on a non-telegram endpoint, is a typed 400.
+/// Unknown endpoints still 404 first; a same-key replay still no-ops without
+/// re-stamping (the engine's replay gate fires before the sink, so the ref is
+/// never re-validated on replay).
 pub(crate) async fn rotate_messaging_webhook_secret<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, endpoint_id)): Path<(String, String)>,
@@ -2582,6 +2585,16 @@ pub(crate) async fn rotate_messaging_webhook_secret<S: EnvironmentStorage>(
             // `Option<&str>` is `Copy`, so the provision closure below
             // captures it without moving `payload`.
             let new_ref = payload.webhook_secret_ref.as_deref();
+            // Mirror the caller-ref `add` invariant: a `webhook_secret_ref` is
+            // only valid for a telegram-class endpoint. Resolved here as an
+            // immutable borrow that ends before the engine takes `env` mutably;
+            // `None` means the endpoint is absent, and the engine 404s before
+            // the sink runs, so the gate is moot in that case.
+            let target_is_telegram = env
+                .messaging_endpoints
+                .iter()
+                .find(|e| e.endpoint_id == endpoint_id)
+                .map(|e| engine::is_telegram_class(&e.provider_type));
             let applied = engine::rotate_messaging_webhook_secret(
                 env,
                 endpoint_id,
@@ -2590,6 +2603,14 @@ pub(crate) async fn rotate_messaging_webhook_secret<S: EnvironmentStorage>(
                 Utc::now(),
                 |existing| match new_ref {
                     Some(raw) => {
+                        if target_is_telegram == Some(false) {
+                            return Err(MessagingError::InvalidSecretRef {
+                                raw: raw.to_string(),
+                                message: "webhook_secret_ref is only valid for telegram-class \
+                                          providers"
+                                    .to_string(),
+                            });
+                        }
                         SecretRef::try_new(raw).map_err(|e| MessagingError::InvalidSecretRef {
                             raw: raw.to_string(),
                             message: e.to_string(),

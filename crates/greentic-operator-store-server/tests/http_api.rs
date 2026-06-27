@@ -3201,14 +3201,31 @@ async fn messaging_rotate_with_new_ref_records_and_bumps() {
     );
 }
 
-/// A malformed `webhook_secret_ref` is rejected by the server's ref parse
-/// (the same validation a caller-ref `add` runs) as a typed 400 — BEFORE any
-/// state mutation.
+/// A malformed `webhook_secret_ref` on a telegram endpoint is rejected by the
+/// server's ref parse (the same validation a caller-ref `add` runs) as a typed
+/// 400 — BEFORE any state mutation. A telegram endpoint is used so the parse,
+/// not the telegram-class gate, is what's exercised.
 #[tokio::test]
 async fn messaging_rotate_with_malformed_ref_is_400() {
     let (_d, app) = app().await;
     create_local_env(&app).await;
-    let eid = add_one_endpoint(&app, "teams", "legal-bot", "k-add").await;
+    let (status, add_body) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/messaging",
+        Some(add_endpoint_body_with_webhook_ref(
+            "telegram",
+            "tg-bot",
+            "secret://local/default/_/messaging-byo/webhook_secret",
+        )),
+        &[("Idempotency-Key", "k-add-tg")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "add body: {add_body}");
+    let eid = add_body["result"]["endpoint_id"]
+        .as_str()
+        .expect("eid")
+        .to_string();
 
     let (status, body) = send_custom(
         app.clone(),
@@ -3221,8 +3238,44 @@ async fn messaging_rotate_with_malformed_ref_is_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
     assert_eq!(body["kind"], "invalid-request");
 
-    // The rejected rotate did not bump the generation.
+    // The rejected rotate did not bump the generation (telegram endpoint sits
+    // at gen 0 after add).
     let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["generation"], 0,
+        "a rejected rotate must not bump the endpoint generation"
+    );
+}
+
+/// A caller-supplied ref on a NON-telegram endpoint is rejected (400) — the
+/// same invariant a caller-ref `add` enforces, so the new-ref rotate cannot
+/// persist a webhook ref on an endpoint that would never have accepted one at
+/// creation.
+#[tokio::test]
+async fn messaging_rotate_new_ref_on_non_telegram_endpoint_is_400() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+    let eid = add_one_endpoint(&app, "teams", "legal-bot", "k-add").await;
+
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/rotate-secret"),
+        Some(json!({"updated_by": "op",
+            "webhook_secret_ref": "secret://local/default/_/messaging-x/webhook_secret"})),
+        &[("Idempotency-Key", "k-rotate-nontg")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["kind"], "invalid-request");
+
+    // The rejected rotate neither stamped a ref nor bumped the generation.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["webhook_secret_ref"],
+        serde_json::Value::Null,
+        "a rejected rotate must not stamp a ref on a non-telegram endpoint"
+    );
     assert_eq!(
         read["environment"]["messaging_endpoints"][0]["generation"], 0,
         "a rejected rotate must not bump the endpoint generation"
