@@ -2713,6 +2713,9 @@ fn deploy_payload(
         // Single-revision pull ref: a K8s worker fetches the bundle from here
         // at boot; `bundle_path` above supplies the integrity digest.
         bundle_source_uri: rb.spec.bundle_source_uri.clone(),
+        // Local manifest-apply path: the artifact at `bundle_path` is staged
+        // locally, so no remote pins are threaded.
+        remote_pins: None,
         idempotency_key: None,
         config_overrides: rb.spec.config_overrides.clone(),
         route_binding,
@@ -3879,6 +3882,7 @@ mod tests {
                 customer_id: None,
                 bundle_path: Some(fixture()),
                 bundle_source_uri: None,
+                remote_pins: None,
                 idempotency_key: None,
                 config_overrides: None,
                 route_binding: None,
@@ -4906,6 +4910,7 @@ mod tests {
             customer_id: None,
             bundle_path: Some(fixture()),
             bundle_source_uri: None,
+            remote_pins: None,
             idempotency_key: None,
             config_overrides: None,
             route_binding: Some(super::super::bundles::RouteBindingPayload {

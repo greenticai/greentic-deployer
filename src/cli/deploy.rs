@@ -39,7 +39,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use greentic_deploy_spec::{EnvId, RouteBinding};
+use greentic_deploy_spec::{
+    BundleDeployment, CustomerId, DeploymentId, EnvId, Environment, RouteBinding,
+};
 
 /// Per-pack config overrides: `<pack_id> -> <key> -> <json value>`.
 type ConfigOverridesMap = BTreeMap<String, BTreeMap<String, Value>>;
@@ -61,6 +63,35 @@ const VERB: &str = "run";
 
 /// 100 % of traffic, in basis points.
 pub(crate) const FULL_TRAFFIC_BPS: u32 = 10_000;
+
+/// Caller-pinned artifact pointers for a remote (`--store-url`) deploy.
+///
+/// The local `op deploy --bundle <file>` path extracts the artifact and
+/// derives `bundle_digest` / `pack_list` / `pack_list_lock_ref` from it, but a
+/// remote store keeps no bundle bytes — so a remote deploy requires the bundle
+/// already pushed to a registry and its pointers supplied here (exactly the
+/// pins remote `revisions stage` demands). Optional fields default to the same
+/// canonical stage defaults; `bundle_digest` is the only one validated as
+/// non-placeholder by the remote path (a remote worker must be able to verify
+/// what it pulls). Ignored entirely on the local path.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemoteBundlePins {
+    /// Real (non-placeholder) content digest the worker verifies after pull.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_digest: Option<String>,
+    /// Pinned pack-list the worker materializes the revision from.
+    #[serde(default)]
+    pub pack_list: Vec<super::revisions::PackListEntryPayload>,
+    /// Env-relative pack-list lockfile pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_list_lock_ref: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_sidecar_ref: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_seconds: Option<u32>,
+}
 
 /// Input to [`deploy`]. Everything but `bundle_id` and `bundle_path` has a
 /// sensible default; the CLI requires `--bundle` and derives `bundle_id` from
@@ -86,6 +117,11 @@ pub struct BundleDeployPayload {
     /// `--bundle` file; this only records where the worker can re-fetch it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_source_uri: Option<String>,
+    /// Caller-pinned artifact pointers, required only on the remote
+    /// (`--store-url`) path (the local `--bundle` path derives them from the
+    /// artifact and ignores this). See [`RemoteBundlePins`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_pins: Option<RemoteBundlePins>,
     /// Idempotency key for the traffic cut-over. Defaults to a value derived
     /// from the freshly-minted revision id, so each deploy is a distinct
     /// (non-replay) cut-over.
@@ -171,6 +207,110 @@ impl DeploySummary {
             serde_json::to_value(self).expect("DeploySummary is json-safe"),
         )
     }
+
+    /// Build the routed-deploy outcome directly. Used by the remote
+    /// (`--store-url`) path, which composes the typed store verbs and so never
+    /// holds a `DeploySummary` value to call [`Self::into_outcome`] on.
+    pub(crate) fn routed_outcome(
+        env_id: &EnvId,
+        bundle_id: String,
+        deployment_id: String,
+        revision_id: String,
+        reused_deployment: bool,
+        superseded_revisions: Vec<String>,
+    ) -> OpOutcome {
+        Self::routed(
+            env_id,
+            bundle_id,
+            deployment_id,
+            revision_id,
+            reused_deployment,
+            superseded_revisions,
+        )
+        .into_outcome()
+    }
+}
+
+// --- pure rollout decisions ---------------------------------------------------
+//
+// Shared by the local `deploy` (above) and the remote `--store-url`
+// `remote_deploy`. They operate on an already-loaded `Environment` + the deploy
+// payload so the blue-green rollout *decisions* (idempotent replay, deployment
+// reuse, route immutability, which revisions get superseded) are single-sourced;
+// only the *execution* — local CLI verbs vs. typed HTTP-store calls — differs.
+
+/// The deployment for `(bundle_id, customer_id)` in `env`, if already deployed.
+pub(crate) fn find_existing_deployment<'a>(
+    env: &'a Environment,
+    bundle_id: &str,
+    customer_id: &CustomerId,
+) -> Option<&'a BundleDeployment> {
+    env.bundles
+        .iter()
+        .find(|b| b.bundle_id.as_str() == bundle_id && b.customer_id == *customer_id)
+}
+
+/// Operation-level idempotency: when the caller supplied a key and `existing`
+/// already has a traffic split under it, the deploy already ran — return its
+/// `(deployment_id, revision_id)` so the caller can echo the original outcome
+/// without minting a duplicate revision or moving the rollback target. `None`
+/// ⇒ proceed with a fresh rollout.
+pub(crate) fn idempotent_deploy_replay(
+    env: &Environment,
+    existing: Option<&BundleDeployment>,
+    idempotency_key: Option<&str>,
+) -> Option<(String, String)> {
+    let key = idempotency_key?;
+    let b = existing?;
+    let split = env
+        .traffic_splits
+        .iter()
+        .find(|s| s.deployment_id == b.deployment_id && s.idempotency_key == key)?;
+    let revision_id = split
+        .entries
+        .first()
+        .map(|e| e.revision_id.to_string())
+        .unwrap_or_default();
+    Some((b.deployment_id.to_string(), revision_id))
+}
+
+/// On re-deploy with a `route_binding`, reject a binding that differs from the
+/// deployment's existing one: routing is bundle-level metadata that `traffic
+/// rollback` does NOT restore, so a silent change here would leave the prior
+/// revision mis-routed after a rollback. Equal ⇒ no-op; `None` ⇒ no change.
+pub(crate) fn ensure_route_binding_unchanged(
+    existing: Option<&BundleDeployment>,
+    requested: Option<&RouteBindingPayload>,
+) -> Result<(), OpError> {
+    if let (Some(b), Some(rb_payload)) = (existing, requested) {
+        let want: RouteBinding = super::bundles::into_route_binding(rb_payload.clone());
+        if want != b.route_binding {
+            return Err(OpError::Conflict(format!(
+                "deploy: route_binding differs from the deployed binding for \
+                 `{}` — routing is bundle-level metadata and is not restored by \
+                 `traffic rollback`. Run `gtc op bundles update --answers ...` to \
+                 change routing on an existing deployment, then re-deploy",
+                b.bundle_id.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Revisions live in `deployment_id`'s current split — they leave the routing
+/// table on the new 100 % cut-over (blue-green) and drain at runtime. Retained
+/// (not archived) so `traffic rollback` still works.
+pub(crate) fn superseded_revisions(env: &Environment, deployment_id: DeploymentId) -> Vec<String> {
+    env.traffic_splits
+        .iter()
+        .find(|s| s.deployment_id == deployment_id)
+        .map(|s| {
+            s.entries
+                .iter()
+                .map(|e| e.revision_id.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Orchestrate add → stage → warm → traffic-set with defaults.
@@ -235,72 +375,35 @@ pub fn deploy(
     // so a keyed retry would otherwise stage a fresh revision and then conflict
     // at the split, orphaning a Ready revision.)
     let env = store.load(&env_id)?;
-    let existing = env
-        .bundles
-        .iter()
-        .find(|b| b.bundle_id.as_str() == bundle_id && b.customer_id == customer_id);
+    let existing = find_existing_deployment(&env, &bundle_id, &customer_id);
 
-    if let Some(key) = payload.idempotency_key.as_deref()
-        && let Some(b) = existing
-        && let Some(split) = env
-            .traffic_splits
-            .iter()
-            .find(|s| s.deployment_id == b.deployment_id && s.idempotency_key == key)
+    // Operation-level idempotency: a keyed deploy whose split already exists
+    // returns the prior outcome without minting a duplicate revision or moving
+    // the rollback target. (`traffic set` alone keys only the cut-over, so a
+    // keyed retry would otherwise stage a fresh revision and then conflict at
+    // the split, orphaning a Ready revision.)
+    if let Some((deployment_id, revision_id)) =
+        idempotent_deploy_replay(&env, existing, payload.idempotency_key.as_deref())
     {
-        let revision_id = split
-            .entries
-            .first()
-            .map(|e| e.revision_id.to_string())
-            .unwrap_or_default();
-        return Ok(DeploySummary::routed(
+        return Ok(DeploySummary::routed_outcome(
             &env_id,
             bundle_id,
-            b.deployment_id.to_string(),
+            deployment_id,
             revision_id,
             true,
             Vec::new(),
-        )
-        .into_outcome());
+        ));
     }
 
-    // On re-deploy with a route_binding in the payload, reject any binding
-    // that differs from the deployment's existing one BEFORE staging a
-    // revision. Routing is bundle-level metadata that `traffic rollback`
-    // does NOT restore (see `traffic::rollback`), so allowing a mutation
-    // here would leave the prior revision mis-routed after a rollback.
-    //
-    // Equal → no-op (preserves the demo flow where the user re-runs the
-    // same deploy command). Different → reject with Conflict pointing to
-    // `gtc op bundles update` as the right verb for routing mutations on
-    // an existing deployment. None → fall through (no change requested).
-    if let (Some(b), Some(rb_payload)) = (existing, payload.route_binding.as_ref()) {
-        let requested: RouteBinding = super::bundles::into_route_binding(rb_payload.clone());
-        if requested != b.route_binding {
-            return Err(OpError::Conflict(format!(
-                "deploy: route_binding differs from the deployed binding for \
-                 `{bundle_id}` — routing is bundle-level metadata and is not \
-                 restored by `traffic rollback`. Run `gtc op bundles update \
-                 --answers ...` to change routing on an existing deployment, \
-                 then re-deploy"
-            )));
-        }
-    }
+    // On re-deploy with a route_binding, reject a binding that differs from the
+    // deployment's existing one BEFORE staging a revision (routing is not
+    // restored by `traffic rollback`).
+    ensure_route_binding_unchanged(existing, payload.route_binding.as_ref())?;
 
     let (deployment_id, reused, superseded_revisions) = match existing {
         Some(b) => {
             let dep = b.deployment_id;
-            let superseded: Vec<String> = env
-                .traffic_splits
-                .iter()
-                .find(|s| s.deployment_id == dep)
-                .map(|s| {
-                    s.entries
-                        .iter()
-                        .map(|e| e.revision_id.to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-            (dep.to_string(), true, superseded)
+            (dep.to_string(), true, superseded_revisions(&env, dep))
         }
         None => {
             let add_payload = BundleAddPayload {
@@ -500,6 +603,7 @@ pub fn payload_from_deploy_args(
         customer_id,
         bundle_path: Some(bundle_path),
         bundle_source_uri: None,
+        remote_pins: None,
         idempotency_key,
         config_overrides,
         route_binding,
@@ -751,6 +855,7 @@ mod tests {
             customer_id: None,
             bundle_path: Some(fixture()),
             bundle_source_uri: None,
+            remote_pins: None,
             idempotency_key: None,
             config_overrides: None,
             route_binding: None,
