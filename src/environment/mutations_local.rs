@@ -1115,6 +1115,9 @@ impl LocalFsStore {
                 &updated_by,
                 &idempotency_key,
                 Utc::now(),
+                // The local store mints its own value; it never threads a
+                // caller-supplied ref (the CLI rejects one).
+                None,
                 |existing| {
                     self.provision_webhook_secret_sink(
                         env_id,

@@ -603,6 +603,44 @@ impl HttpEnvironmentStore {
         )
     }
 
+    /// `POST /environments/{env_id}/messaging/{eid}/rotate-secret` carrying an
+    /// optional caller-supplied NEW `webhook_secret_ref` (raw `secret://`
+    /// URI). The control-plane store never mints secret material, so:
+    /// - `Some(ref)` — the operator has already provisioned the value in its
+    ///   own secrets plane; the server records the asserted ref and bumps the
+    ///   endpoint generation.
+    /// - `None` — the server cannot prove a rotation and answers 501.
+    ///
+    /// The [`EnvironmentMutations::rotate_messaging_webhook_secret`] trait
+    /// method delegates here with `None` (that generic surface carries no ref;
+    /// the new-ref path is remote-store-specific and reached through the
+    /// `--store-url` dispatch).
+    pub fn rotate_messaging_webhook_secret_to_ref(
+        &self,
+        env_id: &EnvId,
+        endpoint_id: MessagingEndpointId,
+        updated_by: String,
+        webhook_secret_ref: Option<String>,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<MessagingEndpoint, StoreError> {
+        let idem_key = idempotency_key.as_str().to_string();
+        let req = RotateWebhookSecretPayload {
+            updated_by,
+            webhook_secret_ref,
+        };
+        self.send_mutation(
+            env_id,
+            reqwest::Method::POST,
+            &format!(
+                "environments/{}/messaging/{}/rotate-secret",
+                encode_segment(env_id.as_str()),
+                encode_segment(&endpoint_id.to_string()),
+            ),
+            Some(&idem_key),
+            Some(&req),
+        )
+    }
+
     /// `GET /environments/{env_id}/trust-root` — the env's trusted-key set
     /// (empty for an absent row, which the server treats as closed-by-default;
     /// a missing ENV is still a 404 → [`StoreError::NotFound`]). Inherent
@@ -1515,18 +1553,16 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         updated_by: String,
         idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError> {
-        let idem_key = idempotency_key.as_str().to_string();
-        let req = RotateWebhookSecretPayload { updated_by };
-        self.send_mutation(
+        // The generic mutation surface carries no caller ref; the new-ref
+        // rotation is remote-store-specific and goes through the inherent
+        // `rotate_messaging_webhook_secret_to_ref` from the `--store-url`
+        // dispatch. A no-ref rotation is refused by the server (501).
+        self.rotate_messaging_webhook_secret_to_ref(
             env_id,
-            reqwest::Method::POST,
-            &format!(
-                "environments/{}/messaging/{}/rotate-secret",
-                encode_segment(env_id.as_str()),
-                encode_segment(&endpoint_id.to_string()),
-            ),
-            Some(&idem_key),
-            Some(&req),
+            endpoint_id,
+            updated_by,
+            None,
+            idempotency_key,
         )
     }
 
@@ -2634,6 +2670,23 @@ mod tests {
             &env_id(),
             MessagingEndpointId::new(),
             "tester".to_string(),
+            idem(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rotate_messaging_webhook_secret_to_ref_carries_new_ref() {
+        // The new-ref variant: the inherent method threads a caller-supplied
+        // ref into the request body. The server records it (proven server-side
+        // in http_api); here we assert the client round-trips a 200 response.
+        let body = sample_messaging_endpoint();
+        let (_mock, store) = happy_store(200, &body);
+        let result = store.rotate_messaging_webhook_secret_to_ref(
+            &env_id(),
+            MessagingEndpointId::new(),
+            "tester".to_string(),
+            Some("secret://local/acme/_/messaging-tg/webhook_secret".to_string()),
             idem(),
         );
         assert!(result.is_ok());
