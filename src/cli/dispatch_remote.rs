@@ -134,7 +134,7 @@ fn route_remote(
             EnvVerb::Doctor { .. } => Err(not_supported("env doctor")),
             EnvVerb::ToolCheck { .. } => Err(not_supported("env tool-check")),
             EnvVerb::Render(_) => Err(not_supported("env render")),
-            EnvVerb::Reconcile(_) => Err(not_supported("env reconcile")),
+            EnvVerb::Reconcile(args) => remote_reconcile(store, flags, args),
             EnvVerb::ApplyRevision(_) => Err(not_supported("env apply-revision")),
             EnvVerb::ApplyTraffic(_) => Err(not_supported("env apply-traffic")),
             EnvVerb::Destroy { .. } => Err(not_supported("env destroy")),
@@ -1279,6 +1279,215 @@ fn remote_deploy(
         revision_id.to_string(),
         reused,
         superseded,
+    ))
+}
+
+/// The `--answers` payload for remote `env reconcile`. The control-plane store
+/// holds NO answer blobs (the remote apply path strips every binding
+/// `answers_ref`), so the operator supplies the reconcile-time execution context
+/// locally — the same two answer objects the local path reads from the env's
+/// Deployer- and Secrets-slot `answers_ref` files. `deny_unknown_fields` so a
+/// mistyped top-level key fails closed instead of silently defaulting (an empty
+/// `deployer_answers` would target the ambient cluster context).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteReconcilePayload {
+    /// Deployer-slot (k8s) answers: `kubeconfig_context`, `namespace`,
+    /// `runtime_image`, router overrides — the same shape the Deployer binding's
+    /// `answers_ref` file holds locally. Absent → ambient kubeconfig context.
+    #[serde(default)]
+    deployer_answers: Value,
+    /// Secrets-slot Vault connection answers: `addr` + `role` required, mounts /
+    /// prefix / transit / namespace default to the provider's — the same shape
+    /// the Secrets binding's `answers_ref` file holds locally. Required: remote
+    /// reconcile is Vault-only.
+    #[serde(default)]
+    secrets_answers: Value,
+}
+
+/// Remote `op env reconcile` over `--store-url`. Reads the desired-state
+/// [`Environment`] to fail-fast on the structural gates, then runs the
+/// server-mediated `env.reconcile` op (`reconcile_environment`) — the store
+/// AUTHORIZEs + AUDITs + CAS-pins the reconcile and returns the authorized
+/// snapshot — before running the SAME k8s convergence as local
+/// [`reconcile`](super::env::reconcile) against it. Only the answer source and
+/// the store-side authorization step differ from local. The store keeps no
+/// answer blobs, so the operator supplies the reconcile-time context via
+/// `--answers` ([`RemoteReconcilePayload`]); it is therefore Vault-secrets-only
+/// (no local dev-store to ship values from), k8s-only (same gate as local), and
+/// ships no dev-store Secret (`dev_secrets = None` — the worker resolves
+/// `secret://` under pod identity). Keep the gate/sequence in sync with local
+/// `reconcile` until a shared engine lands.
+fn remote_reconcile(
+    store: &HttpEnvironmentStore,
+    flags: &OpFlags,
+    args: super::dispatch::EnvReconcileArgs,
+) -> Result<OpOutcome, OpError> {
+    use greentic_deploy_spec::CapabilitySlot;
+
+    let env_id = parse_env_id(&args.env_id)?;
+    let env = store.load_environment(&env_id).map_err(|e| match e {
+        StoreError::NotFound(_) => OpError::NotFound(format!(
+            "environment `{env_id}` not found on the remote store"
+        )),
+        other => map_store_err_preserving_noun(other),
+    })?;
+
+    // k8s-only, same gate as local reconcile: resolve the live deployer kind
+    // (honours `--kind`, refuses to switch deployers) then require it be k8s.
+    let descriptor = super::env::resolve_live_deployer_kind(&env, args.kind.as_deref())?;
+    let k8s_path = crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
+    if descriptor.path() != k8s_path {
+        return Err(OpError::Conflict(format!(
+            "remote env reconcile is only supported for the `{k8s_path}` deployer env-pack \
+             today; `{}` cannot be reconciled to a live cluster",
+            descriptor.path()
+        )));
+    }
+    // Parity with local: confirm the kind is actually registered.
+    crate::env_packs::EnvPackRegistry::with_builtins()
+        .resolve_for_slot(CapabilitySlot::Deployer, &descriptor)
+        .map_err(|e| OpError::Conflict(e.to_string()))?;
+
+    // Vault-secrets-only: a remote store has no local dev-store to ship secret
+    // values from, so an env whose Secrets backend is the dev-store (or has no
+    // secrets binding at all) cannot be reconciled remotely. Fail closed on any
+    // non-Vault kind and point at the local path.
+    match env.pack_for_slot(CapabilitySlot::Secrets) {
+        Some(b) if b.kind.path() == crate::defaults::VAULT_SECRETS_PATH => {}
+        Some(b) if b.kind.path() == crate::defaults::DEV_STORE_SECRETS_PATH => {
+            return Err(OpError::Conflict(
+                "remote env reconcile requires a Vault secrets backend; this env binds the \
+                 dev-store backend, whose secret values live on a local disk a remote store has \
+                 none of — reconcile it locally (without `--store-url`)"
+                    .to_string(),
+            ));
+        }
+        Some(b) => {
+            return Err(OpError::Conflict(format!(
+                "unknown secrets backend kind `{}`; remote reconcile supports only `{}`",
+                b.kind.path(),
+                crate::defaults::VAULT_SECRETS_PATH
+            )));
+        }
+        None => {
+            return Err(OpError::Conflict(
+                "remote env reconcile requires a Vault secrets binding; this env has none (the \
+                 dev-store default ships values from a local disk a remote store has none of) — \
+                 bind the Vault secrets pack first"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // The store holds no answer blobs — the operator supplies the reconcile-time
+    // context locally.
+    let Some(answers_path) = flags.answers.as_ref() else {
+        return Err(OpError::InvalidArgument(
+            "remote env reconcile requires `--answers <file>` carrying `deployer_answers` \
+             (k8s: kubeconfig_context, …) and `secrets_answers` (Vault: addr, role, …) — the \
+             control-plane store keeps no answer files"
+                .to_string(),
+        ));
+    };
+    let payload: RemoteReconcilePayload = super::load_answers(answers_path)?;
+
+    // Map the supplied Vault answers to the runtime backend (fail-closed on a
+    // missing `addr`/`role`) — the same pure mapping the local path uses. A null
+    // block maps to `None` so the mapper's own "requires a non-empty addr" error
+    // surfaces instead of a "must be a JSON object" one.
+    let secrets_answers = (!payload.secrets_answers.is_null()).then_some(&payload.secrets_answers);
+    let secrets_backend = super::env::secrets_backend_from_vault_answers(secrets_answers)?;
+
+    // Deployer answers (kubeconfig_context, namespace, …); absent → ambient
+    // kubeconfig context. Borrowed (like `secrets_answers` above) — `payload`
+    // outlives both uses, so no clone of the answer tree.
+    let deployer_answers =
+        (!payload.deployer_answers.is_null()).then_some(&payload.deployer_answers);
+
+    // Bound deployer identity — resolved BEFORE the authorization so a missing
+    // identity fails fast (the same posture as the structural gates) and the
+    // ONLY step left after the store records the authorization is the
+    // unavoidable live cluster apply. A remote env has no local dev-store, so
+    // resolve against an empty scratch store — the dev-store source is then a
+    // guaranteed miss and resolution falls to the env var → in-cluster identity
+    // Secret (the documented fresh-operator-machine path). No `credentials_ref`
+    // → ambient.
+    let scratch_dir = tempfile::tempdir().map_err(|e| {
+        OpError::Conflict(format!(
+            "creating a scratch dir for identity resolution: {e}"
+        ))
+    })?;
+    let scratch = crate::environment::LocalFsStore::new(scratch_dir.path());
+    let bound_token = crate::env_packs::k8s::bound_identity::resolve_bound_identity(
+        &scratch,
+        &env,
+        &env_id,
+        deployer_answers,
+    )?;
+    let identity = if bound_token.is_some() {
+        "bound"
+    } else {
+        "ambient"
+    };
+
+    // Server-mediated authorization: the bare read above + the identity
+    // resolution just now let us fail-fast on everything that does NOT touch the
+    // cluster; now ask the control-plane store to AUTHORIZE + AUDIT + CAS-pin the
+    // reconcile. `load_environment` cached the ETag we reviewed, which
+    // `reconcile_environment` replays as the mandatory `If-Match`, so a revision
+    // that advanced under us is refused (412) instead of silently reconciled.
+    // The store returns the authorized snapshot — apply exactly that (CAS
+    // guarantees it equals the gated `env`; rebind so the apply runs against the
+    // revision the store authorized).
+    //
+    // This records an AUTHORIZATION (RBAC + CAS), NOT a completion: the store has
+    // no cluster access, so the live apply below is reflected only in the
+    // returned report (and the operator's CLI output), not yet reported back to
+    // the store audit. A completion/failure report-back is a tracked follow-up.
+    let idempotency_key = super::mint_idempotency_key();
+    let env = store
+        .reconcile_environment(&env_id, &idempotency_key)
+        .map_err(|e| match e {
+            StoreError::NotFound(_) => OpError::NotFound(format!(
+                "environment `{env_id}` not found on the remote store"
+            )),
+            // The reconcile op's only conflict-class outcome is a CAS
+            // precondition failure (412): the env advanced between the read and
+            // the authorize. Append the actionable next step to the server's
+            // ETag-bearing message.
+            StoreError::Conflict(msg) => OpError::Conflict(format!(
+                "{msg}; the environment may have advanced on the store since it was \
+                 read — re-run `op env reconcile` to reconcile the current revision"
+            )),
+            other => map_store_err_preserving_noun(other),
+        })?;
+
+    // Run the SAME store-free convergence as local reconcile. No dev-store Secret
+    // (`None`): the worker resolves `secret://` from Vault under pod identity.
+    let report = super::env::reconcile_k8s_cluster(
+        &env,
+        deployer_answers,
+        bound_token,
+        None,
+        secrets_backend,
+    )?;
+
+    Ok(OpOutcome::new(
+        "env",
+        "reconcile",
+        json!({
+            "environment_id": env.environment_id.as_str(),
+            "kind": descriptor.as_str(),
+            // Remote reconcile sources its answers from `--answers`, not a stored
+            // `answers_ref` (the control-plane store keeps none).
+            "answers_source": "--answers",
+            "identity": identity,
+            "applied_count": report.applied.len(),
+            "pruned_count": report.pruned.len(),
+            "applied": report.applied,
+            "pruned": report.pruned,
+        }),
     ))
 }
 
@@ -4178,5 +4387,219 @@ mod tests {
         assert!(update.route_binding.is_some());
         assert!(update.status.is_none());
         assert!(update.revenue_share.is_none());
+    }
+
+    // -- remote env reconcile -----------------------------------------------
+    // The convergence itself needs a live cluster (`reconcile_k8s_cluster`), so
+    // — exactly like the local `reconcile` tests — these cover the gate/validation
+    // surface and stop before any cluster contact.
+
+    /// Wrap a typed env in the `GET /environments/{id}` response shape
+    /// (`load_environment` reads `{ environment, etag }`).
+    fn get_env_response(env: &greentic_deploy_spec::Environment) -> String {
+        serde_json::json!({ "environment": env, "etag": "sha256:test" }).to_string()
+    }
+
+    fn reconcile_args(env_id: &str) -> crate::cli::dispatch::EnvReconcileArgs {
+        crate::cli::dispatch::EnvReconcileArgs {
+            env_id: env_id.to_string(),
+            kind: None,
+        }
+    }
+
+    /// A k8s-deployer + Vault-secrets env — the only binding shape remote
+    /// reconcile accepts (all gates pass; the reconcile then needs a cluster).
+    fn k8s_vault_env() -> greentic_deploy_spec::Environment {
+        use crate::cli::tests_common::{make_binding, make_env};
+        use greentic_deploy_spec::CapabilitySlot;
+        let mut env = make_env("prod");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.k8s@1.0.0",
+        ));
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            crate::defaults::VAULT_SECRETS_PACK,
+        ));
+        env
+    }
+
+    #[test]
+    fn remote_reconcile_env_not_found_is_mapped() {
+        let mock = start_mock(vec![(404, "{\"error\":\"nope\"}")], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let err = remote_reconcile(&store, &no_flags(), reconcile_args("ghost")).unwrap_err();
+        assert!(matches!(err, OpError::NotFound(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn remote_reconcile_rejects_no_deployer_binding() {
+        use crate::cli::tests_common::make_env;
+        let env = make_env("prod"); // packs empty → no deployer binding
+        let mock = start_mock(vec![(200, &get_env_response(&env))], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let err = remote_reconcile(&store, &no_flags(), reconcile_args("prod")).unwrap_err();
+        assert!(
+            matches!(err, OpError::Conflict(ref m) if m.contains("deployer binding")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn remote_reconcile_rejects_non_k8s_deployer() {
+        use crate::cli::tests_common::{make_binding, make_env};
+        use greentic_deploy_spec::CapabilitySlot;
+        let mut env = make_env("prod");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            crate::defaults::LOCAL_DEPLOYER_PACK,
+        ));
+        let mock = start_mock(vec![(200, &get_env_response(&env))], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let err = remote_reconcile(&store, &no_flags(), reconcile_args("prod")).unwrap_err();
+        assert!(
+            matches!(err, OpError::Conflict(ref m) if m.contains("only supported for")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn remote_reconcile_rejects_dev_store_secrets() {
+        use crate::cli::tests_common::{make_binding, make_env};
+        use greentic_deploy_spec::CapabilitySlot;
+        let mut env = make_env("prod");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.k8s@1.0.0",
+        ));
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            crate::defaults::LOCAL_SECRETS_PACK, // dev-store backend
+        ));
+        let mock = start_mock(vec![(200, &get_env_response(&env))], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let err = remote_reconcile(&store, &no_flags(), reconcile_args("prod")).unwrap_err();
+        assert!(
+            matches!(err, OpError::Conflict(ref m) if m.contains("Vault secrets backend")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn remote_reconcile_requires_answers() {
+        // A k8s + Vault env clears every binding gate, but reconcile needs the
+        // operator's local answers — the control-plane store keeps none.
+        let env = k8s_vault_env();
+        let mock = start_mock(vec![(200, &get_env_response(&env))], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let err = remote_reconcile(&store, &no_flags(), reconcile_args("prod")).unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(ref m) if m.contains("--answers")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn remote_reconcile_requires_vault_addr_role() {
+        // `--answers` present but the Vault block omits addr/role → fail closed
+        // (the same pure mapping the local path uses) before any cluster contact.
+        let env = k8s_vault_env();
+        let mock = start_mock(vec![(200, &get_env_response(&env))], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = answers_flags(serde_json::json!({})); // no secrets_answers
+        let err = remote_reconcile(&store, &flags, reconcile_args("prod")).unwrap_err();
+        assert!(
+            matches!(err, OpError::Conflict(ref m) if m.contains("addr")),
+            "got {err:?}"
+        );
+    }
+
+    /// Once the gates pass, reconcile routes through the server-mediated
+    /// `env.reconcile` op: the GET-cached ETag MUST replay as `If-Match` on the
+    /// POST (CAS), and a 412 — the env advanced under us — surfaces as a
+    /// Conflict carrying the re-run guidance, never a silent stale apply.
+    #[test]
+    fn remote_reconcile_pins_if_match_and_maps_concurrent_advance() {
+        let env = k8s_vault_env();
+        let requests: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = requests.clone();
+        let check: CheckFn = Arc::new(move |req_line: &str, headers: &str, _body: &[u8]| {
+            recorder
+                .lock()
+                .unwrap()
+                .push((req_line.to_string(), headers.to_lowercase()));
+        });
+        let mock = start_mock(
+            vec![
+                (200, &get_env_response(&env)), // load_environment read
+                (412, r#"{"detail":"stale"}"#), // reconcile POST: env advanced
+            ],
+            Some(check),
+        );
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "secrets_answers": {"addr": "http://vault.local:8200", "role": "greentic-worker"}
+        }));
+        let err = remote_reconcile(&store, &flags, reconcile_args("prod")).unwrap_err();
+
+        assert!(
+            matches!(err, OpError::Conflict(ref m) if m.contains("re-run")),
+            "412 must surface as a re-run Conflict, got {err:?}"
+        );
+        let reqs = requests.lock().unwrap();
+        assert_eq!(
+            reqs.len(),
+            2,
+            "expected GET then reconcile POST, got {reqs:?}"
+        );
+        assert!(
+            reqs[0].0.starts_with("GET "),
+            "first request is the read: {}",
+            reqs[0].0
+        );
+        assert!(
+            reqs[1].0.starts_with("POST ") && reqs[1].0.contains("/reconcile"),
+            "second request is the reconcile POST: {}",
+            reqs[1].0
+        );
+        assert!(
+            reqs[1].1.contains("if-match: \"sha256:test\""),
+            "reconcile POST must replay the reviewed ETag as If-Match: {}",
+            reqs[1].1
+        );
+        assert!(
+            reqs[1].1.contains("idempotency-key:"),
+            "reconcile POST must carry an idempotency key: {}",
+            reqs[1].1
+        );
+    }
+
+    /// The whole point of routing reconcile through the store: a denial
+    /// (e.g. a read-only token) is refused server-side and surfaces with the
+    /// typed `unauthorized` noun — not as a silent local apply that bypassed
+    /// the control plane's authorization boundary.
+    #[test]
+    fn remote_reconcile_surfaces_server_authz_denial() {
+        let env = k8s_vault_env();
+        let mock = start_mock(
+            vec![
+                (200, &get_env_response(&env)),
+                (
+                    403,
+                    r#"{"kind":"unauthorized","policy":"rbac-v1","reason":"read-only token"}"#,
+                ),
+            ],
+            None,
+        );
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "secrets_answers": {"addr": "http://vault.local:8200", "role": "greentic-worker"}
+        }));
+        let err = remote_reconcile(&store, &flags, reconcile_args("prod")).unwrap_err();
+        assert!(
+            matches!(err, OpError::Unauthorized { ref reason, .. } if reason.contains("read-only")),
+            "server authz denial must surface as Unauthorized, got {err:?}"
+        );
     }
 }

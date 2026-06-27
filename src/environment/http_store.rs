@@ -576,6 +576,33 @@ impl HttpEnvironmentStore {
         )
     }
 
+    /// `POST /environments/{env_id}/reconcile` — server-mediated reconcile
+    /// authorization. Asks the control-plane store to AUTHORIZE + AUDIT +
+    /// CAS-pin a reconcile and return the authorized [`Environment`] snapshot;
+    /// the operator still executes the k8s apply against the live cluster (the
+    /// store has no cluster access). The cached strong ETag — captured by a
+    /// prior [`load_environment`](EnvironmentReads::load_environment) read in
+    /// this invocation — is replayed as the MANDATORY `If-Match`, so the
+    /// snapshot returned is provably the revision the operator reviewed; a
+    /// concurrent advance is refused server-side with a 412 (surfaced here as
+    /// [`StoreError::Conflict`]). The reconcile writes no desired state, so the
+    /// returned generation/ETag echo the loaded revision unchanged.
+    ///
+    /// Callers MUST `load_environment` first: without a cached ETag the request
+    /// carries no `If-Match` and the server answers 428.
+    pub fn reconcile_environment(
+        &self,
+        env_id: &EnvId,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<Environment, StoreError> {
+        self.send_mutation_no_body(
+            env_id,
+            reqwest::Method::POST,
+            &self.env_path(env_id, "/reconcile"),
+            Some(idempotency_key.as_str()),
+        )
+    }
+
     /// `GET /environments/{env_id}/trust-root` — the env's trusted-key set
     /// (empty for an absent row, which the server treats as closed-by-default;
     /// a missing ENV is still a 404 → [`StoreError::NotFound`]). Inherent
