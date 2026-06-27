@@ -1018,19 +1018,6 @@ fn remote_revision_warm(
 // deploy (composite: add → stage → warm → traffic over the remote store)
 // ---------------------------------------------------------------------------
 
-/// Remote `op deploy` over `--store-url`. Runs the same blue-green rollout as
-/// the local [`deploy`](super::deploy::deploy) — add the bundle deployment (when
-/// new), stage a revision, warm it, route 100 % of traffic — but against the
-/// HTTP store and from caller-pinned artifact pointers. A control-plane store
-/// keeps no bundle bytes, so the local `--bundle <local.gtbundle>` path is
-/// rejected with a push-to-registry hint: the caller supplies a
-/// `bundle_source_uri` and a real `bundle_digest` (plus optional `pack_list` /
-/// lock) via `--answers`, exactly like remote `revisions stage`. The rollout
-/// decisions (idempotent replay, deployment reuse, route immutability,
-/// superseded revisions) are the shared `super::deploy` helpers, so local and
-/// remote can't drift; the cut-over reuses `remote_traffic_set` so entry
-/// parsing and telemetry stay single-sourced.
-///
 /// Deterministic staged-revision id for a retry-safe remote deploy: the same
 /// deploy `idempotency_key` always derives the same id, so a lost-response retry
 /// stages (and the server replays) the SAME revision instead of minting a
@@ -1047,6 +1034,19 @@ fn deploy_revision_id(idempotency_key: Option<&str>) -> RevisionId {
     }
 }
 
+/// Remote `op deploy` over `--store-url`. Runs the same blue-green rollout as
+/// the local [`deploy`](super::deploy::deploy) — add the bundle deployment (when
+/// new), stage a revision, warm it, route 100 % of traffic — but against the
+/// HTTP store and from caller-pinned artifact pointers. A control-plane store
+/// keeps no bundle bytes, so the local `--bundle <local.gtbundle>` path is
+/// rejected with a push-to-registry hint: the caller supplies a
+/// `bundle_source_uri` and a real `bundle_digest` (plus optional `pack_list` /
+/// lock) via `--answers`, exactly like remote `revisions stage`. The rollout
+/// decisions (idempotent replay, deployment reuse, route immutability,
+/// superseded revisions) are the shared `super::deploy` helpers; the execution
+/// sequence (add → stage → warm → traffic) mirrors local `deploy()`, so keep the
+/// two in sync until a shared rollout engine lands. The cut-over reuses
+/// `remote_traffic_set` so entry parsing and telemetry stay single-sourced.
 fn remote_deploy(
     store: &dyn EnvironmentMutations,
     flags: &OpFlags,
@@ -1094,19 +1094,21 @@ fn remote_deploy(
                     .to_string(),
             )
         })?;
-    let bundle_digest = pins
-        .bundle_digest
-        .as_deref()
-        .map(str::trim)
-        .filter(|d| !d.is_empty() && *d != super::revisions::default_bundle_digest())
-        .map(str::to_string)
-        .ok_or_else(|| {
-            OpError::InvalidArgument(
-                "remote `op deploy` requires a real `bundle_digest` (in remote_pins) — the \
-                 placeholder default cannot be verified by a remote worker"
-                    .to_string(),
-            )
-        })?;
+    // Reuse the shared `remote_pullable_digest` (→ `digest_is_real`) so the
+    // `sha256:…`-shaped, non-placeholder rule has ONE definition across the
+    // remote stage / apply / deploy paths (the inline check used to be looser —
+    // it would have accepted a malformed, non-`sha256:` digest).
+    let bundle_digest = pins.bundle_digest.as_deref().map(str::trim);
+    if !remote_pullable_digest(bundle_digest) {
+        return Err(OpError::InvalidArgument(
+            "remote `op deploy` requires a real pinned `bundle_digest` (sha256:…) in remote_pins \
+             — a remote worker cannot verify a placeholder or unpinned pull"
+                .to_string(),
+        ));
+    }
+    let bundle_digest = bundle_digest
+        .expect("remote_pullable_digest is false for None")
+        .to_string();
 
     // Validate ALL caller pins — including the pack list, which can fail on a
     // malformed version string — BEFORE any store mutation, so a bad answers
@@ -3186,18 +3188,23 @@ mod tests {
 
     #[test]
     fn remote_deploy_requires_real_bundle_digest() {
-        // source_uri present, but the digest is the placeholder default → reject.
-        let (_tmp, flags) = answers_flags(serde_json::json!({
-            "environment_id": "local",
-            "bundle_id": "my-bundle",
-            "bundle_source_uri": "oci://registry.example/b@sha256:abc",
-            "remote_pins": {"bundle_digest": "sha256:00"}
-        }));
-        let err = remote_deploy(&build_dummy_store(), &flags, None).unwrap_err();
-        assert!(
-            matches!(err, OpError::InvalidArgument(ref m) if m.contains("bundle_digest")),
-            "got {err:?}"
-        );
+        // The digest must be `sha256:…`-shaped and non-placeholder. Both the
+        // placeholder default AND a malformed non-sha256 string are rejected — the
+        // latter is what reusing the shared `remote_pullable_digest` tightened (the
+        // old inline check would have accepted it).
+        for bad in ["sha256:00", "foo"] {
+            let (_tmp, flags) = answers_flags(serde_json::json!({
+                "environment_id": "local",
+                "bundle_id": "my-bundle",
+                "bundle_source_uri": "oci://registry.example/b@sha256:abc",
+                "remote_pins": {"bundle_digest": bad}
+            }));
+            let err = remote_deploy(&build_dummy_store(), &flags, None).unwrap_err();
+            assert!(
+                matches!(err, OpError::InvalidArgument(ref m) if m.contains("bundle_digest")),
+                "digest `{bad}` must be rejected, got {err:?}"
+            );
+        }
     }
 
     fn deploy_bundle_json() -> serde_json::Value {
