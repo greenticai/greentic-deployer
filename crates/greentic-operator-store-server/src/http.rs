@@ -101,6 +101,10 @@ where
             "/environments/{env_id}",
             get(api::get_environment::<S>).patch(api::update_environment::<S>),
         )
+        .route(
+            "/environments/{env_id}/reconcile",
+            post(api::reconcile_environment::<S>),
+        )
         .route("/environments/{env_id}/runtime", get(api::get_runtime::<S>))
         .route(
             "/environments/{env_id}/migrate-bindings",
