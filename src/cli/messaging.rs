@@ -943,13 +943,19 @@ fn build_webhook_secret_ref(
 }
 
 /// Provision a webhook secret for an endpoint: choose the ref URI (existing if
-/// rotating an endpoint that already has one; freshly built under `tenant`
-/// otherwise) and, when the env's secrets backend custodies values in the local
-/// dev-store (`custodial`), mint a fresh value and write it there. For a
+/// rotating an endpoint that already has one; freshly built under the resolved
+/// tenant otherwise) and, when the env's secrets backend custodies values in the
+/// local dev-store (`custodial`), mint a fresh value and write it there. For a
 /// non-custodial backend (e.g. Vault) the value is seeded out-of-band by the
 /// operator — the control plane only stamps the ref and never writes a value the
 /// runtime would not read. Returns the ref the caller stamps onto
 /// `MessagingEndpoint.webhook_secret_ref`.
+///
+/// `owner` is the env's owning tenant. The dev-store is not tenant-scoped, so a
+/// custodial env with no owner keeps the conventional `default` segment. A
+/// non-custodial backend scopes reads to the env owner, so a `default`/blank
+/// segment would be unresolvable at runtime — require a real owner and fail
+/// closed rather than stamp a dead ref.
 ///
 /// Shared by `add` (always `existing_ref = None` — fresh endpoint) and
 /// `rotate_webhook_secret` (`existing_ref = Some(_)` for endpoints that
@@ -960,10 +966,21 @@ pub(crate) fn provision_webhook_secret(
     store: &LocalFsStore,
     env_id: &EnvId,
     endpoint_id: &MessagingEndpointId,
-    tenant: &str,
+    owner: Option<&str>,
     custodial: bool,
     existing_ref: Option<&SecretRef>,
 ) -> Result<SecretRef, OpError> {
+    let tenant = match (custodial, owner) {
+        (true, owner) => owner.unwrap_or("default"),
+        (false, Some(owner)) => owner,
+        (false, None) => {
+            return Err(OpError::Conflict(format!(
+                "a webhook secret on a non-dev-store secrets backend requires the environment to \
+                 declare an owning tenant (`tenant_org_id`); env `{}` has none",
+                env_id.as_str()
+            )));
+        }
+    };
     let secret_ref = match existing_ref {
         Some(r) => r.clone(),
         None => build_webhook_secret_ref(env_id, endpoint_id, tenant)?,
@@ -1938,7 +1955,8 @@ mod tests {
         // Non-custodial (e.g. Vault): builds the tenant-scoped ref but writes
         // NOTHING to the dev-store — the operator seeds the value out-of-band.
         let ref_vault =
-            provision_webhook_secret(&store, &env_id, &eid, "tenant-default", false, None).unwrap();
+            provision_webhook_secret(&store, &env_id, &eid, Some("tenant-default"), false, None)
+                .unwrap();
         assert_eq!(
             ref_vault.as_str(),
             format!("secret://local/tenant-default/_/messaging-{eid_lower}/webhook_secret")
@@ -1949,8 +1967,12 @@ mod tests {
         );
 
         // Custodial (dev-store): the value is minted and written at the ref.
-        let ref_dev =
-            provision_webhook_secret(&store, &env_id, &eid, "default", true, None).unwrap();
+        // No owner → the conventional `default` tenant segment.
+        let ref_dev = provision_webhook_secret(&store, &env_id, &eid, None, true, None).unwrap();
+        assert_eq!(
+            ref_dev.as_str(),
+            format!("secret://local/default/_/messaging-{eid_lower}/webhook_secret")
+        );
         assert!(
             devstore_has_value(&store, &ref_dev),
             "custodial provisioning must write the dev-store value"
@@ -1959,6 +1981,20 @@ mod tests {
             read_devstore_value(&store, &ref_dev).len() >= 32,
             "custodial webhook secret must be ≥32 chars"
         );
+    }
+
+    #[test]
+    fn provision_webhook_secret_fails_closed_on_non_custodial_without_owner() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let env_id = EnvId::try_from("local").unwrap();
+        let eid = MessagingEndpointId::new();
+        // A non-custodial backend (e.g. Vault) scopes reads to the env owner, so a
+        // missing owner would mint an unresolvable `default` ref — fail closed.
+        let err = provision_webhook_secret(&store, &env_id, &eid, None, false, None).unwrap_err();
+        let OpError::Conflict(msg) = err else {
+            panic!("expected OpError::Conflict");
+        };
+        assert!(msg.contains("owning tenant"), "got: {msg}");
     }
 
     fn rotate_payload(endpoint_id: &str, key: &str) -> EndpointRotateWebhookSecretPayload {
