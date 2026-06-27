@@ -1404,37 +1404,14 @@ fn remote_reconcile(
     let deployer_answers =
         (!payload.deployer_answers.is_null()).then(|| payload.deployer_answers.clone());
 
-    // Server-mediated authorization: the bare read above let us fail-fast on
-    // the structural gates (k8s-only, Vault-only, `--answers`); now ask the
-    // control-plane store to AUTHORIZE + AUDIT + CAS-pin the reconcile.
-    // `load_environment` cached the ETag we reviewed, which `reconcile_environment`
-    // replays as the mandatory `If-Match`, so a revision that advanced under us
-    // is refused (412) instead of silently reconciled. The store returns the
-    // authorized snapshot — apply exactly that. CAS guarantees it equals the
-    // gated `env`, so the descriptor/gates computed above still hold; rebind so
-    // the apply runs against the revision the store authorized.
-    let idempotency_key = super::mint_idempotency_key();
-    let env = store
-        .reconcile_environment(&env_id, &idempotency_key)
-        .map_err(|e| match e {
-            StoreError::NotFound(_) => OpError::NotFound(format!(
-                "environment `{env_id}` not found on the remote store"
-            )),
-            // The reconcile op's only conflict-class outcome is a CAS
-            // precondition failure (412): the env advanced between the read and
-            // the authorize. Append the actionable next step to the server's
-            // ETag-bearing message.
-            StoreError::Conflict(msg) => OpError::Conflict(format!(
-                "{msg}; the environment may have advanced on the store since it was \
-                 read — re-run `op env reconcile` to reconcile the current revision"
-            )),
-            other => map_store_err_preserving_noun(other),
-        })?;
-
-    // Bound deployer identity: a remote env has no local dev-store, so resolve
-    // against an empty scratch store — the dev-store source is then a guaranteed
-    // miss and resolution falls to the env var → in-cluster identity Secret (the
-    // documented fresh-operator-machine path). No `credentials_ref` → ambient.
+    // Bound deployer identity — resolved BEFORE the authorization so a missing
+    // identity fails fast (the same posture as the structural gates) and the
+    // ONLY step left after the store records the authorization is the
+    // unavoidable live cluster apply. A remote env has no local dev-store, so
+    // resolve against an empty scratch store — the dev-store source is then a
+    // guaranteed miss and resolution falls to the env var → in-cluster identity
+    // Secret (the documented fresh-operator-machine path). No `credentials_ref`
+    // → ambient.
     let scratch_dir = tempfile::tempdir().map_err(|e| {
         OpError::Conflict(format!(
             "creating a scratch dir for identity resolution: {e}"
@@ -1452,6 +1429,38 @@ fn remote_reconcile(
     } else {
         "ambient"
     };
+
+    // Server-mediated authorization: the bare read above + the identity
+    // resolution just now let us fail-fast on everything that does NOT touch the
+    // cluster; now ask the control-plane store to AUTHORIZE + AUDIT + CAS-pin the
+    // reconcile. `load_environment` cached the ETag we reviewed, which
+    // `reconcile_environment` replays as the mandatory `If-Match`, so a revision
+    // that advanced under us is refused (412) instead of silently reconciled.
+    // The store returns the authorized snapshot — apply exactly that (CAS
+    // guarantees it equals the gated `env`; rebind so the apply runs against the
+    // revision the store authorized).
+    //
+    // This records an AUTHORIZATION (RBAC + CAS), NOT a completion: the store has
+    // no cluster access, so the live apply below is reflected only in the
+    // returned report (and the operator's CLI output), not yet reported back to
+    // the store audit. A completion/failure report-back is a tracked follow-up.
+    let idempotency_key = super::mint_idempotency_key();
+    let env = store
+        .reconcile_environment(&env_id, &idempotency_key)
+        .map_err(|e| match e {
+            StoreError::NotFound(_) => OpError::NotFound(format!(
+                "environment `{env_id}` not found on the remote store"
+            )),
+            // The reconcile op's only conflict-class outcome is a CAS
+            // precondition failure (412): the env advanced between the read and
+            // the authorize. Append the actionable next step to the server's
+            // ETag-bearing message.
+            StoreError::Conflict(msg) => OpError::Conflict(format!(
+                "{msg}; the environment may have advanced on the store since it was \
+                 read — re-run `op env reconcile` to reconcile the current revision"
+            )),
+            other => map_store_err_preserving_noun(other),
+        })?;
 
     // Run the SAME store-free convergence as local reconcile. No dev-store Secret
     // (`None`): the worker resolves `secret://` from Vault under pod identity.
