@@ -915,31 +915,41 @@ fn generate_webhook_secret() -> Result<String, OpError> {
 /// Construct the deterministic `SecretRef` URI for an endpoint's webhook
 /// secret. The dev-store backend requires the 5-segment shape
 /// `secrets://<env>/<tenant>/<team>/<pack>/<name>`, so the SecretRef mirrors
-/// that: `secret://<env>/default/_/messaging-<eid>/webhook_secret`.
+/// that: `secret://<env>/<tenant>/_/messaging-<eid>/webhook_secret`.
 ///
-/// Using `default/_` as tenant/team is the standard convention for
-/// system-generated secrets (see `cli/secrets.rs put` and the runtime's
-/// `canonical_team` which maps `default` → `_`). The endpoint id is folded
-/// to lowercase in the pack segment because `MessagingEndpointId` is a ULID
-/// (uppercase) and the runtime canonicalizes pack segments.
+/// `tenant` is the env's owning tenant (`tenant_org_id`), or `default` for an
+/// ownerless local env. It MUST match the tenant the runtime secrets backend
+/// is scoped to: a Vault-backed worker pod scopes its `SecretsCore` to the env
+/// owner, so a hardcoded `default` segment on an owned env would be refused
+/// in-process and the webhook would never resolve. `_` is the tenant-level
+/// team placeholder (the runtime's `canonical_team` maps `default` → `_`). The
+/// endpoint id is folded to lowercase in the pack segment because
+/// `MessagingEndpointId` is a ULID (uppercase) and the runtime canonicalizes
+/// pack segments.
 fn build_webhook_secret_ref(
     env_id: &EnvId,
     endpoint_id: &MessagingEndpointId,
+    tenant: &str,
 ) -> Result<SecretRef, OpError> {
     let eid_lower = endpoint_id.to_string().to_lowercase();
     let uri = format!(
-        "secret://{}/default/_/messaging-{}/webhook_secret",
+        "secret://{}/{}/_/messaging-{}/webhook_secret",
         env_id.as_str(),
+        tenant,
         eid_lower
     );
     SecretRef::try_new(uri)
         .map_err(|e| OpError::InvalidArgument(format!("webhook secret ref: {e}")))
 }
 
-/// Provision a webhook secret for an endpoint: generate the value, choose
-/// the ref URI (existing if rotating an endpoint that already has one;
-/// freshly built otherwise), write the value to the dev-store, return the
-/// ref the caller stamps onto `MessagingEndpoint.webhook_secret_ref`.
+/// Provision a webhook secret for an endpoint: choose the ref URI (existing if
+/// rotating an endpoint that already has one; freshly built under `tenant`
+/// otherwise) and, when the env's secrets backend custodies values in the local
+/// dev-store (`custodial`), mint a fresh value and write it there. For a
+/// non-custodial backend (e.g. Vault) the value is seeded out-of-band by the
+/// operator — the control plane only stamps the ref and never writes a value the
+/// runtime would not read. Returns the ref the caller stamps onto
+/// `MessagingEndpoint.webhook_secret_ref`.
 ///
 /// Shared by `add` (always `existing_ref = None` — fresh endpoint) and
 /// `rotate_webhook_secret` (`existing_ref = Some(_)` for endpoints that
@@ -950,14 +960,18 @@ pub(crate) fn provision_webhook_secret(
     store: &LocalFsStore,
     env_id: &EnvId,
     endpoint_id: &MessagingEndpointId,
+    tenant: &str,
+    custodial: bool,
     existing_ref: Option<&SecretRef>,
 ) -> Result<SecretRef, OpError> {
-    let value = generate_webhook_secret()?;
     let secret_ref = match existing_ref {
         Some(r) => r.clone(),
-        None => build_webhook_secret_ref(env_id, endpoint_id)?,
+        None => build_webhook_secret_ref(env_id, endpoint_id, tenant)?,
     };
-    write_webhook_secret_to_devstore(store, env_id, &secret_ref, &value)?;
+    if custodial {
+        let value = generate_webhook_secret()?;
+        write_webhook_secret_to_devstore(store, env_id, &secret_ref, &value)?;
+    }
     Ok(secret_ref)
 }
 
@@ -1874,6 +1888,77 @@ mod tests {
         let ep = load_raw_endpoint(&store, &id);
         ep.validate()
             .expect("endpoint with webhook_secret_ref must pass deploy-spec validate");
+    }
+
+    /// Like [`read_devstore_value`] but does not panic when the key is absent —
+    /// used to assert that non-custodial provisioning writes NOTHING.
+    fn devstore_has_value(store: &LocalFsStore, secret_ref: &SecretRef) -> bool {
+        use greentic_secrets_lib::{DevStore, SecretsStore};
+        let env_id = EnvId::try_from("local").unwrap();
+        let env_dir = store.env_dir(&env_id).unwrap();
+        let dev_path = crate::cli::secrets::resolve_dev_store_path(
+            &env_dir,
+            std::env::var_os(crate::cli::secrets::DEV_SECRETS_PATH_ENV).map(PathBuf::from),
+        );
+        let store_uri =
+            crate::cli::secrets::secret_ref_to_store_uri(secret_ref).expect("store-aligned ref");
+        // The dev-store file only exists once something has written to it; a
+        // non-custodial provision writes nothing, so an absent store == no value.
+        let Ok(dev) = DevStore::with_path(dev_path) else {
+            return false;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { dev.get(&store_uri).await.is_ok() })
+    }
+
+    #[test]
+    fn build_webhook_secret_ref_uses_provided_tenant() {
+        // The tenant segment is the env owner, not a hardcoded `default`, so the
+        // ref resolves under a Vault-backed worker's tenant-scoped SecretsCore.
+        let env_id = EnvId::try_from("vault-demo").unwrap();
+        let eid = MessagingEndpointId::new();
+        let eid_lower = eid.to_string().to_lowercase();
+        let r = build_webhook_secret_ref(&env_id, &eid, "tenant-default").unwrap();
+        assert_eq!(
+            r.as_str(),
+            format!("secret://vault-demo/tenant-default/_/messaging-{eid_lower}/webhook_secret")
+        );
+    }
+
+    #[test]
+    fn provision_webhook_secret_honors_tenant_and_custodial_gate() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let env_id = EnvId::try_from("local").unwrap();
+        let eid = MessagingEndpointId::new();
+        let eid_lower = eid.to_string().to_lowercase();
+
+        // Non-custodial (e.g. Vault): builds the tenant-scoped ref but writes
+        // NOTHING to the dev-store — the operator seeds the value out-of-band.
+        let ref_vault =
+            provision_webhook_secret(&store, &env_id, &eid, "tenant-default", false, None).unwrap();
+        assert_eq!(
+            ref_vault.as_str(),
+            format!("secret://local/tenant-default/_/messaging-{eid_lower}/webhook_secret")
+        );
+        assert!(
+            !devstore_has_value(&store, &ref_vault),
+            "non-custodial provisioning must not write a dev-store value"
+        );
+
+        // Custodial (dev-store): the value is minted and written at the ref.
+        let ref_dev =
+            provision_webhook_secret(&store, &env_id, &eid, "default", true, None).unwrap();
+        assert!(
+            devstore_has_value(&store, &ref_dev),
+            "custodial provisioning must write the dev-store value"
+        );
+        assert!(
+            read_devstore_value(&store, &ref_dev).len() >= 32,
+            "custodial webhook secret must be ≥32 chars"
+        );
     }
 
     fn rotate_payload(endpoint_id: &str, key: &str) -> EndpointRotateWebhookSecretPayload {

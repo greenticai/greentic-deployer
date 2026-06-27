@@ -140,6 +140,22 @@ fn map_messaging_err(err: engine::MessagingError) -> StoreError {
     }
 }
 
+/// Derive the webhook-secret provisioning context from the env: the tenant
+/// segment for the ref (the env owner `tenant_org_id`, else `default` for an
+/// ownerless local env) and whether the secrets backend custodies values in the
+/// local dev-store (so the sink mints + writes the value) versus an external
+/// backend like Vault (where the operator seeds the value out-of-band and the
+/// sink only stamps the ref). Computed from `env` before the `&mut env` engine
+/// call so the `provision` closure captures owned values, not a borrow of `env`.
+fn webhook_provision_ctx(env: &Environment) -> (String, bool) {
+    let tenant = env
+        .host_config
+        .tenant_org_id
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    (tenant, crate::cli::env::secrets_backend_is_dev_store(env))
+}
+
 impl LocalFsStore {
     // -------------------------------------------------------------
     // Environment lifecycle  (PR-3a.3)
@@ -944,13 +960,16 @@ impl LocalFsStore {
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
             let eid = MessagingEndpointId::new();
+            let (tenant, custodial) = webhook_provision_ctx(&env);
             let applied = engine::add_messaging_endpoint(
                 &mut env,
                 payload,
                 eid,
                 &idempotency_key,
                 Utc::now(),
-                |existing| self.provision_webhook_secret_sink(env_id, &eid, existing),
+                |existing| {
+                    self.provision_webhook_secret_sink(env_id, &eid, &tenant, custodial, existing)
+                },
             )
             .map_err(map_messaging_err)?;
             self.finish_messaging_mutation(locked, &env, applied)
@@ -1067,21 +1086,31 @@ impl LocalFsStore {
     ) -> Result<MessagingEndpoint, StoreError> {
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
+            let (tenant, custodial) = webhook_provision_ctx(&env);
             let applied = engine::rotate_messaging_webhook_secret(
                 &mut env,
                 endpoint_id,
                 &updated_by,
                 &idempotency_key,
                 Utc::now(),
-                |existing| self.provision_webhook_secret_sink(env_id, &endpoint_id, existing),
+                |existing| {
+                    self.provision_webhook_secret_sink(
+                        env_id,
+                        &endpoint_id,
+                        &tenant,
+                        custodial,
+                        existing,
+                    )
+                },
             )
             .map_err(map_messaging_err)?;
             self.finish_messaging_mutation(locked, &env, applied)
         })
     }
 
-    /// The LocalFS webhook-secret sink for the engine's `provision` seam:
-    /// mint a CSPRNG value and write it into the env-pack dev-store via
+    /// The LocalFS webhook-secret sink for the engine's `provision` seam: build
+    /// the ref under `tenant` and, when `custodial`, mint a CSPRNG value and
+    /// write it into the env-pack dev-store via
     /// [`crate::cli::messaging::provision_webhook_secret`]. Failures map to
     /// [`engine::MessagingError::SecretProvision`], which
     /// [`map_messaging_err`] folds back onto the `Conflict` noun this store
@@ -1090,10 +1119,19 @@ impl LocalFsStore {
         &self,
         env_id: &EnvId,
         endpoint_id: &MessagingEndpointId,
+        tenant: &str,
+        custodial: bool,
         existing_ref: Option<&SecretRef>,
     ) -> Result<SecretRef, engine::MessagingError> {
-        crate::cli::messaging::provision_webhook_secret(self, env_id, endpoint_id, existing_ref)
-            .map_err(|e| engine::MessagingError::SecretProvision(e.to_string()))
+        crate::cli::messaging::provision_webhook_secret(
+            self,
+            env_id,
+            endpoint_id,
+            tenant,
+            custodial,
+            existing_ref,
+        )
+        .map_err(|e| engine::MessagingError::SecretProvision(e.to_string()))
     }
 
     /// Shared tail of every endpoint-returning messaging verb: persist when

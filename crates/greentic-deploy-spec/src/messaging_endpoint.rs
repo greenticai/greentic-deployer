@@ -76,7 +76,9 @@ pub struct MessagingEndpoint {
     /// field carries only the URI so `environment.json` and per-endpoint
     /// projections never persist live authenticator material.
     ///
-    /// URI scheme: `secret://<env>/default/_/messaging-<eid>/webhook_secret`.
+    /// URI scheme: `secret://<env>/<tenant>/_/messaging-<eid>/webhook_secret`,
+    /// where `<tenant>` is the env's owning tenant (`default` for an ownerless
+    /// local env) so the ref resolves under the runtime backend's tenant scope.
     /// `None` preserves the pre-decoupling fallback where `provider_id`
     /// doubles as the secret-token.
     ///
