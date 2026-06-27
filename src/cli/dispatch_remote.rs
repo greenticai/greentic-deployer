@@ -37,6 +37,7 @@ use super::dispatch::{
 use super::env_apply::{ApplyMode, ApplyOptions};
 use super::env_manifest::{EnvManifest, ManifestBundle};
 use super::{OpError, OpFlags, OpOutcome, map_store_err_preserving_noun};
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -251,8 +252,12 @@ fn route_remote(
             TrustRootVerb::List { env_id } => remote_trust_root_list(store, &env_id),
         },
 
+        // -- deploy (composite rollout over the remote store) ------------------
+        OpNoun::Deploy(args) => {
+            remote_deploy(store, flags, super::deploy::payload_from_deploy_args(args)?)
+        }
+
         // -- local-only nouns --------------------------------------------------
-        OpNoun::Deploy(_) => Err(not_supported("deploy")),
         OpNoun::Config { verb } => match verb {
             ConfigVerb::Show => Err(not_supported("config show")),
             ConfigVerb::Set => Err(not_supported("config set")),
@@ -1006,6 +1011,274 @@ fn remote_revision_warm(
         "warm",
         serde_json::to_value(super::revisions::RevisionSummary::from(&outcome.revision))
             .expect("RevisionSummary is json-safe"),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// deploy (composite: add → stage → warm → traffic over the remote store)
+// ---------------------------------------------------------------------------
+
+/// Deterministic staged-revision id for a retry-safe remote deploy: the same
+/// deploy `idempotency_key` always derives the same id, so a lost-response retry
+/// stages (and the server replays) the SAME revision instead of minting a
+/// duplicate Staged/Ready one. A one-shot deploy (no key) mints a fresh id.
+fn deploy_revision_id(idempotency_key: Option<&str>) -> RevisionId {
+    match idempotency_key {
+        Some(key) => {
+            let digest = Sha256::digest(format!("greentic-deploy-revision:{key}").as_bytes());
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            RevisionId(ulid::Ulid::from_bytes(bytes))
+        }
+        None => crate::environment::mint_revision_id(),
+    }
+}
+
+/// Remote `op deploy` over `--store-url`. Runs the same blue-green rollout as
+/// the local [`deploy`](super::deploy::deploy) — add the bundle deployment (when
+/// new), stage a revision, warm it, route 100 % of traffic — but against the
+/// HTTP store and from caller-pinned artifact pointers. A control-plane store
+/// keeps no bundle bytes, so the local `--bundle <local.gtbundle>` path is
+/// rejected with a push-to-registry hint: the caller supplies a
+/// `bundle_source_uri` and a real `bundle_digest` (plus optional `pack_list` /
+/// lock) via `--answers`, exactly like remote `revisions stage`. The rollout
+/// decisions (idempotent replay, deployment reuse, route immutability,
+/// superseded revisions) are the shared `super::deploy` helpers; the execution
+/// sequence (add → stage → warm → traffic) mirrors local `deploy()`, so keep the
+/// two in sync until a shared rollout engine lands. The cut-over reuses
+/// `remote_traffic_set` so entry parsing and telemetry stay single-sourced.
+fn remote_deploy(
+    store: &dyn EnvironmentMutations,
+    flags: &OpFlags,
+    payload: Option<super::deploy::BundleDeployPayload>,
+) -> Result<OpOutcome, OpError> {
+    let payload = resolve_payload::<super::deploy::BundleDeployPayload>(flags, payload)?;
+
+    // A remote store can't extract a local artifact server-side.
+    if payload.bundle_path.is_some() {
+        return Err(OpError::InvalidArgument(
+            "`op deploy --bundle <local.gtbundle>` cannot run against a remote --store-url \
+             store: the local artifact can't be extracted server-side. Push the bundle to a \
+             registry, then deploy with `--answers <file>` carrying pinned pointers \
+             (bundle_source_uri, bundle_digest, pack_list)."
+                .to_string(),
+        ));
+    }
+
+    let env_id = parse_env_id(&payload.environment_id)?;
+    let bundle_id = payload.bundle_id.trim().to_string();
+    if bundle_id.is_empty() {
+        return Err(OpError::InvalidArgument(
+            "bundle_id must not be empty".to_string(),
+        ));
+    }
+    if let Some(rb) = payload.route_binding.as_ref() {
+        rb.validate()?;
+    }
+    let customer_id = super::bundles::resolve_customer_id(&env_id, payload.customer_id.clone())?;
+
+    // Require real pins: a placeholder digest or missing source URI would strand
+    // a remote worker (and `warm` would then promote an unservable revision).
+    // Mirrors remote `revisions stage`.
+    let pins = payload.remote_pins.clone().unwrap_or_default();
+    let bundle_source_uri = payload
+        .bundle_source_uri
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            OpError::InvalidArgument(
+                "remote `op deploy` requires `bundle_source_uri` (oci://… / repo://… / \
+                 store://…) so a remote worker can pull the bundle at boot"
+                    .to_string(),
+            )
+        })?;
+    // Reuse the shared `remote_pullable_digest` (→ `digest_is_real`) so the
+    // `sha256:…`-shaped, non-placeholder rule has ONE definition across the
+    // remote stage / apply / deploy paths (the inline check used to be looser —
+    // it would have accepted a malformed, non-`sha256:` digest).
+    let bundle_digest = pins.bundle_digest.as_deref().map(str::trim);
+    if !remote_pullable_digest(bundle_digest) {
+        return Err(OpError::InvalidArgument(
+            "remote `op deploy` requires a real pinned `bundle_digest` (sha256:…) in remote_pins \
+             — a remote worker cannot verify a placeholder or unpinned pull"
+                .to_string(),
+        ));
+    }
+    let bundle_digest = bundle_digest
+        .expect("remote_pullable_digest is false for None")
+        .to_string();
+
+    // Validate ALL caller pins — including the pack list, which can fail on a
+    // malformed version string — BEFORE any store mutation, so a bad answers
+    // file can never commit a bundle it then can't roll out (Codex finding 1).
+    let pack_list = super::revisions::parse_pack_list(pins.pack_list.clone())?;
+
+    // Retry-safety (A8 §2): when the caller pins a deploy `idempotency_key`, the
+    // staged revision id AND every sub-operation key are DERIVED from it, so a
+    // lost-response retry replays the same add/stage/warm/traffic instead of
+    // minting a duplicate revision (orphaning the prior Staged/Ready one). A
+    // one-shot deploy (no key) mints, exactly like the local path. Distinct
+    // suffixes keep the sub-op keys from colliding (same key + different body is
+    // a 409 idempotency-conflict); the cut-over keeps the BARE key so a completed
+    // retry is short-circuited by `idempotent_deploy_replay` above.
+    let deploy_key = payload.idempotency_key.clone();
+    let staged_revision_id = deploy_revision_id(deploy_key.as_deref());
+    let sub_key = |suffix: &str| -> Result<IdempotencyKey, OpError> {
+        super::resolve_idempotency_key(deploy_key.as_deref().map(|k| format!("{k}:{suffix}")))
+    };
+
+    // Load the env once for the rollout decisions (shared with the local path).
+    let env = store
+        .load_environment(&env_id)
+        .map_err(map_store_err_preserving_noun)?;
+    let existing = super::deploy::find_existing_deployment(&env, &bundle_id, &customer_id);
+
+    // Idempotent replay: a keyed deploy whose split already exists echoes the
+    // prior outcome without minting a duplicate revision or moving the rollback
+    // target.
+    if let Some((deployment_id, revision_id)) =
+        super::deploy::idempotent_deploy_replay(&env, existing, payload.idempotency_key.as_deref())
+    {
+        return Ok(super::deploy::DeploySummary::routed_outcome(
+            &env_id,
+            bundle_id,
+            deployment_id,
+            revision_id,
+            true,
+            Vec::new(),
+        ));
+    }
+    super::deploy::ensure_route_binding_unchanged(existing, payload.route_binding.as_ref())?;
+
+    // Resolve the deployment: reuse the existing one (blue-green) or add fresh.
+    let (deployment_id, reused, superseded) = match existing {
+        Some(b) => {
+            let dep = b.deployment_id;
+            (dep, true, super::deploy::superseded_revisions(&env, dep))
+        }
+        None => {
+            let deployment = store
+                .add_bundle(
+                    &env_id,
+                    AddBundlePayload {
+                        bundle_id: BundleId::new(bundle_id.clone()),
+                        customer_id: customer_id.clone(),
+                        revenue_share: super::bundles::convert_revenue_share(
+                            &payload
+                                .revenue_share
+                                .clone()
+                                .unwrap_or_else(super::bundles::default_revenue_share),
+                        ),
+                        route_binding: Some(super::bundles::into_route_binding(
+                            payload.route_binding.clone().unwrap_or_default(),
+                        )),
+                        authorization_ref: Some(
+                            super::bundles::default_authorization_ref()
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
+                        config_overrides: payload.config_overrides.clone().unwrap_or_default(),
+                    },
+                    sub_key("add")?,
+                )
+                .map_err(map_store_err_preserving_noun)?;
+            (deployment.deployment_id, false, Vec::new())
+        }
+    };
+    drop(env);
+
+    // Stage the pinned revision (the pack list was validated up-front).
+    let revision = store
+        .stage_revision(
+            &env_id,
+            StageRevisionPayload {
+                revision_id: staged_revision_id,
+                deployment_id,
+                bundle_digest,
+                bundle_source_uri: Some(bundle_source_uri),
+                pack_list,
+                pack_list_lock_ref: pins.pack_list_lock_ref.clone().unwrap_or_default(),
+                pack_config_refs: Vec::new(),
+                config_digest: pins
+                    .config_digest
+                    .clone()
+                    .unwrap_or_else(super::revisions::default_config_digest),
+                signature_sidecar_ref: pins
+                    .signature_sidecar_ref
+                    .clone()
+                    .unwrap_or_else(super::revisions::default_signature_sidecar_ref),
+                drain_seconds: pins
+                    .drain_seconds
+                    .unwrap_or_else(super::revisions::default_drain_seconds),
+            },
+            sub_key("stage")?,
+        )
+        .map_err(map_store_err_preserving_noun)?;
+    let revision_id = revision.revision_id;
+
+    // Warm it to Ready behind the no-op gate (deploy has no health producers).
+    store
+        .warm_revision(
+            &env_id,
+            WarmRevisionPayload {
+                revision_id,
+                health_gate: Ok(()),
+                expected_lifecycle: revision.lifecycle,
+            },
+            sub_key("warm")?,
+        )
+        .map_err(map_store_err_preserving_noun)?;
+
+    // Re-deploy override replacement: after warm, before cut-over (so a failed
+    // stage/warm never replaces the live deployment's overrides).
+    if reused && let Some(ref overrides) = payload.config_overrides {
+        store
+            .update_bundle(
+                &env_id,
+                UpdateBundlePayload {
+                    deployment_id,
+                    status: None,
+                    route_binding: None,
+                    revenue_share: None,
+                    config_overrides: Some(overrides.clone()),
+                },
+                sub_key("override")?,
+            )
+            .map_err(map_store_err_preserving_noun)?;
+    }
+
+    // Route 100 % to the new revision. Reuse the remote traffic verb so entry
+    // parsing + telemetry stay single-sourced.
+    let cutover_key = payload
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| format!("deploy:{deployment_id}:{revision_id}"));
+    remote_traffic_set(
+        store,
+        flags,
+        Some(super::traffic::TrafficSetPayload {
+            environment_id: env_id.as_str().to_string(),
+            deployment_id: deployment_id.to_string(),
+            entries: vec![super::traffic::TrafficSetEntryPayload {
+                revision_id: revision_id.to_string(),
+                weight_bps: Some(super::deploy::FULL_TRAFFIC_BPS),
+                weight_percent: None,
+            }],
+            updated_by: super::traffic::default_updated_by(),
+            idempotency_key: cutover_key,
+            authorization_ref: super::traffic::default_authorization_ref(),
+        }),
+    )?;
+
+    Ok(super::deploy::DeploySummary::routed_outcome(
+        &env_id,
+        bundle_id,
+        deployment_id.to_string(),
+        revision_id.to_string(),
+        reused,
+        superseded,
     ))
 }
 
@@ -2876,6 +3149,306 @@ mod tests {
         assert!(
             matches!(result, Err(OpError::NotFound(ref m)) if m.contains("not found")),
             "got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // deploy (remote composite): guards, full rollout, idempotent replay
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn remote_deploy_rejects_local_bundle_path() {
+        // A local `.gtbundle` can't be extracted server-side — reject before
+        // any HTTP call (a dead-port store proves no connection is attempted).
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "bundle_id": "my-bundle",
+            "bundle_path": "/tmp/local.gtbundle"
+        }));
+        let err = remote_deploy(&build_dummy_store(), &flags, None).unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(ref m) if m.contains("can't be extracted server-side")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn remote_deploy_requires_bundle_source_uri() {
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "bundle_id": "my-bundle",
+            "remote_pins": {"bundle_digest": "sha256:abc"}
+        }));
+        let err = remote_deploy(&build_dummy_store(), &flags, None).unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(ref m) if m.contains("bundle_source_uri")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn remote_deploy_requires_real_bundle_digest() {
+        // The digest must be `sha256:…`-shaped and non-placeholder. Both the
+        // placeholder default AND a malformed non-sha256 string are rejected — the
+        // latter is what reusing the shared `remote_pullable_digest` tightened (the
+        // old inline check would have accepted it).
+        for bad in ["sha256:00", "foo"] {
+            let (_tmp, flags) = answers_flags(serde_json::json!({
+                "environment_id": "local",
+                "bundle_id": "my-bundle",
+                "bundle_source_uri": "oci://registry.example/b@sha256:abc",
+                "remote_pins": {"bundle_digest": bad}
+            }));
+            let err = remote_deploy(&build_dummy_store(), &flags, None).unwrap_err();
+            assert!(
+                matches!(err, OpError::InvalidArgument(ref m) if m.contains("bundle_digest")),
+                "digest `{bad}` must be rejected, got {err:?}"
+            );
+        }
+    }
+
+    fn deploy_bundle_json() -> serde_json::Value {
+        serde_json::json!({
+            "schema": "greentic.bundle-deployment.v1",
+            "deployment_id": "01JABC000000000000000000ZZ",
+            "env_id": "local",
+            "bundle_id": "my-bundle",
+            "customer_id": "local-dev",
+            "status": "active",
+            "current_revisions": [],
+            "route_binding": {"hosts": [], "path_prefixes": [], "tenant_selector": {"tenant": "default", "team": "default"}},
+            "revenue_share": [{"party_id": "greentic", "basis_points": 10000}],
+            "revenue_policy_ref": "revenue.json",
+            "created_at": "2026-06-09T12:00:00Z",
+            "authorization_ref": "auth.json",
+            "config_overrides": {}
+        })
+    }
+
+    fn deploy_split_json() -> serde_json::Value {
+        serde_json::json!({
+            "schema": "greentic.traffic-split.v1",
+            "env_id": "local",
+            "deployment_id": "01JABC000000000000000000ZZ",
+            "bundle_id": "my-bundle",
+            "entries": [{"revision_id": TEST_REV_ID, "weight_bps": 10000}],
+            "generation": 1,
+            "updated_at": "2026-06-09T12:00:00Z",
+            "updated_by": "operator",
+            "idempotency_key": "{{IDEMPOTENCY_KEY}}",
+            "authorization_ref": "auth.json",
+            "previous_split_ref": null
+        })
+    }
+
+    #[test]
+    fn remote_deploy_fresh_happy_path() {
+        // Fresh deploy over the remote store: GET env (no bundle) → add → stage
+        // → warm → traffic. Five sequential responses, in call order.
+        let get_body = serde_json::json!({
+            "environment": env_json(),
+            "etag": "sha256:test",
+            "generation": 1
+        })
+        .to_string();
+        let add_body = wrap_mutation(deploy_bundle_json());
+        let stage_body = wrap_mutation(revision_json(TEST_REV_ID, "staged"));
+        let warm_body = wrap_mutation(serde_json::json!({
+            "revision": revision_json(TEST_REV_ID, "ready"),
+            "environment": env_json(),
+            "starting_lifecycle": "staged"
+        }));
+        let traffic_body = wrap_mutation(serde_json::json!({
+            "split": deploy_split_json(),
+            "previous_generation": null,
+            "new_generation": 1,
+            "environment": env_json()
+        }));
+        let mock = start_mock(
+            vec![
+                (200, &get_body),
+                (201, &add_body),
+                (201, &stage_body),
+                (200, &warm_body),
+                (200, &traffic_body),
+            ],
+            None,
+        );
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "bundle_id": "my-bundle",
+            "bundle_source_uri": "oci://registry.example/my-bundle@sha256:deadbeef",
+            "remote_pins": {"bundle_digest": "sha256:deadbeef"}
+        }));
+        let outcome = remote_deploy(&store, &flags, None).unwrap();
+        assert_eq!(outcome.noun, "deploy");
+        assert_eq!(outcome.op, "run");
+        assert_eq!(outcome.result["reused_deployment"], false);
+        assert_eq!(outcome.result["revision_id"], TEST_REV_ID);
+        assert_eq!(outcome.result["status"], "routed");
+    }
+
+    #[test]
+    fn remote_deploy_idempotent_replay_short_circuits() {
+        // A keyed deploy whose split already exists under that key returns the
+        // prior outcome after a SINGLE GET — no add/stage/warm/traffic. Only one
+        // response is queued, so a second HTTP call would hang the test.
+        let mut env = env_json();
+        env["bundles"] = serde_json::json!([deploy_bundle_json()]);
+        let mut split = deploy_split_json();
+        split["idempotency_key"] = serde_json::json!("deploy-key-1");
+        env["traffic_splits"] = serde_json::json!([split]);
+        let get_body = serde_json::json!({
+            "environment": env,
+            "etag": "sha256:test",
+            "generation": 1
+        })
+        .to_string();
+        let mock = start_mock(vec![(200, &get_body)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "bundle_id": "my-bundle",
+            "bundle_source_uri": "oci://registry.example/my-bundle@sha256:deadbeef",
+            "idempotency_key": "deploy-key-1",
+            "remote_pins": {"bundle_digest": "sha256:deadbeef"}
+        }));
+        let outcome = remote_deploy(&store, &flags, None).unwrap();
+        assert_eq!(outcome.result["reused_deployment"], true);
+        assert_eq!(outcome.result["revision_id"], TEST_REV_ID);
+    }
+
+    #[test]
+    fn deploy_revision_id_is_deterministic_per_key() {
+        // Retry-safety hinges on a STABLE revision id derived from the deploy key
+        // (a fresh id would change the stage fingerprint and defeat replay).
+        let a = deploy_revision_id(Some("deploy-key-1"));
+        assert_eq!(
+            a,
+            deploy_revision_id(Some("deploy-key-1")),
+            "same key must derive the same revision id"
+        );
+        assert_ne!(
+            a,
+            deploy_revision_id(Some("deploy-key-2")),
+            "different keys must derive different revision ids"
+        );
+        assert_ne!(
+            deploy_revision_id(None),
+            deploy_revision_id(None),
+            "keyless deploys mint a fresh id each time"
+        );
+    }
+
+    #[test]
+    fn remote_deploy_validates_pins_before_any_mutation() {
+        // An invalid pack_list version must be rejected BEFORE any HTTP call, so a
+        // bad answers file can't commit a bundle it then can't roll out. A
+        // dead-port store proves no connection (hence no mutation) is attempted.
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "bundle_id": "my-bundle",
+            "bundle_source_uri": "oci://registry.example/my-bundle@sha256:deadbeef",
+            "remote_pins": {
+                "bundle_digest": "sha256:deadbeef",
+                "pack_list": [{
+                    "pack_id": "p",
+                    "version": "not-a-semver",
+                    "digest": "sha256:aa",
+                    "source_uri": "oci://registry.example/p@sha256:aa"
+                }]
+            }
+        }));
+        let err = remote_deploy(&build_dummy_store(), &flags, None).unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(ref m) if m.contains("pack version")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn remote_deploy_keyed_stages_the_derived_revision() {
+        // A keyed remote deploy stages the DETERMINISTIC revision id (so a
+        // lost-response retry replays the same revision) under a `:stage` sub-key,
+        // warms under `:warm`, and cuts over under the BARE deploy key (so a
+        // completed retry is caught by the replay short-circuit). Capture every
+        // request to assert the wiring.
+        let key = "deploy-key-xyz";
+        let derived = deploy_revision_id(Some(key)).to_string();
+        let captured =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String, String)>::new()));
+        let cap = std::sync::Arc::clone(&captured);
+        let check: CheckFn =
+            std::sync::Arc::new(move |req_line: &str, headers: &str, body: &[u8]| {
+                cap.lock().unwrap().push((
+                    req_line.to_string(),
+                    headers.to_lowercase(),
+                    String::from_utf8_lossy(body).to_string(),
+                ));
+            });
+
+        let get_body = serde_json::json!({
+            "environment": env_json(), "etag": "sha256:test", "generation": 1
+        })
+        .to_string();
+        let add_body = wrap_mutation(deploy_bundle_json());
+        let stage_body = wrap_mutation(revision_json(&derived, "staged"));
+        let warm_body = wrap_mutation(serde_json::json!({
+            "revision": revision_json(&derived, "ready"),
+            "environment": env_json(),
+            "starting_lifecycle": "staged"
+        }));
+        let mut split = deploy_split_json();
+        split["entries"] = serde_json::json!([{"revision_id": derived, "weight_bps": 10000}]);
+        let traffic_body = wrap_mutation(serde_json::json!({
+            "split": split, "previous_generation": null, "new_generation": 1,
+            "environment": env_json()
+        }));
+        let mock = start_mock(
+            vec![
+                (200, &get_body),
+                (201, &add_body),
+                (201, &stage_body),
+                (200, &warm_body),
+                (200, &traffic_body),
+            ],
+            Some(check),
+        );
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "bundle_id": "my-bundle",
+            "bundle_source_uri": "oci://registry.example/my-bundle@sha256:deadbeef",
+            "idempotency_key": key,
+            "remote_pins": {"bundle_digest": "sha256:deadbeef"}
+        }));
+        remote_deploy(&store, &flags, None).unwrap();
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 5, "GET + add + stage + warm + traffic");
+        let (stage_line, stage_headers, stage_body) = &reqs[2];
+        assert!(
+            stage_line.contains("/revisions"),
+            "stage line: {stage_line}"
+        );
+        assert!(
+            stage_body.contains(&derived),
+            "stage must send the derived revision id {derived}: {stage_body}"
+        );
+        assert!(
+            stage_headers.contains(&format!("idempotency-key: {key}:stage")),
+            "stage headers: {stage_headers}"
+        );
+        assert!(
+            reqs[3].1.contains(&format!("idempotency-key: {key}:warm")),
+            "warm headers: {}",
+            reqs[3].1
+        );
+        assert!(
+            reqs[4].1.contains(&format!("idempotency-key: {key}")),
+            "traffic must use the bare deploy key: {}",
+            reqs[4].1
         );
     }
 
