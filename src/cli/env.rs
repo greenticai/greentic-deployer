@@ -1468,6 +1468,20 @@ pub(crate) fn resolve_secrets_backend(
     secrets_backend_from_vault_answers(load_secrets_answers(store, env)?.as_ref())
 }
 
+/// Whether the env's `Secrets`-slot backend custodies secret values in the
+/// local dev-store. No binding or the dev-store kind → `true` (the control
+/// plane mints + writes webhook-secret values locally); any other kind (e.g.
+/// Vault) → `false` (the operator seeds the value out-of-band and the control
+/// plane only stamps the ref). Unlike [`resolve_secrets_backend`] this inspects
+/// only the binding *kind*, never the connection answers, so it cannot fail —
+/// endpoint provisioning must not be coupled to Vault-answer validity.
+pub(crate) fn secrets_backend_is_dev_store(env: &greentic_deploy_spec::Environment) -> bool {
+    match env.pack_for_slot(CapabilitySlot::Secrets) {
+        None => true,
+        Some(binding) => binding.kind.path() == crate::defaults::DEV_STORE_SECRETS_PATH,
+    }
+}
+
 /// Pure mapping of a Vault `Secrets`-binding's answers to a [`VaultBackend`]:
 /// `addr` + `role` are required; the rest default to the provider's. Factored
 /// out of [`resolve_secrets_backend`] so the field mapping + fail-closed
@@ -4465,6 +4479,30 @@ mod tests {
             resolve_secrets_backend(&store, &env).unwrap(),
             SecretsBackend::DevStore
         ));
+    }
+
+    #[test]
+    fn secrets_backend_is_dev_store_classifies_by_kind() {
+        // No Secrets binding → custodial dev-store.
+        assert!(secrets_backend_is_dev_store(&make_env("local")));
+
+        // Explicit dev-store binding → custodial.
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            crate::defaults::LOCAL_SECRETS_PACK,
+        ));
+        assert!(secrets_backend_is_dev_store(&env));
+
+        // Vault binding → NOT custodial: the operator seeds the value out-of-band
+        // and the control plane only stamps the ref. Note this never parses the
+        // Vault answers, so it does not fail closed like `resolve_secrets_backend`.
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            crate::defaults::VAULT_SECRETS_PACK,
+        ));
+        assert!(!secrets_backend_is_dev_store(&env));
     }
 
     #[test]
