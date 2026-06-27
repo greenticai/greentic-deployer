@@ -3376,10 +3376,10 @@ mod tests {
         // request to assert the wiring.
         let key = "deploy-key-xyz";
         let derived = deploy_revision_id(Some(key)).to_string();
-        let captured: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String, String)>::new()));
         let cap = std::sync::Arc::clone(&captured);
-        let check: std::sync::Arc<dyn Fn(&str, &str, &[u8]) + Send + Sync> =
+        let check: CheckFn =
             std::sync::Arc::new(move |req_line: &str, headers: &str, body: &[u8]| {
                 cap.lock().unwrap().push((
                     req_line.to_string(),
