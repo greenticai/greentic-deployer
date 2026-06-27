@@ -1400,9 +1400,10 @@ fn remote_reconcile(
     let secrets_backend = super::env::secrets_backend_from_vault_answers(secrets_answers)?;
 
     // Deployer answers (kubeconfig_context, namespace, …); absent → ambient
-    // kubeconfig context.
+    // kubeconfig context. Borrowed (like `secrets_answers` above) — `payload`
+    // outlives both uses, so no clone of the answer tree.
     let deployer_answers =
-        (!payload.deployer_answers.is_null()).then(|| payload.deployer_answers.clone());
+        (!payload.deployer_answers.is_null()).then_some(&payload.deployer_answers);
 
     // Bound deployer identity — resolved BEFORE the authorization so a missing
     // identity fails fast (the same posture as the structural gates) and the
@@ -1422,7 +1423,7 @@ fn remote_reconcile(
         &scratch,
         &env,
         &env_id,
-        deployer_answers.as_ref(),
+        deployer_answers,
     )?;
     let identity = if bound_token.is_some() {
         "bound"
@@ -1466,7 +1467,7 @@ fn remote_reconcile(
     // (`None`): the worker resolves `secret://` from Vault under pod identity.
     let report = super::env::reconcile_k8s_cluster(
         &env,
-        deployer_answers.as_ref(),
+        deployer_answers,
         bound_token,
         None,
         secrets_backend,
