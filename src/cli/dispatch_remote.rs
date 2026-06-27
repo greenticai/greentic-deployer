@@ -37,6 +37,7 @@ use super::dispatch::{
 use super::env_apply::{ApplyMode, ApplyOptions};
 use super::env_manifest::{EnvManifest, ManifestBundle};
 use super::{OpError, OpFlags, OpOutcome, map_store_err_preserving_noun};
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -1029,6 +1030,23 @@ fn remote_revision_warm(
 /// superseded revisions) are the shared `super::deploy` helpers, so local and
 /// remote can't drift; the cut-over reuses `remote_traffic_set` so entry
 /// parsing and telemetry stay single-sourced.
+///
+/// Deterministic staged-revision id for a retry-safe remote deploy: the same
+/// deploy `idempotency_key` always derives the same id, so a lost-response retry
+/// stages (and the server replays) the SAME revision instead of minting a
+/// duplicate Staged/Ready one. A one-shot deploy (no key) mints a fresh id.
+fn deploy_revision_id(idempotency_key: Option<&str>) -> RevisionId {
+    match idempotency_key {
+        Some(key) => {
+            let digest = Sha256::digest(format!("greentic-deploy-revision:{key}").as_bytes());
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            RevisionId(ulid::Ulid::from_bytes(bytes))
+        }
+        None => crate::environment::mint_revision_id(),
+    }
+}
+
 fn remote_deploy(
     store: &dyn EnvironmentMutations,
     flags: &OpFlags,
@@ -1090,6 +1108,25 @@ fn remote_deploy(
             )
         })?;
 
+    // Validate ALL caller pins — including the pack list, which can fail on a
+    // malformed version string — BEFORE any store mutation, so a bad answers
+    // file can never commit a bundle it then can't roll out (Codex finding 1).
+    let pack_list = super::revisions::parse_pack_list(pins.pack_list.clone())?;
+
+    // Retry-safety (A8 §2): when the caller pins a deploy `idempotency_key`, the
+    // staged revision id AND every sub-operation key are DERIVED from it, so a
+    // lost-response retry replays the same add/stage/warm/traffic instead of
+    // minting a duplicate revision (orphaning the prior Staged/Ready one). A
+    // one-shot deploy (no key) mints, exactly like the local path. Distinct
+    // suffixes keep the sub-op keys from colliding (same key + different body is
+    // a 409 idempotency-conflict); the cut-over keeps the BARE key so a completed
+    // retry is short-circuited by `idempotent_deploy_replay` above.
+    let deploy_key = payload.idempotency_key.clone();
+    let staged_revision_id = deploy_revision_id(deploy_key.as_deref());
+    let sub_key = |suffix: &str| -> Result<IdempotencyKey, OpError> {
+        super::resolve_idempotency_key(deploy_key.as_deref().map(|k| format!("{k}:{suffix}")))
+    };
+
     // Load the env once for the rollout decisions (shared with the local path).
     let env = store
         .load_environment(&env_id)
@@ -1142,7 +1179,7 @@ fn remote_deploy(
                         ),
                         config_overrides: payload.config_overrides.clone().unwrap_or_default(),
                     },
-                    super::resolve_idempotency_key(None)?,
+                    sub_key("add")?,
                 )
                 .map_err(map_store_err_preserving_noun)?;
             (deployment.deployment_id, false, Vec::new())
@@ -1150,13 +1187,12 @@ fn remote_deploy(
     };
     drop(env);
 
-    // Stage the pinned revision.
-    let pack_list = super::revisions::parse_pack_list(pins.pack_list.clone())?;
+    // Stage the pinned revision (the pack list was validated up-front).
     let revision = store
         .stage_revision(
             &env_id,
             StageRevisionPayload {
-                revision_id: crate::environment::mint_revision_id(),
+                revision_id: staged_revision_id,
                 deployment_id,
                 bundle_digest,
                 bundle_source_uri: Some(bundle_source_uri),
@@ -1175,7 +1211,7 @@ fn remote_deploy(
                     .drain_seconds
                     .unwrap_or_else(super::revisions::default_drain_seconds),
             },
-            super::resolve_idempotency_key(None)?,
+            sub_key("stage")?,
         )
         .map_err(map_store_err_preserving_noun)?;
     let revision_id = revision.revision_id;
@@ -1189,7 +1225,7 @@ fn remote_deploy(
                 health_gate: Ok(()),
                 expected_lifecycle: revision.lifecycle,
             },
-            super::resolve_idempotency_key(None)?,
+            sub_key("warm")?,
         )
         .map_err(map_store_err_preserving_noun)?;
 
@@ -1206,7 +1242,7 @@ fn remote_deploy(
                     revenue_share: None,
                     config_overrides: Some(overrides.clone()),
                 },
-                super::resolve_idempotency_key(None)?,
+                sub_key("override")?,
             )
             .map_err(map_store_err_preserving_noun)?;
     }
@@ -3274,6 +3310,139 @@ mod tests {
         let outcome = remote_deploy(&store, &flags, None).unwrap();
         assert_eq!(outcome.result["reused_deployment"], true);
         assert_eq!(outcome.result["revision_id"], TEST_REV_ID);
+    }
+
+    #[test]
+    fn deploy_revision_id_is_deterministic_per_key() {
+        // Retry-safety hinges on a STABLE revision id derived from the deploy key
+        // (a fresh id would change the stage fingerprint and defeat replay).
+        let a = deploy_revision_id(Some("deploy-key-1"));
+        assert_eq!(
+            a,
+            deploy_revision_id(Some("deploy-key-1")),
+            "same key must derive the same revision id"
+        );
+        assert_ne!(
+            a,
+            deploy_revision_id(Some("deploy-key-2")),
+            "different keys must derive different revision ids"
+        );
+        assert_ne!(
+            deploy_revision_id(None),
+            deploy_revision_id(None),
+            "keyless deploys mint a fresh id each time"
+        );
+    }
+
+    #[test]
+    fn remote_deploy_validates_pins_before_any_mutation() {
+        // An invalid pack_list version must be rejected BEFORE any HTTP call, so a
+        // bad answers file can't commit a bundle it then can't roll out. A
+        // dead-port store proves no connection (hence no mutation) is attempted.
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "bundle_id": "my-bundle",
+            "bundle_source_uri": "oci://registry.example/my-bundle@sha256:deadbeef",
+            "remote_pins": {
+                "bundle_digest": "sha256:deadbeef",
+                "pack_list": [{
+                    "pack_id": "p",
+                    "version": "not-a-semver",
+                    "digest": "sha256:aa",
+                    "source_uri": "oci://registry.example/p@sha256:aa"
+                }]
+            }
+        }));
+        let err = remote_deploy(&build_dummy_store(), &flags, None).unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(ref m) if m.contains("pack version")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn remote_deploy_keyed_stages_the_derived_revision() {
+        // A keyed remote deploy stages the DETERMINISTIC revision id (so a
+        // lost-response retry replays the same revision) under a `:stage` sub-key,
+        // warms under `:warm`, and cuts over under the BARE deploy key (so a
+        // completed retry is caught by the replay short-circuit). Capture every
+        // request to assert the wiring.
+        let key = "deploy-key-xyz";
+        let derived = deploy_revision_id(Some(key)).to_string();
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = std::sync::Arc::clone(&captured);
+        let check: std::sync::Arc<dyn Fn(&str, &str, &[u8]) + Send + Sync> =
+            std::sync::Arc::new(move |req_line: &str, headers: &str, body: &[u8]| {
+                cap.lock().unwrap().push((
+                    req_line.to_string(),
+                    headers.to_lowercase(),
+                    String::from_utf8_lossy(body).to_string(),
+                ));
+            });
+
+        let get_body = serde_json::json!({
+            "environment": env_json(), "etag": "sha256:test", "generation": 1
+        })
+        .to_string();
+        let add_body = wrap_mutation(deploy_bundle_json());
+        let stage_body = wrap_mutation(revision_json(&derived, "staged"));
+        let warm_body = wrap_mutation(serde_json::json!({
+            "revision": revision_json(&derived, "ready"),
+            "environment": env_json(),
+            "starting_lifecycle": "staged"
+        }));
+        let mut split = deploy_split_json();
+        split["entries"] = serde_json::json!([{"revision_id": derived, "weight_bps": 10000}]);
+        let traffic_body = wrap_mutation(serde_json::json!({
+            "split": split, "previous_generation": null, "new_generation": 1,
+            "environment": env_json()
+        }));
+        let mock = start_mock(
+            vec![
+                (200, &get_body),
+                (201, &add_body),
+                (201, &stage_body),
+                (200, &warm_body),
+                (200, &traffic_body),
+            ],
+            Some(check),
+        );
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "bundle_id": "my-bundle",
+            "bundle_source_uri": "oci://registry.example/my-bundle@sha256:deadbeef",
+            "idempotency_key": key,
+            "remote_pins": {"bundle_digest": "sha256:deadbeef"}
+        }));
+        remote_deploy(&store, &flags, None).unwrap();
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 5, "GET + add + stage + warm + traffic");
+        let (stage_line, stage_headers, stage_body) = &reqs[2];
+        assert!(
+            stage_line.contains("/revisions"),
+            "stage line: {stage_line}"
+        );
+        assert!(
+            stage_body.contains(&derived),
+            "stage must send the derived revision id {derived}: {stage_body}"
+        );
+        assert!(
+            stage_headers.contains(&format!("idempotency-key: {key}:stage")),
+            "stage headers: {stage_headers}"
+        );
+        assert!(
+            reqs[3].1.contains(&format!("idempotency-key: {key}:warm")),
+            "warm headers: {}",
+            reqs[3].1
+        );
+        assert!(
+            reqs[4].1.contains(&format!("idempotency-key: {key}")),
+            "traffic must use the bare deploy key: {}",
+            reqs[4].1
+        );
     }
 
     #[test]

@@ -778,15 +778,28 @@ fn deploy_schema() -> Value {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "BundleDeployPayload",
         "type": "object",
-        "required": ["bundle_id", "bundle_path"],
+        "required": ["bundle_id"],
         "additionalProperties": false,
         "properties": {
             "environment_id": {"type": "string", "default": "local"},
             "bundle_id": {"type": "string"},
             "customer_id": {"type": "string"},
-            "bundle_path": {"type": "string", "description": "local .gtbundle path (required)"},
-            "bundle_source_uri": {"type": "string", "description": "oci:// / repo:// / store:// ref the bundle was resolved from; makes the staged revision pullable by a remote worker. Omit for local-serve-only"},
-            "idempotency_key": {"type": "string", "description": "supply to make retries idempotent"},
+            "bundle_path": {"type": "string", "description": "local .gtbundle path. REQUIRED for a local deploy; OMIT for a remote --store-url deploy (the artifact can't be extracted server-side)"},
+            "bundle_source_uri": {"type": "string", "description": "oci:// / repo:// / store:// ref the bundle was resolved from; makes the staged revision pullable by a remote worker. REQUIRED for a remote --store-url deploy; omit for local-serve-only"},
+            "remote_pins": {
+                "type": "object",
+                "description": "caller-pinned artifact pointers for a remote (--store-url) deploy (the bundle is pre-pushed to a registry). Ignored on the local path.",
+                "additionalProperties": false,
+                "properties": {
+                    "bundle_digest": {"type": "string", "description": "real (non-placeholder) content digest the worker verifies after pull. REQUIRED for a remote deploy"},
+                    "pack_list": {"type": "array", "items": {"type": "object"}},
+                    "pack_list_lock_ref": {"type": "string"},
+                    "config_digest": {"type": "string"},
+                    "signature_sidecar_ref": {"type": "string"},
+                    "drain_seconds": {"type": "integer"}
+                }
+            },
+            "idempotency_key": {"type": "string", "description": "supply to make retries idempotent; on a remote --store-url deploy it also derives a stable revision id + per-step keys so a lost-response retry replays instead of duplicating the revision"},
             "config_overrides": {
                 "type": "object",
                 "description": "D.4: per-pack provider config overrides keyed by pack_id (object of {key: json-value})",
@@ -829,6 +842,36 @@ mod tests {
             "deploy_schema must list `bundle_source_uri` so --schema-driven \
              callers can record the bundle's registry source (schema: {schema:#})"
         );
+    }
+
+    #[test]
+    fn deploy_schema_models_remote_mode() {
+        // A remote --store-url deploy supplies bundle_source_uri + remote_pins and
+        // OMITS bundle_path. The schema must declare remote_pins and must not
+        // require bundle_path, else a --schema-driven remote answers file is
+        // rejected against its own contract (Codex finding 3).
+        let schema = deploy_schema();
+        assert!(
+            schema.pointer("/properties/remote_pins").is_some(),
+            "deploy_schema must declare `remote_pins`: {schema:#}"
+        );
+        assert!(
+            schema
+                .pointer("/properties/remote_pins/properties/bundle_digest")
+                .is_some(),
+            "remote_pins must declare `bundle_digest`: {schema:#}"
+        );
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required is an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            !required.contains(&"bundle_path"),
+            "bundle_path must not be globally required (it's local-mode only): {required:?}"
+        );
+        assert!(required.contains(&"bundle_id"), "bundle_id stays required");
     }
 
     fn seeded_store() -> (tempfile::TempDir, LocalFsStore) {
