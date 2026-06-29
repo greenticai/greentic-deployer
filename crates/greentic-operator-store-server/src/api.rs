@@ -1082,12 +1082,8 @@ pub(crate) async fn reconcile_environment<S: EnvironmentStorage>(
 /// apply actually succeeded or failed, so the audit reflects reality and not
 /// just the go-ahead.
 ///
-/// Append-only by design: it records a cluster change that already happened, so
-/// it is NOT concurrency-gated — a completion must never be dropped by a write
-/// that raced in between, or the audit would omit a real cluster mutation. The
-/// body's `authorized_generation`/`authorized_etag` correlate the completion to
-/// its authorization (operator-asserted, as with webhook-ref rotation); the
-/// idempotency key gives retry-safety.
+/// Append-only and not concurrency-gated; see [`ReconcileCompletionRequest`]
+/// for the full correlation + retry-safety contract.
 pub(crate) async fn complete_reconcile<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path(env_id): Path<String>,
