@@ -5494,3 +5494,210 @@ async fn reconcile_concurrent_race_error_or_replay() {
     let events = audit_log_event_ids(&store, "local").await;
     assert_eq!(events.len(), 2, "create + reconcile: {events:?}");
 }
+
+// ---------------------------------------------------------------------------
+// reconcile/complete — the second half of a server-mediated reconcile. The
+// operator applies the cluster, then posts the outcome so the durable audit
+// reflects reality, not just the authorization. Append-only (never
+// concurrency-gated); idempotency-key gives retry-safety.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reconcile_complete_records_succeeded() {
+    let (_d, app, store) = app_with_store().await;
+    let etag = create_env_and_etag(&app).await;
+
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile/complete",
+        Some(json!({
+            "authorized_generation": 1,
+            "authorized_etag": etag,
+            "completion": { "status": "succeeded", "applied": 7, "pruned": 2 },
+        })),
+        &[("Idempotency-Key", "RCC-OK")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["idempotency"]["idempotency"], "applied");
+    assert_eq!(body["result"]["recorded"], true);
+    // Audit-only: generation unchanged (create = 1).
+    assert_eq!(body["generation"], 1);
+
+    let audit = &body["audit"];
+    assert_eq!(audit["noun"], "env");
+    assert_eq!(audit["verb"], "reconcile-complete");
+    assert_eq!(audit["result"]["outcome"], "ok");
+    assert_eq!(audit["target"]["authorized_generation"], 1);
+    assert_eq!(audit["target"]["authorized_etag"], etag);
+    assert_eq!(audit["target"]["completion"]["status"], "succeeded");
+    assert_eq!(audit["target"]["completion"]["applied"], 7);
+    assert_eq!(audit["target"]["completion"]["pruned"], 2);
+    // previous == new generation (no bump).
+    assert_eq!(audit["previous_generation"], audit["new_generation"]);
+
+    // create + complete = 2 durable audit rows.
+    let events = audit_log_event_ids(&store, "local").await;
+    assert_eq!(events.len(), 2, "create + reconcile-complete: {events:?}");
+}
+
+#[tokio::test]
+async fn reconcile_complete_records_failed() {
+    let (_d, app, store) = app_with_store().await;
+    let etag = create_env_and_etag(&app).await;
+
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile/complete",
+        Some(json!({
+            "authorized_generation": 1,
+            "authorized_etag": etag,
+            "completion": { "status": "failed", "error": "cannot reach the cluster: timeout" },
+        })),
+        &[("Idempotency-Key", "RCC-FAIL")],
+    )
+    .await;
+    // The cluster apply failed, but recording that failure SUCCEEDS (200) — the
+    // audit must capture a real failed apply, not swallow it.
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["result"]["recorded"], true);
+
+    let events = audit_log_events(&store, "local").await;
+    let complete = events.last().expect("completion audited");
+    assert_eq!(complete["verb"], "reconcile-complete");
+    assert_eq!(complete["target"]["completion"]["status"], "failed");
+    assert_eq!(
+        complete["target"]["completion"]["error"],
+        "cannot reach the cluster: timeout"
+    );
+    // The store-side record itself is ok (the recording succeeded).
+    assert_eq!(complete["result"]["outcome"], "ok");
+}
+
+#[tokio::test]
+async fn reconcile_complete_is_append_only_despite_stale_authorized_generation() {
+    // A completion records a cluster change that already happened. Even if the
+    // env advanced (a concurrent write) since the reconcile was authorized, the
+    // completion must STILL be recorded — never dropped on a concurrency check —
+    // carrying the (now stale) authorized generation as the asserted fact.
+    let (_d, app, store) = app_with_store().await;
+    let etag1 = create_env_and_etag(&app).await;
+
+    // Advance the head past the authorized snapshot.
+    let (status, patched) = send(
+        app.clone(),
+        Method::PATCH,
+        "/environments/local",
+        Some(json!({ "name": "renamed" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(patched["generation"], 2);
+
+    // Complete the reconcile that was authorized at generation 1 / etag1.
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile/complete",
+        Some(json!({
+            "authorized_generation": 1,
+            "authorized_etag": etag1,
+            "completion": { "status": "succeeded", "applied": 1, "pruned": 0 },
+        })),
+        &[("Idempotency-Key", "RCC-STALE")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "append-only: not gated on head; body: {body}"
+    );
+    // The audit stamps the current head (2) but records the asserted authorized
+    // generation (1) for correlation.
+    assert_eq!(body["generation"], 2);
+    assert_eq!(body["audit"]["target"]["authorized_generation"], 1);
+    assert_eq!(body["audit"]["target"]["authorized_etag"], etag1);
+
+    // create + patch + complete = 3 audit rows.
+    let events = audit_log_event_ids(&store, "local").await;
+    assert_eq!(events.len(), 3, "create + patch + complete: {events:?}");
+}
+
+#[tokio::test]
+async fn reconcile_complete_authz_deny_read_only_token() {
+    let (_d, app, store) = rbac_app().await;
+    let admin = bearer(ADMIN_TOKEN);
+    let (status, created) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "RCC-D1"), ("Authorization", &admin)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let etag = created["etag"].as_str().unwrap().to_string();
+
+    let reader = bearer(READER_TOKEN);
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile/complete",
+        Some(json!({
+            "authorized_generation": 1,
+            "authorized_etag": etag,
+            "completion": { "status": "succeeded", "applied": 0, "pruned": 0 },
+        })),
+        &[("Idempotency-Key", "RCC-D2"), ("Authorization", &reader)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["kind"], "unauthorized");
+
+    // Durable denial audit row (env mutation is denied for read-only).
+    let events = audit_log_events(&store, "local").await;
+    let denial = events.last().expect("denial audited");
+    assert_eq!(denial["authorization"]["decision"], "deny");
+    assert_eq!(denial["verb"], "reconcile-complete");
+}
+
+#[tokio::test]
+async fn reconcile_complete_idempotent_replay() {
+    let (_d, app, store) = app_with_store().await;
+    let etag = create_env_and_etag(&app).await;
+    let body_json = json!({
+        "authorized_generation": 1,
+        "authorized_etag": etag,
+        "completion": { "status": "succeeded", "applied": 3, "pruned": 1 },
+    });
+
+    let (status, first) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/reconcile/complete",
+        Some(body_json.clone()),
+        &[("Idempotency-Key", "RCC-IDEM")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {first}");
+    assert_eq!(first["idempotency"]["idempotency"], "applied");
+
+    // Same key + same request → replay (retry-safety, no double-record).
+    let (status, replayed) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile/complete",
+        Some(body_json),
+        &[("Idempotency-Key", "RCC-IDEM")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {replayed}");
+    assert_eq!(replayed["idempotency"]["idempotency"], "replayed");
+    assert_eq!(replayed["audit"]["event_id"], first["audit"]["event_id"]);
+
+    // Only one completion audit row.
+    let events = audit_log_event_ids(&store, "local").await;
+    assert_eq!(events.len(), 2, "create + one completion: {events:?}");
+}

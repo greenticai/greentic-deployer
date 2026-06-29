@@ -58,8 +58,8 @@ use greentic_deploy_spec::{
     EnvId, Environment, EnvironmentRuntime, ExtensionBindingPayload, ExtensionKeyedPayload,
     HealthStatus, IdempotencyKey, IdempotencyOutcome, IdempotencyRecord, ImportOutcome,
     ImportRequest, MessagingBundleLinkPayload, MessagingEndpointId, MigrateMergePayload,
-    PackBindingPayload, Precondition, RemoteStoreError, RestoreOutcome, RestoreRequest,
-    RetentionPolicy, RevisionId, RevisionTransitionOutcome, RevocationConfig,
+    PackBindingPayload, Precondition, ReconcileCompletionRequest, RemoteStoreError, RestoreOutcome,
+    RestoreRequest, RetentionPolicy, RevisionId, RevisionTransitionOutcome, RevocationConfig,
     RollbackTrafficSplitOutcome, RollbackTrafficSplitPayload, RotateWebhookSecretPayload,
     SchemaVersion, SecretRef, SetMessagingWelcomeFlowPayload, SetTrafficSplitPayload,
     StageRevisionPayload, StateEtag, StateIntegrity, TrustRootAddOutcome, TrustRootRemoveOutcome,
@@ -1028,6 +1028,73 @@ pub(crate) async fn reconcile_environment<S: EnvironmentStorage>(
         // No desired-state write — record_journal only (same pattern as
         // set_traffic_split's no-mutation branch and seed_trust_root's
         // no-op path).
+        state.storage.record_journal(&prepared.journal).await?;
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
+}
+
+/// `POST /environments/{id}/reconcile/complete` — record the outcome of a
+/// cluster reconcile the store previously authorized (see
+/// [`reconcile_environment`]). The `…/reconcile` call authorizes + audits the
+/// intent; this call closes the loop by durably auditing whether the cluster
+/// apply actually succeeded or failed, so the audit reflects reality and not
+/// just the go-ahead.
+///
+/// Append-only by design: it records a cluster change that already happened, so
+/// it is NOT concurrency-gated — a completion must never be dropped by a write
+/// that raced in between, or the audit would omit a real cluster mutation. The
+/// body's `authorized_generation`/`authorized_etag` correlate the completion to
+/// its authorization (operator-asserted, as with webhook-ref rotation); the
+/// idempotency key gives retry-safety.
+pub(crate) async fn complete_reconcile<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(payload, fingerprint): ApiJson<ReconcileCompletionRequest>,
+) -> Result<Response, ApiError> {
+    let env_id = parse_env_id(&env_id)?;
+    let auth = authorize_mutation(&state, &headers, &env_id, "env", "reconcile-complete").await?;
+    let idem_key = require_idempotency_key(&headers)?;
+    if let Some(replay) = replay_gate(&state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(replay);
+    }
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        // Loaded only to stamp the audit at the current head; the completion is
+        // NOT gated on it (append-only — see the doc comment). A stale
+        // `authorized_generation` is recorded as the asserted fact, not rejected.
+        let loaded = state
+            .storage
+            .load_env(&env_id)
+            .await
+            .map_err(load_storage_error)?;
+        let completion =
+            serde_json::to_value(&payload.completion).map_err(envelope_encode_error)?;
+        let target = json!({
+            "environment_id": env_id,
+            "authorized_generation": payload.authorized_generation,
+            "authorized_etag": payload.authorized_etag.0,
+            "completion": completion,
+        });
+        let prepared = prepare_mutation(
+            json!({ "recorded": true }),
+            &env_id,
+            "env",
+            "reconcile-complete",
+            target,
+            idem_key,
+            &fingerprint,
+            &auth,
+            Some(loaded.revision.generation),
+            loaded.revision.clone(),
+        )?;
+        // Audit-only: record_journal, no desired-state write (same pattern as
+        // reconcile_environment).
         state.storage.record_journal(&prepared.journal).await?;
         Ok(prepared.into_response())
     }
