@@ -5572,8 +5572,15 @@ async fn reconcile_complete_records_failed() {
         complete["target"]["completion"]["error"],
         "cannot reach the cluster: timeout"
     );
-    // The store-side record itself is ok (the recording succeeded).
-    assert_eq!(complete["result"]["outcome"], "ok");
+    // The failed reconcile is FIRST-CLASS in the audit result (not buried in
+    // target.completion) so AuditResult monitors catch it — even though the HTTP
+    // recording itself succeeded (200, asserted above).
+    assert_eq!(complete["result"]["outcome"], "error");
+    assert_eq!(complete["result"]["kind"], "reconcile-failed");
+    assert_eq!(
+        complete["result"]["message"],
+        "cannot reach the cluster: timeout"
+    );
 }
 
 #[tokio::test]

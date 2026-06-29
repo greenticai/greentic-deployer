@@ -58,12 +58,13 @@ use greentic_deploy_spec::{
     EnvId, Environment, EnvironmentRuntime, ExtensionBindingPayload, ExtensionKeyedPayload,
     HealthStatus, IdempotencyKey, IdempotencyOutcome, IdempotencyRecord, ImportOutcome,
     ImportRequest, MessagingBundleLinkPayload, MessagingEndpointId, MigrateMergePayload,
-    PackBindingPayload, Precondition, ReconcileCompletionRequest, RemoteStoreError, RestoreOutcome,
-    RestoreRequest, RetentionPolicy, RevisionId, RevisionTransitionOutcome, RevocationConfig,
-    RollbackTrafficSplitOutcome, RollbackTrafficSplitPayload, RotateWebhookSecretPayload,
-    SchemaVersion, SecretRef, SetMessagingWelcomeFlowPayload, SetTrafficSplitPayload,
-    StageRevisionPayload, StateEtag, StateIntegrity, TrustRootAddOutcome, TrustRootRemoveOutcome,
-    TrustRootSeed, UpdateEnvironmentPayload, WarmRevisionPayload,
+    PackBindingPayload, Precondition, ReconcileCompletion, ReconcileCompletionRequest,
+    RemoteStoreError, RestoreOutcome, RestoreRequest, RetentionPolicy, RevisionId,
+    RevisionTransitionOutcome, RevocationConfig, RollbackTrafficSplitOutcome,
+    RollbackTrafficSplitPayload, RotateWebhookSecretPayload, SchemaVersion, SecretRef,
+    SetMessagingWelcomeFlowPayload, SetTrafficSplitPayload, StageRevisionPayload, StateEtag,
+    StateIntegrity, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
+    UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 use greentic_operator_trust::operator_key::{self, OperatorKey};
 use greentic_operator_trust::revenue_policy::{self, RevenuePolicyError};
@@ -458,6 +459,42 @@ fn prepare_mutation<T: Serialize>(
     previous_generation: Option<u64>,
     revision: EnvRevision,
 ) -> Result<PreparedMutation, ApiError> {
+    prepare_mutation_audited(
+        result,
+        env_id,
+        noun,
+        verb,
+        target,
+        idempotency_key,
+        fingerprint,
+        auth,
+        previous_generation,
+        revision,
+        AuditResult::Ok,
+    )
+}
+
+/// Like [`prepare_mutation`] but lets the caller stamp the audit `result`.
+/// Almost every mutation succeeds-or-errors at the store boundary, so
+/// `prepare_mutation` hard-codes `Ok`. `reconcile-complete` is the exception:
+/// it durably records an outcome that happened off-box, so a `Failed` cluster
+/// apply is a successful *recording* (HTTP 200) of a *failed* reconcile — its
+/// audit `result` must be `Error` so the audit query surface flags it, instead
+/// of the failure hiding inside `target.completion`.
+#[allow(clippy::too_many_arguments)]
+fn prepare_mutation_audited<T: Serialize>(
+    result: T,
+    env_id: &EnvId,
+    noun: &str,
+    verb: &str,
+    target: Value,
+    idempotency_key: String,
+    fingerprint: &RequestFingerprint,
+    auth: &AuthContext,
+    previous_generation: Option<u64>,
+    revision: EnvRevision,
+    audit_result: AuditResult,
+) -> Result<PreparedMutation, ApiError> {
     let audit = AuditEvent {
         schema: SchemaVersion::AUDIT_EVENT_V1.into(),
         event_id: ulid::Ulid::new().to_string(),
@@ -471,7 +508,7 @@ fn prepare_mutation<T: Serialize>(
         new_generation: Some(revision.generation),
         idempotency_key: Some(idempotency_key.clone()),
         authorization: auth.decision.clone(),
-        result: AuditResult::Ok,
+        result: audit_result,
     };
     let audit_event = serde_json::to_value(&audit).map_err(envelope_encode_error)?;
     let audit_event_id = audit.event_id.clone();
@@ -1075,13 +1112,24 @@ pub(crate) async fn complete_reconcile<S: EnvironmentStorage>(
             .map_err(load_storage_error)?;
         let completion =
             serde_json::to_value(&payload.completion).map_err(envelope_encode_error)?;
+        // A failed cluster apply is a successful *recording* (HTTP 200) of a
+        // *failed* reconcile: stamp the audit `result` as Error so operators
+        // monitoring AuditResult see the failure, rather than it hiding inside
+        // `target.completion`.
+        let audit_result = match &payload.completion {
+            ReconcileCompletion::Succeeded { .. } => AuditResult::Ok,
+            ReconcileCompletion::Failed { error } => AuditResult::Error {
+                kind: "reconcile-failed".to_string(),
+                message: error.clone(),
+            },
+        };
         let target = json!({
             "environment_id": env_id,
             "authorized_generation": payload.authorized_generation,
             "authorized_etag": payload.authorized_etag.0,
             "completion": completion,
         });
-        let prepared = prepare_mutation(
+        let prepared = prepare_mutation_audited(
             json!({ "recorded": true }),
             &env_id,
             "env",
@@ -1092,6 +1140,7 @@ pub(crate) async fn complete_reconcile<S: EnvironmentStorage>(
             &auth,
             Some(loaded.revision.generation),
             loaded.revision.clone(),
+            audit_result,
         )?;
         // Audit-only: record_journal, no desired-state write (same pattern as
         // reconcile_environment).
