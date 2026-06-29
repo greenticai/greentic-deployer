@@ -78,8 +78,8 @@ pub use refs::{
 pub use remote::{
     BackupArtifact, BackupManifest, ConcurrencyConflict, IdempotencyKey, IdempotencyOutcome,
     IdempotencyRecord, IdempotencyReplay, ImportOutcome, ImportRequest, MutationResponse,
-    Precondition, PreconditionError, RbacRequest, RemoteContractError, RemoteStoreError,
-    RestoreOutcome, RestoreRequest, StateEtag,
+    Precondition, PreconditionError, RbacRequest, ReconcileCompletion, ReconcileCompletionRequest,
+    RemoteContractError, RemoteStoreError, RestoreOutcome, RestoreRequest, StateEtag,
 };
 pub use retention::{HealthState, HealthStatus, RetentionPolicy, RevocationConfig};
 pub use revenue_policy::RevenuePolicyDocument;

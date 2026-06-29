@@ -351,6 +351,45 @@ impl RestoreOutcome {
     }
 }
 
+/// Operator-reported outcome of a cluster reconcile, posted back to the store
+/// AFTER the cluster apply so the durable audit reflects the real result — not
+/// just the authorization the matching `reconcile` recorded. Provider-neutral
+/// counts; the full applied/pruned resource lists stay in the operator's CLI
+/// output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ReconcileCompletion {
+    /// The cluster converged. `applied`/`pruned` are resource counts.
+    Succeeded { applied: u32, pruned: u32 },
+    /// The cluster apply failed; `error` is the operator-side reason.
+    Failed { error: String },
+}
+
+/// Body of `POST /environments/{id}/reconcile/complete` — the second half of a
+/// server-mediated reconcile. The operator first calls `…/reconcile` (which
+/// authorizes + audits the intent and pins the reviewed state), applies the
+/// cluster, then posts this to record the actual outcome.
+///
+/// This is **append-only**: it records a cluster change that already happened,
+/// so it is never gated on a concurrency check — a write that raced in between
+/// must not erase the audit of a real cluster mutation. The `authorized_*`
+/// fields carry the generation + etag the matching reconcile authorized,
+/// asserted by the operator (the server stamps what the authorized caller
+/// reports, exactly as webhook-ref rotation does), so the audit can correlate
+/// the completion to its authorization even after the head has advanced.
+/// Retry-safety comes from the idempotency key, not a precondition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconcileCompletionRequest {
+    /// Generation the matching reconcile authorized (from its response envelope).
+    pub authorized_generation: u64,
+    /// Etag the matching reconcile authorized — correlates this completion to
+    /// the exact reviewed snapshot.
+    pub authorized_etag: StateEtag,
+    /// The cluster outcome to record.
+    pub completion: ReconcileCompletion,
+}
+
 /// Errors a remote store can return, each mapped to its HTTP status so the
 /// client and server agree on the contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
