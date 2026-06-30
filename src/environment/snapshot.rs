@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use greentic_deploy_spec::{CapabilitySlot, EnvId, SecretRef};
+use greentic_deploy_spec::{CapabilitySlot, EnvId};
 use serde::{Deserialize, Serialize};
 
 use super::atomic_write::{atomic_write_bytes, atomic_write_json};
@@ -166,7 +166,8 @@ fn capture_file(
     manifest: &mut BTreeMap<String, bool>,
 ) -> Result<(), StoreError> {
     let src = env_dir.join(rel_path);
-    if src.is_file() {
+    let present = src.is_file();
+    if present {
         let dst = snap_dir.join(rel_path);
         let dst_parent = dst.parent().expect("snapshot file always has a parent");
         fs::create_dir_all(dst_parent).map_err(|source| StoreError::Io {
@@ -177,10 +178,8 @@ fn capture_file(
             path: src.clone(),
             source,
         })?;
-        manifest.insert(rel_path.to_string(), true);
-    } else {
-        manifest.insert(rel_path.to_string(), false);
     }
+    manifest.insert(rel_path.to_string(), present);
     Ok(())
 }
 
@@ -195,10 +194,8 @@ fn capture_file(
 ///    convention).
 /// 2. Restores each captured file byte-exact via [`atomic_write_bytes`].
 /// 3. Deletes any live file that was absent in the snapshot (meaningful-absence).
-/// 4. Loads the restored `Environment`, rewrites every [`SecretRef`]'s
-///    env-segment to the target `env_id` (so `validate()` does not reject
-///    with `CrossEnvRef`), then re-derives `runtime-config.json` and the
-///    messaging projection.
+/// 4. Re-derives the projected files (`runtime-config.json`, messaging
+///    projection) from the restored `Environment`, which `load()` validates.
 ///
 /// Restore is not transactional across files: each overwrite is individually
 /// atomic (rename-over) and the prior contents are copied to `backups/` first,
@@ -297,45 +294,13 @@ pub fn restore_environment(
             }
         }
 
-        // --- Rewrite SecretRef env segments + re-derive projections ---
+        // --- Re-derive projected files from the restored env ---
         //
-        // Load the restored environment.json, rewrite any SecretRef whose
-        // env_segment differs from the target env_id, then save and re-derive.
-        let mut env = locked.load()?;
-        let target_env_str = env_id.as_str();
-
-        let mut rewritten = false;
-
-        // credentials_ref
-        if let Some(ref cred) = env.credentials_ref
-            && cred.env_segment() != target_env_str
-        {
-            env.credentials_ref = Some(rewrite_secret_ref_env(cred, target_env_str)?);
-            rewritten = true;
-        }
-
-        // messaging_endpoints[].secret_refs + webhook_secret_ref
-        for ep in &mut env.messaging_endpoints {
-            for sr in &mut ep.secret_refs {
-                if sr.env_segment() != target_env_str {
-                    *sr = rewrite_secret_ref_env(sr, target_env_str)?;
-                    rewritten = true;
-                }
-            }
-            if let Some(ref wsr) = ep.webhook_secret_ref
-                && wsr.env_segment() != target_env_str
-            {
-                ep.webhook_secret_ref = Some(rewrite_secret_ref_env(wsr, target_env_str)?);
-                rewritten = true;
-            }
-        }
-
-        if rewritten {
-            // Re-save with corrected refs so the on-disk file passes validate().
-            locked.save(&env)?;
-        }
-
-        // Re-derive projected files from the (possibly rewritten) env.
+        // `load()` validates environment.json, so a stray cross-env SecretRef
+        // would fail loudly here. Restore is same-env by construction (the
+        // snapshot lives under this env's own dir), so no ref rewriting is
+        // needed.
+        let env = locked.load()?;
         locked.refresh_runtime_config(&env)?;
         locked.refresh_messaging_projection(&env)?;
 
@@ -352,23 +317,6 @@ fn is_safe_rel_path(rel: &str) -> bool {
     !p.is_absolute() && p.components().all(|c| matches!(c, Component::Normal(_)))
 }
 
-/// Replace the env-segment in a `SecretRef` URI with `new_env`.
-///
-/// `secret://<old_env>/rest/of/path` → `secret://<new_env>/rest/of/path`
-fn rewrite_secret_ref_env(sr: &SecretRef, new_env: &str) -> Result<SecretRef, StoreError> {
-    let raw = sr.as_str();
-    let scheme = "secret://";
-    let after_scheme = &raw[scheme.len()..];
-    let rest = match after_scheme.find('/') {
-        Some(idx) => &after_scheme[idx..],
-        None => "",
-    };
-    let new_raw = format!("{scheme}{new_env}{rest}");
-    SecretRef::try_new(new_raw).map_err(|e| {
-        StoreError::InvalidArgument(format!("failed to rewrite SecretRef env segment: {e}"))
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -382,7 +330,7 @@ mod tests {
     use chrono::Utc;
     use greentic_deploy_spec::{
         EnvId, Environment, EnvironmentHostConfig, HealthStatus, MessagingEndpoint,
-        MessagingEndpointId, RetentionPolicy, RevocationConfig, SchemaVersion,
+        MessagingEndpointId, RetentionPolicy, RevocationConfig, SchemaVersion, SecretRef,
     };
     use tempfile::TempDir;
 
@@ -587,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn secret_ref_rewrite_passes_validate() {
+    fn restore_with_secret_refs_passes_validate() {
         let tmp = TempDir::new().unwrap();
         let (store, env_id, mut env) = seed_env(&tmp);
 
@@ -629,22 +577,6 @@ mod tests {
         let a = SnapshotId::new();
         let b = SnapshotId::new();
         assert_ne!(a, b);
-    }
-
-    #[test]
-    fn rewrite_secret_ref_env_works() {
-        let sr = SecretRef::try_new("secret://old-env/tenant/team/cat/name").unwrap();
-        let rewritten = rewrite_secret_ref_env(&sr, "new-env").unwrap();
-        assert_eq!(rewritten.as_str(), "secret://new-env/tenant/team/cat/name");
-        assert_eq!(rewritten.env_segment(), "new-env");
-    }
-
-    #[test]
-    fn rewrite_secret_ref_env_no_trailing_path() {
-        let sr = SecretRef::try_new("secret://old-env").unwrap();
-        let rewritten = rewrite_secret_ref_env(&sr, "new-env").unwrap();
-        assert_eq!(rewritten.as_str(), "secret://new-env");
-        assert_eq!(rewritten.env_segment(), "new-env");
     }
 
     #[test]
