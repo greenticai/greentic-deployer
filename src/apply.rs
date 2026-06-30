@@ -1989,14 +1989,28 @@ fn materialize_secrets_provider_binding(config: &DeployerConfig, deploy_dir: &Pa
     let Some(binding) = secrets_provider_binding_for_target(config) else {
         return Ok(());
     };
-    let path = deploy_dir.join(SECRETS_PROVIDER_BINDING_RELATIVE_PATH);
+    let bytes =
+        serde_json::to_vec_pretty(&binding).map_err(|err| DeployerError::Other(err.to_string()))?;
+    // Write to the deploy output (the deployer's emitted artifacts) AND, when a
+    // bundle root is known, into it too. The runtime `.gtbundle` the worker
+    // loads is (re)built from the bundle root, so writing only to the deploy
+    // dir meant a cloud-deployed worker never saw the secrets-provider binding.
+    write_secrets_provider_binding(deploy_dir, &bytes)?;
+    if let Some(bundle_root) = config.bundle_root.as_deref() {
+        write_secrets_provider_binding(bundle_root, &bytes)?;
+    }
+    Ok(())
+}
+
+/// Write the secrets-provider binding under `root` at the canonical relative
+/// path, creating the parent directory. Used for both the deploy output and the
+/// bundle root.
+fn write_secrets_provider_binding(root: &Path, bytes: &[u8]) -> Result<()> {
+    let path = root.join(SECRETS_PROVIDER_BINDING_RELATIVE_PATH);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(&binding).map_err(|err| DeployerError::Other(err.to_string()))?,
-    )?;
+    fs::write(path, bytes)?;
     Ok(())
 }
 
@@ -5282,6 +5296,8 @@ kind: Deployment
             .expect("load default config")
             .config;
         greentic.paths.state_dir = dir.path().join(".greentic-state");
+        let bundle_root_dir = dir.path().join("bundle");
+        std::fs::create_dir_all(&bundle_root_dir).expect("create bundle root");
 
         let config = DeployerConfig {
             capability: DeployerCapability::Plan,
@@ -5290,7 +5306,7 @@ kind: Deployment
             tenant: "demo".into(),
             environment: "dev".into(),
             pack_path: Some(pack_path.clone()),
-            bundle_root: None,
+            bundle_root: Some(bundle_root_dir.clone()),
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
             provider_pack: Some(pack_path.clone()),
@@ -5374,6 +5390,17 @@ kind: Deployment
         let note = std::fs::read_to_string(artifacts.deploy_dir.join("terraform-handoff.txt"))
             .expect("read terraform handoff note");
         assert!(note.contains("secrets_provider_binding="));
+
+        // The binding must ALSO land in the bundle root, so the rebuilt
+        // .gtbundle artifact the worker loads contains it — not only the deploy
+        // output. Regression for the cloud secrets-binding handoff gap (#311).
+        let bundle_binding: SecretsProviderBinding = serde_json::from_slice(
+            &std::fs::read(bundle_root_dir.join(SECRETS_PROVIDER_BINDING_RELATIVE_PATH))
+                .expect("read bundle-root secrets provider binding"),
+        )
+        .expect("parse bundle-root secrets provider binding");
+        assert_eq!(bundle_binding.provider_id, "greentic.secrets.aws-sm");
+        assert_eq!(bundle_binding.pack, "providers/secrets/aws-sm.gtpack");
     }
 
     #[test]
