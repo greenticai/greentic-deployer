@@ -34,14 +34,9 @@ use super::trust_root::TRUST_ROOT_FILE;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SnapshotId(String);
 
-impl Default for SnapshotId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl SnapshotId {
     /// Generate a new, unique snapshot identifier.
+    #[allow(clippy::new_without_default)] // a `Default` would hide a clock/RNG read
     pub fn new() -> Self {
         Self(ulid::Ulid::new().to_string())
     }
@@ -148,11 +143,8 @@ fn snapshot_locked(store: &LocalFsStore, env_id: &EnvId) -> Result<SnapshotId, S
             capture_file(&env_dir, &rel, &snap_dir, &mut manifest_files)?;
         }
     }
-    // Record messaging dir absence so restore knows to clean up stale files.
-    if !messaging_dir.is_dir() {
-        // No messaging files existed — nothing to record (absence is the
-        // default; restore deletes anything not in the manifest).
-    }
+    // If `messaging/` is absent there's nothing to record: absence is the
+    // default, and restore deletes anything not present in the manifest.
 
     // Persist the manifest itself.
     let manifest = SnapshotManifest {
@@ -207,6 +199,11 @@ fn capture_file(
 ///    env-segment to the target `env_id` (so `validate()` does not reject
 ///    with `CrossEnvRef`), then re-derives `runtime-config.json` and the
 ///    messaging projection.
+///
+/// Restore is not transactional across files: each overwrite is individually
+/// atomic (rename-over) and the prior contents are copied to `backups/` first,
+/// but if a mid-restore step fails the env is left partially restored —
+/// recovery is then manual via the timestamped copies under `backups/`.
 pub fn restore_environment(
     store: &LocalFsStore,
     env_id: &EnvId,
@@ -218,7 +215,9 @@ pub fn restore_environment(
         let manifest_path = snap_dir.join(MANIFEST_FILE);
 
         if !manifest_path.is_file() {
-            return Err(StoreError::NotFound(env_id.clone()));
+            return Err(StoreError::DependentNotFound(format!(
+                "snapshot `{snapshot}` not found in env `{env_id}`"
+            )));
         }
         let manifest_bytes = fs::read(&manifest_path).map_err(|source| StoreError::Io {
             path: manifest_path.clone(),
@@ -234,6 +233,14 @@ pub fn restore_environment(
 
         // --- Restore each tracked file ---
         for (rel_path, present) in &manifest.files {
+            // Defense-in-depth: snapshot manifests are written internally with
+            // fixed relative paths, but reject anything that could escape the
+            // env dir in case a snapshot's manifest.json was tampered with.
+            if !is_safe_rel_path(rel_path) {
+                return Err(StoreError::InvalidArgument(format!(
+                    "snapshot manifest contains an unsafe path `{rel_path}`"
+                )));
+            }
             let live_path = env_dir.join(rel_path);
             if *present {
                 // File was present at snapshot time → restore byte-exact.
@@ -334,6 +341,15 @@ pub fn restore_environment(
 
         Ok(())
     })
+}
+
+/// Whether `rel` is a safe relative path confined to the env dir — not
+/// absolute and free of `..`/root components. Guards restore against a
+/// tampered snapshot manifest.
+fn is_safe_rel_path(rel: &str) -> bool {
+    use std::path::Component;
+    let p = Path::new(rel);
+    !p.is_absolute() && p.components().all(|c| matches!(c, Component::Normal(_)))
 }
 
 /// Replace the env-segment in a `SecretRef` URI with `new_env`.
@@ -489,8 +505,9 @@ mod tests {
             restored_env_bytes, corrupted,
             "should not be corrupted anymore"
         );
-        // The environment.json was re-saved (SecretRef re-derive path), so we
-        // verify via deserialization + validate.
+        // SecretRefs already match this env, so environment.json is byte-exact
+        // from the snapshot (the re-save path is a no-op here); verify via
+        // deserialization + validate.
         let restored_env: Environment = serde_json::from_slice(&restored_env_bytes).unwrap();
         restored_env.validate().unwrap();
         assert_eq!(restored_env.environment_id, env_id);
@@ -628,5 +645,17 @@ mod tests {
         let rewritten = rewrite_secret_ref_env(&sr, "new-env").unwrap();
         assert_eq!(rewritten.as_str(), "secret://new-env");
         assert_eq!(rewritten.env_segment(), "new-env");
+    }
+
+    #[test]
+    fn is_safe_rel_path_rejects_escapes() {
+        // Normal manifest paths are accepted.
+        assert!(is_safe_rel_path("environment.json"));
+        assert!(is_safe_rel_path("env-packs/deployer/answers.json"));
+        assert!(is_safe_rel_path("messaging/tg.json"));
+        // Anything that could escape the env dir is rejected.
+        assert!(!is_safe_rel_path("../other-env/environment.json"));
+        assert!(!is_safe_rel_path("/etc/passwd"));
+        assert!(!is_safe_rel_path("a/../../b"));
     }
 }
