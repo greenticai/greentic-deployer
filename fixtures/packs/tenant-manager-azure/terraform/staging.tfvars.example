@@ -1,0 +1,10 @@
+azure_subscription_id          = "00000000-0000-0000-0000-000000000000"
+azure_resource_group           = "greentic-tm-rg"
+azure_location                 = "eastus"
+image_uri                      = "greentic.azurecr.io/tenant-manager@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+domain_name                    = "id.example.com"
+db_sku_name                    = "B_Standard_B1ms"
+key_vault_id                   = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/greentic-tm-rg/providers/Microsoft.KeyVault/vaults/greentic-kv"
+master_key_secret_id           = "https://greentic-kv.vault.azure.net/secrets/tm-master-key"
+platform_secret_hash_secret_id = "https://greentic-kv.vault.azure.net/secrets/tm-platform-hash"
+create_dns_record              = false

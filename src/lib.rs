@@ -1,4 +1,8 @@
 #![forbid(unsafe_code)]
+// The env-manifest JSON schema (`cli::env_manifest::manifest_schema`) is one
+// large `serde_json::json!` literal; `json!` recurses once per object key, so
+// the default limit of 128 is exceeded as the schema grows.
+#![recursion_limit = "256"]
 
 pub mod adapter;
 pub mod admin_access;
@@ -9,10 +13,15 @@ pub mod apply;
 pub mod aws;
 pub mod azure;
 pub mod bundle_upload;
+pub mod cli;
 pub mod config;
 pub mod contract;
+pub mod credentials;
+pub mod defaults;
 pub mod deployment;
 pub mod desktop;
+pub mod env_packs;
+pub mod environment;
 pub mod error;
 pub mod extension;
 pub mod extension_sources;
@@ -23,18 +32,25 @@ pub mod juju_machine;
 pub mod k8s_raw;
 pub mod multi_target;
 pub mod operator;
+// Moved to the `greentic-operator-trust` crate (PR-4.2e) so the
+// operator-store-server can load/generate its own operator key; re-exported
+// so `crate::operator_key::*` call sites stay unchanged.
+pub use greentic_operator_trust::operator_key;
 pub mod pack_introspect;
 pub mod path_safety;
 pub mod plan;
+pub(crate) mod rollout_telemetry;
 pub mod runtime_secret_sink;
 pub mod runtime_secrets;
 pub mod serverless;
 pub mod single_vm;
 pub mod snap;
+pub mod sorx_routing;
 pub mod spec;
 pub mod surface;
 pub mod telemetry;
 pub mod terraform;
+pub mod tool_check;
 
 pub use adapter::{AdapterFamily, MultiTargetKind, UnifiedTargetSelection};
 pub use admin_access::{
@@ -57,6 +73,7 @@ pub use deployment::{
     ApplyExecutionOutcome, DestroyExecutionOutcome, ExecutionOutcome, ExecutionOutcomePayload,
     StatusExecutionOutcome,
 };
+pub use env_packs::{EnvPackHandler, EnvPackRegistry, RegistryError};
 pub use error::DeployerError;
 pub use extension::{
     BuiltinBackendDescriptor, BuiltinBackendExecutionKind, BuiltinBackendHandlerId,
@@ -118,3 +135,4 @@ pub use spec::{
     ServiceManager, ServiceSpec, StorageSpec,
 };
 pub use terraform::TerraformRequest;
+pub use tool_check::{ToolCheck, ToolCheckOutcome};

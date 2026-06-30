@@ -71,9 +71,9 @@ fn sample_flow(id: &str, kind: FlowKind, component: &ComponentManifest) -> Flow 
             output: OutputMapping {
                 mapping: serde_json::Value::Null,
             },
+            err_map: None,
             routing: Routing::End,
             telemetry: Default::default(),
-            err_map: Default::default(),
         },
     );
 
@@ -112,6 +112,7 @@ fn sample_manifest() -> PackManifest {
     ];
 
     PackManifest {
+        agents: Default::default(),
         schema_version: "pack-v1".to_string(),
         pack_id: PackId::from_str("dev.greentic.sample").unwrap(),
         name: None,
@@ -178,7 +179,7 @@ fn default_config(pack_path: PathBuf) -> DeployerConfig {
         strategy: "iac-only".into(),
         tenant: "acme".into(),
         environment: "dev".into(),
-        pack_path,
+        pack_path: Some(pack_path),
         bundle_root: None,
         providers_dir: PathBuf::from("providers/deployer"),
         packs_dir: PathBuf::from("packs"),

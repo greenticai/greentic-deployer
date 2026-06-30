@@ -11,7 +11,7 @@ use crate::plan::PlanContext;
 pub struct TerraformRequest {
     pub capability: DeployerCapability,
     pub tenant: String,
-    pub pack_path: PathBuf,
+    pub pack_path: Option<PathBuf>,
     pub provider_pack: Option<PathBuf>,
     pub deploy_pack_id_override: Option<String>,
     pub deploy_flow_id_override: Option<String>,
@@ -35,7 +35,7 @@ impl TerraformRequest {
     pub fn new(
         capability: DeployerCapability,
         tenant: impl Into<String>,
-        pack_path: PathBuf,
+        pack_path: Option<PathBuf>,
     ) -> Self {
         Self {
             capability,
@@ -141,14 +141,17 @@ mod tests {
 
     #[test]
     fn terraform_request_defaults_to_generic_terraform_target() {
-        let request =
-            TerraformRequest::new(DeployerCapability::Plan, "acme", PathBuf::from("pack-dir"))
-                .into_deployer_request();
+        let request = TerraformRequest::new(
+            DeployerCapability::Plan,
+            "acme",
+            Some(PathBuf::from("pack-dir")),
+        )
+        .into_deployer_request();
 
         assert_eq!(request.provider, Provider::Generic);
         assert_eq!(request.strategy, "terraform");
         assert_eq!(request.tenant, "acme");
-        assert_eq!(request.pack_path, PathBuf::from("pack-dir"));
+        assert_eq!(request.pack_path, Some(PathBuf::from("pack-dir")));
     }
 
     #[test]
@@ -159,7 +162,7 @@ mod tests {
             strategy: "iac-only".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: PathBuf::from("pack-dir"),
+            pack_path: Some(PathBuf::from("pack-dir")),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),

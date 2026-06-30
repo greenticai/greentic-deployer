@@ -33,6 +33,7 @@ pub fn build_provider_gtpack(fixture_name: &str, output_path: &Path, pack_id: &s
             .expect("parse contract");
 
     let mut manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "pack-v1".to_string(),
         pack_id: PackId::from_str(pack_id).expect("pack id"),
         name: Some("Fixture terraform provider pack".to_string()),
@@ -68,6 +69,7 @@ pub fn build_operator_provider_gtpack(output_path: &Path) {
             .expect("parse contract");
 
     let mut manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "pack-v1".to_string(),
         pack_id: PackId::from_str("greentic.deploy.operator").expect("pack id"),
         name: Some("Fixture operator provider pack".to_string()),

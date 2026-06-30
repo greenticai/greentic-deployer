@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TenantManagerGcpDeployInput",
+  "type": "object",
+  "required": [
+    "gcp_project_id",
+    "gcp_region",
+    "image_uri",
+    "domain_name",
+    "master_key_secret_id",
+    "platform_secret_hash_secret_id"
+  ],
+  "properties": {
+    "gcp_project_id": { "type": "string", "description": "GCP project ID" },
+    "gcp_region": { "type": "string", "description": "GCP region (e.g. us-central1)" },
+    "image_uri": { "type": "string", "description": "digest-pinned tenant-manager image" },
+    "domain_name": { "type": "string", "description": "Custom domain for the Cloud Run service" },
+    "db_tier": { "type": "string", "default": "db-f1-micro", "description": "Cloud SQL machine tier" },
+    "master_key_secret_id": { "type": "string", "description": "Secret Manager secret ID for the master key (not the full resource name)" },
+    "platform_secret_hash_secret_id": { "type": "string", "description": "Secret Manager secret ID for the platform secret hash" }
+  }
+}

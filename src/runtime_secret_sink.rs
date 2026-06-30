@@ -167,10 +167,11 @@ mod tests {
                 key: key.to_string(),
                 required: true,
                 default_value: None,
+                aliases: Vec::new(),
                 generated: None,
                 source: PathBuf::from("packs/demo"),
             },
-            value: SecretValue::new(value.to_string()),
+            value: SecretValue::from(value.to_string()),
             source: crate::runtime_secrets::SecretValueSource::DevStore {
                 path: PathBuf::from(".greentic/dev/.dev.secrets.env"),
             },

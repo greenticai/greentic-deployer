@@ -25,7 +25,7 @@ use crate::runtime_secrets::{
 pub struct AwsRequest {
     pub capability: DeployerCapability,
     pub tenant: String,
-    pub pack_path: PathBuf,
+    pub pack_path: Option<PathBuf>,
     pub bundle_root: Option<PathBuf>,
     pub bundle_source: Option<String>,
     pub bundle_digest: Option<String>,
@@ -88,7 +88,7 @@ impl AwsRequest {
     pub fn new(
         capability: DeployerCapability,
         tenant: impl Into<String>,
-        pack_path: PathBuf,
+        pack_path: Option<PathBuf>,
     ) -> Self {
         Self {
             capability,
@@ -178,9 +178,7 @@ fn build_aws_request_from_ext(
     AwsRequest {
         capability,
         tenant: cfg.tenant.clone(),
-        pack_path: pack_path
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_default(),
+        pack_path: pack_path.map(std::path::Path::to_path_buf),
         bundle_root: None,
         bundle_source: Some(cfg.bundle_source.clone()),
         bundle_digest: Some(cfg.bundle_digest.clone()),
@@ -742,10 +740,16 @@ fn aws_cli_capture(args: &[&str], label: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    use tempfile::tempdir;
+
     #[test]
     fn aws_request_defaults_to_aws_iac_target() {
-        let request = AwsRequest::new(DeployerCapability::Plan, "acme", PathBuf::from("pack-dir"))
-            .into_deployer_request();
+        let request = AwsRequest::new(
+            DeployerCapability::Plan,
+            "acme",
+            Some(PathBuf::from("pack-dir")),
+        )
+        .into_deployer_request();
 
         assert_eq!(request.provider, Provider::Aws);
         assert_eq!(request.strategy, "iac-only");
@@ -754,8 +758,11 @@ mod tests {
 
     #[test]
     fn aws_request_preserves_all_passthrough_fields() {
-        let mut request =
-            AwsRequest::new(DeployerCapability::Apply, "acme", PathBuf::from("pack-dir"));
+        let mut request = AwsRequest::new(
+            DeployerCapability::Apply,
+            "acme",
+            Some(PathBuf::from("pack-dir")),
+        );
         request.bundle_root = Some(PathBuf::from("bundle-root"));
         request.bundle_source = Some("s3://bucket/bundle.gtbundle".into());
         request.bundle_digest = Some("sha256:abc".into());
@@ -837,8 +844,12 @@ mod tests {
     #[test]
     fn ensure_aws_config_rejects_non_aws_provider() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut request = AwsRequest::new(DeployerCapability::Plan, "acme", tmp.path().into())
-            .into_deployer_request();
+        let mut request = AwsRequest::new(
+            DeployerCapability::Plan,
+            "acme",
+            Some(tmp.path().to_path_buf()),
+        )
+        .into_deployer_request();
         request.provider = Provider::Gcp;
         let config = DeployerConfig::resolve(request).expect("resolve config");
 
@@ -852,8 +863,12 @@ mod tests {
     #[test]
     fn ensure_aws_config_accepts_aws_iac_config() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let request = AwsRequest::new(DeployerCapability::Plan, "acme", tmp.path().into())
-            .into_deployer_request();
+        let request = AwsRequest::new(
+            DeployerCapability::Plan,
+            "acme",
+            Some(tmp.path().to_path_buf()),
+        )
+        .into_deployer_request();
         let config = DeployerConfig::resolve(request).expect("resolve config");
 
         ensure_aws_config(&config).expect("aws config");
@@ -882,7 +897,7 @@ mod tests {
 
         assert_eq!(request.capability, DeployerCapability::Destroy);
         assert_eq!(request.tenant, "acme");
-        assert_eq!(request.pack_path, PathBuf::from("pack"));
+        assert_eq!(request.pack_path, Some(PathBuf::from("pack")));
         assert_eq!(
             request.bundle_source.as_deref(),
             Some("oci://registry.example/acme/prod")
@@ -924,7 +939,7 @@ mod tests {
 
         assert_eq!(request.capability, DeployerCapability::Apply);
         assert_eq!(request.tenant, "default");
-        assert_eq!(request.pack_path, PathBuf::new());
+        assert_eq!(request.pack_path, None);
         assert_eq!(
             request.bundle_source.as_deref(),
             Some("s3://bucket/bundle.gtbundle")
@@ -1183,5 +1198,184 @@ mod tests {
                 || msg.contains("bundle_source"),
             "got: {msg}"
         );
+    }
+
+    #[test]
+    fn build_aws_request_from_ext_populates_extension_fields() {
+        let cfg = AwsEcsFargateExtConfig {
+            region: "eu-north-1".to_string(),
+            environment: "prod".to_string(),
+            operator_image_digest: "sha256:deadbeef".to_string(),
+            bundle_source: "oci://registry.example/app@sha256:1111".to_string(),
+            bundle_digest: "sha256:2222".to_string(),
+            remote_state_backend: "s3://demo/state".to_string(),
+            redis_url: None,
+            dns_name: Some("api.example.com".to_string()),
+            public_base_url: Some("https://api.example.com".to_string()),
+            repo_registry_base: Some("https://repo.example.com".to_string()),
+            store_registry_base: Some("https://store.example.com".to_string()),
+            admin_allowed_clients: Some("CN=admin".to_string()),
+            tenant: "acme".to_string(),
+        };
+
+        let request = build_aws_request_from_ext(
+            DeployerCapability::Destroy,
+            &cfg,
+            Some(Path::new("/tmp/demo-pack")),
+        );
+
+        assert_eq!(request.capability, DeployerCapability::Destroy);
+        assert_eq!(request.tenant, "acme");
+        assert_eq!(request.pack_path, Some(PathBuf::from("/tmp/demo-pack")));
+        assert_eq!(
+            request.bundle_source.as_deref(),
+            Some("oci://registry.example/app@sha256:1111")
+        );
+        assert_eq!(request.bundle_digest.as_deref(), Some("sha256:2222"));
+        assert_eq!(request.environment.as_deref(), Some("prod"));
+        assert_eq!(
+            request.repo_registry_base.as_deref(),
+            Some("https://repo.example.com")
+        );
+        assert_eq!(
+            request.store_registry_base.as_deref(),
+            Some("https://store.example.com")
+        );
+        assert!(request.execute_local);
+        assert_eq!(request.output, OutputFormat::Text);
+    }
+
+    #[test]
+    fn helper_parsers_extract_expected_aws_values() {
+        assert_eq!(
+            aws_region_from_secret_arn(
+                "arn:aws:secretsmanager:eu-north-1:123456789012:secret:greentic/admin/demo/ca"
+            )
+            .as_deref(),
+            Some("eu-north-1")
+        );
+        assert_eq!(aws_region_from_secret_arn("invalid"), None);
+
+        assert_eq!(
+            deploy_name_prefix_from_secret_arn(
+                "arn:aws:secretsmanager:eu-north-1:123456789012:secret:greentic/admin/demo/ca"
+            )
+            .as_deref(),
+            Some("demo")
+        );
+        assert_eq!(
+            deploy_name_prefix_from_secret_arn(
+                "arn:aws:secretsmanager:eu-north-1:123456789012:secret:other/demo/ca"
+            ),
+            None
+        );
+
+        assert_eq!(
+            task_id_from_arn("arn:aws:ecs:eu-north-1:123456789012:task/demo-cluster/task-123")
+                .as_deref(),
+            Some("task-123")
+        );
+    }
+
+    #[test]
+    fn maybe_write_tunnel_admin_certs_skips_when_secret_refs_are_missing() {
+        let temp = tempdir().expect("tempdir");
+        let outputs = serde_json::json!({
+            "admin_ca_secret_ref": {
+                "value": "arn:aws:secretsmanager:eu-north-1:123456789012:secret:greentic/admin/demo/ca"
+            }
+        });
+
+        maybe_write_tunnel_admin_certs(temp.path(), &outputs, "eu-north-1", "demo")
+            .expect("skip missing refs");
+
+        assert!(!tunnel_admin_cert_dir(temp.path(), "demo").exists());
+    }
+
+    #[test]
+    fn run_admin_tunnel_reports_missing_admin_ca_secret_ref() {
+        let temp = tempdir().expect("tempdir");
+        let bundle_dir = temp.path().join("bundle");
+        let deploy_dir = bundle_dir
+            .join(".greentic")
+            .join("deploy")
+            .join("aws")
+            .join("demo")
+            .join("state");
+        fs::create_dir_all(&deploy_dir).expect("create deploy dir");
+        fs::write(deploy_dir.join("terraform-outputs.json"), b"{}").expect("write outputs");
+
+        let err = run_admin_tunnel(AwsAdminTunnelRequest {
+            bundle_dir,
+            local_port: "8443".to_string(),
+            container: "app".to_string(),
+        })
+        .unwrap_err();
+
+        assert!(format!("{err}").contains("missing admin_ca_secret_ref"));
+    }
+
+    #[test]
+    fn run_admin_tunnel_rejects_secret_refs_without_deploy_prefix() {
+        let temp = tempdir().expect("tempdir");
+        let bundle_dir = temp.path().join("bundle");
+        let deploy_dir = bundle_dir
+            .join(".greentic")
+            .join("deploy")
+            .join("aws")
+            .join("demo")
+            .join("state");
+        fs::create_dir_all(&deploy_dir).expect("create deploy dir");
+        fs::write(
+            deploy_dir.join("terraform-outputs.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "admin_ca_secret_ref": {
+                    "value": "arn:aws:secretsmanager:eu-north-1:123456789012:secret:other/demo/ca"
+                }
+            }))
+            .expect("serialize outputs"),
+        )
+        .expect("write outputs");
+
+        let err = run_admin_tunnel(AwsAdminTunnelRequest {
+            bundle_dir,
+            local_port: "8443".to_string(),
+            container: "app".to_string(),
+        })
+        .unwrap_err();
+
+        assert!(format!("{err}").contains("failed to derive deploy name prefix"));
+    }
+
+    #[test]
+    fn run_admin_tunnel_rejects_secret_refs_without_region() {
+        let temp = tempdir().expect("tempdir");
+        let bundle_dir = temp.path().join("bundle");
+        let deploy_dir = bundle_dir
+            .join(".greentic")
+            .join("deploy")
+            .join("aws")
+            .join("demo")
+            .join("state");
+        fs::create_dir_all(&deploy_dir).expect("create deploy dir");
+        fs::write(
+            deploy_dir.join("terraform-outputs.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "admin_ca_secret_ref": {
+                    "value": "invalid-secret-ref"
+                }
+            }))
+            .expect("serialize outputs"),
+        )
+        .expect("write outputs");
+
+        let err = run_admin_tunnel(AwsAdminTunnelRequest {
+            bundle_dir,
+            local_port: "8443".to_string(),
+            container: "app".to_string(),
+        })
+        .unwrap_err();
+
+        assert!(format!("{err}").contains("failed to derive AWS region"));
     }
 }

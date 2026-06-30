@@ -1,0 +1,20 @@
+{
+  "kind": "status",
+  "deployment_id": "deploy/azure/acme/staging",
+  "state": "handoff_ready",
+  "provider": "azure",
+  "strategy": "iac-only",
+  "status_source": "terraform_handoff",
+  "endpoints": [
+    "https://id.example.com"
+  ],
+  "health_checks": [
+    "terraform_root:present",
+    "script:terraform-status.sh:present"
+  ],
+  "output_refs": {
+    "cloud_provider": "azure",
+    "service_url": "https://id.example.com",
+    "db_fqdn": "greentic-tm-prod-postgres.postgres.database.azure.com"
+  }
+}

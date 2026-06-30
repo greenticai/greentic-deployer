@@ -6,25 +6,21 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use greentic_secrets_lib::{
-    DevStore, SecretsStore, TEAM_PLACEHOLDER, canonical_secret_name, canonical_secret_store_key,
-    normalize_team,
+    DevStore, GeneratedSecretRequirement, GeneratedSecretScope, SecretsStore, TEAM_PLACEHOLDER,
+    canonical_secret_name, canonical_secret_store_key, generated_scope_team, normalize_team,
 };
-use greentic_types::{ExtensionInline, decode_pack_manifest};
-use rand::RngExt as _;
 use serde::Deserialize;
-use serde_cbor::value::Value as CborValue;
-use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use zip::{ZipArchive, result::ZipError};
 
 use crate::config::{DeployerConfig, Provider};
 use crate::contract::DeployerCapability;
+use crate::environment::{EnvironmentStore, LocalFsStore};
 use crate::error::{DeployerError, Result};
+use greentic_deploy_spec::{EnvId, Environment};
 
 const DEV_SECRETS_PATH_ENV: &str = "GREENTIC_DEV_SECRETS_PATH";
-const EXT_GENERATED_SECRETS_V1: &str = "greentic.generated-secrets.v1";
 const SECRET_ASSET_PATHS: &[&str] = &[
     "assets/secret-requirements.json",
     "assets/secret_requirements.json",
@@ -39,35 +35,31 @@ pub struct RuntimeSecretRequirement {
     pub key: String,
     pub required: bool,
     pub default_value: Option<String>,
+    /// Canonicalized alternate names a previously-seeded value may live under.
+    /// Resolution checks these URIs too, mirroring greentic-start so a value
+    /// stored under a legacy/aliased key is still found and promoted.
+    pub aliases: Vec<String>,
+    /// Generation policy when the secret is system-generated; `None` =
+    /// operator-supplied. Carried (parsed into the shared `greentic-secrets`
+    /// model) so the deployer is *aware* which secrets are system-minted — used
+    /// today for a clearer missing-secret diagnostic; the active mint/promote
+    /// pass is a deferred follow-up.
     pub generated: Option<GeneratedSecretRequirement>,
     pub source: PathBuf,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GeneratedSecretRequirement {
-    pub policy: String,
-    pub length: usize,
-    pub encoding: String,
-    pub scope: GeneratedSecretScope,
-    pub regenerate_if_present: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GeneratedSecretScope {
-    pub level: String,
-    pub team: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SecretValue(String);
 
 impl SecretValue {
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-
     pub fn expose(&self) -> &str {
         &self.0
+    }
+}
+
+impl From<String> for SecretValue {
+    fn from(value: String) -> Self {
+        Self(value)
     }
 }
 
@@ -88,8 +80,6 @@ pub struct ResolvedRuntimeSecret {
 pub enum SecretValueSource {
     Env { key: String },
     DevStore { path: PathBuf },
-    SetupAnswers { path: PathBuf },
-    Generated,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +113,76 @@ pub struct RuntimeSecretContext {
     pub environment: String,
     pub tenant: String,
     pub team: Option<String>,
+    /// Dev-store roots beyond `bundle_root` to also search for secret values —
+    /// e.g. the operator env directory (`~/.greentic/environments/<env>`) where
+    /// `op messaging add` and `gtc setup` write. Cloud-apply populates this so
+    /// per-endpoint webhook secrets and setup-minted generated secrets resolve;
+    /// other callers leave it empty.
+    pub extra_dev_store_roots: Vec<PathBuf>,
+}
+
+/// Shared cloud-apply secret inputs: resolves the bundle root + pack paths,
+/// best-effort loads the operator `Environment`, and returns the resolution
+/// context plus the pack-declared and per-endpoint (webhook) requirements.
+/// Endpoint requirements are deduped against pack URIs HERE — the single place
+/// that "pack wins on URI collision" policy lives — so the promote path and the
+/// env-map both see exactly one remote name per URI. `Ok(None)` when there is
+/// no bundle root to scan; callers map that to their own empty result.
+struct CloudSecretInputs {
+    ctx: RuntimeSecretContext,
+    pack_requirements: Vec<RuntimeSecretRequirement>,
+    endpoint_requirements: Vec<RuntimeSecretRequirement>,
+}
+
+fn collect_cloud_secret_inputs(config: &DeployerConfig) -> Result<Option<CloudSecretInputs>> {
+    let Some(bundle_root) = config.bundle_root.clone().or_else(|| {
+        config
+            .pack_path
+            .as_deref()
+            .and_then(infer_bundle_root_from_pack_path)
+    }) else {
+        return Ok(None);
+    };
+
+    let mut pack_paths: Vec<PathBuf> = config.pack_path.clone().into_iter().collect();
+    if let Some(provider_pack) = config.provider_pack.as_ref() {
+        pack_paths.push(provider_pack.clone());
+    }
+    pack_paths.extend(discover_bundle_pack_paths(&bundle_root)?);
+    pack_paths = dedup_paths(pack_paths);
+
+    let loaded_env = load_environment_for_config(config)?;
+    let extra_dev_store_roots = loaded_env
+        .as_ref()
+        .map(|(_, env_dir)| vec![env_dir.clone()])
+        .unwrap_or_default();
+    let ctx = RuntimeSecretContext {
+        bundle_root,
+        pack_paths,
+        environment: config.environment.clone(),
+        tenant: config.tenant.clone(),
+        team: None,
+        extra_dev_store_roots,
+    };
+
+    let pack_requirements = collect_requirements(&ctx)?;
+    let mut endpoint_requirements = match loaded_env.as_ref() {
+        Some((env, _)) => collect_endpoint_webhook_requirements(env)?,
+        None => Vec::new(),
+    };
+    // Pack-declared requirements win on any URI collision: drop a per-endpoint
+    // requirement whose URI a pack already declares so promotion and the env-map
+    // never disagree on which remote name backs a URI.
+    if !endpoint_requirements.is_empty() {
+        let pack_uris: BTreeSet<&str> = pack_requirements.iter().map(|r| r.uri.as_str()).collect();
+        endpoint_requirements.retain(|r| !pack_uris.contains(r.uri.as_str()));
+    }
+
+    Ok(Some(CloudSecretInputs {
+        ctx,
+        pack_requirements,
+        endpoint_requirements,
+    }))
 }
 
 pub async fn resolve_for_cloud_apply(
@@ -136,35 +196,174 @@ pub async fn resolve_for_cloud_apply(
     {
         return Ok(None);
     }
-    let Some(bundle_root) = config
-        .bundle_root
-        .clone()
-        .or_else(|| infer_bundle_root_from_pack_path(&config.pack_path))
+    let Some(CloudSecretInputs {
+        ctx,
+        mut pack_requirements,
+        endpoint_requirements,
+    }) = collect_cloud_secret_inputs(config)?
     else {
         return Ok(None);
     };
-
-    let pack_paths = pack_paths_for_cloud_apply(config, &bundle_root)?;
-
-    let ctx = RuntimeSecretContext {
-        bundle_root,
-        pack_paths,
-        environment: config.environment.clone(),
-        tenant: config.tenant.clone(),
-        team: None,
-    };
-    let requirements = collect_requirements(&ctx)?;
-    if requirements.is_empty() {
+    // Endpoint requirements are already deduped against pack URIs, so merging is
+    // a plain extend. Per-endpoint webhook secrets aren't pack-declared, so this
+    // is how they get resolved from the env dev-store and promoted.
+    pack_requirements.extend(endpoint_requirements);
+    if pack_requirements.is_empty() {
         return Ok(None);
     }
 
-    let resolution = resolve_runtime_secrets(&ctx, &requirements).await;
+    let resolution = resolve_runtime_secrets(&ctx, &pack_requirements).await;
     if !resolution.missing.is_empty() {
         return Err(DeployerError::Config(format_missing_runtime_secrets(
             &resolution.missing,
         )));
     }
     Ok(Some(resolution))
+}
+
+fn load_environment_for_config(config: &DeployerConfig) -> Result<Option<(Environment, PathBuf)>> {
+    // Not a valid env id, or no per-user store root to look under → no
+    // operator environment to enumerate; the pack-only path is unaffected.
+    // A non-default `--store-root` is not visible from `DeployerConfig`, so
+    // such deploys also land here (documented limitation).
+    let Ok(env_id) = EnvId::try_from(config.environment.as_str()) else {
+        return Ok(None);
+    };
+    let Some(root) = LocalFsStore::default_root() else {
+        return Ok(None);
+    };
+    load_environment_from_store(&LocalFsStore::new(root), &env_id)
+}
+
+/// Load an environment, failing CLOSED once we know it exists: a present-but
+/// unreadable `environment.json` (or an `env_dir` failure) must surface, not
+/// be silently treated as "no env" — that would drop required endpoint
+/// secrets from promotion with no deploy-time signal.
+fn load_environment_from_store(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+) -> Result<Option<(Environment, PathBuf)>> {
+    if !store
+        .exists(env_id)
+        .map_err(|e| DeployerError::Config(format!("environment store: {e}")))?
+    {
+        return Ok(None);
+    }
+    let env = store
+        .load(env_id)
+        .map_err(|e| DeployerError::Config(format!("load environment {env_id}: {e}")))?;
+    let env_dir = store
+        .env_dir(env_id)
+        .map_err(|e| DeployerError::Config(format!("environment dir {env_id}: {e}")))?;
+    Ok(Some((env, env_dir)))
+}
+
+const WEBHOOK_SECRET_KEY: &str = "webhook_secret";
+
+/// Synthesize a runtime-secret requirement for each per-endpoint webhook secret
+/// recorded on the environment. The value already lives in the env dev-store
+/// (minted by `op messaging add`/`rotate`); cloud-apply must promote it so the
+/// runtime — which reads it by the same `secrets://…` URI — finds it in the
+/// cloud secret manager. These are never pack-declared, which is the gap this
+/// closes. `provider_id` embeds the (lowercased) endpoint id so each webhook
+/// promotes to a distinct cloud secret name.
+fn collect_endpoint_webhook_requirements(
+    env: &Environment,
+) -> Result<Vec<RuntimeSecretRequirement>> {
+    let mut out = Vec::new();
+    for endpoint in &env.messaging_endpoints {
+        let Some(secret_ref) = endpoint.webhook_secret_ref.as_ref() else {
+            continue;
+        };
+        let uri = secret_ref
+            .to_store_uri()
+            .map_err(|e| {
+                DeployerError::Config(format!(
+                    "messaging endpoint {} webhook_secret_ref: {e}",
+                    endpoint.endpoint_id
+                ))
+            })?
+            .to_string();
+        let eid_lower = endpoint.endpoint_id.to_string().to_lowercase();
+        out.push(RuntimeSecretRequirement {
+            uri,
+            provider_id: format!("messaging-{eid_lower}"),
+            key: WEBHOOK_SECRET_KEY.to_string(),
+            required: true,
+            default_value: None,
+            aliases: Vec::new(),
+            generated: None,
+            source: PathBuf::from("environment.json"),
+        });
+    }
+    Ok(out)
+}
+
+/// The cloud secret-manager resource name a requirement promotes to, scoped to
+/// the active cloud provider's naming rules. `None` for non-cloud providers.
+fn cloud_remote_name(
+    provider: Provider,
+    prefix: &str,
+    requirement: &RuntimeSecretRequirement,
+) -> Option<String> {
+    match provider {
+        Provider::Aws => Some(cloud_secret_name(
+            prefix,
+            &requirement.provider_id,
+            &requirement.key,
+        )),
+        Provider::Azure => Some(flat_cloud_secret_name(
+            prefix,
+            &requirement.provider_id,
+            &requirement.key,
+            127,
+        )),
+        Provider::Gcp => Some(flat_cloud_secret_name(
+            prefix,
+            &requirement.provider_id,
+            &requirement.key,
+            255,
+        )),
+        _ => None,
+    }
+}
+
+fn build_cloud_env_map(
+    provider: Provider,
+    prefix: &str,
+    pack_requirements: &[RuntimeSecretRequirement],
+    endpoint_requirements: &[RuntimeSecretRequirement],
+    resolved_uris: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let mut env_map = BTreeMap::new();
+    for requirement in pack_requirements {
+        if !requirement.required && !resolved_uris.contains(&requirement.uri) {
+            continue;
+        }
+        let Some(remote_name) = cloud_remote_name(provider, prefix, requirement) else {
+            continue;
+        };
+        env_map.insert(requirement.uri.clone(), remote_name.clone());
+        env_map.insert(requirement.key.clone(), remote_name);
+    }
+    // Per-endpoint webhook secrets key the env-map by URI ONLY (every
+    // endpoint's `key` is the literal `webhook_secret`, so a bare-key alias
+    // would collide across endpoints). The `contains_key` guard is defensive:
+    // `collect_cloud_secret_inputs` already drops endpoint URIs a pack declares,
+    // but keeping it makes this pure helper correct on any input (pack wins).
+    for requirement in endpoint_requirements {
+        if env_map.contains_key(&requirement.uri) {
+            continue;
+        }
+        if !requirement.required && !resolved_uris.contains(&requirement.uri) {
+            continue;
+        }
+        let Some(remote_name) = cloud_remote_name(provider, prefix, requirement) else {
+            continue;
+        };
+        env_map.insert(requirement.uri.clone(), remote_name);
+    }
+    env_map
 }
 
 pub fn default_cloud_secret_prefix(environment: &str, tenant: &str, team: Option<&str>) -> String {
@@ -184,13 +383,24 @@ pub fn collect_requirements(ctx: &RuntimeSecretContext) -> Result<Vec<RuntimeSec
         let provider_id = provider_id_from_pack_path(pack_path);
         for req in load_secret_requirements_from_pack(pack_path)? {
             let key = canonical_secret_name(&req.key);
-            let uri = canonical_secret_uri(
-                &ctx.environment,
-                &ctx.tenant,
-                requirement_team(req.generated.as_ref(), ctx.team.as_deref()),
-                &provider_id,
-                &key,
-            );
+            let generated = req
+                .generated
+                .as_ref()
+                .map(AssetGeneratedSecret::to_requirement);
+            // A system-generated secret is minted under the team its scope
+            // resolves to (`generated_scope_team`) — NOT the context team — so
+            // the deployer reads/promotes it from exactly where the runtime
+            // seeded it. Operator-supplied secrets stay on the context team.
+            let team = match &generated {
+                Some(generated) => generated_scope_team(generated, ctx.team.as_deref()),
+                None => ctx.team.as_deref(),
+            };
+            let uri = canonical_secret_uri(&ctx.environment, &ctx.tenant, team, &provider_id, &key);
+            let aliases = req
+                .aliases
+                .iter()
+                .map(|alias| canonical_secret_name(alias))
+                .collect();
             by_uri
                 .entry(uri.clone())
                 .or_insert(RuntimeSecretRequirement {
@@ -199,7 +409,8 @@ pub fn collect_requirements(ctx: &RuntimeSecretContext) -> Result<Vec<RuntimeSec
                     key,
                     required: req.required,
                     default_value: req.default_value,
-                    generated: req.generated,
+                    aliases,
+                    generated,
                     source: pack_path.clone(),
                 });
         }
@@ -207,190 +418,234 @@ pub fn collect_requirements(ctx: &RuntimeSecretContext) -> Result<Vec<RuntimeSec
     Ok(by_uri.into_values().collect())
 }
 
-fn pack_paths_for_cloud_apply(config: &DeployerConfig, bundle_root: &Path) -> Result<Vec<PathBuf>> {
-    let mut pack_paths = vec![config.pack_path.clone()];
-    if let Some(provider_pack) = config.provider_pack.as_ref() {
-        pack_paths.push(provider_pack.clone());
-    }
-    pack_paths.extend(
-        discover_bundle_pack_paths(bundle_root)?
-            .into_iter()
-            .filter(|path| include_pack_for_cloud_provider(config.provider, bundle_root, path)),
-    );
-    Ok(dedup_paths(pack_paths))
-}
-
-fn include_pack_for_cloud_provider(
-    provider: Provider,
+/// Secret requirements a built bundle declares, for the env-manifest
+/// wizard's "ask only what's needed" secrets step.
+///
+/// `bundle_root` is the bundle workspace directory (the parent of the
+/// `.gtbundle` artifact), where `packs/` and `providers/` live. Each pack's
+/// `secret-requirements.json` is read and scoped to `environment`/`tenant`
+/// (team `_`) via the same [`collect_requirements`] the cloud-apply path
+/// uses — so the wizard derives exactly the paths the apply engine later
+/// writes. Returns an empty vec when the bundle declares no secrets (or has
+/// not been built yet — `packs/` absent).
+pub fn bundle_secret_requirements(
     bundle_root: &Path,
-    pack_path: &Path,
-) -> bool {
-    let Ok(relative) = pack_path.strip_prefix(bundle_root) else {
-        return true;
+    environment: &str,
+    tenant: &str,
+) -> Result<Vec<RuntimeSecretRequirement>> {
+    let pack_paths = discover_bundle_pack_paths(bundle_root)?;
+    let ctx = RuntimeSecretContext {
+        bundle_root: bundle_root.to_path_buf(),
+        pack_paths,
+        environment: environment.to_string(),
+        tenant: tenant.to_string(),
+        team: None,
+        extra_dev_store_roots: Vec::new(),
     };
-    let mut components = relative.components();
-    let Some(std::path::Component::Normal(first)) = components.next() else {
-        return true;
-    };
-    let Some(std::path::Component::Normal(second)) = components.next() else {
-        return true;
-    };
-    if first != "providers" || second != "secrets" {
-        return true;
-    }
-    let Some(active_stem) = active_secrets_provider_pack_stem(provider) else {
-        return false;
-    };
-    provider_id_from_pack_path(pack_path) == active_stem
+    collect_requirements(&ctx)
 }
 
-fn active_secrets_provider_pack_stem(provider: Provider) -> Option<&'static str> {
-    match provider {
-        Provider::Aws => Some("aws-sm"),
-        Provider::Gcp => Some("gcp-sm"),
-        Provider::Azure => Some("azure-kv"),
-        _ => None,
-    }
+/// The dev-store manifest `path` (`<tenant>/<team>/<pack>/<name>`) carried
+/// by a `secrets://<environment>/...` URI — the inverse of
+/// [`canonical_secret_uri`]'s prefix. `None` when `uri` is not a
+/// `secrets://` URI scoped to `environment`.
+pub fn manifest_secret_path(uri: &str, environment: &str) -> Option<String> {
+    uri.strip_prefix(&format!("secrets://{environment}/"))
+        .map(str::to_string)
 }
 
 pub fn runtime_secret_env_map_for_cloud(
-    _config: &DeployerConfig,
+    config: &DeployerConfig,
 ) -> Result<BTreeMap<String, String>> {
-    // Cloud runtimes now receive `state/config/platform/secrets-provider.json`.
-    // Runtime secrets are still resolved and promoted before apply, but they
-    // must not be exposed as `GREENTIC_SECRET__...` environment variables.
-    Ok(BTreeMap::new())
+    if !matches!(
+        config.provider,
+        Provider::Aws | Provider::Azure | Provider::Gcp
+    ) {
+        return Ok(BTreeMap::new());
+    }
+    let Some(CloudSecretInputs {
+        ctx,
+        pack_requirements,
+        endpoint_requirements,
+    }) = collect_cloud_secret_inputs(config)?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let prefix = default_cloud_secret_prefix(&config.environment, &config.tenant, None);
+
+    // Unify env-map generation with the resolution that the cloud-secret
+    // promotion path uses. `resolve_runtime_secrets` consults env vars AND
+    // every dev secrets store on disk, so optional secrets backed only by
+    // the DevStore are included in the env_map (Codex review F1: previously
+    // the env-only filter silently skipped DevStore-backed optionals while
+    // the AWS/GCP/Azure apply paths still promoted them, producing
+    // runtime auth failures because Terraform was never given the URI).
+    let all_requirements: Vec<RuntimeSecretRequirement> = pack_requirements
+        .iter()
+        .chain(endpoint_requirements.iter())
+        .cloned()
+        .collect();
+    let resolution = block_on_async_resolution(&ctx, &all_requirements);
+    let resolved_uris: BTreeSet<String> = resolution
+        .resolved
+        .into_iter()
+        .map(|r| r.requirement.uri)
+        .collect();
+
+    let env_map = build_cloud_env_map(
+        config.provider,
+        &prefix,
+        &pack_requirements,
+        &endpoint_requirements,
+        &resolved_uris,
+    );
+    Ok(env_map)
+}
+
+/// Run `resolve_runtime_secrets` from a sync context, regardless of the
+/// caller's runtime.
+///
+/// The deployer's production call chain is `run_cloud_backend` →
+/// `run_backend_operation` (which builds a **current-thread** runtime via
+/// `Builder::new_current_thread().block_on(apply::run)`) → several sync
+/// helpers → `runtime_secret_env_map_for_cloud` → here. We therefore CANNOT
+/// use `tokio::task::block_in_place` (it panics on a current-thread runtime)
+/// nor `Handle::current().block_on` (re-entrant block_on on the same
+/// current-thread runtime panics).
+///
+/// Instead, hop to a dedicated OS thread that owns its own current-thread
+/// runtime. `std::thread::scope` lets the closure borrow `ctx`/`requirements`
+/// without a `'static` bound; the inner runtime is fully independent of the
+/// caller's, so this works whether the caller is on a current-thread runtime,
+/// a multi-thread runtime, or no runtime at all.
+fn block_on_async_resolution(
+    ctx: &RuntimeSecretContext,
+    requirements: &[RuntimeSecretRequirement],
+) -> RuntimeSecretResolution {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build runtime for runtime-secret resolution")
+                    .block_on(resolve_runtime_secrets(ctx, requirements))
+            })
+            .join()
+            .expect("runtime-secret resolution thread panicked")
+    })
 }
 
 pub async fn resolve_runtime_secrets(
     ctx: &RuntimeSecretContext,
     requirements: &[RuntimeSecretRequirement],
 ) -> RuntimeSecretResolution {
-    let store_paths = dev_store_paths(&ctx.bundle_root);
+    let store_paths = dev_store_paths(&ctx.bundle_root, &ctx.extra_dev_store_roots);
     let mut resolved = Vec::new();
     let mut missing = Vec::new();
 
     for requirement in requirements {
         let mut checked_sources = Vec::new();
-        if let Some(env_key) = canonical_secret_store_key(&requirement.uri) {
-            checked_sources.push(format!("env {env_key}"));
-            if let Ok(value) = env::var(&env_key)
-                && !value.is_empty()
-            {
-                resolved.push(ResolvedRuntimeSecret {
-                    requirement: requirement.clone(),
-                    value: SecretValue(value),
-                    source: SecretValueSource::Env { key: env_key },
-                });
-                continue;
-            }
-        }
+        // Candidate store URIs: the primary, then any aliases (a value seeded
+        // under a legacy/aliased name still satisfies the requirement, mirroring
+        // greentic-start). Alias URIs must share the primary's resolved scope:
+        // a generated secret lives under `generated_scope_team`, not the context
+        // team (the same derivation `collect_requirements` used for the primary).
+        let team = match &requirement.generated {
+            Some(generated) => generated_scope_team(generated, ctx.team.as_deref()),
+            None => ctx.team.as_deref(),
+        };
+        let candidate_uris: Vec<String> = std::iter::once(requirement.uri.clone())
+            .chain(requirement.aliases.iter().map(|alias| {
+                canonical_secret_uri(
+                    &ctx.environment,
+                    &ctx.tenant,
+                    team,
+                    &requirement.provider_id,
+                    alias,
+                )
+            }))
+            .collect();
 
         let mut found = None;
-        for path in &store_paths {
-            checked_sources.push(path.display().to_string());
-            if !path.exists() {
-                continue;
-            }
-            if let Ok(store) = DevStore::with_path(path)
-                && let Ok(bytes) = store.get(&requirement.uri).await
-                && let Ok(value) = String::from_utf8(bytes)
-                && !value.is_empty()
-            {
-                // `gtc setup --non-interactive` writes raw `${VAR}` placeholders
-                // into the dev secrets store too — not just into setup-answers.
-                // Expand them here against the process env so the promoted
-                // cloud secret carries the actual value, not the placeholder
-                // string. If the env var is unset, treat the dev-store entry
-                // as unresolved and fall back to setup-answers (where the same
-                // expansion runs as a second chance) before marking missing.
-                if let Some(env_key) = extract_env_placeholder(&value) {
-                    checked_sources.push(format!("env ${{{env_key}}} (from dev store)"));
-                    match env::var(&env_key) {
-                        Ok(resolved) if !resolved.is_empty() => {
-                            found = Some((path.clone(), resolved));
-                            break;
-                        }
-                        _ => continue,
+        'candidates: for uri in &candidate_uris {
+            if let Some(env_key) = canonical_secret_store_key(uri) {
+                checked_sources.push(format!("env {env_key}"));
+                if let Ok(value) = env::var(&env_key)
+                    && !value.is_empty()
+                {
+                    if is_placeholder_secret_value(&value, uri) {
+                        checked_sources
+                            .push(format!("env {env_key} (auto-seeded placeholder, ignored)"));
+                    } else {
+                        found = Some((SecretValueSource::Env { key: env_key }, value));
+                        break 'candidates;
                     }
                 }
-                found = Some((path.clone(), value));
-                break;
+            }
+
+            for path in &store_paths {
+                checked_sources.push(path.display().to_string());
+                if !path.exists() {
+                    continue;
+                }
+                if let Ok(store) = DevStore::with_path(path)
+                    && let Ok(bytes) = store.get(uri).await
+                    && let Ok(value) = String::from_utf8(bytes)
+                    && !value.is_empty()
+                {
+                    // `gtc setup --non-interactive` writes raw `${VAR}`
+                    // placeholders into the dev secrets store. Expand them here
+                    // against the process env so the promoted cloud secret
+                    // carries the actual value, not the placeholder string. If
+                    // the env var is unset, treat the dev-store entry as
+                    // unresolved and keep looking.
+                    if let Some(env_key) = extract_env_placeholder(&value) {
+                        checked_sources.push(format!("env ${{{env_key}}} (from dev store)"));
+                        match env::var(&env_key) {
+                            Ok(expanded)
+                                if !expanded.is_empty()
+                                    && !is_placeholder_secret_value(&expanded, uri) =>
+                            {
+                                found = Some((
+                                    SecretValueSource::DevStore { path: path.clone() },
+                                    expanded,
+                                ));
+                                break 'candidates;
+                            }
+                            _ => continue,
+                        }
+                    }
+                    // A `greentic-start`-seeded placeholder is not a real
+                    // secret. Treat it as unresolved and keep searching: if no
+                    // real value turns up, a required secret fails the deploy
+                    // (it lands in `missing`); an optional one is skipped, so a
+                    // value an operator pre-seeded directly in the cloud secret
+                    // manager survives instead of being clobbered.
+                    if is_placeholder_secret_value(&value, uri) {
+                        checked_sources.push(format!(
+                            "{} (auto-seeded placeholder, ignored)",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                    found = Some((SecretValueSource::DevStore { path: path.clone() }, value));
+                    break 'candidates;
+                }
             }
         }
 
-        if let Some((path, value)) = found {
+        if let Some((source, value)) = found {
             resolved.push(ResolvedRuntimeSecret {
                 requirement: requirement.clone(),
                 value: SecretValue(value),
-                source: SecretValueSource::DevStore { path },
+                source,
             });
-        } else if let Some((path, value)) =
-            resolve_from_setup_answers(&ctx.bundle_root, requirement, &mut checked_sources)
-        {
-            resolved.push(ResolvedRuntimeSecret {
-                requirement: requirement.clone(),
-                value: SecretValue(value),
-                source: SecretValueSource::SetupAnswers { path },
-            });
-        } else if let Some(generated) = &requirement.generated {
-            // Transitional fallback. `greentic setup` is now the single place
-            // that introduces secrets — including generated ones — into the
-            // local secrets manager, and `gtc start` only *moves* them to the
-            // target. A value should therefore already have resolved above.
-            // Generating here means an older bundle (built before setup-side
-            // generation) was deployed: warn loudly and generate so the deploy
-            // still succeeds, rather than synthesising a placeholder/default.
-            checked_sources.push("generated secret metadata".to_string());
-            match generated_secret_value(generated) {
-                Ok(value) => {
-                    tracing::warn!(
-                        secret_uri = %requirement.uri,
-                        secret_key = %requirement.key,
-                        "generated runtime secret was absent from the local secrets manager; \
-                         generating at deploy as a transitional fallback (setup should introduce it)"
-                    );
-                    resolved.push(ResolvedRuntimeSecret {
-                        requirement: requirement.clone(),
-                        value: SecretValue(value),
-                        source: SecretValueSource::Generated,
-                    });
-                }
-                Err(err) if requirement.required => {
-                    checked_sources.push(format!("generation failed: {err}"));
-                    tracing::warn!(
-                        secret_uri = %requirement.uri,
-                        secret_key = %requirement.key,
-                        "required runtime secret could not be generated"
-                    );
-                    missing.push(MissingRuntimeSecret {
-                        requirement: requirement.clone(),
-                        checked_sources,
-                    });
-                }
-                Err(_) => {}
-            }
         } else if requirement.required {
-            tracing::warn!(
-                secret_uri = %requirement.uri,
-                secret_key = %requirement.key,
-                checked_sources = ?checked_sources,
-                "required runtime secret is not available in the local secrets manager"
-            );
             missing.push(MissingRuntimeSecret {
                 requirement: requirement.clone(),
                 checked_sources,
             });
-        } else {
-            // Optional secret (for example a value acquired at runtime such as
-            // an OAuth token) is absent from the local secrets manager. Warn
-            // and let it slide rather than promoting a synthesised value.
-            tracing::warn!(
-                secret_uri = %requirement.uri,
-                secret_key = %requirement.key,
-                "optional runtime secret not found in the local secrets manager; \
-                 leaving unset for runtime resolution"
-            );
         }
     }
 
@@ -401,6 +656,11 @@ pub fn format_missing_runtime_secrets(missing: &[MissingRuntimeSecret]) -> Strin
     let mut out = String::from("missing required runtime secrets:\n");
     for entry in missing {
         out.push_str(&format!("  - {}\n", entry.requirement.uri));
+        if entry.requirement.generated.is_some() {
+            out.push_str(
+                "    (system-generated — run `gtc setup` / provisioning to mint it before deploy)\n",
+            );
+        }
         out.push_str("    checked:\n");
         for source in &entry.checked_sources {
             out.push_str(&format!("      - {source}\n"));
@@ -458,6 +718,15 @@ pub fn flat_cloud_secret_name(
     format!("{}{}", normalized[..keep].trim_matches('-'), suffix)
 }
 
+/// Build a canonical runtime secret store URI
+/// (`secrets://<env>/<tenant>/<team|_>/<provider>/<name>`).
+///
+/// Team normalization (`default`/empty → `_`) and name normalization both come
+/// from `greentic-secrets` so this can never drift from the runtime reader. The
+/// `provider` segment is taken verbatim — pack ids carry hyphens the runtime
+/// preserves. `canonical_secret_store_key`, `canonical_secret_name`, and
+/// `normalize_team`/`TEAM_PLACEHOLDER` are likewise the shared library
+/// definitions (imported above).
 pub fn canonical_secret_uri(
     env: &str,
     tenant: &str,
@@ -466,42 +735,25 @@ pub fn canonical_secret_uri(
     key: &str,
 ) -> String {
     let team = normalize_team(team);
-    // Normalize the provider segment the same way as the key (and as the cloud
-    // secret name / env-bridge key already do), so a value written under a
-    // provider id like `messaging-webchat-gui` resolves when a component fetches
-    // it under `messaging.webchat-gui` — both collapse to `messaging_webchat_gui`.
     format!(
         "secrets://{}/{}/{}/{}/{}",
         env,
         tenant,
         team.as_deref().unwrap_or(TEAM_PLACEHOLDER),
-        canonical_secret_name(provider),
+        provider,
         canonical_secret_name(key)
     )
 }
 
-fn requirement_team<'a>(
-    generated: Option<&'a GeneratedSecretRequirement>,
-    default_team: Option<&'a str>,
-) -> Option<&'a str> {
-    let Some(generated) = generated else {
-        return default_team;
-    };
-    if generated.scope.level.eq_ignore_ascii_case("tenant")
-        || generated.scope.team.as_deref() == Some("_")
-    {
-        return None;
-    }
-    generated.scope.team.as_deref().or(default_team)
-}
-
-fn dev_store_paths(bundle_root: &Path) -> Vec<PathBuf> {
+fn dev_store_paths(bundle_root: &Path, extra_roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(path) = env::var_os(DEV_SECRETS_PATH_ENV) {
         paths.push(PathBuf::from(path));
     }
-    paths.push(bundle_root.join(".greentic/dev/.dev.secrets.env"));
-    paths.push(bundle_root.join(".greentic/state/dev/.dev.secrets.env"));
+    for root in std::iter::once(bundle_root).chain(extra_roots.iter().map(PathBuf::as_path)) {
+        paths.push(root.join(".greentic/dev/.dev.secrets.env"));
+        paths.push(root.join(".greentic/state/dev/.dev.secrets.env"));
+    }
 
     let mut seen = BTreeSet::new();
     paths
@@ -558,13 +810,6 @@ fn provider_id_from_pack_path(pack_path: &Path) -> String {
         .unwrap_or_else(|| "provider".to_string())
 }
 
-fn config_id_from_pack_path(pack_path: &Path) -> Option<String> {
-    pack_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .map(ToOwned::to_owned)
-}
-
 fn infer_bundle_root_from_pack_path(pack_path: &Path) -> Option<PathBuf> {
     let mut current = if pack_path.is_dir() {
         Some(pack_path)
@@ -609,7 +854,7 @@ fn is_probably_tar(path: &Path) -> Result<bool> {
 }
 
 fn load_secret_requirements_from_dir(pack_path: &Path) -> Result<Vec<PackSecretRequirement>> {
-    let mut requirements = load_generated_requirements_from_dir(pack_path)?;
+    let mut requirements = Vec::new();
     for asset in SECRET_ASSET_PATHS {
         let path = pack_path.join(asset);
         if path.exists() {
@@ -631,7 +876,7 @@ fn load_secret_requirements_from_zip(pack_path: &Path) -> Result<Vec<PackSecretR
         Ok(archive) => archive,
         Err(_) => return Ok(Vec::new()),
     };
-    let mut requirements = load_generated_requirements_from_zip(&mut archive)?;
+    let mut requirements = Vec::new();
     for asset in SECRET_ASSET_PATHS {
         match archive.by_name(asset) {
             Ok(mut entry) => {
@@ -685,49 +930,25 @@ fn load_secret_requirements_from_tar(pack_path: &Path) -> Result<Vec<PackSecretR
             let mut contents = String::new();
             entry.read_to_string(&mut contents)?;
             requirements.extend(parse_setup_secret_requirements(&contents, &path)?);
-        } else if path_str == "manifest.cbor" {
-            let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes)?;
-            requirements.extend(load_generated_requirements_from_manifest_cbor_bytes(
-                &bytes,
-            )?);
-        } else if path_str == "pack.manifest.json" {
-            let mut contents = String::new();
-            entry.read_to_string(&mut contents)?;
-            requirements.extend(load_generated_requirements_from_manifest_json_str(
-                &contents,
-            )?);
         }
     }
     Ok(dedup_requirements(requirements))
 }
 
 fn parse_requirements(contents: &str, path: &Path) -> Result<Vec<PackSecretRequirement>> {
-    let path_display = path.display().to_string();
-    let requirements: Vec<AssetSecretRequirement> =
-        serde_json::from_str(contents).map_err(|err| {
-            DeployerError::Config(format!(
-                "parse secret requirements from {path_display}: {err}"
-            ))
-        })?;
-    Ok(requirements
-        .into_iter()
-        .filter_map(asset_requirement_to_pack_requirement)
-        .collect())
+    serde_json::from_str(contents).map_err(|err| {
+        DeployerError::Config(format!(
+            "parse secret requirements from {}: {err}",
+            path.display()
+        ))
+    })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct PackSecretRequirement {
     key: String,
-    required: bool,
-    default_value: Option<String>,
-    generated: Option<GeneratedSecretRequirement>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AssetSecretRequirement {
-    key: Option<String>,
-    name: Option<String>,
+    #[serde(default)]
+    aliases: Vec<String>,
     #[serde(default = "default_required")]
     required: bool,
     #[serde(default)]
@@ -736,6 +957,12 @@ struct AssetSecretRequirement {
     generated: Option<AssetGeneratedSecret>,
 }
 
+/// The `generated` block of a pack `secret-requirements.json` entry — the
+/// deployer's own reader for the shared generation model (Option A: parsers
+/// stay per-repo). Optional fields take the same asset-path defaults
+/// greentic-start applies (length 32, `base64url`, team scope) so a pack mints
+/// identically wherever it's read; [`AssetGeneratedSecret::to_requirement`]
+/// lifts it into the canonical [`GeneratedSecretRequirement`].
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct AssetGeneratedSecret {
     policy: Option<String>,
@@ -752,23 +979,26 @@ struct AssetGeneratedSecretScope {
     team: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct GeneratedSecretsExtension {
-    #[serde(default)]
-    secrets: Vec<GeneratedSecretEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GeneratedSecretEntry {
-    key: String,
-    #[serde(default = "default_required")]
-    required: bool,
-    policy: Option<String>,
-    length: Option<usize>,
-    encoding: Option<String>,
-    scope: Option<AssetGeneratedSecretScope>,
-    #[serde(default)]
-    regenerate_if_present: Option<bool>,
+impl AssetGeneratedSecret {
+    fn to_requirement(&self) -> GeneratedSecretRequirement {
+        GeneratedSecretRequirement {
+            policy: self.policy.clone().unwrap_or_else(|| "random".to_string()),
+            length: self.length.unwrap_or(32),
+            encoding: self
+                .encoding
+                .clone()
+                .unwrap_or_else(|| "base64url".to_string()),
+            scope: GeneratedSecretScope {
+                level: self
+                    .scope
+                    .as_ref()
+                    .and_then(|scope| scope.level.clone())
+                    .unwrap_or_else(|| "team".to_string()),
+                team: self.scope.as_ref().and_then(|scope| scope.team.clone()),
+            },
+            regenerate_if_present: self.regenerate_if_present.unwrap_or(false),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -794,9 +1024,11 @@ fn parse_setup_secret_requirements(
     contents: &str,
     path: &Path,
 ) -> Result<Vec<PackSecretRequirement>> {
-    let path_display = path.display().to_string();
     let setup: SetupSpec = serde_yaml_bw::from_str(contents).map_err(|err| {
-        DeployerError::Config(format!("parse setup secrets from {path_display}: {err}"))
+        DeployerError::Config(format!(
+            "parse setup secrets from {}: {err}",
+            path.display()
+        ))
     })?;
     Ok(setup
         .questions
@@ -804,6 +1036,7 @@ fn parse_setup_secret_requirements(
         .filter(|question| question.secret)
         .map(|question| PackSecretRequirement {
             key: question.secret_key.unwrap_or(question.name),
+            aliases: Vec::new(),
             required: question.required,
             default_value: question.default,
             generated: None,
@@ -822,6 +1055,9 @@ fn dedup_requirements(requirements: Vec<PackSecretRequirement>) -> Vec<PackSecre
                 if existing.default_value.is_none() {
                     existing.default_value = requirement.default_value.clone();
                 }
+                if existing.aliases.is_empty() {
+                    existing.aliases = requirement.aliases.clone();
+                }
                 if existing.generated.is_none() {
                     existing.generated = requirement.generated.clone();
                 }
@@ -831,305 +1067,9 @@ fn dedup_requirements(requirements: Vec<PackSecretRequirement>) -> Vec<PackSecre
     by_key.into_values().collect()
 }
 
-fn asset_requirement_to_pack_requirement(
-    req: AssetSecretRequirement,
-) -> Option<PackSecretRequirement> {
-    let key = req.key.or(req.name)?;
-    Some(PackSecretRequirement {
-        key,
-        required: req.required,
-        default_value: req.default_value,
-        generated: req.generated.map(|generated| GeneratedSecretRequirement {
-            policy: generated.policy.unwrap_or_else(|| "random".to_string()),
-            length: generated.length.unwrap_or(32),
-            encoding: generated
-                .encoding
-                .unwrap_or_else(|| "base64url".to_string()),
-            scope: GeneratedSecretScope {
-                level: generated
-                    .scope
-                    .as_ref()
-                    .and_then(|scope| scope.level.clone())
-                    .unwrap_or_else(|| "team".to_string()),
-                team: generated.scope.and_then(|scope| scope.team),
-            },
-            regenerate_if_present: generated.regenerate_if_present.unwrap_or(false),
-        }),
-    })
-}
-
-fn load_generated_requirements_from_dir(pack_path: &Path) -> Result<Vec<PackSecretRequirement>> {
-    let manifest_cbor = pack_path.join("manifest.cbor");
-    if manifest_cbor.exists() {
-        let bytes = std::fs::read(&manifest_cbor)?;
-        let requirements = load_generated_requirements_from_manifest_cbor_bytes(&bytes)?;
-        if !requirements.is_empty() {
-            return Ok(requirements);
-        }
-    }
-    let manifest_json = pack_path.join("pack.manifest.json");
-    if manifest_json.exists() {
-        let contents = std::fs::read_to_string(&manifest_json)?;
-        return load_generated_requirements_from_manifest_json_str(&contents);
-    }
-    Ok(Vec::new())
-}
-
-fn load_generated_requirements_from_zip<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-) -> Result<Vec<PackSecretRequirement>> {
-    match archive.by_name("manifest.cbor") {
-        Ok(mut entry) => {
-            let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes)?;
-            let requirements = load_generated_requirements_from_manifest_cbor_bytes(&bytes)?;
-            if !requirements.is_empty() {
-                return Ok(requirements);
-            }
-        }
-        Err(ZipError::FileNotFound) => {}
-        Err(err) => return Err(DeployerError::Other(err.to_string())),
-    }
-    match archive.by_name("pack.manifest.json") {
-        Ok(mut entry) => {
-            let mut contents = String::new();
-            entry.read_to_string(&mut contents)?;
-            load_generated_requirements_from_manifest_json_str(&contents)
-        }
-        Err(ZipError::FileNotFound) => Ok(Vec::new()),
-        Err(err) => Err(DeployerError::Other(err.to_string())),
-    }
-}
-
-fn load_generated_requirements_from_manifest_cbor_bytes(
-    bytes: &[u8],
-) -> Result<Vec<PackSecretRequirement>> {
-    if let Ok(manifest) = decode_pack_manifest(bytes) {
-        let Some(value) = manifest
-            .extensions
-            .as_ref()
-            .and_then(|extensions| extensions.get(EXT_GENERATED_SECRETS_V1))
-            .and_then(|extension| extension.inline.as_ref())
-        else {
-            return Ok(Vec::new());
-        };
-        let ExtensionInline::Other(value) = value else {
-            return Ok(Vec::new());
-        };
-        return parse_generated_secrets_extension(value.clone());
-    }
-
-    let Ok(value) = serde_cbor::from_slice::<CborValue>(bytes) else {
-        return Ok(Vec::new());
-    };
-    let Some(inline) = cbor_generated_extension_inline(&value) else {
-        return Ok(Vec::new());
-    };
-    let json = cbor_to_json(inline)?;
-    parse_generated_secrets_extension(json)
-}
-
-fn load_generated_requirements_from_manifest_json_str(
-    contents: &str,
-) -> Result<Vec<PackSecretRequirement>> {
-    let manifest: serde_json::Value = serde_json::from_str(contents).map_err(|err| {
-        DeployerError::Config(format!("parse pack.manifest.json generated secrets: {err}"))
-    })?;
-    let Some(value) = manifest
-        .get("extensions")
-        .and_then(|extensions| extensions.get(EXT_GENERATED_SECRETS_V1))
-        .and_then(|extension| extension.get("inline"))
-    else {
-        return Ok(Vec::new());
-    };
-    parse_generated_secrets_extension(value.clone())
-}
-
-fn parse_generated_secrets_extension(
-    value: serde_json::Value,
-) -> Result<Vec<PackSecretRequirement>> {
-    let extension: GeneratedSecretsExtension = serde_json::from_value(value).map_err(|err| {
-        DeployerError::Config(format!("parse generated secrets extension: {err}"))
-    })?;
-    Ok(extension
-        .secrets
-        .into_iter()
-        .filter(|secret| secret.required)
-        .map(|secret| PackSecretRequirement {
-            key: secret.key,
-            required: true,
-            default_value: None,
-            generated: Some(GeneratedSecretRequirement {
-                policy: secret.policy.unwrap_or_else(|| "random".to_string()),
-                length: secret.length.unwrap_or(20),
-                encoding: secret.encoding.unwrap_or_else(|| "raw_text".to_string()),
-                scope: GeneratedSecretScope {
-                    level: secret
-                        .scope
-                        .as_ref()
-                        .and_then(|scope| scope.level.clone())
-                        .unwrap_or_else(|| "tenant".to_string()),
-                    team: secret.scope.and_then(|scope| scope.team),
-                },
-                regenerate_if_present: secret.regenerate_if_present.unwrap_or(false),
-            }),
-        })
-        .collect())
-}
-
-fn cbor_generated_extension_inline(value: &CborValue) -> Option<&CborValue> {
-    let CborValue::Map(map) = value else {
-        return None;
-    };
-    let extensions = cbor_map_get(map, "extensions")?;
-    let CborValue::Map(extensions) = extensions else {
-        return None;
-    };
-    let extension = cbor_map_get(extensions, EXT_GENERATED_SECRETS_V1)?;
-    let CborValue::Map(extension) = extension else {
-        return None;
-    };
-    cbor_map_get(extension, "inline")
-}
-
-fn cbor_map_get<'a>(map: &'a BTreeMap<CborValue, CborValue>, key: &str) -> Option<&'a CborValue> {
-    map.iter().find_map(|(candidate, value)| match candidate {
-        CborValue::Text(text) if text == key => Some(value),
-        _ => None,
-    })
-}
-
-fn cbor_to_json(value: &CborValue) -> Result<serde_json::Value> {
-    match value {
-        CborValue::Null => Ok(serde_json::Value::Null),
-        CborValue::Bool(value) => Ok(serde_json::Value::Bool(*value)),
-        CborValue::Integer(value) => Ok(serde_json::Value::Number(
-            serde_json::Number::from_i128(*value).ok_or_else(|| {
-                DeployerError::Config("generated secrets integer is out of range".to_string())
-            })?,
-        )),
-        CborValue::Float(value) => serde_json::Number::from_f64(*value)
-            .map(serde_json::Value::Number)
-            .ok_or_else(|| DeployerError::Config("generated secrets float is invalid".to_string())),
-        CborValue::Bytes(_) => Err(DeployerError::Config(
-            "generated secrets extension cannot contain bytes".to_string(),
-        )),
-        CborValue::Text(value) => Ok(serde_json::Value::String(value.clone())),
-        CborValue::Array(values) => values
-            .iter()
-            .map(cbor_to_json)
-            .collect::<Result<Vec<_>>>()
-            .map(serde_json::Value::Array),
-        CborValue::Map(map) => {
-            let mut object = serde_json::Map::new();
-            for (key, value) in map {
-                let CborValue::Text(key) = key else {
-                    return Err(DeployerError::Config(
-                        "generated secrets extension object key must be a string".to_string(),
-                    ));
-                };
-                object.insert(key.clone(), cbor_to_json(value)?);
-            }
-            Ok(serde_json::Value::Object(object))
-        }
-        _ => Err(DeployerError::Config(
-            "generated secrets extension contains unsupported CBOR value".to_string(),
-        )),
-    }
-}
-
-fn generated_secret_value(generated: &GeneratedSecretRequirement) -> Result<String> {
-    if !generated.policy.eq_ignore_ascii_case("random") {
-        return Err(DeployerError::Config(format!(
-            "unsupported generated secret policy `{}`",
-            generated.policy
-        )));
-    }
-    let length = generated.length.max(1);
-    match generated.encoding.as_str() {
-        "raw_text" => Ok(random_ascii(length)),
-        "base64url" => {
-            let mut bytes = vec![0u8; length];
-            rand::rng().fill(&mut bytes[..]);
-            Ok(URL_SAFE_NO_PAD.encode(bytes))
-        }
-        "hex" => {
-            let mut bytes = vec![0u8; length];
-            rand::rng().fill(&mut bytes[..]);
-            Ok(hex::encode(bytes))
-        }
-        other => Err(DeployerError::Config(format!(
-            "unsupported generated secret encoding `{other}`"
-        ))),
-    }
-}
-
-fn random_ascii(length: usize) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
-    let mut bytes = vec![0u8; length];
-    rand::rng().fill(&mut bytes[..]);
-    bytes
-        .into_iter()
-        .map(|byte| ALPHABET[usize::from(byte) % ALPHABET.len()] as char)
-        .collect()
-}
-
-fn resolve_from_setup_answers(
-    bundle_root: &Path,
-    requirement: &RuntimeSecretRequirement,
-    checked_sources: &mut Vec<String>,
-) -> Option<(PathBuf, String)> {
-    for config_id in setup_answer_config_id_candidates(&requirement.source) {
-        let path = bundle_root
-            .join("state/config")
-            .join(config_id)
-            .join("setup-answers.json");
-        checked_sources.push(path.display().to_string());
-        let contents = match std::fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(_) => continue,
-        };
-        let answers = match serde_json::from_str::<BTreeMap<String, JsonValue>>(&contents) {
-            Ok(answers) => answers,
-            Err(_) => continue,
-        };
-        for (key, value) in answers {
-            if canonical_secret_name(&key) != requirement.key {
-                continue;
-            }
-            if let Some(value) = value.as_str()
-                && !value.is_empty()
-            {
-                if let Some(env_key) = extract_env_placeholder(value) {
-                    checked_sources.push(format!("env ${{{env_key}}} (from setup-answers)"));
-                    return match env::var(&env_key) {
-                        Ok(resolved) if !resolved.is_empty() => Some((path, resolved)),
-                        _ => None,
-                    };
-                }
-                return Some((path, value.to_string()));
-            }
-        }
-    }
-    None
-}
-
-fn setup_answer_config_id_candidates(pack_path: &Path) -> Vec<String> {
-    let Some(config_id) = config_id_from_pack_path(pack_path) else {
-        return Vec::new();
-    };
-    let mut candidates = vec![config_id.clone()];
-    if let Some((base, _)) = config_id.split_once("-gtpack-sha-")
-        && !base.is_empty()
-    {
-        candidates.push(base.to_string());
-    }
-    candidates
-}
-
 // Parse a whole-string `${VAR}` placeholder and return `VAR`.
-// `greentic-setup` persists unresolved env-var references in setup-answers.json
-// when a non-interactive run cannot prompt. Without expansion here, those
+// `greentic-setup` persists unresolved env-var references in the dev secrets
+// store when a non-interactive run cannot prompt. Without expansion here those
 // placeholders would propagate to the cloud secrets store verbatim and break
 // providers that try to use the value (e.g. state-redis treating `${REDIS_URL}`
 // as a connection string).
@@ -1142,6 +1082,31 @@ fn extract_env_placeholder(value: &str) -> Option<String> {
     Some(inner.to_string())
 }
 
+/// Whether `value` (the value resolved for `uri`) is a placeholder
+/// `greentic-start` auto-seeds into the dev store for un-provisioned secrets
+/// (`secrets_setup::placeholder_text_for_uri`): `ollama-placeholder` for
+/// `api_key`-shaped URIs, `placeholder for <uri>` for everything else. These
+/// are NOT real credentials — promoting one to a cloud secret manager would
+/// both ship a non-working value AND clobber any real value an operator
+/// pre-seeded there, so the cloud-apply resolver treats them as unresolved.
+///
+/// Both forms are matched **exactly**, never by prefix: `ollama-placeholder`
+/// is a globally-unique sentinel, and `placeholder for <uri>` is compared
+/// against *this* candidate's `uri` so an arbitrary operator value that merely
+/// begins with `placeholder for ` is not misclassified as unresolved.
+///
+/// NOTE: the marker strings are duplicated from `greentic-start`
+/// (`secrets_setup.rs`) and must stay in sync. A shared sentinel in the
+/// foundation crate is the deeper fix (tracked with the secrets-lib scaffold
+/// follow-up), out of scope for this surgical change.
+fn is_placeholder_secret_value(value: &str, uri: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed == "ollama-placeholder"
+        || trimmed
+            .strip_prefix("placeholder for ")
+            .is_some_and(|rest| rest == uri)
+}
+
 fn default_required() -> bool {
     true
 }
@@ -1149,6 +1114,7 @@ fn default_required() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use greentic_deploy_spec::MessagingEndpointId;
 
     #[test]
     fn extract_env_placeholder_matches_whole_string_dollar_brace_form() {
@@ -1178,20 +1144,6 @@ mod tests {
     }
 
     #[test]
-    fn setup_answer_config_id_candidates_include_gtpack_sha_base_alias() {
-        let candidates = setup_answer_config_id_candidates(Path::new(
-            "/tmp/packs/deep-research-demo-gtpack-sha-abc123.gtpack",
-        ));
-        assert_eq!(
-            candidates,
-            vec![
-                "deep-research-demo-gtpack-sha-abc123".to_string(),
-                "deep-research-demo".to_string(),
-            ]
-        );
-    }
-
-    #[test]
     fn canonical_env_key_matches_start_runtime_shape() {
         assert_eq!(
             canonical_secret_store_key("secrets://dev/demo/_/openai/api_key").as_deref(),
@@ -1212,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn requirement_uri_normalizes_provider_segment() {
+    fn requirement_uri_preserves_pack_provider_id_hyphens() {
         let dir = tempfile::tempdir().unwrap();
         let pack_dir = dir.path().join("packs/messaging-webchat-gui/assets");
         std::fs::create_dir_all(&pack_dir).unwrap();
@@ -1228,6 +1180,7 @@ mod tests {
             environment: "dev".into(),
             tenant: "demo".into(),
             team: None,
+            extra_dev_store_roots: Vec::new(),
         };
 
         let requirements = collect_requirements(&ctx).unwrap();
@@ -1235,7 +1188,7 @@ mod tests {
         assert_eq!(requirements[0].provider_id, "messaging-webchat-gui");
         assert_eq!(
             requirements[0].uri,
-            "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key"
+            "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key"
         );
         assert_eq!(
             cloud_secret_name(
@@ -1248,411 +1201,57 @@ mod tests {
     }
 
     #[test]
-    fn collect_requirements_discovers_generated_secret_from_manifest_cbor_extension() {
-        use greentic_types::{
-            ExtensionInline, ExtensionRef, PackId, PackKind, PackManifest, PackSignatures,
-            encode_pack_manifest,
-        };
-        use semver::Version;
-        use serde_json::json;
-        use std::io::Write;
-        use zip::write::FileOptions;
-
+    fn bundle_secret_requirements_reads_packs_dir_scoped_to_tenant() {
+        // Mirrors the env-manifest wizard: a built bundle workspace with a
+        // provider pack under `packs/` whose `secret-requirements.json`
+        // declares one key. The wizard derives exactly the manifest secret
+        // path the apply engine later writes.
         let dir = tempfile::tempdir().unwrap();
-        let pack = dir.path().join("packs/messaging-webchat-gui.gtpack");
-        std::fs::create_dir_all(pack.parent().unwrap()).unwrap();
-        let mut extensions = BTreeMap::new();
-        extensions.insert(
-            "greentic.generated-secrets.v1".to_string(),
-            ExtensionRef {
-                kind: "greentic.generated-secrets.v1".to_string(),
-                version: "1".to_string(),
-                digest: None,
-                location: None,
-                inline: Some(ExtensionInline::Other(json!({
-                    "secrets": [{
-                        "key": "jwt_signing_key",
-                        "aliases": ["JWT_SIGNING_KEY"],
-                        "required": true,
-                        "policy": "random",
-                        "length": 20,
-                        "encoding": "raw_text",
-                        "scope": {"level": "tenant", "team": "_"},
-                        "regenerate_if_present": false
-                    }]
-                }))),
-            },
-        );
-        let manifest = PackManifest {
-            schema_version: "1".to_string(),
-            pack_id: PackId::new("messaging-webchat-gui").unwrap(),
-            name: None,
-            version: Version::parse("0.0.0").unwrap(),
-            kind: PackKind::Provider,
-            publisher: "test".to_string(),
-            components: Vec::new(),
-            flows: Vec::new(),
-            dependencies: Vec::new(),
-            capabilities: Vec::new(),
-            secret_requirements: Vec::new(),
-            signatures: PackSignatures::default(),
-            bootstrap: None,
-            extensions: Some(extensions),
-        };
-        let file = File::create(&pack).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        zip.start_file("manifest.cbor", FileOptions::<()>::default())
-            .unwrap();
-        zip.write_all(&encode_pack_manifest(&manifest).unwrap())
-            .unwrap();
-        zip.finish().unwrap();
+        let pack_dir = dir.path().join("packs/messaging-telegram");
+        std::fs::create_dir_all(pack_dir.join("assets")).unwrap();
+        // `pack.yaml` marks the directory as a pack so `discover_bundle_pack_paths`
+        // picks it up (real bundles ship `.gtpack` archives; a marked dir is the
+        // lighter-weight equivalent for the test).
+        std::fs::write(pack_dir.join("pack.yaml"), "id: messaging-telegram\n").unwrap();
+        std::fs::write(
+            pack_dir.join("assets/secret-requirements.json"),
+            r#"[{"key":"TELEGRAM_BOT_TOKEN","required":true}]"#,
+        )
+        .unwrap();
 
-        let ctx = RuntimeSecretContext {
-            bundle_root: dir.path().to_path_buf(),
-            pack_paths: vec![pack],
-            environment: "dev".into(),
-            tenant: "demo".into(),
-            team: Some("default".into()),
-        };
-
-        let requirements = collect_requirements(&ctx).unwrap();
-        assert_eq!(requirements.len(), 1);
+        let reqs = bundle_secret_requirements(dir.path(), "local", "legal").unwrap();
+        assert_eq!(reqs.len(), 1);
         assert_eq!(
-            requirements[0].uri,
-            "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key"
+            reqs[0].uri,
+            "secrets://local/legal/_/messaging-telegram/telegram_bot_token"
         );
-        assert_eq!(requirements[0].key, "jwt_signing_key");
-        assert!(requirements[0].generated.is_some());
+        // …and the inverse strips the env prefix back to the manifest path.
+        assert_eq!(
+            manifest_secret_path(&reqs[0].uri, "local").as_deref(),
+            Some("legal/_/messaging-telegram/telegram_bot_token")
+        );
     }
 
     #[test]
-    fn collect_requirements_discovers_generated_secret_from_pack_manifest_json_extension() {
-        use std::io::Write;
-        use zip::write::FileOptions;
-
+    fn bundle_secret_requirements_empty_when_unbuilt() {
+        // No `packs/` dir (bundle not built yet) → no requirements, no error.
         let dir = tempfile::tempdir().unwrap();
-        let pack = dir.path().join("packs/messaging-webchat-gui.gtpack");
-        std::fs::create_dir_all(pack.parent().unwrap()).unwrap();
-        let file = File::create(&pack).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        zip.start_file("pack.manifest.json", FileOptions::<()>::default())
-            .unwrap();
-        zip.write_all(
-            br#"{
-                "extensions": {
-                    "greentic.generated-secrets.v1": {
-                        "inline": {
-                            "secrets": [{
-                                "key": "jwt_signing_key",
-                                "policy": "random",
-                                "length": 20,
-                                "encoding": "raw_text",
-                                "scope": {"level": "tenant", "team": "_"}
-                            }]
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-        zip.finish().unwrap();
-
-        let ctx = RuntimeSecretContext {
-            bundle_root: dir.path().to_path_buf(),
-            pack_paths: vec![pack],
-            environment: "dev".into(),
-            tenant: "demo".into(),
-            team: Some("default".into()),
-        };
-
-        let requirements = collect_requirements(&ctx).unwrap();
-        assert_eq!(requirements.len(), 1);
-        assert_eq!(
-            requirements[0].uri,
-            "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key"
-        );
-        assert!(requirements[0].generated.is_some());
+        let reqs = bundle_secret_requirements(dir.path(), "local", "legal").unwrap();
+        assert!(reqs.is_empty());
     }
 
     #[test]
-    fn runtime_secret_env_map_omits_generated_secret_env_aliases_for_cloud_binding() {
-        use greentic_types::{
-            ExtensionInline, ExtensionRef, PackId, PackKind, PackManifest, PackSignatures,
-            encode_pack_manifest,
-        };
-        use semver::Version;
-        use serde_json::json;
-        use std::io::Write;
-        use zip::write::FileOptions;
-
-        let dir = tempfile::tempdir().unwrap();
-        let bundle_root = dir.path();
-        let pack = bundle_root.join("packs/messaging-webchat-gui.gtpack");
-        std::fs::create_dir_all(pack.parent().unwrap()).unwrap();
-        let mut extensions = BTreeMap::new();
-        extensions.insert(
-            "greentic.generated-secrets.v1".to_string(),
-            ExtensionRef {
-                kind: "greentic.generated-secrets.v1".to_string(),
-                version: "1".to_string(),
-                digest: None,
-                location: None,
-                inline: Some(ExtensionInline::Other(json!({
-                    "secrets": [{
-                        "key": "jwt_signing_key",
-                        "policy": "random",
-                        "length": 20,
-                        "encoding": "raw_text",
-                        "scope": {"level": "tenant", "team": "_"}
-                    }]
-                }))),
-            },
-        );
-        let manifest = PackManifest {
-            schema_version: "1".to_string(),
-            pack_id: PackId::new("messaging-webchat-gui").unwrap(),
-            name: None,
-            version: Version::parse("0.0.0").unwrap(),
-            kind: PackKind::Provider,
-            publisher: "test".to_string(),
-            components: Vec::new(),
-            flows: Vec::new(),
-            dependencies: Vec::new(),
-            capabilities: Vec::new(),
-            secret_requirements: Vec::new(),
-            signatures: PackSignatures::default(),
-            bootstrap: None,
-            extensions: Some(extensions),
-        };
-        let file = File::create(&pack).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        zip.start_file("manifest.cbor", FileOptions::<()>::default())
-            .unwrap();
-        zip.write_all(&encode_pack_manifest(&manifest).unwrap())
-            .unwrap();
-        zip.finish().unwrap();
-
-        let config = DeployerConfig {
-            capability: DeployerCapability::Apply,
-            provider: Provider::Aws,
-            strategy: "iac-only".into(),
-            tenant: "demo".into(),
-            environment: "dev".into(),
-            pack_path: pack.clone(),
-            bundle_root: Some(bundle_root.to_path_buf()),
-            providers_dir: PathBuf::from("providers/deployer"),
-            packs_dir: PathBuf::from("packs"),
-            provider_pack: None,
-            pack_ref: None,
-            distributor_url: None,
-            distributor_token: None,
-            preview: false,
-            dry_run: false,
-            execute_local: true,
-            output: crate::config::OutputFormat::Json,
-            greentic: greentic_config::ConfigResolver::new()
-                .load()
-                .unwrap()
-                .config,
-            provenance: greentic_config::ProvenanceMap::new(),
-            config_warnings: Vec::new(),
-            deploy_pack_id_override: None,
-            deploy_flow_id_override: None,
-            bundle_source: Some("file:///tmp/demo.gtbundle".into()),
-            bundle_digest: Some(
-                "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
-            ),
-            repo_registry_base: None,
-            store_registry_base: None,
-        };
-
-        let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
-        assert!(env_map.is_empty());
-    }
-
-    #[tokio::test]
-    async fn cloud_apply_resolution_generates_generated_secret_without_setup_answer() {
-        let dir = tempfile::tempdir().unwrap();
-        let pack = dir.path().join("packs/messaging-webchat-gui");
-        std::fs::create_dir_all(pack.join("assets")).unwrap();
-        std::fs::write(
-            pack.join("assets/secret-requirements.json"),
-            r#"[{
-                "key":"jwt_signing_key",
-                "required":true,
-                "generated":{
-                    "policy":"random",
-                    "length":20,
-                    "encoding":"raw_text",
-                    "scope":{"level":"tenant","team":"_"},
-                    "regenerate_if_present":false
-                }
-            }]"#,
-        )
-        .unwrap();
-
-        let ctx = RuntimeSecretContext {
-            bundle_root: dir.path().to_path_buf(),
-            pack_paths: vec![pack],
-            environment: "dev".into(),
-            tenant: "demo".into(),
-            team: Some("default".into()),
-        };
-        let requirements = collect_requirements(&ctx).unwrap();
-        let resolution = resolve_runtime_secrets(&ctx, &requirements).await;
-
-        assert!(resolution.missing.is_empty());
-        assert_eq!(resolution.resolved.len(), 1);
-        assert_eq!(resolution.resolved[0].value.expose().len(), 20);
-        assert!(matches!(
-            resolution.resolved[0].source,
-            SecretValueSource::Generated
-        ));
-    }
-
-    #[tokio::test]
-    async fn cloud_apply_resolution_slides_optional_secret_without_local_value() {
-        // An optional secret with only a setup.yaml default must NOT promote
-        // that default to the cloud secrets manager (the silent-wrong-value
-        // path is gone). With no value in the local secrets manager it is
-        // neither resolved nor reported missing — it is left to slide.
-        let dir = tempfile::tempdir().unwrap();
-        let pack = dir.path().join("packs/deep-research-demo");
-        std::fs::create_dir_all(pack.join("assets")).unwrap();
-        std::fs::write(
-            pack.join("assets/setup.yaml"),
-            r#"
-questions:
-  - name: api_key_secret
-    secret_key: api_key_secret
-    secret: true
-    required: false
-    default: ollama-placeholder
-"#,
-        )
-        .unwrap();
-
-        let ctx = RuntimeSecretContext {
-            bundle_root: dir.path().to_path_buf(),
-            pack_paths: vec![pack],
-            environment: "dev".into(),
-            tenant: "demo".into(),
-            team: None,
-        };
-        let requirements = collect_requirements(&ctx).unwrap();
-        let resolution = resolve_runtime_secrets(&ctx, &requirements).await;
-
-        assert!(
-            resolution.resolved.is_empty(),
-            "optional secret must not resolve from a setup.yaml default: {:?}",
-            resolution.resolved
-        );
-        assert!(
-            resolution.missing.is_empty(),
-            "optional secret must not be reported missing"
-        );
-    }
-
-    #[tokio::test]
-    async fn cloud_apply_resolution_moves_generated_secret_from_local_store() {
-        // When setup has already introduced the generated secret into the local
-        // store, the deployer MOVES that exact value (DevStore source) rather
-        // than generating a fresh, divergent one.
-        use greentic_secrets_lib::{DevStore, SecretFormat};
-        let dir = tempfile::tempdir().unwrap();
-        let pack = dir.path().join("packs/messaging-webchat-gui");
-        std::fs::create_dir_all(pack.join("assets")).unwrap();
-        std::fs::write(
-            pack.join("assets/secret-requirements.json"),
-            r#"[{
-                "key":"jwt_signing_key",
-                "required":true,
-                "generated":{
-                    "policy":"random",
-                    "length":20,
-                    "encoding":"raw_text",
-                    "scope":{"level":"tenant","team":"_"},
-                    "regenerate_if_present":false
-                }
-            }]"#,
-        )
-        .unwrap();
-
-        let uri = "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key";
-        let store_path = dir.path().join(".greentic/state/dev/.dev.secrets.env");
-        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
-        let store = DevStore::with_path(&store_path).unwrap();
-        store
-            .put(uri, SecretFormat::Text, b"setup-introduced-key")
-            .await
-            .unwrap();
-
-        let ctx = RuntimeSecretContext {
-            bundle_root: dir.path().to_path_buf(),
-            pack_paths: vec![pack],
-            environment: "dev".into(),
-            tenant: "demo".into(),
-            team: None,
-        };
-        let requirements = collect_requirements(&ctx).unwrap();
-        let resolution = resolve_runtime_secrets(&ctx, &requirements).await;
-
-        assert!(resolution.missing.is_empty());
-        assert_eq!(resolution.resolved.len(), 1);
+    fn manifest_secret_path_rejects_foreign_env_or_scheme() {
         assert_eq!(
-            resolution.resolved[0].value.expose(),
-            "setup-introduced-key",
-            "the local-store value must be moved, not regenerated"
+            manifest_secret_path("secrets://prod/legal/_/p/tok", "local"),
+            None,
+            "different env is not stripped"
         );
-        assert!(matches!(
-            resolution.resolved[0].source,
-            SecretValueSource::DevStore { .. }
-        ));
-    }
-
-    #[test]
-    fn generated_secret_value_supports_start_encodings() {
-        let raw = generated_secret_value(&GeneratedSecretRequirement {
-            policy: "random".into(),
-            length: 20,
-            encoding: "raw_text".into(),
-            scope: GeneratedSecretScope {
-                level: "tenant".into(),
-                team: Some("_".into()),
-            },
-            regenerate_if_present: false,
-        })
-        .unwrap();
-        assert_eq!(raw.len(), 20);
-
-        let b64 = generated_secret_value(&GeneratedSecretRequirement {
-            policy: "random".into(),
-            length: 20,
-            encoding: "base64url".into(),
-            scope: GeneratedSecretScope {
-                level: "tenant".into(),
-                team: Some("_".into()),
-            },
-            regenerate_if_present: false,
-        })
-        .unwrap();
-        assert!(!b64.contains('+'));
-        assert!(!b64.contains('/'));
-        assert!(!b64.contains('='));
-
-        let hex = generated_secret_value(&GeneratedSecretRequirement {
-            policy: "random".into(),
-            length: 20,
-            encoding: "hex".into(),
-            scope: GeneratedSecretScope {
-                level: "tenant".into(),
-                team: Some("_".into()),
-            },
-            regenerate_if_present: false,
-        })
-        .unwrap();
-        assert_eq!(hex.len(), 40);
-        assert!(hex.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_eq!(
+            manifest_secret_path("https://example.com/x", "local"),
+            None,
+            "non-secrets scheme is rejected"
+        );
     }
 
     #[test]
@@ -1747,112 +1346,16 @@ questions:
     }
 
     #[tokio::test]
-    async fn cloud_apply_resolution_filters_secrets_provider_packs_by_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let bundle_root = dir.path();
-        let app_pack = bundle_root.join("packs/greentic-main-website");
-        std::fs::create_dir_all(&app_pack).unwrap();
-        std::fs::write(app_pack.join("pack.yaml"), "id: greentic-main-website\n").unwrap();
-
-        let aws_provider = bundle_root.join("providers/secrets/aws-sm");
-        std::fs::create_dir_all(aws_provider.join("assets")).unwrap();
-        std::fs::write(
-            aws_provider.join("pack.yaml"),
-            "id: greentic.secrets.aws-sm\n",
-        )
-        .unwrap();
-        std::fs::write(
-            aws_provider.join("assets/secret-requirements.json"),
-            r#"[{
-                "key":"aws_runtime_probe",
-                "required":true,
-                "generated":{
-                    "policy":"random",
-                    "length":20,
-                    "encoding":"raw_text",
-                    "scope":{"level":"tenant","team":"_"}
-                }
-            }]"#,
-        )
-        .unwrap();
-
-        for (provider_dir, key) in [
-            ("gcp-sm", "gcp_project_credentials"),
-            ("azure-kv", "azure_key_vault_credentials"),
-        ] {
-            let inactive_provider = bundle_root.join("providers/secrets").join(provider_dir);
-            std::fs::create_dir_all(inactive_provider.join("assets")).unwrap();
-            std::fs::write(
-                inactive_provider.join("pack.yaml"),
-                format!("id: greentic.secrets.{provider_dir}\n"),
-            )
-            .unwrap();
-            std::fs::write(
-                inactive_provider.join("assets/secret-requirements.json"),
-                format!(r#"[{{"key":"{key}","required":true}}]"#),
-            )
-            .unwrap();
-        }
-
-        let config = DeployerConfig {
-            capability: DeployerCapability::Apply,
-            provider: Provider::Aws,
-            strategy: "iac-only".into(),
-            tenant: "demo".into(),
-            environment: "dev".into(),
-            pack_path: app_pack,
-            bundle_root: Some(bundle_root.to_path_buf()),
-            providers_dir: PathBuf::from("providers/deployer"),
-            packs_dir: PathBuf::from("packs"),
-            provider_pack: None,
-            pack_ref: None,
-            distributor_url: None,
-            distributor_token: None,
-            preview: false,
-            dry_run: false,
-            execute_local: true,
-            output: crate::config::OutputFormat::Json,
-            greentic: greentic_config::ConfigResolver::new()
-                .load()
-                .unwrap()
-                .config,
-            provenance: greentic_config::ProvenanceMap::new(),
-            config_warnings: Vec::new(),
-            deploy_pack_id_override: None,
-            deploy_flow_id_override: None,
-            bundle_source: Some("file:///tmp/demo.gtbundle".into()),
-            bundle_digest: Some(
-                "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
-            ),
-            repo_registry_base: None,
-            store_registry_base: None,
-        };
-
-        let resolution = resolve_for_cloud_apply(&config)
-            .await
-            .expect("resolve AWS cloud runtime secrets")
-            .expect("runtime secrets should be present");
-        let resolved_uris = resolution
-            .resolved
-            .iter()
-            .map(|secret| secret.requirement.uri.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            resolved_uris,
-            vec!["secrets://dev/demo/_/aws_sm/aws_runtime_probe"]
-        );
-        assert!(resolution.missing.is_empty());
-    }
-
-    #[tokio::test]
-    async fn resolves_secret_values_from_setup_answers() {
+    async fn resolve_runtime_secrets_no_longer_falls_back_to_setup_answers() {
+        // Pre-B12a, `setup-answers.json` was a secondary source when the dev
+        // store missed. After B12a, the dev store is the only source — a stale
+        // plaintext value at the legacy sink must NOT resolve.
         let dir = tempfile::tempdir().unwrap();
         let answers_dir = dir.path().join("state/config/demo-pack");
         std::fs::create_dir_all(&answers_dir).unwrap();
         std::fs::write(
             answers_dir.join("setup-answers.json"),
-            r#"{"api_key":"secret-value"}"#,
+            r#"{"api_key":"STALE-PLAINTEXT-MUST-NOT-LEAK"}"#,
         )
         .unwrap();
         let ctx = RuntimeSecretContext {
@@ -1861,6 +1364,7 @@ questions:
             environment: "dev".into(),
             tenant: "demo".into(),
             team: None,
+            extra_dev_store_roots: Vec::new(),
         };
         let requirement = RuntimeSecretRequirement {
             uri: canonical_secret_uri("dev", "demo", None, "demo_pack", "api_key"),
@@ -1868,24 +1372,29 @@ questions:
             key: "api_key".into(),
             required: true,
             default_value: None,
+            aliases: Vec::new(),
             generated: None,
             source: dir.path().join("packs/demo-pack.gtpack"),
         };
 
         let resolution = resolve_runtime_secrets(&ctx, &[requirement]).await;
-        assert!(resolution.missing.is_empty());
-        assert_eq!(resolution.resolved.len(), 1);
-        assert_eq!(resolution.resolved[0].value.expose(), "secret-value");
-        assert!(matches!(
-            resolution.resolved[0].source,
-            SecretValueSource::SetupAnswers { .. }
-        ));
+        assert!(
+            resolution.resolved.is_empty(),
+            "no source means no resolution"
+        );
+        assert_eq!(resolution.missing.len(), 1);
+        assert!(
+            !resolution.missing[0]
+                .checked_sources
+                .iter()
+                .any(|s| s.contains("setup-answers")),
+            "setup-answers must not appear in checked_sources after B12a",
+        );
     }
 
-    #[test]
-    fn runtime_secret_env_map_omits_explicit_secret_env_aliases_for_cloud_binding() {
-        let dir = tempfile::tempdir().unwrap();
-        let bundle_root = dir.path();
+    fn build_skips_unresolved_optional_fixture(
+        bundle_root: &Path,
+    ) -> (PathBuf, std::path::PathBuf) {
         let packs_dir = bundle_root.join("packs");
         let config_dir = bundle_root.join("state/config/demo-app");
         std::fs::create_dir_all(packs_dir.join("demo-app/assets")).unwrap();
@@ -1906,19 +1415,24 @@ questions:
 "#,
         )
         .unwrap();
+        // A stale plaintext in setup-answers.json MUST NOT make api_key
+        // appear in env_map — the setup-answers fallback is gone (B12a).
         std::fs::write(
             config_dir.join("setup-answers.json"),
-            r#"{"api_key":"secret-value"}"#,
+            r#"{"api_key":"STALE-PLAINTEXT-MUST-NOT-LEAK"}"#,
         )
         .unwrap();
+        (packs_dir.clone(), packs_dir.join("demo-app"))
+    }
 
-        let config = DeployerConfig {
+    fn deployer_config_for_fixture(bundle_root: &Path, pack_path: PathBuf) -> DeployerConfig {
+        DeployerConfig {
             capability: DeployerCapability::Apply,
             provider: Provider::Aws,
             strategy: "iac-only".into(),
             tenant: "demo".into(),
             environment: "dev".into(),
-            pack_path: packs_dir.join("demo-app"),
+            pack_path: Some(pack_path),
             bundle_root: Some(bundle_root.to_path_buf()),
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -1944,72 +1458,666 @@ questions:
             ),
             repo_registry_base: None,
             store_registry_base: None,
-        };
-
-        let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
-        assert!(env_map.is_empty());
+        }
     }
 
     #[test]
-    fn runtime_secret_env_map_omits_optional_setup_secret_default_for_cloud_binding() {
+    fn runtime_secret_env_map_skips_unresolved_optional_secrets() {
         let dir = tempfile::tempdir().unwrap();
         let bundle_root = dir.path();
-        let packs_dir = bundle_root.join("packs");
-        std::fs::create_dir_all(packs_dir.join("deep-research-demo/assets")).unwrap();
-        std::fs::write(
-            packs_dir.join("deep-research-demo/assets/setup.yaml"),
-            r#"
-questions:
-  - name: api_key_secret
-    secret_key: api_key_secret
-    secret: true
-    required: false
-    default: ollama-placeholder
-"#,
-        )
-        .unwrap();
-
-        let config = DeployerConfig {
-            capability: DeployerCapability::Apply,
-            provider: Provider::Aws,
-            strategy: "iac-only".into(),
-            tenant: "demo".into(),
-            environment: "dev".into(),
-            pack_path: packs_dir.join("deep-research-demo"),
-            bundle_root: Some(bundle_root.to_path_buf()),
-            providers_dir: PathBuf::from("providers/deployer"),
-            packs_dir: PathBuf::from("packs"),
-            provider_pack: None,
-            pack_ref: None,
-            distributor_url: None,
-            distributor_token: None,
-            preview: false,
-            dry_run: false,
-            execute_local: true,
-            output: crate::config::OutputFormat::Json,
-            greentic: greentic_config::ConfigResolver::new()
-                .load()
-                .unwrap()
-                .config,
-            provenance: greentic_config::ProvenanceMap::new(),
-            config_warnings: Vec::new(),
-            deploy_pack_id_override: None,
-            deploy_flow_id_override: None,
-            bundle_source: Some("file:///tmp/demo.gtbundle".into()),
-            bundle_digest: Some(
-                "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
-            ),
-            repo_registry_base: None,
-            store_registry_base: None,
-        };
+        let (_packs_dir, pack_path) = build_skips_unresolved_optional_fixture(bundle_root);
+        let config = deployer_config_for_fixture(bundle_root, pack_path);
 
         let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
-        assert!(env_map.is_empty());
+        // Required secret is always included.
+        assert!(env_map.contains_key("secrets://dev/demo/_/demo-app/jwt_signing_key"));
+        // Optionals with no source in env or DevStore are skipped — the
+        // stale plaintext in setup-answers.json must not contribute.
+        assert!(!env_map.contains_key("secrets://dev/demo/_/demo-app/api_key"));
+        assert!(!env_map.contains_key("secrets://dev/demo/_/demo-app/oauth_client_secret"));
+        assert!(!env_map.contains_key("oauth_client_secret"));
+    }
+
+    fn seed_devstore_api_key(bundle_root: &Path) {
+        use greentic_secrets_lib::{DevStore, SecretFormat};
+        let store_path = bundle_root.join(".greentic/state/dev/.dev.secrets.env");
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        let store = DevStore::with_path(&store_path).unwrap();
+        // Seed via an isolated current-thread runtime — no ambient runtime
+        // required, matching how the production sync path reaches the store.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                store
+                    .put(
+                        "secrets://dev/demo/_/demo-app/api_key",
+                        SecretFormat::Text,
+                        b"from-dev-store",
+                    )
+                    .await
+                    .unwrap();
+            });
+    }
+
+    fn assert_devstore_optional_in_env_map(env_map: &BTreeMap<String, String>) {
+        assert!(
+            env_map.contains_key("secrets://dev/demo/_/demo-app/api_key"),
+            "optional secret with DevStore value MUST appear in env_map: {env_map:?}",
+        );
+        assert!(env_map.contains_key("secrets://dev/demo/_/demo-app/jwt_signing_key"));
+        // Other optional with no source stays skipped.
+        assert!(!env_map.contains_key("secrets://dev/demo/_/demo-app/oauth_client_secret"));
+    }
+
+    #[test]
+    fn runtime_secret_env_map_includes_optional_secrets_with_devstore_value() {
+        // Codex F1 regression: an optional secret backed only by the dev
+        // secrets store (no env var) MUST appear in the cloud env_map so
+        // Terraform can wire it through to the runtime.
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_root = dir.path();
+        let (_packs_dir, pack_path) = build_skips_unresolved_optional_fixture(bundle_root);
+        seed_devstore_api_key(bundle_root);
+
+        let config = deployer_config_for_fixture(bundle_root, pack_path);
+        let env_map = runtime_secret_env_map_for_cloud(&config).unwrap();
+        assert_devstore_optional_in_env_map(&env_map);
+    }
+
+    // xhigh review C1 regression: the production cloud-deploy path runs
+    // `runtime_secret_env_map_for_cloud` from *inside* a current-thread tokio
+    // runtime (run_backend_operation builds `Builder::new_current_thread()`).
+    // The previous `block_in_place` bridge panicked there. This test
+    // reproduces that exact reentry shape and must not panic.
+    #[test]
+    fn runtime_secret_env_map_callable_from_within_current_thread_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_root = dir.path();
+        let (_packs_dir, pack_path) = build_skips_unresolved_optional_fixture(bundle_root);
+        seed_devstore_api_key(bundle_root);
+        let config = deployer_config_for_fixture(bundle_root, pack_path);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let env_map = rt
+            .block_on(async { runtime_secret_env_map_for_cloud(&config) })
+            .unwrap();
+        assert_devstore_optional_in_env_map(&env_map);
     }
 
     #[test]
     fn secret_value_debug_is_redacted() {
         let value = SecretValue("super-secret".to_string());
         assert_eq!(format!("{value:?}"), "<redacted>");
+    }
+
+    #[tokio::test]
+    async fn resolve_runtime_secrets_honors_alias_uris() {
+        // A value seeded only under an alias URI must still satisfy the
+        // requirement (mirrors greentic-start's alias handling).
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_root = dir.path();
+        let store_path = bundle_root.join(".greentic/state/dev/.dev.secrets.env");
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        let alias_uri = canonical_secret_uri("dev", "demo", None, "demo_pack", "legacy_jwt_key");
+        {
+            let store = DevStore::with_path(&store_path).unwrap();
+            store
+                .put(
+                    &alias_uri,
+                    greentic_secrets_lib::SecretFormat::Text,
+                    b"aliased-value",
+                )
+                .await
+                .unwrap();
+        }
+
+        let ctx = RuntimeSecretContext {
+            bundle_root: bundle_root.to_path_buf(),
+            pack_paths: Vec::new(),
+            environment: "dev".into(),
+            tenant: "demo".into(),
+            team: None,
+            extra_dev_store_roots: Vec::new(),
+        };
+        let requirement = RuntimeSecretRequirement {
+            uri: canonical_secret_uri("dev", "demo", None, "demo_pack", "jwt_signing_key"),
+            provider_id: "demo_pack".into(),
+            key: "jwt_signing_key".into(),
+            required: true,
+            default_value: None,
+            aliases: vec!["legacy_jwt_key".into()],
+            generated: None,
+            source: bundle_root.join("packs/demo-pack.gtpack"),
+        };
+
+        let resolution = resolve_runtime_secrets(&ctx, &[requirement]).await;
+        assert!(resolution.missing.is_empty(), "alias value must resolve");
+        assert_eq!(resolution.resolved.len(), 1);
+        assert_eq!(resolution.resolved[0].value.expose(), "aliased-value");
+    }
+
+    #[test]
+    fn collect_requirements_parses_generated_and_aliases() {
+        // The deployer parses the pack's `generated`/`aliases` metadata into the
+        // shared `greentic-secrets` model so it is aware which secrets are
+        // system-minted (Option A: reader stays here, model is shared).
+        let dir = tempfile::tempdir().unwrap();
+        let pack_dir = dir.path().join("packs/messaging-webex/assets");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("secret-requirements.json"),
+            r#"[{"key":"webex_webhook_secret","aliases":["WEBEX_WEBHOOK_SECRET"],"required":true,"generated":{"policy":"random","length":20,"encoding":"raw_text","scope":{"level":"tenant","team":"_"}}}]"#,
+        )
+        .unwrap();
+
+        let ctx = RuntimeSecretContext {
+            bundle_root: dir.path().to_path_buf(),
+            pack_paths: vec![dir.path().join("packs/messaging-webex")],
+            environment: "dev".into(),
+            tenant: "demo".into(),
+            team: None,
+            extra_dev_store_roots: Vec::new(),
+        };
+        let reqs = collect_requirements(&ctx).unwrap();
+        assert_eq!(reqs.len(), 1);
+        let req = &reqs[0];
+        assert_eq!(req.key, "webex_webhook_secret");
+        // Aliases are canonicalized to match the store-key derivation.
+        assert_eq!(req.aliases, vec!["webex_webhook_secret".to_string()]);
+        let generated = req.generated.as_ref().expect("generated policy parsed");
+        assert_eq!(generated.policy, "random");
+        assert_eq!(generated.length, 20);
+        assert_eq!(generated.encoding, "raw_text");
+        assert_eq!(generated.scope.level, "tenant");
+        assert_eq!(generated.scope.team.as_deref(), Some("_"));
+    }
+
+    #[tokio::test]
+    async fn generated_secret_resolves_from_its_declared_team_scope() {
+        // A generated secret explicitly scoped to a real team is minted by the
+        // runtime under that team (`generated_scope_team`), not the context
+        // team (`_`). The deployer must derive the SAME team for both the
+        // primary URI and the alias candidate URIs, or it searches `_` and
+        // misses the value — the cloud-promotion gap this consolidation closes.
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_root = dir.path();
+        let pack_dir = bundle_root.join("packs/messaging-webex/assets");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("secret-requirements.json"),
+            r#"[{"key":"webex_webhook_secret","aliases":["legacy_webhook"],"required":true,"generated":{"policy":"random","length":20,"encoding":"raw_text","scope":{"level":"team","team":"legal"}}}]"#,
+        )
+        .unwrap();
+
+        let ctx = RuntimeSecretContext {
+            bundle_root: bundle_root.to_path_buf(),
+            pack_paths: vec![bundle_root.join("packs/messaging-webex")],
+            environment: "dev".into(),
+            tenant: "demo".into(),
+            team: None,
+            extra_dev_store_roots: Vec::new(),
+        };
+        let reqs = collect_requirements(&ctx).unwrap();
+        assert_eq!(reqs.len(), 1);
+        // Primary URI is scoped to the declared team `legal`, not `_`.
+        assert!(
+            reqs[0].uri.starts_with("secrets://dev/demo/legal/"),
+            "generated secret must be team-scoped, got {}",
+            reqs[0].uri,
+        );
+
+        // Seed the value under the *alias* at the same team scope; resolution
+        // must find it via the team-scoped alias candidate URI.
+        let alias_uri = canonical_secret_uri(
+            "dev",
+            "demo",
+            Some("legal"),
+            &reqs[0].provider_id,
+            "legacy_webhook",
+        );
+        let store_path = bundle_root.join(".greentic/state/dev/.dev.secrets.env");
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        {
+            let store = DevStore::with_path(&store_path).unwrap();
+            store
+                .put(
+                    &alias_uri,
+                    greentic_secrets_lib::SecretFormat::Text,
+                    b"team-scoped-value",
+                )
+                .await
+                .unwrap();
+        }
+
+        let resolution = resolve_runtime_secrets(&ctx, &reqs).await;
+        assert!(
+            resolution.missing.is_empty(),
+            "team-scoped alias value must resolve: {:?}",
+            resolution.missing,
+        );
+        assert_eq!(resolution.resolved.len(), 1);
+        assert_eq!(resolution.resolved[0].value.expose(), "team-scoped-value");
+    }
+
+    /// A required, operator-supplied-shaped requirement — the common test shape
+    /// (no default, no aliases, not generated).
+    fn req(uri: &str, provider_id: &str, key: &str) -> RuntimeSecretRequirement {
+        RuntimeSecretRequirement {
+            uri: uri.into(),
+            provider_id: provider_id.into(),
+            key: key.into(),
+            required: true,
+            default_value: None,
+            aliases: Vec::new(),
+            generated: None,
+            source: PathBuf::from("environment.json"),
+        }
+    }
+
+    async fn seed_dev_store_value(bundle_root: &Path, uri: &str, value: &[u8]) {
+        use greentic_secrets_lib::{DevStore, SecretFormat};
+        let store_path = bundle_root.join(".greentic/state/dev/.dev.secrets.env");
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        let store = DevStore::with_path(&store_path).unwrap();
+        store.put(uri, SecretFormat::Text, value).await.unwrap();
+    }
+
+    fn ctx_for(bundle_root: &Path, environment: &str, tenant: &str) -> RuntimeSecretContext {
+        RuntimeSecretContext {
+            bundle_root: bundle_root.to_path_buf(),
+            pack_paths: Vec::new(),
+            environment: environment.into(),
+            tenant: tenant.into(),
+            team: None,
+            extra_dev_store_roots: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn is_placeholder_secret_value_matches_only_exact_start_markers() {
+        let uri = "secrets://dev/demo/_/openai/api_key";
+        // `ollama-placeholder` is a global sentinel (URI-independent), trimmed.
+        assert!(is_placeholder_secret_value("ollama-placeholder", uri));
+        assert!(is_placeholder_secret_value("  ollama-placeholder  ", uri));
+        // `placeholder for <uri>` matches ONLY for its own URI.
+        assert!(is_placeholder_secret_value(
+            "placeholder for secrets://dev/demo/_/openai/api_key",
+            uri
+        ));
+        assert!(
+            !is_placeholder_secret_value("placeholder for secrets://dev/demo/_/other/key", uri),
+            "the templated marker must not match a different URI"
+        );
+        // Genuine credentials (incl. a real value that merely *starts with*
+        // `placeholder for `) and the unexpanded ${VAR} form must NOT match.
+        assert!(!is_placeholder_secret_value(
+            "placeholder for my passphrase",
+            uri
+        ));
+        assert!(!is_placeholder_secret_value("sk-realkey-123", uri));
+        assert!(!is_placeholder_secret_value("", uri));
+        assert!(!is_placeholder_secret_value("${OPENAI_API_KEY}", uri));
+        assert!(!is_placeholder_secret_value("ollama", uri));
+    }
+
+    #[tokio::test]
+    async fn resolve_treats_start_placeholder_as_unresolved_required_is_missing() {
+        // A required secret whose only dev-store value is a greentic-start
+        // placeholder must NOT resolve: the deploy fails loudly (the secret
+        // lands in `missing`) instead of promoting `ollama-placeholder` to the
+        // cloud secret manager.
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "secrets://dev/demo/_/openai/api_key";
+        seed_dev_store_value(dir.path(), uri, b"ollama-placeholder").await;
+
+        let ctx = ctx_for(dir.path(), "dev", "demo");
+        let resolution = resolve_runtime_secrets(&ctx, &[req(uri, "openai", "api_key")]).await;
+
+        assert!(
+            resolution.resolved.is_empty(),
+            "a placeholder must not resolve"
+        );
+        assert_eq!(resolution.missing.len(), 1);
+        assert_eq!(resolution.missing[0].requirement.uri, uri);
+        assert!(
+            resolution.missing[0]
+                .checked_sources
+                .iter()
+                .any(|s| s.contains("auto-seeded placeholder")),
+            "the ignored placeholder source must be recorded for the operator: {:?}",
+            resolution.missing[0].checked_sources,
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_skips_optional_placeholder_so_cloud_value_survives() {
+        // An OPTIONAL secret backed only by a placeholder is dropped (neither
+        // resolved nor missing), so it is never promoted — a value an operator
+        // pre-seeded directly in the cloud secret manager is left intact.
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "secrets://dev/demo/_/openai/api_key";
+        seed_dev_store_value(dir.path(), uri, b"ollama-placeholder").await;
+
+        let ctx = ctx_for(dir.path(), "dev", "demo");
+        let mut requirement = req(uri, "openai", "api_key");
+        requirement.required = false;
+        let resolution = resolve_runtime_secrets(&ctx, &[requirement]).await;
+
+        assert!(resolution.resolved.is_empty());
+        assert!(
+            resolution.missing.is_empty(),
+            "an optional placeholder is skipped, not reported missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_ignores_uri_scoped_placeholder_for_marker() {
+        // The `placeholder for <uri>` marker (start's non-api_key form) seeded
+        // under its own URI is treated as unresolved.
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "secrets://dev/demo/_/webhook/token";
+        seed_dev_store_value(
+            dir.path(),
+            uri,
+            b"placeholder for secrets://dev/demo/_/webhook/token",
+        )
+        .await;
+
+        let ctx = ctx_for(dir.path(), "dev", "demo");
+        let resolution = resolve_runtime_secrets(&ctx, &[req(uri, "webhook", "token")]).await;
+
+        assert!(resolution.resolved.is_empty());
+        assert_eq!(resolution.missing.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_keeps_real_value_that_merely_starts_with_placeholder_for() {
+        // Codex F2 regression: a genuine secret value beginning with
+        // "placeholder for " — but NOT equal to the exact `placeholder for
+        // <uri>` marker — must still resolve. The matcher is exact, not a
+        // prefix, so real operator bytes are never misclassified.
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "secrets://dev/demo/_/app/passphrase";
+        let real = b"placeholder for the vault, rotated monthly";
+        seed_dev_store_value(dir.path(), uri, real).await;
+
+        let ctx = ctx_for(dir.path(), "dev", "demo");
+        let resolution = resolve_runtime_secrets(&ctx, &[req(uri, "app", "passphrase")]).await;
+
+        assert!(resolution.missing.is_empty());
+        assert_eq!(resolution.resolved.len(), 1);
+        assert_eq!(
+            resolution.resolved[0].value.expose(),
+            "placeholder for the vault, rotated monthly"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_still_accepts_a_real_value_after_placeholder_guard() {
+        // Regression: the guard must not over-match a genuine credential.
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "secrets://dev/demo/_/openai/api_key";
+        seed_dev_store_value(dir.path(), uri, b"sk-realkey-123").await;
+
+        let ctx = ctx_for(dir.path(), "dev", "demo");
+        let resolution = resolve_runtime_secrets(&ctx, &[req(uri, "openai", "api_key")]).await;
+
+        assert!(resolution.missing.is_empty());
+        assert_eq!(resolution.resolved.len(), 1);
+        assert_eq!(resolution.resolved[0].value.expose(), "sk-realkey-123");
+    }
+
+    fn env_with_webhook_endpoint(
+        env_id: &str,
+        eid: MessagingEndpointId,
+        with_ref: bool,
+    ) -> Environment {
+        use chrono::Utc;
+        use greentic_deploy_spec::{
+            EnvironmentHostConfig, MessagingEndpoint, SchemaVersion, SecretRef,
+        };
+        let eid_lower = eid.to_string().to_lowercase();
+        let webhook_secret_ref = with_ref.then(|| {
+            SecretRef::try_new(format!(
+                "secret://{env_id}/default/_/messaging-{eid_lower}/webhook_secret"
+            ))
+            .unwrap()
+        });
+        let endpoint = MessagingEndpoint {
+            schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
+            env_id: EnvId::try_from(env_id).unwrap(),
+            endpoint_id: eid,
+            provider_id: "tg-legal".into(),
+            provider_type: "telegram".into(),
+            display_name: "Legal Bot".into(),
+            secret_refs: Vec::new(),
+            webhook_secret_ref,
+            linked_bundles: Vec::new(),
+            welcome_flow: None,
+            generation: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            updated_by: "operator://test".into(),
+        };
+        Environment {
+            schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
+            environment_id: EnvId::try_from(env_id).unwrap(),
+            name: env_id.into(),
+            host_config: EnvironmentHostConfig {
+                env_id: EnvId::try_from(env_id).unwrap(),
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+                public_base_url: None,
+                gui_enabled: None,
+            },
+            packs: Vec::new(),
+            credentials_ref: None,
+            bundles: Vec::new(),
+            revisions: Vec::new(),
+            traffic_splits: Vec::new(),
+            messaging_endpoints: vec![endpoint],
+            extensions: Vec::new(),
+            revocation: Default::default(),
+            retention: Default::default(),
+            health: Default::default(),
+        }
+    }
+
+    #[test]
+    fn endpoint_webhook_requirement_matches_runtime_read_uri() {
+        let eid = MessagingEndpointId::new();
+        let eid_lower = eid.to_string().to_lowercase();
+        let env = env_with_webhook_endpoint("prod", eid, true);
+
+        let reqs = collect_endpoint_webhook_requirements(&env).unwrap();
+        assert_eq!(reqs.len(), 1);
+        let req = &reqs[0];
+        // Deploy==runtime alignment: the URI the deployer promotes under MUST be
+        // the exact `secrets://…` URI greentic-start derives from the endpoint's
+        // webhook_secret_ref (tenant `default`, team `_`, lowercased eid). Drift
+        // here means the runtime can't find the secret in the cloud manager.
+        assert_eq!(
+            req.uri,
+            format!("secrets://prod/default/_/messaging-{eid_lower}/webhook_secret")
+        );
+        assert_eq!(req.provider_id, format!("messaging-{eid_lower}"));
+        assert_eq!(req.key, "webhook_secret");
+        assert!(req.required);
+        assert!(req.generated.is_none());
+    }
+
+    #[test]
+    fn endpoint_without_webhook_ref_yields_no_requirement() {
+        let env = env_with_webhook_endpoint("prod", MessagingEndpointId::new(), false);
+        assert!(
+            collect_endpoint_webhook_requirements(&env)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dev_store_paths_includes_extra_env_roots_deduped() {
+        let bundle = PathBuf::from("/bundle");
+        let env_dir = PathBuf::from("/env");
+        let paths = dev_store_paths(&bundle, std::slice::from_ref(&env_dir));
+        assert!(paths.contains(&bundle.join(".greentic/dev/.dev.secrets.env")));
+        assert!(paths.contains(&bundle.join(".greentic/state/dev/.dev.secrets.env")));
+        assert!(paths.contains(&env_dir.join(".greentic/dev/.dev.secrets.env")));
+        assert!(paths.contains(&env_dir.join(".greentic/state/dev/.dev.secrets.env")));
+
+        // bundle_root == env_dir must not duplicate entries.
+        let deduped = dev_store_paths(&bundle, std::slice::from_ref(&bundle));
+        let unique: BTreeSet<_> = deduped.iter().cloned().collect();
+        assert_eq!(deduped.len(), unique.len());
+    }
+
+    #[test]
+    fn cloud_remote_name_for_webhook_is_endpoint_scoped() {
+        let req = req(
+            "secrets://prod/default/_/messaging-abc/webhook_secret",
+            "messaging-abc",
+            WEBHOOK_SECRET_KEY,
+        );
+        let prefix = default_cloud_secret_prefix("prod", "acme", None);
+        // `cloud_secret_name` canonicalizes the provider/key segments (hyphen →
+        // underscore). This is the internal cloud-SM resource name; the runtime
+        // still reads by the raw `secrets://…messaging-abc…` URI (the env-map key).
+        assert_eq!(
+            cloud_remote_name(Provider::Aws, &prefix, &req).unwrap(),
+            "greentic/prod/acme/_/messaging_abc/webhook_secret"
+        );
+        // Distinct endpoints → distinct cloud names (no cross-endpoint collision).
+        let mut req2 = req.clone();
+        req2.provider_id = "messaging-xyz".into();
+        assert_ne!(
+            cloud_remote_name(Provider::Aws, &prefix, &req),
+            cloud_remote_name(Provider::Aws, &prefix, &req2)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_finds_webhook_value_in_env_dir_dev_store() {
+        // The webhook value lives in the env dev-store (where `op messaging add`
+        // writes), NOT the bundle-root dev-store the pack-scan path reads.
+        // resolve_runtime_secrets must consult the extra env root.
+        let bundle = tempfile::tempdir().unwrap();
+        let env_dir = tempfile::tempdir().unwrap();
+        let uri = "secrets://prod/default/_/messaging-abc/webhook_secret";
+        let store_path = env_dir.path().join(".greentic/dev/.dev.secrets.env");
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        {
+            let store = DevStore::with_path(&store_path).unwrap();
+            store
+                .put(uri, greentic_secrets_lib::SecretFormat::Text, b"wh-value")
+                .await
+                .unwrap();
+        }
+
+        let ctx = RuntimeSecretContext {
+            bundle_root: bundle.path().to_path_buf(),
+            pack_paths: Vec::new(),
+            environment: "prod".into(),
+            tenant: "demo".into(),
+            team: None,
+            extra_dev_store_roots: vec![env_dir.path().to_path_buf()],
+        };
+        let requirement = req(uri, "messaging-abc", WEBHOOK_SECRET_KEY);
+        let resolution = resolve_runtime_secrets(&ctx, std::slice::from_ref(&requirement)).await;
+        assert!(resolution.missing.is_empty(), "{:?}", resolution.missing);
+        assert_eq!(resolution.resolved.len(), 1);
+        assert_eq!(resolution.resolved[0].value.expose(), "wh-value");
+    }
+
+    #[tokio::test]
+    async fn resolve_misses_webhook_value_without_env_root() {
+        // Same value present only in the env dev-store, but no extra env root →
+        // the bundle-root-only search misses it. This is exactly the gap the
+        // env-root wiring closes.
+        let bundle = tempfile::tempdir().unwrap();
+        let env_dir = tempfile::tempdir().unwrap();
+        let uri = "secrets://prod/default/_/messaging-abc/webhook_secret";
+        let store_path = env_dir.path().join(".greentic/dev/.dev.secrets.env");
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        {
+            let store = DevStore::with_path(&store_path).unwrap();
+            store
+                .put(uri, greentic_secrets_lib::SecretFormat::Text, b"wh-value")
+                .await
+                .unwrap();
+        }
+        let ctx = RuntimeSecretContext {
+            bundle_root: bundle.path().to_path_buf(),
+            pack_paths: Vec::new(),
+            environment: "prod".into(),
+            tenant: "demo".into(),
+            team: None,
+            extra_dev_store_roots: Vec::new(),
+        };
+        let requirement = req(uri, "messaging-abc", WEBHOOK_SECRET_KEY);
+        let resolution = resolve_runtime_secrets(&ctx, std::slice::from_ref(&requirement)).await;
+        assert_eq!(resolution.missing.len(), 1);
+    }
+
+    #[test]
+    fn load_environment_from_store_returns_none_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env_id = EnvId::try_from("prod").unwrap();
+        assert!(
+            load_environment_from_store(&store, &env_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn load_environment_from_store_fails_closed_on_corrupt_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env_id = EnvId::try_from("prod").unwrap();
+        let env_path = dir.path().join("prod/environment.json");
+        std::fs::create_dir_all(env_path.parent().unwrap()).unwrap();
+        std::fs::write(&env_path, b"{ not valid json").unwrap();
+        assert!(load_environment_from_store(&store, &env_id).is_err());
+    }
+
+    #[test]
+    fn build_cloud_env_map_pack_wins_on_uri_collision() {
+        let uri = "secrets://prod/default/_/messaging-abc/webhook_secret".to_string();
+        let pack = req(&uri, "packprov", "api_key");
+        let ep_collide = req(&uri, "messaging-abc", WEBHOOK_SECRET_KEY);
+        let ep_other = req(
+            "secrets://prod/default/_/messaging-xyz/webhook_secret",
+            "messaging-xyz",
+            WEBHOOK_SECRET_KEY,
+        );
+        let resolved: BTreeSet<String> = [
+            uri.clone(),
+            "secrets://prod/default/_/messaging-xyz/webhook_secret".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let prefix = default_cloud_secret_prefix("prod", "acme", None);
+        let map = build_cloud_env_map(
+            Provider::Aws,
+            &prefix,
+            std::slice::from_ref(&pack),
+            &[ep_collide, ep_other],
+            &resolved,
+        );
+        // Collision URI keeps the PACK remote name (built from packprov/api_key),
+        // not the endpoint's.
+        assert_eq!(
+            map.get(&uri).unwrap(),
+            &cloud_remote_name(Provider::Aws, &prefix, &pack).unwrap()
+        );
+        assert!(map.contains_key("secrets://prod/default/_/messaging-xyz/webhook_secret"));
     }
 }
