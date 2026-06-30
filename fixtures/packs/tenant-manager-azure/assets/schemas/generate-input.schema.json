@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TenantManagerAzureDeployInput",
+  "type": "object",
+  "required": [
+    "azure_subscription_id",
+    "azure_resource_group",
+    "azure_location",
+    "image_uri",
+    "domain_name",
+    "key_vault_id",
+    "master_key_secret_id",
+    "platform_secret_hash_secret_id"
+  ],
+  "properties": {
+    "azure_subscription_id": { "type": "string", "description": "Azure subscription ID (UUID)" },
+    "azure_resource_group": { "type": "string", "description": "Name of the Azure resource group to deploy into" },
+    "azure_location": { "type": "string", "description": "Azure region (e.g. eastus, westeurope)" },
+    "image_uri": { "type": "string", "description": "Digest-pinned tenant-manager container image" },
+    "domain_name": { "type": "string", "description": "Custom domain to bind to the Container App" },
+    "key_vault_id": { "type": "string", "description": "Azure Key Vault resource ID holding the secrets" },
+    "db_sku_name": { "type": "string", "default": "B_Standard_B1ms", "description": "PostgreSQL Flexible Server SKU name" },
+    "master_key_secret_id": { "type": "string", "description": "Azure Key Vault secret identifier for GREENTIC_TM_MASTER_KEY" },
+    "platform_secret_hash_secret_id": { "type": "string", "description": "Azure Key Vault secret identifier for GREENTIC_PLATFORM_SECRET_HASH" }
+  }
+}

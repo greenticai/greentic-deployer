@@ -10,7 +10,7 @@ use crate::plan::PlanContext;
 pub struct SnapRequest {
     pub capability: DeployerCapability,
     pub tenant: String,
-    pub pack_path: PathBuf,
+    pub pack_path: Option<PathBuf>,
     pub provider_pack: Option<PathBuf>,
     pub deploy_pack_id_override: Option<String>,
     pub deploy_flow_id_override: Option<String>,
@@ -34,7 +34,7 @@ impl SnapRequest {
     pub fn new(
         capability: DeployerCapability,
         tenant: impl Into<String>,
-        pack_path: PathBuf,
+        pack_path: Option<PathBuf>,
     ) -> Self {
         Self {
             capability,
@@ -140,8 +140,12 @@ mod tests {
 
     #[test]
     fn snap_request_defaults_to_local_snap_target() {
-        let request = SnapRequest::new(DeployerCapability::Plan, "acme", PathBuf::from("pack-dir"))
-            .into_deployer_request();
+        let request = SnapRequest::new(
+            DeployerCapability::Plan,
+            "acme",
+            Some(PathBuf::from("pack-dir")),
+        )
+        .into_deployer_request();
 
         assert_eq!(request.provider, Provider::Local);
         assert_eq!(request.strategy, "snap");

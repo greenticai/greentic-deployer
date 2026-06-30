@@ -54,3 +54,53 @@ jobs:
 
       - name: Build (no default features)
         run: cargo build --no-default-features
+
+  # Live-cluster gate for `op env reconcile`: stand up a throwaway kind
+  # cluster and drive the full apply→prune ceremony against a real API
+  # server. This is the only coverage of reconcile's success path — the unit
+  # tests never open a socket. Gated by GREENTIC_K8S_E2E so the test no-ops
+  # everywhere else.
+  k8s-e2e:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      GREENTIC_K8S_E2E: "1"
+    steps:
+      - name: Free disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: gtc-e2e
+      # Load the develop runtime image so the serving E2Es run against a pod
+      # that actually serves: the M2 `worker_reaches_ready_*` /
+      # `worker_pulls_http_bundle_*` tests and the M3
+      # `worker_executes_a_real_flow_over_workers_invoke` regression guard.
+      # greentic-start's `distroless-dev.yml` publishes `:develop` on every push
+      # to develop, so the pull is MANDATORY (not best-effort): a failure fails
+      # the job rather than letting the serving tests silently self-skip — a
+      # silent skip would be a false green for the #466 flow-execution guard.
+      - name: Load the develop runtime image for the serving E2E
+        run: |
+          IMG=ghcr.io/greenticai/greentic-start-distroless:develop
+          docker pull "$IMG"
+          kind load docker-image "$IMG" --name gtc-e2e
+          echo "GREENTIC_K8S_SERVING_IMAGE=$IMG" >> "$GITHUB_ENV"
+          echo "::notice::loaded $IMG; the serving E2Es will run"
+      # `oras` loads the fixture bundle into the in-cluster registry for the OCI
+      # boot-pull test (`worker_pulls_oci_bundle_and_serves_the_real_revision`);
+      # `registry:2` itself is pulled on-demand by kind, like `busybox`.
+      - uses: oras-project/setup-oras@v1
+      # `--test-threads=1`: the reconcile/apply-revision tests drive env `local`
+      # (namespace `gtc-local`) on the one kind cluster, so they must not run
+      # concurrently; the credentials test is read-only SSAR but shares the run.
+      - name: Reconcile + apply-revision + credentials E2E
+        run: cargo test --features k8s-client --test k8s_reconcile_e2e -- --nocapture --test-threads=1

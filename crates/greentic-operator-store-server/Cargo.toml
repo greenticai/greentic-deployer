@@ -1,0 +1,51 @@
+[package]
+name = "greentic-operator-store-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Operator store server: HTTP front for the Greentic environment store (Phase D PR-4)"
+license = "MIT"
+publish = false
+
+[dependencies]
+greentic-deploy-spec = { path = "../greentic-deploy-spec", version = "0.1" }
+greentic-operator-trust = { path = "../greentic-operator-trust", version = "0.1" }
+axum = { version = "0.8", features = ["macros"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+fs4 = "0.13"
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ulid = "1"
+
+[dependencies.sqlx]
+version = "0.8"
+default-features = false
+features = [
+    "runtime-tokio",
+    "sqlite",
+    "json",
+    "macros",
+    "migrate",
+]
+
+[dependencies.tokio]
+version = "1"
+features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "net",
+]
+
+[dev-dependencies]
+# Re-declared to turn on `test_support` (shared keypair fixtures) for tests.
+greentic-operator-trust = { path = "../greentic-operator-trust", version = "0.1", features = ["test-utils"] }
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

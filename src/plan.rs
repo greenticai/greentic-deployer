@@ -144,6 +144,10 @@ pub struct PlanContext {
     pub secrets: Vec<SecretRequirement>,
     /// Deployment target hints (provider/strategy strings).
     pub deployment: DeploymentHints,
+    /// True when no app bundle was provided; the deployment pack owns all
+    /// infrastructure decisions and the operator-module rewrite must be skipped.
+    #[serde(default)]
+    pub serviceless: bool,
 }
 
 impl PlanContext {
@@ -307,5 +311,6 @@ pub fn assemble_plan(
         channels,
         secrets,
         deployment,
+        serviceless: false,
     }
 }

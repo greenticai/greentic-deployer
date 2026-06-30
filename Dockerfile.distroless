@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1.7
+#
+# C4 (Phase A): musl-static binary on a distroless nonroot base.
+# Default base is gcr.io/distroless/static-debian12:nonroot (uid 65532, no
+# shell, ships ca-certificates); Chainguard is the optional hardened upgrade.
+
+FROM rust:1.95-bookworm AS build
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    musl-tools \
+    build-essential \
+    cmake \
+    perl \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add x86_64-unknown-linux-musl
+
+ENV CC_x86_64_unknown_linux_musl=musl-gcc
+ENV CXX_x86_64_unknown_linux_musl=g++
+ENV CARGO_TARGET_DIR=/tmp/target
+
+COPY . .
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/tmp/target \
+    cargo build --release --target x86_64-unknown-linux-musl \
+    --config 'profile.release.strip=true' --bin greentic-deployer \
+    && mkdir -p /out \
+    && cp /tmp/target/x86_64-unknown-linux-musl/release/greentic-deployer /out/greentic-deployer
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=build /out/greentic-deployer /usr/local/bin/greentic-deployer
+
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/greentic-deployer"]

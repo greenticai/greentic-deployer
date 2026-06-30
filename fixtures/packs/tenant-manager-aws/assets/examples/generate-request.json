@@ -1,0 +1,10 @@
+{
+  "aws_region": "ap-southeast-1",
+  "image_uri": "123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/greentic-tenant-manager@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "domain_name": "id.example.com",
+  "acm_certificate_arn": "arn:aws:acm:ap-southeast-1:123456789012:certificate/00000000-0000-0000-0000-000000000000",
+  "vpc_id": "vpc-00000000000000000",
+  "subnet_ids": ["subnet-00000000000000000", "subnet-11111111111111111"],
+  "master_key_secret_arn": "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:tm-master-key",
+  "platform_secret_hash_arn": "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:tm-platform-hash"
+}
