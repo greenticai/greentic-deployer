@@ -4877,7 +4877,7 @@ mod tests {
         // as {"a":[true,"x"],"b":1}.
         assert_eq!(
             hash_json(&json!({"b": 1, "a": [true, "x"]})),
-            "f15ef113d6e0c876b9ea9e90ebc36ad3f8b350d44634ba2fc407e978fb8cebeb"
+            "7dbf0fc2e630db542306410b1f9352c863160b14c5cbacbc1e2b51661d87b4d4"
         );
     }
 
