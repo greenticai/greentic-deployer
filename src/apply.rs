@@ -3793,20 +3793,54 @@ fn configure_terraform_backend(
 }
 
 fn normalize_terraform_main_tf(config: &DeployerConfig, terraform_root: &Path) -> Result<()> {
-    if config.provider != crate::config::Provider::Gcp {
-        return Ok(());
-    }
+    // The `operator_image` local in main.tf decides which greentic-start image the
+    // operator module runs. Older published deploy packs (e.g. the `:stable`
+    // aws.gtpack) HARDCODE the GHCR image and never reference `var.operator_image`,
+    // so the `GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE` override is silently
+    // dropped (the tfvar is written but unused). Rewrite the `operator_image` local
+    // on EVERY cloud target so the override always wins:
+    //   - override set  -> force the literal image (works even when var.operator_image
+    //                      is undeclared in an old pack).
+    //   - override unset-> ensure the `var.operator_image != "" ? ...` conditional.
+    // This was previously GCP-only, which is why AWS deploys ignored the override.
+    let override_img = std::env::var("GREENTIC_DEPLOY_TERRAFORM_VAR_OPERATOR_IMAGE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     let main_tf_path = terraform_root.join("main.tf");
     if main_tf_path.exists() {
         let contents = fs::read_to_string(&main_tf_path)?;
-        let old = r#"  operator_image        = "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}""#;
-        let new = r#"  operator_image        = var.operator_image != "" ? var.operator_image : "ghcr.io/greenticai/greentic-start-distroless@${var.operator_image_digest}""#;
-        if contents.contains(old) {
-            fs::write(&main_tf_path, contents.replace(old, new))?;
+        let mut rewritten = Vec::with_capacity(contents.lines().count() + 1);
+        let mut changed = false;
+        for line in contents.lines() {
+            let trimmed = line.trim_start();
+            let is_operator_image_local = trimmed.starts_with("operator_image")
+                && trimmed.contains("ghcr.io/greenticai/greentic-start-distroless");
+            if is_operator_image_local && let Some(eq) = line.find('=') {
+                let lhs = &line[..=eq]; // keep original indentation + alignment
+                if let Some(img) = &override_img {
+                    rewritten.push(format!("{lhs} {}", serde_json::json!(img)));
+                    changed = true;
+                    continue;
+                } else if !trimmed.contains("var.operator_image !=") {
+                    rewritten.push(format!(
+                        "{lhs} var.operator_image != \"\" ? var.operator_image : \"ghcr.io/greenticai/greentic-start-distroless@${{var.operator_image_digest}}\""
+                    ));
+                    changed = true;
+                    continue;
+                }
+            }
+            rewritten.push(line.to_string());
+        }
+        if changed {
+            fs::write(&main_tf_path, rewritten.join("\n") + "\n")?;
         }
     }
-    normalize_gcp_operator_module_main_tf(terraform_root)?;
+
+    if config.provider == crate::config::Provider::Gcp {
+        normalize_gcp_operator_module_main_tf(terraform_root)?;
+    }
     Ok(())
 }
 
