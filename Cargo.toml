@@ -10,7 +10,7 @@ resolver = "2"
 
 [package]
 name = "greentic-deployer"
-version = "1.1.1-dev.0"
+version = "1.1.2-dev.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic deployer runtime for plan construction and deployment-pack dispatch"
@@ -122,19 +122,19 @@ features = [
 # Floor pinned to the C5.1 publish that exposes `RolloutEvent` +
 # `emit_rollout_event`. Lower versions in the same range satisfy
 # `>=1.1.0-dev` but lack the rollout module.
-version = ">=1.1.0-dev.26432434860, <1.2.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 features = [
     "otlp",
 ]
 
 [dependencies.greentic-types]
-version = ">=1.1.0-dev.26561934923, <1.2.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 
 [dependencies.greentic-distributor-client]
 version = ">=1.1.0-dev, <1.2.0-0"
 
 [dependencies.greentic-secrets-lib]
-version = ">=1.1.0-dev.28257467351, <1.2.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 features = [
     "providers-dev",
     "providers-vault",
@@ -302,4 +302,4 @@ greentic-deploy-spec = { path = "crates/greentic-deploy-spec" }
 # E2E can derive the canonical store-key the bound-credential resolver reads,
 # and seed a ServiceAccount token via env var. Already in the lockfile via the
 # normal dep, so no resolution change.
-greentic-secrets-lib = ">=1.1.0-dev.27563392344, <1.2.0-0"
+greentic-secrets-lib = ">=1.1.0-dev, <1.2.0-0"
