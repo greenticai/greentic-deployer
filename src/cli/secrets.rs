@@ -77,6 +77,11 @@ pub struct SecretsPutPayload {
 pub struct SecretsGetPayload {
     pub environment_id: String,
     pub path: String,
+    /// When true, the decrypted value is included in the outcome envelope.
+    /// Default false — only presence + metadata is returned, so a `get` does
+    /// not leak the value into CI logs / audit trails.
+    #[serde(default)]
+    pub reveal: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +227,10 @@ pub fn put(
     })
 }
 
+/// `op secrets get`. Reads a secret back for the dev-store and Vault backends
+/// (symmetric to [`put`]); other kinds return `NotYetImplemented` (A9). Reads
+/// are not audited (matching [`list`]). By default only presence + metadata is
+/// returned; `reveal: true` includes the decrypted value.
 pub fn get(
     store: &LocalFsStore,
     flags: &OpFlags,
@@ -233,17 +242,65 @@ pub fn get(
     let payload = resolve_payload::<SecretsGetPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let env = store.load(&env_id)?;
-    let _secrets = require_secrets_pack(&env, &env_id)?;
-    SecretRef::try_new(format!(
-        "secret://{}/{}",
-        env_id.as_str(),
-        payload.path.trim_start_matches('/')
-    ))
-    .map_err(|e| OpError::InvalidArgument(format!("secret path: {e}")))?;
-    Err(OpError::NotYetImplemented(
-        "secrets backend dispatch lands in A9 (env-pack registry); A3 wires the surface only"
-            .to_string(),
-    ))
+    let secrets = require_secrets_pack(&env, &env_id)?;
+    let rel_path = payload.path.trim_start_matches('/');
+    let secret_uri = format!("secret://{}/{rel_path}", env_id.as_str());
+    SecretRef::try_new(secret_uri.clone())
+        .map_err(|e| OpError::InvalidArgument(format!("secret path: {e}")))?;
+
+    let kind = secrets.kind.to_string();
+    let kind_path = secrets.kind.path();
+    if kind_path == DEV_STORE_KIND_PATH {
+        validate_dev_store_secret_path(rel_path)?;
+        let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
+        let dev_path = resolve_dev_store_path(
+            &store.env_dir(&env_id)?,
+            std::env::var_os(DEV_SECRETS_PATH_ENV).map(PathBuf::from),
+        );
+        // A missing store file means nothing was ever written for this env —
+        // absence, not an error (mirrors `dev_store_has`'s existence guard).
+        let value = if dev_path.exists() {
+            dev_store_get_value(&dev_path, &store_uri)?
+        } else {
+            None
+        };
+        Ok(OpOutcome::new(
+            NOUN,
+            "get",
+            get_result_json(
+                env_id.as_str(),
+                &secret_uri,
+                &store_uri,
+                &kind,
+                json!({"store_path": dev_path.display().to_string()}),
+                value,
+                payload.reveal,
+            ),
+        ))
+    } else if kind_path == crate::defaults::VAULT_SECRETS_PATH {
+        validate_dev_store_secret_path(rel_path)?;
+        let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
+        let (value, vault_addr) = vault_seed_get(store, &env, &store_uri)?;
+        Ok(OpOutcome::new(
+            NOUN,
+            "get",
+            get_result_json(
+                env_id.as_str(),
+                &secret_uri,
+                &store_uri,
+                &kind,
+                json!({"vault_addr": vault_addr}),
+                value,
+                payload.reveal,
+            ),
+        ))
+    } else {
+        Err(OpError::NotYetImplemented(
+            "secrets backend dispatch beyond the dev-store and Vault lands in A9 \
+             (env-pack registry)"
+                .to_string(),
+        ))
+    }
 }
 
 pub fn rotate(
@@ -279,6 +336,37 @@ pub fn rotate(
 }
 
 // --- internals -----------------------------------------------------------
+
+/// Build the `get` outcome body: identity fields + a `present` flag, plus the
+/// decrypted value only when `reveal` is set (so a non-revealing `get` never
+/// puts material into logs/audit). `extra` carries the backend-specific field
+/// (`store_path` for dev-store, `vault_addr` for Vault).
+fn get_result_json(
+    env_id: &str,
+    secret_ref: &str,
+    store_uri: &str,
+    secrets_kind: &str,
+    extra: Value,
+    value: Option<String>,
+    reveal: bool,
+) -> Value {
+    let mut body = json!({
+        "environment_id": env_id,
+        "secret_ref": secret_ref,
+        "store_uri": store_uri,
+        "secrets_kind": secrets_kind,
+        "present": value.is_some(),
+    });
+    if let Value::Object(extra_map) = extra
+        && let Value::Object(map) = &mut body
+    {
+        map.extend(extra_map);
+    }
+    if reveal && let Some(v) = value {
+        body["value"] = Value::String(v);
+    }
+    body
+}
 
 /// Seed a Vault-backed secret through the embedded [`SecretsCore`]: the value is
 /// envelope-encrypted via `transit/encrypt` and written to the KV record the
@@ -385,6 +473,88 @@ fn vault_seed_put(
     })?;
 
     Ok(addr)
+}
+
+/// Read a Vault-backed secret back through the embedded [`SecretsCore`] — the
+/// counterpart to [`vault_seed_put`]. Assembles the same connection (binding
+/// mounts + ambient `VAULT_TOKEN`/`VAULT_ADDR`, with the same path-consistency
+/// guard) and `get_text`s the store URI; the broker `transit/decrypt`s the
+/// envelope. Returns `(Some(plaintext), addr)` when present, `(None, addr)`
+/// when the key is absent. The admin `VAULT_TOKEN` must hold `transit/decrypt`
+/// + KV read.
+fn vault_seed_get(
+    store: &LocalFsStore,
+    env: &Environment,
+    store_uri: &str,
+) -> Result<(Option<String>, String), OpError> {
+    use crate::env_packs::k8s::manifests::SecretsBackend;
+    use greentic_secrets_lib::core::{CoreBuilder, Error as CoreError, SecretsError, rt};
+
+    let tenant = env
+        .host_config
+        .tenant_org_id
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| {
+            OpError::InvalidArgument(
+                "a Vault-backed env must be tenant-owned before reading; set the owner with \
+                 `op env update <env> --tenant-org <tenant>`"
+                    .to_string(),
+            )
+        })?;
+
+    let SecretsBackend::Vault(vault) = super::env::resolve_secrets_backend(store, env)? else {
+        return Err(OpError::Conflict(
+            "env secrets binding is not Vault-backed".to_string(),
+        ));
+    };
+
+    if std::env::var("VAULT_TOKEN")
+        .map(|t| t.trim().is_empty())
+        .unwrap_or(true)
+    {
+        return Err(OpError::InvalidArgument(
+            "reading a Vault-backed secret needs an admin `VAULT_TOKEN` (with `transit/decrypt` \
+             and KV read) exported in the environment"
+                .to_string(),
+        ));
+    }
+    let addr = match std::env::var("VAULT_ADDR") {
+        Ok(a) if !a.trim().is_empty() => a,
+        _ => {
+            return Err(OpError::InvalidArgument(
+                "reading a Vault-backed secret needs `VAULT_ADDR` exported (a Vault address \
+                 reachable from here, e.g. a port-forward to the in-cluster Vault)"
+                    .to_string(),
+            ));
+        }
+    };
+
+    vault_seed_path_consistency(&vault, |var| {
+        std::env::var(var).ok().and_then(|v| {
+            let trimmed = v.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+    })?;
+
+    let value: Option<String> = rt::sync_await(async {
+        let components = greentic_secrets_lib::vault::build_backend()
+            .await
+            .map_err(|e| OpError::Conflict(format!("vault backend init failed: {e}")))?;
+        let core = CoreBuilder::default()
+            .tenant(tenant.as_str())
+            .backend(components.backend, components.key_provider)
+            .build()
+            .await
+            .map_err(|e| OpError::Conflict(format!("vault secrets core build failed: {e}")))?;
+        match core.get_text(store_uri).await {
+            Ok(text) => Ok(Some(text)),
+            Err(SecretsError::Core(CoreError::NotFound { .. })) => Ok(None),
+            Err(e) => Err(OpError::Conflict(format!("vault get failed: {e}"))),
+        }
+    })?;
+
+    Ok((value, addr))
 }
 
 /// Fail closed when the operator's ambient Vault environment would not resolve
@@ -837,7 +1007,8 @@ fn get_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "environment_id": {"type": "string"},
-            "path": {"type": "string"}
+            "path": {"type": "string"},
+            "reveal": {"type": "boolean", "default": false, "description": "Include the decrypted value in the outcome. Default false — presence + metadata only."}
         }
     })
 }
@@ -1363,16 +1534,120 @@ mod tests {
     }
 
     #[test]
-    fn get_yields_not_yet_implemented_after_path_validation() {
+    fn get_reads_back_put_value_from_dev_store() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&env_with_secrets()).unwrap();
+        let path = "default/_/messaging-telegram/telegram_bot_token";
+        put(
+            &store,
+            &OpFlags::default(),
+            Some(SecretsPutPayload {
+                environment_id: "local".to_string(),
+                path: path.to_string(),
+                value: "tok-roundtrip-456".to_string(),
+                idempotency_key: None,
+            }),
+        )
+        .unwrap();
+
+        // reveal=false → present, but the value never appears in the envelope.
+        let outcome = get(
+            &store,
+            &OpFlags::default(),
+            Some(SecretsGetPayload {
+                environment_id: "local".to_string(),
+                path: path.to_string(),
+                reveal: false,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.result.get("present").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(outcome.result.get("value").is_none());
+        let envelope = serde_json::to_string(&outcome).unwrap();
+        assert!(!envelope.contains("tok-roundtrip-456"));
+
+        // reveal=true → the decrypted value is included.
+        let outcome = get(
+            &store,
+            &OpFlags::default(),
+            Some(SecretsGetPayload {
+                environment_id: "local".to_string(),
+                path: path.to_string(),
+                reveal: true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.result.get("value").and_then(|v| v.as_str()),
+            Some("tok-roundtrip-456")
+        );
+    }
+
+    #[test]
+    fn get_absent_key_returns_present_false() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&env_with_secrets()).unwrap();
+        let outcome = get(
+            &store,
+            &OpFlags::default(),
+            Some(SecretsGetPayload {
+                environment_id: "local".to_string(),
+                path: "default/_/messaging-telegram/never_written".to_string(),
+                reveal: true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.result.get("present").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert!(outcome.result.get("value").is_none());
+    }
+
+    #[test]
+    fn get_vault_requires_tenant_owned_env() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        // Mirror put: a Vault env with no tenant owner must fail closed before
+        // any Vault I/O (the runtime scopes a Vault SecretsCore to the owner).
+        store
+            .save(&env_with_secrets_kind("greentic.secrets.vault@0.1.0"))
+            .unwrap();
         let err = get(
             &store,
             &OpFlags::default(),
             Some(SecretsGetPayload {
                 environment_id: "local".to_string(),
-                path: "credentials/aws".to_string(),
+                path: "tenant-default/_/messaging-telegram/telegram_bot_token".to_string(),
+                reveal: false,
+            }),
+        )
+        .unwrap_err();
+        match err {
+            OpError::InvalidArgument(m) => assert!(m.contains("tenant-owned"), "msg: {m}"),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_non_dev_store_backend_returns_not_yet_implemented() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store
+            .save(&env_with_secrets_kind("greentic.secrets.aws-sm@1.0.0"))
+            .unwrap();
+        let err = get(
+            &store,
+            &OpFlags::default(),
+            Some(SecretsGetPayload {
+                environment_id: "local".to_string(),
+                path: "default/_/pack/key_name".to_string(),
+                reveal: false,
             }),
         )
         .unwrap_err();
