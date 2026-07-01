@@ -1849,7 +1849,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2013,7 +2013,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2376,7 +2376,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "greentic-bundle-reader",
- "greentic-deploy-spec 0.1.28036269983",
+ "greentic-deploy-spec 0.1.28508166238",
  "greentic-distributor-client",
  "greentic-qa-lib",
  "hex",
@@ -2462,9 +2462,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deploy-spec"
-version = "0.1.28036269983"
+version = "0.1.28508166238"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0308e4df4fd262fdcb40c3093fbb200f8b65c3c8c772b2871637ec3f15566f85"
+checksum = "a9f03727414ea5a9338f149bafe155af3201a5b6c1d16db1381924cc2ec83052"
 dependencies = [
  "chrono",
  "greentic-config-types",
@@ -2483,7 +2483,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3868,7 +3868,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5019,7 +5019,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5087,7 +5087,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5954,7 +5954,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
