@@ -18,9 +18,9 @@ schemars = ["dep:schemars"]
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
-greentic-config-types = ">=1.1.0-dev, <1.2.0-0"
-greentic-secrets-spec = ">=1.1.0-dev.27563392344, <1.2.0-0"
-greentic-types = ">=1.1.0-dev.26561934923, <1.2.0-0"
+greentic-config-types = ">=1.1.0-0, <1.2.0-0"
+greentic-secrets-spec = ">=1.1.0-0, <1.2.0-0"
+greentic-types = ">=1.1.0-0, <1.2.0-0"
 http = "1"
 hex = "0.4"
 schemars = { version = "0.8", optional = true }
