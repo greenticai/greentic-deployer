@@ -39,13 +39,14 @@ const ENV_ID: &str = "local";
 const NAMESPACE: &str = "gtc-local";
 const ROUTER_DEPLOY: &str = "gtc-router";
 
-/// A runtime image that deliberately never serves `/healthz` under the
-/// `start --env` boot: the stable `:latest` predates the bundle-less serve
-/// path, so `start --env` fails fast and the worker never becomes ready. The
-/// warm-gate-blocks test pins this (via a `runtime_image` answer) so it keeps
-/// testing the readiness gate even though [`DEFAULT_RUNTIME_IMAGE`] is now a
-/// serving `:develop` image.
-const UNREADY_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless:latest";
+/// A runtime image that deliberately never serves `/healthz`: the pause
+/// container sleeps forever without opening any port, so the worker
+/// Deployment's `httpGet /healthz` readinessProbe fails permanently and
+/// `availableReplicas` stays 0.  Pinned to an immutable versioned tag
+/// (`pause:3.9`) — mutable tags like `:latest` or `:develop` break when the
+/// upstream image is republished with a serving build (which is exactly what
+/// happened to `greentic-start-distroless:latest` after the 1.1 GA).
+const UNREADY_IMAGE: &str = "registry.k8s.io/pause:3.9";
 
 /// Store-aligned credentials ref for the deployer's bound ServiceAccount token
 /// (`secret://<env>/<tenant>/<team>/<pack>/<name>`). The resolver derives the
@@ -478,11 +479,10 @@ fn apply_revision(store: &Path, revision_id: &str) -> String {
 ///
 /// This exercises the BLOCK path: the worker never becomes ready, so
 /// `warm_revision`'s readiness wait times out. The caller pins a
-/// deliberately-unready [`UNREADY_IMAGE`] (the stable `:latest`, which predates
-/// the `start --env` boot and fails fast) via a `runtime_image` answer, so the
-/// gate blocks on the image regardless of what [`DEFAULT_RUNTIME_IMAGE`] is —
-/// now a serving `:develop`. The positive path (a real serving image reaches
-/// Ready) is covered by
+/// deliberately-unready [`UNREADY_IMAGE`] (an immutable `pause:3.9` image that
+/// sleeps forever without serving `/healthz`) via a `runtime_image` answer, so
+/// the gate blocks regardless of what [`DEFAULT_RUNTIME_IMAGE`] is. The
+/// positive path (a real serving image reaches Ready) is covered by
 /// `worker_reaches_ready_and_serves_healthz_with_a_serving_image`. A short
 /// `GREENTIC_K8S_WARM_READY_TIMEOUT_SECS` keeps the gate observable without a
 /// multi-minute hang (the default is 5 minutes).
@@ -1217,11 +1217,11 @@ fn apply_revision_warm_gate_blocks_unready_worker_then_archives_against_a_live_c
 
     // apply-revision on the Ready (present) revision → warm branch. warm
     // re-upserts the worker pair, then waits for the rollout. The pinned
-    // UNREADY_IMAGE (`:latest`) predates the `start --env` serve boot and exits
-    // immediately, so the pod never becomes available and the readiness gate
-    // FAILS the warm rather than promoting a non-serving worker — the
-    // live-cluster proof that the gate reads real Deployment status
-    // (`observedGeneration` + `availableReplicas`) and blocks.
+    // UNREADY_IMAGE (`pause:3.9`) never serves `/healthz`, so the pod never
+    // becomes available and the readiness gate FAILS the warm rather than
+    // promoting a non-serving worker — the live-cluster proof that the gate
+    // reads real Deployment status (`observedGeneration` + `availableReplicas`)
+    // and blocks.
     let err = apply_revision_expect_not_ready(store, &revision_id);
     assert_eq!(
         err["error"]["kind"], "conflict",
