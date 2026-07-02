@@ -20,6 +20,8 @@ use std::path::Path;
 use greentic_deploy_spec::{CapabilitySlot, EnvId};
 use serde::{Deserialize, Serialize};
 
+use crate::cli::secrets::{DEV_SECRETS_PATH_ENV, DEV_STORE_RELATIVE, DEV_STORE_STATE_RELATIVE};
+
 use super::atomic_write::{atomic_write_bytes, atomic_write_json};
 use super::store::{LocalFsStore, StoreError};
 use super::trust_root::TRUST_ROOT_FILE;
@@ -145,6 +147,32 @@ fn snapshot_locked(store: &LocalFsStore, env_id: &EnvId) -> Result<SnapshotId, S
     }
     // If `messaging/` is absent there's nothing to record: absence is the
     // default, and restore deletes anything not present in the manifest.
+
+    // --- Dev-store secrets (P0b coverage for apply-updates rollback) ---
+    //
+    // The env's local dev-store secrets file(s) — where `op secrets put`,
+    // `op messaging add`, and an update-plan apply write secret material,
+    // resolved by `cli::secrets` relative to the env dir. Both candidate paths
+    // are captured unconditionally: `capture_file` records an absent one as
+    // meaningful-absence, and restore is byte-exact regardless of which the
+    // runtime resolves. Capturing these is what lets a failed apply-updates roll
+    // back secret writes, so `secrets[]` and `messaging_endpoints[]` are safe to
+    // apply.
+    for rel in [DEV_STORE_RELATIVE, DEV_STORE_STATE_RELATIVE] {
+        capture_file(&env_dir, rel, &snap_dir, &mut manifest_files)?;
+    }
+    // If the operator redirected the dev-store off the env tree via
+    // GREENTIC_DEV_SECRETS_PATH, this env-dir-relative snapshot cannot reach it.
+    // Warn rather than fail: the override is a rare dev-time knob, and failing
+    // would block apply-updates for everyone who sets it — but a later restore
+    // would silently not cover those secrets, so surface the gap.
+    if std::env::var_os(DEV_SECRETS_PATH_ENV).is_some() {
+        tracing::warn!(
+            env_id = %env_id,
+            "GREENTIC_DEV_SECRETS_PATH is set; the dev-store lives outside the env dir and is not \
+             captured in this snapshot — an apply-updates rollback will not restore its secrets"
+        );
+    }
 
     // Persist the manifest itself.
     let manifest = SnapshotManifest {
@@ -569,6 +597,76 @@ mod tests {
             if let Some(wsr) = &ep.webhook_secret_ref {
                 assert_eq!(wsr.env_segment(), env_id.as_str());
             }
+        }
+    }
+
+    #[test]
+    fn snapshot_and_restore_dev_store() {
+        let tmp = TempDir::new().unwrap();
+        let (store, env_id, _env) = seed_env(&tmp);
+        let env_dir = tmp.path().join(env_id.as_str());
+
+        // Seed a dev-store secrets file (what `op secrets put` / an apply writes).
+        let dev_file = env_dir.join(DEV_STORE_RELATIVE);
+        fs::create_dir_all(dev_file.parent().unwrap()).unwrap();
+        let original = b"secrets://snapshot-test/_/p/k=v1\n";
+        fs::write(&dev_file, original).unwrap();
+
+        let snap_id = snapshot_environment(&store, &env_id).unwrap();
+
+        // A later apply mutates the dev-store...
+        fs::write(&dev_file, b"secrets://snapshot-test/_/p/k=TAMPERED\n").unwrap();
+
+        // ...and rollback restores it byte-exact.
+        restore_environment(&store, &env_id, &snap_id).unwrap();
+        assert_eq!(fs::read(&dev_file).unwrap(), original);
+    }
+
+    #[test]
+    fn meaningful_absence_dev_store() {
+        let tmp = TempDir::new().unwrap();
+        let (store, env_id, _env) = seed_env(&tmp);
+        let env_dir = tmp.path().join(env_id.as_str());
+        let dev_file = env_dir.join(DEV_STORE_RELATIVE);
+        assert!(!dev_file.exists());
+
+        // Snapshot captures the absence.
+        let snap_id = snapshot_environment(&store, &env_id).unwrap();
+
+        // A secret appears post-snapshot (an apply wrote one).
+        fs::create_dir_all(dev_file.parent().unwrap()).unwrap();
+        fs::write(&dev_file, b"secrets://snapshot-test/_/p/k=new\n").unwrap();
+
+        // Rollback removes it — a snapshot records exactly what was there.
+        restore_environment(&store, &env_id, &snap_id).unwrap();
+        assert!(
+            !dev_file.exists(),
+            "dev-store file must be absent after restoring a snapshot that lacked it"
+        );
+    }
+
+    #[test]
+    fn snapshot_captures_both_dev_store_paths() {
+        let tmp = TempDir::new().unwrap();
+        let (store, env_id, _env) = seed_env(&tmp);
+        let env_dir = tmp.path().join(env_id.as_str());
+
+        // Seed BOTH candidate dev-store locations.
+        for rel in [DEV_STORE_RELATIVE, DEV_STORE_STATE_RELATIVE] {
+            let f = env_dir.join(rel);
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(&f, format!("{rel}\n")).unwrap();
+        }
+
+        let snap_id = snapshot_environment(&store, &env_id).unwrap();
+
+        // Both are recorded present in the manifest and copied into the snapshot.
+        let snap_dir = env_dir.join(SNAPSHOTS_DIR).join(snap_id.as_str());
+        let manifest: SnapshotManifest =
+            serde_json::from_slice(&fs::read(snap_dir.join(MANIFEST_FILE)).unwrap()).unwrap();
+        for rel in [DEV_STORE_RELATIVE, DEV_STORE_STATE_RELATIVE] {
+            assert_eq!(manifest.files.get(rel), Some(&true), "{rel} present");
+            assert!(snap_dir.join(rel).is_file(), "{rel} copied into snapshot");
         }
     }
 
