@@ -134,6 +134,13 @@ pub enum OpNoun {
         #[command(subcommand)]
         verb: ExtensionsVerb,
     },
+    /// Per-environment update-channel enrollment (`P1b`). `enroll` mints a
+    /// client certificate at the Cert-CA and persists it to the env secrets
+    /// backend; `status` reports the stored certificate's serial + validity.
+    Updates {
+        #[command(subcommand)]
+        verb: UpdatesVerb,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -656,6 +663,23 @@ pub enum ExtensionsVerb {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum UpdatesVerb {
+    /// Enroll the env's update channel: mint a key + CSR, exchange it at the
+    /// Cert-CA for a signed client certificate, and persist cert/key/CA into the
+    /// env secrets backend. Re-running re-enrolls (manual rotation).
+    Enroll(UpdatesEnrollArgs),
+    /// Report the enrolled update-channel certificate's serial + validity window.
+    Status { env_id: Option<String> },
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesEnrollArgs {
+    pub env_id: Option<String>,
+    #[arg(long = "ca-url")]
+    pub ca_url: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
 pub enum BundlesVerb {
     Add,
     Update,
@@ -927,6 +951,7 @@ pub fn dispatch_op_with_registry(
         OpNoun::TrustRoot { verb } => dispatch_trust_root(&store, &flags, verb),
         OpNoun::Messaging { verb } => dispatch_messaging(&store, &flags, verb),
         OpNoun::Extensions { verb } => dispatch_extensions(&store, &flags, verb),
+        OpNoun::Updates { verb } => dispatch_updates(&store, &flags, verb),
     };
     result.inspect_err(|err| print_error(noun, verb, err))
 }
@@ -1051,6 +1076,13 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 ExtensionsVerb::Remove => "remove",
                 ExtensionsVerb::Rollback => "rollback",
                 ExtensionsVerb::List { .. } => "list",
+            },
+        ),
+        OpNoun::Updates { verb } => (
+            "updates",
+            match verb {
+                UpdatesVerb::Enroll(_) => "enroll",
+                UpdatesVerb::Status { .. } => "status",
             },
         ),
     }
@@ -1294,6 +1326,33 @@ fn dispatch_trust_root(
                 _ => None,
             };
             super::trust_root::remove(store, flags, payload)?
+        }
+    };
+    print_outcome(&outcome)
+}
+
+fn dispatch_updates(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    verb: UpdatesVerb,
+) -> Result<(), OpError> {
+    let outcome = match verb {
+        UpdatesVerb::Enroll(args) => {
+            let payload = match (args.env_id, args.ca_url) {
+                (Some(environment_id), Some(ca_url)) => {
+                    Some(super::updates::UpdatesEnrollPayload {
+                        environment_id,
+                        ca_url,
+                    })
+                }
+                _ => None, // fall through to --answers / --schema
+            };
+            super::updates::enroll(store, flags, payload)?
+        }
+        UpdatesVerb::Status { env_id } => {
+            let payload = env_id
+                .map(|environment_id| super::updates::UpdatesStatusPayload { environment_id });
+            super::updates::status(store, flags, payload)?
         }
     };
     print_outcome(&outcome)

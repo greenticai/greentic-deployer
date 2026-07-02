@@ -32,7 +32,7 @@ use crate::environment::{
 use super::dispatch::{
     BundlesVerb, ConfigVerb, CredentialsVerb, EnvPacksVerb, EnvVerb, ExtensionsVerb,
     MessagingEndpointVerb, MessagingNoun, OpCommand, OpNoun, RevisionsVerb, SecretsVerb,
-    TrafficVerb, TrustRootVerb, print_outcome,
+    TrafficVerb, TrustRootVerb, UpdatesVerb, print_outcome,
 };
 use super::env_apply::{ApplyMode, ApplyOptions};
 use super::env_manifest::{EnvManifest, ManifestBundle};
@@ -274,6 +274,12 @@ fn route_remote(
             SecretsVerb::Put => Err(not_supported("secrets put")),
             SecretsVerb::Get => Err(not_supported("secrets get")),
             SecretsVerb::Rotate => Err(not_supported("secrets rotate")),
+        },
+        // Update-channel enrollment writes to the env's local secrets backend
+        // and talks to the external Cert-CA — not a remote-store operation.
+        OpNoun::Updates { verb } => match verb {
+            UpdatesVerb::Enroll(_) => Err(not_supported("updates enroll")),
+            UpdatesVerb::Status { .. } => Err(not_supported("updates status")),
         },
     }
 }

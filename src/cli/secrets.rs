@@ -174,56 +174,22 @@ pub fn put(
             ));
         }
         let kind_path = secrets.kind.path();
-        if kind_path == DEV_STORE_KIND_PATH {
-            validate_dev_store_secret_path(rel_path)?;
-            let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
-            let dev_path = resolve_dev_store_path(
-                &store.env_dir(&env_id)?,
-                std::env::var_os(DEV_SECRETS_PATH_ENV).map(PathBuf::from),
-            );
-            dev_store_put(&dev_path, &store_uri, &payload.value)?;
-            Ok((
-                OpOutcome::new(
-                    NOUN,
-                    "put",
-                    json!({
-                        "environment_id": env_id.as_str(),
-                        "secret_ref": secret_uri,
-                        "store_uri": store_uri,
-                        "secrets_kind": secrets.kind.to_string(),
-                        "store_path": dev_path.display().to_string(),
-                        "written": true,
-                    }),
-                ),
-                AuditGens::NONE,
-            ))
-        } else if kind_path == crate::defaults::VAULT_SECRETS_PATH {
-            // Same ref shape as the dev store; the difference is the backend.
-            validate_dev_store_secret_path(rel_path)?;
-            let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
-            let vault_addr = vault_seed_put(store, &env, &store_uri, &payload.value)?;
-            Ok((
-                OpOutcome::new(
-                    NOUN,
-                    "put",
-                    json!({
-                        "environment_id": env_id.as_str(),
-                        "secret_ref": secret_uri,
-                        "store_uri": store_uri,
-                        "secrets_kind": secrets.kind.to_string(),
-                        "vault_addr": vault_addr,
-                        "written": true,
-                    }),
-                ),
-                AuditGens::NONE,
-            ))
-        } else {
-            Err(OpError::NotYetImplemented(
-                "secrets backend dispatch beyond the dev-store and Vault lands in A9 \
-                 (env-pack registry)"
-                    .to_string(),
-            ))
+        let (store_uri, extra) =
+            put_env_secret(store, &env, &env_id, kind_path, rel_path, &payload.value)?;
+        // Preserve the pre-extraction field order (backend-specific field before
+        // `written`): base identity fields, then the backend `extra`, then the
+        // `written` flag.
+        let mut result = json!({
+            "environment_id": env_id.as_str(),
+            "secret_ref": secret_uri,
+            "store_uri": store_uri,
+            "secrets_kind": secrets.kind.to_string(),
+        });
+        if let (Value::Object(result_map), Value::Object(extra_map)) = (&mut result, extra) {
+            result_map.extend(extra_map);
         }
+        result["written"] = Value::Bool(true);
+        Ok((OpOutcome::new(NOUN, "put", result), AuditGens::NONE))
     })
 }
 
@@ -250,57 +216,20 @@ pub fn get(
 
     let kind = secrets.kind.to_string();
     let kind_path = secrets.kind.path();
-    if kind_path == DEV_STORE_KIND_PATH {
-        validate_dev_store_secret_path(rel_path)?;
-        let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
-        let dev_path = resolve_dev_store_path(
-            &store.env_dir(&env_id)?,
-            std::env::var_os(DEV_SECRETS_PATH_ENV).map(PathBuf::from),
-        );
-        // A missing store file means nothing was ever written for this env —
-        // absence, not an error (mirrors `dev_store_has`'s existence guard).
-        let value = if dev_path.exists() {
-            dev_store_get_value(&dev_path, &store_uri)?
-        } else {
-            None
-        };
-        Ok(OpOutcome::new(
-            NOUN,
-            "get",
-            get_result_json(
-                env_id.as_str(),
-                &secret_uri,
-                &store_uri,
-                &kind,
-                json!({"store_path": dev_path.display().to_string()}),
-                value,
-                payload.reveal,
-            ),
-        ))
-    } else if kind_path == crate::defaults::VAULT_SECRETS_PATH {
-        validate_dev_store_secret_path(rel_path)?;
-        let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
-        let (value, vault_addr) = vault_seed_get(store, &env, &store_uri)?;
-        Ok(OpOutcome::new(
-            NOUN,
-            "get",
-            get_result_json(
-                env_id.as_str(),
-                &secret_uri,
-                &store_uri,
-                &kind,
-                json!({"vault_addr": vault_addr}),
-                value,
-                payload.reveal,
-            ),
-        ))
-    } else {
-        Err(OpError::NotYetImplemented(
-            "secrets backend dispatch beyond the dev-store and Vault lands in A9 \
-             (env-pack registry)"
-                .to_string(),
-        ))
-    }
+    let (value, store_uri, extra) = get_env_secret(store, &env, &env_id, kind_path, rel_path)?;
+    Ok(OpOutcome::new(
+        NOUN,
+        "get",
+        get_result_json(
+            env_id.as_str(),
+            &secret_uri,
+            &store_uri,
+            &kind,
+            extra,
+            value,
+            payload.reveal,
+        ),
+    ))
 }
 
 pub fn rotate(
@@ -336,6 +265,91 @@ pub fn rotate(
 }
 
 // --- internals -----------------------------------------------------------
+
+/// Persist `value` at `rel_path` (`<tenant>/<team>/<pack>/<name>`) into the
+/// env's configured secrets backend, dispatching on `kind_path` (dev-store or
+/// Vault). Returns `(store_uri, backend_extra)` where `backend_extra` is the
+/// backend-identifying JSON fragment for the op outcome (`store_path` for the
+/// dev store, `vault_addr` for Vault). Shared by `op secrets put` and
+/// `op updates enroll` so the two write surfaces cannot drift.
+pub(super) fn put_env_secret(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    kind_path: &str,
+    rel_path: &str,
+    value: &str,
+) -> Result<(String, Value), OpError> {
+    if kind_path == DEV_STORE_KIND_PATH {
+        validate_dev_store_secret_path(rel_path)?;
+        let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
+        let dev_path = resolve_dev_store_path(
+            &store.env_dir(env_id)?,
+            std::env::var_os(DEV_SECRETS_PATH_ENV).map(PathBuf::from),
+        );
+        dev_store_put(&dev_path, &store_uri, value)?;
+        Ok((
+            store_uri,
+            json!({"store_path": dev_path.display().to_string()}),
+        ))
+    } else if kind_path == crate::defaults::VAULT_SECRETS_PATH {
+        // Same ref shape as the dev store; the difference is the backend.
+        validate_dev_store_secret_path(rel_path)?;
+        let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
+        let vault_addr = vault_seed_put(store, env, &store_uri, value)?;
+        Ok((store_uri, json!({"vault_addr": vault_addr})))
+    } else {
+        Err(OpError::NotYetImplemented(
+            "secrets backend dispatch beyond the dev-store and Vault lands in A9 \
+             (env-pack registry)"
+                .to_string(),
+        ))
+    }
+}
+
+/// Read the value at `rel_path` back from the env's configured secrets backend,
+/// dispatching on `kind_path`. Returns `(value, store_uri, backend_extra)`;
+/// `value` is `None` when the key is absent. Counterpart to [`put_env_secret`];
+/// shared by `op secrets get` and `op updates status`.
+pub(super) fn get_env_secret(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    kind_path: &str,
+    rel_path: &str,
+) -> Result<(Option<String>, String, Value), OpError> {
+    if kind_path == DEV_STORE_KIND_PATH {
+        validate_dev_store_secret_path(rel_path)?;
+        let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
+        let dev_path = resolve_dev_store_path(
+            &store.env_dir(env_id)?,
+            std::env::var_os(DEV_SECRETS_PATH_ENV).map(PathBuf::from),
+        );
+        // A missing store file means nothing was ever written for this env —
+        // absence, not an error (mirrors `dev_store_has`'s existence guard).
+        let value = if dev_path.exists() {
+            dev_store_get_value(&dev_path, &store_uri)?
+        } else {
+            None
+        };
+        Ok((
+            value,
+            store_uri,
+            json!({"store_path": dev_path.display().to_string()}),
+        ))
+    } else if kind_path == crate::defaults::VAULT_SECRETS_PATH {
+        validate_dev_store_secret_path(rel_path)?;
+        let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
+        let (value, vault_addr) = vault_seed_get(store, env, &store_uri)?;
+        Ok((value, store_uri, json!({"vault_addr": vault_addr})))
+    } else {
+        Err(OpError::NotYetImplemented(
+            "secrets backend dispatch beyond the dev-store and Vault lands in A9 \
+             (env-pack registry)"
+                .to_string(),
+        ))
+    }
+}
 
 /// Build the `get` outcome body: identity fields + a `present` flag, plus the
 /// decrypted value only when `reveal` is set (so a non-revealing `get` never
