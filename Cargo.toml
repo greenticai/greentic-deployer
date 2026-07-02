@@ -140,6 +140,13 @@ features = [
     "providers-vault",
 ]
 
+[dependencies.greentic-update]
+version = "0.1"
+features = [
+    "enroll",
+    "mtls",
+]
+
 [dependencies.serde]
 version = "1"
 features = [
