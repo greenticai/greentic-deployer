@@ -670,6 +670,9 @@ pub enum UpdatesVerb {
     Enroll(UpdatesEnrollArgs),
     /// Report the enrolled update-channel certificate's serial + validity window.
     Status { env_id: Option<String> },
+    /// Fetch a signed update plan (over the enrolled mTLS channel or from a
+    /// local file), verify it against the env trust root, and stage it.
+    Get(UpdatesGetArgs),
 }
 
 #[derive(Args, Debug)]
@@ -677,6 +680,21 @@ pub struct UpdatesEnrollArgs {
     pub env_id: Option<String>,
     #[arg(long = "ca-url")]
     pub ca_url: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesGetArgs {
+    pub env_id: Option<String>,
+    /// Fetch the signed plan (document + `.sig` sidecar) from this base URL over
+    /// the enrolled mTLS channel.
+    #[arg(long = "plan-url", conflicts_with_all = ["plan_file", "plan_sig_file"])]
+    pub plan_url: Option<String>,
+    /// Local plan document (airgap import / testing). Requires `--plan-sig-file`.
+    #[arg(long = "plan-file", requires = "plan_sig_file")]
+    pub plan_file: Option<PathBuf>,
+    /// DSSE envelope sidecar for `--plan-file`.
+    #[arg(long = "plan-sig-file", requires = "plan_file")]
+    pub plan_sig_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1083,6 +1101,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
             match verb {
                 UpdatesVerb::Enroll(_) => "enroll",
                 UpdatesVerb::Status { .. } => "status",
+                UpdatesVerb::Get(_) => "get",
             },
         ),
     }
@@ -1353,6 +1372,17 @@ fn dispatch_updates(
             let payload = env_id
                 .map(|environment_id| super::updates::UpdatesStatusPayload { environment_id });
             super::updates::status(store, flags, payload)?
+        }
+        UpdatesVerb::Get(args) => {
+            let payload = args
+                .env_id
+                .map(|environment_id| super::updates::UpdatesGetPayload {
+                    environment_id,
+                    plan_url: args.plan_url,
+                    plan_file: args.plan_file,
+                    plan_sig_file: args.plan_sig_file,
+                });
+            super::updates::get(store, flags, payload)?
         }
     };
     print_outcome(&outcome)
