@@ -56,6 +56,38 @@ fn tls_rel_path(tenant: &str, name: &str) -> String {
     format!("{tenant}/_/{TLS_PACK}/{name}")
 }
 
+/// Whether a CA base URL is acceptable for enrollment. HTTPS is always allowed
+/// (the client authenticates the CA's server certificate). Plaintext `http://`
+/// is allowed ONLY to a loopback host, for a local-development CA: enrollment
+/// establishes the update-channel trust anchor, so bootstrapping it over an
+/// unauthenticated channel to a *remote* host would let an on-path attacker
+/// return a malicious CA that gets persisted as the trust anchor.
+fn ca_url_is_acceptable(url: &str) -> bool {
+    if let Some(rest) = url.strip_prefix("https://") {
+        return !rest.is_empty();
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    // Authority = everything up to the first path/query/fragment delimiter.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Strip optional `userinfo@`.
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    // Host without port: bracketed IPv6 keeps its inner text; otherwise the
+    // segment before the first `:`.
+    let host = if let Some(inner) = host_port.strip_prefix('[') {
+        inner.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    // `localhost`, or an actual loopback IP (127.0.0.0/8, ::1) — parsed as an IP
+    // so a hostname like `127.0.0.1.evil.com` is NOT treated as loopback.
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// The enrolled certificate's identity is the env's owning tenant, so an owner
 /// is required. Mirrors `vault_seed_put`'s fail-closed tenant guard (a
 /// Vault-backed env is single-tenant at the runtime) so the two write surfaces
@@ -93,9 +125,12 @@ pub fn enroll(
             "ca_url must not be empty".to_string(),
         ));
     }
-    if !(ca_url.starts_with("https://") || ca_url.starts_with("http://")) {
+    if !ca_url_is_acceptable(&ca_url) {
         return Err(OpError::InvalidArgument(
-            "ca_url must be an http(s) URL".to_string(),
+            "ca_url must be an https:// URL; plaintext http:// is accepted only for a loopback \
+             CA in local development. Enrollment establishes the update-channel trust anchor, so \
+             it must not bootstrap over an unauthenticated channel to a remote host."
+                .to_string(),
         ));
     }
     let ctx = AuditCtx {
@@ -120,6 +155,20 @@ pub fn enroll(
             greentic_update::enroll::enroll(&client, &ca_url, &tenant, env_id.as_str()).await
         })
         .map_err(|e| OpError::Conflict(format!("update-channel enrollment failed: {e}")))?;
+
+        // Validate the CA response before persisting: prove the ca/cert/key
+        // parse and load as an mTLS identity, so structurally-unusable material
+        // is never stored as the update-channel trust anchor. (Chain
+        // verification and the (tenant, env) identity binding are enforced
+        // server-side at mTLS use time in Phase 2.)
+        greentic_update::tls::build_mtls_client(&greentic_update::tls::MtlsConfig {
+            ca_pem: enrollment.ca_pem.clone(),
+            client_cert_pem: enrollment.client_cert_pem.clone(),
+            client_key_pem: enrollment.client_key_pem.clone(),
+        })
+        .map_err(|e| {
+            OpError::Conflict(format!("CA response is not a usable mTLS identity: {e}"))
+        })?;
 
         let stored = persist_enrollment(
             store,
@@ -159,11 +208,16 @@ fn persist_enrollment(
     ca_url: &str,
     enrollment: &greentic_update::enroll::Enrollment,
 ) -> Result<Vec<Value>, OpError> {
+    // The certificate is written LAST as a commit marker: `status` (and the
+    // Phase 2 consumer) key on `updater_cert`, so a failure part-way through
+    // leaves the env reporting not-enrolled rather than half-enrolled. Re-running
+    // `enroll` overwrites the whole set. The dev-store/Vault backends have no
+    // cross-key transaction, so this ordering is the atomicity we can offer.
     let items = [
         (KEY_NAME, enrollment.client_key_pem.as_str()),
-        (CERT_NAME, enrollment.client_cert_pem.as_str()),
         (CA_NAME, enrollment.ca_pem.as_str()),
         (CA_URL_NAME, ca_url),
+        (CERT_NAME, enrollment.client_cert_pem.as_str()),
     ];
     let mut stored = Vec::with_capacity(items.len());
     for (name, value) in items {
@@ -380,6 +434,46 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
     }
 
     #[test]
+    fn ca_url_is_acceptable_requires_https_or_loopback_http() {
+        // HTTPS is always acceptable.
+        assert!(ca_url_is_acceptable("https://ca.example"));
+        assert!(ca_url_is_acceptable("https://ca.example:8443/v1/enroll"));
+        // Plaintext HTTP only to a genuine loopback host.
+        assert!(ca_url_is_acceptable("http://localhost"));
+        assert!(ca_url_is_acceptable("http://localhost:8080/enroll"));
+        assert!(ca_url_is_acceptable("http://127.0.0.1:9000"));
+        assert!(ca_url_is_acceptable("http://127.5.5.5"));
+        assert!(ca_url_is_acceptable("http://[::1]:8080"));
+        // Plaintext HTTP to a remote host is refused (trust-anchor MITM risk).
+        assert!(!ca_url_is_acceptable("http://ca.example"));
+        assert!(!ca_url_is_acceptable("http://ca.example:8080/enroll"));
+        // A hostname that merely starts with "127." is NOT loopback.
+        assert!(!ca_url_is_acceptable("http://127.0.0.1.evil.com"));
+        // Other schemes and empties are refused.
+        assert!(!ca_url_is_acceptable("ftp://ca.example"));
+        assert!(!ca_url_is_acceptable("ca.example"));
+        assert!(!ca_url_is_acceptable("https://"));
+        assert!(!ca_url_is_acceptable(""));
+    }
+
+    #[test]
+    fn enroll_rejects_plaintext_remote_ca_url() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&dev_store_env_with_tenant()).unwrap();
+        let err = enroll(
+            &store,
+            &OpFlags::default(),
+            Some(UpdatesEnrollPayload {
+                environment_id: "local".into(),
+                ca_url: "http://ca.example/enroll".into(),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    #[test]
     fn enroll_requires_tenant_owner() {
         // Env with a secrets pack but no tenant owner: enrollment must fail
         // closed (the cert identity is the owning tenant) before any network.
@@ -508,11 +602,11 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         )
         .unwrap();
 
-        // All four artifacts written, in order, under the expected URIs.
+        // All four artifacts written; the certificate is written LAST (commit marker).
         let names: Vec<&str> = stored.iter().map(|e| e["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec![KEY_NAME, CERT_NAME, CA_NAME, CA_URL_NAME]);
+        assert_eq!(names, vec![KEY_NAME, CA_NAME, CA_URL_NAME, CERT_NAME]);
         assert_eq!(
-            stored[1]["store_uri"].as_str().unwrap(),
+            stored[3]["store_uri"].as_str().unwrap(),
             "secrets://local/acme/_/tls/updater_cert"
         );
 
