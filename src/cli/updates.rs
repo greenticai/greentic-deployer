@@ -17,6 +17,7 @@
 use std::path::PathBuf;
 
 use greentic_deploy_spec::{EnvId, Environment};
+use greentic_distributor_client::{CachePolicy, DistClient, DistOptions, ResolvePolicy};
 use greentic_secrets_lib::core::rt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -298,11 +299,10 @@ pub fn status(
 /// not wrapped in `audit_and_record` (like `status`).
 ///
 /// The gates run *before* any staging write, so a rejected plan leaves nothing
-/// half-staged. A plan that declares no artifacts needs nothing fetched and is
-/// advanced straight to `staged`; a plan that declares artifacts is admitted at
-/// `downloading` and its artifact download is scoped to a follow-up (Phase 2b),
-/// where the `DistClient` fetch + digest-domain reconciliation is developed
-/// against real artifacts (see the plan's integration-test track). The outcome's
+/// half-staged. Declared artifacts are then fetched into the staging tree
+/// (through the content-addressed `DistClient`, with `put_artifact` re-verifying
+/// each digest fail-closed) and the plan is promoted `downloading → inbox →
+/// staged`; a plan with no artifacts promotes straight away. The outcome's
 /// `stage` field reports where the plan landed.
 pub fn get(
     store: &LocalFsStore,
@@ -363,69 +363,39 @@ fn get_impl(
         )));
     }
 
-    // 4. Pre-flight gates, before touching the staging tree: downgrade guard
-    //    (monotonic sequence), then compatibility. NOTE: these read staging state
-    //    (`latest_applied_sequence`/`applied_plan_ids`) and are re-checked at
-    //    apply (Phase 3); the read → `begin` window is not held under the staging
-    //    lock, so a concurrent updater on the SAME env could admit against stale
-    //    facts. Closing that fully needs a locked `begin_checked` admission API in
-    //    greentic-update (Phase 2b crate follow-up); single-operator use is safe.
+    // 4. Admit to staging under a single lock hold — or RESUME an
+    //    already-admitted identical plan. The downgrade guard (monotonic
+    //    sequence) and the compatibility gate run INSIDE `begin_checked`'s
+    //    admission predicate, atomically with the begin writes, so a concurrent
+    //    updater on the same env cannot change the applied set between the check
+    //    and the commit (closes the gate/begin race from #417's review). Both
+    //    gates run before any staging write, so a rejected plan leaves nothing
+    //    half-staged.
+    //
+    //    Loading an existing same-digest plan first makes `get` idempotent /
+    //    resumable: `begin_checked` alone errors `PlanExists` on re-run, so a
+    //    crash after admission but before the promotion transitions would strand
+    //    the plan. A same-id plan with a DIFFERENT digest is refused (a distinct
+    //    plan must not reuse the id).
     let root = open_updates_root(&env_id, updates_root_override)?;
-    let last_applied = root
-        .latest_applied_sequence()
-        .map_err(|e| OpError::Conflict(format!("read update staging state: {e}")))?;
-    greentic_update::plan::ensure_not_downgrade(&verified.plan, last_applied)
-        .map_err(|e| OpError::Conflict(format!("update plan rejected: {e}")))?;
+    let staged = admit_or_resume(&root, &verified, &plan_bytes, &envelope_bytes)?;
 
-    let applied = applied_plan_ids(&root)?;
-    let facts = greentic_update::plan::RuntimeFacts {
-        // The operator CLI is released in lockstep with the runtime it manages,
-        // so its own version is the runtime-version floor we can assert locally.
-        runtime_version: Some(env!("CARGO_PKG_VERSION")),
-        // The operator does not observe the live component ABI; a plan that pins
-        // `compat.abi` is left to apply-time (Phase 3), where the running runtime
-        // reports it. Unknown here ⇒ `check_compat` fails closed on an abi pin.
-        abi: None,
-        applied_plan_ids: &applied,
-    };
-    greentic_update::plan::check_compat(&verified.plan.compat, &facts)
-        .map_err(|e| OpError::Conflict(format!("update plan incompatible: {e}")))?;
-
-    // 5. Admit to staging — or RESUME an already-admitted identical plan.
-    //    `begin` alone errors `PlanExists` on re-run, so a crash after `begin`
-    //    but before the promotion transitions would strand the plan and make the
-    //    command un-retryable. Loading an existing same-digest plan makes `get`
-    //    idempotent/resumable; a same-id plan with a DIFFERENT digest is refused
-    //    (a distinct plan must not reuse the id). Writes plan.json + plan.json.sig
-    //    + state.json@downloading on the fresh path.
-    let staged = match root
-        .load(&verified.plan.plan_id)
-        .map_err(|e| OpError::Conflict(format!("load staged update plan: {e}")))?
-    {
-        Some(existing) => {
-            if existing.plan_sha256() != verified.plan_sha256 {
-                return Err(OpError::Conflict(format!(
-                    "a different plan is already staged under id `{}`",
-                    verified.plan.plan_id
-                )));
-            }
-            existing
-        }
-        None => root
-            .begin(&verified, &plan_bytes, &envelope_bytes)
-            .map_err(|e| OpError::Conflict(format!("stage update plan: {e}")))?,
-    };
-
-    // 6. A plan with no artifacts needs nothing fetched → advance it to `staged`
-    //    (resuming from wherever a prior partial run left it — idempotent). A
-    //    plan with artifacts stays at `downloading` until Phase 2b's download.
+    // 6. Fetch every declared artifact into the staging tree, then promote to
+    //    `staged`. A plan with no artifacts promotes straight away. Both paths
+    //    are idempotent/resumable: a plan already past `downloading` is returned
+    //    as-is (a completed prior run), and `put_artifact` is content-addressed
+    //    and fail-closed on a digest mismatch.
     let artifacts_total = verified.plan.artifacts.len();
     let final_stage = if artifacts_total == 0 {
-        advance_zero_artifact_to_staged(&staged)?
+        advance_to_staged(&staged)?
     } else {
-        staged
-            .stage()
-            .map_err(|e| OpError::Conflict(format!("read update staging stage: {e}")))?
+        let fetcher = DistArtifactFetcher::new();
+        download_and_stage(
+            &staged,
+            &verified.plan.artifacts,
+            &fetcher,
+            RetryPolicy::default(),
+        )?
     };
 
     Ok(OpOutcome::new(
@@ -457,23 +427,124 @@ fn open_updates_root(
     opened.map_err(|e| OpError::Conflict(format!("open update staging root: {e}")))
 }
 
-/// Plan ids already applied to this environment (feeds the plan's `requires`
-/// compatibility check).
-fn applied_plan_ids(root: &greentic_update::staging::UpdatesRoot) -> Result<Vec<String>, OpError> {
-    Ok(root
+/// The `begin_checked` admission predicate for `op updates get`: the downgrade
+/// guard (monotonic sequence vs the applied set) and the compatibility gate,
+/// evaluated against the lock-held [`AdmissionFacts`] snapshot so both run
+/// atomically with the begin writes. Returns the `OpError` a rejection surfaces
+/// as; the caller maps `BeginCheckedError::Rejected(op)` straight back to it.
+///
+/// [`AdmissionFacts`]: greentic_update::staging::AdmissionFacts
+fn admit_plan(
+    verified: &greentic_update::plan::VerifiedUpdatePlan,
+    facts: &greentic_update::staging::AdmissionFacts,
+) -> Result<(), OpError> {
+    // Downgrade guard: the plan's sequence must be newer than the highest
+    // already-applied sequence (read under the staging lock).
+    greentic_update::plan::ensure_not_downgrade(&verified.plan, facts.latest_applied_sequence)
+        .map_err(|e| OpError::Conflict(format!("update plan rejected: {e}")))?;
+    // Compatibility gate against the applied set + local runtime facts.
+    let runtime_facts = greentic_update::plan::RuntimeFacts {
+        // The operator CLI is released in lockstep with the runtime it manages,
+        // so its own version is the runtime-version floor we can assert locally.
+        runtime_version: Some(env!("CARGO_PKG_VERSION")),
+        // The operator does not observe the live component ABI; a plan pinning
+        // `compat.abi` is left to apply-time (Phase 3), where the running runtime
+        // reports it. Unknown here ⇒ `check_compat` fails closed on an abi pin.
+        abi: None,
+        applied_plan_ids: &facts.applied_plan_ids,
+    };
+    greentic_update::plan::check_compat(&verified.plan.compat, &runtime_facts)
+        .map_err(|e| OpError::Conflict(format!("update plan incompatible: {e}")))
+}
+
+/// Admit a verified plan to staging, or resume an identical already-staged one.
+///
+/// Fresh admission runs [`admit_plan`] inside `begin_checked`, so the downgrade
+/// and compat gates are atomic with the begin writes. On RESUME (a same-digest
+/// plan already present — the idempotent/crash-recovery path), admission is
+/// **re-run** before any further promotion: a plan stranded at `downloading`/
+/// `inbox` could otherwise be promoted after a newer plan was applied in the
+/// interim, silently bypassing the downgrade guard `begin_checked` makes
+/// authoritative. Terminal `failed`/`rejected` plans are refused (not resumed
+/// as success); already-`staged`/`applying`/`applied` plans passed admission at
+/// begin and are returned as-is.
+///
+/// The resume re-check is best-effort (not held under the staging lock — the
+/// deployer can't; the atomic gate is the fresh `begin_checked`, and apply
+/// re-checks downgrade). Single-operator use is unaffected.
+fn admit_or_resume(
+    root: &greentic_update::staging::UpdatesRoot,
+    verified: &greentic_update::plan::VerifiedUpdatePlan,
+    plan_bytes: &[u8],
+    envelope_bytes: &[u8],
+) -> Result<greentic_update::staging::StagedPlan, OpError> {
+    use greentic_update::staging::UpdateStage;
+    match root
+        .load(&verified.plan.plan_id)
+        .map_err(|e| OpError::Conflict(format!("load staged update plan: {e}")))?
+    {
+        Some(existing) => {
+            if existing.plan_sha256() != verified.plan_sha256 {
+                return Err(OpError::Conflict(format!(
+                    "a different plan is already staged under id `{}`",
+                    verified.plan.plan_id
+                )));
+            }
+            let stage = existing
+                .stage()
+                .map_err(|e| OpError::Conflict(format!("read update staging stage: {e}")))?;
+            match stage {
+                // Terminal outcomes are not "resumable" — report, don't succeed.
+                UpdateStage::Failed | UpdateStage::Rejected => Err(OpError::Conflict(format!(
+                    "plan `{}` is already `{stage}`; not resuming",
+                    verified.plan.plan_id
+                ))),
+                // Stranded mid-flight: re-gate against the CURRENT applied set
+                // before resuming, so a newer applied plan invalidates it.
+                UpdateStage::Downloading | UpdateStage::Inbox => {
+                    admit_plan(verified, &current_admission_facts(root)?)?;
+                    Ok(existing)
+                }
+                // Already admitted AND promoted — its gates ran at begin.
+                UpdateStage::Staged | UpdateStage::Applying | UpdateStage::Applied => Ok(existing),
+            }
+        }
+        None => root
+            .begin_checked(verified, plan_bytes, envelope_bytes, |facts| {
+                admit_plan(verified, facts)
+            })
+            .map_err(|e| match e {
+                greentic_update::staging::BeginCheckedError::Rejected(op) => op,
+                greentic_update::staging::BeginCheckedError::Staging(s) => {
+                    OpError::Conflict(format!("stage update plan: {s}"))
+                }
+            }),
+    }
+}
+
+/// Snapshot the applied-plan set for a resume-time re-gate (best-effort — not
+/// under the staging lock; the atomic gate is `begin_checked`).
+fn current_admission_facts(
+    root: &greentic_update::staging::UpdatesRoot,
+) -> Result<greentic_update::staging::AdmissionFacts, OpError> {
+    let applied: Vec<_> = root
         .list()
         .map_err(|e| OpError::Conflict(format!("list staged update plans: {e}")))?
         .into_iter()
         .filter(|s| s.stage == greentic_update::staging::UpdateStage::Applied)
-        .map(|s| s.plan_id)
-        .collect())
+        .collect();
+    Ok(greentic_update::staging::AdmissionFacts {
+        latest_applied_sequence: applied.iter().map(|s| s.sequence).max(),
+        applied_plan_ids: applied.into_iter().map(|s| s.plan_id).collect(),
+    })
 }
 
-/// Advance a zero-artifact plan to `staged`, from wherever it currently sits
-/// (`downloading` → `inbox` → `staged`). Idempotent: an already-`staged` plan is
-/// a no-op, so a resumed partial run converges. Non-`downloading`/`inbox` stages
-/// (already `staged`, or terminal) are left untouched.
-fn advance_zero_artifact_to_staged(
+/// Promote a plan to `staged`, from wherever it currently sits (`downloading` →
+/// `inbox` → `staged`). Idempotent: an already-`staged` plan is a no-op, so a
+/// resumed partial run converges. Non-`downloading`/`inbox` stages (already
+/// `staged`, or terminal) are left untouched. Used by both the zero-artifact
+/// path and after a successful artifact download.
+fn advance_to_staged(
     staged: &greentic_update::staging::StagedPlan,
 ) -> Result<greentic_update::staging::UpdateStage, OpError> {
     use greentic_update::staging::UpdateStage;
@@ -493,6 +564,189 @@ fn advance_zero_artifact_to_staged(
             .stage;
     }
     Ok(stage)
+}
+
+/// Fetches an update artifact's bytes by its declared `source`. A seam so the
+/// download orchestration is unit-testable without a live registry.
+trait ArtifactFetcher {
+    fn fetch(&self, artifact: &greentic_update::plan::PlanArtifact) -> Result<Vec<u8>, OpError>;
+}
+
+/// Retry/backoff for a transient artifact fetch: `attempts` total tries with
+/// exponential backoff from `base_delay`. Tests use a zero delay.
+#[derive(Clone, Copy)]
+struct RetryPolicy {
+    attempts: u32,
+    base_delay: std::time::Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            attempts: 3,
+            base_delay: std::time::Duration::from_millis(500),
+        }
+    }
+}
+
+/// The production [`ArtifactFetcher`]: resolves and fetches through the
+/// content-addressed `DistClient` (handles `oci://`, `https://`, `file://`),
+/// returning the cached bytes. It does not need to trust the transport —
+/// artifacts are integrity-anchored by the signed plan's digests (`put_artifact`
+/// re-verifies), not by mTLS. The plan document itself is the mTLS/DSSE-verified
+/// artifact; its listed content is digest-verified regardless of how it arrives.
+struct DistArtifactFetcher {
+    client: DistClient,
+}
+
+impl DistArtifactFetcher {
+    fn new() -> Self {
+        Self {
+            client: DistClient::new(DistOptions::default()),
+        }
+    }
+}
+
+impl ArtifactFetcher for DistArtifactFetcher {
+    fn fetch(&self, artifact: &greentic_update::plan::PlanArtifact) -> Result<Vec<u8>, OpError> {
+        let source = artifact.source.as_deref().ok_or_else(|| {
+            OpError::InvalidArgument(format!(
+                "artifact `{}` declares no source to download (in-band airgap \
+                 artifacts are not supported by `op updates get`)",
+                artifact.name
+            ))
+        })?;
+        // Confine sources to remote registry schemes — an explicit `https://` or
+        // `oci://`. Reject `file://`, bare local paths, and DistClient's other
+        // schemes: even a signed plan must not make the operator read local
+        // files or resolve ambiguous bare refs. Digest verification only happens
+        // AFTER a fetch, so the scheme is the pre-fetch trust boundary.
+        if !(source.starts_with("https://") || source.starts_with("oci://")) {
+            return Err(OpError::InvalidArgument(format!(
+                "artifact `{}` source `{source}` is not an allowed remote scheme \
+                 (expected `https://` or `oci://`)",
+                artifact.name
+            )));
+        }
+        rt::sync_await(async {
+            let parsed = self
+                .client
+                .parse_source(source)
+                .map_err(|e| OpError::Fetch(format!("parse artifact source `{source}`: {e}")))?;
+            let descriptor = self
+                .client
+                .resolve(parsed, ResolvePolicy)
+                .await
+                .map_err(|e| {
+                    OpError::Fetch(format!("resolve artifact `{}`: {e}", artifact.name))
+                })?;
+            // Bound the download by the resolver's declared size *before* fetching
+            // the body (best-effort — `size_bytes` may be 0 if unknown).
+            reject_oversize(artifact, descriptor.size_bytes)?;
+            let resolved = self
+                .client
+                .fetch(&descriptor, CachePolicy)
+                .await
+                .map_err(|e| OpError::Fetch(format!("fetch artifact `{}`: {e}", artifact.name)))?;
+            // Authoritative cap on the actual bytes before loading them into
+            // memory (and into `put_artifact`'s digest buffer).
+            let len = std::fs::metadata(&resolved.local_path)
+                .map_err(|e| {
+                    OpError::Fetch(format!(
+                        "stat fetched artifact `{}` at {}: {e}",
+                        artifact.name,
+                        resolved.local_path.display()
+                    ))
+                })?
+                .len();
+            reject_oversize(artifact, len)?;
+            std::fs::read(&resolved.local_path).map_err(|e| {
+                OpError::Fetch(format!(
+                    "read fetched artifact `{}` at {}: {e}",
+                    artifact.name,
+                    resolved.local_path.display()
+                ))
+            })
+        })
+    }
+}
+
+/// Hard ceiling on a single downloaded artifact — bounds the in-memory read and
+/// the digest-check buffer (`put_artifact` takes the whole `&[u8]`). Update
+/// artifacts (packs, wasm, binaries) are far smaller; this only trips on a
+/// poisoned or oversized source, before the digest gate can reject it.
+const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+
+fn reject_oversize(
+    artifact: &greentic_update::plan::PlanArtifact,
+    size: u64,
+) -> Result<(), OpError> {
+    if size > MAX_ARTIFACT_BYTES {
+        return Err(OpError::Fetch(format!(
+            "artifact `{}` is {size} bytes, over the {MAX_ARTIFACT_BYTES}-byte cap",
+            artifact.name
+        )));
+    }
+    Ok(())
+}
+
+/// Fetch one artifact, retrying transient failures with exponential backoff.
+/// Every fetch error is treated as retryable — the authoritative integrity gate
+/// is `put_artifact`'s digest check, not the fetch outcome.
+fn fetch_with_retry(
+    fetcher: &dyn ArtifactFetcher,
+    artifact: &greentic_update::plan::PlanArtifact,
+    retry: RetryPolicy,
+) -> Result<Vec<u8>, OpError> {
+    let attempts = retry.attempts.max(1);
+    let mut delay = retry.base_delay;
+    let mut last_err = None;
+    for attempt in 1..=attempts {
+        match fetcher.fetch(artifact) {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < attempts {
+                    if !delay.is_zero() {
+                        std::thread::sleep(delay);
+                    }
+                    delay = delay.saturating_mul(2);
+                }
+            }
+        }
+    }
+    Err(last_err.expect("retry loop runs at least once"))
+}
+
+/// Download every artifact a plan declares into its staging tree, then promote
+/// `downloading → inbox → staged`. Idempotent/resumable: a plan already past
+/// `downloading` (a completed prior run) is returned as-is without re-fetching;
+/// while `downloading`, every artifact is (re-)fetched and handed to
+/// `put_artifact`, which is content-addressed and fail-closed on a digest
+/// mismatch — so re-fetching an already-present artifact is safe.
+fn download_and_stage(
+    staged: &greentic_update::staging::StagedPlan,
+    artifacts: &[greentic_update::plan::PlanArtifact],
+    fetcher: &dyn ArtifactFetcher,
+    retry: RetryPolicy,
+) -> Result<greentic_update::staging::UpdateStage, OpError> {
+    use greentic_update::staging::UpdateStage;
+    let stage = staged
+        .stage()
+        .map_err(|e| OpError::Conflict(format!("read update staging stage: {e}")))?;
+    // Resume: only fetch while still `downloading`. A plan already promoted or
+    // terminal has been handled — return its stage unchanged.
+    if stage != UpdateStage::Downloading {
+        return Ok(stage);
+    }
+    for artifact in artifacts {
+        let bytes = fetch_with_retry(fetcher, artifact, retry)?;
+        staged
+            .put_artifact(artifact, &bytes)
+            .map_err(|e| OpError::Conflict(format!("stage artifact `{}`: {e}", artifact.name)))?;
+    }
+    // Every artifact is present and digest-verified → promote to `staged`.
+    advance_to_staged(staged)
 }
 
 /// Resolve the `(plan document, DSSE envelope)` byte pair from the payload's
@@ -1340,5 +1594,315 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         .unwrap();
         assert_eq!(second.result["stage"], "staged");
         assert_eq!(second.result["plan_id"], "plan-idem");
+    }
+
+    // ---- Phase 2b: artifact download orchestration -----------------------
+
+    /// An [`ArtifactFetcher`] stub: serves canned bytes by artifact name, can
+    /// fail its first `fail_times` calls (retry testing), and counts calls.
+    struct StubFetcher {
+        bytes: std::collections::HashMap<String, Vec<u8>>,
+        fail_times: std::cell::Cell<u32>,
+        calls: std::cell::Cell<u32>,
+    }
+
+    impl StubFetcher {
+        fn serving(entries: &[(&str, &[u8])]) -> Self {
+            Self {
+                bytes: entries
+                    .iter()
+                    .map(|(n, b)| (n.to_string(), b.to_vec()))
+                    .collect(),
+                fail_times: std::cell::Cell::new(0),
+                calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl ArtifactFetcher for StubFetcher {
+        fn fetch(
+            &self,
+            artifact: &greentic_update::plan::PlanArtifact,
+        ) -> Result<Vec<u8>, OpError> {
+            self.calls.set(self.calls.get() + 1);
+            let remaining = self.fail_times.get();
+            if remaining > 0 {
+                self.fail_times.set(remaining - 1);
+                return Err(OpError::Fetch("transient".into()));
+            }
+            self.bytes
+                .get(&artifact.name)
+                .cloned()
+                .ok_or_else(|| OpError::Fetch(format!("no stub bytes for `{}`", artifact.name)))
+        }
+    }
+
+    fn digest_of(bytes: &[u8]) -> String {
+        format!("sha256:{}", greentic_update::plan::sha256_hex(bytes))
+    }
+
+    /// Build+sign a plan carrying `artifacts`, verify it, and admit it to a
+    /// fresh staging root — returning the `Downloading` StagedPlan.
+    fn downloading_plan(
+        updates_dir: &std::path::Path,
+        artifacts: Value,
+    ) -> greentic_update::staging::StagedPlan {
+        let (priv9, tk9) = key_pair(9);
+        let build_trust = TrustRoot::new(vec![tk9.clone()]);
+        let (plan_b, sig_b) = signed_plan(
+            "local",
+            "plan-dl",
+            1,
+            artifacts,
+            json!({}),
+            &priv9,
+            &tk9.key_id,
+            &build_trust,
+        );
+        let verify_trust = TrustRoot::new(vec![tk9]);
+        let verified =
+            greentic_update::plan::verify_update_plan(&plan_b, &sig_b, &verify_trust).unwrap();
+        let root = greentic_update::staging::UpdatesRoot::open_in(updates_dir, "local").unwrap();
+        root.begin(&verified, &plan_b, &sig_b).unwrap()
+    }
+
+    fn no_delay(attempts: u32) -> RetryPolicy {
+        RetryPolicy {
+            attempts,
+            base_delay: std::time::Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn download_and_stage_fetches_all_and_promotes() {
+        use greentic_update::staging::UpdateStage;
+        let updates_dir = tempdir().unwrap();
+        let (a1, a2) = (b"alpha-bytes".as_slice(), b"beta-bytes".as_slice());
+        let staged = downloading_plan(
+            updates_dir.path(),
+            json!([
+                {"name": "a1", "version": "1.0.0", "digest": digest_of(a1), "source": "file:///a1"},
+                {"name": "a2", "version": "1.0.0", "digest": digest_of(a2), "source": "file:///a2"},
+            ]),
+        );
+        let stub = StubFetcher::serving(&[("a1", a1), ("a2", a2)]);
+        let arts = staged.plan().artifacts.to_vec();
+
+        let stage = download_and_stage(&staged, &arts, &stub, no_delay(1)).unwrap();
+
+        assert_eq!(stage, UpdateStage::Staged);
+        assert_eq!(stub.calls.get(), 2, "both artifacts fetched");
+        // Content-addressed blobs landed under the plan's artifacts dir.
+        assert_eq!(staged.stage().unwrap(), UpdateStage::Staged);
+    }
+
+    #[test]
+    fn download_and_stage_digest_mismatch_fails_closed() {
+        use greentic_update::staging::UpdateStage;
+        let updates_dir = tempdir().unwrap();
+        // Plan declares the digest of "correct" but the fetcher returns "wrong".
+        let staged = downloading_plan(
+            updates_dir.path(),
+            json!([
+                {"name": "a1", "version": "1.0.0", "digest": digest_of(b"correct"), "source": "file:///a1"},
+            ]),
+        );
+        let stub = StubFetcher::serving(&[("a1", b"wrong")]);
+        let arts = staged.plan().artifacts.to_vec();
+
+        let err = download_and_stage(&staged, &arts, &stub, no_delay(1)).unwrap_err();
+
+        assert!(matches!(err, OpError::Conflict(m) if m.contains("digest mismatch")));
+        // Fail-closed: the plan is NOT promoted; nothing half-staged.
+        assert_eq!(staged.stage().unwrap(), UpdateStage::Downloading);
+    }
+
+    #[test]
+    fn download_and_stage_resumes_without_refetching() {
+        use greentic_update::staging::UpdateStage;
+        let updates_dir = tempdir().unwrap();
+        let staged = downloading_plan(
+            updates_dir.path(),
+            json!([{"name": "a1", "version": "1.0.0", "digest": digest_of(b"x"), "source": "file:///a1"}]),
+        );
+        // Simulate a completed prior run: already promoted to `staged`.
+        staged.transition(UpdateStage::Inbox).unwrap();
+        staged.transition(UpdateStage::Staged).unwrap();
+
+        let stub = StubFetcher::serving(&[("a1", b"x")]);
+        let arts = staged.plan().artifacts.to_vec();
+        let stage = download_and_stage(&staged, &arts, &stub, no_delay(1)).unwrap();
+
+        assert_eq!(stage, UpdateStage::Staged);
+        assert_eq!(stub.calls.get(), 0, "already-staged plan must not re-fetch");
+    }
+
+    #[test]
+    fn fetch_with_retry_retries_transient_then_succeeds() {
+        let stub = StubFetcher::serving(&[("a1", b"ok")]);
+        stub.fail_times.set(2); // fail twice, then succeed on the 3rd try
+        let artifact: greentic_update::plan::PlanArtifact = serde_json::from_value(
+            json!({"name": "a1", "version": "1.0.0", "digest": digest_of(b"ok"), "source": "file:///a1"}),
+        )
+        .unwrap();
+
+        let bytes = fetch_with_retry(&stub, &artifact, no_delay(3)).unwrap();
+
+        assert_eq!(bytes, b"ok");
+        assert_eq!(stub.calls.get(), 3);
+    }
+
+    #[test]
+    fn fetch_with_retry_exhausts_attempts_and_returns_last_error() {
+        let stub = StubFetcher::serving(&[("a1", b"ok")]);
+        stub.fail_times.set(99); // never succeeds within the budget
+        let artifact: greentic_update::plan::PlanArtifact = serde_json::from_value(
+            json!({"name": "a1", "version": "1.0.0", "digest": digest_of(b"ok"), "source": "file:///a1"}),
+        )
+        .unwrap();
+
+        let err = fetch_with_retry(&stub, &artifact, no_delay(2)).unwrap_err();
+
+        assert!(matches!(err, OpError::Fetch(_)));
+        assert_eq!(stub.calls.get(), 2, "exactly `attempts` tries");
+    }
+
+    #[test]
+    fn dist_fetcher_rejects_artifact_without_source() {
+        // The real fetcher fails closed (before any network) on an artifact that
+        // declares no `source` — online `get` cannot materialize it.
+        let artifact: greentic_update::plan::PlanArtifact = serde_json::from_value(
+            json!({"name": "a1", "version": "1.0.0", "digest": digest_of(b"x")}),
+        )
+        .unwrap();
+        let err = DistArtifactFetcher::new().fetch(&artifact).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("no source")));
+    }
+
+    #[test]
+    fn dist_fetcher_rejects_disallowed_scheme() {
+        // A signed plan must not make the operator read local files: file:// and
+        // bare paths are refused before any resolve/fetch (no network).
+        for src in ["file:///etc/passwd", "/etc/passwd", "repo://x", "store://y"] {
+            let artifact: greentic_update::plan::PlanArtifact = serde_json::from_value(
+                json!({"name": "a1", "version": "1.0.0", "digest": digest_of(b"x"), "source": src}),
+            )
+            .unwrap();
+            let err = DistArtifactFetcher::new().fetch(&artifact).unwrap_err();
+            assert!(
+                matches!(err, OpError::InvalidArgument(m) if m.contains("allowed remote scheme")),
+                "source `{src}` should be rejected by scheme"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_oversize_caps_large_artifacts() {
+        let artifact: greentic_update::plan::PlanArtifact = serde_json::from_value(
+            json!({"name": "big", "version": "1.0.0", "digest": digest_of(b"x")}),
+        )
+        .unwrap();
+        assert!(reject_oversize(&artifact, MAX_ARTIFACT_BYTES).is_ok());
+        assert!(matches!(
+            reject_oversize(&artifact, MAX_ARTIFACT_BYTES + 1),
+            Err(OpError::Fetch(_))
+        ));
+    }
+
+    // ---- Phase 2b: admit_or_resume re-gating (Codex #418) -----------------
+
+    fn verify_with(
+        plan_b: &[u8],
+        sig_b: &[u8],
+        tk: &TrustedKey,
+    ) -> greentic_update::plan::VerifiedUpdatePlan {
+        greentic_update::plan::verify_update_plan(plan_b, sig_b, &TrustRoot::new(vec![tk.clone()]))
+            .unwrap()
+    }
+
+    /// Sign + verify a zero-artifact plan for env `local` under key `tk`.
+    fn signed_local(
+        plan_id: &str,
+        sequence: u64,
+        priv_pem: &str,
+        tk: &TrustedKey,
+    ) -> (Vec<u8>, Vec<u8>, greentic_update::plan::VerifiedUpdatePlan) {
+        let build_trust = TrustRoot::new(vec![tk.clone()]);
+        let (p, s) = signed_plan(
+            "local",
+            plan_id,
+            sequence,
+            json!([]),
+            json!({}),
+            priv_pem,
+            &tk.key_id,
+            &build_trust,
+        );
+        let v = verify_with(&p, &s, tk);
+        (p, s, v)
+    }
+
+    #[test]
+    fn admit_or_resume_regates_stranded_downgrade() {
+        use greentic_update::staging::UpdateStage;
+        let updates_dir = tempdir().unwrap();
+        let (priv9, tk9) = key_pair(9);
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+
+        // A newer plan (seq 6) is already Applied.
+        let (pa, sa, va) = signed_local("applied", 6, &priv9, &tk9);
+        let applied = root.begin(&va, &pa, &sa).unwrap();
+        applied.transition(UpdateStage::Inbox).unwrap();
+        applied.transition(UpdateStage::Staged).unwrap();
+        applied.transition(UpdateStage::Applying).unwrap();
+        applied.transition(UpdateStage::Applied).unwrap();
+
+        // An older plan (seq 5) got stranded at `downloading` before that apply.
+        let (ps, ss, vs) = signed_local("stale", 5, &priv9, &tk9);
+        root.begin(&vs, &ps, &ss).unwrap();
+        assert_eq!(
+            root.load("stale").unwrap().unwrap().stage().unwrap(),
+            UpdateStage::Downloading
+        );
+
+        // Resuming it must RE-GATE and reject the now-downgrade — not promote it.
+        let err = admit_or_resume(&root, &vs, &ps, &ss).unwrap_err();
+        assert!(matches!(err, OpError::Conflict(m) if m.contains("rejected")));
+    }
+
+    #[test]
+    fn admit_or_resume_refuses_terminal_plan() {
+        use greentic_update::staging::UpdateStage;
+        let updates_dir = tempdir().unwrap();
+        let (priv9, tk9) = key_pair(9);
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+
+        let (p, s, v) = signed_local("term", 1, &priv9, &tk9);
+        let staged = root.begin(&v, &p, &s).unwrap();
+        staged.transition(UpdateStage::Rejected).unwrap();
+
+        let err = admit_or_resume(&root, &v, &p, &s).unwrap_err();
+        assert!(matches!(err, OpError::Conflict(m) if m.contains("not resuming")));
+    }
+
+    #[test]
+    fn admit_or_resume_returns_promoted_plan_as_is() {
+        use greentic_update::staging::UpdateStage;
+        let updates_dir = tempdir().unwrap();
+        let (priv9, tk9) = key_pair(9);
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+
+        // A fully-staged plan (admission already ran at begin) is idempotently
+        // returned as-is — NOT re-gated (which could wrongly reject it later).
+        let (p, s, v) = signed_local("done", 1, &priv9, &tk9);
+        let staged = root.begin(&v, &p, &s).unwrap();
+        staged.transition(UpdateStage::Inbox).unwrap();
+        staged.transition(UpdateStage::Staged).unwrap();
+
+        let resumed = admit_or_resume(&root, &v, &p, &s).unwrap();
+        assert_eq!(resumed.stage().unwrap(), UpdateStage::Staged);
     }
 }
