@@ -14,13 +14,16 @@
 //! caller), not in `greentic-update`, which stays free of any secrets
 //! dependency — the crate returns raw PEM and the operator persists it.
 
+use std::path::PathBuf;
+
 use greentic_deploy_spec::{EnvId, Environment};
 use greentic_secrets_lib::core::rt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{EnvironmentStore, LocalFsStore};
+use crate::environment::{EnvironmentStore, LocalFsStore, trust_root as store_trust_root};
 
+use super::env_manifest::{ENV_MANIFEST_SCHEMA_V1, EnvManifest};
 use super::secrets::{get_env_secret, put_env_secret, require_secrets_pack};
 use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
 
@@ -50,21 +53,38 @@ pub struct UpdatesStatusPayload {
     pub environment_id: String,
 }
 
+/// Payload for `op updates get`. Exactly one plan source is required: `plan_url`
+/// (fetched over the enrolled mTLS channel) or the `plan_file` + `plan_sig_file`
+/// pair (airgap import / local testing).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatesGetPayload {
+    pub environment_id: String,
+    /// Fetch the signed plan document + `.sig` sidecar from this base URL over
+    /// the enrolled mTLS channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_url: Option<String>,
+    /// Local plan document (airgap import / testing). Requires `plan_sig_file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_file: Option<PathBuf>,
+    /// DSSE envelope sidecar for `plan_file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_sig_file: Option<PathBuf>,
+}
+
 /// The dev-store/Vault secret path for one TLS artifact: `<tenant>/_/tls/<name>`
 /// (`<tenant>/<team>/<pack>/<name>` with the default team `_`).
 fn tls_rel_path(tenant: &str, name: &str) -> String {
     format!("{tenant}/_/{TLS_PACK}/{name}")
 }
 
-/// Whether a CA base URL is acceptable for enrollment. HTTPS is always allowed
-/// (the client validates the CA's server certificate). Plaintext `http://` is
-/// allowed ONLY to a loopback host, for a local-development CA: enrollment
-/// establishes the update-channel trust anchor, so bootstrapping it over an
-/// unauthenticated channel to a *remote* host would let an on-path attacker
-/// return a malicious CA that gets persisted as the trust anchor. A hostname
-/// that merely starts with `127.` (e.g. `127.0.0.1.evil.com`) parses as a
-/// domain, not a loopback IP, so it is refused.
-fn ca_url_is_acceptable(raw: &str) -> bool {
+/// Whether a control-plane URL (the Cert-CA for enrollment, or the plan-fetch
+/// endpoint for `get`) is acceptable. HTTPS is always allowed. Plaintext
+/// `http://` is allowed ONLY to a loopback host, for local development: over
+/// plaintext the enrolled mTLS client identity is never presented and a remote
+/// on-path attacker could serve a malicious CA (enrollment) or a stale
+/// validly-signed plan (fetch). A hostname that merely starts with `127.` (e.g.
+/// `127.0.0.1.evil.com`) parses as a domain, not a loopback IP, so it is refused.
+fn control_url_is_acceptable(raw: &str) -> bool {
     let Ok(parsed) = url::Url::parse(raw) else {
         return false;
     };
@@ -117,7 +137,7 @@ pub fn enroll(
             "ca_url must not be empty".to_string(),
         ));
     }
-    if !ca_url_is_acceptable(&ca_url) {
+    if !control_url_is_acceptable(&ca_url) {
         return Err(OpError::InvalidArgument(
             "ca_url must be an https:// URL; plaintext http:// is accepted only for a loopback \
              CA in local development. Enrollment establishes the update-channel trust anchor, so \
@@ -269,6 +289,327 @@ pub fn status(
     Ok(OpOutcome::new(NOUN, "status", body))
 }
 
+/// `op updates get` — pull a signed update plan (over the enrolled mTLS channel
+/// or from a local file), verify it against the env trust root, run the
+/// downgrade + compatibility gates, and admit it to the update staging tree.
+///
+/// Read-only with respect to the environment store — the only writes are into
+/// the update staging tree, which keeps its own audit ledger — so this verb is
+/// not wrapped in `audit_and_record` (like `status`).
+///
+/// The gates run *before* any staging write, so a rejected plan leaves nothing
+/// half-staged. A plan that declares no artifacts needs nothing fetched and is
+/// advanced straight to `staged`; a plan that declares artifacts is admitted at
+/// `downloading` and its artifact download is scoped to a follow-up (Phase 2b),
+/// where the `DistClient` fetch + digest-domain reconciliation is developed
+/// against real artifacts (see the plan's integration-test track). The outcome's
+/// `stage` field reports where the plan landed.
+pub fn get(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<UpdatesGetPayload>,
+) -> Result<OpOutcome, OpError> {
+    get_impl(store, flags, payload, None)
+}
+
+/// Body of [`get`], with an optional staging-root override so tests can point
+/// the FSM at a tempdir instead of `~/.greentic/updates` (the crate forbids
+/// `unsafe`, so an env-var override is not available in tests).
+fn get_impl(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<UpdatesGetPayload>,
+    updates_root_override: Option<&std::path::Path>,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(NOUN, "get", get_schema()));
+    }
+    let payload = resolve_payload::<UpdatesGetPayload>(flags, payload)?;
+    let env_id = parse_env_id(&payload.environment_id)?;
+    let env = store.load(&env_id)?;
+
+    // 1. Source the signed plan bytes (mTLS pull or local file pair).
+    let (plan_bytes, envelope_bytes) = load_plan_source(store, &env, &env_id, &payload)?;
+
+    // 2. Verify the DSSE signature + subject digest against the env trust root.
+    //    Closed-by-default: an env with no trusted keys rejects every plan.
+    let env_dir = store.env_dir(&env_id)?;
+    let trust = store_trust_root::load(&env_dir)?;
+    let verified = greentic_update::plan::verify_update_plan(&plan_bytes, &envelope_bytes, &trust)
+        .map_err(|e| OpError::Conflict(format!("update plan failed verification: {e}")))?;
+
+    // 3. The plan must target THIS environment. Two identities must agree — the
+    //    plan header (`plan.env_id`) AND the signed desired-state manifest it
+    //    carries (`target.environment.id`). Both are under the DSSE signature, so
+    //    a divergence means a buggy/compromised signer produced a plan whose
+    //    header names this env while its manifest reconciles another; fail closed
+    //    on either mismatch before touching the staging tree.
+    if verified.plan.env_id != env_id.as_str() {
+        return Err(OpError::InvalidArgument(format!(
+            "plan targets env `{}`, not `{env_id}`",
+            verified.plan.env_id
+        )));
+    }
+    let manifest: EnvManifest =
+        serde_json::from_value(verified.plan.target.clone()).map_err(|e| {
+            OpError::InvalidArgument(format!(
+                "plan target is not a valid {ENV_MANIFEST_SCHEMA_V1}: {e}"
+            ))
+        })?;
+    if manifest.environment.id != env_id.as_str() {
+        return Err(OpError::InvalidArgument(format!(
+            "plan target manifest names env `{}`, not `{env_id}`",
+            manifest.environment.id
+        )));
+    }
+
+    // 4. Pre-flight gates, before touching the staging tree: downgrade guard
+    //    (monotonic sequence), then compatibility. NOTE: these read staging state
+    //    (`latest_applied_sequence`/`applied_plan_ids`) and are re-checked at
+    //    apply (Phase 3); the read → `begin` window is not held under the staging
+    //    lock, so a concurrent updater on the SAME env could admit against stale
+    //    facts. Closing that fully needs a locked `begin_checked` admission API in
+    //    greentic-update (Phase 2b crate follow-up); single-operator use is safe.
+    let root = open_updates_root(&env_id, updates_root_override)?;
+    let last_applied = root
+        .latest_applied_sequence()
+        .map_err(|e| OpError::Conflict(format!("read update staging state: {e}")))?;
+    greentic_update::plan::ensure_not_downgrade(&verified.plan, last_applied)
+        .map_err(|e| OpError::Conflict(format!("update plan rejected: {e}")))?;
+
+    let applied = applied_plan_ids(&root)?;
+    let facts = greentic_update::plan::RuntimeFacts {
+        // The operator CLI is released in lockstep with the runtime it manages,
+        // so its own version is the runtime-version floor we can assert locally.
+        runtime_version: Some(env!("CARGO_PKG_VERSION")),
+        // The operator does not observe the live component ABI; a plan that pins
+        // `compat.abi` is left to apply-time (Phase 3), where the running runtime
+        // reports it. Unknown here ⇒ `check_compat` fails closed on an abi pin.
+        abi: None,
+        applied_plan_ids: &applied,
+    };
+    greentic_update::plan::check_compat(&verified.plan.compat, &facts)
+        .map_err(|e| OpError::Conflict(format!("update plan incompatible: {e}")))?;
+
+    // 5. Admit to staging — or RESUME an already-admitted identical plan.
+    //    `begin` alone errors `PlanExists` on re-run, so a crash after `begin`
+    //    but before the promotion transitions would strand the plan and make the
+    //    command un-retryable. Loading an existing same-digest plan makes `get`
+    //    idempotent/resumable; a same-id plan with a DIFFERENT digest is refused
+    //    (a distinct plan must not reuse the id). Writes plan.json + plan.json.sig
+    //    + state.json@downloading on the fresh path.
+    let staged = match root
+        .load(&verified.plan.plan_id)
+        .map_err(|e| OpError::Conflict(format!("load staged update plan: {e}")))?
+    {
+        Some(existing) => {
+            if existing.plan_sha256() != verified.plan_sha256 {
+                return Err(OpError::Conflict(format!(
+                    "a different plan is already staged under id `{}`",
+                    verified.plan.plan_id
+                )));
+            }
+            existing
+        }
+        None => root
+            .begin(&verified, &plan_bytes, &envelope_bytes)
+            .map_err(|e| OpError::Conflict(format!("stage update plan: {e}")))?,
+    };
+
+    // 6. A plan with no artifacts needs nothing fetched → advance it to `staged`
+    //    (resuming from wherever a prior partial run left it — idempotent). A
+    //    plan with artifacts stays at `downloading` until Phase 2b's download.
+    let artifacts_total = verified.plan.artifacts.len();
+    let final_stage = if artifacts_total == 0 {
+        advance_zero_artifact_to_staged(&staged)?
+    } else {
+        staged
+            .stage()
+            .map_err(|e| OpError::Conflict(format!("read update staging stage: {e}")))?
+    };
+
+    Ok(OpOutcome::new(
+        NOUN,
+        "get",
+        json!({
+            "environment_id": env_id.as_str(),
+            "plan_id": verified.plan.plan_id,
+            "sequence": verified.plan.sequence,
+            "plan_sha256": verified.plan_sha256,
+            "verified_key_ids": verified.verified_key_ids,
+            "stage": final_stage.as_str(),
+            "artifacts_total": artifacts_total,
+            "plan_dir": staged.dir().display().to_string(),
+        }),
+    ))
+}
+
+/// Open the per-env update staging root (`GREENTIC_UPDATES_DIR` or
+/// `~/.greentic/updates/<env_id>`).
+fn open_updates_root(
+    env_id: &EnvId,
+    root_override: Option<&std::path::Path>,
+) -> Result<greentic_update::staging::UpdatesRoot, OpError> {
+    let opened = match root_override {
+        Some(root) => greentic_update::staging::UpdatesRoot::open_in(root, env_id.as_str()),
+        None => greentic_update::staging::UpdatesRoot::open(env_id.as_str()),
+    };
+    opened.map_err(|e| OpError::Conflict(format!("open update staging root: {e}")))
+}
+
+/// Plan ids already applied to this environment (feeds the plan's `requires`
+/// compatibility check).
+fn applied_plan_ids(root: &greentic_update::staging::UpdatesRoot) -> Result<Vec<String>, OpError> {
+    Ok(root
+        .list()
+        .map_err(|e| OpError::Conflict(format!("list staged update plans: {e}")))?
+        .into_iter()
+        .filter(|s| s.stage == greentic_update::staging::UpdateStage::Applied)
+        .map(|s| s.plan_id)
+        .collect())
+}
+
+/// Advance a zero-artifact plan to `staged`, from wherever it currently sits
+/// (`downloading` → `inbox` → `staged`). Idempotent: an already-`staged` plan is
+/// a no-op, so a resumed partial run converges. Non-`downloading`/`inbox` stages
+/// (already `staged`, or terminal) are left untouched.
+fn advance_zero_artifact_to_staged(
+    staged: &greentic_update::staging::StagedPlan,
+) -> Result<greentic_update::staging::UpdateStage, OpError> {
+    use greentic_update::staging::UpdateStage;
+    let mut stage = staged
+        .stage()
+        .map_err(|e| OpError::Conflict(format!("read update staging stage: {e}")))?;
+    if stage == UpdateStage::Downloading {
+        stage = staged
+            .transition(UpdateStage::Inbox)
+            .map_err(|e| OpError::Conflict(format!("advance update staging: {e}")))?
+            .stage;
+    }
+    if stage == UpdateStage::Inbox {
+        stage = staged
+            .transition(UpdateStage::Staged)
+            .map_err(|e| OpError::Conflict(format!("advance update staging: {e}")))?
+            .stage;
+    }
+    Ok(stage)
+}
+
+/// Resolve the `(plan document, DSSE envelope)` byte pair from the payload's
+/// source. Exactly one of `plan_url` or (`plan_file` + `plan_sig_file`) must be
+/// set.
+fn load_plan_source(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    payload: &UpdatesGetPayload,
+) -> Result<(Vec<u8>, Vec<u8>), OpError> {
+    match (
+        &payload.plan_url,
+        &payload.plan_file,
+        &payload.plan_sig_file,
+    ) {
+        (Some(url), None, None) => {
+            // The plan is fetched over the enrolled mTLS identity, which is only
+            // presented over TLS — reject plaintext `http://` (except loopback,
+            // for a local dev server) so a remote endpoint can't be reached
+            // without the client cert.
+            if !control_url_is_acceptable(url) {
+                return Err(OpError::InvalidArgument(
+                    "plan_url must be an https:// URL; plaintext http:// is accepted only for a \
+                     loopback dev server. The enrolled mTLS client identity is presented only over \
+                     TLS, so a plaintext fetch would bypass it."
+                        .to_string(),
+                ));
+            }
+            fetch_plan_over_mtls(store, env, env_id, url)
+        }
+        (None, Some(plan), Some(sig)) => {
+            let plan_bytes = std::fs::read(plan).map_err(|source| OpError::Io {
+                path: plan.clone(),
+                source,
+            })?;
+            let sig_bytes = std::fs::read(sig).map_err(|source| OpError::Io {
+                path: sig.clone(),
+                source,
+            })?;
+            Ok((plan_bytes, sig_bytes))
+        }
+        _ => Err(OpError::InvalidArgument(
+            "exactly one plan source is required: `plan_url`, or `plan_file` with `plan_sig_file`"
+                .to_string(),
+        )),
+    }
+}
+
+/// Fetch the plan document + `.sig` sidecar over the enrolled mTLS channel,
+/// using the persisted cert/key/CA (from `enroll`). GETs `<plan_url>` for the
+/// document and `<plan_url>.sig` for the envelope — the crate's sidecar
+/// convention (`plan.json` + `plan.json.sig`). Integration-covered: no plan
+/// server exists until Phase 6, so the local `plan_file` pair is the unit-tested
+/// source.
+fn fetch_plan_over_mtls(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    plan_url: &str,
+) -> Result<(Vec<u8>, Vec<u8>), OpError> {
+    let secrets = require_secrets_pack(env, env_id)?;
+    let kind_path = secrets.kind.path();
+    let tenant = require_tenant(env, env_id)?;
+
+    let read_enrolled = |name: &str| -> Result<String, OpError> {
+        let rel = tls_rel_path(&tenant, name);
+        let (value, _uri, _extra) = get_env_secret(store, env, env_id, kind_path, &rel)?;
+        value.ok_or_else(|| {
+            OpError::NotFound(format!(
+                "env `{env_id}` is not enrolled for updates (missing `{name}`); \
+                 run `op updates enroll` first"
+            ))
+        })
+    };
+    let cert_pem = read_enrolled(CERT_NAME)?;
+    let key_pem = read_enrolled(KEY_NAME)?;
+    let ca_pem = read_enrolled(CA_NAME)?;
+
+    // Build the `.sig` sidecar URL by mutating the path (not appending to the
+    // raw string), so a query/fragment on `plan_url` doesn't corrupt it.
+    let sig_url = {
+        let mut u = url::Url::parse(plan_url)
+            .map_err(|e| OpError::InvalidArgument(format!("plan_url: {e}")))?;
+        let sig_path = format!("{}.sig", u.path());
+        u.set_path(&sig_path);
+        u.to_string()
+    };
+    rt::sync_await(async {
+        let client = greentic_update::tls::build_mtls_client(&greentic_update::tls::MtlsConfig {
+            ca_pem,
+            client_cert_pem: cert_pem,
+            client_key_pem: key_pem,
+        })
+        .map_err(|e| OpError::Conflict(format!("stored mTLS identity is unusable: {e}")))?;
+        let plan_bytes = mtls_get(&client, plan_url).await?;
+        let sig_bytes = mtls_get(&client, &sig_url).await?;
+        Ok::<(Vec<u8>, Vec<u8>), OpError>((plan_bytes, sig_bytes))
+    })
+}
+
+/// GET `url` over the mTLS client, returning the body bytes. Non-2xx and
+/// transport errors both map to [`OpError::Fetch`].
+async fn mtls_get(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, OpError> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| OpError::Fetch(format!("GET {url}: {e}")))?;
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| OpError::Fetch(format!("GET {url}: reading body: {e}")))?;
+    Ok(bytes.to_vec())
+}
+
 fn parse_env_id(raw: &str) -> Result<EnvId, OpError> {
     EnvId::try_from(raw).map_err(|e| OpError::InvalidArgument(format!("environment_id: {e}")))
 }
@@ -311,6 +652,22 @@ fn status_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "environment_id": {"type": "string"}
+        }
+    })
+}
+
+fn get_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "UpdatesGetPayload",
+        "type": "object",
+        "required": ["environment_id"],
+        "additionalProperties": false,
+        "properties": {
+            "environment_id": {"type": "string"},
+            "plan_url": {"type": "string", "description": "Fetch the signed plan (+ `.sig` sidecar) from this URL over the enrolled mTLS channel."},
+            "plan_file": {"type": "string", "description": "Local plan document (airgap import / testing); requires plan_sig_file."},
+            "plan_sig_file": {"type": "string", "description": "DSSE envelope sidecar for plan_file."}
         }
     })
 }
@@ -426,26 +783,28 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
     }
 
     #[test]
-    fn ca_url_is_acceptable_requires_https_or_loopback_http() {
+    fn control_url_is_acceptable_requires_https_or_loopback_http() {
         // HTTPS is always acceptable.
-        assert!(ca_url_is_acceptable("https://ca.example"));
-        assert!(ca_url_is_acceptable("https://ca.example:8443/v1/enroll"));
+        assert!(control_url_is_acceptable("https://ca.example"));
+        assert!(control_url_is_acceptable(
+            "https://ca.example:8443/v1/enroll"
+        ));
         // Plaintext HTTP only to a genuine loopback host.
-        assert!(ca_url_is_acceptable("http://localhost"));
-        assert!(ca_url_is_acceptable("http://localhost:8080/enroll"));
-        assert!(ca_url_is_acceptable("http://127.0.0.1:9000"));
-        assert!(ca_url_is_acceptable("http://127.5.5.5"));
-        assert!(ca_url_is_acceptable("http://[::1]:8080"));
+        assert!(control_url_is_acceptable("http://localhost"));
+        assert!(control_url_is_acceptable("http://localhost:8080/enroll"));
+        assert!(control_url_is_acceptable("http://127.0.0.1:9000"));
+        assert!(control_url_is_acceptable("http://127.5.5.5"));
+        assert!(control_url_is_acceptable("http://[::1]:8080"));
         // Plaintext HTTP to a remote host is refused (trust-anchor MITM risk).
-        assert!(!ca_url_is_acceptable("http://ca.example"));
-        assert!(!ca_url_is_acceptable("http://ca.example:8080/enroll"));
+        assert!(!control_url_is_acceptable("http://ca.example"));
+        assert!(!control_url_is_acceptable("http://ca.example:8080/enroll"));
         // A hostname that merely starts with "127." is NOT loopback.
-        assert!(!ca_url_is_acceptable("http://127.0.0.1.evil.com"));
+        assert!(!control_url_is_acceptable("http://127.0.0.1.evil.com"));
         // Other schemes and empties are refused.
-        assert!(!ca_url_is_acceptable("ftp://ca.example"));
-        assert!(!ca_url_is_acceptable("ca.example"));
-        assert!(!ca_url_is_acceptable("https://"));
-        assert!(!ca_url_is_acceptable(""));
+        assert!(!control_url_is_acceptable("ftp://ca.example"));
+        assert!(!control_url_is_acceptable("ca.example"));
+        assert!(!control_url_is_acceptable("https://"));
+        assert!(!control_url_is_acceptable(""));
     }
 
     #[test]
@@ -634,5 +993,352 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert_eq!(out.result["enrolled"], true);
         let info = greentic_update::tls::parse_cert_info(TEST_CERT_PEM).unwrap();
         assert_eq!(out.result["serial"].as_str().unwrap(), info.serial_hex);
+    }
+
+    // ---- `get` ----
+
+    use greentic_distributor_client::signing::{TrustRoot, TrustedKey};
+
+    /// Deterministic Ed25519 key: PKCS#8 private PEM + the matching `TrustedKey`.
+    fn key_pair(seed: u8) -> (String, TrustedKey) {
+        use ed25519_dalek::SigningKey;
+        use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+        use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
+        use greentic_distributor_client::signing::key_id_for_public_key_pem;
+
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let priv_pem = sk.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
+        let pub_pem = sk
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let key_id = key_id_for_public_key_pem(&pub_pem).unwrap();
+        (
+            priv_pem,
+            TrustedKey {
+                key_id,
+                public_key_pem: pub_pem,
+            },
+        )
+    }
+
+    /// Build + sign an update plan, returning `(plan_bytes, envelope_bytes)`.
+    /// `build_trust` must contain the signing key (build self-verifies).
+    #[allow(clippy::too_many_arguments)]
+    fn signed_plan(
+        env_id: &str,
+        plan_id: &str,
+        sequence: u64,
+        artifacts: Value,
+        compat: Value,
+        priv_pem: &str,
+        key_id: &str,
+        build_trust: &TrustRoot,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let plan: greentic_update::plan::UpdatePlan = serde_json::from_value(json!({
+            "schema": "greentic.update-plan.v1",
+            "plan_id": plan_id,
+            "env_id": env_id,
+            "sequence": sequence,
+            "created_at": "2026-07-02T00:00:00Z",
+            "nonce": format!("nonce-{plan_id}"),
+            "target": {"schema": "greentic.env-manifest.v1", "environment": {"id": env_id}},
+            "artifacts": artifacts,
+            "compat": compat,
+            "rollback": {"policy": "auto", "health_timeout_s": 120, "on_fail": "restore"},
+        }))
+        .unwrap();
+        let built =
+            greentic_update::plan::build_update_plan(&plan, priv_pem, key_id, build_trust).unwrap();
+        (built.plan_bytes, built.envelope_bytes)
+    }
+
+    /// Save a fresh `local` env and seed its trust root with `tk`.
+    fn env_trusting(store: &LocalFsStore, tk: &TrustedKey) -> EnvId {
+        let env = make_env("local");
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        let env_dir = store.env_dir(&env_id).unwrap();
+        store_trust_root::add_trusted_key(&env_dir, tk.clone()).unwrap();
+        env_id
+    }
+
+    #[test]
+    fn get_schema_only_returns_payload_schema() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let out = get(
+            &store,
+            &OpFlags {
+                schema_only: true,
+                ..OpFlags::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.op, "get");
+        assert_eq!(out.noun, NOUN);
+        assert!(out.result["properties"]["plan_url"].is_object());
+    }
+
+    #[test]
+    fn get_rejects_missing_plan_source() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let err = get(
+            &store,
+            &OpFlags::default(),
+            Some(UpdatesGetPayload {
+                environment_id: "local".into(),
+                plan_url: None,
+                plan_file: None,
+                plan_sig_file: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn get_rejects_plan_signed_by_untrusted_key() {
+        // Env trusts key 7; the plan is signed by key 9 (trusted only at build).
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (_priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+
+        let (priv9, tk9) = key_pair(9);
+        let build_trust = TrustRoot::new(vec![tk9.clone()]);
+        let (plan_b, sig_b) = signed_plan(
+            "local",
+            "plan-x",
+            1,
+            json!([]),
+            json!({}),
+            &priv9,
+            &tk9.key_id,
+            &build_trust,
+        );
+        let plan_file = dir.path().join("plan.json");
+        let sig_file = dir.path().join("plan.json.sig");
+        std::fs::write(&plan_file, &plan_b).unwrap();
+        std::fs::write(&sig_file, &sig_b).unwrap();
+
+        let err = get(
+            &store,
+            &OpFlags::default(),
+            Some(UpdatesGetPayload {
+                environment_id: env_id.to_string(),
+                plan_url: None,
+                plan_file: Some(plan_file),
+                plan_sig_file: Some(sig_file),
+            }),
+        )
+        .unwrap_err();
+        // Closed-by-default: the env trust root does not hold the signer.
+        assert!(matches!(err, OpError::Conflict(_)));
+    }
+
+    #[test]
+    fn get_rejects_plan_targeting_another_env() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        // Signed by the trusted key, but the plan targets env `other`.
+        let (plan_b, sig_b) = signed_plan(
+            "other",
+            "plan-x",
+            1,
+            json!([]),
+            json!({}),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let plan_file = dir.path().join("plan.json");
+        let sig_file = dir.path().join("plan.json.sig");
+        std::fs::write(&plan_file, &plan_b).unwrap();
+        std::fs::write(&sig_file, &sig_b).unwrap();
+
+        let err = get(
+            &store,
+            &OpFlags::default(),
+            Some(UpdatesGetPayload {
+                environment_id: env_id.to_string(),
+                plan_url: None,
+                plan_file: Some(plan_file),
+                plan_sig_file: Some(sig_file),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn get_stages_zero_artifact_plan_to_staged() {
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        // No artifacts + unconstrained compat ⇒ the pipeline reaches `staged`.
+        let (plan_b, sig_b) = signed_plan(
+            "local",
+            "plan-happy",
+            1,
+            json!([]),
+            json!({}),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let plan_file = dir.path().join("plan.json");
+        let sig_file = dir.path().join("plan.json.sig");
+        std::fs::write(&plan_file, &plan_b).unwrap();
+        std::fs::write(&sig_file, &sig_b).unwrap();
+
+        // The test seam points the staging FSM at a tempdir (no env-var / unsafe).
+        let out = get_impl(
+            &store,
+            &OpFlags::default(),
+            Some(UpdatesGetPayload {
+                environment_id: env_id.to_string(),
+                plan_url: None,
+                plan_file: Some(plan_file),
+                plan_sig_file: Some(sig_file),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap();
+
+        assert_eq!(out.op, "get");
+        assert_eq!(out.result["stage"], "staged");
+        assert_eq!(out.result["plan_id"], "plan-happy");
+        assert_eq!(out.result["artifacts_total"], 0);
+        assert_eq!(out.result["sequence"], 1);
+    }
+
+    #[test]
+    fn get_rejects_target_manifest_naming_another_env() {
+        // plan.env_id matches `local`, but the signed target manifest names
+        // `other` — a self-inconsistent plan must be refused (fail closed).
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+
+        let plan: greentic_update::plan::UpdatePlan = serde_json::from_value(json!({
+            "schema": "greentic.update-plan.v1",
+            "plan_id": "plan-mismatch",
+            "env_id": "local",
+            "sequence": 1,
+            "created_at": "2026-07-02T00:00:00Z",
+            "nonce": "n",
+            "target": {"schema": "greentic.env-manifest.v1", "environment": {"id": "other"}},
+            "artifacts": [],
+            "compat": {},
+            "rollback": {"policy": "auto", "health_timeout_s": 120, "on_fail": "restore"},
+        }))
+        .unwrap();
+        let built =
+            greentic_update::plan::build_update_plan(&plan, &priv7, &tk7.key_id, &build_trust)
+                .unwrap();
+        let plan_file = dir.path().join("plan.json");
+        let sig_file = dir.path().join("plan.json.sig");
+        std::fs::write(&plan_file, &built.plan_bytes).unwrap();
+        std::fs::write(&sig_file, &built.envelope_bytes).unwrap();
+
+        // Fails at the identity check, before the staging root is touched.
+        let err = get(
+            &store,
+            &OpFlags::default(),
+            Some(UpdatesGetPayload {
+                environment_id: env_id.to_string(),
+                plan_url: None,
+                plan_file: Some(plan_file),
+                plan_sig_file: Some(sig_file),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn get_rejects_plaintext_remote_plan_url() {
+        // A remote plaintext plan_url would fetch without presenting the enrolled
+        // mTLS identity — rejected before any secret read or network call.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let err = get(
+            &store,
+            &OpFlags::default(),
+            Some(UpdatesGetPayload {
+                environment_id: "local".into(),
+                plan_url: Some("http://updates.example/plan".into()),
+                plan_file: None,
+                plan_sig_file: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn get_is_idempotent_on_reget() {
+        // Re-running `get` on the same plan must resume, not error `PlanExists`.
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        let (plan_b, sig_b) = signed_plan(
+            "local",
+            "plan-idem",
+            1,
+            json!([]),
+            json!({}),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let plan_file = dir.path().join("plan.json");
+        let sig_file = dir.path().join("plan.json.sig");
+        std::fs::write(&plan_file, &plan_b).unwrap();
+        std::fs::write(&sig_file, &sig_b).unwrap();
+
+        let payload = || UpdatesGetPayload {
+            environment_id: env_id.to_string(),
+            plan_url: None,
+            plan_file: Some(plan_file.clone()),
+            plan_sig_file: Some(sig_file.clone()),
+        };
+        let first = get_impl(
+            &store,
+            &OpFlags::default(),
+            Some(payload()),
+            Some(updates_dir.path()),
+        )
+        .unwrap();
+        assert_eq!(first.result["stage"], "staged");
+
+        let second = get_impl(
+            &store,
+            &OpFlags::default(),
+            Some(payload()),
+            Some(updates_dir.path()),
+        )
+        .unwrap();
+        assert_eq!(second.result["stage"], "staged");
+        assert_eq!(second.result["plan_id"], "plan-idem");
     }
 }
