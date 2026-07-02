@@ -607,9 +607,10 @@ fn advance_to_staged(
 /// `env_apply` verifies the applied bytes against the signed plan), and manifest
 /// content that writes non-rollbackable dev-store secrets (`secrets[]` and
 /// `messaging_endpoints[]`) is refused (the snapshot does not cover the
-/// dev-store). Concurrent apply on one env is single-flight best-effort; the
-/// atomic apply-admission (the apply analogue of `begin_checked`) is a
-/// follow-up.
+/// dev-store). Concurrent apply on one env is single-flight: `begin_apply_checked`
+/// admits at most one plan into `applying` per env under the staging lock,
+/// rejecting a second, and runs the downgrade/compat re-gate atomically with the
+/// `staged → applying` transition.
 pub fn apply_updates(
     store: &LocalFsStore,
     flags: &OpFlags,
@@ -685,12 +686,10 @@ fn apply_updates_impl(
         }
     };
 
-    // Re-run the downgrade + compat gates against the CURRENT applied set (a
-    // newer plan may have been applied since this was staged).
-    if let Err(e) = admit_plan(&verified, &current_admission_facts(&root)?) {
-        let _ = staged.transition(UpdateStage::Rejected);
-        return Err(e);
-    }
+    // The downgrade + compat re-gate moves INTO the `begin_apply_checked`
+    // predicate below, so it runs atomically with the `staged → applying`
+    // transition against a lock-held applied-set snapshot (closing the TOCTOU
+    // where a newer plan applies between the re-gate and the transition).
 
     // Re-verify every declared artifact's on-disk checksum, fail closed.
     for artifact in &verified.plan.artifacts {
@@ -720,33 +719,39 @@ fn apply_updates_impl(
         idempotency_key: Some(verified.plan.plan_id.clone()),
     };
     audit_and_record(store, ctx, |committed| {
-        // Single-flight guard (best-effort): reject if another plan for this env
-        // is already mid-apply. apply-updates is designed for single-operator
-        // use; the fully-atomic guarantee — holding the staging lock across the
-        // downgrade/compat re-gate AND the `staged → applying` transition (and
-        // rejecting a second Applying plan) — needs a locked apply-admission API
-        // in greentic-update, the apply-side analogue of `begin_checked`. Until
-        // then this narrows, but does not close, the concurrent-apply window;
-        // env_apply's own per-env store flock still serializes the actual
-        // mutation. (Atomic apply-admission → follow-up.)
-        if let Ok(states) = root.list()
-            && let Some(other) = states
-                .iter()
-                .find(|s| s.plan_id != verified.plan.plan_id && s.stage == UpdateStage::Applying)
+        // Atomically admit this plan into `applying` under one staging-lock hold:
+        // the downgrade/compat re-gate runs against a race-free applied-set
+        // snapshot, a second in-flight apply is rejected (single-flight), and the
+        // `staged → applying` transition commits — all before the lock releases.
+        // This closes the concurrent-apply TOCTOU the best-effort guard only
+        // narrowed; env_apply's own per-env store flock still serializes the
+        // actual mutation below.
+        match root.begin_apply_checked(&verified.plan.plan_id, |facts| admit_plan(&verified, facts))
         {
-            return Err(OpError::Conflict(format!(
-                "another update plan (`{}`) is already applying to env `{env_id}`; \
-                 apply is single-flight per environment",
-                other.plan_id
-            )));
+            Ok(_applying) => {}
+            Err(greentic_update::staging::BeginApplyError::Rejected(e)) => {
+                // The downgrade/compat re-gate rejected the plan (a newer plan
+                // applied since staging) — it's dead. Nothing was mutated.
+                let _ = staged.transition(UpdateStage::Rejected);
+                return Err(e);
+            }
+            Err(greentic_update::staging::BeginApplyError::AlreadyApplying {
+                applying, ..
+            }) => {
+                return Err(OpError::Conflict(format!(
+                    "another update plan (`{applying}`) is already applying to env `{env_id}`; \
+                     apply is single-flight per environment"
+                )));
+            }
+            Err(greentic_update::staging::BeginApplyError::Staging(s)) => {
+                // The target left `staged` between the pre-check and the lock (a
+                // concurrent transition), or a plan marker is corrupt — fail
+                // closed without mutating.
+                return Err(OpError::Conflict(format!("apply admission failed: {s}")));
+            }
         }
-
-        // Enter the mutating region: `staged → applying`.
-        staged
-            .transition(UpdateStage::Applying)
-            .map_err(|e| OpError::Conflict(format!("begin apply (staged → applying): {e}")))?;
-        // Everything below persists staging state even on the Err path, so an
-        // audit-append failure must be treated as fail-closed.
+        // `applying` is now committed on disk, so every path below must be
+        // fail-closed for the audit ledger.
         committed.mark_committed();
 
         // Snapshot the whole env BEFORE any mutation. If this fails, nothing
@@ -2676,6 +2681,50 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert_eq!(
             on_disk_stage(updates_dir.path(), "plan-b"),
             UpdateStage::Rejected
+        );
+    }
+
+    #[test]
+    fn apply_rejects_concurrent_applying_plan() {
+        use greentic_update::staging::{UpdateStage, UpdatesRoot};
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+
+        // Two staged plans; park one at `applying` (an in-flight apply on this
+        // env). begin_apply_checked's single-flight gate must then refuse the
+        // other — atomically, under the staging lock.
+        stage_local(updates_dir.path(), "plan-a", 1, &priv7, &tk7);
+        stage_local(updates_dir.path(), "plan-b", 2, &priv7, &tk7);
+        let root = UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        root.load("plan-a")
+            .unwrap()
+            .unwrap()
+            .transition(UpdateStage::Applying)
+            .unwrap();
+
+        let err = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-b".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(m) if m.contains("single-flight")));
+        // plan-b stays Staged (single-flight is retryable, not fatal); plan-a is
+        // untouched — neither the env nor the losing plan was mutated.
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-b"),
+            UpdateStage::Staged
+        );
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-a"),
+            UpdateStage::Applying
         );
     }
 
