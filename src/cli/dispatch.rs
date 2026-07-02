@@ -673,6 +673,9 @@ pub enum UpdatesVerb {
     /// Fetch a signed update plan (over the enrolled mTLS channel or from a
     /// local file), verify it against the env trust root, and stage it.
     Get(UpdatesGetArgs),
+    /// Apply a staged update plan to its environment: re-verify, snapshot,
+    /// converge via the env-apply pipeline, and roll back on failure.
+    Apply(UpdatesApplyArgs),
 }
 
 #[derive(Args, Debug)]
@@ -680,6 +683,14 @@ pub struct UpdatesEnrollArgs {
     pub env_id: Option<String>,
     #[arg(long = "ca-url")]
     pub ca_url: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesApplyArgs {
+    pub env_id: Option<String>,
+    /// Plan id of the staged plan to apply (from a prior `op updates get`).
+    #[arg(long = "plan-id")]
+    pub plan_id: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1102,6 +1113,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 UpdatesVerb::Enroll(_) => "enroll",
                 UpdatesVerb::Status { .. } => "status",
                 UpdatesVerb::Get(_) => "get",
+                UpdatesVerb::Apply(_) => "apply",
             },
         ),
     }
@@ -1383,6 +1395,18 @@ fn dispatch_updates(
                     plan_sig_file: args.plan_sig_file,
                 });
             super::updates::get(store, flags, payload)?
+        }
+        UpdatesVerb::Apply(args) => {
+            let payload = match (args.env_id, args.plan_id) {
+                (Some(environment_id), Some(plan_id)) => {
+                    Some(super::updates::ApplyUpdatesPayload {
+                        environment_id,
+                        plan_id,
+                    })
+                }
+                _ => None, // fall through to --answers / --schema
+            };
+            super::updates::apply_updates(store, flags, payload)?
         }
     };
     print_outcome(&outcome)
