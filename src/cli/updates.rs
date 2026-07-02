@@ -272,7 +272,7 @@ fn status_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::secrets::{DEV_STORE_KIND_PATH, put_env_secret};
+    use crate::cli::secrets::{DEV_STORE_KIND_PATH, get_env_secret, put_env_secret};
     use crate::cli::tests_common::{make_binding, make_env};
     use greentic_deploy_spec::CapabilitySlot;
     use tempfile::tempdir;
@@ -473,5 +473,80 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         )
         .unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn persist_enrollment_writes_all_four_secrets_then_status_reads_them() {
+        // Exercises the durable side-effect of `enroll` without a CA: build a
+        // synthetic Enrollment, persist it, read all four secrets back through
+        // the same dispatch a reader uses, and confirm `status` finds the cert.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = dev_store_env_with_tenant();
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+
+        let enrollment = greentic_update::enroll::Enrollment {
+            client_key_pem: "-----BEGIN PRIVATE KEY-----\nKEYMATERIAL\n-----END PRIVATE KEY-----\n"
+                .to_string(),
+            client_cert_pem: TEST_CERT_PEM.to_string(),
+            ca_pem: "-----BEGIN CERTIFICATE-----\nCAMATERIAL\n-----END CERTIFICATE-----\n"
+                .to_string(),
+            serial: "61aa465e0b59ad1368fc05a35135fb1027d97a72".to_string(),
+            not_after: "2036-06-29T08:29:35Z".to_string(),
+        };
+        let ca_url = "https://ca.example";
+
+        let stored = persist_enrollment(
+            &store,
+            &env,
+            &env_id,
+            DEV_STORE_KIND_PATH,
+            "acme",
+            ca_url,
+            &enrollment,
+        )
+        .unwrap();
+
+        // All four artifacts written, in order, under the expected URIs.
+        let names: Vec<&str> = stored.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec![KEY_NAME, CERT_NAME, CA_NAME, CA_URL_NAME]);
+        assert_eq!(
+            stored[1]["store_uri"].as_str().unwrap(),
+            "secrets://local/acme/_/tls/updater_cert"
+        );
+
+        // Read each back through get_env_secret (the reader's dispatch).
+        let read = |name: &str| {
+            get_env_secret(
+                &store,
+                &env,
+                &env_id,
+                DEV_STORE_KIND_PATH,
+                &tls_rel_path("acme", name),
+            )
+            .unwrap()
+            .0
+        };
+        assert_eq!(
+            read(KEY_NAME).as_deref(),
+            Some(enrollment.client_key_pem.as_str())
+        );
+        assert_eq!(read(CERT_NAME).as_deref(), Some(TEST_CERT_PEM));
+        assert_eq!(read(CA_NAME).as_deref(), Some(enrollment.ca_pem.as_str()));
+        assert_eq!(read(CA_URL_NAME).as_deref(), Some(ca_url));
+
+        // Full producer -> consumer round-trip: `status` finds the persisted cert.
+        let out = status(
+            &store,
+            &OpFlags::default(),
+            Some(UpdatesStatusPayload {
+                environment_id: "local".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(out.result["enrolled"], true);
+        let info = greentic_update::tls::parse_cert_info(TEST_CERT_PEM).unwrap();
+        assert_eq!(out.result["serial"].as_str().unwrap(), info.serial_hex);
     }
 }
