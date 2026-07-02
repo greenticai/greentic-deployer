@@ -57,35 +57,27 @@ fn tls_rel_path(tenant: &str, name: &str) -> String {
 }
 
 /// Whether a CA base URL is acceptable for enrollment. HTTPS is always allowed
-/// (the client authenticates the CA's server certificate). Plaintext `http://`
-/// is allowed ONLY to a loopback host, for a local-development CA: enrollment
+/// (the client validates the CA's server certificate). Plaintext `http://` is
+/// allowed ONLY to a loopback host, for a local-development CA: enrollment
 /// establishes the update-channel trust anchor, so bootstrapping it over an
 /// unauthenticated channel to a *remote* host would let an on-path attacker
-/// return a malicious CA that gets persisted as the trust anchor.
-fn ca_url_is_acceptable(url: &str) -> bool {
-    if let Some(rest) = url.strip_prefix("https://") {
-        return !rest.is_empty();
-    }
-    let Some(rest) = url.strip_prefix("http://") else {
+/// return a malicious CA that gets persisted as the trust anchor. A hostname
+/// that merely starts with `127.` (e.g. `127.0.0.1.evil.com`) parses as a
+/// domain, not a loopback IP, so it is refused.
+fn ca_url_is_acceptable(raw: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw) else {
         return false;
     };
-    // Authority = everything up to the first path/query/fragment delimiter.
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // Strip optional `userinfo@`.
-    let host_port = authority.rsplit('@').next().unwrap_or(authority);
-    // Host without port: bracketed IPv6 keeps its inner text; otherwise the
-    // segment before the first `:`.
-    let host = if let Some(inner) = host_port.strip_prefix('[') {
-        inner.split(']').next().unwrap_or("")
-    } else {
-        host_port.split(':').next().unwrap_or("")
-    };
-    // `localhost`, or an actual loopback IP (127.0.0.0/8, ::1) — parsed as an IP
-    // so a hostname like `127.0.0.1.evil.com` is NOT treated as loopback.
-    host == "localhost"
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+    match parsed.scheme() {
+        "https" => true,
+        "http" => match parsed.host() {
+            Some(url::Host::Domain(host)) => host == "localhost",
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        _ => false,
+    }
 }
 
 /// The enrolled certificate's identity is the env's owning tenant, so an owner
