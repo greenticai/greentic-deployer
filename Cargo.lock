@@ -2913,11 +2913,12 @@ dependencies = [
 
 [[package]]
 name = "greentic-update"
-version = "0.1.28574369828"
+version = "0.1.28584160182"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c0572ef19b3890b495fa422d6468d9c8e3bb99175f5c31df3278d3efa148c4e"
+checksum = "2315e8855fc25337d71f45c0254d3fada975d3b225e37409a4f68943c737bbbe"
 dependencies = [
  "chrono",
+ "fs4",
  "greentic-distributor-client",
  "hex",
  "rcgen",
@@ -2926,6 +2927,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
  "x509-parser",
 ]
@@ -7325,7 +7327,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

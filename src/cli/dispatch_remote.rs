@@ -280,6 +280,7 @@ fn route_remote(
         OpNoun::Updates { verb } => match verb {
             UpdatesVerb::Enroll(_) => Err(not_supported("updates enroll")),
             UpdatesVerb::Status { .. } => Err(not_supported("updates status")),
+            UpdatesVerb::Get(_) => Err(not_supported("updates get")),
         },
     }
 }
