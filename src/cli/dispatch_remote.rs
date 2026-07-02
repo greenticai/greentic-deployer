@@ -281,6 +281,7 @@ fn route_remote(
             UpdatesVerb::Enroll(_) => Err(not_supported("updates enroll")),
             UpdatesVerb::Status { .. } => Err(not_supported("updates status")),
             UpdatesVerb::Get(_) => Err(not_supported("updates get")),
+            UpdatesVerb::Apply(_) => Err(not_supported("updates apply")),
         },
     }
 }
