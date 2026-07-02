@@ -22,7 +22,10 @@ use greentic_secrets_lib::core::rt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{EnvironmentStore, LocalFsStore, trust_root as store_trust_root};
+use crate::environment::{
+    EnvironmentStore, LocalFsStore, restore_environment, snapshot_environment,
+    trust_root as store_trust_root,
+};
 
 use super::env_manifest::{ENV_MANIFEST_SCHEMA_V1, EnvManifest};
 use super::secrets::{get_env_secret, put_env_secret, require_secrets_pack};
@@ -70,6 +73,14 @@ pub struct UpdatesGetPayload {
     /// DSSE envelope sidecar for `plan_file`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_sig_file: Option<PathBuf>,
+}
+
+/// Payload for `op updates apply` — apply a staged plan to its environment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyUpdatesPayload {
+    pub environment_id: String,
+    /// Plan id of the staged plan to apply (from a prior `op updates get`).
+    pub plan_id: String,
 }
 
 /// The dev-store/Vault secret path for one TLS artifact: `<tenant>/_/tls/<name>`
@@ -566,6 +577,403 @@ fn advance_to_staged(
     Ok(stage)
 }
 
+/// `op updates apply` — apply a STAGED update plan to its environment
+/// (Phase 3 of the Greentic updater). **Mutation.**
+///
+/// The staged plan (from `op updates get`) is re-verified end-to-end off the
+/// on-disk staging tree *before* any environment mutation — DSSE signature,
+/// per-artifact checksums, the tamper cross-check against the write-time
+/// digest, the target-env identity, and the downgrade + compat gates against
+/// the current applied set. Re-verification is defense-in-depth: the plan was
+/// verified at `get`, but the bytes sitting on disk are untrusted at apply
+/// time.
+///
+/// A passing plan is then applied under a whole-env snapshot: `staged →
+/// applying`, snapshot the environment (P0b), drive the declarative
+/// [`env_apply`](super::env_apply::apply) pipeline with the plan's signed
+/// target manifest, and on success `applying → applied` (so
+/// `latest_applied_sequence` advances). On ANY apply failure the pre-apply
+/// snapshot is restored and the plan is marked `failed`. A plan stranded in
+/// `applying` from a prior crash is failed closed (re-stage via `op updates
+/// get`). The mutating region runs inside `audit_and_record`.
+///
+/// Scope of this increment: **content add/update only** (the manifest is
+/// upsert-applied — resource removal/prune is deferred). Success means the env
+/// store converged (`env_apply`'s internal verify); live runtime health is not
+/// gated here (the deployer cannot reach `greentic-start`'s health gate). The
+/// binary self-update track is not built; a plan carrying binaries would fail
+/// the manifest parse. Fail-closed guards on the target manifest (see
+/// [`check_applyable_manifest`]): bundles must be `bundle_digest`-pinned (so
+/// `env_apply` verifies the applied bytes against the signed plan), and manifest
+/// content that writes non-rollbackable dev-store secrets (`secrets[]` and
+/// `messaging_endpoints[]`) is refused (the snapshot does not cover the
+/// dev-store). Concurrent apply on one env is single-flight best-effort; the
+/// atomic apply-admission (the apply analogue of `begin_checked`) is a
+/// follow-up.
+pub fn apply_updates(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<ApplyUpdatesPayload>,
+) -> Result<OpOutcome, OpError> {
+    apply_updates_impl(store, flags, payload, None)
+}
+
+/// Body of [`apply_updates`], with an optional staging-root override so tests
+/// can point the FSM at a tempdir instead of `~/.greentic/updates`.
+fn apply_updates_impl(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<ApplyUpdatesPayload>,
+    updates_root_override: Option<&std::path::Path>,
+) -> Result<OpOutcome, OpError> {
+    use greentic_update::staging::{RetentionPolicy, UpdateStage};
+
+    if flags.schema_only {
+        return Ok(OpOutcome::new(NOUN, "apply", apply_updates_schema()));
+    }
+    let payload = resolve_payload::<ApplyUpdatesPayload>(flags, payload)?;
+    let env_id = parse_env_id(&payload.environment_id)?;
+
+    // Load the staged plan handle (read-only). A missing plan is a plain
+    // NotFound — nothing to apply.
+    let root = open_updates_root(&env_id, updates_root_override)?;
+    let staged = root
+        .load(&payload.plan_id)
+        .map_err(|e| OpError::Conflict(format!("load staged update plan: {e}")))?
+        .ok_or_else(|| {
+            OpError::NotFound(format!(
+                "no staged plan `{}` under env `{env_id}`; run `op updates get` first",
+                payload.plan_id
+            ))
+        })?;
+
+    // Stage gate. Only a `staged` plan is applicable. A plan stuck in
+    // `applying` is the residue of a prior crash between the transitions — fail
+    // it closed (the operator re-stages via `op updates get`, which resumes an
+    // identical plan). Any other stage (still downloading, or already terminal)
+    // is a plain argument error.
+    let stage = staged
+        .stage()
+        .map_err(|e| OpError::Conflict(format!("read update staging stage: {e}")))?;
+    match stage {
+        UpdateStage::Staged => {}
+        UpdateStage::Applying => {
+            staged
+                .transition(UpdateStage::Failed)
+                .map_err(|e| OpError::Conflict(format!("fail stale `applying` plan: {e}")))?;
+            return Err(OpError::Conflict(format!(
+                "plan `{}` was stuck in `applying` from a prior crash and has been marked \
+                 `failed`; re-stage with `op updates get` and re-apply",
+                payload.plan_id
+            )));
+        }
+        other => {
+            return Err(OpError::InvalidArgument(format!(
+                "plan `{}` is `{other}`, not `staged`; only a staged plan can be applied",
+                payload.plan_id
+            )));
+        }
+    }
+
+    // Re-verify the staged plan bytes off disk (DSSE + tamper cross-check +
+    // target-env identity). A rejected plan is dead — mark it `rejected`.
+    let verified = match reverify_staged(store, &staged, &env_id) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = staged.transition(UpdateStage::Rejected);
+            return Err(e);
+        }
+    };
+
+    // Re-run the downgrade + compat gates against the CURRENT applied set (a
+    // newer plan may have been applied since this was staged).
+    if let Err(e) = admit_plan(&verified, &current_admission_facts(&root)?) {
+        let _ = staged.transition(UpdateStage::Rejected);
+        return Err(e);
+    }
+
+    // Re-verify every declared artifact's on-disk checksum, fail closed.
+    for artifact in &verified.plan.artifacts {
+        if let Err(e) = staged.verify_artifact_on_disk(artifact) {
+            let _ = staged.transition(UpdateStage::Rejected);
+            return Err(OpError::Conflict(format!(
+                "staged artifact `{}` failed integrity re-check: {e}",
+                artifact.name
+            )));
+        }
+    }
+
+    // The plan's signed target manifest drives the apply.
+    let target = verified.plan.target.clone();
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "apply",
+        target: json!({
+            "environment_id": env_id.as_str(),
+            "plan_id": verified.plan.plan_id,
+            "sequence": verified.plan.sequence,
+            "plan_sha256": verified.plan_sha256,
+        }),
+        // Applying the same plan twice is a no-op via the FSM (a second apply
+        // hits the terminal-stage gate); key audit dedup on the plan id.
+        idempotency_key: Some(verified.plan.plan_id.clone()),
+    };
+    audit_and_record(store, ctx, |committed| {
+        // Single-flight guard (best-effort): reject if another plan for this env
+        // is already mid-apply. apply-updates is designed for single-operator
+        // use; the fully-atomic guarantee — holding the staging lock across the
+        // downgrade/compat re-gate AND the `staged → applying` transition (and
+        // rejecting a second Applying plan) — needs a locked apply-admission API
+        // in greentic-update, the apply-side analogue of `begin_checked`. Until
+        // then this narrows, but does not close, the concurrent-apply window;
+        // env_apply's own per-env store flock still serializes the actual
+        // mutation. (Atomic apply-admission → follow-up.)
+        if let Ok(states) = root.list()
+            && let Some(other) = states
+                .iter()
+                .find(|s| s.plan_id != verified.plan.plan_id && s.stage == UpdateStage::Applying)
+        {
+            return Err(OpError::Conflict(format!(
+                "another update plan (`{}`) is already applying to env `{env_id}`; \
+                 apply is single-flight per environment",
+                other.plan_id
+            )));
+        }
+
+        // Enter the mutating region: `staged → applying`.
+        staged
+            .transition(UpdateStage::Applying)
+            .map_err(|e| OpError::Conflict(format!("begin apply (staged → applying): {e}")))?;
+        // Everything below persists staging state even on the Err path, so an
+        // audit-append failure must be treated as fail-closed.
+        committed.mark_committed();
+
+        // Snapshot the whole env BEFORE any mutation. If this fails, nothing
+        // was mutated — fail the plan, no restore needed.
+        let snap_id = match snapshot_environment(store, &env_id) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = staged.transition(UpdateStage::Failed);
+                return Err(e.into());
+            }
+        };
+
+        // Drive the declarative apply pipeline with the signed target manifest.
+        match run_manifest_apply(store, &target) {
+            Ok(apply_outcome) => {
+                staged.transition(UpdateStage::Applied).map_err(|e| {
+                    OpError::Conflict(format!("mark plan applied (applying → applied): {e}"))
+                })?;
+                // Best-effort retention of terminal plans (never evicts active).
+                let _ = root.apply_retention(&RetentionPolicy { keep_terminal: 5 });
+                let outcome = OpOutcome::new(
+                    NOUN,
+                    "apply",
+                    json!({
+                        "environment_id": env_id.as_str(),
+                        "plan_id": verified.plan.plan_id,
+                        "sequence": verified.plan.sequence,
+                        "plan_sha256": verified.plan_sha256,
+                        "snapshot_id": snap_id.to_string(),
+                        "stage": UpdateStage::Applied.as_str(),
+                        "apply_result": apply_outcome.result,
+                    }),
+                );
+                Ok((outcome, super::AuditGens::NONE))
+            }
+            Err(apply_err) => {
+                // Roll the whole env back to the pre-apply snapshot, then fail
+                // the plan. The plan is dead either way, but the surfaced error
+                // must tell the TRUTH about whether the rollback actually
+                // completed — never claim "restored" when restore failed and the
+                // env may be partially applied.
+                let restored = restore_environment(store, &env_id, &snap_id);
+                let _ = staged.transition(UpdateStage::Failed);
+                match restored {
+                    Ok(()) => Err(OpError::Conflict(format!(
+                        "apply of plan `{}` failed; environment rolled back to snapshot `{snap_id}`: \
+                         {apply_err}",
+                        verified.plan.plan_id
+                    ))),
+                    Err(restore_err) => {
+                        tracing::error!(
+                            env_id = %env_id,
+                            snapshot_id = %snap_id,
+                            apply_error = %apply_err,
+                            restore_error = %restore_err,
+                            "apply-updates rollback FAILED; environment may be partially applied"
+                        );
+                        Err(OpError::Conflict(format!(
+                            "apply of plan `{}` failed AND automatic rollback FAILED; the \
+                             environment may be partially applied — manual recovery is required \
+                             from snapshot `{snap_id}`. apply error: {apply_err}; rollback error: \
+                             {restore_err}",
+                            verified.plan.plan_id
+                        )))
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Re-verify a staged plan off its on-disk bytes: DSSE signature against the
+/// env trust root, a hash cross-check against the write-time digest recorded in
+/// `state.json` (catches a `plan.json` swapped after staging), and the
+/// target-env identity (both the plan header and the signed manifest must name
+/// this env). Returns the re-verified plan.
+fn reverify_staged(
+    store: &LocalFsStore,
+    staged: &greentic_update::staging::StagedPlan,
+    env_id: &EnvId,
+) -> Result<greentic_update::plan::VerifiedUpdatePlan, OpError> {
+    let plan_bytes = staged
+        .plan_bytes()
+        .map_err(|e| OpError::Conflict(format!("read staged plan bytes: {e}")))?;
+    let envelope_bytes = staged
+        .envelope_bytes()
+        .map_err(|e| OpError::Conflict(format!("read staged plan envelope: {e}")))?;
+
+    let env_dir = store.env_dir(env_id)?;
+    let trust = store_trust_root::load(&env_dir)?;
+    let verified = greentic_update::plan::verify_update_plan(&plan_bytes, &envelope_bytes, &trust)
+        .map_err(|e| OpError::Conflict(format!("staged plan failed re-verification: {e}")))?;
+
+    // The freshly-hashed plan bytes must match the digest captured at stage
+    // time; a divergence means `plan.json` changed on disk since it was staged.
+    if verified.plan_sha256 != staged.plan_sha256() {
+        return Err(OpError::Conflict(format!(
+            "staged plan `{}` hash changed since staging (tampered on disk?)",
+            verified.plan.plan_id
+        )));
+    }
+    // Target-env identity: the plan header AND the signed desired-state manifest
+    // must both name this env (both are under the DSSE signature).
+    if verified.plan.env_id != env_id.as_str() {
+        return Err(OpError::InvalidArgument(format!(
+            "staged plan targets env `{}`, not `{env_id}`",
+            verified.plan.env_id
+        )));
+    }
+    let manifest: EnvManifest =
+        serde_json::from_value(verified.plan.target.clone()).map_err(|e| {
+            OpError::InvalidArgument(format!(
+                "plan target is not a valid {ENV_MANIFEST_SCHEMA_V1}: {e}"
+            ))
+        })?;
+    if manifest.environment.id != env_id.as_str() {
+        return Err(OpError::InvalidArgument(format!(
+            "plan target manifest names env `{}`, not `{env_id}`",
+            manifest.environment.id
+        )));
+    }
+    // Fail closed on manifest content this increment cannot apply *safely*.
+    check_applyable_manifest(&manifest)?;
+    Ok(verified)
+}
+
+/// Reject a target manifest whose apply/rollback this increment cannot yet
+/// guarantee. These are fail-closed scope guards, not permanent limits:
+///
+/// - **dev-store secret side effects** — `env_apply` writes dev-store secret
+///   material for `secrets[]` (a `put-secret` step) and for
+///   `messaging_endpoints[]` (a telegram-class endpoint auto-provisions a
+///   webhook secret). The P0b snapshot does not capture the dev-store, so a
+///   post-apply rollback could not undo those writes. Both are refused until
+///   snapshot coverage is extended. (Audited against `env_apply`'s `StepOp`
+///   execute arms: only `PutSecret` and `EndpointAdd` write dev-store secrets.)
+/// - **unpinned bundles** — apply-updates does not yet source bundle artifacts
+///   from the verified staged set, so require a `bundle_digest` on every bundle
+///   (and revision); `env_apply` then pins the applied bytes to the DSSE-signed
+///   manifest, so unpinned / trust-on-first-use content can't be applied.
+///   (Materializing from the staged blobs → follow-up.)
+fn check_applyable_manifest(manifest: &EnvManifest) -> Result<(), OpError> {
+    // Anything that writes dev-store secrets is non-rollbackable under the P0b
+    // snapshot, so fail closed on it.
+    if !manifest.secrets.is_empty() {
+        return Err(dev_store_secret_err("secrets[]"));
+    }
+    if !manifest.messaging_endpoints.is_empty() {
+        return Err(dev_store_secret_err("messaging_endpoints[]"));
+    }
+    for bundle in &manifest.bundles {
+        match &bundle.revisions {
+            Some(revisions) => {
+                for rev in revisions {
+                    if rev.bundle_digest.is_none() {
+                        return Err(unpinned_bundle_err(&bundle.bundle_id, Some(&rev.name)));
+                    }
+                }
+            }
+            None => {
+                if bundle.bundle_digest.is_none() {
+                    return Err(unpinned_bundle_err(&bundle.bundle_id, None));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dev_store_secret_err(field: &str) -> OpError {
+    OpError::InvalidArgument(format!(
+        "update plan target declares {field}; applying it via an update plan is not yet supported \
+         — env_apply writes dev-store secret material that the environment snapshot does not \
+         cover, so a rollback could not undo it"
+    ))
+}
+
+fn unpinned_bundle_err(bundle_id: &str, revision: Option<&str>) -> OpError {
+    let target = match revision {
+        Some(r) => format!("bundle `{bundle_id}` revision `{r}`"),
+        None => format!("bundle `{bundle_id}`"),
+    };
+    OpError::InvalidArgument(format!(
+        "update plan target {target} has no bundle_digest; update-plan bundles must be \
+         digest-pinned so the applied content is verified against the signed plan"
+    ))
+}
+
+/// Write the plan's signed target manifest to a temp file and drive the
+/// declarative `env_apply` pipeline non-interactively (`--yes`). The temp file
+/// is held alive until apply returns.
+fn run_manifest_apply(store: &LocalFsStore, target: &Value) -> Result<OpOutcome, OpError> {
+    use std::io::Write as _;
+
+    let bytes = serde_json::to_vec(target)
+        .map_err(|e| OpError::InvalidArgument(format!("serialize plan target manifest: {e}")))?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix("greentic-update-target-")
+        .suffix(".json")
+        .tempfile()
+        .map_err(|source| OpError::Io {
+            path: PathBuf::from("<tempfile>"),
+            source,
+        })?;
+    tmp.write_all(&bytes).map_err(|source| OpError::Io {
+        path: tmp.path().to_path_buf(),
+        source,
+    })?;
+    tmp.flush().map_err(|source| OpError::Io {
+        path: tmp.path().to_path_buf(),
+        source,
+    })?;
+
+    let apply_flags = OpFlags {
+        schema_only: false,
+        answers: Some(tmp.path().to_path_buf()),
+    };
+    let opts = super::env_apply::ApplyOptions {
+        mode: super::env_apply::ApplyMode::Apply,
+        updated_by: Some("apply-updates".to_string()),
+        yes: true,
+        non_interactive: true,
+        ..Default::default()
+    };
+    super::env_apply::apply(store, &apply_flags, opts)
+}
+
 /// Fetches an update artifact's bytes by its declared `source`. A seam so the
 /// download orchestration is unit-testable without a live registry.
 trait ArtifactFetcher {
@@ -922,6 +1330,20 @@ fn get_schema() -> Value {
             "plan_url": {"type": "string", "description": "Fetch the signed plan (+ `.sig` sidecar) from this URL over the enrolled mTLS channel."},
             "plan_file": {"type": "string", "description": "Local plan document (airgap import / testing); requires plan_sig_file."},
             "plan_sig_file": {"type": "string", "description": "DSSE envelope sidecar for plan_file."}
+        }
+    })
+}
+
+fn apply_updates_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "ApplyUpdatesPayload",
+        "type": "object",
+        "required": ["environment_id", "plan_id"],
+        "additionalProperties": false,
+        "properties": {
+            "environment_id": {"type": "string"},
+            "plan_id": {"type": "string", "description": "Plan id of the staged plan to apply (from `op updates get`)."}
         }
     })
 }
@@ -1904,5 +2326,555 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
 
         let resumed = admit_or_resume(&root, &v, &p, &s).unwrap();
         assert_eq!(resumed.stage().unwrap(), UpdateStage::Staged);
+    }
+
+    // ---- Phase 3: op updates apply ----------------------------------------
+
+    /// Build + sign a plan with a custom target manifest (for apply tests that
+    /// need a non-minimal manifest — e.g. a bundle that fails to resolve).
+    #[allow(clippy::too_many_arguments)]
+    fn signed_plan_target(
+        env_id: &str,
+        plan_id: &str,
+        sequence: u64,
+        target: Value,
+        priv_pem: &str,
+        key_id: &str,
+        build_trust: &TrustRoot,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let plan: greentic_update::plan::UpdatePlan = serde_json::from_value(json!({
+            "schema": "greentic.update-plan.v1",
+            "plan_id": plan_id,
+            "env_id": env_id,
+            "sequence": sequence,
+            "created_at": "2026-07-02T00:00:00Z",
+            "nonce": format!("nonce-{plan_id}"),
+            "target": target,
+            "artifacts": [],
+            "compat": {},
+            "rollback": {"policy": "auto", "health_timeout_s": 120, "on_fail": "restore"},
+        }))
+        .unwrap();
+        let built =
+            greentic_update::plan::build_update_plan(&plan, priv_pem, key_id, build_trust).unwrap();
+        (built.plan_bytes, built.envelope_bytes)
+    }
+
+    /// Stage a signed zero-artifact plan for `local` directly to `Staged`
+    /// (bypasses the network path of `get`, same on-disk result). The env must
+    /// already trust `tk`.
+    fn stage_local(
+        updates_root: &std::path::Path,
+        plan_id: &str,
+        sequence: u64,
+        priv_pem: &str,
+        tk: &TrustedKey,
+    ) {
+        let (p, s, v) = signed_local(plan_id, sequence, priv_pem, tk);
+        let root = greentic_update::staging::UpdatesRoot::open_in(updates_root, "local").unwrap();
+        let staged = root.begin(&v, &p, &s).unwrap();
+        advance_to_staged(&staged).unwrap();
+    }
+
+    /// Load a staged plan's on-disk stage.
+    fn on_disk_stage(
+        updates_root: &std::path::Path,
+        plan_id: &str,
+    ) -> greentic_update::staging::UpdateStage {
+        greentic_update::staging::UpdatesRoot::open_in(updates_root, "local")
+            .unwrap()
+            .load(plan_id)
+            .unwrap()
+            .unwrap()
+            .stage()
+            .unwrap()
+    }
+
+    #[test]
+    fn apply_schema_only_returns_payload_schema() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let out = apply_updates(
+            &store,
+            &OpFlags {
+                schema_only: true,
+                ..OpFlags::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.op, "apply");
+        assert_eq!(out.noun, NOUN);
+        assert!(out.result["properties"]["plan_id"].is_object());
+    }
+
+    #[test]
+    fn apply_plan_not_found_is_not_found() {
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (_priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+        let err = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "ghost".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::NotFound(_)));
+    }
+
+    #[test]
+    fn apply_happy_path_zero_artifact_converges_and_marks_applied() {
+        use greentic_update::staging::UpdateStage;
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+        stage_local(updates_dir.path(), "plan-1", 1, &priv7, &tk7);
+
+        let out = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-1".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap();
+
+        assert_eq!(out.op, "apply");
+        assert_eq!(out.result["stage"], "applied");
+        assert_eq!(out.result["plan_id"], "plan-1");
+        assert!(out.result["snapshot_id"].as_str().is_some());
+
+        // On-disk FSM marker advanced to Applied.
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-1"),
+            UpdateStage::Applied
+        );
+        // A pre-apply snapshot was captured, and a deployer-layer audit event
+        // was written for the mutation.
+        let env_dir = store.env_dir(&env_id).unwrap();
+        assert!(env_dir.join("snapshots").is_dir(), "snapshot must exist");
+        let audit = std::fs::read_to_string(env_dir.join("audit").join("events.jsonl")).unwrap();
+        assert!(
+            audit.contains("plan-1"),
+            "audit must record the apply: {audit}"
+        );
+    }
+
+    #[test]
+    fn apply_rejects_already_applied_plan() {
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+        stage_local(updates_dir.path(), "plan-1", 1, &priv7, &tk7);
+
+        let payload = ApplyUpdatesPayload {
+            environment_id: "local".into(),
+            plan_id: "plan-1".into(),
+        };
+        apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(payload.clone()),
+            Some(updates_dir.path()),
+        )
+        .unwrap();
+        // Re-applying a terminal (Applied) plan is refused by the stage gate.
+        let err = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(payload),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("not `staged`")));
+    }
+
+    #[test]
+    fn apply_fails_closed_on_stale_applying_plan() {
+        use greentic_update::staging::UpdateStage;
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+        stage_local(updates_dir.path(), "plan-1", 1, &priv7, &tk7);
+        // Simulate a crash mid-apply: the plan is left in Applying.
+        greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local")
+            .unwrap()
+            .load("plan-1")
+            .unwrap()
+            .unwrap()
+            .transition(UpdateStage::Applying)
+            .unwrap();
+
+        let err = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-1".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(m) if m.contains("prior crash")));
+        // The stale plan was failed closed.
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-1"),
+            UpdateStage::Failed
+        );
+    }
+
+    #[test]
+    fn apply_rejects_swapped_plan_via_hash_cross_check() {
+        use greentic_update::staging::UpdateStage;
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+        stage_local(updates_dir.path(), "plan-1", 1, &priv7, &tk7);
+
+        // Swap BOTH plan.json and its sidecar for a DIFFERENT, validly-signed
+        // plan (same id, different sequence ⇒ different bytes). `verify_update_plan`
+        // accepts it, but its hash differs from the digest recorded at staging.
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        let (p2, s2) = signed_plan(
+            "local",
+            "plan-1",
+            2,
+            json!([]),
+            json!({}),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let plan_dir = greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local")
+            .unwrap()
+            .load("plan-1")
+            .unwrap()
+            .unwrap()
+            .dir()
+            .to_path_buf();
+        std::fs::write(plan_dir.join("plan.json"), &p2).unwrap();
+        std::fs::write(plan_dir.join("plan.json.sig"), &s2).unwrap();
+
+        let err = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-1".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(m) if m.contains("hash changed")));
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-1"),
+            UpdateStage::Rejected
+        );
+    }
+
+    #[test]
+    fn apply_rejects_tampered_artifact_blob() {
+        use greentic_update::staging::{UpdateStage, UpdatesRoot};
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+
+        let payload = b"the-artifact-bytes";
+        let art_digest = format!("sha256:{}", greentic_update::plan::sha256_hex(payload));
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        let (p, s) = signed_plan(
+            "local",
+            "plan-art",
+            1,
+            json!([{"name": "pack-a", "version": "1.0.0", "digest": art_digest, "source": "oci://x/y:1"}]),
+            json!({}),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let v = verify_with(&p, &s, &tk7);
+        let root = UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        let staged = root.begin(&v, &p, &s).unwrap();
+        staged.put_artifact(&v.plan.artifacts[0], payload).unwrap();
+        advance_to_staged(&staged).unwrap();
+        // Corrupt the staged blob after it passed the ingest hash check.
+        let blob = staged.artifact_blob_path(&v.plan.artifacts[0]).unwrap();
+        std::fs::write(&blob, b"corrupted").unwrap();
+
+        let err = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-art".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(m) if m.contains("integrity")));
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-art"),
+            UpdateStage::Rejected
+        );
+    }
+
+    #[test]
+    fn apply_regates_downgrade_against_applied_set() {
+        use greentic_update::staging::UpdateStage;
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+
+        // Both staged BEFORE either applies (so neither is rejected at stage).
+        stage_local(updates_dir.path(), "plan-a", 2, &priv7, &tk7);
+        stage_local(updates_dir.path(), "plan-b", 1, &priv7, &tk7);
+
+        // Apply the newer plan first ⇒ latest_applied_sequence = 2.
+        apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-a".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap();
+
+        // Applying the older plan is now a downgrade ⇒ rejected at apply time.
+        let err = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-b".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(_)));
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-b"),
+            UpdateStage::Rejected
+        );
+    }
+
+    #[test]
+    fn apply_rolls_back_and_fails_plan_on_apply_error() {
+        use greentic_update::staging::{UpdateStage, UpdatesRoot};
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+
+        // A valid, digest-pinned manifest whose bundle artifact does not exist
+        // ⇒ env_apply errors at resolve time (after the snapshot is taken).
+        let bad_target = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "b1",
+                "bundle_path": "/nonexistent/missing.gtbundle",
+                "bundle_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            }]
+        });
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        let (p, s) = signed_plan_target(
+            "local",
+            "plan-bad",
+            1,
+            bad_target,
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let v = verify_with(&p, &s, &tk7);
+        let root = UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        let staged = root.begin(&v, &p, &s).unwrap();
+        advance_to_staged(&staged).unwrap();
+
+        let err = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-bad".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        // The env was rolled back and the plan failed.
+        assert!(matches!(err, OpError::Conflict(m) if m.contains("rolled back")));
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-bad"),
+            UpdateStage::Failed
+        );
+        assert!(store.env_dir(&env_id).unwrap().join("snapshots").is_dir());
+    }
+
+    #[test]
+    fn apply_rejects_target_declaring_secrets() {
+        use greentic_update::staging::{UpdateStage, UpdatesRoot};
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+
+        // A signed target that declares secrets[] — refused fail-closed because
+        // the snapshot cannot roll a secret rotation back.
+        let target = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "secrets": [{"path": "acme/_/tls/foo", "from_env": "FOO"}]
+        });
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        let (p, s) = signed_plan_target(
+            "local",
+            "plan-sec",
+            1,
+            target,
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let v = verify_with(&p, &s, &tk7);
+        let root = UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        let staged = root.begin(&v, &p, &s).unwrap();
+        advance_to_staged(&staged).unwrap();
+
+        let err = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-sec".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("secrets")));
+        // Refused pre-mutation ⇒ marked Rejected, env untouched.
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-sec"),
+            UpdateStage::Rejected
+        );
+    }
+
+    #[test]
+    fn apply_rejects_target_declaring_messaging_endpoints() {
+        use greentic_update::staging::{UpdateStage, UpdatesRoot};
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+
+        // Telegram-class endpoints auto-provision a webhook secret in the
+        // dev-store, which the snapshot does not cover ⇒ refused fail-closed.
+        let target = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "messaging_endpoints": [{"name": "tg", "provider_type": "messaging.telegram.bot"}]
+        });
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        let (p, s) = signed_plan_target(
+            "local",
+            "plan-ep",
+            1,
+            target,
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let v = verify_with(&p, &s, &tk7);
+        let root = UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        let staged = root.begin(&v, &p, &s).unwrap();
+        advance_to_staged(&staged).unwrap();
+
+        let err = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-ep".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("messaging_endpoints")));
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-ep"),
+            UpdateStage::Rejected
+        );
+    }
+
+    #[test]
+    fn apply_rejects_unpinned_bundle() {
+        use greentic_update::staging::{UpdateStage, UpdatesRoot};
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+
+        // A bundle with no bundle_digest is refused: apply-updates requires
+        // update-plan bundles to be digest-pinned.
+        let target = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "b1", "bundle_path": "/some/local.gtbundle"}]
+        });
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        let (p, s) = signed_plan_target(
+            "local",
+            "plan-unpinned",
+            1,
+            target,
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let v = verify_with(&p, &s, &tk7);
+        let root = UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        let staged = root.begin(&v, &p, &s).unwrap();
+        advance_to_staged(&staged).unwrap();
+
+        let err = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-unpinned".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("bundle_digest")));
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-unpinned"),
+            UpdateStage::Rejected
+        );
     }
 }
