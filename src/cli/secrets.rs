@@ -42,15 +42,17 @@ pub(super) const DEV_STORE_KIND_PATH: &str = "greentic.secrets.dev-store";
 
 /// Same override the runtime reader honors (`greentic-start
 /// `dev_store_path::override_path`): when set, both writer and reader use
-/// this path instead of the env-dir defaults below.
-pub(super) const DEV_SECRETS_PATH_ENV: &str = "GREENTIC_DEV_SECRETS_PATH";
+/// this path instead of the env-dir defaults below. `pub(crate)` so the P0b
+/// snapshot can note when the dev-store is redirected off the env tree.
+pub(crate) const DEV_SECRETS_PATH_ENV: &str = "GREENTIC_DEV_SECRETS_PATH";
 
 /// Dev-store candidates relative to the env dir. MUST mirror greentic-start's
 /// `dev_store_path.rs` (`STORE_RELATIVE` / `STORE_STATE_RELATIVE`) — the
 /// runtime's `SecretsClient::open(<env_dir>)` resolves the same chain, so a
-/// put here is what a served revision reads back.
-pub(super) const DEV_STORE_RELATIVE: &str = ".greentic/dev/.dev.secrets.env";
-const DEV_STORE_STATE_RELATIVE: &str = ".greentic/state/dev/.dev.secrets.env";
+/// put here is what a served revision reads back. `pub(crate)` so the P0b
+/// snapshot (`environment::snapshot`) captures the same paths this writes.
+pub(crate) const DEV_STORE_RELATIVE: &str = ".greentic/dev/.dev.secrets.env";
+pub(crate) const DEV_STORE_STATE_RELATIVE: &str = ".greentic/state/dev/.dev.secrets.env";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretsListPayload {
