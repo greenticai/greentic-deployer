@@ -1426,17 +1426,20 @@ fn dispatch_updates(
             super::updates::apply_updates(store, flags, payload)?
         }
         UpdatesVerb::Recover(args) => {
+            // `--force` is operator attestation, not a payload field: thread it
+            // separately so it applies whether the ids come from the CLI or from
+            // `--answers` (it is never silently dropped on the answers path).
+            let force = args.force;
             let payload = match (args.env_id, args.plan_id) {
                 (Some(environment_id), Some(plan_id)) => {
                     Some(super::updates::RecoverUpdatesPayload {
                         environment_id,
                         plan_id,
-                        force: args.force,
                     })
                 }
                 _ => None, // fall through to --answers / --schema
             };
-            super::updates::recover_updates(store, flags, payload)?
+            super::updates::recover_updates(store, flags, payload, force)?
         }
     };
     print_outcome(&outcome)

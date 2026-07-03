@@ -85,17 +85,14 @@ pub struct ApplyUpdatesPayload {
 }
 
 /// Payload for `op updates recover` — force a plan stranded in `applying` by a
-/// crashed applier to `failed`, so a fresh `get` + `apply` can proceed.
+/// crashed applier to `failed`, so a fresh `get` + `apply` can proceed. The
+/// `--force` attestation is a CLI-only argument (operator intent, not a
+/// replayable answers field), so it is threaded separately, not carried here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoverUpdatesPayload {
     pub environment_id: String,
     /// Plan id of the `applying` plan to force-fail (from a prior `op updates get`).
     pub plan_id: String,
-    /// Assert the applier is dead and force-fail `applying → failed`. Required:
-    /// an `applying` plan on disk is indistinguishable from a genuinely in-flight
-    /// apply, so recover refuses without it (fail closed).
-    #[serde(default)]
-    pub force: bool,
 }
 
 /// The dev-store/Vault secret path for one TLS artifact: `<tenant>/_/tls/<name>`
@@ -890,8 +887,9 @@ pub fn recover_updates(
     store: &LocalFsStore,
     flags: &OpFlags,
     payload: Option<RecoverUpdatesPayload>,
+    force: bool,
 ) -> Result<OpOutcome, OpError> {
-    recover_updates_impl(store, flags, payload, None)
+    recover_updates_impl(store, flags, payload, force, None)
 }
 
 /// Body of [`recover_updates`], with an optional staging-root override so tests
@@ -900,6 +898,7 @@ fn recover_updates_impl(
     store: &LocalFsStore,
     flags: &OpFlags,
     payload: Option<RecoverUpdatesPayload>,
+    force: bool,
     updates_root_override: Option<&std::path::Path>,
 ) -> Result<OpOutcome, OpError> {
     use greentic_update::staging::UpdateStage;
@@ -961,7 +960,7 @@ fn recover_updates_impl(
     // disk an `applying` plan cannot be told apart from a live concurrent apply,
     // and force-failing a live apply would strand it (env mutated, plan `failed`,
     // sequence never advanced). `--force` is that assertion.
-    if !payload.force {
+    if !force {
         return Err(OpError::Conflict(format!(
             "plan `{}` is `applying` on env `{env_id}` (since {applying_since}); recover \
              force-fails it to `failed`, which is UNSAFE if an apply is genuinely in progress. \
@@ -1706,8 +1705,7 @@ fn recover_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "environment_id": {"type": "string"},
-            "plan_id": {"type": "string", "description": "Plan id of the `applying` plan to force-fail (from `op updates get`)."},
-            "force": {"type": "boolean", "default": false, "description": "Assert the applier is dead and force-fail `applying → failed`. Required; recover refuses without it."}
+            "plan_id": {"type": "string", "description": "Plan id of the `applying` plan to force-fail (from `op updates get`). Pass `--force` on the CLI to attest the applier is dead — recover refuses without it."}
         }
     })
 }
@@ -3547,12 +3545,12 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
                 ..OpFlags::default()
             },
             None,
+            false,
         )
         .unwrap();
         assert_eq!(out.op, "recover");
         assert_eq!(out.noun, NOUN);
         assert!(out.result["properties"]["plan_id"].is_object());
-        assert!(out.result["properties"]["force"].is_object());
     }
 
     #[test]
@@ -3568,8 +3566,8 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             Some(RecoverUpdatesPayload {
                 environment_id: "local".into(),
                 plan_id: "ghost".into(),
-                force: true,
             }),
+            true,
             Some(updates_dir.path()),
         )
         .unwrap_err();
@@ -3600,8 +3598,8 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             Some(RecoverUpdatesPayload {
                 environment_id: "local".into(),
                 plan_id: "plan-1".into(),
-                force: true,
             }),
+            true,
             Some(updates_dir.path()),
         )
         .unwrap();
@@ -3648,8 +3646,8 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             Some(RecoverUpdatesPayload {
                 environment_id: "local".into(),
                 plan_id: "plan-1".into(),
-                force: false,
             }),
+            false,
             Some(updates_dir.path()),
         )
         .unwrap_err();
@@ -3677,8 +3675,8 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             Some(RecoverUpdatesPayload {
                 environment_id: "local".into(),
                 plan_id: "plan-1".into(),
-                force: true,
             }),
+            true,
             Some(updates_dir.path()),
         )
         .unwrap_err();
@@ -3716,8 +3714,8 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             Some(RecoverUpdatesPayload {
                 environment_id: "local".into(),
                 plan_id: "plan-1".into(),
-                force: true,
             }),
+            true,
             Some(updates_dir.path()),
         )
         .unwrap_err();
