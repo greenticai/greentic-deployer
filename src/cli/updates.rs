@@ -605,10 +605,11 @@ fn advance_to_staged(
 /// binary self-update track is not built; a plan carrying binaries would fail
 /// the manifest parse. Fail-closed guards on the target manifest (see
 /// [`check_applyable_manifest`]): bundles must be `bundle_digest`-pinned (so
-/// `env_apply` verifies the applied bytes against the signed plan), and manifest
-/// content that writes non-rollbackable dev-store secrets (`secrets[]` and
-/// `messaging_endpoints[]`) is refused (the snapshot does not cover the
-/// dev-store). Concurrent apply on one env is single-flight: `begin_apply_checked`
+/// `env_apply` verifies the applied bytes against the signed plan), and
+/// `secrets[]` / `messaging_endpoints[]` (which write dev-store secret material)
+/// are applyable only when the effective `Secrets` sink is the P0b-snapshotted
+/// dev-store, so a failed apply can roll those writes back. Concurrent apply on
+/// one env is single-flight: `begin_apply_checked`
 /// admits at most one plan into `applying` per env under the staging lock,
 /// rejecting a second, and runs the downgrade/compat re-gate atomically with the
 /// `staged → applying` transition.
@@ -902,8 +903,14 @@ fn reverify_staged(
             manifest.environment.id
         )));
     }
-    // Fail closed on manifest content this increment cannot apply *safely*.
-    check_applyable_manifest(&manifest)?;
+    // Fail closed on manifest content this increment cannot apply *safely*. The
+    // dev-store-secret guard needs the env's `Secrets` binding and whether the
+    // dev-store is redirected off the env tree; both are resolved here so the
+    // check stays a pure, race-free function.
+    let env = store.load(env_id)?;
+    let dev_secrets_path_override =
+        std::env::var_os(super::secrets::DEV_SECRETS_PATH_ENV).is_some();
+    check_applyable_manifest(&env, &manifest, dev_secrets_path_override)?;
     Ok(verified)
 }
 
@@ -913,24 +920,34 @@ fn reverify_staged(
 /// - **dev-store secret side effects** — `env_apply` writes dev-store secret
 ///   material for `secrets[]` (a `put-secret` step) and for
 ///   `messaging_endpoints[]` (a telegram-class endpoint auto-provisions a
-///   webhook secret). The P0b snapshot does not capture the dev-store, so a
-///   post-apply rollback could not undo those writes. Both are refused until
-///   snapshot coverage is extended. (Audited against `env_apply`'s `StepOp`
-///   execute arms: only `PutSecret` and `EndpointAdd` write dev-store secrets.)
+///   webhook secret). Those writes are rollback-safe only when they land in the
+///   dev-store the P0b snapshot captures, so they're allowed **only** when the
+///   effective `Secrets` sink is that dev-store — see
+///   [`dev_store_secret_sink_is_snapshotted`]. (Audited against `env_apply`'s
+///   `StepOp` execute arms: only `PutSecret` and `EndpointAdd` write dev-store
+///   secrets.)
 /// - **unpinned bundles** — require a `bundle_digest` on every bundle (and
 ///   revision). The digest is both the integrity pin and the key that
 ///   materializes the bundle from the verified staged blob set (see
 ///   [`materialize_bundles`]); `env_apply` re-verifies the applied bytes against
 ///   it. Unpinned / trust-on-first-use content has no staged blob to bind to and
 ///   can't be applied.
-fn check_applyable_manifest(manifest: &EnvManifest) -> Result<(), OpError> {
-    // Anything that writes dev-store secrets is non-rollbackable under the P0b
-    // snapshot, so fail closed on it.
-    if !manifest.secrets.is_empty() {
-        return Err(dev_store_secret_err("secrets[]"));
-    }
-    if !manifest.messaging_endpoints.is_empty() {
-        return Err(dev_store_secret_err("messaging_endpoints[]"));
+///
+/// `dev_secrets_path_override` is `GREENTIC_DEV_SECRETS_PATH` presence, resolved
+/// by the caller (the test harness cannot set process env vars safely).
+fn check_applyable_manifest(
+    env: &Environment,
+    manifest: &EnvManifest,
+    dev_secrets_path_override: bool,
+) -> Result<(), OpError> {
+    // secrets[] / messaging_endpoints[] both write dev-store secret material;
+    // allow them only when a failed apply's rollback (the P0b snapshot) would
+    // undo those writes — i.e. the effective sink is the snapshotted dev-store.
+    if (!manifest.secrets.is_empty() || !manifest.messaging_endpoints.is_empty())
+        && let Err(reason) =
+            dev_store_secret_sink_is_snapshotted(env, manifest, dev_secrets_path_override)
+    {
+        return Err(dev_store_secret_err(reason));
     }
     for bundle in &manifest.bundles {
         match &bundle.revisions {
@@ -951,11 +968,61 @@ fn check_applyable_manifest(manifest: &EnvManifest) -> Result<(), OpError> {
     Ok(())
 }
 
-fn dev_store_secret_err(field: &str) -> OpError {
+/// Whether the dev-store secret writes `env_apply` performs for this manifest
+/// would land in the dev-store the P0b snapshot captures (and can therefore be
+/// rolled back). Returns `Err(reason)` naming the first way the sink escapes the
+/// snapshot; `Ok(())` when it is fully covered. Three escapes:
+///
+/// 1. the env's current `Secrets` binding is a non-dev-store backend (e.g.
+///    Vault) — those values live outside the snapshot;
+/// 2. the manifest rebinds the `Secrets` slot to a non-dev-store kind —
+///    `env_apply` applies `packs[]` before `secrets[]`, so the rebind takes
+///    effect first and redirects the writes;
+/// 3. `GREENTIC_DEV_SECRETS_PATH` redirects the dev-store off the env tree,
+///    which the env-dir-relative snapshot cannot reach.
+///
+/// Accepted residuals (single-operator scope, not redesigned here): the binding
+/// is read before `env_apply` takes its own env flock, so a concurrent manual
+/// `op env` rebind between this check and the apply reopens the hole (the same
+/// class as the apply re-gate race); and the guard is uniform across `secrets[]`
+/// and `messaging_endpoints[]` even though a Vault `EndpointAdd` only stamps a
+/// ref (a possible future loosening).
+fn dev_store_secret_sink_is_snapshotted(
+    env: &Environment,
+    manifest: &EnvManifest,
+    dev_secrets_path_override: bool,
+) -> Result<(), &'static str> {
+    if !crate::cli::env::secrets_backend_is_dev_store(env) {
+        return Err("the env's Secrets slot is bound to a non-dev-store backend");
+    }
+    if manifest_rebinds_secrets_off_dev_store(manifest) {
+        return Err("the manifest rebinds the Secrets slot to a non-dev-store backend");
+    }
+    if dev_secrets_path_override {
+        return Err(
+            "GREENTIC_DEV_SECRETS_PATH redirects the dev-store off the snapshotted env tree",
+        );
+    }
+    Ok(())
+}
+
+/// True if the manifest's `packs[]` binds the `Secrets` slot to a kind whose
+/// path is not the dev-store. An unparseable kind is treated as a rebind
+/// (fail-closed); shape validation rejects it later regardless.
+fn manifest_rebinds_secrets_off_dev_store(manifest: &EnvManifest) -> bool {
+    manifest.packs.iter().any(|p| {
+        p.slot == greentic_deploy_spec::CapabilitySlot::Secrets
+            && greentic_deploy_spec::PackDescriptor::try_new(&p.kind)
+                .map(|d| d.path() != crate::defaults::DEV_STORE_SECRETS_PATH)
+                .unwrap_or(true)
+    })
+}
+
+fn dev_store_secret_err(reason: &str) -> OpError {
     OpError::InvalidArgument(format!(
-        "update plan target declares {field}; applying it via an update plan is not yet supported \
-         — env_apply writes dev-store secret material that the environment snapshot does not \
-         cover, so a rollback could not undo it"
+        "update plan target declares secrets[] or messaging_endpoints[], but {reason}; env_apply \
+         writes dev-store secret material that the environment snapshot would not cover, so a \
+         rollback could not undo it"
     ))
 }
 
@@ -1926,7 +1993,18 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
 
     /// Save a fresh `local` env and seed its trust root with `tk`.
     fn env_trusting(store: &LocalFsStore, tk: &TrustedKey) -> EnvId {
-        let env = make_env("local");
+        env_trusting_secrets(store, tk, None)
+    }
+
+    /// Like [`env_trusting`] but optionally binds the env's `Secrets` slot to
+    /// `kind` (e.g. `VAULT_SECRETS_PACK`), so the apply-time dev-store guard
+    /// sees a non-dev-store backend. `None` leaves the slot unbound (custodial
+    /// dev-store).
+    fn env_trusting_secrets(store: &LocalFsStore, tk: &TrustedKey, kind: Option<&str>) -> EnvId {
+        let mut env = make_env("local");
+        if let Some(k) = kind {
+            env.packs.push(make_binding(CapabilitySlot::Secrets, k));
+        }
         store.save(&env).unwrap();
         let env_id = EnvId::try_from("local").unwrap();
         let env_dir = store.env_dir(&env_id).unwrap();
@@ -2977,16 +3055,17 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
     }
 
     #[test]
-    fn apply_rejects_target_declaring_secrets() {
+    fn apply_rejects_secrets_when_backend_not_dev_store() {
         use greentic_update::staging::{UpdateStage, UpdatesRoot};
         let dir = tempdir().unwrap();
         let updates_dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let (priv7, tk7) = key_pair(7);
-        env_trusting(&store, &tk7);
+        // Env's Secrets slot is bound to Vault, so secret writes land outside the
+        // P0b snapshot ⇒ secrets[] is refused fail-closed, and the plan is left
+        // Rejected pre-mutation.
+        env_trusting_secrets(&store, &tk7, Some(crate::defaults::VAULT_SECRETS_PACK));
 
-        // A signed target that declares secrets[] — refused fail-closed because
-        // the snapshot cannot roll a secret rotation back.
         let target = json!({
             "schema": "greentic.env-manifest.v1",
             "environment": {"id": "local"},
@@ -3017,7 +3096,7 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             Some(updates_dir.path()),
         )
         .unwrap_err();
-        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("secrets")));
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("non-dev-store backend")));
         // Refused pre-mutation ⇒ marked Rejected, env untouched.
         assert_eq!(
             on_disk_stage(updates_dir.path(), "plan-sec"),
@@ -3026,16 +3105,16 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
     }
 
     #[test]
-    fn apply_rejects_target_declaring_messaging_endpoints() {
+    fn apply_rejects_endpoints_when_backend_not_dev_store() {
         use greentic_update::staging::{UpdateStage, UpdatesRoot};
         let dir = tempdir().unwrap();
         let updates_dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let (priv7, tk7) = key_pair(7);
-        env_trusting(&store, &tk7);
+        // Telegram-class endpoints auto-provision a webhook secret; under a Vault
+        // Secrets binding that write escapes the snapshot ⇒ refused fail-closed.
+        env_trusting_secrets(&store, &tk7, Some(crate::defaults::VAULT_SECRETS_PACK));
 
-        // Telegram-class endpoints auto-provision a webhook secret in the
-        // dev-store, which the snapshot does not cover ⇒ refused fail-closed.
         let target = json!({
             "schema": "greentic.env-manifest.v1",
             "environment": {"id": "local"},
@@ -3066,7 +3145,7 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             Some(updates_dir.path()),
         )
         .unwrap_err();
-        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("messaging_endpoints")));
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("non-dev-store backend")));
         assert_eq!(
             on_disk_stage(updates_dir.path(), "plan-ep"),
             UpdateStage::Rejected
@@ -3119,5 +3198,107 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             on_disk_stage(updates_dir.path(), "plan-unpinned"),
             UpdateStage::Rejected
         );
+    }
+
+    // ---- precise dev-store-secret guard (check_applyable_manifest) ----
+
+    fn parse_manifest(v: Value) -> EnvManifest {
+        serde_json::from_value(v).expect("valid env-manifest")
+    }
+
+    fn secrets_manifest() -> EnvManifest {
+        parse_manifest(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "secrets": [{"path": "acme/_/tls/foo", "from_env": "FOO"}]
+        }))
+    }
+
+    #[test]
+    fn guard_accepts_secret_writes_on_dev_store_env() {
+        // No Secrets binding ⇒ custodial dev-store; no manifest rebind; no
+        // override ⇒ the writes land in the snapshotted dev-store, so both
+        // secrets[] and messaging_endpoints[] are applyable.
+        let env = make_env("local");
+        check_applyable_manifest(&env, &secrets_manifest(), false).unwrap();
+
+        let endpoints = parse_manifest(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "messaging_endpoints": [{"name": "tg", "provider_type": "messaging.telegram.bot"}]
+        }));
+        check_applyable_manifest(&env, &endpoints, false).unwrap();
+    }
+
+    #[test]
+    fn guard_rejects_secret_writes_when_env_backend_is_vault() {
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            crate::defaults::VAULT_SECRETS_PACK,
+        ));
+        let err = check_applyable_manifest(&env, &secrets_manifest(), false).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("non-dev-store backend")));
+    }
+
+    #[test]
+    fn guard_rejects_secret_writes_when_manifest_rebinds_secrets_off_dev_store() {
+        // Env is dev-store, but the manifest rebinds Secrets → Vault; env_apply
+        // applies packs[] before secrets[], so the write escapes the snapshot.
+        let env = make_env("local");
+        let m = parse_manifest(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "packs": [{"slot": "secrets", "kind": "greentic.secrets.vault@1.0.0", "pack_ref": "vault"}],
+            "secrets": [{"path": "acme/_/tls/foo", "from_env": "FOO"}]
+        }));
+        let err = check_applyable_manifest(&env, &m, false).unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(msg) if msg.contains("rebinds the Secrets slot"))
+        );
+    }
+
+    #[test]
+    fn guard_accepts_manifest_rebinding_secrets_to_dev_store() {
+        // A same-family (dev-store) rebind is not an escape — the sink stays
+        // snapshotted.
+        let env = make_env("local");
+        let m = parse_manifest(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "packs": [{"slot": "secrets", "kind": "greentic.secrets.dev-store@1.0.0", "pack_ref": "local"}],
+            "secrets": [{"path": "acme/_/tls/foo", "from_env": "FOO"}]
+        }));
+        check_applyable_manifest(&env, &m, false).unwrap();
+    }
+
+    #[test]
+    fn guard_rejects_secret_writes_under_dev_secrets_path_override() {
+        // GREENTIC_DEV_SECRETS_PATH redirects the dev-store off the env tree; the
+        // snapshot can't reach it, so secret writes are refused. Passed as a bool
+        // because the multithreaded harness cannot set process env vars safely.
+        let env = make_env("local");
+        let err = check_applyable_manifest(&env, &secrets_manifest(), true).unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(m) if m.contains("GREENTIC_DEV_SECRETS_PATH"))
+        );
+    }
+
+    #[test]
+    fn guard_ignores_sink_when_manifest_writes_no_secrets() {
+        // The sink guard fires only for secrets[]/messaging_endpoints[]. A pinned
+        // bundle on a Vault-backed env is applyable — it writes no dev-store
+        // secret material.
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            crate::defaults::VAULT_SECRETS_PACK,
+        ));
+        let m = parse_manifest(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "b1", "bundle_path": "/x.gtbundle", "bundle_digest": "sha256:aa"}]
+        }));
+        check_applyable_manifest(&env, &m, false).unwrap();
     }
 }
