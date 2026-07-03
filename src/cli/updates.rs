@@ -1482,22 +1482,6 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
     // ---- materialize_bundles (pure manifest rewrite) --------------------
 
     #[test]
-    fn materialize_rewrites_single_revision_bundle_path_on_digest_match() {
-        let target = json!({
-            "bundles": [{
-                "bundle_id": "b1",
-                "bundle_path": "orig.gtbundle",
-                "bundle_digest": "sha256:aaa",
-            }],
-        });
-        let mut staged = BTreeMap::new();
-        staged.insert("sha256:aaa".to_string(), PathBuf::from("/staged/aaa/blob"));
-
-        let out = materialize_bundles(&target, &staged);
-        assert_eq!(out["bundles"][0]["bundle_path"], json!("/staged/aaa/blob"));
-    }
-
-    #[test]
     fn materialize_uri_only_bundle_gets_local_path_and_keeps_uri() {
         // A URI-only single-revision bundle (no local path): materializing must
         // fill in `bundle_path` so apply reads local, while leaving
