@@ -14,6 +14,7 @@
 //! caller), not in `greentic-update`, which stays free of any secrets
 //! dependency — the crate returns raw PEM and the operator persists it.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use greentic_deploy_spec::{EnvId, Environment};
@@ -692,7 +693,11 @@ fn apply_updates_impl(
     // transition against a lock-held applied-set snapshot (closing the TOCTOU
     // where a newer plan applies between the re-gate and the transition).
 
-    // Re-verify every declared artifact's on-disk checksum, fail closed.
+    // Re-verify every declared artifact's on-disk checksum (fail closed), and
+    // record each verified artifact's content-addressed blob path keyed by its
+    // digest, so bundle entries can be materialized from the local staged set
+    // below (no network re-fetch at apply time).
+    let mut staged_blobs: BTreeMap<String, PathBuf> = BTreeMap::new();
     for artifact in &verified.plan.artifacts {
         if let Err(e) = staged.verify_artifact_on_disk(artifact) {
             let _ = staged.transition(UpdateStage::Rejected);
@@ -701,10 +706,21 @@ fn apply_updates_impl(
                 artifact.name
             )));
         }
+        // Infallible after the verify above (same digest validation), but keep
+        // it fail-closed rather than unwrapping.
+        let blob = staged.artifact_blob_path(artifact).map_err(|e| {
+            OpError::Conflict(format!(
+                "resolve staged blob path for artifact `{}`: {e}",
+                artifact.name
+            ))
+        })?;
+        staged_blobs.insert(artifact.digest.clone(), blob);
     }
 
-    // The plan's signed target manifest drives the apply.
-    let target = verified.plan.target.clone();
+    // The plan's signed target manifest drives the apply. Point its bundle
+    // artifacts at the already-verified staged blobs so the apply runs from
+    // local disk instead of re-fetching them from the network.
+    let target = materialize_bundles(&verified.plan.target, &staged_blobs);
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -901,11 +917,12 @@ fn reverify_staged(
 ///   post-apply rollback could not undo those writes. Both are refused until
 ///   snapshot coverage is extended. (Audited against `env_apply`'s `StepOp`
 ///   execute arms: only `PutSecret` and `EndpointAdd` write dev-store secrets.)
-/// - **unpinned bundles** — apply-updates does not yet source bundle artifacts
-///   from the verified staged set, so require a `bundle_digest` on every bundle
-///   (and revision); `env_apply` then pins the applied bytes to the DSSE-signed
-///   manifest, so unpinned / trust-on-first-use content can't be applied.
-///   (Materializing from the staged blobs → follow-up.)
+/// - **unpinned bundles** — require a `bundle_digest` on every bundle (and
+///   revision). The digest is both the integrity pin and the key that
+///   materializes the bundle from the verified staged blob set (see
+///   [`materialize_bundles`]); `env_apply` re-verifies the applied bytes against
+///   it. Unpinned / trust-on-first-use content has no staged blob to bind to and
+///   can't be applied.
 fn check_applyable_manifest(manifest: &EnvManifest) -> Result<(), OpError> {
     // Anything that writes dev-store secrets is non-rollbackable under the P0b
     // snapshot, so fail closed on it.
@@ -951,6 +968,61 @@ fn unpinned_bundle_err(bundle_id: &str, revision: Option<&str>) -> OpError {
         "update plan target {target} has no bundle_digest; update-plan bundles must be \
          digest-pinned so the applied content is verified against the signed plan"
     ))
+}
+
+/// Rewrite the target manifest's bundle artifact paths to point at the
+/// content-addressed blobs already staged and integrity-verified for this plan,
+/// so `env_apply` reads them off local disk instead of re-fetching from the
+/// network at apply time. For every bundle (single-revision) or revision whose
+/// `bundle_digest` is present in `staged_blobs`, its `bundle_path` is set to the
+/// staged blob's absolute path. A `bundle_source_uri`, if present, is left
+/// intact — it stays the boot-time pull ref for a K8s worker, which reads the
+/// local `bundle_path` for the apply and the URI later. A bundle whose digest is
+/// not staged is left untouched, so apply falls back to its declared remote
+/// source exactly as before this pass existed.
+fn materialize_bundles(target: &Value, staged_blobs: &BTreeMap<String, PathBuf>) -> Value {
+    let mut target = target.clone();
+    let Some(bundles) = target.get_mut("bundles").and_then(Value::as_array_mut) else {
+        return target;
+    };
+    for bundle in bundles {
+        match bundle.get_mut("revisions").and_then(Value::as_array_mut) {
+            // Multi-revision: each revision carries its own digest + path.
+            Some(revisions) => {
+                for rev in revisions {
+                    materialize_entry(rev, staged_blobs);
+                }
+            }
+            // Single-revision: the digest + path live on the bundle itself.
+            None => materialize_entry(bundle, staged_blobs),
+        }
+    }
+    target
+}
+
+/// Point one bundle/revision object at its staged blob when its `bundle_digest`
+/// is in `staged_blobs`. A digest with no staged blob is a no-op: the entry
+/// keeps its declared source and apply pulls it remotely. That fall-through is
+/// warn-logged because, in a plan whose whole point is offline apply, a bundle
+/// that still has to reach the network is worth surfacing.
+fn materialize_entry(entry: &mut Value, staged_blobs: &BTreeMap<String, PathBuf>) {
+    let Some(digest) = entry.get("bundle_digest").and_then(Value::as_str) else {
+        return;
+    };
+    match staged_blobs.get(digest) {
+        Some(blob) => {
+            // Absolute content-addressed path; `env_apply` reads it directly and
+            // re-verifies the bytes against `bundle_digest` at deploy time.
+            entry["bundle_path"] = Value::String(blob.to_string_lossy().into_owned());
+        }
+        None => {
+            tracing::warn!(
+                bundle_digest = %digest,
+                "update bundle digest not in the staged set; apply will fall back to its \
+                 declared remote source"
+            );
+        }
+    }
 }
 
 /// Write the plan's signed target manifest to a temp file and drive the
@@ -1405,6 +1477,111 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         ));
         env.host_config.tenant_org_id = Some("acme".to_string());
         env
+    }
+
+    // ---- materialize_bundles (pure manifest rewrite) --------------------
+
+    #[test]
+    fn materialize_uri_only_bundle_gets_local_path_and_keeps_uri() {
+        // A URI-only single-revision bundle (no local path): materializing must
+        // fill in `bundle_path` so apply reads local, while leaving
+        // `bundle_source_uri` intact as the boot-time pull ref. This is what
+        // lets a digest-matched apply run fully offline.
+        let target = json!({
+            "bundles": [{
+                "bundle_id": "b1",
+                "bundle_source_uri": "oci://registry/example:1",
+                "bundle_digest": "sha256:aaa",
+            }],
+        });
+        let mut staged = BTreeMap::new();
+        staged.insert("sha256:aaa".to_string(), PathBuf::from("/staged/aaa/blob"));
+
+        let out = materialize_bundles(&target, &staged);
+        assert_eq!(out["bundles"][0]["bundle_path"], json!("/staged/aaa/blob"));
+        assert_eq!(
+            out["bundles"][0]["bundle_source_uri"],
+            json!("oci://registry/example:1"),
+            "the boot-time pull ref must survive materialization"
+        );
+    }
+
+    #[test]
+    fn materialize_single_revision_with_path_and_uri_overwrites_path_keeps_uri() {
+        // A valid single-revision shape can carry BOTH a local `bundle_path` and
+        // a `bundle_source_uri` (the boot-time pull ref). Materializing must
+        // overwrite the path with the staged blob yet leave the URI intact.
+        let target = json!({
+            "bundles": [{
+                "bundle_id": "b1",
+                "bundle_path": "orig.gtbundle",
+                "bundle_source_uri": "oci://registry/example:1",
+                "bundle_digest": "sha256:aaa",
+            }],
+        });
+        let mut staged = BTreeMap::new();
+        staged.insert("sha256:aaa".to_string(), PathBuf::from("/staged/aaa/blob"));
+
+        let out = materialize_bundles(&target, &staged);
+        assert_eq!(out["bundles"][0]["bundle_path"], json!("/staged/aaa/blob"));
+        assert_eq!(
+            out["bundles"][0]["bundle_source_uri"],
+            json!("oci://registry/example:1"),
+            "the boot-time pull ref must survive materialization"
+        );
+    }
+
+    #[test]
+    fn materialize_leaves_unmatched_digest_untouched() {
+        // A bundle whose digest is not in the staged set must keep its declared
+        // source verbatim — apply falls back to the remote pull.
+        let target = json!({
+            "bundles": [{
+                "bundle_id": "b1",
+                "bundle_path": "orig.gtbundle",
+                "bundle_digest": "sha256:zzz",
+            }],
+        });
+        let mut staged = BTreeMap::new();
+        staged.insert("sha256:aaa".to_string(), PathBuf::from("/staged/aaa/blob"));
+
+        let out = materialize_bundles(&target, &staged);
+        assert_eq!(out["bundles"][0]["bundle_path"], json!("orig.gtbundle"));
+    }
+
+    #[test]
+    fn materialize_rewrites_each_revision_and_leaves_bundle_level_alone() {
+        let target = json!({
+            "bundles": [{
+                "bundle_id": "b1",
+                "revisions": [
+                    { "name": "blue",  "bundle_path": "blue.gtbundle",  "bundle_digest": "sha256:aaa" },
+                    { "name": "green", "bundle_path": "green.gtbundle", "bundle_digest": "sha256:bbb",
+                      "bundle_source_uri": "oci://registry/green:1" },
+                ],
+            }],
+        });
+        let mut staged = BTreeMap::new();
+        staged.insert("sha256:aaa".to_string(), PathBuf::from("/staged/aaa/blob"));
+        staged.insert("sha256:bbb".to_string(), PathBuf::from("/staged/bbb/blob"));
+
+        let out = materialize_bundles(&target, &staged);
+        let revs = &out["bundles"][0]["revisions"];
+        assert_eq!(revs[0]["bundle_path"], json!("/staged/aaa/blob"));
+        assert_eq!(revs[1]["bundle_path"], json!("/staged/bbb/blob"));
+        assert_eq!(
+            revs[1]["bundle_source_uri"],
+            json!("oci://registry/green:1")
+        );
+        // A multi-revision bundle carries no bundle-level path; nothing is added.
+        assert!(out["bundles"][0].get("bundle_path").is_none());
+    }
+
+    #[test]
+    fn materialize_target_without_bundles_is_a_noop() {
+        let target = json!({ "environment": { "id": "local" } });
+        let out = materialize_bundles(&target, &BTreeMap::new());
+        assert_eq!(out, target);
     }
 
     #[test]
