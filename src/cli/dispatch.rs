@@ -680,6 +680,13 @@ pub enum UpdatesVerb {
     /// (`applying → failed`, audited), so a fresh `get` + `apply` can proceed.
     /// Requires `--force`; does not roll back partial changes.
     Recover(UpdatesRecoverArgs),
+    /// Set the update-channel notification policy (`update-channel.json`):
+    /// whether the runtime acts on a discovered update, and the fallback poll
+    /// interval. Only the flags supplied are changed. Disabled by default.
+    ConfigSet(UpdatesConfigSetArgs),
+    /// Show the update-channel notification policy (stored fields + resolved
+    /// effective values). Read-only.
+    ConfigShow { env_id: Option<String> },
 }
 
 #[derive(Args, Debug)]
@@ -707,6 +714,22 @@ pub struct UpdatesRecoverArgs {
     /// recover refuses without it (a live apply is indistinguishable on disk).
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesConfigSetArgs {
+    pub env_id: Option<String>,
+    /// Master switch for the update-channel notification machinery. Omit to
+    /// leave unchanged (absent = disabled, deny-by-default).
+    #[arg(long)]
+    pub enabled: Option<bool>,
+    /// Action on a verified notification: `record-only` or `stage`. Omit to
+    /// leave unchanged (unset resolves to `stage`).
+    #[arg(long = "on-notify")]
+    pub on_notify: Option<String>,
+    /// Fallback poll interval in seconds (>= 60). Omit to leave unchanged.
+    #[arg(long = "poll-interval-secs")]
+    pub poll_interval_secs: Option<u64>,
 }
 
 #[derive(Args, Debug)]
@@ -1131,6 +1154,8 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 UpdatesVerb::Get(_) => "get",
                 UpdatesVerb::Apply(_) => "apply",
                 UpdatesVerb::Recover(_) => "recover",
+                UpdatesVerb::ConfigSet(_) => "config-set",
+                UpdatesVerb::ConfigShow { .. } => "config-show",
             },
         ),
     }
@@ -1440,6 +1465,22 @@ fn dispatch_updates(
                 _ => None, // fall through to --answers / --schema
             };
             super::updates::recover_updates(store, flags, payload, force)?
+        }
+        UpdatesVerb::ConfigSet(args) => {
+            let payload =
+                args.env_id
+                    .map(|environment_id| super::updates::UpdateConfigSetPayload {
+                        environment_id,
+                        enabled: args.enabled,
+                        on_notify: args.on_notify,
+                        poll_interval_secs: args.poll_interval_secs,
+                    });
+            super::updates::config_set(store, flags, payload)?
+        }
+        UpdatesVerb::ConfigShow { env_id } => {
+            let payload = env_id
+                .map(|environment_id| super::updates::UpdateConfigShowFilter { environment_id });
+            super::updates::config_show(store, flags, payload)?
         }
     };
     print_outcome(&outcome)
