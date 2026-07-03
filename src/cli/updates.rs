@@ -17,7 +17,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use greentic_deploy_spec::{EnvId, Environment};
+use greentic_deploy_spec::{
+    EnvId, Environment, MIN_POLL_INTERVAL_SECS, OnNotifyAction, UpdateChannelConfig,
+};
 use greentic_distributor_client::{CachePolicy, DistClient, DistOptions, ResolvePolicy};
 use greentic_secrets_lib::core::rt;
 use serde::{Deserialize, Serialize};
@@ -93,6 +95,34 @@ pub struct RecoverUpdatesPayload {
     pub environment_id: String,
     /// Plan id of the `applying` plan to force-fail (from a prior `op updates get`).
     pub plan_id: String,
+}
+
+/// Payload for `op updates config-set` — set the update-channel notification
+/// policy (`update-channel.json`). Every behavior field is optional; only those
+/// supplied are changed, the rest keep their stored value (same semantics as
+/// `op config set`). Enrollment/identity is unaffected — this is policy only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateConfigSetPayload {
+    pub environment_id: String,
+    /// Master switch for the notification machinery. `None` leaves the stored
+    /// value unchanged; absent file resolves to disabled (deny-by-default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// On-notify action: `record-only` or `stage`. `None` leaves the stored
+    /// value unchanged (unset resolves to `stage`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_notify: Option<String>,
+    /// Fallback poll interval in seconds (rejected below the 60s floor). `None`
+    /// leaves the stored value unchanged (unset resolves to 3600).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval_secs: Option<u64>,
+}
+
+/// Filter for `op updates config-show` — read-only view of the update-channel
+/// policy (stored fields + resolved effective values).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateConfigShowFilter {
+    pub environment_id: String,
 }
 
 /// The dev-store/Vault secret path for one TLS artifact: `<tenant>/_/tls/<name>`
@@ -1027,6 +1057,127 @@ fn recover_updates_impl(
     })
 }
 
+/// `op updates config-set` — set the update-channel notification policy. Only
+/// the fields supplied are changed; the rest keep their stored value. An absent
+/// `update-channel.json` is seeded from `disabled` (deny-by-default), so the
+/// first `config-set` is what turns the channel on.
+pub fn config_set(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<UpdateConfigSetPayload>,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(NOUN, "config-set", config_set_schema()));
+    }
+    let payload = resolve_payload::<UpdateConfigSetPayload>(flags, payload)?;
+    let env_id = parse_env_id(&payload.environment_id)?;
+
+    // Parse/validate every input BEFORE touching the store or the audit log, so
+    // a malformed value is rejected fail-closed with nothing half-written.
+    let parsed_on_notify = payload
+        .on_notify
+        .as_deref()
+        .map(|raw| {
+            OnNotifyAction::parse(raw).ok_or_else(|| {
+                OpError::InvalidArgument(format!(
+                    "on_notify {raw:?} is not a valid action (expected `record-only` or `stage`)"
+                ))
+            })
+        })
+        .transpose()?;
+    if let Some(secs) = payload.poll_interval_secs
+        && secs < MIN_POLL_INTERVAL_SECS
+    {
+        return Err(OpError::InvalidArgument(format!(
+            "poll_interval_secs {secs} is below the {MIN_POLL_INTERVAL_SECS}s floor"
+        )));
+    }
+    if !store.exists(&env_id)? {
+        return Err(OpError::NotFound(format!(
+            "environment `{env_id}` not found"
+        )));
+    }
+
+    let mut fields = Vec::new();
+    if payload.enabled.is_some() {
+        fields.push("enabled");
+    }
+    if parsed_on_notify.is_some() {
+        fields.push("on_notify");
+    }
+    if payload.poll_interval_secs.is_some() {
+        fields.push("poll_interval_secs");
+    }
+
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "config-set",
+        target: json!({ "fields": fields }),
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, |_committed| {
+        // Read-modify-write under the store's env flock (save_update_channel
+        // takes it): merge the supplied fields onto the current (or seeded)
+        // policy so unset fields are preserved.
+        let mut cfg = store
+            .load_update_channel(&env_id)?
+            .unwrap_or_else(|| UpdateChannelConfig::disabled(env_id.clone()));
+        if let Some(enabled) = payload.enabled {
+            cfg.enabled = Some(enabled);
+        }
+        if let Some(on_notify) = parsed_on_notify {
+            cfg.on_notify = Some(on_notify);
+        }
+        if let Some(secs) = payload.poll_interval_secs {
+            cfg.poll_interval_secs = Some(secs);
+        }
+        store.save_update_channel(&cfg)?;
+        let outcome = OpOutcome::new(NOUN, "config-set", config_view(&cfg));
+        Ok((outcome, super::AuditGens::NONE))
+    })
+}
+
+/// `op updates config-show` — read the update-channel policy: the raw stored
+/// fields plus the resolved effective values. Read-only, not audited.
+pub fn config_show(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<UpdateConfigShowFilter>,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(NOUN, "config-show", config_show_schema()));
+    }
+    let payload = resolve_payload::<UpdateConfigShowFilter>(flags, payload)?;
+    let env_id = parse_env_id(&payload.environment_id)?;
+    if !store.exists(&env_id)? {
+        return Err(OpError::NotFound(format!(
+            "environment `{env_id}` not found"
+        )));
+    }
+    let cfg = store
+        .load_update_channel(&env_id)?
+        .unwrap_or_else(|| UpdateChannelConfig::disabled(env_id.clone()));
+    Ok(OpOutcome::new(NOUN, "config-show", config_view(&cfg)))
+}
+
+/// Render an [`UpdateChannelConfig`] for an op outcome: the raw stored fields
+/// plus the resolved effective values, so an operator sees both what is set and
+/// what the runtime will actually do.
+fn config_view(cfg: &UpdateChannelConfig) -> Value {
+    json!({
+        "environment_id": cfg.environment_id.as_str(),
+        "enabled": cfg.enabled,
+        "on_notify": cfg.on_notify.map(|a| a.as_str()),
+        "poll_interval_secs": cfg.poll_interval_secs,
+        "resolved": {
+            "enabled": cfg.resolved_enabled(),
+            "on_notify": cfg.resolved_on_notify().as_str(),
+            "poll_interval_secs": cfg.resolved_poll_interval_secs(),
+        }
+    })
+}
+
 /// Re-verify a staged plan off its on-disk bytes: DSSE signature against the
 /// env trust root, a hash cross-check against the write-time digest recorded in
 /// `state.json` (catches a `plan.json` swapped after staging), and the
@@ -1710,6 +1861,35 @@ fn recover_schema() -> Value {
     })
 }
 
+fn config_set_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "UpdateConfigSetPayload",
+        "type": "object",
+        "required": ["environment_id"],
+        "additionalProperties": false,
+        "properties": {
+            "environment_id": {"type": "string"},
+            "enabled": {"type": ["boolean", "null"], "description": "master switch for the update-channel notification machinery; null leaves the stored value unchanged (absent = disabled, deny-by-default)"},
+            "on_notify": {"type": ["string", "null"], "enum": [null, "record-only", "record_only", "stage"], "description": "action on a verified notification; null leaves the stored value unchanged (unset resolves to `stage`; full self-update is not offered)"},
+            "poll_interval_secs": {"type": ["integer", "null"], "minimum": MIN_POLL_INTERVAL_SECS, "description": "fallback poll interval in seconds; null leaves the stored value unchanged (unset resolves to 3600)"}
+        }
+    })
+}
+
+fn config_show_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "UpdateConfigShowFilter",
+        "type": "object",
+        "required": ["environment_id"],
+        "additionalProperties": false,
+        "properties": {
+            "environment_id": {"type": "string"}
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1717,6 +1897,151 @@ mod tests {
     use crate::cli::tests_common::{make_binding, make_env};
     use greentic_deploy_spec::CapabilitySlot;
     use tempfile::tempdir;
+
+    // --- update-channel config (Phase 4 notification policy) ----------------
+
+    fn store_with_env(dir: &std::path::Path, env_id: &str) -> (LocalFsStore, EnvId) {
+        let store = LocalFsStore::new(dir);
+        store.save(&make_env(env_id)).unwrap();
+        (store, EnvId::try_from(env_id).unwrap())
+    }
+
+    #[test]
+    fn config_show_defaults_to_disabled() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        let out = config_show(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigShowFilter {
+                environment_id: "local".into(),
+            }),
+        )
+        .unwrap();
+        let resolved = &out.result["resolved"];
+        assert_eq!(resolved["enabled"].as_bool(), Some(false));
+        assert_eq!(resolved["on_notify"].as_str(), Some("stage"));
+        assert_eq!(resolved["poll_interval_secs"].as_u64(), Some(3600));
+        // A show never writes the sidecar.
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_set_persists_and_round_trips() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: Some(true),
+                on_notify: Some("record-only".into()),
+                poll_interval_secs: Some(120),
+            }),
+        )
+        .unwrap();
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert_eq!(cfg.enabled, Some(true));
+        assert_eq!(cfg.on_notify, Some(OnNotifyAction::RecordOnly));
+        assert_eq!(cfg.poll_interval_secs, Some(120));
+        assert!(cfg.resolved_enabled());
+    }
+
+    #[test]
+    fn config_set_partial_update_preserves_other_fields() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        let set = |p: UpdateConfigSetPayload| {
+            config_set(&store, &OpFlags::default(), Some(p)).unwrap();
+        };
+        set(UpdateConfigSetPayload {
+            environment_id: "local".into(),
+            enabled: Some(true),
+            on_notify: None,
+            poll_interval_secs: None,
+        });
+        set(UpdateConfigSetPayload {
+            environment_id: "local".into(),
+            enabled: None,
+            on_notify: Some("record-only".into()),
+            poll_interval_secs: None,
+        });
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert_eq!(cfg.enabled, Some(true)); // preserved across the second set
+        assert_eq!(cfg.on_notify, Some(OnNotifyAction::RecordOnly));
+    }
+
+    #[test]
+    fn config_set_rejects_invalid_on_notify() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: Some("apply".into()),
+                poll_interval_secs: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        // Fail-closed: nothing was written.
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_set_rejects_poll_interval_below_floor() {
+        let dir = tempdir().unwrap();
+        let (store, _) = store_with_env(dir.path(), "local");
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: Some(10),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn config_set_unknown_env_is_not_found() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path()); // no env saved
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "ghost".into(),
+                enabled: Some(true),
+                on_notify: None,
+                poll_interval_secs: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::NotFound(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn config_schema_only_returns_schemas() {
+        let flags = OpFlags {
+            schema_only: true,
+            ..OpFlags::default()
+        };
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let s = config_set(&store, &flags, None).unwrap();
+        assert_eq!(s.op, "config-set");
+        assert!(s.result["properties"]["enabled"].is_object());
+        let sh = config_show(&store, &flags, None).unwrap();
+        assert_eq!(sh.op, "config-show");
+    }
 
     // A self-signed X.509 cert (public material only) used to exercise the
     // `status` parse path without a running CA.

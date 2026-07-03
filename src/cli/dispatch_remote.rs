@@ -283,6 +283,8 @@ fn route_remote(
             UpdatesVerb::Get(_) => Err(not_supported("updates get")),
             UpdatesVerb::Apply(_) => Err(not_supported("updates apply")),
             UpdatesVerb::Recover(_) => Err(not_supported("updates recover")),
+            UpdatesVerb::ConfigSet(_) => Err(not_supported("updates config-set")),
+            UpdatesVerb::ConfigShow { .. } => Err(not_supported("updates config-show")),
         },
     }
 }
