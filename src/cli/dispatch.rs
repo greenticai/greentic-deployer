@@ -676,6 +676,10 @@ pub enum UpdatesVerb {
     /// Apply a staged update plan to its environment: re-verify, snapshot,
     /// converge via the env-apply pipeline, and roll back on failure.
     Apply(UpdatesApplyArgs),
+    /// Force-fail a plan stranded in `applying` by a crashed applier
+    /// (`applying → failed`, audited), so a fresh `get` + `apply` can proceed.
+    /// Requires `--force`; does not roll back partial changes.
+    Recover(UpdatesRecoverArgs),
 }
 
 #[derive(Args, Debug)]
@@ -691,6 +695,18 @@ pub struct UpdatesApplyArgs {
     /// Plan id of the staged plan to apply (from a prior `op updates get`).
     #[arg(long = "plan-id")]
     pub plan_id: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesRecoverArgs {
+    pub env_id: Option<String>,
+    /// Plan id of the `applying` plan to force-fail (from a prior `op updates get`).
+    #[arg(long = "plan-id")]
+    pub plan_id: Option<String>,
+    /// Assert the applier is dead and force-fail `applying → failed`. Required —
+    /// recover refuses without it (a live apply is indistinguishable on disk).
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1114,6 +1130,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 UpdatesVerb::Status { .. } => "status",
                 UpdatesVerb::Get(_) => "get",
                 UpdatesVerb::Apply(_) => "apply",
+                UpdatesVerb::Recover(_) => "recover",
             },
         ),
     }
@@ -1407,6 +1424,22 @@ fn dispatch_updates(
                 _ => None, // fall through to --answers / --schema
             };
             super::updates::apply_updates(store, flags, payload)?
+        }
+        UpdatesVerb::Recover(args) => {
+            // `--force` is operator attestation, not a payload field: thread it
+            // separately so it applies whether the ids come from the CLI or from
+            // `--answers` (it is never silently dropped on the answers path).
+            let force = args.force;
+            let payload = match (args.env_id, args.plan_id) {
+                (Some(environment_id), Some(plan_id)) => {
+                    Some(super::updates::RecoverUpdatesPayload {
+                        environment_id,
+                        plan_id,
+                    })
+                }
+                _ => None, // fall through to --answers / --schema
+            };
+            super::updates::recover_updates(store, flags, payload, force)?
         }
     };
     print_outcome(&outcome)

@@ -84,6 +84,17 @@ pub struct ApplyUpdatesPayload {
     pub plan_id: String,
 }
 
+/// Payload for `op updates recover` — force a plan stranded in `applying` by a
+/// crashed applier to `failed`, so a fresh `get` + `apply` can proceed. The
+/// `--force` attestation is a CLI-only argument (operator intent, not a
+/// replayable answers field), so it is threaded separately, not carried here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoverUpdatesPayload {
+    pub environment_id: String,
+    /// Plan id of the `applying` plan to force-fail (from a prior `op updates get`).
+    pub plan_id: String,
+}
+
 /// The dev-store/Vault secret path for one TLS artifact: `<tenant>/_/tls/<name>`
 /// (`<tenant>/<team>/<pack>/<name>` with the default team `_`).
 fn tls_rel_path(tenant: &str, name: &str) -> String {
@@ -853,6 +864,169 @@ fn apply_updates_impl(
     })
 }
 
+/// `op updates recover` — force-fail a plan stranded in `applying` by a crashed
+/// applier (Phase 3.1 of the Greentic updater). **Mutation.**
+///
+/// `op updates apply` deliberately refuses to auto-fail an `applying` plan: the
+/// staging lock is not held across the whole apply (env_apply's own flock
+/// serializes the mutation), so on disk a *crashed* applier and an *active*
+/// concurrent apply are indistinguishable — auto-failing the marker could strand
+/// a live apply (env mutated, plan `failed`, `latest_applied_sequence` never
+/// advances). `recover` is the explicit operator escape hatch for the crashed
+/// case: it force-transitions `applying → failed` (a legal FSM edge) under the
+/// staging lock, and requires `--force` so the operator affirms the applier is
+/// genuinely dead.
+///
+/// Scope: this un-sticks the update FSM only. It does **not** roll back any
+/// partial environment change the interrupted apply may have made — the P0b
+/// snapshot id is not durably linked to the plan, so a safe automated rollback is
+/// not possible here. The success outcome names the env's `snapshots/` directory
+/// for manual restore, and re-running `op updates get` re-stages the plan for a
+/// clean apply.
+pub fn recover_updates(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<RecoverUpdatesPayload>,
+    force: bool,
+) -> Result<OpOutcome, OpError> {
+    recover_updates_impl(store, flags, payload, force, None)
+}
+
+/// Body of [`recover_updates`], with an optional staging-root override so tests
+/// can point the FSM at a tempdir instead of `~/.greentic/updates`.
+fn recover_updates_impl(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<RecoverUpdatesPayload>,
+    force: bool,
+    updates_root_override: Option<&std::path::Path>,
+) -> Result<OpOutcome, OpError> {
+    use greentic_update::staging::UpdateStage;
+
+    if flags.schema_only {
+        return Ok(OpOutcome::new(NOUN, "recover", recover_schema()));
+    }
+    let payload = resolve_payload::<RecoverUpdatesPayload>(flags, payload)?;
+    let env_id = parse_env_id(&payload.environment_id)?;
+
+    // Load the staged plan handle (read-only). A missing plan is a plain
+    // NotFound — nothing to recover.
+    let root = open_updates_root(&env_id, updates_root_override)?;
+    let staged = root
+        .load(&payload.plan_id)
+        .map_err(|e| OpError::Conflict(format!("load staged update plan: {e}")))?
+        .ok_or_else(|| {
+            OpError::NotFound(format!(
+                "no staged plan `{}` under env `{env_id}`; nothing to recover",
+                payload.plan_id
+            ))
+        })?;
+
+    // Stage gate. Only an `applying` plan is recoverable. Every other stage is an
+    // argument error with a stage-specific hint — nothing is mutated, nothing is
+    // audited (this mirrors how `apply` gates before its audited region).
+    let state = staged
+        .state()
+        .map_err(|e| OpError::Conflict(format!("read update staging state: {e}")))?;
+    match state.stage {
+        UpdateStage::Applying => {}
+        UpdateStage::Staged => {
+            return Err(OpError::InvalidArgument(format!(
+                "plan `{}` is `staged`, not `applying`; nothing to recover — apply it with \
+                 `op updates apply`",
+                payload.plan_id
+            )));
+        }
+        terminal @ (UpdateStage::Applied | UpdateStage::Failed | UpdateStage::Rejected) => {
+            return Err(OpError::InvalidArgument(format!(
+                "plan `{}` is already `{terminal}` (terminal); nothing to recover",
+                payload.plan_id
+            )));
+        }
+        staging @ (UpdateStage::Downloading | UpdateStage::Inbox) => {
+            return Err(OpError::InvalidArgument(format!(
+                "plan `{}` is `{staging}` (still staging); nothing was applied, so there is \
+                 nothing to recover — re-run `op updates get`",
+                payload.plan_id
+            )));
+        }
+    }
+
+    // The instant the plan entered `applying` — the operator's cue for whether a
+    // live apply is plausible (seconds ago) or the applier is long dead.
+    let applying_since = state.updated_at.to_rfc3339();
+
+    // Fail closed unless the operator explicitly asserts the applier is dead. On
+    // disk an `applying` plan cannot be told apart from a live concurrent apply,
+    // and force-failing a live apply would strand it (env mutated, plan `failed`,
+    // sequence never advanced). `--force` is that assertion.
+    if !force {
+        return Err(OpError::Conflict(format!(
+            "plan `{}` is `applying` on env `{env_id}` (since {applying_since}); recover \
+             force-fails it to `failed`, which is UNSAFE if an apply is genuinely in progress. \
+             If you have confirmed no apply is running for this plan, re-run with `--force`",
+            payload.plan_id
+        )));
+    }
+
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "recover",
+        target: json!({
+            "environment_id": env_id.as_str(),
+            "plan_id": payload.plan_id,
+            "previous_stage": UpdateStage::Applying.as_str(),
+            "applying_since": applying_since,
+        }),
+        // Recovering the same plan twice is a no-op: the second call hits the
+        // terminal-stage gate above (now `failed`) before reaching this mutation.
+        idempotency_key: Some(payload.plan_id.clone()),
+    };
+    audit_and_record(store, ctx, |committed| {
+        // The single mutation: force the stranded plan to `failed` under the
+        // staging lock, which re-reads the on-disk stage before validating the
+        // `applying → failed` edge (safe against a concurrent transition).
+        //
+        // `transition` writes `state.json` BEFORE appending its own staging audit
+        // line, so an audit-append failure returns `Err` AFTER `failed` already
+        // committed. Mirror the apply-admission handling: on error, re-read the
+        // stage; if the plan is now `failed`, the mutation is durable, so mark the
+        // op committed — the deployer audit boundary must stay fail-closed rather
+        // than demote the failure to best-effort.
+        if let Err(e) = staged.transition(UpdateStage::Failed) {
+            if staged
+                .stage()
+                .map(|s| s == UpdateStage::Failed)
+                .unwrap_or(false)
+            {
+                committed.mark_committed();
+            }
+            return Err(OpError::Conflict(format!(
+                "force-fail plan (applying → failed): {e}"
+            )));
+        }
+        committed.mark_committed();
+        let outcome = OpOutcome::new(
+            NOUN,
+            "recover",
+            json!({
+                "environment_id": env_id.as_str(),
+                "plan_id": payload.plan_id,
+                "previous_stage": UpdateStage::Applying.as_str(),
+                "stage": UpdateStage::Failed.as_str(),
+                "applying_since": applying_since,
+                "note": "recover un-stuck the update FSM (applying → failed); it did NOT roll \
+                         back any partial environment change from the interrupted apply. Inspect \
+                         the environment and restore from a snapshot under <env_dir>/snapshots/ if \
+                         needed. This plan id is now terminal (`failed`) and cannot be re-staged; \
+                         retry by fetching a fresh plan with `op updates get`.",
+            }),
+        );
+        Ok((outcome, super::AuditGens::NONE))
+    })
+}
+
 /// Re-verify a staged plan off its on-disk bytes: DSSE signature against the
 /// env trust root, a hash cross-check against the write-time digest recorded in
 /// `state.json` (catches a `plan.json` swapped after staging), and the
@@ -1518,6 +1692,20 @@ fn apply_updates_schema() -> Value {
         "properties": {
             "environment_id": {"type": "string"},
             "plan_id": {"type": "string", "description": "Plan id of the staged plan to apply (from `op updates get`)."}
+        }
+    })
+}
+
+fn recover_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "RecoverUpdatesPayload",
+        "type": "object",
+        "required": ["environment_id", "plan_id"],
+        "additionalProperties": false,
+        "properties": {
+            "environment_id": {"type": "string"},
+            "plan_id": {"type": "string", "description": "Plan id of the `applying` plan to force-fail (from `op updates get`). Pass `--force` on the CLI to attest the applier is dead — recover refuses without it."}
         }
     })
 }
@@ -3342,5 +3530,199 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             "bundles": [{"bundle_id": "b1", "bundle_path": "/x.gtbundle", "bundle_digest": "sha256:aa"}]
         }));
         check_applyable_manifest(&env, td.path(), &m, false).unwrap();
+    }
+
+    // ---- Phase 3.1: op updates recover ------------------------------------
+
+    #[test]
+    fn recover_schema_only_returns_payload_schema() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let out = recover_updates(
+            &store,
+            &OpFlags {
+                schema_only: true,
+                ..OpFlags::default()
+            },
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(out.op, "recover");
+        assert_eq!(out.noun, NOUN);
+        assert!(out.result["properties"]["plan_id"].is_object());
+    }
+
+    #[test]
+    fn recover_plan_not_found_is_not_found() {
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (_priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+        let err = recover_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(RecoverUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "ghost".into(),
+            }),
+            true,
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::NotFound(_)));
+    }
+
+    #[test]
+    fn recover_forces_applying_to_failed_and_audits() {
+        use greentic_update::staging::{UpdateStage, UpdatesRoot};
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+        stage_local(updates_dir.path(), "plan-1", 1, &priv7, &tk7);
+        // Strand the plan in `applying`, as a crashed applier would leave it.
+        UpdatesRoot::open_in(updates_dir.path(), "local")
+            .unwrap()
+            .load("plan-1")
+            .unwrap()
+            .unwrap()
+            .transition(UpdateStage::Applying)
+            .unwrap();
+
+        let out = recover_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(RecoverUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-1".into(),
+            }),
+            true,
+            Some(updates_dir.path()),
+        )
+        .unwrap();
+
+        assert_eq!(out.op, "recover");
+        assert_eq!(out.result["previous_stage"], "applying");
+        assert_eq!(out.result["stage"], "failed");
+        assert!(out.result["applying_since"].as_str().is_some());
+
+        // On-disk FSM marker was force-failed.
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-1"),
+            UpdateStage::Failed
+        );
+        // The recovery was recorded in the deployer audit ledger.
+        let env_dir = store.env_dir(&env_id).unwrap();
+        let audit = std::fs::read_to_string(env_dir.join("audit").join("events.jsonl")).unwrap();
+        assert!(
+            audit.contains("recover") && audit.contains("plan-1"),
+            "audit must record the recover: {audit}"
+        );
+    }
+
+    #[test]
+    fn recover_refuses_without_force() {
+        use greentic_update::staging::{UpdateStage, UpdatesRoot};
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+        stage_local(updates_dir.path(), "plan-1", 1, &priv7, &tk7);
+        UpdatesRoot::open_in(updates_dir.path(), "local")
+            .unwrap()
+            .load("plan-1")
+            .unwrap()
+            .unwrap()
+            .transition(UpdateStage::Applying)
+            .unwrap();
+
+        let err = recover_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(RecoverUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-1".into(),
+            }),
+            false,
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Conflict(m) if m.contains("--force")));
+        // Fail-closed: the plan is untouched — still Applying.
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-1"),
+            UpdateStage::Applying
+        );
+    }
+
+    #[test]
+    fn recover_rejects_staged_plan() {
+        use greentic_update::staging::UpdateStage;
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+        stage_local(updates_dir.path(), "plan-1", 1, &priv7, &tk7);
+
+        let err = recover_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(RecoverUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-1".into(),
+            }),
+            true,
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("not `applying`")));
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-1"),
+            UpdateStage::Staged
+        );
+    }
+
+    #[test]
+    fn recover_rejects_terminal_plan() {
+        use greentic_update::staging::UpdateStage;
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+        stage_local(updates_dir.path(), "plan-1", 1, &priv7, &tk7);
+        // Apply to completion ⇒ terminal `applied`.
+        apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-1".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap();
+
+        let err = recover_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(RecoverUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-1".into(),
+            }),
+            true,
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("terminal")));
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-1"),
+            UpdateStage::Applied
+        );
     }
 }
