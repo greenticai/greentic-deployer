@@ -972,7 +972,7 @@ fn check_applyable_manifest(
 /// Whether the dev-store secret writes `env_apply` performs for this manifest
 /// would land in the dev-store the P0b snapshot captures (and can therefore be
 /// rolled back). Returns `Err(reason)` naming the first way the sink escapes the
-/// snapshot; `Ok(())` when it is fully covered. Three escapes:
+/// snapshot; `Ok(())` when it is fully covered. Four escapes:
 ///
 /// 1. the env's current `Secrets` binding is a non-dev-store backend (e.g.
 ///    Vault) — those values live outside the snapshot;
