@@ -988,9 +988,25 @@ fn recover_updates_impl(
         // The single mutation: force the stranded plan to `failed` under the
         // staging lock, which re-reads the on-disk stage before validating the
         // `applying → failed` edge (safe against a concurrent transition).
-        staged
-            .transition(UpdateStage::Failed)
-            .map_err(|e| OpError::Conflict(format!("force-fail plan (applying → failed): {e}")))?;
+        //
+        // `transition` writes `state.json` BEFORE appending its own staging audit
+        // line, so an audit-append failure returns `Err` AFTER `failed` already
+        // committed. Mirror the apply-admission handling: on error, re-read the
+        // stage; if the plan is now `failed`, the mutation is durable, so mark the
+        // op committed — the deployer audit boundary must stay fail-closed rather
+        // than demote the failure to best-effort.
+        if let Err(e) = staged.transition(UpdateStage::Failed) {
+            if staged
+                .stage()
+                .map(|s| s == UpdateStage::Failed)
+                .unwrap_or(false)
+            {
+                committed.mark_committed();
+            }
+            return Err(OpError::Conflict(format!(
+                "force-fail plan (applying → failed): {e}"
+            )));
+        }
         committed.mark_committed();
         let outcome = OpOutcome::new(
             NOUN,
@@ -1004,7 +1020,8 @@ fn recover_updates_impl(
                 "note": "recover un-stuck the update FSM (applying → failed); it did NOT roll \
                          back any partial environment change from the interrupted apply. Inspect \
                          the environment and restore from a snapshot under <env_dir>/snapshots/ if \
-                         needed, then re-run `op updates get` to re-stage and apply.",
+                         needed. This plan id is now terminal (`failed`) and cannot be re-staged; \
+                         retry by fetching a fresh plan with `op updates get`.",
             }),
         );
         Ok((outcome, super::AuditGens::NONE))
