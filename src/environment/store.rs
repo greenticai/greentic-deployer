@@ -282,13 +282,16 @@ impl LocalFsStore {
         Ok(Some(cfg))
     }
 
-    /// Persist the update-channel policy under the env flock, backing up any
-    /// prior file first (mirrors [`save_runtime`](EnvironmentStore::save_runtime)).
-    pub fn save_update_channel(&self, cfg: &UpdateChannelConfig) -> Result<(), StoreError> {
-        let env_id = &cfg.environment_id;
-        let _guard = EnvFlock::acquire(&self.lock_path(env_id)?)?;
-        let target = self.update_channel_path(env_id)?;
-        copy_to_backup(&target, &self.backups_dir(env_id)?)?;
+    /// Write the update-channel policy WITHOUT acquiring the env flock — the
+    /// caller must already hold it (via [`LocalFsStore::transact`] / [`Locked`]).
+    /// Backs up any prior file first, then writes atomically. There is
+    /// deliberately no unlocked public `save_update_channel`: the sidecar is
+    /// only ever written inside a locked transaction, so the read-modify-write
+    /// in `op updates config-set` is free of lost updates (mirrors
+    /// `save_runtime_locked`).
+    fn save_update_channel_locked(&self, cfg: &UpdateChannelConfig) -> Result<(), StoreError> {
+        let target = self.update_channel_path(&cfg.environment_id)?;
+        copy_to_backup(&target, &self.backups_dir(&cfg.environment_id)?)?;
         atomic_write_json(&target, cfg)?;
         Ok(())
     }
@@ -766,6 +769,20 @@ impl<'a> Locked<'a> {
             });
         }
         self.store.save_runtime_locked(runtime)
+    }
+
+    pub fn load_update_channel(&self) -> Result<Option<UpdateChannelConfig>, StoreError> {
+        self.store.load_update_channel(&self.env_id)
+    }
+
+    pub fn save_update_channel(&self, cfg: &UpdateChannelConfig) -> Result<(), StoreError> {
+        if cfg.environment_id != self.env_id {
+            return Err(StoreError::EnvIdMismatch {
+                file: self.env_id.clone(),
+                value: cfg.environment_id.clone(),
+            });
+        }
+        self.store.save_update_channel_locked(cfg)
     }
 
     pub fn load_pack_answers(&self, slot: CapabilitySlot) -> Result<Option<Value>, StoreError> {

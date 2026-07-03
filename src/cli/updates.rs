@@ -1117,22 +1117,29 @@ pub fn config_set(
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |_committed| {
-        // Read-modify-write under the store's env flock (save_update_channel
-        // takes it): merge the supplied fields onto the current (or seeded)
-        // policy so unset fields are preserved.
-        let mut cfg = store
-            .load_update_channel(&env_id)?
-            .unwrap_or_else(|| UpdateChannelConfig::disabled(env_id.clone()));
-        if let Some(enabled) = payload.enabled {
-            cfg.enabled = Some(enabled);
-        }
-        if let Some(on_notify) = parsed_on_notify {
-            cfg.on_notify = Some(on_notify);
-        }
-        if let Some(secs) = payload.poll_interval_secs {
-            cfg.poll_interval_secs = Some(secs);
-        }
-        store.save_update_channel(&cfg)?;
+        // One locked transaction (mirrors `op config set` → `update_environment`):
+        // hold the env flock across validate → read → merge → write so two
+        // disjoint concurrent `config-set`s can't drop each other's fields, and
+        // a corrupt/spoofed env directory (which `exists` alone would admit) is
+        // rejected fail-closed before anything is written.
+        let cfg = store.transact(&env_id, |locked| -> Result<UpdateChannelConfig, OpError> {
+            // Validated Environment load under the lock (schema + env-id binding).
+            locked.load()?;
+            let mut cfg = locked
+                .load_update_channel()?
+                .unwrap_or_else(|| UpdateChannelConfig::disabled(env_id.clone()));
+            if let Some(enabled) = payload.enabled {
+                cfg.enabled = Some(enabled);
+            }
+            if let Some(on_notify) = parsed_on_notify {
+                cfg.on_notify = Some(on_notify);
+            }
+            if let Some(secs) = payload.poll_interval_secs {
+                cfg.poll_interval_secs = Some(secs);
+            }
+            locked.save_update_channel(&cfg)?;
+            Ok(cfg)
+        })?;
         let outcome = OpOutcome::new(NOUN, "config-set", config_view(&cfg));
         Ok((outcome, super::AuditGens::NONE))
     })
@@ -2041,6 +2048,84 @@ mod tests {
         assert!(s.result["properties"]["enabled"].is_object());
         let sh = config_show(&store, &flags, None).unwrap();
         assert_eq!(sh.op, "config-show");
+    }
+
+    #[test]
+    fn config_set_concurrent_disjoint_updates_both_survive() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        // Two operators set disjoint fields at the same time. The env flock held
+        // across each read-modify-write (via `transact`) serializes them, so the
+        // later writer observes the earlier writer's field and neither is lost.
+        std::thread::scope(|s| {
+            let a = store.clone();
+            s.spawn(move || {
+                config_set(
+                    &a,
+                    &OpFlags::default(),
+                    Some(UpdateConfigSetPayload {
+                        environment_id: "local".into(),
+                        enabled: Some(true),
+                        on_notify: None,
+                        poll_interval_secs: None,
+                    }),
+                )
+                .unwrap();
+            });
+            let b = store.clone();
+            s.spawn(move || {
+                config_set(
+                    &b,
+                    &OpFlags::default(),
+                    Some(UpdateConfigSetPayload {
+                        environment_id: "local".into(),
+                        enabled: None,
+                        on_notify: Some("record-only".into()),
+                        poll_interval_secs: None,
+                    }),
+                )
+                .unwrap();
+            });
+        });
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert_eq!(cfg.enabled, Some(true));
+        assert_eq!(cfg.on_notify, Some(OnNotifyAction::RecordOnly));
+    }
+
+    #[test]
+    fn config_set_rejects_corrupt_environment() {
+        // A directory whose `environment.json` is present (so `exists` admits it)
+        // but does not deserialize must be rejected fail-closed under the lock —
+        // no sidecar is written for an env the store itself would reject.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env_id = EnvId::try_from("local").unwrap();
+        let env_dir = dir.path().join("local");
+        std::fs::create_dir_all(&env_dir).unwrap();
+        std::fs::write(
+            env_dir.join("environment.json"),
+            b"{ not-valid environment ]",
+        )
+        .unwrap();
+        // The shallow presence check admits the corrupt directory...
+        assert!(store.exists(&env_id).unwrap());
+        // ...but the validated load inside the locked transaction rejects it,
+        // so the call errors and no sidecar is written.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: Some(true),
+                on_notify: None,
+                poll_interval_secs: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            !env_dir.join("update-channel.json").exists(),
+            "sidecar must not be written for a corrupt env"
+        );
     }
 
     // A self-signed X.509 cert (public material only) used to exercise the
