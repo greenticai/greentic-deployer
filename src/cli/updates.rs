@@ -15,7 +15,7 @@
 //! dependency — the crate returns raw PEM and the operator persists it.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use greentic_deploy_spec::{EnvId, Environment};
 use greentic_distributor_client::{CachePolicy, DistClient, DistOptions, ResolvePolicy};
@@ -904,13 +904,13 @@ fn reverify_staged(
         )));
     }
     // Fail closed on manifest content this increment cannot apply *safely*. The
-    // dev-store-secret guard needs the env's `Secrets` binding and whether the
-    // dev-store is redirected off the env tree; both are resolved here so the
-    // check stays a pure, race-free function.
+    // dev-store-secret guard needs the env's `Secrets` binding, the env dir (to
+    // check the dev-store files aren't symlinked off the tree), and whether the
+    // dev-store is redirected off the tree by the override.
     let env = store.load(env_id)?;
     let dev_secrets_path_override =
         std::env::var_os(super::secrets::DEV_SECRETS_PATH_ENV).is_some();
-    check_applyable_manifest(&env, &manifest, dev_secrets_path_override)?;
+    check_applyable_manifest(&env, &env_dir, &manifest, dev_secrets_path_override)?;
     Ok(verified)
 }
 
@@ -937,6 +937,7 @@ fn reverify_staged(
 /// by the caller (the test harness cannot set process env vars safely).
 fn check_applyable_manifest(
     env: &Environment,
+    env_dir: &Path,
     manifest: &EnvManifest,
     dev_secrets_path_override: bool,
 ) -> Result<(), OpError> {
@@ -945,7 +946,7 @@ fn check_applyable_manifest(
     // undo those writes — i.e. the effective sink is the snapshotted dev-store.
     if (!manifest.secrets.is_empty() || !manifest.messaging_endpoints.is_empty())
         && let Err(reason) =
-            dev_store_secret_sink_is_snapshotted(env, manifest, dev_secrets_path_override)
+            dev_store_secret_sink_is_snapshotted(env, env_dir, manifest, dev_secrets_path_override)
     {
         return Err(dev_store_secret_err(reason));
     }
@@ -980,15 +981,20 @@ fn check_applyable_manifest(
 ///    effect first and redirects the writes;
 /// 3. `GREENTIC_DEV_SECRETS_PATH` redirects the dev-store off the env tree,
 ///    which the env-dir-relative snapshot cannot reach.
+/// 4. a dev-store secrets file (or an ancestor under the env dir) is a symlink —
+///    the snapshot follows the link on capture but restore's atomic rename-over
+///    replaces the *link* with a regular file, so the external target keeps the
+///    written secret; refuse rather than leak a write past rollback.
 ///
 /// Accepted residuals (single-operator scope, not redesigned here): the binding
-/// is read before `env_apply` takes its own env flock, so a concurrent manual
-/// `op env` rebind between this check and the apply reopens the hole (the same
-/// class as the apply re-gate race); and the guard is uniform across `secrets[]`
-/// and `messaging_endpoints[]` even though a Vault `EndpointAdd` only stamps a
-/// ref (a possible future loosening).
+/// and the symlink state are read before `env_apply` takes its own env flock, so
+/// a concurrent manual `op env` rebind (or symlink plant) between this check and
+/// the apply reopens the hole (the same class as the apply re-gate race); and
+/// the guard is uniform across `secrets[]` and `messaging_endpoints[]` even
+/// though a Vault `EndpointAdd` only stamps a ref (a possible future loosening).
 fn dev_store_secret_sink_is_snapshotted(
     env: &Environment,
+    env_dir: &Path,
     manifest: &EnvManifest,
     dev_secrets_path_override: bool,
 ) -> Result<(), &'static str> {
@@ -1002,6 +1008,17 @@ fn dev_store_secret_sink_is_snapshotted(
         return Err(
             "GREENTIC_DEV_SECRETS_PATH redirects the dev-store off the snapshotted env tree",
         );
+    }
+    // Both dev-store candidate files must resolve through plain directories under
+    // the env dir — a symlinked candidate (or ancestor) escapes the snapshot's
+    // rollback (see condition 4). Fail closed on a symlink or any IO error.
+    for rel in [
+        crate::cli::secrets::DEV_STORE_RELATIVE,
+        crate::cli::secrets::DEV_STORE_STATE_RELATIVE,
+    ] {
+        if crate::path_safety::assert_no_symlink_ancestors(env_dir, &env_dir.join(rel)).is_err() {
+            return Err("a dev-store secrets file resolves through a symlink outside the env tree");
+        }
     }
     Ok(())
 }
@@ -3217,17 +3234,18 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
     #[test]
     fn guard_accepts_secret_writes_on_dev_store_env() {
         // No Secrets binding ⇒ custodial dev-store; no manifest rebind; no
-        // override ⇒ the writes land in the snapshotted dev-store, so both
-        // secrets[] and messaging_endpoints[] are applyable.
+        // override; no symlinked candidate ⇒ the writes land in the snapshotted
+        // dev-store, so both secrets[] and messaging_endpoints[] are applyable.
         let env = make_env("local");
-        check_applyable_manifest(&env, &secrets_manifest(), false).unwrap();
+        let td = tempdir().unwrap();
+        check_applyable_manifest(&env, td.path(), &secrets_manifest(), false).unwrap();
 
         let endpoints = parse_manifest(json!({
             "schema": "greentic.env-manifest.v1",
             "environment": {"id": "local"},
             "messaging_endpoints": [{"name": "tg", "provider_type": "messaging.telegram.bot"}]
         }));
-        check_applyable_manifest(&env, &endpoints, false).unwrap();
+        check_applyable_manifest(&env, td.path(), &endpoints, false).unwrap();
     }
 
     #[test]
@@ -3237,7 +3255,9 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             CapabilitySlot::Secrets,
             crate::defaults::VAULT_SECRETS_PACK,
         ));
-        let err = check_applyable_manifest(&env, &secrets_manifest(), false).unwrap_err();
+        let td = tempdir().unwrap();
+        let err =
+            check_applyable_manifest(&env, td.path(), &secrets_manifest(), false).unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("non-dev-store backend")));
     }
 
@@ -3246,13 +3266,14 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         // Env is dev-store, but the manifest rebinds Secrets → Vault; env_apply
         // applies packs[] before secrets[], so the write escapes the snapshot.
         let env = make_env("local");
+        let td = tempdir().unwrap();
         let m = parse_manifest(json!({
             "schema": "greentic.env-manifest.v1",
             "environment": {"id": "local"},
             "packs": [{"slot": "secrets", "kind": "greentic.secrets.vault@1.0.0", "pack_ref": "vault"}],
             "secrets": [{"path": "acme/_/tls/foo", "from_env": "FOO"}]
         }));
-        let err = check_applyable_manifest(&env, &m, false).unwrap_err();
+        let err = check_applyable_manifest(&env, td.path(), &m, false).unwrap_err();
         assert!(
             matches!(err, OpError::InvalidArgument(msg) if msg.contains("rebinds the Secrets slot"))
         );
@@ -3263,13 +3284,14 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         // A same-family (dev-store) rebind is not an escape — the sink stays
         // snapshotted.
         let env = make_env("local");
+        let td = tempdir().unwrap();
         let m = parse_manifest(json!({
             "schema": "greentic.env-manifest.v1",
             "environment": {"id": "local"},
             "packs": [{"slot": "secrets", "kind": "greentic.secrets.dev-store@1.0.0", "pack_ref": "local"}],
             "secrets": [{"path": "acme/_/tls/foo", "from_env": "FOO"}]
         }));
-        check_applyable_manifest(&env, &m, false).unwrap();
+        check_applyable_manifest(&env, td.path(), &m, false).unwrap();
     }
 
     #[test]
@@ -3278,10 +3300,29 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         // snapshot can't reach it, so secret writes are refused. Passed as a bool
         // because the multithreaded harness cannot set process env vars safely.
         let env = make_env("local");
-        let err = check_applyable_manifest(&env, &secrets_manifest(), true).unwrap_err();
+        let td = tempdir().unwrap();
+        let err = check_applyable_manifest(&env, td.path(), &secrets_manifest(), true).unwrap_err();
         assert!(
             matches!(err, OpError::InvalidArgument(m) if m.contains("GREENTIC_DEV_SECRETS_PATH"))
         );
+    }
+
+    #[test]
+    fn guard_rejects_secret_writes_when_dev_store_file_is_symlinked() {
+        // A pre-existing symlink where the dev-store file resolves escapes the
+        // snapshot's rollback (capture follows it; restore's rename-over replaces
+        // the link, leaving the external target's written secret in place).
+        use std::os::unix::fs::symlink;
+        let env = make_env("local");
+        let td = tempdir().unwrap();
+        let dev = td.path().join(crate::cli::secrets::DEV_STORE_RELATIVE);
+        std::fs::create_dir_all(dev.parent().unwrap()).unwrap();
+        let external = td.path().join("external.env");
+        std::fs::write(&external, b"x").unwrap();
+        symlink(&external, &dev).unwrap();
+        let err =
+            check_applyable_manifest(&env, td.path(), &secrets_manifest(), false).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("symlink")));
     }
 
     #[test]
@@ -3294,11 +3335,12 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             CapabilitySlot::Secrets,
             crate::defaults::VAULT_SECRETS_PACK,
         ));
+        let td = tempdir().unwrap();
         let m = parse_manifest(json!({
             "schema": "greentic.env-manifest.v1",
             "environment": {"id": "local"},
             "bundles": [{"bundle_id": "b1", "bundle_path": "/x.gtbundle", "bundle_digest": "sha256:aa"}]
         }));
-        check_applyable_manifest(&env, &m, false).unwrap();
+        check_applyable_manifest(&env, td.path(), &m, false).unwrap();
     }
 }
