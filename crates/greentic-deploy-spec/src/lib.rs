@@ -17,6 +17,7 @@ pub mod credentials;
 pub mod engine;
 pub mod environment;
 pub mod environment_runtime;
+pub mod environment_update_channel;
 pub mod error;
 pub mod ids;
 pub mod integrity;
@@ -63,6 +64,9 @@ pub use environment::{
     GUI_DEFAULT_ENV_ID, validate_public_base_url,
 };
 pub use environment_runtime::{EnvironmentRuntime, RuntimeDiscoveryValue};
+pub use environment_update_channel::{
+    DEFAULT_POLL_INTERVAL_SECS, MIN_POLL_INTERVAL_SECS, OnNotifyAction, UpdateChannelConfig,
+};
 pub use error::SpecError;
 pub use ids::{
     BundleId, CustomerId, DeploymentId, MessagingEndpointId, PackId, PartyId, RevisionId,
