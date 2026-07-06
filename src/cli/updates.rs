@@ -133,6 +133,11 @@ pub struct UpdateConfigSetPayload {
     /// leaves the stored value unchanged (unset resolves to 3600).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_interval_secs: Option<u64>,
+    /// Base URL to poll for the latest signed update plan (`{url}` + `{url}.sig`).
+    /// `None` leaves the stored value unchanged; must be https (or http to
+    /// loopback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_endpoint: Option<String>,
 }
 
 /// Filter for `op updates config-show` — read-only view of the update-channel
@@ -1129,6 +1134,20 @@ pub fn config_set(
             "poll_interval_secs {secs} is below the {MIN_POLL_INTERVAL_SECS}s floor"
         )));
     }
+    let validated_plan_endpoint = payload
+        .plan_endpoint
+        .as_deref()
+        .filter(|ep| !ep.trim().is_empty())
+        .map(|ep| {
+            if !control_url_is_acceptable(ep) {
+                return Err(OpError::InvalidArgument(format!(
+                    "plan_endpoint {ep:?} is not an acceptable control URL \
+                     (https required; http only to loopback)"
+                )));
+            }
+            Ok(ep.to_string())
+        })
+        .transpose()?;
     if !store.exists(&env_id)? {
         return Err(OpError::NotFound(format!(
             "environment `{env_id}` not found"
@@ -1144,6 +1163,9 @@ pub fn config_set(
     }
     if payload.poll_interval_secs.is_some() {
         fields.push("poll_interval_secs");
+    }
+    if validated_plan_endpoint.is_some() {
+        fields.push("plan_endpoint");
     }
 
     let ctx = AuditCtx {
@@ -1173,6 +1195,9 @@ pub fn config_set(
             }
             if let Some(secs) = payload.poll_interval_secs {
                 cfg.poll_interval_secs = Some(secs);
+            }
+            if let Some(ep) = validated_plan_endpoint.clone() {
+                cfg.plan_endpoint = Some(ep);
             }
             locked.save_update_channel(&cfg)?;
             Ok(cfg)
@@ -1214,10 +1239,12 @@ fn config_view(cfg: &UpdateChannelConfig) -> Value {
         "enabled": cfg.enabled,
         "on_notify": cfg.on_notify.map(|a| a.as_str()),
         "poll_interval_secs": cfg.poll_interval_secs,
+        "plan_endpoint": cfg.plan_endpoint,
         "resolved": {
             "enabled": cfg.resolved_enabled(),
             "on_notify": cfg.resolved_on_notify().as_str(),
             "poll_interval_secs": cfg.resolved_poll_interval_secs(),
+            "plan_endpoint": cfg.resolved_plan_endpoint(),
         }
     })
 }
@@ -1937,7 +1964,8 @@ fn config_set_schema() -> Value {
             "environment_id": {"type": "string"},
             "enabled": {"type": ["boolean", "null"], "description": "master switch for the update-channel notification machinery; null leaves the stored value unchanged (absent = disabled, deny-by-default)"},
             "on_notify": {"type": ["string", "null"], "enum": [null, "record-only", "record_only", "stage"], "description": "action on a verified notification; null leaves the stored value unchanged (unset resolves to `stage`; full self-update is not offered)"},
-            "poll_interval_secs": {"type": ["integer", "null"], "minimum": MIN_POLL_INTERVAL_SECS, "description": "fallback poll interval in seconds; null leaves the stored value unchanged (unset resolves to 3600)"}
+            "poll_interval_secs": {"type": ["integer", "null"], "minimum": MIN_POLL_INTERVAL_SECS, "description": "fallback poll interval in seconds; null leaves the stored value unchanged (unset resolves to 3600)"},
+            "plan_endpoint": {"type": ["string", "null"], "description": "base URL to poll for the latest signed update plan (`{url}` + `{url}.sig`); null leaves the stored value unchanged; must be https (or http to loopback)"}
         }
     })
 }
@@ -2003,6 +2031,7 @@ mod tests {
                 enabled: Some(true),
                 on_notify: Some("record-only".into()),
                 poll_interval_secs: Some(120),
+                plan_endpoint: Some("https://updates.example.com/plans/latest".into()),
             }),
         )
         .unwrap();
@@ -2010,7 +2039,28 @@ mod tests {
         assert_eq!(cfg.enabled, Some(true));
         assert_eq!(cfg.on_notify, Some(OnNotifyAction::RecordOnly));
         assert_eq!(cfg.poll_interval_secs, Some(120));
+        assert_eq!(
+            cfg.plan_endpoint.as_deref(),
+            Some("https://updates.example.com/plans/latest")
+        );
         assert!(cfg.resolved_enabled());
+        // Read back via config-show and verify the resolved view.
+        let out = config_show(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigShowFilter {
+                environment_id: "local".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            out.result["plan_endpoint"].as_str(),
+            Some("https://updates.example.com/plans/latest")
+        );
+        assert_eq!(
+            out.result["resolved"]["plan_endpoint"].as_str(),
+            Some("https://updates.example.com/plans/latest")
+        );
     }
 
     #[test]
@@ -2025,12 +2075,14 @@ mod tests {
             enabled: Some(true),
             on_notify: None,
             poll_interval_secs: None,
+            plan_endpoint: None,
         });
         set(UpdateConfigSetPayload {
             environment_id: "local".into(),
             enabled: None,
             on_notify: Some("record-only".into()),
             poll_interval_secs: None,
+            plan_endpoint: None,
         });
         let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
         assert_eq!(cfg.enabled, Some(true)); // preserved across the second set
@@ -2049,6 +2101,7 @@ mod tests {
                 enabled: None,
                 on_notify: Some("apply".into()),
                 poll_interval_secs: None,
+                plan_endpoint: None,
             }),
         )
         .unwrap_err();
@@ -2069,10 +2122,32 @@ mod tests {
                 enabled: None,
                 on_notify: None,
                 poll_interval_secs: Some(10),
+                plan_endpoint: None,
             }),
         )
         .unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn config_set_rejects_unacceptable_plan_endpoint() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some("http://example.com/plan".into()),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        // Fail-closed: nothing was written.
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
     }
 
     #[test]
@@ -2087,6 +2162,7 @@ mod tests {
                 enabled: Some(true),
                 on_notify: None,
                 poll_interval_secs: None,
+                plan_endpoint: None,
             }),
         )
         .unwrap_err();
@@ -2126,6 +2202,7 @@ mod tests {
                         enabled: Some(true),
                         on_notify: None,
                         poll_interval_secs: None,
+                        plan_endpoint: None,
                     }),
                 )
                 .unwrap();
@@ -2140,6 +2217,7 @@ mod tests {
                         enabled: None,
                         on_notify: Some("record-only".into()),
                         poll_interval_secs: None,
+                        plan_endpoint: None,
                     }),
                 )
                 .unwrap();
@@ -2177,6 +2255,7 @@ mod tests {
                 enabled: Some(true),
                 on_notify: None,
                 poll_interval_secs: None,
+                plan_endpoint: None,
             }),
         )
         .unwrap_err();

@@ -77,6 +77,13 @@ pub struct UpdateChannelConfig {
     /// clamped up to [`MIN_POLL_INTERVAL_SECS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_interval_secs: Option<u64>,
+    /// Base URL the poll loop GETs the latest signed plan from (`{url}` for the
+    /// plan, `{url}.sig` for the DSSE envelope). Absent → the poll loop has no
+    /// source and does nothing even if `enabled` is `true`. This is operator
+    /// policy, carries nothing secret, and is validated as an acceptable control
+    /// URL on set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_endpoint: Option<String>,
 }
 
 impl UpdateChannelConfig {
@@ -93,6 +100,7 @@ impl UpdateChannelConfig {
             enabled: None,
             on_notify: None,
             poll_interval_secs: None,
+            plan_endpoint: None,
         }
     }
 
@@ -112,6 +120,11 @@ impl UpdateChannelConfig {
         self.poll_interval_secs
             .unwrap_or(DEFAULT_POLL_INTERVAL_SECS)
             .max(MIN_POLL_INTERVAL_SECS)
+    }
+
+    /// Resolved plan endpoint (`None` when unset — the poll loop has no source).
+    pub fn resolved_plan_endpoint(&self) -> Option<&str> {
+        self.plan_endpoint.as_deref()
     }
 }
 
@@ -166,7 +179,25 @@ mod tests {
         assert!(json.get("enabled").is_none());
         assert!(json.get("on_notify").is_none());
         assert!(json.get("poll_interval_secs").is_none());
+        assert!(json.get("plan_endpoint").is_none());
         let back: UpdateChannelConfig = serde_json::from_value(json).unwrap();
         assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn plan_endpoint_round_trips() {
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.plan_endpoint = Some("https://updates.example.com/plans/latest".into());
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            json.get("plan_endpoint").and_then(|v| v.as_str()),
+            Some("https://updates.example.com/plans/latest")
+        );
+        let back: UpdateChannelConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.plan_endpoint, cfg.plan_endpoint);
+        assert_eq!(
+            back.resolved_plan_endpoint(),
+            Some("https://updates.example.com/plans/latest")
+        );
     }
 }
