@@ -134,6 +134,13 @@ pub enum OpNoun {
         #[command(subcommand)]
         verb: ExtensionsVerb,
     },
+    /// Per-environment update-channel enrollment (`P1b`). `enroll` mints a
+    /// client certificate at the Cert-CA and persists it to the env secrets
+    /// backend; `status` reports the stored certificate's serial + validity.
+    Updates {
+        #[command(subcommand)]
+        verb: UpdatesVerb,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -656,6 +663,91 @@ pub enum ExtensionsVerb {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum UpdatesVerb {
+    /// Enroll the env's update channel: mint a key + CSR, exchange it at the
+    /// Cert-CA for a signed client certificate, and persist cert/key/CA into the
+    /// env secrets backend. Re-running re-enrolls (manual rotation).
+    Enroll(UpdatesEnrollArgs),
+    /// Report the enrolled update-channel certificate's serial + validity window.
+    Status { env_id: Option<String> },
+    /// Fetch a signed update plan (over the enrolled mTLS channel or from a
+    /// local file), verify it against the env trust root, and stage it.
+    Get(UpdatesGetArgs),
+    /// Apply a staged update plan to its environment: re-verify, snapshot,
+    /// converge via the env-apply pipeline, and roll back on failure.
+    Apply(UpdatesApplyArgs),
+    /// Force-fail a plan stranded in `applying` by a crashed applier
+    /// (`applying → failed`, audited), so a fresh `get` + `apply` can proceed.
+    /// Requires `--force`; does not roll back partial changes.
+    Recover(UpdatesRecoverArgs),
+    /// Set the update-channel notification policy (`update-channel.json`):
+    /// whether the runtime acts on a discovered update, and the fallback poll
+    /// interval. Only the flags supplied are changed. Disabled by default.
+    ConfigSet(UpdatesConfigSetArgs),
+    /// Show the update-channel notification policy (stored fields + resolved
+    /// effective values). Read-only.
+    ConfigShow { env_id: Option<String> },
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesEnrollArgs {
+    pub env_id: Option<String>,
+    #[arg(long = "ca-url")]
+    pub ca_url: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesApplyArgs {
+    pub env_id: Option<String>,
+    /// Plan id of the staged plan to apply (from a prior `op updates get`).
+    #[arg(long = "plan-id")]
+    pub plan_id: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesRecoverArgs {
+    pub env_id: Option<String>,
+    /// Plan id of the `applying` plan to force-fail (from a prior `op updates get`).
+    #[arg(long = "plan-id")]
+    pub plan_id: Option<String>,
+    /// Assert the applier is dead and force-fail `applying → failed`. Required —
+    /// recover refuses without it (a live apply is indistinguishable on disk).
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesConfigSetArgs {
+    pub env_id: Option<String>,
+    /// Master switch for the update-channel notification machinery. Omit to
+    /// leave unchanged (absent = disabled, deny-by-default).
+    #[arg(long)]
+    pub enabled: Option<bool>,
+    /// Action on a verified notification: `record-only` or `stage`. Omit to
+    /// leave unchanged (unset resolves to `stage`).
+    #[arg(long = "on-notify")]
+    pub on_notify: Option<String>,
+    /// Fallback poll interval in seconds (>= 60). Omit to leave unchanged.
+    #[arg(long = "poll-interval-secs")]
+    pub poll_interval_secs: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesGetArgs {
+    pub env_id: Option<String>,
+    /// Fetch the signed plan (document + `.sig` sidecar) from this base URL over
+    /// the enrolled mTLS channel.
+    #[arg(long = "plan-url", conflicts_with_all = ["plan_file", "plan_sig_file"])]
+    pub plan_url: Option<String>,
+    /// Local plan document (airgap import / testing). Requires `--plan-sig-file`.
+    #[arg(long = "plan-file", requires = "plan_sig_file")]
+    pub plan_file: Option<PathBuf>,
+    /// DSSE envelope sidecar for `--plan-file`.
+    #[arg(long = "plan-sig-file", requires = "plan_file")]
+    pub plan_sig_file: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
 pub enum BundlesVerb {
     Add,
     Update,
@@ -927,6 +1019,7 @@ pub fn dispatch_op_with_registry(
         OpNoun::TrustRoot { verb } => dispatch_trust_root(&store, &flags, verb),
         OpNoun::Messaging { verb } => dispatch_messaging(&store, &flags, verb),
         OpNoun::Extensions { verb } => dispatch_extensions(&store, &flags, verb),
+        OpNoun::Updates { verb } => dispatch_updates(&store, &flags, verb),
     };
     result.inspect_err(|err| print_error(noun, verb, err))
 }
@@ -1051,6 +1144,18 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 ExtensionsVerb::Remove => "remove",
                 ExtensionsVerb::Rollback => "rollback",
                 ExtensionsVerb::List { .. } => "list",
+            },
+        ),
+        OpNoun::Updates { verb } => (
+            "updates",
+            match verb {
+                UpdatesVerb::Enroll(_) => "enroll",
+                UpdatesVerb::Status { .. } => "status",
+                UpdatesVerb::Get(_) => "get",
+                UpdatesVerb::Apply(_) => "apply",
+                UpdatesVerb::Recover(_) => "recover",
+                UpdatesVerb::ConfigSet(_) => "config-set",
+                UpdatesVerb::ConfigShow { .. } => "config-show",
             },
         ),
     }
@@ -1294,6 +1399,88 @@ fn dispatch_trust_root(
                 _ => None,
             };
             super::trust_root::remove(store, flags, payload)?
+        }
+    };
+    print_outcome(&outcome)
+}
+
+fn dispatch_updates(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    verb: UpdatesVerb,
+) -> Result<(), OpError> {
+    let outcome = match verb {
+        UpdatesVerb::Enroll(args) => {
+            let payload = match (args.env_id, args.ca_url) {
+                (Some(environment_id), Some(ca_url)) => {
+                    Some(super::updates::UpdatesEnrollPayload {
+                        environment_id,
+                        ca_url,
+                    })
+                }
+                _ => None, // fall through to --answers / --schema
+            };
+            super::updates::enroll(store, flags, payload)?
+        }
+        UpdatesVerb::Status { env_id } => {
+            let payload = env_id
+                .map(|environment_id| super::updates::UpdatesStatusPayload { environment_id });
+            super::updates::status(store, flags, payload)?
+        }
+        UpdatesVerb::Get(args) => {
+            let payload = args
+                .env_id
+                .map(|environment_id| super::updates::UpdatesGetPayload {
+                    environment_id,
+                    plan_url: args.plan_url,
+                    plan_file: args.plan_file,
+                    plan_sig_file: args.plan_sig_file,
+                });
+            super::updates::get(store, flags, payload)?
+        }
+        UpdatesVerb::Apply(args) => {
+            let payload = match (args.env_id, args.plan_id) {
+                (Some(environment_id), Some(plan_id)) => {
+                    Some(super::updates::ApplyUpdatesPayload {
+                        environment_id,
+                        plan_id,
+                    })
+                }
+                _ => None, // fall through to --answers / --schema
+            };
+            super::updates::apply_updates(store, flags, payload)?
+        }
+        UpdatesVerb::Recover(args) => {
+            // `--force` is operator attestation, not a payload field: thread it
+            // separately so it applies whether the ids come from the CLI or from
+            // `--answers` (it is never silently dropped on the answers path).
+            let force = args.force;
+            let payload = match (args.env_id, args.plan_id) {
+                (Some(environment_id), Some(plan_id)) => {
+                    Some(super::updates::RecoverUpdatesPayload {
+                        environment_id,
+                        plan_id,
+                    })
+                }
+                _ => None, // fall through to --answers / --schema
+            };
+            super::updates::recover_updates(store, flags, payload, force)?
+        }
+        UpdatesVerb::ConfigSet(args) => {
+            let payload =
+                args.env_id
+                    .map(|environment_id| super::updates::UpdateConfigSetPayload {
+                        environment_id,
+                        enabled: args.enabled,
+                        on_notify: args.on_notify,
+                        poll_interval_secs: args.poll_interval_secs,
+                    });
+            super::updates::config_set(store, flags, payload)?
+        }
+        UpdatesVerb::ConfigShow { env_id } => {
+            let payload = env_id
+                .map(|environment_id| super::updates::UpdateConfigShowFilter { environment_id });
+            super::updates::config_show(store, flags, payload)?
         }
     };
     print_outcome(&outcome)
