@@ -1137,8 +1137,18 @@ pub fn config_set(
     let validated_plan_endpoint = payload
         .plan_endpoint
         .as_deref()
-        .filter(|ep| !ep.trim().is_empty())
-        .map(|ep| {
+        .map(|raw| {
+            let ep = raw.trim();
+            if ep.is_empty() {
+                // Reject fail-closed rather than silently no-op: an operator who
+                // passes a blank value is trying to change something. To stop
+                // polling, disable the channel; to repoint, pass a new URL.
+                return Err(OpError::InvalidArgument(
+                    "plan_endpoint must not be blank (to stop polling, disable \
+                     the channel; to repoint, pass a new URL)"
+                        .to_string(),
+                ));
+            }
             if !control_url_is_acceptable(ep) {
                 return Err(OpError::InvalidArgument(format!(
                     "plan_endpoint {ep:?} is not an acceptable control URL \
@@ -2147,6 +2157,52 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
         // Fail-closed: nothing was written.
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_set_rejects_blank_plan_endpoint() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+
+        // Whitespace-only is rejected.
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some("   ".into()),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        let msg = format!("{err}");
+        assert!(msg.contains("blank"), "error should mention 'blank': {msg}");
+        // Fail-closed: nothing was written.
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+
+        // Empty string is rejected the same way.
+        let err2 = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some("".into()),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err2, OpError::InvalidArgument(_)), "got {err2:?}");
+        let msg2 = format!("{err2}");
+        assert!(
+            msg2.contains("blank"),
+            "error should mention 'blank': {msg2}"
+        );
         assert!(store.load_update_channel(&env_id).unwrap().is_none());
     }
 
