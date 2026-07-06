@@ -730,6 +730,10 @@ pub struct UpdatesConfigSetArgs {
     /// Fallback poll interval in seconds (>= 60). Omit to leave unchanged.
     #[arg(long = "poll-interval-secs")]
     pub poll_interval_secs: Option<u64>,
+    /// Base URL to poll for the latest signed update plan (`{url}` + `{url}.sig`).
+    /// Must be https (or http to loopback). Omit to leave unchanged.
+    #[arg(long = "plan-endpoint")]
+    pub plan_endpoint: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1474,6 +1478,7 @@ fn dispatch_updates(
                         enabled: args.enabled,
                         on_notify: args.on_notify,
                         poll_interval_secs: args.poll_interval_secs,
+                        plan_endpoint: args.plan_endpoint,
                     });
             super::updates::config_set(store, flags, payload)?
         }
