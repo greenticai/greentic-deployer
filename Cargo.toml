@@ -10,7 +10,7 @@ resolver = "2"
 
 [package]
 name = "greentic-deployer"
-version = "1.1.4"
+version = "1.1.5"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic deployer runtime for plan construction and deployment-pack dispatch"
@@ -82,7 +82,7 @@ fs4 = "0.13"
 greentic-bundle = ">=1.1.0-0, <1.2.0-0"
 greentic-config = ">=1.1.0-0, <1.2.0-0"
 greentic-config-types = ">=1.1.0-0, <1.2.0-0"
-greentic-deploy-spec = { path = "crates/greentic-deploy-spec", version = "0.1" }
+greentic-deploy-spec = { path = "crates/greentic-deploy-spec", version = "0.2" }
 greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.1" }
 serde_json = "1"
 semver = "1"
