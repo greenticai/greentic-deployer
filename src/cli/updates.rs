@@ -38,12 +38,29 @@ const NOUN: &str = "updates";
 
 /// Secrets pack (category) the update-channel TLS material lives under.
 const TLS_PACK: &str = "tls";
-/// Store-canonical secret names (single underscore — the runtime reader
-/// collapses `__` to `_`, so a double-underscore name would never be found).
-const CERT_NAME: &str = "updater_cert";
-const KEY_NAME: &str = "updater_key";
-const CA_NAME: &str = "updater_ca";
-const CA_URL_NAME: &str = "updater_ca_url";
+/// Store-canonical secret name for the enrolled mTLS identity (single underscore
+/// — the runtime reader collapses `__` to `_`, so a double-underscore name would
+/// never be found). The whole identity is persisted under this ONE name as a
+/// JSON [`StoredIdentity`] blob rather than as four separate
+/// `updater_cert`/`updater_key`/`updater_ca`/`updater_ca_url` secrets: a single
+/// write is atomic at the granularity the dev-store / Vault backends offer, so a
+/// re-enrollment (rotation) can never leave a fresh private key paired with the
+/// PREVIOUS certificate — a mismatch `status` would still report as enrolled
+/// while every mTLS handshake fails.
+const IDENTITY_NAME: &str = "updater_identity";
+
+/// The enrolled update-channel mTLS identity, persisted as one JSON secret under
+/// [`IDENTITY_NAME`]. Written atomically by `enroll`; read by `status` and the
+/// plan fetch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredIdentity {
+    client_key_pem: String,
+    client_cert_pem: String,
+    ca_pem: String,
+    /// The Cert-CA base URL enrollment used. Retained for audit and the Phase 6
+    /// poll; not read on the fetch path today.
+    ca_url: String,
+}
 
 /// Payload for `op updates enroll`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,8 +280,8 @@ pub fn enroll(
 }
 
 /// Write the enrolled material into the env secrets backend. Returns the list of
-/// `{name, store_uri}` written, for the outcome. Partial failure is recoverable
-/// by re-running `enroll` (each write overwrites).
+/// `{name, store_uri}` written, for the outcome. Recoverable by re-running
+/// `enroll` (the single write overwrites).
 fn persist_enrollment(
     store: &LocalFsStore,
     env: &Environment,
@@ -274,24 +291,46 @@ fn persist_enrollment(
     ca_url: &str,
     enrollment: &greentic_update::enroll::Enrollment,
 ) -> Result<Vec<Value>, OpError> {
-    // The certificate is written LAST as a commit marker: `status` (and the
-    // Phase 2 consumer) key on `updater_cert`, so a failure part-way through
-    // leaves the env reporting not-enrolled rather than half-enrolled. Re-running
-    // `enroll` overwrites the whole set. The dev-store/Vault backends have no
-    // cross-key transaction, so this ordering is the atomicity we can offer.
-    let items = [
-        (KEY_NAME, enrollment.client_key_pem.as_str()),
-        (CA_NAME, enrollment.ca_pem.as_str()),
-        (CA_URL_NAME, ca_url),
-        (CERT_NAME, enrollment.client_cert_pem.as_str()),
-    ];
-    let mut stored = Vec::with_capacity(items.len());
-    for (name, value) in items {
-        let rel_path = tls_rel_path(tenant, name);
-        let (store_uri, _extra) = put_env_secret(store, env, env_id, kind_path, &rel_path, value)?;
-        stored.push(json!({"name": name, "store_uri": store_uri}));
+    // The whole identity is written as ONE secret, so key and certificate always
+    // flip together: there is no inter-key window in which a re-enrollment could
+    // leave the new private key paired with the previous certificate. A single
+    // put is as atomic as the dev-store / Vault backends allow; on failure the
+    // prior identity is left intact and `enroll` can simply be re-run.
+    let identity = StoredIdentity {
+        client_key_pem: enrollment.client_key_pem.clone(),
+        client_cert_pem: enrollment.client_cert_pem.clone(),
+        ca_pem: enrollment.ca_pem.clone(),
+        ca_url: ca_url.to_string(),
+    };
+    let value = serde_json::to_string(&identity)
+        .map_err(|e| OpError::Conflict(format!("serialize update-channel identity: {e}")))?;
+    let rel_path = tls_rel_path(tenant, IDENTITY_NAME);
+    let (store_uri, _extra) = put_env_secret(store, env, env_id, kind_path, &rel_path, &value)?;
+    Ok(vec![json!({"name": IDENTITY_NAME, "store_uri": store_uri})])
+}
+
+/// Read the enrolled mTLS identity for `env_id`. `Ok(None)` when the env holds no
+/// enrollment (deny-by-default: an absent secret is "not enrolled", not an
+/// error). A present-but-unparseable blob is a hard error — the store never
+/// silently degrades a corrupt identity into "not enrolled".
+fn load_identity(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    kind_path: &str,
+    tenant: &str,
+) -> Result<Option<StoredIdentity>, OpError> {
+    let rel = tls_rel_path(tenant, IDENTITY_NAME);
+    let (value, _uri, _extra) = get_env_secret(store, env, env_id, kind_path, &rel)?;
+    match value {
+        None => Ok(None),
+        Some(raw) => {
+            let identity = serde_json::from_str::<StoredIdentity>(&raw).map_err(|e| {
+                OpError::Conflict(format!("stored update-channel identity is corrupt: {e}"))
+            })?;
+            Ok(Some(identity))
+        }
     }
-    Ok(stored)
 }
 
 /// `op updates status` — report whether the env holds an enrolled update-channel
@@ -312,19 +351,17 @@ pub fn status(
     let kind_path = secrets.kind.path();
     let tenant = require_tenant(&env, &env_id)?;
 
-    let cert_rel = tls_rel_path(&tenant, CERT_NAME);
-    let (cert_pem, _store_uri, _extra) =
-        get_env_secret(store, &env, &env_id, kind_path, &cert_rel)?;
+    let identity = load_identity(store, &env, &env_id, kind_path, &tenant)?;
 
-    let body = match cert_pem {
+    let body = match identity {
         None => json!({
             "environment_id": env_id.as_str(),
             "tenant": tenant,
             "secrets_kind": secrets.kind.to_string(),
             "enrolled": false,
         }),
-        Some(pem) => {
-            let info = greentic_update::tls::parse_cert_info(&pem).map_err(|e| {
+        Some(id) => {
+            let info = greentic_update::tls::parse_cert_info(&id.client_cert_pem).map_err(|e| {
                 OpError::Conflict(format!(
                     "stored update-channel certificate is unparseable: {e}"
                 ))
@@ -1554,9 +1591,13 @@ impl ArtifactFetcher for DistArtifactFetcher {
                 .map_err(|e| {
                     OpError::Fetch(format!("resolve artifact `{}`: {e}", artifact.name))
                 })?;
-            // Bound the download by the resolver's declared size *before* fetching
-            // the body (best-effort — `size_bytes` may be 0 if unknown).
-            reject_oversize(artifact, descriptor.size_bytes)?;
+            // Require a KNOWN, in-bounds size *before* fetching the body. The
+            // resolver reports `size_bytes == 0` when the source declared no size
+            // (e.g. a direct-HTTPS response with no `Content-Length`); fetching
+            // such a source streams an unbounded body to disk before the
+            // post-fetch length cap below can trip. Refuse it fail-closed rather
+            // than download something we cannot bound up front.
+            reject_unsized_or_oversize(artifact, descriptor.size_bytes)?;
             let resolved = self
                 .client
                 .fetch(&descriptor, CachePolicy)
@@ -1602,6 +1643,25 @@ fn reject_oversize(
         )));
     }
     Ok(())
+}
+
+/// Pre-fetch size gate: the resolver-declared `size` must be both KNOWN
+/// (non-zero) and within [`MAX_ARTIFACT_BYTES`]. A `size` of 0 means the source
+/// declared no size, so the download could not be bounded before streaming it to
+/// disk — refuse it fail-closed. (An empty artifact is degenerate anyway; a real
+/// one would fail its digest gate.)
+fn reject_unsized_or_oversize(
+    artifact: &greentic_update::plan::PlanArtifact,
+    size: u64,
+) -> Result<(), OpError> {
+    if size == 0 {
+        return Err(OpError::Fetch(format!(
+            "artifact `{}` has no declared size (the source sent no Content-Length); \
+             refusing to fetch an unbounded body",
+            artifact.name
+        )));
+    }
+    reject_oversize(artifact, size)
 }
 
 /// Fetch one artifact, retrying transient failures with exponential backoff.
@@ -1726,19 +1786,17 @@ fn fetch_plan_over_mtls(
     let kind_path = secrets.kind.path();
     let tenant = require_tenant(env, env_id)?;
 
-    let read_enrolled = |name: &str| -> Result<String, OpError> {
-        let rel = tls_rel_path(&tenant, name);
-        let (value, _uri, _extra) = get_env_secret(store, env, env_id, kind_path, &rel)?;
-        value.ok_or_else(|| {
-            OpError::NotFound(format!(
-                "env `{env_id}` is not enrolled for updates (missing `{name}`); \
-                 run `op updates enroll` first"
-            ))
-        })
-    };
-    let cert_pem = read_enrolled(CERT_NAME)?;
-    let key_pem = read_enrolled(KEY_NAME)?;
-    let ca_pem = read_enrolled(CA_NAME)?;
+    let identity = load_identity(store, env, env_id, kind_path, &tenant)?.ok_or_else(|| {
+        OpError::NotFound(format!(
+            "env `{env_id}` is not enrolled for updates; run `op updates enroll` first"
+        ))
+    })?;
+    let StoredIdentity {
+        client_key_pem: key_pem,
+        client_cert_pem: cert_pem,
+        ca_pem,
+        ..
+    } = identity;
 
     // Build the `.sig` sidecar URL by mutating the path (not appending to the
     // raw string), so a query/fragment on `plan_url` doesn't corrupt it.
@@ -1900,7 +1958,7 @@ fn config_show_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::secrets::{DEV_STORE_KIND_PATH, get_env_secret, put_env_secret};
+    use crate::cli::secrets::{DEV_STORE_KIND_PATH, put_env_secret};
     use crate::cli::tests_common::{make_binding, make_env};
     use greentic_deploy_spec::CapabilitySlot;
     use tempfile::tempdir;
@@ -2424,14 +2482,20 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         let env = dev_store_env_with_tenant();
         store.save(&env).unwrap();
         let env_id = EnvId::try_from("local").unwrap();
-        // Seed the cert exactly where `enroll` would persist it.
+        // Seed the identity blob exactly where `enroll` would persist it.
+        let identity = StoredIdentity {
+            client_key_pem: "-----BEGIN PRIVATE KEY-----\nK\n-----END PRIVATE KEY-----\n".into(),
+            client_cert_pem: TEST_CERT_PEM.to_string(),
+            ca_pem: "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n".into(),
+            ca_url: "https://ca.example".into(),
+        };
         put_env_secret(
             &store,
             &env,
             &env_id,
             DEV_STORE_KIND_PATH,
-            "acme/_/tls/updater_cert",
-            TEST_CERT_PEM,
+            "acme/_/tls/updater_identity",
+            &serde_json::to_string(&identity).unwrap(),
         )
         .unwrap();
         let out = status(
@@ -2474,10 +2538,10 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
     }
 
     #[test]
-    fn persist_enrollment_writes_all_four_secrets_then_status_reads_them() {
+    fn persist_enrollment_writes_one_identity_secret_then_status_reads_it() {
         // Exercises the durable side-effect of `enroll` without a CA: build a
-        // synthetic Enrollment, persist it, read all four secrets back through
-        // the same dispatch a reader uses, and confirm `status` finds the cert.
+        // synthetic Enrollment, persist it as the single identity secret, read it
+        // back through the reader's dispatch, and confirm `status` finds the cert.
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let env = dev_store_env_with_tenant();
@@ -2506,33 +2570,22 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         )
         .unwrap();
 
-        // All four artifacts written; the certificate is written LAST (commit marker).
+        // Exactly ONE secret is written — the whole identity as an atomic blob.
         let names: Vec<&str> = stored.iter().map(|e| e["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec![KEY_NAME, CA_NAME, CA_URL_NAME, CERT_NAME]);
+        assert_eq!(names, vec![IDENTITY_NAME]);
         assert_eq!(
-            stored[3]["store_uri"].as_str().unwrap(),
-            "secrets://local/acme/_/tls/updater_cert"
+            stored[0]["store_uri"].as_str().unwrap(),
+            "secrets://local/acme/_/tls/updater_identity"
         );
 
-        // Read each back through get_env_secret (the reader's dispatch).
-        let read = |name: &str| {
-            get_env_secret(
-                &store,
-                &env,
-                &env_id,
-                DEV_STORE_KIND_PATH,
-                &tls_rel_path("acme", name),
-            )
+        // The blob round-trips every field through the reader's dispatch.
+        let identity = load_identity(&store, &env, &env_id, DEV_STORE_KIND_PATH, "acme")
             .unwrap()
-            .0
-        };
-        assert_eq!(
-            read(KEY_NAME).as_deref(),
-            Some(enrollment.client_key_pem.as_str())
-        );
-        assert_eq!(read(CERT_NAME).as_deref(), Some(TEST_CERT_PEM));
-        assert_eq!(read(CA_NAME).as_deref(), Some(enrollment.ca_pem.as_str()));
-        assert_eq!(read(CA_URL_NAME).as_deref(), Some(ca_url));
+            .expect("identity present after enroll");
+        assert_eq!(identity.client_key_pem, enrollment.client_key_pem);
+        assert_eq!(identity.client_cert_pem, TEST_CERT_PEM);
+        assert_eq!(identity.ca_pem, enrollment.ca_pem);
+        assert_eq!(identity.ca_url, ca_url);
 
         // Full producer -> consumer round-trip: `status` finds the persisted cert.
         let out = status(
@@ -2546,6 +2599,74 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert_eq!(out.result["enrolled"], true);
         let info = greentic_update::tls::parse_cert_info(TEST_CERT_PEM).unwrap();
         assert_eq!(out.result["serial"].as_str().unwrap(), info.serial_hex);
+    }
+
+    #[test]
+    fn re_enrollment_rotates_the_whole_identity_atomically() {
+        // Regression for the rotation-corruption hazard: a re-enrollment must
+        // never leave the new private key paired with the previous certificate.
+        // With the single-secret layout the stored blob is always wholly the last
+        // enrollment's material — key, ca and ca_url all flip together, so there
+        // is no window in which a reader sees a mismatched pair.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = dev_store_env_with_tenant();
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+
+        let enroll_with = |key: &str, ca: &str, ca_url: &str| {
+            persist_enrollment(
+                &store,
+                &env,
+                &env_id,
+                DEV_STORE_KIND_PATH,
+                "acme",
+                ca_url,
+                &greentic_update::enroll::Enrollment {
+                    client_key_pem: key.to_string(),
+                    client_cert_pem: TEST_CERT_PEM.to_string(),
+                    ca_pem: ca.to_string(),
+                    serial: "s".to_string(),
+                    not_after: "2036-06-29T08:29:35Z".to_string(),
+                },
+            )
+            .unwrap();
+        };
+
+        enroll_with("KEY-A", "CA-A", "https://a.example");
+        enroll_with("KEY-B", "CA-B", "https://b.example");
+
+        let identity = load_identity(&store, &env, &env_id, DEV_STORE_KIND_PATH, "acme")
+            .unwrap()
+            .expect("identity present after rotation");
+        // Every field is the SECOND enrollment's — no field is left at "A".
+        assert_eq!(identity.client_key_pem, "KEY-B");
+        assert_eq!(identity.ca_pem, "CA-B");
+        assert_eq!(identity.ca_url, "https://b.example");
+    }
+
+    #[test]
+    fn load_identity_rejects_a_corrupt_blob() {
+        // A present-but-unparseable identity is a hard error, never silently
+        // downgraded to "not enrolled" (which would mask a real problem).
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = dev_store_env_with_tenant();
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+
+        put_env_secret(
+            &store,
+            &env,
+            &env_id,
+            DEV_STORE_KIND_PATH,
+            &tls_rel_path("acme", IDENTITY_NAME),
+            "not json",
+        )
+        .unwrap();
+
+        let err = load_identity(&store, &env, &env_id, DEV_STORE_KIND_PATH, "acme").unwrap_err();
+        assert!(matches!(err, OpError::Conflict(m) if m.contains("corrupt")));
     }
 
     // ---- `get` ----
@@ -3115,6 +3236,28 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert!(reject_oversize(&artifact, MAX_ARTIFACT_BYTES).is_ok());
         assert!(matches!(
             reject_oversize(&artifact, MAX_ARTIFACT_BYTES + 1),
+            Err(OpError::Fetch(_))
+        ));
+    }
+
+    #[test]
+    fn reject_unsized_or_oversize_requires_a_known_size() {
+        let artifact: greentic_update::plan::PlanArtifact = serde_json::from_value(
+            json!({"name": "a", "version": "1.0.0", "digest": digest_of(b"x")}),
+        )
+        .unwrap();
+        // A known, in-bounds size passes the pre-fetch gate.
+        assert!(reject_unsized_or_oversize(&artifact, 1).is_ok());
+        assert!(reject_unsized_or_oversize(&artifact, MAX_ARTIFACT_BYTES).is_ok());
+        // Unknown size (0) is refused *before* any fetch — the body cannot be
+        // bounded up front, so we never stream it to disk.
+        assert!(matches!(
+            reject_unsized_or_oversize(&artifact, 0),
+            Err(OpError::Fetch(m)) if m.contains("no declared size")
+        ));
+        // Over the cap is still refused.
+        assert!(matches!(
+            reject_unsized_or_oversize(&artifact, MAX_ARTIFACT_BYTES + 1),
             Err(OpError::Fetch(_))
         ));
     }
