@@ -1206,7 +1206,7 @@ pub fn config_set(
             if let Some(secs) = payload.poll_interval_secs {
                 cfg.poll_interval_secs = Some(secs);
             }
-            if let Some(ep) = validated_plan_endpoint.clone() {
+            if let Some(ep) = validated_plan_endpoint {
                 cfg.plan_endpoint = Some(ep);
             }
             locked.save_update_channel(&cfg)?;
