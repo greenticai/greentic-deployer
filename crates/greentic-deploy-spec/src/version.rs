@@ -31,6 +31,7 @@ impl SchemaVersion {
     pub const BACKUP_MANIFEST_V1: &'static str = "greentic.backup-manifest.v1";
     pub const BACKUP_ARTIFACT_V1: &'static str = "greentic.backup-artifact.v1";
     pub const MESSAGING_ENDPOINT_V1: &'static str = "greentic.messaging-endpoint.v1";
+    pub const UPDATE_CHANNEL_V1: &'static str = "greentic.update-channel.v1";
 
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
