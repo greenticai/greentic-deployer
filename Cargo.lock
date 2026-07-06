@@ -2545,7 +2545,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "1.1.5"
+version = "1.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2714,7 +2714,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-operator-trust"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "ed25519-dalek",
