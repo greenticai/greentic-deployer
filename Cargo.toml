@@ -10,7 +10,7 @@ resolver = "2"
 
 [package]
 name = "greentic-deployer"
-version = "1.1.5"
+version = "1.1.6"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic deployer runtime for plan construction and deployment-pack dispatch"
@@ -83,7 +83,7 @@ greentic-bundle = ">=1.1.0-0, <1.2.0-0"
 greentic-config = ">=1.1.0-0, <1.2.0-0"
 greentic-config-types = ">=1.1.0-0, <1.2.0-0"
 greentic-deploy-spec = { path = "crates/greentic-deploy-spec", version = "0.2" }
-greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.1" }
+greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.2" }
 serde_json = "1"
 semver = "1"
 thiserror = "2"
@@ -292,7 +292,7 @@ tower-test = "0.4"
 http = "1"
 http-body-util = "0.1"
 # Re-declared to turn on `test_support` (shared keypair fixtures) for tests.
-greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.1", features = ["test-utils"] }
+greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.2", features = ["test-utils"] }
 # Path-only (no version) on purpose: the server crate is `publish = false`,
 # and cargo strips versionless path dev-deps at publish time. Used by the
 # `store_server_e2e` test to drive the real `HttpEnvironmentStore` client
