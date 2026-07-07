@@ -730,6 +730,20 @@ fn apply_updates_impl(
         }
     };
 
+    // `op updates apply` converges CONTENT (artifacts + target bundles) only. A
+    // plan may also carry binary artifacts, which are installed by the
+    // greentic-start update receiver, not by this verb — warn so an "applied"
+    // result is never read as "binary installed", and a binary-only plan-build
+    // output is not silently applied as a no-op success.
+    if !verified.plan.binaries.is_empty() {
+        tracing::warn!(
+            env_id = %env_id,
+            binary_count = verified.plan.binaries.len(),
+            "update plan carries binary artifact(s) that `op updates apply` does not \
+             install; binary self-update is applied by the greentic-start update receiver"
+        );
+    }
+
     // The downgrade + compat re-gate moves INTO the `begin_apply_checked`
     // predicate below, so it runs atomically with the `staged → applying`
     // transition against a lock-held applied-set snapshot (closing the TOCTOU
@@ -843,19 +857,28 @@ fn apply_updates_impl(
                 })?;
                 // Best-effort retention of terminal plans (never evicts active).
                 let _ = root.apply_retention(&RetentionPolicy { keep_terminal: 5 });
-                let outcome = OpOutcome::new(
-                    NOUN,
-                    "apply",
-                    json!({
-                        "environment_id": env_id.as_str(),
-                        "plan_id": verified.plan.plan_id,
-                        "sequence": verified.plan.sequence,
-                        "plan_sha256": verified.plan_sha256,
-                        "snapshot_id": snap_id.to_string(),
-                        "stage": UpdateStage::Applied.as_str(),
-                        "apply_result": apply_outcome.result,
-                    }),
-                );
+                let mut body = json!({
+                    "environment_id": env_id.as_str(),
+                    "plan_id": verified.plan.plan_id,
+                    "sequence": verified.plan.sequence,
+                    "plan_sha256": verified.plan_sha256,
+                    "snapshot_id": snap_id.to_string(),
+                    "stage": UpdateStage::Applied.as_str(),
+                    "apply_result": apply_outcome.result,
+                });
+                // Surface any binary artifacts this content apply did NOT install,
+                // so the "applied" result is never misread as a completed binary
+                // self-update (those are applied by the greentic-start receiver).
+                if !verified.plan.binaries.is_empty() {
+                    let not_applied: Vec<Value> = verified
+                        .plan
+                        .binaries
+                        .iter()
+                        .map(|b| json!({"name": b.name, "version": b.version, "target": b.target}))
+                        .collect();
+                    body["binaries_not_applied"] = Value::Array(not_applied);
+                }
+                let outcome = OpOutcome::new(NOUN, "apply", body);
                 Ok((outcome, super::AuditGens::NONE))
             }
             Err(apply_err) => {
@@ -3672,6 +3695,77 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             audit.contains("plan-1"),
             "audit must record the apply: {audit}"
         );
+    }
+
+    #[test]
+    fn apply_annotates_binaries_it_does_not_install() {
+        use greentic_update::staging::{UpdateStage, UpdatesRoot};
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+
+        // A binary-carrying `plan-build`-style output: no content artifacts, a
+        // valid minimal target, one binary. `op updates apply` converges the
+        // (empty) content but MUST surface that it did not install the binary,
+        // so the "applied" result is never misread as a completed self-update.
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        let plan: greentic_update::plan::UpdatePlan = serde_json::from_value(json!({
+            "schema": "greentic.update-plan.v1",
+            "plan_id": "plan-bin",
+            "env_id": "local",
+            "sequence": 1,
+            "created_at": "2026-07-02T00:00:00Z",
+            "nonce": "nonce-plan-bin",
+            "target": {"schema": "greentic.env-manifest.v1", "environment": {"id": "local"}},
+            "artifacts": [],
+            "binaries": [{
+                "name": "greentic-start",
+                "version": "1.1.9",
+                "target": "x86_64-unknown-linux-gnu",
+                "digest": "sha256:abc123",
+                "source": "https://example.test/greentic-start.tgz"
+            }],
+            "compat": {},
+            "rollback": {"policy": "auto", "health_timeout_s": 120, "on_fail": "restore"},
+        }))
+        .unwrap();
+        let built =
+            greentic_update::plan::build_update_plan(&plan, &priv7, &tk7.key_id, &build_trust)
+                .unwrap();
+        let verified = verify_with(&built.plan_bytes, &built.envelope_bytes, &tk7);
+        let root = UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        let staged = root
+            .begin(&verified, &built.plan_bytes, &built.envelope_bytes)
+            .unwrap();
+        advance_to_staged(&staged).unwrap();
+
+        let out = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-bin".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap();
+
+        // Content still converges + marks applied ...
+        assert_eq!(out.result["stage"], "applied");
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-bin"),
+            UpdateStage::Applied
+        );
+        // ... but the uninstalled binary is surfaced.
+        let bins = out.result["binaries_not_applied"]
+            .as_array()
+            .expect("binaries_not_applied must be present when the plan carries binaries");
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0]["name"], "greentic-start");
+        assert_eq!(bins[0]["version"], "1.1.9");
+        assert_eq!(bins[0]["target"], "x86_64-unknown-linux-gnu");
     }
 
     #[test]
