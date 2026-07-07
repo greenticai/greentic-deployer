@@ -113,3 +113,118 @@ fn check_secret_ref_env(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn env_id() -> EnvId {
+        EnvId::from_str("local").unwrap()
+    }
+
+    fn valid_credentials() -> Credentials {
+        Credentials {
+            schema: SchemaVersion::new(SchemaVersion::CREDENTIALS_V1),
+            env_id: env_id(),
+            deployer_kind: PackDescriptor::try_new("greentic.deployer.local-process@1.0.0")
+                .unwrap(),
+            mode: CredentialsMode::Requirements,
+            provided_credentials_ref: SecretRef::try_new("secret://local/credentials/local")
+                .unwrap(),
+            validation: CredentialsValidation {
+                last_run_at: chrono::Utc::now(),
+                result: CredentialsValidationResult::Pass,
+                missing_capabilities: vec![],
+            },
+            bootstrap: None,
+            expiry: None,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_correct_schema_and_env() {
+        let creds = valid_credentials();
+        assert!(creds.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_wrong_schema() {
+        let mut creds = valid_credentials();
+        creds.schema = SchemaVersion::new("greentic.wrong.v1");
+        let err = creds.validate().unwrap_err();
+        assert!(
+            matches!(err, SpecError::SchemaMismatch { .. }),
+            "expected SchemaMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_cross_env_provided_ref() {
+        let mut creds = valid_credentials();
+        creds.provided_credentials_ref =
+            SecretRef::try_new("secret://other-env/credentials/x").unwrap();
+        let err = creds.validate().unwrap_err();
+        assert!(
+            matches!(err, SpecError::CrossEnvRef { .. }),
+            "expected CrossEnvRef, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_cross_env_bootstrap_ref() {
+        let mut creds = valid_credentials();
+        creds.bootstrap = Some(CredentialsBootstrap {
+            admin_credential_consumed_at: chrono::Utc::now(),
+            rules_pack_ref: std::path::PathBuf::from("rules/v1.gtpack"),
+            generated_credentials_ref: SecretRef::try_new("secret://other-env/generated/x")
+                .unwrap(),
+        });
+        let err = creds.validate().unwrap_err();
+        assert!(
+            matches!(err, SpecError::CrossEnvRef { .. }),
+            "expected CrossEnvRef, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_bootstrap_with_matching_env() {
+        let mut creds = valid_credentials();
+        creds.bootstrap = Some(CredentialsBootstrap {
+            admin_credential_consumed_at: chrono::Utc::now(),
+            rules_pack_ref: std::path::PathBuf::from("rules/v1.gtpack"),
+            generated_credentials_ref: SecretRef::try_new("secret://local/generated/x").unwrap(),
+        });
+        assert!(creds.validate().is_ok());
+    }
+
+    #[test]
+    fn schema_str_matches_constant() {
+        assert_eq!(Credentials::schema_str(), SchemaVersion::CREDENTIALS_V1);
+    }
+
+    #[test]
+    fn mode_serde_round_trip() {
+        let req = CredentialsMode::Requirements;
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#""requirements""#);
+        let boot = CredentialsMode::Bootstrap;
+        let json = serde_json::to_string(&boot).unwrap();
+        assert_eq!(json, r#""bootstrap""#);
+    }
+
+    #[test]
+    fn validation_result_serde_round_trip() {
+        let pass = CredentialsValidationResult::Pass;
+        assert_eq!(serde_json::to_string(&pass).unwrap(), r#""pass""#);
+        let fail = CredentialsValidationResult::Fail;
+        assert_eq!(serde_json::to_string(&fail).unwrap(), r#""fail""#);
+    }
+
+    #[test]
+    fn expiry_is_optional_and_skipped_when_none() {
+        let creds = valid_credentials();
+        let json = serde_json::to_value(&creds).unwrap();
+        assert!(json.get("expiry").is_none());
+    }
+}

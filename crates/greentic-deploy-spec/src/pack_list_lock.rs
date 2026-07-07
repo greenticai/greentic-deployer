@@ -41,3 +41,45 @@ impl PackListLock {
         SchemaVersion::PACK_LIST_LOCK_V1
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> PackListLock {
+        PackListLock {
+            schema: SchemaVersion::new(SchemaVersion::PACK_LIST_LOCK_V1),
+            revision_id: RevisionId::new(),
+            packs: vec![LockedPack {
+                pack_id: PackId::new("customer.support"),
+                path: PathBuf::from("revisions/01.../customer.support"),
+                digest: "sha256:abcdef1234567890".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn schema_str_matches_constant() {
+        assert_eq!(PackListLock::schema_str(), SchemaVersion::PACK_LIST_LOCK_V1);
+    }
+
+    #[test]
+    fn json_round_trip() {
+        let original = sample();
+        let json = serde_json::to_string(&original).unwrap();
+        let back: PackListLock = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, back);
+    }
+
+    #[test]
+    fn empty_packs_round_trips() {
+        let lock = PackListLock {
+            schema: SchemaVersion::new(SchemaVersion::PACK_LIST_LOCK_V1),
+            revision_id: RevisionId::new(),
+            packs: vec![],
+        };
+        let json = serde_json::to_string(&lock).unwrap();
+        let back: PackListLock = serde_json::from_str(&json).unwrap();
+        assert!(back.packs.is_empty());
+    }
+}

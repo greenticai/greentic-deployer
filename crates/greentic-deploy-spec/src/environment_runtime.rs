@@ -33,3 +33,54 @@ impl EnvironmentRuntime {
         SchemaVersion::ENVIRONMENT_RUNTIME_V1
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn sample() -> EnvironmentRuntime {
+        let mut discovered = BTreeMap::new();
+        discovered.insert(
+            "alb_dns".into(),
+            serde_json::Value::String("a.example.com".into()),
+        );
+        EnvironmentRuntime {
+            schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_RUNTIME_V1),
+            environment_id: greentic_types::EnvId::from_str("local").unwrap(),
+            discovered,
+            generated_at: Utc::now(),
+            generated_by: PackDescriptor::try_new("greentic.deployer.local-process@1.0.0").unwrap(),
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn schema_str_matches_constant() {
+        assert_eq!(
+            EnvironmentRuntime::schema_str(),
+            SchemaVersion::ENVIRONMENT_RUNTIME_V1
+        );
+    }
+
+    #[test]
+    fn json_round_trip() {
+        let original = sample();
+        let json = serde_json::to_string(&original).unwrap();
+        let back: EnvironmentRuntime = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, back);
+    }
+
+    #[test]
+    fn discovered_defaults_to_empty() {
+        let json = serde_json::json!({
+            "schema": SchemaVersion::ENVIRONMENT_RUNTIME_V1,
+            "environment_id": "local",
+            "generated_at": "2026-01-01T00:00:00Z",
+            "generated_by": "greentic.deployer.local-process@1.0.0",
+            "generation": 1
+        });
+        let rt: EnvironmentRuntime = serde_json::from_value(json).unwrap();
+        assert!(rt.discovered.is_empty());
+    }
+}

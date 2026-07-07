@@ -18,3 +18,17 @@ use std::collections::BTreeMap;
 pub fn dump_all_schemas() -> BTreeMap<&'static str, RootSchema> {
     BTreeMap::new()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dump_all_schemas_returns_empty_pending_wiring() {
+        let schemas = dump_all_schemas();
+        assert!(
+            schemas.is_empty(),
+            "stub should return empty until schemars derives are wired"
+        );
+    }
+}
