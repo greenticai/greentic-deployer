@@ -113,8 +113,8 @@ pub async fn run_conformance<D: Deployer + ?Sized>(deployer: &D) -> Result<(), C
     .await?;
     check_idempotent(
         "warm_revision",
-        || deployer.warm_revision(&env, r_warm),
-        || deployer.warm_revision(&env, r_warm),
+        || deployer.warm_revision(&env, r_warm, None),
+        || deployer.warm_revision(&env, r_warm, None),
     )
     .await?;
     check_idempotent(
@@ -125,8 +125,8 @@ pub async fn run_conformance<D: Deployer + ?Sized>(deployer: &D) -> Result<(), C
     .await?;
     check_idempotent(
         "archive_revision",
-        || deployer.archive_revision(&env, r_archive),
-        || deployer.archive_revision(&env, r_archive),
+        || deployer.archive_revision(&env, r_archive, None),
+        || deployer.archive_revision(&env, r_archive, None),
     )
     .await?;
 
@@ -136,14 +136,14 @@ pub async fn run_conformance<D: Deployer + ?Sized>(deployer: &D) -> Result<(), C
 
     check_idempotent(
         "apply_traffic_split",
-        || deployer.apply_traffic_split(&env, dep_a),
-        || deployer.apply_traffic_split(&env, dep_a),
+        || deployer.apply_traffic_split(&env, dep_a, None),
+        || deployer.apply_traffic_split(&env, dep_a, None),
     )
     .await?;
     check_idempotent(
         "apply_traffic_split[dep_b]",
-        || deployer.apply_traffic_split(&env, dep_b),
-        || deployer.apply_traffic_split(&env, dep_b),
+        || deployer.apply_traffic_split(&env, dep_b, None),
+        || deployer.apply_traffic_split(&env, dep_b, None),
     )
     .await?;
     check_cross_deployment_independence(deployer, &env, dep_a, dep_b).await?;
@@ -185,7 +185,10 @@ async fn check_unknown_revision_rejected<D: Deployer + ?Sized>(
     )?;
     classify_unknown_revision(
         "warm_revision",
-        deployer.warm_revision(&env, unknown).await.map(|_| ()),
+        deployer
+            .warm_revision(&env, unknown, None)
+            .await
+            .map(|_| ()),
     )?;
     classify_unknown_revision(
         "drain_revision",
@@ -193,7 +196,10 @@ async fn check_unknown_revision_rejected<D: Deployer + ?Sized>(
     )?;
     classify_unknown_revision(
         "archive_revision",
-        deployer.archive_revision(&env, unknown).await.map(|_| ()),
+        deployer
+            .archive_revision(&env, unknown, None)
+            .await
+            .map(|_| ()),
     )?;
     Ok(())
 }
@@ -219,7 +225,7 @@ async fn check_invalid_split_rejected<D: Deployer + ?Sized>(
         .iter()
         .map(|e| u64::from(e.weight_bps))
         .sum();
-    match deployer.apply_traffic_split(&env, dep).await {
+    match deployer.apply_traffic_split(&env, dep, None).await {
         Ok(_) => Err(ConformanceFailure::InvalidSplitAccepted { sum }),
         Err(DeployerError::InvalidSplit { .. }) => Ok(()),
         Err(source) => Err(ConformanceFailure::InvalidSplitWrongError { sum, source }),
@@ -231,7 +237,7 @@ async fn check_missing_split_rejected<D: Deployer + ?Sized>(
 ) -> Result<(), ConformanceFailure> {
     let env = build_env_without_split();
     let dep = env.bundles[0].deployment_id;
-    match deployer.apply_traffic_split(&env, dep).await {
+    match deployer.apply_traffic_split(&env, dep, None).await {
         Ok(_) => Err(ConformanceFailure::MissingSplitAccepted),
         Err(DeployerError::SplitNotFound { .. }) => Ok(()),
         Err(source) => Err(ConformanceFailure::MissingSplitWrongError { source }),
@@ -258,7 +264,7 @@ async fn check_cross_deployment_independence<D: Deployer + ?Sized>(
         .unwrap_or_default();
 
     let outcome_a = deployer
-        .apply_traffic_split(env, dep_a)
+        .apply_traffic_split(env, dep_a, None)
         .await
         .map_err(|source| ConformanceFailure::HappyPathFailed {
             verb: "apply_traffic_split[cross-dep:a]",
@@ -269,7 +275,7 @@ async fn check_cross_deployment_independence<D: Deployer + ?Sized>(
     }
 
     let outcome_b = deployer
-        .apply_traffic_split(env, dep_b)
+        .apply_traffic_split(env, dep_b, None)
         .await
         .map_err(|source| ConformanceFailure::HappyPathFailed {
             verb: "apply_traffic_split[cross-dep:b]",
@@ -325,6 +331,7 @@ pub(crate) fn build_fixture_env() -> Environment {
             tenant_org_id: None,
             listen_addr: None,
             public_base_url: None,
+            gui_enabled: None,
         },
         packs: Vec::new(),
         credentials_ref: None,
@@ -433,6 +440,7 @@ fn make_revision(
         created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).single().unwrap(),
         bundle_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
             .to_string(),
+        bundle_source_uri: None,
         pack_list: vec![PackListEntry::from_lock_primitives(
             PackId::new("greentic.fixture.pack"),
             "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
@@ -506,6 +514,7 @@ mod tests {
             &self,
             env: &Environment,
             revision_id: RevisionId,
+            _answers: Option<&serde_json::Value>,
         ) -> Result<WarmOutcome, DeployerError> {
             require_revision(env, revision_id)?;
             Ok(WarmOutcome::default())
@@ -524,6 +533,7 @@ mod tests {
             &self,
             env: &Environment,
             revision_id: RevisionId,
+            _answers: Option<&serde_json::Value>,
         ) -> Result<ArchiveOutcome, DeployerError> {
             require_revision(env, revision_id)?;
             Ok(ArchiveOutcome::default())
@@ -533,6 +543,7 @@ mod tests {
             &self,
             env: &Environment,
             deployment_id: DeploymentId,
+            _answers: Option<&serde_json::Value>,
         ) -> Result<TrafficSplitOutcome, DeployerError> {
             enforce_split_invariants(env, deployment_id)
         }
@@ -576,6 +587,7 @@ mod tests {
             &self,
             env: &Environment,
             revision_id: RevisionId,
+            _answers: Option<&serde_json::Value>,
         ) -> Result<WarmOutcome, DeployerError> {
             require_revision(env, revision_id)?;
             if self.called.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -597,6 +609,7 @@ mod tests {
             &self,
             env: &Environment,
             revision_id: RevisionId,
+            _answers: Option<&serde_json::Value>,
         ) -> Result<ArchiveOutcome, DeployerError> {
             require_revision(env, revision_id)?;
             Ok(ArchiveOutcome::default())
@@ -606,6 +619,7 @@ mod tests {
             &self,
             env: &Environment,
             deployment_id: DeploymentId,
+            _answers: Option<&serde_json::Value>,
         ) -> Result<TrafficSplitOutcome, DeployerError> {
             enforce_split_invariants(env, deployment_id)
         }
@@ -648,6 +662,7 @@ mod tests {
             &self,
             env: &Environment,
             revision_id: RevisionId,
+            _answers: Option<&serde_json::Value>,
         ) -> Result<WarmOutcome, DeployerError> {
             require_revision(env, revision_id)?;
             Ok(WarmOutcome::default())
@@ -664,6 +679,7 @@ mod tests {
             &self,
             env: &Environment,
             revision_id: RevisionId,
+            _answers: Option<&serde_json::Value>,
         ) -> Result<ArchiveOutcome, DeployerError> {
             require_revision(env, revision_id)?;
             Ok(ArchiveOutcome::default())
@@ -672,6 +688,7 @@ mod tests {
             &self,
             _env: &Environment,
             deployment_id: DeploymentId,
+            _answers: Option<&serde_json::Value>,
         ) -> Result<TrafficSplitOutcome, DeployerError> {
             // Doesn't check the sum — should fail the bench.
             Ok(TrafficSplitOutcome {
@@ -713,6 +730,7 @@ mod tests {
             &self,
             env: &Environment,
             revision_id: RevisionId,
+            _answers: Option<&serde_json::Value>,
         ) -> Result<WarmOutcome, DeployerError> {
             require_revision(env, revision_id)?;
             Ok(WarmOutcome::default())
@@ -729,6 +747,7 @@ mod tests {
             &self,
             env: &Environment,
             revision_id: RevisionId,
+            _answers: Option<&serde_json::Value>,
         ) -> Result<ArchiveOutcome, DeployerError> {
             require_revision(env, revision_id)?;
             Ok(ArchiveOutcome::default())
@@ -737,6 +756,7 @@ mod tests {
             &self,
             env: &Environment,
             deployment_id: DeploymentId,
+            _answers: Option<&serde_json::Value>,
         ) -> Result<TrafficSplitOutcome, DeployerError> {
             // Borrow the shared precondition path, then corrupt the
             // self-report so the bench's cross-deployment check fires.

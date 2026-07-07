@@ -18,6 +18,15 @@ pub const LOCAL_ENV_ID: &str = "local";
 pub const LOCAL_DEPLOYER_PACK: &str = "greentic.deployer.local-process@0.1.0";
 /// Pack descriptor for the secrets slot on the `local` env.
 pub const LOCAL_SECRETS_PACK: &str = "greentic.secrets.dev-store@0.1.0";
+/// Version-independent descriptor path of the dev-store secrets backend — the
+/// default binding, delivered into a cluster as the `gtc-dev-secrets` Secret.
+pub const DEV_STORE_SECRETS_PATH: &str = "greentic.secrets.dev-store";
+/// Version-independent descriptor path of the HashiCorp Vault secrets backend
+/// (Phase E). Bound to the `Secrets` slot to make the worker resolve `secret://`
+/// refs from Vault under its pod ServiceAccount identity.
+pub const VAULT_SECRETS_PATH: &str = "greentic.secrets.vault";
+/// Pack descriptor for the Vault secrets backend binding.
+pub const VAULT_SECRETS_PACK: &str = "greentic.secrets.vault@0.1.0";
 /// Pack descriptor for the telemetry slot on the `local` env.
 pub const LOCAL_TELEMETRY_PACK: &str = "greentic.telemetry.stdout@0.1.0";
 /// Pack descriptor for the sessions slot on the `local` env.

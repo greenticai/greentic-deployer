@@ -10,20 +10,28 @@
 //!
 //! # The webhook-secret seam
 //!
-//! Telegram-class endpoints need a per-endpoint webhook secret minted at
-//! `add` time and re-minted on `rotate-webhook-secret`. Generating the
-//! secret VALUE and persisting it is backend I/O, so the two transforms
-//! take a `provision` closure: it receives the endpoint's existing ref
-//! (`Some` when rotating an endpoint that already carries one, `None`
-//! otherwise) and returns the [`SecretRef`] to stamp on
-//! `MessagingEndpoint.webhook_secret_ref`. `LocalFsStore` provisions into
-//! the env-pack dev-store (`cli::messaging::provision_webhook_secret`); the
-//! operator-store-server has no secrets sink yet and supplies a closure
-//! that refuses with [`MessagingError::SecretProvision`] (mapped to a 501
-//! `not-yet-implemented` on the wire — the Phase D secrets sink lifts
-//! this). The closure runs AFTER replay/duplicate/ref validation, so a
-//! refusing or failing sink never fires on a replay and never leaves a
-//! half-validated mutation.
+//! Telegram-class endpoints need a per-endpoint webhook secret. Generating
+//! the VALUE and deciding where it lives are backend concerns, so `add` and
+//! `rotate-webhook-secret` take a `provision` closure: it receives the
+//! endpoint's existing ref (`Some` when rotating an endpoint that already
+//! carries one, `None` otherwise) and returns the [`SecretRef`] to stamp on
+//! `MessagingEndpoint.webhook_secret_ref`. `LocalFsStore` mints the value
+//! and persists it into the env-pack dev-store
+//! (`cli::messaging::provision_webhook_secret`).
+//!
+//! Callers may instead SUPPLY the ref directly on `add` via
+//! [`AddMessagingEndpointPayload::webhook_secret_ref`]: when present for a
+//! telegram-class endpoint the transform validates and stamps it WITHOUT
+//! calling `provision`. Remote operator stores use this — the operator owns
+//! value provisioning in its own secrets plane and ships only the ref, so
+//! the control-plane store never custodies secret material. Its `provision`
+//! closure always refuses ([`MessagingError::SecretProvision`], mapped to
+//! 501): the server neither mints nor rotates secrets, so a telegram-class
+//! `add` over a remote store must supply the ref and `rotate-webhook-secret`
+//! is unsupported there (the server cannot prove a value rotated). The
+//! closure / supplied-ref step runs AFTER replay/duplicate/ref validation,
+//! so it never fires on a replay and never leaves a half-validated
+//! mutation.
 //!
 //! # Idempotency key is domain state here
 //!
@@ -174,6 +182,15 @@ pub struct AddMessagingEndpointPayload {
     /// transform so local and remote reject malformed refs identically.
     #[serde(default)]
     pub secret_refs: Vec<String>,
+    /// Optional caller-supplied per-endpoint webhook secret ref (raw
+    /// `secret://` URI). When present for a telegram-class endpoint the
+    /// transform validates and stamps it WITHOUT calling `provision` — the
+    /// caller owns value provisioning (remote operator stores use this so
+    /// the control-plane store never mints or custodies secret material).
+    /// `None` keeps the backend-provision path (LocalFS auto-mints). Supplying
+    /// it for a non-telegram-class endpoint is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret_ref: Option<String>,
     pub updated_by: String,
 }
 
@@ -204,6 +221,17 @@ pub struct SetMessagingWelcomeFlowPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RotateWebhookSecretPayload {
     pub updated_by: String,
+    /// Optional caller-supplied NEW webhook secret ref (raw `secret://` URI).
+    /// When present the transform stamps it WITHOUT calling `provision` — the
+    /// caller has already provisioned the value in its own secrets plane
+    /// (remote operator stores use this so the control-plane store never mints
+    /// or custodies secret material, mirroring [`AddMessagingEndpointPayload::
+    /// webhook_secret_ref`]). `None` keeps the backend-provision path (LocalFS
+    /// auto-mints; a control-plane store refuses, since it cannot prove a
+    /// rotation it did not perform). The field is omitted on the wire when
+    /// `None`, so the body stays byte-compatible with pre-new-ref clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret_ref: Option<String>,
 }
 
 /// What a messaging transform did, by index into
@@ -233,7 +261,12 @@ const OP_ROTATE_WEBHOOK_SECRET: &str = "rotate-webhook-secret";
 /// creation time. Covers `"telegram"`, `"telegram.<x>"`,
 /// `"messaging.telegram"`, and `"messaging.telegram.<x>"` — strict on the
 /// dot so `"telegrambot"` and `"messaging.telegrambot"` do NOT match.
-fn is_telegram_class(provider_type: &str) -> bool {
+///
+/// Public so the remote dispatch layer can reuse the canonical matcher to
+/// pre-validate that a telegram-class endpoint carries a caller-supplied
+/// `webhook_secret_ref` before a remote round-trip (rather than duplicating
+/// the rule and risking drift).
+pub fn is_telegram_class(provider_type: &str) -> bool {
     let rest = provider_type
         .strip_prefix("messaging.")
         .unwrap_or(provider_type);
@@ -409,10 +442,20 @@ pub fn add_messaging_endpoint(
             })
         })
         .collect::<Result<_, _>>()?;
-    let webhook_secret_ref = if is_telegram_class(&payload.provider_type) {
-        Some(provision(None)?)
-    } else {
-        None
+    let webhook_secret_ref = match (
+        is_telegram_class(&payload.provider_type),
+        payload.webhook_secret_ref.as_deref(),
+    ) {
+        // Caller-supplied ref: validate (telegram-class gate + parse) and stamp
+        // it, never calling the backend sink. The caller owns value
+        // provisioning (remote operator stores ship the ref so the
+        // control-plane store never mints or custodies secret material); a ref
+        // on a non-telegram endpoint is a caller error.
+        (is_telegram, Some(raw)) => Some(validate_caller_webhook_ref(is_telegram, raw)?),
+        // Telegram-class with no supplied ref: the backend provisions
+        // (LocalFS auto-mints + stores; a control-plane store refuses).
+        (true, None) => Some(provision(None)?),
+        (false, None) => None,
     };
     env.messaging_endpoints.push(MessagingEndpoint {
         schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
@@ -587,17 +630,40 @@ pub fn remove_messaging_endpoint(env: &mut Environment, endpoint_id: MessagingEn
     }
 }
 
-/// Rotate the webhook secret for a messaging endpoint: `provision` mints a
-/// new secret value (receiving the existing ref so an already-decoupled
-/// endpoint keeps its URI) and the returned ref is stamped. Idempotent on
-/// same-key replay (`mutated == false`, `provision` not called — a replay
-/// must never overwrite the live secret with a fresh value).
+/// Validate a caller-supplied webhook secret ref. A `webhook_secret_ref` is
+/// only meaningful for a telegram-class endpoint (rejected otherwise) and must
+/// parse as a [`SecretRef`]. Shared by `add` and the new-ref `rotate` so the
+/// telegram-class gate, the parse, and the error message live in one place.
+fn validate_caller_webhook_ref(is_telegram: bool, raw: &str) -> Result<SecretRef, MessagingError> {
+    if !is_telegram {
+        return Err(MessagingError::InvalidSecretRef {
+            raw: raw.to_string(),
+            message: "webhook_secret_ref is only valid for telegram-class providers".to_string(),
+        });
+    }
+    SecretRef::try_new(raw).map_err(|e| MessagingError::InvalidSecretRef {
+        raw: raw.to_string(),
+        message: e.to_string(),
+    })
+}
+
+/// Rotate the webhook secret for a messaging endpoint.
+///
+/// With `new_ref = Some(raw)` the caller supplies a NEW ref already
+/// provisioned in its own secrets plane: it is validated (the telegram-class
+/// gate and ref parse that `add` enforces) and stamped WITHOUT calling
+/// `provision`. With `new_ref = None` the backend `provision` mints a value
+/// (receiving the existing ref so an already-decoupled endpoint keeps its URI)
+/// and the returned ref is stamped. Idempotent on same-key replay
+/// (`mutated == false`, neither path runs — a replay must never overwrite the
+/// live secret nor re-validate the ref).
 pub fn rotate_messaging_webhook_secret(
     env: &mut Environment,
     endpoint_id: MessagingEndpointId,
     updated_by: &str,
     idempotency_key: &IdempotencyKey,
     now: DateTime<Utc>,
+    new_ref: Option<&str>,
     provision: impl FnOnce(Option<&SecretRef>) -> Result<SecretRef, MessagingError>,
 ) -> Result<MessagingApplied, MessagingError> {
     let idx = find_endpoint_idx(env, endpoint_id)?;
@@ -608,7 +674,13 @@ pub fn rotate_messaging_webhook_secret(
             mutated: false,
         });
     }
-    let secret_ref = provision(env.messaging_endpoints[idx].webhook_secret_ref.as_ref())?;
+    let secret_ref = match new_ref {
+        Some(raw) => validate_caller_webhook_ref(
+            is_telegram_class(&env.messaging_endpoints[idx].provider_type),
+            raw,
+        )?,
+        None => provision(env.messaging_endpoints[idx].webhook_secret_ref.as_ref())?,
+    };
     env.messaging_endpoints[idx].webhook_secret_ref = Some(secret_ref);
     stamp_mutation(
         &mut env.messaging_endpoints[idx],
@@ -650,6 +722,7 @@ mod tests {
                 tenant_org_id: None,
                 listen_addr: None,
                 public_base_url: None,
+                gui_enabled: None,
             },
             RevocationConfig::default(),
             RetentionPolicy::default(),
@@ -671,7 +744,19 @@ mod tests {
             provider_type: provider_type.to_string(),
             display_name: format!("{provider_type} {provider_id}"),
             secret_refs: Vec::new(),
+            webhook_secret_ref: None,
             updated_by: "tester".to_string(),
+        }
+    }
+
+    fn add_payload_with_webhook_ref(
+        provider_type: &str,
+        provider_id: &str,
+        webhook_secret_ref: &str,
+    ) -> AddMessagingEndpointPayload {
+        AddMessagingEndpointPayload {
+            webhook_secret_ref: Some(webhook_secret_ref.to_string()),
+            ..add_payload(provider_type, provider_id)
         }
     }
 
@@ -766,6 +851,78 @@ mod tests {
             env.messaging_endpoints[applied.index].webhook_secret_ref,
             Some(fixed_ref())
         );
+    }
+
+    #[test]
+    fn add_telegram_class_with_supplied_ref_uses_it_without_provision() {
+        let mut env = minimal_env();
+        let supplied = "secret://local/default/_/messaging-byo/webhook_secret";
+        // `no_provision` panics if called — proves the supplied ref bypasses
+        // the backend sink entirely (the remote operator-store path).
+        let applied = add_messaging_endpoint(
+            &mut env,
+            add_payload_with_webhook_ref("telegram", "bot-a", supplied),
+            MessagingEndpointId::new(),
+            &key("k1"),
+            fixed_now(),
+            no_provision,
+        )
+        .unwrap();
+        assert!(applied.mutated);
+        assert_eq!(
+            env.messaging_endpoints[applied.index]
+                .webhook_secret_ref
+                .as_ref()
+                .map(|r| r.as_str()),
+            Some(supplied)
+        );
+    }
+
+    #[test]
+    fn add_telegram_class_with_malformed_supplied_ref_is_rejected() {
+        let mut env = minimal_env();
+        let err = add_messaging_endpoint(
+            &mut env,
+            add_payload_with_webhook_ref("telegram", "bot-a", "not-a-secret-uri"),
+            MessagingEndpointId::new(),
+            &key("k1"),
+            fixed_now(),
+            no_provision,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MessagingError::InvalidSecretRef { .. }));
+        assert!(
+            env.messaging_endpoints.is_empty(),
+            "a rejected add must not push"
+        );
+    }
+
+    #[test]
+    fn add_non_telegram_with_supplied_ref_is_rejected() {
+        let mut env = minimal_env();
+        let err = add_messaging_endpoint(
+            &mut env,
+            add_payload_with_webhook_ref(
+                "teams",
+                "legal",
+                "secret://local/default/_/messaging-x/webhook_secret",
+            ),
+            MessagingEndpointId::new(),
+            &key("k1"),
+            fixed_now(),
+            no_provision,
+        )
+        .unwrap_err();
+        match err {
+            MessagingError::InvalidSecretRef { ref message, .. } => {
+                assert!(
+                    message.contains("only valid for telegram-class"),
+                    "got {err:?}"
+                );
+            }
+            other => panic!("expected InvalidSecretRef, got {other:?}"),
+        }
+        assert!(env.messaging_endpoints.is_empty());
     }
 
     #[test]
@@ -1060,6 +1217,7 @@ mod tests {
             sequence: 1,
             created_at: fixed_now(),
             bundle_digest: "sha256:deadbeef".to_string(),
+            bundle_source_uri: None,
             pack_list: vec![PackListEntry {
                 pack_id: PackId::new("known-pack"),
                 version: "1.0.0".parse().unwrap(),
@@ -1172,6 +1330,7 @@ mod tests {
             "op",
             &key("k2"),
             fixed_now(),
+            None,
             |existing| {
                 assert_eq!(existing, Some(&fixed_ref()), "existing ref must be reused");
                 Ok(fixed_ref())
@@ -1202,6 +1361,7 @@ mod tests {
             "op",
             &key("k-rotate"),
             fixed_now(),
+            None,
             |existing| {
                 assert_eq!(existing, Some(&fixed_ref()));
                 Ok(fixed_ref())
@@ -1216,6 +1376,7 @@ mod tests {
             "op",
             &key("k-rotate"),
             fixed_now(),
+            None,
             no_provision,
         )
         .unwrap();
@@ -1233,10 +1394,69 @@ mod tests {
             "op",
             &key("k1"),
             fixed_now(),
+            None,
             no_provision,
         )
         .unwrap_err();
         assert!(matches!(err, MessagingError::EndpointNotFound { .. }));
+    }
+
+    #[test]
+    fn rotate_new_ref_validates_and_stamps_without_provision() {
+        let mut env = minimal_env();
+        let applied = add_messaging_endpoint(
+            &mut env,
+            add_payload("telegram", "bot-a"),
+            MessagingEndpointId::new(),
+            &key("k1"),
+            fixed_now(),
+            |_| Ok(fixed_ref()),
+        )
+        .unwrap();
+        let eid = env.messaging_endpoints[applied.index].endpoint_id;
+        // A caller-supplied new ref is validated + stamped; `provision` (here a
+        // panicking sink) is never reached on the new-ref path.
+        let rotated = rotate_messaging_webhook_secret(
+            &mut env,
+            eid,
+            "op",
+            &key("k2"),
+            fixed_now(),
+            Some("secret://local/acme/_/messaging-tg/webhook_secret"),
+            no_provision,
+        )
+        .unwrap();
+        assert!(rotated.mutated);
+        assert_eq!(
+            env.messaging_endpoints[rotated.index].webhook_secret_ref,
+            Some(SecretRef::try_new("secret://local/acme/_/messaging-tg/webhook_secret").unwrap())
+        );
+    }
+
+    #[test]
+    fn rotate_new_ref_on_non_telegram_rejected() {
+        let mut env = minimal_env();
+        let applied = add_messaging_endpoint(
+            &mut env,
+            add_payload("teams", "legal-bot"),
+            MessagingEndpointId::new(),
+            &key("k1"),
+            fixed_now(),
+            no_provision,
+        )
+        .unwrap();
+        let eid = env.messaging_endpoints[applied.index].endpoint_id;
+        let err = rotate_messaging_webhook_secret(
+            &mut env,
+            eid,
+            "op",
+            &key("k2"),
+            fixed_now(),
+            Some("secret://local/acme/_/messaging-x/webhook_secret"),
+            no_provision,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MessagingError::InvalidSecretRef { .. }));
     }
 
     // --- cross-op idem-key isolation (regression for the operation-scope fix) -----
@@ -1265,6 +1485,7 @@ mod tests {
             "op",
             &key("k-shared"),
             fixed_now(),
+            None,
             |existing| {
                 provision_called = true;
                 assert_eq!(existing, Some(&fixed_ref()));
@@ -1343,9 +1564,12 @@ mod tests {
             provider_type: "teams".to_string(),
             display_name: "Legal".to_string(),
             secret_refs: vec!["secret://local/default/_/p/token".to_string()],
+            webhook_secret_ref: None,
             updated_by: "op".to_string(),
         };
         let json = serde_json::to_value(&payload).unwrap();
+        // `webhook_secret_ref: None` is omitted (skip_serializing_if), so the
+        // wire shape stays byte-compatible with pre-BYO-ref clients/servers.
         assert_eq!(
             json,
             serde_json::json!({
@@ -1357,6 +1581,44 @@ mod tests {
             })
         );
         let back: AddMessagingEndpointPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(back, payload);
+    }
+
+    #[test]
+    fn add_payload_wire_encoding_with_webhook_ref() {
+        let payload = AddMessagingEndpointPayload {
+            provider_id: "tg-bot".to_string(),
+            provider_type: "telegram".to_string(),
+            display_name: "Bot".to_string(),
+            secret_refs: Vec::new(),
+            webhook_secret_ref: Some(
+                "secret://local/default/_/messaging-byo/webhook_secret".to_string(),
+            ),
+            updated_by: "op".to_string(),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            json["webhook_secret_ref"],
+            "secret://local/default/_/messaging-byo/webhook_secret"
+        );
+        let back: AddMessagingEndpointPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(back, payload);
+    }
+
+    #[test]
+    fn rotate_payload_wire_encoding_carries_new_ref() {
+        let payload = RotateWebhookSecretPayload {
+            updated_by: "op".to_string(),
+            webhook_secret_ref: Some(
+                "secret://local/acme/_/messaging-tg/webhook_secret".to_string(),
+            ),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            json["webhook_secret_ref"],
+            "secret://local/acme/_/messaging-tg/webhook_secret"
+        );
+        let back: RotateWebhookSecretPayload = serde_json::from_value(json).unwrap();
         assert_eq!(back, payload);
     }
 
@@ -1398,7 +1660,10 @@ mod tests {
     fn rotate_payload_wire_encoding() {
         let payload = RotateWebhookSecretPayload {
             updated_by: "op".to_string(),
+            webhook_secret_ref: None,
         };
+        // `webhook_secret_ref: None` is omitted (skip_serializing_if), so the
+        // body stays byte-compatible with a pre-new-ref client/server.
         assert_eq!(
             serde_json::to_value(&payload).unwrap(),
             serde_json::json!({"updated_by": "op"})

@@ -29,6 +29,37 @@ use super::credentials::K8sOperation;
 /// Name of the ServiceAccount the rules pack provisions.
 pub const DEPLOYER_SERVICE_ACCOUNT: &str = "greentic-deployer";
 
+/// Filename of the RBAC manifest entry in the rendered rules pack. The
+/// `--bind` path (`K8sDeployerCredentials::bootstrap`) extracts this exact
+/// entry and applies it live, so the live apply and the offline
+/// `kubectl apply -f` stay byte-identical — keep the renderer and the
+/// extractor referencing this one constant.
+pub(crate) const K8S_RBAC_MANIFEST_FILENAME: &str = "k8s-min-rbac.yaml";
+
+/// Store-aligned path (under `secret://<env>/…`) where the deployer's bound
+/// ServiceAccount token lives: `<tenant>/<team>/<category>/<name>`. It MUST be
+/// store-aligned so `op secrets put` can write it and the resolver
+/// (`cli::secrets::resolve_credentials_token`) can read it back via
+/// `SecretRef::to_store_uri` — a non-aligned ref (e.g. `…/k8s/deployer-token`)
+/// has no store location and fails to resolve. The bootstrap README advertises
+/// `secret://<env>/{this}` so the documented binding matches what resolves.
+pub(crate) const DEPLOYER_TOKEN_STORE_PATH: &str = "default/_/k8s-deployer/deployer_token";
+
+/// Name of the in-cluster `core/v1 Secret` the `--bind` path writes the
+/// minted ServiceAccount bearer into, in the deployer namespace. This is the
+/// durable, portable home for the bound identity: the local dev-store is a
+/// per-machine cache, whereas a different operator machine with ambient
+/// cluster read access resolves the bearer from this Secret. The write goes
+/// through the same guarded `KubeCluster::apply` as the RBAC objects, so it
+/// carries the env-ownership label and a re-bind converges in place.
+pub(crate) const DEPLOYER_IDENTITY_SECRET_NAME: &str = "greentic-deployer-identity";
+
+/// `data` key under [`DEPLOYER_IDENTITY_SECRET_NAME`] holding the bearer. Only
+/// the `k8s-client` kube layer reads/writes it (the `--bind` Secret round-trip);
+/// gated to avoid a dead-code warning in feature-less builds.
+#[cfg(feature = "k8s-client")]
+pub(crate) const DEPLOYER_IDENTITY_BEARER_KEY: &str = "bearer";
+
 /// Input shape for [`render_min_rbac_rules_pack`]. Borrowed; no heap cost.
 pub struct K8sRulesPackInput<'a> {
     /// Env this pack is scoped to (names + labels).
@@ -51,7 +82,7 @@ pub fn render_min_rbac_rules_pack(input: &K8sRulesPackInput<'_>) -> RulesPack {
     RulesPack {
         entries: vec![
             RulesPackEntry {
-                filename: "k8s-min-rbac.yaml".into(),
+                filename: K8S_RBAC_MANIFEST_FILENAME.into(),
                 content: render_rbac_yaml(input),
                 description: Some(format!(
                     "Namespace + minimum-privilege ServiceAccount/Role/RoleBinding for \
@@ -226,7 +257,7 @@ requirements converges to green.
 
    ```sh
    gtc op credentials rotate {env_id} --provided-credentials-ref \
-     "secret://{env_id}/k8s/deployer-token"
+     "secret://{env_id}/{store_path}"
    ```
 
 5. Re-run requirements:
@@ -251,6 +282,7 @@ env-packs.
         sa = DEPLOYER_SERVICE_ACCOUNT,
         admin_hint = input.admin_context_hint,
         op_bullets = op_bullets,
+        store_path = DEPLOYER_TOKEN_STORE_PATH,
     )
 }
 
@@ -301,10 +333,29 @@ mod tests {
     fn role_rules_aggregate_one_rule_per_group_resource_with_every_verb() {
         let pack = render_min_rbac_rules_pack(&input());
         let yaml = &pack.entries[0].content;
-        // One rule per (group, resource) — 5 distinct pairs in the list.
-        assert_eq!(yaml.matches("- apiGroups:").count(), 5);
+        // One rule per (group, resource) — 7 distinct pairs in the list.
+        assert_eq!(yaml.matches("- apiGroups:").count(), 7);
         assert!(yaml.contains("resources: [\"deployments\"]"));
         assert!(yaml.contains("verbs: [get, create, patch, delete]"));
+        // The Vault worker ServiceAccount is grantable (env-lifetime, upsert).
+        assert!(yaml.contains("resources: [\"serviceaccounts\"]"));
+        let sa_rule = yaml
+            .split("- apiGroups:")
+            .find(|s| s.contains("serviceaccounts"))
+            .unwrap();
+        assert!(
+            sa_rule.contains("verbs: [get, create, patch]"),
+            "serviceaccounts is upsert-only:\n{sa_rule}"
+        );
+        // Secrets carry delete so a Vault reconcile clears the stale Secret.
+        let secrets_rule = yaml
+            .split("- apiGroups:")
+            .find(|s| s.contains("\"secrets\""))
+            .unwrap();
+        assert!(
+            secrets_rule.contains("verbs: [get, create, patch, delete]"),
+            "secrets must carry delete for DevStore→Vault cleanup:\n{secrets_rule}"
+        );
         // Env-lifetime objects carry no delete.
         assert!(yaml.contains("resources: [\"configmaps\"]"));
         let configmap_rule = yaml

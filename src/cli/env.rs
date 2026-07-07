@@ -5,12 +5,14 @@
 
 use chrono::Utc;
 use greentic_deploy_spec::{
-    CapabilitySlot, EnvId, Environment, EnvironmentHostConfig, validate_public_base_url,
+    CapabilitySlot, EnvId, Environment, EnvironmentHostConfig, RevisionId, validate_public_base_url,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{EnvironmentStore, FieldUpdate, LocalFsStore, UpdateEnvironmentPayload};
+use crate::environment::{
+    EnvironmentReads, EnvironmentStore, FieldUpdate, LocalFsStore, UpdateEnvironmentPayload,
+};
 
 use super::{
     AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
@@ -129,6 +131,7 @@ pub fn create(
                     tenant_org_id: payload.tenant_org_id,
                     listen_addr: parsed_listen_addr,
                     public_base_url: parsed_public_base_url,
+                    gui_enabled: None,
                 },
             )
             .map_err(map_store_err_preserving_noun)?;
@@ -186,6 +189,7 @@ pub fn update(
                     tenant_org_id: FieldUpdate::from_option(payload.tenant_org_id),
                     listen_addr: FieldUpdate::Keep,
                     public_base_url: FieldUpdate::from_option(parsed_public_base_url),
+                    gui_enabled: FieldUpdate::Keep,
                 },
             )
             .map_err(map_store_err_preserving_noun)?;
@@ -199,7 +203,7 @@ pub fn update(
 }
 
 /// `op env list`.
-pub fn list(store: &LocalFsStore, flags: &OpFlags) -> Result<OpOutcome, OpError> {
+pub fn list(store: &dyn EnvironmentReads, flags: &OpFlags) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         // `list` has no input; produce a null-input schema as a placeholder.
         return Ok(OpOutcome::new(
@@ -209,8 +213,8 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags) -> Result<OpOutcome, OpError>
         ));
     }
     let mut summaries = Vec::new();
-    for env_id in store.list()? {
-        let env = store.load(&env_id)?;
+    for env_id in store.list_env_ids()? {
+        let env = store.load_env(&env_id)?;
         summaries.push(EnvSummary::from(&env));
     }
     Ok(OpOutcome::new(
@@ -221,7 +225,11 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags) -> Result<OpOutcome, OpError>
 }
 
 /// `op env show <env_id>`.
-pub fn show(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOutcome, OpError> {
+pub fn show(
+    store: &dyn EnvironmentReads,
+    flags: &OpFlags,
+    env_id: &str,
+) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(
             NOUN,
@@ -231,11 +239,11 @@ pub fn show(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
     }
     let env_id =
         EnvId::try_from(env_id).map_err(|e| OpError::InvalidArgument(format!("env_id: {e}")))?;
-    if !store.exists(&env_id)? {
+    if !store.env_exists(&env_id)? {
         return Err(OpError::NotFound(format!("environment `{env_id}`")));
     }
-    let env = store.load(&env_id)?;
-    let runtime = store.load_runtime(&env_id)?;
+    let env = store.load_env(&env_id)?;
+    let runtime = store.read_runtime(&env_id)?;
     Ok(OpOutcome::new(
         NOUN,
         "show",
@@ -543,9 +551,24 @@ pub fn render(
     // exists, its kind path matches the resolved descriptor, and
     // `answers_ref` is `Some`.
     let (answers, answers_ref_wire) = load_render_answers(store, &env, &descriptor)?;
-    let objects = renderer
-        .render_environment(&env, answers.as_ref())
-        .map_err(|e| OpError::Conflict(e.to_string()))?;
+    // The K8s renderer's worker secrets identity (dev-store Secret vs. Vault SA
+    // + `VAULT_*` env) depends on the env's `Secrets`-slot binding, which the
+    // registry handler doesn't carry — resolve it and render through a handler
+    // that does. Other deployers ignore the secrets slot, so they keep the
+    // registry handler.
+    use crate::env_packs::render::ManifestRenderer as _;
+    let objects = if descriptor.path() == crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH
+    {
+        let secrets_backend = resolve_secrets_backend(store, &env)?;
+        crate::env_packs::k8s::K8sDeployerHandler::default()
+            .with_secrets_backend(secrets_backend)
+            .render_environment(&env, answers.as_ref())
+            .map_err(|e| OpError::Conflict(e.to_string()))?
+    } else {
+        renderer
+            .render_environment(&env, answers.as_ref())
+            .map_err(|e| OpError::Conflict(e.to_string()))?
+    };
 
     let mut result = json!({
         "environment_id": env.environment_id.as_str(),
@@ -566,6 +589,767 @@ pub fn render(
     Ok(OpOutcome::new(NOUN, "render", result))
 }
 
+/// `op env reconcile <env_id> [--kind <descriptor>]` — apply the env's
+/// declarative desired state to its live cluster and prune the workers of
+/// revisions no longer present. The apply-side counterpart of `render` (use
+/// `render` for a no-side-effect preview, or a GitOps repository handoff).
+///
+/// K8s deployer env-pack only today: applying rendered manifests to a cluster
+/// is K8s-specific, so other deployer kinds surface a `Conflict` (the AWS-ECS
+/// reconcile path is a later Phase D slice). The same `answers_ref` /
+/// `--kind` resolution as `render` applies.
+///
+/// The deployer connects through the binding's `kubeconfig_context` answer
+/// and authenticates with the ambient kubeconfig / in-cluster identity today;
+/// resolving the env's rotated ServiceAccount token (`credentials_ref` →
+/// bearer) rides the Phase D secrets sink.
+pub fn reconcile(
+    store: &LocalFsStore,
+    registry: &crate::env_packs::EnvPackRegistry,
+    flags: &OpFlags,
+    args: super::dispatch::EnvReconcileArgs,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(
+            NOUN,
+            "reconcile",
+            json!({
+                "input_schema": "env_id positional; --kind <path[@version]> optional \
+                 (defaults to the env's deployer binding)"
+            }),
+        ));
+    }
+    let env_id = EnvId::try_from(args.env_id.as_str())
+        .map_err(|e| OpError::InvalidArgument(format!("env_id: {e}")))?;
+    if !store.exists(&env_id)? {
+        return Err(OpError::NotFound(format!("environment `{env_id}`")));
+    }
+    let env = store.load(&env_id)?;
+    let descriptor = resolve_live_deployer_kind(&env, args.kind.as_deref())?;
+
+    // Reconcile applies rendered manifests to a live cluster — K8s-specific.
+    let k8s_path = crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
+    if descriptor.path() != k8s_path {
+        return Err(OpError::Conflict(format!(
+            "env reconcile is only supported for the `{k8s_path}` deployer env-pack \
+             today; `{}` cannot be reconciled to a live cluster (the AWS-ECS reconcile \
+             path is a later Phase D slice)",
+            descriptor.path()
+        )));
+    }
+    // Parity with render: confirm the kind is actually registered.
+    let _handler = registry
+        .resolve_for_slot(CapabilitySlot::Deployer, &descriptor)
+        .map_err(|e| OpError::Conflict(e.to_string()))?;
+
+    let (answers, answers_ref_wire) = load_render_answers(store, &env, &descriptor)?;
+    // Resolve the env's bound deployer credential to a ServiceAccount bearer
+    // token; `None` → connect with the ambient kubeconfig / in-cluster
+    // identity (the pre-closure behaviour). Fail-closed if a ref is bound but
+    // unresolvable. Beyond env-var / dev-store, this also reads the durable
+    // in-cluster identity Secret (ambient) so a fresh operator machine
+    // resolves a `--bind` credential it never wrote locally.
+    let bound_token =
+        crate::env_packs::k8s::resolve_bound_identity(store, &env, &env_id, answers.as_ref())?;
+    let identity = if bound_token.is_some() {
+        "bound"
+    } else {
+        "ambient"
+    };
+    // Capture the env's local dev-store so reconcile delivers the operator's
+    // secrets to the worker (the K8s "no runtime secrets" gap). `None` when the
+    // env has no dev-store file yet — the worker's staging init is then a no-op.
+    let dev_secrets = read_dev_secrets_b64(store, &env_id)?;
+    // Resolve the env's `Secrets`-slot binding into the backend the worker
+    // resolves `secret://` refs against — dev-store (values shipped in via the
+    // Secret above) or Vault (pod identity + `VAULT_*` env, no values shipped).
+    let secrets_backend = resolve_secrets_backend(store, &env)?;
+    let report = reconcile_k8s_cluster(
+        &env,
+        answers.as_ref(),
+        bound_token,
+        dev_secrets,
+        secrets_backend,
+    )?;
+
+    Ok(OpOutcome::new(
+        NOUN,
+        "reconcile",
+        json!({
+            "environment_id": env.environment_id.as_str(),
+            "kind": descriptor.as_str(),
+            "answers_ref": answers_ref_wire,
+            // Identity the cluster was mutated as: "bound" = the env's
+            // credentials_ref resolved to a ServiceAccount bearer; "ambient" =
+            // the CLI's kubeconfig / in-cluster identity (no bound credential).
+            // Surfaced so a live mutation is never silent about which identity
+            // it ran as.
+            "identity": identity,
+            "applied_count": report.applied.len(),
+            "pruned_count": report.pruned.len(),
+            "applied": report.applied,
+            "pruned": report.pruned,
+        }),
+    ))
+}
+
+/// Connect to the cluster (binding's `kubeconfig_context`, with `bound_token`
+/// overriding the ambient identity when the env has a resolved credential) and
+/// converge desired state. Requires the `k8s-client` feature.
+#[cfg(feature = "k8s-client")]
+pub(crate) fn reconcile_k8s_cluster(
+    env: &Environment,
+    answers: Option<&Value>,
+    bound_token: Option<String>,
+    dev_secrets: Option<String>,
+    secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
+) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
+    use crate::env_packs::k8s::async_bridge::run_k8s_async;
+    use crate::env_packs::k8s::kube_client::connect;
+    use crate::env_packs::k8s::manifests::kubeconfig_context_from_answers;
+    use crate::env_packs::k8s::{K8sDeployerHandler, KubeCluster};
+    use std::sync::Arc;
+
+    let kubeconfig_context = kubeconfig_context_from_answers(answers);
+    // A bound (namespace-scoped) identity must not apply the cluster-scoped
+    // Namespace — `bootstrap --bind` already created it, and the bound Role
+    // grants no cluster-scoped verbs. The ambient kubeconfig / in-cluster
+    // identity (`None`) keeps managing the Namespace, so reconcile still
+    // bootstraps a fresh env unchanged.
+    let manage_namespace = bound_token.is_none();
+    run_k8s_async(async move {
+        // `bound_token`: the env's credentials_ref resolved to a ServiceAccount
+        // bearer (overrides the context's auth); `None` → the ambient
+        // kubeconfig / in-cluster identity.
+        let client = connect(kubeconfig_context.as_deref(), bound_token.as_deref())
+            .await
+            .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
+        let handler = K8sDeployerHandler::with_cluster_and_dev_secrets(
+            Arc::new(KubeCluster::new(client)),
+            dev_secrets,
+        )
+        .with_secrets_backend(secrets_backend);
+        handler
+            .reconcile(env, answers, manage_namespace)
+            .await
+            .map_err(|e| OpError::Conflict(e.to_string()))
+    })
+}
+
+/// `k8s-client`-less builds cannot talk to a cluster.
+#[cfg(not(feature = "k8s-client"))]
+pub(crate) fn reconcile_k8s_cluster(
+    _env: &Environment,
+    _answers: Option<&Value>,
+    _bound_token: Option<String>,
+    _dev_secrets: Option<String>,
+    _secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
+) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
+    Err(OpError::Conflict(
+        "this build was compiled without the `k8s-client` feature; \
+         `op env reconcile` needs it to connect to a cluster"
+            .to_string(),
+    ))
+}
+
+/// Read the env's local dev-store and base64-encode it for the reconcile-time
+/// dev-store Secret. `Ok(None)` when no dev-store file exists yet (the worker's
+/// staging init is then a guarded no-op). A read error other than not-found is
+/// surfaced — a present-but-unreadable store should fail the reconcile rather
+/// than silently ship an empty Secret.
+fn read_dev_secrets_b64(store: &LocalFsStore, env_id: &EnvId) -> Result<Option<String>, OpError> {
+    use base64::Engine as _;
+    let env_dir = store
+        .env_dir(env_id)
+        .map_err(|e| OpError::Conflict(format!("resolving env dir: {e}")))?;
+    let path = super::secrets::resolve_dev_store_path(&env_dir, None);
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(Some(
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(OpError::Conflict(format!(
+            "reading dev-store at {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// `op env apply-revision <env_id> <revision_id> [--kind <descriptor>]` — bring
+/// a SINGLE revision's worker resources into agreement with its recorded
+/// lifecycle. A revision with cluster presence (Warming / Ready / Draining)
+/// has its worker Deployment + Service applied; an absent one (Staged / Failed
+/// / Archived / Inactive) has them torn down. The surgical counterpart of
+/// `reconcile`, which converges the WHOLE env — `apply-revision` assumes the
+/// env-level set (namespace, router) already exists (establish it with
+/// `reconcile`), so it only touches the one revision's worker pair.
+///
+/// K8s deployer env-pack only today (same gate as `reconcile`). Connects
+/// through the binding's `kubeconfig_context` answer with the ambient
+/// kubeconfig / in-cluster identity; resolving the env's bound ServiceAccount
+/// token rides the Phase D secrets sink.
+///
+/// # Known gaps (Phase D later slices)
+///
+/// - **Answer / namespace drift.** Both branches render the worker objects from
+///   the binding's *current* answers, so the teardown targets the namespace the
+///   answers name *now*. If a revision was warmed in namespace A and the binding
+///   namespace later changes to B, the archive branch deletes B's worker (a
+///   no-op) and reports success, leaving A's worker running — the same drift
+///   `reconcile`'s prune already has. A drift-safe teardown needs the
+///   per-revision applied-param snapshot or the label-based GC seam
+///   (`K8sCluster::list`) tracked with `reconcile`'s prune-scope gap; until then
+///   the binding namespace must stay stable while a revision is live (the
+///   wizard already states the namespace must match the bootstrap rules pack).
+pub fn apply_revision(
+    store: &LocalFsStore,
+    registry: &crate::env_packs::EnvPackRegistry,
+    flags: &OpFlags,
+    args: super::dispatch::EnvApplyRevisionArgs,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(
+            NOUN,
+            "apply-revision",
+            json!({
+                "input_schema": "env_id + revision_id positional; --kind <path[@version]> optional \
+                 (defaults to the env's deployer binding)"
+            }),
+        ));
+    }
+    let env_id = EnvId::try_from(args.env_id.as_str())
+        .map_err(|e| OpError::InvalidArgument(format!("env_id: {e}")))?;
+    if !store.exists(&env_id)? {
+        return Err(OpError::NotFound(format!("environment `{env_id}`")));
+    }
+    let env = store.load(&env_id)?;
+
+    let descriptor = resolve_live_deployer_kind(&env, args.kind.as_deref())?;
+
+    // Confirm the kind is actually registered (parity with reconcile).
+    let _handler = registry
+        .resolve_for_slot(CapabilitySlot::Deployer, &descriptor)
+        .map_err(|e| OpError::Conflict(e.to_string()))?;
+
+    // Applicability gate, BEFORE the per-revision lookup so an unsupported
+    // deployer kind rejects regardless of the revision arg: K8s (applies
+    // manifests to a cluster) and AWS-ECS (drives task sets) have live apply
+    // paths; any other registered deployer (e.g. local-process) does not.
+    let k8s_path = crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
+    let is_k8s = descriptor.path() == k8s_path;
+    if !is_k8s && !is_aws_ecs_kind(&descriptor) {
+        return Err(unsupported_apply_kind(&descriptor));
+    }
+
+    let revision_id = {
+        use std::str::FromStr;
+        let ulid = ulid::Ulid::from_str(&args.revision_id)
+            .map_err(|e| OpError::InvalidArgument(format!("revision_id: {e}")))?;
+        RevisionId(ulid)
+    };
+    let revision = env
+        .revisions
+        .iter()
+        .find(|r| r.revision_id == revision_id)
+        .ok_or_else(|| {
+            OpError::NotFound(format!(
+                "revision `{revision_id}` not found in env `{env_id}`"
+            ))
+        })?;
+
+    let (answers, answers_ref_wire) = load_render_answers(store, &env, &descriptor)?;
+
+    // Present → apply the worker resources (warm); absent → tear them down
+    // (archive). Same B7 two-state presence model the renderer and reconcile
+    // use; the lifecycle→presence predicate is backend-agnostic.
+    let present = crate::env_packs::k8s::manifests::has_cluster_presence(revision.lifecycle);
+    let action = if present { "warmed" } else { "archived" };
+    let lifecycle = revision.lifecycle;
+
+    // Backend dispatch: connect as the bound identity (fail-closed when a ref is
+    // bound but unresolvable, never a silent ambient fall-back) and drive the
+    // single revision's verb. Returns the identity used + the live resource name
+    // (K8s worker Deployment / ECS service) for the outcome. The applicability
+    // gate above guarantees the `else` arm is AWS-ECS.
+    let (identity, worker_name): (&'static str, String) = if is_k8s {
+        let worker_name = crate::env_packs::k8s::manifests::worker_name(revision);
+        let bound_token =
+            crate::env_packs::k8s::resolve_bound_identity(store, &env, &env_id, answers.as_ref())?;
+        let identity = if bound_token.is_some() {
+            "bound"
+        } else {
+            "ambient"
+        };
+        // Resolve the env's Secrets backend so a Vault env's single-revision
+        // warm renders the worker with its Vault identity + `VAULT_*` env, not a
+        // default DevStore worker (parity with `reconcile` / `op env render`).
+        let secrets_backend = resolve_secrets_backend(store, &env)?;
+        apply_revision_k8s_cluster(
+            &env,
+            revision_id,
+            present,
+            answers.as_ref(),
+            bound_token,
+            secrets_backend,
+        )?;
+        (identity, worker_name)
+    } else {
+        apply_revision_non_k8s(
+            store,
+            &env,
+            &env_id,
+            revision_id,
+            present,
+            answers.as_ref(),
+            &descriptor,
+        )?
+    };
+
+    Ok(OpOutcome::new(
+        NOUN,
+        "apply-revision",
+        json!({
+            "environment_id": env.environment_id.as_str(),
+            "kind": descriptor.as_str(),
+            "revision_id": revision_id.to_string(),
+            "lifecycle": lifecycle,
+            // Which Deployer verb the recorded lifecycle drove.
+            "action": action,
+            "worker_name": worker_name,
+            "answers_ref": answers_ref_wire,
+            // Identity the cluster was mutated as — see `reconcile`.
+            "identity": identity,
+        }),
+    ))
+}
+
+/// Connect to the cluster and dispatch the single revision's Deployer verb:
+/// `warm_revision` when present, `archive_revision` when absent. Requires the
+/// `k8s-client` feature.
+#[cfg(feature = "k8s-client")]
+fn apply_revision_k8s_cluster(
+    env: &Environment,
+    revision_id: RevisionId,
+    present: bool,
+    answers: Option<&Value>,
+    bound_token: Option<String>,
+    secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
+) -> Result<(), OpError> {
+    use crate::env_packs::deployer::Deployer;
+    use crate::env_packs::k8s::async_bridge::run_k8s_async;
+    use crate::env_packs::k8s::kube_client::connect;
+    use crate::env_packs::k8s::manifests::kubeconfig_context_from_answers;
+    use crate::env_packs::k8s::{K8sDeployerHandler, KubeCluster};
+    use std::sync::Arc;
+
+    let kubeconfig_context = kubeconfig_context_from_answers(answers);
+    run_k8s_async(async move {
+        // `bound_token`: resolved ServiceAccount bearer (overrides the
+        // context's auth); `None` → ambient identity (same as reconcile).
+        let client = connect(kubeconfig_context.as_deref(), bound_token.as_deref())
+            .await
+            .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
+        let handler = K8sDeployerHandler::with_cluster(Arc::new(KubeCluster::new(client)))
+            .with_secrets_backend(secrets_backend);
+        let result = if present {
+            handler
+                .warm_revision(env, revision_id, answers)
+                .await
+                .map(|_| ())
+        } else {
+            handler
+                .archive_revision(env, revision_id, answers)
+                .await
+                .map(|_| ())
+        };
+        result.map_err(|e| OpError::Conflict(e.to_string()))
+    })
+}
+
+/// `k8s-client`-less builds cannot talk to a cluster.
+#[cfg(not(feature = "k8s-client"))]
+fn apply_revision_k8s_cluster(
+    _env: &Environment,
+    _revision_id: RevisionId,
+    _present: bool,
+    _answers: Option<&Value>,
+    _bound_token: Option<String>,
+    _secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
+) -> Result<(), OpError> {
+    Err(OpError::Conflict(
+        "this build was compiled without the `k8s-client` feature; \
+         `op env apply-revision` needs it to connect to a cluster"
+            .to_string(),
+    ))
+}
+
+/// True when the descriptor is the AWS-ECS deployer kind. `false` on builds
+/// without the AWS env-pack compiled in (`creds-aws` off) — the kind cannot be
+/// served, so the applicability gate rejects it.
+#[cfg(feature = "creds-aws")]
+fn is_aws_ecs_kind(descriptor: &greentic_deploy_spec::PackDescriptor) -> bool {
+    descriptor.path() == crate::env_packs::aws::AwsEcsDeployerHandler::DESCRIPTOR_PATH
+}
+
+#[cfg(not(feature = "creds-aws"))]
+fn is_aws_ecs_kind(_descriptor: &greentic_deploy_spec::PackDescriptor) -> bool {
+    false
+}
+
+/// Conflict for a deployer kind with no live single-revision apply path
+/// (anything other than K8s / AWS-ECS — e.g. the local-process deployer, which
+/// runs in-process and has nothing to apply to a remote target).
+fn unsupported_apply_kind(descriptor: &greentic_deploy_spec::PackDescriptor) -> OpError {
+    OpError::Conflict(format!(
+        "env apply-revision is only supported for the `{}` (K8s) and \
+         `greentic.deployer.aws-ecs` (AWS-ECS) deployer env-packs today; `{}` has no live \
+         single-revision apply path",
+        crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH,
+        descriptor.path()
+    ))
+}
+
+/// Dispatch `apply-revision` for a non-K8s deployer. Today only the AWS-ECS
+/// env-pack has a live deploy path; every other registered kind is rejected.
+/// Returns `(identity, worker_name)` — the AWS analogue of the K8s
+/// `(bound|ambient, worker Deployment name)`.
+#[cfg(feature = "creds-aws")]
+#[allow(clippy::too_many_arguments)]
+fn apply_revision_non_k8s(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    revision_id: RevisionId,
+    present: bool,
+    answers: Option<&Value>,
+    descriptor: &greentic_deploy_spec::PackDescriptor,
+) -> Result<(&'static str, String), OpError> {
+    if descriptor.path() != crate::env_packs::aws::AwsEcsDeployerHandler::DESCRIPTOR_PATH {
+        return Err(unsupported_apply_kind(descriptor));
+    }
+    apply_revision_aws_ecs(store, env, env_id, revision_id, present, answers)
+}
+
+#[cfg(not(feature = "creds-aws"))]
+#[allow(clippy::too_many_arguments)]
+fn apply_revision_non_k8s(
+    _store: &LocalFsStore,
+    _env: &Environment,
+    _env_id: &EnvId,
+    _revision_id: RevisionId,
+    _present: bool,
+    _answers: Option<&Value>,
+    descriptor: &greentic_deploy_spec::PackDescriptor,
+) -> Result<(&'static str, String), OpError> {
+    Err(unsupported_apply_kind(descriptor))
+}
+
+/// Fail-closed identity guard: a binding that pins a deployer role to assume
+/// (`assume_role_arn`) MUST have a bound session, else the live call would
+/// silently run as the ambient AWS identity — a tenant/account-isolation
+/// footgun (the role was configured but never assumed, i.e. `op env bootstrap
+/// --bind` was not run). `true` ⇒ refuse. (`aws_profile` honoring at deploy
+/// time is a separate, still-deferred SDK client-builder slice — the binding
+/// parser validates it but the verbs do not consume it yet.)
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+fn pinned_role_without_session(assume_role_arn: Option<&str>, session_present: bool) -> bool {
+    assume_role_arn.is_some() && !session_present
+}
+
+/// Resolve the bound deployer session, parse the AWS-ECS construction inputs,
+/// and enforce the fail-closed preconditions. Returns
+/// `(identity_label, session, launch, region, target_group_pool)` — everything
+/// `RealEcsTarget::resolve` needs plus the outcome's identity label. Shared by
+/// `apply-revision` and `apply-traffic` so both honor the same guards.
+///
+/// Fails closed (before any AWS call) when the binding pins `assume_role_arn`
+/// but no session is bound (`pinned_role_without_session`), and when the Fargate
+/// launch config is absent.
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+#[allow(clippy::type_complexity)]
+fn aws_ecs_target_inputs(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    answers: Option<&Value>,
+) -> Result<
+    (
+        &'static str,
+        Option<crate::env_packs::aws::credentials::AssumedSession>,
+        crate::env_packs::aws::real_target::FargateLaunchConfig,
+        String,
+        Vec<String>,
+    ),
+    OpError,
+> {
+    use crate::env_packs::aws::deployer::AwsEcsParams;
+
+    // Bound STS session when the env declares one, else the ambient chain
+    // (fail-closed if a ref is bound but unreadable). AWS analogue of the K8s
+    // bound-ServiceAccount bearer.
+    let session = crate::env_packs::aws::bound_session::resolve_bound_session(store, env, env_id)?;
+    let identity = if session.is_some() {
+        "bound"
+    } else {
+        "ambient"
+    };
+    let params = AwsEcsParams::from_answers(env, answers)
+        .map_err(|e| OpError::Conflict(format!("invalid aws-ecs binding answers: {e}")))?;
+    if pinned_role_without_session(params.assume_role_arn.as_deref(), session.is_some()) {
+        return Err(OpError::Conflict(
+            "the aws-ecs binding pins `assume_role_arn` (a deployer role to assume) but no bound \
+             deployer session was found — refusing to run as the ambient AWS identity. Mint the \
+             scoped session first with `op env bootstrap --bind` (or `op credentials rotate`)."
+                .to_string(),
+        ));
+    }
+    let launch = params.launch.ok_or_else(|| {
+        OpError::Conflict(
+            "the aws-ecs deployer binding has no Fargate launch config (needs execution_role_arn \
+             + subnets + security_groups); re-run the binding wizard before applying"
+                .to_string(),
+        )
+    })?;
+    Ok((
+        identity,
+        session,
+        launch,
+        params.region,
+        params.target_group_pool,
+    ))
+}
+
+/// Resolve the region-pinned AWS clients (with the bound session injected) and
+/// wrap them in a handler. Shared by the AWS verb dispatchers so the
+/// resolve + `with_target` boilerplate (and its error message) lives once.
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+async fn resolve_ecs_handler(
+    region: &str,
+    launch: crate::env_packs::aws::real_target::FargateLaunchConfig,
+    pool: Vec<String>,
+    session: Option<crate::env_packs::aws::credentials::AssumedSession>,
+) -> Result<crate::env_packs::aws::AwsEcsDeployerHandler, OpError> {
+    use crate::env_packs::aws::AwsEcsDeployerHandler;
+    use crate::env_packs::aws::real_target::RealEcsTarget;
+    use std::sync::Arc;
+
+    let target = RealEcsTarget::resolve(region, launch, pool, session)
+        .await
+        .map_err(|e| {
+            OpError::Conflict(format!(
+                "cannot initialize the AWS ECS deployer client: {e}"
+            ))
+        })?;
+    Ok(AwsEcsDeployerHandler::with_target(Arc::new(target)))
+}
+
+/// Connect to AWS and drive the single revision's ECS verb: `warm_revision`
+/// when present, `archive_revision` when absent (mirrors
+/// `apply_revision_k8s_cluster`). Returns `(identity, ECS service name)`.
+/// Requires the `deploy-aws-ecs` feature.
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+fn apply_revision_aws_ecs(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    revision_id: RevisionId,
+    present: bool,
+    answers: Option<&Value>,
+) -> Result<(&'static str, String), OpError> {
+    use crate::env_packs::aws::credentials::run_aws_async;
+    use crate::env_packs::aws::real_target::service_name;
+    use crate::env_packs::deployer::Deployer;
+
+    let revision = env
+        .revisions
+        .iter()
+        .find(|r| r.revision_id == revision_id)
+        .expect("revision presence checked by the caller");
+    let worker_name = service_name(&revision.deployment_id);
+    let (identity, session, launch, region, pool) =
+        aws_ecs_target_inputs(store, env, env_id, answers)?;
+
+    run_aws_async(async move {
+        let handler = resolve_ecs_handler(&region, launch, pool, session).await?;
+        if present {
+            handler
+                .warm_revision(env, revision_id, answers)
+                .await
+                .map_err(|e| OpError::Conflict(e.to_string()))?;
+        } else {
+            handler
+                .archive_revision(env, revision_id, answers)
+                .await
+                .map_err(|e| OpError::Conflict(e.to_string()))?;
+        }
+        Ok::<(), OpError>(())
+    })?;
+    Ok((identity, worker_name))
+}
+
+#[cfg(all(feature = "creds-aws", not(feature = "deploy-aws-ecs")))]
+fn apply_revision_aws_ecs(
+    _store: &LocalFsStore,
+    _env: &Environment,
+    _env_id: &EnvId,
+    _revision_id: RevisionId,
+    _present: bool,
+    _answers: Option<&Value>,
+) -> Result<(&'static str, String), OpError> {
+    Err(OpError::Conflict(
+        "this build was compiled without the `deploy-aws-ecs` feature; \
+         `op env apply-revision` for an aws-ecs env needs it to talk to AWS"
+            .to_string(),
+    ))
+}
+
+/// `op env apply-traffic <env_id> <deployment_id> [--kind <descriptor>]`.
+///
+/// Pushes the env's recorded traffic split for one deployment to the live ALB
+/// listener (AWS-ECS only). The split is recorded spec-only by `op traffic set`;
+/// this verb makes it observable in the live runtime — the AWS analogue of
+/// `apply-revision` for the routing side. K8s needs no such verb: its
+/// in-process router reads the split from runtime-config, so the runtime applies
+/// it without a deployer round-trip.
+pub fn apply_traffic(
+    store: &LocalFsStore,
+    registry: &crate::env_packs::EnvPackRegistry,
+    flags: &OpFlags,
+    args: super::dispatch::EnvApplyTrafficArgs,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(
+            NOUN,
+            "apply-traffic",
+            json!({
+                "input_schema": "env_id + deployment_id positional; --kind <path[@version]> \
+                 optional (defaults to the env's deployer binding)"
+            }),
+        ));
+    }
+    let env_id = EnvId::try_from(args.env_id.as_str())
+        .map_err(|e| OpError::InvalidArgument(format!("env_id: {e}")))?;
+    if !store.exists(&env_id)? {
+        return Err(OpError::NotFound(format!("environment `{env_id}`")));
+    }
+    let env = store.load(&env_id)?;
+    let descriptor = resolve_live_deployer_kind(&env, args.kind.as_deref())?;
+
+    // AWS-ECS only: the ALB listener is the live router, so the split must be
+    // pushed to it. K8s serves splits from its in-process router (runtime
+    // config), so there is no listener to write — `op traffic set` suffices.
+    // Gate on the typed-const-backed helper (not a literal) so the path can't
+    // drift from `AwsEcsDeployerHandler::DESCRIPTOR_PATH`.
+    if !is_aws_ecs_kind(&descriptor) {
+        return Err(OpError::Conflict(format!(
+            "env apply-traffic is only supported for the `greentic.deployer.aws-ecs` (AWS-ECS) \
+             deployer env-pack; `{}` serves traffic splits from its runtime router — record the \
+             split with `op traffic set` and the runtime applies it",
+            descriptor.path()
+        )));
+    }
+    // Parity with apply-revision: confirm the kind is registered.
+    let _handler = registry
+        .resolve_for_slot(CapabilitySlot::Deployer, &descriptor)
+        .map_err(|e| OpError::Conflict(e.to_string()))?;
+
+    let deployment_id = {
+        use std::str::FromStr;
+        let ulid = ulid::Ulid::from_str(&args.deployment_id)
+            .map_err(|e| OpError::InvalidArgument(format!("deployment_id: {e}")))?;
+        greentic_deploy_spec::DeploymentId(ulid)
+    };
+    let (answers, _answers_ref_wire) = load_render_answers(store, &env, &descriptor)?;
+
+    // NOTE: when the binding records an ALB routing condition
+    // (`alb_routing_host` / `alb_routing_path`), `apply_traffic_split` writes a
+    // per-deployment listener rule so deployments coexist behind one listener;
+    // with no routing condition it REPLACES the listener's default action
+    // (whole-listener ownership), assuming the `alb_listener_arn` is dedicated to
+    // this deployment — see the `op env apply-traffic` help WARNING.
+    let (identity, outcome) =
+        apply_traffic_aws_ecs(store, &env, &env_id, deployment_id, answers.as_ref())?;
+
+    Ok(OpOutcome::new(
+        NOUN,
+        "apply-traffic",
+        json!({
+            "environment_id": env.environment_id.as_str(),
+            "kind": descriptor.as_str(),
+            "deployment_id": deployment_id.to_string(),
+            // Identity the ALB was mutated as (see apply-revision).
+            "identity": identity,
+            // The split this call enforced (mirrors the env's recorded entries).
+            "applied_entries": outcome
+                .applied_entries
+                .iter()
+                .map(|e| {
+                    json!({
+                        "revision_id": e.revision_id.to_string(),
+                        "weight_bps": e.weight_bps,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }),
+    ))
+}
+
+/// Connect to AWS and push one deployment's recorded traffic split to its ALB
+/// listener via `apply_traffic_split` (a no-op live when no `alb_listener_arn`
+/// is configured — the recorded split's invariants are still enforced). Returns
+/// the identity used + the enforced split. Requires the `deploy-aws-ecs`
+/// feature.
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+fn apply_traffic_aws_ecs(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    deployment_id: greentic_deploy_spec::DeploymentId,
+    answers: Option<&Value>,
+) -> Result<
+    (
+        &'static str,
+        crate::env_packs::deployer::TrafficSplitOutcome,
+    ),
+    OpError,
+> {
+    use crate::env_packs::aws::credentials::run_aws_async;
+    use crate::env_packs::deployer::Deployer;
+
+    let (identity, session, launch, region, pool) =
+        aws_ecs_target_inputs(store, env, env_id, answers)?;
+
+    let outcome = run_aws_async(async move {
+        let handler = resolve_ecs_handler(&region, launch, pool, session).await?;
+        handler
+            .apply_traffic_split(env, deployment_id, answers)
+            .await
+            .map_err(|e| OpError::Conflict(e.to_string()))
+    })?;
+    Ok((identity, outcome))
+}
+
+#[cfg(not(all(feature = "creds-aws", feature = "deploy-aws-ecs")))]
+fn apply_traffic_aws_ecs(
+    _store: &LocalFsStore,
+    _env: &Environment,
+    _env_id: &EnvId,
+    _deployment_id: greentic_deploy_spec::DeploymentId,
+    _answers: Option<&Value>,
+) -> Result<
+    (
+        &'static str,
+        crate::env_packs::deployer::TrafficSplitOutcome,
+    ),
+    OpError,
+> {
+    Err(OpError::Conflict(
+        "this build was compiled without the `deploy-aws-ecs` feature; \
+         `op env apply-traffic` needs it to talk to AWS"
+            .to_string(),
+    ))
+}
+
 /// Load the deployer binding's recorded wizard answers for the render path.
 ///
 /// Returns `(Some(json), env-relative path string)` when the binding exists
@@ -574,7 +1358,11 @@ pub fn render(
 /// Errors (fail-closed) when `answers_ref` is set but the file is missing,
 /// unreadable, or contains invalid JSON — never silently falls back to
 /// defaults.
-fn load_render_answers(
+///
+/// `pub(crate)` so the credentials CLI path can read the same binding
+/// answers when connecting a live validator client for `op credentials
+/// requirements` (it needs `kubeconfig_context`).
+pub(crate) fn load_render_answers(
     store: &LocalFsStore,
     env: &greentic_deploy_spec::Environment,
     descriptor: &greentic_deploy_spec::PackDescriptor,
@@ -587,6 +1375,20 @@ fn load_render_answers(
     let Some(rel_path) = answers_ref else {
         return Ok((None, Value::Null));
     };
+    let answers = read_binding_answers(store, env, rel_path)?;
+    let wire = json!(rel_path.to_string_lossy());
+    Ok((Some(answers), wire))
+}
+
+/// Read + parse a binding's `answers_ref` JSON file, enforcing that it lives
+/// under the env dir (fail-closed on path escape or a missing file). Shared by
+/// [`load_render_answers`] (Deployer slot) and [`load_secrets_answers`]
+/// (Secrets slot).
+fn read_binding_answers(
+    store: &LocalFsStore,
+    env: &greentic_deploy_spec::Environment,
+    rel_path: &std::path::Path,
+) -> Result<Value, OpError> {
     let env_dir = store.env_dir(&env.environment_id)?;
     // Containment check: the answers file must live under the env dir.
     // `normalize_under_root` canonicalizes, so it ALSO fails when the file
@@ -615,14 +1417,124 @@ fn load_render_answers(
         path: abs_path.clone(),
         source: e,
     })?;
-    let answers: Value = serde_json::from_str(&raw).map_err(|e| {
+    serde_json::from_str(&raw).map_err(|e| {
         OpError::Conflict(format!(
             "answers_ref `{}` contains invalid JSON: {e}",
             rel_path.display()
         ))
-    })?;
-    let wire = json!(rel_path.to_string_lossy());
-    Ok((Some(answers), wire))
+    })
+}
+
+/// Resolve the env's `Secrets`-slot binding answers (the non-secret connection
+/// config for a real backend), if the binding records an `answers_ref`. Mirrors
+/// [`load_render_answers`] but for the `Secrets` slot.
+fn load_secrets_answers(
+    store: &LocalFsStore,
+    env: &greentic_deploy_spec::Environment,
+) -> Result<Option<Value>, OpError> {
+    let Some(binding) = env.pack_for_slot(CapabilitySlot::Secrets) else {
+        return Ok(None);
+    };
+    let Some(rel_path) = binding.answers_ref.as_ref() else {
+        return Ok(None);
+    };
+    Ok(Some(read_binding_answers(store, env, rel_path)?))
+}
+
+/// Resolve the env's `Secrets`-slot binding into the runtime secrets backend the
+/// K8s manifests render. No binding or the dev-store kind → `DevStore`; the
+/// Vault kind → a Vault backend whose non-secret connection config comes from
+/// the binding's answers (`addr` + `role` required; mounts / prefix / transit /
+/// namespace default to the provider's). An unknown secrets kind fails closed.
+pub(crate) fn resolve_secrets_backend(
+    store: &LocalFsStore,
+    env: &greentic_deploy_spec::Environment,
+) -> Result<crate::env_packs::k8s::manifests::SecretsBackend, OpError> {
+    use crate::env_packs::k8s::manifests::SecretsBackend;
+    let Some(binding) = env.pack_for_slot(CapabilitySlot::Secrets) else {
+        return Ok(SecretsBackend::DevStore);
+    };
+    let path = binding.kind.path();
+    if path == crate::defaults::DEV_STORE_SECRETS_PATH {
+        return Ok(SecretsBackend::DevStore);
+    }
+    if path != crate::defaults::VAULT_SECRETS_PATH {
+        return Err(OpError::Conflict(format!(
+            "unknown secrets backend kind `{path}`; expected `{}` or `{}`",
+            crate::defaults::DEV_STORE_SECRETS_PATH,
+            crate::defaults::VAULT_SECRETS_PATH
+        )));
+    }
+    secrets_backend_from_vault_answers(load_secrets_answers(store, env)?.as_ref())
+}
+
+/// Whether the env's `Secrets`-slot backend custodies secret values in the
+/// local dev-store. No binding or the dev-store kind → `true` (the control
+/// plane mints + writes webhook-secret values locally); any other kind (e.g.
+/// Vault) → `false` (the operator seeds the value out-of-band and the control
+/// plane only stamps the ref). Unlike [`resolve_secrets_backend`] this inspects
+/// only the binding *kind*, never the connection answers, so it cannot fail —
+/// endpoint provisioning must not be coupled to Vault-answer validity.
+pub(crate) fn secrets_backend_is_dev_store(env: &greentic_deploy_spec::Environment) -> bool {
+    match env.pack_for_slot(CapabilitySlot::Secrets) {
+        None => true,
+        Some(binding) => binding.kind.path() == crate::defaults::DEV_STORE_SECRETS_PATH,
+    }
+}
+
+/// Pure mapping of a Vault `Secrets`-binding's answers to a [`VaultBackend`]:
+/// `addr` + `role` are required; the rest default to the provider's. Factored
+/// out of [`resolve_secrets_backend`] so the field mapping + fail-closed
+/// validation is unit-tested without a store.
+pub(crate) fn secrets_backend_from_vault_answers(
+    answers: Option<&Value>,
+) -> Result<crate::env_packs::k8s::manifests::SecretsBackend, OpError> {
+    use crate::env_packs::k8s::manifests::{
+        SecretsBackend, VAULT_DEFAULT_AUTH_MOUNT, VAULT_DEFAULT_KV_MOUNT, VAULT_DEFAULT_KV_PREFIX,
+        VAULT_DEFAULT_TRANSIT_KEY, VAULT_DEFAULT_TRANSIT_MOUNT, VaultBackend,
+    };
+    let empty = serde_json::Map::new();
+    let obj = match answers {
+        Some(v) => v.as_object().ok_or_else(|| {
+            OpError::Conflict("vault secrets binding answers must be a JSON object".to_string())
+        })?,
+        None => &empty,
+    };
+    let required = |key: &str| -> Result<String, OpError> {
+        obj.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                OpError::Conflict(format!(
+                    "vault secrets backend requires a non-empty `{key}` answer"
+                ))
+            })
+    };
+    let optional = |key: &str, default: &str| -> String {
+        obj.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| default.to_string())
+    };
+    Ok(SecretsBackend::Vault(VaultBackend {
+        addr: required("addr")?,
+        k8s_role: required("role")?,
+        kv_mount: optional("kv_mount", VAULT_DEFAULT_KV_MOUNT),
+        kv_prefix: optional("kv_prefix", VAULT_DEFAULT_KV_PREFIX),
+        auth_mount: optional("auth_mount", VAULT_DEFAULT_AUTH_MOUNT),
+        transit_mount: optional("transit_mount", VAULT_DEFAULT_TRANSIT_MOUNT),
+        transit_key: optional("transit_key", VAULT_DEFAULT_TRANSIT_KEY),
+        namespace: obj
+            .get("namespace")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    }))
 }
 
 /// Resolve the `--kind` argument for `op env render` to a full
@@ -655,6 +1567,39 @@ fn resolve_render_kind(
             ))),
         },
     }
+}
+
+/// Resolve the deployer descriptor for a LIVE (cluster-mutating) verb
+/// (`reconcile`, `apply-revision`).
+///
+/// Unlike [`resolve_render_kind`] — which backs the read-only `render` preview
+/// and deliberately lets a full `--kind` describe an *unbound* deployer — a
+/// live verb must mutate ONLY the env's declared deployer. The resolved
+/// descriptor's **path** must equal the env's Deployer-slot binding path, so a
+/// full `--kind` may override the binding's *version* (same deployer) but can
+/// neither switch deployers (e.g. force `greentic.deployer.k8s` onto a
+/// local-process env) nor apply to an env with no deployer binding at all.
+/// Without this, `--kind <full k8s descriptor>` would drive K8s apply/teardown
+/// against a cluster for an env that was never K8s-bound.
+pub(crate) fn resolve_live_deployer_kind(
+    env: &Environment,
+    kind: Option<&str>,
+) -> Result<greentic_deploy_spec::PackDescriptor, OpError> {
+    let descriptor = resolve_render_kind(env, kind)?;
+    let bound = env.pack_for_slot(CapabilitySlot::Deployer).ok_or_else(|| {
+        OpError::Conflict(
+            "env has no deployer binding; a live apply must target a bound deployer".to_string(),
+        )
+    })?;
+    if descriptor.path() != bound.kind.path() {
+        return Err(OpError::Conflict(format!(
+            "env is bound to deployer `{}`; a live apply cannot use `{}` — it is not the env's \
+             bound deployer (a full `--kind` may override the version, not switch deployers)",
+            bound.kind.path(),
+            descriptor.path()
+        )));
+    }
+    Ok(descriptor)
 }
 
 /// Result of [`write_rendered_objects`].
@@ -1486,6 +2431,7 @@ mod tests {
                     tenant_org_id: FieldUpdate::Clear,
                     listen_addr: FieldUpdate::Clear,
                     public_base_url: FieldUpdate::Clear,
+                    gui_enabled: FieldUpdate::Keep,
                 },
             )
             .unwrap();
@@ -1530,6 +2476,7 @@ mod tests {
                     tenant_org_id: FieldUpdate::Set("new-org".to_string()), // overwrite
                     listen_addr: FieldUpdate::Clear, // clear
                     public_base_url: FieldUpdate::Set("https://new.example.com".to_string()),
+                    gui_enabled: FieldUpdate::Keep,
                 },
             )
             .unwrap();
@@ -1577,6 +2524,7 @@ mod tests {
                     tenant_org_id: FieldUpdate::Clear,
                     listen_addr: FieldUpdate::Clear,
                     public_base_url: FieldUpdate::Clear,
+                    gui_enabled: FieldUpdate::Keep,
                 },
             )
             .unwrap();
@@ -2168,10 +3116,14 @@ mod tests {
     }
 
     #[test]
-    fn create_non_local_env_refuses_and_audits_deny() {
+    fn create_non_local_env_succeeds_and_audits_under_local_owner() {
+        // Named (non-`local`) envs are first-class on the local FS store
+        // (fs-ownership is the authz boundary). `op env create prod` succeeds,
+        // persists the env, and audits the mutation under the `local-owner`
+        // policy. (Shared-store RBAC lives on the remote path, not here.)
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
-        let err = create(
+        create(
             &store,
             &OpFlags::default(),
             Some(EnvCreatePayload {
@@ -2183,34 +3135,24 @@ mod tests {
                 public_base_url: None,
             }),
         )
-        .unwrap_err();
-        assert!(
-            matches!(err, OpError::Unauthorized { .. }),
-            "got {err:?}; deny-path must surface as Unauthorized"
-        );
-        // No environment.json was created.
+        .expect("named env create must succeed on the local store");
+        // environment.json was persisted.
         let env_json = dir.path().join("prod").join("environment.json");
-        assert!(
-            !env_json.exists(),
-            "deny must not leave behind environment.json"
-        );
-        // Audit event was written under the denied env's audit dir.
+        assert!(env_json.exists(), "create must persist environment.json");
+        // The mutation was audited as an allowed `local-owner` decision.
         let log = dir.path().join("prod").join("audit").join("events.jsonl");
-        let raw = std::fs::read_to_string(&log).expect("audit log must exist on deny");
+        let raw = std::fs::read_to_string(&log).expect("audit log must exist after create");
         let event: crate::environment::AuditEvent = serde_json::from_str(raw.trim_end()).unwrap();
         assert_eq!(event.env_id, "prod");
         assert_eq!(event.noun, "env");
         assert_eq!(event.verb, "create");
-        matches!(
-            event.authorization,
-            crate::environment::AuditDecision::Deny { .. }
-        );
-        match event.result {
-            crate::environment::AuditResult::Error { kind, .. } => {
-                assert_eq!(kind, "unauthorized");
+        match event.authorization {
+            crate::environment::AuditDecision::Allow { policy, .. } => {
+                assert_eq!(policy, crate::environment::POLICY_LOCAL_OWNER);
             }
-            other => panic!("expected Error result, got {other:?}"),
+            other => panic!("expected Allow, got {other:?}"),
         }
+        assert!(matches!(event.result, crate::environment::AuditResult::Ok));
     }
 
     #[test]
@@ -2598,10 +3540,12 @@ mod tests {
     use crate::cli::dispatch::EnvRenderArgs;
     use std::path::PathBuf;
 
-    /// `K8sParams::for_env` env-level set: Namespace, ConfigMap, router
-    /// Deployment + Service + PDB, 4 NetworkPolicies. An env with no
-    /// present revisions renders exactly these.
-    const K8S_ENV_LEVEL_OBJECT_COUNT: usize = 9;
+    /// `K8sParams::for_env` env-level set: Namespace, env-store ConfigMap,
+    /// runtime-config ConfigMap, router Deployment + Service + PDB, 6
+    /// NetworkPolicies (the worker- and router-egress policies are always
+    /// rendered; their egress rule toggles allow-all/deny by pullability — see
+    /// the manifests-crate render tests). Every env renders exactly these.
+    const K8S_ENV_LEVEL_OBJECT_COUNT: usize = 12;
 
     fn render_args(env_id: &str, kind: Option<&str>, output: Option<PathBuf>) -> EnvRenderArgs {
         EnvRenderArgs {
@@ -2874,6 +3818,397 @@ mod tests {
         assert!(outcome.result.get("input_schema").is_some());
     }
 
+    // -- reconcile ----------------------------------------------------------
+
+    use crate::cli::dispatch::EnvReconcileArgs;
+
+    fn reconcile_args(env_id: &str, kind: Option<&str>) -> EnvReconcileArgs {
+        EnvReconcileArgs {
+            env_id: env_id.to_string(),
+            kind: kind.map(str::to_string),
+        }
+    }
+
+    /// A non-K8s deployer kind cannot be reconciled to a cluster — the verb
+    /// rejects before any connect attempt (here the env's default binding is
+    /// local-process).
+    #[test]
+    fn reconcile_rejects_non_k8s_deployer_kind() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            crate::defaults::LOCAL_DEPLOYER_PACK,
+        ));
+        store.save(&env).unwrap();
+        let err = reconcile(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            reconcile_args("local", None),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(msg.contains("only supported for"), "{msg}"),
+            other => panic!("expected Conflict, got {other}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_missing_env_is_not_found() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let err = reconcile(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            reconcile_args("ghost", None),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::NotFound(_)), "{err}");
+    }
+
+    #[test]
+    fn reconcile_schema_only_returns_input_schema() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let flags = OpFlags {
+            schema_only: true,
+            ..OpFlags::default()
+        };
+        let outcome = reconcile(&store, &reg, &flags, reconcile_args("zain", None)).unwrap();
+        assert_eq!(outcome.op, "reconcile");
+        assert!(outcome.result.get("input_schema").is_some());
+    }
+
+    // -- apply-revision -----------------------------------------------------
+
+    use crate::cli::dispatch::EnvApplyRevisionArgs;
+
+    fn apply_revision_args(
+        env_id: &str,
+        revision_id: &str,
+        kind: Option<&str>,
+    ) -> EnvApplyRevisionArgs {
+        EnvApplyRevisionArgs {
+            env_id: env_id.to_string(),
+            revision_id: revision_id.to_string(),
+            kind: kind.map(str::to_string),
+        }
+    }
+
+    /// A deployer kind with no live apply path (here: local-process) is
+    /// rejected at the applicability gate, before the per-revision lookup (so a
+    /// bogus revision id is irrelevant here). K8s and AWS-ECS are admitted.
+    #[test]
+    fn apply_revision_rejects_unsupported_deployer_kind() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            crate::defaults::LOCAL_DEPLOYER_PACK,
+        ));
+        store.save(&env).unwrap();
+        let err = apply_revision(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_revision_args("local", "00000000000000000000000000", None),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(msg.contains("only supported for"), "{msg}"),
+            other => panic!("expected Conflict, got {other}"),
+        }
+    }
+
+    /// The AWS-ECS deployer kind IS admitted past the applicability gate (the
+    /// PR-3c-2b live-wiring change): with a bogus revision id the verb now falls
+    /// through to the per-revision lookup and returns `NotFound`, where it
+    /// previously rejected the whole kind with a `Conflict`. Proves the gate no
+    /// longer hard-rejects AWS — no AWS call is reached (revision lookup fails
+    /// first), so the test is deterministic without credentials.
+    #[test]
+    fn apply_revision_admits_aws_ecs_kind() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.aws-ecs@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let err = apply_revision(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_revision_args("local", "00000000000000000000000000", None),
+        )
+        .unwrap_err();
+        match err {
+            OpError::NotFound(msg) => assert!(msg.contains("revision"), "{msg}"),
+            other => panic!("expected NotFound(revision), got {other}"),
+        }
+    }
+
+    // -- apply-traffic ------------------------------------------------------
+
+    use crate::cli::dispatch::EnvApplyTrafficArgs;
+
+    fn apply_traffic_args(
+        env_id: &str,
+        deployment_id: &str,
+        kind: Option<&str>,
+    ) -> EnvApplyTrafficArgs {
+        EnvApplyTrafficArgs {
+            env_id: env_id.to_string(),
+            deployment_id: deployment_id.to_string(),
+            kind: kind.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn apply_traffic_schema_only_returns_input_schema() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let flags = OpFlags {
+            schema_only: true,
+            ..OpFlags::default()
+        };
+        let outcome = apply_traffic(
+            &store,
+            &reg,
+            &flags,
+            apply_traffic_args("zain", "00000000000000000000000000", None),
+        )
+        .unwrap();
+        assert_eq!(outcome.op, "apply-traffic");
+        assert!(outcome.result.get("input_schema").is_some());
+    }
+
+    /// A non-AWS deployer (here: local-process) is rejected — K8s and the local
+    /// deployer serve splits from their runtime router, so there is no listener
+    /// for `apply-traffic` to push to.
+    #[test]
+    fn apply_traffic_rejects_non_aws_deployer_kind() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            crate::defaults::LOCAL_DEPLOYER_PACK,
+        ));
+        store.save(&env).unwrap();
+        let err = apply_traffic(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_traffic_args("local", "00000000000000000000000000", None),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(msg.contains("only supported for"), "{msg}"),
+            other => panic!("expected Conflict, got {other}"),
+        }
+    }
+
+    /// An AWS-ECS env IS admitted past the gate, but a binding without a Fargate
+    /// launch config is rejected before any AWS call (deterministic, no creds).
+    /// Proves the AWS path is reached AND the launch precondition fires first.
+    #[cfg(feature = "deploy-aws-ecs")]
+    #[test]
+    fn apply_traffic_admits_aws_ecs_but_requires_launch_config() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.aws-ecs@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let err = apply_traffic(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_traffic_args("local", "00000000000000000000000000", None),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(msg.contains("Fargate launch config"), "{msg}"),
+            other => panic!("expected Conflict(launch config), got {other}"),
+        }
+    }
+
+    /// Identity guard: a binding that pins `assume_role_arn` must have a bound
+    /// session, else the live AWS call would silently run as the ambient
+    /// identity (a tenant/account-isolation footgun). Only that exact case
+    /// refuses; an unpinned env legitimately falls back to ambient.
+    #[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+    #[test]
+    fn pinned_role_without_session_refuses_only_role_without_session() {
+        // role pinned + no session → refuse (the footgun)
+        assert!(pinned_role_without_session(
+            Some("arn:aws:iam::1:role/dep"),
+            false
+        ));
+        // role pinned + session present → ok (the session IS the assumed role)
+        assert!(!pinned_role_without_session(
+            Some("arn:aws:iam::1:role/dep"),
+            true
+        ));
+        // no role pinned → ambient fallback is intentional, never refuse
+        assert!(!pinned_role_without_session(None, false));
+        assert!(!pinned_role_without_session(None, true));
+    }
+
+    #[test]
+    fn apply_revision_missing_env_is_not_found() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let err = apply_revision(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_revision_args("ghost", "00000000000000000000000000", None),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::NotFound(_)), "{err}");
+    }
+
+    /// A K8s env with a revision id that isn't staged → NotFound, surfaced
+    /// AFTER the applicability gate (the env IS K8s) but before any connect.
+    #[test]
+    fn apply_revision_missing_revision_is_not_found() {
+        let dir = tempdir().unwrap();
+        let store = store_with_k8s_env(dir.path());
+        let reg = builtins();
+        let err = apply_revision(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_revision_args("zain", "00000000000000000000000000", None),
+        )
+        .unwrap_err();
+        match err {
+            OpError::NotFound(msg) => assert!(msg.contains("revision"), "{msg}"),
+            other => panic!("expected NotFound(revision), got {other}"),
+        }
+    }
+
+    /// An unparseable revision id is rejected as InvalidArgument (after the
+    /// applicability gate passes).
+    #[test]
+    fn apply_revision_bad_revision_id_is_invalid_argument() {
+        let dir = tempdir().unwrap();
+        let store = store_with_k8s_env(dir.path());
+        let reg = builtins();
+        let err = apply_revision(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_revision_args("zain", "not-a-ulid", None),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "{err}");
+    }
+
+    #[test]
+    fn apply_revision_schema_only_returns_input_schema() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let flags = OpFlags {
+            schema_only: true,
+            ..OpFlags::default()
+        };
+        let outcome = apply_revision(
+            &store,
+            &reg,
+            &flags,
+            apply_revision_args("zain", "00000000000000000000000000", None),
+        )
+        .unwrap();
+        assert_eq!(outcome.op, "apply-revision");
+        assert!(outcome.result.get("input_schema").is_some());
+    }
+
+    /// A live verb must not be forced onto a deployer the env isn't bound to: a
+    /// full `--kind` K8s override against a local-process-bound env is rejected
+    /// at the binding-match guard, before any cluster connect (the Codex F1
+    /// fix). The same guard backs `reconcile`.
+    #[test]
+    fn apply_revision_rejects_unbound_deployer_kind_override() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            crate::defaults::LOCAL_DEPLOYER_PACK,
+        ));
+        store.save(&env).unwrap();
+        let err = apply_revision(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_revision_args(
+                "local",
+                "00000000000000000000000000",
+                Some("greentic.deployer.k8s@1.0.0"),
+            ),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(
+                msg.contains("bound to deployer") && msg.contains("not the env's"),
+                "{msg}"
+            ),
+            other => panic!("expected Conflict (unbound deployer), got {other}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_rejects_unbound_deployer_kind_override() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            crate::defaults::LOCAL_DEPLOYER_PACK,
+        ));
+        store.save(&env).unwrap();
+        let err = reconcile(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            reconcile_args("local", Some("greentic.deployer.k8s@1.0.0")),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(msg.contains("bound to deployer"), "{msg}"),
+            other => panic!("expected Conflict (unbound deployer), got {other}"),
+        }
+    }
+
     // ---- Fix 1: answers_ref consumption ------------------------------------
 
     #[test]
@@ -3117,5 +4452,156 @@ mod tests {
             Some("fake-rendered"),
             "the custom renderer's objects must come back"
         );
+    }
+
+    // ---- secrets backend resolution (Phase E.3) ----------------------------
+
+    use crate::cli::tests_common::make_binding;
+    use crate::env_packs::k8s::manifests::{SecretsBackend, VaultBackend};
+
+    #[test]
+    fn resolve_secrets_backend_defaults_to_dev_store() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        // No Secrets binding → dev-store (back-compat with sandbox envs).
+        let env = make_env("local");
+        assert!(matches!(
+            resolve_secrets_backend(&store, &env).unwrap(),
+            SecretsBackend::DevStore
+        ));
+        // An explicit dev-store binding → dev-store.
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            crate::defaults::LOCAL_SECRETS_PACK,
+        ));
+        assert!(matches!(
+            resolve_secrets_backend(&store, &env).unwrap(),
+            SecretsBackend::DevStore
+        ));
+    }
+
+    #[test]
+    fn secrets_backend_is_dev_store_classifies_by_kind() {
+        // No Secrets binding → custodial dev-store.
+        assert!(secrets_backend_is_dev_store(&make_env("local")));
+
+        // Explicit dev-store binding → custodial.
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            crate::defaults::LOCAL_SECRETS_PACK,
+        ));
+        assert!(secrets_backend_is_dev_store(&env));
+
+        // Vault binding → NOT custodial: the operator seeds the value out-of-band
+        // and the control plane only stamps the ref. Note this never parses the
+        // Vault answers, so it does not fail closed like `resolve_secrets_backend`.
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            crate::defaults::VAULT_SECRETS_PACK,
+        ));
+        assert!(!secrets_backend_is_dev_store(&env));
+    }
+
+    #[test]
+    fn resolve_secrets_backend_rejects_unknown_kind() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            "greentic.secrets.bogus@1.0.0",
+        ));
+        let OpError::Conflict(msg) = resolve_secrets_backend(&store, &env).unwrap_err() else {
+            panic!("expected Conflict");
+        };
+        assert!(msg.contains("unknown secrets backend kind"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_secrets_backend_vault_without_answers_fails_closed() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        // Vault binding with no `answers_ref` → the required addr is missing.
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            crate::defaults::VAULT_SECRETS_PACK,
+        ));
+        let OpError::Conflict(msg) = resolve_secrets_backend(&store, &env).unwrap_err() else {
+            panic!("expected Conflict");
+        };
+        assert!(msg.contains("requires a non-empty `addr`"), "got: {msg}");
+    }
+
+    #[test]
+    fn vault_answers_map_to_backend_with_provider_defaults() {
+        // addr is trimmed; the rest fall back to the provider defaults.
+        let answers = json!({"addr": " http://vault.vault.svc:8200 ", "role": "worker"});
+        let SecretsBackend::Vault(b) = secrets_backend_from_vault_answers(Some(&answers)).unwrap()
+        else {
+            panic!("expected Vault");
+        };
+        assert_eq!(
+            b,
+            VaultBackend {
+                addr: "http://vault.vault.svc:8200".to_string(),
+                k8s_role: "worker".to_string(),
+                kv_mount: "secret".to_string(),
+                kv_prefix: "greentic".to_string(),
+                auth_mount: "kubernetes".to_string(),
+                transit_mount: "transit".to_string(),
+                transit_key: "greentic".to_string(),
+                namespace: None,
+            }
+        );
+    }
+
+    #[test]
+    fn vault_answers_override_defaults_and_namespace() {
+        let answers = json!({
+            "addr": "https://vault.example:8200",
+            "role": "worker",
+            "kv_mount": "kv",
+            "kv_prefix": "tenant-a",
+            "auth_mount": "k8s-eu",
+            "transit_mount": "tr",
+            "transit_key": "rk",
+            "namespace": "admin/team",
+        });
+        let SecretsBackend::Vault(b) = secrets_backend_from_vault_answers(Some(&answers)).unwrap()
+        else {
+            panic!("expected Vault");
+        };
+        assert_eq!(b.kv_mount, "kv");
+        assert_eq!(b.kv_prefix, "tenant-a");
+        assert_eq!(b.auth_mount, "k8s-eu");
+        assert_eq!(b.transit_mount, "tr");
+        assert_eq!(b.transit_key, "rk");
+        assert_eq!(b.namespace.as_deref(), Some("admin/team"));
+    }
+
+    #[test]
+    fn vault_answers_missing_role_fails_closed() {
+        let answers = json!({"addr": "http://vault:8200"});
+        let OpError::Conflict(msg) =
+            secrets_backend_from_vault_answers(Some(&answers)).unwrap_err()
+        else {
+            panic!("expected Conflict");
+        };
+        assert!(msg.contains("`role`"), "got: {msg}");
+    }
+
+    #[test]
+    fn vault_answers_non_object_rejected() {
+        let answers = json!("not an object");
+        let OpError::Conflict(msg) =
+            secrets_backend_from_vault_answers(Some(&answers)).unwrap_err()
+        else {
+            panic!("expected Conflict");
+        };
+        assert!(msg.contains("must be a JSON object"), "got: {msg}");
     }
 }

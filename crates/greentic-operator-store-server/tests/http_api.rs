@@ -16,6 +16,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use greentic_deploy_spec::StateIntegrity;
 use greentic_operator_store_server::http::{router, router_with_operator_key};
 use greentic_operator_store_server::sqlite::SqliteEnvironmentStore;
 use greentic_operator_store_server::storage::EnvironmentStorage;
@@ -499,6 +500,7 @@ async fn get_corrupt_stored_env_is_500_internal() {
             tenant_org_id: None,
             listen_addr: None,
             public_base_url: None,
+            gui_enabled: None,
         },
         greentic_deploy_spec::RevocationConfig::default(),
         greentic_deploy_spec::RetentionPolicy::default(),
@@ -582,6 +584,7 @@ async fn seed_env_with_deployment(store: &SqliteEnvironmentStore, env_id: &str) 
             tenant_org_id: None,
             listen_addr: None,
             public_base_url: None,
+            gui_enabled: None,
         },
         Default::default(),
         Default::default(),
@@ -2597,6 +2600,18 @@ fn add_endpoint_body(provider_type: &str, provider_id: &str) -> Value {
     })
 }
 
+/// Add-endpoint body carrying a caller-supplied `webhook_secret_ref` — the
+/// remote BYO-ref path for telegram-class endpoints (the server never mints).
+fn add_endpoint_body_with_webhook_ref(
+    provider_type: &str,
+    provider_id: &str,
+    webhook_secret_ref: &str,
+) -> Value {
+    let mut body = add_endpoint_body(provider_type, provider_id);
+    body["webhook_secret_ref"] = json!(webhook_secret_ref);
+    body
+}
+
 /// Add an endpoint under an explicit idempotency key (the messaging group
 /// uses the key as replay-detection domain state, so tests that add more
 /// than one endpoint must vary it) and return the server-minted id.
@@ -2665,10 +2680,12 @@ async fn messaging_add_persists_endpoint_with_server_minted_id() {
 }
 
 #[tokio::test]
-async fn messaging_add_telegram_class_is_501_and_persists_nothing() {
+async fn messaging_add_telegram_class_without_ref_is_501_and_persists_nothing() {
     let (_d, app) = app().await;
     create_local_env(&app).await;
 
+    // A telegram-class add over a remote store MUST carry a caller-supplied
+    // webhook_secret_ref; without one the server cannot mint and refuses.
     let (status, body) = send(
         app.clone(),
         Method::POST,
@@ -2682,8 +2699,8 @@ async fn messaging_add_telegram_class_is_501_and_persists_nothing() {
         body["detail"]
             .as_str()
             .unwrap_or("")
-            .contains("secrets sink"),
-        "detail must point at the missing sink: {body}"
+            .contains("webhook_secret_ref"),
+        "detail must direct the caller to supply a ref: {body}"
     );
 
     let (_, read) = send(app, Method::GET, "/environments/local", None).await;
@@ -2693,6 +2710,35 @@ async fn messaging_add_telegram_class_is_501_and_persists_nothing() {
         "the refused add must not persist"
     );
     assert_eq!(read["generation"], 1, "env CAS must not advance");
+}
+
+#[tokio::test]
+async fn messaging_add_telegram_class_with_webhook_ref_persists() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+
+    let supplied = "secret://local/default/_/messaging-byo/webhook_secret";
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/messaging",
+        Some(add_endpoint_body_with_webhook_ref(
+            "telegram", "tg-bot", supplied,
+        )),
+        &[("Idempotency-Key", IDEM_KEY)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["audit"]["target"]["provider_type"], "telegram");
+    assert_eq!(body["result"]["webhook_secret_ref"], supplied);
+    // create=1 → endpoint add=2
+    assert_eq!(body["generation"], 2);
+
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["webhook_secret_ref"], supplied,
+        "the supplied ref is stamped onto the persisted endpoint"
+    );
 }
 
 #[tokio::test]
@@ -2971,12 +3017,14 @@ async fn messaging_remove_is_idempotent_without_second_cas_advance() {
 }
 
 #[tokio::test]
-async fn messaging_rotate_secret_is_501_until_the_secrets_sink_lands() {
+async fn messaging_rotate_refless_endpoint_is_501_no_server_minting() {
     let (_d, app) = app().await;
     create_local_env(&app).await;
+    // A non-telegram endpoint carries no webhook_secret_ref, so rotate hits
+    // the sink with `existing = None`. The control-plane store never mints, so
+    // it refuses — there is no ref to echo.
     let eid = add_one_endpoint(&app, "teams", "legal-bot", "k-add").await;
 
-    // Existing endpoint, fresh key → the refusing sink answers 501.
     let (status, body) = send_custom(
         app.clone(),
         Method::POST,
@@ -3000,6 +3048,53 @@ async fn messaging_rotate_secret_is_501_until_the_secrets_sink_lands() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
     assert_eq!(body["kind"], "dependent-not-found");
+}
+
+#[tokio::test]
+async fn messaging_rotate_ref_bearing_endpoint_is_501_not_falsely_succeeded() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+
+    // Even a telegram endpoint added with a caller-supplied ref CANNOT be
+    // rotated on a remote store: the value lives operator-side, so the server
+    // cannot prove a rotation occurred and refuses rather than journal a
+    // misleading success (it never echoes the ref + bumps the generation).
+    let supplied = "secret://local/default/_/messaging-byo/webhook_secret";
+    let (status, add_body) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/messaging",
+        Some(add_endpoint_body_with_webhook_ref(
+            "telegram", "tg-bot", supplied,
+        )),
+        &[("Idempotency-Key", "k-add-tg")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "add body: {add_body}");
+    let eid = add_body["result"]["endpoint_id"].as_str().expect("eid");
+
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/rotate-secret"),
+        Some(json!({"updated_by": "op"})),
+        &[("Idempotency-Key", "k-rotate-tg")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "rotate body: {body}");
+    assert_eq!(body["kind"], "not-yet-implemented");
+
+    // The refused rotate must NOT have touched the endpoint — ref unchanged,
+    // generation still 0 (no false rotation recorded).
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["webhook_secret_ref"],
+        supplied
+    );
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["generation"], 0,
+        "a refused rotate must not bump the endpoint generation"
+    );
 }
 
 /// Regression: add a (non-telegram) endpoint with key K, then POST
@@ -3034,6 +3129,156 @@ async fn messaging_rotate_with_add_key_does_not_falsely_replay() {
             .unwrap_or("")
             .contains("messaging.endpoint.add"),
         "the conflict names the operation that consumed the key: {body}"
+    );
+}
+
+/// The new-ref variant (B2): a rotate carrying a NEW caller-supplied
+/// `webhook_secret_ref` is RECORDED — the operator provisioned the value in
+/// its own secrets plane, so the server stamps the asserted ref and bumps the
+/// generation without minting. A second rotation re-points again (no
+/// new-vs-existing equality guard), proving the same-ref case is also honest.
+#[tokio::test]
+async fn messaging_rotate_with_new_ref_records_and_bumps() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+
+    let old_ref = "secret://local/default/_/messaging-byo/webhook_secret";
+    let (status, add_body) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/messaging",
+        Some(add_endpoint_body_with_webhook_ref(
+            "telegram", "tg-bot", old_ref,
+        )),
+        &[("Idempotency-Key", "k-add-tg")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "add body: {add_body}");
+    let eid = add_body["result"]["endpoint_id"]
+        .as_str()
+        .expect("eid")
+        .to_string();
+
+    // Rotate to a NEW caller-provisioned ref → recorded (ref moves, gen 1).
+    let new_ref = "secret://local/default/_/messaging-byo/webhook_secret_v2";
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/rotate-secret"),
+        Some(json!({"updated_by": "op", "webhook_secret_ref": new_ref})),
+        &[("Idempotency-Key", "k-rotate-new")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "rotate body: {body}");
+    assert_eq!(body["result"]["webhook_secret_ref"], new_ref);
+
+    let (_, read) = send(app.clone(), Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["webhook_secret_ref"],
+        new_ref
+    );
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["generation"], 1,
+        "a recorded rotation bumps the endpoint generation"
+    );
+
+    // Re-rotate to the SAME ref under a fresh key: no equality guard, so it is
+    // still recorded (the operator may have rotated the value behind the same
+    // path and wants the generation bumped) → gen 2.
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/rotate-secret"),
+        Some(json!({"updated_by": "op", "webhook_secret_ref": new_ref})),
+        &[("Idempotency-Key", "k-rotate-again")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "re-rotate body: {body}");
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["generation"], 2,
+        "re-rotating to the same ref still bumps the generation"
+    );
+}
+
+/// A malformed `webhook_secret_ref` on a telegram endpoint is rejected by the
+/// server's ref parse (the same validation a caller-ref `add` runs) as a typed
+/// 400 — BEFORE any state mutation. A telegram endpoint is used so the parse,
+/// not the telegram-class gate, is what's exercised.
+#[tokio::test]
+async fn messaging_rotate_with_malformed_ref_is_400() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+    let (status, add_body) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/messaging",
+        Some(add_endpoint_body_with_webhook_ref(
+            "telegram",
+            "tg-bot",
+            "secret://local/default/_/messaging-byo/webhook_secret",
+        )),
+        &[("Idempotency-Key", "k-add-tg")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "add body: {add_body}");
+    let eid = add_body["result"]["endpoint_id"]
+        .as_str()
+        .expect("eid")
+        .to_string();
+
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/rotate-secret"),
+        Some(json!({"updated_by": "op", "webhook_secret_ref": "not-a-valid-uri"})),
+        &[("Idempotency-Key", "k-rotate-bad")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["kind"], "invalid-request");
+
+    // The rejected rotate did not bump the generation (telegram endpoint sits
+    // at gen 0 after add).
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["generation"], 0,
+        "a rejected rotate must not bump the endpoint generation"
+    );
+}
+
+/// A caller-supplied ref on a NON-telegram endpoint is rejected (400) — the
+/// same invariant a caller-ref `add` enforces, so the new-ref rotate cannot
+/// persist a webhook ref on an endpoint that would never have accepted one at
+/// creation.
+#[tokio::test]
+async fn messaging_rotate_new_ref_on_non_telegram_endpoint_is_400() {
+    let (_d, app) = app().await;
+    create_local_env(&app).await;
+    let eid = add_one_endpoint(&app, "teams", "legal-bot", "k-add").await;
+
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        &format!("/environments/local/messaging/{eid}/rotate-secret"),
+        Some(json!({"updated_by": "op",
+            "webhook_secret_ref": "secret://local/default/_/messaging-x/webhook_secret"})),
+        &[("Idempotency-Key", "k-rotate-nontg")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["kind"], "invalid-request");
+
+    // The rejected rotate neither stamped a ref nor bumped the generation.
+    let (_, read) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["webhook_secret_ref"],
+        serde_json::Value::Null,
+        "a rejected rotate must not stamp a ref on a non-telegram endpoint"
+    );
+    assert_eq!(
+        read["environment"]["messaging_endpoints"][0]["generation"], 0,
+        "a rejected rotate must not bump the endpoint generation"
     );
 }
 
@@ -3883,6 +4128,97 @@ async fn read_only_role_cannot_mutate_and_the_denial_names_the_actor() {
 }
 
 #[tokio::test]
+async fn read_only_token_cannot_export_a_backup() {
+    // Export returns the FULL recovery payload (env + sidecars + audit), so it
+    // is a backup-operator privilege — a read-only token (manifests only) must
+    // not exfiltrate it, even though it may read.
+    let (_d, app, store) = rbac_app().await;
+    let operator = bearer(OPERATOR_TOKEN);
+    let (status, _) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "EXP-1"), ("Authorization", &operator)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, backup) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+        &[("Idempotency-Key", "EXP-2"), ("Authorization", &operator)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {backup}");
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+
+    let reader = bearer(READER_TOKEN);
+    let (status, body) = send_custom(
+        app,
+        Method::GET,
+        &format!("/environments/local/backups/{backup_id}/export"),
+        None,
+        &[("Authorization", &reader)],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "read-only must not export: {body}"
+    );
+    assert!(
+        body["reason"].as_str().unwrap().contains("read-only"),
+        "reason names the role: {body}"
+    );
+
+    // The denied export attempt is audited as a privileged backup operation.
+    let events = audit_log_events(&store, "local").await;
+    let denial = events.last().expect("denial audited");
+    assert_eq!(denial["authorization"]["decision"], "deny");
+    assert_eq!(denial["noun"], "backup");
+    assert_eq!(denial["verb"], "export");
+    assert_eq!(denial["actor"]["user"], "viewer");
+}
+
+#[tokio::test]
+async fn operator_token_can_export_a_backup() {
+    let (_d, app, _store) = rbac_app().await;
+    let operator = bearer(OPERATOR_TOKEN);
+    let (status, _) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "EXP-3"), ("Authorization", &operator)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, backup) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+        &[("Idempotency-Key", "EXP-4"), ("Authorization", &operator)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+
+    let (status, artifact) = send_custom(
+        app,
+        Method::GET,
+        &format!("/environments/local/backups/{backup_id}/export"),
+        None,
+        &[("Authorization", &operator)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "operator may export: {artifact}");
+    assert_eq!(artifact["schema"], "greentic.backup-artifact.v1");
+}
+
+#[tokio::test]
 async fn operator_role_deploys_but_cannot_touch_trust_root_custody() {
     let (_d, app, _store) = rbac_app().await;
     let operator = bearer(OPERATOR_TOKEN);
@@ -4057,6 +4393,282 @@ async fn backup_then_restore_reverts_content_and_advances_generation() {
 
     // create + patch + backup + restore all audited durably.
     assert_eq!(audit_log_event_ids(&store, "local").await.len(), 4);
+}
+
+#[tokio::test]
+async fn export_backup_returns_a_self_verifying_artifact() {
+    let (_d, app) = app().await;
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, backup) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+
+    let (status, artifact) = send(
+        app,
+        Method::GET,
+        &format!("/environments/local/backups/{backup_id}/export"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {artifact}");
+
+    // Self-describing, and the manifest echoes the backup we created.
+    assert_eq!(artifact["schema"], "greentic.backup-artifact.v1");
+    assert_eq!(artifact["manifest"]["backup_id"], backup_id);
+    assert_eq!(artifact["manifest"]["env_id"], "local");
+    assert_eq!(artifact["manifest"]["generation"], 1);
+
+    // The artifact verifies OFFLINE: its digest recomputes over the snapshot,
+    // and the snapshot carries the captured environment document.
+    let recomputed = StateIntegrity::sha256_of(&artifact["snapshot"])
+        .expect("hash")
+        .digest;
+    assert_eq!(
+        artifact["snapshot_digest"].as_str().unwrap(),
+        recomputed,
+        "snapshot digest must verify against the snapshot bytes"
+    );
+    assert_eq!(artifact["snapshot"]["environment"]["name"], "local");
+}
+
+#[tokio::test]
+async fn export_of_an_unknown_backup_is_404() {
+    let (_d, app) = app().await;
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(
+        app,
+        Method::GET,
+        "/environments/local/backups/01JTKW5B4W4Q5Y1CQW93F7S5VH/export",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+}
+
+#[tokio::test]
+async fn disaster_recovery_import_reproduces_environment_and_audit_in_a_fresh_store() {
+    // --- Store A: a live env with active routing (a traffic split) + audit. ---
+    let (_da, app_a, store_a) = app_with_store().await;
+    let deployment_id = seed_env_with_deployment(&store_a, "local").await;
+    let rid = ready_one(&app_a, deployment_id).await;
+    let (status, _) = send(
+        app_a.clone(),
+        Method::POST,
+        "/environments/local/traffic",
+        Some(traffic_body(deployment_id, &[(rid, 10_000)])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // A field change so reproduction proves more than just the routing.
+    let (status, _) = send(
+        app_a.clone(),
+        Method::PATCH,
+        "/environments/local",
+        Some(json!({"name": "renamed"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Back up the live doc, then export the portable artifact.
+    let (status, backup) = send(
+        app_a.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+    let (_, before) = send(app_a.clone(), Method::GET, "/environments/local", None).await;
+    let (status, artifact) = send(
+        app_a,
+        Method::GET,
+        &format!("/environments/local/backups/{backup_id}/export"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let captured: Vec<String> = artifact["snapshot"]["audit_log"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["event_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !captured.is_empty(),
+        "backup must have captured audit history"
+    );
+
+    // --- Total loss: a brand-new store that has never seen the env. ---
+    let (_db, app_b, store_b) = app_with_store().await;
+    let (status, imported) = send(
+        app_b.clone(),
+        Method::POST,
+        "/environments/local/import",
+        Some(json!({ "artifact": artifact })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {imported}");
+    assert_envelope(&imported, "local");
+    assert_eq!(imported["audit"]["verb"], "import");
+    assert_eq!(imported["result"]["imported_generation"], 1);
+    // The reconstructed content's strong validator IS the backup's digest.
+    assert_eq!(
+        imported["result"]["integrity"]["digest"],
+        artifact["manifest"]["integrity"]["digest"]
+    );
+    assert_eq!(
+        imported["etag"], artifact["manifest"]["integrity"]["digest"],
+        "imported etag must equal the snapshot's env digest"
+    );
+
+    // The full environment document is reproduced (name + active routing:
+    // revisions and traffic splits live in the env doc).
+    let (_, read_b) = send(app_b, Method::GET, "/environments/local", None).await;
+    assert_eq!(
+        read_b["environment"], before["environment"],
+        "imported env doc must reproduce the backed-up one"
+    );
+
+    // Audit history reproduced, with the import event appended last.
+    let mut expected = captured;
+    expected.push(imported["audit"]["event_id"].as_str().unwrap().to_string());
+    assert_eq!(audit_log_event_ids(&store_b, "local").await, expected);
+}
+
+#[tokio::test]
+async fn import_into_an_existing_environment_is_409() {
+    let (_d, app) = app().await;
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, backup) = send(
+        app.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+    )
+    .await;
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+    let (_, artifact) = send(
+        app.clone(),
+        Method::GET,
+        &format!("/environments/local/backups/{backup_id}/export"),
+        None,
+    )
+    .await;
+    // The env still exists → import refuses, never clobbers.
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/environments/local/import",
+        Some(json!({ "artifact": artifact })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+}
+
+#[tokio::test]
+async fn import_of_a_tampered_artifact_is_422() {
+    let (_da, app_a) = app().await;
+    let (status, _) = send(
+        app_a.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, backup) = send(
+        app_a.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+    )
+    .await;
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+    let (_, mut artifact) = send(
+        app_a,
+        Method::GET,
+        &format!("/environments/local/backups/{backup_id}/export"),
+        None,
+    )
+    .await;
+    // Tamper the snapshot without fixing the digest.
+    artifact["snapshot"]["environment"]["name"] = json!("evil");
+    // A fresh store; the corruption is caught before anything is written.
+    let (_db, app_b) = app().await;
+    let (status, body) = send(
+        app_b,
+        Method::POST,
+        "/environments/local/import",
+        Some(json!({ "artifact": artifact })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+}
+
+#[tokio::test]
+async fn import_under_a_mismatched_env_id_is_400() {
+    let (_da, app_a) = app().await;
+    let (status, _) = send(
+        app_a.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, backup) = send(
+        app_a.clone(),
+        Method::POST,
+        "/environments/local/backups",
+        None,
+    )
+    .await;
+    let backup_id = backup["result"]["backup_id"].as_str().unwrap().to_string();
+    let (_, artifact) = send(
+        app_a,
+        Method::GET,
+        &format!("/environments/local/backups/{backup_id}/export"),
+        None,
+    )
+    .await;
+    // The artifact names "local"; importing it under a different path is refused.
+    let (_db, app_b) = app().await;
+    let (status, body) = send(
+        app_b,
+        Method::POST,
+        "/environments/other/import",
+        Some(json!({ "artifact": artifact })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
 }
 
 #[tokio::test]
@@ -4440,4 +5052,659 @@ async fn env_scoped_token_can_only_access_its_environments() {
     let envs = body["environments"].as_array().unwrap();
     assert_eq!(envs.len(), 1);
     assert_eq!(envs[0], "staging");
+}
+
+// ---------------------------------------------------------------------------
+// Reconcile (PR-A) — server-mediated reconcile authorization
+// ---------------------------------------------------------------------------
+//
+// The reconcile endpoint authorizes + audits + CAS-pins a reconcile and
+// returns the authorized env snapshot. No desired-state write; generation
+// and etag echo the loaded revision unchanged. If-Match is MANDATORY.
+
+/// Helper: create env "local" and return the etag from the create response.
+async fn create_env_and_etag(app: &Router) -> String {
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create env failed: {body}");
+    body["etag"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn reconcile_authz_allow() {
+    let (_d, app, store) = app_with_store().await;
+    let etag = create_env_and_etag(&app).await;
+    let if_match = format!("\"{etag}\"");
+
+    let (status, body) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-1"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Envelope shape.
+    assert!(body["etag"].is_string(), "etag missing: {body}");
+    assert!(body["generation"].is_u64(), "generation missing: {body}");
+    assert_eq!(body["idempotency"]["idempotency"], "applied");
+
+    // Result is the full Environment document.
+    assert_eq!(body["result"]["environment_id"], "local");
+
+    // Generation unchanged (create = 1, reconcile does not bump).
+    assert_eq!(body["generation"], 1);
+
+    // Audit record.
+    let audit = &body["audit"];
+    assert_eq!(audit["env_id"], "local");
+    assert_eq!(audit["noun"], "env");
+    assert_eq!(audit["verb"], "reconcile");
+    assert_eq!(audit["authorization"]["decision"], "allow");
+    assert_eq!(audit["result"]["outcome"], "ok");
+    assert_eq!(audit["idempotency_key"], "REC-1");
+
+    // One audit row in the log (the create's + reconcile's).
+    let events = audit_log_event_ids(&store, "local").await;
+    assert_eq!(events.len(), 2, "create + reconcile: {events:?}");
+}
+
+#[tokio::test]
+async fn reconcile_authz_deny_read_only_token() {
+    let (_d, app, store) = rbac_app().await;
+    let admin = bearer(ADMIN_TOKEN);
+    let (status, created) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "REC-D1"), ("Authorization", &admin)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let etag = created["etag"].as_str().unwrap();
+    let if_match = format!("\"{etag}\"");
+
+    let reader = bearer(READER_TOKEN);
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[
+            ("Idempotency-Key", "REC-D2"),
+            ("Authorization", &reader),
+            ("If-Match", &if_match),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["kind"], "unauthorized");
+    assert!(body["reason"].as_str().unwrap().contains("read-only"));
+
+    // Durable denial audit row was written (authenticated denial).
+    let events = audit_log_events(&store, "local").await;
+    let denial = events.last().expect("denial audited");
+    assert_eq!(denial["authorization"]["decision"], "deny");
+    assert_eq!(denial["noun"], "env");
+    assert_eq!(denial["verb"], "reconcile");
+    assert_eq!(
+        denial["result"]["kind"], "unauthorized",
+        "denial result: {denial}"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_authz_deny_env_scoped_token_wrong_env() {
+    let (_d, app, store) = rbac_app().await;
+    let admin = bearer(ADMIN_TOKEN);
+
+    // Create "prod" — the scoped token only covers "staging".
+    let (status, created) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("prod")),
+        &[("Idempotency-Key", "REC-S1"), ("Authorization", &admin)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let etag = created["etag"].as_str().unwrap();
+    let if_match = format!("\"{etag}\"");
+
+    let scoped = bearer(SCOPED_TOKEN);
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/prod/reconcile",
+        None,
+        &[
+            ("Idempotency-Key", "REC-S2"),
+            ("Authorization", &scoped),
+            ("If-Match", &if_match),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert!(body["reason"].as_str().unwrap().contains("not scoped"));
+
+    // Durable denial audit row.
+    let events = audit_log_events(&store, "prod").await;
+    let denial = events.last().expect("denial audited");
+    assert_eq!(denial["authorization"]["decision"], "deny");
+    assert_eq!(denial["actor"]["user"], "scoped-admin");
+}
+
+#[tokio::test]
+async fn reconcile_cas_conflict_412() {
+    let (_d, app) = app().await;
+    let etag = create_env_and_etag(&app).await;
+
+    // Mutate the env (bumps generation/etag).
+    let (status, _) = send(
+        app.clone(),
+        Method::PATCH,
+        "/environments/local",
+        Some(json!({"name": "renamed"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // POST reconcile with the ORIGINAL (stale) etag.
+    let stale_if_match = format!("\"{etag}\"");
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[
+            ("Idempotency-Key", "REC-CAS"),
+            ("If-Match", &stale_if_match),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "body: {body}");
+    assert_eq!(body["kind"], "precondition-failed");
+    // ConcurrencyConflict body contains the stale expected and current actual.
+    assert_eq!(body["expected_etag"], etag);
+    assert!(
+        body["actual_etag"].is_string(),
+        "actual_etag missing: {body}"
+    );
+    assert_ne!(body["actual_etag"], etag, "etags should differ: {body}");
+}
+
+#[tokio::test]
+async fn reconcile_cas_missing_if_match_428() {
+    let (_d, app) = app().await;
+    create_env_and_etag(&app).await;
+
+    // POST reconcile WITHOUT If-Match.
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-428")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_REQUIRED, "body: {body}");
+    assert_eq!(body["kind"], "precondition-required");
+    assert!(
+        body["detail"].as_str().unwrap_or("").contains("If-Match"),
+        "detail must mention If-Match: {body}"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_durable_audit_row_written() {
+    let (_d, app, store) = app_with_store().await;
+    let etag = create_env_and_etag(&app).await;
+    let if_match = format!("\"{etag}\"");
+
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-AUD"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Query the audit log directly.
+    let events = audit_log_events(&store, "local").await;
+    // create + reconcile = 2 audit rows.
+    assert_eq!(events.len(), 2, "create + reconcile: {events:?}");
+    let reconcile_event = &events[1];
+    assert_eq!(reconcile_event["noun"], "env");
+    assert_eq!(reconcile_event["verb"], "reconcile");
+    // Target records the snapshot identity.
+    assert_eq!(reconcile_event["target"]["environment_id"], "local");
+    assert_eq!(reconcile_event["target"]["generation"], 1);
+    assert!(
+        reconcile_event["target"]["etag"].is_string(),
+        "target.etag missing: {reconcile_event}"
+    );
+    // previous_generation == new_generation (no bump).
+    assert_eq!(
+        reconcile_event["previous_generation"], reconcile_event["new_generation"],
+        "generation should not change: {reconcile_event}"
+    );
+    assert_eq!(reconcile_event["result"]["outcome"], "ok");
+}
+
+#[tokio::test]
+async fn reconcile_idempotent_replay() {
+    let (_d, app, store) = app_with_store().await;
+    let etag = create_env_and_etag(&app).await;
+    let if_match = format!("\"{etag}\"");
+
+    // First request.
+    let (status, original) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-IDEM"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {original}");
+    assert_eq!(original["idempotency"]["idempotency"], "applied");
+
+    // Same key, same request → replay.
+    let (status, replayed) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-IDEM"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {replayed}");
+    assert_eq!(replayed["idempotency"]["idempotency"], "replayed");
+    // Same response body (original snapshot, original audit event).
+    assert_eq!(replayed["result"], original["result"]);
+    assert_eq!(replayed["audit"], original["audit"]);
+    assert_eq!(replayed["etag"], original["etag"]);
+    assert_eq!(replayed["generation"], original["generation"]);
+
+    // No second audit row.
+    let events = audit_log_event_ids(&store, "local").await;
+    assert_eq!(events.len(), 2, "create + reconcile only: {events:?}");
+}
+
+#[tokio::test]
+async fn reconcile_idempotency_conflict_different_fingerprint() {
+    let (_d, app) = app().await;
+    let etag = create_env_and_etag(&app).await;
+    let if_match = format!("\"{etag}\"");
+
+    // Reconcile env "local" with key K1.
+    let (status, _) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-FP"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Create a backup on the SAME env with the SAME key K1 — different
+    // path produces a different fingerprint → 409 idempotency-conflict.
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/backups",
+        None,
+        &[("Idempotency-Key", "REC-FP")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["kind"], "idempotency-conflict");
+}
+
+#[tokio::test]
+async fn reconcile_generation_not_bumped() {
+    let (_d, app) = app().await;
+    let etag = create_env_and_etag(&app).await;
+    let if_match = format!("\"{etag}\"");
+
+    // GET env before reconcile.
+    let (status, before) = send(app.clone(), Method::GET, "/environments/local", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let gen_before = before["generation"].as_u64().unwrap();
+
+    // Reconcile.
+    let (status, _) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-GEN"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // GET env after reconcile.
+    let (status, after) = send(app, Method::GET, "/environments/local", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        after["generation"].as_u64().unwrap(),
+        gen_before,
+        "generation must not be bumped by reconcile"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_env_not_found_404() {
+    let (_d, app) = app().await;
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/nonexistent/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-404"), ("If-Match", "\"deadbeef\"")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["kind"], "not-found");
+}
+
+#[tokio::test]
+async fn reconcile_open_dev_posture_allows_with_honest_audit() {
+    // Open-dev (default) allows reconcile without any token.
+    let (_d, app, _store) = app_with_store().await;
+    let etag = create_env_and_etag(&app).await;
+    let if_match = format!("\"{etag}\"");
+
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-OD"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["audit"]["authorization"]["decision"], "allow");
+    assert_eq!(body["audit"]["authorization"]["policy"], "open-dev");
+
+    // If-Match was still mandatory (open-dev does not bypass CAS).
+    let (status, body) = send_custom(
+        app_with_store().await.1,
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-OD2")],
+    )
+    .await;
+    // This hits a fresh store with no "local" env, so it will be either 428
+    // (if If-Match check runs first) or 404. The 428 fires before loading
+    // state, so it wins.
+    assert_eq!(status, StatusCode::PRECONDITION_REQUIRED, "body: {body}");
+}
+
+#[tokio::test]
+async fn reconcile_concurrent_race_error_or_replay() {
+    // Simulate the concurrent race: first reconcile commits, then a second
+    // with the same key gets IdempotencyKeyCommitted from record_journal
+    // and falls through error_or_replay to replay the first.
+    //
+    // We cannot easily simulate true concurrency in a single-threaded test,
+    // but we can verify the replay path by issuing the same request twice
+    // (the first commits the key; the second replays via replay_gate).
+    let (_d, app, store) = app_with_store().await;
+    let etag = create_env_and_etag(&app).await;
+    let if_match = format!("\"{etag}\"");
+
+    let (status, first) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-RACE"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {first}");
+    assert_eq!(first["idempotency"]["idempotency"], "applied");
+
+    // Second identical request → replayed via the replay_gate.
+    let (status, second) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile",
+        None,
+        &[("Idempotency-Key", "REC-RACE"), ("If-Match", &if_match)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {second}");
+    assert_eq!(second["idempotency"]["idempotency"], "replayed");
+    assert_eq!(second["audit"]["event_id"], first["audit"]["event_id"]);
+
+    // Only one audit row was appended for reconcile.
+    let events = audit_log_event_ids(&store, "local").await;
+    assert_eq!(events.len(), 2, "create + reconcile: {events:?}");
+}
+
+// ---------------------------------------------------------------------------
+// reconcile/complete — the second half of a server-mediated reconcile. The
+// operator applies the cluster, then posts the outcome so the durable audit
+// reflects reality, not just the authorization. Append-only (never
+// concurrency-gated); idempotency-key gives retry-safety.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reconcile_complete_records_succeeded() {
+    let (_d, app, store) = app_with_store().await;
+    let etag = create_env_and_etag(&app).await;
+
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile/complete",
+        Some(json!({
+            "authorized_generation": 1,
+            "authorized_etag": etag,
+            "completion": { "status": "succeeded", "applied": 7, "pruned": 2 },
+        })),
+        &[("Idempotency-Key", "RCC-OK")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["idempotency"]["idempotency"], "applied");
+    assert_eq!(body["result"]["recorded"], true);
+    // Audit-only: generation unchanged (create = 1).
+    assert_eq!(body["generation"], 1);
+
+    let audit = &body["audit"];
+    assert_eq!(audit["noun"], "env");
+    assert_eq!(audit["verb"], "reconcile-complete");
+    assert_eq!(audit["result"]["outcome"], "ok");
+    assert_eq!(audit["target"]["authorized_generation"], 1);
+    assert_eq!(audit["target"]["authorized_etag"], etag);
+    assert_eq!(audit["target"]["completion"]["status"], "succeeded");
+    assert_eq!(audit["target"]["completion"]["applied"], 7);
+    assert_eq!(audit["target"]["completion"]["pruned"], 2);
+    // previous == new generation (no bump).
+    assert_eq!(audit["previous_generation"], audit["new_generation"]);
+
+    // create + complete = 2 durable audit rows.
+    let events = audit_log_event_ids(&store, "local").await;
+    assert_eq!(events.len(), 2, "create + reconcile-complete: {events:?}");
+}
+
+#[tokio::test]
+async fn reconcile_complete_records_failed() {
+    let (_d, app, store) = app_with_store().await;
+    let etag = create_env_and_etag(&app).await;
+
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile/complete",
+        Some(json!({
+            "authorized_generation": 1,
+            "authorized_etag": etag,
+            "completion": { "status": "failed", "error": "cannot reach the cluster: timeout" },
+        })),
+        &[("Idempotency-Key", "RCC-FAIL")],
+    )
+    .await;
+    // The cluster apply failed, but recording that failure SUCCEEDS (200) — the
+    // audit must capture a real failed apply, not swallow it.
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["result"]["recorded"], true);
+
+    let events = audit_log_events(&store, "local").await;
+    let complete = events.last().expect("completion audited");
+    assert_eq!(complete["verb"], "reconcile-complete");
+    assert_eq!(complete["target"]["completion"]["status"], "failed");
+    assert_eq!(
+        complete["target"]["completion"]["error"],
+        "cannot reach the cluster: timeout"
+    );
+    // The failed reconcile is FIRST-CLASS in the audit result (not buried in
+    // target.completion) so AuditResult monitors catch it — even though the HTTP
+    // recording itself succeeded (200, asserted above).
+    assert_eq!(complete["result"]["outcome"], "error");
+    assert_eq!(complete["result"]["kind"], "reconcile-failed");
+    assert_eq!(
+        complete["result"]["message"],
+        "cannot reach the cluster: timeout"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_complete_is_append_only_despite_stale_authorized_generation() {
+    // A completion records a cluster change that already happened. Even if the
+    // env advanced (a concurrent write) since the reconcile was authorized, the
+    // completion must STILL be recorded — never dropped on a concurrency check —
+    // carrying the (now stale) authorized generation as the asserted fact.
+    let (_d, app, store) = app_with_store().await;
+    let etag1 = create_env_and_etag(&app).await;
+
+    // Advance the head past the authorized snapshot.
+    let (status, patched) = send(
+        app.clone(),
+        Method::PATCH,
+        "/environments/local",
+        Some(json!({ "name": "renamed" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(patched["generation"], 2);
+
+    // Complete the reconcile that was authorized at generation 1 / etag1.
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile/complete",
+        Some(json!({
+            "authorized_generation": 1,
+            "authorized_etag": etag1,
+            "completion": { "status": "succeeded", "applied": 1, "pruned": 0 },
+        })),
+        &[("Idempotency-Key", "RCC-STALE")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "append-only: not gated on head; body: {body}"
+    );
+    // The audit stamps the current head (2) but records the asserted authorized
+    // generation (1) for correlation.
+    assert_eq!(body["generation"], 2);
+    assert_eq!(body["audit"]["target"]["authorized_generation"], 1);
+    assert_eq!(body["audit"]["target"]["authorized_etag"], etag1);
+
+    // create + patch + complete = 3 audit rows.
+    let events = audit_log_event_ids(&store, "local").await;
+    assert_eq!(events.len(), 3, "create + patch + complete: {events:?}");
+}
+
+#[tokio::test]
+async fn reconcile_complete_authz_deny_read_only_token() {
+    let (_d, app, store) = rbac_app().await;
+    let admin = bearer(ADMIN_TOKEN);
+    let (status, created) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments",
+        Some(create_body("local")),
+        &[("Idempotency-Key", "RCC-D1"), ("Authorization", &admin)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let etag = created["etag"].as_str().unwrap().to_string();
+
+    let reader = bearer(READER_TOKEN);
+    let (status, body) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile/complete",
+        Some(json!({
+            "authorized_generation": 1,
+            "authorized_etag": etag,
+            "completion": { "status": "succeeded", "applied": 0, "pruned": 0 },
+        })),
+        &[("Idempotency-Key", "RCC-D2"), ("Authorization", &reader)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["kind"], "unauthorized");
+
+    // Durable denial audit row (env mutation is denied for read-only).
+    let events = audit_log_events(&store, "local").await;
+    let denial = events.last().expect("denial audited");
+    assert_eq!(denial["authorization"]["decision"], "deny");
+    assert_eq!(denial["verb"], "reconcile-complete");
+}
+
+#[tokio::test]
+async fn reconcile_complete_idempotent_replay() {
+    let (_d, app, store) = app_with_store().await;
+    let etag = create_env_and_etag(&app).await;
+    let body_json = json!({
+        "authorized_generation": 1,
+        "authorized_etag": etag,
+        "completion": { "status": "succeeded", "applied": 3, "pruned": 1 },
+    });
+
+    let (status, first) = send_custom(
+        app.clone(),
+        Method::POST,
+        "/environments/local/reconcile/complete",
+        Some(body_json.clone()),
+        &[("Idempotency-Key", "RCC-IDEM")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {first}");
+    assert_eq!(first["idempotency"]["idempotency"], "applied");
+
+    // Same key + same request → replay (retry-safety, no double-record).
+    let (status, replayed) = send_custom(
+        app,
+        Method::POST,
+        "/environments/local/reconcile/complete",
+        Some(body_json),
+        &[("Idempotency-Key", "RCC-IDEM")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {replayed}");
+    assert_eq!(replayed["idempotency"]["idempotency"], "replayed");
+    assert_eq!(replayed["audit"]["event_id"], first["audit"]["event_id"]);
+
+    // Only one completion audit row.
+    let events = audit_log_event_ids(&store, "local").await;
+    assert_eq!(events.len(), 2, "create + one completion: {events:?}");
 }

@@ -4,33 +4,40 @@
 //! real-cloud proving ground of the next-gen deployment model. The
 //! scaffold ships the full deterministic half of the slice; the typed
 //! Kubernetes API client landed as [`kube_client`] (PR-5.2, `k8s-client`
-//! feature) behind the seams defined here. Constructing that client from
-//! the binding's answers and binding it to verb dispatch — plus the
-//! kind/real-cluster E2E — is the PR-5.3 orchestration wiring. Zain's
-//! infrastructure answers (`plans/zain-k8s-alignment.md`) gate the
+//! feature) behind the seams defined here. `gtc op env reconcile` (PR-5.3)
+//! constructs that client from the binding's answers and applies the
+//! rendered desired state through it
+//! ([`K8sDeployerHandler::reconcile`](deployer::K8sDeployerHandler::reconcile)).
+//! `gtc op credentials requirements` now connects a live validator client
+//! (the CLI's credentials path injects it via `K8sDeployerCredentials::with_client`)
+//! and per-revision Deployer-verb dispatch (`op env apply-revision`) has
+//! shipped; the live-cluster readiness wait is the remaining PR-5.3 slice.
+//! Zain's infrastructure answers (`plans/zain-k8s-alignment.md`) gate the
 //! real-cluster and production acceptance, not this scaffold — sandbox
 //! defaults per that doc.
 //!
 //! ## Answers consumption
 //!
-//! `op env render` reads the binding's `answers_ref` and feeds it to
-//! [`K8sParams::from_answers`](manifests::K8sParams::from_answers) so
-//! operator overrides (namespace, runtime image, router replicas) reach
-//! the rendered manifests. The Deployer verbs (`warm_revision`,
-//! `apply_traffic_split`) still use `K8sParams::for_env` sandbox
-//! defaults — they have no env-dir access on the trait; threading
-//! answers into them rides the PR-5.3 orchestration wiring.
+//! `op env render` and `op env reconcile` read the binding's `answers_ref`
+//! and feed it to [`K8sParams::from_answers`](manifests::K8sParams::from_answers)
+//! so operator overrides (namespace, runtime image, router replicas) reach
+//! the rendered manifests; reconcile additionally reads `kubeconfig_context`
+//! to target the cluster. The per-revision Deployer verbs (`warm_revision`,
+//! `archive_revision`, `apply_traffic_split`) take the binding's `answers`
+//! as a trait parameter (PR-5.3) and feed the same `from_answers`
+//! projection; `op env apply-revision` and `op credentials requirements`
+//! resolve and thread it in.
 //!
-//! ## Operator CLI lifecycle verb disclaimer
+//! ## Operator CLI verb disclaimer
 //!
-//! The operator CLI's revision/traffic verbs (`gtc op revision warm`,
-//! `gtc op traffic set`, etc.) do not yet invoke `Deployer` impls —
-//! they are storage-layer only, true for every registered deployer
-//! today (including AWS-ECS since C3; there is no non-test caller of
-//! `as_deployer()` anywhere). Until the PR-5.x orchestration wiring
-//! lands, binding `greentic.deployer.k8s` gives the credentials and
-//! bootstrap surface only; no cluster workloads are created or mutated
-//! by lifecycle verbs.
+//! `gtc op env reconcile` is the apply path: it constructs a connected
+//! cluster client and creates / upserts / prunes cluster workloads. The
+//! per-revision lifecycle verbs (`gtc op revision warm`, `gtc op traffic
+//! set`, etc.) remain storage-layer only — they record desired state and
+//! do not invoke `Deployer` impls, true for every registered deployer
+//! (including AWS-ECS since C3). Per-revision Deployer-verb dispatch
+//! (`op env apply-revision`) has shipped; the live-cluster readiness wait
+//! is the remaining PR-5.3 slice.
 //!
 //! Module layout (mirrors the local-process / AWS-ECS reference shape):
 //!
@@ -61,7 +68,9 @@
 //!   RoleBinding rules pack, derived from the same operations list the
 //!   probes validate.
 
+pub(crate) mod async_bridge;
 pub mod bootstrap;
+pub mod bound_identity;
 pub mod cluster;
 pub mod credentials;
 pub mod deployer;
@@ -78,8 +87,10 @@ use semver::VersionReq;
 use super::slot::EnvPackHandler;
 use crate::tool_check::ToolCheck;
 
-pub use cluster::{K8sCluster, K8sClusterError, ObjectRef, UnconfiguredCluster};
+pub use bound_identity::resolve_bound_identity;
+pub use cluster::{K8sCluster, K8sClusterError, ObjectRef, RolloutStatus, UnconfiguredCluster};
 pub use credentials::{K8sDeployerCredentials, K8sValidatorClient};
+pub use deployer::ReconcileReport;
 #[cfg(feature = "k8s-client")]
 pub use kube_client::{KubeCluster, KubeValidatorClient};
 
@@ -90,6 +101,17 @@ pub struct K8sDeployerHandler {
     /// Cluster side-effect seam the [`Deployer`](crate::env_packs::deployer::Deployer)
     /// verbs mutate through. Crate-visible so `deployer.rs` reaches it.
     pub(crate) cluster: Arc<dyn K8sCluster>,
+    /// Base64 of the env's local dev-store, supplied by the reconcile call site
+    /// (which owns the filesystem read). The [`ManifestRenderer`] impl injects
+    /// it into the rendered dev-store Secret. `None` keeps the rendering pure
+    /// (the preview path and the per-revision verbs render no secret material).
+    dev_secrets_data: Option<String>,
+    /// Which secrets backend the worker resolves `secret://` refs against, and
+    /// (for Vault) the non-secret connection config rendered into the pod. The
+    /// CLI resolves it from the env's `Secrets`-slot binding and injects it via
+    /// [`Self::with_secrets_backend`]; defaults to
+    /// [`SecretsBackend::DevStore`](manifests::SecretsBackend::DevStore).
+    secrets_backend: manifests::SecretsBackend,
 }
 
 impl Default for K8sDeployerHandler {
@@ -97,6 +119,8 @@ impl Default for K8sDeployerHandler {
         Self {
             creds: K8sDeployerCredentials::default(),
             cluster: Arc::new(UnconfiguredCluster),
+            dev_secrets_data: None,
+            secrets_backend: manifests::SecretsBackend::DevStore,
         }
     }
 }
@@ -118,7 +142,35 @@ impl K8sDeployerHandler {
         Self {
             creds: K8sDeployerCredentials::default(),
             cluster,
+            dev_secrets_data: None,
+            secrets_backend: manifests::SecretsBackend::DevStore,
         }
+    }
+
+    /// Construct with a cluster seam plus the env's dev-store bytes (base64),
+    /// so `reconcile` renders the dev-store Secret carrying the operator's
+    /// secrets. The reconcile CLI reads the dev-store file (it owns the
+    /// filesystem) and passes it here; `None` renders an empty Secret.
+    pub fn with_cluster_and_dev_secrets(
+        cluster: Arc<dyn K8sCluster>,
+        dev_secrets_data: Option<String>,
+    ) -> Self {
+        Self {
+            creds: K8sDeployerCredentials::default(),
+            cluster,
+            dev_secrets_data,
+            secrets_backend: manifests::SecretsBackend::DevStore,
+        }
+    }
+
+    /// Overlay the env's resolved secrets backend (the CLI derives it from the
+    /// env's `Secrets`-slot binding). Builder-style so it composes with the
+    /// cluster / dev-store constructors; the [`ManifestRenderer`] impl reads it
+    /// to render the worker's secrets identity (dev-store Secret vs. Vault SA +
+    /// `VAULT_*` env).
+    pub fn with_secrets_backend(mut self, secrets_backend: manifests::SecretsBackend) -> Self {
+        self.secrets_backend = secrets_backend;
+        self
     }
 }
 

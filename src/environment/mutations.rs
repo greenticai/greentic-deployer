@@ -113,6 +113,30 @@ pub trait EnvironmentMutations: Send + Sync {
     ) -> Result<Environment, StoreError>;
 
     // -------------------------------------------------------------
+    // Reads
+    //   (no dedicated CLI verb — used by the remote dispatch to
+    //    evaluate client-side preconditions before a mutation)
+    // -------------------------------------------------------------
+
+    /// Read the current environment state. This is the single READ verb on an
+    /// otherwise mutation-only trait: the remote dispatch needs it to evaluate
+    /// client-side preconditions — e.g. the `warm` health-gate's
+    /// `expected_lifecycle`, which the local closure-based path reads inline
+    /// under its flock. Maps to `GET /environments/{env_id}` on the HTTP
+    /// backend and delegates to
+    /// [`EnvironmentStore::load`](super::EnvironmentStore::load) on
+    /// `LocalFsStore`.
+    fn load_environment(&self, env_id: &EnvId) -> Result<Environment, StoreError>;
+
+    /// True when the env's trust root holds at least one operator key. Maps to
+    /// `GET /environments/{env_id}/trust-root` on the HTTP backend and to a
+    /// trust-root file read on `LocalFsStore`. A read-only probe (like
+    /// [`Self::load_environment`]) — remote `env apply --check` uses it to diff
+    /// a declared `trust_root` instead of assuming it is seeded (the env
+    /// document does not carry trust-root state).
+    fn trust_root_is_seeded(&self, env_id: &EnvId) -> Result<bool, StoreError>;
+
+    // -------------------------------------------------------------
     // Migration
     //   `op env migrate-dev --apply`
     // -------------------------------------------------------------

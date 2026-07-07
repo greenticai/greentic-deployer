@@ -69,8 +69,8 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use greentic_deploy_spec::{
-    BundleDeploymentStatus, CustomerId, DeploymentId, EnvId, Environment, MessagingEndpoint,
-    RouteBinding,
+    BundleDeploymentStatus, CapabilitySlot, CustomerId, DeploymentId, EnvId, Environment,
+    MessagingEndpoint, RouteBinding,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -190,6 +190,9 @@ struct SplitRevisionEntry {
     expected_digest: String,
     weight_bps: u32,
     drain_seconds: Option<u32>,
+    /// OCI/repo/store pull ref for the staged revision (K8s boot pull);
+    /// `None` = local-serve only.
+    bundle_source_uri: Option<String>,
 }
 
 /// Reference to an endpoint that may not exist yet at plan time. `Created`
@@ -348,6 +351,10 @@ struct ApplyContext {
     missing: Vec<MissingItem>,
     warnings: Vec<String>,
     updated_by: String,
+    /// Directory of the manifest file. Pack-binding `answers_ref`s resolve
+    /// against it, and apply stages them into the env store so reconcile
+    /// (which resolves against the env dir) can find them.
+    manifest_dir: PathBuf,
 }
 
 // --- entry point ----------------------------------------------------------------
@@ -410,7 +417,7 @@ pub enum ApplyMode {
 }
 
 impl ApplyMode {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             ApplyMode::Apply => "apply",
             ApplyMode::DryRun => "dry-run",
@@ -672,18 +679,16 @@ fn resolve_and_validate(
     let env = if store.exists(&env_id)? {
         Some(store.load(&env_id)?)
     } else {
-        // `env apply` reconciles an EXISTING non-local env, but it cannot
-        // CREATE one: the local store is authorization-gated to `local` only
-        // (A7 `authorize_local_only`), so non-local env creation is reserved
-        // for the remote operator store. Surface a clear error at plan time
-        // rather than letting execute hit a confusing `Unauthorized`.
+        // `env apply` bootstraps only the `local` env (its `env init` step
+        // seeds the default bindings). A named env is first-class on the local
+        // store but must be created explicitly first — `apply` reconciles an
+        // existing named env, it does not bootstrap one. Surface a clear error
+        // at plan time rather than failing mid-execute.
         if env_id.as_str() != crate::defaults::LOCAL_ENV_ID {
             return Err(OpError::NotFound(format!(
-                "environment `{env_id}` not found — `env apply` can reconcile an existing \
-                 non-local environment but cannot create one locally (the `local`-only \
-                 authorization policy reserves non-local env creation for the remote \
-                 operator store). Create `{env_id}` via the operator store first, or use \
-                 `local`."
+                "environment `{env_id}` not found — `env apply` reconciles an existing \
+                 named environment but does not create one. Run `op env create {env_id}` \
+                 first, then re-run apply (or use `local`, which apply bootstraps)."
             )));
         }
         None
@@ -785,6 +790,62 @@ fn resolve_and_validate(
     for b in &manifest.bundles {
         let customer_id = super::bundles::resolve_customer_id(&env_id, b.customer_id.clone())?;
 
+        // Single-revision, remote-only source: no local `bundle_path`. Fetch the
+        // artifact from `bundle_source_uri` so it stages exactly like a local
+        // bundle, then verify any declared digest. (Multi-revision remote-only
+        // is a follow-up; `validate_shape` permits URI-only for the
+        // single-revision form only.)
+        if b.bundle_path.is_none() && b.revisions.is_none() {
+            let uri = b
+                .bundle_source_uri
+                .as_deref()
+                .expect("validate_shape: single-revision URI-only carries bundle_source_uri");
+            let fetched = match super::bundle_fetch::fetch_bundle_uri_to_local(uri) {
+                Ok(path) => path,
+                // Unreachable registry / missing artifact is an input gap,
+                // reported like an absent local file (skippable, not fatal).
+                Err(OpError::Fetch(message)) => {
+                    missing.push(MissingItem {
+                        kind: MissingKind::BundleArtifact,
+                        key: b.bundle_id.clone(),
+                        source: format!("uri:{uri} ({message})"),
+                    });
+                    continue;
+                }
+                // A malformed / unsupported URI is a manifest bug — fail fast.
+                Err(other) => return Err(other),
+            };
+            let digest = resolved_artifact_digest(
+                &fetched,
+                b.bundle_digest.as_deref(),
+                &format!("bundle `{}`", b.bundle_id),
+            )?;
+            resolved_bundles.push(ResolvedBundle {
+                spec: b.clone(),
+                customer_id,
+                revisions: vec![ResolvedRevision {
+                    spec: ManifestRevision {
+                        name: "default".to_string(),
+                        // Vestigial: `deploy_payload` reads `resolved_path`, not
+                        // this. The fetched cache file is the local location.
+                        bundle_path: fetched.clone(),
+                        weight_percent: None,
+                        weight_bps: Some(super::deploy::FULL_TRAFFIC_BPS),
+                        drain_seconds: None,
+                        abort_metrics: Vec::new(),
+                        // The single-revision pull ref lives on the bundle
+                        // (`rb.spec.bundle_source_uri`, read by `deploy_payload`).
+                        bundle_source_uri: None,
+                        bundle_digest: None,
+                    },
+                    resolved_path: fetched,
+                    digest,
+                    weight_bps: super::deploy::FULL_TRAFFIC_BPS,
+                }],
+            });
+            continue;
+        }
+
         // Resolve each artifact path (single-revision or multi-revision).
         let artifact_specs: Vec<(&std::path::Path, Option<&ManifestRevision>)> =
             if let Some(bp) = &b.bundle_path {
@@ -828,11 +889,15 @@ fn resolve_and_validate(
                 any_missing = true;
                 continue;
             }
-            let digest =
-                super::bundle_stage::sha256_file(&resolved_path).map_err(|source| OpError::Io {
-                    path: resolved_path.clone(),
-                    source,
-                })?;
+            let declared_digest = match rev_spec {
+                Some(r) => r.bundle_digest.as_deref(),
+                None => b.bundle_digest.as_deref(),
+            };
+            let location = match rev_spec {
+                Some(r) => format!("bundle `{}`, revision `{}`", b.bundle_id, r.name),
+                None => format!("bundle `{}`", b.bundle_id),
+            };
+            let digest = resolved_artifact_digest(&resolved_path, declared_digest, &location)?;
             let spec = rev_spec.cloned().unwrap_or_else(|| {
                 // Synthesize a ManifestRevision for single-revision entries.
                 ManifestRevision {
@@ -845,6 +910,11 @@ fn resolve_and_validate(
                     weight_bps: Some(super::deploy::FULL_TRAFFIC_BPS),
                     drain_seconds: None,
                     abort_metrics: Vec::new(),
+                    // Single-revision pull ref lives on the bundle
+                    // (`rb.spec.bundle_source_uri`, read by `deploy_payload`),
+                    // not on this synthetic revision.
+                    bundle_source_uri: None,
+                    bundle_digest: None,
                 }
             });
             resolved_revs.push(ResolvedRevision {
@@ -1028,6 +1098,7 @@ fn resolve_and_validate(
         missing,
         warnings,
         updated_by,
+        manifest_dir: manifest_dir.to_path_buf(),
     })
 }
 
@@ -1115,7 +1186,7 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
         },
     }
 
-    // 2. UpdateHostConfig (name, region, tenant_org_id, listen_addr).
+    // 2. UpdateHostConfig (name, region, tenant_org_id, listen_addr, gui_enabled).
     //    Compares declared manifest fields against the live env; any declared
     //    field that differs emits ONE UpdateHostConfig step. On a fresh env
     //    (env == None) the host-config update is deferred to after the
@@ -1137,8 +1208,19 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                 .expect("validate_shape already validated listen_addr");
             env.host_config.listen_addr != Some(parsed)
         });
+        // Compares against the RAW stored value (like every other host-config
+        // field) — declaring a value always persists it; the env-id default
+        // (on for local) is resolved by the runtime only when unset.
+        let gui_enabled_differs = me
+            .gui_enabled
+            .is_some_and(|g| env.host_config.gui_enabled != Some(g));
 
-        if name_differs || region_differs || tenant_org_differs || listen_addr_differs {
+        if name_differs
+            || region_differs
+            || tenant_org_differs
+            || listen_addr_differs
+            || gui_enabled_differs
+        {
             let mut fields = Vec::new();
             if name_differs {
                 fields.push("name");
@@ -1152,11 +1234,15 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
             if listen_addr_differs {
                 fields.push("listen_addr");
             }
+            if gui_enabled_differs {
+                fields.push("gui_enabled");
+            }
             let desired_hash = hash_json(&json!({
                 "name": me.name,
                 "region": me.region,
                 "tenant_org_id": me.tenant_org_id,
                 "listen_addr": me.listen_addr,
+                "gui_enabled": me.gui_enabled,
             }));
             let ikey = derive_idempotency_key(
                 &ctx.env_id,
@@ -1177,20 +1263,15 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     tenant_org_id: me.tenant_org_id.clone(),
                     listen_addr: me.listen_addr.clone(),
                     public_base_url: None, // public_base_url is handled by SetPublicUrl
+                    gui_enabled: me.gui_enabled,
                 })),
             });
-        } else {
-            let has_declared_host_config = me.name.is_some()
-                || me.region.is_some()
-                || me.tenant_org_id.is_some()
-                || me.listen_addr.is_some();
-            if has_declared_host_config {
-                steps.push(ApplyStep::no_op(
-                    ApplyStepKind::UpdateHostConfig,
-                    env_id_str.clone(),
-                    "host-config unchanged",
-                ));
-            }
+        } else if me.declares_host_config() {
+            steps.push(ApplyStep::no_op(
+                ApplyStepKind::UpdateHostConfig,
+                env_id_str.clone(),
+                "host-config unchanged",
+            ));
         }
     } else {
         // Fresh env (always `local` here — see EnsureEnvironment). `env init`
@@ -1198,11 +1279,7 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
         // host-config is applied by a deferred UpdateHostConfig step that runs
         // after the env is created.
         let me = &ctx.manifest.environment;
-        let has_host_config = me.name.is_some()
-            || me.region.is_some()
-            || me.tenant_org_id.is_some()
-            || me.listen_addr.is_some();
-        if has_host_config {
+        if me.declares_host_config() {
             steps.push(ApplyStep {
                 kind: ApplyStepKind::UpdateHostConfig,
                 key: env_id_str.clone(),
@@ -1216,6 +1293,7 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     tenant_org_id: me.tenant_org_id.clone(),
                     listen_addr: me.listen_addr.clone(),
                     public_base_url: None,
+                    gui_enabled: me.gui_enabled,
                 })),
             });
         }
@@ -1283,10 +1361,30 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
             Some(b) => {
                 let kind_differs = b.kind.to_string() != mp.kind;
                 let pack_ref_differs = b.pack_ref.as_str() != mp.pack_ref;
-                let answers_ref_differs = mp
-                    .answers_ref
-                    .as_ref()
-                    .is_some_and(|ar| b.answers_ref.as_ref() != Some(ar));
+                // Content-aware + ref-aware: the stored ref is the env-relative
+                // staged path (rewritten on apply), so a raw string compare
+                // against the manifest-relative ref would always differ.
+                // Compare the staged file's bytes to the manifest source AND
+                // verify the binding's `answers_ref` points at the canonical
+                // staged path — a prior interrupted apply could have staged the
+                // file but failed to persist the ref on the binding, so checking
+                // bytes alone would miss that drift. (A manifest that drops
+                // answers_ref is left as-is here, matching the prior behaviour.)
+                let answers_ref_differs = match &mp.answers_ref {
+                    Some(ar) => {
+                        let content_outdated = staged_answers_outdated(
+                            store,
+                            &ctx.env_id,
+                            &ctx.manifest_dir,
+                            mp.slot,
+                            ar,
+                        )?;
+                        let ref_wrong =
+                            b.answers_ref.as_deref() != Some(staged_answers_rel(mp.slot).as_path());
+                        content_outdated || ref_wrong
+                    }
+                    None => false,
+                };
                 if kind_differs || pack_ref_differs || answers_ref_differs {
                     let desired_hash = hash_json(&json!({
                         "slot": mp.slot.to_string(),
@@ -1525,7 +1623,12 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     .as_ref()
                     .is_some_and(|o| *o != dep.config_overrides);
                 let env = ctx.env.as_ref().expect("existing deployment implies env");
-                let converged = deployment_converged(env, dep.deployment_id, &primary_digest());
+                let converged = deployment_converged(
+                    env,
+                    dep.deployment_id,
+                    &primary_digest(),
+                    rb.spec.bundle_source_uri.as_deref(),
+                );
                 let needs_deploy = !converged;
                 let live = live_revision_digest(env, dep.deployment_id);
 
@@ -1751,6 +1854,10 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                         provider_type: ep.provider_type.clone(),
                         display_name: ep.name.clone(),
                         secret_refs: ep.secret_refs.clone(),
+                        // The env-manifest doesn't carry a webhook secret ref;
+                        // a manifest-applied telegram endpoint auto-mints via the
+                        // local dev-store sink (env apply is local-only).
+                        webhook_secret_ref: None,
                         idempotency_key: Some(ikey),
                         updated_by: ctx.updated_by.clone(),
                     })),
@@ -1943,10 +2050,12 @@ fn execute(store: &LocalFsStore, ctx: &ApplyContext, steps: &[ApplyStep]) -> Res
                 super::config::set(store, &exec_flags, Some((**payload).clone())).map(|_| ())
             }
             StepOp::AddPackBinding(payload) => {
-                super::env_packs::add(store, &exec_flags, Some((**payload).clone())).map(|_| ())
+                let payload = stage_binding_answers(store, ctx, (**payload).clone())?;
+                super::env_packs::add(store, &exec_flags, Some(payload)).map(|_| ())
             }
             StepOp::UpdatePackBinding(payload) => {
-                super::env_packs::update(store, &exec_flags, Some((**payload).clone())).map(|_| ())
+                let payload = stage_binding_answers(store, ctx, (**payload).clone())?;
+                super::env_packs::update(store, &exec_flags, Some(payload)).map(|_| ())
             }
             StepOp::AddExtension(payload) => {
                 super::extensions::add(store, &exec_flags, Some((**payload).clone())).map(|_| ())
@@ -2140,6 +2249,15 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
                 ));
             }
         }
+        if let Some(gui_enabled) = me.gui_enabled {
+            checked += 1;
+            if env.host_config.gui_enabled != Some(gui_enabled) {
+                failures.push(format!(
+                    "gui_enabled is `{:?}`, expected `{gui_enabled}`",
+                    env.host_config.gui_enabled
+                ));
+            }
+        }
     }
 
     if ctx.manifest.trust_root == Some(TrustRootDirective::Bootstrap) {
@@ -2179,6 +2297,16 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
                 mp.slot,
                 b.pack_ref.as_str(),
                 mp.pack_ref
+            ));
+        }
+        if mp.answers_ref.is_some()
+            && b.answers_ref.as_deref() != Some(staged_answers_rel(mp.slot).as_path())
+        {
+            failures.push(format!(
+                "pack slot `{}`: answers_ref is `{:?}`, expected `{:?}`",
+                mp.slot,
+                b.answers_ref,
+                staged_answers_rel(mp.slot)
             ));
         }
     }
@@ -2242,7 +2370,12 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
             }
         } else {
             let primary_digest = &rb.revisions[0].digest;
-            if !deployment_converged(&env, dep.deployment_id, primary_digest) {
+            if !deployment_converged(
+                &env,
+                dep.deployment_id,
+                primary_digest,
+                rb.spec.bundle_source_uri.as_deref(),
+            ) {
                 failures.push(format!(
                     "bundle `{}`: live revision digest is `{}`, expected `{}`",
                     rb.spec.bundle_id,
@@ -2447,6 +2580,124 @@ fn bundle_meta_update_step(
     })
 }
 
+/// Canonical in-store location for a pack binding's staged answers file —
+/// `env-packs/<slot>/answers.json`, relative to the env dir. Matches the
+/// path convention the reconcile resolver ([`super::env::load_render_answers`])
+/// expects.
+fn staged_answers_rel(slot: CapabilitySlot) -> PathBuf {
+    PathBuf::from("env-packs")
+        .join(slot.to_string())
+        .join("answers.json")
+}
+
+/// Resolve a binding's `answers_ref` against the manifest dir (the schema
+/// contract: paths are manifest-relative).
+fn resolve_answers_src(manifest_dir: &Path, manifest_ref: &Path) -> PathBuf {
+    if manifest_ref.is_absolute() {
+        manifest_ref.to_path_buf()
+    } else {
+        manifest_dir.join(manifest_ref)
+    }
+}
+
+/// True when the staged answers file is missing or its content differs from
+/// the manifest source — i.e. apply must (re)stage it. Identical content
+/// re-applies as a no-op, so apply stays idempotent.
+fn staged_answers_outdated(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    manifest_dir: &Path,
+    slot: CapabilitySlot,
+    manifest_ref: &Path,
+) -> Result<bool, OpError> {
+    let src = resolve_answers_src(manifest_dir, manifest_ref);
+    let staged = store.env_dir(env_id)?.join(staged_answers_rel(slot));
+    let src_bytes = std::fs::read(&src).map_err(|source| OpError::Io {
+        path: src.clone(),
+        source,
+    })?;
+    match std::fs::read(&staged) {
+        Ok(staged_bytes) => Ok(staged_bytes != src_bytes),
+        Err(_) => Ok(true),
+    }
+}
+
+/// Copy a binding's manifest-relative `answers_ref` into the env store at the
+/// canonical path and return that env-relative path. Apply records the
+/// returned ref on the binding so reconcile — which resolves `answers_ref`
+/// against the env dir — finds the file. Skips a no-op self-copy when source
+/// and destination are already the same file.
+fn stage_answers_file(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    manifest_dir: &Path,
+    slot: CapabilitySlot,
+    manifest_ref: &Path,
+) -> Result<PathBuf, OpError> {
+    let src = resolve_answers_src(manifest_dir, manifest_ref);
+    let rel = staged_answers_rel(slot);
+    let dest = store.env_dir(env_id)?.join(&rel);
+    let same_file = dest.exists() && src.canonicalize().ok() == dest.canonicalize().ok();
+    if !same_file {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| OpError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        std::fs::copy(&src, &dest).map_err(|source| OpError::Io {
+            path: src.clone(),
+            source,
+        })?;
+    }
+    Ok(rel)
+}
+
+/// Stage a pack binding's answers file (if any) and rewrite the payload's
+/// `answers_ref` to the env-relative staged path before it is persisted.
+/// Bindings without an answers_ref pass through unchanged.
+fn stage_binding_answers(
+    store: &LocalFsStore,
+    ctx: &ApplyContext,
+    mut payload: EnvPackBindingPayload,
+) -> Result<EnvPackBindingPayload, OpError> {
+    if let Some(manifest_ref) = payload.answers_ref.clone() {
+        payload.answers_ref = Some(stage_answers_file(
+            store,
+            &ctx.env_id,
+            &ctx.manifest_dir,
+            payload.slot,
+            &manifest_ref,
+        )?);
+    }
+    Ok(payload)
+}
+
+/// Hash a resolved bundle artifact and, when the manifest pins a `bundle_digest`,
+/// fail closed unless the file matches. Returns the computed `sha256:` digest
+/// recorded on the revision. `location` labels the bundle (and revision, for a
+/// split) in the mismatch error. Applies uniformly to local `bundle_path`
+/// artifacts and to ones fetched from a `bundle_source_uri`.
+fn resolved_artifact_digest(
+    path: &std::path::Path,
+    declared: Option<&str>,
+    location: &str,
+) -> Result<String, OpError> {
+    let digest = super::bundle_stage::sha256_file(path).map_err(|source| OpError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if let Some(declared) = declared
+        && declared != digest
+    {
+        return Err(OpError::Conflict(format!(
+            "{location}: declared bundle_digest `{declared}` does not match the resolved \
+             artifact digest `{digest}`"
+        )));
+    }
+    Ok(digest)
+}
+
 /// Build a [`BundleDeployPayload`] from a resolved single-revision bundle.
 /// The primary (first) resolved revision supplies the artifact path.
 fn deploy_payload(
@@ -2459,6 +2710,12 @@ fn deploy_payload(
         bundle_id: rb.spec.bundle_id.clone(),
         customer_id: rb.spec.customer_id.clone(),
         bundle_path: Some(rb.revisions[0].resolved_path.clone()),
+        // Single-revision pull ref: a K8s worker fetches the bundle from here
+        // at boot; `bundle_path` above supplies the integrity digest.
+        bundle_source_uri: rb.spec.bundle_source_uri.clone(),
+        // Local manifest-apply path: the artifact at `bundle_path` is staged
+        // locally, so no remote pins are threaded.
+        remote_pins: None,
         idempotency_key: None,
         config_overrides: rb.spec.config_overrides.clone(),
         route_binding,
@@ -2486,6 +2743,7 @@ fn deploy_split_op(env_id: &str, rb: &ResolvedBundle) -> StepOp {
                 expected_digest: rr.digest.clone(),
                 weight_bps: rr.weight_bps,
                 drain_seconds: rr.spec.drain_seconds,
+                bundle_source_uri: rr.spec.bundle_source_uri.clone(),
             })
             .collect(),
     }
@@ -2560,8 +2818,16 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
         let stage_payload = RevisionStagePayload {
             environment_id: env_id.to_string(),
             deployment_id: deployment_id.clone(),
+            // Local `--bundle` stage: the store mints the id + key.
+            revision_id: None,
+            idempotency_key: None,
             bundle_path: Some(rev.resolved_path.clone()),
             bundle_digest: super::revisions::default_bundle_digest(),
+            // Pull ref the manifest declared for this revision (`oci://` /
+            // `repo://` / `store://`); a K8s worker fetches the bundle from
+            // here at boot. `bundle_path` above supplies the integrity digest.
+            // `None` = local-serve only.
+            bundle_source_uri: rev.bundle_source_uri.clone(),
             pack_list: Vec::new(),
             pack_list_lock_ref: PathBuf::new(),
             config_digest: super::revisions::default_config_digest(),
@@ -2672,18 +2938,21 @@ fn live_revision_digest(env: &Environment, deployment_id: DeploymentId) -> Optio
 
 /// A digest the diff can trust: real `sha256:` material, not the
 /// `sha256:00` placeholder pre-digest revisions carry.
-fn digest_is_real(digest: &str) -> bool {
+pub(super) fn digest_is_real(digest: &str) -> bool {
     digest.starts_with("sha256:") && digest.len() > "sha256:".len() && digest != "sha256:00"
 }
 
 /// Strict convergence: the deployment's traffic split has EXACTLY ONE entry
 /// at full weight (10,000 bps), that entry's revision exists, carries a real
-/// digest, and the digest matches `expected_digest`. A mixed split (e.g.
-/// 60/40 blue-green) or a degenerate placeholder digest is NOT converged.
+/// digest, the digest matches `expected_digest`, and `bundle_source_uri`
+/// matches (`None` vs `Some` counts as a difference — a K8s worker needs
+/// the pull ref to boot). A mixed split (e.g. 60/40 blue-green) or a
+/// degenerate placeholder digest is NOT converged.
 fn deployment_converged(
     env: &Environment,
     deployment_id: DeploymentId,
     expected_digest: &str,
+    expected_source_uri: Option<&str>,
 ) -> bool {
     let Some(split) = env
         .traffic_splits
@@ -2699,17 +2968,22 @@ fn deployment_converged(
     env.revisions
         .iter()
         .find(|r| r.revision_id == entry.revision_id)
-        .is_some_and(|r| digest_is_real(&r.bundle_digest) && r.bundle_digest == expected_digest)
+        .is_some_and(|r| {
+            digest_is_real(&r.bundle_digest)
+                && r.bundle_digest == expected_digest
+                && r.bundle_source_uri.as_deref() == expected_source_uri
+        })
 }
 
 /// Multi-revision convergence: the deployment's traffic split is the exact
-/// `(digest, weight_bps)` multiset declared by `expected` — every live entry
-/// resolves to a real-digest revision, and the live `(digest, weight)` bag
-/// equals the expected bag. Order-independent (both bags are sorted before
-/// comparison) and duplicate-safe: two expected revisions that share the same
-/// artifact AND weight require two matching live entries, not one. A false
-/// "converged" is the dangerous direction — it would silently skip applying
-/// the desired split — so this is multiset equality, not set containment.
+/// `(digest, weight_bps, bundle_source_uri)` multiset declared by `expected`
+/// — every live entry resolves to a real-digest revision, and the live
+/// `(digest, weight, source_uri)` bag equals the expected bag.
+/// Order-independent (both bags are sorted before comparison) and
+/// duplicate-safe: two expected revisions that share the same artifact AND
+/// weight require two matching live entries, not one. A false "converged" is
+/// the dangerous direction — it would silently skip applying the desired
+/// split — so this is multiset equality, not set containment.
 fn split_converged(
     env: &Environment,
     deployment_id: DeploymentId,
@@ -2725,9 +2999,9 @@ fn split_converged(
     if split.entries.len() != expected.len() {
         return false;
     }
-    // Live `(digest, weight_bps)` bag. Any entry pointing at a missing or
-    // placeholder-digest revision fails convergence outright.
-    let mut live_bag: Vec<(&str, u32)> = Vec::with_capacity(split.entries.len());
+    // Live `(digest, weight_bps, source_uri)` bag. Any entry pointing at a
+    // missing or placeholder-digest revision fails convergence outright.
+    let mut live_bag: Vec<(&str, u32, Option<&str>)> = Vec::with_capacity(split.entries.len());
     for entry in &split.entries {
         let Some(rev) = env
             .revisions
@@ -2739,12 +3013,22 @@ fn split_converged(
         if !digest_is_real(&rev.bundle_digest) {
             return false;
         }
-        live_bag.push((rev.bundle_digest.as_str(), entry.weight_bps));
+        live_bag.push((
+            rev.bundle_digest.as_str(),
+            entry.weight_bps,
+            rev.bundle_source_uri.as_deref(),
+        ));
     }
-    // Expected `(digest, weight_bps)` bag.
-    let mut expected_bag: Vec<(&str, u32)> = expected
+    // Expected `(digest, weight_bps, source_uri)` bag.
+    let mut expected_bag: Vec<(&str, u32, Option<&str>)> = expected
         .iter()
-        .map(|rr| (rr.digest.as_str(), rr.weight_bps))
+        .map(|rr| {
+            (
+                rr.digest.as_str(),
+                rr.weight_bps,
+                rr.spec.bundle_source_uri.as_deref(),
+            )
+        })
         .collect();
     // Multiset equality via sort-and-compare (counts already match).
     live_bag.sort_unstable();
@@ -2930,6 +3214,78 @@ mod tests {
         let path = dir.join("manifest.json");
         std::fs::write(&path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
         path
+    }
+
+    #[test]
+    fn resolved_artifact_digest_records_computed_when_undeclared() {
+        let path = fixture();
+        let digest = resolved_artifact_digest(&path, None, "bundle `x`").unwrap();
+        assert_eq!(
+            digest,
+            super::super::bundle_stage::sha256_file(&path).unwrap()
+        );
+    }
+
+    #[test]
+    fn resolved_artifact_digest_passes_when_declared_matches() {
+        let path = fixture();
+        let real = super::super::bundle_stage::sha256_file(&path).unwrap();
+        let digest = resolved_artifact_digest(&path, Some(&real), "bundle `x`").unwrap();
+        assert_eq!(digest, real);
+    }
+
+    #[test]
+    fn resolved_artifact_digest_rejects_declared_mismatch() {
+        let path = fixture();
+        let err =
+            resolved_artifact_digest(&path, Some("sha256:deadbeef"), "bundle `x`").unwrap_err();
+        assert_eq!(err.kind(), "conflict");
+        assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    /// Full URI-only apply: no local `bundle_path`, just a `bundle_source_uri`.
+    /// Apply fetches the bundle from ghcr, stages it, and records a revision
+    /// carrying the OCI pull ref + a real digest a K8s worker boots from.
+    /// Ignored by default (network + ghcr reachability).
+    #[test]
+    #[ignore = "network: applies a URI-only manifest that pulls from ghcr"]
+    fn uri_only_apply_pulls_and_records_a_pullable_revision() {
+        const URI: &str = "oci://ghcr.io/greenticai/greentic-demo-bundles/webchat-bot:v1";
+        let (dir, store) = seeded_store();
+        let manifest = serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "remote",
+                "bundle_source_uri": URI
+            }]
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let outcome = run_apply(&store, &manifest_path).expect("uri-only apply succeeds");
+        assert_eq!(
+            outcome.result["missing"].as_array().unwrap().len(),
+            0,
+            "no missing inputs: {}",
+            outcome.result
+        );
+        let env = load_local(&store);
+        assert_eq!(env.bundles.len(), 1);
+        let dep = &env.bundles[0];
+        let digest = live_revision_digest(&env, dep.deployment_id).expect("live revision");
+        assert!(
+            digest.starts_with("sha256:") && digest != "sha256:00",
+            "real digest recorded: {digest}"
+        );
+        let rev = env
+            .revisions
+            .iter()
+            .find(|r| r.deployment_id == dep.deployment_id)
+            .expect("revision recorded");
+        assert_eq!(
+            rev.bundle_source_uri.as_deref(),
+            Some(URI),
+            "K8s worker pull ref recorded on the revision"
+        );
     }
 
     fn run_mode(
@@ -3349,6 +3705,7 @@ mod tests {
                     provider_type: "messaging.telegram.bot".to_string(),
                     display_name: "legal-bot".to_string(),
                     secret_refs: Vec::new(),
+                    webhook_secret_ref: None,
                     idempotency_key: None,
                     updated_by: "test".to_string(),
                 }),
@@ -3384,6 +3741,7 @@ mod tests {
                 provider_type: "messaging.teams.bot".to_string(),
                 display_name: "legal-bot".to_string(),
                 secret_refs: Vec::new(),
+                webhook_secret_ref: None,
                 idempotency_key: None,
                 updated_by: "test".to_string(),
             }),
@@ -3480,9 +3838,10 @@ mod tests {
 
     #[test]
     fn nonexistent_nonlocal_env_gives_clear_error() {
-        // `env apply` can reconcile an existing non-local env, but creating one
-        // is reserved for the remote operator store (A7) — a non-existent
-        // non-local env must fail at plan time with a clear message.
+        // `env apply` reconciles an existing named env but does not bootstrap
+        // one (only `local` is auto-created). Applying a manifest for a
+        // not-yet-created named env must fail at plan time with a clear message
+        // pointing the user at `op env create <id>`.
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let manifest = json!({
@@ -3499,7 +3858,9 @@ mod tests {
         match err {
             OpError::NotFound(msg) => {
                 assert!(
-                    msg.contains("cannot create one locally") && msg.contains("operator store"),
+                    msg.contains("not found")
+                        && msg.contains("op env create prod")
+                        && msg.contains("does not create one"),
                     "got: {msg}"
                 );
             }
@@ -3520,6 +3881,8 @@ mod tests {
                 bundle_id: "preexisting".to_string(),
                 customer_id: None,
                 bundle_path: Some(fixture()),
+                bundle_source_uri: None,
+                remote_pins: None,
                 idempotency_key: None,
                 config_overrides: None,
                 route_binding: None,
@@ -3669,8 +4032,8 @@ mod tests {
 
     // --- split_converged is multiset equality, not set containment ---
 
-    /// Build a `ResolvedRevision` with the given digest + weight (the only
-    /// two fields `split_converged` reads).
+    /// Build a `ResolvedRevision` with the given digest + weight
+    /// (`bundle_source_uri` defaults to `None`).
     fn resolved_rev(name: &str, digest: &str, weight_bps: u32) -> ResolvedRevision {
         ResolvedRevision {
             spec: ManifestRevision {
@@ -3680,6 +4043,8 @@ mod tests {
                 weight_bps: Some(weight_bps),
                 drain_seconds: None,
                 abort_metrics: Vec::new(),
+                bundle_source_uri: None,
+                bundle_digest: None,
             },
             resolved_path: PathBuf::from(format!("{name}.gtbundle")),
             digest: digest.to_string(),
@@ -4544,6 +4909,8 @@ mod tests {
             bundle_id: "quickstart".to_string(),
             customer_id: None,
             bundle_path: Some(fixture()),
+            bundle_source_uri: None,
+            remote_pins: None,
             idempotency_key: None,
             config_overrides: None,
             route_binding: Some(super::super::bundles::RouteBindingPayload {
@@ -4647,6 +5014,232 @@ mod tests {
         assert_eq!(b.kind.to_string(), "greentic.deployer.local@2.0.0");
         assert_eq!(b.pack_ref.as_str(), "builtin:deployer-local-v2");
         assert!(b.generation > 0, "generation must bump on update");
+    }
+
+    #[test]
+    fn apply_stages_pack_answers_into_env_store() {
+        let (dir, store) = seeded_store();
+        // The answers file lives next to the manifest (manifest-relative ref).
+        let answers = json!({"runtime_image": "ghcr.io/x/y:dev", "tunnel": "cloudflared"});
+        std::fs::write(
+            dir.path().join("deployer-answers.json"),
+            serde_json::to_vec_pretty(&answers).unwrap(),
+        )
+        .unwrap();
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "deployer",
+                "kind": "greentic.deployer.local@1.0.0",
+                "pack_ref": "builtin:deployer-local",
+                "answers_ref": "deployer-answers.json"
+            }]
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        run_apply(&store, &manifest_path).expect("apply with answers_ref");
+
+        // The file is staged into the env store at the canonical path...
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        let staged = env_dir.join("env-packs/deployer/answers.json");
+        assert!(staged.is_file(), "answers must be staged at {staged:?}");
+        let staged_val: Value = serde_json::from_slice(&std::fs::read(&staged).unwrap()).unwrap();
+        assert_eq!(staged_val, answers);
+
+        // ...and the binding records the env-relative staged ref, so reconcile
+        // (which resolves against the env dir) finds it.
+        let env = load_local(&store);
+        let b = env.pack_for_slot(CapabilitySlot::Deployer).expect("bound");
+        assert_eq!(
+            b.answers_ref.as_deref(),
+            Some(Path::new("env-packs/deployer/answers.json"))
+        );
+
+        // Idempotent: re-apply is a no-op (content unchanged).
+        let second = run_apply(&store, &manifest_path).expect("re-apply");
+        assert_eq!(second.result["changed"], 0, "{}", second.result);
+    }
+
+    #[test]
+    fn apply_restages_pack_answers_on_content_change() {
+        let (dir, store) = seeded_store();
+        let p = dir.path().join("deployer-answers.json");
+        std::fs::write(&p, br#"{"runtime_image":"img:v1"}"#).unwrap();
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "deployer",
+                "kind": "greentic.deployer.local@1.0.0",
+                "pack_ref": "builtin:deployer-local",
+                "answers_ref": "deployer-answers.json"
+            }]
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        run_apply(&store, &manifest_path).expect("first apply");
+
+        // Edit the source content (same filename) and re-apply — the staged
+        // copy must refresh even though the manifest ref string is unchanged.
+        std::fs::write(&p, br#"{"runtime_image":"img:v2"}"#).unwrap();
+        let plan = run_dry(&store, &manifest_path).expect("dry-run after edit");
+        let actions = step_actions(&plan.result);
+        assert!(
+            actions.contains(&("update-pack-binding".to_string(), "update".to_string())),
+            "content change must plan update-pack-binding: {actions:?}"
+        );
+        run_apply(&store, &manifest_path).expect("re-apply");
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        let staged = std::fs::read(env_dir.join("env-packs/deployer/answers.json")).unwrap();
+        assert_eq!(staged, br#"{"runtime_image":"img:v2"}"#);
+    }
+
+    #[test]
+    fn apply_with_oci_bundle_and_linking_endpoint() {
+        let (dir, store) = seeded_store();
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "webchat-bot",
+                "bundle_path": fixture(),
+                "bundle_source_uri": "oci://ghcr.io/greenticai/demo/webchat-bot:v1",
+                "route_binding": {
+                    "path_prefixes": ["/"],
+                    "tenant_selector": {"tenant": "tenant-default", "team": "default"}
+                }
+            }],
+            "messaging_endpoints": [{
+                "name": "webchat-bot",
+                "provider_type": "messaging.telegram.bot",
+                "links": ["webchat-bot"]
+            }]
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        // The endpoint link resolves because the bundle is declared in the
+        // manifest, and the OCI source is recorded on the staged revision so a
+        // K8s worker can pull it at boot — both in a single apply.
+        run_apply(&store, &manifest_path).expect("apply oci bundle + linking endpoint");
+        let env = load_local(&store);
+        assert_eq!(
+            env.revisions[0].bundle_source_uri.as_deref(),
+            Some("oci://ghcr.io/greenticai/demo/webchat-bot:v1"),
+            "manifest bundle_source_uri must reach the staged revision"
+        );
+    }
+
+    #[test]
+    fn apply_multi_revision_threads_bundle_source_uri() {
+        let (dir, store) = seeded_store();
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "split-bot",
+                "revisions": [
+                    {"name": "a", "bundle_path": fixture(), "weight_bps": 10000,
+                     "bundle_source_uri": "oci://ghcr.io/greenticai/demo/split:a"}
+                ]
+            }]
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        run_apply(&store, &manifest_path).expect("apply split with oci source");
+        let env = load_local(&store);
+        assert_eq!(
+            env.revisions[0].bundle_source_uri.as_deref(),
+            Some("oci://ghcr.io/greenticai/demo/split:a"),
+            "per-revision bundle_source_uri must reach the staged revision"
+        );
+    }
+
+    #[test]
+    fn adding_bundle_source_uri_to_converged_deployment_redeploys_and_sets_it() {
+        let (dir, store) = seeded_store();
+        // Deploy the bundle with NO OCI source — local-serve only.
+        let m1 = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "b", "bundle_path": fixture()}]
+        });
+        let p1 = write_manifest(dir.path(), &m1);
+        run_apply(&store, &p1).expect("first apply");
+        assert!(
+            load_local(&store)
+                .revisions
+                .iter()
+                .all(|r| r.bundle_source_uri.is_none()),
+            "baseline revision must have no pull ref"
+        );
+
+        // Re-apply the SAME artifact (same digest) but now declaring an OCI
+        // source. Digest-only convergence would treat this as a no-op; the fix
+        // must re-deploy so the live revision records the pull ref a K8s worker
+        // needs to boot.
+        let m2 = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "b", "bundle_path": fixture(),
+                         "bundle_source_uri": "oci://ex/b:v1"}]
+        });
+        let p2 = write_manifest(dir.path(), &m2);
+        run_apply(&store, &p2).expect("re-apply with oci source");
+        let env = load_local(&store);
+        assert!(
+            env.revisions
+                .iter()
+                .any(|r| r.bundle_source_uri.as_deref() == Some("oci://ex/b:v1")),
+            "adding bundle_source_uri to a same-digest deployment must (re)deploy a \
+             revision carrying it; saw: {:?}",
+            env.revisions
+                .iter()
+                .map(|r| r.bundle_source_uri.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn answers_ref_drift_on_binding_is_repaired_even_when_staged_file_matches() {
+        let (dir, store) = seeded_store();
+        std::fs::write(dir.path().join("deployer-answers.json"), br#"{"x":1}"#).unwrap();
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "deployer",
+                "kind": "greentic.deployer.local@1.0.0",
+                "pack_ref": "builtin:deployer-local",
+                "answers_ref": "deployer-answers.json"
+            }]
+        });
+        let mp = write_manifest(dir.path(), &manifest);
+        run_apply(&store, &mp).expect("first apply stages file + canonical ref");
+
+        // Simulate an interrupted prior apply: the file is staged (content still
+        // matches the manifest) but the binding never persisted its
+        // `answers_ref`. Content-only drift detection would miss this.
+        let mut env = load_local(&store);
+        for b in &mut env.packs {
+            if b.slot == CapabilitySlot::Deployer {
+                b.answers_ref = None;
+            }
+        }
+        store.save(&env).expect("save drifted env");
+
+        // Re-apply: the ref mismatch must replan an update that restores the
+        // canonical staged ref, even though the staged file content is unchanged.
+        let plan = run_dry(&store, &mp).expect("dry-run on drifted binding");
+        let actions = step_actions(&plan.result);
+        assert!(
+            actions.contains(&("update-pack-binding".to_string(), "update".to_string())),
+            "a wrong/missing answers_ref must replan update-pack-binding: {actions:?}"
+        );
+        run_apply(&store, &mp).expect("re-apply repairs the ref");
+        let env = load_local(&store);
+        let b = env.pack_for_slot(CapabilitySlot::Deployer).expect("bound");
+        assert_eq!(
+            b.answers_ref.as_deref(),
+            Some(Path::new("env-packs/deployer/answers.json")),
+            "re-apply must restore the canonical staged answers_ref"
+        );
     }
 
     #[test]
@@ -4803,6 +5396,38 @@ mod tests {
         assert_eq!(
             env.host_config.listen_addr,
             Some("0.0.0.0:9090".parse().unwrap())
+        );
+
+        // Idempotent re-apply.
+        let second = run_apply(&store, &manifest_path).expect("re-apply");
+        assert_eq!(second.result["changed"], 0, "{}", second.result);
+    }
+
+    #[test]
+    fn gui_enabled_reconcile_then_idempotent() {
+        let (dir, store) = seeded_store();
+        // `local` resolves GUI-on by default; declaring `false` is an explicit
+        // override that must persist and survive a re-apply as a no-op.
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {
+                "id": "local",
+                "gui_enabled": false
+            }
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let outcome = run_apply(&store, &manifest_path).expect("gui apply");
+        let actions = step_actions(&outcome.result);
+        assert!(
+            actions.contains(&("update-host-config".to_string(), "update".to_string())),
+            "must plan update-host-config for gui_enabled: {actions:?}"
+        );
+
+        let env = load_local(&store);
+        assert_eq!(env.host_config.gui_enabled, Some(false));
+        assert!(
+            !env.host_config.resolved_gui_enabled(),
+            "explicit false overrides the local default-on"
         );
 
         // Idempotent re-apply.

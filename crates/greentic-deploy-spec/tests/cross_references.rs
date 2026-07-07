@@ -33,6 +33,7 @@ fn env_with(
             tenant_org_id: None,
             listen_addr: None,
             public_base_url: None,
+            gui_enabled: None,
         },
         packs: vec![EnvPackBinding {
             slot: CapabilitySlot::Deployer,
@@ -73,6 +74,7 @@ fn revision(
         sequence: 1,
         created_at: Utc::now(),
         bundle_digest: "sha256:0".into(),
+        bundle_source_uri: None,
         pack_list: vec![PackListEntry {
             pack_id: PackId::new("p"),
             version: SemVer::new(1, 0, 0),

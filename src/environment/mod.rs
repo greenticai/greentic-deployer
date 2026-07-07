@@ -19,14 +19,16 @@ pub mod lifecycle;
 pub mod messaging;
 pub mod mutations;
 pub mod mutations_local;
+pub mod reads;
 pub mod runtime_config;
+pub mod snapshot;
 pub mod store;
 pub mod trust_root;
 
 pub use atomic_write::{AtomicWriteError, atomic_write_bytes, atomic_write_json, copy_to_backup};
 pub use audit::{
     AUDIT_EVENT_SCHEMA_V1, Actor, AuditDecision, AuditError, AuditEvent, AuditLog, AuditResult,
-    POLICY_LOCAL_ONLY, authorize_local_only, current_local_actor,
+    POLICY_LOCAL_ONLY, POLICY_LOCAL_OWNER, authorize_local_owner, current_local_actor,
 };
 pub use bootstrap::{EnsureLocalEnvironmentPayload, LocalEnvOutcome};
 pub use bundle_deployment::{
@@ -47,7 +49,9 @@ pub use mutations::{
     SetTrafficSplitPayload, StageRevisionPayload, TrustRootAddOutcome, TrustRootRemoveOutcome,
     TrustRootSeed, UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
+pub use reads::EnvironmentReads;
 pub use runtime_config::materialize_runtime_config;
+pub use snapshot::{SnapshotId, restore_environment, snapshot_environment};
 pub use store::{EnvironmentStore, LocalFsStore, Locked, StoreError};
 pub use trust_root::{
     TRUST_ROOT_FILE, TRUST_ROOT_SCHEMA_V1, TrustRootDocument, TrustRootError, add_trusted_key,

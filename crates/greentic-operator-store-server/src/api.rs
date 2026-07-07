@@ -53,16 +53,18 @@ use greentic_deploy_spec::engine::{
 };
 use greentic_deploy_spec::{
     AddMessagingEndpointPayload, AddTrustedKeyPayload, ApplyTrafficSplitOutcome, AuditDecision,
-    AuditEvent, AuditResult, BackupManifest, BindingGenerationOutcome, BundleDeployment,
-    CapabilitySlot, ConcurrencyConflict, CreateEnvironmentPayload, DeploymentId, EnvId,
-    Environment, ExtensionBindingPayload, ExtensionKeyedPayload, HealthStatus, IdempotencyKey,
-    IdempotencyOutcome, IdempotencyRecord, MessagingBundleLinkPayload, MessagingEndpointId,
-    MigrateMergePayload, PackBindingPayload, Precondition, RemoteStoreError, RestoreOutcome,
-    RestoreRequest, RetentionPolicy, RevisionId, RevisionTransitionOutcome, RevocationConfig,
-    RollbackTrafficSplitOutcome, RollbackTrafficSplitPayload, RotateWebhookSecretPayload,
-    SchemaVersion, SecretRef, SetMessagingWelcomeFlowPayload, SetTrafficSplitPayload,
-    StageRevisionPayload, StateEtag, StateIntegrity, TrustRootAddOutcome, TrustRootRemoveOutcome,
-    TrustRootSeed, UpdateEnvironmentPayload, WarmRevisionPayload,
+    AuditEvent, AuditResult, BackupArtifact, BackupManifest, BindingGenerationOutcome,
+    BundleDeployment, CapabilitySlot, ConcurrencyConflict, CreateEnvironmentPayload, DeploymentId,
+    EnvId, Environment, EnvironmentRuntime, ExtensionBindingPayload, ExtensionKeyedPayload,
+    HealthStatus, IdempotencyKey, IdempotencyOutcome, IdempotencyRecord, ImportOutcome,
+    ImportRequest, MessagingBundleLinkPayload, MessagingEndpointId, MigrateMergePayload,
+    PackBindingPayload, Precondition, ReconcileCompletion, ReconcileCompletionRequest,
+    RemoteStoreError, RestoreOutcome, RestoreRequest, RetentionPolicy, RevisionId,
+    RevisionTransitionOutcome, RevocationConfig, RollbackTrafficSplitOutcome,
+    RollbackTrafficSplitPayload, RotateWebhookSecretPayload, SchemaVersion, SecretRef,
+    SetMessagingWelcomeFlowPayload, SetTrafficSplitPayload, StageRevisionPayload, StateEtag,
+    StateIntegrity, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
+    UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 use greentic_operator_trust::operator_key::{self, OperatorKey};
 use greentic_operator_trust::revenue_policy::{self, RevenuePolicyError};
@@ -457,6 +459,42 @@ fn prepare_mutation<T: Serialize>(
     previous_generation: Option<u64>,
     revision: EnvRevision,
 ) -> Result<PreparedMutation, ApiError> {
+    prepare_mutation_audited(
+        result,
+        env_id,
+        noun,
+        verb,
+        target,
+        idempotency_key,
+        fingerprint,
+        auth,
+        previous_generation,
+        revision,
+        AuditResult::Ok,
+    )
+}
+
+/// Like [`prepare_mutation`] but lets the caller stamp the audit `result`.
+/// Almost every mutation succeeds-or-errors at the store boundary, so
+/// `prepare_mutation` hard-codes `Ok`. `reconcile-complete` is the exception:
+/// it durably records an outcome that happened off-box, so a `Failed` cluster
+/// apply is a successful *recording* (HTTP 200) of a *failed* reconcile — its
+/// audit `result` must be `Error` so the audit query surface flags it, instead
+/// of the failure hiding inside `target.completion`.
+#[allow(clippy::too_many_arguments)]
+fn prepare_mutation_audited<T: Serialize>(
+    result: T,
+    env_id: &EnvId,
+    noun: &str,
+    verb: &str,
+    target: Value,
+    idempotency_key: String,
+    fingerprint: &RequestFingerprint,
+    auth: &AuthContext,
+    previous_generation: Option<u64>,
+    revision: EnvRevision,
+    audit_result: AuditResult,
+) -> Result<PreparedMutation, ApiError> {
     let audit = AuditEvent {
         schema: SchemaVersion::AUDIT_EVENT_V1.into(),
         event_id: ulid::Ulid::new().to_string(),
@@ -470,7 +508,7 @@ fn prepare_mutation<T: Serialize>(
         new_generation: Some(revision.generation),
         idempotency_key: Some(idempotency_key.clone()),
         authorization: auth.decision.clone(),
-        result: AuditResult::Ok,
+        result: audit_result,
     };
     let audit_event = serde_json::to_value(&audit).map_err(envelope_encode_error)?;
     let audit_event_id = audit.event_id.clone();
@@ -950,6 +988,159 @@ pub(crate) async fn update_environment<S: EnvironmentStorage>(
             .storage
             .update_env_journaled(&env, &precondition, Some(&prepared.journal))
             .await?;
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
+}
+
+/// `POST /environments/{env_id}/reconcile` — server-mediated reconcile
+/// authorization (PR-A). The store authorizes + audits + CAS-pins the
+/// reconcile and hands back the authorized env snapshot; the operator
+/// still executes the k8s apply. No desired-state write — generation
+/// and etag echo the loaded revision unchanged.
+///
+/// `If-Match` is MANDATORY (defense-in-depth against TOCTOU): the operator
+/// must pin the reviewed state, and the server enforces it. Absent
+/// `If-Match` returns 428; a stale etag returns 412.
+pub(crate) async fn reconcile_environment<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+    Fingerprint(fingerprint): Fingerprint,
+) -> Result<Response, ApiError> {
+    let env_id = parse_env_id(&env_id)?;
+    let auth = authorize_mutation(&state, &headers, &env_id, "env", "reconcile").await?;
+    let idem_key = require_idempotency_key(&headers)?;
+    let client_etag = match parse_if_match(&headers)? {
+        Some(etag) => etag,
+        None => {
+            return Err(ApiError(RemoteStoreError::PreconditionRequired {
+                detail: "reconcile requires If-Match to pin the reviewed state".to_string(),
+            }));
+        }
+    };
+    if let Some(replay) = replay_gate(&state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(replay);
+    }
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let loaded = state
+            .storage
+            .load_env(&env_id)
+            .await
+            .map_err(load_storage_error)?;
+        // Manual CAS check: the handler never calls update_env_journaled
+        // (where resolve_precondition normally fires), so compare here.
+        if client_etag != loaded.revision.etag {
+            return Err(ApiError(RemoteStoreError::PreconditionFailed(
+                ConcurrencyConflict {
+                    expected_etag: Some(client_etag.0),
+                    actual_etag: loaded.revision.etag.0.clone(),
+                    expected_generation: None,
+                    actual_generation: loaded.revision.generation,
+                },
+            )));
+        }
+        let target = json!({
+            "environment_id": env_id,
+            "generation": loaded.revision.generation,
+            "etag": loaded.revision.etag.0,
+        });
+        let prepared = prepare_mutation(
+            &loaded.value,
+            &env_id,
+            "env",
+            "reconcile",
+            target,
+            idem_key,
+            &fingerprint,
+            &auth,
+            Some(loaded.revision.generation),
+            loaded.revision.clone(),
+        )?;
+        // No desired-state write — record_journal only (same pattern as
+        // set_traffic_split's no-mutation branch and seed_trust_root's
+        // no-op path).
+        state.storage.record_journal(&prepared.journal).await?;
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
+}
+
+/// `POST /environments/{id}/reconcile/complete` — record the outcome of a
+/// cluster reconcile the store previously authorized (see
+/// [`reconcile_environment`]). The `…/reconcile` call authorizes + audits the
+/// intent; this call closes the loop by durably auditing whether the cluster
+/// apply actually succeeded or failed, so the audit reflects reality and not
+/// just the go-ahead.
+///
+/// Append-only and not concurrency-gated; see [`ReconcileCompletionRequest`]
+/// for the full correlation + retry-safety contract.
+pub(crate) async fn complete_reconcile<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(payload, fingerprint): ApiJson<ReconcileCompletionRequest>,
+) -> Result<Response, ApiError> {
+    let env_id = parse_env_id(&env_id)?;
+    let auth = authorize_mutation(&state, &headers, &env_id, "env", "reconcile-complete").await?;
+    let idem_key = require_idempotency_key(&headers)?;
+    if let Some(replay) = replay_gate(&state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(replay);
+    }
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        // Loaded only to stamp the audit at the current head; the completion is
+        // NOT gated on it (append-only — see the doc comment). A stale
+        // `authorized_generation` is recorded as the asserted fact, not rejected.
+        let loaded = state
+            .storage
+            .load_env(&env_id)
+            .await
+            .map_err(load_storage_error)?;
+        let completion =
+            serde_json::to_value(&payload.completion).map_err(envelope_encode_error)?;
+        // A failed cluster apply is a successful *recording* (HTTP 200) of a
+        // *failed* reconcile: stamp the audit `result` as Error so operators
+        // monitoring AuditResult see the failure, rather than it hiding inside
+        // `target.completion`.
+        let audit_result = match &payload.completion {
+            ReconcileCompletion::Succeeded { .. } => AuditResult::Ok,
+            ReconcileCompletion::Failed { error } => AuditResult::Error {
+                kind: "reconcile-failed".to_string(),
+                message: error.clone(),
+            },
+        };
+        let target = json!({
+            "environment_id": env_id,
+            "authorized_generation": payload.authorized_generation,
+            "authorized_etag": payload.authorized_etag.0,
+            "completion": completion,
+        });
+        let prepared = prepare_mutation_audited(
+            json!({ "recorded": true }),
+            &env_id,
+            "env",
+            "reconcile-complete",
+            target,
+            idem_key,
+            &fingerprint,
+            &auth,
+            Some(loaded.revision.generation),
+            loaded.revision.clone(),
+            audit_result,
+        )?;
+        // Audit-only: record_journal, no desired-state write (same pattern as
+        // reconcile_environment).
+        state.storage.record_journal(&prepared.journal).await?;
         Ok(prepared.into_response())
     }
     .await;
@@ -2134,12 +2325,17 @@ pub(crate) async fn remove_bundle<S: EnvironmentStorage>(
 // - The derived `<env_dir>/messaging/` projection refresh — remote
 //   consumers read the environment via `GET` (the runtime-config
 //   projection precedent).
-// - The webhook-secret SINK: the server has no secrets store yet, so its
-//   `provision` closure refuses and telegram-class `add` /
-//   `rotate-webhook-secret` answer 501 `not-yet-implemented` until the
-//   Phase D secrets sink lands. The refusal fires exactly where the
-//   LocalFS sink would write — after replay/duplicate/ref validation —
-//   so every other path through the verbs behaves identically.
+// - The webhook-secret SINK: a control-plane store has no secrets plane and
+//   never mints, rotates, or custodies secret material. A caller-supplied
+//   `webhook_secret_ref` (telegram `add`, or the new-ref `rotate`) is stamped
+//   by the engine without touching the sink — the operator provisions the
+//   value in its own secrets plane. The sink itself ALWAYS refuses, so the
+//   only paths that reach it — a telegram `add` with NO ref, or a
+//   `rotate-webhook-secret` with NO ref (the server cannot prove a value
+//   rotated, so it will not journal a misleading success) — answer 501
+//   `not-yet-implemented`. The refusal fires exactly where the LocalFS sink
+//   would write — after replay/duplicate/ref validation — so every other path
+//   is identical.
 //
 // Persist rule: the engine reports `mutated == false` for idempotent
 // replays/no-ops — the handler then echoes the loaded CAS coordinates
@@ -2169,9 +2365,11 @@ impl From<MessagingError> for ApiError {
             | MessagingError::InvalidSecretRef { .. } => RemoteStoreError::InvalidRequest {
                 detail: err.to_string(),
             },
-            // Only the refusing server sink produces this variant here
-            // (LocalFS maps its dev-store sink failures to `Conflict`
-            // instead) — so 501 is the accurate wire rendering.
+            // The server sink always refuses, so this is produced by a fresh
+            // telegram add with no caller-supplied ref or by any rotate;
+            // LocalFS maps its dev-store sink failures to `Conflict` instead.
+            // 501 is the accurate rendering — the control-plane store has no
+            // secrets plane.
             MessagingError::SecretProvision(detail) => {
                 RemoteStoreError::NotYetImplemented { detail }
             }
@@ -2191,13 +2389,30 @@ fn parse_endpoint_id(raw: &str) -> Result<MessagingEndpointId, ApiError> {
         })
 }
 
-/// The server's webhook-secret `provision` seam: refuse until the Phase D
-/// secrets sink lands (see the section comment).
+/// The server's webhook-secret `provision` seam. A control-plane operator
+/// store has NO secrets plane and never mints, rotates, or custodies secret
+/// material, so the sink ALWAYS refuses:
+///
+/// - **add**: a telegram-class `add` over a remote store must carry a
+///   caller-supplied `webhook_secret_ref` (the operator provisions the value
+///   in its own secrets plane). The engine then bypasses this sink entirely,
+///   so the only `add` that reaches it is one with no ref — which is refused.
+/// - **rotate (no new ref)**: the server cannot prove a value rotated (the
+///   value lives operator-side), so echoing the existing ref would journal a
+///   misleading success — refused here. A rotate that DOES carry a new
+///   caller-supplied `webhook_secret_ref` bypasses this sink entirely (the
+///   handler stamps the asserted ref directly), the same way a caller-ref
+///   `add` does.
+///
+/// Both add-with-no-ref and rotate-with-no-ref surface as 501 with a
+/// directive message.
 fn server_webhook_secret_sink(_existing: Option<&SecretRef>) -> Result<SecretRef, MessagingError> {
     Err(MessagingError::SecretProvision(
-        "webhook-secret provisioning is not yet implemented on the operator store server \
-         (needs the Phase D secrets sink); telegram-class `add` and `rotate-webhook-secret` \
-         remain local-only until it lands"
+        "the operator store server neither mints nor rotates webhook secrets: a telegram-class \
+         `add` must carry a caller-supplied `webhook_secret_ref` (the operator provisions the \
+         value in its own secrets plane), and `rotate-webhook-secret` requires a new \
+         caller-supplied `webhook_secret_ref` on a remote store — re-provision the value \
+         operator-side and pass its ref, or use the local store"
             .to_string(),
     ))
 }
@@ -2448,10 +2663,24 @@ pub(crate) async fn remove_messaging_endpoint<S: EnvironmentStorage>(
 }
 
 /// `POST /environments/{env_id}/messaging/{endpoint_id}/rotate-secret` —
-/// rotate the endpoint's webhook secret (A8 messaging route 6). Until the
-/// Phase D secrets sink lands this answers 501 wherever the LocalFS sink
-/// would mint a value (unknown endpoints still 404 first; a same-key
-/// replay still succeeds without re-minting).
+/// rotate the endpoint's webhook secret (A8 messaging route 6).
+///
+/// Two modes, keyed on whether the body carries a NEW `webhook_secret_ref`:
+/// - **with a caller-supplied ref**: the operator has already provisioned the
+///   value in its own secrets plane, so the server records the asserted ref
+///   (the env doc's `webhook_secret_ref` moves to it) and bumps the
+///   generation — verifiable in the same sense a telegram-class `add` with a
+///   caller ref is, because the server only echoes what the caller asserts.
+///   The target endpoint MUST be telegram-class (the same invariant `add`
+///   enforces) — a ref on a non-telegram endpoint is a 400.
+/// - **without a ref**: the value lives operator-side, so the server cannot
+///   prove a rotation occurred and journaling a generation bump would be a
+///   misleading success — the always-refusing sink answers 501.
+///
+/// A malformed ref, or a ref on a non-telegram endpoint, is a typed 400.
+/// Unknown endpoints still 404 first; a same-key replay still no-ops without
+/// re-stamping (the engine's replay gate fires before the sink, so the ref is
+/// never re-validated on replay).
 pub(crate) async fn rotate_messaging_webhook_secret<S: EnvironmentStorage>(
     State(state): State<AppState<S>>,
     Path((env_id, endpoint_id)): Path<(String, String)>,
@@ -2466,12 +2695,17 @@ pub(crate) async fn rotate_messaging_webhook_secret<S: EnvironmentStorage>(
         fingerprint,
         "rotate-webhook-secret",
         |env, key| {
+            // A caller-supplied new ref is validated + stamped by the engine
+            // (telegram-class gate + parse, mirroring `add`); with no ref the
+            // server sink refuses (501), since the control-plane store cannot
+            // mint or prove an operator-side rotation.
             let applied = engine::rotate_messaging_webhook_secret(
                 env,
                 endpoint_id,
                 &payload.updated_by,
                 key,
                 Utc::now(),
+                payload.webhook_secret_ref.as_deref(),
                 server_webhook_secret_sink,
             )?;
             let ep = env.messaging_endpoints[applied.index].clone();
@@ -3030,6 +3264,35 @@ pub struct GetEnvironmentResponse {
     pub generation: u64,
 }
 
+/// `GET /environments/{env_id}/runtime` — the runtime host-config sidecar, or
+/// `null` when none has been written. The deployer's `env show` over
+/// `--store-url` reads this so it can distinguish "no runtime" from "runtime
+/// not exposed over HTTP" (a missing ENV is still a 404).
+pub(crate) async fn get_runtime<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<GetRuntimeResponse>, ApiError> {
+    let env_id = parse_env_id(&env_id)?;
+    authorize_read(&state, &headers, Some(&env_id))?;
+    if !state.storage.exists(&env_id).await? {
+        return Err(ApiError(RemoteStoreError::NotFound));
+    }
+    let runtime = state
+        .storage
+        .load_runtime(&env_id)
+        .await
+        .map_err(load_storage_error)?
+        .map(|loaded| loaded.value);
+    Ok(Json(GetRuntimeResponse { runtime }))
+}
+
+/// `GET /environments/{env_id}/runtime` response body.
+#[derive(Debug, Serialize)]
+pub struct GetRuntimeResponse {
+    pub runtime: Option<EnvironmentRuntime>,
+}
+
 /// `GET /environments/{env_id}/trust-root` — list the env's trusted keys.
 /// An absent row reads as an empty key set (closed-by-default, mirroring
 /// the LocalFS `load`), while a missing ENV is still a 404. Plain JSON in
@@ -3090,13 +3353,12 @@ pub(crate) async fn create_backup<S: EnvironmentStorage>(
     }
     let recheck_key = idem_key.clone();
     let outcome = async {
-        let loaded = state
-            .storage
-            .load_env(&env_id)
-            .await
-            .map_err(load_storage_error)?;
-        // Build the composite snapshot: env + runtime + pack_answers.
-        let snapshot = state
+        // Capture the composite snapshot (env + runtime + pack_answers) AND the
+        // environment revision it was read at, atomically in one transaction.
+        // Sourcing the generation from a separate load_env could race a
+        // concurrent mutation and stamp the manifest with a generation that
+        // does not match the captured content.
+        let (snapshot, revision) = state
             .storage
             .load_env_snapshot(&env_id)
             .await
@@ -3127,7 +3389,7 @@ pub(crate) async fn create_backup<S: EnvironmentStorage>(
             backup_id: ulid::Ulid::new().to_string(),
             env_id: env_id.clone(),
             created_at: Utc::now(),
-            generation: loaded.revision.generation,
+            generation: revision.generation,
             integrity,
             size_bytes,
         };
@@ -3145,8 +3407,8 @@ pub(crate) async fn create_backup<S: EnvironmentStorage>(
             idem_key,
             &fingerprint,
             &auth,
-            Some(loaded.revision.generation),
-            loaded.revision.clone(),
+            Some(revision.generation),
+            revision,
         )?;
         state
             .storage
@@ -3229,6 +3491,148 @@ pub(crate) async fn delete_backup<S: EnvironmentStorage>(
                 detail: format!("backup `{backup_id}` not found in env `{env_id}`"),
             }));
         }
+        Ok(prepared.into_response())
+    }
+    .await;
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => error_or_replay(&state, &env_id, &recheck_key, &fingerprint, err).await,
+    }
+}
+
+/// `GET /environments/{env_id}/backups/{backup_id}/export` — pull a backup
+/// OFFSITE as a portable, self-verifying [`BackupArtifact`] (A8 #5, disaster
+/// recovery). The artifact carries the manifest, the FULL composite snapshot
+/// (env + sidecars + audit), and the snapshot digest — the exact bytes a later
+/// import re-verifies and replays, so a backup survives total store loss.
+///
+/// Though it performs no mutation (no idempotency key, no journal), export is
+/// gated at BACKUP-OPERATOR privilege (`authorize_mutation` on
+/// `backup`/`export`), NOT generic read: the snapshot is the complete recovery
+/// payload — environment document, runtime, pack answers, and audit history —
+/// which a read-only actor (entitled only to manifests, via `list_backups`)
+/// must not be able to exfiltrate offsite. An unknown `backup_id` is a 404.
+pub(crate) async fn export_backup<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path((env_id, backup_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<BackupArtifact>, ApiError> {
+    let env_id = parse_env_id(&env_id)?;
+    authorize_mutation(&state, &headers, &env_id, "backup", "export").await?;
+    let backup = state
+        .storage
+        .load_backup(&env_id, &backup_id)
+        .await
+        .map_err(load_storage_error)?
+        .ok_or_else(|| {
+            ApiError(RemoteStoreError::DependentNotFound {
+                detail: format!("backup `{backup_id}` not found in env `{env_id}`"),
+            })
+        })?;
+    Ok(Json(BackupArtifact {
+        schema: SchemaVersion::BACKUP_ARTIFACT_V1.into(),
+        manifest: backup.manifest,
+        snapshot: backup.state,
+        snapshot_digest: backup.snapshot_digest,
+    }))
+}
+
+/// `POST /environments/{env_id}/import` — reconstruct an environment from a
+/// portable [`BackupArtifact`] (A8 #5, disaster recovery). Unlike `restore` (a
+/// precondition-guarded rollback of an EXISTING env), import is the FRESH-store
+/// path: it refuses if the environment already exists (409) and otherwise
+/// creates it at generation 1. The artifact carries no precondition — there is
+/// no prior generation to pin after total loss. The composite snapshot's
+/// integrity is verified (recompute the digest) BEFORE anything is written — a
+/// corrupted artifact is never reconstructed (the same #6 guard restore
+/// applies) — and the path `env_id` must match the artifact's manifest. The
+/// commit is the same journaled write as every mutation, so the import is
+/// audited and replay-protected.
+pub(crate) async fn import_environment<S: EnvironmentStorage>(
+    State(state): State<AppState<S>>,
+    Path(env_id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(payload, fingerprint): ApiJson<ImportRequest>,
+) -> Result<Response, ApiError> {
+    let env_id = parse_env_id(&env_id)?;
+    let auth = authorize_mutation(&state, &headers, &env_id, "backup", "import").await?;
+    let idem_key = require_idempotency_key(&headers)?;
+    if let Some(replay) = replay_gate(&state, &env_id, &idem_key, &fingerprint).await? {
+        return Ok(replay);
+    }
+    let recheck_key = idem_key.clone();
+    let outcome = async {
+        let artifact = payload.artifact;
+        // The artifact names the env it captured; importing it under a
+        // different path would mis-key the reconstructed sidecars.
+        if artifact.manifest.env_id != env_id {
+            return Err(ApiError(RemoteStoreError::InvalidRequest {
+                detail: format!(
+                    "artifact env_id `{}` does not match path `{env_id}`",
+                    artifact.manifest.env_id
+                ),
+            }));
+        }
+        // Verify the composite snapshot digest before importing — a corrupted
+        // or tampered artifact is never reconstructed.
+        let recomputed = StateIntegrity::sha256_of(&artifact.snapshot).map_err(|err| {
+            tracing::error!(error = %err, "import snapshot hashing failed");
+            ApiError(RemoteStoreError::Internal {
+                message: "import snapshot hashing failed".to_string(),
+            })
+        })?;
+        if recomputed.digest != artifact.snapshot_digest {
+            return Err(ApiError(RemoteStoreError::IntegrityMismatch {
+                expected: artifact.snapshot_digest.clone(),
+                actual: recomputed.digest,
+            }));
+        }
+        let snapshot: crate::storage::EnvSnapshot = serde_json::from_value(artifact.snapshot)
+            .map_err(|err| {
+                tracing::error!(error = %err, backup_id = %artifact.manifest.backup_id,
+                        "import snapshot failed to decode");
+                ApiError(RemoteStoreError::Internal {
+                    message: "import snapshot failed to decode".to_string(),
+                })
+            })?;
+        let imported_env: Environment = serde_json::from_value(snapshot.environment.clone())
+            .map_err(|err| {
+                tracing::error!(error = %err, backup_id = %artifact.manifest.backup_id,
+                        "import environment failed to decode");
+                ApiError(RemoteStoreError::Internal {
+                    message: "import environment failed to decode".to_string(),
+                })
+            })?;
+        // A fresh create: generation 1, no prior CAS state.
+        let next = created_revision(&imported_env)?;
+        let outcome = ImportOutcome {
+            imported_generation: next.generation,
+            integrity: artifact.manifest.integrity.clone(),
+        };
+        let target = json!({
+            "environment_id": env_id,
+            "backup_id": artifact.manifest.backup_id,
+            "backup_generation": artifact.manifest.generation,
+            "imported_generation": next.generation,
+        });
+        let prepared = prepare_mutation(
+            &outcome,
+            &env_id,
+            "backup",
+            "import",
+            target,
+            idem_key,
+            &fingerprint,
+            &auth,
+            None,
+            next,
+        )?;
+        // Existence is enforced by the storage layer's atomic create
+        // (`AlreadyExists` → 409) — no load-then-check race.
+        state
+            .storage
+            .import_env_journaled(&env_id, &snapshot, Some(&prepared.journal))
+            .await?;
         Ok(prepared.into_response())
     }
     .await;

@@ -49,9 +49,13 @@ impl DeploymentSpecV1 {
             _ => match Self::from_yaml_str(&contents) {
                 Ok(spec) => Ok(spec),
                 Err(yaml_err) => Self::from_json_str(&contents).map_err(|json_err| {
+                    let yaml_err = yaml_err.to_string();
+                    let json_err = json_err.to_string();
                     DeployerError::Config(format!(
-                        "failed to parse deployment spec {} as YAML ({yaml_err}) or JSON ({json_err})",
-                        path.display()
+                        "failed to parse deployment spec {} as YAML ({}) or JSON ({})",
+                        path.display(),
+                        yaml_err,
+                        json_err
                     ))
                 }),
             },

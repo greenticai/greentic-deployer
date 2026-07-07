@@ -35,7 +35,7 @@ use super::mutations::{
     StageRevisionPayload, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
     UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
-use super::store::{LocalFsStore, StoreError};
+use super::store::{EnvironmentStore, LocalFsStore, StoreError};
 use super::trust_root::{self as store_trust_root, trust_root_path};
 
 /// Map a [`LifecycleError`] into `StoreError`, peeling `LifecycleError::Store`
@@ -138,6 +138,26 @@ fn map_messaging_err(err: engine::MessagingError) -> StoreError {
         }
         E::SecretProvision(message) => StoreError::Conflict(message),
     }
+}
+
+/// Derive the webhook-secret provisioning context from the env: the env's owning
+/// tenant (`tenant_org_id`, trimmed; `None` when absent or blank) and whether the
+/// secrets backend custodies values in the local dev-store (so the sink mints +
+/// writes the value) versus an external backend like Vault (where the operator
+/// seeds the value out-of-band and the sink only stamps the ref). Computed from
+/// `env` before the `&mut env` engine call so the `provision` closure captures
+/// owned values, not a borrow of `env`. The owner→tenant-segment mapping (and the
+/// fail-closed rule for non-custodial backends with no owner) lives in
+/// [`crate::cli::messaging::provision_webhook_secret`].
+fn webhook_provision_ctx(env: &Environment) -> (Option<String>, bool) {
+    let owner = env
+        .host_config
+        .tenant_org_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    (owner, crate::cli::env::secrets_backend_is_dev_store(env))
 }
 
 impl LocalFsStore {
@@ -944,13 +964,22 @@ impl LocalFsStore {
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
             let eid = MessagingEndpointId::new();
+            let (owner, custodial) = webhook_provision_ctx(&env);
             let applied = engine::add_messaging_endpoint(
                 &mut env,
                 payload,
                 eid,
                 &idempotency_key,
                 Utc::now(),
-                |existing| self.provision_webhook_secret_sink(env_id, &eid, existing),
+                |existing| {
+                    self.provision_webhook_secret_sink(
+                        env_id,
+                        &eid,
+                        owner.as_deref(),
+                        custodial,
+                        existing,
+                    )
+                },
             )
             .map_err(map_messaging_err)?;
             self.finish_messaging_mutation(locked, &env, applied)
@@ -1067,22 +1096,48 @@ impl LocalFsStore {
     ) -> Result<MessagingEndpoint, StoreError> {
         self.transact(env_id, |locked| {
             let mut env = locked.load()?;
+            let (owner, custodial) = webhook_provision_ctx(&env);
+            // The control plane can only rotate a value it custodies (the local
+            // dev-store). For an external backend (e.g. Vault) the value lives in
+            // the backend and is rotated out-of-band, so fail closed rather than
+            // bump generation and report success without changing anything.
+            if !custodial {
+                return Err(StoreError::Conflict(format!(
+                    "cannot rotate a webhook secret on a non-dev-store secrets backend from the \
+                     control plane (env `{}`); rotate the value in the secrets backend and \
+                     re-seed it (e.g. via `op secrets put`)",
+                    env_id.as_str()
+                )));
+            }
             let applied = engine::rotate_messaging_webhook_secret(
                 &mut env,
                 endpoint_id,
                 &updated_by,
                 &idempotency_key,
                 Utc::now(),
-                |existing| self.provision_webhook_secret_sink(env_id, &endpoint_id, existing),
+                // The local store mints its own value; it never threads a
+                // caller-supplied ref (the CLI rejects one).
+                None,
+                |existing| {
+                    self.provision_webhook_secret_sink(
+                        env_id,
+                        &endpoint_id,
+                        owner.as_deref(),
+                        custodial,
+                        existing,
+                    )
+                },
             )
             .map_err(map_messaging_err)?;
             self.finish_messaging_mutation(locked, &env, applied)
         })
     }
 
-    /// The LocalFS webhook-secret sink for the engine's `provision` seam:
-    /// mint a CSPRNG value and write it into the env-pack dev-store via
-    /// [`crate::cli::messaging::provision_webhook_secret`]. Failures map to
+    /// The LocalFS webhook-secret sink for the engine's `provision` seam: build
+    /// the ref under the env `owner` (or `default` for an ownerless custodial
+    /// env) and, when `custodial`, mint a CSPRNG value and write it into the
+    /// env-pack dev-store via [`crate::cli::messaging::provision_webhook_secret`].
+    /// A non-custodial backend with no `owner` fails closed there. Failures map to
     /// [`engine::MessagingError::SecretProvision`], which
     /// [`map_messaging_err`] folds back onto the `Conflict` noun this store
     /// raised before the engine rewire.
@@ -1090,10 +1145,19 @@ impl LocalFsStore {
         &self,
         env_id: &EnvId,
         endpoint_id: &MessagingEndpointId,
+        owner: Option<&str>,
+        custodial: bool,
         existing_ref: Option<&SecretRef>,
     ) -> Result<SecretRef, engine::MessagingError> {
-        crate::cli::messaging::provision_webhook_secret(self, env_id, endpoint_id, existing_ref)
-            .map_err(|e| engine::MessagingError::SecretProvision(e.to_string()))
+        crate::cli::messaging::provision_webhook_secret(
+            self,
+            env_id,
+            endpoint_id,
+            owner,
+            custodial,
+            existing_ref,
+        )
+        .map_err(|e| engine::MessagingError::SecretProvision(e.to_string()))
     }
 
     /// Shared tail of every endpoint-returning messaging verb: persist when
@@ -1177,6 +1241,7 @@ impl LocalFsStore {
                             tenant_org_id: None,
                             listen_addr: Some(greentic_deploy_spec::DEFAULT_LISTEN_ADDR),
                             public_base_url: payload.public_base_url.clone(),
+                            gui_enabled: None,
                         },
                         packs,
                         credentials_ref: None,
@@ -1253,6 +1318,21 @@ impl EnvironmentMutations for LocalFsStore {
         patch: UpdateEnvironmentPayload,
     ) -> Result<Environment, StoreError> {
         self.update_environment(env_id, patch)
+    }
+
+    /// Reads the persisted env via [`EnvironmentStore::load`] — the trait's
+    /// one read verb, surfaced here so `&dyn EnvironmentMutations` callers
+    /// (the remote dispatch) can evaluate client-side preconditions.
+    fn load_environment(&self, env_id: &EnvId) -> Result<Environment, StoreError> {
+        EnvironmentStore::load(self, env_id)
+    }
+
+    /// A seeded env has the trust-root file present — the seed/add paths always
+    /// write ≥1 key, mirroring the `tr_path.exists()` check in
+    /// [`LocalFsStore::seed_trust_root_if_absent`].
+    fn trust_root_is_seeded(&self, env_id: &EnvId) -> Result<bool, StoreError> {
+        let env_dir = self.env_dir(env_id)?;
+        Ok(trust_root_path(&env_dir).exists())
     }
 
     /// See [`LocalFsStore::migrate_merge_bindings`].
@@ -1576,6 +1656,7 @@ mod warm_revision_tests {
                 tenant_org_id: None,
                 listen_addr: None,
                 public_base_url: None,
+                gui_enabled: None,
             },
             packs: Vec::new(),
             credentials_ref: None,
@@ -1614,6 +1695,7 @@ mod warm_revision_tests {
                 sequence: 1,
                 created_at: Utc.with_ymd_and_hms(2026, 6, 9, 12, 0, 0).unwrap(),
                 bundle_digest: "sha256:00".to_string(),
+                bundle_source_uri: None,
                 pack_list: Vec::new(),
                 pack_list_lock_ref: PathBuf::new(),
                 pack_config_refs: Vec::new(),
@@ -1925,6 +2007,7 @@ mod bootstrap_typed_verb_tests {
                 tenant_org_id: None,
                 listen_addr: None,
                 public_base_url: None,
+                gui_enabled: None,
             },
             packs: Vec::new(),
             credentials_ref: None,
@@ -1950,6 +2033,77 @@ mod bootstrap_typed_verb_tests {
             generation: 0,
             previous_binding_ref: None,
         }
+    }
+
+    #[test]
+    fn webhook_provision_ctx_trims_and_blanks_owner() {
+        let (_tmp, store) = store();
+        let mut env = seed_empty_local_env(&store);
+        // No Secrets binding → custodial dev-store; no owner → None.
+        let (owner, custodial) = webhook_provision_ctx(&env);
+        assert_eq!(owner, None);
+        assert!(custodial);
+        // A padded owner is trimmed.
+        env.host_config.tenant_org_id = Some("  tenant-default  ".to_string());
+        assert_eq!(
+            webhook_provision_ctx(&env).0.as_deref(),
+            Some("tenant-default")
+        );
+        // A blank owner collapses to None.
+        env.host_config.tenant_org_id = Some("   ".to_string());
+        assert_eq!(webhook_provision_ctx(&env).0, None);
+    }
+
+    #[test]
+    fn rotate_messaging_webhook_secret_rejects_non_dev_store_backend() {
+        let (_tmp, store) = store();
+        let mut env = seed_empty_local_env(&store);
+        // A tenant-owned env bound to the Vault secrets backend (non-custodial).
+        env.host_config.tenant_org_id = Some("tenant-default".to_string());
+        env.packs.push(custom_binding(
+            CapabilitySlot::Secrets,
+            crate::defaults::VAULT_SECRETS_PACK,
+        ));
+        store.save(&env).unwrap();
+
+        // Add stamps the owner-tenant ref without writing a dev-store value.
+        let added = store
+            .add_messaging_endpoint(
+                &env_id(),
+                AddMessagingEndpointPayload {
+                    provider_id: "tg".to_string(),
+                    provider_type: "telegram".to_string(),
+                    display_name: "t".to_string(),
+                    secret_refs: Vec::new(),
+                    webhook_secret_ref: None,
+                    updated_by: "tester".to_string(),
+                },
+                IdempotencyKey::new(ulid::Ulid::new().to_string()).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            added
+                .webhook_secret_ref
+                .as_ref()
+                .expect("telegram endpoint stamps a ref")
+                .as_str()
+                .starts_with("secret://local/tenant-default/_/"),
+            "add must stamp the owner-tenant ref"
+        );
+
+        // Rotate must fail closed — the control plane cannot rotate a Vault value.
+        let err = store
+            .rotate_messaging_webhook_secret(
+                &env_id(),
+                added.endpoint_id,
+                "tester".to_string(),
+                IdempotencyKey::new(ulid::Ulid::new().to_string()).unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(ref m) if m.contains("non-dev-store")),
+            "expected Conflict, got {err:?}"
+        );
     }
 
     #[test]

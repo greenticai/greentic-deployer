@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TenantManagerAwsDeployInput",
+  "type": "object",
+  "required": ["aws_region", "image_uri", "domain_name", "acm_certificate_arn",
+               "vpc_id", "subnet_ids", "master_key_secret_arn", "platform_secret_hash_arn"],
+  "properties": {
+    "aws_region": { "type": "string" },
+    "image_uri": { "type": "string", "description": "digest-pinned tenant-manager image" },
+    "db_instance_class": { "type": "string", "default": "db.t4g.micro" },
+    "domain_name": { "type": "string" },
+    "acm_certificate_arn": { "type": "string" },
+    "vpc_id": { "type": "string" },
+    "subnet_ids": { "type": "array", "items": { "type": "string" }, "minItems": 2 },
+    "master_key_secret_arn": { "type": "string" },
+    "platform_secret_hash_arn": { "type": "string" }
+  }
+}

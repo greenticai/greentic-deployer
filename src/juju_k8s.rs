@@ -10,7 +10,7 @@ use crate::plan::PlanContext;
 pub struct JujuK8sRequest {
     pub capability: DeployerCapability,
     pub tenant: String,
-    pub pack_path: PathBuf,
+    pub pack_path: Option<PathBuf>,
     pub provider_pack: Option<PathBuf>,
     pub deploy_pack_id_override: Option<String>,
     pub deploy_flow_id_override: Option<String>,
@@ -34,7 +34,7 @@ impl JujuK8sRequest {
     pub fn new(
         capability: DeployerCapability,
         tenant: impl Into<String>,
-        pack_path: PathBuf,
+        pack_path: Option<PathBuf>,
     ) -> Self {
         Self {
             capability,
@@ -141,9 +141,12 @@ mod tests {
 
     #[test]
     fn juju_k8s_request_defaults_to_k8s_juju_k8s_target() {
-        let request =
-            JujuK8sRequest::new(DeployerCapability::Plan, "acme", PathBuf::from("pack-dir"))
-                .into_deployer_request();
+        let request = JujuK8sRequest::new(
+            DeployerCapability::Plan,
+            "acme",
+            Some(PathBuf::from("pack-dir")),
+        )
+        .into_deployer_request();
 
         assert_eq!(request.provider, Provider::K8s);
         assert_eq!(request.strategy, "juju-k8s");

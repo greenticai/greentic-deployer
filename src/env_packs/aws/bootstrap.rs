@@ -83,10 +83,16 @@ pub fn render_min_iam_rules_pack(input: &IamRulesPackInput<'_>) -> RulesPack {
 enum ActionBucket {
     /// `sts:*` and `iam:Simulate*` — read-only, safe at `Resource = "*"`.
     ReadOnly,
-    /// `ecs:*` — ECS rollout, scoped to cluster/service ARN.
+    /// `ecs:*` — ECS rollout, scoped to cluster/service/task-set ARN.
     Ecs,
+    /// `ecs:Register/DeregisterTaskDefinition` — no resource-level scoping;
+    /// Resource = "*".
+    EcsTaskDefinition,
     /// `ecr:*` — image push, scoped to repo ARN.
     Ecr,
+    /// `elasticloadbalancing:Describe*` — no resource-level scoping;
+    /// Resource = "*".
+    AlbReadOnly,
     /// `elasticloadbalancing:*` — ALB mutation, scoped to listener ARN.
     Alb,
     /// `iam:PassRole` — privilege-sensitive, scoped + conditioned.
@@ -102,11 +108,17 @@ fn classify_action(action: &str) -> ActionBucket {
     if action.starts_with("sts:") || action.starts_with("iam:Simulate") {
         return ActionBucket::ReadOnly;
     }
+    if action == "ecs:RegisterTaskDefinition" || action == "ecs:DeregisterTaskDefinition" {
+        return ActionBucket::EcsTaskDefinition;
+    }
     if action.starts_with("ecs:") {
         return ActionBucket::Ecs;
     }
     if action.starts_with("ecr:") {
         return ActionBucket::Ecr;
+    }
+    if action.starts_with("elasticloadbalancing:Describe") {
+        return ActionBucket::AlbReadOnly;
     }
     if action.starts_with("elasticloadbalancing:") {
         return ActionBucket::Alb;
@@ -148,14 +160,26 @@ const BUCKET_SPECS: &[BucketSpec] = &[
     },
     BucketSpec {
         bucket: ActionBucket::Ecs,
-        comment: "ECS rollout — admin scopes to cluster/service ARN at apply.",
+        comment: "ECS rollout — admin scopes to cluster/service/task-set ARNs at apply.",
         resource: "<REPLACE_WITH_ECS_RESOURCE_ARNS>",
+        extra: None,
+    },
+    BucketSpec {
+        bucket: ActionBucket::EcsTaskDefinition,
+        comment: "ECS task-definition lifecycle — no resource-level scoping; Resource must be \"*\".",
+        resource: "*",
         extra: None,
     },
     BucketSpec {
         bucket: ActionBucket::Ecr,
         comment: "ECR image push — admin scopes to repo ARN.",
         resource: "<REPLACE_WITH_ECR_REPO_ARNS>",
+        extra: None,
+    },
+    BucketSpec {
+        bucket: ActionBucket::AlbReadOnly,
+        comment: "ELB describe — no resource-level scoping; Resource = \"*\".",
+        resource: "*",
         extra: None,
     },
     BucketSpec {
@@ -345,13 +369,24 @@ The policy is split into multiple statements by sensitivity:
 
 - **Read-only** (`sts:GetCallerIdentity`, `iam:SimulatePrincipalPolicy`)
   — `Resource = "*"` is safe; these are validation-only.
-- **ECS** (`ecs:*`) — replace `<REPLACE_WITH_ECS_RESOURCE_ARNS>` with
-  your cluster/service ARNs, e.g.
+- **ECS rollout** (scopable `ecs:*` verbs) — replace
+  `<REPLACE_WITH_ECS_RESOURCE_ARNS>` with your cluster/service/task-set
+  ARNs, e.g.
   `arn:aws:ecs:<region>:<account>:service/<cluster>/greentic-*`.
+- **ECS task-definition lifecycle** (`ecs:RegisterTaskDefinition`,
+  `ecs:DeregisterTaskDefinition`) — granted at `Resource = "*"` because
+  AWS provides no resource-level scoping for these actions.
 - **ECR** (`ecr:PutImage`) — replace `<REPLACE_WITH_ECR_REPO_ARNS>` with
   your repository ARN, e.g.
   `arn:aws:ecr:<region>:<account>:repository/greentic-*`.
-- **ALB** (`elasticloadbalancing:ModifyListener`) — replace
+- **ELB describe** (`elasticloadbalancing:DescribeTargetGroups`) —
+  granted at `Resource = "*"` because AWS provides no resource-level
+  scoping for describe actions.
+- **ALB listener mutation** (`elasticloadbalancing:ModifyListener`,
+  `DescribeRules`, `CreateRule`, `ModifyRule`, `AddTags`, `DescribeTags`) —
+  `ModifyListener` writes the listener's default action; the rule verbs write
+  per-deployment listener rules, and the tag verbs stamp + verify each rule's
+  owning deployment so the deployer only rewrites rules it created. Replace
   `<REPLACE_WITH_ALB_LISTENER_ARNS>` with your listener ARN.
 - **iam:PassRole** — replace `<REPLACE_WITH_ECS_TASK_ROLE_ARN>` with the
   ARN of the ECS task-execution role, e.g.
@@ -719,5 +754,40 @@ mod tests {
         // Non-ARN strings → false.
         assert!(!looks_like_arn("customer-admin"));
         assert!(!looks_like_arn(""));
+    }
+
+    /// Actions AWS provides no resource-level scoping for must render at
+    /// `Resource = "*"`, never under a `<REPLACE_WITH_*>` placeholder — otherwise
+    /// an admin who scopes the placeholder literally gets a role denied those
+    /// actions. Renders from the real validated verb list so adding such a verb
+    /// without classifying it correctly fails here.
+    #[test]
+    fn unscopable_verbs_render_at_star() {
+        use crate::env_packs::aws::credentials::VALIDATED_IAM_VERBS;
+        let star_only = [
+            "ecs:RegisterTaskDefinition",
+            "ecs:DeregisterTaskDefinition",
+            "elasticloadbalancing:DescribeTargetGroups",
+        ];
+        for verb in VALIDATED_IAM_VERBS {
+            let bucket = classify_action(verb);
+            assert_ne!(
+                bucket,
+                ActionBucket::Unrecognized,
+                "validated verb `{verb}` must classify to a known bucket"
+            );
+            let spec = BUCKET_SPECS
+                .iter()
+                .find(|s| s.bucket == bucket)
+                .expect("every bucket has a spec");
+            if star_only.contains(verb) {
+                assert_eq!(
+                    spec.resource, "*",
+                    "`{verb}` has no resource-level scoping; it must render at \
+                     Resource = \"*\", not `{}`",
+                    spec.resource
+                );
+            }
+        }
     }
 }

@@ -19,6 +19,7 @@ impl From<EnvironmentConfig> for EnvironmentHostConfig {
             tenant_org_id: None,
             listen_addr: None,
             public_base_url: None,
+            gui_enabled: None,
         }
     }
 }
@@ -31,6 +32,7 @@ impl From<&EnvironmentConfig> for EnvironmentHostConfig {
             tenant_org_id: None,
             listen_addr: None,
             public_base_url: None,
+            gui_enabled: None,
         }
     }
 }

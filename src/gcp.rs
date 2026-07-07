@@ -17,7 +17,7 @@ use crate::runtime_secrets::{
 pub struct GcpRequest {
     pub capability: DeployerCapability,
     pub tenant: String,
-    pub pack_path: PathBuf,
+    pub pack_path: Option<PathBuf>,
     pub bundle_root: Option<PathBuf>,
     pub bundle_source: Option<String>,
     pub bundle_digest: Option<String>,
@@ -49,7 +49,7 @@ impl GcpRequest {
     pub fn new(
         capability: DeployerCapability,
         tenant: impl Into<String>,
-        pack_path: PathBuf,
+        pack_path: Option<PathBuf>,
     ) -> Self {
         Self {
             capability,
@@ -168,9 +168,7 @@ fn build_gcp_request_from_ext(
     GcpRequest {
         capability,
         tenant: cfg.tenant.clone(),
-        pack_path: pack_path
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_default(),
+        pack_path: pack_path.map(std::path::Path::to_path_buf),
         bundle_root: None,
         bundle_source: Some(cfg.bundle_source.clone()),
         bundle_digest: Some(cfg.bundle_digest.clone()),
@@ -399,8 +397,12 @@ mod tests {
 
     #[test]
     fn gcp_request_defaults_to_gcp_iac_target() {
-        let request = GcpRequest::new(DeployerCapability::Plan, "acme", PathBuf::from("pack-dir"))
-            .into_deployer_request();
+        let request = GcpRequest::new(
+            DeployerCapability::Plan,
+            "acme",
+            Some(PathBuf::from("pack-dir")),
+        )
+        .into_deployer_request();
 
         assert_eq!(request.provider, Provider::Gcp);
         assert_eq!(request.strategy, "iac-only");
@@ -409,8 +411,11 @@ mod tests {
 
     #[test]
     fn gcp_request_preserves_all_passthrough_fields() {
-        let mut request =
-            GcpRequest::new(DeployerCapability::Apply, "acme", PathBuf::from("pack-dir"));
+        let mut request = GcpRequest::new(
+            DeployerCapability::Apply,
+            "acme",
+            Some(PathBuf::from("pack-dir")),
+        );
         request.bundle_root = Some(PathBuf::from("bundle-root"));
         request.bundle_source = Some("gs://bucket/bundle.gtbundle".into());
         request.bundle_digest = Some("sha256:abc".into());
@@ -492,8 +497,12 @@ mod tests {
     #[test]
     fn ensure_gcp_config_rejects_non_gcp_provider() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut request = GcpRequest::new(DeployerCapability::Plan, "acme", tmp.path().into())
-            .into_deployer_request();
+        let mut request = GcpRequest::new(
+            DeployerCapability::Plan,
+            "acme",
+            Some(tmp.path().to_path_buf()),
+        )
+        .into_deployer_request();
         request.provider = Provider::Aws;
         let config = DeployerConfig::resolve(request).expect("resolve config");
 
@@ -507,8 +516,12 @@ mod tests {
     #[test]
     fn ensure_gcp_config_accepts_gcp_iac_config() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let request = GcpRequest::new(DeployerCapability::Plan, "acme", tmp.path().into())
-            .into_deployer_request();
+        let request = GcpRequest::new(
+            DeployerCapability::Plan,
+            "acme",
+            Some(tmp.path().to_path_buf()),
+        )
+        .into_deployer_request();
         let config = DeployerConfig::resolve(request).expect("resolve config");
 
         ensure_gcp_config(&config).expect("gcp config");
@@ -600,7 +613,7 @@ mod tests {
 
         assert_eq!(request.capability, DeployerCapability::Destroy);
         assert_eq!(request.tenant, "acme");
-        assert_eq!(request.pack_path, PathBuf::from("pack"));
+        assert_eq!(request.pack_path, Some(PathBuf::from("pack")));
         assert_eq!(
             request.bundle_source.as_deref(),
             Some("oci://registry.example/acme/prod")

@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use greentic_deploy_spec::CapabilitySlot;
+use greentic_deploy_spec::GUI_DEFAULT_ENV_ID;
 use qa_spec::spec::ListSpec;
 use qa_spec::spec::question::QuestionPolicy;
 use qa_spec::{AnswerSet, Expr, FormSpec, QuestionSpec, QuestionType};
@@ -68,8 +69,8 @@ pub struct EnvManifest {
 pub struct ManifestEnvironment {
     /// Environment id. Apply bootstraps `local` (via `env init`, seeding the
     /// default env-pack bindings). Any other id must ALREADY exist — apply
-    /// reconciles a non-local env but cannot create one (non-local creation
-    /// is reserved for the remote operator store, A7).
+    /// reconciles a named env but does not create one; create it explicitly
+    /// first via `op env create <id>` (locally) or the remote operator store.
     pub id: String,
     /// When set, persisted via the `env set-public-url` path. Absent/`null`
     /// means "leave whatever is there" (upsert — apply never clears it).
@@ -89,6 +90,26 @@ pub struct ManifestEnvironment {
     /// `SocketAddr` during shape validation). Absent = leave untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<String>,
+    /// Whether the runtime serves the built-in webchat GUI. Absent = leave the
+    /// stored value unchanged (upsert, like the other host-config fields); the
+    /// env-id default — on for `local`, off otherwise — applies only when the
+    /// stored value is unset. `true`/`false` is an explicit choice reconciled
+    /// via `op config set`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gui_enabled: Option<bool>,
+}
+
+impl ManifestEnvironment {
+    /// True if the manifest declares any field that flows through `op config
+    /// set` / the `UpdateHostConfig` apply step. `public_base_url` is excluded
+    /// on purpose — it's reconciled by the separate `SetPublicUrl` step.
+    pub(crate) fn declares_host_config(&self) -> bool {
+        self.name.is_some()
+            || self.region.is_some()
+            || self.tenant_org_id.is_some()
+            || self.listen_addr.is_some()
+            || self.gui_enabled.is_some()
+    }
 }
 
 /// v1 accepts only the string `"bootstrap"`. A future
@@ -186,6 +207,22 @@ pub struct ManifestBundle {
     /// on re-deploy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_binding: Option<RouteBindingPayload>,
+    /// Optional `oci://` pull ref recorded on the staged revision so a K8s
+    /// worker can fetch the bundle at boot. May stand alone (URI-only): apply
+    /// fetches it once to derive the integrity digest, so no local `bundle_path`
+    /// is needed on the apply host. When it rides alongside a local
+    /// `bundle_path`, the path supplies the artifact and any scheme the worker
+    /// understands is fine here; URI-only requires `oci://` (the only scheme
+    /// apply fetches today). Single-revision form only; multi-revision carries
+    /// the ref per `revisions[]` entry. Absent = local `bundle_path` required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_source_uri: Option<String>,
+    /// Optional `sha256:<hex>` integrity pin for the resolved artifact. When
+    /// set, apply fails closed unless the artifact (local or fetched) hashes to
+    /// this; when absent, apply records the computed digest (trust-on-first-use).
+    /// Recommended for a `bundle_source_uri`-only bundle so the pull is pinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_digest: Option<String>,
 }
 
 /// One revision in a multi-revision bundle entry. Each carries its own
@@ -214,6 +251,16 @@ pub struct ManifestRevision {
     /// canary-evaluation engine (not consumed by apply today).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub abort_metrics: Vec<String>,
+    /// Optional `oci://`/`repo://`/`store://` pull ref recorded on this staged
+    /// revision so a K8s worker can fetch it at boot. `bundle_path` stays
+    /// required (integrity digest). Absent = local-serve only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_source_uri: Option<String>,
+    /// Optional `sha256:<hex>` integrity pin for `bundle_path`. When set, apply
+    /// fails closed unless the artifact hashes to this; absent = record the
+    /// computed digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,9 +422,11 @@ impl EnvManifest {
                     b.bundle_id
                 )));
             }
-            // XOR: exactly one of `bundle_path` / `revisions` must be set.
+            // A bundle entry is single-revision (a `bundle_path` and/or a
+            // `bundle_source_uri`, 100 % traffic) XOR multi-revision
+            // (`revisions[]`). A single-revision entry needs at least one
+            // source; a remote-only source must be a `bundle_source_uri`.
             match (&b.bundle_path, &b.revisions) {
-                (Some(_), None) | (None, Some(_)) => {}
                 (Some(_), Some(_)) => {
                     return Err(OpError::InvalidArgument(format!(
                         "bundle `{}`: `bundle_path` and `revisions` are mutually exclusive \
@@ -386,13 +435,42 @@ impl EnvManifest {
                         b.bundle_id
                     )));
                 }
+                (None, Some(_)) => {
+                    // Multi-revision: the bundle-level `bundle_source_uri` and
+                    // `bundle_digest` are single-revision-only fields — a split
+                    // carries them per `revisions[]` entry.
+                    if b.bundle_source_uri.is_some() {
+                        return Err(OpError::InvalidArgument(format!(
+                            "bundle `{}`: bundle-level `bundle_source_uri` is for the \
+                             single-revision form — declare a per-revision \
+                             `bundle_source_uri` inside `revisions[]` for a traffic split",
+                            b.bundle_id
+                        )));
+                    }
+                    if b.bundle_digest.is_some() {
+                        return Err(OpError::InvalidArgument(format!(
+                            "bundle `{}`: bundle-level `bundle_digest` is for the \
+                             single-revision form — declare a per-revision \
+                             `bundle_digest` inside `revisions[]` for a traffic split",
+                            b.bundle_id
+                        )));
+                    }
+                }
+                (Some(_), None) => {}
                 (None, None) => {
-                    return Err(OpError::InvalidArgument(format!(
-                        "bundle `{}`: either `bundle_path` or `revisions` must be set",
-                        b.bundle_id
-                    )));
+                    // Single-revision with no local artifact: a remote
+                    // `bundle_source_uri` is the only remaining source.
+                    if b.bundle_source_uri.is_none() {
+                        return Err(OpError::InvalidArgument(format!(
+                            "bundle `{}`: a single-revision bundle needs a `bundle_path` \
+                             or a `bundle_source_uri`",
+                            b.bundle_id
+                        )));
+                    }
                 }
             }
+            // Integrity pin format (when declared): a `sha256:<hex>` string.
+            validate_digest_pin(&b.bundle_id, None, b.bundle_digest.as_deref())?;
 
             // Per-revision validation (multi-revision form only).
             if let Some(revisions) = &b.revisions {
@@ -424,6 +502,12 @@ impl EnvManifest {
                             b.bundle_id, rev.name
                         )));
                     }
+                    // Integrity pin format (when declared): a `sha256:<hex>` string.
+                    validate_digest_pin(
+                        &b.bundle_id,
+                        Some(&rev.name),
+                        rev.bundle_digest.as_deref(),
+                    )?;
                 }
                 // Weight consistency: all-set must sum to FULL_TRAFFIC_BPS;
                 // all-unset = equal split (computed at resolve time); mixed = error.
@@ -516,6 +600,29 @@ impl EnvManifest {
 
 /// Full traffic in basis points (10 000 bps = 100 %).
 pub(crate) const FULL_TRAFFIC_BPS: u32 = 10_000;
+
+/// Validate an optional `sha256:<hex>` integrity pin. `None` = no pin (always
+/// ok). A present digest must be a non-empty `sha256:`-prefixed string; the
+/// byte-exact comparison against the resolved artifact happens at apply time.
+fn validate_digest_pin(
+    bundle_id: &str,
+    revision: Option<&str>,
+    digest: Option<&str>,
+) -> Result<(), OpError> {
+    let Some(digest) = digest else {
+        return Ok(());
+    };
+    if digest.starts_with("sha256:") && digest.len() > "sha256:".len() {
+        return Ok(());
+    }
+    let location = match revision {
+        Some(name) => format!("bundle `{bundle_id}`, revision `{name}`"),
+        None => format!("bundle `{bundle_id}`"),
+    };
+    Err(OpError::InvalidArgument(format!(
+        "{location}: bundle_digest `{digest}` must be a `sha256:<hex>` string"
+    )))
+}
 
 /// Validate the weight consistency of a multi-revision bundle entry.
 ///
@@ -661,7 +768,8 @@ pub fn manifest_schema() -> Value {
                     "name": {"type": ["string", "null"], "description": "display name; absent = leave untouched (or default to id on create)"},
                     "region": {"type": ["string", "null"], "description": "cloud region tag; absent = leave untouched"},
                     "tenant_org_id": {"type": ["string", "null"], "description": "tenant organization id; absent = leave untouched"},
-                    "listen_addr": {"type": ["string", "null"], "description": "bind address (SocketAddr); absent = leave untouched"}
+                    "listen_addr": {"type": ["string", "null"], "description": "bind address (SocketAddr); absent = leave untouched"},
+                    "gui_enabled": {"type": ["boolean", "null"], "description": "serve the built-in webchat GUI; absent/null = leave the stored value unchanged (upsert) — the env-id default (on for local, off elsewhere) applies only when the stored value is unset"}
                 }
             },
             "trust_root": {"enum": ["bootstrap", null], "description": "`bootstrap` seeds the operator key (idempotent)"},
@@ -715,7 +823,9 @@ pub fn manifest_schema() -> Value {
                                     "weight_percent": {"type": ["integer", "null"], "description": "0..100; mutually exclusive with weight_bps"},
                                     "weight_bps": {"type": ["integer", "null"], "description": "0..10000; mutually exclusive with weight_percent"},
                                     "drain_seconds": {"type": ["integer", "null"], "description": "per-revision drain window override"},
-                                    "abort_metrics": {"type": "array", "items": {"type": "string"}, "description": "reserved for canary evaluation"}
+                                    "abort_metrics": {"type": "array", "items": {"type": "string"}, "description": "reserved for canary evaluation"},
+                                    "bundle_source_uri": {"type": ["string", "null"], "description": "oci://repo://store:// pull ref for K8s boot; rides alongside bundle_path (digest source); absent = local-serve only"},
+                                    "bundle_digest": {"type": ["string", "null"], "description": "optional sha256:<hex> integrity pin for bundle_path; verified at apply"}
                                 }
                             }
                         },
@@ -746,7 +856,9 @@ pub fn manifest_schema() -> Value {
                                     "properties": {"tenant": {"type": "string"}, "team": {"type": "string"}}
                                 }
                             }
-                        }
+                        },
+                        "bundle_source_uri": {"type": ["string", "null"], "description": "single-revision oci:// pull ref for K8s boot; may stand alone (apply fetches it once for the digest) or ride alongside bundle_path; absent = local bundle_path required"},
+                        "bundle_digest": {"type": ["string", "null"], "description": "optional sha256:<hex> integrity pin for the resolved artifact; verified at apply, else the computed digest is recorded"}
                     }
                 }
             },
@@ -802,11 +914,24 @@ pub const ENV_MANIFEST_FORM_ID: &str = "greentic.env-manifest";
 /// converting wrong.
 pub const ENV_MANIFEST_FORM_VERSION: &str = "1";
 
+/// [`manifest_form_spec_for_env`] for the default env id ([`GUI_DEFAULT_ENV_ID`],
+/// i.e. `local`). Back-compat entry point for callers that don't yet thread the
+/// target env id; prefer the `_for_env` form so the `webchat_gui` default
+/// reflects the env (off for non-local).
+pub fn manifest_form_spec() -> FormSpec {
+    manifest_form_spec_for_env(GUI_DEFAULT_ENV_ID)
+}
+
 /// The one `qa_spec::FormSpec` for authoring a manifest. The greentic-setup
 /// terminal wizard, the future web UI, and Adaptive-Card front-ends all
 /// render these same questions; [`answers_to_manifest`] converts the
 /// resulting [`AnswerSet`] into a typed [`EnvManifest`] — the manifest stays
 /// the durable artifact, answers are an input mechanism.
+///
+/// `env_id` is the environment the wizard targets; it sets the `webchat_gui`
+/// default (on for `local`, off elsewhere — see [`GUI_DEFAULT_ENV_ID`]) so a
+/// non-local pass doesn't default the loopback-only console on. It does not
+/// otherwise constrain the answers.
 ///
 /// Conventions (each pinned by a test):
 /// - Repeating manifest sections (`secrets[]`, `bundles[]`,
@@ -828,7 +953,7 @@ pub const ENV_MANIFEST_FORM_VERSION: &str = "1";
 /// - Nested string arrays (`links`, `route_path_prefixes`, …) are
 ///   comma-separated `String` questions — qa-spec `List` rows cannot nest
 ///   lists. [`answers_to_manifest`] owns the split.
-pub fn manifest_form_spec() -> FormSpec {
+pub fn manifest_form_spec_for_env(env_id: &str) -> FormSpec {
     let mut environment_id = question(
         "environment_id",
         QuestionType::String,
@@ -858,6 +983,23 @@ pub fn manifest_form_spec() -> FormSpec {
         true,
     );
     trust_root_bootstrap.default_value = Some("true".to_string());
+
+    let mut webchat_gui = question(
+        "webchat_gui",
+        QuestionType::Boolean,
+        "Add a webchat GUI?",
+        "Serve the built-in webchat console so you can chat with this \
+         environment by opening its URL in a browser. On by default for \
+         `local`; the chat path is loopback-only and unauthenticated, so \
+         keep it off for environments exposed on a public URL unless you \
+         intend it.",
+        true,
+    );
+    // Env-aware default so a non-local wizard pass doesn't silently enable the
+    // loopback-only console: matches `resolved_gui_enabled()` (on for the
+    // `local` env id, off elsewhere) — the single home of the policy lives in
+    // `GUI_DEFAULT_ENV_ID`. `Some(_)` answers still override either way.
+    webchat_gui.default_value = Some((env_id == GUI_DEFAULT_ENV_ID).to_string());
 
     let mut secrets = question(
         "secrets",
@@ -1125,6 +1267,7 @@ pub fn manifest_form_spec() -> FormSpec {
             environment_id,
             public_base_url,
             trust_root_bootstrap,
+            webchat_gui,
             bundles,
             messaging_endpoints,
             secrets,
@@ -1210,6 +1353,18 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
             )));
         }
     };
+    // Absent ⇒ `None` (leave the env-id default to resolve); the wizard always
+    // supplies this (required, default `true`), so a missing value only comes
+    // from a minimal hand-written answers file.
+    let gui_enabled = match map.get("webchat_gui") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(other) => {
+            return Err(OpError::InvalidArgument(format!(
+                "answers: webchat_gui must be a boolean, got {other}"
+            )));
+        }
+    };
 
     let mut secrets = Vec::new();
     for (idx, row) in rows(map, "secrets")?.iter().enumerate() {
@@ -1287,6 +1442,10 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
             status: None,
             config_overrides,
             route_binding,
+            // The wizard authors local-serve bundles; OCI pull refs and digest
+            // pins are JSON-first (hand-authored for K8s deployments).
+            bundle_source_uri: None,
+            bundle_digest: None,
         });
     }
 
@@ -1336,6 +1495,7 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
             region: None,
             tenant_org_id: None,
             listen_addr: None,
+            gui_enabled,
         },
         trust_root,
         secrets,
@@ -1861,6 +2021,32 @@ mod tests {
         }
     }
 
+    fn webchat_gui_default(spec: &FormSpec) -> Option<&str> {
+        spec.questions
+            .iter()
+            .find(|q| q.id == "webchat_gui")
+            .expect("webchat_gui question")
+            .default_value
+            .as_deref()
+    }
+
+    #[test]
+    fn webchat_gui_default_is_env_aware() {
+        // `local` opts the loopback console in by default; any other env id
+        // defaults it OFF so a non-local wizard pass doesn't silently enable
+        // an unauthenticated surface. Mirrors `resolved_gui_enabled()`.
+        assert_eq!(
+            webchat_gui_default(&manifest_form_spec_for_env(GUI_DEFAULT_ENV_ID)),
+            Some("true")
+        );
+        assert_eq!(
+            webchat_gui_default(&manifest_form_spec_for_env("prod")),
+            Some("false")
+        );
+        // Back-compat entry point keeps the historical local default.
+        assert_eq!(webchat_gui_default(&manifest_form_spec()), Some("true"));
+    }
+
     #[test]
     fn required_marks_the_normal_mode_surface() {
         // `required` is validation truth AND the normal-mode marker under
@@ -1881,6 +2067,7 @@ mod tests {
         let expected: BTreeSet<String> = [
             "environment_id",
             "trust_root_bootstrap",
+            "webchat_gui",
             // `secrets.from_env` is no longer required (a paste secret omits
             // it); `secrets.source` defaults to `env`, so it is not required
             // either.
@@ -1989,6 +2176,7 @@ mod tests {
             ("environment.region", ""),
             ("environment.tenant_org_id", ""),
             ("environment.listen_addr", ""),
+            ("environment.gui_enabled", "webchat_gui"),
             ("trust_root", "trust_root_bootstrap"),
             ("secrets[].path", "secrets.path"),
             ("secrets[].from_env", "secrets.from_env"),
@@ -1998,6 +2186,9 @@ mod tests {
             ("packs[].answers_ref", ""),
             ("bundles[].bundle_id", "bundles.bundle_id"),
             ("bundles[].bundle_path", "bundles.bundle_path"),
+            // OCI/repo/store pull ref + digest pin are JSON-first (no form question).
+            ("bundles[].bundle_source_uri", ""),
+            ("bundles[].bundle_digest", ""),
             // Multi-revision fields are JSON-first (no form question).
             ("bundles[].revisions[].name", ""),
             ("bundles[].revisions[].bundle_path", ""),
@@ -2005,6 +2196,8 @@ mod tests {
             ("bundles[].revisions[].weight_bps", ""),
             ("bundles[].revisions[].drain_seconds", ""),
             ("bundles[].revisions[].abort_metrics", ""),
+            ("bundles[].revisions[].bundle_source_uri", ""),
+            ("bundles[].revisions[].bundle_digest", ""),
             ("bundles[].customer_id", "bundles.customer_id"),
             // revenue_share / status are JSON-first (no form question).
             ("bundles[].revenue_share[].party_id", ""),
@@ -2113,6 +2306,7 @@ mod tests {
             "environment_id": "local",
             "public_base_url": "https://bots.example.com",
             "trust_root_bootstrap": true,
+            "webchat_gui": true,
             "secrets": [
                 {
                     "path": "legal/_/messaging-telegram/telegram_bot_token",
@@ -2216,7 +2410,8 @@ mod tests {
             &manifest_form_spec(),
             &serde_json::json!({
                 "environment_id": "local",
-                "trust_root_bootstrap": true
+                "trust_root_bootstrap": true,
+                "webchat_gui": true
             }),
         );
         assert!(
@@ -2428,7 +2623,42 @@ mod tests {
     }
 
     #[test]
-    fn neither_bundle_path_nor_revisions_fails() {
+    fn bundle_source_uri_round_trips_single_and_multi() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [
+                {"bundle_id": "single", "bundle_path": "x.gtbundle",
+                 "bundle_source_uri": "oci://ex/single:v1"},
+                {"bundle_id": "multi", "revisions": [
+                    {"name": "a", "bundle_path": "a.gtbundle",
+                     "bundle_source_uri": "oci://ex/multi:a"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        manifest.validate_shape().unwrap();
+        assert_eq!(
+            manifest.bundles[0].bundle_source_uri.as_deref(),
+            Some("oci://ex/single:v1")
+        );
+        assert_eq!(
+            manifest.bundles[1].revisions.as_ref().unwrap()[0]
+                .bundle_source_uri
+                .as_deref(),
+            Some("oci://ex/multi:a")
+        );
+        // Survives a serialize round-trip.
+        let back: EnvManifest =
+            serde_json::from_value(serde_json::to_value(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            back.bundles[0].bundle_source_uri.as_deref(),
+            Some("oci://ex/single:v1")
+        );
+    }
+
+    #[test]
+    fn bundle_with_no_path_no_uri_no_revisions_fails() {
         let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
             "schema": ENV_MANIFEST_SCHEMA_V1,
             "environment": {"id": "local"},
@@ -2438,7 +2668,117 @@ mod tests {
         }))
         .unwrap();
         let err = manifest.validate_shape().unwrap_err();
-        assert!(err.to_string().contains("must be set"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("needs a `bundle_path` or a `bundle_source_uri`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn single_revision_bundle_source_uri_only_is_valid() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "remote-only",
+                "bundle_source_uri": "oci://ex/remote-only:v1",
+                "bundle_digest": "sha256:abc123"
+            }]
+        }))
+        .unwrap();
+        manifest.validate_shape().unwrap();
+        assert!(manifest.bundles[0].bundle_path.is_none());
+        assert_eq!(
+            manifest.bundles[0].bundle_source_uri.as_deref(),
+            Some("oci://ex/remote-only:v1")
+        );
+        assert_eq!(
+            manifest.bundles[0].bundle_digest.as_deref(),
+            Some("sha256:abc123")
+        );
+        // Survives a serialize round-trip.
+        let back: EnvManifest =
+            serde_json::from_value(serde_json::to_value(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            back.bundles[0].bundle_digest.as_deref(),
+            Some("sha256:abc123")
+        );
+    }
+
+    #[test]
+    fn bundle_level_source_uri_with_revisions_fails() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "split",
+                "bundle_source_uri": "oci://ex/split:v1",
+                "revisions": [
+                    {"name": "a", "bundle_path": "a.gtbundle"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("single-revision form"), "{err}");
+    }
+
+    #[test]
+    fn bundle_level_digest_with_revisions_fails() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "split-digest",
+                "bundle_digest": "sha256:abc123",
+                "revisions": [
+                    {"name": "a", "bundle_path": "a.gtbundle"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("single-revision form"), "{err}");
+    }
+
+    #[test]
+    fn malformed_bundle_digest_fails() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "bad-digest",
+                "bundle_path": "x.gtbundle",
+                "bundle_digest": "deadbeef"
+            }]
+        }))
+        .unwrap();
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(
+            err.to_string().contains("must be a `sha256:<hex>` string"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn malformed_per_revision_bundle_digest_fails() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "split-bad-digest",
+                "revisions": [
+                    {"name": "a", "bundle_path": "a.gtbundle", "bundle_digest": "nope"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let err = manifest.validate_shape().unwrap_err();
+        assert!(
+            err.to_string().contains("must be a `sha256:<hex>` string"),
+            "{err}"
+        );
     }
 
     #[test]

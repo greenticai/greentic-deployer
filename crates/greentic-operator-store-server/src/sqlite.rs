@@ -33,9 +33,9 @@ use sqlx::{
 use greentic_operator_trust::trust_root::{TRUST_ROOT_SCHEMA_V1, TrustRootDocument};
 
 use crate::storage::{
-    EnvRevision, EnvSnapshot, EnvironmentStorage, Loaded, LoadedAnswers, LoadedEnv, LoadedRuntime,
-    LoadedTrustRoot, MutationJournal, RevenuePolicyArtifact, StorageError, StoredBackup,
-    StoredIdempotencyRecord,
+    AuditEntry, AuditRetention, EnvRevision, EnvSnapshot, EnvironmentStorage, Loaded,
+    LoadedAnswers, LoadedEnv, LoadedRuntime, LoadedTrustRoot, MutationJournal,
+    RevenuePolicyArtifact, StorageError, StoredBackup, StoredIdempotencyRecord,
 };
 
 impl From<sqlx::Error> for StorageError {
@@ -62,6 +62,11 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 pub struct SqliteEnvironmentStore {
     pool: SqlitePool,
     _owner_lock: Arc<File>,
+    /// Opt-in per-environment audit-log row cap. `None` (the default)
+    /// keeps the audit log append-only without bound; `Some(cap)` prunes
+    /// the oldest rows beyond `cap` after each append and records the
+    /// watermark (see [`prune_audit_log`]).
+    audit_max_rows_per_env: Option<i64>,
 }
 
 impl SqliteEnvironmentStore {
@@ -122,11 +127,51 @@ impl SqliteEnvironmentStore {
         Ok(Self {
             pool,
             _owner_lock: Arc::new(lock_file),
+            audit_max_rows_per_env: None,
         })
+    }
+
+    /// Enable opt-in audit-log retention: keep at most `max_rows` audit
+    /// rows per environment, pruning the oldest beyond that after each
+    /// append. `None` (the default) leaves the audit log unbounded. A
+    /// `Some(0)` is clamped to `Some(1)` so the just-appended row always
+    /// survives (the CLI already rejects 0; the clamp guards direct
+    /// callers).
+    pub fn with_audit_max_rows_per_env(mut self, max_rows: Option<u32>) -> Self {
+        self.audit_max_rows_per_env = max_rows.map(|n| (n as i64).max(1));
+        self
     }
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// One-shot startup reconciliation of audit-log retention. When a cap
+    /// is configured, bring every environment that is already over the cap
+    /// down to it (writing its `audit_retention` watermark) — closing the
+    /// gap for environments that may never be appended to again (the
+    /// disk-pressure / compliance-rollout case the cap exists to serve).
+    /// No-op when retention is off; idempotent (a second run finds nothing
+    /// over the cap).
+    pub async fn reconcile_audit_retention(&self) -> Result<(), StorageError> {
+        let Some(cap) = self.audit_max_rows_per_env else {
+            return Ok(());
+        };
+        let over_cap =
+            sqlx::query("SELECT env_id FROM audit_log GROUP BY env_id HAVING COUNT(*) > $1")
+                .bind(cap)
+                .fetch_all(&self.pool)
+                .await?;
+        for row in over_cap {
+            let env_id_str: String = row.try_get("env_id")?;
+            let Ok(env_id) = EnvId::try_from(env_id_str.as_str()) else {
+                continue; // skip a malformed id defensively; should not occur
+            };
+            let mut tx = self.pool.begin().await?;
+            prune_audit_log(&mut tx, &env_id, cap).await?;
+            tx.commit().await?;
+        }
+        Ok(())
     }
 }
 
@@ -213,7 +258,7 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         .await?;
 
         if let Some(row) = inserted {
-            journal_in_tx(&mut tx, journal).await?;
+            journal_in_tx(&mut tx, journal, self.audit_max_rows_per_env).await?;
             tx.commit().await?;
             return decode_revision(&row);
         }
@@ -236,7 +281,7 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
     ) -> Result<EnvRevision, StorageError> {
         let mut tx = self.pool.begin().await?;
         let revision = update_env_in_tx(&mut tx, env, precondition).await?;
-        journal_in_tx(&mut tx, journal).await?;
+        journal_in_tx(&mut tx, journal, self.audit_max_rows_per_env).await?;
         tx.commit().await?;
         Ok(revision)
     }
@@ -268,7 +313,7 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
 
     async fn record_journal(&self, journal: &MutationJournal) -> Result<(), StorageError> {
         let mut tx = self.pool.begin().await?;
-        journal_in_tx(&mut tx, Some(journal)).await?;
+        journal_in_tx(&mut tx, Some(journal), self.audit_max_rows_per_env).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -600,7 +645,7 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
                 new_gen
             }
         };
-        journal_in_tx(&mut tx, journal).await?;
+        journal_in_tx(&mut tx, journal, self.audit_max_rows_per_env).await?;
         tx.commit().await?;
         Ok(EnvRevision {
             generation: new_gen,
@@ -709,7 +754,7 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         //    artifact back too — committed env state and the artifact it
         //    references commit or fail as one.
         let revision = update_env_in_tx(&mut tx, env, precondition).await?;
-        journal_in_tx(&mut tx, journal).await?;
+        journal_in_tx(&mut tx, journal, self.audit_max_rows_per_env).await?;
         tx.commit().await?;
         Ok(revision)
     }
@@ -786,7 +831,7 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         .bind(&backup.snapshot_digest)
         .execute(&mut *tx)
         .await?;
-        journal_in_tx(&mut tx, journal).await?;
+        journal_in_tx(&mut tx, journal, self.audit_max_rows_per_env).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -846,25 +891,34 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
             // record a mutation that did not apply).
             return Ok(false);
         }
-        journal_in_tx(&mut tx, journal).await?;
+        journal_in_tx(&mut tx, journal, self.audit_max_rows_per_env).await?;
         tx.commit().await?;
         Ok(true)
     }
 
-    async fn load_env_snapshot(&self, env_id: &EnvId) -> Result<EnvSnapshot, StorageError> {
+    async fn load_env_snapshot(
+        &self,
+        env_id: &EnvId,
+    ) -> Result<(EnvSnapshot, EnvRevision), StorageError> {
         // One transaction so the capture cannot be torn by an interleaved
         // mutation (the single-connection pool serializes statements but
         // NOT multi-statement sequences outside a tx).
         let mut tx = self.pool.begin().await?;
 
         // Environment row (required — callers already verified existence).
-        let env_row = sqlx::query("SELECT data FROM environments WHERE env_id = $1")
-            .bind(env_id.as_str())
-            .fetch_optional(&mut *tx)
-            .await?;
+        // Read the revision (generation + etag) in the SAME transaction as the
+        // content so the caller can stamp the backup manifest with a generation
+        // that provably matches the captured bytes. (No integrity re-check here
+        // — create_backup recomputes its own digest over the captured value.)
+        let env_row =
+            sqlx::query("SELECT generation, etag, data FROM environments WHERE env_id = $1")
+                .bind(env_id.as_str())
+                .fetch_optional(&mut *tx)
+                .await?;
         let Some(env_row) = env_row else {
             return Err(StorageError::NotFound(env_id.clone()));
         };
+        let revision = decode_revision(&env_row)?;
         let environment: Value = env_row.try_get("data")?;
 
         // Runtime sidecar (optional).
@@ -890,12 +944,55 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
             pack_answers.insert(slot, data);
         }
 
+        // Audit history (PR-4.4 archival): the full append-only log, oldest
+        // first, plus the retention watermark if retention has trimmed it.
+        // Captured in the same tx so the archived audit cannot be torn from
+        // the content it accompanies.
+        let audit_rows = sqlx::query(
+            "SELECT id, event_id, recorded_at, event FROM audit_log \
+             WHERE env_id = $1 ORDER BY id",
+        )
+        .bind(env_id.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut audit_log = Vec::with_capacity(audit_rows.len());
+        for row in &audit_rows {
+            audit_log.push(AuditEntry {
+                id: row.try_get("id")?,
+                event_id: row.try_get("event_id")?,
+                recorded_at: row.try_get("recorded_at")?,
+                event: row.try_get("event")?,
+            });
+        }
+
+        let watermark_row = sqlx::query(
+            "SELECT pruned_through_id, pruned_total, policy_max_rows, last_pruned_at \
+             FROM audit_retention WHERE env_id = $1",
+        )
+        .bind(env_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let audit_retention = match watermark_row {
+            Some(row) => Some(AuditRetention {
+                pruned_through_id: row.try_get("pruned_through_id")?,
+                pruned_total: row.try_get("pruned_total")?,
+                policy_max_rows: row.try_get("policy_max_rows")?,
+                last_pruned_at: row.try_get("last_pruned_at")?,
+            }),
+            None => None,
+        };
+
         tx.commit().await?;
-        Ok(EnvSnapshot {
-            environment,
-            runtime,
-            pack_answers,
-        })
+        Ok((
+            EnvSnapshot {
+                environment,
+                runtime,
+                pack_answers,
+                audit_log,
+                audit_retention,
+            },
+            revision,
+        ))
     }
 
     async fn restore_env_journaled(
@@ -1038,7 +1135,152 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
             }
         }
 
-        journal_in_tx(&mut tx, journal).await?;
+        // 4. Audit ledger: re-instate the snapshot's captured history. A
+        //    normal rollback into a live store is a no-op here (the captured
+        //    rows are already present), but a backup taken before retention
+        //    pruned rows reconstructs the forgotten ones, and a fresh store
+        //    gets the whole archived history back. Live rows are never deleted.
+        //    Runs BEFORE the journal so the restore's own audit event lands
+        //    last (the newest row), and any configured cap re-prunes against
+        //    the reconstructed history inside `journal_in_tx`.
+        replay_audit_in_tx(
+            &mut tx,
+            env_id,
+            &snapshot.audit_log,
+            snapshot.audit_retention.as_ref(),
+        )
+        .await?;
+
+        journal_in_tx(&mut tx, journal, self.audit_max_rows_per_env).await?;
+        tx.commit().await?;
+        Ok(revision)
+    }
+
+    async fn import_env_journaled(
+        &self,
+        env_id: &EnvId,
+        snapshot: &EnvSnapshot,
+        journal: Option<&MutationJournal>,
+    ) -> Result<EnvRevision, StorageError> {
+        let env: Environment = serde_json::from_value(snapshot.environment.clone())?;
+        validate_environment(&env)?;
+        // The artifact names the env it captured; refuse to import it under a
+        // different key (sidecars are keyed by env_id, the env row by the
+        // doc's id — they must agree).
+        if env.environment_id != *env_id {
+            return Err(StorageError::EnvIdMismatch {
+                keyed: env_id.clone(),
+                payload: env.environment_id,
+            });
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        // 1. Create the environment row. Import is the FRESH-store path: a
+        //    conflict means the env already exists — refuse (409), never
+        //    clobber. Mirrors `create_env_journaled`'s if-absent insert.
+        let (etag, integrity, data) = serialize_for_write(&env)?;
+        let inserted = sqlx::query(
+            "INSERT INTO environments (env_id, generation, etag, data, integrity_digest) \
+             VALUES ($1, 1, $2, $3, $4) \
+             ON CONFLICT (env_id) DO NOTHING \
+             RETURNING generation, etag",
+        )
+        .bind(env_id.as_str())
+        .bind(&etag.0)
+        .bind(&data)
+        .bind(&integrity.digest)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = inserted else {
+            let existing = sqlx::query("SELECT generation FROM environments WHERE env_id = $1")
+                .bind(env_id.as_str())
+                .fetch_one(&mut *tx)
+                .await?;
+            let generation: i64 = existing.try_get("generation")?;
+            return Err(StorageError::AlreadyExists {
+                env_id: env_id.clone(),
+                generation: generation as u64,
+            });
+        };
+        let revision = decode_revision(&row)?;
+
+        // 2. Runtime sidecar: fresh insert at generation 1 if the snapshot
+        //    carried one (no existing row to continue — the store is empty).
+        if let Some(runtime_data) = &snapshot.runtime {
+            let (rt_etag, rt_integrity, rt_data) = serialize_for_write_value(runtime_data)?;
+            sqlx::query(
+                "INSERT INTO environment_runtimes \
+                 (env_id, generation, etag, data, integrity_digest) \
+                 VALUES ($1, 1, $2, $3, $4)",
+            )
+            .bind(env_id.as_str())
+            .bind(&rt_etag.0)
+            .bind(&rt_data)
+            .bind(&rt_integrity.digest)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 3. Pack-answers sidecars: fresh insert at generation 1 each.
+        for (slot, answers_data) in &snapshot.pack_answers {
+            let (pa_etag, pa_integrity, pa_data) = serialize_for_write_value(answers_data)?;
+            sqlx::query(
+                "INSERT INTO pack_answers \
+                 (env_id, slot, generation, etag, data, integrity_digest) \
+                 VALUES ($1, $2, 1, $3, $4, $5)",
+            )
+            .bind(env_id.as_str())
+            .bind(slot.as_str())
+            .bind(&pa_etag.0)
+            .bind(&pa_data)
+            .bind(&pa_integrity.digest)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 4. Audit ledger: reconstruct the captured history with FRESH ids.
+        //    Import does NOT preserve the captured `audit_log.id` (unlike the
+        //    same-env restore): the id is a global PRIMARY KEY shared across
+        //    every env and also consumed by the import event below and by any
+        //    OTHER env imported into this store. Preserving it would let one
+        //    env's import-event id land on another env's captured id and
+        //    silently drop that distinct row (`INSERT OR IGNORE`). The append
+        //    ORDER plus `event_id`/`recorded_at` are what matter forensically,
+        //    not the store-local numeric id, so each row is inserted in order
+        //    letting autoincrement assign a new id (`event_id` is globally
+        //    unique, so OR IGNORE here only guards a true re-import duplicate).
+        for entry in &snapshot.audit_log {
+            sqlx::query(
+                "INSERT OR IGNORE INTO audit_log (env_id, event_id, recorded_at, event) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(env_id.as_str())
+            .bind(&entry.event_id)
+            .bind(&entry.recorded_at)
+            .bind(&entry.event)
+            .execute(&mut *tx)
+            .await?;
+        }
+        // Carry the captured retention watermark verbatim — the historical
+        // record of what was pruned before the backup; a fresh store has no
+        // live watermark to reconcile against.
+        if let Some(watermark) = &snapshot.audit_retention {
+            sqlx::query(
+                "INSERT INTO audit_retention \
+                   (env_id, pruned_through_id, pruned_total, policy_max_rows, last_pruned_at) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(env_id.as_str())
+            .bind(watermark.pruned_through_id)
+            .bind(watermark.pruned_total)
+            .bind(watermark.policy_max_rows)
+            .bind(&watermark.last_pruned_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        journal_in_tx(&mut tx, journal, self.audit_max_rows_per_env).await?;
         tx.commit().await?;
         Ok(revision)
     }
@@ -1049,12 +1291,21 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
         event_id: &str,
         event: &Value,
     ) -> Result<(), StorageError> {
+        // Append and, when a cap is configured, prune in the same
+        // transaction so a crash can't leave the env over the cap with no
+        // watermark. (With retention off this is a single-statement tx —
+        // equivalent to a bare autocommit insert.)
+        let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO audit_log (env_id, event_id, event) VALUES ($1, $2, $3)")
             .bind(env_id.as_str())
             .bind(event_id)
             .bind(event)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        if let Some(cap) = self.audit_max_rows_per_env {
+            prune_audit_log(&mut tx, env_id, cap).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 }
@@ -1074,6 +1325,7 @@ impl EnvironmentStorage for SqliteEnvironmentStore {
 async fn journal_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     journal: Option<&MutationJournal>,
+    audit_cap: Option<i64>,
 ) -> Result<(), StorageError> {
     let Some(journal) = journal else {
         return Ok(());
@@ -1116,6 +1368,152 @@ async fn journal_in_tx(
         .bind(&journal.audit_event)
         .execute(&mut **tx)
         .await?;
+    if let Some(cap) = audit_cap {
+        prune_audit_log(tx, &journal.env_id, cap).await?;
+    }
+    Ok(())
+}
+
+/// Re-instate a snapshot's captured audit history into the caller's
+/// transaction (the restore path). Audit is an append-only LEDGER, never
+/// rewound: each captured row is re-inserted preserving its original `id` and
+/// `recorded_at`, so a row that is still live is skipped (a true duplicate)
+/// and a row that retention pruned is reconstructed in place. LIVE rows are
+/// NEVER deleted — rolling back content must not erase forensic history.
+///
+/// ONE exception preserves the watermark's meaning: a row at or below the LIVE
+/// `pruned_through_id` is NOT resurrected. That id range is forensically
+/// declared "forgotten"; re-inserting into it would make the watermark lie and
+/// let the next prune double-count the row. Captured rows above the live
+/// watermark — or all rows, when there is no live watermark — are eligible.
+///
+/// `INSERT OR IGNORE` (not `ON CONFLICT(event_id)`) because re-inserting with
+/// the original `id` can collide on the `id` PRIMARY KEY as well as the
+/// `event_id` unique index, and a targeted upsert raises on a non-target
+/// conflict. Restore targets the SAME env (captured ids == live ids,
+/// append-only), so every ignored row is a true duplicate — OR IGNORE never
+/// silently drops a distinct row.
+///
+/// The retention watermark advances MONOTONICALLY: `pruned_through_id` and
+/// `pruned_total` reconcile by `max`, so a normal rollback keeps the (larger)
+/// live watermark and a fresh store copies the captured one. `max` — NOT the
+/// `+` accumulation `prune_audit_log` uses — because reconciling is not a fresh
+/// prune and must not double-count. An absent captured watermark leaves any
+/// live watermark untouched (it reflects real pruning that happened).
+async fn replay_audit_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    env_id: &EnvId,
+    audit_log: &[AuditEntry],
+    audit_retention: Option<&AuditRetention>,
+) -> Result<(), StorageError> {
+    // Skip captured rows the LIVE watermark has already declared forgotten:
+    // resurrecting a row at or below `pruned_through_id` would make the
+    // watermark lie and let the next prune double-count it. No watermark →
+    // threshold 0 → every captured row is eligible.
+    let live_pruned_through: i64 =
+        match sqlx::query("SELECT pruned_through_id FROM audit_retention WHERE env_id = $1")
+            .bind(env_id.as_str())
+            .fetch_optional(&mut **tx)
+            .await?
+        {
+            Some(row) => row.try_get("pruned_through_id")?,
+            None => 0,
+        };
+
+    for entry in audit_log {
+        if entry.id <= live_pruned_through {
+            continue;
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO audit_log (id, env_id, event_id, recorded_at, event) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(entry.id)
+        .bind(env_id.as_str())
+        .bind(&entry.event_id)
+        .bind(&entry.recorded_at)
+        .bind(&entry.event)
+        .execute(&mut **tx)
+        .await?;
+    }
+    if let Some(watermark) = audit_retention {
+        sqlx::query(
+            "INSERT INTO audit_retention \
+               (env_id, pruned_through_id, pruned_total, policy_max_rows, last_pruned_at) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT(env_id) DO UPDATE SET \
+               pruned_through_id = max(audit_retention.pruned_through_id, excluded.pruned_through_id), \
+               pruned_total = max(audit_retention.pruned_total, excluded.pruned_total), \
+               policy_max_rows = excluded.policy_max_rows, \
+               last_pruned_at = excluded.last_pruned_at",
+        )
+        .bind(env_id.as_str())
+        .bind(watermark.pruned_through_id)
+        .bind(watermark.pruned_total)
+        .bind(watermark.policy_max_rows)
+        .bind(&watermark.last_pruned_at)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Opt-in audit-log retention. Keep at most `cap` audit rows for `env_id`
+/// (the most recent by `id`), pruning the oldest beyond that. UNLIKE the
+/// silent idempotency-ledger eviction, the prune is self-auditing: when it
+/// removes rows it upserts the `audit_retention` watermark for the env so
+/// the store always reveals how far back history has been trimmed
+/// (`pruned_through_id`), how much (`pruned_total`), and under which cap.
+///
+/// `cap >= 1` is assumed (the constructor clamps `0` up to `1`), so the
+/// just-appended row — the newest — always survives. Runs inside the
+/// caller's transaction; no-op when nothing exceeds the cap.
+async fn prune_audit_log(
+    conn: &mut sqlx::SqliteConnection,
+    env_id: &EnvId,
+    cap: i64,
+) -> Result<(), StorageError> {
+    // `through` = the highest id to prune: the id of the (cap+1)-th newest
+    // row for this env, i.e. the new high-water of forgotten history. No
+    // row (nothing to prune) when the env is at or under the cap.
+    let cutoff = sqlx::query(
+        "SELECT id FROM audit_log WHERE env_id = $1 ORDER BY id DESC LIMIT 1 OFFSET $2",
+    )
+    .bind(env_id.as_str())
+    .bind(cap)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(cutoff) = cutoff else {
+        return Ok(());
+    };
+    let through: i64 = cutoff.try_get("id")?;
+    // A primary-key range delete: every row at or below the cutoff is older
+    // than the newest `cap`, so it is exactly the set to forget.
+    let deleted = sqlx::query("DELETE FROM audit_log WHERE env_id = $1 AND id <= $2")
+        .bind(env_id.as_str())
+        .bind(through)
+        .execute(&mut *conn)
+        .await?;
+    let pruned = deleted.rows_affected() as i64;
+    // Upsert the monotonic watermark. `pruned_through_id` always advances
+    // (we always remove the oldest under a single-writer store); the total
+    // accumulates across prunes.
+    sqlx::query(
+        "INSERT INTO audit_retention \
+           (env_id, pruned_through_id, pruned_total, policy_max_rows, last_pruned_at) \
+         VALUES ($1, $2, $3, $4, datetime('now')) \
+         ON CONFLICT(env_id) DO UPDATE SET \
+           pruned_through_id = excluded.pruned_through_id, \
+           pruned_total = audit_retention.pruned_total + excluded.pruned_total, \
+           policy_max_rows = excluded.policy_max_rows, \
+           last_pruned_at = excluded.last_pruned_at",
+    )
+    .bind(env_id.as_str())
+    .bind(through)
+    .bind(pruned)
+    .bind(cap)
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 

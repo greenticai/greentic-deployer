@@ -143,8 +143,12 @@ impl StorageError {
 /// are evicted inside the same transaction that inserts a new one; a
 /// retry of an evicted key simply re-executes, the same acceptance the
 /// replay contract already grants pre-ledger requests. The audit log is
-/// deliberately NOT bounded — it must never forget a committed mutation;
-/// archival is the PR-4.4 backup story.
+/// append-only WITHOUT bound by default — it must never forget a committed
+/// mutation; archival is the PR-4.4 backup story. An operator may opt in to
+/// a per-environment audit-row cap
+/// ([`crate::sqlite::SqliteEnvironmentStore::with_audit_max_rows_per_env`]),
+/// in which case the prune is recorded in the `audit_retention` watermark
+/// rather than dropped silently like the ledger.
 pub const MAX_LEDGER_ROWS_PER_ENV: i64 = 4096;
 
 /// Per-environment backup cap (A8 #5). Backups are operator-initiated
@@ -154,9 +158,50 @@ pub const MAX_LEDGER_ROWS_PER_ENV: i64 = 4096;
 /// asking the operator to delete explicitly.
 pub const MAX_BACKUPS_PER_ENV: i64 = 256;
 
-/// Composite environment snapshot: the environment document plus any
-/// sidecar state (runtime, pack answers) captured at backup time.
-/// Restore reverts all three atomically.
+/// One captured `audit_log` row (PR-4.4 archival). The original `id` is
+/// preserved so a later restore can re-instate the row at its place in the
+/// append sequence and keep the [`AuditRetention`] watermark consistent.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AuditEntry {
+    /// `audit_log.id` — the append-order key. Preserved across backup/restore.
+    pub id: i64,
+    /// `audit_log.event_id` — the unique ULID of the audit record.
+    pub event_id: String,
+    /// `audit_log.recorded_at` — wall-clock the row was appended.
+    pub recorded_at: String,
+    /// The full `AuditEvent` JSON.
+    pub event: Value,
+}
+
+/// The captured `audit_retention` watermark (PR-4.4 archival): how far back
+/// retention has trimmed this env's audit history. Present only when the env
+/// has a watermark row (retention has pruned at least once).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AuditRetention {
+    /// Highest `audit_log.id` retention has removed (everything `<=` is gone).
+    pub pruned_through_id: i64,
+    /// Cumulative count of audit rows removed.
+    pub pruned_total: i64,
+    /// The cap in force at the last prune.
+    pub policy_max_rows: i64,
+    /// Wall-clock of the last prune.
+    pub last_pruned_at: String,
+}
+
+/// Composite environment snapshot: the environment document plus any sidecar
+/// state (runtime, pack answers) AND the durable audit history (`audit_log`
+/// rows + the `audit_retention` watermark) captured at backup time.
+///
+/// `load_env_snapshot` populates every field;
+/// [`EnvironmentStorage::restore_env_journaled`] reverts the content
+/// (environment + sidecars) AND re-instates the captured audit history —
+/// merging the archived rows back by `event_id` without ever deleting a live
+/// row, so a backup is a complete, recoverable archival point.
+///
+/// The `audit_log` / `audit_retention` fields are serde-defaulted and skipped
+/// when empty, so backups taken before audit capture existed deserialize to an
+/// empty log and no watermark (and the serialized form of an audit-free env is
+/// byte-identical to the pre-capture shape — no digest churn).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EnvSnapshot {
     /// The environment row (the `Environment` document).
@@ -167,6 +212,13 @@ pub struct EnvSnapshot {
     /// Pack-answers sidecars keyed by slot, if any were present.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub pack_answers: std::collections::BTreeMap<String, Value>,
+    /// The full `audit_log` for the env at backup time, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_log: Vec<AuditEntry>,
+    /// The `audit_retention` watermark at backup time, if retention has
+    /// trimmed this env's history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_retention: Option<AuditRetention>,
 }
 
 /// One stored backup: the contract's [`BackupManifest`] metadata plus the
@@ -487,23 +539,67 @@ pub trait EnvironmentStorage: Send + Sync {
     /// Load the composite environment snapshot for a backup: the environment
     /// document, the runtime sidecar (if any), and all pack-answers sidecars.
     /// Used by `create_backup` to build the [`EnvSnapshot`] atomically.
+    ///
+    /// Returns the captured snapshot together with the environment
+    /// [`EnvRevision`] read in the SAME transaction. `create_backup` must use
+    /// this revision for the manifest's `generation` and the envelope CAS — a
+    /// separate `load_env` read could observe a different generation than the
+    /// snapshot content, producing a backup whose metadata lies about what it
+    /// captured.
     fn load_env_snapshot(
         &self,
         env_id: &EnvId,
-    ) -> impl Future<Output = Result<EnvSnapshot, StorageError>> + Send;
+    ) -> impl Future<Output = Result<(EnvSnapshot, EnvRevision), StorageError>> + Send;
 
     /// Restore a composite [`EnvSnapshot`] atomically: replace the
-    /// environment row, upsert/delete the runtime sidecar, and upsert/delete
-    /// every pack-answers sidecar — all inside ONE transaction together with
-    /// the [`MutationJournal`] rows. The `precondition` guards the
-    /// environment row (the CAS target); the sidecars are replaced
-    /// unconditionally (their preconditions were not captured at backup time,
-    /// and restoring partial state is worse than restoring all of it).
+    /// environment row, upsert/delete the runtime sidecar, upsert/delete
+    /// every pack-answers sidecar, AND re-instate the captured audit history
+    /// — all inside ONE transaction together with the [`MutationJournal`]
+    /// rows. The `precondition` guards the environment row (the CAS target);
+    /// the sidecars are replaced unconditionally (their preconditions were not
+    /// captured at backup time, and restoring partial state is worse than
+    /// restoring all of it).
+    ///
+    /// Audit is a forward-only ledger, so its "restore" is a MERGE, not a
+    /// replacement: captured rows are re-inserted by `event_id` (preserving
+    /// their original `id`/`recorded_at`) and live rows are never deleted —
+    /// rolling content back must not erase forensic history. The retention
+    /// watermark only advances. A normal rollback into a live store is
+    /// therefore a no-op for audit; the merge matters when restoring into a
+    /// store that has lost (pruned) or never had those rows.
     fn restore_env_journaled(
         &self,
         env_id: &EnvId,
         snapshot: &EnvSnapshot,
         precondition: &Precondition,
+        journal: Option<&MutationJournal>,
+    ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
+
+    /// Import a composite [`EnvSnapshot`] into a store that does NOT yet have
+    /// the environment — disaster recovery from a portable backup. Unlike
+    /// [`Self::restore_env_journaled`] (a precondition-guarded rollback of an
+    /// EXISTING environment), import CREATES the environment row, failing
+    /// [`StorageError::AlreadyExists`] (409) if it is already present so it can
+    /// never clobber live state, and reconstructs every sidecar plus the
+    /// captured audit history from scratch — all inside ONE transaction with
+    /// the [`MutationJournal`] rows.
+    ///
+    /// The environment is created fresh at generation 1; the reproduced
+    /// deployment state (revisions + traffic splits — the active routing) lives
+    /// in the restored environment document, not in the row's CAS counter.
+    ///
+    /// Scope: import reconstructs exactly what an [`EnvSnapshot`] captures — the
+    /// environment document, runtime/pack-answers sidecars, and audit history.
+    /// Operator-level material kept OUTSIDE the snapshot (trust-root documents,
+    /// signed revenue-policy artifacts) is NOT reproduced — the same boundary
+    /// `restore` has — and must be re-established separately during recovery.
+    /// Audit rows are re-appended with FRESH ids (the captured global ids are
+    /// not preserved), since the id is store-wide and shared with other envs'
+    /// imports; `event_id`/`recorded_at`/order carry the forensic identity.
+    fn import_env_journaled(
+        &self,
+        env_id: &EnvId,
+        snapshot: &EnvSnapshot,
         journal: Option<&MutationJournal>,
     ) -> impl Future<Output = Result<EnvRevision, StorageError>> + Send;
 

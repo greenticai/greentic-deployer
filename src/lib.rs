@@ -1,4 +1,8 @@
 #![forbid(unsafe_code)]
+// The env-manifest JSON schema (`cli::env_manifest::manifest_schema`) is one
+// large `serde_json::json!` literal; `json!` recurses once per object key, so
+// the default limit of 128 is exceeded as the schema grows.
+#![recursion_limit = "256"]
 
 pub mod adapter;
 pub mod admin_access;
@@ -36,6 +40,7 @@ pub mod pack_introspect;
 pub mod path_safety;
 pub mod plan;
 pub(crate) mod rollout_telemetry;
+pub mod runtime_secret_sink;
 pub mod runtime_secrets;
 pub mod serverless;
 pub mod single_vm;

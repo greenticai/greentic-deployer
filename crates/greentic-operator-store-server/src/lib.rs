@@ -58,8 +58,13 @@
 //!   key reuse is a typed `409 idempotency-conflict`, and failed requests
 //!   consume nothing. The ledger is bounded per-environment
 //!   (`MAX_LEDGER_ROWS_PER_ENV` = 4096 rows, clock-free eviction in the
-//!   inserting transaction); the audit log is deliberately append-only
-//!   without bound — archival is the backup story below.
+//!   inserting transaction); the audit log is append-only without bound by
+//!   default — archival is the backup story below. Operators who must cap
+//!   audit growth can opt in to a per-environment audit-row limit
+//!   (`--audit-max-rows-per-env`): the oldest rows beyond the cap are
+//!   pruned in the appending transaction and the prune is recorded — not
+//!   dropped silently like the ledger — in the `audit_retention` watermark
+//!   (`pruned_through_id`, `pruned_total`, `policy_max_rows`).
 //! - RBAC (A8 #3, PR-4.4): [`rbac::RbacEngine`] — static bearer-token
 //!   authentication with coarse roles (`admin` / `operator` /
 //!   `read-only`) and optional per-environment scoping (`env_ids`),

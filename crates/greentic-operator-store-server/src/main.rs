@@ -43,6 +43,12 @@ struct Args {
         default_value_t = false
     )]
     insecure_allow_non_loopback: bool,
+    /// Opt-in per-environment audit-log retention: keep at most this many
+    /// audit rows per environment, pruning the oldest beyond the cap (the
+    /// prune is recorded in the `audit_retention` watermark). Unset (the
+    /// default) keeps the audit log append-only without bound.
+    #[arg(long, env = "GREENTIC_STORE_AUDIT_MAX_ROWS", value_parser = clap::value_parser!(u32).range(1..))]
+    audit_max_rows_per_env: Option<u32>,
 }
 
 #[tokio::main]
@@ -90,7 +96,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // `open` creates the parent directory and the database file if missing.
-    let store = SqliteEnvironmentStore::open(&args.db).await?;
+    let store = SqliteEnvironmentStore::open(&args.db)
+        .await?
+        .with_audit_max_rows_per_env(args.audit_max_rows_per_env);
+    if let Some(cap) = args.audit_max_rows_per_env {
+        tracing::info!(
+            audit_max_rows_per_env = cap,
+            "audit-log retention enabled: pruning oldest audit rows beyond the \
+             per-environment cap (recorded in the audit_retention watermark)"
+        );
+        store.reconcile_audit_retention().await?;
+    }
     let storage = Arc::new(store);
     let app = router_with_options(
         storage,

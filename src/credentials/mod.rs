@@ -26,18 +26,22 @@
 //! credential material at all (C2).
 
 pub mod bootstrap;
+pub mod rotate;
 pub mod rules_export;
 pub mod validate;
 
 pub use bootstrap::{
-    BootstrapError, BootstrapInput, BootstrapOutcome, RunBootstrapError, ZeroizedAdmin,
-    run_bootstrap,
+    BootstrapError, BootstrapInput, BootstrapOutcome, BoundSecretSink, RunBootstrapError,
+    ZeroizedAdmin, run_bootstrap,
 };
+pub use rotate::{RotateOutcome, RunRotateError, run_rotate};
 pub use rules_export::{RulesExportError, RulesPack, RulesPackEntry, write_rules_pack};
 pub use validate::{
     Capability, CapabilityCheck, CapabilityStatus, RequirementsReport, ValidateError,
     ValidationContext, validate_requirements,
 };
+
+use chrono::{DateTime, Utc};
 
 /// Contract a deployer env-pack handler implements to surface its
 /// credentials story to the `gtc op credentials` CLI.
@@ -84,4 +88,50 @@ pub trait DeployerCredentials: std::fmt::Debug + Send + Sync {
     /// actually consumed) and would leave a sentinel `credentials_ref`
     /// pointing at nothing.
     fn bootstrap(&self, input: &BootstrapInput<'_>) -> Result<BootstrapOutcome, BootstrapError>;
+
+    /// Best-effort compensating cleanup for a bootstrap that wrote durable
+    /// credential material to a REMOTE backend (e.g. the K8s `--bind` path
+    /// writes the minted bearer into an in-cluster Secret) but then failed a
+    /// later persistence step. Without this a failed bootstrap could leave a
+    /// live bearer in the backend while the env stays unbound. The CLI calls it
+    /// on the bootstrap error path; the delete is idempotent (a never-written
+    /// Secret 404s harmlessly), so an unconditional call is safe.
+    ///
+    /// Default is a no-op — deployers that bind no remote material (the
+    /// local-process / render-only paths) have nothing to undo. Implementations
+    /// MUST NOT panic; cleanup failures are swallowed (the caller already has a
+    /// bootstrap error to report). It does NOT cover a hard process crash
+    /// between the remote write and the local commit — short-lived bound tokens
+    /// + rotation are the systemic mitigation for that residual window.
+    fn rollback_bound_material(&self, _env_id: &greentic_deploy_spec::EnvId) {}
+
+    /// The absolute time the given bound credential *material* should be
+    /// rotated, derived from the material's own self-reported lifetime (e.g.
+    /// the K8s projected-ServiceAccount-token JWT's `iat`/`exp` claims).
+    /// Returns `None` when the lifetime can't be determined.
+    ///
+    /// Default is `None`: deployers that mint no time-bounded material (the
+    /// render-only / local paths, and AWS until its STS producer lands) have
+    /// no rotation point to compute. Backends that mint bounded credentials
+    /// override this to decode their own material format — the rotation
+    /// *policy* (rotate at 80% of lifetime) stays shared in
+    /// [`rotate::rotate_at_from_window`], only the decode varies.
+    fn rotate_at(&self, _material: &str) -> Option<DateTime<Utc>> {
+        None
+    }
+
+    /// Whether the given bound material is at/past its rotation point.
+    ///
+    /// Fails OPEN: material whose lifetime can't be decoded
+    /// ([`rotate_at`](Self::rotate_at) returns `None`) is treated as due, so
+    /// `op credentials rotate --if-needed` errs toward rotating rather than
+    /// letting an opaque token silently lapse. The policy lives here; only the
+    /// per-backend `rotate_at` decode is overridden, so impls should not need
+    /// to override this.
+    fn rotation_due(&self, material: &str, now: DateTime<Utc>) -> bool {
+        match self.rotate_at(material) {
+            Some(rotate_at) => now >= rotate_at,
+            None => true,
+        }
+    }
 }

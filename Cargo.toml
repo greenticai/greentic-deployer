@@ -10,7 +10,7 @@ resolver = "2"
 
 [package]
 name = "greentic-deployer"
-version = "1.2.0-dev.0"
+version = "1.1.6"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic deployer runtime for plan construction and deployment-pack dispatch"
@@ -30,7 +30,7 @@ categories = [
 ]
 
 [features]
-default = ["bundle-upload-aws", "runtime-secrets-aws", "creds-aws", "k8s-client"]
+default = ["bundle-upload-aws", "runtime-secrets-aws", "creds-aws", "deploy-aws-ecs", "k8s-client"]
 internal-tools = []
 test-utils = []
 bundle-upload-aws = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime-api"]
@@ -40,10 +40,19 @@ runtime-secrets-aws = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "dep:aws-
 # alongside the other AWS deps; the env-pack registers only when this is
 # enabled.
 creds-aws = ["dep:aws-sdk-sts", "dep:aws-sdk-iam", "dep:aws-config", "dep:aws-smithy-runtime-api"]
+# Phase D D-AWS-1 (PR-2): the aws-sdk-backed `RealEcsTarget` impl of the
+# `EcsDeployTarget` seam — drives ECS task sets + ELBv2 weighted forward
+# actions. Default-on alongside the other AWS deps. The seam / fake / verbs
+# from PR-1 are SDK-free under `creds-aws`; this feature only adds the real
+# client, so `--no-default-features --features creds-aws` still builds.
+deploy-aws-ecs = ["dep:aws-sdk-ecs", "dep:aws-sdk-elasticloadbalancingv2", "dep:aws-config", "dep:aws-smithy-runtime-api"]
 # Phase D K8s slice (PR-5.2): typed Kubernetes API client behind the
 # `K8sCluster` / `K8sValidatorClient` seams. Default-on alongside the AWS
-# deps; kube's defaults are client + rustls-tls + ring (no openssl).
-k8s-client = ["dep:kube", "dep:k8s-openapi"]
+# deps; kube's defaults are client + rustls-tls + ring (no openssl). The
+# direct `rustls` dep is only for pinning the process-default CryptoProvider
+# at `connect()` — both `ring` (kube) and `aws-lc-rs` (AWS SDK) are linked,
+# so rustls 0.23 cannot auto-select one and the first TLS handshake panics.
+k8s-client = ["dep:kube", "dep:k8s-openapi", "dep:rustls"]
 bundle-upload-gcp = []
 bundle-upload-azure = []
 
@@ -68,12 +77,13 @@ required-features = [
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+base64 = "0.22"
 fs4 = "0.13"
-greentic-bundle = ">=1.2.0-dev, <1.3.0-0"
-greentic-config = ">=1.1.0-dev, <1.2.0-0"
-greentic-config-types = ">=1.1.0-dev, <1.2.0-0"
-greentic-deploy-spec = { path = "crates/greentic-deploy-spec", version = "0.1" }
-greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.1" }
+greentic-bundle = ">=1.1.0-0, <1.2.0-0"
+greentic-config = ">=1.1.0-0, <1.2.0-0"
+greentic-config-types = ">=1.1.0-0, <1.2.0-0"
+greentic-deploy-spec = { path = "crates/greentic-deploy-spec", version = "0.2" }
+greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.2" }
 serde_json = "1"
 semver = "1"
 thiserror = "2"
@@ -100,7 +110,7 @@ libc = "0.2"
 # is a runtime dep now (it was dev-only for the C6 env-pack YAML round-trip
 # tests; the env-pack trait still carries raw YAML). Already in the runtime
 # graph via greentic-bundle -> greentic-qa-lib, so this adds no new crates.
-qa-spec = ">=1.1.0-dev, <1.2.0-0"
+qa-spec = ">=1.1.0-0, <1.2.0-0"
 
 [dependencies.clap]
 version = "4.5"
@@ -112,21 +122,29 @@ features = [
 # Floor pinned to the C5.1 publish that exposes `RolloutEvent` +
 # `emit_rollout_event`. Lower versions in the same range satisfy
 # `>=1.1.0-dev` but lack the rollout module.
-version = ">=1.1.0-dev.26432434860, <1.2.0-0"
+version = ">=1.1.0-0, <1.2.0-0"
 features = [
     "otlp",
 ]
 
 [dependencies.greentic-types]
-version = ">=1.1.0-dev.26561934923, <1.2.0-0"
+version = ">=1.1.0-0, <1.2.0-0"
 
 [dependencies.greentic-distributor-client]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-0, <1.2.0-0"
 
 [dependencies.greentic-secrets-lib]
-version = ">=1.1.0-dev.27563392344, <1.2.0-0"
+version = ">=1.1.0-0, <1.2.0-0"
 features = [
     "providers-dev",
+    "providers-vault",
+]
+
+[dependencies.greentic-update]
+version = "0.1"
+features = [
+    "enroll",
+    "mtls",
 ]
 
 [dependencies.serde]
@@ -221,9 +239,35 @@ features = [
     "rt-tokio",
 ]
 
+[dependencies.aws-sdk-ecs]
+version = "1"
+optional = true
+default-features = false
+features = [
+    "default-https-client",
+    "rt-tokio",
+]
+
+[dependencies.aws-sdk-elasticloadbalancingv2]
+version = "1"
+optional = true
+default-features = false
+features = [
+    "default-https-client",
+    "rt-tokio",
+]
+
 [dependencies.kube]
 version = "3.1"
 optional = true
+
+# Only used to install a process-default rustls CryptoProvider before the
+# first cluster connection (see `kube_client::connect`). `ring` matches
+# kube's bundled provider; version unifies with kube's transitive rustls.
+[dependencies.rustls]
+version = "0.23"
+optional = true
+features = ["ring"]
 
 [dependencies.k8s-openapi]
 # Version feature pins the generated API types, not the cluster we can
@@ -241,7 +285,6 @@ version = "3"
 
 [dev-dependencies]
 wat = "1"
-base64 = "0.22"
 # kube-client mock harness (PR-5.2): drive a real `kube::Client` against
 # a `tower_test::mock` service so the K8sCluster / K8sValidatorClient
 # impls are asserted at the HTTP layer without a cluster.
@@ -249,10 +292,21 @@ tower-test = "0.4"
 http = "1"
 http-body-util = "0.1"
 # Re-declared to turn on `test_support` (shared keypair fixtures) for tests.
-greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.1", features = ["test-utils"] }
+greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.2", features = ["test-utils"] }
 # Path-only (no version) on purpose: the server crate is `publish = false`,
 # and cargo strips versionless path dev-deps at publish time. Used by the
 # `store_server_e2e` test to drive the real `HttpEnvironmentStore` client
 # against a real operator-store-server listener.
 greentic-operator-store-server = { path = "crates/greentic-operator-store-server" }
 axum = "0.8"
+# Path-only (no version) like the store-server above: lets the live-cluster
+# E2E set a `credentials_ref` through the public `EnvironmentStore` API
+# (the K8s deployer requires credential material and there is no CLI setter).
+# Resolves to the same path crate the lib uses, so the `Environment` types
+# unify across the test/lib boundary.
+greentic-deploy-spec = { path = "crates/greentic-deploy-spec" }
+# Re-declared (same registry version the lib already pins) so the live-cluster
+# E2E can derive the canonical store-key the bound-credential resolver reads,
+# and seed a ServiceAccount token via env var. Already in the lockfile via the
+# normal dep, so no resolution change.
+greentic-secrets-lib = ">=1.1.0-0, <1.2.0-0"

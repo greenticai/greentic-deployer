@@ -38,6 +38,7 @@
 use std::path::PathBuf;
 
 pub mod bootstrap;
+pub mod bundle_fetch;
 pub mod bundle_stage;
 pub mod bundles;
 pub mod config;
@@ -58,6 +59,7 @@ pub mod revisions;
 pub mod secrets;
 pub mod traffic;
 pub mod trust_root;
+pub mod updates;
 // pub mod bundles;
 // pub mod revisions;
 // pub mod traffic;
@@ -66,7 +68,7 @@ pub mod trust_root;
 // pub mod secrets;
 
 #[cfg(test)]
-mod tests_common;
+pub(crate) mod tests_common;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -74,7 +76,7 @@ use thiserror::Error;
 
 use crate::environment::{
     AuditDecision, AuditEvent, AuditLog, AuditResult, LifecycleError, LocalFsStore, StoreError,
-    authorize_local_only, current_local_actor,
+    authorize_local_owner, current_local_actor,
 };
 use greentic_deploy_spec::{EnvId, SpecError};
 
@@ -103,6 +105,11 @@ pub enum OpError {
     NotYetImplemented(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    /// A remote `bundle_source_uri` could not be fetched (registry unreachable,
+    /// auth/transport failure, or the artifact is missing). The fetched bytes
+    /// are gated against the manifest `bundle_digest` separately by the caller.
+    #[error("bundle fetch failed: {0}")]
+    Fetch(String),
     #[error("unauthorized: {policy} — {reason}")]
     Unauthorized { policy: String, reason: String },
     #[error("audit log write failed after the mutation committed: {0}")]
@@ -194,6 +201,7 @@ impl OpError {
             OpError::NotFound(_) => "not-found",
             OpError::NotYetImplemented(_) => "not-yet-implemented",
             OpError::Conflict(_) => "conflict",
+            OpError::Fetch(_) => "fetch",
             OpError::Unauthorized { .. } => "unauthorized",
             OpError::Audit(_) => "audit",
             OpError::RevenuePolicy(_) => "revenue-policy",
@@ -344,9 +352,9 @@ impl AuditGens {
     };
 }
 
-/// Wrap a mutating verb body in local-only authorization + append-only audit.
+/// Wrap a mutating verb body in local-store authorization + append-only audit.
 ///
-/// 1. Runs [`authorize_local_only`] against `ctx.env_id`.
+/// 1. Runs [`authorize_local_owner`] against `ctx.env_id`.
 /// 2. On `Deny`: returns `OpError::Unauthorized` without calling `mutate`.
 /// 3. On `Allow`: runs `mutate` and records the outcome.
 /// 4. Always appends an [`AuditEvent`] to `<store_root>/<env_id>/audit/events.jsonl`.
@@ -389,7 +397,7 @@ pub(crate) fn audit_and_record<F>(
 where
     F: FnOnce(&CommitMarker) -> Result<(OpOutcome, AuditGens), OpError>,
 {
-    let decision = authorize_local_only(&ctx.env_id);
+    let decision = authorize_local_owner(&ctx.env_id);
     let commit_marker = CommitMarker::new();
     let (result, gens) = match &decision {
         AuditDecision::Deny { policy, reason } => (

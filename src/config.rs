@@ -62,7 +62,7 @@ pub struct DeployerRequest {
     pub strategy: String,
     pub tenant: String,
     pub environment: Option<String>,
-    pub pack_path: PathBuf,
+    pub pack_path: Option<PathBuf>,
     pub bundle_root: Option<PathBuf>,
     pub bundle_source: Option<String>,
     pub bundle_digest: Option<String>,
@@ -94,7 +94,7 @@ impl DeployerRequest {
         capability: DeployerCapability,
         provider: Provider,
         tenant: impl Into<String>,
-        pack_path: PathBuf,
+        pack_path: Option<PathBuf>,
     ) -> Self {
         Self {
             capability,
@@ -137,7 +137,7 @@ pub struct DeployerConfig {
     pub strategy: String,
     pub tenant: String,
     pub environment: String,
-    pub pack_path: PathBuf,
+    pub pack_path: Option<PathBuf>,
     pub bundle_root: Option<PathBuf>,
     pub bundle_source: Option<String>,
     pub bundle_digest: Option<String>,
@@ -172,10 +172,13 @@ impl DeployerConfig {
             .map_err(|err| DeployerError::Config(err.to_string()))?;
         let greentic = resolved.config;
 
-        if !request.pack_path.exists() && request.pack_id.is_none() {
+        if let Some(ref path) = request.pack_path
+            && !path.exists()
+            && request.pack_id.is_none()
+        {
             return Err(DeployerError::Config(format!(
                 "pack path {} does not exist (and no pack_id provided)",
-                request.pack_path.display()
+                path.display()
             )));
         }
 
@@ -246,7 +249,29 @@ impl DeployerConfig {
     }
 
     pub fn output_scope_key(&self) -> String {
-        scope_key_for_path(&self.pack_path)
+        match &self.pack_path {
+            Some(path) => scope_key_for_path(path),
+            None => {
+                let raw = format!(
+                    "{}-{}-{}",
+                    self.provider.as_str(),
+                    self.tenant,
+                    self.environment
+                );
+                let mut scoped = String::with_capacity(raw.len());
+                for ch in raw.chars() {
+                    if ch.is_ascii_alphanumeric() {
+                        scoped.push(ch.to_ascii_lowercase());
+                    } else {
+                        scoped.push('-');
+                    }
+                }
+                while scoped.contains("--") {
+                    scoped = scoped.replace("--", "-");
+                }
+                scoped.trim_matches('-').to_string()
+            }
+        }
     }
 
     pub fn provider_output_dir(&self) -> PathBuf {
@@ -398,7 +423,7 @@ mod tests {
             DeployerCapability::Plan,
             Provider::Aws,
             "acme",
-            PathBuf::from("examples/acme-pack"),
+            Some(PathBuf::from("examples/acme-pack")),
         )
     }
 
@@ -486,7 +511,7 @@ kind = "none"
         let cfg_path = write_config(dir.path());
 
         let mut request = base_request();
-        request.pack_path = dir.path().to_path_buf();
+        request.pack_path = Some(dir.path().to_path_buf());
         request.pack_id = Some("dev.greentic.sample".into());
         request.pack_version = Some("0.1.0".into());
         request.pack_digest = Some("sha256:deadbeef".into());
@@ -511,11 +536,11 @@ kind = "none"
         fs::write(&second_pack, "").expect("write second pack");
 
         let mut first_request = base_request();
-        first_request.pack_path = first_pack;
+        first_request.pack_path = Some(first_pack);
         let first_config = DeployerConfig::resolve(first_request).expect("first config");
 
         let mut second_request = base_request();
-        second_request.pack_path = second_pack;
+        second_request.pack_path = Some(second_pack);
         let second_config = DeployerConfig::resolve(second_request).expect("second config");
 
         assert_ne!(

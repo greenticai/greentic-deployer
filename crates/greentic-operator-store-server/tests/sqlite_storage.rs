@@ -28,7 +28,7 @@ use serde_json::json;
 use sqlx::Row;
 
 mod common;
-use common::fresh_store;
+use common::{fresh_store, fresh_store_with_audit_cap};
 
 fn env_id(s: &str) -> EnvId {
     EnvId::try_from(s).expect("valid env id")
@@ -49,6 +49,7 @@ fn minimal_environment(id: &EnvId) -> Environment {
             tenant_org_id: None,
             listen_addr: None,
             public_base_url: None,
+            gui_enabled: None,
         },
         packs: vec![EnvPackBinding {
             slot: CapabilitySlot::Deployer,
@@ -1266,13 +1267,148 @@ async fn ledger_evicts_beyond_the_per_env_window() {
 }
 
 // ---------------------------------------------------------------------------
+// Audit-log retention (opt-in per-environment cap + watermark)
+// ---------------------------------------------------------------------------
+
+/// Read the `audit_retention` watermark for an env, if any prune happened.
+async fn audit_watermark(store: &SqliteEnvironmentStore, id: &EnvId) -> Option<(i64, i64, i64)> {
+    sqlx::query(
+        "SELECT pruned_through_id, pruned_total, policy_max_rows \
+         FROM audit_retention WHERE env_id = $1",
+    )
+    .bind(id.as_str())
+    .fetch_optional(store.pool())
+    .await
+    .expect("watermark query")
+    .map(|r| {
+        (
+            r.get::<i64, _>("pruned_through_id"),
+            r.get::<i64, _>("pruned_total"),
+            r.get::<i64, _>("policy_max_rows"),
+        )
+    })
+}
+
+#[tokio::test]
+async fn audit_log_is_unbounded_by_default() {
+    // No cap configured (the default): the audit log stays append-only.
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    for i in 0..10 {
+        store
+            .record_journal(&journal(&id, &format!("k-{i}"), &format!("fp-{i}")))
+            .await
+            .expect("record journal");
+    }
+
+    assert_eq!(audit_event_ids(&store, &id).await.len(), 10);
+    assert!(
+        audit_watermark(&store, &id).await.is_none(),
+        "no prune, so no watermark row"
+    );
+}
+
+#[tokio::test]
+async fn audit_retention_caps_rows_and_records_watermark() {
+    let (_dir, store) = fresh_store_with_audit_cap(4).await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    // 6 journaled audit rows (ids 1..=6) under a cap of 4.
+    for i in 0..6 {
+        store
+            .record_journal(&journal(&id, &format!("k-{i}"), &format!("fp-{i}")))
+            .await
+            .expect("record journal");
+    }
+
+    // The newest 4 survive; the oldest 2 (k-0/k-1) are pruned.
+    assert_eq!(
+        audit_event_ids(&store, &id).await,
+        vec!["evt-k-2", "evt-k-3", "evt-k-4", "evt-k-5"]
+    );
+    // Watermark: 2 rows removed, high-water at audit_log.id 2, cap 4.
+    assert_eq!(audit_watermark(&store, &id).await, Some((2, 2, 4)));
+}
+
+#[tokio::test]
+async fn audit_retention_applies_to_standalone_record_audit() {
+    // The RBAC-denied path appends via `record_audit`, not the journal —
+    // it must honor the cap too.
+    let (_dir, store) = fresh_store_with_audit_cap(3).await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    for i in 0..5 {
+        store
+            .record_audit(&id, &format!("evt-{i}"), &json!({"i": i}))
+            .await
+            .expect("record audit");
+    }
+
+    assert_eq!(
+        audit_event_ids(&store, &id).await,
+        vec!["evt-2", "evt-3", "evt-4"]
+    );
+    assert_eq!(audit_watermark(&store, &id).await, Some((2, 2, 3)));
+}
+
+#[tokio::test]
+async fn audit_watermark_accumulates_and_is_per_env() {
+    let (_dir, store) = fresh_store_with_audit_cap(2).await;
+    let a = env_id("local");
+    let b = env_id("other");
+    store
+        .create_env(&minimal_environment(&a))
+        .await
+        .expect("create a");
+    store
+        .create_env(&minimal_environment(&b))
+        .await
+        .expect("create b");
+
+    // 5 audit rows on env a, cap 2 → 3 pruned, newest 2 kept.
+    for i in 0..5 {
+        store
+            .record_audit(&a, &format!("a-{i}"), &json!({}))
+            .await
+            .expect("record a");
+    }
+    let (_through, total_a, policy_a) = audit_watermark(&store, &a).await.expect("a watermark");
+    assert_eq!((total_a, policy_a), (3, 2), "3 of env a's 5 rows pruned");
+    assert_eq!(audit_event_ids(&store, &a).await, vec!["a-3", "a-4"]);
+
+    // env b stays under its cap — never pruned, no watermark.
+    store
+        .record_audit(&b, "b-0", &json!({}))
+        .await
+        .expect("record b");
+    assert_eq!(audit_event_ids(&store, &b).await, vec!["b-0"]);
+    assert!(
+        audit_watermark(&store, &b).await.is_none(),
+        "env b never crossed its cap"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Backups + standalone audit append (A8 #3/#5, PR-4.4)
 // ---------------------------------------------------------------------------
 
 use greentic_deploy_spec::{BackupManifest, StateIntegrity};
 use greentic_operator_store_server::storage::{MAX_BACKUPS_PER_ENV, StoredBackup};
 
-use greentic_operator_store_server::storage::EnvSnapshot;
+use greentic_operator_store_server::storage::{AuditEntry, AuditRetention, EnvSnapshot};
 
 fn stored_backup(id: &EnvId, backup_id: &str, env: &Environment) -> StoredBackup {
     let env_json = serde_json::to_value(env).expect("env json");
@@ -1281,6 +1417,8 @@ fn stored_backup(id: &EnvId, backup_id: &str, env: &Environment) -> StoredBackup
         environment: env_json,
         runtime: None,
         pack_answers: std::collections::BTreeMap::new(),
+        audit_log: Vec::new(),
+        audit_retention: None,
     };
     let state = serde_json::to_value(&snapshot).expect("snapshot json");
     let snapshot_digest = StateIntegrity::sha256_of(&state)
@@ -1501,9 +1639,14 @@ async fn restore_preserves_sidecar_generation_sequences_and_tombstones() {
     assert_eq!(pa_rev1.generation, 1);
 
     // --- Take a backup (snapshot has Deployer slot + runtime). ---
-    let snapshot = store.load_env_snapshot(&id).await.expect("snapshot");
+    let (snapshot, snap_rev) = store.load_env_snapshot(&id).await.expect("snapshot");
     assert!(snapshot.runtime.is_some());
     assert!(snapshot.pack_answers.contains_key("deployer"));
+    // The captured revision is read in the same tx as the content, so it must
+    // match the env row's current generation (what create_backup stamps onto
+    // the manifest).
+    let env_now = store.load_env(&id).await.expect("load env for revision");
+    assert_eq!(snap_rev.generation, env_now.revision.generation);
 
     // --- Advance Deployer to gen 2 (post-backup mutation). ---
     let deployer_v2 = json!({"region": "us-east-1"});
@@ -1597,4 +1740,521 @@ async fn restore_preserves_sidecar_generation_sequences_and_tombstones() {
         rt_gen, 3,
         "runtime generation must continue (2+1=3), not reset to 1"
     );
+}
+
+#[tokio::test]
+async fn audit_retention_reconciles_existing_over_cap_rows_at_startup() {
+    // Pre-existing audit history written with retention OFF.
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+    for i in 0..6 {
+        store
+            .record_journal(&journal(&id, &format!("k-{i}"), &format!("fp-{i}")))
+            .await
+            .expect("record journal");
+    }
+    assert_eq!(audit_event_ids(&store, &id).await.len(), 6);
+
+    // The operator enables the cap; startup reconciliation caps existing
+    // rows WITHOUT any new append.
+    let store = store.with_audit_max_rows_per_env(Some(4));
+    store
+        .reconcile_audit_retention()
+        .await
+        .expect("reconcile audit retention");
+
+    assert_eq!(
+        audit_event_ids(&store, &id).await,
+        vec!["evt-k-2", "evt-k-3", "evt-k-4", "evt-k-5"]
+    );
+    assert_eq!(audit_watermark(&store, &id).await, Some((2, 2, 4)));
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot audit capture (PR-4.4 archival, fresh-store DR foundation)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn load_env_snapshot_captures_audit_log_and_watermark() {
+    // Cap at 4; six journaled mutations prune the oldest two (mirrors the
+    // retention suite), so the snapshot must capture the surviving four audit
+    // rows AND the watermark that records the forgotten two.
+    let (_dir, store) = fresh_store_with_audit_cap(4).await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+    for i in 0..6 {
+        store
+            .record_journal(&journal(&id, &format!("k-{i}"), &format!("fp-{i}")))
+            .await
+            .expect("record journal");
+    }
+
+    let (snapshot, _rev) = store.load_env_snapshot(&id).await.expect("snapshot");
+
+    // The four surviving rows, oldest first, with ascending preserved ids.
+    let captured: Vec<&str> = snapshot
+        .audit_log
+        .iter()
+        .map(|e| e.event_id.as_str())
+        .collect();
+    assert_eq!(captured, vec!["evt-k-2", "evt-k-3", "evt-k-4", "evt-k-5"]);
+    assert!(
+        snapshot.audit_log.windows(2).all(|w| w[0].id < w[1].id),
+        "captured ids must be ascending append order"
+    );
+    assert_eq!(snapshot.audit_log[0].event["verb"], "update");
+
+    // The watermark records the two forgotten rows under the cap.
+    let wm = snapshot
+        .audit_retention
+        .as_ref()
+        .expect("watermark present after a prune");
+    assert_eq!(
+        (wm.pruned_through_id, wm.pruned_total, wm.policy_max_rows),
+        (2, 2, 4)
+    );
+
+    // The populated snapshot serde-round-trips (the `backups.state` blob form).
+    let blob = serde_json::to_value(&snapshot).expect("serialize snapshot");
+    let back: EnvSnapshot = serde_json::from_value(blob).expect("deserialize snapshot");
+    assert_eq!(back, snapshot);
+}
+
+#[test]
+fn env_snapshot_deserializes_pre_capture_shape_with_empty_audit() {
+    // A snapshot blob written before audit capture existed carries no
+    // audit_log / audit_retention keys; it must deserialize to an empty log
+    // and no watermark so backups taken before this change stay restorable.
+    let blob = json!({
+        "environment": {"name": "local"},
+        "pack_answers": {}
+    });
+    let snap: EnvSnapshot = serde_json::from_value(blob).expect("deserialize pre-capture snapshot");
+    assert!(snap.audit_log.is_empty());
+    assert!(snap.audit_retention.is_none());
+    assert!(snap.runtime.is_none());
+}
+
+#[tokio::test]
+async fn restore_preserves_live_audit_and_appends_its_own_event() {
+    // A rollback into a LIVE store must not erase any audit row: the captured
+    // rows are already present (re-insert is a no-op via INSERT OR IGNORE),
+    // post-backup rows survive the content rollback, and the restore appends
+    // exactly one new audit event as the newest row.
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    // Three mutations, then snapshot (captures evt-k-0..evt-k-2).
+    for i in 0..3 {
+        store
+            .record_journal(&journal(&id, &format!("k-{i}"), &format!("fp-{i}")))
+            .await
+            .expect("record journal");
+    }
+    let (snapshot, _rev) = store.load_env_snapshot(&id).await.expect("snapshot");
+    assert_eq!(snapshot.audit_log.len(), 3);
+
+    // Two more mutations AFTER the backup (absent from the snapshot).
+    for i in 3..5 {
+        store
+            .record_journal(&journal(&id, &format!("k-{i}"), &format!("fp-{i}")))
+            .await
+            .expect("record journal");
+    }
+
+    // Restore from the 3-row snapshot, carrying its own restore journal.
+    let rev = store.load_env(&id).await.expect("load env").revision;
+    store
+        .restore_env_journaled(
+            &id,
+            &snapshot,
+            &Precondition::matching(rev.etag, rev.generation),
+            Some(&journal(&id, "restore", "fp-restore")),
+        )
+        .await
+        .expect("restore");
+
+    // All five live rows survive (none deleted) and the restore event is last.
+    assert_eq!(
+        audit_event_ids(&store, &id).await,
+        vec![
+            "evt-k-0",
+            "evt-k-1",
+            "evt-k-2",
+            "evt-k-3",
+            "evt-k-4",
+            "evt-restore",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn restore_reinstates_a_pruned_audit_row_with_its_original_id() {
+    // The merge matters when the store has LOST a captured row: restore must
+    // reconstruct it in place, preserving its original id and recorded_at so
+    // the append sequence and any watermark stay consistent.
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+    for i in 0..3 {
+        store
+            .record_journal(&journal(&id, &format!("k-{i}"), &format!("fp-{i}")))
+            .await
+            .expect("record journal");
+    }
+    let (snapshot, _rev) = store.load_env_snapshot(&id).await.expect("snapshot");
+    let lost = snapshot.audit_log[0].clone(); // evt-k-0, the oldest
+
+    // Simulate retention having pruned the oldest row after the backup.
+    sqlx::query("DELETE FROM audit_log WHERE event_id = $1")
+        .bind(&lost.event_id)
+        .execute(store.pool())
+        .await
+        .expect("delete row");
+    assert_eq!(
+        audit_event_ids(&store, &id).await,
+        vec!["evt-k-1", "evt-k-2"],
+        "the oldest row is gone before restore"
+    );
+
+    // Restore (no journal — isolate the audit replay from a restore event).
+    let rev = store.load_env(&id).await.expect("load env").revision;
+    store
+        .restore_env_journaled(
+            &id,
+            &snapshot,
+            &Precondition::matching(rev.etag, rev.generation),
+            None,
+        )
+        .await
+        .expect("restore");
+
+    // The lost row is back, at its original position; the survivors are intact.
+    assert_eq!(
+        audit_event_ids(&store, &id).await,
+        vec!["evt-k-0", "evt-k-1", "evt-k-2"],
+    );
+    let reinstated = sqlx::query("SELECT id, recorded_at FROM audit_log WHERE event_id = $1")
+        .bind(&lost.event_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("re-instated row");
+    assert_eq!(
+        reinstated.get::<i64, _>("id"),
+        lost.id,
+        "original id preserved"
+    );
+    assert_eq!(
+        reinstated.get::<String, _>("recorded_at"),
+        lost.recorded_at,
+        "original recorded_at preserved"
+    );
+}
+
+#[tokio::test]
+async fn restore_reconciles_retention_watermark_monotonically() {
+    // The watermark can only advance: a higher captured watermark copies into a
+    // store that has none; a lower one never regresses a higher live one; and
+    // an absent captured watermark leaves the live one untouched.
+    let (_dir, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+
+    let snap_with = |through: i64, total: i64| EnvSnapshot {
+        environment: serde_json::to_value(minimal_environment(&id)).expect("env json"),
+        runtime: None,
+        pack_answers: BTreeMap::new(),
+        audit_log: Vec::new(),
+        audit_retention: Some(AuditRetention {
+            pruned_through_id: through,
+            pruned_total: total,
+            policy_max_rows: 10,
+            last_pruned_at: "2026-01-01T00:00:00Z".to_string(),
+        }),
+    };
+
+    // (1) Copy a captured watermark into a store that has none.
+    let rev = store.load_env(&id).await.expect("load env").revision;
+    store
+        .restore_env_journaled(
+            &id,
+            &snap_with(8, 8),
+            &Precondition::matching(rev.etag, rev.generation),
+            None,
+        )
+        .await
+        .expect("restore high");
+    assert_eq!(audit_watermark(&store, &id).await, Some((8, 8, 10)));
+
+    // (2) A lower captured watermark must NOT regress the live one.
+    let rev = store.load_env(&id).await.expect("load env").revision;
+    store
+        .restore_env_journaled(
+            &id,
+            &snap_with(5, 5),
+            &Precondition::matching(rev.etag, rev.generation),
+            None,
+        )
+        .await
+        .expect("restore low");
+    assert_eq!(audit_watermark(&store, &id).await, Some((8, 8, 10)));
+
+    // (3) An absent captured watermark leaves the live one untouched.
+    let no_watermark = EnvSnapshot {
+        environment: serde_json::to_value(minimal_environment(&id)).expect("env json"),
+        runtime: None,
+        pack_answers: BTreeMap::new(),
+        audit_log: Vec::new(),
+        audit_retention: None,
+    };
+    let rev = store.load_env(&id).await.expect("load env").revision;
+    store
+        .restore_env_journaled(
+            &id,
+            &no_watermark,
+            &Precondition::matching(rev.etag, rev.generation),
+            None,
+        )
+        .await
+        .expect("restore none");
+    assert_eq!(audit_watermark(&store, &id).await, Some((8, 8, 10)));
+}
+
+#[tokio::test]
+async fn import_creates_env_sidecars_and_audit_into_a_fresh_store() {
+    // The DR shape: build a complete env (content + runtime + pack_answers +
+    // audit) in one store, snapshot it, then import into a SEPARATE fresh store
+    // that has never seen the environment.
+    let (_da, store_a) = fresh_store().await;
+    let id = env_id("local");
+    store_a
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+    store_a
+        .upsert_runtime(&minimal_runtime(&id), None)
+        .await
+        .expect("runtime");
+    store_a
+        .upsert_pack_answers(
+            &id,
+            CapabilitySlot::Deployer,
+            &json!({"region": "eu"}),
+            None,
+        )
+        .await
+        .expect("pack answers");
+    for i in 0..3 {
+        store_a
+            .record_journal(&journal(&id, &format!("k-{i}"), &format!("fp-{i}")))
+            .await
+            .expect("journal");
+    }
+    let (snapshot, _rev) = store_a.load_env_snapshot(&id).await.expect("snapshot");
+    assert_eq!(snapshot.audit_log.len(), 3);
+
+    // Fresh store: the environment is absent.
+    let (_db, store_b) = fresh_store().await;
+    let rev = store_b
+        .import_env_journaled(&id, &snapshot, Some(&journal(&id, "import", "fp-import")))
+        .await
+        .expect("import");
+    assert_eq!(rev.generation, 1, "a fresh import creates at generation 1");
+
+    // Content + both sidecars reproduced.
+    let loaded = store_b.load_env(&id).await.expect("load env");
+    assert_eq!(loaded.value.environment_id, id);
+    assert_eq!(loaded.value.name, minimal_environment(&id).name);
+    assert!(
+        store_b.load_runtime(&id).await.expect("runtime").is_some(),
+        "runtime sidecar reproduced"
+    );
+    assert!(
+        store_b
+            .load_pack_answers(&id, CapabilitySlot::Deployer)
+            .await
+            .expect("pack answers")
+            .is_some(),
+        "pack-answers sidecar reproduced"
+    );
+    // Audit history reproduced, with the import event appended last.
+    assert_eq!(
+        audit_event_ids(&store_b, &id).await,
+        vec!["evt-k-0", "evt-k-1", "evt-k-2", "evt-import"],
+    );
+}
+
+#[tokio::test]
+async fn import_refuses_when_the_env_already_exists() {
+    // Import never clobbers a live environment.
+    let (_d, store) = fresh_store().await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+    let (snapshot, _) = store.load_env_snapshot(&id).await.expect("snapshot");
+    let err = store
+        .import_env_journaled(&id, &snapshot, None)
+        .await
+        .expect_err("import into an existing env must fail");
+    assert!(
+        matches!(err, StorageError::AlreadyExists { .. }),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn import_rejects_an_env_id_mismatch() {
+    // The snapshot names the env it captured; importing it under a different
+    // key is refused (it would mis-key the reconstructed sidecars).
+    let (_d, store) = fresh_store().await;
+    let other = env_id("other");
+    store
+        .create_env(&minimal_environment(&other))
+        .await
+        .expect("create env");
+    let (snapshot, _) = store.load_env_snapshot(&other).await.expect("snapshot");
+    let err = store
+        .import_env_journaled(&env_id("local"), &snapshot, None)
+        .await
+        .expect_err("env-id mismatch must fail");
+    assert!(
+        matches!(err, StorageError::EnvIdMismatch { .. }),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn importing_two_envs_with_interleaved_audit_ids_loses_no_rows() {
+    // Two envs whose captured audit ids interleave in the original global
+    // sequence (alpha: 1,3,5 ; beta: 2,4,6). Importing both into ONE fresh
+    // store must not let either env's preserved id collide with the other's
+    // import event and silently drop a row — import reconstructs audit with
+    // fresh ids, so every distinct event survives.
+    let (_db, store) = fresh_store().await;
+    let snapshot = |name: &str, rows: &[(i64, &str)]| EnvSnapshot {
+        environment: serde_json::to_value(minimal_environment(&env_id(name))).expect("env json"),
+        runtime: None,
+        pack_answers: BTreeMap::new(),
+        audit_log: rows
+            .iter()
+            .map(|(id, ev)| AuditEntry {
+                id: *id,
+                event_id: ev.to_string(),
+                recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                event: json!({"verb": "update"}),
+            })
+            .collect(),
+        audit_retention: None,
+    };
+    let alpha = snapshot("alpha", &[(1, "a-1"), (3, "a-3"), (5, "a-5")]);
+    let beta = snapshot("beta", &[(2, "b-2"), (4, "b-4"), (6, "b-6")]);
+
+    store
+        .import_env_journaled(
+            &env_id("alpha"),
+            &alpha,
+            Some(&journal(&env_id("alpha"), "imp-a", "fp-a")),
+        )
+        .await
+        .expect("import alpha");
+    store
+        .import_env_journaled(
+            &env_id("beta"),
+            &beta,
+            Some(&journal(&env_id("beta"), "imp-b", "fp-b")),
+        )
+        .await
+        .expect("import beta");
+
+    // Every captured event survives in its own env, plus that env's import
+    // event — nothing is lost to a cross-env global-id collision.
+    assert_eq!(
+        audit_event_ids(&store, &env_id("alpha")).await,
+        vec!["a-1", "a-3", "a-5", "evt-imp-a"],
+    );
+    assert_eq!(
+        audit_event_ids(&store, &env_id("beta")).await,
+        vec!["b-2", "b-4", "b-6", "evt-imp-b"],
+    );
+}
+
+#[tokio::test]
+async fn restore_does_not_resurrect_rows_below_the_live_retention_watermark() {
+    // A backup taken BEFORE pruning carries early audit rows. If the live store
+    // has since pruned those ids (its watermark advanced past them), restore
+    // must NOT bring them back — resurrecting a row at or below
+    // `pruned_through_id` would make the forensic watermark lie.
+    let (_dir, store) = fresh_store_with_audit_cap(2).await;
+    let id = env_id("local");
+    store
+        .create_env(&minimal_environment(&id))
+        .await
+        .expect("create env");
+    // Four mutations under cap=2 → rows 1,2 pruned, watermark (2, 2, 2); live
+    // rows are evt-k-2 (id 3) and evt-k-3 (id 4).
+    for i in 0..4 {
+        store
+            .record_journal(&journal(&id, &format!("k-{i}"), &format!("fp-{i}")))
+            .await
+            .expect("journal");
+    }
+    assert_eq!(audit_watermark(&store, &id).await, Some((2, 2, 2)));
+    assert_eq!(
+        audit_event_ids(&store, &id).await,
+        vec!["evt-k-2", "evt-k-3"]
+    );
+
+    // A pre-prune backup: its audit_log still holds the early rows 1..4.
+    let snapshot = EnvSnapshot {
+        environment: serde_json::to_value(minimal_environment(&id)).expect("env json"),
+        runtime: None,
+        pack_answers: BTreeMap::new(),
+        audit_log: (1..=4)
+            .map(|i| AuditEntry {
+                id: i,
+                event_id: format!("evt-k-{}", i - 1),
+                recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                event: json!({"verb": "update"}),
+            })
+            .collect(),
+        audit_retention: None,
+    };
+    let rev = store.load_env(&id).await.expect("load env").revision;
+    store
+        .restore_env_journaled(
+            &id,
+            &snapshot,
+            &Precondition::matching(rev.etag, rev.generation),
+            None,
+        )
+        .await
+        .expect("restore");
+
+    // Rows 1,2 (<= the live watermark) are NOT resurrected; 3,4 were already
+    // present (true duplicates). The watermark is unchanged.
+    assert_eq!(
+        audit_event_ids(&store, &id).await,
+        vec!["evt-k-2", "evt-k-3"],
+        "rows the live watermark covers must not come back"
+    );
+    assert_eq!(audit_watermark(&store, &id).await, Some((2, 2, 2)));
 }

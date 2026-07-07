@@ -6,6 +6,25 @@
 
 The current open-source product direction is single-VM deployment only. Broader deployment targets should be treated as commercial/private scope. See [docs/single-vm-v1.md](docs/single-vm-v1.md).
 
+## Kubernetes deployment (env-pack model)
+
+For running a digital worker **on Kubernetes** — pulling a bundle over OCI,
+serving it, routing traffic, and reaching it from Telegram/Webchat — see the
+detailed guide:
+
+- **[docs/k8s-deployment.md](docs/k8s-deployment.md)** — mental model
+  (cluster id vs environment id; store vs cluster), the rendered objects,
+  declarative `op env apply` + `op env reconcile` quickstart (kind), deploying
+  to a new/real cluster (EKS/GKE/AKS/on-prem), the config reference
+  (deployer answers + env-manifest), the dev-store secrets bridge, known gaps,
+  and troubleshooting.
+
+This `op env …` env-pack path is distinct from the lower-level
+deployment-pack adapters below (`k8s-raw`, `helm`, `operator`, `juju-k8s`),
+which materialize handoff manifests/scripts from a provider pack rather than
+managing a live environment store. The guide opens with how to choose between
+the two.
+
 ## Concepts
 
 - **Application packs** (`kind: application` or `mixed`) describe flows, components, tools, secrets, tenant bindings, and deployment hints.
@@ -370,6 +389,11 @@ The first explicit multi-target adapter is also exposed as
 
 `k8s-raw` is the second explicit `multi-target` adapter surface. It fixes
 `provider=k8s` and `strategy=raw-manifests`.
+
+> For running a worker on a live cluster (OCI bundle pull, traffic routing,
+> Telegram/Webchat), prefer the env-pack path in
+> [docs/k8s-deployment.md](docs/k8s-deployment.md). `k8s-raw` materializes
+> handoff manifests from a provider pack and does not manage an environment.
 
 Example generate:
 

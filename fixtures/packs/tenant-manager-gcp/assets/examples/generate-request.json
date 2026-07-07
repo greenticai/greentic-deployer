@@ -1,0 +1,9 @@
+{
+  "gcp_project_id": "my-greentic-project",
+  "gcp_region": "us-central1",
+  "image_uri": "us-central1-docker.pkg.dev/my-greentic-project/greentic/tenant-manager@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "domain_name": "id.example.com",
+  "db_tier": "db-f1-micro",
+  "master_key_secret_id": "tm-master-key",
+  "platform_secret_hash_secret_id": "tm-platform-hash"
+}

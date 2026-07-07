@@ -43,10 +43,10 @@
 
 use std::path::Path;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use greentic_deploy_spec::{
-    CapabilitySlot, Credentials, CredentialsBootstrap, CredentialsMode, CredentialsValidation,
-    CredentialsValidationResult, EnvId, SchemaVersion, SecretRef,
+    CapabilitySlot, Credentials, CredentialsBootstrap, CredentialsExpiry, CredentialsMode,
+    CredentialsValidation, CredentialsValidationResult, EnvId, SchemaVersion, SecretRef,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -127,10 +127,10 @@ pub struct BootstrapInput<'a> {
 
 /// Successful bootstrap output.
 ///
-/// The handler returns this; the runner persists the rules pack and
-/// stamps the env's [`Credentials`] doc. The handler does NOT touch the
-/// store directly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The handler returns this; the runner persists the rules pack, writes any
+/// bound secret material to the secret backend, and stamps the env's
+/// [`Credentials`] doc. The handler does NOT touch the env store directly.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct BootstrapOutcome {
     /// Rules-pack content the customer's admin can review and apply.
     /// Empty for deployers that need no offline IaC step (e.g.
@@ -145,12 +145,55 @@ pub struct BootstrapOutcome {
     /// <uri>` binds the real value the customer's admin produces by
     /// applying the rules pack offline.
     ///
-    /// AWS C3 stub returns `None` (admin runs Terraform); Phase D AWS
-    /// will return `Some` once the deployer can mint a session token
-    /// directly. Local-process never reaches here (returns
+    /// AWS C3 stub returns `None` (admin runs Terraform); the K8s
+    /// `--bind` path returns `Some` once it has minted a ServiceAccount
+    /// token directly. Local-process never reaches here (returns
     /// `BootstrapError::NotApplicable`).
     pub bound_credentials_ref: Option<SecretRef>,
+    /// When the handler minted a credential with a bounded lifetime (e.g.
+    /// a K8s `TokenRequest` token), the absolute expiry the cluster
+    /// granted. The runner stamps it into [`Credentials::expiry`] so the
+    /// re-bind deadline is visible; `None` for non-expiring or render-only
+    /// bootstraps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_expiry: Option<DateTime<Utc>>,
+    /// Secret material the handler minted that the runner must persist to
+    /// the env's secret backend (the location `resolve_credentials_token`
+    /// reads it back from) BEFORE recording `credentials_ref`.
+    ///
+    /// `#[serde(skip)]` — material is never serialized into the persisted
+    /// [`Credentials`] doc or any audit record; it lives only for the
+    /// in-process handler→runner handoff and is zeroized on drop. `None`
+    /// for render-only bootstraps (the admin supplies the material
+    /// out-of-band and binds it via `op credentials rotate`).
+    #[serde(skip)]
+    pub bound_secret_material: Option<Zeroizing<String>>,
 }
+
+impl std::fmt::Debug for BootstrapOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never render `bound_secret_material` — it carries live token
+        // material (and `Zeroizing<String>`'s own Debug would print it).
+        // Surface only its presence.
+        f.debug_struct("BootstrapOutcome")
+            .field("rules_pack", &self.rules_pack)
+            .field("bound_credentials_ref", &self.bound_credentials_ref)
+            .field("bound_expiry", &self.bound_expiry)
+            .field(
+                "bound_secret_material",
+                &self.bound_secret_material.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// Sink the runner calls to persist bound secret material into the env's
+/// secret backend. Inverted dependency: the runner owns the env flock and
+/// the write-before-persist ordering, while the caller (the CLI) owns the
+/// dev-store specifics. Receives the env root, the ref the material binds
+/// to, and the material; `Ok(())` ⇒ durably stored, `Err(msg)` aborts the
+/// bootstrap before `credentials_ref` is recorded.
+pub type BoundSecretSink<'a> = dyn Fn(&Path, &SecretRef, &str) -> Result<(), String> + 'a;
 
 #[derive(Debug, Error)]
 pub enum BootstrapError {
@@ -185,6 +228,8 @@ pub enum RunBootstrapError {
     Bootstrap(#[from] BootstrapError),
     #[error(transparent)]
     RulesExport(#[from] RulesExportError),
+    #[error("failed to persist bound credential material: {0}")]
+    SecretWrite(String),
 }
 
 /// Drive a `bootstrap` flow against the env's bound deployer env-pack,
@@ -207,6 +252,8 @@ pub fn run_bootstrap(
     registry: &EnvPackRegistry,
     env_id: &EnvId,
     admin: &ZeroizedAdmin,
+    creds_override: Option<&dyn super::DeployerCredentials>,
+    secret_sink: &BoundSecretSink<'_>,
 ) -> Result<Credentials, RunBootstrapError> {
     store.transact(env_id, |locked| {
         let mut env = locked.load()?;
@@ -217,12 +264,20 @@ pub fn run_bootstrap(
             return Err(RunBootstrapError::AlreadyBootstrapped(env_id.clone()));
         }
 
+        // Resolve the handler even when an override is supplied: this is
+        // where the A9 slot/version match is enforced. The override (the
+        // CLI's admin-connected K8s credentials for `--bind`) then replaces
+        // the handler's own bootstrap path — mirrors the `creds_override`
+        // seam in `validate_requirements`.
         let handler = registry.resolve_for_slot(CapabilitySlot::Deployer, &deployer.kind)?;
-        let creds = handler.deployer_credentials().ok_or_else(|| {
-            RunBootstrapError::HandlerNotRegistered {
-                kind: deployer.kind.as_str().to_string(),
-            }
-        })?;
+        let creds: &dyn super::DeployerCredentials = match creds_override {
+            Some(c) => c,
+            None => handler.deployer_credentials().ok_or_else(|| {
+                RunBootstrapError::HandlerNotRegistered {
+                    kind: deployer.kind.as_str().to_string(),
+                }
+            })?,
+        };
 
         let env_root = store.env_dir(env_id)?;
         let input = BootstrapInput {
@@ -276,8 +331,24 @@ pub fn run_bootstrap(
                 rules_pack_ref,
                 generated_credentials_ref: doc_ref,
             }),
-            expiry: None,
+            expiry: outcome.bound_expiry.map(|expires_at| CredentialsExpiry {
+                expires_at,
+                rotate_at: None,
+            }),
         };
+
+        // Persist bound secret material (when the handler minted it) to the
+        // secret backend BEFORE recording credentials_ref: the env must
+        // never point at a credential whose material isn't there. On write
+        // failure, return WITHOUT persisting credentials_ref so bootstrap
+        // stays re-runnable (no AlreadyBootstrapped lockout).
+        if let (Some(bound_ref), Some(material)) = (
+            outcome.bound_credentials_ref.as_ref(),
+            outcome.bound_secret_material.as_ref(),
+        ) {
+            secret_sink(&env_root, bound_ref, material.as_str())
+                .map_err(RunBootstrapError::SecretWrite)?;
+        }
 
         // Only persist credentials_ref when the handler actually bound
         // material. When `None`, the env stays uncredentialed — bootstrap

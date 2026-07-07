@@ -287,15 +287,6 @@ resource "azurerm_container_app" "this" {
   }
 
   dynamic "secret" {
-    for_each = trimspace(var.runtime_secret_prefix) != "" && local.secret_prefix != null ? var.runtime_secret_env : {}
-    content {
-      name                = secret.value
-      key_vault_secret_id = "${local.secret_prefix}/secrets/${secret.value}"
-      identity            = "System"
-    }
-  }
-
-  dynamic "secret" {
     for_each = local.can_manage_key_vault_secrets ? var.secrets_map : {}
     content {
       name                = local.operator_secret_names[secret.key]
@@ -425,38 +416,6 @@ resource "azurerm_container_app" "this" {
       env {
         name  = "GREENTIC_HEALTH_STARTUP_TIMEOUT_SECONDS"
         value = "120"
-      }
-
-      dynamic "env" {
-        for_each = trimspace(var.runtime_secret_prefix) != "" && local.secret_prefix != null ? [trim(var.runtime_secret_prefix, "/")] : []
-        content {
-          name  = "GREENTIC_SECRETS_BACKEND"
-          value = "env"
-        }
-      }
-
-      dynamic "env" {
-        for_each = trimspace(var.runtime_secret_prefix) != "" && local.secret_prefix != null ? ["1"] : []
-        content {
-          name  = "GREENTIC_ALLOW_ENV_SECRETS"
-          value = env.value
-        }
-      }
-
-      dynamic "env" {
-        for_each = trimspace(var.runtime_secret_prefix) != "" && local.secret_prefix != null ? [trim(var.runtime_secret_prefix, "/")] : []
-        content {
-          name  = "GREENTIC_SECRETS_MANAGER_PACK"
-          value = "providers/deployer/azure.gtpack"
-        }
-      }
-
-      dynamic "env" {
-        for_each = trimspace(var.runtime_secret_prefix) != "" && local.secret_prefix != null ? var.runtime_secret_env : {}
-        content {
-          name        = env.key
-          secret_name = env.value
-        }
       }
 
       dynamic "env" {

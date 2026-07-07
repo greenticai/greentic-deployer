@@ -129,6 +129,31 @@ questions:
     constraint:
       pattern: '^arn:aws:elasticloadbalancing:[a-z0-9-]+:[0-9]{12}:listener/.+$'
 
+  - id: alb_routing_host
+    type: string
+    title: ALB routing — host header (optional)
+    description: >-
+      Host header that scopes this deployment to its own listener rule, so
+      several deployments coexist behind one `alb_listener_arn` instead of
+      fighting over the listener's default action (e.g. `app.example.com`).
+      Set this and/or the path pattern to route per deployment; leave both
+      blank to let this deployment own the listener's default action (one
+      deployment per listener — the legacy behaviour).
+    required: false
+    constraint:
+      min_len: 1
+
+  - id: alb_routing_path
+    type: string
+    title: ALB routing — path pattern (optional)
+    description: >-
+      URL path pattern that scopes this deployment to its own listener rule
+      (e.g. `/app/*`). AND-combined with the host header when both are set.
+      Leave both blank to own the listener's default action.
+    required: false
+    constraint:
+      pattern: '^/.*'
+
   - id: container_image_tag_prefix
     type: string
     title: Container image tag prefix
@@ -140,3 +165,122 @@ questions:
     default_value: "rev-"
     constraint:
       pattern: '^[a-zA-Z0-9_.-]*$'
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Fargate launch config + target-group pool (D-AWS-1 PR-3c).
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # The non-secret compute / network / routing scope the real ECS target
+  # needs to stand up a Fargate task definition + task set and shift ALB
+  # traffic. Stable per binding (not per revision). Parsed by
+  # `AwsEcsParams::from_answers`; consumed by the construction wiring that
+  # builds the real target (PR-3c). The launch set is all-or-nothing:
+  # supply `execution_role_arn` + `subnets` + `security_groups` together.
+
+  - id: execution_role_arn
+    type: string
+    title: Task execution role ARN
+    description: >-
+      IAM role the ECS agent assumes to pull the image and write logs
+      (the Fargate task execution role). Required to deploy a worker;
+      the rules pack the bootstrap renders creates a suitable role.
+    required: true
+    constraint:
+      pattern: '^arn:aws:iam::[0-9]{12}:role/.+$'
+
+  - id: task_role_arn
+    type: string
+    title: Task role ARN (optional)
+    description: >-
+      IAM role the worker's containers assume for app-level AWS access.
+      Leave blank when the worker needs no AWS API access of its own.
+    required: false
+    constraint:
+      pattern: '^arn:aws:iam::[0-9]{12}:role/.+$'
+
+  - id: subnets
+    type: string
+    title: Fargate subnets
+    description: >-
+      Comma-separated awsvpc subnet IDs the task ENIs attach to (e.g.
+      `subnet-aaaa,subnet-bbbb`). At least one; private subnets need a
+      NAT, or set "Assign public IP", to reach ECR.
+    required: true
+    constraint:
+      pattern: '^subnet-[a-z0-9]+(\s*,\s*subnet-[a-z0-9]+)*$'
+
+  - id: security_groups
+    type: string
+    title: Task security groups
+    description: >-
+      Comma-separated security-group IDs applied to the task ENIs (e.g.
+      `sg-aaaa,sg-bbbb`). At least one.
+    required: true
+    constraint:
+      pattern: '^sg-[a-z0-9]+(\s*,\s*sg-[a-z0-9]+)*$'
+
+  - id: assign_public_ip
+    type: enum
+    title: Assign public IP
+    description: >-
+      Give Fargate tasks a public IP. Required for tasks in public
+      subnets with no NAT gateway so they can pull the image from ECR.
+    required: false
+    default_value: "false"
+    choices: ["false", "true"]
+
+  - id: cpu
+    type: string
+    title: Task CPU units
+    description: >-
+      Fargate task-level CPU units (`256` = 0.25 vCPU, `512`, `1024`,
+      …). Must form a valid Fargate CPU/memory combination.
+    required: false
+    default_value: "256"
+    constraint:
+      pattern: '^[0-9]+$'
+
+  - id: memory
+    type: string
+    title: Task memory (MiB)
+    description: >-
+      Fargate task-level memory in MiB (`512`, `1024`, …). Must pair
+      with the CPU units per the Fargate combination table.
+    required: false
+    default_value: "512"
+    constraint:
+      pattern: '^[0-9]+$'
+
+  - id: container_name
+    type: string
+    title: Container name
+    description: >-
+      Logical container name in the task definition; also the
+      `containerName` the load balancer routes to.
+    required: false
+    default_value: "worker"
+    constraint:
+      pattern: '^[a-zA-Z0-9_-]{1,255}$'
+
+  - id: container_port
+    type: string
+    title: Container port
+    description: >-
+      Port the worker container listens on and the target group
+      forwards to.
+    required: false
+    default_value: "8080"
+    constraint:
+      pattern: '^[0-9]{1,5}$'
+
+  - id: target_group_arns
+    type: string
+    title: Target-group pool
+    description: >-
+      Comma-separated pool of pre-provisioned ALB target groups (ARNs,
+      or names up to 32 chars) the deployer assigns revisions to for
+      blue/green traffic shifting. Provide at least two for a blue/green
+      rollout; the deployer binds each live revision to a free pool
+      member. Leave blank when no ALB mirror is configured.
+    required: false
+    constraint:
+      min_len: 1

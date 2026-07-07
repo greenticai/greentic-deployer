@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use greentic_deploy_spec::{
     CapabilitySlot, EnvId, Environment, EnvironmentRuntime, MessagingEndpoint, MessagingEndpointId,
-    RuntimeConfig, SchemaVersion, SpecError,
+    RuntimeConfig, SchemaVersion, SpecError, UpdateChannelConfig,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -244,6 +244,56 @@ impl LocalFsStore {
     /// `EnvironmentRuntime` host-config view).
     fn runtime_config_path(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
         Ok(self.env_dir(env_id)?.join("runtime-config.json"))
+    }
+
+    /// `<env_dir>/update-channel.json` — the operator's update-channel policy
+    /// ([`UpdateChannelConfig`], `§Phase 4`). Optional; an absent file resolves
+    /// to disabled.
+    fn update_channel_path(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
+        Ok(self.env_dir(env_id)?.join("update-channel.json"))
+    }
+
+    /// Load the operator's update-channel policy. Absent file → `Ok(None)`
+    /// (callers resolve that to deny-by-default). Validates the env-id binding
+    /// and schema discriminator, mirroring [`load_runtime`](EnvironmentStore::load_runtime).
+    /// Inherent (not a trait method): the update channel is a local-runtime
+    /// concern, so remote store backends need not carry it.
+    pub fn load_update_channel(
+        &self,
+        env_id: &EnvId,
+    ) -> Result<Option<UpdateChannelConfig>, StoreError> {
+        let path = self.update_channel_path(env_id)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let cfg: UpdateChannelConfig = self.read_json(&path)?;
+        if cfg.environment_id != *env_id {
+            return Err(StoreError::EnvIdMismatch {
+                file: env_id.clone(),
+                value: cfg.environment_id,
+            });
+        }
+        if cfg.schema.as_str() != SchemaVersion::UPDATE_CHANNEL_V1 {
+            return Err(StoreError::Spec(SpecError::SchemaMismatch {
+                expected: SchemaVersion::UPDATE_CHANNEL_V1,
+                actual: cfg.schema.as_str().to_string(),
+            }));
+        }
+        Ok(Some(cfg))
+    }
+
+    /// Write the update-channel policy WITHOUT acquiring the env flock — the
+    /// caller must already hold it (via [`LocalFsStore::transact`] / [`Locked`]).
+    /// Backs up any prior file first, then writes atomically. There is
+    /// deliberately no unlocked public `save_update_channel`: the sidecar is
+    /// only ever written inside a locked transaction, so the read-modify-write
+    /// in `op updates config-set` is free of lost updates (mirrors
+    /// `save_runtime_locked`).
+    fn save_update_channel_locked(&self, cfg: &UpdateChannelConfig) -> Result<(), StoreError> {
+        let target = self.update_channel_path(&cfg.environment_id)?;
+        copy_to_backup(&target, &self.backups_dir(&cfg.environment_id)?)?;
+        atomic_write_json(&target, cfg)?;
+        Ok(())
     }
 
     fn pack_answers_path(
@@ -719,6 +769,20 @@ impl<'a> Locked<'a> {
             });
         }
         self.store.save_runtime_locked(runtime)
+    }
+
+    pub fn load_update_channel(&self) -> Result<Option<UpdateChannelConfig>, StoreError> {
+        self.store.load_update_channel(&self.env_id)
+    }
+
+    pub fn save_update_channel(&self, cfg: &UpdateChannelConfig) -> Result<(), StoreError> {
+        if cfg.environment_id != self.env_id {
+            return Err(StoreError::EnvIdMismatch {
+                file: self.env_id.clone(),
+                value: cfg.environment_id.clone(),
+            });
+        }
+        self.store.save_update_channel_locked(cfg)
     }
 
     pub fn load_pack_answers(&self, slot: CapabilitySlot) -> Result<Option<Value>, StoreError> {

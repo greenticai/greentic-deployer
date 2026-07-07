@@ -45,6 +45,11 @@
 //! | `seed_trust_root_if_absent`   | POST   | `/environments/{env_id}/trust-root/seed`                  |
 //! | `add_trusted_key`             | POST   | `/environments/{env_id}/trust-root/keys`                  |
 //! | `remove_trusted_key`          | DELETE | `/environments/{env_id}/trust-root/keys/{key_id}`         |
+//! | `load_environment`            | GET    | `/environments/{env_id}`                                  |
+//!
+//! `load_environment` is the one READ verb (no idempotency key, no audit
+//! envelope) — the remote dispatch uses it to evaluate client-side
+//! preconditions such as the `warm` health-gate's expected lifecycle.
 //!
 //! The backup/restore group (A8 #5, PR-4.4) is server-only — `LocalFsStore`
 //! has no implementation, so these are inherent methods on
@@ -65,10 +70,34 @@
 //!
 //! # ETag / CAS
 //!
-//! Deferred to a follow-up (PR-3b-fu). Today the server is the source of
-//! truth and we use last-write-wins. [`Precondition`] types from
-//! `remote.rs` are ready but adding an optional precondition parameter to
-//! the trait changes the trait — out of scope for this PR.
+//! The store does **ETag-chained optimistic concurrency** entirely at the
+//! transport layer — no change to the [`EnvironmentMutations`] trait or any
+//! CLI call site. Per environment, it remembers the last strong ETag it
+//! observed (from the [`MutationEnvelope`] of every successful mutation, and
+//! from [`load_environment`](EnvironmentMutations::load_environment)'s
+//! response) in [`Self::cached_etag`], and replays it as a quoted `If-Match`
+//! header on the next mutation against that env. The server (A8 §1) then
+//! rejects the write with `412` if any other writer advanced the environment
+//! since that ETag. The cache is keyed by env because one store represents a
+//! remote endpoint, not a single env.
+//!
+//! This catches the two windows a per-invocation CLI actually exposes:
+//! - **read-then-decide-then-write** within one command (e.g. `revisions
+//!   warm` reads the lifecycle, runs health checks, then writes) — the write
+//!   is pinned to the ETag the decision was based on;
+//! - **multi-write commands** (e.g. `op env apply`) — each write is pinned
+//!   to the ETag the previous write returned, so a concurrent writer slipping
+//!   between two of our writes is caught.
+//!
+//! A single-write command on a fresh store has no cached ETag, so it sends
+//! no `If-Match`; the server's own load-pinned generation (a torn-write
+//! guard) still applies. Cross-*invocation* lost-update protection (one
+//! operator overwriting another's separately-issued command) needs an
+//! explicit caller-supplied expectation and is a separate, opt-in follow-up.
+//! A `412`/`428` clears the cache so a stale ETag is never replayed.
+//!
+//! `LocalFsStore` needs none of this — its `flock` serialises writers — so
+//! CAS lives only here, not on the shared trait.
 //!
 //! # Error mapping
 //!
@@ -79,7 +108,7 @@
 //!
 //! # Follow-ups
 //!
-//! - ETag/CAS at the wire layer (PR-3b-fu)
+//! - Explicit cross-invocation CAS (caller-supplied `--expect-generation`)
 //! - `StoreError::Transport` variant
 //! - `AuthMethod::Mtls` for production (mTLS)
 //! - PR-3c wires dispatch between `LocalFsStore` and `HttpEnvironmentStore`
@@ -87,15 +116,21 @@
 use greentic_deploy_spec::{
     AuditDecision, AuditEvent, AuditResult, BackupManifest, BindingGenerationOutcome,
     BundleDeployment, BundleId, CapabilitySlot, DeploymentId, EnvId, EnvPackBinding, Environment,
-    EnvironmentHostConfig, ExtensionBinding, ExtensionBindingPayload, ExtensionKeyedPayload,
-    IdempotencyKey, IdempotencyOutcome, MessagingBundleLinkPayload, MessagingEndpoint,
-    MessagingEndpointId, PackBindingPayload, RemoteStoreError, RestoreOutcome, RestoreRequest,
-    Revision, RevisionId, RollbackTrafficSplitPayload, RotateWebhookSecretPayload, StateEtag,
+    EnvironmentHostConfig, EnvironmentRuntime, ExtensionBinding, ExtensionBindingPayload,
+    ExtensionKeyedPayload, IdempotencyKey, IdempotencyOutcome, MessagingBundleLinkPayload,
+    MessagingEndpoint, MessagingEndpointId, PackBindingPayload, RemoteStoreError, RestoreOutcome,
+    RestoreRequest, Revision, RevisionId, RollbackTrafficSplitPayload, RotateWebhookSecretPayload,
+    StateEtag,
 };
+use greentic_distributor_client::signing::TrustedKey;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use url::Url;
+
+use super::reads::EnvironmentReads;
 
 use super::mutations::{
     AddBundlePayload, AddMessagingEndpointPayload, AddTrustedKeyPayload, ApplyTrafficSplitOutcome,
@@ -177,6 +212,17 @@ pub struct HttpEnvironmentStore {
     /// Pre-rendered `Authorization: Bearer <token>` value, built once at
     /// construction. `None` when [`AuthMethod::None`].
     auth_header_value: Option<String>,
+    /// Last strong ETag observed per environment — from a successful mutation
+    /// envelope or a `load_environment` read — replayed as `If-Match` on the
+    /// next mutation against the *same* environment to chain optimistic-
+    /// concurrency checks across the calls of one CLI invocation (see the
+    /// module-level "ETag / CAS" doc). Keyed by `EnvId` (as a string) because
+    /// one store represents a remote endpoint, not a single env: every trait
+    /// method is env-scoped, so a single store-wide ETag could otherwise pin
+    /// one env's write to another env's validator. `Arc<Mutex<…>>` so the
+    /// store stays `Clone + Send + Sync`; the deployer CLI drives a single
+    /// store on one thread, so the lock is uncontended.
+    cached_etag: Arc<Mutex<HashMap<String, StateEtag>>>,
 }
 
 /// Ensure `base_url`'s path ends with `/` so [`Url::join`] treats relative
@@ -252,7 +298,35 @@ impl HttpEnvironmentStore {
             client,
             base_url: normalize_base_url(base_url),
             auth_header_value,
+            cached_etag: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// The cached strong ETag for `env_id`, rendered as a quoted `If-Match`
+    /// header value (RFC 7232 strong validator), or `None` when nothing has
+    /// been observed yet for that env. See the module-level "ETag / CAS" doc.
+    fn if_match_header(&self, env_id: &EnvId) -> Option<String> {
+        self.cached_etag
+            .lock()
+            .expect("cached_etag mutex poisoned")
+            .get(env_id.as_str())
+            .map(StateEtag::header_value)
+    }
+
+    /// Record (or clear) `env_id`'s ETag to replay on its next mutation.
+    /// Called with the envelope ETag after every successful mutation and with
+    /// the GET ETag after `load_environment`; called with `None` to drop a
+    /// now-uncertain ETag after a mutation error.
+    fn remember_etag(&self, env_id: &EnvId, etag: Option<StateEtag>) {
+        let mut cache = self.cached_etag.lock().expect("cached_etag mutex poisoned");
+        match etag {
+            Some(etag) => {
+                cache.insert(env_id.as_str().to_string(), etag);
+            }
+            None => {
+                cache.remove(env_id.as_str());
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -284,13 +358,18 @@ impl HttpEnvironmentStore {
     /// - Sets `Content-Type` and `Accept` to `application/json`.
     /// - Adds `Authorization: Bearer` if configured.
     /// - Adds `Idempotency-Key` header when provided.
+    /// - Adds `If-Match` header when `if_match` is provided (the caller passes
+    ///   the cached strong ETag for mutations; reads pass `None`).
     /// - On success (2xx), deserializes the body as `R`.
-    /// - On error, maps the HTTP status + body to [`StoreError`].
+    /// - On error, maps the HTTP status + body to [`StoreError`]. The cached
+    ///   ETag is left untouched here — [`Self::send_mutation`] owns clearing it
+    ///   on a mutation error (a read error must not invalidate a valid ETag).
     fn send<P: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         method: reqwest::Method,
         path: &str,
         idempotency_key: Option<&str>,
+        if_match: Option<&str>,
         body: Option<&P>,
     ) -> Result<R, StoreError> {
         let url = self.url(path)?;
@@ -305,6 +384,9 @@ impl HttpEnvironmentStore {
         }
         if let Some(key) = idempotency_key {
             builder = builder.header("Idempotency-Key", key);
+        }
+        if let Some(etag) = if_match {
+            builder = builder.header("If-Match", etag);
         }
         if let Some(payload) = body {
             builder = builder.json(payload);
@@ -341,11 +423,12 @@ impl HttpEnvironmentStore {
 
     /// Send a mutating request whose A8 response is a [`MutationEnvelope`]
     /// wrapping the domain result alongside ETag/generation/idempotency
-    /// metadata. Enforces the A8 §4 audit invariant on the success envelope
-    /// (see [`MutationEnvelope::validated`]) against `expected_env` — the
-    /// env the request targeted — then returns only the domain `result`;
-    /// PR-3b-fu will surface the remaining envelope metadata via a
-    /// return-type extension.
+    /// metadata. Replays the cached strong ETag as `If-Match`, caches the
+    /// post-commit ETag for the next mutation, enforces the A8 §4 audit
+    /// invariant on the success envelope (see [`MutationEnvelope::validated`])
+    /// against `expected_env` — the env the request targeted — then returns
+    /// only the domain `result`. The `generation`/`idempotency` envelope
+    /// fields are not yet surfaced to callers (PR-3b-fu).
     fn send_mutation<P: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         expected_env: &EnvId,
@@ -354,8 +437,46 @@ impl HttpEnvironmentStore {
         idempotency_key: Option<&str>,
         body: Option<&P>,
     ) -> Result<R, StoreError> {
-        let envelope: MutationEnvelope<R> = self.send(method, path, idempotency_key, body)?;
-        envelope.validated(expected_env, idempotency_key)
+        let if_match = self.if_match_header(expected_env);
+        match self.send::<P, MutationEnvelope<R>>(
+            method,
+            path,
+            idempotency_key,
+            if_match.as_deref(),
+            body,
+        ) {
+            Ok(envelope) => match envelope.etag.clone() {
+                // Chain the post-commit ETag onto the next mutation against
+                // this env in this invocation.
+                Some(etag) => {
+                    self.remember_etag(expected_env, Some(etag));
+                    envelope.validated(expected_env, idempotency_key)
+                }
+                // A8 makes `etag` non-optional on a mutation response
+                // (`MutationResponse.etag`); its absence on a 2xx is a contract
+                // violation. Because CAS now chains on it, silently continuing
+                // would disable lost-update protection — so reject loudly,
+                // mirroring the audit-record enforcement in `validated`. Drop
+                // any prior entry first so a later write re-pins from scratch.
+                None => {
+                    self.remember_etag(expected_env, None);
+                    Err(committed_after_save(
+                        "A8 mutation response omitted the required `etag`".to_string(),
+                        idempotency_key,
+                    ))
+                }
+            },
+            Err(err) => {
+                // A mutation error leaves the committed state uncertain — a
+                // rejected `If-Match` (412), but also a *committed-on-error*
+                // path like a failing `warm` health gate, which advances the
+                // server's state (and ETag) while returning an error. Drop this
+                // env's cached ETag so the next write re-pins via the server's
+                // load-pinned guard instead of replaying a now-stale validator.
+                self.remember_etag(expected_env, None);
+                Err(err)
+            }
+        }
     }
 
     /// [`send_mutation`](Self::send_mutation) variant with no request body.
@@ -406,6 +527,7 @@ impl HttpEnvironmentStore {
             &self.env_path(env_id, "/backups"),
             None,
             None,
+            None,
         )?;
         Ok(response.backups)
     }
@@ -452,6 +574,141 @@ impl HttpEnvironmentStore {
             Some(idempotency_key.as_str()),
             Some(request),
         )
+    }
+
+    /// `POST /environments/{env_id}/reconcile` — server-mediated reconcile
+    /// authorization. Asks the control-plane store to AUTHORIZE + AUDIT +
+    /// CAS-pin a reconcile and return the authorized [`Environment`] snapshot;
+    /// the operator still executes the k8s apply against the live cluster (the
+    /// store has no cluster access). The cached strong ETag — captured by a
+    /// prior [`load_environment`](EnvironmentReads::load_environment) read in
+    /// this invocation — is replayed as the MANDATORY `If-Match`, so the
+    /// snapshot returned is provably the revision the operator reviewed; a
+    /// concurrent advance is refused server-side with a 412 (surfaced here as
+    /// [`StoreError::Conflict`]). The reconcile writes no desired state, so the
+    /// returned generation/ETag echo the loaded revision unchanged.
+    ///
+    /// Callers MUST `load_environment` first: without a cached ETag the request
+    /// carries no `If-Match` and the server answers 428.
+    pub fn reconcile_environment(
+        &self,
+        env_id: &EnvId,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<Environment, StoreError> {
+        self.send_mutation_no_body(
+            env_id,
+            reqwest::Method::POST,
+            &self.env_path(env_id, "/reconcile"),
+            Some(idempotency_key.as_str()),
+        )
+    }
+
+    /// `POST /environments/{env_id}/messaging/{eid}/rotate-secret` carrying an
+    /// optional caller-supplied NEW `webhook_secret_ref` (raw `secret://`
+    /// URI). The control-plane store never mints secret material, so:
+    /// - `Some(ref)` — the operator has already provisioned the value in its
+    ///   own secrets plane; the server records the asserted ref and bumps the
+    ///   endpoint generation.
+    /// - `None` — the server cannot prove a rotation and answers 501.
+    ///
+    /// The [`EnvironmentMutations::rotate_messaging_webhook_secret`] trait
+    /// method delegates here with `None` (that generic surface carries no ref;
+    /// the new-ref path is remote-store-specific and reached through the
+    /// `--store-url` dispatch).
+    pub fn rotate_messaging_webhook_secret_to_ref(
+        &self,
+        env_id: &EnvId,
+        endpoint_id: MessagingEndpointId,
+        updated_by: String,
+        webhook_secret_ref: Option<String>,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<MessagingEndpoint, StoreError> {
+        let idem_key = idempotency_key.as_str().to_string();
+        let req = RotateWebhookSecretPayload {
+            updated_by,
+            webhook_secret_ref,
+        };
+        self.send_mutation(
+            env_id,
+            reqwest::Method::POST,
+            &format!(
+                "environments/{}/messaging/{}/rotate-secret",
+                encode_segment(env_id.as_str()),
+                encode_segment(&endpoint_id.to_string()),
+            ),
+            Some(&idem_key),
+            Some(&req),
+        )
+    }
+
+    /// `GET /environments/{env_id}/trust-root` — the env's trusted-key set
+    /// (empty for an absent row, which the server treats as closed-by-default;
+    /// a missing ENV is still a 404 → [`StoreError::NotFound`]). Inherent
+    /// rather than on [`EnvironmentReads`] because trust roots are a separate
+    /// document with their own error type and have no `LocalFsStore`
+    /// equivalent on that trait.
+    pub fn load_trust_root_keys(&self, env_id: &EnvId) -> Result<Vec<TrustedKey>, StoreError> {
+        #[derive(Deserialize)]
+        struct TrustRootResponse {
+            keys: Vec<TrustedKey>,
+        }
+        let response: TrustRootResponse = self.send::<(), _>(
+            reqwest::Method::GET,
+            &self.env_path(env_id, "/trust-root"),
+            None,
+            None,
+            None,
+        )?;
+        Ok(response.keys)
+    }
+}
+
+impl EnvironmentReads for HttpEnvironmentStore {
+    /// `GET /environments` → the sorted env-id set (RBAC read-scope filtering
+    /// is applied server-side).
+    fn list_env_ids(&self) -> Result<Vec<EnvId>, StoreError> {
+        #[derive(Deserialize)]
+        struct EnvsResponse {
+            environments: Vec<EnvId>,
+        }
+        let response: EnvsResponse =
+            self.send::<(), _>(reqwest::Method::GET, "environments", None, None, None)?;
+        Ok(response.environments)
+    }
+
+    /// A `GET` of the env mapped to a boolean: 200 → present, 404 → absent.
+    fn env_exists(&self, env_id: &EnvId) -> Result<bool, StoreError> {
+        match self.load_env(env_id) {
+            Ok(_) => Ok(true),
+            Err(StoreError::NotFound(_)) => Ok(false),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// The environment document. Delegates to the mutation-side read
+    /// [`EnvironmentMutations::load_environment`] (`GET
+    /// /environments/{env_id}`) so the env GET shape lives in one place; the
+    /// read verbs only project the returned document.
+    fn load_env(&self, env_id: &EnvId) -> Result<Environment, StoreError> {
+        EnvironmentMutations::load_environment(self, env_id)
+    }
+
+    /// `GET /environments/{env_id}/runtime` → the runtime host-config sidecar
+    /// (`null` when none has been written) so remote `env show` reports the
+    /// real runtime instead of conflating "absent" with "not exposed".
+    fn read_runtime(&self, env_id: &EnvId) -> Result<Option<EnvironmentRuntime>, StoreError> {
+        #[derive(Deserialize)]
+        struct GetRuntimeResponse {
+            runtime: Option<EnvironmentRuntime>,
+        }
+        let response: GetRuntimeResponse = self.send::<(), _>(
+            reqwest::Method::GET,
+            &self.env_path(env_id, "/runtime"),
+            None,
+            None,
+            None,
+        )?;
+        Ok(response.runtime)
     }
 }
 
@@ -543,20 +800,22 @@ fn committed_after_save(message: String, idempotency_key: Option<&str>) -> Store
 /// `result` alongside CAS/idempotency/audit metadata defined in
 /// [`greentic_deploy_spec::remote::MutationResponse`].
 ///
-/// PR-3b parses the full envelope so that a future return-type extension
-/// (PR-3b-fu) can surface ETag/generation without re-parsing. Today the
-/// trait methods return bare domain types, so callers see only `result` —
-/// except `audit`, which [`validate_success_audit`] enforces on every
-/// success (PR-4.0/F2). It stays `Option` so a missing record is rejected
-/// with a precise contract-violation message instead of a generic serde
+/// PR-3b parses the full envelope. The `etag` drives wire-layer CAS (cached
+/// and replayed as `If-Match`); `generation` awaits a future return-type
+/// extension (PR-3b-fu). The trait methods return bare domain types, so
+/// callers see only `result` — except `audit`, which
+/// [`validate_success_audit`] enforces on every success (PR-4.0/F2). It stays
+/// `Option` so a missing record is rejected with a precise contract-violation
+/// message instead of a generic serde
 /// deserialize error.
 #[derive(Debug, Deserialize)]
 struct MutationEnvelope<T> {
     result: T,
-    // Fields present per A8 but not yet surfaced to callers (PR-3b-fu).
+    // The post-commit strong validator — chained onto the next mutation's
+    // `If-Match` (see the module-level "ETag / CAS" doc).
     #[serde(default)]
-    #[allow(dead_code)]
     etag: Option<StateEtag>,
+    // Present per A8 but not yet surfaced to callers (PR-3b-fu).
     #[serde(default)]
     #[allow(dead_code)]
     generation: Option<u64>,
@@ -783,6 +1042,48 @@ impl EnvironmentMutations for HttpEnvironmentStore {
             Some(&idem_key),
             Some(&patch),
         )
+    }
+
+    fn load_environment(&self, env_id: &EnvId) -> Result<Environment, StoreError> {
+        // `GET /environments/{env_id}` → `GetEnvironmentResponse`. A read
+        // carries no A8 audit envelope, so use the plain `send` — the mutation
+        // helper would reject the (correctly) absent audit record.
+        #[derive(serde::Deserialize)]
+        struct GetEnvResponse {
+            environment: Environment,
+            // The strong validator for the loaded state. Captured so a write
+            // later in the same invocation (e.g. the `warm` health gate that
+            // read this lifecycle) is pinned to what it observed.
+            #[serde(default)]
+            etag: Option<StateEtag>,
+        }
+        let resp: GetEnvResponse = self.send::<(), _>(
+            reqwest::Method::GET,
+            &self.env_path(env_id, ""),
+            None,
+            None,
+            None,
+        )?;
+        self.remember_etag(env_id, resp.etag);
+        Ok(resp.environment)
+    }
+
+    fn trust_root_is_seeded(&self, env_id: &EnvId) -> Result<bool, StoreError> {
+        // `GET /environments/{env_id}/trust-root` → `{ keys: [...] }`. A read
+        // carries no A8 audit envelope, so use the plain `send` (the mutation
+        // helper would reject the correctly-absent audit record).
+        #[derive(serde::Deserialize)]
+        struct TrustRootView {
+            keys: Vec<serde_json::Value>,
+        }
+        let resp: TrustRootView = self.send::<(), _>(
+            reqwest::Method::GET,
+            &self.env_path(env_id, "/trust-root"),
+            None,
+            None,
+            None,
+        )?;
+        Ok(!resp.keys.is_empty())
     }
 
     fn migrate_merge_bindings(
@@ -1252,18 +1553,16 @@ impl EnvironmentMutations for HttpEnvironmentStore {
         updated_by: String,
         idempotency_key: IdempotencyKey,
     ) -> Result<MessagingEndpoint, StoreError> {
-        let idem_key = idempotency_key.as_str().to_string();
-        let req = RotateWebhookSecretPayload { updated_by };
-        self.send_mutation(
+        // The generic mutation surface carries no caller ref; the new-ref
+        // rotation is remote-store-specific and goes through the inherent
+        // `rotate_messaging_webhook_secret_to_ref` from the `--store-url`
+        // dispatch. A no-ref rotation is refused by the server (501).
+        self.rotate_messaging_webhook_secret_to_ref(
             env_id,
-            reqwest::Method::POST,
-            &format!(
-                "environments/{}/messaging/{}/rotate-secret",
-                encode_segment(env_id.as_str()),
-                encode_segment(&endpoint_id.to_string()),
-            ),
-            Some(&idem_key),
-            Some(&req),
+            endpoint_id,
+            updated_by,
+            None,
+            idempotency_key,
         )
     }
 
@@ -1338,7 +1637,7 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// Minimal mock server: binds an ephemeral port, accepts one request,
     /// validates it with `check`, and responds with the given status + body.
@@ -1704,6 +2003,7 @@ mod tests {
                 tenant_org_id: None,
                 listen_addr: None,
                 public_base_url: None,
+                gui_enabled: None,
             },
         );
         assert!(result.is_ok());
@@ -1726,6 +2026,7 @@ mod tests {
                 tenant_org_id: None,
                 listen_addr: None,
                 public_base_url: None,
+                gui_enabled: None,
             },
         );
         assert!(matches!(result, Err(StoreError::Conflict(_))));
@@ -1831,6 +2132,7 @@ mod tests {
                 revision_id: RevisionId::new(),
                 deployment_id: DeploymentId::new(),
                 bundle_digest: "sha256:00".to_string(),
+                bundle_source_uri: None,
                 pack_list: Vec::new(),
                 pack_list_lock_ref: PathBuf::new(),
                 pack_config_refs: Vec::new(),
@@ -1857,6 +2159,7 @@ mod tests {
                 revision_id: RevisionId::new(),
                 deployment_id: DeploymentId::new(),
                 bundle_digest: "sha256:00".to_string(),
+                bundle_source_uri: None,
                 pack_list: Vec::new(),
                 pack_list_lock_ref: PathBuf::new(),
                 pack_config_refs: Vec::new(),
@@ -1942,6 +2245,44 @@ mod tests {
         let (_mock, store) = happy_store(200, &body);
         let result = store.archive_revision(&env_id(), RevisionId::new(), idem());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn load_environment_happy_path() {
+        // `GET /environments/{id}` → `GetEnvironmentResponse`: a plain read,
+        // NOT a mutation envelope (no audit record on the wire).
+        let body = serde_json::json!({
+            "environment": {
+                "schema": "greentic.environment.v1",
+                "environment_id": "local",
+                "name": "test",
+                "host_config": {"env_id": "local"},
+                "packs": [],
+                "bundles": [],
+                "revisions": [],
+                "traffic_splits": [],
+                "messaging_endpoints": [],
+                "extensions": [],
+                "revocation": {},
+                "retention": {},
+                "health": {}
+            },
+            "etag": "sha256:test",
+            "generation": 3
+        })
+        .to_string();
+        let (_mock, store) = happy_store(200, &body);
+        let env = store.load_environment(&env_id()).expect("load ok");
+        assert_eq!(env.environment_id.as_str(), "local");
+        assert_eq!(env.name, "test");
+    }
+
+    #[test]
+    fn load_environment_404_returns_not_found() {
+        let err_body = serde_json::json!({"kind": "not-found", "detail": "no such env"});
+        let (_mock, store) = happy_store(404, &err_body.to_string());
+        let result = store.load_environment(&env_id());
+        assert!(matches!(result, Err(StoreError::NotFound(_))));
     }
 
     // -----------------------------------------------------------------------
@@ -2256,6 +2597,9 @@ mod tests {
                 provider_type: "telegram".to_string(),
                 display_name: "Telegram Bot".to_string(),
                 secret_refs: Vec::new(),
+                webhook_secret_ref: Some(
+                    "secret://local/default/_/messaging-byo/webhook_secret".to_string(),
+                ),
                 updated_by: "tester".to_string(),
             },
             idem(),
@@ -2326,6 +2670,23 @@ mod tests {
             &env_id(),
             MessagingEndpointId::new(),
             "tester".to_string(),
+            idem(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rotate_messaging_webhook_secret_to_ref_carries_new_ref() {
+        // The new-ref variant: the inherent method threads a caller-supplied
+        // ref into the request body. The server records it (proven server-side
+        // in http_api); here we assert the client round-trips a 200 response.
+        let body = sample_messaging_endpoint();
+        let (_mock, store) = happy_store(200, &body);
+        let result = store.rotate_messaging_webhook_secret_to_ref(
+            &env_id(),
+            MessagingEndpointId::new(),
+            "tester".to_string(),
+            Some("secret://local/acme/_/messaging-tg/webhook_secret".to_string()),
             idem(),
         );
         assert!(result.is_ok());
@@ -2443,6 +2804,7 @@ mod tests {
                 revision_id: RevisionId::new(),
                 deployment_id: DeploymentId::new(),
                 bundle_digest: "sha256:00".to_string(),
+                bundle_source_uri: None,
                 pack_list: Vec::new(),
                 pack_list_lock_ref: PathBuf::new(),
                 pack_config_refs: Vec::new(),
@@ -2451,6 +2813,194 @@ mod tests {
                 drain_seconds: 30,
             },
             idem(),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ETag-chained CAS (wire-layer If-Match)
+    // -----------------------------------------------------------------------
+
+    /// A [`CheckFn`] that records each request's (lower-cased) header block in
+    /// arrival order, so a test can assert per-request `If-Match` behaviour
+    /// after the calls complete.
+    fn header_recorder() -> (Arc<Mutex<Vec<String>>>, CheckFn) {
+        let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = recorded.clone();
+        let check: CheckFn = Arc::new(move |_req: &str, headers: &str, _body: &[u8]| {
+            sink.lock().unwrap().push(headers.to_lowercase());
+        });
+        (recorded, check)
+    }
+
+    /// A mutation envelope (`update_environment` shape) carrying a chosen ETag.
+    fn env_envelope_with_etag(etag: &str) -> String {
+        wrap_mutation_tweaked(sample_env_domain(), |env| {
+            env["etag"] = serde_json::json!(etag);
+        })
+    }
+
+    /// The `load_environment` GET body (plain read, not a mutation envelope).
+    fn get_env_body_with_etag(etag: &str) -> String {
+        serde_json::json!({
+            "environment": sample_env_domain(),
+            "etag": etag,
+            "generation": 1
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn first_mutation_sends_no_if_match_then_chains_next() {
+        // Fresh store has no cached ETag → first write omits If-Match; its
+        // response ETag is then replayed as If-Match on the second write.
+        let (recorded, check) = header_recorder();
+        let mock = start_mock(
+            vec![
+                (200, &env_envelope_with_etag("sha256:rev1")),
+                (200, &env_envelope_with_etag("sha256:rev2")),
+            ],
+            Some(check),
+        );
+        let store = mock_store(mock.addr, AuthMethod::None);
+        store
+            .update_environment(&env_id(), UpdateEnvironmentPayload::default())
+            .expect("first write ok");
+        store
+            .update_environment(&env_id(), UpdateEnvironmentPayload::default())
+            .expect("second write ok");
+
+        let headers = recorded.lock().unwrap();
+        assert_eq!(headers.len(), 2, "expected two requests");
+        assert!(
+            !headers[0].contains("if-match:"),
+            "first write must not send If-Match: {}",
+            headers[0]
+        );
+        assert!(
+            headers[1].contains("if-match: \"sha256:rev1\""),
+            "second write must replay the first response's ETag: {}",
+            headers[1]
+        );
+    }
+
+    #[test]
+    fn read_then_write_pins_the_read_etag() {
+        // `load_environment` captures the GET ETag; the following mutation
+        // (the read-then-decide-then-write shape, e.g. `warm`) pins it.
+        let (recorded, check) = header_recorder();
+        let mock = start_mock(
+            vec![
+                (200, &get_env_body_with_etag("sha256:loaded")),
+                (200, &env_envelope_with_etag("sha256:rev2")),
+            ],
+            Some(check),
+        );
+        let store = mock_store(mock.addr, AuthMethod::None);
+        store.load_environment(&env_id()).expect("load ok");
+        store
+            .update_environment(&env_id(), UpdateEnvironmentPayload::default())
+            .expect("write ok");
+
+        let headers = recorded.lock().unwrap();
+        assert!(
+            !headers[0].contains("if-match:"),
+            "the GET read must not send If-Match: {}",
+            headers[0]
+        );
+        assert!(
+            headers[1].contains("if-match: \"sha256:loaded\""),
+            "the write must pin the loaded ETag: {}",
+            headers[1]
+        );
+    }
+
+    #[test]
+    fn precondition_failed_surfaces_conflict_and_clears_cache() {
+        // write1 caches an ETag; write2 sends it and gets 412 → Conflict +
+        // cache cleared; write3 therefore sends no If-Match.
+        let (recorded, check) = header_recorder();
+        let mock = start_mock(
+            vec![
+                (200, &env_envelope_with_etag("sha256:rev1")),
+                (412, r#"{"detail":"stale"}"#),
+                (200, &env_envelope_with_etag("sha256:rev3")),
+            ],
+            Some(check),
+        );
+        let store = mock_store(mock.addr, AuthMethod::None);
+        store
+            .update_environment(&env_id(), UpdateEnvironmentPayload::default())
+            .expect("write1 ok");
+        let conflict = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
+        assert!(
+            matches!(conflict, Err(StoreError::Conflict(_))),
+            "412 must surface as Conflict, got {conflict:?}"
+        );
+        store
+            .update_environment(&env_id(), UpdateEnvironmentPayload::default())
+            .expect("write3 ok");
+
+        let headers = recorded.lock().unwrap();
+        assert_eq!(headers.len(), 3, "expected three requests");
+        assert!(
+            !headers[0].contains("if-match:"),
+            "write1 must not send If-Match: {}",
+            headers[0]
+        );
+        assert!(
+            headers[1].contains("if-match: \"sha256:rev1\""),
+            "write2 must replay write1's ETag: {}",
+            headers[1]
+        );
+        assert!(
+            !headers[2].contains("if-match:"),
+            "write3 must not replay a 412-invalidated ETag: {}",
+            headers[2]
+        );
+    }
+
+    #[test]
+    fn etag_cache_is_scoped_per_environment() {
+        // One store represents an endpoint, not an env: a read of env A must
+        // not pin a write to env B. Load `staging`, then mutate `local` — the
+        // mutation must send no If-Match (the cache holds only `staging`).
+        let staging = EnvId::try_from("staging").unwrap();
+        let (recorded, check) = header_recorder();
+        let mock = start_mock(
+            vec![
+                (200, &get_env_body_with_etag("sha256:staging")),
+                (200, &env_envelope_with_etag("sha256:local")),
+            ],
+            Some(check),
+        );
+        let store = mock_store(mock.addr, AuthMethod::None);
+        store.load_environment(&staging).expect("load staging ok");
+        store
+            .update_environment(&env_id(), UpdateEnvironmentPayload::default())
+            .expect("write local ok");
+
+        let headers = recorded.lock().unwrap();
+        assert!(
+            !headers[1].contains("if-match:"),
+            "a write to `local` must not replay `staging`'s ETag: {}",
+            headers[1]
+        );
+    }
+
+    #[test]
+    fn mutation_response_without_etag_is_rejected() {
+        // A8 makes `etag` non-optional on a mutation response; CAS depends on
+        // it, so a 2xx envelope that omits it is a contract violation, not a
+        // silent fall-back to blind writes.
+        let body = wrap_mutation_tweaked(sample_env_domain(), |env| {
+            env.as_object_mut().unwrap().remove("etag");
+        });
+        let (_mock, store) = happy_store(200, &body);
+        let result = store.update_environment(&env_id(), UpdateEnvironmentPayload::default());
+        let msg = unwrap_committed_conflict(result);
+        assert!(
+            msg.contains("etag"),
+            "expected a missing-etag contract violation, got: {msg}"
         );
     }
 
@@ -2669,6 +3219,7 @@ mod tests {
                 tenant_org_id: None,
                 listen_addr: None,
                 public_base_url: None,
+                gui_enabled: None,
             },
         );
         assert!(result.is_ok());
@@ -2736,6 +3287,7 @@ mod tests {
                 tenant_org_id: None,
                 listen_addr: None,
                 public_base_url: None,
+                gui_enabled: None,
             },
         );
     }

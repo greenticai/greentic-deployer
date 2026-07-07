@@ -19,7 +19,7 @@ use greentic_deploy_spec::{EnvId, ExtensionBinding, PackDescriptor, PackId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::environment::{EnvironmentStore, ExtensionKey, LocalFsStore};
+use crate::environment::{EnvironmentReads, ExtensionKey, LocalFsStore};
 
 use super::{
     AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record, map_store_err_preserving_noun,
@@ -237,7 +237,11 @@ pub fn rollback(
     })
 }
 
-pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOutcome, OpError> {
+pub fn list(
+    store: &dyn EnvironmentReads,
+    flags: &OpFlags,
+    env_id: &str,
+) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(
             NOUN,
@@ -246,10 +250,10 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
         ));
     }
     let env_id = parse_env_id(env_id)?;
-    if !store.exists(&env_id)? {
+    if !store.env_exists(&env_id)? {
         return Err(OpError::NotFound(format!("environment `{env_id}`")));
     }
-    let env = store.load(&env_id)?;
+    let env = store.load_env(&env_id)?;
     let bindings: Vec<ExtensionSummary> = env
         .extensions
         .iter()
@@ -352,6 +356,7 @@ fn remove_schema() -> Value {
 mod tests {
     use super::*;
     use crate::cli::tests_common::make_env;
+    use crate::environment::EnvironmentStore;
     use crate::environment::LocalFsStore;
     use tempfile::tempdir;
 

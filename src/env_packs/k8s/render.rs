@@ -13,32 +13,12 @@
 //! rendered manifests. When no answers are recorded, sandbox defaults
 //! apply (`K8sParams::for_env`).
 
-use greentic_deploy_spec::{Environment, RevisionLifecycle};
+use greentic_deploy_spec::Environment;
 use serde_json::Value;
 
 use super::K8sDeployerHandler;
-use super::manifests::{self, K8sParams};
+use super::manifests::{self, K8sParams, has_cluster_presence};
 use crate::env_packs::render::{ManifestRenderer, RenderError};
-
-/// Whether a revision's persisted lifecycle puts its worker objects in the
-/// cluster's desired state.
-///
-/// `warm_revision` applies the worker pair (`Staged → Warming → Ready`)
-/// and the objects stay up through `Draining` — drain is routing-side,
-/// teardown happens at `archive_revision` (the B7 two-state model). So:
-///
-/// - `Warming` / `Ready` / `Draining` → present.
-/// - `Inactive` → absent. A post-drain revision's objects may still exist
-///   transiently until the operator archives it, but it is pending
-///   teardown, not desired.
-/// - `Staged` / `Failed` / `Archived` → absent (never applied, or torn
-///   down).
-fn has_cluster_presence(lifecycle: RevisionLifecycle) -> bool {
-    matches!(
-        lifecycle,
-        RevisionLifecycle::Warming | RevisionLifecycle::Ready | RevisionLifecycle::Draining
-    )
-}
 
 impl ManifestRenderer for K8sDeployerHandler {
     fn render_environment(
@@ -46,7 +26,16 @@ impl ManifestRenderer for K8sDeployerHandler {
         env: &Environment,
         answers: Option<&serde_json::Value>,
     ) -> Result<Vec<Value>, RenderError> {
-        let params = K8sParams::from_answers(env, answers).map_err(RenderError::InvalidAnswers)?;
+        let mut params =
+            K8sParams::from_answers(env, answers).map_err(RenderError::InvalidAnswers)?;
+        // The reconcile call site owns the filesystem read; inject the dev-store
+        // bytes it captured so the env-level Secret carries the operator's
+        // secrets. `None` on the preview path → an empty Secret.
+        params.dev_secrets_data = self.dev_secrets_data.clone();
+        // The CLI resolves the env's `Secrets`-slot binding into a backend and
+        // injects it; render/reconcile both set it, so the rendered worker
+        // identity (dev-store Secret vs. Vault SA) matches the env's binding.
+        params.secrets_backend = self.secrets_backend.clone();
         let mut objects = manifests::render_environment_manifests(env, &params);
         for revision in &env.revisions {
             if has_cluster_presence(revision.lifecycle) {
@@ -111,26 +100,6 @@ mod tests {
                 "revision `{}` ({:?}) presence mismatch",
                 revision.revision_id,
                 revision.lifecycle
-            );
-        }
-    }
-
-    #[test]
-    fn presence_policy_matches_the_b7_two_state_model() {
-        use RevisionLifecycle::*;
-        for (lifecycle, present) in [
-            (Inactive, false),
-            (Staged, false),
-            (Warming, true),
-            (Ready, true),
-            (Draining, true),
-            (Failed, false),
-            (Archived, false),
-        ] {
-            assert_eq!(
-                has_cluster_presence(lifecycle),
-                present,
-                "{lifecycle:?} presence policy drifted"
             );
         }
     }

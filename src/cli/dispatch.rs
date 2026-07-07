@@ -134,6 +134,13 @@ pub enum OpNoun {
         #[command(subcommand)]
         verb: ExtensionsVerb,
     },
+    /// Per-environment update-channel enrollment (`P1b`). `enroll` mints a
+    /// client certificate at the Cert-CA and persists it to the env secrets
+    /// backend; `status` reports the stored certificate's serial + validity.
+    Updates {
+        #[command(subcommand)]
+        verb: UpdatesVerb,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -201,6 +208,12 @@ pub struct MessagingEndpointAddArgs {
     /// Repeating.
     #[arg(long = "secret-ref", value_name = "URI")]
     pub secret_ref: Vec<String>,
+    /// Per-endpoint webhook secret ref (telegram-class only). Required when
+    /// adding a telegram-class endpoint against a remote `--store-url` store
+    /// (which never mints secrets — the operator provisions the value and
+    /// passes the ref); omit on the local store to auto-mint into the dev-store.
+    #[arg(long = "webhook-secret-ref", value_name = "URI")]
+    pub webhook_secret_ref: Option<String>,
     /// Idempotency key. Required for safe retries; mutations replay no-op when
     /// the same key + identity is supplied.
     #[arg(long = "idempotency-key")]
@@ -321,6 +334,31 @@ pub enum EnvVerb {
     /// step 10). With `--output` writes one YAML file per object in apply
     /// order; otherwise embeds the manifests in the JSON outcome.
     Render(EnvRenderArgs),
+    /// Apply the env's declarative desired state to its live cluster and
+    /// prune the workers of revisions no longer present (the apply-side
+    /// counterpart of `render`). K8s deployer env-pack only today; connects
+    /// through the binding's `kubeconfig_context` answer.
+    Reconcile(EnvReconcileArgs),
+    /// Bring a SINGLE revision's worker resources into agreement with its
+    /// recorded lifecycle (present → apply the worker pair, absent → tear it
+    /// down) — the surgical counterpart of `reconcile`. K8s deployer env-pack
+    /// only today; connects through the binding's `kubeconfig_context` answer.
+    ApplyRevision(EnvApplyRevisionArgs),
+    /// Push one deployment's recorded traffic split to its live ALB listener
+    /// (the routing-side counterpart of `apply-revision`). AWS-ECS deployer
+    /// env-pack only — K8s serves splits from its in-process runtime router, so
+    /// `op traffic set` alone suffices there. The split itself is recorded by
+    /// `op traffic set`; this verb makes it observable in the live runtime.
+    ///
+    /// Routing depends on the binding's ALB routing answers. With a routing
+    /// condition set (`alb_routing_host` / `alb_routing_path`), this writes a
+    /// per-deployment listener RULE keyed by that host/path, leaving the default
+    /// action and sibling deployments' rules intact — deployments coexist behind
+    /// one listener. With NO routing condition, it falls back to REPLACING the
+    /// listener's default action, which assumes the `alb_listener_arn` is
+    /// DEDICATED to this one deployment (a split then clobbers any sibling
+    /// routing / auth / redirect on that listener).
+    ApplyTraffic(EnvApplyTrafficArgs),
     Destroy {
         env_id: String,
         #[arg(long)]
@@ -443,7 +481,7 @@ pub struct EnvApplyArgs {
 }
 
 impl EnvApplyArgs {
-    fn into_options(self) -> super::env_apply::ApplyOptions {
+    pub(crate) fn into_options(self) -> super::env_apply::ApplyOptions {
         use super::env_apply::ApplyMode;
         // clap's `conflicts_with` guarantees at most one of `--dry-run` /
         // `--check` is set.
@@ -538,6 +576,54 @@ pub struct EnvRenderArgs {
     pub output: Option<PathBuf>,
 }
 
+/// Args for `op env reconcile`. Applies desired state to the live cluster —
+/// the apply-side counterpart of `render` (use `render` for a no-side-effect
+/// preview).
+#[derive(Args, Debug)]
+pub struct EnvReconcileArgs {
+    /// Environment id (e.g. `zain-prod`).
+    pub env_id: String,
+    /// Deployer env-pack kind to reconcile with — a full `<path>@<version>`
+    /// descriptor, or a bare path matching the env's deployer binding.
+    /// Defaults to the env's Deployer-slot binding.
+    #[arg(long)]
+    pub kind: Option<String>,
+}
+
+/// Args for `op env apply-revision <env_id> <revision_id> [--kind <descriptor>]`.
+/// Surgical single-revision counterpart of `reconcile`: brings ONE revision's
+/// worker resources into agreement with its recorded lifecycle (present →
+/// apply, absent → tear down). Assumes the env-level set (namespace, router)
+/// already exists — `reconcile` establishes that.
+#[derive(Args, Debug)]
+pub struct EnvApplyRevisionArgs {
+    /// Environment id (e.g. `zain-prod`).
+    pub env_id: String,
+    /// Revision id (ULID) to apply — must already exist in the env.
+    pub revision_id: String,
+    /// Deployer env-pack kind to apply with — a full `<path>@<version>`
+    /// descriptor, or a bare path matching the env's deployer binding.
+    /// Defaults to the env's Deployer-slot binding.
+    #[arg(long)]
+    pub kind: Option<String>,
+}
+
+/// Args for `op env apply-traffic <env_id> <deployment_id> [--kind <descriptor>]`.
+/// Pushes the deployment's recorded traffic split to its live ALB listener
+/// (AWS-ECS only). Record the split first with `op traffic set`.
+#[derive(Args, Debug)]
+pub struct EnvApplyTrafficArgs {
+    /// Environment id (e.g. `zain-prod`).
+    pub env_id: String,
+    /// Deployment id (ULID) whose recorded split to apply.
+    pub deployment_id: String,
+    /// Deployer env-pack kind to apply with — a full `<path>@<version>`
+    /// descriptor, or a bare path matching the env's deployer binding.
+    /// Defaults to the env's Deployer-slot binding.
+    #[arg(long)]
+    pub kind: Option<String>,
+}
+
 /// Args for `op env set-public-url <env_id> <URL>`. Both fields are
 /// required positional — this verb only sets the public URL, no other
 /// host_config fields. `--answers` is rejected: this is a dedicated
@@ -574,6 +660,95 @@ pub enum ExtensionsVerb {
     Remove,
     Rollback,
     List { env_id: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum UpdatesVerb {
+    /// Enroll the env's update channel: mint a key + CSR, exchange it at the
+    /// Cert-CA for a signed client certificate, and persist cert/key/CA into the
+    /// env secrets backend. Re-running re-enrolls (manual rotation).
+    Enroll(UpdatesEnrollArgs),
+    /// Report the enrolled update-channel certificate's serial + validity window.
+    Status { env_id: Option<String> },
+    /// Fetch a signed update plan (over the enrolled mTLS channel or from a
+    /// local file), verify it against the env trust root, and stage it.
+    Get(UpdatesGetArgs),
+    /// Apply a staged update plan to its environment: re-verify, snapshot,
+    /// converge via the env-apply pipeline, and roll back on failure.
+    Apply(UpdatesApplyArgs),
+    /// Force-fail a plan stranded in `applying` by a crashed applier
+    /// (`applying → failed`, audited), so a fresh `get` + `apply` can proceed.
+    /// Requires `--force`; does not roll back partial changes.
+    Recover(UpdatesRecoverArgs),
+    /// Set the update-channel notification policy (`update-channel.json`):
+    /// whether the runtime acts on a discovered update, and the fallback poll
+    /// interval. Only the flags supplied are changed. Disabled by default.
+    ConfigSet(UpdatesConfigSetArgs),
+    /// Show the update-channel notification policy (stored fields + resolved
+    /// effective values). Read-only.
+    ConfigShow { env_id: Option<String> },
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesEnrollArgs {
+    pub env_id: Option<String>,
+    #[arg(long = "ca-url")]
+    pub ca_url: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesApplyArgs {
+    pub env_id: Option<String>,
+    /// Plan id of the staged plan to apply (from a prior `op updates get`).
+    #[arg(long = "plan-id")]
+    pub plan_id: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesRecoverArgs {
+    pub env_id: Option<String>,
+    /// Plan id of the `applying` plan to force-fail (from a prior `op updates get`).
+    #[arg(long = "plan-id")]
+    pub plan_id: Option<String>,
+    /// Assert the applier is dead and force-fail `applying → failed`. Required —
+    /// recover refuses without it (a live apply is indistinguishable on disk).
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesConfigSetArgs {
+    pub env_id: Option<String>,
+    /// Master switch for the update-channel notification machinery. Omit to
+    /// leave unchanged (absent = disabled, deny-by-default).
+    #[arg(long)]
+    pub enabled: Option<bool>,
+    /// Action on a verified notification: `record-only` or `stage`. Omit to
+    /// leave unchanged (unset resolves to `stage`).
+    #[arg(long = "on-notify")]
+    pub on_notify: Option<String>,
+    /// Fallback poll interval in seconds (>= 60). Omit to leave unchanged.
+    #[arg(long = "poll-interval-secs")]
+    pub poll_interval_secs: Option<u64>,
+    /// Base URL to poll for the latest signed update plan (`{url}` + `{url}.sig`).
+    /// Must be https (or http to loopback). Omit to leave unchanged.
+    #[arg(long = "plan-endpoint")]
+    pub plan_endpoint: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesGetArgs {
+    pub env_id: Option<String>,
+    /// Fetch the signed plan (document + `.sig` sidecar) from this base URL over
+    /// the enrolled mTLS channel.
+    #[arg(long = "plan-url", conflicts_with_all = ["plan_file", "plan_sig_file"])]
+    pub plan_url: Option<String>,
+    /// Local plan document (airgap import / testing). Requires `--plan-sig-file`.
+    #[arg(long = "plan-file", requires = "plan_sig_file")]
+    pub plan_file: Option<PathBuf>,
+    /// DSSE envelope sidecar for `--plan-file`.
+    #[arg(long = "plan-sig-file", requires = "plan_file")]
+    pub plan_sig_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -848,6 +1023,7 @@ pub fn dispatch_op_with_registry(
         OpNoun::TrustRoot { verb } => dispatch_trust_root(&store, &flags, verb),
         OpNoun::Messaging { verb } => dispatch_messaging(&store, &flags, verb),
         OpNoun::Extensions { verb } => dispatch_extensions(&store, &flags, verb),
+        OpNoun::Updates { verb } => dispatch_updates(&store, &flags, verb),
     };
     result.inspect_err(|err| print_error(noun, verb, err))
 }
@@ -870,6 +1046,9 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 EnvVerb::Doctor { .. } => "doctor",
                 EnvVerb::ToolCheck { .. } => "tool-check",
                 EnvVerb::Render(_) => "render",
+                EnvVerb::Reconcile(_) => "reconcile",
+                EnvVerb::ApplyRevision(_) => "apply-revision",
+                EnvVerb::ApplyTraffic(_) => "apply-traffic",
                 EnvVerb::Destroy { .. } => "destroy",
                 EnvVerb::MigrateDev { .. } => "migrate-dev",
                 EnvVerb::MigrateState { .. } => "migrate-state",
@@ -971,6 +1150,18 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 ExtensionsVerb::List { .. } => "list",
             },
         ),
+        OpNoun::Updates { verb } => (
+            "updates",
+            match verb {
+                UpdatesVerb::Enroll(_) => "enroll",
+                UpdatesVerb::Status { .. } => "status",
+                UpdatesVerb::Get(_) => "get",
+                UpdatesVerb::Apply(_) => "apply",
+                UpdatesVerb::Recover(_) => "recover",
+                UpdatesVerb::ConfigSet(_) => "config-set",
+                UpdatesVerb::ConfigShow { .. } => "config-show",
+            },
+        ),
     }
 }
 
@@ -1004,6 +1195,9 @@ fn dispatch_env(
         EnvVerb::Doctor { env_id } => super::env::doctor(store, flags, &env_id)?,
         EnvVerb::ToolCheck { env_id } => super::env::tool_check(store, flags, &env_id)?,
         EnvVerb::Render(args) => super::env::render(store, registry, flags, args)?,
+        EnvVerb::Reconcile(args) => super::env::reconcile(store, registry, flags, args)?,
+        EnvVerb::ApplyRevision(args) => super::env::apply_revision(store, registry, flags, args)?,
+        EnvVerb::ApplyTraffic(args) => super::env::apply_traffic(store, registry, flags, args)?,
         EnvVerb::Destroy { env_id, confirm } => {
             super::env::destroy(store, flags, &env_id, confirm)?
         }
@@ -1209,6 +1403,89 @@ fn dispatch_trust_root(
                 _ => None,
             };
             super::trust_root::remove(store, flags, payload)?
+        }
+    };
+    print_outcome(&outcome)
+}
+
+fn dispatch_updates(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    verb: UpdatesVerb,
+) -> Result<(), OpError> {
+    let outcome = match verb {
+        UpdatesVerb::Enroll(args) => {
+            let payload = match (args.env_id, args.ca_url) {
+                (Some(environment_id), Some(ca_url)) => {
+                    Some(super::updates::UpdatesEnrollPayload {
+                        environment_id,
+                        ca_url,
+                    })
+                }
+                _ => None, // fall through to --answers / --schema
+            };
+            super::updates::enroll(store, flags, payload)?
+        }
+        UpdatesVerb::Status { env_id } => {
+            let payload = env_id
+                .map(|environment_id| super::updates::UpdatesStatusPayload { environment_id });
+            super::updates::status(store, flags, payload)?
+        }
+        UpdatesVerb::Get(args) => {
+            let payload = args
+                .env_id
+                .map(|environment_id| super::updates::UpdatesGetPayload {
+                    environment_id,
+                    plan_url: args.plan_url,
+                    plan_file: args.plan_file,
+                    plan_sig_file: args.plan_sig_file,
+                });
+            super::updates::get(store, flags, payload)?
+        }
+        UpdatesVerb::Apply(args) => {
+            let payload = match (args.env_id, args.plan_id) {
+                (Some(environment_id), Some(plan_id)) => {
+                    Some(super::updates::ApplyUpdatesPayload {
+                        environment_id,
+                        plan_id,
+                    })
+                }
+                _ => None, // fall through to --answers / --schema
+            };
+            super::updates::apply_updates(store, flags, payload)?
+        }
+        UpdatesVerb::Recover(args) => {
+            // `--force` is operator attestation, not a payload field: thread it
+            // separately so it applies whether the ids come from the CLI or from
+            // `--answers` (it is never silently dropped on the answers path).
+            let force = args.force;
+            let payload = match (args.env_id, args.plan_id) {
+                (Some(environment_id), Some(plan_id)) => {
+                    Some(super::updates::RecoverUpdatesPayload {
+                        environment_id,
+                        plan_id,
+                    })
+                }
+                _ => None, // fall through to --answers / --schema
+            };
+            super::updates::recover_updates(store, flags, payload, force)?
+        }
+        UpdatesVerb::ConfigSet(args) => {
+            let payload =
+                args.env_id
+                    .map(|environment_id| super::updates::UpdateConfigSetPayload {
+                        environment_id,
+                        enabled: args.enabled,
+                        on_notify: args.on_notify,
+                        poll_interval_secs: args.poll_interval_secs,
+                        plan_endpoint: args.plan_endpoint,
+                    });
+            super::updates::config_set(store, flags, payload)?
+        }
+        UpdatesVerb::ConfigShow { env_id } => {
+            let payload = env_id
+                .map(|environment_id| super::updates::UpdateConfigShowFilter { environment_id });
+            super::updates::config_show(store, flags, payload)?
         }
     };
     print_outcome(&outcome)

@@ -17,6 +17,7 @@ pub mod credentials;
 pub mod engine;
 pub mod environment;
 pub mod environment_runtime;
+pub mod environment_update_channel;
 pub mod error;
 pub mod ids;
 pub mod integrity;
@@ -60,9 +61,12 @@ pub use engine::{
 };
 pub use environment::{
     DEFAULT_LISTEN_ADDR, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding,
-    validate_public_base_url,
+    GUI_DEFAULT_ENV_ID, validate_public_base_url,
 };
 pub use environment_runtime::{EnvironmentRuntime, RuntimeDiscoveryValue};
+pub use environment_update_channel::{
+    DEFAULT_POLL_INTERVAL_SECS, MIN_POLL_INTERVAL_SECS, OnNotifyAction, UpdateChannelConfig,
+};
 pub use error::SpecError;
 pub use ids::{
     BundleId, CustomerId, DeploymentId, MessagingEndpointId, PackId, PartyId, RevisionId,
@@ -76,8 +80,9 @@ pub use refs::{
     SecretRefParseError,
 };
 pub use remote::{
-    BackupManifest, ConcurrencyConflict, IdempotencyKey, IdempotencyOutcome, IdempotencyRecord,
-    IdempotencyReplay, MutationResponse, Precondition, PreconditionError, RbacRequest,
+    BackupArtifact, BackupManifest, ConcurrencyConflict, IdempotencyKey, IdempotencyOutcome,
+    IdempotencyRecord, IdempotencyReplay, ImportOutcome, ImportRequest, MutationResponse,
+    Precondition, PreconditionError, RbacRequest, ReconcileCompletion, ReconcileCompletionRequest,
     RemoteContractError, RemoteStoreError, RestoreOutcome, RestoreRequest, StateEtag,
 };
 pub use retention::{HealthState, HealthStatus, RetentionPolicy, RevocationConfig};

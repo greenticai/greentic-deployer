@@ -16,9 +16,10 @@ use std::sync::Arc;
 use chrono::Utc;
 use greentic_deploy_spec::{
     BundleDeployment, BundleDeploymentStatus, BundleId, CapabilitySlot, CustomerId, DeploymentId,
-    EnvId, EnvPackBinding, EnvironmentHostConfig, ExtensionBinding, ExtensionKey, IdempotencyKey,
-    PackDescriptor, PackId, PackListEntry, PartyId, Precondition, RevenueShareEntry, RevisionId,
-    RevisionLifecycle, RouteBinding, SchemaVersion, SemVer, TenantSelector, TrafficSplitEntry,
+    EnvId, EnvPackBinding, EnvironmentHostConfig, EnvironmentRuntime, ExtensionBinding,
+    ExtensionKey, IdempotencyKey, PackDescriptor, PackId, PackListEntry, PartyId, Precondition,
+    RevenueShareEntry, RevisionId, RevisionLifecycle, RouteBinding, SchemaVersion, SemVer,
+    TenantSelector, TrafficSplitEntry,
 };
 use greentic_deployer::environment::{
     AddBundlePayload, AddMessagingEndpointPayload, FieldUpdate, MigrateMergePayload,
@@ -26,8 +27,8 @@ use greentic_deployer::environment::{
     UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 use greentic_deployer::environment::{
-    AuthMethod, EnvironmentMutations, HealthCheckId, HealthGateFailure, HttpEnvironmentStore,
-    LifecycleError, StoreError,
+    AuthMethod, EnvironmentMutations, EnvironmentReads, HealthCheckId, HealthGateFailure,
+    HttpEnvironmentStore, LifecycleError, StoreError,
 };
 use greentic_operator_store_server::http::router_with_operator_key;
 use greentic_operator_store_server::sqlite::SqliteEnvironmentStore;
@@ -48,6 +49,7 @@ fn stage_payload(deployment_id: DeploymentId) -> StageRevisionPayload {
         revision_id: RevisionId::new(),
         deployment_id,
         bundle_digest: "sha256:00".to_string(),
+        bundle_source_uri: None,
         pack_list: vec![PackListEntry {
             pack_id: greentic_deploy_spec::PackId::new("greentic.test.pack"),
             version: SemVer::new(1, 0, 0),
@@ -103,6 +105,18 @@ async fn seed_deployment(backend: &SqliteEnvironmentStore, id: &EnvId) -> Deploy
     deployment_id
 }
 
+fn runtime_for(id: &EnvId) -> EnvironmentRuntime {
+    EnvironmentRuntime {
+        schema: SchemaVersion::from(SchemaVersion::ENVIRONMENT_RUNTIME_V1),
+        environment_id: id.clone(),
+        discovered: Default::default(),
+        generated_at: Utc::now(),
+        generated_by: PackDescriptor::try_new("greentic.deployer.local-process@1.0.0")
+            .expect("valid pack descriptor"),
+        generation: 1,
+    }
+}
+
 fn host_config(raw: &str) -> EnvironmentHostConfig {
     EnvironmentHostConfig {
         env_id: env_id(raw),
@@ -110,6 +124,7 @@ fn host_config(raw: &str) -> EnvironmentHostConfig {
         tenant_org_id: None,
         listen_addr: None,
         public_base_url: None,
+        gui_enabled: None,
     }
 }
 
@@ -172,6 +187,7 @@ async fn remote_env_lifecycle_end_to_end() {
                     tenant_org_id: FieldUpdate::Set("org-1".to_string()),
                     listen_addr: FieldUpdate::Keep,
                     public_base_url: FieldUpdate::Keep,
+                    gui_enabled: FieldUpdate::Keep,
                 },
             )
             .expect("update environment");
@@ -625,6 +641,7 @@ async fn remote_env_lifecycle_end_to_end() {
                     provider_type: "teams".to_string(),
                     display_name: "Legal".to_string(),
                     secret_refs: Vec::new(),
+                    webhook_secret_ref: None,
                     updated_by: "e2e".to_string(),
                 },
                 idem("k-msg-add"),
@@ -633,8 +650,9 @@ async fn remote_env_lifecycle_end_to_end() {
         assert_eq!(ep.provider_id, "legal-bot");
         assert_eq!(ep.updated_by, "e2e#idem=add:k-msg-add");
 
-        // Telegram-class add → the server's 501 maps onto the same
-        // `NotYetImplemented` noun PR-4.0 reserved for it.
+        // Telegram-class add with NO caller-supplied webhook_secret_ref → the
+        // control-plane store cannot mint, so the sink refuses and the 501
+        // maps onto the `NotYetImplemented` noun PR-4.0 reserved for it.
         let err = store
             .add_messaging_endpoint(
                 &id,
@@ -643,14 +661,38 @@ async fn remote_env_lifecycle_end_to_end() {
                     provider_type: "telegram".to_string(),
                     display_name: "Telegram".to_string(),
                     secret_refs: Vec::new(),
+                    webhook_secret_ref: None,
                     updated_by: "e2e".to_string(),
                 },
                 idem("k-msg-add-tg"),
             )
-            .expect_err("telegram-class add needs the Phase D secrets sink");
+            .expect_err("telegram-class add without a ref cannot be server-minted");
         assert!(
             matches!(err, StoreError::NotYetImplemented(_)),
             "unexpected error: {err:?}"
+        );
+
+        // Telegram-class add WITH a caller-supplied ref → the server stamps it
+        // (the operator owns value provisioning) and the endpoint persists.
+        let tg = store
+            .add_messaging_endpoint(
+                &id,
+                AddMessagingEndpointPayload {
+                    provider_id: "tg-bot".to_string(),
+                    provider_type: "telegram".to_string(),
+                    display_name: "Telegram".to_string(),
+                    secret_refs: Vec::new(),
+                    webhook_secret_ref: Some(
+                        "secret://local/default/_/messaging-byo/webhook_secret".to_string(),
+                    ),
+                    updated_by: "e2e".to_string(),
+                },
+                idem("k-msg-add-tg-ref"),
+            )
+            .expect("telegram-class add with a caller-supplied ref persists");
+        assert_eq!(
+            tg.webhook_secret_ref.as_ref().map(|r| r.as_str()),
+            Some("secret://local/default/_/messaging-byo/webhook_secret"),
         );
 
         // Link → welcome-flow → unlink-blocked-by-welcome → remove.
@@ -795,6 +837,7 @@ async fn backup_restore_end_to_end() {
                     tenant_org_id: FieldUpdate::Keep,
                     listen_addr: FieldUpdate::Keep,
                     public_base_url: FieldUpdate::Keep,
+                    gui_enabled: FieldUpdate::Keep,
                 },
             )
             .expect("update environment");
@@ -955,4 +998,186 @@ async fn rbac_bearer_token_end_to_end() {
     })
     .await
     .expect("client task");
+}
+
+/// The read surface (`EnvironmentReads` + the inherent trust-root read) over
+/// the wire: `env list`/`show`, the per-env document projections, and
+/// `trust-root list` all read through the server's `GET` endpoints. This is
+/// the client half of the read-verb dispatch wired in `dispatch_remote`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_reads_end_to_end() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SqliteEnvironmentStore::open(&dir.path().join("store.sqlite"))
+        .await
+        .expect("open sqlite store");
+    let backend = Arc::new(store);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let serve_backend = Arc::clone(&backend);
+    let operator_key_path = dir.path().join("operator-key.pem");
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router_with_operator_key(serve_backend, operator_key_path),
+        )
+        .await
+        .expect("serve");
+    });
+
+    let base = Url::parse(&format!("http://{addr}/")).expect("base url");
+    let id = env_id("local");
+
+    // Create an env to read back (the client owns env creation).
+    {
+        let base = base.clone();
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = HttpEnvironmentStore::new(base, AuthMethod::None).expect("client");
+            store
+                .create_environment(&id, "local".to_string(), host_config("local"))
+                .expect("create environment");
+        })
+        .await
+        .expect("create task");
+    }
+
+    // Seed a runtime sidecar through the backend — the deployer client has no
+    // runtime-write verb (greentic-start writes it at boot), so this stands in
+    // for "a runtime has been applied" and proves the read is not a fake null.
+    backend
+        .upsert_runtime(&runtime_for(&id), None)
+        .await
+        .expect("seed runtime");
+
+    tokio::task::spawn_blocking(move || {
+        let store = HttpEnvironmentStore::new(base, AuthMethod::None).expect("client");
+
+        // `env list` → GET /environments.
+        let ids = store.list_env_ids().expect("list env ids");
+        assert_eq!(ids, vec![id.clone()]);
+
+        // `env_exists` maps the GET to a boolean: present vs absent.
+        assert!(store.env_exists(&id).expect("exists present"));
+        assert!(
+            !store
+                .env_exists(&env_id("ghost"))
+                .expect("exists absent is Ok(false), not an error")
+        );
+
+        // `env show` (and every per-env list/show verb) reads the document.
+        let env = store.load_env(&id).expect("load env");
+        assert_eq!(env.environment_id, id);
+
+        // The runtime sidecar IS exposed over HTTP now: a seeded runtime reads
+        // back (not a misleading `null`), and a missing env is a 404.
+        let runtime = store
+            .read_runtime(&id)
+            .expect("read runtime")
+            .expect("seeded runtime must read back over HTTP");
+        assert_eq!(runtime.environment_id, id);
+        let err = store
+            .read_runtime(&env_id("ghost"))
+            .expect_err("runtime read for a missing env must be NotFound");
+        assert!(matches!(err, StoreError::NotFound(_)), "got {err:?}");
+
+        // `trust-root list` → GET /trust-root: a fresh env is closed-by-default
+        // (empty key set), and a missing env is a 404.
+        let keys = store
+            .load_trust_root_keys(&id)
+            .expect("load trust-root keys");
+        assert!(keys.is_empty(), "fresh env has no trusted keys");
+        let err = store
+            .load_trust_root_keys(&env_id("ghost"))
+            .expect_err("trust-root for a missing env must be NotFound");
+        assert!(matches!(err, StoreError::NotFound(_)), "got {err:?}");
+    })
+    .await
+    .expect("client task");
+}
+
+/// PR-B: the client's `reconcile_environment` against the REAL store-server
+/// route — the wire-compat + CAS gate for server-mediated remote reconcile
+/// (codex pr-harden Finding 1: prove the POST targets a handler present in the
+/// same tree, the A8 envelope — audit record included, which `send_mutation`'s
+/// `validated` enforces — round-trips into `Environment`, and the mandatory
+/// `If-Match` refuses a stale snapshot). The live cluster apply is out of scope
+/// here; this gate is the client<->server authorization contract only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_reconcile_authorization_end_to_end() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SqliteEnvironmentStore::open(&dir.path().join("store.sqlite"))
+        .await
+        .expect("open sqlite store");
+    let backend = Arc::new(store);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let serve_backend = Arc::clone(&backend);
+    let operator_key_path = dir.path().join("operator-key.pem");
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router_with_operator_key(serve_backend, operator_key_path),
+        )
+        .await
+        .expect("serve");
+    });
+
+    let id = env_id("local");
+    let client_id = id.clone();
+    tokio::task::spawn_blocking(move || {
+        let base = Url::parse(&format!("http://{addr}/")).expect("base url");
+        let store_a = HttpEnvironmentStore::new(base.clone(), AuthMethod::None).expect("client a");
+        store_a
+            .create_environment(&client_id, "local".to_string(), host_config("local"))
+            .expect("create environment");
+
+        // Load pins the reviewed ETag; the reconcile then authorizes against it
+        // (replayed as the mandatory If-Match) and returns the authorized
+        // snapshot — proving the route exists and the A8 envelope round-trips.
+        let _loaded = store_a.load_environment(&client_id).expect("load");
+        let authorized = store_a
+            .reconcile_environment(&client_id, &idem("k-reconcile-1"))
+            .expect("reconcile authorized");
+        assert_eq!(authorized.environment_id, client_id);
+
+        // Mandatory-If-Match CAS: a second client advances the ETag behind
+        // store_a's back, so store_a's replayed (now-stale) ETag is refused 412.
+        let store_b = HttpEnvironmentStore::new(base, AuthMethod::None).expect("client b");
+        store_b.load_environment(&client_id).expect("load b");
+        store_b
+            .update_environment(
+                &client_id,
+                UpdateEnvironmentPayload {
+                    name: Some("advanced-by-another-operator".to_string()),
+                    region: FieldUpdate::Keep,
+                    tenant_org_id: FieldUpdate::Keep,
+                    listen_addr: FieldUpdate::Keep,
+                    public_base_url: FieldUpdate::Keep,
+                    gui_enabled: FieldUpdate::Keep,
+                },
+            )
+            .expect("advance the env out-of-band");
+        let err = store_a
+            .reconcile_environment(&client_id, &idem("k-reconcile-stale"))
+            .expect_err("stale reconcile must be refused");
+        assert!(
+            matches!(err, StoreError::Conflict(ref m) if m.contains("precondition")),
+            "stale If-Match must surface as a precondition Conflict: {err:?}"
+        );
+    })
+    .await
+    .expect("reconcile client task");
+
+    // The reconcile writes no desired state: the only generation bump is
+    // store_b's rename (create gen 1 -> update gen 2), NOT either reconcile.
+    let final_env = backend.load_env(&id).await.expect("load env");
+    assert_eq!(
+        final_env.revision.generation, 2,
+        "reconcile must not bump generation"
+    );
+    assert_eq!(final_env.value.name, "advanced-by-another-operator");
 }

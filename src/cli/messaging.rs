@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use std::str::FromStr;
 
 use crate::environment::{
-    AddMessagingEndpointPayload, EnvironmentStore, LocalFsStore, SetMessagingWelcomeFlowPayload,
+    AddMessagingEndpointPayload, EnvironmentReads, LocalFsStore, SetMessagingWelcomeFlowPayload,
 };
 
 use super::dispatch::{
@@ -48,6 +48,12 @@ pub struct EndpointAddPayload {
     pub display_name: String,
     #[serde(default)]
     pub secret_refs: Vec<String>,
+    /// Optional caller-supplied per-endpoint webhook secret ref. Only valid
+    /// for telegram-class providers. Required when adding such an endpoint
+    /// against a remote `--store-url` store (which never mints secrets); on
+    /// the local store it is optional (absent → the dev-store sink auto-mints).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret_ref: Option<String>,
     /// Caller-supplied A8 §2 idempotency key. Optional on the CLI
     /// surface; when absent, the verb mints one per invocation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,6 +96,15 @@ pub struct EndpointRotateWebhookSecretPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     pub updated_by: String,
+    /// Optional NEW webhook secret ref (raw `secret://` URI) for the
+    /// new-ref rotation variant on a remote `--store-url` store: the operator
+    /// provisions the value in its own secrets plane and passes its ref here,
+    /// so the control-plane store records it without ever minting or custodying
+    /// secret material. Supplied via `--answers` only (the inline-flag form
+    /// carries no ref). Honored ONLY by the remote dispatch — the local store
+    /// mints its own value and REJECTS a supplied ref.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +168,7 @@ impl MessagingEndpointAddArgs {
             || self.provider_id.is_some()
             || self.display_name.is_some()
             || !self.secret_ref.is_empty()
+            || self.webhook_secret_ref.is_some()
             || self.idempotency_key.is_some()
             || self.updated_by.is_some()
     }
@@ -199,6 +215,7 @@ impl MessagingEndpointAddArgs {
             provider_type: self.provider_type.unwrap(),
             display_name: self.display_name.unwrap(),
             secret_refs: self.secret_ref,
+            webhook_secret_ref: self.webhook_secret_ref,
             idempotency_key: self.idempotency_key,
             updated_by: self.updated_by.unwrap(),
         }))
@@ -404,6 +421,9 @@ impl MessagingEndpointRemoveArgs {
                 endpoint_id: eid,
                 idempotency_key: ikey,
                 updated_by: by,
+                // The inline-flag form carries no new ref; the new-ref variant
+                // is supplied via `--answers` (a remote-only enhancement).
+                webhook_secret_ref: None,
             }))
     }
 }
@@ -495,6 +515,7 @@ pub fn add(
                     provider_type,
                     display_name,
                     secret_refs: payload.secret_refs,
+                    webhook_secret_ref: payload.webhook_secret_ref,
                     updated_by,
                 },
                 idempotency_key,
@@ -518,7 +539,11 @@ pub fn add(
     })
 }
 
-pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOutcome, OpError> {
+pub fn list(
+    store: &dyn EnvironmentReads,
+    flags: &OpFlags,
+    env_id: &str,
+) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(
             NOUN,
@@ -527,10 +552,10 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
         ));
     }
     let env_id = parse_env_id(env_id)?;
-    if !store.exists(&env_id)? {
+    if !store.env_exists(&env_id)? {
         return Err(OpError::NotFound(format!("environment `{env_id}`")));
     }
-    let env = store.load(&env_id)?;
+    let env = store.load_env(&env_id)?;
     let endpoints: Vec<EndpointSummary> = env
         .messaging_endpoints
         .iter()
@@ -544,7 +569,7 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
 }
 
 pub fn show(
-    store: &LocalFsStore,
+    store: &dyn EnvironmentReads,
     flags: &OpFlags,
     env_id: &str,
     endpoint_id: &str,
@@ -558,10 +583,10 @@ pub fn show(
     }
     let env_id = parse_env_id(env_id)?;
     let endpoint_id = parse_endpoint_id(endpoint_id)?;
-    if !store.exists(&env_id)? {
+    if !store.env_exists(&env_id)? {
         return Err(OpError::NotFound(format!("environment `{env_id}`")));
     }
-    let env = store.load(&env_id)?;
+    let env = store.load_env(&env_id)?;
     let endpoint = env
         .messaging_endpoints
         .iter()
@@ -789,6 +814,16 @@ pub fn rotate_webhook_secret(
         ));
     }
     let payload = resolve_payload(flags, payload)?;
+    // The new-ref variant is a remote-store-only enhancement: the local store
+    // custodies the value and mints its own ref, so a caller-supplied ref has
+    // no honest meaning here. Reject it rather than silently ignore it.
+    if payload.webhook_secret_ref.is_some() {
+        return Err(OpError::InvalidArgument(
+            "webhook_secret_ref is only honored by a remote `--store-url` store; the local \
+             store mints its own webhook secret value and ref"
+                .to_string(),
+        ));
+    }
     let env_id = parse_env_id(&payload.environment_id)?;
     let endpoint_id = parse_endpoint_id(&payload.endpoint_id)?;
     let updated_by = require_nonempty("updated_by", &payload.updated_by)?;
@@ -902,31 +937,47 @@ fn generate_webhook_secret() -> Result<String, OpError> {
 /// Construct the deterministic `SecretRef` URI for an endpoint's webhook
 /// secret. The dev-store backend requires the 5-segment shape
 /// `secrets://<env>/<tenant>/<team>/<pack>/<name>`, so the SecretRef mirrors
-/// that: `secret://<env>/default/_/messaging-<eid>/webhook_secret`.
+/// that: `secret://<env>/<tenant>/_/messaging-<eid>/webhook_secret`.
 ///
-/// Using `default/_` as tenant/team is the standard convention for
-/// system-generated secrets (see `cli/secrets.rs put` and the runtime's
-/// `canonical_team` which maps `default` → `_`). The endpoint id is folded
-/// to lowercase in the pack segment because `MessagingEndpointId` is a ULID
-/// (uppercase) and the runtime canonicalizes pack segments.
+/// `tenant` is the env's owning tenant (`tenant_org_id`), or `default` for an
+/// ownerless local env. It MUST match the tenant the runtime secrets backend
+/// is scoped to: a Vault-backed worker pod scopes its `SecretsCore` to the env
+/// owner, so a hardcoded `default` segment on an owned env would be refused
+/// in-process and the webhook would never resolve. `_` is the tenant-level
+/// team placeholder (the runtime's `canonical_team` maps `default` → `_`). The
+/// endpoint id is folded to lowercase in the pack segment because
+/// `MessagingEndpointId` is a ULID (uppercase) and the runtime canonicalizes
+/// pack segments.
 fn build_webhook_secret_ref(
     env_id: &EnvId,
     endpoint_id: &MessagingEndpointId,
+    tenant: &str,
 ) -> Result<SecretRef, OpError> {
     let eid_lower = endpoint_id.to_string().to_lowercase();
     let uri = format!(
-        "secret://{}/default/_/messaging-{}/webhook_secret",
+        "secret://{}/{}/_/messaging-{}/webhook_secret",
         env_id.as_str(),
+        tenant,
         eid_lower
     );
     SecretRef::try_new(uri)
         .map_err(|e| OpError::InvalidArgument(format!("webhook secret ref: {e}")))
 }
 
-/// Provision a webhook secret for an endpoint: generate the value, choose
-/// the ref URI (existing if rotating an endpoint that already has one;
-/// freshly built otherwise), write the value to the dev-store, return the
-/// ref the caller stamps onto `MessagingEndpoint.webhook_secret_ref`.
+/// Provision a webhook secret for an endpoint: choose the ref URI (existing if
+/// rotating an endpoint that already has one; freshly built under the resolved
+/// tenant otherwise) and, when the env's secrets backend custodies values in the
+/// local dev-store (`custodial`), mint a fresh value and write it there. For a
+/// non-custodial backend (e.g. Vault) the value is seeded out-of-band by the
+/// operator — the control plane only stamps the ref and never writes a value the
+/// runtime would not read. Returns the ref the caller stamps onto
+/// `MessagingEndpoint.webhook_secret_ref`.
+///
+/// `owner` is the env's owning tenant. The dev-store is not tenant-scoped, so a
+/// custodial env with no owner keeps the conventional `default` segment. A
+/// non-custodial backend scopes reads to the env owner, so a `default`/blank
+/// segment would be unresolvable at runtime — require a real owner and fail
+/// closed rather than stamp a dead ref.
 ///
 /// Shared by `add` (always `existing_ref = None` — fresh endpoint) and
 /// `rotate_webhook_secret` (`existing_ref = Some(_)` for endpoints that
@@ -937,14 +988,33 @@ pub(crate) fn provision_webhook_secret(
     store: &LocalFsStore,
     env_id: &EnvId,
     endpoint_id: &MessagingEndpointId,
+    owner: Option<&str>,
+    custodial: bool,
     existing_ref: Option<&SecretRef>,
 ) -> Result<SecretRef, OpError> {
-    let value = generate_webhook_secret()?;
+    // The tenant segment is the env owner when present. When it is absent, the
+    // dev-store (not tenant-scoped) falls back to the conventional `default`,
+    // while a non-custodial backend (tenant-scoped) fails closed rather than
+    // stamp an unresolvable ref.
+    let tenant = match owner {
+        Some(owner) => owner,
+        None if custodial => "default",
+        None => {
+            return Err(OpError::Conflict(format!(
+                "a webhook secret on a non-dev-store secrets backend requires the environment to \
+                 declare an owning tenant (`tenant_org_id`); env `{}` has none",
+                env_id.as_str()
+            )));
+        }
+    };
     let secret_ref = match existing_ref {
         Some(r) => r.clone(),
-        None => build_webhook_secret_ref(env_id, endpoint_id)?,
+        None => build_webhook_secret_ref(env_id, endpoint_id, tenant)?,
     };
-    write_webhook_secret_to_devstore(store, env_id, &secret_ref, &value)?;
+    if custodial {
+        let value = generate_webhook_secret()?;
+        write_webhook_secret_to_devstore(store, env_id, &secret_ref, &value)?;
+    }
     Ok(secret_ref)
 }
 
@@ -987,6 +1057,7 @@ fn add_schema() -> Value {
             "provider_type",
             "display_name",
             "secret_refs (array of secret:// URIs)",
+            "webhook_secret_ref (optional; telegram-class only; required on a remote --store-url store)",
             "idempotency_key",
             "updated_by",
         ],
@@ -1049,6 +1120,7 @@ fn rotate_webhook_secret_schema() -> Value {
 mod tests {
     use super::*;
     use crate::cli::tests_common::{make_bundle_deployment, make_env};
+    use crate::environment::EnvironmentStore;
     use crate::environment::messaging::MessagingEndpointIndexEntry;
     use tempfile::tempdir;
 
@@ -1075,6 +1147,7 @@ mod tests {
             provider_type: provider_type.to_string(),
             display_name: format!("{provider_type} {provider_id}"),
             secret_refs: vec![],
+            webhook_secret_ref: None,
             idempotency_key: Some(key.to_string()),
             updated_by: "tester".to_string(),
         }
@@ -1679,6 +1752,7 @@ mod tests {
             provider_type: "teams".to_string(),
             display_name: "x".to_string(),
             secret_refs: vec![],
+            webhook_secret_ref: None,
             idempotency_key: Some("k1".to_string()),
             updated_by: "tester".to_string(),
         };
@@ -1748,6 +1822,29 @@ mod tests {
             value.len() >= 32,
             "dev-store secret must be ≥32 chars, got {}",
             value.len()
+        );
+    }
+
+    #[test]
+    fn add_telegram_with_supplied_ref_stamps_it_and_skips_auto_mint() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let supplied = "secret://local/default/_/messaging-byo/webhook_secret";
+        let outcome = add(
+            &store,
+            &OpFlags::default(),
+            Some(EndpointAddPayload {
+                webhook_secret_ref: Some(supplied.to_string()),
+                ..add_payload("telegram", "legal-bot", "k1")
+            }),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&outcome);
+        let ep = load_raw_endpoint(&store, &id);
+        // The supplied ref is stamped verbatim — NOT the eid-derived URI the
+        // auto-mint path would build.
+        assert_eq!(
+            ep.webhook_secret_ref.as_ref().map(|r| r.as_str()),
+            Some(supplied)
         );
     }
 
@@ -1836,12 +1933,103 @@ mod tests {
             .expect("endpoint with webhook_secret_ref must pass deploy-spec validate");
     }
 
+    /// Like [`read_devstore_value`] but does not panic when the key is absent —
+    /// used to assert that non-custodial provisioning writes NOTHING.
+    fn devstore_has_value(store: &LocalFsStore, secret_ref: &SecretRef) -> bool {
+        use greentic_secrets_lib::{DevStore, SecretsStore};
+        let env_id = EnvId::try_from("local").unwrap();
+        let env_dir = store.env_dir(&env_id).unwrap();
+        let dev_path = crate::cli::secrets::resolve_dev_store_path(
+            &env_dir,
+            std::env::var_os(crate::cli::secrets::DEV_SECRETS_PATH_ENV).map(PathBuf::from),
+        );
+        let store_uri =
+            crate::cli::secrets::secret_ref_to_store_uri(secret_ref).expect("store-aligned ref");
+        // The dev-store file only exists once something has written to it; a
+        // non-custodial provision writes nothing, so an absent store == no value.
+        let Ok(dev) = DevStore::with_path(dev_path) else {
+            return false;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { dev.get(&store_uri).await.is_ok() })
+    }
+
+    #[test]
+    fn build_webhook_secret_ref_uses_provided_tenant() {
+        // The tenant segment is the env owner, not a hardcoded `default`, so the
+        // ref resolves under a Vault-backed worker's tenant-scoped SecretsCore.
+        let env_id = EnvId::try_from("vault-demo").unwrap();
+        let eid = MessagingEndpointId::new();
+        let eid_lower = eid.to_string().to_lowercase();
+        let r = build_webhook_secret_ref(&env_id, &eid, "tenant-default").unwrap();
+        assert_eq!(
+            r.as_str(),
+            format!("secret://vault-demo/tenant-default/_/messaging-{eid_lower}/webhook_secret")
+        );
+    }
+
+    #[test]
+    fn provision_webhook_secret_honors_tenant_and_custodial_gate() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let env_id = EnvId::try_from("local").unwrap();
+        let eid = MessagingEndpointId::new();
+        let eid_lower = eid.to_string().to_lowercase();
+
+        // Non-custodial (e.g. Vault): builds the tenant-scoped ref but writes
+        // NOTHING to the dev-store — the operator seeds the value out-of-band.
+        let ref_vault =
+            provision_webhook_secret(&store, &env_id, &eid, Some("tenant-default"), false, None)
+                .unwrap();
+        assert_eq!(
+            ref_vault.as_str(),
+            format!("secret://local/tenant-default/_/messaging-{eid_lower}/webhook_secret")
+        );
+        assert!(
+            !devstore_has_value(&store, &ref_vault),
+            "non-custodial provisioning must not write a dev-store value"
+        );
+
+        // Custodial (dev-store): the value is minted and written at the ref.
+        // No owner → the conventional `default` tenant segment.
+        let ref_dev = provision_webhook_secret(&store, &env_id, &eid, None, true, None).unwrap();
+        assert_eq!(
+            ref_dev.as_str(),
+            format!("secret://local/default/_/messaging-{eid_lower}/webhook_secret")
+        );
+        assert!(
+            devstore_has_value(&store, &ref_dev),
+            "custodial provisioning must write the dev-store value"
+        );
+        assert!(
+            read_devstore_value(&store, &ref_dev).len() >= 32,
+            "custodial webhook secret must be ≥32 chars"
+        );
+    }
+
+    #[test]
+    fn provision_webhook_secret_fails_closed_on_non_custodial_without_owner() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let env_id = EnvId::try_from("local").unwrap();
+        let eid = MessagingEndpointId::new();
+        // A non-custodial backend (e.g. Vault) scopes reads to the env owner, so a
+        // missing owner would mint an unresolvable `default` ref — fail closed.
+        let err = provision_webhook_secret(&store, &env_id, &eid, None, false, None).unwrap_err();
+        let OpError::Conflict(msg) = err else {
+            panic!("expected OpError::Conflict");
+        };
+        assert!(msg.contains("owning tenant"), "got: {msg}");
+    }
+
     fn rotate_payload(endpoint_id: &str, key: &str) -> EndpointRotateWebhookSecretPayload {
         EndpointRotateWebhookSecretPayload {
             environment_id: "local".to_string(),
             endpoint_id: endpoint_id.to_string(),
             idempotency_key: Some(key.to_string()),
             updated_by: "tester".to_string(),
+            webhook_secret_ref: None,
         }
     }
 
@@ -1884,6 +2072,29 @@ mod tests {
             after.generation,
             before_gen + 1,
             "rotate must bump generation"
+        );
+    }
+
+    #[test]
+    fn local_rotate_rejects_supplied_webhook_ref() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let added = add(
+            &store,
+            &OpFlags::default(),
+            Some(add_payload("telegram", "legal-bot", "k1")),
+        )
+        .unwrap();
+        let id = endpoint_id_from(&added);
+        // The new-ref variant is remote-store-only: the local store mints its
+        // own value+ref, so a caller-supplied ref fails closed rather than
+        // being silently ignored.
+        let mut payload = rotate_payload(&id.to_string(), "k-rotate");
+        payload.webhook_secret_ref =
+            Some("secret://local/default/_/messaging-x/webhook_secret".to_string());
+        let err = rotate_webhook_secret(&store, &OpFlags::default(), Some(payload)).unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
         );
     }
 
@@ -1937,6 +2148,7 @@ mod tests {
             provider_id: Some("legal-bot".into()),
             display_name: Some("Legal Bot".into()),
             secret_ref: vec![],
+            webhook_secret_ref: None,
             idempotency_key: Some("k1".into()),
             updated_by: Some("alice".into()),
         }
@@ -2009,6 +2221,7 @@ mod tests {
             provider_id: None,
             display_name: None,
             secret_ref: vec![],
+            webhook_secret_ref: None,
             idempotency_key: None,
             updated_by: None,
         };
@@ -2225,6 +2438,7 @@ mod tests {
             provider_id: None,
             display_name: None,
             secret_ref: vec![],
+            webhook_secret_ref: None,
             idempotency_key: None,
             updated_by: None,
         };
@@ -2417,6 +2631,7 @@ mod tests {
             provider_id: Some("cli-bot".into()),
             display_name: Some("CLI Bot".into()),
             secret_ref: vec![],
+            webhook_secret_ref: None,
             idempotency_key: Some("cli-add-1".into()),
             updated_by: Some("cli".into()),
         }

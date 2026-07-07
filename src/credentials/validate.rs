@@ -136,10 +136,18 @@ pub enum ValidateError {
 /// 1. Load the env; require a deployer slot and a `credentials_ref`.
 /// 2. Resolve the deployer's handler via the registry (also rejects slot
 ///    or version mismatches per A9).
-/// 3. Read the handler's [`super::DeployerCredentials`] (None ⇒ Phase D
-///    handler that hasn't registered a credentials contract yet).
-/// 4. Run the handler's probes against `ValidationContext { env_root }`.
+/// 3. Use `creds_override` when the caller supplies one, else read the
+///    handler's [`super::DeployerCredentials`] (None ⇒ Phase D handler
+///    that hasn't registered a credentials contract yet).
+/// 4. Run the probes against `ValidationContext { env_root }`.
 /// 5. Build a [`Credentials`] doc stamped with `last_run_at` + result.
+///
+/// `creds_override`, when `Some`, replaces the handler's own probe (step 3)
+/// — the K8s `requirements` CLI path injects a live-cluster-connected
+/// [`K8sValidatorClient`](crate::env_packs::k8s::K8sValidatorClient) this
+/// way (the handler's default credentials hold no client and fail closed).
+/// The handler is still resolved unconditionally so the A9 slot/version
+/// check runs regardless of the override.
 ///
 /// Returns both the doc and the report so the CLI can render the per-check
 /// detail while the persisted doc carries only the structured summary.
@@ -147,19 +155,25 @@ pub fn validate_requirements(
     store: &LocalFsStore,
     registry: &EnvPackRegistry,
     env_id: &EnvId,
+    creds_override: Option<&dyn super::DeployerCredentials>,
 ) -> Result<(Credentials, RequirementsReport), ValidateError> {
     let env = store.load(env_id)?;
     let deployer = env
         .pack_for_slot(CapabilitySlot::Deployer)
         .ok_or_else(|| ValidateError::NoDeployerBound(env_id.clone()))?;
 
+    // Resolve the handler even when an override is supplied: this is where
+    // the A9 slot/version match is enforced.
     let handler = registry.resolve_for_slot(CapabilitySlot::Deployer, &deployer.kind)?;
-    let creds =
-        handler
-            .deployer_credentials()
-            .ok_or_else(|| ValidateError::HandlerNotRegistered {
-                kind: deployer.kind.as_str().to_string(),
-            })?;
+    let creds: &dyn super::DeployerCredentials =
+        match creds_override {
+            Some(c) => c,
+            None => handler.deployer_credentials().ok_or_else(|| {
+                ValidateError::HandlerNotRegistered {
+                    kind: deployer.kind.as_str().to_string(),
+                }
+            })?,
+        };
 
     // No-material deployers (e.g. local-process) can pass validation
     // without a credentials_ref. For deployers that require material,
@@ -262,5 +276,66 @@ mod tests {
         let report = RequirementsReport::new(vec![]);
         assert!(report.passed());
         assert!(report.missing().is_empty());
+    }
+
+    /// A sentinel credentials probe used to prove the runner honors
+    /// `creds_override` instead of the handler's own probe.
+    #[derive(Debug)]
+    struct FakeCreds;
+    impl crate::credentials::DeployerCredentials for FakeCreds {
+        fn requires_credentials_material(&self) -> bool {
+            false
+        }
+        fn required_capabilities(&self) -> Vec<Capability> {
+            vec![cap("fake.only")]
+        }
+        fn validate(&self, _ctx: &ValidationContext<'_>) -> RequirementsReport {
+            RequirementsReport::new(vec![CapabilityCheck {
+                capability: cap("fake.only"),
+                status: CapabilityStatus::Pass,
+            }])
+        }
+        fn bootstrap(
+            &self,
+            _input: &crate::credentials::BootstrapInput<'_>,
+        ) -> Result<crate::credentials::BootstrapOutcome, crate::credentials::BootstrapError>
+        {
+            unreachable!("the override test never bootstraps")
+        }
+    }
+
+    /// When the caller supplies `creds_override`, the runner validates with
+    /// it and ignores the handler's own probe — the seam the K8s
+    /// `requirements` CLI uses to inject a live-cluster validator.
+    #[test]
+    fn validate_requirements_honors_creds_override() {
+        use crate::cli::tests_common::{make_binding, make_env};
+        use crate::environment::EnvironmentStore;
+        use greentic_deploy_spec::CapabilitySlot;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            // A registered deployer so the A9 resolve still succeeds; its
+            // own probe declares 2 caps, distinct from the fake's 1.
+            "greentic.deployer.local-process@0.1.0",
+        ));
+        store.save(&env).unwrap();
+
+        let registry = EnvPackRegistry::with_builtins();
+        let fake = FakeCreds;
+        let (_doc, report) = validate_requirements(
+            &store,
+            &registry,
+            &EnvId::try_from("local").unwrap(),
+            Some(&fake),
+        )
+        .expect("override path validates");
+
+        assert_eq!(report.checks.len(), 1, "override report, not handler's");
+        assert_eq!(report.checks[0].capability.id, "fake.only");
     }
 }

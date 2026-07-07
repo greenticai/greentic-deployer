@@ -25,7 +25,7 @@ use crate::runtime_secrets::{
 pub struct AwsRequest {
     pub capability: DeployerCapability,
     pub tenant: String,
-    pub pack_path: PathBuf,
+    pub pack_path: Option<PathBuf>,
     pub bundle_root: Option<PathBuf>,
     pub bundle_source: Option<String>,
     pub bundle_digest: Option<String>,
@@ -91,7 +91,7 @@ impl AwsRequest {
     pub fn new(
         capability: DeployerCapability,
         tenant: impl Into<String>,
-        pack_path: PathBuf,
+        pack_path: Option<PathBuf>,
     ) -> Self {
         Self {
             capability,
@@ -183,9 +183,7 @@ fn build_aws_request_from_ext(
     AwsRequest {
         capability,
         tenant: cfg.tenant.clone(),
-        pack_path: pack_path
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_default(),
+        pack_path: pack_path.map(std::path::Path::to_path_buf),
         bundle_root: None,
         bundle_source: Some(cfg.bundle_source.clone()),
         bundle_digest: Some(cfg.bundle_digest.clone()),
@@ -307,33 +305,148 @@ async fn promote_to_aws_secrets_manager(
     tenant: &str,
     team: Option<&str>,
 ) -> Result<PromoteRuntimeSecretsReport> {
-    let region = aws_runtime_secrets_region();
-    let mut report = PromoteRuntimeSecretsReport::default();
+    let sink = AwsCliSecretSink {
+        region: aws_runtime_secrets_region(),
+    };
+    crate::runtime_secret_sink::promote_runtime_secrets(
+        &sink,
+        resolved,
+        prefix,
+        bundle_digest,
+        environment,
+        tenant,
+        team.unwrap_or("_"),
+        "aws",
+        "aws-secrets-manager",
+    )
+}
 
-    for secret in resolved {
-        let remote_name = crate::runtime_secrets::cloud_secret_name(
-            prefix,
-            &secret.requirement.provider_id,
-            &secret.requirement.key,
+/// [`RuntimeSecretSink`](crate::runtime_secret_sink::RuntimeSecretSink) backed by
+/// the `aws secretsmanager` CLI. Kept thin so the promotion orchestration is
+/// exercised against an in-memory mock instead of this.
+#[cfg(feature = "runtime-secrets-aws")]
+struct AwsCliSecretSink {
+    region: String,
+}
+
+#[cfg(feature = "runtime-secrets-aws")]
+impl crate::runtime_secret_sink::RuntimeSecretSink for AwsCliSecretSink {
+    fn upsert(
+        &self,
+        name: &str,
+        value: &str,
+        tags: &[(String, String)],
+    ) -> Result<crate::runtime_secret_sink::UpsertOutcome> {
+        use crate::runtime_secret_sink::UpsertOutcome;
+
+        let mut temp = tempfile::NamedTempFile::new()
+            .map_err(|err| DeployerError::Other(format!("create temporary secret file: {err}")))?;
+        temp.write_all(value.as_bytes())?;
+        temp.flush()?;
+        let secret_file = format!(
+            "file://{}",
+            temp.path().to_str().ok_or_else(|| {
+                DeployerError::Other("temporary secret path is not UTF-8".to_string())
+            })?
         );
-        put_aws_secret_with_cli(
-            secret,
-            &remote_name,
-            bundle_digest,
-            environment,
-            tenant,
-            team.unwrap_or("_"),
-            &region,
-        )?;
-        report
-            .promoted
-            .push(crate::runtime_secrets::PromotedRuntimeSecret {
-                uri: secret.requirement.uri.clone(),
-                remote_name,
-            });
-    }
 
-    Ok(report)
+        let mut create = ProcessCommand::new("aws");
+        create.args([
+            "secretsmanager",
+            "create-secret",
+            "--region",
+            &self.region,
+            "--name",
+            name,
+            "--secret-string",
+            &secret_file,
+        ]);
+        // A single `--tags` with all tags: repeating the flag makes the AWS CLI
+        // keep only the last one, which silently dropped every tag but one.
+        if !tags.is_empty() {
+            create.arg("--tags");
+            for (key, value) in tags {
+                create.arg(format!("Key={key},Value={value}"));
+            }
+        }
+
+        let create = create
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|err| {
+                DeployerError::Other(format!("run aws secretsmanager create-secret: {err}"))
+            })?;
+        if create.status.success() {
+            return Ok(UpsertOutcome::Created);
+        }
+
+        let create_stderr = String::from_utf8_lossy(&create.stderr);
+        if !create_stderr.contains("ResourceExistsException") {
+            return Err(DeployerError::Other(format!(
+                "create AWS Secrets Manager secret {name}: {}",
+                create_stderr.trim()
+            )));
+        }
+
+        let update = ProcessCommand::new("aws")
+            .args([
+                "secretsmanager",
+                "put-secret-value",
+                "--region",
+                &self.region,
+                "--secret-id",
+                name,
+                "--secret-string",
+                &secret_file,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|err| {
+                DeployerError::Other(format!("run aws secretsmanager put-secret-value: {err}"))
+            })?;
+        if update.status.success() {
+            // put-secret-value updates the value but not tags, so a pre-existing
+            // secret stays untagged (this is why `list-secrets --filters
+            // tag-key=greentic:managed-by` came back empty). Apply tags
+            // explicitly; this is best-effort metadata, so don't fail the deploy.
+            if !tags.is_empty() {
+                let mut tag = ProcessCommand::new("aws");
+                tag.args([
+                    "secretsmanager",
+                    "tag-resource",
+                    "--region",
+                    &self.region,
+                    "--secret-id",
+                    name,
+                    "--tags",
+                ]);
+                for (key, value) in tags {
+                    tag.arg(format!("Key={key},Value={value}"));
+                }
+                match tag.stdout(Stdio::null()).stderr(Stdio::piped()).output() {
+                    Ok(out) if out.status.success() => {}
+                    Ok(out) => tracing::warn!(
+                        secret = %name,
+                        stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                        "failed to tag existing secret on update"
+                    ),
+                    Err(err) => tracing::warn!(
+                        secret = %name,
+                        %err,
+                        "failed to invoke aws secretsmanager tag-resource"
+                    ),
+                }
+            }
+            Ok(UpsertOutcome::Updated)
+        } else {
+            Err(DeployerError::Other(format!(
+                "update AWS Secrets Manager secret {name}: {}",
+                String::from_utf8_lossy(&update.stderr).trim()
+            )))
+        }
+    }
 }
 
 #[cfg(feature = "runtime-secrets-aws")]
@@ -375,124 +488,6 @@ async fn promote_to_aws_secrets_manager(
     Err(DeployerError::Config(
         "AWS runtime secret promotion is not enabled".to_string(),
     ))
-}
-
-#[cfg(feature = "runtime-secrets-aws")]
-fn put_aws_secret_with_cli(
-    secret: &ResolvedRuntimeSecret,
-    remote_name: &str,
-    bundle_digest: Option<&str>,
-    environment: &str,
-    tenant: &str,
-    team: &str,
-    region: &str,
-) -> Result<()> {
-    let mut temp = tempfile::NamedTempFile::new()
-        .map_err(|err| DeployerError::Other(format!("create temporary secret file: {err}")))?;
-    temp.write_all(secret.value.expose().as_bytes())?;
-    temp.flush()?;
-    let secret_file = format!(
-        "file://{}",
-        temp.path().to_str().ok_or_else(|| {
-            DeployerError::Other("temporary secret path is not UTF-8".to_string())
-        })?
-    );
-
-    let mut create = ProcessCommand::new("aws");
-    create.args([
-        "secretsmanager",
-        "create-secret",
-        "--region",
-        region,
-        "--name",
-        remote_name,
-        "--secret-string",
-        &secret_file,
-    ]);
-    for (key, value) in aws_secret_tags(
-        &secret.requirement.uri,
-        bundle_digest,
-        environment,
-        tenant,
-        team,
-    ) {
-        create.arg("--tags").arg(format!("Key={key},Value={value}"));
-    }
-
-    let create = create
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|err| {
-            DeployerError::Other(format!("run aws secretsmanager create-secret: {err}"))
-        })?;
-    if create.status.success() {
-        return Ok(());
-    }
-
-    let create_stderr = String::from_utf8_lossy(&create.stderr);
-    if !create_stderr.contains("ResourceExistsException") {
-        return Err(DeployerError::Other(format!(
-            "create AWS Secrets Manager secret {remote_name}: {}",
-            create_stderr.trim()
-        )));
-    }
-
-    #[cfg(feature = "runtime-secrets-aws")]
-    let update = ProcessCommand::new("aws")
-        .args([
-            "secretsmanager",
-            "put-secret-value",
-            "--region",
-            region,
-            "--secret-id",
-            remote_name,
-            "--secret-string",
-            &secret_file,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|err| {
-            DeployerError::Other(format!("run aws secretsmanager put-secret-value: {err}"))
-        })?;
-    if update.status.success() {
-        Ok(())
-    } else {
-        Err(DeployerError::Other(format!(
-            "update AWS Secrets Manager secret {remote_name}: {}",
-            String::from_utf8_lossy(&update.stderr).trim()
-        )))
-    }
-}
-
-#[cfg(feature = "runtime-secrets-aws")]
-fn aws_secret_tags(
-    secret_uri: &str,
-    bundle_digest: Option<&str>,
-    environment: &str,
-    tenant: &str,
-    team: &str,
-) -> Vec<(String, String)> {
-    let mut tags = vec![
-        (
-            "greentic:managed-by".to_string(),
-            "greentic-deployer".to_string(),
-        ),
-        ("greentic:provider".to_string(), "aws".to_string()),
-        (
-            "greentic:secret-manager".to_string(),
-            "aws-secrets-manager".to_string(),
-        ),
-        ("greentic:environment".to_string(), environment.to_string()),
-        ("greentic:tenant".to_string(), tenant.to_string()),
-        ("greentic:team".to_string(), team.to_string()),
-        ("greentic:secret-uri".to_string(), secret_uri.to_string()),
-    ];
-    if let Some(digest) = bundle_digest {
-        tags.push(("greentic:bundle-digest".to_string(), digest.to_string()));
-    }
-    tags
 }
 
 pub fn run_admin_tunnel(args: AwsAdminTunnelRequest) -> Result<()> {
@@ -755,8 +750,12 @@ mod tests {
 
     #[test]
     fn aws_request_defaults_to_aws_iac_target() {
-        let request = AwsRequest::new(DeployerCapability::Plan, "acme", PathBuf::from("pack-dir"))
-            .into_deployer_request();
+        let request = AwsRequest::new(
+            DeployerCapability::Plan,
+            "acme",
+            Some(PathBuf::from("pack-dir")),
+        )
+        .into_deployer_request();
 
         assert_eq!(request.provider, Provider::Aws);
         assert_eq!(request.strategy, "iac-only");
@@ -777,8 +776,11 @@ mod tests {
 
     #[test]
     fn aws_request_preserves_all_passthrough_fields() {
-        let mut request =
-            AwsRequest::new(DeployerCapability::Apply, "acme", PathBuf::from("pack-dir"));
+        let mut request = AwsRequest::new(
+            DeployerCapability::Apply,
+            "acme",
+            Some(PathBuf::from("pack-dir")),
+        );
         request.bundle_root = Some(PathBuf::from("bundle-root"));
         request.bundle_source = Some("s3://bucket/bundle.gtbundle".into());
         request.bundle_digest = Some("sha256:abc".into());
@@ -860,8 +862,12 @@ mod tests {
     #[test]
     fn ensure_aws_config_rejects_non_aws_provider() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut request = AwsRequest::new(DeployerCapability::Plan, "acme", tmp.path().into())
-            .into_deployer_request();
+        let mut request = AwsRequest::new(
+            DeployerCapability::Plan,
+            "acme",
+            Some(tmp.path().to_path_buf()),
+        )
+        .into_deployer_request();
         request.provider = Provider::Gcp;
         let config = DeployerConfig::resolve(request).expect("resolve config");
 
@@ -875,8 +881,12 @@ mod tests {
     #[test]
     fn ensure_aws_config_accepts_aws_iac_config() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let request = AwsRequest::new(DeployerCapability::Plan, "acme", tmp.path().into())
-            .into_deployer_request();
+        let request = AwsRequest::new(
+            DeployerCapability::Plan,
+            "acme",
+            Some(tmp.path().to_path_buf()),
+        )
+        .into_deployer_request();
         let config = DeployerConfig::resolve(request).expect("resolve config");
 
         ensure_aws_config(&config).expect("aws config");
@@ -905,7 +915,7 @@ mod tests {
 
         assert_eq!(request.capability, DeployerCapability::Destroy);
         assert_eq!(request.tenant, "acme");
-        assert_eq!(request.pack_path, PathBuf::from("pack"));
+        assert_eq!(request.pack_path, Some(PathBuf::from("pack")));
         assert_eq!(
             request.bundle_source.as_deref(),
             Some("oci://registry.example/acme/prod")
@@ -947,7 +957,7 @@ mod tests {
 
         assert_eq!(request.capability, DeployerCapability::Apply);
         assert_eq!(request.tenant, "default");
-        assert_eq!(request.pack_path, PathBuf::new());
+        assert_eq!(request.pack_path, None);
         assert_eq!(
             request.bundle_source.as_deref(),
             Some("s3://bucket/bundle.gtbundle")
@@ -959,54 +969,6 @@ mod tests {
         assert!(request.execute_local);
         assert!(!request.preview);
         assert!(!request.dry_run);
-    }
-
-    #[cfg(feature = "runtime-secrets-aws")]
-    #[test]
-    fn aws_secret_tags_include_management_scope_and_bundle_digest() {
-        let tags = aws_secret_tags(
-            "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key",
-            Some("sha256:bundle"),
-            "dev",
-            "demo",
-            "_",
-        );
-
-        assert!(tags.contains(&("greentic:managed-by".into(), "greentic-deployer".into())));
-        assert!(tags.contains(&(
-            "greentic:secret-manager".into(),
-            "aws-secrets-manager".into()
-        )));
-        assert!(tags.contains(&("greentic:environment".into(), "dev".into())));
-        assert!(tags.contains(&("greentic:tenant".into(), "demo".into())));
-        assert!(tags.contains(&("greentic:team".into(), "_".into())));
-        assert!(tags.contains(&("greentic:bundle-digest".into(), "sha256:bundle".into())));
-        assert!(tags.iter().any(|(key, value)| {
-            key == "greentic:secret-uri" && value.contains("messaging-webchat-gui")
-        }));
-    }
-
-    #[cfg(feature = "runtime-secrets-aws")]
-    #[test]
-    fn aws_secret_tags_omit_bundle_digest_when_absent() {
-        let tags = aws_secret_tags(
-            "secrets://dev/demo/_/deep-research-demo/api_key_secret",
-            None,
-            "dev",
-            "demo",
-            "_",
-        );
-
-        assert!(tags.contains(&("greentic:provider".into(), "aws".into())));
-        assert!(tags.contains(&(
-            "greentic:secret-uri".into(),
-            "secrets://dev/demo/_/deep-research-demo/api_key_secret".into()
-        )));
-        assert!(
-            !tags
-                .iter()
-                .any(|(key, _value)| key == "greentic:bundle-digest")
-        );
     }
 
     #[test]
@@ -1282,7 +1244,7 @@ mod tests {
 
         assert_eq!(request.capability, DeployerCapability::Destroy);
         assert_eq!(request.tenant, "acme");
-        assert_eq!(request.pack_path, PathBuf::from("/tmp/demo-pack"));
+        assert_eq!(request.pack_path, Some(PathBuf::from("/tmp/demo-pack")));
         assert_eq!(
             request.bundle_source.as_deref(),
             Some("oci://registry.example/app@sha256:1111")

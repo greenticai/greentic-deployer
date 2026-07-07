@@ -102,6 +102,15 @@ where
             get(api::get_environment::<S>).patch(api::update_environment::<S>),
         )
         .route(
+            "/environments/{env_id}/reconcile",
+            post(api::reconcile_environment::<S>),
+        )
+        .route(
+            "/environments/{env_id}/reconcile/complete",
+            post(api::complete_reconcile::<S>),
+        )
+        .route("/environments/{env_id}/runtime", get(api::get_runtime::<S>))
+        .route(
             "/environments/{env_id}/migrate-bindings",
             post(api::migrate_bindings::<S>),
         )
@@ -209,8 +218,16 @@ where
             delete(api::delete_backup::<S>),
         )
         .route(
+            "/environments/{env_id}/backups/{backup_id}/export",
+            get(api::export_backup::<S>),
+        )
+        .route(
             "/environments/{env_id}/restore",
             post(api::restore_environment::<S>),
+        )
+        .route(
+            "/environments/{env_id}/import",
+            post(api::import_environment::<S>),
         )
         .with_state(AppState {
             storage,

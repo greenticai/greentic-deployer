@@ -1,0 +1,29 @@
+{
+  "kind": "generate",
+  "capability": "generate",
+  "provider": "gcp",
+  "strategy": "terraform",
+  "terraform_root": "terraform",
+  "supported_clouds": [
+    "gcp"
+  ],
+  "cloud_modules": {
+    "gcp": "modules/cloudsql"
+  },
+  "generated_files": [
+    "main.tf",
+    "variables.tf",
+    "outputs.tf",
+    "providers.tf",
+    "staging.tfvars.example",
+    "modules/cloudsql/main.tf",
+    "modules/cloudsql/variables.tf",
+    "modules/cloudsql/outputs.tf",
+    "modules/service/main.tf",
+    "modules/service/variables.tf",
+    "modules/service/outputs.tf",
+    "modules/route/main.tf",
+    "modules/route/variables.tf",
+    "modules/route/outputs.tf"
+  ]
+}

@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::environment::{
-    EnvironmentStore, LocalFsStore, StageRevisionPayload, WarmRevisionPayload,
+    EnvironmentReads, EnvironmentStore, LocalFsStore, StageRevisionPayload, WarmRevisionPayload,
 };
 use crate::rollout_telemetry::emit_lifecycle_event;
 use greentic_deploy_spec::Environment;
@@ -50,6 +50,21 @@ const NOUN: &str = "revisions";
 pub struct RevisionStagePayload {
     pub environment_id: String,
     pub deployment_id: String,
+    /// Stable revision id for safe lost-response retries against an HTTP store
+    /// (A8 §2). When absent, one is minted per invocation — fine for a one-shot
+    /// local stage, but a bare remote retry then mints a *different* id (and
+    /// key), changing the request fingerprint so the server's replay ledger
+    /// can't dedup it. Pin it together with `idempotency_key` for retry-safe
+    /// remote staging. Honored by the remote (`--store-url`) path; the local
+    /// path always mints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_id: Option<String>,
+    /// Caller-supplied A8 §2 idempotency key. Optional for back-compat; when
+    /// absent, one is minted per invocation. Supply a stable key (with
+    /// `revision_id`) for safe lost-response retries against the HTTP store.
+    /// Honored by the remote (`--store-url`) path; the local path always mints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     /// Local `.gtbundle` to resolve. When set, the bundle is extracted under
     /// the revision dir and its embedded `.gtpack`s are pinned into
     /// `pack-list.lock` — `bundle_digest` / `pack_list` / `pack_list_lock_ref`
@@ -60,6 +75,15 @@ pub struct RevisionStagePayload {
     pub bundle_path: Option<PathBuf>,
     #[serde(default = "default_bundle_digest")]
     pub bundle_digest: String,
+    /// Registry reference the bundle was resolved from (`oci://…`, `repo://…`,
+    /// `store://…`), asserted by the caller that resolved it. Recorded on the
+    /// revision so a remote worker can pull the bundle at boot; `None` for a
+    /// locally-staged bundle. The deployer never derives this — by the time
+    /// `stage` runs the `--bundle` path already holds a local file — so the
+    /// caller threads it through. `bundle_digest` is the integrity backstop on
+    /// whatever the worker pulls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_source_uri: Option<String>,
     #[serde(default)]
     pub pack_list: Vec<PackListEntryPayload>,
     /// Env-relative pack-list lockfile. Empty (the default) means "no lock
@@ -88,6 +112,28 @@ pub(super) fn default_signature_sidecar_ref() -> PathBuf {
 }
 pub(super) fn default_drain_seconds() -> u32 {
     30
+}
+
+/// Convert wire-shaped [`PackListEntryPayload`]s into pinned [`PackListEntry`]s,
+/// validating each version string. Shared by the local stage (`--answers`
+/// legacy path) and the remote `--store-url` dispatch.
+pub(super) fn parse_pack_list(
+    entries: Vec<PackListEntryPayload>,
+) -> Result<Vec<PackListEntry>, OpError> {
+    entries
+        .into_iter()
+        .map(|e| {
+            Ok::<_, OpError>(PackListEntry {
+                pack_id: PackId::new(e.pack_id),
+                version: e
+                    .version
+                    .parse::<SemVer>()
+                    .map_err(|err| OpError::InvalidArgument(format!("pack version: {err}")))?,
+                digest: e.digest,
+                source_uri: e.source_uri,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,21 +201,7 @@ pub fn stage(
     let pack_list = if payload.bundle_path.is_some() {
         Vec::new()
     } else {
-        payload
-            .pack_list
-            .into_iter()
-            .map(|e| {
-                Ok::<_, OpError>(PackListEntry {
-                    pack_id: PackId::new(e.pack_id),
-                    version: e
-                        .version
-                        .parse::<SemVer>()
-                        .map_err(|err| OpError::InvalidArgument(format!("pack version: {err}")))?,
-                    digest: e.digest,
-                    source_uri: e.source_uri,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?
+        parse_pack_list(payload.pack_list)?
     };
     if !is_valid_transition(RevisionLifecycle::Inactive, RevisionLifecycle::Staged) {
         return Err(OpError::Conflict(
@@ -189,6 +221,7 @@ pub fn stage(
     let RevisionStagePayload {
         bundle_path,
         bundle_digest: payload_bundle_digest,
+        bundle_source_uri,
         pack_list_lock_ref: payload_pack_list_lock_ref,
         config_digest,
         signature_sidecar_ref,
@@ -289,6 +322,7 @@ pub fn stage(
             revision_id,
             deployment_id,
             bundle_digest,
+            bundle_source_uri,
             pack_list: revision_pack_list,
             pack_list_lock_ref,
             pack_config_refs,
@@ -535,7 +569,11 @@ pub fn archive(
 }
 
 /// `op revisions list <env>` (filterable by `--deployment <id>` later).
-pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOutcome, OpError> {
+pub fn list(
+    store: &dyn EnvironmentReads,
+    flags: &OpFlags,
+    env_id: &str,
+) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(
             NOUN,
@@ -544,10 +582,10 @@ pub fn list(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpOut
         ));
     }
     let env_id = parse_env_id(env_id)?;
-    if !store.exists(&env_id)? {
+    if !store.env_exists(&env_id)? {
         return Err(OpError::NotFound(format!("environment `{env_id}`")));
     }
-    let env = store.load(&env_id)?;
+    let env = store.load_env(&env_id)?;
     let revisions: Vec<RevisionSummary> = env.revisions.iter().map(RevisionSummary::from).collect();
     Ok(OpOutcome::new(
         NOUN,
@@ -723,8 +761,15 @@ pub fn payload_from_stage_args(
     Ok(Some(RevisionStagePayload {
         environment_id,
         deployment_id,
+        // Direct local `--bundle` stage: the store mints the id + key.
+        revision_id: None,
+        idempotency_key: None,
         bundle_path: Some(bundle_path),
         bundle_digest: default_bundle_digest(),
+        // Direct CLI staging takes a local `.gtbundle`; there is no registry
+        // coordinate to record, so the revision is local-serve only. Pass
+        // `bundle_source_uri` via `--answers` to make it remotely pullable.
+        bundle_source_uri: None,
         pack_list: Vec::new(),
         pack_list_lock_ref: PathBuf::new(),
         config_digest: default_config_digest(),
@@ -785,6 +830,7 @@ fn stage_schema() -> Value {
             "deployment_id": {"type": "string", "description": "ULID"},
             "bundle_path": {"type": "string", "description": "Local .gtbundle to extract + pin; derives bundle_digest/pack_list/pack_list_lock_ref"},
             "bundle_digest": {"type": "string"},
+            "bundle_source_uri": {"type": "string", "description": "oci:// / repo:// / store:// ref the bundle was resolved from; makes the revision pullable by a remote worker. Omit for local-serve-only"},
             "pack_list": {"type": "array"},
             "pack_list_lock_ref": {"type": "string"},
             "config_digest": {"type": "string"},
@@ -834,6 +880,21 @@ mod tests {
         );
     }
 
+    /// Schema-drift regression: `stage_schema()` declares
+    /// `additionalProperties: false`, so a `--schema`-driven `--answers` caller
+    /// that supplies `bundle_source_uri` (the remote-pull coordinate) would be
+    /// rejected unless the schema advertises the field. Without this the env
+    /// store records a non-pullable revision.
+    #[test]
+    fn stage_schema_lists_bundle_source_uri() {
+        let schema = stage_schema();
+        assert!(
+            schema.pointer("/properties/bundle_source_uri").is_some(),
+            "stage_schema must list `bundle_source_uri` so --schema-driven \
+             callers can record the bundle's registry source (schema: {schema:#})"
+        );
+    }
+
     fn seed_env_with_deployment(store: &LocalFsStore) -> DeploymentId {
         let mut env = make_env("local");
         let deployment = make_bundle_deployment("local", "fast2flow");
@@ -847,8 +908,11 @@ mod tests {
         RevisionStagePayload {
             environment_id: "local".to_string(),
             deployment_id: deployment_id.to_string(),
+            revision_id: None,
+            idempotency_key: None,
             bundle_path: None,
             bundle_digest: "sha256:00".to_string(),
+            bundle_source_uri: None,
             pack_list: vec![PackListEntryPayload {
                 pack_id: "greentic.test.pack".to_string(),
                 version: "1.0.0".to_string(),
@@ -878,21 +942,37 @@ mod tests {
         );
     }
 
-    /// `stage --bundle <local .gtbundle>` extracts the bundle, pins every
-    /// embedded `.gtpack` into a `pack-list.lock` under the revision dir, and
-    /// records the env-relative lock ref + a real bundle digest on the
-    /// revision. The lock's per-pack digest must equal the sha256 of the
-    /// extracted `.gtpack` on disk — the exact invariant greentic-start's
-    /// `load_revision` re-checks at boot.
-    /// Regression for PR-3a.5 Codex finding: bundle staging must NOT touch
-    /// the filesystem before `audit_and_record`'s authz gate. A `stage
-    /// --bundle` against a non-local env must return `Unauthorized` AND
-    /// leave the env's `revisions/` dir untouched.
+    /// A stage payload that asserts the bundle's registry source records
+    /// `bundle_source_uri` on the stored revision (threaded
+    /// `RevisionStagePayload` → `StageRevisionPayload` → `Revision`), so a
+    /// remote worker can pull the bundle at boot. The default local stage
+    /// leaves it `None`.
     #[test]
-    fn stage_with_bundle_on_non_local_env_rejects_before_writing_files() {
+    fn stage_records_bundle_source_uri_on_the_revision() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
-        // Seed a non-local env so `authorize_local_only` denies.
+        let did = seed_env_with_deployment(&store);
+
+        let mut payload = stage_payload(&did);
+        payload.bundle_source_uri =
+            Some("oci://ghcr.io/greenticai/bundles/demo@sha256:abc".to_string());
+        stage(&store, &OpFlags::default(), Some(payload)).unwrap();
+
+        let env = store.load(&parse_env_id("local").unwrap()).unwrap();
+        assert_eq!(
+            env.revisions[0].bundle_source_uri.as_deref(),
+            Some("oci://ghcr.io/greenticai/bundles/demo@sha256:abc")
+        );
+    }
+
+    /// Named (non-`local`) envs are first-class on the local store, so staging
+    /// a bundle into a named env is no longer authorization-denied. (The old
+    /// "no FS writes before the deny" invariant is moot locally — there is no
+    /// local deny path — and the remote RBAC path enforces it server-side.)
+    #[test]
+    fn stage_with_bundle_on_named_env_is_not_authz_denied() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
         let mut env = make_env("prod");
         let deployment = make_bundle_deployment("prod", "fast2flow");
         let did = deployment.deployment_id;
@@ -905,21 +985,10 @@ mod tests {
         payload.environment_id = "prod".to_string();
         payload.bundle_path = Some(fixture);
 
-        let err = stage(&store, &OpFlags::default(), Some(payload)).unwrap_err();
+        let result = stage(&store, &OpFlags::default(), Some(payload));
         assert!(
-            matches!(err, OpError::Unauthorized { .. }),
-            "non-local env stage must be denied, got: {err:?}"
-        );
-        // No revisions dir should have been created — bundle staging
-        // must run INSIDE the audit_and_record closure, not before.
-        let rev_root = dir.path().join("prod").join("revisions");
-        assert!(
-            !rev_root.exists()
-                || std::fs::read_dir(&rev_root)
-                    .map(|d| d.count() == 0)
-                    .unwrap_or(true),
-            "denied stage must not write under `{}`",
-            rev_root.display()
+            !matches!(result, Err(OpError::Unauthorized { .. })),
+            "named env stage must not be authz-denied; got {result:?}"
         );
     }
 

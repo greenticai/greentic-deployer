@@ -30,6 +30,8 @@ locals {
   admin_bind                = "127.0.0.1:${local.admin_port}"
   effective_public_base_url = trimspace(var.public_base_url) != "" ? var.public_base_url : "http://${aws_lb.this.dns_name}"
   admin_secret_prefix       = "greentic/admin/${local.name_prefix}"
+  bundle_fetcher_enabled    = trimspace(var.bundle_s3_object_ref) != ""
+  operator_bundle_source    = local.bundle_fetcher_enabled ? "/greentic-bundle/bundle.gtbundle" : var.bundle_source
   effective_vpc_id          = var.use_default_vpc ? data.aws_vpc.default[0].id : aws_vpc.this[0].id
   effective_subnet_ids      = var.use_default_vpc ? slice(data.aws_subnets.default[0].ids, 0, min(2, length(data.aws_subnets.default[0].ids))) : aws_subnet.public[*].id
   common_tags = {
@@ -387,11 +389,6 @@ resource "aws_secretsmanager_secret_version" "operator" {
   secret_string = each.value
 }
 
-data "aws_secretsmanager_secret" "runtime" {
-  for_each = var.runtime_secret_env
-  name     = each.value
-}
-
 resource "aws_iam_role_policy" "task_execution_admin_secrets" {
   name = "${local.name_prefix}-task-exec-admin-secrets"
   role = aws_iam_role.task_execution.id
@@ -459,6 +456,25 @@ resource "aws_iam_role_policy" "task_runtime_secrets" {
   })
 }
 
+resource "aws_iam_role_policy" "task_bundle_s3_object" {
+  count = trimspace(var.bundle_s3_object_arn) != "" ? 1 : 0
+  name  = "${local.name_prefix}-task-bundle-s3-object"
+  role  = aws_iam_role.task_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject"
+        ]
+        Resource = var.bundle_s3_object_arn
+      }
+    ]
+  })
+}
+
 resource "aws_ecs_task_definition" "this" {
   family                   = "${local.name_prefix}-task"
   requires_compatibilities = ["FARGATE"]
@@ -468,174 +484,291 @@ resource "aws_ecs_task_definition" "this" {
   execution_role_arn       = aws_iam_role.task_execution.arn
   task_role_arn            = aws_iam_role.task_execution.arn
 
-  container_definitions = jsonencode([
-    {
-      name      = "app"
-      image     = var.operator_image
-      essential = true
-      command = [
-        "start",
-        "--bundle",
-        var.bundle_source,
-        "--tenant",
-        var.tenant,
-        "--cloudflared",
-        "off",
-        "--ngrok",
-        "off",
-        "--admin",
-        "--admin-port",
-        tostring(local.admin_port)
-      ]
-      portMappings = [
-        {
-          containerPort = local.app_port
-          hostPort      = local.app_port
-          protocol      = "tcp"
-        }
-      ]
-      environment = concat(
-        [
+  volume {
+    name = "greentic-bundle"
+  }
+
+  # Writable ephemeral scratch for the operator under a read-only root filesystem.
+  # greentic-start writes its log dir, bundle unpack, component cache and dev-store
+  # under /tmp/greentic-start/..., so mounting this at /tmp covers logs + state.
+  volume {
+    name = "greentic-scratch"
+  }
+
+  # Writable scratch for the ECS Exec SSM agent so `aws ecs execute-command`
+  # keeps working under readonlyRootFilesystem (debugging hardened tasks).
+  volume {
+    name = "ssm-state"
+  }
+
+  volume {
+    name = "ssm-log"
+  }
+
+  container_definitions = jsonencode(concat(
+    [
+      {
+        # Init container: chown the ephemeral scratch volume to the operator's
+        # non-root uid so it can write logs/state at /tmp under a read-only root
+        # filesystem (ECS volumes mount root-owned by default).
+        name       = "scratch-init"
+        image      = "public.ecr.aws/aws-cli/aws-cli:latest"
+        essential  = false
+        entryPoint = ["/bin/sh", "-c"]
+        command = [
+          "mkdir -p /scratch/greentic-start && chown -R 65532:65532 /scratch"
+        ]
+        mountPoints = [
           {
-            name  = "GREENTIC_BUNDLE_SOURCE"
-            value = var.bundle_source
-          },
-          {
-            name  = "GREENTIC_BUNDLE_DIGEST"
-            value = var.bundle_digest
-          },
-          {
-            name  = "GREENTIC_REPO_REGISTRY_BASE"
-            value = var.repo_registry_base
-          },
-          {
-            name  = "GREENTIC_STORE_REGISTRY_BASE"
-            value = var.store_registry_base
-          },
-          {
-            name  = "GREENTIC_ADMIN_LISTEN"
-            value = local.admin_bind
-          },
-          {
-            name  = "GREENTIC_GATEWAY_LISTEN_ADDR"
-            value = "0.0.0.0"
-          },
-          {
-            name  = "GREENTIC_GATEWAY_PORT"
-            value = tostring(local.app_port)
-          },
-          {
-            name  = "GREENTIC_ADMIN_CA_SECRET_REF"
-            value = aws_secretsmanager_secret.admin_ca.arn
-          },
-          {
-            name  = "GREENTIC_ADMIN_SERVER_CERT_SECRET_REF"
-            value = aws_secretsmanager_secret.admin_server_cert.arn
-          },
-          {
-            name  = "GREENTIC_ADMIN_SERVER_KEY_SECRET_REF"
-            value = aws_secretsmanager_secret.admin_server_key.arn
-          },
-          {
-            name  = "GREENTIC_HEALTH_READINESS_PATH"
-            value = "/readyz"
-          },
-          {
-            name  = "GREENTIC_HEALTH_LIVENESS_PATH"
-            value = "/healthz"
-          },
-          {
-            name  = "GREENTIC_HEALTH_STARTUP_TIMEOUT_SECONDS"
-            value = "120"
-          }
-        ],
-        trimspace(var.runtime_secret_prefix) != "" ? [
-          {
-            name  = "GREENTIC_SECRETS_BACKEND"
-            value = "env"
-          },
-          {
-            name  = "GREENTIC_ALLOW_ENV_SECRETS"
-            value = "1"
-          },
-          {
-            name  = "GREENTIC_SECRETS_MANAGER_PACK"
-            value = "providers/deployer/aws.gtpack"
-          }
-        ] : [],
-        [
-          {
-            name  = "PUBLIC_BASE_URL"
-            value = local.effective_public_base_url
-          },
-          {
-            name  = "GREENTIC_WEBCHAT_BASE_URL"
-            value = local.effective_public_base_url
-          },
-          {
-            name  = "GREENTIC_WEBCHAT_ROUTE"
-            value = "webchat"
-          },
-          {
-            name  = "GREENTIC_WEBCHAT_TENANT_CHANNEL_ID"
-            value = "${var.tenant}:webchat"
-          },
-          {
-            name  = "GREENTIC_WEBCHAT_MODE"
-            value = "websocket"
-          }
-        ],
-        var.redis_url != "" ? [
-          {
-            name  = "REDIS_URL"
-            value = var.redis_url
-          }
-        ] : [],
-        var.admin_allowed_clients != "" ? [
-          {
-            name  = "GREENTIC_ADMIN_ALLOWED_CLIENTS"
-            value = var.admin_allowed_clients
-          }
-        ] : []
-      )
-      secrets = concat(
-        [
-          {
-            name      = "GREENTIC_ADMIN_CA_PEM"
-            valueFrom = aws_secretsmanager_secret.admin_ca.arn
-          },
-          {
-            name      = "GREENTIC_ADMIN_SERVER_CERT_PEM"
-            valueFrom = aws_secretsmanager_secret.admin_server_cert.arn
-          },
-          {
-            name      = "GREENTIC_ADMIN_SERVER_KEY_PEM"
-            valueFrom = aws_secretsmanager_secret.admin_server_key.arn
-          }
-        ],
-        [
-          for name, secret_name in var.runtime_secret_env : {
-            name      = name
-            valueFrom = data.aws_secretsmanager_secret.runtime[name].arn
-          }
-        ],
-        [
-          for name, secret in aws_secretsmanager_secret.operator : {
-            name      = name
-            valueFrom = secret.arn
+            sourceVolume  = "greentic-scratch"
+            containerPath = "/scratch"
+            readOnly      = false
           }
         ]
-      )
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          awslogs-group         = aws_cloudwatch_log_group.this.name
-          awslogs-region        = data.aws_region.current.name
-          awslogs-stream-prefix = "ecs"
+        logConfiguration = {
+          logDriver = "awslogs"
+          options = {
+            awslogs-group         = aws_cloudwatch_log_group.this.name
+            awslogs-region        = data.aws_region.current.name
+            awslogs-stream-prefix = "scratch-init"
+          }
         }
       }
-    }
-  ])
+    ],
+    local.bundle_fetcher_enabled ? [
+      {
+        name      = "bundle-fetcher"
+        image     = "public.ecr.aws/aws-cli/aws-cli:latest"
+        essential = false
+        command = [
+          "s3",
+          "cp",
+          var.bundle_s3_object_ref,
+          local.operator_bundle_source
+        ]
+        mountPoints = [
+          {
+            sourceVolume  = "greentic-bundle"
+            containerPath = "/greentic-bundle"
+            readOnly      = false
+          }
+        ]
+        logConfiguration = {
+          logDriver = "awslogs"
+          options = {
+            awslogs-group         = aws_cloudwatch_log_group.this.name
+            awslogs-region        = data.aws_region.current.name
+            awslogs-stream-prefix = "bundle-fetcher"
+          }
+        }
+      }
+    ] : [],
+    [
+      {
+        name      = "app"
+        image     = var.operator_image
+        essential = true
+        command = [
+          "start",
+          "--bundle",
+          local.operator_bundle_source,
+          "--tenant",
+          var.tenant,
+          "--cloudflared",
+          "off",
+          "--ngrok",
+          "off",
+          "--admin",
+          "--admin-port",
+          tostring(local.admin_port)
+        ]
+        dependsOn = concat(
+          [
+            {
+              containerName = "scratch-init"
+              condition     = "SUCCESS"
+            }
+          ],
+          local.bundle_fetcher_enabled ? [
+            {
+              containerName = "bundle-fetcher"
+              condition     = "SUCCESS"
+            }
+          ] : []
+        )
+        # Harden the operator with a read-only root filesystem; it gets its only
+        # writable area from the ephemeral scratch volume mounted at /tmp (log dir,
+        # bundle unpack, cache, dev-store all live under /tmp/greentic-start/...).
+        readonlyRootFilesystem = true
+        mountPoints = concat(
+          [
+            {
+              sourceVolume  = "greentic-scratch"
+              containerPath = "/tmp"
+              readOnly      = false
+            },
+            {
+              sourceVolume  = "ssm-state"
+              containerPath = "/var/lib/amazon/ssm"
+              readOnly      = false
+            },
+            {
+              sourceVolume  = "ssm-log"
+              containerPath = "/var/log/amazon"
+              readOnly      = false
+            }
+          ],
+          local.bundle_fetcher_enabled ? [
+            {
+              sourceVolume  = "greentic-bundle"
+              containerPath = "/greentic-bundle"
+              readOnly      = true
+            }
+          ] : []
+        )
+        portMappings = [
+          {
+            containerPort = local.app_port
+            hostPort      = local.app_port
+            protocol      = "tcp"
+          }
+        ]
+        environment = concat(
+          [
+            {
+              # Route temp files (log dir, bundle unpack, cache) to the writable
+              # scratch mount under a read-only root filesystem.
+              name  = "TMPDIR"
+              value = "/tmp"
+            },
+            {
+              # Route $HOME-relative writes (e.g. ~/.cache used by the WASM/
+              # wasmtime invoke path) to the writable scratch mount too; otherwise
+              # they hit the read-only rootfs and the /token path hangs.
+              name  = "HOME"
+              value = "/tmp"
+            },
+            {
+              name  = "GREENTIC_BUNDLE_SOURCE"
+              value = local.operator_bundle_source
+            },
+            {
+              name  = "GREENTIC_BUNDLE_DIGEST"
+              value = var.bundle_digest
+            },
+            {
+              name  = "GREENTIC_REPO_REGISTRY_BASE"
+              value = var.repo_registry_base
+            },
+            {
+              name  = "GREENTIC_STORE_REGISTRY_BASE"
+              value = var.store_registry_base
+            },
+            {
+              name  = "GREENTIC_ADMIN_LISTEN"
+              value = local.admin_bind
+            },
+            {
+              name  = "GREENTIC_GATEWAY_LISTEN_ADDR"
+              value = "0.0.0.0"
+            },
+            {
+              name  = "GREENTIC_GATEWAY_PORT"
+              value = tostring(local.app_port)
+            },
+            {
+              name  = "GREENTIC_ADMIN_CA_SECRET_REF"
+              value = aws_secretsmanager_secret.admin_ca.arn
+            },
+            {
+              name  = "GREENTIC_ADMIN_SERVER_CERT_SECRET_REF"
+              value = aws_secretsmanager_secret.admin_server_cert.arn
+            },
+            {
+              name  = "GREENTIC_ADMIN_SERVER_KEY_SECRET_REF"
+              value = aws_secretsmanager_secret.admin_server_key.arn
+            },
+            {
+              name  = "GREENTIC_HEALTH_READINESS_PATH"
+              value = "/readyz"
+            },
+            {
+              name  = "GREENTIC_HEALTH_LIVENESS_PATH"
+              value = "/healthz"
+            },
+            {
+              name  = "GREENTIC_HEALTH_STARTUP_TIMEOUT_SECONDS"
+              value = "120"
+            }
+          ],
+          [
+            {
+              name  = "PUBLIC_BASE_URL"
+              value = local.effective_public_base_url
+            },
+            {
+              name  = "GREENTIC_WEBCHAT_BASE_URL"
+              value = local.effective_public_base_url
+            },
+            {
+              name  = "GREENTIC_WEBCHAT_ROUTE"
+              value = "webchat"
+            },
+            {
+              name  = "GREENTIC_WEBCHAT_TENANT_CHANNEL_ID"
+              value = "${var.tenant}:webchat"
+            },
+            {
+              name  = "GREENTIC_WEBCHAT_MODE"
+              value = "websocket"
+            }
+          ],
+          var.redis_url != "" ? [
+            {
+              name  = "REDIS_URL"
+              value = var.redis_url
+            }
+          ] : [],
+          var.admin_allowed_clients != "" ? [
+            {
+              name  = "GREENTIC_ADMIN_ALLOWED_CLIENTS"
+              value = var.admin_allowed_clients
+            }
+          ] : []
+        )
+        secrets = concat(
+          [
+            {
+              name      = "GREENTIC_ADMIN_CA_PEM"
+              valueFrom = aws_secretsmanager_secret.admin_ca.arn
+            },
+            {
+              name      = "GREENTIC_ADMIN_SERVER_CERT_PEM"
+              valueFrom = aws_secretsmanager_secret.admin_server_cert.arn
+            },
+            {
+              name      = "GREENTIC_ADMIN_SERVER_KEY_PEM"
+              valueFrom = aws_secretsmanager_secret.admin_server_key.arn
+            }
+          ],
+          [
+            for name, secret in aws_secretsmanager_secret.operator : {
+              name      = name
+              valueFrom = secret.arn
+            }
+          ]
+        )
+        logConfiguration = {
+          logDriver = "awslogs"
+          options = {
+            awslogs-group         = aws_cloudwatch_log_group.this.name
+            awslogs-region        = data.aws_region.current.name
+            awslogs-stream-prefix = "ecs"
+          }
+        }
+      }
+    ]
+  ))
 
   tags = local.common_tags
 }

@@ -40,19 +40,60 @@ pub fn load_pack_manifest_from_bytes(bytes: &[u8]) -> Result<PackManifest> {
 /// Build a plan context from the provided pack.
 pub fn build_plan(config: &DeployerConfig) -> Result<PlanContext> {
     let cwd = std::env::current_dir()?;
-    let mut source = if let Some(pack_ref) = &config.pack_ref {
+    if let Some(pack_ref) = &config.pack_ref {
         let source = resolve_distributor_source(config)?;
-        PackSource::from_registry(pack_ref.clone(), source)?
-    } else {
-        let safe_path = if config.pack_path.is_absolute() {
-            config.pack_path.canonicalize()?
+        let mut pack_source = PackSource::from_registry(pack_ref.clone(), source)?;
+        return build_plan_with_source(&mut pack_source, config);
+    }
+    if let Some(pack_path) = &config.pack_path {
+        let safe_path = if pack_path.is_absolute() {
+            pack_path.canonicalize()?
         } else {
-            normalize_under_root(&cwd, &config.pack_path)
+            normalize_under_root(&cwd, pack_path)
                 .map_err(|err| DeployerError::Pack(err.to_string()))?
         };
-        PackSource::open(&safe_path)?
+        let mut pack_source = PackSource::open(&safe_path)?;
+        return build_plan_with_source(&mut pack_source, config);
+    }
+    // No bundle pack provided: build a minimal serviceless plan.
+    Ok(build_serviceless_plan(config))
+}
+
+/// Build a minimal plan context when no app bundle is provided (self-contained service packs).
+///
+/// Used when a deployment pack carries its own complete terraform (e.g. `tenant-manager-aws.gtpack`)
+/// and the caller has no Greentic app bundle to introspect. The resulting plan has empty
+/// runners/channels/components/secrets — the deployment pack owns all infrastructure decisions.
+fn build_serviceless_plan(config: &DeployerConfig) -> PlanContext {
+    use crate::plan::{DeploymentHints, Target, assemble_plan};
+    use greentic_types::deployment::DeploymentPlan;
+    use semver::Version;
+    use serde_json::Value as JsonValue;
+
+    let target: Target = config.provider.into();
+    let deployment = DeploymentHints {
+        target,
+        provider: config.provider.as_str().to_string(),
+        strategy: config.strategy.clone(),
     };
-    build_plan_with_source(&mut source, config)
+
+    let plan = DeploymentPlan {
+        pack_id: config.tenant.clone(),
+        pack_version: Version::new(0, 0, 0),
+        tenant: config.tenant.clone(),
+        environment: config.environment.clone(),
+        runners: Vec::new(),
+        messaging: None,
+        channels: Vec::new(),
+        secrets: Vec::new(),
+        oauth: Vec::new(),
+        telemetry: None,
+        extra: JsonValue::Null,
+    };
+
+    let mut ctx = assemble_plan(plan, config, deployment, Vec::new(), Vec::new());
+    ctx.serviceless = true;
+    ctx
 }
 
 /// Build a plan using an explicitly provided pack source (e.g., registry).
@@ -1268,7 +1309,7 @@ mod tests {
             strategy: "iac-only".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path: PathBuf::from("unused.gtpack"),
+            pack_path: Some(PathBuf::from("unused.gtpack")),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
@@ -1307,7 +1348,7 @@ mod tests {
             strategy: "iac-only".into(),
             tenant: "acme".into(),
             environment: "staging".into(),
-            pack_path,
+            pack_path: Some(pack_path),
             bundle_root: None,
             providers_dir: PathBuf::from("providers/deployer"),
             packs_dir: PathBuf::from("packs"),
