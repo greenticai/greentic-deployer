@@ -2040,45 +2040,7 @@ pub fn plan_build(
 
     // Resolve the signing key: explicit --signing-key or the global operator key.
     let (priv_pem, key_id) = match &args.signing_key {
-        Some(key_path) => {
-            use ed25519_dalek::pkcs8::DecodePrivateKey;
-            use ed25519_dalek::pkcs8::spki::EncodePublicKey;
-            use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
-            use zeroize::Zeroizing;
-
-            // Pre-size the buffer to the file length so read_to_string
-            // writes into the initial allocation without realloc.  Each
-            // realloc would free an intermediate buffer holding partial key
-            // material back to the global allocator unzeroed.
-            let file_meta = std::fs::metadata(key_path).map_err(|source| OpError::Io {
-                path: key_path.clone(),
-                source,
-            })?;
-            let len: usize = file_meta.len().try_into().unwrap_or(usize::MAX);
-            let mut pem = Zeroizing::new(String::with_capacity(len.saturating_add(8)));
-            {
-                use std::io::Read;
-                let mut file = std::fs::File::open(key_path).map_err(|source| OpError::Io {
-                    path: key_path.clone(),
-                    source,
-                })?;
-                file.read_to_string(&mut pem)
-                    .map_err(|source| OpError::Io {
-                        path: key_path.clone(),
-                        source,
-                    })?;
-            }
-            let signing_key = ed25519_dalek::SigningKey::from_pkcs8_pem(&pem).map_err(|e| {
-                OpError::InvalidArgument(format!("signing key at {}: {e}", key_path.display()))
-            })?;
-            let public_pem = signing_key
-                .verifying_key()
-                .to_public_key_pem(LineEnding::LF)
-                .map_err(|e| OpError::InvalidArgument(format!("derive public key PEM: {e}")))?;
-            let kid = greentic_distributor_client::signing::key_id_for_public_key_pem(&public_pem)
-                .map_err(|e| OpError::InvalidArgument(format!("derive key id: {e}")))?;
-            (pem, kid)
-        }
+        Some(key_path) => crate::operator_key::read_signing_key_at(key_path)?,
         None => {
             let op_key = crate::operator_key::load_existing_only().map_err(|e| {
                 OpError::InvalidArgument(format!(
