@@ -62,7 +62,11 @@ pub const MIN_POLL_INTERVAL_SECS: u64 = 60;
 /// `greentic.update-channel.v1` — operator policy for the update channel's
 /// notification behavior. Persisted as `<env_dir>/update-channel.json`. Every
 /// behavior field is `Option`: absent = the deny-by-default resolution below.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is deliberately not derived: [`unknown`](Self::unknown) holds arbitrary
+/// JSON (`serde_json::Value` is `PartialEq` but not `Eq`). Nothing in the
+/// ecosystem uses this type as a map key or in a set, so `PartialEq` is enough.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UpdateChannelConfig {
     pub schema: SchemaVersion,
     pub environment_id: EnvId,
@@ -84,6 +88,18 @@ pub struct UpdateChannelConfig {
     /// URL on set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_endpoint: Option<String>,
+    /// Forward-compatibility catch-all. Any keys in the on-disk
+    /// `update-channel.json` that this binary's schema does not recognize are
+    /// captured here and re-emitted verbatim on save. `config-set` is a
+    /// read-modify-write, so without this a binary older than the one that wrote
+    /// the file would silently drop the newer fields it doesn't know — under a
+    /// rollback that would reset an enabled channel's policy (e.g. lose its
+    /// `plan_endpoint`). Establishes forward-compat from this schema revision on;
+    /// it cannot retroactively protect fields against binaries that predate it.
+    /// Empty in the common case, so it serializes to nothing and the on-disk file
+    /// is unchanged for configs with no unknown keys.
+    #[serde(flatten)]
+    pub unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 impl UpdateChannelConfig {
@@ -101,6 +117,7 @@ impl UpdateChannelConfig {
             on_notify: None,
             poll_interval_secs: None,
             plan_endpoint: None,
+            unknown: serde_json::Map::new(),
         }
     }
 
@@ -199,5 +216,60 @@ mod tests {
             back.resolved_plan_endpoint(),
             Some("https://updates.example.com/plans/latest")
         );
+    }
+
+    #[test]
+    fn unknown_fields_survive_read_modify_write() {
+        // A file written by a NEWER binary carries a field this schema revision
+        // does not know (`future_field`). It must survive a load → mutate a known
+        // field → save cycle (what `op updates config-set` does) so a rolled-back
+        // binary never silently drops the newer policy.
+        let on_disk = serde_json::json!({
+            "schema": UpdateChannelConfig::schema_str(),
+            "environment_id": "local",
+            "enabled": true,
+            "future_field": { "nested": [1, 2, 3] },
+        });
+
+        let mut cfg: UpdateChannelConfig = serde_json::from_value(on_disk).unwrap();
+        // Known fields parse; the unknown key lands in the catch-all (never in a
+        // typed field).
+        assert_eq!(cfg.enabled, Some(true));
+        assert_eq!(
+            cfg.unknown.get("future_field"),
+            Some(&serde_json::json!({ "nested": [1, 2, 3] }))
+        );
+        assert!(!cfg.unknown.contains_key("enabled"));
+
+        // Mutate a known field the way `config-set` would, then re-serialize.
+        cfg.on_notify = Some(OnNotifyAction::RecordOnly);
+        let rewritten = serde_json::to_value(&cfg).unwrap();
+
+        // The unknown field is re-emitted verbatim at the top level (flattened),
+        // alongside the mutated known field.
+        assert_eq!(
+            rewritten.get("future_field"),
+            Some(&serde_json::json!({ "nested": [1, 2, 3] }))
+        );
+        assert_eq!(
+            rewritten.get("on_notify").and_then(|v| v.as_str()),
+            Some("record_only")
+        );
+        assert_eq!(
+            rewritten.get("enabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn no_unknown_fields_serializes_clean() {
+        // The common case: a config with no unknown keys serializes to exactly the
+        // known fields — the catch-all adds nothing to the on-disk file.
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+        let json = serde_json::to_value(&cfg).unwrap();
+        let obj = json.as_object().unwrap();
+        // schema, environment_id, enabled — and nothing else.
+        assert_eq!(obj.len(), 3, "unexpected keys: {obj:?}");
     }
 }
