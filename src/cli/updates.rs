@@ -897,12 +897,12 @@ fn apply_updates_impl(
                 // the success path. Otherwise (Case B: state.json stuck at
                 // Applying), return an honest error stating the env content IS
                 // applied and pointing at `op updates recover`.
-                let mut transition_ok = false;
                 for attempt in 0..2u8 {
                     match staged.transition(UpdateStage::Applied) {
                         Ok(_) => {
-                            transition_ok = true;
-                            break;
+                            // Best-effort retention of terminal plans (never evicts active).
+                            let _ = root.apply_retention(&RetentionPolicy { keep_terminal: 5 });
+                            return build_success_outcome();
                         }
                         Err(e) => {
                             if attempt == 0 {
@@ -918,12 +918,6 @@ fn apply_updates_impl(
                     }
                 }
 
-                if transition_ok {
-                    // Best-effort retention of terminal plans (never evicts active).
-                    let _ = root.apply_retention(&RetentionPolicy { keep_terminal: 5 });
-                    return build_success_outcome();
-                }
-
                 // Persistent failure. Re-read the on-disk stage to distinguish
                 // Case A (state IS Applied, audit-append gap) from Case B
                 // (state stuck at Applying).
@@ -935,31 +929,24 @@ fn apply_updates_impl(
                         let _ = root.apply_retention(&RetentionPolicy { keep_terminal: 5 });
                         build_success_outcome()
                     }
-                    Ok(actual_stage) => {
-                        // Case B: state.json is stuck (likely still Applying).
-                        // The env content IS applied, but the FSM marker did
-                        // not advance. Do NOT restore the snapshot — the env
-                        // is correct. Return an honest error with recovery
+                    stage_result => {
+                        // Case B: state.json did not reach Applied — either
+                        // stuck (likely Applying) or unreadable. The env
+                        // content IS applied, but the FSM marker did not
+                        // advance. Do NOT restore the snapshot — the env is
+                        // correct. Return an honest error with recovery
                         // instructions.
+                        let detail = match stage_result {
+                            Ok(s) => format!(" (current stage: `{}`)", s.as_str()),
+                            Err(e) => format!(" and the current stage is unreadable: {e}"),
+                        };
                         Err(OpError::Conflict(format!(
                             "plan `{}` content was applied successfully, but the staging \
-                             marker could not advance to `applied` (current stage: `{}`); \
+                             marker could not advance to `applied`{}; \
                              the environment is correct — run \
                              `op updates recover --force` to un-stick the marker, then \
                              re-stage with `op updates get` if sequence tracking matters",
-                            verified.plan.plan_id,
-                            actual_stage.as_str(),
-                        )))
-                    }
-                    Err(e) => {
-                        // Cannot even re-read the stage — surface what we know.
-                        Err(OpError::Conflict(format!(
-                            "plan `{}` content was applied successfully, but the staging \
-                             marker could not advance to `applied` and the current stage \
-                             is unreadable: {e}; the environment is correct — run \
-                             `op updates recover --force` to un-stick the marker, then \
-                             re-stage with `op updates get` if sequence tracking matters",
-                            verified.plan.plan_id,
+                            verified.plan.plan_id, detail,
                         )))
                     }
                 }
