@@ -852,34 +852,117 @@ fn apply_updates_impl(
         // Drive the declarative apply pipeline with the signed target manifest.
         match run_manifest_apply(store, &target) {
             Ok(apply_outcome) => {
-                staged.transition(UpdateStage::Applied).map_err(|e| {
-                    OpError::Conflict(format!("mark plan applied (applying → applied): {e}"))
-                })?;
-                // Best-effort retention of terminal plans (never evicts active).
-                let _ = root.apply_retention(&RetentionPolicy { keep_terminal: 5 });
-                let mut body = json!({
-                    "environment_id": env_id.as_str(),
-                    "plan_id": verified.plan.plan_id,
-                    "sequence": verified.plan.sequence,
-                    "plan_sha256": verified.plan_sha256,
-                    "snapshot_id": snap_id.to_string(),
-                    "stage": UpdateStage::Applied.as_str(),
-                    "apply_result": apply_outcome.result,
-                });
-                // Surface any binary artifacts this content apply did NOT install,
-                // so the "applied" result is never misread as a completed binary
-                // self-update (those are applied by the greentic-start receiver).
-                if !verified.plan.binaries.is_empty() {
-                    let not_applied: Vec<Value> = verified
-                        .plan
-                        .binaries
-                        .iter()
-                        .map(|b| json!({"name": b.name, "version": b.version, "target": b.target}))
-                        .collect();
-                    body["binaries_not_applied"] = Value::Array(not_applied);
+                // Build the success outcome body. Shared by the normal-success
+                // path AND the Case-A recovery (state reached Applied but the
+                // audit-append failed), so it lives in a closure to stay DRY.
+                let build_success_outcome = || {
+                    let mut body = json!({
+                        "environment_id": env_id.as_str(),
+                        "plan_id": verified.plan.plan_id,
+                        "sequence": verified.plan.sequence,
+                        "plan_sha256": verified.plan_sha256,
+                        "snapshot_id": snap_id.to_string(),
+                        "stage": UpdateStage::Applied.as_str(),
+                        "apply_result": apply_outcome.result,
+                    });
+                    // Surface any binary artifacts this content apply did NOT
+                    // install, so the "applied" result is never misread as a
+                    // completed binary self-update (those are applied by the
+                    // greentic-start receiver).
+                    if !verified.plan.binaries.is_empty() {
+                        let not_applied: Vec<Value> = verified
+                            .plan
+                            .binaries
+                            .iter()
+                            .map(|b| {
+                                json!({"name": b.name, "version": b.version, "target": b.target})
+                            })
+                            .collect();
+                        body["binaries_not_applied"] = Value::Array(not_applied);
+                    }
+                    let outcome = OpOutcome::new(NOUN, "apply", body);
+                    Ok((outcome, super::AuditGens::NONE))
+                };
+
+                // Allow test code to inject a fault immediately before the
+                // applying -> applied transition, so the Case-B honest-error
+                // branch is exercisable.
+                #[cfg(test)]
+                run_pre_applied_transition_hook();
+
+                // Retry the applying -> applied transition up to 2 attempts
+                // with a 200ms sleep between. If the transition persistently
+                // fails, re-read the stage: if it already reached Applied
+                // (Case A: state.json committed but audit-append failed), take
+                // the success path. Otherwise (Case B: state.json stuck at
+                // Applying), return an honest error stating the env content IS
+                // applied and pointing at `op updates recover`.
+                let mut transition_ok = false;
+                for attempt in 0..2u8 {
+                    match staged.transition(UpdateStage::Applied) {
+                        Ok(_) => {
+                            transition_ok = true;
+                            break;
+                        }
+                        Err(e) => {
+                            if attempt == 0 {
+                                tracing::warn!(
+                                    plan_id = %verified.plan.plan_id,
+                                    error = %e,
+                                    "applying -> applied transition failed; retrying in 200ms"
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                            }
+                            // Second attempt failed — fall through to re-read.
+                        }
+                    }
                 }
-                let outcome = OpOutcome::new(NOUN, "apply", body);
-                Ok((outcome, super::AuditGens::NONE))
+
+                if transition_ok {
+                    // Best-effort retention of terminal plans (never evicts active).
+                    let _ = root.apply_retention(&RetentionPolicy { keep_terminal: 5 });
+                    return build_success_outcome();
+                }
+
+                // Persistent failure. Re-read the on-disk stage to distinguish
+                // Case A (state IS Applied, audit-append gap) from Case B
+                // (state stuck at Applying).
+                match staged.stage() {
+                    Ok(UpdateStage::Applied) => {
+                        // Case A: the state.json write committed but the
+                        // audit-append (or a subsequent retry's lock acquire)
+                        // failed. The FSM is correct — take the success path.
+                        let _ = root.apply_retention(&RetentionPolicy { keep_terminal: 5 });
+                        build_success_outcome()
+                    }
+                    Ok(actual_stage) => {
+                        // Case B: state.json is stuck (likely still Applying).
+                        // The env content IS applied, but the FSM marker did
+                        // not advance. Do NOT restore the snapshot — the env
+                        // is correct. Return an honest error with recovery
+                        // instructions.
+                        Err(OpError::Conflict(format!(
+                            "plan `{}` content was applied successfully, but the staging \
+                             marker could not advance to `applied` (current stage: `{}`); \
+                             the environment is correct — run \
+                             `op updates recover --force` to un-stick the marker, then \
+                             re-stage with `op updates get` if sequence tracking matters",
+                            verified.plan.plan_id,
+                            actual_stage.as_str(),
+                        )))
+                    }
+                    Err(e) => {
+                        // Cannot even re-read the stage — surface what we know.
+                        Err(OpError::Conflict(format!(
+                            "plan `{}` content was applied successfully, but the staging \
+                             marker could not advance to `applied` and the current stage \
+                             is unreadable: {e}; the environment is correct — run \
+                             `op updates recover --force` to un-stick the marker, then \
+                             re-stage with `op updates get` if sequence tracking matters",
+                            verified.plan.plan_id,
+                        )))
+                    }
+                }
             }
             Err(apply_err) => {
                 // Roll the whole env back to the pre-apply snapshot, then fail
@@ -2219,6 +2302,26 @@ fn config_show_schema() -> Value {
             "environment_id": {"type": "string"}
         }
     })
+}
+
+// Test-only fault-injection hook: called immediately before the
+// `applying -> applied` transition retry loop in `apply_updates_impl`.
+// Tests install a closure here to sabotage the on-disk plan directory
+// (e.g. chmod it read-only) so the transition write fails, exercising the
+// Case-B honest-error branch.
+#[cfg(test)]
+thread_local! {
+    static PRE_APPLIED_TRANSITION_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_pre_applied_transition_hook() {
+    PRE_APPLIED_TRANSITION_HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f();
+        }
+    });
 }
 
 #[cfg(test)]
@@ -3751,6 +3854,86 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert_eq!(bins[0]["name"], "greentic-start");
         assert_eq!(bins[0]["version"], "1.1.9");
         assert_eq!(bins[0]["target"], "x86_64-unknown-linux-gnu");
+    }
+
+    #[test]
+    fn apply_transition_failure_returns_honest_recover_error() {
+        // Exercise Case B: run_manifest_apply succeeds (env content IS mutated),
+        // but the applying -> applied transition persistently fails. The error
+        // must contain "recover" and NOT claim the apply itself failed.
+        use greentic_update::staging::UpdateStage;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+        stage_local(updates_dir.path(), "plan-stuck", 1, &priv7, &tk7);
+
+        // Resolve the on-disk plan directory so we can chmod it read-only from
+        // inside the fault hook, preventing `state.json` writes.
+        let plan_dir = greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local")
+            .unwrap()
+            .load("plan-stuck")
+            .unwrap()
+            .unwrap()
+            .dir()
+            .to_path_buf();
+
+        // Install a fault hook that fires AFTER run_manifest_apply succeeds but
+        // BEFORE the transition retry loop. Making the plan dir read-only
+        // prevents `state.json` from being rewritten, so the transition fails
+        // with an I/O error.
+        let hook_dir = plan_dir.clone();
+        PRE_APPLIED_TRANSITION_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::set_permissions(&hook_dir, std::fs::Permissions::from_mode(0o500))
+                    .expect("chmod plan dir read-only");
+            }));
+        });
+
+        let err = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-stuck".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+
+        // Clean up the hook so it does not interfere with other tests.
+        PRE_APPLIED_TRANSITION_HOOK.with(|h| {
+            *h.borrow_mut() = None;
+        });
+        // Restore write permission so tempdir cleanup succeeds.
+        std::fs::set_permissions(&plan_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The error must mention `recover` and must NOT claim the apply failed.
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("recover"),
+            "error must point at `op updates recover`: {msg}"
+        );
+        assert!(
+            msg.contains("applied successfully"),
+            "error must state content was applied: {msg}"
+        );
+
+        // The on-disk stage is stuck at Applying (Case B), NOT Applied.
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-stuck"),
+            UpdateStage::Applying
+        );
+
+        // The env content WAS applied — a snapshot was captured pre-mutation.
+        let env_dir = store.env_dir(&env_id).unwrap();
+        assert!(
+            env_dir.join("snapshots").is_dir(),
+            "snapshot must exist (env was mutated)"
+        );
     }
 
     #[test]
