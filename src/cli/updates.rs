@@ -1808,6 +1808,19 @@ async fn mtls_get(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, OpErro
 /// Parse a `--binary` spec string (comma-separated key=value) into a
 /// [`greentic_update::plan::BinaryArtifact`]. Required keys: `name`, `version`,
 /// `target`, `digest`. Optional: `source`.
+/// A `--binary` spec's required key must be present and non-empty.
+fn require_non_empty(value: Option<String>, key: &str) -> Result<String, OpError> {
+    let value = value.ok_or_else(|| {
+        OpError::InvalidArgument(format!("--binary: missing required key `{key}`"))
+    })?;
+    if value.is_empty() {
+        return Err(OpError::InvalidArgument(format!(
+            "--binary: `{key}` must not be empty"
+        )));
+    }
+    Ok(value)
+}
+
 fn parse_binary_spec(spec: &str) -> Result<greentic_update::plan::BinaryArtifact, OpError> {
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;
@@ -1872,38 +1885,10 @@ fn parse_binary_spec(spec: &str) -> Result<greentic_update::plan::BinaryArtifact
         }
     }
 
-    let name = name.ok_or_else(|| {
-        OpError::InvalidArgument("--binary: missing required key `name`".to_string())
-    })?;
-    if name.is_empty() {
-        return Err(OpError::InvalidArgument(
-            "--binary: `name` must not be empty".to_string(),
-        ));
-    }
-    let version = version.ok_or_else(|| {
-        OpError::InvalidArgument("--binary: missing required key `version`".to_string())
-    })?;
-    if version.is_empty() {
-        return Err(OpError::InvalidArgument(
-            "--binary: `version` must not be empty".to_string(),
-        ));
-    }
-    let target = target.ok_or_else(|| {
-        OpError::InvalidArgument("--binary: missing required key `target`".to_string())
-    })?;
-    if target.is_empty() {
-        return Err(OpError::InvalidArgument(
-            "--binary: `target` must not be empty".to_string(),
-        ));
-    }
-    let digest = digest.ok_or_else(|| {
-        OpError::InvalidArgument("--binary: missing required key `digest`".to_string())
-    })?;
-    if digest.is_empty() {
-        return Err(OpError::InvalidArgument(
-            "--binary: `digest` must not be empty".to_string(),
-        ));
-    }
+    let name = require_non_empty(name, "name")?;
+    let version = require_non_empty(version, "version")?;
+    let target = require_non_empty(target, "target")?;
+    let digest = require_non_empty(digest, "digest")?;
 
     Ok(greentic_update::plan::BinaryArtifact {
         name,
@@ -2036,8 +2021,8 @@ pub fn plan_build(
 
     // Build the compat requirements.
     let mut compat = CompatRequirements::default();
-    if let Some(ref min_rt) = args.min_runtime {
-        compat.min_runtime = Some(min_rt.clone());
+    if let Some(min_rt) = args.min_runtime {
+        compat.min_runtime = Some(min_rt);
     }
 
     let plan = UpdatePlan {
