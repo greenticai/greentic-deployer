@@ -285,6 +285,7 @@ fn route_remote(
             UpdatesVerb::Recover(_) => Err(not_supported("updates recover")),
             UpdatesVerb::ConfigSet(_) => Err(not_supported("updates config-set")),
             UpdatesVerb::ConfigShow { .. } => Err(not_supported("updates config-show")),
+            UpdatesVerb::PlanBuild(_) => Err(not_supported("updates plan-build")),
         },
     }
 }

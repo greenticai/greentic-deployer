@@ -141,7 +141,9 @@ features = [
 ]
 
 [dependencies.greentic-update]
-version = "0.1"
+# Floor bumped to 0.1.28859386871: first publish carrying the `binaries` /
+# `select_binary` schema (BinaryArtifact) that `op updates plan-build` constructs.
+version = ">=0.1.28859386871, <0.2"
 features = [
     "enroll",
     "mtls",

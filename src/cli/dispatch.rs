@@ -687,6 +687,10 @@ pub enum UpdatesVerb {
     /// Show the update-channel notification policy (stored fields + resolved
     /// effective values). Read-only.
     ConfigShow { env_id: Option<String> },
+    /// Build and DSSE-sign an UpdatePlan carrying one or more binary artifacts,
+    /// writing `plan.json` + `plan.json.sig` that round-trip through the
+    /// existing `verify_update_plan`. Producer side of binary self-update.
+    PlanBuild(UpdatesPlanBuildArgs),
 }
 
 #[derive(Args, Debug)]
@@ -730,6 +734,31 @@ pub struct UpdatesConfigSetArgs {
     /// Fallback poll interval in seconds (>= 60). Omit to leave unchanged.
     #[arg(long = "poll-interval-secs")]
     pub poll_interval_secs: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesPlanBuildArgs {
+    /// Target environment id.
+    pub env_id: String,
+    /// Monotonic plan sequence (the consumer enforces anti-rollback).
+    #[arg(long)]
+    pub sequence: u64,
+    /// Binary artifact spec (repeatable). Comma-separated key=value:
+    /// `name=greentic-start,version=1.1.9,target=x86_64-unknown-linux-gnu,digest=sha256:<hex>[,source=https://...]`.
+    #[arg(long = "binary", required = true)]
+    pub binaries: Vec<String>,
+    /// PKCS#8 Ed25519 private key PEM for signing. Default: the global operator key.
+    #[arg(long = "signing-key")]
+    pub signing_key: Option<PathBuf>,
+    /// JSON file for the plan target (env-manifest.v1). Default: `{}`.
+    #[arg(long = "target-file")]
+    pub target_file: Option<PathBuf>,
+    /// Minimum runtime version (semver) for `compat.min_runtime`.
+    #[arg(long = "min-runtime")]
+    pub min_runtime: Option<String>,
+    /// Output directory for `plan.json` + `plan.json.sig`. Default: current dir.
+    #[arg(long = "out-dir")]
+    pub out_dir: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1156,6 +1185,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 UpdatesVerb::Recover(_) => "recover",
                 UpdatesVerb::ConfigSet(_) => "config-set",
                 UpdatesVerb::ConfigShow { .. } => "config-show",
+                UpdatesVerb::PlanBuild(_) => "plan-build",
             },
         ),
     }
@@ -1482,6 +1512,7 @@ fn dispatch_updates(
                 .map(|environment_id| super::updates::UpdateConfigShowFilter { environment_id });
             super::updates::config_show(store, flags, payload)?
         }
+        UpdatesVerb::PlanBuild(args) => super::updates::plan_build(store, flags, args)?,
     };
     print_outcome(&outcome)
 }
