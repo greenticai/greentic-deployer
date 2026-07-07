@@ -2913,9 +2913,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-update"
-version = "0.1.28607531727"
+version = "0.1.28859386871"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd32a91765c9ec536cdbdd98274a70f08f521fff2518c41bf2e32a3611c0c4b7"
+checksum = "a47eb7b004ef9ad38b5d11acd9561c4b0cf28f9126c9cfe1d86fcf8ae66c6691"
 dependencies = [
  "chrono",
  "fs4",
