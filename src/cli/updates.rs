@@ -1801,11 +1801,46 @@ fn parse_binary_spec(spec: &str) -> Result<greentic_update::plan::BinaryArtifact
             OpError::InvalidArgument(format!("--binary: expected key=value pair, got `{part}`"))
         })?;
         match key {
-            "name" => name = Some(value.to_string()),
-            "version" => version = Some(value.to_string()),
-            "target" => target = Some(value.to_string()),
-            "digest" => digest = Some(value.to_string()),
-            "source" => source = Some(value.to_string()),
+            "name" => {
+                if name.is_some() {
+                    return Err(OpError::InvalidArgument(
+                        "--binary: duplicate key `name`".to_string(),
+                    ));
+                }
+                name = Some(value.to_string());
+            }
+            "version" => {
+                if version.is_some() {
+                    return Err(OpError::InvalidArgument(
+                        "--binary: duplicate key `version`".to_string(),
+                    ));
+                }
+                version = Some(value.to_string());
+            }
+            "target" => {
+                if target.is_some() {
+                    return Err(OpError::InvalidArgument(
+                        "--binary: duplicate key `target`".to_string(),
+                    ));
+                }
+                target = Some(value.to_string());
+            }
+            "digest" => {
+                if digest.is_some() {
+                    return Err(OpError::InvalidArgument(
+                        "--binary: duplicate key `digest`".to_string(),
+                    ));
+                }
+                digest = Some(value.to_string());
+            }
+            "source" => {
+                if source.is_some() {
+                    return Err(OpError::InvalidArgument(
+                        "--binary: duplicate key `source`".to_string(),
+                    ));
+                }
+                source = Some(value.to_string());
+            }
             unknown => {
                 return Err(OpError::InvalidArgument(format!(
                     "--binary: unknown key `{unknown}` (expected name, version, target, digest, source)"
@@ -1817,12 +1852,27 @@ fn parse_binary_spec(spec: &str) -> Result<greentic_update::plan::BinaryArtifact
     let name = name.ok_or_else(|| {
         OpError::InvalidArgument("--binary: missing required key `name`".to_string())
     })?;
+    if name.is_empty() {
+        return Err(OpError::InvalidArgument(
+            "--binary: `name` must not be empty".to_string(),
+        ));
+    }
     let version = version.ok_or_else(|| {
         OpError::InvalidArgument("--binary: missing required key `version`".to_string())
     })?;
+    if version.is_empty() {
+        return Err(OpError::InvalidArgument(
+            "--binary: `version` must not be empty".to_string(),
+        ));
+    }
     let target = target.ok_or_else(|| {
         OpError::InvalidArgument("--binary: missing required key `target`".to_string())
     })?;
+    if target.is_empty() {
+        return Err(OpError::InvalidArgument(
+            "--binary: `target` must not be empty".to_string(),
+        ));
+    }
     let digest = digest.ok_or_else(|| {
         OpError::InvalidArgument("--binary: missing required key `digest`".to_string())
     })?;
@@ -1863,7 +1913,14 @@ pub fn plan_build(
         return Ok(OpOutcome::new(NOUN, "plan-build", plan_build_schema()));
     }
 
-    let env_id = parse_env_id(&args.env_id)?;
+    let env_id_raw = args.env_id.ok_or_else(|| {
+        OpError::InvalidArgument("env_id is required (positional argument)".to_string())
+    })?;
+    let env_id = parse_env_id(&env_id_raw)?;
+
+    let sequence = args
+        .sequence
+        .ok_or_else(|| OpError::InvalidArgument("--sequence is required".to_string()))?;
 
     // Parse all --binary specs up front, before touching disk.
     let binaries: Vec<BinaryArtifact> = args
@@ -1886,11 +1943,28 @@ pub fn plan_build(
             use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
             use zeroize::Zeroizing;
 
-            let raw = std::fs::read_to_string(key_path).map_err(|source| OpError::Io {
+            // Pre-size the buffer to the file length so read_to_string
+            // writes into the initial allocation without realloc.  Each
+            // realloc would free an intermediate buffer holding partial key
+            // material back to the global allocator unzeroed.
+            let file_meta = std::fs::metadata(key_path).map_err(|source| OpError::Io {
                 path: key_path.clone(),
                 source,
             })?;
-            let pem = Zeroizing::new(raw);
+            let len: usize = file_meta.len().try_into().unwrap_or(usize::MAX);
+            let mut pem = Zeroizing::new(String::with_capacity(len.saturating_add(8)));
+            {
+                use std::io::Read;
+                let mut file = std::fs::File::open(key_path).map_err(|source| OpError::Io {
+                    path: key_path.clone(),
+                    source,
+                })?;
+                file.read_to_string(&mut pem)
+                    .map_err(|source| OpError::Io {
+                        path: key_path.clone(),
+                        source,
+                    })?;
+            }
             let signing_key = ed25519_dalek::SigningKey::from_pkcs8_pem(&pem).map_err(|e| {
                 OpError::InvalidArgument(format!("signing key at {}: {e}", key_path.display()))
             })?;
@@ -1917,7 +1991,7 @@ pub fn plan_build(
     let env_dir = store.env_dir(&env_id)?;
     let trust = store_trust_root::load(&env_dir)?;
 
-    // Build the plan target from --target-file or default to {}.
+    // Build the plan target from --target-file or a minimal valid env-manifest.
     let target: serde_json::Value = match &args.target_file {
         Some(path) => {
             let bytes = std::fs::read(path).map_err(|source| OpError::Io {
@@ -1931,7 +2005,10 @@ pub fn plan_build(
                 ))
             })?
         }
-        None => json!({}),
+        None => json!({
+            "schema": super::env_manifest::ENV_MANIFEST_SCHEMA_V1,
+            "environment": { "id": env_id.as_str() },
+        }),
     };
 
     // Build the compat requirements.
@@ -1944,7 +2021,7 @@ pub fn plan_build(
         schema: UPDATE_PLAN_SCHEMA_V1.to_string(),
         plan_id: ulid::Ulid::new().to_string(),
         env_id: env_id.to_string(),
-        sequence: args.sequence,
+        sequence,
         created_at: Utc::now(),
         nonce: ulid::Ulid::new().to_string(),
         target,
@@ -2010,7 +2087,7 @@ fn plan_build_schema() -> Value {
             "sequence": {"type": "integer", "description": "Monotonic plan sequence (anti-rollback)."},
             "binaries": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Binary artifact specs (comma-separated key=value)."},
             "signing_key": {"type": ["string", "null"], "description": "PKCS#8 Ed25519 private key PEM path. Default: global operator key."},
-            "target_file": {"type": ["string", "null"], "description": "JSON file for the plan target (env-manifest.v1). Default: {}."},
+            "target_file": {"type": ["string", "null"], "description": "JSON file for the plan target (env-manifest.v1). Default: minimal manifest with schema + env id."},
             "min_runtime": {"type": ["string", "null"], "description": "Minimum runtime version (semver) for compat.min_runtime."},
             "out_dir": {"type": ["string", "null"], "description": "Output directory for plan.json + plan.json.sig. Default: current dir."}
         }
@@ -4400,8 +4477,8 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         out_dir: PathBuf,
     ) -> crate::cli::dispatch::UpdatesPlanBuildArgs {
         crate::cli::dispatch::UpdatesPlanBuildArgs {
-            env_id: env_id.to_string(),
-            sequence,
+            env_id: Some(env_id.to_string()),
+            sequence: Some(sequence),
             binaries,
             signing_key,
             target_file: None,

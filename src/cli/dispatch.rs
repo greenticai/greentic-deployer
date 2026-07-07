@@ -739,18 +739,18 @@ pub struct UpdatesConfigSetArgs {
 #[derive(Args, Debug)]
 pub struct UpdatesPlanBuildArgs {
     /// Target environment id.
-    pub env_id: String,
+    pub env_id: Option<String>,
     /// Monotonic plan sequence (the consumer enforces anti-rollback).
     #[arg(long)]
-    pub sequence: u64,
+    pub sequence: Option<u64>,
     /// Binary artifact spec (repeatable). Comma-separated key=value:
     /// `name=greentic-start,version=1.1.9,target=x86_64-unknown-linux-gnu,digest=sha256:<hex>[,source=https://...]`.
-    #[arg(long = "binary", required = true)]
+    #[arg(long = "binary")]
     pub binaries: Vec<String>,
     /// PKCS#8 Ed25519 private key PEM for signing. Default: the global operator key.
     #[arg(long = "signing-key")]
     pub signing_key: Option<PathBuf>,
-    /// JSON file for the plan target (env-manifest.v1). Default: `{}`.
+    /// JSON file for the plan target (env-manifest.v1). Default: minimal manifest with schema + env id.
     #[arg(long = "target-file")]
     pub target_file: Option<PathBuf>,
     /// Minimum runtime version (semver) for `compat.min_runtime`.
