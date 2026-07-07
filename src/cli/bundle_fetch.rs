@@ -133,6 +133,36 @@ mod tests {
         assert_eq!(err.kind(), "not-yet-implemented");
     }
 
+    #[test]
+    fn http_scheme_is_not_yet_implemented() {
+        let err = fetch_bundle_uri_to_local("http://example.com/webchat-bot.gtbundle").unwrap_err();
+        assert_eq!(err.kind(), "not-yet-implemented");
+    }
+
+    #[test]
+    fn oci_scheme_trims_surrounding_whitespace() {
+        // Whitespace-padded empty ref → the trimmed string `oci://` strips
+        // to an empty oci_ref, which should be InvalidArgument, not
+        // NotYetImplemented (the strip_prefix succeeds, then the empty check
+        // fires).
+        let err = fetch_bundle_uri_to_local("  oci://  ").unwrap_err();
+        assert_eq!(err.kind(), "invalid-argument");
+    }
+
+    #[test]
+    fn oci_scheme_with_unreachable_registry_is_fetch_error() {
+        // A syntactically valid OCI ref that points at a non-existent host.
+        // Exercises the thread-scope + tokio runtime path in fetch_oci_to_cache.
+        let err = fetch_bundle_uri_to_local("oci://this-host-does-not-exist.invalid/repo:tag")
+            .unwrap_err();
+        assert_eq!(err.kind(), "fetch");
+    }
+
+    #[test]
+    fn oci_scheme_constant_matches_expected_prefix() {
+        assert_eq!(OCI_SCHEME, "oci://");
+    }
+
     /// Live OCI pull against the public demo bundle. Ignored by default (needs
     /// network + ghcr reachability); run with `--ignored` locally or in a
     /// network-enabled CI job. Verifies the `oci://` happy path end-to-end:
