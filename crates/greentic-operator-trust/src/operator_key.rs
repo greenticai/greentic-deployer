@@ -189,6 +189,28 @@ pub fn load_existing_only() -> Result<OperatorKey, OperatorKeyError> {
     load_existing(&path, pem)
 }
 
+/// Read an existing signing key at an explicit path (e.g. `--signing-key`)
+/// with the same hardening as [`load_existing_only`]: symlink-ancestor gate,
+/// `O_NOFOLLOW` open, regular-file + mode (0600) checks, and a pre-sized
+/// `Zeroizing` read. Returns `(private_pem, key_id)`. Unlike `load_existing`,
+/// it writes NO `.pub` sibling — the path is caller-supplied, so regenerating
+/// a public file next to it would litter unexpected state. The mode/symlink
+/// enforcement is Unix-only (a no-op on other platforms, matching
+/// `read_existing_securely`).
+pub fn read_signing_key_at(path: &Path) -> Result<(Zeroizing<String>, String), OperatorKeyError> {
+    refuse_symlink_in_ancestors(path)?;
+    let private_pem = read_existing_securely(path)?;
+    let sk = Ed25519SigningKey::from_pkcs8_pem(&private_pem)
+        .map_err(|e| OperatorKeyError::KeyDecode(format!("PKCS#8 private PEM: {e}")))?;
+    let vk = sk.verifying_key();
+    let public_pem = vk
+        .to_public_key_pem(LineEnding::LF)
+        .map_err(|e| OperatorKeyError::KeyDecode(format!("derive SPKI PEM: {e}")))?;
+    drop(sk);
+    let key_id = key_id_for_public_key_pem(&public_pem)?;
+    Ok((private_pem, key_id))
+}
+
 /// Like [`load_or_generate`] but with an explicit path (tests + callers
 /// that already resolved the path themselves).
 pub fn load_or_generate_at(path: &Path) -> Result<OperatorKey, OperatorKeyError> {
@@ -801,5 +823,98 @@ mod tests {
         chmod(&path, 0o600);
         let err = load_or_generate_at(&path).expect_err("bad PEM must reject");
         assert!(matches!(err, OperatorKeyError::KeyDecode(_)));
+    }
+
+    // ── read_signing_key_at tests ──────────────────────────────────────
+
+    #[test]
+    fn read_signing_key_at_valid_key_matches_load_or_generate() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+        let generated = load_or_generate_at(&path).unwrap();
+        let (pem, kid) = read_signing_key_at(&path).unwrap();
+        assert_eq!(kid.len(), 32, "key_id must be a 32-hex-char string");
+        assert_eq!(
+            kid, generated.key_id,
+            "key_id must match load_or_generate_at"
+        );
+        assert_eq!(*pem, *generated.private_pem);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_signing_key_at_rejects_mode_0644() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+        load_or_generate_at(&path).unwrap();
+        chmod(&path, 0o644);
+        let err = read_signing_key_at(&path).expect_err("0644 must be rejected");
+        assert!(
+            matches!(err, OperatorKeyError::InsecurePermissions { .. }),
+            "expected InsecurePermissions, got {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_signing_key_at_rejects_symlinked_key() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real.pem");
+        load_or_generate_at(&real).unwrap();
+        let link = dir.path().join("link.pem");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = read_signing_key_at(&link).expect_err("symlink must be rejected");
+        assert!(
+            matches!(err, OperatorKeyError::NotRegularFile { .. }),
+            "expected NotRegularFile, got {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_signing_key_at_rejects_symlinked_ancestor() {
+        let dir = tempdir().unwrap();
+        let real_dir = dir.path().join("real-dir");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let key_in_real = real_dir.join("key.pem");
+        load_or_generate_at(&key_in_real).unwrap();
+        let sym_dir = dir.path().join("sym-dir");
+        std::os::unix::fs::symlink(&real_dir, &sym_dir).unwrap();
+        let key_via_sym = sym_dir.join("key.pem");
+        let err = read_signing_key_at(&key_via_sym).expect_err("ancestor symlink must reject");
+        match err {
+            OperatorKeyError::SymlinkInAncestor { ancestor, .. } => {
+                assert_eq!(ancestor, sym_dir);
+            }
+            other => panic!("expected SymlinkInAncestor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_signing_key_at_does_not_write_pub_sibling() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+        load_or_generate_at(&path).unwrap();
+        let pub_path = public_sibling(&path);
+        assert!(pub_path.exists());
+        std::fs::remove_file(&pub_path).unwrap();
+        let (_pem, _kid) = read_signing_key_at(&path).unwrap();
+        assert!(
+            !pub_path.exists(),
+            "read_signing_key_at must not create a .pub sibling"
+        );
+    }
+
+    #[test]
+    fn read_signing_key_at_nonexistent_yields_not_found() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.pem");
+        let err = read_signing_key_at(&path).expect_err("missing file must error");
+        match err {
+            OperatorKeyError::Io { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected Io with NotFound, got {other:?}"),
+        }
     }
 }
