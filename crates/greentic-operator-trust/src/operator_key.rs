@@ -200,14 +200,7 @@ pub fn load_existing_only() -> Result<OperatorKey, OperatorKeyError> {
 pub fn read_signing_key_at(path: &Path) -> Result<(Zeroizing<String>, String), OperatorKeyError> {
     refuse_symlink_in_ancestors(path)?;
     let private_pem = read_existing_securely(path)?;
-    let sk = Ed25519SigningKey::from_pkcs8_pem(&private_pem)
-        .map_err(|e| OperatorKeyError::KeyDecode(format!("PKCS#8 private PEM: {e}")))?;
-    let vk = sk.verifying_key();
-    let public_pem = vk
-        .to_public_key_pem(LineEnding::LF)
-        .map_err(|e| OperatorKeyError::KeyDecode(format!("derive SPKI PEM: {e}")))?;
-    drop(sk);
-    let key_id = key_id_for_public_key_pem(&public_pem)?;
+    let (_public_pem, key_id) = derive_public_pem_and_key_id(&private_pem)?;
     Ok((private_pem, key_id))
 }
 
@@ -367,11 +360,11 @@ fn check_mode(_path: &Path, _meta: &std::fs::Metadata) -> Result<(), OperatorKey
     Ok(())
 }
 
-fn load_existing(
-    path: &Path,
-    private_pem: Zeroizing<String>,
-) -> Result<OperatorKey, OperatorKeyError> {
-    let sk = Ed25519SigningKey::from_pkcs8_pem(&private_pem)
+/// Decode a PKCS#8 private PEM, derive the SPKI public PEM and the canonical
+/// key-id (hex SHA-256 prefix). The signing key is wiped (`drop`) before
+/// returning so only the public material escapes this scope.
+fn derive_public_pem_and_key_id(private_pem: &str) -> Result<(String, String), OperatorKeyError> {
+    let sk = Ed25519SigningKey::from_pkcs8_pem(private_pem)
         .map_err(|e| OperatorKeyError::KeyDecode(format!("PKCS#8 private PEM: {e}")))?;
     let vk = sk.verifying_key();
     let public_pem = vk
@@ -379,6 +372,14 @@ fn load_existing(
         .map_err(|e| OperatorKeyError::KeyDecode(format!("derive SPKI PEM: {e}")))?;
     drop(sk);
     let key_id = key_id_for_public_key_pem(&public_pem)?;
+    Ok((public_pem, key_id))
+}
+
+fn load_existing(
+    path: &Path,
+    private_pem: Zeroizing<String>,
+) -> Result<OperatorKey, OperatorKeyError> {
+    let (public_pem, key_id) = derive_public_pem_and_key_id(&private_pem)?;
 
     let pub_path = public_sibling(path);
     match std::fs::read_to_string(&pub_path) {
