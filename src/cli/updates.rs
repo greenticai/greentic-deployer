@@ -772,6 +772,20 @@ fn apply_updates_impl(
         }
     };
 
+    // `op updates apply` converges CONTENT (artifacts + target bundles) only. A
+    // plan may also carry binary artifacts, which are installed by the
+    // greentic-start update receiver, not by this verb — warn so an "applied"
+    // result is never read as "binary installed", and a binary-only plan-build
+    // output is not silently applied as a no-op success.
+    if !verified.plan.binaries.is_empty() {
+        tracing::warn!(
+            env_id = %env_id,
+            binary_count = verified.plan.binaries.len(),
+            "update plan carries binary artifact(s) that `op updates apply` does not \
+             install; binary self-update is applied by the greentic-start update receiver"
+        );
+    }
+
     // The downgrade + compat re-gate moves INTO the `begin_apply_checked`
     // predicate below, so it runs atomically with the `staged → applying`
     // transition against a lock-held applied-set snapshot (closing the TOCTOU
@@ -880,15 +894,11 @@ fn apply_updates_impl(
         // Drive the declarative apply pipeline with the signed target manifest.
         match run_manifest_apply(store, &target) {
             Ok(apply_outcome) => {
-                staged.transition(UpdateStage::Applied).map_err(|e| {
-                    OpError::Conflict(format!("mark plan applied (applying → applied): {e}"))
-                })?;
-                // Best-effort retention of terminal plans (never evicts active).
-                let _ = root.apply_retention(&RetentionPolicy { keep_terminal: 5 });
-                let outcome = OpOutcome::new(
-                    NOUN,
-                    "apply",
-                    json!({
+                // Build the success outcome body. Shared by the normal-success
+                // path AND the Case-A recovery (state reached Applied but the
+                // audit-append failed), so it lives in a closure to stay DRY.
+                let build_success_outcome = || {
+                    let mut body = json!({
                         "environment_id": env_id.as_str(),
                         "plan_id": verified.plan.plan_id,
                         "sequence": verified.plan.sequence,
@@ -896,9 +906,92 @@ fn apply_updates_impl(
                         "snapshot_id": snap_id.to_string(),
                         "stage": UpdateStage::Applied.as_str(),
                         "apply_result": apply_outcome.result,
-                    }),
-                );
-                Ok((outcome, super::AuditGens::NONE))
+                    });
+                    // Surface any binary artifacts this content apply did NOT
+                    // install, so the "applied" result is never misread as a
+                    // completed binary self-update (those are applied by the
+                    // greentic-start receiver).
+                    if !verified.plan.binaries.is_empty() {
+                        let not_applied: Vec<Value> = verified
+                            .plan
+                            .binaries
+                            .iter()
+                            .map(|b| {
+                                json!({"name": b.name, "version": b.version, "target": b.target})
+                            })
+                            .collect();
+                        body["binaries_not_applied"] = Value::Array(not_applied);
+                    }
+                    let outcome = OpOutcome::new(NOUN, "apply", body);
+                    Ok((outcome, super::AuditGens::NONE))
+                };
+
+                // Allow test code to inject a fault immediately before the
+                // applying -> applied transition, so the Case-B honest-error
+                // branch is exercisable.
+                #[cfg(test)]
+                run_pre_applied_transition_hook();
+
+                // Retry the applying -> applied transition up to 2 attempts
+                // with a 200ms sleep between. If the transition persistently
+                // fails, re-read the stage: if it already reached Applied
+                // (Case A: state.json committed but audit-append failed), take
+                // the success path. Otherwise (Case B: state.json stuck at
+                // Applying), return an honest error stating the env content IS
+                // applied and pointing at `op updates recover`.
+                for attempt in 0..2u8 {
+                    match staged.transition(UpdateStage::Applied) {
+                        Ok(_) => {
+                            // Best-effort retention of terminal plans (never evicts active).
+                            let _ = root.apply_retention(&RetentionPolicy { keep_terminal: 5 });
+                            return build_success_outcome();
+                        }
+                        Err(e) => {
+                            if attempt == 0 {
+                                tracing::warn!(
+                                    plan_id = %verified.plan.plan_id,
+                                    error = %e,
+                                    "applying -> applied transition failed; retrying in 200ms"
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                            }
+                            // Second attempt failed — fall through to re-read.
+                        }
+                    }
+                }
+
+                // Persistent failure. Re-read the on-disk stage to distinguish
+                // Case A (state IS Applied, audit-append gap) from Case B
+                // (state stuck at Applying).
+                match staged.stage() {
+                    Ok(UpdateStage::Applied) => {
+                        // Case A: the state.json write committed but the
+                        // audit-append (or a subsequent retry's lock acquire)
+                        // failed. The FSM is correct — take the success path.
+                        let _ = root.apply_retention(&RetentionPolicy { keep_terminal: 5 });
+                        build_success_outcome()
+                    }
+                    stage_result => {
+                        // Case B: state.json did not reach Applied — either
+                        // stuck (likely Applying) or unreadable. The env
+                        // content IS applied, but the FSM marker did not
+                        // advance. Do NOT restore the snapshot — the env is
+                        // correct. Return an honest error with recovery
+                        // instructions.
+                        let detail = match stage_result {
+                            Ok(s) => format!(" (current stage: `{}`)", s.as_str()),
+                            Err(e) => format!(" and the current stage is unreadable: {e}"),
+                        };
+                        Err(OpError::Conflict(format!(
+                            "plan `{}` content was applied successfully, but the staging \
+                             marker could not advance to `applied`{}; \
+                             the environment is correct — run \
+                             `op updates recover --force` to un-stick the marker, then \
+                             re-stage with `op updates get` if sequence tracking matters",
+                            verified.plan.plan_id, detail,
+                        )))
+                    }
+                }
             }
             Err(apply_err) => {
                 // Roll the whole env back to the pre-apply snapshot, then fail
@@ -1873,6 +1966,269 @@ async fn mtls_get(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, OpErro
     Ok(bytes.to_vec())
 }
 
+// ---------------------------------------------------------------------------
+// plan-build: build + DSSE-sign an UpdatePlan carrying binary artifacts
+// ---------------------------------------------------------------------------
+
+/// Parse a `--binary` spec string (comma-separated key=value) into a
+/// [`greentic_update::plan::BinaryArtifact`]. Required keys: `name`, `version`,
+/// `target`, `digest`. Optional: `source`.
+/// A `--binary` spec's required key must be present and non-empty.
+fn require_non_empty(value: Option<String>, key: &str) -> Result<String, OpError> {
+    let value = value.ok_or_else(|| {
+        OpError::InvalidArgument(format!("--binary: missing required key `{key}`"))
+    })?;
+    if value.is_empty() {
+        return Err(OpError::InvalidArgument(format!(
+            "--binary: `{key}` must not be empty"
+        )));
+    }
+    Ok(value)
+}
+
+fn parse_binary_spec(spec: &str) -> Result<greentic_update::plan::BinaryArtifact, OpError> {
+    let mut name: Option<String> = None;
+    let mut version: Option<String> = None;
+    let mut target: Option<String> = None;
+    let mut digest: Option<String> = None;
+    let mut source: Option<String> = None;
+
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (key, value) = part.split_once('=').ok_or_else(|| {
+            OpError::InvalidArgument(format!("--binary: expected key=value pair, got `{part}`"))
+        })?;
+        match key {
+            "name" => {
+                if name.is_some() {
+                    return Err(OpError::InvalidArgument(
+                        "--binary: duplicate key `name`".to_string(),
+                    ));
+                }
+                name = Some(value.to_string());
+            }
+            "version" => {
+                if version.is_some() {
+                    return Err(OpError::InvalidArgument(
+                        "--binary: duplicate key `version`".to_string(),
+                    ));
+                }
+                version = Some(value.to_string());
+            }
+            "target" => {
+                if target.is_some() {
+                    return Err(OpError::InvalidArgument(
+                        "--binary: duplicate key `target`".to_string(),
+                    ));
+                }
+                target = Some(value.to_string());
+            }
+            "digest" => {
+                if digest.is_some() {
+                    return Err(OpError::InvalidArgument(
+                        "--binary: duplicate key `digest`".to_string(),
+                    ));
+                }
+                digest = Some(value.to_string());
+            }
+            "source" => {
+                if source.is_some() {
+                    return Err(OpError::InvalidArgument(
+                        "--binary: duplicate key `source`".to_string(),
+                    ));
+                }
+                source = Some(value.to_string());
+            }
+            unknown => {
+                return Err(OpError::InvalidArgument(format!(
+                    "--binary: unknown key `{unknown}` (expected name, version, target, digest, source)"
+                )));
+            }
+        }
+    }
+
+    let name = require_non_empty(name, "name")?;
+    let version = require_non_empty(version, "version")?;
+    let target = require_non_empty(target, "target")?;
+    let digest = require_non_empty(digest, "digest")?;
+
+    Ok(greentic_update::plan::BinaryArtifact {
+        name,
+        version,
+        target,
+        digest,
+        source,
+    })
+}
+
+/// `op updates plan-build` — build and DSSE-sign an [`UpdatePlan`] carrying one
+/// or more binary artifacts, writing `plan.json` + `plan.json.sig` to the
+/// output directory. The emitted pair round-trips through
+/// [`greentic_update::plan::verify_update_plan`] against the env's trust root.
+///
+/// This is the producer side of the binary self-update path; the consumer side
+/// (`greentic-start`'s stage-only binary self-update) already shipped.
+pub fn plan_build(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    args: crate::cli::dispatch::UpdatesPlanBuildArgs,
+) -> Result<OpOutcome, OpError> {
+    use chrono::Utc;
+    use greentic_update::plan::{
+        BinaryArtifact, CompatRequirements, OnFail, RollbackKind, RollbackPolicy,
+        UPDATE_PLAN_SCHEMA_V1, UpdatePlan,
+    };
+
+    if flags.schema_only {
+        return Ok(OpOutcome::new(NOUN, "plan-build", plan_build_schema()));
+    }
+
+    let env_id_raw = args.env_id.ok_or_else(|| {
+        OpError::InvalidArgument("env_id is required (positional argument)".to_string())
+    })?;
+    let env_id = parse_env_id(&env_id_raw)?;
+
+    let sequence = args
+        .sequence
+        .ok_or_else(|| OpError::InvalidArgument("--sequence is required".to_string()))?;
+
+    // Parse all --binary specs up front, before touching disk.
+    let binaries: Vec<BinaryArtifact> = args
+        .binaries
+        .iter()
+        .map(|s| parse_binary_spec(s))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if binaries.is_empty() {
+        return Err(OpError::InvalidArgument(
+            "at least one --binary is required".to_string(),
+        ));
+    }
+
+    // Resolve the signing key: explicit --signing-key or the global operator key.
+    let (priv_pem, key_id) = match &args.signing_key {
+        Some(key_path) => crate::operator_key::read_signing_key_at(key_path)?,
+        None => {
+            let op_key = crate::operator_key::load_existing_only().map_err(|e| {
+                OpError::InvalidArgument(format!(
+                    "no --signing-key provided and the global operator key is unavailable: {e}. \
+                     Create or bootstrap the operator key first, or pass --signing-key <path>."
+                ))
+            })?;
+            (op_key.private_pem, op_key.key_id)
+        }
+    };
+
+    // Load the env trust root so build_update_plan can verify the key is trusted.
+    let env_dir = store.env_dir(&env_id)?;
+    let trust = store_trust_root::load(&env_dir)?;
+
+    // Build the plan target from --target-file or a minimal valid env-manifest.
+    let target: serde_json::Value = match &args.target_file {
+        Some(path) => {
+            let bytes = std::fs::read(path).map_err(|source| OpError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            serde_json::from_slice(&bytes).map_err(|e| {
+                OpError::InvalidArgument(format!(
+                    "target file {} is not valid JSON: {e}",
+                    path.display()
+                ))
+            })?
+        }
+        None => json!({
+            "schema": super::env_manifest::ENV_MANIFEST_SCHEMA_V1,
+            "environment": { "id": env_id.as_str() },
+        }),
+    };
+
+    // Build the compat requirements.
+    let mut compat = CompatRequirements::default();
+    if let Some(min_rt) = args.min_runtime {
+        compat.min_runtime = Some(min_rt);
+    }
+
+    let plan = UpdatePlan {
+        schema: UPDATE_PLAN_SCHEMA_V1.to_string(),
+        plan_id: ulid::Ulid::new().to_string(),
+        env_id: env_id.to_string(),
+        sequence,
+        created_at: Utc::now(),
+        nonce: ulid::Ulid::new().to_string(),
+        target,
+        artifacts: vec![],
+        binaries,
+        compat,
+        rollback: RollbackPolicy {
+            policy: RollbackKind::Auto,
+            health_timeout_s: 120,
+            on_fail: OnFail::Restore,
+        },
+    };
+
+    let built = greentic_update::plan::build_update_plan(&plan, &priv_pem, &key_id, &trust)
+        .map_err(|e| {
+            OpError::Conflict(format!(
+                "build + sign update plan failed (is the signing key trusted by the env \
+                 trust root?): {e}"
+            ))
+        })?;
+
+    // Write plan.json + plan.json.sig to the output directory.
+    let out_dir = args.out_dir.unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&out_dir).map_err(|source| OpError::Io {
+        path: out_dir.clone(),
+        source,
+    })?;
+    let plan_path = out_dir.join("plan.json");
+    let sig_path = out_dir.join("plan.json.sig");
+    std::fs::write(&plan_path, &built.plan_bytes).map_err(|source| OpError::Io {
+        path: plan_path.clone(),
+        source,
+    })?;
+    std::fs::write(&sig_path, &built.envelope_bytes).map_err(|source| OpError::Io {
+        path: sig_path.clone(),
+        source,
+    })?;
+
+    Ok(OpOutcome::new(
+        NOUN,
+        "plan-build",
+        json!({
+            "environment_id": env_id.as_str(),
+            "plan_id": plan.plan_id,
+            "sequence": plan.sequence,
+            "plan_sha256": built.plan_sha256,
+            "key_id": built.key_id,
+            "plan_path": plan_path.display().to_string(),
+            "sig_path": sig_path.display().to_string(),
+        }),
+    ))
+}
+
+fn plan_build_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "UpdatesPlanBuildArgs",
+        "type": "object",
+        "required": ["env_id", "sequence", "binaries"],
+        "additionalProperties": false,
+        "properties": {
+            "env_id": {"type": "string"},
+            "sequence": {"type": "integer", "description": "Monotonic plan sequence (anti-rollback)."},
+            "binaries": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Binary artifact specs (comma-separated key=value)."},
+            "signing_key": {"type": ["string", "null"], "description": "PKCS#8 Ed25519 private key PEM path. Default: global operator key."},
+            "target_file": {"type": ["string", "null"], "description": "JSON file for the plan target (env-manifest.v1). Default: minimal manifest with schema + env id."},
+            "min_runtime": {"type": ["string", "null"], "description": "Minimum runtime version (semver) for compat.min_runtime."},
+            "out_dir": {"type": ["string", "null"], "description": "Output directory for plan.json + plan.json.sig. Default: current dir."}
+        }
+    })
+}
+
 fn parse_env_id(raw: &str) -> Result<EnvId, OpError> {
     EnvId::try_from(raw).map_err(|e| OpError::InvalidArgument(format!("environment_id: {e}")))
 }
@@ -1991,6 +2347,26 @@ fn config_show_schema() -> Value {
             "environment_id": {"type": "string"}
         }
     })
+}
+
+// Test-only fault-injection hook: called immediately before the
+// `applying -> applied` transition retry loop in `apply_updates_impl`.
+// Tests install a closure here to sabotage the on-disk plan directory
+// (e.g. chmod it read-only) so the transition write fails, exercising the
+// Case-B honest-error branch.
+#[cfg(test)]
+thread_local! {
+    static PRE_APPLIED_TRANSITION_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_pre_applied_transition_hook() {
+    PRE_APPLIED_TRANSITION_HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f();
+        }
+    });
 }
 
 #[cfg(test)]
@@ -3637,6 +4013,157 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
     }
 
     #[test]
+    fn apply_annotates_binaries_it_does_not_install() {
+        use greentic_update::staging::{UpdateStage, UpdatesRoot};
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+
+        // A binary-carrying `plan-build`-style output: no content artifacts, a
+        // valid minimal target, one binary. `op updates apply` converges the
+        // (empty) content but MUST surface that it did not install the binary,
+        // so the "applied" result is never misread as a completed self-update.
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        let plan: greentic_update::plan::UpdatePlan = serde_json::from_value(json!({
+            "schema": "greentic.update-plan.v1",
+            "plan_id": "plan-bin",
+            "env_id": "local",
+            "sequence": 1,
+            "created_at": "2026-07-02T00:00:00Z",
+            "nonce": "nonce-plan-bin",
+            "target": {"schema": "greentic.env-manifest.v1", "environment": {"id": "local"}},
+            "artifacts": [],
+            "binaries": [{
+                "name": "greentic-start",
+                "version": "1.1.9",
+                "target": "x86_64-unknown-linux-gnu",
+                "digest": "sha256:abc123",
+                "source": "https://example.test/greentic-start.tgz"
+            }],
+            "compat": {},
+            "rollback": {"policy": "auto", "health_timeout_s": 120, "on_fail": "restore"},
+        }))
+        .unwrap();
+        let built =
+            greentic_update::plan::build_update_plan(&plan, &priv7, &tk7.key_id, &build_trust)
+                .unwrap();
+        let verified = verify_with(&built.plan_bytes, &built.envelope_bytes, &tk7);
+        let root = UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        let staged = root
+            .begin(&verified, &built.plan_bytes, &built.envelope_bytes)
+            .unwrap();
+        advance_to_staged(&staged).unwrap();
+
+        let out = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-bin".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap();
+
+        // Content still converges + marks applied ...
+        assert_eq!(out.result["stage"], "applied");
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-bin"),
+            UpdateStage::Applied
+        );
+        // ... but the uninstalled binary is surfaced.
+        let bins = out.result["binaries_not_applied"]
+            .as_array()
+            .expect("binaries_not_applied must be present when the plan carries binaries");
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0]["name"], "greentic-start");
+        assert_eq!(bins[0]["version"], "1.1.9");
+        assert_eq!(bins[0]["target"], "x86_64-unknown-linux-gnu");
+    }
+
+    #[test]
+    fn apply_transition_failure_returns_honest_recover_error() {
+        // Exercise Case B: run_manifest_apply succeeds (env content IS mutated),
+        // but the applying -> applied transition persistently fails. The error
+        // must contain "recover" and NOT claim the apply itself failed.
+        use greentic_update::staging::UpdateStage;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+        stage_local(updates_dir.path(), "plan-stuck", 1, &priv7, &tk7);
+
+        // Resolve the on-disk plan directory so we can chmod it read-only from
+        // inside the fault hook, preventing `state.json` writes.
+        let plan_dir = greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local")
+            .unwrap()
+            .load("plan-stuck")
+            .unwrap()
+            .unwrap()
+            .dir()
+            .to_path_buf();
+
+        // Install a fault hook that fires AFTER run_manifest_apply succeeds but
+        // BEFORE the transition retry loop. Making the plan dir read-only
+        // prevents `state.json` from being rewritten, so the transition fails
+        // with an I/O error.
+        let hook_dir = plan_dir.clone();
+        PRE_APPLIED_TRANSITION_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::set_permissions(&hook_dir, std::fs::Permissions::from_mode(0o500))
+                    .expect("chmod plan dir read-only");
+            }));
+        });
+
+        let err = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-stuck".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+
+        // Clean up the hook so it does not interfere with other tests.
+        PRE_APPLIED_TRANSITION_HOOK.with(|h| {
+            *h.borrow_mut() = None;
+        });
+        // Restore write permission so tempdir cleanup succeeds.
+        std::fs::set_permissions(&plan_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The error must mention `recover` and must NOT claim the apply failed.
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("recover"),
+            "error must point at `op updates recover`: {msg}"
+        );
+        assert!(
+            msg.contains("applied successfully"),
+            "error must state content was applied: {msg}"
+        );
+
+        // The on-disk stage is stuck at Applying (Case B), NOT Applied.
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-stuck"),
+            UpdateStage::Applying
+        );
+
+        // The env content WAS applied — a snapshot was captured pre-mutation.
+        let env_dir = store.env_dir(&env_id).unwrap();
+        assert!(
+            env_dir.join("snapshots").is_dir(),
+            "snapshot must exist (env was mutated)"
+        );
+    }
+
+    #[test]
     fn apply_rejects_already_applied_plan() {
         let dir = tempdir().unwrap();
         let updates_dir = tempdir().unwrap();
@@ -4412,5 +4939,251 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             on_disk_stage(updates_dir.path(), "plan-1"),
             UpdateStage::Applied
         );
+    }
+
+    // ---- plan-build -------------------------------------------------------
+
+    /// Write an ephemeral PKCS#8 Ed25519 private key PEM to `dir/key.pem` and
+    /// return (path, TrustedKey) so callers can seed the env trust root and pass
+    /// `--signing-key`.
+    fn write_ephemeral_key(dir: &std::path::Path) -> (PathBuf, TrustedKey) {
+        let (priv_pem, tk) = key_pair(42);
+        let key_path = dir.join("key.pem");
+        std::fs::write(&key_path, &priv_pem).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        (key_path, tk)
+    }
+
+    fn plan_build_args(
+        env_id: &str,
+        sequence: u64,
+        binaries: Vec<String>,
+        signing_key: Option<PathBuf>,
+        out_dir: PathBuf,
+    ) -> crate::cli::dispatch::UpdatesPlanBuildArgs {
+        crate::cli::dispatch::UpdatesPlanBuildArgs {
+            env_id: Some(env_id.to_string()),
+            sequence: Some(sequence),
+            binaries,
+            signing_key,
+            target_file: None,
+            min_runtime: None,
+            out_dir: Some(out_dir),
+        }
+    }
+
+    #[test]
+    fn parse_binary_spec_happy_path() {
+        let spec = "name=greentic-start,version=1.1.9,target=x86_64-unknown-linux-gnu,digest=sha256:abc123";
+        let ba = parse_binary_spec(spec).unwrap();
+        assert_eq!(ba.name, "greentic-start");
+        assert_eq!(ba.version, "1.1.9");
+        assert_eq!(ba.target, "x86_64-unknown-linux-gnu");
+        assert_eq!(ba.digest, "sha256:abc123");
+        assert_eq!(ba.source, None);
+    }
+
+    #[test]
+    fn parse_binary_spec_with_source() {
+        let spec = "name=greentic-start,version=1.1.9,target=x86_64-unknown-linux-gnu,digest=sha256:abc,source=https://example.com/bin.tar.gz";
+        let ba = parse_binary_spec(spec).unwrap();
+        assert_eq!(ba.source.as_deref(), Some("https://example.com/bin.tar.gz"));
+    }
+
+    #[test]
+    fn parse_binary_spec_missing_required_key() {
+        // Missing `digest`.
+        let spec = "name=greentic-start,version=1.1.9,target=x86_64-unknown-linux-gnu";
+        let err = parse_binary_spec(spec).unwrap_err();
+        match err {
+            OpError::InvalidArgument(msg) => assert!(
+                msg.contains("digest"),
+                "error should name the missing key `digest`, got: {msg}"
+            ),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_binary_spec_unknown_key() {
+        let spec = "name=x,version=1,target=t,digest=d,flavor=sweet";
+        let err = parse_binary_spec(spec).unwrap_err();
+        match err {
+            OpError::InvalidArgument(msg) => assert!(
+                msg.contains("flavor"),
+                "error should name the unknown key `flavor`, got: {msg}"
+            ),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_binary_spec_source_omitted_is_none() {
+        let spec = "name=x,version=1,target=t,digest=d";
+        let ba = parse_binary_spec(spec).unwrap();
+        assert!(ba.source.is_none());
+    }
+
+    #[test]
+    fn plan_build_round_trip_verifies() {
+        let dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (key_path, tk) = write_ephemeral_key(dir.path());
+        env_trusting(&store, &tk);
+
+        let args = plan_build_args(
+            "local",
+            1,
+            vec![
+                "name=greentic-start,version=1.1.9,target=x86_64-unknown-linux-gnu,digest=sha256:deadbeef,source=https://example.com/bin.tar.gz".to_string(),
+            ],
+            Some(key_path),
+            out_dir.path().to_path_buf(),
+        );
+        let outcome = plan_build(&store, &OpFlags::default(), args).unwrap();
+        assert_eq!(outcome.noun, NOUN);
+        assert_eq!(outcome.op, "plan-build");
+
+        // Read the emitted files and verify against the env trust root.
+        let plan_bytes = std::fs::read(out_dir.path().join("plan.json")).unwrap();
+        let sig_bytes = std::fs::read(out_dir.path().join("plan.json.sig")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        let trust = store_trust_root::load(&env_dir).unwrap();
+        let verified =
+            greentic_update::plan::verify_update_plan(&plan_bytes, &sig_bytes, &trust).unwrap();
+
+        // The decoded plan binaries must match the input spec.
+        assert_eq!(verified.plan.binaries.len(), 1);
+        let b = &verified.plan.binaries[0];
+        assert_eq!(b.name, "greentic-start");
+        assert_eq!(b.version, "1.1.9");
+        assert_eq!(b.target, "x86_64-unknown-linux-gnu");
+        assert_eq!(b.digest, "sha256:deadbeef");
+        assert_eq!(b.source.as_deref(), Some("https://example.com/bin.tar.gz"));
+
+        // Content artifacts are empty (plan-build is binary-only).
+        assert!(verified.plan.artifacts.is_empty());
+        // Sequence matches.
+        assert_eq!(verified.plan.sequence, 1);
+    }
+
+    #[test]
+    fn plan_build_fail_closed_untrusted_key() {
+        let dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        // Trust key 7, but sign with key 42.
+        let (_priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+        let (key_path_42, _tk42) = write_ephemeral_key(dir.path());
+
+        let args = plan_build_args(
+            "local",
+            1,
+            vec!["name=x,version=1,target=t,digest=d".to_string()],
+            Some(key_path_42),
+            out_dir.path().to_path_buf(),
+        );
+        let err = plan_build(&store, &OpFlags::default(), args).unwrap_err();
+        assert!(
+            matches!(err, OpError::Conflict(_)),
+            "expected Conflict for untrusted key, got {err:?}"
+        );
+        // No files written.
+        assert!(!out_dir.path().join("plan.json").exists());
+    }
+
+    #[test]
+    fn plan_build_min_runtime_threaded_through() {
+        let dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (key_path, tk) = write_ephemeral_key(dir.path());
+        env_trusting(&store, &tk);
+
+        let mut args = plan_build_args(
+            "local",
+            1,
+            vec!["name=x,version=1,target=t,digest=d".to_string()],
+            Some(key_path),
+            out_dir.path().to_path_buf(),
+        );
+        args.min_runtime = Some("1.1.5".to_string());
+        let _outcome = plan_build(&store, &OpFlags::default(), args).unwrap();
+
+        let plan_bytes = std::fs::read(out_dir.path().join("plan.json")).unwrap();
+        let sig_bytes = std::fs::read(out_dir.path().join("plan.json.sig")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        let trust = store_trust_root::load(&env_dir).unwrap();
+        let verified =
+            greentic_update::plan::verify_update_plan(&plan_bytes, &sig_bytes, &trust).unwrap();
+        assert_eq!(verified.plan.compat.min_runtime.as_deref(), Some("1.1.5"));
+    }
+
+    #[test]
+    fn plan_build_target_file_threaded_through() {
+        let dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (key_path, tk) = write_ephemeral_key(dir.path());
+        env_trusting(&store, &tk);
+
+        let target_file = dir.path().join("target.json");
+        std::fs::write(
+            &target_file,
+            r#"{"schema":"greentic.env-manifest.v1","environment":{"id":"local"}}"#,
+        )
+        .unwrap();
+
+        let mut args = plan_build_args(
+            "local",
+            1,
+            vec!["name=x,version=1,target=t,digest=d".to_string()],
+            Some(key_path),
+            out_dir.path().to_path_buf(),
+        );
+        args.target_file = Some(target_file);
+        let _outcome = plan_build(&store, &OpFlags::default(), args).unwrap();
+
+        let plan_bytes = std::fs::read(out_dir.path().join("plan.json")).unwrap();
+        let sig_bytes = std::fs::read(out_dir.path().join("plan.json.sig")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        let trust = store_trust_root::load(&env_dir).unwrap();
+        let verified =
+            greentic_update::plan::verify_update_plan(&plan_bytes, &sig_bytes, &trust).unwrap();
+        assert_eq!(
+            verified.plan.target["environment"]["id"].as_str(),
+            Some("local")
+        );
+    }
+
+    #[test]
+    fn plan_build_schema_only() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let args = plan_build_args(
+            "local",
+            1,
+            vec!["name=x,version=1,target=t,digest=d".to_string()],
+            None,
+            dir.path().to_path_buf(),
+        );
+        let out = plan_build(
+            &store,
+            &OpFlags {
+                schema_only: true,
+                ..OpFlags::default()
+            },
+            args,
+        )
+        .unwrap();
+        assert_eq!(out.op, "plan-build");
+        assert_eq!(out.noun, NOUN);
+        assert!(out.result["properties"]["sequence"].is_object());
     }
 }
