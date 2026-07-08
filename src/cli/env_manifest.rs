@@ -92,7 +92,9 @@ pub struct ManifestUpdates {
     pub enabled: Option<bool>,
     /// `record-only`, `stage`, or `apply`. Absent = leave the stored value
     /// unchanged (unset resolves to `stage`). `apply` is the opt-in that lets
-    /// the runtime converge onto a discovered plan with no operator step.
+    /// the runtime converge onto a discovered plan with no operator step — the
+    /// executor lives in `greentic-start`, and a release that predates
+    /// `on_update` reads the legacy `on_notify` mirror and stages instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_notify: Option<String>,
     /// Poll interval in seconds; rejected below the 60s floor. Absent = leave

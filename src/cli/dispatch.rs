@@ -735,7 +735,9 @@ pub struct UpdatesConfigSetArgs {
     pub enabled: Option<bool>,
     /// Action on a verified plan: `record-only`, `stage`, or `apply`. Omit to
     /// leave unchanged (unset resolves to `stage`). `apply` opts the environment
-    /// into converging on its own, with no operator step.
+    /// into converging on its own, with no operator step — but the executor lives
+    /// in the runtime: a `greentic-start` that predates `on_update` reads the
+    /// legacy `on_notify` mirror and stages instead.
     #[arg(long = "on-notify")]
     pub on_notify: Option<String>,
     /// Fallback poll interval in seconds (>= 60). Omit to leave unchanged.

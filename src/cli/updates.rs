@@ -2195,6 +2195,37 @@ fn strip_updates_block(target: &mut serde_json::Value) -> bool {
         .is_some_and(|obj| obj.remove("updates").is_some())
 }
 
+/// Reject, before signing, a plan target the consumer is guaranteed to refuse.
+///
+/// `op updates apply` deserializes the signed target as an [`EnvManifest`] and
+/// requires its environment id to match the plan's. Skipping those checks on the
+/// producer side used to be harmless: `plan-build` writes to a directory, and an
+/// operator inspects the pair before doing anything with it. `publish` uploads
+/// straight to the live channel and consumes a sequence number, so a malformed or
+/// misaddressed target would become the plan every client fetches, DSSE-verifies
+/// and rejects, once per poll cycle, until a corrected plan is published at a
+/// higher sequence. Fail here instead.
+///
+/// Deliberately *not* the full [`check_applyable_manifest`]: that also gates on
+/// the target env's runtime state (its secrets sink, its rollback snapshot),
+/// which the producer does not share with the consumer.
+fn validate_plan_target(target: &serde_json::Value, env_id: &EnvId) -> Result<(), OpError> {
+    let manifest: EnvManifest = serde_json::from_value(target.clone()).map_err(|e| {
+        OpError::InvalidArgument(format!(
+            "plan target is not a valid `{}`: {e}",
+            super::env_manifest::ENV_MANIFEST_SCHEMA_V1
+        ))
+    })?;
+    manifest.validate_shape()?;
+    if manifest.environment.id != env_id.as_str() {
+        return Err(OpError::InvalidArgument(format!(
+            "plan target declares environment `{}`, but the plan is for `{env_id}`",
+            manifest.environment.id
+        )));
+    }
+    Ok(())
+}
+
 /// Build + DSSE-sign an [`UpdatePlan`](greentic_update::plan::UpdatePlan) for
 /// `env_id` against the env's trust root. The signed pair round-trips through
 /// [`greentic_update::plan::verify_update_plan`].
@@ -2266,6 +2297,8 @@ fn build_and_sign_plan(
         }),
     };
     let stripped_updates_block = strip_updates_block(&mut target);
+    // Validate the document we are about to sign — i.e. after the strip.
+    validate_plan_target(&target, env_id)?;
 
     let mut compat = CompatRequirements::default();
     if let Some(min_rt) = content.min_runtime.clone() {
@@ -2667,7 +2700,7 @@ fn config_set_schema() -> Value {
         "properties": {
             "environment_id": {"type": "string"},
             "enabled": {"type": ["boolean", "null"], "description": "master switch for the update-channel notification machinery; null leaves the stored value unchanged (absent = disabled, deny-by-default)"},
-            "on_notify": {"type": ["string", "null"], "enum": [null, "record-only", "record_only", "stage", "apply"], "description": "action on a verified plan; null leaves the stored value unchanged (unset resolves to `stage`). `apply` opts the environment into converging on its own — it also writes the legacy `on_notify: stage` mirror so an older runtime stages instead of breaking"},
+            "on_notify": {"type": ["string", "null"], "enum": [null, "record-only", "record_only", "stage", "apply"], "description": "action on a verified plan; null leaves the stored value unchanged (unset resolves to `stage`). `apply` opts the environment into converging on its own; the executor lives in the runtime, and a greentic-start that predates `on_update` reads the legacy `on_notify: stage` mirror this also writes, staging instead of breaking"},
             "poll_interval_secs": {"type": ["integer", "null"], "minimum": MIN_POLL_INTERVAL_SECS, "description": "fallback poll interval in seconds; null leaves the stored value unchanged (unset resolves to 3600)"},
             "plan_endpoint": {"type": ["string", "null"], "description": "base URL to poll for the latest signed update plan (`{url}` + `{url}.sig`); null leaves the stored value unchanged; must be https (or http to loopback)"}
         }
@@ -5769,6 +5802,124 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert_eq!(
             verified.plan.target["bundles"][0]["bundle_id"].as_str(),
             Some("app")
+        );
+    }
+
+    /// `plan-build` with `target_json` as the target, returning the result.
+    fn plan_build_with_target(
+        dir: &Path,
+        out_dir: &Path,
+        target_json: &str,
+    ) -> Result<(), OpError> {
+        let store = LocalFsStore::new(dir);
+        let (key_path, tk) = write_ephemeral_key(dir);
+        env_trusting(&store, &tk);
+        let target_file = dir.join("target.json");
+        std::fs::write(&target_file, target_json).unwrap();
+        let mut args = plan_build_args("local", 1, vec![], Some(key_path), out_dir.to_path_buf());
+        args.target_file = Some(target_file);
+        plan_build(&store, &OpFlags::default(), args).map(|_| ())
+    }
+
+    #[test]
+    fn plan_build_rejects_a_target_that_is_not_an_env_manifest() {
+        // `publish` uploads straight to the live channel and burns a sequence, so
+        // a target every client is going to reject must never get that far.
+        let dir = tempdir().unwrap();
+        let out = tempdir().unwrap();
+        let err =
+            plan_build_with_target(dir.path(), out.path(), r#"{"hello":"world"}"#).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("not a valid")),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            !out.path().join("plan.json").exists(),
+            "a rejected target must not leave a signed plan behind"
+        );
+    }
+
+    #[test]
+    fn plan_build_rejects_a_target_that_fails_shape_validation() {
+        let dir = tempdir().unwrap();
+        let out = tempdir().unwrap();
+        let err = plan_build_with_target(
+            dir.path(),
+            out.path(),
+            r#"{"schema":"greentic.env-manifest.v2","environment":{"id":"local"}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("schema")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn plan_build_rejects_a_target_addressed_to_another_environment() {
+        // The consumer cross-checks `manifest.environment.id` against the plan's
+        // env id and refuses. Catch the misaddressed target at sign time.
+        let dir = tempdir().unwrap();
+        let out = tempdir().unwrap();
+        let err = plan_build_with_target(
+            dir.path(),
+            out.path(),
+            r#"{"schema":"greentic.env-manifest.v1","environment":{"id":"staging"}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m)
+                if m.contains("staging") && m.contains("local")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn plan_build_validates_the_target_after_the_updates_strip() {
+        // The `updates` block is not part of `EnvManifest`'s applyable shape as
+        // far as a plan is concerned, and it is stripped — so a target carrying
+        // one must still validate. (It parses either way; this pins the ordering
+        // so a future `deny`-style check cannot fire on a field we just removed.)
+        let dir = tempdir().unwrap();
+        let out = tempdir().unwrap();
+        plan_build_with_target(
+            dir.path(),
+            out.path(),
+            r#"{"schema":"greentic.env-manifest.v1","environment":{"id":"local"},
+                "updates":{"plan_endpoint":"https://u.example.com/plan"}}"#,
+        )
+        .expect("a stripped target validates");
+        assert!(out.path().join("plan.json").exists());
+    }
+
+    #[test]
+    fn publish_rejects_a_bad_target_before_burning_a_sequence() {
+        // Ordering guarantee: the target is validated during signing, which runs
+        // before the upload. A misaddressed target must fail without the plan
+        // server ever being contacted — the endpoint here is a closed port, and a
+        // Fetch error would mean we got as far as the upload.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (key_path, tk) = write_ephemeral_key(dir.path());
+        env_trusting(&store, &tk);
+
+        let target_file = dir.path().join("target.json");
+        std::fs::write(
+            &target_file,
+            r#"{"schema":"greentic.env-manifest.v1","environment":{"id":"staging"}}"#,
+        )
+        .unwrap();
+
+        let mut args = publish_args("local");
+        args.target_file = Some(target_file);
+        args.upload_token = Some("token".to_string());
+        args.signing_key = Some(key_path);
+        args.sequence = Some(2);
+        args.plan_endpoint = Some("http://127.0.0.1:1/v1/environments/local/plan".to_string());
+        let err = publish(&store, &OpFlags::default(), args).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("staging")),
+            "expected the target to be rejected before the upload, got: {err:?}"
         );
     }
 

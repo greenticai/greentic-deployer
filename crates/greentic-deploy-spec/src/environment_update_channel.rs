@@ -84,6 +84,14 @@ pub enum UpdateAction {
     /// Stage, then converge the environment onto the plan's signed target —
     /// snapshot, apply, verify, roll back on failure. The runtime updates
     /// itself with no operator step. Opt-in only.
+    ///
+    /// **Requires a runtime that reads `on_update`.** The executor lives in
+    /// `greentic-start`; releases that predate this field resolve their policy
+    /// from the legacy [`on_notify`](UpdateChannelConfig::on_notify) mirror,
+    /// which [`legacy_on_notify`](Self::legacy_on_notify) sets to
+    /// [`OnNotifyAction::Stage`]. Against such a runtime `Apply` therefore
+    /// *stages* — safe, and visibly short of what was asked for. Check
+    /// `op updates config-show` against the runtime version actually deployed.
     Apply,
 }
 
