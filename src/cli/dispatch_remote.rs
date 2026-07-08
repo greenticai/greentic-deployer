@@ -286,6 +286,9 @@ fn route_remote(
             UpdatesVerb::ConfigSet(_) => Err(not_supported("updates config-set")),
             UpdatesVerb::ConfigShow { .. } => Err(not_supported("updates config-show")),
             UpdatesVerb::PlanBuild(_) => Err(not_supported("updates plan-build")),
+            // Signs with the local operator key against the local env trust
+            // root; the remote store holds neither.
+            UpdatesVerb::Publish(_) => Err(not_supported("updates publish")),
         },
     }
 }

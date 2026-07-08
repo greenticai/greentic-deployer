@@ -692,6 +692,11 @@ pub enum UpdatesVerb {
     /// writing `plan.json` + `plan.json.sig` that round-trip through the
     /// existing `verify_update_plan`. Producer side of the update path.
     PlanBuild(UpdatesPlanBuildArgs),
+    /// Sign a plan and upload it to the environment's plan server, in one step.
+    /// The online counterpart to `plan-build`: the sequence defaults to the
+    /// server's current one plus one, and the endpoint defaults to the env's
+    /// configured `plan_endpoint`. The signing key never leaves this machine.
+    Publish(UpdatesPublishArgs),
 }
 
 #[derive(Args, Debug)]
@@ -728,8 +733,9 @@ pub struct UpdatesConfigSetArgs {
     /// leave unchanged (absent = disabled, deny-by-default).
     #[arg(long)]
     pub enabled: Option<bool>,
-    /// Action on a verified notification: `record-only` or `stage`. Omit to
-    /// leave unchanged (unset resolves to `stage`).
+    /// Action on a verified plan: `record-only`, `stage`, or `apply`. Omit to
+    /// leave unchanged (unset resolves to `stage`). `apply` opts the environment
+    /// into converging on its own, with no operator step.
     #[arg(long = "on-notify")]
     pub on_notify: Option<String>,
     /// Fallback poll interval in seconds (>= 60). Omit to leave unchanged.
@@ -739,6 +745,39 @@ pub struct UpdatesConfigSetArgs {
     /// Must be https (or http to loopback). Omit to leave unchanged.
     #[arg(long = "plan-endpoint")]
     pub plan_endpoint: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesPublishArgs {
+    /// Target environment id.
+    pub env_id: Option<String>,
+    /// JSON file for the plan target (env-manifest.v1). Its `updates` block, if
+    /// any, is stripped before signing — a plan may not re-point the channel it
+    /// arrives on. Required unless `--binary` is supplied.
+    #[arg(long = "target-file")]
+    pub target_file: Option<PathBuf>,
+    /// Monotonic plan sequence (anti-rollback). Default: the plan server's
+    /// current sequence plus one.
+    #[arg(long)]
+    pub sequence: Option<u64>,
+    /// Binary artifact spec (repeatable); see `plan-build --binary`.
+    #[arg(long = "binary")]
+    pub binaries: Vec<String>,
+    /// PKCS#8 Ed25519 private key PEM for signing. Default: the global operator key.
+    #[arg(long = "signing-key")]
+    pub signing_key: Option<PathBuf>,
+    /// Minimum runtime version (semver) for `compat.min_runtime`.
+    #[arg(long = "min-runtime")]
+    pub min_runtime: Option<String>,
+    /// Plan-server endpoint to publish to. Default: the env's configured
+    /// `plan_endpoint`, so the environment's subscription decides where its
+    /// updates are published.
+    #[arg(long = "plan-endpoint")]
+    pub plan_endpoint: Option<String>,
+    /// Plan-server upload credential. Prefer `$GREENTIC_PLAN_UPLOAD_TOKEN` — a
+    /// token passed on the command line lands in shell history and `ps`.
+    #[arg(long = "upload-token")]
+    pub upload_token: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1193,6 +1232,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 UpdatesVerb::ConfigSet(_) => "config-set",
                 UpdatesVerb::ConfigShow { .. } => "config-show",
                 UpdatesVerb::PlanBuild(_) => "plan-build",
+                UpdatesVerb::Publish(_) => "publish",
             },
         ),
     }
@@ -1521,6 +1561,7 @@ fn dispatch_updates(
             super::updates::config_show(store, flags, payload)?
         }
         UpdatesVerb::PlanBuild(args) => super::updates::plan_build(store, flags, args)?,
+        UpdatesVerb::Publish(args) => super::updates::publish(store, flags, args)?,
     };
     print_outcome(&outcome)
 }
