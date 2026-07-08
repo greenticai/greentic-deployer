@@ -1969,13 +1969,16 @@ fn parse_binary_spec(spec: &str) -> Result<greentic_update::plan::BinaryArtifact
     })
 }
 
-/// `op updates plan-build` — build and DSSE-sign an [`UpdatePlan`] carrying one
-/// or more binary artifacts, writing `plan.json` + `plan.json.sig` to the
-/// output directory. The emitted pair round-trips through
+/// `op updates plan-build` — build and DSSE-sign an [`UpdatePlan`] carrying a
+/// content target (`--target-file`), one or more binary artifacts (`--binary`),
+/// or both, writing `plan.json` + `plan.json.sig` to the output directory. The
+/// emitted pair round-trips through
 /// [`greentic_update::plan::verify_update_plan`] against the env's trust root.
 ///
-/// This is the producer side of the binary self-update path; the consumer side
-/// (`greentic-start`'s stage-only binary self-update) already shipped.
+/// This is the producer side of the update path: `--target-file` drives the
+/// content convergence `op updates apply` performs, `--binary` drives
+/// `greentic-start`'s stage-only binary self-update. A plan with neither is a
+/// signed no-op and is rejected.
 pub fn plan_build(
     store: &LocalFsStore,
     flags: &OpFlags,
@@ -2007,9 +2010,13 @@ pub fn plan_build(
         .map(|s| parse_binary_spec(s))
         .collect::<Result<Vec<_>, _>>()?;
 
-    if binaries.is_empty() {
+    // A plan with neither a content target nor a binary artifact converges
+    // nothing: `op updates apply` is upsert-only, so the default minimal target
+    // is a no-op, and there is no binary for the runtime to swap. Refuse to sign
+    // it rather than mint a plan that reports `applied` without changing anything.
+    if binaries.is_empty() && args.target_file.is_none() {
         return Err(OpError::InvalidArgument(
-            "at least one --binary is required".to_string(),
+            "at least one --binary or a --target-file is required".to_string(),
         ));
     }
 
@@ -2120,14 +2127,18 @@ fn plan_build_schema() -> Value {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "UpdatesPlanBuildArgs",
         "type": "object",
-        "required": ["env_id", "sequence", "binaries"],
+        "required": ["env_id", "sequence"],
         "additionalProperties": false,
+        "anyOf": [
+            {"required": ["binaries"]},
+            {"required": ["target_file"]}
+        ],
         "properties": {
             "env_id": {"type": "string"},
             "sequence": {"type": "integer", "description": "Monotonic plan sequence (anti-rollback)."},
-            "binaries": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Binary artifact specs (comma-separated key=value)."},
+            "binaries": {"type": "array", "items": {"type": "string"}, "description": "Binary artifact specs (comma-separated key=value). Required unless target_file is set."},
             "signing_key": {"type": ["string", "null"], "description": "PKCS#8 Ed25519 private key PEM path. Default: global operator key."},
-            "target_file": {"type": ["string", "null"], "description": "JSON file for the plan target (env-manifest.v1). Default: minimal manifest with schema + env id."},
+            "target_file": {"type": ["string", "null"], "description": "JSON file for the plan target (env-manifest.v1). Required unless binaries is set. Default: minimal manifest with schema + env id."},
             "min_runtime": {"type": ["string", "null"], "description": "Minimum runtime version (semver) for compat.min_runtime."},
             "out_dir": {"type": ["string", "null"], "description": "Output directory for plan.json + plan.json.sig. Default: current dir."}
         }
@@ -4881,6 +4892,61 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert_eq!(
             verified.plan.target["environment"]["id"].as_str(),
             Some("local")
+        );
+    }
+
+    #[test]
+    fn plan_build_content_only_plan_verifies() {
+        let dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (key_path, tk) = write_ephemeral_key(dir.path());
+        env_trusting(&store, &tk);
+
+        let target_file = dir.path().join("target.json");
+        std::fs::write(
+            &target_file,
+            r#"{"schema":"greentic.env-manifest.v1","environment":{"id":"local"},
+                "bundles":[{"bundle_id":"app","bundle_path":"/tmp/app.gtbundle","bundle_digest":"sha256:aa"}]}"#,
+        )
+        .unwrap();
+
+        // No --binary at all: a content-only plan is the ordinary env-update case.
+        let mut args = plan_build_args(
+            "local",
+            2,
+            vec![],
+            Some(key_path),
+            out_dir.path().to_path_buf(),
+        );
+        args.target_file = Some(target_file);
+        plan_build(&store, &OpFlags::default(), args).unwrap();
+
+        let plan_bytes = std::fs::read(out_dir.path().join("plan.json")).unwrap();
+        let sig_bytes = std::fs::read(out_dir.path().join("plan.json.sig")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        let trust = store_trust_root::load(&env_dir).unwrap();
+        let verified =
+            greentic_update::plan::verify_update_plan(&plan_bytes, &sig_bytes, &trust).unwrap();
+        assert!(verified.plan.binaries.is_empty());
+        assert_eq!(
+            verified.plan.target["bundles"][0]["bundle_id"].as_str(),
+            Some("app")
+        );
+    }
+
+    #[test]
+    fn plan_build_rejects_plan_with_neither_target_nor_binary() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (key_path, tk) = write_ephemeral_key(dir.path());
+        env_trusting(&store, &tk);
+
+        let args = plan_build_args("local", 1, vec![], Some(key_path), dir.path().to_path_buf());
+        let err = plan_build(&store, &OpFlags::default(), args).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("--binary") && m.contains("--target-file")),
+            "unexpected error: {err:?}"
         );
     }
 
