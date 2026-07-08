@@ -687,9 +687,10 @@ pub enum UpdatesVerb {
     /// Show the update-channel notification policy (stored fields + resolved
     /// effective values). Read-only.
     ConfigShow { env_id: Option<String> },
-    /// Build and DSSE-sign an UpdatePlan carrying one or more binary artifacts,
+    /// Build and DSSE-sign an UpdatePlan carrying a content target
+    /// (`--target-file`), one or more binary artifacts (`--binary`), or both,
     /// writing `plan.json` + `plan.json.sig` that round-trip through the
-    /// existing `verify_update_plan`. Producer side of binary self-update.
+    /// existing `verify_update_plan`. Producer side of the update path.
     PlanBuild(UpdatesPlanBuildArgs),
 }
 
@@ -749,12 +750,14 @@ pub struct UpdatesPlanBuildArgs {
     pub sequence: Option<u64>,
     /// Binary artifact spec (repeatable). Comma-separated key=value:
     /// `name=greentic-start,version=1.1.9,target=x86_64-unknown-linux-gnu,digest=sha256:<hex>[,source=https://...]`.
+    /// Required unless `--target-file` is supplied.
     #[arg(long = "binary")]
     pub binaries: Vec<String>,
     /// PKCS#8 Ed25519 private key PEM for signing. Default: the global operator key.
     #[arg(long = "signing-key")]
     pub signing_key: Option<PathBuf>,
-    /// JSON file for the plan target (env-manifest.v1). Default: minimal manifest with schema + env id.
+    /// JSON file for the plan target (env-manifest.v1). Required unless
+    /// `--binary` is supplied. Default: minimal manifest with schema + env id.
     #[arg(long = "target-file")]
     pub target_file: Option<PathBuf>,
     /// Minimum runtime version (semver) for `compat.min_runtime`.
