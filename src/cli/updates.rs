@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use greentic_deploy_spec::{
-    EnvId, Environment, MIN_POLL_INTERVAL_SECS, OnNotifyAction, UpdateChannelConfig,
+    EnvId, Environment, MIN_POLL_INTERVAL_SECS, UpdateAction, UpdateChannelConfig,
 };
 use greentic_distributor_client::{CachePolicy, DistClient, DistOptions, ResolvePolicy};
 use greentic_secrets_lib::core::rt;
@@ -125,8 +125,9 @@ pub struct UpdateConfigSetPayload {
     /// value unchanged; absent file resolves to disabled (deny-by-default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
-    /// On-notify action: `record-only` or `stage`. `None` leaves the stored
-    /// value unchanged (unset resolves to `stage`).
+    /// Action on a verified plan: `record-only`, `stage`, or `apply`. `None`
+    /// leaves the stored value unchanged (unset resolves to `stage`). Writes
+    /// both `on_update` and the legacy `on_notify` mirror.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_notify: Option<String>,
     /// Fallback poll interval in seconds (rejected below the 60s floor). `None`
@@ -1209,13 +1210,14 @@ pub fn config_set(
 
     // Parse/validate every input BEFORE touching the store or the audit log, so
     // a malformed value is rejected fail-closed with nothing half-written.
-    let parsed_on_notify = payload
+    let parsed_action = payload
         .on_notify
         .as_deref()
         .map(|raw| {
-            OnNotifyAction::parse(raw).ok_or_else(|| {
+            UpdateAction::parse(raw).ok_or_else(|| {
                 OpError::InvalidArgument(format!(
-                    "on_notify {raw:?} is not a valid action (expected `record-only` or `stage`)"
+                    "on_notify {raw:?} is not a valid action \
+                     (expected `record-only`, `stage`, or `apply`)"
                 ))
             })
         })
@@ -1261,7 +1263,10 @@ pub fn config_set(
     if payload.enabled.is_some() {
         fields.push("enabled");
     }
-    if parsed_on_notify.is_some() {
+    if parsed_action.is_some() {
+        // One flag, two on-disk fields: `set_action` mirrors the action down to
+        // the legacy `on_notify` so an older binary reads a safe policy.
+        fields.push("on_update");
         fields.push("on_notify");
     }
     if payload.poll_interval_secs.is_some() {
@@ -1293,8 +1298,8 @@ pub fn config_set(
             if let Some(enabled) = payload.enabled {
                 cfg.enabled = Some(enabled);
             }
-            if let Some(on_notify) = parsed_on_notify {
-                cfg.on_notify = Some(on_notify);
+            if let Some(action) = parsed_action {
+                cfg.set_action(action);
             }
             if let Some(secs) = payload.poll_interval_secs {
                 cfg.poll_interval_secs = Some(secs);
@@ -1340,11 +1345,15 @@ fn config_view(cfg: &UpdateChannelConfig) -> Value {
     json!({
         "environment_id": cfg.environment_id.as_str(),
         "enabled": cfg.enabled,
+        // `on_notify` is the legacy mirror of `on_update`; both are reported raw
+        // so an operator can see exactly what an older binary would read.
         "on_notify": cfg.on_notify.map(|a| a.as_str()),
+        "on_update": cfg.on_update.map(|a| a.as_str()),
         "poll_interval_secs": cfg.poll_interval_secs,
         "plan_endpoint": cfg.plan_endpoint,
         "resolved": {
             "enabled": cfg.resolved_enabled(),
+            "action": cfg.resolved_action().as_str(),
             "on_notify": cfg.resolved_on_notify().as_str(),
             "poll_interval_secs": cfg.resolved_poll_interval_secs(),
             "plan_endpoint": cfg.resolved_plan_endpoint(),
@@ -2340,7 +2349,7 @@ fn config_set_schema() -> Value {
         "properties": {
             "environment_id": {"type": "string"},
             "enabled": {"type": ["boolean", "null"], "description": "master switch for the update-channel notification machinery; null leaves the stored value unchanged (absent = disabled, deny-by-default)"},
-            "on_notify": {"type": ["string", "null"], "enum": [null, "record-only", "record_only", "stage"], "description": "action on a verified notification; null leaves the stored value unchanged (unset resolves to `stage`; full self-update is not offered)"},
+            "on_notify": {"type": ["string", "null"], "enum": [null, "record-only", "record_only", "stage", "apply"], "description": "action on a verified plan; null leaves the stored value unchanged (unset resolves to `stage`). `apply` opts the environment into converging on its own — it also writes the legacy `on_notify: stage` mirror so an older runtime stages instead of breaking"},
             "poll_interval_secs": {"type": ["integer", "null"], "minimum": MIN_POLL_INTERVAL_SECS, "description": "fallback poll interval in seconds; null leaves the stored value unchanged (unset resolves to 3600)"},
             "plan_endpoint": {"type": ["string", "null"], "description": "base URL to poll for the latest signed update plan (`{url}` + `{url}.sig`); null leaves the stored value unchanged; must be https (or http to loopback)"}
         }
@@ -2385,7 +2394,7 @@ mod tests {
     use super::*;
     use crate::cli::secrets::{DEV_STORE_KIND_PATH, put_env_secret};
     use crate::cli::tests_common::{make_binding, make_env};
-    use greentic_deploy_spec::CapabilitySlot;
+    use greentic_deploy_spec::{CapabilitySlot, OnNotifyAction};
     use tempfile::tempdir;
 
     // --- update-channel config (Phase 4 notification policy) ----------------
@@ -2435,6 +2444,7 @@ mod tests {
         let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
         assert_eq!(cfg.enabled, Some(true));
         assert_eq!(cfg.on_notify, Some(OnNotifyAction::RecordOnly));
+        assert_eq!(cfg.on_update, Some(UpdateAction::RecordOnly));
         assert_eq!(cfg.poll_interval_secs, Some(120));
         assert_eq!(
             cfg.plan_endpoint.as_deref(),
@@ -2458,6 +2468,36 @@ mod tests {
             out.result["resolved"]["plan_endpoint"].as_str(),
             Some("https://updates.example.com/plans/latest")
         );
+    }
+
+    #[test]
+    fn config_set_apply_persists_action_and_a_safe_legacy_mirror() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        let out = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: Some(true),
+                on_notify: Some("apply".into()),
+                poll_interval_secs: None,
+                plan_endpoint: None,
+            }),
+        )
+        .unwrap();
+
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert_eq!(cfg.on_update, Some(UpdateAction::Apply));
+        assert_eq!(cfg.resolved_action(), UpdateAction::Apply);
+        // The whole point of the two-field shape: a binary that predates
+        // `on_update` reads this and STAGES, rather than failing to parse the
+        // channel or ignoring an operator's opt-in.
+        assert_eq!(cfg.on_notify, Some(OnNotifyAction::Stage));
+
+        assert_eq!(out.result["on_update"].as_str(), Some("apply"));
+        assert_eq!(out.result["on_notify"].as_str(), Some("stage"));
+        assert_eq!(out.result["resolved"]["action"].as_str(), Some("apply"));
     }
 
     #[test]
@@ -2490,19 +2530,24 @@ mod tests {
     fn config_set_rejects_invalid_on_notify() {
         let dir = tempdir().unwrap();
         let (store, env_id) = store_with_env(dir.path(), "local");
+        // `apply` used to be the example of an unsupported action; it is now a
+        // real one, so the rejection is exercised with a value that is still not.
         let err = config_set(
             &store,
             &OpFlags::default(),
             Some(UpdateConfigSetPayload {
                 environment_id: "local".into(),
                 enabled: None,
-                on_notify: Some("apply".into()),
+                on_notify: Some("converge".into()),
                 poll_interval_secs: None,
                 plan_endpoint: None,
             }),
         )
         .unwrap_err();
-        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        assert!(
+            matches!(err, OpError::InvalidArgument(ref m) if m.contains("apply")),
+            "got {err:?}"
+        );
         // Fail-closed: nothing was written.
         assert!(store.load_update_channel(&env_id).unwrap().is_none());
     }
