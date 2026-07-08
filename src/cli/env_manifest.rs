@@ -62,6 +62,53 @@ pub struct EnvManifest {
     pub extensions: Vec<ManifestExtension>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messaging_endpoints: Vec<ManifestEndpoint>,
+    /// Update-channel subscription. Declaring this block IS the opt-in: apply
+    /// writes `<env_dir>/update-channel.json` and the runtime starts polling on
+    /// its next boot. Absent = the channel is untouched (deny-by-default for a
+    /// fresh env; upsert-only, so it is never torn down by omission).
+    ///
+    /// Operator-authored manifests only. A manifest that arrives as the *target*
+    /// of a signed update plan may not carry this block: a plan that re-points
+    /// `plan_endpoint` would be a self-perpetuating takeover primitive, so
+    /// `op updates publish` strips it at sign time and
+    /// `updates::check_applyable_manifest` rejects it at apply time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updates: Option<ManifestUpdates>,
+}
+
+/// `updates` block of [`EnvManifest`] — a declarative mirror of
+/// `greentic.update-channel.v1`, minus the schema/env-id fields the manifest
+/// already carries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestUpdates {
+    /// Base URL the runtime polls for the latest signed plan (`{url}` for the
+    /// plan, `{url}.sig` for the DSSE envelope, `{url}/meta` for the sequence).
+    /// https, or http to loopback.
+    pub plan_endpoint: String,
+    /// Master switch. Absent = `true`: an operator who wrote this block wants
+    /// the channel on. Set `false` to declare the endpoint without subscribing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// `record-only`, `stage`, or `apply`. Absent = leave the stored value
+    /// unchanged (unset resolves to `stage`). `apply` is the opt-in that lets
+    /// the runtime converge onto a discovered plan with no operator step — the
+    /// executor lives in `greentic-start`, and a release that predates
+    /// `on_update` reads the legacy `on_notify` mirror and stages instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_notify: Option<String>,
+    /// Poll interval in seconds; rejected below the 60s floor. Absent = leave
+    /// the stored value unchanged (unset resolves to 3600).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval_secs: Option<u64>,
+}
+
+impl ManifestUpdates {
+    /// Resolved master switch — absent means "on", because declaring the block
+    /// is the subscription.
+    pub fn resolved_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,6 +362,39 @@ impl EnvManifest {
                     "environment.listen_addr `{raw}` is not a valid socket address: {e}"
                 ))
             })?;
+        }
+
+        // updates: same validators `op updates config-set` applies, so a manifest
+        // cannot express a channel the imperative verb would refuse.
+        if let Some(updates) = &self.updates {
+            let endpoint = updates.plan_endpoint.trim();
+            if endpoint.is_empty() {
+                return Err(OpError::InvalidArgument(
+                    "updates.plan_endpoint must not be empty".to_string(),
+                ));
+            }
+            if !super::updates::control_url_is_acceptable(endpoint) {
+                return Err(OpError::InvalidArgument(format!(
+                    "updates.plan_endpoint {endpoint:?} is not an acceptable control URL \
+                     (https required; http only to loopback)"
+                )));
+            }
+            if let Some(raw) = &updates.on_notify
+                && greentic_deploy_spec::UpdateAction::parse(raw).is_none()
+            {
+                return Err(OpError::InvalidArgument(format!(
+                    "updates.on_notify {raw:?} is not a valid action \
+                     (expected `record-only`, `stage`, or `apply`)"
+                )));
+            }
+            if let Some(secs) = updates.poll_interval_secs
+                && secs < greentic_deploy_spec::MIN_POLL_INTERVAL_SECS
+            {
+                return Err(OpError::InvalidArgument(format!(
+                    "updates.poll_interval_secs {secs} is below the {}s floor",
+                    greentic_deploy_spec::MIN_POLL_INTERVAL_SECS
+                )));
+            }
         }
 
         // Env-pack bindings: each slot must bind in packs, unique slots,
@@ -1497,6 +1577,9 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
             listen_addr: None,
             gui_enabled,
         },
+        // The wizard has no update-channel question yet; `None` leaves whatever
+        // the env already has (upsert), rather than tearing a channel down.
+        updates: None,
         trust_root,
         secrets,
         packs: Vec::new(),
@@ -2979,5 +3062,115 @@ mod tests {
             err.to_string().contains("status") || err.to_string().contains("variant"),
             "{err}"
         );
+    }
+
+    // --- updates block ------------------------------------------------------
+
+    fn with_updates(updates: serde_json::Value) -> Result<EnvManifest, serde_json::Error> {
+        serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "updates": updates
+        }))
+    }
+
+    #[test]
+    fn updates_block_is_optional_and_absent_by_default() {
+        assert!(minimal(ENV_MANIFEST_SCHEMA_V1).updates.is_none());
+    }
+
+    #[test]
+    fn updates_block_declaring_only_an_endpoint_is_enabled() {
+        let m = with_updates(serde_json::json!({"plan_endpoint": "https://u.example.com/plan"}))
+            .expect("parses");
+        m.validate_shape().expect("valid");
+        let updates = m.updates.as_ref().unwrap();
+        assert!(
+            updates.resolved_enabled(),
+            "declaring the block is the subscription"
+        );
+        assert!(
+            updates.on_notify.is_none(),
+            "action left to the stored value"
+        );
+    }
+
+    #[test]
+    fn updates_block_can_declare_an_endpoint_without_subscribing() {
+        let m = with_updates(
+            serde_json::json!({"plan_endpoint": "https://u.example.com/plan", "enabled": false}),
+        )
+        .expect("parses");
+        m.validate_shape().expect("valid");
+        assert!(!m.updates.as_ref().unwrap().resolved_enabled());
+    }
+
+    #[test]
+    fn updates_block_accepts_every_action() {
+        for action in ["record-only", "record_only", "stage", "apply"] {
+            let m = with_updates(serde_json::json!({
+                "plan_endpoint": "https://u.example.com/plan",
+                "on_notify": action
+            }))
+            .expect("parses");
+            m.validate_shape()
+                .unwrap_or_else(|e| panic!("{action}: {e}"));
+        }
+    }
+
+    #[test]
+    fn updates_block_rejects_an_unknown_action() {
+        let m = with_updates(serde_json::json!({
+            "plan_endpoint": "https://u.example.com/plan",
+            "on_notify": "converge"
+        }))
+        .expect("parses");
+        let err = m.validate_shape().unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(ref msg) if msg.contains("updates.on_notify")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn updates_block_rejects_a_non_loopback_http_endpoint() {
+        // Same control-URL rule `op updates config-set` enforces: a manifest
+        // cannot express a channel the imperative verb would refuse.
+        let m =
+            with_updates(serde_json::json!({"plan_endpoint": "http://updates.example.com/plan"}))
+                .expect("parses");
+        let err = m.validate_shape().unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(ref msg) if msg.contains("control URL")),
+            "{err}"
+        );
+        // ...while http to loopback (the demo) is fine.
+        let ok = with_updates(
+            serde_json::json!({"plan_endpoint": "http://127.0.0.1:3140/v1/environments/local/plan"}),
+        )
+        .expect("parses");
+        ok.validate_shape().expect("loopback http is acceptable");
+    }
+
+    #[test]
+    fn updates_block_rejects_a_poll_interval_below_the_floor() {
+        let m = with_updates(serde_json::json!({
+            "plan_endpoint": "https://u.example.com/plan",
+            "poll_interval_secs": 5
+        }))
+        .expect("parses");
+        let err = m.validate_shape().unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(ref msg) if msg.contains("floor")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn updates_block_rejects_unknown_and_missing_fields_at_parse() {
+        assert!(
+            with_updates(serde_json::json!({"plan_endpoint": "https://u/p", "typo": 1})).is_err()
+        );
+        assert!(with_updates(serde_json::json!({"enabled": true})).is_err());
     }
 }

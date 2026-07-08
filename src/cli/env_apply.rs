@@ -70,7 +70,7 @@ use std::path::{Path, PathBuf};
 
 use greentic_deploy_spec::{
     BundleDeploymentStatus, CapabilitySlot, CustomerId, DeploymentId, EnvId, Environment,
-    MessagingEndpoint, RouteBinding,
+    MessagingEndpoint, RouteBinding, UpdateAction,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -87,7 +87,8 @@ use super::deploy::BundleDeployPayload;
 use super::env::EnvInitPayload;
 use super::env_manifest::{
     ENV_MANIFEST_SCHEMA_V1, EnvManifest, ManifestBundle, ManifestEndpoint, ManifestRevision,
-    ManifestWelcomeFlow, TrustRootDirective, compute_effective_weights_bps, manifest_schema,
+    ManifestUpdates, ManifestWelcomeFlow, TrustRootDirective, compute_effective_weights_bps,
+    manifest_schema,
 };
 use super::env_packs::EnvPackBindingPayload;
 use super::extensions::ExtensionBindingPayload;
@@ -96,6 +97,7 @@ use super::messaging::{
 };
 use super::secrets::SecretsPutPayload;
 use super::trust_root::TrustRootBootstrapPayload;
+use super::updates::UpdateConfigSetPayload;
 use super::{OpError, OpFlags, OpOutcome};
 
 const NOUN: &str = "env";
@@ -157,6 +159,7 @@ enum ApplyStepKind {
     AddEndpoint,
     LinkEndpoint,
     SetWelcomeFlow,
+    ConfigureUpdates,
 }
 
 impl ApplyStepKind {
@@ -176,6 +179,7 @@ impl ApplyStepKind {
             ApplyStepKind::AddEndpoint => "add-endpoint",
             ApplyStepKind::LinkEndpoint => "link-endpoint",
             ApplyStepKind::SetWelcomeFlow => "set-welcome-flow",
+            ApplyStepKind::ConfigureUpdates => "configure-updates",
         }
     }
 }
@@ -242,6 +246,10 @@ enum StepOp {
         revisions: Vec<SplitRevisionEntry>,
     },
     UpdateHostConfig(Box<ConfigSetPayload>),
+    /// Write `<env_dir>/update-channel.json` through `op updates config-set`,
+    /// so the manifest path and the imperative verb share one validator, one
+    /// locked read-modify-write, and one audit record.
+    ConfigureUpdates(Box<UpdateConfigSetPayload>),
     AddPackBinding(Box<EnvPackBindingPayload>),
     UpdatePackBinding(Box<EnvPackBindingPayload>),
     AddExtension(Box<ExtensionBindingPayload>),
@@ -1941,7 +1949,86 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
         }
     }
 
+    // Update-channel subscription, last: an environment only starts polling for
+    // updates once everything else it declares has converged. A failed bundle
+    // deploy therefore leaves the env unsubscribed rather than subscribed to a
+    // channel it cannot yet serve.
+    if let Some(updates) = &ctx.manifest.updates {
+        steps.push(updates_step(store, ctx, updates)?);
+    }
+
     Ok(steps)
+}
+
+/// Update-channel diff. `op updates config-set` is a merge — a `None` field
+/// leaves the stored value alone — so a declared field is compared against
+/// what is on disk and an all-equal comparison plans as a no-op.
+///
+/// `on_notify` and `poll_interval_secs` were already validated by
+/// [`EnvManifest::validate_shape`], so the parse here cannot fail; the
+/// declared-but-unset case is what `None` means (leave the stored value).
+fn updates_step(
+    store: &LocalFsStore,
+    ctx: &ApplyContext,
+    updates: &ManifestUpdates,
+) -> Result<ApplyStep, OpError> {
+    let key = ctx.env_id.as_str().to_string();
+    let enabled = updates.resolved_enabled();
+    let endpoint = updates.plan_endpoint.trim().to_string();
+    let declared_action = updates.on_notify.as_deref().and_then(UpdateAction::parse);
+
+    let current = store.load_update_channel(&ctx.env_id)?;
+    let unchanged = current.as_ref().is_some_and(|cur| {
+        cur.enabled == Some(enabled)
+            && cur.resolved_plan_endpoint() == Some(endpoint.as_str())
+            && declared_action.is_none_or(|want| cur.resolved_action() == want)
+            && updates
+                .poll_interval_secs
+                .is_none_or(|want| cur.resolved_poll_interval_secs() == want)
+    });
+    if unchanged {
+        return Ok(ApplyStep::no_op(
+            ApplyStepKind::ConfigureUpdates,
+            key,
+            "update-channel unchanged",
+        ));
+    }
+
+    let action_label = declared_action.map_or("stage (default)", |a| a.as_str());
+    let detail = format!(
+        "{}, on-update {action_label} → {endpoint}",
+        if enabled { "enabled" } else { "disabled" },
+    );
+    let desired_hash = hash_json(&json!({
+        "enabled": enabled,
+        "on_notify": updates.on_notify,
+        "poll_interval_secs": updates.poll_interval_secs,
+        "plan_endpoint": endpoint,
+    }));
+    let ikey = derive_idempotency_key(
+        &ctx.env_id,
+        ApplyStepKind::ConfigureUpdates.label(),
+        &key,
+        &desired_hash,
+    );
+    Ok(ApplyStep {
+        kind: ApplyStepKind::ConfigureUpdates,
+        key: key.clone(),
+        action: if current.is_some() {
+            ApplyAction::Update
+        } else {
+            ApplyAction::Create
+        },
+        detail,
+        idempotency_key: Some(ikey),
+        op: StepOp::ConfigureUpdates(Box::new(UpdateConfigSetPayload {
+            environment_id: key,
+            enabled: Some(enabled),
+            on_notify: updates.on_notify.clone(),
+            poll_interval_secs: updates.poll_interval_secs,
+            plan_endpoint: Some(endpoint),
+        })),
+    })
 }
 
 /// Trust-root diff: read-only — `load_existing_only` never generates a key,
@@ -2048,6 +2135,10 @@ fn execute(store: &LocalFsStore, ctx: &ApplyContext, steps: &[ApplyStep]) -> Res
             }
             StepOp::UpdateHostConfig(payload) => {
                 super::config::set(store, &exec_flags, Some((**payload).clone())).map(|_| ())
+            }
+            StepOp::ConfigureUpdates(payload) => {
+                super::updates::config_set(store, &exec_flags, Some((**payload).clone()))
+                    .map(|_| ())
             }
             StepOp::AddPackBinding(payload) => {
                 let payload = stage_binding_answers(store, ctx, (**payload).clone())?;
@@ -3362,6 +3453,110 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// The manifest shape the demo uses: declaring `updates` IS the
+    /// subscription, so no `op updates config-set` is needed.
+    fn updates_manifest(on_notify: &str) -> Value {
+        json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "http://127.0.0.1:3140/v1/environments/local/plan",
+                "on_notify": on_notify,
+                "poll_interval_secs": 60,
+            }
+        })
+    }
+
+    #[test]
+    fn updates_block_subscribes_the_env_and_reapply_is_a_noop() {
+        let (dir, store) = seeded_store();
+        let path = write_manifest(dir.path(), &updates_manifest("apply"));
+
+        let outcome = run_apply(&store, &path).expect("apply succeeds");
+        assert!(
+            step_actions(&outcome.result)
+                .contains(&("configure-updates".to_string(), "create".to_string())),
+            "steps: {:?}",
+            step_actions(&outcome.result)
+        );
+
+        let cfg = store
+            .load_update_channel(&EnvId::try_from("local").unwrap())
+            .unwrap()
+            .expect("update-channel.json written");
+        assert!(cfg.resolved_enabled(), "declaring the block enables it");
+        assert_eq!(cfg.resolved_action(), UpdateAction::Apply);
+        assert_eq!(cfg.resolved_poll_interval_secs(), 60);
+        assert_eq!(
+            cfg.resolved_plan_endpoint(),
+            Some("http://127.0.0.1:3140/v1/environments/local/plan")
+        );
+        // The legacy mirror keeps an older runtime staging rather than broken.
+        assert_eq!(
+            cfg.on_notify,
+            Some(greentic_deploy_spec::OnNotifyAction::Stage)
+        );
+
+        // Converged: a second apply of the same manifest changes nothing.
+        let again = run_apply(&store, &path).expect("re-apply succeeds");
+        assert!(
+            step_actions(&again.result)
+                .contains(&("configure-updates".to_string(), "no-op".to_string())),
+            "steps: {:?}",
+            step_actions(&again.result)
+        );
+    }
+
+    #[test]
+    fn updates_block_is_absent_by_default_so_the_channel_stays_deny_by_default() {
+        let (dir, store) = seeded_store();
+        let path = write_manifest(
+            dir.path(),
+            &json!({"schema": "greentic.env-manifest.v1", "environment": {"id": "local"}}),
+        );
+        let outcome = run_apply(&store, &path).expect("apply succeeds");
+        assert!(
+            !step_actions(&outcome.result)
+                .iter()
+                .any(|(kind, _)| kind == "configure-updates"),
+            "a manifest with no `updates` block must not plan a channel step"
+        );
+        assert!(
+            store
+                .load_update_channel(&EnvId::try_from("local").unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn updates_block_changing_action_replans_as_update_not_create() {
+        let (dir, store) = seeded_store();
+        let staged = write_manifest(dir.path(), &updates_manifest("stage"));
+        run_apply(&store, &staged).expect("first apply");
+
+        // Same endpoint, different action → an Update step, and the stored
+        // action follows the manifest.
+        let applied = dir.path().join("manifest-apply.json");
+        std::fs::write(
+            &applied,
+            serde_json::to_vec_pretty(&updates_manifest("apply")).unwrap(),
+        )
+        .unwrap();
+        let outcome = run_apply(&store, &applied).expect("second apply");
+        assert!(
+            step_actions(&outcome.result)
+                .contains(&("configure-updates".to_string(), "update".to_string())),
+            "steps: {:?}",
+            step_actions(&outcome.result)
+        );
+        let cfg = store
+            .load_update_channel(&EnvId::try_from("local").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.resolved_action(), UpdateAction::Apply);
     }
 
     #[test]

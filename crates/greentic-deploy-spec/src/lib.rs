@@ -65,7 +65,8 @@ pub use environment::{
 };
 pub use environment_runtime::{EnvironmentRuntime, RuntimeDiscoveryValue};
 pub use environment_update_channel::{
-    DEFAULT_POLL_INTERVAL_SECS, MIN_POLL_INTERVAL_SECS, OnNotifyAction, UpdateChannelConfig,
+    DEFAULT_POLL_INTERVAL_SECS, MIN_POLL_INTERVAL_SECS, OnNotifyAction, UpdateAction,
+    UpdateChannelConfig,
 };
 pub use error::SpecError;
 pub use ids::{
