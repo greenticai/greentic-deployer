@@ -161,7 +161,7 @@ fn tls_rel_path(tenant: &str, name: &str) -> String {
 /// on-path attacker could serve a malicious CA (enrollment) or a stale
 /// validly-signed plan (fetch). A hostname that merely starts with `127.` (e.g.
 /// `127.0.0.1.evil.com`) parses as a domain, not a loopback IP, so it is refused.
-fn control_url_is_acceptable(raw: &str) -> bool {
+pub(crate) fn control_url_is_acceptable(raw: &str) -> bool {
     let Ok(parsed) = url::Url::parse(raw) else {
         return false;
     };
@@ -1449,6 +1449,21 @@ fn check_applyable_manifest(
     manifest: &EnvManifest,
     dev_secrets_path_override: bool,
 ) -> Result<(), OpError> {
+    // An update plan may not re-point the channel it arrived on. Honoring
+    // `updates` here would let one signed plan redirect `plan_endpoint` at a
+    // server of its choosing and thereby control every plan that follows — a
+    // self-perpetuating takeover from a single mis-signed artifact. The channel
+    // is operator-local state, set by `op env apply` or `op updates config-set`;
+    // `op updates publish` strips the block at sign time, and this is the
+    // fail-closed backstop for a plan built any other way.
+    if manifest.updates.is_some() {
+        return Err(OpError::InvalidArgument(
+            "update plan target declares an `updates` block: a plan may not \
+             re-point the update channel it arrived on. Configure the channel \
+             with `op env apply` or `op updates config-set`."
+                .to_string(),
+        ));
+    }
     // secrets[] / messaging_endpoints[] both write dev-store secret material;
     // allow them only when a failed apply's rollback (the P0b snapshot) would
     // undo those writes — i.e. the effective sink is the snapshotted dev-store.
@@ -4718,6 +4733,37 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         let err =
             check_applyable_manifest(&env, td.path(), &secrets_manifest(), false).unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("non-dev-store backend")));
+    }
+
+    #[test]
+    fn guard_rejects_a_plan_target_that_repoints_the_update_channel() {
+        // A signed plan whose target re-points `plan_endpoint` would control
+        // every plan that follows it. Refused before anything is applied.
+        let env = make_env("local");
+        let td = tempdir().unwrap();
+        let m = parse_manifest(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "updates": {"plan_endpoint": "https://attacker.example.com/plan"}
+        }));
+        let err = check_applyable_manifest(&env, td.path(), &m, false).unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(msg) if msg.contains("re-point the update channel")),
+            "unexpected error"
+        );
+    }
+
+    #[test]
+    fn guard_accepts_a_plan_target_without_an_updates_block() {
+        // The shape `op updates publish` produces: the block is stripped at sign
+        // time, so an ordinary content plan applies.
+        let env = make_env("local");
+        let td = tempdir().unwrap();
+        let m = parse_manifest(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"}
+        }));
+        check_applyable_manifest(&env, td.path(), &m, false).unwrap();
     }
 
     #[test]
