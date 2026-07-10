@@ -135,7 +135,7 @@ pub(crate) fn up(
         manifest.cluster.as_ref().map(|c| {
             c.kubeconfig_context
                 .clone()
-                .unwrap_or_else(|| format!("kind-{}", c.name))
+                .unwrap_or_else(|| kind_context_name(&c.name))
         })
     } else {
         ensure_kind_cluster(&manifest)?
@@ -491,7 +491,6 @@ fn kind_cluster_exists(list_stdout: &str, name: &str) -> bool {
 }
 
 /// The kubeconfig context name kind uses for a cluster.
-#[cfg(any(feature = "k8s-client", test))]
 fn kind_context_name(name: &str) -> String {
     format!("kind-{name}")
 }
