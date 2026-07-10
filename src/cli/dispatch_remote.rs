@@ -119,6 +119,7 @@ fn route_remote(
                 remote_env_set_public_url(store, &args.env_id, &args.url)
             }
             EnvVerb::Init(_) => Err(not_supported("env init")),
+            EnvVerb::Up(_) => Err(not_supported("env up")),
             // Manifest-driven whole-env document reconcile over the remote
             // store. `--emit-answers-template` is store-independent (a local
             // template write), so it runs the same as on the local path.
@@ -1488,6 +1489,7 @@ fn remote_reconcile(
         bound_token,
         None,
         secrets_backend,
+        false,
     )?;
 
     Ok(OpOutcome::new(

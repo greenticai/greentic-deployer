@@ -537,6 +537,37 @@ fn prompt_secret_value(path: &str, from_env: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Write each pack's inline `answers` to a temp file and point its `answers_ref`
+/// at the absolute path. `stage_answers_file` copies it into the env dir and
+/// rewrites the persisted ref to an env-relative path, so the temp dir may be
+/// dropped once `apply` returns.
+fn materialize_inline_pack_answers(
+    manifest: &mut EnvManifest,
+) -> Result<Option<tempfile::TempDir>, OpError> {
+    let needs = manifest.packs.iter().any(|p| p.answers.is_some());
+    if !needs {
+        return Ok(None);
+    }
+    let dir = tempfile::tempdir().map_err(|e| OpError::Io {
+        path: PathBuf::from("<tempdir>"),
+        source: e,
+    })?;
+    for (i, pack) in manifest.packs.iter_mut().enumerate() {
+        let Some(answers) = pack.answers.take() else {
+            continue;
+        };
+        let file = dir.path().join(format!("pack-{i}-answers.json"));
+        let bytes = serde_json::to_vec_pretty(&answers)
+            .map_err(|e| OpError::InvalidArgument(format!("serialize inline answers: {e}")))?;
+        std::fs::write(&file, bytes).map_err(|e| OpError::Io {
+            path: file.clone(),
+            source: e,
+        })?;
+        pack.answers_ref = Some(file);
+    }
+    Ok(Some(dir))
+}
+
 /// [`apply`] with the `from_env` secret-value lookup and the TTY prompter
 /// injected. Tests pass fakes so they never mutate the process environment
 /// (`set_var` is unsafe under a multithreaded test harness) and never need
@@ -566,8 +597,9 @@ fn apply_with_lookups(
                 .to_string(),
         )
     })?;
-    let manifest: EnvManifest = super::load_answers(&manifest_path)?;
+    let mut manifest: EnvManifest = super::load_answers(&manifest_path)?;
     manifest.validate_shape()?;
+    let _inline_answers_dir = materialize_inline_pack_answers(&mut manifest)?;
     let manifest_dir = manifest_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -5772,5 +5804,62 @@ mod tests {
             "create",
             "revocation action must be create: {revocation}"
         );
+    }
+
+    #[test]
+    fn materialize_inline_pack_answers_writes_temp_file_and_clears_field() {
+        use crate::cli::env_manifest::ENV_MANIFEST_SCHEMA_V1;
+
+        let mut manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "deployer",
+                "kind": "greentic.deployer.k8s@1.0.0",
+                "pack_ref": "builtin",
+                "answers": {"runtime_image": "example.com/img:v1"}
+            }]
+        }))
+        .unwrap();
+
+        let dir = materialize_inline_pack_answers(&mut manifest)
+            .expect("materialize succeeds")
+            .expect("temp dir returned");
+
+        assert!(
+            manifest.packs[0].answers.is_none(),
+            "inline answers cleared"
+        );
+        let ref_path = manifest.packs[0]
+            .answers_ref
+            .as_ref()
+            .expect("answers_ref set");
+        assert!(ref_path.is_absolute(), "answers_ref is absolute");
+        assert!(ref_path.is_file(), "temp file exists");
+
+        let content: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(ref_path).unwrap()).unwrap();
+        assert_eq!(content["runtime_image"], "example.com/img:v1");
+
+        drop(dir);
+    }
+
+    #[test]
+    fn materialize_inline_pack_answers_noop_when_no_inline() {
+        use crate::cli::env_manifest::ENV_MANIFEST_SCHEMA_V1;
+
+        let mut manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "deployer",
+                "kind": "greentic.deployer.k8s@1.0.0",
+                "pack_ref": "builtin"
+            }]
+        }))
+        .unwrap();
+
+        let result = materialize_inline_pack_answers(&mut manifest).expect("succeeds");
+        assert!(result.is_none(), "no temp dir needed");
     }
 }

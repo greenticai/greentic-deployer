@@ -670,6 +670,7 @@ pub fn reconcile(
         bound_token,
         dev_secrets,
         secrets_backend,
+        false,
     )?;
 
     Ok(OpOutcome::new(
@@ -703,6 +704,7 @@ pub(crate) fn reconcile_k8s_cluster(
     bound_token: Option<String>,
     dev_secrets: Option<String>,
     secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
+    wait_for_rollout: bool,
 ) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
     use crate::env_packs::k8s::async_bridge::run_k8s_async;
     use crate::env_packs::k8s::kube_client::connect;
@@ -730,7 +732,7 @@ pub(crate) fn reconcile_k8s_cluster(
         )
         .with_secrets_backend(secrets_backend);
         handler
-            .reconcile(env, answers, manage_namespace)
+            .reconcile_and_wait(env, answers, manage_namespace, wait_for_rollout)
             .await
             .map_err(|e| OpError::Conflict(e.to_string()))
     })
@@ -744,6 +746,7 @@ pub(crate) fn reconcile_k8s_cluster(
     _bound_token: Option<String>,
     _dev_secrets: Option<String>,
     _secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
+    _wait_for_rollout: bool,
 ) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `k8s-client` feature; \
@@ -757,7 +760,10 @@ pub(crate) fn reconcile_k8s_cluster(
 /// staging init is then a guarded no-op). A read error other than not-found is
 /// surfaced — a present-but-unreadable store should fail the reconcile rather
 /// than silently ship an empty Secret.
-fn read_dev_secrets_b64(store: &LocalFsStore, env_id: &EnvId) -> Result<Option<String>, OpError> {
+pub(crate) fn read_dev_secrets_b64(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+) -> Result<Option<String>, OpError> {
     use base64::Engine as _;
     let env_dir = store
         .env_dir(env_id)
