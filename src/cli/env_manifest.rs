@@ -79,6 +79,13 @@ pub struct EnvManifest {
     /// `updates::check_applyable_manifest` rejects it at apply time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updates: Option<ManifestUpdates>,
+    /// In-cluster Vault provisioning for `env up`. Like `cluster`/`updates`, this
+    /// is a JSON-first block the wizard never asks about — Rust struct +
+    /// `validate_shape()` only, excluded from the emitted schema/template. Absent
+    /// = `env up` runs no Vault phase (the secrets backend is whatever the packs
+    /// bind). Ignored by plain `env apply`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_bootstrap: Option<VaultBootstrapConfig>,
 }
 
 /// `updates` block of [`EnvManifest`] — a declarative mirror of
@@ -182,6 +189,83 @@ pub struct ManifestCluster {
     pub kubeconfig_context: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub load_images: Vec<String>,
+}
+
+/// Default namespace the in-cluster dev Vault is deployed into. Matches the
+/// `k8s-vault-demo` (`vault.greentic.svc:8200`) — deliberately NOT the env
+/// namespace, which reconcile creates in a later phase.
+pub const DEFAULT_VAULT_NAMESPACE: &str = "greentic";
+/// Default dev-mode root token. Dev-mode Vault is in-memory and insecure; the
+/// token only has to match what the seed phase presents.
+pub const DEFAULT_VAULT_ROOT_TOKEN: &str = "root";
+/// Default dev-mode Vault image (matches `k8s-vault-demo/vault.yaml`).
+pub const DEFAULT_VAULT_DEV_IMAGE: &str = "hashicorp/vault:1.17";
+
+/// How `env up` obtains the Vault the env's secrets are seeded into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VaultDeployMode {
+    /// Deploy an in-memory dev-mode Vault into the cluster and bootstrap it.
+    /// Requires a cluster-admin kubeconfig (it applies a cluster-scoped
+    /// `ClusterRoleBinding`), so it is a kind/local-dev path only.
+    DevInCluster,
+    /// The env's binding already points at a reachable Vault; `env up` skips
+    /// the deploy + bootstrap and only seeds.
+    External,
+}
+
+/// In-cluster Vault provisioning declaration for `env up`. Follows the
+/// `cluster`/`updates` precedent: a JSON-first block the wizard never asks
+/// about, validated by [`EnvManifest::validate_shape`] and excluded from the
+/// emitted schema/template. Seed VALUES never appear here — `seed[]` reuses
+/// [`ManifestSecret`], so each entry names an env var (or is supplied by an
+/// interactive masked paste).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultBootstrapConfig {
+    pub deploy: VaultDeployMode,
+    /// Namespace the dev Vault runs in (default [`DEFAULT_VAULT_NAMESPACE`]).
+    /// Ignored for `external`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// Dev-mode root token used to bootstrap + seed (default
+    /// [`DEFAULT_VAULT_ROOT_TOKEN`]). Ignored for `external`, which seeds with
+    /// the ambient/binding credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_token: Option<String>,
+    /// Dev-mode Vault image (default [`DEFAULT_VAULT_DEV_IMAGE`]). Ignored for
+    /// `external`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// Secrets to seed into Vault after apply, before reconcile. Same shape and
+    /// masked-paste fallback as the dev-store `secrets[]` slot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seed: Vec<ManifestSecret>,
+}
+
+impl VaultBootstrapConfig {
+    /// Resolved Vault namespace (explicit or the dev default).
+    pub fn resolved_namespace(&self) -> &str {
+        self.namespace.as_deref().unwrap_or(DEFAULT_VAULT_NAMESPACE)
+    }
+
+    /// Resolved dev-mode root token (explicit or the dev default).
+    pub fn resolved_root_token(&self) -> &str {
+        self.root_token
+            .as_deref()
+            .unwrap_or(DEFAULT_VAULT_ROOT_TOKEN)
+    }
+
+    /// Resolved dev-mode Vault image (explicit or the dev default).
+    pub fn resolved_image(&self) -> &str {
+        self.image.as_deref().unwrap_or(DEFAULT_VAULT_DEV_IMAGE)
+    }
+
+    /// Whether `env up` should deploy + bootstrap an in-cluster dev Vault (vs.
+    /// seed an already-reachable external Vault).
+    pub fn is_dev_in_cluster(&self) -> bool {
+        matches!(self.deploy, VaultDeployMode::DevInCluster)
+    }
 }
 
 /// v1 accepts only the string `"bootstrap"`. A future
@@ -723,6 +807,63 @@ impl EnvManifest {
                     return Err(OpError::InvalidArgument(format!(
                         "endpoint `{}`: duplicate link `{link}` in links[]",
                         ep.name
+                    )));
+                }
+            }
+        }
+
+        // vault_bootstrap: same path-shape checks as `secrets[]` on the
+        // seed[] entries (shared helper — the two secret surfaces cannot
+        // drift). Values (`from_env` resolution) are checked later, with
+        // process context, in the `env up` seed phase.
+        if let Some(vault) = &self.vault_bootstrap {
+            // A vault-backed env seeds through `vault_bootstrap.seed[]`; the
+            // dev-store `secrets[]` slot cannot reach Vault (env_apply writes
+            // it through the dev store only), so carrying both is a mistake.
+            if !self.secrets.is_empty() {
+                return Err(OpError::InvalidArgument(
+                    "manifest declares both `vault_bootstrap` and dev-store `secrets[]`; \
+                     a Vault-backed env seeds through `vault_bootstrap.seed[]` — move the \
+                     entries there (dev-store `secrets[]` cannot write to Vault)"
+                        .to_string(),
+                ));
+            }
+            if let Some(ns) = &vault.namespace
+                && ns.trim().is_empty()
+            {
+                return Err(OpError::InvalidArgument(
+                    "vault_bootstrap.namespace, when present, must not be empty".to_string(),
+                ));
+            }
+            if let Some(token) = &vault.root_token
+                && token.trim().is_empty()
+            {
+                return Err(OpError::InvalidArgument(
+                    "vault_bootstrap.root_token, when present, must not be empty".to_string(),
+                ));
+            }
+            if let Some(image) = &vault.image
+                && image.trim().is_empty()
+            {
+                return Err(OpError::InvalidArgument(
+                    "vault_bootstrap.image, when present, must not be empty".to_string(),
+                ));
+            }
+            let mut seed_paths = BTreeSet::new();
+            for s in &vault.seed {
+                let rel_path = s.path.trim_start_matches('/');
+                super::secrets::validate_dev_store_secret_path(rel_path)?;
+                if !seed_paths.insert(rel_path) {
+                    return Err(OpError::InvalidArgument(format!(
+                        "duplicate seed path `{rel_path}` in manifest vault_bootstrap.seed[]"
+                    )));
+                }
+                if let Some(from_env) = &s.from_env
+                    && from_env.trim().is_empty()
+                {
+                    return Err(OpError::InvalidArgument(format!(
+                        "vault_bootstrap.seed `{rel_path}`: from_env, when present, must name an \
+                         environment variable — omit it entirely for a pasted secret"
                     )));
                 }
             }
@@ -1634,6 +1775,9 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
         // The wizard has no update-channel question yet; `None` leaves whatever
         // the env already has (upsert), rather than tearing a channel down.
         updates: None,
+        // JSON-first block (like `cluster`/`updates`); the wizard never asks
+        // about in-cluster Vault provisioning.
+        vault_bootstrap: None,
         trust_root,
         secrets,
         packs: Vec::new(),
@@ -3269,6 +3413,122 @@ mod tests {
         let m2: EnvManifest = serde_json::from_str(&serialized).unwrap();
         m2.validate_shape().expect("round-trip valid");
         assert_eq!(serialized, serde_json::to_string(&m2).unwrap());
+    }
+
+    #[test]
+    fn manifest_round_trips_with_vault_bootstrap() {
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "vault-demo", "tenant_org_id": "org-1"},
+            "vault_bootstrap": {
+                "deploy": "dev-in-cluster",
+                "namespace": "vaultns",
+                "root_token": "s.abc",
+                "image": "hashicorp/vault:1.18",
+                "seed": [
+                    {"path": "org-1/_/messaging-telegram/telegram_bot_token",
+                     "from_env": "TELEGRAM_DEMO_BOT_TOKEN"}
+                ]
+            }
+        }))
+        .unwrap();
+        m.validate_shape().expect("valid with vault_bootstrap");
+        let vault = m.vault_bootstrap.as_ref().expect("vault present");
+        assert_eq!(vault.deploy, VaultDeployMode::DevInCluster);
+        assert!(vault.is_dev_in_cluster());
+        assert_eq!(vault.resolved_namespace(), "vaultns");
+        assert_eq!(vault.resolved_root_token(), "s.abc");
+        assert_eq!(vault.resolved_image(), "hashicorp/vault:1.18");
+        assert_eq!(vault.seed.len(), 1);
+
+        let serialized = serde_json::to_string(&m).unwrap();
+        let m2: EnvManifest = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(serialized, serde_json::to_string(&m2).unwrap());
+    }
+
+    #[test]
+    fn vault_bootstrap_defaults_resolve_to_the_demo_values() {
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "vault-demo", "tenant_org_id": "org-1"},
+            "vault_bootstrap": {"deploy": "dev-in-cluster"}
+        }))
+        .unwrap();
+        m.validate_shape()
+            .expect("valid with minimal vault_bootstrap");
+        let vault = m.vault_bootstrap.as_ref().unwrap();
+        assert_eq!(vault.resolved_namespace(), DEFAULT_VAULT_NAMESPACE);
+        assert_eq!(vault.resolved_root_token(), DEFAULT_VAULT_ROOT_TOKEN);
+        assert_eq!(vault.resolved_image(), DEFAULT_VAULT_DEV_IMAGE);
+        assert!(vault.seed.is_empty());
+    }
+
+    #[test]
+    fn vault_bootstrap_external_mode_parses() {
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "vault-demo", "tenant_org_id": "org-1"},
+            "vault_bootstrap": {"deploy": "external"}
+        }))
+        .unwrap();
+        m.validate_shape().expect("valid external");
+        assert!(!m.vault_bootstrap.as_ref().unwrap().is_dev_in_cluster());
+    }
+
+    #[test]
+    fn vault_bootstrap_deny_unknown_fields() {
+        let err = serde_json::from_value::<EnvManifest>(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "vault_bootstrap": {"deploy": "dev-in-cluster", "bogus": true}
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn vault_bootstrap_and_dev_store_secrets_are_mutually_exclusive() {
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "vault-demo", "tenant_org_id": "org-1"},
+            "secrets": [{"path": "org-1/_/p/tok", "from_env": "TOK"}],
+            "vault_bootstrap": {"deploy": "dev-in-cluster"}
+        }))
+        .unwrap();
+        let err = m.validate_shape().unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(ref msg)
+                if msg.contains("vault_bootstrap") && msg.contains("secrets[]")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn vault_bootstrap_rejects_empty_namespace_and_bad_seed_path() {
+        let empty_ns: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "vault-demo"},
+            "vault_bootstrap": {"deploy": "dev-in-cluster", "namespace": "  "}
+        }))
+        .unwrap();
+        assert!(matches!(
+            empty_ns.validate_shape().unwrap_err(),
+            OpError::InvalidArgument(_)
+        ));
+
+        let bad_seed: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "vault-demo"},
+            "vault_bootstrap": {
+                "deploy": "dev-in-cluster",
+                "seed": [{"path": "too/few/segments"}]
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            bad_seed.validate_shape().unwrap_err(),
+            OpError::InvalidArgument(_)
+        ));
     }
 
     #[test]

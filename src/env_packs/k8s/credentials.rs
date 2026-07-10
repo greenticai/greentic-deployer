@@ -219,6 +219,17 @@ pub trait K8sValidatorClient: std::fmt::Debug + Send + Sync {
         namespace: &'a str,
         operations: &'a [K8sOperation],
     ) -> Result<Vec<OperationDecision>, K8sClientError>;
+
+    /// Run one `SelfSubjectAccessReview` per operation at CLUSTER scope (no
+    /// namespace). Same ordering/decision contract as [`Self::review_access`].
+    /// The `env up` Vault phase uses this to preflight
+    /// `clusterrolebindings.create` before applying the dev Vault's
+    /// cluster-scoped `system:auth-delegator` binding — a namespaced SSAR
+    /// cannot express a cluster-scoped verb.
+    async fn review_cluster_access<'a>(
+        &'a self,
+        operations: &'a [K8sOperation],
+    ) -> Result<Vec<OperationDecision>, K8sClientError>;
 }
 
 /// Future yielded by a [`K8sValidatorConnector`].
@@ -824,6 +835,16 @@ mod tests {
                 .unwrap()
                 .take()
                 .expect("test must wire review_response")
+        }
+
+        async fn review_cluster_access<'a>(
+            &'a self,
+            _operations: &'a [K8sOperation],
+        ) -> Result<Vec<OperationDecision>, K8sClientError> {
+            // The credentials `validate` path is namespace-scoped only; the
+            // cluster-scoped review is exercised against the production client's
+            // HTTP mock (`kube_client.rs`), never through this validate mock.
+            unimplemented!("MockK8sClient does not drive the cluster-scoped review")
         }
     }
 

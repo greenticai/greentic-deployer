@@ -49,6 +49,12 @@ pub struct EnvUpArgs {
     /// Local port for the router port-forward (default 8080).
     #[arg(long = "port", default_value_t = 8080)]
     pub port: u16,
+    /// Downgrade a missing Vault seed (a `vault_bootstrap.seed[]` entry whose
+    /// value cannot be resolved and is not already in Vault) from a hard error
+    /// to a warning. Off by default: a fresh dev Vault that boots without its
+    /// secrets fails only at runtime, so `env up` fails closed instead.
+    #[arg(long = "allow-missing-seeds")]
+    pub allow_missing_seeds: bool,
     /// Audit principal forwarded to every composed mutation.
     #[arg(long = "updated-by")]
     pub updated_by: Option<String>,
@@ -78,7 +84,8 @@ pub(crate) fn up(
                 json!({
                     "input_schema": "manifest via --answers <PATH>; \
                      --yes, --non-interactive, --dry-run, --skip-cluster, \
-                     --no-port-forward, --port <u16>, --updated-by <STRING>"
+                     --no-port-forward, --port <u16>, --allow-missing-seeds, \
+                     --updated-by <STRING>"
                 }),
             ),
             None,
@@ -235,8 +242,34 @@ pub(crate) fn up(
         return Ok((apply_outcome, None));
     }
 
+    // ── Phase 4b: vault ──────────────────────────────────────────────
+    // Deploy + bootstrap + seed an in-cluster (or external) Vault, when the
+    // manifest declares one. Pinned AFTER apply (the secrets binding it needs
+    // is now in the store) and BEFORE reconcile (workers boot there and must
+    // find their secrets already present).
+    let vault_report = if manifest.vault_bootstrap.is_some() {
+        Some(vault_phase(
+            store,
+            &env_id,
+            &manifest,
+            ctx.as_deref(),
+            args.non_interactive,
+            args.allow_missing_seeds,
+        )?)
+    } else {
+        None
+    };
+
     // ── Phase 5: reconcile + rollout ─────────────────────────────────
     let (report, namespace) = reconcile_phase(store, registry, &env_id, ctx.as_deref())?;
+
+    // ── Phase 6b: verify ─────────────────────────────────────────────
+    // Vault only: confirm the reconciled worker is Vault-shaped (SA `gtc-worker`,
+    // `VAULT_*` env) — a belt-and-suspenders check that the secrets backend
+    // resolved as Vault end to end.
+    if let Some(vault) = &vault_report {
+        vault_verify_phase(&vault.worker_namespace, ctx.as_deref())?;
+    }
 
     // ── Phase 6: access ──────────────────────────────────────────────
     eprintln!(
@@ -263,20 +296,25 @@ pub(crate) fn up(
         })
     };
 
-    Ok((
-        OpOutcome::new(
-            NOUN,
-            "up",
-            json!({
-                "environment_id": env_id.as_str(),
-                "applied_count": report.applied.len(),
-                "pruned_count": report.pruned.len(),
-                "applied": report.applied,
-                "pruned": report.pruned,
-            }),
-        ),
-        forward,
-    ))
+    let mut result = json!({
+        "environment_id": env_id.as_str(),
+        "applied_count": report.applied.len(),
+        "pruned_count": report.pruned.len(),
+        "applied": report.applied,
+        "pruned": report.pruned,
+    });
+    if let Some(vault) = &vault_report {
+        result["vault"] = json!({
+            "namespace": vault.namespace,
+            "deploy": if vault.dev_in_cluster { "dev-in-cluster" } else { "external" },
+            "was_already_configured": vault.was_already_configured,
+            "seeded": vault.seeds.seeded,
+            "skipped_present": vault.seeds.skipped_present,
+            "warned_missing": vault.seeds.warned_missing,
+        });
+    }
+
+    Ok((OpOutcome::new(NOUN, "up", result), forward))
 }
 
 /// Phase 5 — reconcile + rollout, gated on `k8s-client`.
@@ -347,6 +385,584 @@ fn reconcile_phase(
         "this build was compiled without the `k8s-client` feature; \
          `op env up` needs it to connect to a cluster"
             .to_string(),
+    ))
+}
+
+// ── Phase 4b/6b: Vault ───────────────────────────────────────────────
+
+/// The dev Vault's in-cluster HTTP port.
+#[cfg(feature = "k8s-client")]
+const VAULT_REMOTE_PORT: u16 = 8200;
+/// The API server URL Vault's Kubernetes auth reviews worker tokens against.
+#[cfg(feature = "k8s-client")]
+const VAULT_KUBERNETES_HOST: &str = "https://kubernetes.default.svc";
+/// The cluster-scoped verb the in-cluster Vault path needs (its
+/// `system:auth-delegator` ClusterRoleBinding). Preflighted before apply.
+#[cfg(feature = "k8s-client")]
+const VAULT_CRB_CREATE_OP: crate::env_packs::k8s::credentials::K8sOperation =
+    crate::env_packs::k8s::credentials::K8sOperation {
+        group: "rbac.authorization.k8s.io",
+        resource: "clusterrolebindings",
+        verb: "create",
+    };
+
+/// What the seed phase did, threaded into the `up` outcome.
+#[derive(Debug, Default, Clone)]
+struct SeedSummary {
+    seeded: usize,
+    skipped_present: usize,
+    warned_missing: usize,
+}
+
+/// The vault phase result, for the outcome + verify.
+#[derive(Debug, Clone)]
+struct VaultPhaseReport {
+    namespace: String,
+    worker_namespace: String,
+    dev_in_cluster: bool,
+    was_already_configured: bool,
+    seeds: SeedSummary,
+}
+
+/// The action to take for a seed whose value could not be resolved. Pure
+/// decision table (unit-tested): a present secret on a surviving Vault is a
+/// skip; otherwise a missing value is a hard error unless `--allow-missing-seeds`
+/// downgrades it to a warning. (A fresh Vault always passes `present=false`.)
+#[cfg(any(feature = "k8s-client", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum MissingSeedAction {
+    SkipPresent,
+    Warn,
+    Fail,
+}
+
+#[cfg(any(feature = "k8s-client", test))]
+fn decide_missing_seed(present_in_vault: bool, allow_missing: bool) -> MissingSeedAction {
+    if present_in_vault {
+        MissingSeedAction::SkipPresent
+    } else if allow_missing {
+        MissingSeedAction::Warn
+    } else {
+        MissingSeedAction::Fail
+    }
+}
+
+/// Fail closed unless every cluster-scoped preflight decision is `Allowed`.
+/// On denial, name `vault_bootstrap.deploy: "external"` as the path for a
+/// cluster where the operator lacks cluster-admin RBAC.
+#[cfg(any(feature = "k8s-client", test))]
+fn evaluate_cluster_crb_preflight(
+    decisions: &[crate::env_packs::k8s::credentials::OperationDecision],
+) -> Result<(), OpError> {
+    use crate::env_packs::k8s::credentials::AccessDecision;
+    for d in decisions {
+        if let AccessDecision::Denied(reason) = &d.decision {
+            return Err(OpError::Conflict(format!(
+                "in-cluster Vault (`vault_bootstrap.deploy: \"dev-in-cluster\"`) needs a \
+                 cluster-admin kubeconfig: the current credential cannot `create` \
+                 `clusterrolebindings` ({reason}). Use an admin context (kind / local dev), or \
+                 set `vault_bootstrap.deploy: \"external\"` and point the binding at a Vault you \
+                 provisioned separately"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A transient `kubectl port-forward` to the dev Vault, killed on drop. stdout
+/// and stderr are silenced; `start` polls the local port until it accepts (or
+/// the child dies) before returning, so callers can dial it immediately.
+#[cfg(feature = "k8s-client")]
+struct VaultPortForward {
+    child: std::process::Child,
+    local_port: u16,
+}
+
+#[cfg(feature = "k8s-client")]
+impl VaultPortForward {
+    fn start(context: Option<&str>, namespace: &str, remote_port: u16) -> Result<Self, OpError> {
+        use std::process::{Command, Stdio};
+        // Reserve an ephemeral local port, then release it for kubectl to bind.
+        // A tiny TOCTOU race window remains (another process could grab it); the
+        // readiness poll below surfaces that as a clear failure.
+        let local_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| {
+                OpError::Conflict(format!("vault: could not reserve a local port: {e}"))
+            })?;
+            l.local_addr()
+                .map_err(|e| OpError::Conflict(format!("vault: local port: {e}")))?
+                .port()
+        };
+        let mut cmd = Command::new("kubectl");
+        if let Some(ctx) = context {
+            cmd.args(["--context", ctx]);
+        }
+        cmd.args([
+            "-n",
+            namespace,
+            "port-forward",
+            "svc/vault",
+            &format!("{local_port}:{remote_port}"),
+        ]);
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+        let child = cmd.spawn().map_err(|e| {
+            OpError::Conflict(format!(
+                "vault: failed to spawn `kubectl port-forward`: {e}"
+            ))
+        })?;
+        let mut pf = Self { child, local_port };
+        pf.wait_ready()?;
+        Ok(pf)
+    }
+
+    fn wait_ready(&mut self) -> Result<(), OpError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Err(OpError::Conflict(format!(
+                    "vault: `kubectl port-forward` exited early ({status}); is `svc/vault` up in \
+                     this namespace and the context an admin kubeconfig?"
+                )));
+            }
+            if std::net::TcpStream::connect(("127.0.0.1", self.local_port)).is_ok() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(OpError::Conflict(
+                    "vault: `kubectl port-forward` did not become ready within 20s".to_string(),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    fn addr(&self) -> String {
+        format!("http://127.0.0.1:{}", self.local_port)
+    }
+}
+
+#[cfg(feature = "k8s-client")]
+impl Drop for VaultPortForward {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Block until the dev Vault Deployment has rolled out (availability is gated by
+/// its `/v1/sys/health` readiness probe, so this also means Vault answers HTTP).
+#[cfg(feature = "k8s-client")]
+async fn wait_for_vault_rollout(
+    cluster: &dyn crate::env_packs::k8s::K8sCluster,
+    deployment: &crate::env_packs::k8s::ObjectRef,
+) -> Result<(), OpError> {
+    let timeout = std::time::Duration::from_secs(180);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let status = cluster
+            .get_rollout_status(deployment)
+            .await
+            .map_err(|e| OpError::Conflict(format!("vault: rollout status: {e}")))?;
+        if status.is_complete(1) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(OpError::Conflict(format!(
+                "vault: deployment `{deployment}` did not become ready within {}s",
+                timeout.as_secs()
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// Resolve the namespace the worker pods run in (the answers' `namespace`, else
+/// the env-derived default) — where the Vault role binds the worker SA and where
+/// verify lists the worker Deployment.
+#[cfg(feature = "k8s-client")]
+fn resolve_worker_namespace(
+    store: &LocalFsStore,
+    env: &greentic_deploy_spec::Environment,
+    env_id: &greentic_deploy_spec::EnvId,
+) -> Result<String, OpError> {
+    let descriptor = super::env::resolve_live_deployer_kind(env, None)?;
+    let (answers, _wire) = super::env::load_render_answers(store, env, &descriptor)?;
+    Ok(answers
+        .as_ref()
+        .and_then(|a| a.get("namespace"))
+        .and_then(Value::as_str)
+        .map(String::from)
+        .unwrap_or_else(|| crate::env_packs::k8s::manifests::namespace_for_env(env_id)))
+}
+
+/// Build the native bootstrap params from the env's Vault binding + the
+/// reachable address and worker identity.
+#[cfg(feature = "k8s-client")]
+#[allow(clippy::too_many_arguments)]
+fn vault_bootstrap_params<'a>(
+    addr: &'a str,
+    token: &'a str,
+    binding: &'a crate::env_packs::k8s::manifests::VaultBackend,
+    env_id: &'a str,
+    tenant: &'a str,
+    worker_sa: &'a str,
+    worker_namespace: &'a str,
+) -> crate::env_packs::k8s::vault_bootstrap::VaultBootstrapParams<'a> {
+    crate::env_packs::k8s::vault_bootstrap::VaultBootstrapParams {
+        addr,
+        token,
+        kv_mount: &binding.kv_mount,
+        kv_prefix: &binding.kv_prefix,
+        transit_mount: &binding.transit_mount,
+        transit_key: &binding.transit_key,
+        auth_mount: &binding.auth_mount,
+        env_id,
+        tenant,
+        worker_sa,
+        worker_namespace,
+        role: &binding.k8s_role,
+        kubernetes_host: VAULT_KUBERNETES_HOST,
+    }
+}
+
+/// A teachable hard-error message for a missing seed value.
+#[cfg(feature = "k8s-client")]
+fn missing_seed_message(
+    rel_path: &str,
+    seed: &crate::cli::env_manifest::ManifestSecret,
+    was_configured: bool,
+) -> String {
+    let source = match &seed.from_env {
+        Some(var) => format!("environment variable `${var}` is unset or empty"),
+        None => "no value was provided (empty paste or --non-interactive)".to_string(),
+    };
+    let vault_state = if was_configured {
+        "and it is not already present in Vault"
+    } else {
+        "and the freshly-bootstrapped Vault cannot already hold it"
+    };
+    format!(
+        "vault seed `{rel_path}`: {source}, {vault_state}. Export the value, supply a masked \
+         paste, or pass --allow-missing-seeds to downgrade this to a warning"
+    )
+}
+
+/// Seed every `vault_bootstrap.seed[]` entry into Vault over `addr` (an explicit
+/// port-forward or external address), scoped to `tenant`. A resolvable value is
+/// always written (idempotent); a missing value follows the
+/// [`decide_missing_seed`] matrix.
+#[cfg(feature = "k8s-client")]
+#[allow(clippy::too_many_arguments)]
+fn seed_secrets(
+    binding: &crate::env_packs::k8s::manifests::VaultBackend,
+    addr: &str,
+    token: &str,
+    tenant: &str,
+    env_id: &greentic_deploy_spec::EnvId,
+    seeds: &[crate::cli::env_manifest::ManifestSecret],
+    was_already_configured: bool,
+    allow_missing_seeds: bool,
+    non_interactive: bool,
+) -> Result<SeedSummary, OpError> {
+    use greentic_secrets_lib::vault::VaultAuth;
+    let mut summary = SeedSummary::default();
+    for seed in seeds {
+        let rel_path = seed.path.trim_start_matches('/');
+        let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
+        let value = match &seed.from_env {
+            Some(var) => std::env::var(var).ok().filter(|v| !v.is_empty()),
+            None if !non_interactive => rpassword::prompt_password(format!(
+                "seed `{rel_path}`: enter value (hidden; empty to skip): "
+            ))
+            .ok()
+            .filter(|v| !v.is_empty()),
+            None => None,
+        };
+        let cfg = || {
+            super::secrets::vault_backend_config_from_binding(
+                binding,
+                addr.to_string(),
+                VaultAuth::Token(token.to_string()),
+            )
+        };
+        match value {
+            Some(v) => {
+                super::secrets::vault_put_with_config(cfg(), tenant, &store_uri, &v)?;
+                eprintln!("[env up] vault: seeded `{rel_path}`");
+                summary.seeded += 1;
+            }
+            None => {
+                let present = was_already_configured
+                    && super::secrets::vault_get_with_config(cfg(), tenant, &store_uri)?.is_some();
+                match decide_missing_seed(present, allow_missing_seeds) {
+                    MissingSeedAction::SkipPresent => {
+                        eprintln!(
+                            "[env up] vault: `{rel_path}` already present in Vault, skipping"
+                        );
+                        summary.skipped_present += 1;
+                    }
+                    MissingSeedAction::Warn => {
+                        eprintln!(
+                            "[env up] vault: WARNING `{rel_path}` has no value and is not in \
+                             Vault (--allow-missing-seeds)"
+                        );
+                        summary.warned_missing += 1;
+                    }
+                    MissingSeedAction::Fail => {
+                        return Err(OpError::InvalidArgument(missing_seed_message(
+                            rel_path,
+                            seed,
+                            was_already_configured,
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(summary)
+}
+
+/// Phase 4b — deploy (dev-in-cluster), bootstrap, and seed the env's Vault.
+/// Runs after apply (the secrets binding is in the store) and before reconcile
+/// (workers boot there and must find their secrets present).
+#[cfg(feature = "k8s-client")]
+fn vault_phase(
+    store: &LocalFsStore,
+    env_id: &greentic_deploy_spec::EnvId,
+    manifest: &EnvManifest,
+    ctx: Option<&str>,
+    non_interactive: bool,
+    allow_missing_seeds: bool,
+) -> Result<VaultPhaseReport, OpError> {
+    use crate::env_packs::k8s::async_bridge::run_k8s_async;
+    use crate::env_packs::k8s::credentials::K8sValidatorClient as _;
+    use crate::env_packs::k8s::kube_client::connect;
+    use crate::env_packs::k8s::manifests::{SecretsBackend, WORKER_SERVICE_ACCOUNT};
+    use crate::env_packs::k8s::vault_infra::{
+        VaultInfraParams, render_vault_deployment, render_vault_manifests,
+    };
+    use crate::env_packs::k8s::{K8sCluster as _, KubeCluster, KubeValidatorClient, ObjectRef};
+    use crate::environment::EnvironmentStore as _;
+
+    let vault_cfg = manifest
+        .vault_bootstrap
+        .as_ref()
+        .expect("caller checks vault_bootstrap.is_some()");
+    let env = store.load(env_id)?;
+
+    let SecretsBackend::Vault(binding) = super::env::resolve_secrets_backend(store, &env)? else {
+        return Err(OpError::InvalidArgument(
+            "manifest declares `vault_bootstrap` but the env's secrets binding is not \
+             Vault-backed; bind a `greentic.secrets.vault@*` pack in packs[] so the worker \
+             resolves `secret://` refs against Vault"
+                .to_string(),
+        ));
+    };
+
+    let tenant = env
+        .host_config
+        .tenant_org_id
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| {
+            OpError::InvalidArgument(
+                "a Vault-backed env must be tenant-owned before seeding; set \
+                 `environment.tenant_org_id` in the manifest"
+                    .to_string(),
+            )
+        })?;
+
+    let vault_ns = vault_cfg.resolved_namespace().to_string();
+    let worker_ns = resolve_worker_namespace(store, &env, env_id)?;
+    let dev_in_cluster = vault_cfg.is_dev_in_cluster();
+
+    // 4b.1 — deploy + rollout (dev-in-cluster only): SSAR preflight, apply the
+    // Vault objects, wait for the pod, all in ONE bridge call (the kube client's
+    // buffer worker lives on that runtime).
+    if dev_in_cluster {
+        let params = VaultInfraParams {
+            namespace: &vault_ns,
+            image: vault_cfg.resolved_image(),
+            root_token: vault_cfg.resolved_root_token(),
+            env_id: env_id.as_str(),
+        };
+        let objects = render_vault_manifests(&params);
+        let deploy_ref = ObjectRef::from_manifest(&render_vault_deployment(&params))
+            .map_err(|e| OpError::Conflict(format!("vault: deployment ref: {e}")))?;
+        let ctx_owned = ctx.map(str::to_string);
+        run_k8s_async(async move {
+            let client = connect(ctx_owned.as_deref(), None)
+                .await
+                .map_err(|e| OpError::Conflict(format!("vault: connect: {e}")))?;
+            let validator = KubeValidatorClient::new(client.clone());
+            let decisions = validator
+                .review_cluster_access(&[VAULT_CRB_CREATE_OP])
+                .await
+                .map_err(|e| OpError::Conflict(format!("vault: cluster access review: {e}")))?;
+            evaluate_cluster_crb_preflight(&decisions)?;
+            let cluster = KubeCluster::new(client.clone());
+            for obj in &objects {
+                cluster.apply(obj).await.map_err(|e| {
+                    OpError::Conflict(format!(
+                        "vault: apply {}: {e}",
+                        obj.get("kind").and_then(Value::as_str).unwrap_or("object")
+                    ))
+                })?;
+            }
+            wait_for_vault_rollout(&cluster, &deploy_ref).await?;
+            Ok::<(), OpError>(())
+        })?;
+        eprintln!("[env up] vault: deployed + ready in namespace `{vault_ns}`");
+    }
+
+    // 4b.2 — bootstrap + seed. dev-in-cluster reaches Vault over a transient
+    // port-forward; external seeds directly against the binding address. Both
+    // run OUTSIDE the async bridge (blocking reqwest + blocking seed core).
+    let root_token = vault_cfg.resolved_root_token();
+    let (was_already_configured, seeds) = if dev_in_cluster {
+        let pf = VaultPortForward::start(ctx, &vault_ns, VAULT_REMOTE_PORT)?;
+        let addr = pf.addr();
+        let outcome = crate::env_packs::k8s::vault_bootstrap::bootstrap(&vault_bootstrap_params(
+            &addr,
+            root_token,
+            &binding,
+            env_id.as_str(),
+            &tenant,
+            WORKER_SERVICE_ACCOUNT,
+            &worker_ns,
+        ))
+        .map_err(|e| OpError::Conflict(format!("vault bootstrap: {e}")))?;
+        eprintln!(
+            "[env up] vault: bootstrapped ({})",
+            if outcome.was_already_configured {
+                "already configured"
+            } else {
+                "fresh"
+            }
+        );
+        let seeds = seed_secrets(
+            &binding,
+            &addr,
+            root_token,
+            &tenant,
+            env_id,
+            &vault_cfg.seed,
+            outcome.was_already_configured,
+            allow_missing_seeds,
+            non_interactive,
+        )?;
+        drop(pf); // kill the port-forward
+        (outcome.was_already_configured, seeds)
+    } else {
+        eprintln!(
+            "[env up] vault: external mode — skipping deploy + bootstrap, seeding against `{}`",
+            binding.addr
+        );
+        let seeds = seed_secrets(
+            &binding,
+            &binding.addr,
+            root_token,
+            &tenant,
+            env_id,
+            &vault_cfg.seed,
+            true, // a surviving external Vault: existence-checked seed semantics
+            allow_missing_seeds,
+            non_interactive,
+        )?;
+        (true, seeds)
+    };
+
+    Ok(VaultPhaseReport {
+        namespace: vault_ns,
+        worker_namespace: worker_ns,
+        dev_in_cluster,
+        was_already_configured,
+        seeds,
+    })
+}
+
+#[cfg(not(feature = "k8s-client"))]
+fn vault_phase(
+    _store: &LocalFsStore,
+    _env_id: &greentic_deploy_spec::EnvId,
+    _manifest: &EnvManifest,
+    _ctx: Option<&str>,
+    _non_interactive: bool,
+    _allow_missing_seeds: bool,
+) -> Result<VaultPhaseReport, OpError> {
+    Err(OpError::Conflict(
+        "this build was compiled without the `k8s-client` feature; \
+         `op env up` needs it to provision Vault"
+            .to_string(),
+    ))
+}
+
+/// Phase 6b — verify (vault only): after reconcile, confirm at least one worker
+/// Deployment in the worker namespace is Vault-shaped (SA `gtc-worker`, a
+/// `VAULT_*` env var). A belt-and-suspenders check that the secrets backend
+/// resolved as Vault end to end.
+#[cfg(feature = "k8s-client")]
+fn vault_verify_phase(worker_namespace: &str, ctx: Option<&str>) -> Result<(), OpError> {
+    use crate::env_packs::k8s::async_bridge::run_k8s_async;
+    use crate::env_packs::k8s::kube_client::connect;
+    use crate::env_packs::k8s::manifests::WORKER_SERVICE_ACCOUNT;
+    use k8s_openapi::api::apps::v1::Deployment;
+    use kube::Api;
+    use kube::api::ListParams;
+
+    let ns = worker_namespace.to_string();
+    let ctx_owned = ctx.map(str::to_string);
+    run_k8s_async(async move {
+        let client = connect(ctx_owned.as_deref(), None)
+            .await
+            .map_err(|e| OpError::Conflict(format!("vault verify: connect: {e}")))?;
+        let api: Api<Deployment> = Api::namespaced(client, &ns);
+        let list = api
+            .list(&ListParams::default().labels("app.kubernetes.io/component=worker"))
+            .await
+            .map_err(|e| OpError::Conflict(format!("vault verify: list workers: {e}")))?;
+        if list.items.is_empty() {
+            return Err(OpError::Conflict(format!(
+                "vault verify: no worker Deployment found in `{ns}` to verify"
+            )));
+        }
+        for dep in &list.items {
+            let name = dep.metadata.name.clone().unwrap_or_default();
+            let pod_spec = dep.spec.as_ref().and_then(|s| s.template.spec.as_ref());
+            let sa = pod_spec.and_then(|p| p.service_account_name.as_deref());
+            if sa != Some(WORKER_SERVICE_ACCOUNT) {
+                return Err(OpError::Conflict(format!(
+                    "vault verify: worker `{name}` runs as `{}`, expected `{WORKER_SERVICE_ACCOUNT}` \
+                     — the secrets backend did not resolve as Vault",
+                    sa.unwrap_or("<none>")
+                )));
+            }
+            let has_vault_env = pod_spec
+                .map(|p| {
+                    p.containers.iter().any(|c| {
+                        c.env.as_ref().is_some_and(|env| {
+                            env.iter()
+                                .any(|e| e.name == "VAULT_ADDR" || e.name == "VAULT_K8S_ROLE")
+                        })
+                    })
+                })
+                .unwrap_or(false);
+            if !has_vault_env {
+                return Err(OpError::Conflict(format!(
+                    "vault verify: worker `{name}` carries no `VAULT_*` env — not Vault-shaped"
+                )));
+            }
+        }
+        eprintln!("[env up] vault: verified worker is Vault-shaped");
+        Ok::<(), OpError>(())
+    })
+}
+
+#[cfg(not(feature = "k8s-client"))]
+fn vault_verify_phase(_worker_namespace: &str, _ctx: Option<&str>) -> Result<(), OpError> {
+    Err(OpError::Conflict(
+        "this build was compiled without the `k8s-client` feature".to_string(),
     ))
 }
 
@@ -682,6 +1298,7 @@ mod tests {
             skip_cluster: false,
             no_port_forward: true,
             port: 8080,
+            allow_missing_seeds: false,
             updated_by: None,
         };
 
@@ -715,6 +1332,49 @@ mod tests {
     fn kind_context_name_formats_correctly() {
         assert_eq!(kind_context_name("my-cluster"), "kind-my-cluster");
         assert_eq!(kind_context_name("local"), "kind-local");
+    }
+
+    #[test]
+    fn decide_missing_seed_matrix() {
+        // Present in Vault always skips (a surviving Vault already holds it),
+        // even under --allow-missing-seeds.
+        assert_eq!(
+            decide_missing_seed(true, false),
+            MissingSeedAction::SkipPresent
+        );
+        assert_eq!(
+            decide_missing_seed(true, true),
+            MissingSeedAction::SkipPresent
+        );
+        // Absent (a fresh Vault always passes present=false, as does a surviving
+        // Vault without the key): fail closed unless the escape hatch is set.
+        assert_eq!(decide_missing_seed(false, false), MissingSeedAction::Fail);
+        assert_eq!(decide_missing_seed(false, true), MissingSeedAction::Warn);
+    }
+
+    #[cfg(feature = "k8s-client")]
+    #[test]
+    fn evaluate_cluster_crb_preflight_allows_when_permitted_and_names_external_on_denial() {
+        use crate::env_packs::k8s::credentials::{AccessDecision, OperationDecision};
+
+        let allowed = vec![OperationDecision {
+            operation: VAULT_CRB_CREATE_OP,
+            decision: AccessDecision::Allowed,
+        }];
+        assert!(evaluate_cluster_crb_preflight(&allowed).is_ok());
+
+        let denied = vec![OperationDecision {
+            operation: VAULT_CRB_CREATE_OP,
+            decision: AccessDecision::Denied("not cluster-admin".to_string()),
+        }];
+        let err = evaluate_cluster_crb_preflight(&denied).unwrap_err();
+        match err {
+            OpError::Conflict(msg) => {
+                assert!(msg.contains("clusterrolebindings"), "{msg}");
+                assert!(msg.contains("external"), "{msg}");
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
     }
 
     #[test]
