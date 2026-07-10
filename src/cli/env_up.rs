@@ -132,10 +132,11 @@ pub(crate) fn up(
 
     // ── Phase 2: cluster ─────────────────────────────────────────────
     let ctx: Option<String> = if skip_cluster {
-        manifest
-            .cluster
-            .as_ref()
-            .and_then(|c| c.kubeconfig_context.clone())
+        manifest.cluster.as_ref().map(|c| {
+            c.kubeconfig_context
+                .clone()
+                .unwrap_or_else(|| format!("kind-{}", c.name))
+        })
     } else {
         ensure_kind_cluster(&manifest)?
     };
@@ -250,6 +251,15 @@ fn reconcile_phase(
 
     let env = store.load(env_id)?;
     let descriptor = super::env::resolve_live_deployer_kind(&env, None)?;
+
+    let k8s_path = crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
+    if descriptor.path() != k8s_path {
+        return Err(OpError::Conflict(format!(
+            "`op env up` is only supported for the `{k8s_path}` deployer env-pack \
+             today; `{}` cannot be reconciled to a live cluster",
+            descriptor.path()
+        )));
+    }
 
     // Parity with reconcile: confirm the kind is actually registered.
     let _handler = registry
