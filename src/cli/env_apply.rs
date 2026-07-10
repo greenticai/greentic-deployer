@@ -557,7 +557,10 @@ fn materialize_inline_pack_answers(
             continue;
         };
         let file = dir.path().join(format!("pack-{i}-answers.json"));
-        let bytes = serde_json::to_vec(&answers)
+        // `stage_answers_file` copies these bytes verbatim into
+        // `<env_dir>/env-packs/<slot>/answers.json`, a durable artifact operators
+        // read. Keep it pretty-printed, like a hand-authored `answers_ref` file.
+        let bytes = serde_json::to_vec_pretty(&answers)
             .map_err(|e| OpError::InvalidArgument(format!("serialize inline answers: {e}")))?;
         std::fs::write(&file, bytes).map_err(|e| OpError::Io {
             path: file.clone(),
