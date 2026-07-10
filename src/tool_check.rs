@@ -343,6 +343,8 @@ pub const MIN_AWS_VERSION: &str = "2.13.0";
 pub const MIN_GCLOUD_VERSION: &str = "450.0.0";
 /// Minimum supported Azure CLI version.
 pub const MIN_AZ_VERSION: &str = "2.50.0";
+/// Minimum supported kind version.
+pub const MIN_KIND_VERSION: &str = "0.20.0";
 
 /// `>=min`, unbounded above: these are external CLIs we don't own, and a newer
 /// major (terraform 2.x, kubectl 1.31, ...) is the normal upgrade path, not a
@@ -448,6 +450,18 @@ pub fn gcloud() -> ToolCheck {
         parse_first_semver_token,
         &version_req_at_least(MIN_GCLOUD_VERSION),
         "Install gcloud from https://cloud.google.com/sdk/docs/install.",
+    )
+}
+
+/// Check `kind` is installed and at or above [`MIN_KIND_VERSION`].
+pub fn kind() -> ToolCheck {
+    check_version_probe(
+        "kind",
+        "kind",
+        &["--version"],
+        parse_first_semver_token,
+        &version_req_at_least(MIN_KIND_VERSION),
+        "Install kind from https://kind.sigs.k8s.io/docs/user/quick-start/#installation.",
     )
 }
 
@@ -667,6 +681,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_first_semver_token_handles_kind_version() {
+        assert_eq!(
+            parse_first_semver_token("kind version 0.23.0"),
+            Some(Version::new(0, 23, 0))
+        );
+    }
+
+    #[test]
     fn parse_first_semver_token_handles_common_shapes() {
         // `tofu --version`: `OpenTofu v1.6.2`
         assert_eq!(
@@ -769,6 +791,7 @@ mod tests {
             aws(),
             gcloud(),
             az(),
+            kind(),
         ] {
             if let ToolCheckOutcome::Missing { install_hint } = &check.outcome {
                 assert!(
@@ -793,6 +816,7 @@ mod tests {
             MIN_AWS_VERSION,
             MIN_GCLOUD_VERSION,
             MIN_AZ_VERSION,
+            MIN_KIND_VERSION,
         ] {
             let _: Version = min.parse().unwrap_or_else(|e| {
                 panic!("MIN_*_VERSION `{min}` is not valid semver: {e}");

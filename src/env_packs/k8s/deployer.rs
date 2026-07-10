@@ -279,6 +279,50 @@ impl K8sDeployerHandler {
         }
         Ok(ReconcileReport { applied, pruned })
     }
+
+    /// Converge, then optionally block until every applied Deployment has
+    /// rolled out.
+    ///
+    /// `ReconcileReport` carries only `ObjectRef`s, so the desired replica
+    /// count is recovered by re-rendering — pure and cheap, the same reason
+    /// `reconcile` recomputes `params` for the prune set.
+    pub async fn reconcile_and_wait(
+        &self,
+        env: &Environment,
+        answers: Option<&Value>,
+        manage_namespace: bool,
+        wait_for_rollout: bool,
+    ) -> Result<ReconcileReport, DeployerError> {
+        let report = self.reconcile(env, answers, manage_namespace).await?;
+        if !wait_for_rollout {
+            return Ok(report);
+        }
+        let desired = self
+            .render_environment(env, answers)
+            .map_err(|e| DeployerError::Provider(e.to_string()))?;
+        for manifest in &desired {
+            if manifest.get("kind").and_then(Value::as_str) != Some("Deployment") {
+                continue;
+            }
+            let object = ObjectRef::from_manifest(manifest).map_err(provider)?;
+            if !report.applied.contains(&object) {
+                continue;
+            }
+            let replicas = manifest
+                .pointer("/spec/replicas")
+                .and_then(Value::as_i64)
+                .unwrap_or(1);
+            wait_for_worker_rollout(
+                self.cluster.as_ref(),
+                &object,
+                replicas as i32,
+                warm_rollout_timeout(),
+                WARM_ROLLOUT_POLL_INTERVAL,
+            )
+            .await?;
+        }
+        Ok(report)
+    }
 }
 
 /// Outcome of [`K8sDeployerHandler::reconcile`].
@@ -846,6 +890,52 @@ mod tests {
         assert!(
             cluster.objects().is_empty(),
             "rejected preconditions must not touch the cluster"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_and_wait_skips_polling_when_wait_is_false() {
+        let cluster = Arc::new(ScriptedRolloutCluster {
+            ready_after: usize::MAX,
+            polls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let handler = K8sDeployerHandler::with_cluster(cluster.clone());
+        let env = build_fixture_env();
+
+        let report = handler
+            .reconcile_and_wait(&env, None, true, false)
+            .await
+            .expect("wait_for_rollout=false must not poll");
+        assert!(
+            !report.applied.is_empty(),
+            "reconcile still applies the desired state"
+        );
+        assert_eq!(
+            cluster.polls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no rollout polls when wait_for_rollout is false"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_and_wait_returns_immediately_when_already_ready() {
+        // InMemoryCluster reports i32::MAX for all replica fields, so every
+        // Deployment is "already ready" and the rollout wait resolves on the
+        // first poll without spinning.
+        let (handler, _cluster) = handler_with_fake();
+        let env = build_fixture_env();
+
+        let report = handler
+            .reconcile_and_wait(&env, None, true, true)
+            .await
+            .expect("already-ready Deployments resolve on the first poll");
+        assert!(
+            !report.applied.is_empty(),
+            "reconcile applies desired state"
+        );
+        assert!(
+            report.applied.iter().any(|o| o.kind == "Deployment"),
+            "at least one Deployment was applied and waited on"
         );
     }
 

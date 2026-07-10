@@ -50,6 +50,7 @@ pub mod env;
 pub mod env_apply;
 pub mod env_manifest;
 pub mod env_packs;
+pub mod env_up;
 pub mod extensions;
 pub mod messaging;
 pub mod migrate;

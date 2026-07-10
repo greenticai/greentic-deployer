@@ -301,6 +301,11 @@ pub enum EnvVerb {
     /// or reports `untouched` if the env is already complete. User-bound
     /// non-default descriptors are NEVER overwritten.
     Init(EnvInitArgs),
+    /// One-command local K8s environment bootstrap: parse → preflight →
+    /// cluster → env ensure → apply → reconcile+rollout → port-forward.
+    /// The manifest arrives via `--answers`. Re-running is safe and
+    /// idempotent.
+    Up(super::env_up::EnvUpArgs),
     /// Declarative, upsert-only environment apply. Reads a
     /// `greentic.env-manifest.v1` document via `--answers <PATH>` and
     /// reconciles the env toward it: validate → diff → plan → execute →
@@ -1110,6 +1115,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
             "env",
             match verb {
                 EnvVerb::Init(_) => "init",
+                EnvVerb::Up(_) => "up",
                 EnvVerb::Apply(_) => "apply",
                 EnvVerb::Create(_) => "create",
                 EnvVerb::Update(_) => "update",
@@ -1248,6 +1254,16 @@ fn dispatch_env(
 ) -> Result<(), OpError> {
     let outcome = match verb {
         EnvVerb::Init(args) => super::env::init(store, flags, args.into_payload(flags)?)?,
+        EnvVerb::Up(args) => {
+            // `up` may block on a foreground port-forward, so the JSON envelope is printed
+            // BEFORE the forward starts — stdout must carry exactly one envelope.
+            let (outcome, forward) = super::env_up::up(store, registry, flags, args)?;
+            print_outcome(&outcome)?;
+            return match forward {
+                Some(pf) => super::env_up::run_port_forward(&pf),
+                None => Ok(()),
+            };
+        }
         EnvVerb::Apply(mut args) => {
             if let Some(path) = args.emit_answers_template.take() {
                 super::env_apply::emit_answers_template(&path)?

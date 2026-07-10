@@ -62,6 +62,11 @@ pub struct EnvManifest {
     pub extensions: Vec<ManifestExtension>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messaging_endpoints: Vec<ManifestEndpoint>,
+    /// Cluster declaration for `env up`. Not a wizard question and not part of
+    /// the schema/template — follows the `updates` precedent: Rust struct +
+    /// `validate_shape()` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<ManifestCluster>,
     /// Update-channel subscription. Declaring this block IS the opt-in: apply
     /// writes `<env_dir>/update-channel.json` and the runtime starts polling on
     /// its next boot. Absent = the channel is untouched (deny-by-default for a
@@ -159,6 +164,26 @@ impl ManifestEnvironment {
     }
 }
 
+/// Cluster provider for `env up`. Only `kind` today; future providers (EKS,
+/// GKE, AKS) extend this enum without a schema bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClusterProvider {
+    Kind,
+}
+
+/// Cluster declaration for `env up`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestCluster {
+    pub provider: ClusterProvider,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubeconfig_context: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub load_images: Vec<String>,
+}
+
 /// v1 accepts only the string `"bootstrap"`. A future
 /// `{ "additional_keys": [...] }` shape extends this enum without a schema
 /// bump.
@@ -196,6 +221,12 @@ pub struct ManifestPack {
     /// Optional answers file relative to the manifest directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answers_ref: Option<PathBuf>,
+    /// Inline answers object — mutually exclusive with `answers_ref`. When
+    /// present, `env up` materializes it to a temp file and points `answers_ref`
+    /// at the absolute path before `apply` runs, so `stage_answers_file` copies
+    /// it into the env dir as usual.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<serde_json::Value>,
 }
 
 /// One extension binding in the open-namespace `extensions[]` section.
@@ -364,6 +395,22 @@ impl EnvManifest {
             })?;
         }
 
+        // cluster: name non-empty, load_images entries non-empty.
+        if let Some(cluster) = &self.cluster {
+            if cluster.name.trim().is_empty() {
+                return Err(OpError::InvalidArgument(
+                    "cluster.name must not be empty".to_string(),
+                ));
+            }
+            for (i, img) in cluster.load_images.iter().enumerate() {
+                if img.trim().is_empty() {
+                    return Err(OpError::InvalidArgument(format!(
+                        "cluster.load_images[{i}] must not be empty"
+                    )));
+                }
+            }
+        }
+
         // updates: same validators `op updates config-set` applies, so a manifest
         // cannot express a channel the imperative verb would refuse.
         if let Some(updates) = &self.updates {
@@ -420,6 +467,12 @@ impl EnvManifest {
             if p.pack_ref.trim().is_empty() {
                 return Err(OpError::InvalidArgument(format!(
                     "packs[] slot `{}`: pack_ref must not be empty",
+                    p.slot
+                )));
+            }
+            if p.answers.is_some() && p.answers_ref.is_some() {
+                return Err(OpError::InvalidArgument(format!(
+                    "packs[] slot `{}`: `answers` and `answers_ref` are mutually exclusive",
                     p.slot
                 )));
             }
@@ -1577,6 +1630,7 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
             listen_addr: None,
             gui_enabled,
         },
+        cluster: None,
         // The wizard has no update-channel question yet; `None` leaves whatever
         // the env already has (upsert), rather than tearing a channel down.
         updates: None,
@@ -3172,5 +3226,136 @@ mod tests {
             with_updates(serde_json::json!({"plan_endpoint": "https://u/p", "typo": 1})).is_err()
         );
         assert!(with_updates(serde_json::json!({"enabled": true})).is_err());
+    }
+
+    // --- cluster + inline answers tests ---
+
+    #[test]
+    fn manifest_round_trips_with_cluster() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "cluster": {
+                "provider": "kind",
+                "name": "my-cluster",
+                "kubeconfig_context": "kind-my-cluster",
+                "load_images": ["example.com/img:latest"]
+            }
+        }))
+        .unwrap();
+        manifest.validate_shape().expect("valid with cluster");
+        let cluster = manifest.cluster.as_ref().expect("cluster present");
+        assert_eq!(cluster.provider, ClusterProvider::Kind);
+        assert_eq!(cluster.name, "my-cluster");
+        assert_eq!(
+            cluster.kubeconfig_context.as_deref(),
+            Some("kind-my-cluster")
+        );
+        assert_eq!(cluster.load_images, vec!["example.com/img:latest"]);
+
+        let json = serde_json::to_value(&manifest).unwrap();
+        let rt: EnvManifest = serde_json::from_value(json).unwrap();
+        rt.validate_shape().expect("round-trip valid");
+    }
+
+    #[test]
+    fn manifest_round_trips_without_cluster() {
+        let json_str = r#"{"schema":"greentic.env-manifest.v1","environment":{"id":"local"}}"#;
+        let m1: EnvManifest = serde_json::from_str(json_str).unwrap();
+        m1.validate_shape().expect("valid without cluster");
+        assert!(m1.cluster.is_none());
+
+        let serialized = serde_json::to_string(&m1).unwrap();
+        let m2: EnvManifest = serde_json::from_str(&serialized).unwrap();
+        m2.validate_shape().expect("round-trip valid");
+        assert_eq!(serialized, serde_json::to_string(&m2).unwrap());
+    }
+
+    #[test]
+    fn cluster_deny_unknown_fields() {
+        let err = serde_json::from_value::<EnvManifest>(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "cluster": {
+                "provider": "kind",
+                "name": "c",
+                "bogus": true
+            }
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn cluster_empty_name_rejected() {
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "cluster": {"provider": "kind", "name": "  "}
+        }))
+        .unwrap();
+        let err = m.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("cluster.name"), "{err}");
+    }
+
+    #[test]
+    fn cluster_empty_load_image_rejected() {
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "cluster": {"provider": "kind", "name": "c", "load_images": ["ok", ""]}
+        }))
+        .unwrap();
+        let err = m.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("load_images"), "{err}");
+    }
+
+    #[test]
+    fn pack_both_answers_and_answers_ref_rejected() {
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "deployer",
+                "kind": "greentic.deployer.k8s@1.0.0",
+                "pack_ref": "builtin",
+                "answers_ref": "answers.json",
+                "answers": {"key": "value"}
+            }]
+        }))
+        .unwrap();
+        let err = m.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn pack_inline_answers_alone_is_valid() {
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "deployer",
+                "kind": "greentic.deployer.k8s@1.0.0",
+                "pack_ref": "builtin",
+                "answers": {"runtime_image": "example.com/img:v1"}
+            }]
+        }))
+        .unwrap();
+        m.validate_shape().expect("inline answers alone is valid");
+        assert!(m.packs[0].answers.is_some());
+        assert!(m.packs[0].answers_ref.is_none());
+    }
+
+    #[test]
+    fn v1_manifest_without_new_fields_byte_identical() {
+        let json = serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "trust_root": "bootstrap"
+        });
+        let m: EnvManifest = serde_json::from_value(json.clone()).unwrap();
+        m.validate_shape().expect("v1 valid");
+        let roundtripped = serde_json::to_value(&m).unwrap();
+        assert_eq!(json, roundtripped);
     }
 }

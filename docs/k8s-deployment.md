@@ -156,24 +156,28 @@ global flags that matter here come **before** the noun:
 
 ---
 
-## 4. Quickstart — declarative deploy to a local kind cluster
+## 4. Quickstart — one file, one command
 
-The fastest path: **2 JSON files, 2 commands** (plus one-time cluster
-bring-up). Brings up **Webchat *and* Telegram**. This is the K8s analog of the
-local `setup --answers … && start --cloudflared on` two-liner.
+`op env up` fuses cluster bring-up, `env apply`, `env reconcile`, the rollout wait, and a
+port-forward into a single **idempotent** command. Re-running it converges. It brings up
+**Webchat *and* Telegram** — the K8s analog of the local
+`setup --answers … && start --cloudflared on` two-liner.
 
-Save the following two files into a directory of your choice (referred to below
-as `$HERE`):
-
-**`k8s.env.json`** — the env-manifest (`greentic.env-manifest.v1`):
+Save one file, `k8s.env.json` (`greentic.env-manifest.v1`):
 
 ```json
 {
   "schema": "greentic.env-manifest.v1",
+  "cluster": {
+    "provider": "kind",
+    "name": "gtc-demo",
+    "load_images": ["ghcr.io/greenticai/greentic-start-distroless:latest"]
+  },
   "environment": { "id": "local", "name": "k8s", "gui_enabled": true },
   "trust_root": "bootstrap",
   "packs": [
-    { "slot": "deployer", "kind": "greentic.deployer.k8s@1.0.0", "pack_ref": "builtin", "answers_ref": "deployer-answers.json" },
+    { "slot": "deployer", "kind": "greentic.deployer.k8s@1.0.0", "pack_ref": "builtin",
+      "answers": { "tunnel": "cloudflared" } },
     { "slot": "secrets",  "kind": "greentic.secrets.dev-store@1.0.0", "pack_ref": "builtin" }
   ],
   "bundles": [
@@ -197,45 +201,52 @@ as `$HERE`):
 }
 ```
 
-**`deployer-answers.json`** — the K8s deployer pack's answers
-(`answers_ref` above):
+Two things differ from a plain `env apply` manifest:
 
-```json
-{
-  "runtime_image": "ghcr.io/greenticai/greentic-start-distroless:develop",
-  "tunnel": "cloudflared"
-}
-```
+- **`cluster`** — kind provisioning is declared, not scripted. `load_images` pre-loads images onto
+  the node so pods never pull them over the network. **Omit the whole block** to deploy into whatever
+  cluster your current kubeconfig context points at; `env up` then skips phases that touch `kind`.
+- **inline `answers`** on the deployer pack replaces the separate `deployer-answers.json`.
+  `runtime_image` is gone — the default is already `ghcr.io/greenticai/greentic-start-distroless:latest`.
+  (Inline answers are a `packs[]` feature; `extensions[]` still use `answers_ref`.)
 
 Then:
 
 ```bash
 export STORE=/tmp/gtc-k8s-demo/.greentic/environments
-export HERE=/path/to/dir/with/the/two/json/files   # where you saved them above
 mkdir -p "$STORE"
 
-# one-time cluster
-kind create cluster --name gtc-demo
-kind export kubeconfig --name gtc-demo
-
-# 1. author the env from ONE manifest (env + trust-root + 2 packs + OCI bundle
-#    staged pullable + Telegram endpoint + bot-token secret). The bot token is
-#    passed inline so it reaches the apply process on any shell, and is never
-#    written to a file.
+# The bot token is passed inline so it reaches the process on any shell,
+# and is never written to a file.
 env TELEGRAM_DEMO_BOT_TOKEN=<your-bot-token> \
-  greentic-deployer op --store-root "$STORE" --answers "$HERE/k8s.env.json" env apply --yes
-
-# 2. push rendered objects onto the cluster
-greentic-deployer op --store-root "$STORE" env reconcile local
+  greentic-deployer op --store-root "$STORE" --answers ./k8s.env.json env up --yes
 ```
+
+or, through the CLI:
+
+```bash
+env TELEGRAM_DEMO_BOT_TOKEN=<your-bot-token> \
+  gtc start k8s --answers ./k8s.env.json --yes
+```
+
+`env up` runs, in order: **preflight** (`kind` / `docker` / `kubectl` presence + minimum versions,
+only for the tools this manifest actually needs) → **cluster** (create the kind cluster if absent,
+`docker pull` + `kind load` each `load_images` entry) → **apply** (author the env into the store) →
+**reconcile + rollout** (push rendered objects, then block until every applied Deployment is
+Available) → **access** (print the namespace and teardown hints, then hold a foreground port-forward
+on `svc/gtc-router`).
+
+Useful flags: `--dry-run` (plan only — never touches the cluster), `--skip-cluster` (the cluster
+already exists), `--no-port-forward`, `--port <N>` (default 8080).
 
 Reach it:
 
 ```bash
-# webchat — port-forward the worker; with a tunnel up the console lives on the
-# loopback admin listener (main port + 1 = 8081). The boot banner prints the port.
+# bundle routes — `env up` is already forwarding svc/gtc-router on localhost:8080
+
+# webchat console — the worker's loopback admin listener (main port + 1 = 8081).
+# Run this in a second shell; the boot banner prints the port.
 WORKER=$(kubectl -n gtc-local get deploy -l component=worker -o jsonpath='{.items[0].metadata.name}')
-kubectl -n gtc-local rollout status deploy/"$WORKER" --timeout=180s
 kubectl -n gtc-local port-forward deploy/"$WORKER" 8081:8081
 #   → http://localhost:8081/chat
 
@@ -244,14 +255,19 @@ kubectl -n gtc-local port-forward deploy/"$WORKER" 8081:8081
 #   confirm: curl -s "https://api.telegram.org/bot<token>/getWebhookInfo" | jq .
 ```
 
-Teardown: `kind delete cluster --name gtc-demo`.
+Teardown: `kind delete cluster --name gtc-demo`, then remove `$STORE`. (`op env destroy` parses and
+audits but is not yet implemented, so there is no store-side teardown verb to call.)
 
-### What collapsed into the two files
+### What collapsed into the one file
 
-| File | Replaces these `op` calls |
-|------|---------------------------|
-| `k8s.env.json` (`op env apply`) | `env create` + 2× `env-packs add` + `trust-root bootstrap` + `bundles add` + `revisions stage` + `revisions warm` + `traffic set` + `messaging endpoint add` + `endpoint link-bundle` + `secrets put` |
-| `deployer-answers.json` | the deployer pack's `runtime_image` + `tunnel` answers |
+| Was | Now |
+|-----|-----|
+| `kind create cluster` + `kind export kubeconfig` + `kind load docker-image` | the `cluster` block |
+| `deployer-answers.json` | inline `answers` on the deployer pack |
+| `op env apply` (which itself replaces `env create` + 2× `env-packs add` + `trust-root bootstrap` + `bundles add` + `revisions stage` + `revisions warm` + `traffic set` + `messaging endpoint add` + `endpoint link-bundle` + `secrets put`) | phase 4 of `op env up` |
+| `op env reconcile local` | phase 5 |
+| `kubectl rollout status` | phase 5 (fused — one cluster connection) |
+| `kubectl port-forward` | phase 6 |
 
 ---
 
@@ -395,9 +411,9 @@ are **rejected** (fail closed on version skew).
 
 | Key | Type | Default | Effect |
 |-----|------|---------|--------|
-| `kubeconfig_context` | string | current context | Which kubeconfig context `reconcile` targets. Client-targeting only — not a manifest knob. |
+| `kubeconfig_context` | string | current context | Which kubeconfig context `reconcile` targets. Client-targeting only — not a manifest knob. When the manifest carries a `cluster` block, `env up` derives this (`kind-<name>`) for its own reconcile; setting it to a *different* value here is an error. |
 | `namespace` | string (RFC 1123 label) | `gtc-<env-id>` | Override the namespace every object lands in. |
-| `runtime_image` | string `[a-z0-9.\-_/:@]+` | `ghcr.io/greenticai/greentic-start-distroless:develop` | Container image for router + worker pods. Pin to a digest in production. |
+| `runtime_image` | string `[a-z0-9.\-_/:@]+` | `ghcr.io/greenticai/greentic-start-distroless:latest` | Container image for router + worker pods. Pin to a digest in production. (The `develop` lane defaults to the `:develop` tag.) |
 | `router_replicas` | int (string or number) | `2` | Router replica count. Must be **≥ 2** (HA). |
 | `tunnel` | `"off"` \| `"cloudflared"` | `off` | Worker public-exposure mode. `cloudflared` → worker spawns a quick tunnel (single-revision only). |
 | `oci_insecure_registries` | string[] (`host[:port]`) | `[]` | Registry authorities the worker/router may pull bundles from over plain HTTP. Rendered as `GREENTIC_OCI_INSECURE_REGISTRIES`. Empty → HTTPS only. |
@@ -406,11 +422,12 @@ are **rejected** (fail closed on version skew).
 
 | Field | Notes |
 |-------|-------|
-| `environment.id` | Drives the namespace (`gtc-<id>`) and the store partition. Only `local` is auto-bootstrapped by `apply`; other ids need `op env create <id>` first. |
+| `cluster` | **`op env up` only** — ignored by `env apply` / `env reconcile`. `{ provider: "kind", name, kubeconfig_context?, load_images? }`. `provider` accepts only `"kind"` today. `load_images[]` are `docker pull`ed then `kind load docker-image`d onto the node. Omit the block to target the ambient kubeconfig context. |
+| `environment.id` | Drives the namespace (`gtc-<id>`) and the store partition. Only `local` is auto-bootstrapped by `apply`; other ids need `op env create <id>` first (`env up` creates it for you, and then requires `environment.tenant_org_id`). |
 | `environment.gui_enabled` | Serve the `/chat` console (loopback-trusted). |
 | `environment.public_base_url` | HTTPS URL for webhook auto-registration (option A). Omit when using a tunnel (the tunnel URL wins). |
 | `trust_root` | `"bootstrap"` to mint the env trust-root. |
-| `packs[]` | `slot` ∈ `deployer` / `secrets` / … (lowercase). For K8s: a `deployer` slot bound to `greentic.deployer.k8s@1.0.0` (+ `answers_ref`), and a `secrets` slot bound to `greentic.secrets.dev-store@1.0.0` if you need pod secrets. |
+| `packs[]` | `slot` ∈ `deployer` / `secrets` / … (lowercase). For K8s: a `deployer` slot bound to `greentic.deployer.k8s@1.0.0`, and a `secrets` slot bound to `greentic.secrets.dev-store@1.0.0` if you need pod secrets. Answers come from either `answers_ref` (a path relative to the manifest) **or** an inline `answers` object — never both. `extensions[]` support `answers_ref` only. |
 | `bundles[]` | Declare the bundle by `bundle_source_uri` (an `oci://` ref the worker pulls) + a `bundle_digest` integrity pin (`sha256:<hex>`) — **no local `bundle_path` needed on the apply host**. `route_binding` selects host/path-prefix + `tenant_selector`. Non-`local` envs require `customer_id`. |
 | `secrets[]` | `{ path, from_env }` — values come from `from_env` (read at apply) or paste; **secret values never go in the manifest**. |
 | `messaging_endpoints[]` | `{ name, provider_type, links }`. `provider_type: "messaging.telegram.bot"`; `links` references a `bundle_id`. The URI segment for the bot-token secret is fixed `messaging-telegram` (not the endpoint name). |
