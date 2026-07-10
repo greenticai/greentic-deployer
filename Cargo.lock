@@ -2426,9 +2426,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-bundle"
-version = "1.2.0-dev.28946580363"
+version = "1.2.0-dev.28999557577"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3115670fe0f0c9e1e29a785df8792e53449e5e3a31f9b6201131d56daa0e2d78"
+checksum = "60271d0622e1d6de5b3b6dc73f03d3fda573f7bfd04f9f51184b437401ed8cee"
 dependencies = [
  "anyhow",
  "backhand",
@@ -2460,9 +2460,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-bundle-reader"
-version = "1.2.0-dev.28946580363"
+version = "1.2.0-dev.28999557577"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31d032fc80a8043b442249686e8ec5b6ee6745492955c799166421075459c4d2"
+checksum = "a655d4498ad178cef8f07da95d9450888243d9ab60a67bea2a3bd0d6112e3bc2"
 dependencies = [
  "backhand",
  "serde",
@@ -2591,9 +2591,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-distributor-client"
-version = "1.2.0-dev.28940870391"
+version = "1.2.0-dev.28997950255"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d995245103f383785ab1322342e2af5fce84e78da01ba1eefc39ecb1d0088e3d"
+checksum = "7bf8601bd6422ae26d60415688af4f1897255f270e8e125ab2b65371545ea0d2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2892,9 +2892,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-update"
-version = "0.1.28946597636"
+version = "0.1.28999598853"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d9de3f1a6fe1fd7be064fea8c71fee7b1d90099880bf942dde6e80666d4303a"
+checksum = "eb50e06b3835c2d98034c5159495ebac1891d6440630cc3b104ddebd0a8ef900"
 dependencies = [
  "chrono",
  "fs4",
@@ -5557,9 +5557,9 @@ dependencies = [
 
 [[package]]
 name = "serde_yaml_gtc"
-version = "2.5.3"
+version = "2.6.28789766602"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8622b658226bcf6beb3b81db219b769bf35da3aa3975b07fa5294da14599a72a"
+checksum = "bcc076cd30d36f57ebd831ec6ed8703fb4099e6ce583be5552318ea506a7f9b6"
 dependencies = [
  "base64 0.22.1",
  "indexmap 2.14.0",
@@ -7306,7 +7306,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
