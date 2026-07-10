@@ -85,6 +85,17 @@ pub(crate) fn up(
         ));
     }
 
+    // Fail before any mutation: without `k8s-client` the reconcile phase cannot
+    // run, and reaching it after `apply` would leave the store converged against
+    // a cluster this build can never talk to.
+    if !cfg!(feature = "k8s-client") {
+        return Err(OpError::Conflict(
+            "this build was compiled without the `k8s-client` feature; \
+             `op env up` needs it to reach a cluster"
+                .to_string(),
+        ));
+    }
+
     // ── Phase 0: parse ───────────────────────────────────────────────
     let answers_path = flags.answers.as_ref().ok_or_else(|| {
         OpError::InvalidArgument(
@@ -101,7 +112,7 @@ pub(crate) fn up(
         .map_err(|e| OpError::InvalidArgument(format!("environment.id: {e}")))?;
 
     let has_cluster = manifest.cluster.is_some();
-    let skip_cluster = args.skip_cluster || !has_cluster;
+    let provision_cluster = should_provision_cluster(has_cluster, args.skip_cluster, args.dry_run);
 
     // ── Phase 1: preflight ───────────────────────────────────────────
     if has_cluster && !args.skip_cluster {
@@ -131,14 +142,25 @@ pub(crate) fn up(
     }
 
     // ── Phase 2: cluster ─────────────────────────────────────────────
-    let ctx: Option<String> = if skip_cluster {
+    // When we do not provision, the context is still derived from the manifest
+    // rather than left to the ambient kubeconfig: a declared `cluster` names the
+    // target, and `--skip-cluster` only means "it already exists".
+    let ctx: Option<String> = if provision_cluster {
+        ensure_kind_cluster(&manifest)?
+    } else {
+        if args.dry_run && has_cluster && !args.skip_cluster {
+            let cluster = manifest.cluster.as_ref().expect("has_cluster");
+            eprintln!(
+                "[env up] dry-run: would ensure kind cluster `{}` and load {} image(s)",
+                cluster.name,
+                cluster.load_images.len()
+            );
+        }
         manifest.cluster.as_ref().map(|c| {
             c.kubeconfig_context
                 .clone()
                 .unwrap_or_else(|| kind_context_name(&c.name))
         })
-    } else {
-        ensure_kind_cluster(&manifest)?
     };
 
     // ── Phase 3: env ensure ──────────────────────────────────────────
@@ -152,6 +174,25 @@ pub(crate) fn up(
                  is not set in the manifest; set it so `env up` can create the environment. \
                  Re-running `op env up` is safe"
             )));
+        }
+        // `env_apply::apply` refuses to plan against an environment that does not
+        // exist, so a dry run cannot go further than naming what it would create.
+        if args.dry_run {
+            eprintln!("[env up] dry-run: would create environment `{env_id}`");
+            return Ok((
+                OpOutcome::new(
+                    NOUN,
+                    "up",
+                    json!({
+                        "dry_run": true,
+                        "environment_id": env_id_str,
+                        "environment_exists": false,
+                        "note": "environment would be created; the apply plan cannot be \
+                                 computed until it exists",
+                    }),
+                ),
+                None,
+            ));
         }
         eprintln!("[env up] creating environment `{env_id}`");
         super::env::create(
@@ -490,6 +531,14 @@ fn kind_cluster_exists(list_stdout: &str, name: &str) -> bool {
     list_stdout.lines().any(|line| line.trim() == name)
 }
 
+/// Whether phase 2 may create a kind cluster and load images into it.
+///
+/// A dry run must never provision: `--dry-run` promises to preview the plan
+/// without mutating the store or the cluster.
+fn should_provision_cluster(has_cluster: bool, skip_cluster: bool, dry_run: bool) -> bool {
+    has_cluster && !skip_cluster && !dry_run
+}
+
 /// The kubeconfig context name kind uses for a cluster.
 fn kind_context_name(name: &str) -> String {
     format!("kind-{name}")
@@ -596,6 +645,70 @@ mod tests {
     fn kind_cluster_exists_empty_stdout() {
         assert!(!kind_cluster_exists("", "anything"));
         assert!(!kind_cluster_exists("\n", "anything"));
+    }
+
+    /// `--dry-run` promises not to mutate the store. A missing non-local env is
+    /// the one place `up` would otherwise write before `apply` ever runs.
+    #[cfg(feature = "k8s-client")]
+    #[test]
+    fn dry_run_does_not_create_a_missing_non_local_environment() {
+        use crate::environment::EnvironmentStore as _;
+        use greentic_deploy_spec::EnvId;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+        let registry = crate::env_packs::EnvPackRegistry::with_builtins();
+
+        let manifest_dir = tempfile::tempdir().unwrap();
+        let manifest_path = manifest_dir.path().join("env.json");
+        let manifest = json!({
+            "schema": crate::cli::env_manifest::ENV_MANIFEST_SCHEMA_V1,
+            "environment": { "id": "staging", "tenant_org_id": "org-1" },
+        });
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let flags = OpFlags {
+            schema_only: false,
+            answers: Some(manifest_path),
+        };
+        let args = EnvUpArgs {
+            yes: true,
+            non_interactive: true,
+            dry_run: true,
+            skip_cluster: false,
+            no_port_forward: true,
+            port: 8080,
+            updated_by: None,
+        };
+
+        let env_id = EnvId::try_from("staging").unwrap();
+        assert!(!store.exists(&env_id).unwrap());
+
+        let (outcome, forward) = up(&store, &registry, &flags, args).expect("dry run succeeds");
+
+        assert!(forward.is_none(), "dry run must not port-forward");
+        assert_eq!(outcome.result["dry_run"], json!(true));
+        assert!(
+            !store.exists(&env_id).unwrap(),
+            "dry run must not create the environment"
+        );
+    }
+
+    #[test]
+    fn should_provision_cluster_only_for_a_real_declared_unskipped_run() {
+        // (has_cluster, skip_cluster, dry_run) -> provision
+        assert!(should_provision_cluster(true, false, false));
+        // A dry run never provisions, however the other flags are set.
+        assert!(!should_provision_cluster(true, false, true));
+        assert!(!should_provision_cluster(true, true, true));
+        // No `cluster` block, or an explicit skip, means nothing to provision.
+        assert!(!should_provision_cluster(false, false, false));
+        assert!(!should_provision_cluster(true, true, false));
+        assert!(!should_provision_cluster(false, true, true));
     }
 
     #[test]
