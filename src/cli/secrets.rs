@@ -406,7 +406,6 @@ fn vault_seed_put(
     value: &str,
 ) -> Result<String, OpError> {
     use crate::env_packs::k8s::manifests::SecretsBackend;
-    use greentic_secrets_lib::core::{CoreBuilder, rt};
 
     // A Vault-backed env is single-tenant at the runtime (greentic-start scopes
     // one SecretsCore to the env owner and fails closed otherwise), so seeding
@@ -470,23 +469,14 @@ fn vault_seed_put(
     })?;
 
     // Construct the embedded core over the env-driven Vault backend and write the
-    // value verbatim (the broker envelope-encrypts). Driven through the secrets
-    // runtime so the async backend runs from this synchronous verb.
-    rt::sync_await(async {
-        let components = greentic_secrets_lib::vault::build_backend()
-            .await
-            .map_err(|e| OpError::Conflict(format!("vault backend init failed: {e}")))?;
-        let core = CoreBuilder::default()
-            .tenant(tenant.as_str())
-            .backend(components.backend, components.key_provider)
-            .build()
-            .await
-            .map_err(|e| OpError::Conflict(format!("vault secrets core build failed: {e}")))?;
-        core.put_text(store_uri, value)
-            .await
-            .map_err(|e| OpError::Conflict(format!("vault put failed: {e}")))?;
-        Ok::<(), OpError>(())
+    // value verbatim (the broker envelope-encrypts). The config is read from the
+    // ambient env (the same fields `build_backend` used) and the write is driven
+    // through the shared seed core so this verb and `env up`'s explicit-config
+    // seed path cannot drift.
+    let config = greentic_secrets_lib::vault::VaultBackendConfig::from_env().map_err(|e| {
+        OpError::Conflict(format!("vault backend config from environment failed: {e}"))
     })?;
+    vault_put_with_config(config, tenant.as_str(), store_uri, value)?;
 
     Ok(addr)
 }
@@ -504,7 +494,6 @@ fn vault_seed_get(
     store_uri: &str,
 ) -> Result<(Option<String>, String), OpError> {
     use crate::env_packs::k8s::manifests::SecretsBackend;
-    use greentic_secrets_lib::core::{CoreBuilder, Error as CoreError, SecretsError, rt};
 
     let tenant = env
         .host_config
@@ -553,12 +542,93 @@ fn vault_seed_get(
         })
     })?;
 
-    let value: Option<String> = rt::sync_await(async {
-        let components = greentic_secrets_lib::vault::build_backend()
+    let config = greentic_secrets_lib::vault::VaultBackendConfig::from_env().map_err(|e| {
+        OpError::Conflict(format!("vault backend config from environment failed: {e}"))
+    })?;
+    let value = vault_get_with_config(config, tenant.as_str(), store_uri)?;
+
+    Ok((value, addr))
+}
+
+/// Default Vault HTTP timeout for the explicit-config seed path (matches the
+/// provider's `VaultBackendConfig::from_env` default).
+#[cfg(feature = "k8s-client")]
+const VAULT_SEED_TIMEOUT_SECS: u64 = 15;
+
+/// Build an explicit [`VaultBackendConfig`] from the env's Vault binding (the
+/// path-determining mounts/prefix/transit/namespace the worker reads) plus an
+/// explicitly-reachable `addr` and `auth`. This is the seam that lets `env up`
+/// seed over a `kubectl port-forward` with a root token WITHOUT mutating process
+/// env (the deployer is `#![forbid(unsafe_code)]`): the binding supplies the
+/// path fields, so the seeded record lands exactly where the worker looks —
+/// path consistency holds by construction, not by the ambient-env
+/// [`vault_seed_path_consistency`] guard the CLI verbs need.
+#[cfg(feature = "k8s-client")]
+pub(crate) fn vault_backend_config_from_binding(
+    vault: &crate::env_packs::k8s::manifests::VaultBackend,
+    addr: String,
+    auth: greentic_secrets_lib::vault::VaultAuth,
+) -> greentic_secrets_lib::vault::VaultBackendConfig {
+    greentic_secrets_lib::vault::VaultBackendConfig {
+        addr,
+        auth,
+        namespace: vault.namespace.clone(),
+        kv_mount: vault.kv_mount.clone(),
+        kv_prefix: vault.kv_prefix.clone(),
+        transit_mount: vault.transit_mount.clone(),
+        transit_key: vault.transit_key.clone(),
+        timeout: std::time::Duration::from_secs(VAULT_SEED_TIMEOUT_SECS),
+        ca_bundle: None,
+    }
+}
+
+/// Write `value` at `store_uri` through an embedded [`SecretsCore`] over the
+/// given explicit Vault backend `config`, scoped to `tenant`. The broker
+/// envelope-encrypts via `transit/encrypt` before the KV write, so the worker
+/// can decrypt on read. Driven through the secrets runtime so the async backend
+/// runs from a synchronous caller — which MUST NOT already be inside a tokio
+/// runtime (the `env up` seed phase runs outside `run_k8s_async`). Shared by the
+/// ambient-env `op secrets put` verb and the `env up` seed phase.
+pub(crate) fn vault_put_with_config(
+    config: greentic_secrets_lib::vault::VaultBackendConfig,
+    tenant: &str,
+    store_uri: &str,
+    value: &str,
+) -> Result<(), OpError> {
+    use greentic_secrets_lib::core::{CoreBuilder, rt};
+    rt::sync_await(async {
+        let components = greentic_secrets_lib::vault::build_backend_with(config)
             .await
             .map_err(|e| OpError::Conflict(format!("vault backend init failed: {e}")))?;
         let core = CoreBuilder::default()
-            .tenant(tenant.as_str())
+            .tenant(tenant)
+            .backend(components.backend, components.key_provider)
+            .build()
+            .await
+            .map_err(|e| OpError::Conflict(format!("vault secrets core build failed: {e}")))?;
+        core.put_text(store_uri, value)
+            .await
+            .map_err(|e| OpError::Conflict(format!("vault put failed: {e}")))?;
+        Ok::<(), OpError>(())
+    })
+}
+
+/// Read `store_uri` back through an embedded [`SecretsCore`] over the given
+/// explicit Vault backend `config` — the counterpart to
+/// [`vault_put_with_config`]. `Some(plaintext)` when present, `None` when
+/// absent. Same runtime constraint as the put.
+pub(crate) fn vault_get_with_config(
+    config: greentic_secrets_lib::vault::VaultBackendConfig,
+    tenant: &str,
+    store_uri: &str,
+) -> Result<Option<String>, OpError> {
+    use greentic_secrets_lib::core::{CoreBuilder, Error as CoreError, SecretsError, rt};
+    rt::sync_await(async {
+        let components = greentic_secrets_lib::vault::build_backend_with(config)
+            .await
+            .map_err(|e| OpError::Conflict(format!("vault backend init failed: {e}")))?;
+        let core = CoreBuilder::default()
+            .tenant(tenant)
             .backend(components.backend, components.key_provider)
             .build()
             .await
@@ -568,9 +638,7 @@ fn vault_seed_get(
             Err(SecretsError::Core(CoreError::NotFound { .. })) => Ok(None),
             Err(e) => Err(OpError::Conflict(format!("vault get failed: {e}"))),
         }
-    })?;
-
-    Ok((value, addr))
+    })
 }
 
 /// Fail closed when the operator's ambient Vault environment would not resolve

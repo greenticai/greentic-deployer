@@ -10,7 +10,7 @@ resolver = "2"
 
 [package]
 name = "greentic-deployer"
-version = "1.1.11"
+version = "1.1.12"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic deployer runtime for plan construction and deployment-pack dispatch"
@@ -311,4 +311,4 @@ greentic-deploy-spec = { path = "crates/greentic-deploy-spec" }
 # E2E can derive the canonical store-key the bound-credential resolver reads,
 # and seed a ServiceAccount token via env var. Already in the lockfile via the
 # normal dep, so no resolution change.
-greentic-secrets-lib = ">=1.1.0-0, <1.2.0-0"
+greentic-secrets-lib = ">=1.1.5, <1.2.0-0"
