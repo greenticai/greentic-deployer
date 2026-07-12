@@ -174,6 +174,10 @@ pub fn preflight_check(runtime: RuntimeKind) -> Result<()> {
 /// Abstraction for command execution so tests can stub.
 pub trait CommandRunner: Send + Sync {
     fn run(&self, cmd: &mut Command) -> anyhow::Result<std::process::ExitStatus>;
+
+    /// Run to completion and capture stdout/stderr. Callers that need to read a
+    /// child's stdout (rather than only its exit status) use this.
+    fn output(&self, cmd: &mut Command) -> anyhow::Result<std::process::Output>;
 }
 
 /// Production runner: invokes `Command::status()`.
@@ -183,6 +187,11 @@ impl CommandRunner for RealCommandRunner {
     fn run(&self, cmd: &mut Command) -> anyhow::Result<std::process::ExitStatus> {
         let program = cmd.get_program().to_string_lossy().to_string();
         cmd.status().with_context(|| format!("spawn {program}"))
+    }
+
+    fn output(&self, cmd: &mut Command) -> anyhow::Result<std::process::Output> {
+        let program = cmd.get_program().to_string_lossy().to_string();
+        cmd.output().with_context(|| format!("spawn {program}"))
     }
 }
 
@@ -385,6 +394,10 @@ mod tests {
             self.captured.lock().unwrap().push(argv);
             Ok(fake_exit_success())
         }
+
+        fn output(&self, _cmd: &mut Command) -> anyhow::Result<std::process::Output> {
+            unreachable!("desktop apply/destroy only ever needs the exit status")
+        }
     }
 
     fn fake_exit_success() -> std::process::ExitStatus {
@@ -467,6 +480,10 @@ mod tests {
                     use std::os::windows::process::ExitStatusExt;
                     Ok(std::process::ExitStatus::from_raw(1))
                 }
+            }
+
+            fn output(&self, _cmd: &mut Command) -> anyhow::Result<std::process::Output> {
+                unreachable!("desktop apply/destroy only ever needs the exit status")
             }
         }
         let err = apply_from_ext_with_runner(
