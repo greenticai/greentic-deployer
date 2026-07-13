@@ -1,40 +1,12 @@
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
 
+#[path = "support/cli_binary.rs"]
+mod cli_binary;
 #[path = "support/provider_pack.rs"]
 mod provider_pack;
 
+use cli_binary::{command_output_with_busy_retry, copied_test_binary};
 use provider_pack::{build_operator_provider_gtpack, example_pack_path, write_fake_command_bin};
-
-fn copied_test_binary(_dir: &tempfile::TempDir) -> std::path::PathBuf {
-    // See tests/support/cli_binary.rs::copied_test_binary for the rationale —
-    // the global cli_test_lock serializes binary execution, so the per-test
-    // 345 MB copy is unnecessary and was tipping CI runners into StorageFull.
-    std::path::PathBuf::from(env!("CARGO_BIN_EXE_greentic-deployer"))
-}
-
-fn cli_test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-fn command_output_with_busy_retry(command: &mut Command) -> std::process::Output {
-    let _guard = cli_test_lock()
-        .lock()
-        .expect("lock cli test process execution");
-    let mut attempts = 0;
-    loop {
-        match command.output() {
-            Ok(output) => return output,
-            Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 5 => {
-                attempts += 1;
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(err) => panic!("run greentic-deployer: {err}"),
-        }
-    }
-}
 
 #[test]
 fn operator_generate_cli_renders_json_output() {
