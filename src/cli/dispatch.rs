@@ -765,8 +765,9 @@ pub struct UpdatesPublishArgs {
     #[arg(long = "target-file")]
     pub target_file: Option<PathBuf>,
     /// Monotonic plan sequence (anti-rollback). Default: the plan server's
-    /// current sequence plus one.
-    #[arg(long)]
+    /// current sequence plus one. Incompatible with --all-envs (sequences
+    /// are per-environment).
+    #[arg(long, conflicts_with = "all_envs")]
     pub sequence: Option<u64>,
     /// Binary artifact spec (repeatable); see `plan-build --binary`.
     #[arg(long = "binary", conflicts_with = "release")]
@@ -802,6 +803,12 @@ pub struct UpdatesPublishArgs {
     /// targets fail the command.
     #[arg(long = "targets", requires = "release", value_delimiter = ',')]
     pub targets: Vec<String>,
+    /// Expected number of target archives in the release. When set and
+    /// --targets is empty (discover-all mode), the command fails if the
+    /// release contains a different number of archives. Guards against
+    /// partial releases silently producing fewer artifacts than expected.
+    #[arg(long = "expected-target-count", requires = "release")]
+    pub expected_target_count: Option<usize>,
     /// Path to a trust-root.json file for plan signing verification.
     /// Bypasses the env-store trust root lookup, enabling CI runners
     /// with no local env dir.
@@ -864,6 +871,11 @@ pub struct UpdatesPlanBuildArgs {
     /// targets fail the command.
     #[arg(long = "targets", requires = "release", value_delimiter = ',')]
     pub targets: Vec<String>,
+    /// Expected number of target archives in the release. When set and
+    /// --targets is empty (discover-all mode), the command fails if the
+    /// release contains a different number of archives.
+    #[arg(long = "expected-target-count", requires = "release")]
+    pub expected_target_count: Option<usize>,
     /// Path to a trust-root.json file for plan signing verification.
     /// Bypasses the env-store trust root lookup, enabling CI runners
     /// with no local env dir.

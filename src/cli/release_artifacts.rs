@@ -40,6 +40,10 @@ pub struct ReleaseSpec {
     pub tag: String,
     /// When non-empty, only derive artifacts for these target triples.
     pub targets: Vec<String>,
+    /// When set and `targets` is empty (discover-all mode), the discovered
+    /// archive count must equal this value. Guards against partial releases
+    /// silently producing fewer artifacts than expected.
+    pub expected_target_count: Option<usize>,
 }
 
 /// A single asset from the GitHub Releases API.
@@ -121,13 +125,23 @@ fn download_capped(
 }
 
 /// Parse a `.sha256` sidecar file. Format: `<hex>  <filename>\n` or `<hex>
-/// <filename>\n` (BSD/GNU sha256sum output).
+/// <filename>\n` (BSD/GNU sha256sum output). Rejects multi-line sidecars
+/// (batch `sha256sum *.tgz` output) to prevent silent first-line extraction.
 pub(crate) fn parse_sidecar_digest(sidecar: &str) -> Result<String, OpError> {
     let trimmed = sidecar.trim();
     if trimmed.is_empty() {
         return Err(OpError::InvalidArgument(
             "sha256 sidecar is empty".to_string(),
         ));
+    }
+    // Reject multi-line sidecars: each archive must have its own sidecar file.
+    let non_empty_lines: Vec<&str> = trimmed.lines().filter(|l| !l.trim().is_empty()).collect();
+    if non_empty_lines.len() > 1 {
+        return Err(OpError::InvalidArgument(format!(
+            "sha256 sidecar contains {} lines; expected exactly one \
+             (each archive needs its own .sha256 sidecar)",
+            non_empty_lines.len()
+        )));
     }
     // Split on whitespace: first token is the hex digest.
     let hex_digest = trimmed
@@ -148,179 +162,26 @@ pub(crate) fn parse_sidecar_digest(sidecar: &str) -> Result<String, OpError> {
 /// Fail-closed: any missing asset, unparseable sidecar, digest mismatch, or
 /// unpack failure fails the whole command. Use `spec.targets` to narrow
 /// which triples are derived (the escape hatch for partial releases).
+/// When `spec.targets` is empty and `spec.expected_target_count` is set,
+/// the discovered archive count must match the expected count.
 pub fn derive_binary_artifacts(spec: &ReleaseSpec) -> Result<Vec<BinaryArtifact>, OpError> {
     let client = github_client()?;
-
-    // Fetch release metadata.
-    let release_url = format!(
-        "https://api.github.com/repos/{}/{}/releases/tags/{}",
-        spec.owner, spec.repo, spec.tag
-    );
-    let release_bytes = download_capped(&client, &release_url, MAX_SIDECAR_BYTES * 1024)?;
-    let release: GitHubRelease = serde_json::from_slice(&release_bytes)
-        .map_err(|e| OpError::InvalidArgument(format!("GitHub release JSON parse error: {e}")))?;
-
-    // Build a map of asset name -> asset for quick lookup.
-    let assets_by_name: HashMap<&str, &GitHubAsset> = release
-        .assets
-        .iter()
-        .map(|a| (a.name.as_str(), a))
-        .collect();
-
-    // Identify target archives: {binary}-v{version}-{target}.{tgz|zip}
-    let prefix = format!("{}-v{}-", spec.binary_name, spec.version);
-    let archive_assets: Vec<(&GitHubAsset, String)> = release
-        .assets
-        .iter()
-        .filter_map(|asset| {
-            let name = &asset.name;
-            if !name.starts_with(&prefix) {
-                return None;
-            }
-            let suffix = &name[prefix.len()..];
-            // suffix is e.g. "x86_64-unknown-linux-gnu.tgz" or
-            // "x86_64-pc-windows-msvc.zip"
-            let target = suffix
-                .strip_suffix(".tgz")
-                .or_else(|| suffix.strip_suffix(".tar.gz"))
-                .or_else(|| suffix.strip_suffix(".zip"))?;
-            // Skip .sha256 sidecars matched as archives.
-            if target.ends_with(".sha256")
-                || target.ends_with(".tgz")
-                || target.ends_with(".tar.gz")
-                || target.ends_with(".zip")
-            {
-                return None;
-            }
-            Some((asset, target.to_string()))
-        })
-        .collect();
-
-    if archive_assets.is_empty() {
-        return Err(OpError::InvalidArgument(format!(
-            "release {} has no archive assets matching `{prefix}*`",
-            spec.tag
-        )));
-    }
-
-    // Filter to requested targets.
-    let filtered: Vec<(&GitHubAsset, String)> = if spec.targets.is_empty() {
-        archive_assets
-    } else {
-        let requested: std::collections::HashSet<&str> =
-            spec.targets.iter().map(String::as_str).collect();
-        let filtered: Vec<_> = archive_assets
-            .into_iter()
-            .filter(|(_, target)| requested.contains(target.as_str()))
-            .collect();
-        // Fail-closed: every requested target must be present.
-        for t in &spec.targets {
-            if !filtered.iter().any(|(_, target)| target == t) {
-                return Err(OpError::NotFound(format!(
-                    "release {} has no archive for target `{t}`",
-                    spec.tag
-                )));
-            }
-        }
-        filtered
+    let fetcher = |url: &str| -> Result<Vec<u8>, OpError> {
+        let cap = if url.contains("/releases/tags/") {
+            MAX_SIDECAR_BYTES * 1024
+        } else if url.ends_with(".sha256") {
+            MAX_SIDECAR_BYTES
+        } else {
+            MAX_BINARY_ARCHIVE_BYTES
+        };
+        download_capped(&client, url, cap)
     };
-
-    let tmp_dir = tempfile::tempdir().map_err(|e| OpError::Fetch(format!("tempdir: {e}")))?;
-    let mut artifacts = Vec::with_capacity(filtered.len());
-
-    for (archive_asset, target) in &filtered {
-        // Download sidecar.
-        let sidecar_name = format!("{}.sha256", archive_asset.name);
-        let sidecar_asset = assets_by_name.get(sidecar_name.as_str()).ok_or_else(|| {
-            OpError::NotFound(format!(
-                "release {} is missing sidecar `{sidecar_name}`",
-                spec.tag
-            ))
-        })?;
-        let sidecar_bytes = download_capped(
-            &client,
-            &sidecar_asset.browser_download_url,
-            MAX_SIDECAR_BYTES,
-        )?;
-        let sidecar_text = String::from_utf8(sidecar_bytes).map_err(|e| {
-            OpError::InvalidArgument(format!("sidecar `{sidecar_name}` is not UTF-8: {e}"))
-        })?;
-        let expected_archive_digest = parse_sidecar_digest(&sidecar_text)?;
-
-        // Download archive.
-        let archive_bytes = download_capped(
-            &client,
-            &archive_asset.browser_download_url,
-            MAX_BINARY_ARCHIVE_BYTES,
-        )?;
-
-        // Verify archive against sidecar.
-        let actual_archive_digest = hex::encode(Sha256::digest(&archive_bytes));
-        if actual_archive_digest != expected_archive_digest {
-            return Err(OpError::Conflict(format!(
-                "archive sha256 mismatch for {target}: expected {expected_archive_digest}, got {actual_archive_digest}"
-            )));
-        }
-
-        // Write archive to a temp file for unpack_release_binary.
-        let archive_ext = if archive_asset.name.ends_with(".zip") {
-            "zip"
-        } else {
-            "tgz"
-        };
-        let archive_path = tmp_dir.path().join(format!("{target}.{archive_ext}"));
-        std::fs::write(&archive_path, &archive_bytes).map_err(|source| OpError::Io {
-            path: archive_path.clone(),
-            source,
-        })?;
-
-        // Unpack inner binary.
-        let unpack_dir = tmp_dir.path().join(format!("{target}-unpack"));
-        std::fs::create_dir_all(&unpack_dir).map_err(|source| OpError::Io {
-            path: unpack_dir.clone(),
-            source,
-        })?;
-
-        let inner_binary_name = if is_windows_target(target) {
-            format!("{}.exe", spec.binary_name)
-        } else {
-            spec.binary_name.clone()
-        };
-
-        let inner_path = greentic_update::binswap::unpack_release_binary(
-            &archive_path,
-            &inner_binary_name,
-            &unpack_dir,
-        )
-        .map_err(|e| {
-            OpError::InvalidArgument(format!(
-                "unpacking inner binary `{inner_binary_name}` from {target} archive: {e}"
-            ))
-        })?;
-
-        // Hash inner binary.
-        let inner_bytes = std::fs::read(&inner_path).map_err(|source| OpError::Io {
-            path: inner_path.clone(),
-            source,
-        })?;
-        let inner_digest = format!("sha256:{}", hex::encode(Sha256::digest(&inner_bytes)));
-
-        artifacts.push(BinaryArtifact {
-            name: spec.binary_name.clone(),
-            version: spec.version.clone(),
-            target: target.clone(),
-            digest: inner_digest,
-            source: Some(archive_asset.browser_download_url.clone()),
-        });
-    }
-
-    Ok(artifacts)
+    derive_binary_artifacts_inner(spec, &fetcher)
 }
 
-/// Internal helper: derive artifacts using a provided fetcher function instead
-/// of the real GitHub API. Used by tests to inject canned responses.
-#[cfg(test)]
-pub(crate) fn derive_binary_artifacts_with_fetcher<F>(
+/// Shared implementation: derive artifacts using a provided fetcher function.
+/// Both the production entry point and tests delegate here.
+fn derive_binary_artifacts_inner<F>(
     spec: &ReleaseSpec,
     fetcher: &F,
 ) -> Result<Vec<BinaryArtifact>, OpError>
@@ -375,6 +236,19 @@ where
     }
 
     let filtered: Vec<(&GitHubAsset, String)> = if spec.targets.is_empty() {
+        // Discover-all mode: validate expected count if set.
+        if let Some(expected) = spec.expected_target_count
+            && archive_assets.len() != expected
+        {
+            let discovered: Vec<&str> = archive_assets.iter().map(|(_, t)| t.as_str()).collect();
+            return Err(OpError::InvalidArgument(format!(
+                "expected {expected} target archives in release {}, found {}: [{}]. \
+                 Use --targets to list the expected set, or fix the release.",
+                spec.tag,
+                archive_assets.len(),
+                discovered.join(", "),
+            )));
+        }
         archive_assets
     } else {
         let requested: std::collections::HashSet<&str> =
@@ -470,6 +344,18 @@ where
     }
 
     Ok(artifacts)
+}
+
+/// Test-visible alias that delegates to the shared inner function.
+#[cfg(test)]
+pub(crate) fn derive_binary_artifacts_with_fetcher<F>(
+    spec: &ReleaseSpec,
+    fetcher: &F,
+) -> Result<Vec<BinaryArtifact>, OpError>
+where
+    F: Fn(&str) -> Result<Vec<u8>, OpError>,
+{
+    derive_binary_artifacts_inner(spec, fetcher)
 }
 
 // ---------------------------------------------------------------------------
@@ -645,6 +531,7 @@ mod tests {
             version: "1.0.0".to_string(),
             tag: "v1.0.0".to_string(),
             targets: vec![],
+            expected_target_count: None,
         };
 
         let tgz_clone = tgz.clone();
@@ -704,6 +591,7 @@ mod tests {
             version: "1.0.0".to_string(),
             tag: "v1.0.0".to_string(),
             targets: vec![],
+            expected_target_count: None,
         };
 
         let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
@@ -752,6 +640,7 @@ mod tests {
             version: "1.0.0".to_string(),
             tag: "v1.0.0".to_string(),
             targets: vec![],
+            expected_target_count: None,
         };
 
         let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
@@ -785,6 +674,7 @@ mod tests {
             version: "1.0.0".to_string(),
             tag: "v1.0.0".to_string(),
             targets: vec!["aarch64-apple-darwin".to_string()],
+            expected_target_count: None,
         };
 
         let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
@@ -834,6 +724,7 @@ mod tests {
             version: "1.0.0".to_string(),
             tag: "v1.0.0".to_string(),
             targets: vec!["x86_64-unknown-linux-gnu".to_string()],
+            expected_target_count: None,
         };
 
         let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
@@ -890,6 +781,7 @@ mod tests {
             version: "1.0.0".to_string(),
             tag: "v1.0.0".to_string(),
             targets: vec![],
+            expected_target_count: None,
         };
 
         let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
@@ -906,5 +798,181 @@ mod tests {
         assert_eq!(artifacts[0].digest, format!("sha256:{inner_hex}"));
         // Confirm it is NOT the tarball digest.
         assert_ne!(artifacts[0].digest, format!("sha256:{tarball_hex}"));
+    }
+
+    // --- Finding 3: multi-line sidecar rejection ---
+
+    #[test]
+    fn sidecar_multi_line_rejected() {
+        let line1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  darwin.tgz";
+        let line2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  linux.tgz";
+        let multi = format!("{line1}\n{line2}\n");
+        let err = parse_sidecar_digest(&multi).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("lines")),
+            "expected multi-line rejection, got: {err:?}"
+        );
+    }
+
+    // --- Finding 7: missing sidecar asset in release ---
+
+    #[test]
+    fn missing_sidecar_asset_fails() {
+        // Release has the archive but not its .sha256 sidecar.
+        let release = release_json(&[(
+            "b-v1.0.0-x86_64-unknown-linux-gnu.tgz",
+            "https://e.com/b.tgz",
+        )]);
+
+        let spec = ReleaseSpec {
+            owner: "t".to_string(),
+            repo: "t".to_string(),
+            binary_name: "b".to_string(),
+            version: "1.0.0".to_string(),
+            tag: "v1.0.0".to_string(),
+            targets: vec![],
+            expected_target_count: None,
+        };
+
+        let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
+            if url.contains("/releases/tags/") {
+                Ok(release.clone())
+            } else {
+                Err(OpError::NotFound(url.to_string()))
+            }
+        };
+
+        let err = derive_binary_artifacts_with_fetcher(&spec, &fetcher).unwrap_err();
+        assert!(
+            matches!(&err, OpError::NotFound(m) if m.contains(".sha256")),
+            "expected NotFound for missing sidecar, got: {err:?}"
+        );
+    }
+
+    // --- Finding 8: no matching archives in release ---
+
+    #[test]
+    fn no_matching_archives_fails() {
+        // Release has assets but none match the expected prefix.
+        let release = release_json(&[
+            ("unrelated-file.tgz", "https://e.com/unrelated.tgz"),
+            (
+                "unrelated-file.tgz.sha256",
+                "https://e.com/unrelated.tgz.sha256",
+            ),
+        ]);
+
+        let spec = ReleaseSpec {
+            owner: "t".to_string(),
+            repo: "t".to_string(),
+            binary_name: "b".to_string(),
+            version: "1.0.0".to_string(),
+            tag: "v1.0.0".to_string(),
+            targets: vec![],
+            expected_target_count: None,
+        };
+
+        let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
+            if url.contains("/releases/tags/") {
+                Ok(release.clone())
+            } else {
+                Err(OpError::NotFound(url.to_string()))
+            }
+        };
+
+        let err = derive_binary_artifacts_with_fetcher(&spec, &fetcher).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("no archive assets matching")),
+            "expected InvalidArgument for no matching archives, got: {err:?}"
+        );
+    }
+
+    // --- Finding 1: expected target count mismatch ---
+
+    #[test]
+    fn expected_target_count_mismatch_fails() {
+        // Release has 1 archive but we expect 2.
+        let binary_content = b"binary";
+        let tgz = build_tgz("b-v1.0.0-x86_64-unknown-linux-gnu", "b", binary_content);
+        let sidecar = make_sidecar(&tgz, "b-v1.0.0-x86_64-unknown-linux-gnu.tgz");
+
+        let release = release_json(&[
+            (
+                "b-v1.0.0-x86_64-unknown-linux-gnu.tgz",
+                "https://e.com/b.tgz",
+            ),
+            (
+                "b-v1.0.0-x86_64-unknown-linux-gnu.tgz.sha256",
+                "https://e.com/b.tgz.sha256",
+            ),
+        ]);
+
+        let spec = ReleaseSpec {
+            owner: "t".to_string(),
+            repo: "t".to_string(),
+            binary_name: "b".to_string(),
+            version: "1.0.0".to_string(),
+            tag: "v1.0.0".to_string(),
+            targets: vec![],
+            expected_target_count: Some(2),
+        };
+
+        let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
+            if url.contains("/releases/tags/") {
+                Ok(release.clone())
+            } else if url.ends_with(".sha256") {
+                Ok(sidecar.as_bytes().to_vec())
+            } else {
+                Ok(tgz.clone())
+            }
+        };
+
+        let err = derive_binary_artifacts_with_fetcher(&spec, &fetcher).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("expected 2") && m.contains("found 1")),
+            "expected count mismatch error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn expected_target_count_matching_succeeds() {
+        // Release has 1 archive and we expect 1.
+        let binary_content = b"binary";
+        let tgz = build_tgz("b-v1.0.0-x86_64-unknown-linux-gnu", "b", binary_content);
+        let sidecar = make_sidecar(&tgz, "b-v1.0.0-x86_64-unknown-linux-gnu.tgz");
+
+        let release = release_json(&[
+            (
+                "b-v1.0.0-x86_64-unknown-linux-gnu.tgz",
+                "https://e.com/b.tgz",
+            ),
+            (
+                "b-v1.0.0-x86_64-unknown-linux-gnu.tgz.sha256",
+                "https://e.com/b.tgz.sha256",
+            ),
+        ]);
+
+        let spec = ReleaseSpec {
+            owner: "t".to_string(),
+            repo: "t".to_string(),
+            binary_name: "b".to_string(),
+            version: "1.0.0".to_string(),
+            tag: "v1.0.0".to_string(),
+            targets: vec![],
+            expected_target_count: Some(1),
+        };
+
+        let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
+            if url.contains("/releases/tags/") {
+                Ok(release.clone())
+            } else if url.ends_with(".sha256") {
+                Ok(sidecar.as_bytes().to_vec())
+            } else {
+                Ok(tgz.clone())
+            }
+        };
+
+        let artifacts = derive_binary_artifacts_with_fetcher(&spec, &fetcher).unwrap();
+        assert_eq!(artifacts.len(), 1);
     }
 }

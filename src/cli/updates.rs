@@ -2104,6 +2104,7 @@ fn resolve_release_artifacts(
     release_repo: Option<&str>,
     release_binary_name: Option<&str>,
     targets: &[String],
+    expected_target_count: Option<usize>,
 ) -> Result<Vec<greentic_update::plan::BinaryArtifact>, OpError> {
     let version = match release {
         Some(v) => v,
@@ -2118,6 +2119,7 @@ fn resolve_release_artifacts(
         version: version.to_string(),
         tag: format!("v{version}"),
         targets: targets.to_vec(),
+        expected_target_count,
     };
     super::release_artifacts::derive_binary_artifacts(&spec)
 }
@@ -2155,6 +2157,7 @@ pub fn plan_build(
         args.release_repo.as_deref(),
         args.release_binary_name.as_deref(),
         &args.targets,
+        args.expected_target_count,
     )?;
 
     let signed = build_and_sign_plan(
@@ -2492,6 +2495,7 @@ pub fn publish(
         args.release_repo.as_deref(),
         args.release_binary_name.as_deref(),
         &args.targets,
+        args.expected_target_count,
     )?;
 
     let token = args
@@ -2729,10 +2733,14 @@ fn publish_all_envs(
     );
 
     if any_failed {
-        // Return the outcome as a Conflict error so the exit code is non-zero,
-        // but the structured output is still available via the error message.
+        // Emit the structured per-env outcome to stdout so the operator can
+        // see which environments succeeded and which failed, then return an
+        // error so the exit code is non-zero.
+        if let Ok(json) = serde_json::to_value(&outcome) {
+            println!("{json}");
+        }
         return Err(OpError::Conflict(format!(
-            "{} of {} environments failed; see output for details",
+            "{} of {} environments failed",
             failed.len(),
             envs.len()
         )));
@@ -5671,6 +5679,7 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             release_repo: None,
             release_binary_name: None,
             targets: vec![],
+            expected_target_count: None,
             trust_root: None,
         }
     }
@@ -5915,6 +5924,7 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             release_repo: None,
             release_binary_name: None,
             targets: vec![],
+            expected_target_count: None,
             trust_root: None,
             all_envs: false,
             plan_server_url: None,
