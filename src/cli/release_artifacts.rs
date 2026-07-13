@@ -10,11 +10,9 @@
 use std::collections::HashMap;
 use std::io::Read;
 
+use super::OpError;
 use greentic_update::plan::BinaryArtifact;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-
-use super::OpError;
 
 /// Mirror the consumer's download cap (256 MiB, from greentic-start).
 const MAX_BINARY_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
@@ -135,12 +133,11 @@ pub(crate) fn parse_sidecar_digest(sidecar: &str) -> Result<String, OpError> {
         ));
     }
     // Reject multi-line sidecars: each archive must have its own sidecar file.
-    let non_empty_lines: Vec<&str> = trimmed.lines().filter(|l| !l.trim().is_empty()).collect();
-    if non_empty_lines.len() > 1 {
+    let non_empty_line_count = trimmed.lines().filter(|l| !l.trim().is_empty()).count();
+    if non_empty_line_count > 1 {
         return Err(OpError::InvalidArgument(format!(
-            "sha256 sidecar contains {} lines; expected exactly one \
+            "sha256 sidecar contains {non_empty_line_count} lines; expected exactly one \
              (each archive needs its own .sha256 sidecar)",
-            non_empty_lines.len()
         )));
     }
     // Split on whitespace: first token is the hex digest.
@@ -304,7 +301,7 @@ where
 
         let archive_bytes = fetcher(&archive_asset.browser_download_url)?;
 
-        let actual_archive_digest = hex::encode(Sha256::digest(&archive_bytes));
+        let actual_archive_digest = greentic_update::plan::sha256_hex(&archive_bytes);
         if actual_archive_digest != expected_archive_digest {
             return Err(OpError::Conflict(format!(
                 "archive sha256 mismatch for {target}: expected {expected_archive_digest}, got {actual_archive_digest}"
@@ -349,7 +346,7 @@ where
             path: inner_path.clone(),
             source,
         })?;
-        let inner_digest = format!("sha256:{}", hex::encode(Sha256::digest(&inner_bytes)));
+        let inner_digest = format!("sha256:{}", greentic_update::plan::sha256_hex(&inner_bytes));
 
         artifacts.push(BinaryArtifact {
             name: spec.binary_name.clone(),
@@ -422,7 +419,7 @@ mod tests {
     }
 
     fn sha256_hex(data: &[u8]) -> String {
-        hex::encode(Sha256::digest(data))
+        greentic_update::plan::sha256_hex(data)
     }
 
     fn make_sidecar(archive_bytes: &[u8], filename: &str) -> String {
@@ -551,16 +548,13 @@ mod tests {
             expected_target_count: None,
         };
 
-        let tgz_clone = tgz.clone();
-        let sidecar_clone = sidecar.clone();
-        let release_clone = release.clone();
         let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
             if url.contains("/releases/tags/") {
-                Ok(release_clone.clone())
+                Ok(release.clone())
             } else if url.ends_with(".sha256") {
-                Ok(sidecar_clone.as_bytes().to_vec())
+                Ok(sidecar.as_bytes().to_vec())
             } else if url.ends_with(".tgz") {
-                Ok(tgz_clone.clone())
+                Ok(tgz.clone())
             } else {
                 Err(OpError::NotFound(format!("unexpected URL: {url}")))
             }
