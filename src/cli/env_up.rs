@@ -1311,14 +1311,8 @@ mod tests {
             answers: Some(manifest_path),
         };
         let args = EnvUpArgs {
-            yes: true,
-            non_interactive: true,
             dry_run: true,
-            skip_cluster: false,
-            no_port_forward: true,
-            port: 8080,
-            allow_missing_seeds: false,
-            updated_by: None,
+            ..up_args()
         };
 
         let env_id = EnvId::try_from("staging").unwrap();
@@ -1809,6 +1803,7 @@ mod tests {
             skip_cluster: false,
             no_port_forward: true,
             port: 8080,
+            allow_missing_seeds: false,
             updated_by: None,
         }
     }
@@ -1917,5 +1912,237 @@ mod tests {
             !store.exists(&EnvId::try_from("staging").unwrap()).unwrap(),
             "the refusal must not leave a half-created environment behind"
         );
+    }
+
+    // ── Phase 4b: vault bootstrap + seeding ──────────────────────────────
+
+    /// An environment variable no test sets — resolving a seed from it always
+    /// yields "no value", without mutating the shared process environment.
+    #[cfg(feature = "k8s-client")]
+    const UNSET_SEED_VAR: &str = "GREENTIC_ENV_UP_TEST_SEED_VALUE_UNSET";
+
+    /// An address nothing listens on: every test below must fail closed *before*
+    /// any Vault round-trip, so reaching the network at all is a test failure.
+    #[cfg(feature = "k8s-client")]
+    const UNREACHABLE_VAULT: &str = "http://127.0.0.1:1";
+
+    #[cfg(feature = "k8s-client")]
+    fn vault_binding() -> crate::env_packs::k8s::manifests::VaultBackend {
+        crate::env_packs::k8s::manifests::VaultBackend {
+            addr: "http://vault.vault.svc:8200".to_string(),
+            k8s_role: "greentic-staging".to_string(),
+            kv_mount: "secret".to_string(),
+            kv_prefix: "greentic".to_string(),
+            auth_mount: "kubernetes".to_string(),
+            transit_mount: "transit".to_string(),
+            transit_key: "greentic".to_string(),
+            namespace: None,
+        }
+    }
+
+    #[cfg(feature = "k8s-client")]
+    fn seed(path: &str, from_env: Option<&str>) -> crate::cli::env_manifest::ManifestSecret {
+        crate::cli::env_manifest::ManifestSecret {
+            path: path.to_string(),
+            from_env: from_env.map(String::from),
+        }
+    }
+
+    #[cfg(feature = "k8s-client")]
+    #[test]
+    fn vault_bootstrap_params_carry_the_binding_and_the_worker_identity() {
+        let binding = vault_binding();
+
+        let p = vault_bootstrap_params(
+            "http://127.0.0.1:8200",
+            "root",
+            &binding,
+            "staging",
+            "acme",
+            "greentic-worker",
+            "greentic-acme-staging",
+        );
+
+        assert_eq!(p.addr, "http://127.0.0.1:8200");
+        assert_eq!(p.token, "root");
+        assert_eq!(p.kv_mount, "secret");
+        assert_eq!(p.kv_prefix, "greentic");
+        assert_eq!(p.transit_mount, "transit");
+        assert_eq!(p.transit_key, "greentic");
+        assert_eq!(p.auth_mount, "kubernetes");
+        assert_eq!(p.env_id, "staging");
+        assert_eq!(p.tenant, "acme");
+        assert_eq!(p.worker_sa, "greentic-worker");
+        assert_eq!(p.worker_namespace, "greentic-acme-staging");
+        assert_eq!(p.role, "greentic-staging");
+        // The k8s auth mount validates worker SA tokens against the in-cluster
+        // API host, never the address `up` reached Vault on.
+        assert_eq!(p.kubernetes_host, "https://kubernetes.default.svc");
+    }
+
+    #[cfg(feature = "k8s-client")]
+    #[test]
+    fn missing_seed_message_names_the_env_var_and_a_surviving_vault() {
+        let msg = missing_seed_message(
+            "acme/team/pack/api-key",
+            &seed("/acme/team/pack/api-key", Some("API_KEY")),
+            true,
+        );
+
+        assert!(msg.contains("`$API_KEY` is unset or empty"), "{msg}");
+        assert!(msg.contains("not already present in Vault"), "{msg}");
+        assert!(msg.contains("--allow-missing-seeds"), "{msg}");
+    }
+
+    #[cfg(feature = "k8s-client")]
+    #[test]
+    fn missing_seed_message_names_the_paste_source_and_a_fresh_vault() {
+        let msg = missing_seed_message(
+            "acme/team/pack/api-key",
+            &seed("/acme/team/pack/api-key", None),
+            false,
+        );
+
+        assert!(msg.contains("no value was provided"), "{msg}");
+        assert!(
+            msg.contains("freshly-bootstrapped Vault cannot already hold it"),
+            "{msg}"
+        );
+    }
+
+    #[cfg(feature = "k8s-client")]
+    #[test]
+    fn seed_secrets_with_no_seeds_never_reaches_vault() {
+        let env_id = greentic_deploy_spec::EnvId::try_from("staging").unwrap();
+
+        let summary = seed_secrets(
+            &vault_binding(),
+            UNREACHABLE_VAULT,
+            "root",
+            "acme",
+            &env_id,
+            &[],
+            false,
+            false,
+            true,
+        )
+        .expect("an empty seed list is a no-op");
+
+        assert_eq!(
+            (
+                summary.seeded,
+                summary.skipped_present,
+                summary.warned_missing
+            ),
+            (0, 0, 0)
+        );
+    }
+
+    /// A fresh Vault (`was_already_configured = false`) cannot hold the secret,
+    /// so the presence probe short-circuits and an unresolvable seed fails
+    /// closed — without a single Vault round-trip.
+    #[cfg(feature = "k8s-client")]
+    #[test]
+    fn seed_secrets_fails_closed_on_an_unresolvable_seed() {
+        let env_id = greentic_deploy_spec::EnvId::try_from("staging").unwrap();
+
+        let err = seed_secrets(
+            &vault_binding(),
+            UNREACHABLE_VAULT,
+            "root",
+            "acme",
+            &env_id,
+            &[seed("/acme/team/pack/api-key", Some(UNSET_SEED_VAR))],
+            false,
+            false,
+            true,
+        )
+        .expect_err("a missing seed on a fresh Vault is a hard error");
+
+        match err {
+            OpError::InvalidArgument(msg) => {
+                assert!(msg.contains("acme/team/pack/api-key"), "{msg}");
+                assert!(msg.contains("--allow-missing-seeds"), "{msg}");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    /// `--allow-missing-seeds` downgrades the same refusal to a warning, for
+    /// both seed sources: an unset `from_env` and a paste that `--non-interactive`
+    /// never prompts for.
+    #[cfg(feature = "k8s-client")]
+    #[test]
+    fn allow_missing_seeds_downgrades_every_unresolvable_seed_to_a_warning() {
+        let env_id = greentic_deploy_spec::EnvId::try_from("staging").unwrap();
+
+        let summary = seed_secrets(
+            &vault_binding(),
+            UNREACHABLE_VAULT,
+            "root",
+            "acme",
+            &env_id,
+            &[
+                seed("/acme/team/pack/api-key", Some(UNSET_SEED_VAR)),
+                seed("acme/team/pack/token", None),
+            ],
+            false,
+            true,
+            true,
+        )
+        .expect("--allow-missing-seeds warns instead of failing");
+
+        assert_eq!(
+            (
+                summary.seeded,
+                summary.skipped_present,
+                summary.warned_missing
+            ),
+            (0, 0, 2)
+        );
+    }
+
+    /// `kubectl port-forward` dying on a missing `svc/vault` must surface as a
+    /// clear error, not a 20s hang.
+    #[cfg(feature = "k8s-client")]
+    #[test]
+    fn vault_port_forward_surfaces_an_early_kubectl_exit() {
+        let child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a child that exits immediately");
+        // Port 1 is privileged and unbound: the readiness probe can only ever
+        // observe the child's exit, never a connection.
+        let mut pf = VaultPortForward {
+            child,
+            local_port: 1,
+        };
+
+        let err = pf
+            .wait_ready()
+            .expect_err("an early `kubectl port-forward` exit is an error");
+
+        match err {
+            OpError::Conflict(msg) => assert!(msg.contains("exited early"), "{msg}"),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    /// A live child plus an accepting local port is exactly what a healthy
+    /// `kubectl port-forward` looks like to the readiness probe.
+    #[cfg(feature = "k8s-client")]
+    #[test]
+    fn vault_port_forward_is_ready_once_the_local_port_accepts() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a local port");
+        let local_port = listener.local_addr().unwrap().port();
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a long-lived child");
+
+        let mut pf = VaultPortForward { child, local_port };
+
+        pf.wait_ready().expect("an accepting port is ready");
+        assert_eq!(pf.addr(), format!("http://127.0.0.1:{local_port}"));
+        // `Drop` reaps the child — a leaked `kubectl` would outlive `up`.
     }
 }
