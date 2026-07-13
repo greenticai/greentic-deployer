@@ -10,7 +10,7 @@ resolver = "2"
 
 [package]
 name = "greentic-deployer"
-version = "1.1.12"
+version = "1.1.13"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic deployer runtime for plan construction and deployment-pack dispatch"
@@ -145,6 +145,7 @@ features = [
 # `select_binary` schema (BinaryArtifact) that `op updates plan-build` constructs.
 version = ">=0.1.28859386871, <0.2"
 features = [
+    "binswap",
     "enroll",
     "mtls",
 ]
@@ -286,6 +287,7 @@ features = [
 version = "3"
 
 [dev-dependencies]
+flate2 = "1"
 wat = "1"
 # kube-client mock harness (PR-5.2): drive a real `kube::Client` against
 # a `tower_test::mock` service so the K8sCluster / K8sValidatorClient
