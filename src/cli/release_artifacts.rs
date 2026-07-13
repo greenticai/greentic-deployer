@@ -268,6 +268,23 @@ where
         filtered
     };
 
+    // Reject duplicate target triples (e.g. both .tgz and .zip for the same
+    // target). The downstream consumer rejects ambiguous (name, target) pairs,
+    // so producing them here would create plans that always fail on apply.
+    {
+        let mut seen = std::collections::HashSet::with_capacity(filtered.len());
+        for (_, target) in &filtered {
+            if !seen.insert(target.as_str()) {
+                return Err(OpError::InvalidArgument(format!(
+                    "release {} has duplicate archives for target `{target}` \
+                     (e.g. both .tgz and .zip); remove the extra archive or use \
+                     --targets to select one format",
+                    spec.tag,
+                )));
+            }
+        }
+    }
+
     let tmp_dir = tempfile::tempdir().map_err(|e| OpError::Fetch(format!("tempdir: {e}")))?;
     let mut artifacts = Vec::with_capacity(filtered.len());
 
@@ -974,5 +991,70 @@ mod tests {
 
         let artifacts = derive_binary_artifacts_with_fetcher(&spec, &fetcher).unwrap();
         assert_eq!(artifacts.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_target_triple_rejected() {
+        // Both .tgz and .zip exist for the same target — should fail.
+        let binary_content = b"binary";
+        let tgz = build_tgz("b-v1.0.0-x86_64-unknown-linux-gnu", "b", binary_content);
+        let zip_bytes = build_zip_archive("b-v1.0.0-x86_64-unknown-linux-gnu", "b", binary_content);
+
+        let release = release_json(&[
+            (
+                "b-v1.0.0-x86_64-unknown-linux-gnu.tgz",
+                "https://e.com/b.tgz",
+            ),
+            (
+                "b-v1.0.0-x86_64-unknown-linux-gnu.tgz.sha256",
+                "https://e.com/b.tgz.sha256",
+            ),
+            (
+                "b-v1.0.0-x86_64-unknown-linux-gnu.zip",
+                "https://e.com/b.zip",
+            ),
+            (
+                "b-v1.0.0-x86_64-unknown-linux-gnu.zip.sha256",
+                "https://e.com/b.zip.sha256",
+            ),
+        ]);
+
+        let spec = ReleaseSpec {
+            owner: "t".to_string(),
+            repo: "t".to_string(),
+            binary_name: "b".to_string(),
+            version: "1.0.0".to_string(),
+            tag: "v1.0.0".to_string(),
+            targets: vec![],
+            expected_target_count: None,
+        };
+
+        let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
+            if url.contains("/releases/tags/") {
+                Ok(release.clone())
+            } else if url.ends_with(".tgz.sha256") {
+                Ok(make_sidecar(&tgz, "b-v1.0.0-x86_64-unknown-linux-gnu.tgz")
+                    .as_bytes()
+                    .to_vec())
+            } else if url.ends_with(".zip.sha256") {
+                Ok(
+                    make_sidecar(&zip_bytes, "b-v1.0.0-x86_64-unknown-linux-gnu.zip")
+                        .as_bytes()
+                        .to_vec(),
+                )
+            } else if url.ends_with(".tgz") {
+                Ok(tgz.clone())
+            } else if url.ends_with(".zip") {
+                Ok(zip_bytes.clone())
+            } else {
+                Err(OpError::NotFound(url.to_string()))
+            }
+        };
+
+        let err = derive_binary_artifacts_with_fetcher(&spec, &fetcher).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("duplicate archives")),
+            "expected duplicate target rejection, got: {err:?}"
+        );
     }
 }
