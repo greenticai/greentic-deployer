@@ -1809,6 +1809,7 @@ mod tests {
             skip_cluster: false,
             no_port_forward: true,
             port: 8080,
+            allow_missing_seeds: false,
             updated_by: None,
         }
     }

@@ -757,10 +757,11 @@ pub struct UpdatesConfigSetArgs {
 #[derive(Args, Debug)]
 pub struct UpdatesPublishArgs {
     /// Target environment id.
+    #[arg(conflicts_with = "all_envs")]
     pub env_id: Option<String>,
     /// JSON file for the plan target (env-manifest.v1). Its `updates` block, if
     /// any, is stripped before signing — a plan may not re-point the channel it
-    /// arrives on. Required unless `--binary` is supplied.
+    /// arrives on. Required unless `--binary` or `--release` is supplied.
     #[arg(long = "target-file")]
     pub target_file: Option<PathBuf>,
     /// Monotonic plan sequence (anti-rollback). Default: the plan server's
@@ -768,7 +769,7 @@ pub struct UpdatesPublishArgs {
     #[arg(long)]
     pub sequence: Option<u64>,
     /// Binary artifact spec (repeatable); see `plan-build --binary`.
-    #[arg(long = "binary")]
+    #[arg(long = "binary", conflicts_with = "release")]
     pub binaries: Vec<String>,
     /// PKCS#8 Ed25519 private key PEM for signing. Default: the global operator key.
     #[arg(long = "signing-key")]
@@ -779,12 +780,46 @@ pub struct UpdatesPublishArgs {
     /// Plan-server endpoint to publish to. Default: the env's configured
     /// `plan_endpoint`, so the environment's subscription decides where its
     /// updates are published.
-    #[arg(long = "plan-endpoint")]
+    #[arg(long = "plan-endpoint", conflicts_with = "plan_server_url")]
     pub plan_endpoint: Option<String>,
     /// Plan-server upload credential. Prefer `$GREENTIC_PLAN_UPLOAD_TOKEN` — a
     /// token passed on the command line lands in shell history and `ps`.
     #[arg(long = "upload-token")]
     pub upload_token: Option<String>,
+    /// Derive binary artifacts from a GitHub release (e.g. `1.1.12`).
+    /// Downloads each target's archive, verifies its `.sha256` sidecar,
+    /// unpacks and hashes the inner binary.
+    #[arg(long = "release", conflicts_with = "binaries")]
+    pub release: Option<String>,
+    /// GitHub `owner/repo` for --release (default: `greenticai/greentic-start`).
+    #[arg(long = "release-repo", requires = "release")]
+    pub release_repo: Option<String>,
+    /// Binary name inside the archive for --release (default: `greentic-start`).
+    #[arg(long = "release-binary-name", requires = "release")]
+    pub release_binary_name: Option<String>,
+    /// Comma-separated target triples to derive from the release. When set,
+    /// only these targets are downloaded and included in the plan. Missing
+    /// targets fail the command.
+    #[arg(long = "targets", requires = "release", value_delimiter = ',')]
+    pub targets: Vec<String>,
+    /// Path to a trust-root.json file for plan signing verification.
+    /// Bypasses the env-store trust root lookup, enabling CI runners
+    /// with no local env dir.
+    #[arg(long = "trust-root")]
+    pub trust_root: Option<PathBuf>,
+    /// Publish to ALL environments registered on the plan server.
+    /// Requires --plan-server-url.
+    #[arg(
+        long = "all-envs",
+        conflicts_with = "env_id",
+        requires = "plan_server_url"
+    )]
+    pub all_envs: bool,
+    /// Base URL of the plan server (e.g. `https://updates.example.com`).
+    /// Used with --all-envs to enumerate and publish to every registered
+    /// environment.
+    #[arg(long = "plan-server-url", conflicts_with = "plan_endpoint")]
+    pub plan_server_url: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -796,14 +831,15 @@ pub struct UpdatesPlanBuildArgs {
     pub sequence: Option<u64>,
     /// Binary artifact spec (repeatable). Comma-separated key=value:
     /// `name=greentic-start,version=1.1.9,target=x86_64-unknown-linux-gnu,digest=sha256:<hex>[,source=https://...]`.
-    /// Required unless `--target-file` is supplied.
-    #[arg(long = "binary")]
+    /// Required unless `--target-file` or `--release` is supplied.
+    #[arg(long = "binary", conflicts_with = "release")]
     pub binaries: Vec<String>,
     /// PKCS#8 Ed25519 private key PEM for signing. Default: the global operator key.
     #[arg(long = "signing-key")]
     pub signing_key: Option<PathBuf>,
     /// JSON file for the plan target (env-manifest.v1). Required unless
-    /// `--binary` is supplied. Default: minimal manifest with schema + env id.
+    /// `--binary` or `--release` is supplied. Default: minimal manifest with
+    /// schema + env id.
     #[arg(long = "target-file")]
     pub target_file: Option<PathBuf>,
     /// Minimum runtime version (semver) for `compat.min_runtime`.
@@ -812,6 +848,27 @@ pub struct UpdatesPlanBuildArgs {
     /// Output directory for `plan.json` + `plan.json.sig`. Default: current dir.
     #[arg(long = "out-dir")]
     pub out_dir: Option<PathBuf>,
+    /// Derive binary artifacts from a GitHub release (e.g. `1.1.12`).
+    /// Downloads each target's archive, verifies its `.sha256` sidecar,
+    /// unpacks and hashes the inner binary.
+    #[arg(long = "release", conflicts_with = "binaries")]
+    pub release: Option<String>,
+    /// GitHub `owner/repo` for --release (default: `greenticai/greentic-start`).
+    #[arg(long = "release-repo", requires = "release")]
+    pub release_repo: Option<String>,
+    /// Binary name inside the archive for --release (default: `greentic-start`).
+    #[arg(long = "release-binary-name", requires = "release")]
+    pub release_binary_name: Option<String>,
+    /// Comma-separated target triples to derive from the release. When set,
+    /// only these targets are downloaded and included in the plan. Missing
+    /// targets fail the command.
+    #[arg(long = "targets", requires = "release", value_delimiter = ',')]
+    pub targets: Vec<String>,
+    /// Path to a trust-root.json file for plan signing verification.
+    /// Bypasses the env-store trust root lookup, enabling CI runners
+    /// with no local env dir.
+    #[arg(long = "trust-root")]
+    pub trust_root: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

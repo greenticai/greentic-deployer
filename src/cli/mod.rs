@@ -56,6 +56,7 @@ pub mod messaging;
 pub mod migrate;
 pub mod migrate_state;
 pub mod pack_config_stage;
+pub(crate) mod release_artifacts;
 pub mod revisions;
 pub mod secrets;
 pub mod traffic;

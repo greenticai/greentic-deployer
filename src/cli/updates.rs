@@ -2088,6 +2088,40 @@ fn parse_binary_spec(spec: &str) -> Result<greentic_update::plan::BinaryArtifact
     })
 }
 
+/// Parse the `owner/repo` form into `(owner, repo)`. Falls back to
+/// `(greenticai, raw)` when no `/` is present.
+fn parse_owner_repo(raw: &str) -> (String, String) {
+    match raw.split_once('/') {
+        Some((owner, repo)) => (owner.to_string(), repo.to_string()),
+        None => ("greenticai".to_string(), raw.to_string()),
+    }
+}
+
+/// Resolve `--release` into pre-derived `BinaryArtifact`s. Returns an empty
+/// vec when `--release` is not set.
+fn resolve_release_artifacts(
+    release: Option<&str>,
+    release_repo: Option<&str>,
+    release_binary_name: Option<&str>,
+    targets: &[String],
+) -> Result<Vec<greentic_update::plan::BinaryArtifact>, OpError> {
+    let version = match release {
+        Some(v) => v,
+        None => return Ok(vec![]),
+    };
+    let (owner, repo) = parse_owner_repo(release_repo.unwrap_or("greenticai/greentic-start"));
+    let binary_name = release_binary_name.unwrap_or("greentic-start").to_string();
+    let spec = super::release_artifacts::ReleaseSpec {
+        owner,
+        repo,
+        binary_name,
+        version: version.to_string(),
+        tag: format!("v{version}"),
+        targets: targets.to_vec(),
+    };
+    super::release_artifacts::derive_binary_artifacts(&spec)
+}
+
 /// `op updates plan-build` — build and DSSE-sign an [`UpdatePlan`] carrying a
 /// content target (`--target-file`), one or more binary artifacts (`--binary`),
 /// or both, writing `plan.json` + `plan.json.sig` to the output directory. The
@@ -2116,15 +2150,24 @@ pub fn plan_build(
         .sequence
         .ok_or_else(|| OpError::InvalidArgument("--sequence is required".to_string()))?;
 
+    let derived_binaries = resolve_release_artifacts(
+        args.release.as_deref(),
+        args.release_repo.as_deref(),
+        args.release_binary_name.as_deref(),
+        &args.targets,
+    )?;
+
     let signed = build_and_sign_plan(
         store,
         &env_id,
         sequence,
         &PlanContent {
             binaries: &args.binaries,
+            derived_binaries,
             target_file: args.target_file.as_deref(),
             min_runtime: args.min_runtime,
             signing_key: args.signing_key.as_deref(),
+            trust_root: args.trust_root.as_deref(),
         },
     )?;
 
@@ -2166,9 +2209,15 @@ pub fn plan_build(
 /// (`publish` → plan server).
 struct PlanContent<'a> {
     binaries: &'a [String],
+    /// Pre-derived artifacts (from --release). When non-empty, `binaries`
+    /// (raw --binary specs) must be empty (enforced by clap conflicts_with).
+    derived_binaries: Vec<greentic_update::plan::BinaryArtifact>,
     target_file: Option<&'a Path>,
     min_runtime: Option<String>,
     signing_key: Option<&'a Path>,
+    /// Override for the trust root file path. When set, the trust root is
+    /// loaded from this file instead of `<env_dir>/trust-root.json`.
+    trust_root: Option<&'a Path>,
 }
 
 /// A built, DSSE-signed plan held in memory.
@@ -2226,6 +2275,22 @@ fn validate_plan_target(target: &serde_json::Value, env_id: &EnvId) -> Result<()
     Ok(())
 }
 
+/// Load a trust root from an explicit file path (vs the directory-based
+/// [`store_trust_root::load`]).
+fn load_trust_root_from_file(
+    path: &Path,
+) -> Result<greentic_distributor_client::signing::TrustRoot, OpError> {
+    use greentic_operator_trust::trust_root::TrustRootDocument;
+    let bytes = std::fs::read(path).map_err(|source| OpError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let doc: TrustRootDocument = serde_json::from_slice(&bytes)
+        .map_err(|e| OpError::InvalidArgument(format!("trust root {}: {e}", path.display())))?;
+    doc.into_trust_root()
+        .map_err(|e| OpError::InvalidArgument(format!("trust root {}: {e}", path.display())))
+}
+
 /// Build + DSSE-sign an [`UpdatePlan`](greentic_update::plan::UpdatePlan) for
 /// `env_id` against the env's trust root. The signed pair round-trips through
 /// [`greentic_update::plan::verify_update_plan`].
@@ -2246,12 +2311,16 @@ fn build_and_sign_plan(
         UPDATE_PLAN_SCHEMA_V1, UpdatePlan,
     };
 
-    // Parse all --binary specs up front, before touching disk.
-    let binaries: Vec<BinaryArtifact> = content
-        .binaries
-        .iter()
-        .map(|s| parse_binary_spec(s))
-        .collect::<Result<Vec<_>, _>>()?;
+    // Resolve binary artifacts: pre-derived (--release) or parsed (--binary).
+    let binaries: Vec<BinaryArtifact> = if !content.derived_binaries.is_empty() {
+        content.derived_binaries.clone()
+    } else {
+        content
+            .binaries
+            .iter()
+            .map(|s| parse_binary_spec(s))
+            .collect::<Result<Vec<_>, _>>()?
+    };
 
     if binaries.is_empty() && content.target_file.is_none() {
         return Err(OpError::InvalidArgument(
@@ -2274,8 +2343,13 @@ fn build_and_sign_plan(
     };
 
     // Load the env trust root so build_update_plan can verify the key is trusted.
-    let env_dir = store.env_dir(env_id)?;
-    let trust = store_trust_root::load(&env_dir)?;
+    let trust = match content.trust_root {
+        Some(path) => load_trust_root_from_file(path)?,
+        None => {
+            let env_dir = store.env_dir(env_id)?;
+            store_trust_root::load(&env_dir)?
+        }
+    };
 
     // Build the plan target from --target-file or a minimal valid env-manifest.
     let mut target: serde_json::Value = match content.target_file {
@@ -2351,16 +2425,22 @@ fn plan_build_schema() -> Value {
         "additionalProperties": false,
         "anyOf": [
             {"required": ["binaries"]},
-            {"required": ["target_file"]}
+            {"required": ["target_file"]},
+            {"required": ["release"]}
         ],
         "properties": {
             "env_id": {"type": "string"},
             "sequence": {"type": "integer", "description": "Monotonic plan sequence (anti-rollback)."},
-            "binaries": {"type": "array", "items": {"type": "string"}, "description": "Binary artifact specs (comma-separated key=value). Required unless target_file is set."},
+            "binaries": {"type": "array", "items": {"type": "string"}, "description": "Binary artifact specs (comma-separated key=value). Required unless target_file or release is set."},
             "signing_key": {"type": ["string", "null"], "description": "PKCS#8 Ed25519 private key PEM path. Default: global operator key."},
-            "target_file": {"type": ["string", "null"], "description": "JSON file for the plan target (env-manifest.v1). Required unless binaries is set. Default: minimal manifest with schema + env id."},
+            "target_file": {"type": ["string", "null"], "description": "JSON file for the plan target (env-manifest.v1). Required unless binaries or release is set. Default: minimal manifest with schema + env id."},
             "min_runtime": {"type": ["string", "null"], "description": "Minimum runtime version (semver) for compat.min_runtime."},
-            "out_dir": {"type": ["string", "null"], "description": "Output directory for plan.json + plan.json.sig. Default: current dir."}
+            "out_dir": {"type": ["string", "null"], "description": "Output directory for plan.json + plan.json.sig. Default: current dir."},
+            "release": {"type": ["string", "null"], "description": "Derive binary artifacts from a GitHub release version (e.g. 1.1.12). Conflicts with binaries."},
+            "release_repo": {"type": ["string", "null"], "description": "GitHub owner/repo for --release. Default: greenticai/greentic-start."},
+            "release_binary_name": {"type": ["string", "null"], "description": "Binary name inside the archive for --release. Default: greentic-start."},
+            "targets": {"type": "array", "items": {"type": "string"}, "description": "Target triples to derive from the release. Default: all."},
+            "trust_root": {"type": ["string", "null"], "description": "Path to a trust-root.json file. Bypasses env-store lookup."}
         }
     })
 }
@@ -2407,33 +2487,12 @@ pub fn publish(
         return Ok(OpOutcome::new(NOUN, "publish", publish_schema()));
     }
 
-    let env_id_raw = args.env_id.ok_or_else(|| {
-        OpError::InvalidArgument("env_id is required (positional argument)".to_string())
-    })?;
-    let env_id = parse_env_id(&env_id_raw)?;
-
-    // Resolve every input before signing, so a missing token or endpoint fails
-    // without minting a plan and burning a sequence number.
-    let plan_endpoint = match args.plan_endpoint {
-        Some(raw) => raw,
-        None => store
-            .load_update_channel(&env_id)?
-            .and_then(|cfg| cfg.resolved_plan_endpoint().map(str::to_string))
-            .ok_or_else(|| {
-                OpError::InvalidArgument(format!(
-                    "env `{env_id}` has no configured plan_endpoint; declare an `updates` block \
-                     in its manifest, run `op updates config-set --plan-endpoint <url>`, or pass \
-                     --plan-endpoint"
-                ))
-            })?,
-    };
-    let plan_endpoint = plan_endpoint.trim().trim_end_matches('/').to_string();
-    if !control_url_is_acceptable(&plan_endpoint) {
-        return Err(OpError::InvalidArgument(format!(
-            "plan_endpoint {plan_endpoint:?} is not an acceptable control URL \
-             (https required; http only to loopback)"
-        )));
-    }
+    let derived_binaries = resolve_release_artifacts(
+        args.release.as_deref(),
+        args.release_repo.as_deref(),
+        args.release_binary_name.as_deref(),
+        &args.targets,
+    )?;
 
     let token = args
         .upload_token
@@ -2446,9 +2505,9 @@ pub fn publish(
             ))
         })?;
 
-    if args.target_file.is_none() && args.binaries.is_empty() {
+    if args.target_file.is_none() && args.binaries.is_empty() && derived_binaries.is_empty() {
         return Err(OpError::InvalidArgument(
-            "--target-file is required (or at least one --binary)".to_string(),
+            "--target-file, --binary, or --release is required".to_string(),
         ));
     }
 
@@ -2456,6 +2515,59 @@ pub fn publish(
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| OpError::Fetch(format!("building HTTP client: {e}")))?;
+
+    if args.all_envs {
+        return publish_all_envs(
+            store,
+            &client,
+            &token,
+            &args.binaries,
+            derived_binaries,
+            args.target_file.as_deref(),
+            args.min_runtime,
+            args.signing_key.as_deref(),
+            args.trust_root.as_deref(),
+            args.plan_server_url
+                .as_deref()
+                .expect("clap requires plan_server_url with all_envs"),
+            args.sequence,
+        );
+    }
+
+    let env_id_raw = args.env_id.ok_or_else(|| {
+        OpError::InvalidArgument("env_id is required (positional argument)".to_string())
+    })?;
+    let env_id = parse_env_id(&env_id_raw)?;
+
+    // Resolve every input before signing, so a missing token or endpoint fails
+    // without minting a plan and burning a sequence number.
+    let plan_endpoint = match args.plan_endpoint {
+        Some(raw) => raw,
+        None => match &args.plan_server_url {
+            Some(base) => format!(
+                "{}/v1/environments/{}/plan",
+                base.trim_end_matches('/'),
+                env_id.as_str()
+            ),
+            None => store
+                .load_update_channel(&env_id)?
+                .and_then(|cfg| cfg.resolved_plan_endpoint().map(str::to_string))
+                .ok_or_else(|| {
+                    OpError::InvalidArgument(format!(
+                        "env `{env_id}` has no configured plan_endpoint; declare an `updates` \
+                         block in its manifest, run `op updates config-set --plan-endpoint \
+                         <url>`, or pass --plan-endpoint"
+                    ))
+                })?,
+        },
+    };
+    let plan_endpoint = plan_endpoint.trim().trim_end_matches('/').to_string();
+    if !control_url_is_acceptable(&plan_endpoint) {
+        return Err(OpError::InvalidArgument(format!(
+            "plan_endpoint {plan_endpoint:?} is not an acceptable control URL \
+             (https required; http only to loopback)"
+        )));
+    }
 
     let sequence = match args.sequence {
         Some(explicit) => explicit,
@@ -2468,9 +2580,11 @@ pub fn publish(
         sequence,
         &PlanContent {
             binaries: &args.binaries,
+            derived_binaries,
             target_file: args.target_file.as_deref(),
             min_runtime: args.min_runtime,
             signing_key: args.signing_key.as_deref(),
+            trust_root: args.trust_root.as_deref(),
         },
     )?;
 
@@ -2490,6 +2604,141 @@ pub fn publish(
             "stripped_updates_block": signed.stripped_updates_block,
         }),
     ))
+}
+
+/// Environment record returned by `GET /v1/environments`.
+#[derive(Debug, Deserialize)]
+struct EnvironmentRecord {
+    id: String,
+}
+
+/// `--all-envs` publish: enumerate environments from the plan server, then
+/// sign + upload one plan per env. Returns a summary with per-env
+/// results; exits non-zero (via `OpError::Conflict`) if any env failed.
+#[allow(clippy::too_many_arguments)]
+fn publish_all_envs(
+    store: &LocalFsStore,
+    client: &reqwest::Client,
+    token: &str,
+    binaries: &[String],
+    derived_binaries: Vec<greentic_update::plan::BinaryArtifact>,
+    target_file: Option<&Path>,
+    min_runtime: Option<String>,
+    signing_key: Option<&Path>,
+    trust_root: Option<&Path>,
+    plan_server_url: &str,
+    explicit_sequence: Option<u64>,
+) -> Result<OpOutcome, OpError> {
+    let base = plan_server_url.trim_end_matches('/');
+    if !control_url_is_acceptable(base) {
+        return Err(OpError::InvalidArgument(format!(
+            "plan_server_url {base:?} is not an acceptable control URL \
+             (https required; http only to loopback)"
+        )));
+    }
+
+    let envs_url = format!("{base}/v1/environments");
+    let envs: Vec<EnvironmentRecord> = rt::sync_await(async {
+        let resp = client
+            .get(&envs_url)
+            .header("x-api-key", token)
+            .send()
+            .await
+            .map_err(|e| OpError::Fetch(format!("GET {envs_url}: {e}")))?;
+        let resp = resp
+            .error_for_status()
+            .map_err(|e| OpError::Fetch(format!("GET {envs_url}: {e}")))?;
+        resp.json::<Vec<EnvironmentRecord>>()
+            .await
+            .map_err(|e| OpError::Fetch(format!("GET {envs_url}: decode: {e}")))
+    })?;
+
+    if envs.is_empty() {
+        return Err(OpError::NotFound(
+            "plan server returned no registered environments".to_string(),
+        ));
+    }
+
+    let mut published = Vec::new();
+    let mut failed = Vec::new();
+
+    for env_rec in &envs {
+        let env_id = match parse_env_id(&env_rec.id) {
+            Ok(id) => id,
+            Err(e) => {
+                failed.push(json!({"env_id": env_rec.id, "error": e.to_string()}));
+                continue;
+            }
+        };
+        let plan_endpoint = format!("{base}/v1/environments/{}/plan", env_id.as_str());
+
+        let sequence = match explicit_sequence {
+            Some(s) => s,
+            None => match rt::sync_await(next_sequence(client, &plan_endpoint)) {
+                Ok(s) => s,
+                Err(e) => {
+                    failed.push(json!({"env_id": env_id.as_str(), "error": e.to_string()}));
+                    continue;
+                }
+            },
+        };
+
+        let signed = match build_and_sign_plan(
+            store,
+            &env_id,
+            sequence,
+            &PlanContent {
+                binaries,
+                derived_binaries: derived_binaries.clone(),
+                target_file,
+                min_runtime: min_runtime.clone(),
+                signing_key,
+                trust_root,
+            },
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                failed.push(json!({"env_id": env_id.as_str(), "error": e.to_string()}));
+                continue;
+            }
+        };
+
+        if let Err(e) = rt::sync_await(upload_plan(client, &plan_endpoint, token, &signed)) {
+            failed.push(json!({"env_id": env_id.as_str(), "error": e.to_string()}));
+            continue;
+        }
+
+        published.push(json!({
+            "env_id": env_id.as_str(),
+            "plan_id": signed.plan_id,
+            "sequence": signed.sequence,
+            "plan_sha256": signed.plan_sha256,
+        }));
+    }
+
+    let any_failed = !failed.is_empty();
+    let outcome = OpOutcome::new(
+        NOUN,
+        "publish",
+        json!({
+            "status": if any_failed { "partial" } else { "published" },
+            "plan_server_url": plan_server_url,
+            "published": published,
+            "failed": failed,
+        }),
+    );
+
+    if any_failed {
+        // Return the outcome as a Conflict error so the exit code is non-zero,
+        // but the structured output is still available via the error message.
+        return Err(OpError::Conflict(format!(
+            "{} of {} environments failed; see output for details",
+            failed.len(),
+            envs.len()
+        )));
+    }
+
+    Ok(outcome)
 }
 
 /// The sequence to publish next: one past whatever the server currently serves.
@@ -2581,21 +2830,28 @@ fn publish_schema() -> Value {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "UpdatesPublishArgs",
         "type": "object",
-        "required": ["env_id"],
         "additionalProperties": false,
         "anyOf": [
             {"required": ["binaries"]},
-            {"required": ["target_file"]}
+            {"required": ["target_file"]},
+            {"required": ["release"]}
         ],
         "properties": {
-            "env_id": {"type": "string"},
-            "target_file": {"type": ["string", "null"], "description": "JSON file for the plan target (env-manifest.v1). Its `updates` block, if any, is stripped before signing. Required unless binaries is set."},
+            "env_id": {"type": ["string", "null"], "description": "Target environment id. Required unless --all-envs is set."},
+            "target_file": {"type": ["string", "null"], "description": "JSON file for the plan target (env-manifest.v1). Its `updates` block, if any, is stripped before signing. Required unless binaries or release is set."},
             "sequence": {"type": ["integer", "null"], "description": "Monotonic plan sequence (anti-rollback). Default: the server's current sequence + 1."},
-            "binaries": {"type": "array", "items": {"type": "string"}, "description": "Binary artifact specs (comma-separated key=value)."},
+            "binaries": {"type": "array", "items": {"type": "string"}, "description": "Binary artifact specs (comma-separated key=value). Conflicts with release."},
             "signing_key": {"type": ["string", "null"], "description": "PKCS#8 Ed25519 private key PEM path. Default: global operator key."},
             "min_runtime": {"type": ["string", "null"], "description": "Minimum runtime version (semver) for compat.min_runtime."},
-            "plan_endpoint": {"type": ["string", "null"], "description": "Plan-server endpoint to publish to. Default: the env's configured plan_endpoint."},
-            "upload_token": {"type": ["string", "null"], "description": "Plan-server upload credential. Prefer $GREENTIC_PLAN_UPLOAD_TOKEN — a token on the command line lands in shell history."}
+            "plan_endpoint": {"type": ["string", "null"], "description": "Plan-server endpoint to publish to. Default: the env's configured plan_endpoint. Conflicts with plan_server_url."},
+            "upload_token": {"type": ["string", "null"], "description": "Plan-server upload credential. Prefer $GREENTIC_PLAN_UPLOAD_TOKEN — a token on the command line lands in shell history."},
+            "release": {"type": ["string", "null"], "description": "Derive binary artifacts from a GitHub release version (e.g. 1.1.12). Conflicts with binaries."},
+            "release_repo": {"type": ["string", "null"], "description": "GitHub owner/repo for --release. Default: greenticai/greentic-start."},
+            "release_binary_name": {"type": ["string", "null"], "description": "Binary name inside the archive for --release. Default: greentic-start."},
+            "targets": {"type": "array", "items": {"type": "string"}, "description": "Target triples to derive from the release. Default: all."},
+            "trust_root": {"type": ["string", "null"], "description": "Path to a trust-root.json file. Bypasses env-store lookup."},
+            "all_envs": {"type": "boolean", "description": "Publish to ALL environments registered on the plan server. Requires plan_server_url."},
+            "plan_server_url": {"type": ["string", "null"], "description": "Base URL of the plan server. Used with all_envs to enumerate environments."}
         }
     })
 }
@@ -5411,6 +5667,11 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             target_file: None,
             min_runtime: None,
             out_dir: Some(out_dir),
+            release: None,
+            release_repo: None,
+            release_binary_name: None,
+            targets: vec![],
+            trust_root: None,
         }
     }
 
@@ -5650,6 +5911,13 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             min_runtime: None,
             plan_endpoint: None,
             upload_token: None,
+            release: None,
+            release_repo: None,
+            release_binary_name: None,
+            targets: vec![],
+            trust_root: None,
+            all_envs: false,
+            plan_server_url: None,
         }
     }
 
@@ -5752,7 +6020,8 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         )
         .unwrap();
         assert_eq!(out.result["title"], json!("UpdatesPublishArgs"));
-        assert_eq!(out.result["required"], json!(["env_id"]));
+        // env_id is no longer required at schema level (optional with --all-envs).
+        assert!(out.result["properties"]["env_id"].is_object());
     }
 
     #[test]
@@ -5976,5 +6245,178 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert_eq!(out.op, "plan-build");
         assert_eq!(out.noun, NOUN);
         assert!(out.result["properties"]["sequence"].is_object());
+    }
+
+    // ---- --release / --trust-root / --all-envs tests -------------------------
+
+    #[test]
+    fn release_and_binary_conflict_rejected_by_clap() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            cmd: Cmd,
+        }
+        #[derive(clap::Subcommand)]
+        enum Cmd {
+            PlanBuild(crate::cli::dispatch::UpdatesPlanBuildArgs),
+        }
+
+        let result = Cli::try_parse_from([
+            "test",
+            "plan-build",
+            "local",
+            "--sequence",
+            "1",
+            "--binary",
+            "name=x,version=1,target=t,digest=d",
+            "--release",
+            "1.1.12",
+        ]);
+        assert!(
+            result.is_err(),
+            "clap should reject --release combined with --binary"
+        );
+    }
+
+    #[test]
+    fn trust_root_override_plan_build() {
+        let dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (key_path, tk) = write_ephemeral_key(dir.path());
+
+        // Create env WITHOUT seeding its trust root.
+        store.save(&make_env("local")).unwrap();
+
+        // Write trust-root.json to a separate location.
+        let trust_root_dir = tempdir().unwrap();
+        let trust_root_path = trust_root_dir.path().join("trust-root.json");
+        let trust_doc =
+            greentic_operator_trust::trust_root::TrustRootDocument::v1(vec![tk.clone()]);
+        std::fs::write(
+            &trust_root_path,
+            serde_json::to_string_pretty(&trust_doc).unwrap(),
+        )
+        .unwrap();
+
+        let mut args = plan_build_args(
+            "local",
+            1,
+            vec!["name=x,version=1,target=t,digest=sha256:aabb".to_string()],
+            Some(key_path),
+            out_dir.path().to_path_buf(),
+        );
+        args.trust_root = Some(trust_root_path);
+
+        let outcome = plan_build(&store, &OpFlags::default(), args).unwrap();
+        assert_eq!(outcome.op, "plan-build");
+
+        // Verify the emitted plan round-trips against the same trust root.
+        let plan_bytes = std::fs::read(out_dir.path().join("plan.json")).unwrap();
+        let sig_bytes = std::fs::read(out_dir.path().join("plan.json.sig")).unwrap();
+        let trust = greentic_distributor_client::signing::TrustRoot::new(vec![tk]);
+        let verified =
+            greentic_update::plan::verify_update_plan(&plan_bytes, &sig_bytes, &trust).unwrap();
+        assert_eq!(verified.plan.binaries.len(), 1);
+    }
+
+    #[test]
+    fn trust_root_override_fails_with_wrong_key() {
+        let dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (key_path_42, _tk42) = write_ephemeral_key(dir.path());
+
+        store.save(&make_env("local")).unwrap();
+
+        // Trust root trusts key 7, signing with key 42.
+        let (_priv7, tk7) = key_pair(7);
+        let trust_root_dir = tempdir().unwrap();
+        let trust_root_path = trust_root_dir.path().join("trust-root.json");
+        let trust_doc = greentic_operator_trust::trust_root::TrustRootDocument::v1(vec![tk7]);
+        std::fs::write(
+            &trust_root_path,
+            serde_json::to_string_pretty(&trust_doc).unwrap(),
+        )
+        .unwrap();
+
+        let mut args = plan_build_args(
+            "local",
+            1,
+            vec!["name=x,version=1,target=t,digest=d".to_string()],
+            Some(key_path_42),
+            out_dir.path().to_path_buf(),
+        );
+        args.trust_root = Some(trust_root_path);
+
+        let err = plan_build(&store, &OpFlags::default(), args).unwrap_err();
+        assert!(
+            matches!(err, OpError::Conflict(_)),
+            "expected Conflict for untrusted key, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn publish_schema_includes_release_fields() {
+        let schema = publish_schema();
+        let props = &schema["properties"];
+        assert!(props["release"].is_object(), "missing release");
+        assert!(props["release_repo"].is_object(), "missing release_repo");
+        assert!(
+            props["release_binary_name"].is_object(),
+            "missing release_binary_name"
+        );
+        assert!(props["targets"].is_object(), "missing targets");
+        assert!(props["trust_root"].is_object(), "missing trust_root");
+        assert!(props["all_envs"].is_object(), "missing all_envs");
+        assert!(
+            props["plan_server_url"].is_object(),
+            "missing plan_server_url"
+        );
+    }
+
+    #[test]
+    fn plan_build_schema_includes_release_fields() {
+        let schema = plan_build_schema();
+        let props = &schema["properties"];
+        assert!(props["release"].is_object(), "missing release");
+        assert!(props["release_repo"].is_object(), "missing release_repo");
+        assert!(
+            props["release_binary_name"].is_object(),
+            "missing release_binary_name"
+        );
+        assert!(props["targets"].is_object(), "missing targets");
+        assert!(props["trust_root"].is_object(), "missing trust_root");
+    }
+
+    #[test]
+    fn publish_requires_content_or_release() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (_key_path, tk) = write_ephemeral_key(dir.path());
+        env_trusting(&store, &tk);
+
+        let mut args = publish_args("local");
+        args.upload_token = Some("token".to_string());
+        args.plan_endpoint = Some("http://127.0.0.1:1/plan".to_string());
+        // No --target-file, no --binary, no --release.
+        let err = publish(&store, &OpFlags::default(), args).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("--release")),
+            "expected error mentioning --release, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_owner_repo_splits_correctly() {
+        let (owner, repo) = parse_owner_repo("greenticai/greentic-start");
+        assert_eq!(owner, "greenticai");
+        assert_eq!(repo, "greentic-start");
+
+        let (owner2, repo2) = parse_owner_repo("greentic-start");
+        assert_eq!(owner2, "greenticai");
+        assert_eq!(repo2, "greentic-start");
     }
 }
