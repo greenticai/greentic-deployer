@@ -327,6 +327,24 @@ pub enum EnvVerb {
     Doctor {
         env_id: String,
     },
+    /// Repair an environment whose traffic splits route to revisions staged
+    /// before greentic 1.1.0. Those revisions recorded a `pack_list_lock_ref`
+    /// that no file ever backed, so they can never serve — and until 1.1.18 a
+    /// single one made the whole env refuse to boot. Repair evicts them from
+    /// their traffic splits (rebalancing any healthy survivors) and archives
+    /// them. Bundles, secrets and messaging endpoints are left untouched;
+    /// re-deploy the affected bundle to bring its deployment back.
+    ///
+    /// Dry-runs by default — pass `--apply` to actually mutate the env.
+    Repair {
+        env_id: String,
+        /// Scan and report; do not touch state. This is also the default.
+        #[arg(long, conflicts_with = "apply")]
+        check: bool,
+        /// Perform the repair.
+        #[arg(long, conflicts_with = "check")]
+        apply: bool,
+    },
     /// Run per-binding tool preflight. Resolves each env-pack binding via the
     /// registry and invokes its handler's `preflight()` to check external
     /// tools (binary presence, version, auth, scope) needed for real work.
@@ -1192,6 +1210,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 EnvVerb::List => "list",
                 EnvVerb::Show { .. } => "show",
                 EnvVerb::Doctor { .. } => "doctor",
+                EnvVerb::Repair { .. } => "repair",
                 EnvVerb::ToolCheck { .. } => "tool-check",
                 EnvVerb::Render(_) => "render",
                 EnvVerb::Reconcile(_) => "reconcile",
@@ -1353,6 +1372,12 @@ fn dispatch_env(
         EnvVerb::List => super::env::list(store, flags)?,
         EnvVerb::Show { env_id } => super::env::show(store, flags, &env_id)?,
         EnvVerb::Doctor { env_id } => super::env::doctor(store, flags, &env_id)?,
+        // `check` is the default, so only an explicit `--apply` mutates.
+        EnvVerb::Repair {
+            env_id,
+            check: _,
+            apply,
+        } => super::env::repair(store, flags, &env_id, apply)?,
         EnvVerb::ToolCheck { env_id } => super::env::tool_check(store, flags, &env_id)?,
         EnvVerb::Render(args) => super::env::render(store, registry, flags, args)?,
         EnvVerb::Reconcile(args) => super::env::reconcile(store, registry, flags, args)?,

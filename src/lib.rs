@@ -37,6 +37,7 @@ pub mod operator;
 // so `crate::operator_key::*` call sites stay unchanged.
 pub use greentic_operator_trust::operator_key;
 pub mod pack_introspect;
+pub mod pack_ref;
 pub mod path_safety;
 pub mod plan;
 pub(crate) mod rollout_telemetry;

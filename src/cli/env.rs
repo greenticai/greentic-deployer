@@ -364,6 +364,27 @@ pub fn doctor(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpO
             }
         }
     }
+    // Revisions that live traffic routes to but whose pinned pack list is not
+    // on disk. These are why an env staged before greentic 1.1.0 refuses to
+    // boot AT ALL — `greentic-start` quarantines the deployment and keeps
+    // serving the rest, but the deployment itself is dead until repaired.
+    let env_dir = store.env_dir(&env_id)?;
+    let stale_revisions: Vec<Value> = crate::pack_ref::scan_stale_revisions(&env, &env_dir)
+        .into_iter()
+        .map(|s| {
+            json!({
+                "deployment_id": s.deployment_id.to_string(),
+                "revision_id": s.revision_id.to_string(),
+                "bundle_id": s.bundle_id.as_str(),
+                "recorded_pack_list_lock_ref": s.recorded_ref.display().to_string(),
+                "expected_path": s.expected_path.display().to_string(),
+                "detail": "pinned pack list is missing; revision was staged before greentic 1.1.0 \
+                           and can never serve",
+                "fix": format!("gtc op env repair {env_id} --apply"),
+            })
+        })
+        .collect();
+
     Ok(OpOutcome::new(
         NOUN,
         "doctor",
@@ -384,10 +405,193 @@ pub fn doctor(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpO
                 "slot_mismatches": extension_report.slot_mismatches,
                 "version_skew": extension_report.version_skew,
             },
+            "stale_revisions": stale_revisions,
             "has_runtime": runtime.is_some(),
             "checked_at": Utc::now(),
         }),
     ))
+}
+
+/// `op env repair <env_id> [--check | --apply]`.
+///
+/// Repairs an environment whose traffic splits route to revisions staged before
+/// greentic 1.1.0. Those revisions recorded a `pack_list_lock_ref` that no file
+/// ever backed (see [`crate::pack_ref`]); they cannot serve, and until 1.1.18
+/// a single one of them made the whole env refuse to boot.
+///
+/// Repair evicts each stale revision from its traffic split and archives it. If
+/// a split is left with healthy revisions, their weights are rebalanced back to
+/// 10,000 bps; if it is left empty, the split is dropped entirely (the
+/// deployment survives with no live routing, so re-deploying its bundle brings
+/// it back). Nothing else is touched — bundles, secrets and messaging endpoints
+/// are left alone.
+///
+/// `--check` reports without mutating; the default (neither flag) is also a
+/// dry run, so an operator cannot destroy state by fat-fingering the verb.
+pub fn repair(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    env_id: &str,
+    apply: bool,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(
+            NOUN,
+            "repair",
+            json!({ "input_schema": "env_id positional; --check | --apply" }),
+        ));
+    }
+    let env_id =
+        EnvId::try_from(env_id).map_err(|e| OpError::InvalidArgument(format!("env_id: {e}")))?;
+    if !store.exists(&env_id)? {
+        return Err(OpError::NotFound(format!("environment `{env_id}`")));
+    }
+    let env_dir = store.env_dir(&env_id)?;
+
+    if !apply {
+        let env = store.load(&env_id)?;
+        let stale = crate::pack_ref::scan_stale_revisions(&env, &env_dir);
+        return Ok(OpOutcome::new(
+            NOUN,
+            "repair",
+            json!({
+                "environment_id": env_id.as_str(),
+                "mode": "check",
+                "stale_revisions": stale.iter().map(describe_stale).collect::<Vec<_>>(),
+                "repaired": 0,
+                "detail": if stale.is_empty() {
+                    "no stale revisions; nothing to repair".to_string()
+                } else {
+                    format!("{} stale revision(s); re-run with --apply to repair", stale.len())
+                },
+            }),
+        ));
+    }
+
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "repair",
+        target: json!({ "environment_id": env_id.to_string() }),
+        idempotency_key: None,
+    };
+    audit_and_record(store, ctx, |_committed| {
+        let result = store.transact(&env_id, |locked| -> Result<Value, OpError> {
+            let mut env = locked.load().map_err(map_store_err_preserving_noun)?;
+            let stale = crate::pack_ref::scan_stale_revisions(&env, &env_dir);
+            if stale.is_empty() {
+                return Ok(json!({
+                    "environment_id": env_id.as_str(),
+                    "mode": "apply",
+                    "stale_revisions": [],
+                    "repaired": 0,
+                    "detail": "no stale revisions; nothing to repair",
+                }));
+            }
+            let report: Vec<Value> = stale.iter().map(describe_stale).collect();
+            let stale_ids: Vec<RevisionId> = stale.iter().map(|s| s.revision_id).collect();
+
+            evict_revisions_from_traffic(&mut env, &stale_ids);
+
+            // Archive the evicted revisions and drop them from their
+            // deployment's `current_revisions`. The lifecycle guard refuses to
+            // archive a revision that still owns live traffic — which is why
+            // the eviction above has to come first.
+            for revision in &mut env.revisions {
+                if stale_ids.contains(&revision.revision_id) {
+                    revision.lifecycle = greentic_deploy_spec::RevisionLifecycle::Archived;
+                }
+            }
+            for deployment in &mut env.bundles {
+                deployment
+                    .current_revisions
+                    .retain(|r| !stale_ids.contains(r));
+            }
+
+            locked.save(&env).map_err(map_store_err_preserving_noun)?;
+            locked
+                .refresh_runtime_config(&env)
+                .map_err(map_store_err_preserving_noun)?;
+
+            Ok(json!({
+                "environment_id": env_id.as_str(),
+                "mode": "apply",
+                "stale_revisions": report,
+                "repaired": stale_ids.len(),
+                "detail": format!(
+                    "archived {} stale revision(s) and rewrote the affected traffic split(s); \
+                     re-deploy the bundle(s) to bring those deployments back",
+                    stale_ids.len()
+                ),
+            }))
+        })?;
+        // Repair rewrites the env document wholesale rather than going through
+        // a generation-stamped store mutation, so there is no previous/new
+        // generation pair to report.
+        Ok((
+            OpOutcome::new(NOUN, "repair", result),
+            super::AuditGens {
+                previous: None,
+                new: None,
+            },
+        ))
+    })
+}
+
+fn describe_stale(s: &crate::pack_ref::StaleRevision) -> Value {
+    json!({
+        "deployment_id": s.deployment_id.to_string(),
+        "revision_id": s.revision_id.to_string(),
+        "bundle_id": s.bundle_id.as_str(),
+        "recorded_pack_list_lock_ref": s.recorded_ref.display().to_string(),
+        "expected_path": s.expected_path.display().to_string(),
+    })
+}
+
+/// Remove `stale` revisions from every traffic split, rebalancing survivors back
+/// to exactly 10,000 bps and dropping any split left with no entries.
+///
+/// The 10,000-bps sum is a hard invariant: `greentic-start` rejects a
+/// deployment whose weights do not total exactly that. So a split that keeps
+/// some healthy revisions must be renormalized, not merely shortened —
+/// otherwise repair would trade a stale-ref failure for a weight-sum failure.
+/// Remainder from integer division goes to the largest survivor, so the total is
+/// exact for any entry count.
+fn evict_revisions_from_traffic(env: &mut Environment, stale: &[RevisionId]) {
+    const TOTAL_BPS: u32 = 10_000;
+    for split in &mut env.traffic_splits {
+        if !split.entries.iter().any(|e| stale.contains(&e.revision_id)) {
+            continue;
+        }
+        split.entries.retain(|e| !stale.contains(&e.revision_id));
+        split.generation = split.generation.saturating_add(1);
+
+        let surviving_total: u32 = split.entries.iter().map(|e| e.weight_bps).sum();
+        if split.entries.is_empty() || surviving_total == 0 {
+            // Nothing healthy left (or every survivor had zero weight): the
+            // deployment has no live routing. Clearing the entries drops the
+            // split from the runtime-config projection entirely.
+            split.entries.clear();
+            continue;
+        }
+        // Renormalize proportionally, then hand the rounding remainder to the
+        // heaviest entry so the sum is exactly TOTAL_BPS.
+        let mut running = 0u32;
+        let mut heaviest = 0usize;
+        for i in 0..split.entries.len() {
+            let scaled = (u64::from(split.entries[i].weight_bps) * u64::from(TOTAL_BPS)
+                / u64::from(surviving_total)) as u32;
+            split.entries[i].weight_bps = scaled;
+            running += scaled;
+            if split.entries[i].weight_bps > split.entries[heaviest].weight_bps {
+                heaviest = i;
+            }
+        }
+        split.entries[heaviest].weight_bps += TOTAL_BPS - running;
+    }
+    // A split with no entries is not a valid TrafficSplit (weights must sum to
+    // 10,000), so drop it rather than persist an invalid document.
+    env.traffic_splits.retain(|s| !s.entries.is_empty());
 }
 
 /// Aggregated registry-resolution issues for `Environment.extensions`, reported
@@ -4609,5 +4813,227 @@ mod tests {
             panic!("expected Conflict");
         };
         assert!(msg.contains("must be a JSON object"), "got: {msg}");
+    }
+
+    /// Repair of environments staged before greentic 1.1.0, whose revisions
+    /// recorded a `pack_list_lock_ref` that no file ever backed.
+    mod repair_stale_revisions {
+        use super::*;
+        use crate::cli::tests_common::{make_bundle_deployment, make_revision, make_traffic_split};
+        use greentic_deploy_spec::{RevisionLifecycle, TrafficSplitEntry};
+        use std::path::{Path, PathBuf};
+
+        /// An env with `bundle_id`'s deployment carrying ONE revision at 100%.
+        /// `pack_list_lock_ref` is left at the fixture default (`pack-list.lock`
+        /// — the pre-1.1.0 placeholder), so the revision is stale unless
+        /// `pin_lock` writes a real lockfile and repoints the ref at it.
+        fn seed_env(dir: &Path, bundle_id: &str, pin_lock: bool) -> (LocalFsStore, RevisionId) {
+            let store = LocalFsStore::new(dir);
+            let mut env = make_env("local");
+            let deployment = make_bundle_deployment("local", bundle_id);
+            let mut revision = make_revision(
+                "local",
+                bundle_id,
+                &deployment.deployment_id,
+                1,
+                RevisionLifecycle::Ready,
+            );
+            if pin_lock {
+                let rel = PathBuf::from("revisions")
+                    .join(revision.revision_id.to_string())
+                    .join("pack-list.lock");
+                let abs = dir.join("local").join(&rel);
+                std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+                std::fs::write(&abs, "{}").unwrap();
+                revision.pack_list_lock_ref = rel;
+            }
+            let split = make_traffic_split(
+                "local",
+                bundle_id,
+                &deployment.deployment_id,
+                &revision.revision_id,
+                "01J000000000000000000000AA",
+            );
+            let revision_id = revision.revision_id;
+            env.bundles.push(deployment);
+            env.revisions.push(revision);
+            env.traffic_splits.push(split);
+            store.save(&env).unwrap();
+            (store, revision_id)
+        }
+
+        #[test]
+        fn doctor_reports_the_stale_revision() {
+            let dir = tempdir().unwrap();
+            let (store, revision_id) = seed_env(dir.path(), "stale-may-bundle", false);
+            let outcome = doctor(&store, &OpFlags::default(), "local").unwrap();
+            let stale = outcome.result["stale_revisions"].as_array().unwrap();
+            assert_eq!(stale.len(), 1, "{:#}", outcome.result);
+            assert_eq!(stale[0]["revision_id"], revision_id.to_string());
+            assert_eq!(stale[0]["recorded_pack_list_lock_ref"], "pack-list.lock");
+        }
+
+        /// A revision whose lockfile really is on disk must never be reported.
+        /// Without this, "repair" could happily archive every healthy revision.
+        #[test]
+        fn doctor_is_silent_on_a_healthy_revision() {
+            let dir = tempdir().unwrap();
+            let (store, _) = seed_env(dir.path(), "healthy-bundle", true);
+            let outcome = doctor(&store, &OpFlags::default(), "local").unwrap();
+            assert!(
+                outcome.result["stale_revisions"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "a revision with a real lockfile is not stale: {:#}",
+                outcome.result
+            );
+        }
+
+        /// The default (no `--apply`) must be a dry run: it reports, and leaves
+        /// the env byte-for-byte alone.
+        #[test]
+        fn check_reports_without_mutating() {
+            let dir = tempdir().unwrap();
+            let (store, revision_id) = seed_env(dir.path(), "stale-may-bundle", false);
+            let outcome = repair(&store, &OpFlags::default(), "local", false).unwrap();
+            assert_eq!(outcome.result["mode"], "check");
+            assert_eq!(outcome.result["repaired"], 0);
+            assert_eq!(
+                outcome.result["stale_revisions"].as_array().unwrap().len(),
+                1
+            );
+
+            let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+            assert_eq!(
+                env.traffic_splits.len(),
+                1,
+                "check must not touch the traffic split"
+            );
+            let revision = env
+                .revisions
+                .iter()
+                .find(|r| r.revision_id == revision_id)
+                .unwrap();
+            assert_eq!(
+                revision.lifecycle,
+                RevisionLifecycle::Ready,
+                "check must not archive anything"
+            );
+        }
+
+        #[test]
+        fn apply_evicts_the_split_and_archives_the_revision() {
+            let dir = tempdir().unwrap();
+            let (store, revision_id) = seed_env(dir.path(), "stale-may-bundle", false);
+            let outcome = repair(&store, &OpFlags::default(), "local", true).unwrap();
+            assert_eq!(outcome.result["mode"], "apply");
+            assert_eq!(outcome.result["repaired"], 1, "{:#}", outcome.result);
+
+            let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+            assert!(
+                env.traffic_splits.is_empty(),
+                "the split had only the stale revision, so it must be dropped entirely"
+            );
+            let revision = env
+                .revisions
+                .iter()
+                .find(|r| r.revision_id == revision_id)
+                .unwrap();
+            assert_eq!(revision.lifecycle, RevisionLifecycle::Archived);
+            assert!(
+                env.bundles[0].current_revisions.is_empty(),
+                "the archived revision must leave the deployment's current_revisions"
+            );
+            // The deployment itself survives: re-deploying its bundle must be
+            // able to bring it back.
+            assert_eq!(env.bundles.len(), 1);
+        }
+
+        #[test]
+        fn apply_is_idempotent() {
+            let dir = tempdir().unwrap();
+            let (store, _) = seed_env(dir.path(), "stale-may-bundle", false);
+            repair(&store, &OpFlags::default(), "local", true).unwrap();
+            let second = repair(&store, &OpFlags::default(), "local", true).unwrap();
+            assert_eq!(second.result["repaired"], 0);
+            assert_eq!(
+                second.result["detail"],
+                "no stale revisions; nothing to repair"
+            );
+        }
+
+        /// A split holding BOTH a stale and a healthy revision must not simply
+        /// lose the stale entry: `greentic-start` rejects any deployment whose
+        /// weights do not sum to exactly 10,000 bps, so dropping 3,000 bps
+        /// would trade a stale-ref failure for a weight-sum failure. The
+        /// survivor has to be renormalized back to 10,000.
+        #[test]
+        fn apply_rebalances_a_split_that_keeps_a_healthy_revision() {
+            let dir = tempdir().unwrap();
+            let store = LocalFsStore::new(dir.path());
+            let mut env = make_env("local");
+            let deployment = make_bundle_deployment("local", "mixed-bundle");
+
+            let stale = make_revision(
+                "local",
+                "mixed-bundle",
+                &deployment.deployment_id,
+                1,
+                RevisionLifecycle::Ready,
+            );
+            let mut healthy = make_revision(
+                "local",
+                "mixed-bundle",
+                &deployment.deployment_id,
+                2,
+                RevisionLifecycle::Ready,
+            );
+            let rel = PathBuf::from("revisions")
+                .join(healthy.revision_id.to_string())
+                .join("pack-list.lock");
+            let abs = dir.path().join("local").join(&rel);
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            std::fs::write(&abs, "{}").unwrap();
+            healthy.pack_list_lock_ref = rel;
+
+            let mut split = make_traffic_split(
+                "local",
+                "mixed-bundle",
+                &deployment.deployment_id,
+                &stale.revision_id,
+                "01J000000000000000000000AA",
+            );
+            // 30% stale / 70% healthy — a canary that straddled the upgrade.
+            split.entries = vec![
+                TrafficSplitEntry {
+                    revision_id: stale.revision_id,
+                    weight_bps: 3_000,
+                },
+                TrafficSplitEntry {
+                    revision_id: healthy.revision_id,
+                    weight_bps: 7_000,
+                },
+            ];
+            let healthy_id = healthy.revision_id;
+            env.bundles.push(deployment);
+            env.revisions.push(stale);
+            env.revisions.push(healthy);
+            env.traffic_splits.push(split);
+            store.save(&env).unwrap();
+
+            let outcome = repair(&store, &OpFlags::default(), "local", true).unwrap();
+            assert_eq!(outcome.result["repaired"], 1);
+
+            let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+            let split = &env.traffic_splits[0];
+            assert_eq!(split.entries.len(), 1, "the stale entry must be evicted");
+            assert_eq!(split.entries[0].revision_id, healthy_id);
+            assert_eq!(
+                split.entries[0].weight_bps, 10_000,
+                "the surviving revision must be renormalized to a full 10,000 bps, \
+                 not left at its original 7,000"
+            );
+        }
     }
 }

@@ -133,6 +133,10 @@ fn route_remote(
             EnvVerb::List => super::env::list(store, flags),
             EnvVerb::Show { env_id } => super::env::show(store, flags, &env_id),
             EnvVerb::Doctor { .. } => Err(not_supported("env doctor")),
+            // Repair reads the env DIRECTORY (it must know whether each
+            // revision's pinned pack list exists on disk), so it is inherently
+            // local-fs only.
+            EnvVerb::Repair { .. } => Err(not_supported("env repair")),
             EnvVerb::ToolCheck { .. } => Err(not_supported("env tool-check")),
             EnvVerb::Render(_) => Err(not_supported("env render")),
             EnvVerb::Reconcile(args) => remote_reconcile(store, flags, args),
