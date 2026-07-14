@@ -613,6 +613,18 @@ mod tests {
         s
     }
 
+    /// Collect from BOTH runtime roots the way `stage_into` does. Five tests were
+    /// repeating this pair; a third root must only ever be added in one place.
+    fn collect_runtime_gtpacks(root: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let packs_dir = root.join("packs");
+        if packs_dir.is_dir() {
+            collect_gtpacks(&packs_dir, &mut found).unwrap();
+        }
+        collect_provider_gtpacks(root, &mut found).unwrap();
+        found
+    }
+
     /// THE REGRESSION THIS FIX EXISTS FOR: a bundle-shipped provider pack must be
     /// pinned into `pack-list.lock`. Before this, `providers/**` was never scanned,
     /// so `messaging-webchat-gui` never reached the runtime and every route it
@@ -624,9 +636,7 @@ mod tests {
         let root = dir.path();
         bundle_tree(root);
 
-        let mut found = Vec::new();
-        collect_gtpacks(&root.join("packs"), &mut found).unwrap();
-        collect_provider_gtpacks(root, &mut found).unwrap();
+        let found = collect_runtime_gtpacks(root);
 
         assert_eq!(
             stems(&found),
@@ -665,9 +675,7 @@ mod tests {
         let root = dir.path();
         bundle_tree(root);
 
-        let mut found = Vec::new();
-        collect_gtpacks(&root.join("packs"), &mut found).unwrap();
-        collect_provider_gtpacks(root, &mut found).unwrap();
+        let found = collect_runtime_gtpacks(root);
 
         let s = stems(&found);
         assert!(!s.iter().any(|p| p == "stray"), "resolved/ pack leaked in");
@@ -698,9 +706,7 @@ mod tests {
         std::fs::write(root.join("packs/dup.gtpack"), b"PK\x03\x04").unwrap();
         std::fs::write(root.join("providers/messaging/dup.gtpack"), b"PK\x03\x04").unwrap();
 
-        let mut found = Vec::new();
-        collect_gtpacks(&root.join("packs"), &mut found).unwrap();
-        collect_provider_gtpacks(root, &mut found).unwrap();
+        let found = collect_runtime_gtpacks(root);
 
         let err =
             reject_duplicate_pack_ids(&found).expect_err("duplicate pack id must be rejected");
@@ -723,9 +729,7 @@ mod tests {
         let root = dir.path();
         bundle_tree(root);
 
-        let mut found = Vec::new();
-        collect_gtpacks(&root.join("packs"), &mut found).unwrap();
-        collect_provider_gtpacks(root, &mut found).unwrap();
+        let found = collect_runtime_gtpacks(root);
 
         reject_duplicate_pack_ids(&found).expect("distinct ids must be accepted");
     }

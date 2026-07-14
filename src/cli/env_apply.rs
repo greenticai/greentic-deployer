@@ -1132,7 +1132,7 @@ fn resolve_and_validate(
         }
     }
 
-    let env_id_for_dir = env_id.clone();
+    let env_dir = store.env_dir(&env_id).ok();
     Ok(ApplyContext {
         env_id,
         manifest,
@@ -1147,7 +1147,7 @@ fn resolve_and_validate(
         warnings,
         updated_by,
         manifest_dir: manifest_dir.to_path_buf(),
-        env_dir: store.env_dir(&env_id_for_dir).ok(),
+        env_dir,
     })
 }
 
@@ -3091,12 +3091,6 @@ pub(super) fn digest_is_real(digest: &str) -> bool {
     digest.starts_with("sha256:") && digest.len() > "sha256:".len() && digest != "sha256:00"
 }
 
-/// Strict convergence: the deployment's traffic split has EXACTLY ONE entry
-/// at full weight (10,000 bps), that entry's revision exists, carries a real
-/// digest, the digest matches `expected_digest`, and `bundle_source_uri`
-/// matches (`None` vs `Some` counts as a difference — a K8s worker needs
-/// the pull ref to boot). A mixed split (e.g. 60/40 blue-green) or a
-/// degenerate placeholder digest is NOT converged.
 /// Every revision this deployment currently serves must pin every runtime pack
 /// its staged bundle carries. A revision staged by a deployer that only scanned
 /// `packs/` has a SHORT lock — its bundle's providers were never pinned, so the
@@ -3136,6 +3130,15 @@ fn live_pack_lists_are_complete(
     })
 }
 
+/// Strict convergence: the deployment's traffic split has EXACTLY ONE entry
+/// at full weight (10,000 bps), that entry's revision exists, carries a real
+/// digest, the digest matches `expected_digest`, and `bundle_source_uri`
+/// matches (`None` vs `Some` counts as a difference — a K8s worker needs
+/// the pull ref to boot). A mixed split (e.g. 60/40 blue-green) or a
+/// degenerate placeholder digest is NOT converged.
+///
+/// Says nothing about whether the converged revision's pack list is COMPLETE —
+/// that is [`live_pack_lists_are_complete`], and both must hold.
 fn deployment_converged(
     env: &Environment,
     deployment_id: DeploymentId,
