@@ -1586,7 +1586,8 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
             }
             Some(dep) if is_multi => {
                 let env = ctx.env.as_ref().expect("existing deployment implies env");
-                let converged = split_converged(env, dep.deployment_id, &rb.revisions);
+                let converged = split_converged(env, dep.deployment_id, &rb.revisions)
+                    && live_pack_lists_are_complete(ctx.env_dir.as_deref(), env, dep.deployment_id);
                 let desired_binding: Option<RouteBinding> =
                     rb.spec.route_binding.clone().map(into_route_binding);
                 let binding_differs = desired_binding
@@ -2520,6 +2521,18 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
                 ));
             }
         }
+        // Post-condition, both shapes: a served revision must pin every runtime
+        // pack its own staged bundle carries. Digest convergence cannot see this —
+        // the digest is unchanged when the lock is short — so without this the
+        // verifier reports `failures: []` over an env that serves no provider
+        // routes at all. That green verify is exactly how this shipped.
+        if !live_pack_lists_are_complete(ctx.env_dir.as_deref(), &env, dep.deployment_id) {
+            failures.push(format!(
+                "bundle `{}`: a served revision's pack-list.lock omits packs its \
+                 staged bundle carries (provider routes will not serve)",
+                rb.spec.bundle_id
+            ));
+        }
         if let Some(binding) = &rb.spec.route_binding {
             let desired = into_route_binding(binding.clone());
             if desired != dep.route_binding {
@@ -3367,7 +3380,7 @@ mod tests {
         bootstrap_env_trust_root, make_binding, make_bundle_deployment, make_env, make_revision,
         make_traffic_split,
     };
-    use greentic_deploy_spec::{CapabilitySlot, RevisionLifecycle};
+    use greentic_deploy_spec::{CapabilitySlot, PackListLock, RevisionLifecycle};
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -3591,6 +3604,148 @@ mod tests {
             "steps: {:?}",
             step_actions(&again.result)
         );
+    }
+
+    /// The `.gtbundle` carrying the real two-root layout: an app pack under
+    /// `packs/` plus provider packs under `providers/<domain>/`.
+    fn provider_fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/bundles/provider-packs-bundle.gtbundle")
+    }
+
+    fn provider_manifest(bundle_path: &Path) -> Value {
+        json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "provider-packs-bundle",
+                "bundle_path": bundle_path,
+            }]
+        })
+    }
+
+    fn lock_of_live_revision(store: &LocalFsStore) -> (PathBuf, PackListLock) {
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        let rev = env.revisions.last().expect("a staged revision");
+        let path = env_dir.join(&rev.pack_list_lock_ref);
+        let lock: PackListLock = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        (path, lock)
+    }
+
+    /// THE SELF-HEAL, at the real call site.
+    ///
+    /// Apply a bundle, then rewrite its `pack-list.lock` exactly the way the
+    /// pre-fix deployer wrote it — provider packs dropped — and re-apply the SAME
+    /// manifest. The bundle digest is unchanged, so digest convergence alone
+    /// no-ops and the env stays broken forever. Completeness makes it re-stage.
+    ///
+    /// Deleting the `live_pack_lists_are_complete` clause from EITHER convergence
+    /// site fails here; the unit tests on the predicate itself do not.
+    #[test]
+    fn re_apply_re_stages_a_revision_whose_pack_list_is_incomplete() {
+        let (dir, store) = seeded_store();
+        let bundle = provider_fixture();
+        let path = write_manifest(dir.path(), &provider_manifest(&bundle));
+
+        run_apply(&store, &path).expect("first apply");
+        let (lock_path, lock) = lock_of_live_revision(&store);
+        let mut ids: Vec<String> = lock.packs.iter().map(|p| p.pack_id.to_string()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["app", "messaging-webchat-gui", "state-memory"],
+            "staging must pin the app pack AND the runtime provider packs"
+        );
+
+        // Converged, healthy: re-applying an unchanged bundle is a no-op.
+        let again = run_apply(&store, &path).expect("re-apply of a healthy env");
+        assert!(
+            step_actions(&again.result)
+                .iter()
+                .any(|(kind, action)| kind == "deploy-bundle" && action == "no-op"),
+            "a healthy env must NOT re-stage on every apply: {:?}",
+            step_actions(&again.result)
+        );
+
+        // Now damage it the way the pre-fix deployer did: keep only the app pack.
+        let mut short = lock.clone();
+        short.packs.retain(|p| p.pack_id.to_string() == "app");
+        assert_eq!(short.packs.len(), 1);
+        std::fs::write(&lock_path, serde_json::to_vec(&short).unwrap()).unwrap();
+
+        // Same manifest, same bundle, same digest — and it MUST re-stage.
+        let healed = run_apply(&store, &path).expect("re-apply of a short-locked env");
+        assert!(
+            step_actions(&healed.result)
+                .iter()
+                .any(|(kind, action)| kind == "deploy-bundle" && action != "no-op"),
+            "an incomplete pack list must re-stage, not converge: {:?}",
+            step_actions(&healed.result)
+        );
+
+        let (_, healed_lock) = lock_of_live_revision(&store);
+        let mut healed_ids: Vec<String> = healed_lock
+            .packs
+            .iter()
+            .map(|p| p.pack_id.to_string())
+            .collect();
+        healed_ids.sort();
+        assert_eq!(
+            healed_ids,
+            vec!["app", "messaging-webchat-gui", "state-memory"],
+            "the re-staged revision must pin the provider packs again"
+        );
+    }
+
+    /// The MULTI-revision (traffic-split) convergence path has its own predicate,
+    /// `split_converged`, and it is a completely separate call site. Wiring the
+    /// completeness check into the single-revision path alone leaves every
+    /// blue-green env unable to heal — the exact gap Codex caught in review.
+    #[test]
+    fn re_apply_re_stages_an_incomplete_pack_list_on_the_multi_revision_path() {
+        let (dir, store) = seeded_store();
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "provider-packs-bundle",
+                "revisions": [
+                    {"name": "a", "bundle_path": provider_fixture(), "weight_bps": 10000}
+                ]
+            }]
+        });
+        let path = write_manifest(dir.path(), &manifest);
+
+        run_apply(&store, &path).expect("first apply");
+        let (lock_path, lock) = lock_of_live_revision(&store);
+        assert_eq!(lock.packs.len(), 3, "app + 2 runtime provider packs");
+
+        // Healthy: an unchanged split re-applies as a no-op.
+        let again = run_apply(&store, &path).expect("re-apply of a healthy split");
+        assert!(
+            step_actions(&again.result)
+                .iter()
+                .any(|(kind, action)| kind == "deploy-split" && action == "no-op"),
+            "a healthy split must not re-stage on every apply: {:?}",
+            step_actions(&again.result)
+        );
+
+        // Damage the lock the way the pre-fix deployer wrote it.
+        let mut short = lock.clone();
+        short.packs.retain(|p| p.pack_id.to_string() == "app");
+        std::fs::write(&lock_path, serde_json::to_vec(&short).unwrap()).unwrap();
+
+        let healed = run_apply(&store, &path).expect("re-apply of a short-locked split");
+        assert!(
+            step_actions(&healed.result)
+                .iter()
+                .any(|(kind, action)| kind == "deploy-split" && action != "no-op"),
+            "an incomplete pack list must re-stage on the SPLIT path too: {:?}",
+            step_actions(&healed.result)
+        );
+        let (_, healed_lock) = lock_of_live_revision(&store);
+        assert_eq!(healed_lock.packs.len(), 3, "provider packs pinned again");
     }
 
     #[test]

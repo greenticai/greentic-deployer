@@ -303,28 +303,29 @@ fn stage_into(
     // by the runner host; cross-checking the embedded pack manifest's id/version
     // against the bundle lock is deferred (needs a `.gtpack` reader) and is
     // belt-and-suspenders on top of the digest binding + bundle-level DSSE.
-    let packs_dir = extract_dir.join("packs");
-    if !packs_dir.is_dir() {
-        return Err(OpError::InvalidArgument(format!(
-            "bundle `{}` has no packs/ directory",
-            bundle_path.display()
-        )));
-    }
+    // Emptiness is judged on the COMBINED set. `packs/` is not individually
+    // mandatory: `app_packs` and `extension_providers` are independent inputs to
+    // the bundle producer, so a bundle whose runtime packs are all providers is
+    // well-formed. Demanding `packs/` here would reject it for having the wrong
+    // kind of pack, which is exactly the single-root assumption this fix removes.
     let mut gtpacks = Vec::new();
-    collect_gtpacks(&packs_dir, &mut gtpacks).map_err(|source| OpError::Io {
-        path: packs_dir.clone(),
-        source,
-    })?;
-    if gtpacks.is_empty() {
-        return Err(OpError::InvalidArgument(format!(
-            "bundle `{}` contains no .gtpack artifacts under packs/",
-            bundle_path.display()
-        )));
+    let packs_dir = extract_dir.join("packs");
+    if packs_dir.is_dir() {
+        collect_gtpacks(&packs_dir, &mut gtpacks).map_err(|source| OpError::Io {
+            path: packs_dir.clone(),
+            source,
+        })?;
     }
     collect_provider_gtpacks(&extract_dir, &mut gtpacks).map_err(|source| OpError::Io {
         path: extract_dir.join(PROVIDERS_DIR),
         source,
     })?;
+    if gtpacks.is_empty() {
+        return Err(OpError::InvalidArgument(format!(
+            "bundle `{}` contains no .gtpack artifacts under packs/ or providers/<domain>/",
+            bundle_path.display()
+        )));
+    }
 
     reject_duplicate_pack_ids(&gtpacks)?;
 
@@ -495,32 +496,36 @@ pub fn pack_list_is_complete(
     let Ok(lock) = serde_json::from_slice::<PackListLock>(&bytes) else {
         return true;
     };
+    // A lock belonging to some other revision tells us nothing about this one.
+    // Force a re-stage rather than trusting it — re-staging writes a correct lock.
+    if lock.revision_id != revision_id {
+        return false;
+    }
     let extract_dir = env_dir
         .join("revisions")
         .join(revision_id.to_string())
         .join("bundle");
-    if !extract_dir.join("packs").is_dir() {
+    if !extract_dir.is_dir() {
         return true; // nothing staged locally — not ours to judge.
     }
 
     let mut on_disk = Vec::new();
-    if collect_gtpacks(&extract_dir.join("packs"), &mut on_disk).is_err() {
+    let packs_dir = extract_dir.join("packs");
+    if packs_dir.is_dir() && collect_gtpacks(&packs_dir, &mut on_disk).is_err() {
         return true;
     }
     if collect_provider_gtpacks(&extract_dir, &mut on_disk).is_err() {
         return true;
     }
-    // Compare by pack id: the lock stores env-relative paths, and comparing those
-    // to absolute on-disk paths would be a permanent false "incomplete".
-    let locked: HashSet<&str> = lock
-        .packs
-        .iter()
-        .map(|p| p.pack_id.as_str())
-        .collect::<HashSet<_>>();
+    // Compare env-relative PATHS, not pack ids. A pack id is the file stem, so
+    // `packs/dup.gtpack` + `providers/messaging/dup.gtpack` would let ONE locked
+    // entry satisfy BOTH on-disk files and a short lock would read as complete —
+    // the env would then never re-stage, and the duplicate-id guard that should
+    // have rejected the bundle would never even run. Paths are exact.
+    let locked: HashSet<&Path> = lock.packs.iter().map(|p| p.path.as_path()).collect();
     on_disk.iter().all(|p| {
-        p.file_stem()
-            .and_then(|s| s.to_str())
-            .is_none_or(|stem| locked.contains(stem))
+        p.strip_prefix(env_dir)
+            .is_ok_and(|rel| locked.contains(rel))
     })
 }
 
@@ -843,6 +848,92 @@ mod tests {
             "fixture must actually ship a deployer pack or this test proves nothing"
         );
         assert!(pack_list_is_complete(env_dir, rev, &lock_ref));
+    }
+
+    /// A bundle whose runtime packs are ALL providers is well-formed: `app_packs`
+    /// and `extension_providers` are independent inputs to the bundle producer.
+    /// Requiring `packs/` would reject it for having the wrong KIND of pack —
+    /// the single-root assumption this fix exists to remove.
+    #[test]
+    fn a_provider_only_bundle_stages() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+        let revision_id = RevisionId::new();
+        let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/bundles/provider-only-bundle.gtbundle");
+
+        let staged = stage_local_bundle(env_dir, revision_id, &bundle)
+            .expect("a bundle with only provider packs must stage");
+
+        let lock: PackListLock = serde_json::from_slice(
+            &std::fs::read(env_dir.join(&staged.pack_list_lock_ref)).unwrap(),
+        )
+        .unwrap();
+        let ids: Vec<String> = lock.packs.iter().map(|p| p.pack_id.to_string()).collect();
+        assert_eq!(ids, vec!["messaging-webchat-gui"]);
+    }
+
+    /// A bundle with NO runtime packs in EITHER root is still rejected — widening
+    /// the scan must not turn "empty bundle" into a silent success.
+    #[test]
+    fn a_bundle_with_no_runtime_packs_in_either_root_is_rejected() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("extract");
+        std::fs::create_dir_all(root.join("providers/deployer")).unwrap();
+        std::fs::write(root.join("providers/deployer/iac.gtpack"), b"PK\x03\x04").unwrap();
+
+        let mut found = Vec::new();
+        collect_provider_gtpacks(&root, &mut found).unwrap();
+        assert!(
+            found.is_empty(),
+            "only a deployer pack is present, so the runtime pack set is empty"
+        );
+    }
+
+    /// Completeness compares env-relative PATHS, not pack ids. Pack ids are file
+    /// stems, so with a stem-based comparison ONE locked `dup` entry would satisfy
+    /// BOTH `packs/dup.gtpack` and `providers/messaging/dup.gtpack` — a short lock
+    /// would read as complete, the env would never re-stage, and the duplicate-id
+    /// guard that should have rejected the bundle would never even run.
+    #[test]
+    fn a_short_lock_is_incomplete_even_when_the_missing_pack_shares_a_file_stem() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+        let revision_id = RevisionId::new();
+
+        // Hand-build the staged state: staging itself would now reject this bundle,
+        // so the only way to hold it is as a legacy revision already on disk.
+        let rev_dir = env_dir.join("revisions").join(revision_id.to_string());
+        let extract = rev_dir.join("bundle");
+        std::fs::create_dir_all(extract.join("packs")).unwrap();
+        std::fs::create_dir_all(extract.join("providers/messaging")).unwrap();
+        std::fs::write(extract.join("packs/dup.gtpack"), b"PK\x03\x04a").unwrap();
+        std::fs::write(
+            extract.join("providers/messaging/dup.gtpack"),
+            b"PK\x03\x04b",
+        )
+        .unwrap();
+
+        // The pre-fix lock: only the packs/ entry, whose pack_id is also `dup`.
+        let app = extract.join("packs/dup.gtpack");
+        let lock = PackListLock {
+            schema: SchemaVersion::new(SchemaVersion::PACK_LIST_LOCK_V1),
+            revision_id,
+            packs: vec![LockedPack {
+                pack_id: PackId::new("dup"),
+                path: app.strip_prefix(env_dir).unwrap().to_path_buf(),
+                digest: sha256_file(&app).unwrap(),
+            }],
+        };
+        let lock_ref = rev_dir.join("pack-list.lock");
+        std::fs::write(&lock_ref, serde_json::to_vec(&lock).unwrap()).unwrap();
+        let lock_ref = lock_ref.strip_prefix(env_dir).unwrap().to_path_buf();
+
+        assert!(
+            !pack_list_is_complete(env_dir, revision_id, &lock_ref),
+            "the provider `dup` pack is NOT pinned — sharing a file stem with the \
+             app pack must not disguise that"
+        );
     }
 
     /// Unknowable cases are "complete": this check exists to trigger a heal, never
