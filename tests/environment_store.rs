@@ -658,3 +658,111 @@ fn default_root_under_home() {
         );
     }
 }
+
+#[test]
+fn destroy_environment_removes_tree_and_returns_canonical_path() {
+    let (tmp, store) = fresh_store();
+    let id = env_id("doomed");
+    store.save(&minimal_environment(&id)).unwrap();
+    // A sidecar the store APIs never wrote proves rename-then-remove needs
+    // no enumeration of the env dir's contents.
+    std::fs::write(tmp.path().join("doomed").join("trust-root.json"), b"{}").unwrap();
+
+    let outcome = store.destroy_environment(&id).unwrap();
+    assert_eq!(outcome.removed_path, tmp.path().join("doomed"));
+    assert_eq!(outcome.reaped_tombstones, 0);
+    assert!(!outcome.removed_path.exists());
+    assert!(!store.exists(&id).unwrap());
+    assert!(store.list().unwrap().is_empty());
+    // A clean purge leaves no tombstone sibling behind.
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(leftovers.is_empty(), "got {leftovers:?}");
+}
+
+#[test]
+fn destroy_environment_missing_env_is_not_found() {
+    let (tmp, store) = fresh_store();
+    let err = store.destroy_environment(&env_id("ghost")).unwrap_err();
+    assert!(matches!(err, StoreError::NotFound(_)), "got {err:?}");
+    // The unlocked fast-path must not leave a flock husk dir behind.
+    assert!(!tmp.path().join("ghost").exists());
+}
+
+/// Make the (future) tombstone's purge fail: a write-protected dir with a
+/// child makes `remove_dir_all` fail after the (committing) rename.
+#[cfg(unix)]
+fn poison_purge(env_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let blocked = env_dir.join("blocked");
+    std::fs::create_dir_all(&blocked).unwrap();
+    std::fs::write(blocked.join("child"), b"x").unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o555)).unwrap();
+}
+
+/// Find the surviving tombstone under `root` and restore write permissions
+/// on its poisoned dir so a reap — or TempDir::drop — can remove it. Call
+/// BEFORE any assertion so cleanup happens on every exit path.
+#[cfg(unix)]
+fn find_tombstone_and_unblock(root: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let tombstone = std::fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().contains(".destroyed~"))
+        .expect("tombstone survives the failed purge");
+    std::fs::set_permissions(
+        tombstone.path().join("blocked"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    tombstone.path()
+}
+
+#[cfg(unix)]
+#[test]
+fn destroy_environment_purge_failure_is_committed_after_save() {
+    let (tmp, store) = fresh_store();
+    let id = env_id("doomed");
+    store.save(&minimal_environment(&id)).unwrap();
+    poison_purge(&tmp.path().join("doomed"));
+
+    let err = store.destroy_environment(&id).unwrap_err();
+    let _tombstone = find_tombstone_and_unblock(tmp.path());
+
+    assert!(err.is_committed_after_save(), "got {err:?}");
+    // The rename committed: the canonical path is gone...
+    assert!(!store.exists(&id).unwrap());
+    assert!(!tmp.path().join("doomed").exists());
+    // ...and the surviving tombstone is invisible to list().
+    assert!(store.list().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn destroy_environment_rerun_reaps_stale_tombstone() {
+    let (tmp, store) = fresh_store();
+    let id = env_id("doomed");
+    store.save(&minimal_environment(&id)).unwrap();
+    poison_purge(&tmp.path().join("doomed"));
+
+    let err = store.destroy_environment(&id).unwrap_err();
+    assert!(err.is_committed_after_save());
+    find_tombstone_and_unblock(tmp.path());
+
+    // Re-running destroy reaps the stale tombstone.
+    let outcome = store.destroy_environment(&id).unwrap();
+    assert_eq!(outcome.removed_path, tmp.path().join("doomed"));
+    assert_eq!(outcome.reaped_tombstones, 1);
+
+    // The tombstone is gone from the root.
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains(".destroyed~"))
+        .collect();
+    assert!(leftovers.is_empty(), "got {leftovers:?}");
+}
