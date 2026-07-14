@@ -2022,6 +2022,10 @@ fn updates_step(
     let enabled = updates.resolved_enabled();
     let endpoint = updates.plan_endpoint.trim().to_string();
     let declared_action = updates.on_notify.as_deref().and_then(UpdateAction::parse);
+    let stream_endpoint = updates
+        .stream_endpoint
+        .as_deref()
+        .map(|s| s.trim().to_string());
 
     let current = store.load_update_channel(&ctx.env_id)?;
     let unchanged = current.as_ref().is_some_and(|cur| {
@@ -2034,10 +2038,9 @@ fn updates_step(
             && updates
                 .push_enabled
                 .is_none_or(|want| cur.push_enabled == Some(want))
-            && updates
-                .stream_endpoint
-                .as_ref()
-                .is_none_or(|want| cur.stream_endpoint.as_deref() == Some(want.as_str()))
+            && stream_endpoint
+                .as_deref()
+                .is_none_or(|want| cur.stream_endpoint.as_deref() == Some(want))
     });
     if unchanged {
         return Ok(ApplyStep::no_op(
@@ -2058,7 +2061,7 @@ fn updates_step(
         "poll_interval_secs": updates.poll_interval_secs,
         "plan_endpoint": endpoint,
         "push_enabled": updates.push_enabled,
-        "stream_endpoint": updates.stream_endpoint,
+        "stream_endpoint": stream_endpoint,
     }));
     let ikey = derive_idempotency_key(
         &ctx.env_id,
@@ -2083,7 +2086,7 @@ fn updates_step(
             poll_interval_secs: updates.poll_interval_secs,
             plan_endpoint: Some(endpoint),
             push_enabled: updates.push_enabled,
-            stream_endpoint: updates.stream_endpoint.clone(),
+            stream_endpoint,
         })),
     })
 }
