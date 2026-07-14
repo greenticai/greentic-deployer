@@ -3885,6 +3885,47 @@ mod tests {
     }
 
     #[test]
+    fn updates_block_whitespace_in_stream_endpoint_is_idempotent() {
+        let (dir, store) = seeded_store();
+
+        // First apply: set an explicit stream_endpoint (trimmed value).
+        let clean = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "http://127.0.0.1:3140/v1/environments/local/plan",
+                "on_notify": "stage",
+                "poll_interval_secs": 60,
+                "stream_endpoint": "https://example.com/custom/stream",
+            }
+        });
+        let first = write_manifest(dir.path(), &clean);
+        run_apply(&store, &first).expect("first apply");
+
+        // Re-apply with leading AND trailing whitespace around the same value.
+        // The trim normalization makes the values match → no-op.
+        let with_ws = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "http://127.0.0.1:3140/v1/environments/local/plan",
+                "on_notify": "stage",
+                "poll_interval_secs": 60,
+                "stream_endpoint": "  https://example.com/custom/stream  ",
+            }
+        });
+        let path = dir.path().join("manifest-ws.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&with_ws).unwrap()).unwrap();
+        let outcome = run_apply(&store, &path).expect("re-apply with whitespace");
+        assert!(
+            step_actions(&outcome.result)
+                .contains(&("configure-updates".to_string(), "no-op".to_string())),
+            "whitespace-only difference in stream_endpoint must not trigger an update step, got: {:?}",
+            step_actions(&outcome.result)
+        );
+    }
+
+    #[test]
     fn fresh_apply_then_noop_reapply() {
         let (dir, store) = seeded_store();
         let manifest_path = write_manifest(dir.path(), &full_manifest(&fixture()));

@@ -155,7 +155,15 @@ pub const MIN_POLL_INTERVAL_SECS: u64 = 60;
 /// `Eq` is deliberately not derived: [`unknown`](Self::unknown) holds arbitrary
 /// JSON (`serde_json::Value` is `PartialEq` but not `Eq`). Nothing in the
 /// ecosystem uses this type as a map key or in a set, so `PartialEq` is enough.
+///
+/// `#[non_exhaustive]` from birth: all behavior fields are optional and additive,
+/// and the `#[serde(flatten)] unknown` catch-all already preserves
+/// forward-compatibility on the wire. `#[non_exhaustive]` now preserves it in the
+/// Rust API — future optional fields can land in a patch release without breaking
+/// downstream struct-literal construction, keeping deploy-spec on the 0.2.x line
+/// that `greentic-runner-host` requires.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct UpdateChannelConfig {
     pub schema: SchemaVersion,
     pub environment_id: EnvId,
