@@ -2031,6 +2031,13 @@ fn updates_step(
             && updates
                 .poll_interval_secs
                 .is_none_or(|want| cur.resolved_poll_interval_secs() == want)
+            && updates
+                .push_enabled
+                .is_none_or(|want| cur.push_enabled == Some(want))
+            && updates
+                .stream_endpoint
+                .as_ref()
+                .is_none_or(|want| cur.stream_endpoint.as_deref() == Some(want.as_str()))
     });
     if unchanged {
         return Ok(ApplyStep::no_op(
@@ -2050,6 +2057,8 @@ fn updates_step(
         "on_notify": updates.on_notify,
         "poll_interval_secs": updates.poll_interval_secs,
         "plan_endpoint": endpoint,
+        "push_enabled": updates.push_enabled,
+        "stream_endpoint": updates.stream_endpoint,
     }));
     let ikey = derive_idempotency_key(
         &ctx.env_id,
@@ -2073,6 +2082,8 @@ fn updates_step(
             on_notify: updates.on_notify.clone(),
             poll_interval_secs: updates.poll_interval_secs,
             plan_endpoint: Some(endpoint),
+            push_enabled: updates.push_enabled,
+            stream_endpoint: updates.stream_endpoint.clone(),
         })),
     })
 }
@@ -3799,6 +3810,39 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cfg.resolved_action(), UpdateAction::Apply);
+    }
+
+    #[test]
+    fn updates_block_changing_push_enabled_replans_as_update() {
+        let (dir, store) = seeded_store();
+        let staged = write_manifest(dir.path(), &updates_manifest("stage"));
+        run_apply(&store, &staged).expect("first apply");
+
+        // Same endpoint + action, but adding push_enabled: false -> Update step.
+        let with_push = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "http://127.0.0.1:3140/v1/environments/local/plan",
+                "on_notify": "stage",
+                "poll_interval_secs": 60,
+                "push_enabled": false,
+            }
+        });
+        let path = dir.path().join("manifest-push.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&with_push).unwrap()).unwrap();
+        let outcome = run_apply(&store, &path).expect("second apply");
+        assert!(
+            step_actions(&outcome.result)
+                .contains(&("configure-updates".to_string(), "update".to_string())),
+            "a push_enabled change must produce an update step, got: {:?}",
+            step_actions(&outcome.result)
+        );
+        let cfg = store
+            .load_update_channel(&EnvId::try_from("local").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.push_enabled, Some(false));
     }
 
     #[test]

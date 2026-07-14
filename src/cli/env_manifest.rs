@@ -113,6 +113,14 @@ pub struct ManifestUpdates {
     /// the stored value unchanged (unset resolves to 3600).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_interval_secs: Option<u64>,
+    /// Whether the runtime subscribes to a pushed update stream (SSE). Absent =
+    /// leave the stored value unchanged (unset resolves to `true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_enabled: Option<bool>,
+    /// SSE stream endpoint URL. Absent = leave the stored value unchanged (unset
+    /// derives from `plan_endpoint`). Must be https (or http to loopback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_endpoint: Option<String>,
 }
 
 impl ManifestUpdates {
@@ -525,6 +533,20 @@ impl EnvManifest {
                     "updates.poll_interval_secs {secs} is below the {}s floor",
                     greentic_deploy_spec::MIN_POLL_INTERVAL_SECS
                 )));
+            }
+            if let Some(ref ep) = updates.stream_endpoint {
+                let ep = ep.trim();
+                if ep.is_empty() {
+                    return Err(OpError::InvalidArgument(
+                        "updates.stream_endpoint must not be empty".to_string(),
+                    ));
+                }
+                if !super::updates::control_url_is_acceptable(ep) {
+                    return Err(OpError::InvalidArgument(format!(
+                        "updates.stream_endpoint {ep:?} is not an acceptable control URL \
+                         (https required; http only to loopback)"
+                    )));
+                }
             }
         }
 
