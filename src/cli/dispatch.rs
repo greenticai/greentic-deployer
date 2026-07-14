@@ -770,6 +770,16 @@ pub struct UpdatesConfigSetArgs {
     /// Must be https (or http to loopback). Omit to leave unchanged.
     #[arg(long = "plan-endpoint")]
     pub plan_endpoint: Option<String>,
+    /// Whether the runtime subscribes to a pushed update stream (SSE) instead
+    /// of relying solely on the fallback poll. Omit to leave unchanged (unset
+    /// resolves to `true`).
+    #[arg(long = "push-enabled")]
+    pub push_enabled: Option<bool>,
+    /// SSE stream endpoint the runtime connects to for pushed updates. Must be
+    /// https (or http to loopback). Omit to leave unchanged (unset derives from
+    /// plan-endpoint).
+    #[arg(long = "stream-endpoint")]
+    pub stream_endpoint: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1664,6 +1674,8 @@ fn dispatch_updates(
                         on_notify: args.on_notify,
                         poll_interval_secs: args.poll_interval_secs,
                         plan_endpoint: args.plan_endpoint,
+                        push_enabled: args.push_enabled,
+                        stream_endpoint: args.stream_endpoint,
                     });
             super::updates::config_set(store, flags, payload)?
         }

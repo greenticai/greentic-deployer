@@ -2540,7 +2540,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-deploy-spec"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "chrono",
  "greentic-config-types",
@@ -2560,7 +2560,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "1.1.15"
+version = "1.1.16"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2582,7 +2582,7 @@ dependencies = [
  "greentic-bundle",
  "greentic-config",
  "greentic-config-types",
- "greentic-deploy-spec 0.2.2",
+ "greentic-deploy-spec 0.2.3",
  "greentic-distributor-client",
  "greentic-operator-store-server",
  "greentic-operator-trust",
@@ -2661,7 +2661,7 @@ name = "greentic-environment-store-postgres"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "greentic-deploy-spec 0.2.2",
+ "greentic-deploy-spec 0.2.3",
  "serde",
  "serde_json",
  "sqlx",
@@ -2711,7 +2711,7 @@ dependencies = [
  "chrono",
  "clap",
  "fs4",
- "greentic-deploy-spec 0.2.2",
+ "greentic-deploy-spec 0.2.3",
  "greentic-operator-trust",
  "hex",
  "http-body-util",
@@ -2734,7 +2734,7 @@ version = "0.2.1"
 dependencies = [
  "chrono",
  "ed25519-dalek",
- "greentic-deploy-spec 0.2.2",
+ "greentic-deploy-spec 0.2.3",
  "greentic-distributor-client",
  "hex",
  "libc",

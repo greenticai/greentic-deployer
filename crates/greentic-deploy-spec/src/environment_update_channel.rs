@@ -155,7 +155,15 @@ pub const MIN_POLL_INTERVAL_SECS: u64 = 60;
 /// `Eq` is deliberately not derived: [`unknown`](Self::unknown) holds arbitrary
 /// JSON (`serde_json::Value` is `PartialEq` but not `Eq`). Nothing in the
 /// ecosystem uses this type as a map key or in a set, so `PartialEq` is enough.
+///
+/// `#[non_exhaustive]` from birth: all behavior fields are optional and additive,
+/// and the `#[serde(flatten)] unknown` catch-all already preserves
+/// forward-compatibility on the wire. `#[non_exhaustive]` now preserves it in the
+/// Rust API — future optional fields can land in a patch release without breaking
+/// downstream struct-literal construction, keeping deploy-spec on the 0.2.x line
+/// that `greentic-runner-host` requires.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct UpdateChannelConfig {
     pub schema: SchemaVersion,
     pub environment_id: EnvId,
@@ -191,6 +199,21 @@ pub struct UpdateChannelConfig {
     /// URL on set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_endpoint: Option<String>,
+    /// Whether the runtime subscribes to a pushed update stream (SSE) instead of
+    /// relying solely on the fallback poll. `None` → resolved to `true`: push
+    /// carries the same data, in the same outbound direction, as the poll this
+    /// channel already authorizes, so it is not a new authority. A server without
+    /// the stream endpoint 404s and the runtime silently degrades to poll-only —
+    /// i.e. exactly today's behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_enabled: Option<bool>,
+    /// SSE stream endpoint the runtime connects to for pushed updates. When unset,
+    /// derived from `plan_endpoint` by replacing a trailing `/plan` with
+    /// `/updates/stream`; `None` when there is no plan endpoint or it does not end
+    /// in `/plan` (we will not guess). Validated as an acceptable control URL on
+    /// set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_endpoint: Option<String>,
     /// Forward-compatibility catch-all. Any keys in the on-disk
     /// `update-channel.json` that this binary's schema does not recognize are
     /// captured here and re-emitted verbatim on save. `config-set` is a
@@ -221,6 +244,8 @@ impl UpdateChannelConfig {
             on_update: None,
             poll_interval_secs: None,
             plan_endpoint: None,
+            push_enabled: None,
+            stream_endpoint: None,
             unknown: serde_json::Map::new(),
         }
     }
@@ -269,6 +294,28 @@ impl UpdateChannelConfig {
     /// Resolved plan endpoint (`None` when unset — the poll loop has no source).
     pub fn resolved_plan_endpoint(&self) -> Option<&str> {
         self.plan_endpoint.as_deref()
+    }
+
+    /// `None` => `true`. Push carries the same data, in the same outbound
+    /// direction, as the poll this channel already authorizes, so it is not a
+    /// new authority. A server without the stream endpoint 404s and the runtime
+    /// silently degrades to poll-only — i.e. exactly today's behavior.
+    pub fn resolved_push_enabled(&self) -> bool {
+        self.push_enabled.unwrap_or(true)
+    }
+
+    /// Explicit value when set; otherwise DERIVED from `plan_endpoint` by
+    /// replacing a trailing `/plan` with `/updates/stream`. Returns `None` when
+    /// there is no plan endpoint, or when it does not end in `/plan` (we will
+    /// not guess).
+    pub fn resolved_stream_endpoint(&self) -> Option<String> {
+        if let Some(ref ep) = self.stream_endpoint {
+            return Some(ep.clone());
+        }
+        let plan_ep = self.plan_endpoint.as_deref()?;
+        plan_ep
+            .strip_suffix("/plan")
+            .map(|base| format!("{base}/updates/stream"))
     }
 }
 
@@ -491,6 +538,149 @@ mod tests {
         let back: UpdateChannelConfig = serde_json::from_value(rewritten).unwrap();
         assert_eq!(back.resolved_action(), UpdateAction::Apply);
         assert_eq!(back.enabled, Some(false));
+    }
+
+    #[test]
+    fn resolved_push_enabled_defaults_to_true() {
+        let cfg = UpdateChannelConfig::disabled(env("local"));
+        assert!(cfg.resolved_push_enabled(), "unset defaults to true");
+        assert_eq!(cfg.push_enabled, None);
+    }
+
+    #[test]
+    fn resolved_push_enabled_respects_explicit_false() {
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.push_enabled = Some(false);
+        assert!(!cfg.resolved_push_enabled());
+    }
+
+    #[test]
+    fn resolved_stream_endpoint_explicit() {
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.stream_endpoint = Some("https://custom.example.com/stream".into());
+        assert_eq!(
+            cfg.resolved_stream_endpoint().as_deref(),
+            Some("https://custom.example.com/stream")
+        );
+    }
+
+    #[test]
+    fn resolved_stream_endpoint_derived_from_plan_endpoint() {
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.plan_endpoint = Some("https://updates.example.com/v1/environments/local/plan".into());
+        assert_eq!(
+            cfg.resolved_stream_endpoint().as_deref(),
+            Some("https://updates.example.com/v1/environments/local/updates/stream")
+        );
+    }
+
+    #[test]
+    fn resolved_stream_endpoint_underivable() {
+        // plan_endpoint does not end in `/plan` — derivation returns None.
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.plan_endpoint = Some("https://updates.example.com/v1/latest".into());
+        assert_eq!(cfg.resolved_stream_endpoint(), None);
+    }
+
+    #[test]
+    fn resolved_stream_endpoint_none_when_no_plan_endpoint() {
+        let cfg = UpdateChannelConfig::disabled(env("local"));
+        assert_eq!(cfg.resolved_stream_endpoint(), None);
+    }
+
+    #[test]
+    fn push_fields_round_trip_through_serde() {
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.push_enabled = Some(false);
+        cfg.stream_endpoint = Some("https://example.com/updates/stream".into());
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            json.get("push_enabled").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            json.get("stream_endpoint").and_then(|v| v.as_str()),
+            Some("https://example.com/updates/stream")
+        );
+        let back: UpdateChannelConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.push_enabled, Some(false));
+        assert_eq!(
+            back.stream_endpoint.as_deref(),
+            Some("https://example.com/updates/stream")
+        );
+    }
+
+    #[test]
+    fn push_fields_omitted_when_none() {
+        let cfg = UpdateChannelConfig::disabled(env("local"));
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert!(json.get("push_enabled").is_none());
+        assert!(json.get("stream_endpoint").is_none());
+    }
+
+    #[test]
+    fn unknown_catch_all_still_works_with_push_fields() {
+        // A config carrying both push fields AND an unknown field:
+        // the unknown key must not collide with the new typed fields.
+        let on_disk = serde_json::json!({
+            "schema": UpdateChannelConfig::schema_str(),
+            "environment_id": "local",
+            "push_enabled": true,
+            "stream_endpoint": "https://example.com/stream",
+            "future_field_2": "hello",
+        });
+        let cfg: UpdateChannelConfig = serde_json::from_value(on_disk).unwrap();
+        assert_eq!(cfg.push_enabled, Some(true));
+        assert_eq!(
+            cfg.stream_endpoint.as_deref(),
+            Some("https://example.com/stream")
+        );
+        assert_eq!(
+            cfg.unknown.get("future_field_2"),
+            Some(&serde_json::json!("hello"))
+        );
+        assert!(!cfg.unknown.contains_key("push_enabled"));
+        assert!(!cfg.unknown.contains_key("stream_endpoint"));
+    }
+
+    #[test]
+    fn new_binary_config_parses_on_old_binary_schema() {
+        // A config written by the NEW binary (with push fields) must still
+        // parse when an older binary reads it — the new keys land in `unknown`
+        // and survive a read-modify-write cycle.
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+        cfg.push_enabled = Some(true);
+        cfg.stream_endpoint = Some("https://example.com/stream".into());
+        let on_disk = serde_json::to_value(&cfg).unwrap();
+
+        // Simulate an old binary that does NOT know push_enabled / stream_endpoint.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct OldConfig {
+            schema: SchemaVersion,
+            environment_id: EnvId,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            enabled: Option<bool>,
+            #[serde(flatten)]
+            unknown: serde_json::Map<String, serde_json::Value>,
+        }
+        let old: OldConfig = serde_json::from_value(on_disk.clone()).unwrap();
+        assert_eq!(old.enabled, Some(true));
+        // push_enabled and stream_endpoint survive as unknown keys.
+        assert_eq!(
+            old.unknown.get("push_enabled"),
+            Some(&serde_json::json!(true))
+        );
+        assert!(old.unknown.contains_key("stream_endpoint"));
+
+        // The old binary re-serializes → the new binary reads back: fields survive.
+        let rewritten = serde_json::to_value(&old).unwrap();
+        let back: UpdateChannelConfig = serde_json::from_value(rewritten).unwrap();
+        assert_eq!(back.push_enabled, Some(true));
+        assert_eq!(
+            back.stream_endpoint.as_deref(),
+            Some("https://example.com/stream")
+        );
     }
 
     #[test]

@@ -139,6 +139,15 @@ pub struct UpdateConfigSetPayload {
     /// loopback).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_endpoint: Option<String>,
+    /// Whether the runtime subscribes to a pushed update stream (SSE). `None`
+    /// leaves the stored value unchanged (unset resolves to `true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_enabled: Option<bool>,
+    /// SSE stream endpoint URL. `None` leaves the stored value unchanged; must
+    /// be https (or http to loopback). When unset, the runtime derives from
+    /// `plan_endpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_endpoint: Option<String>,
 }
 
 /// Filter for `op updates config-show` — read-only view of the update-channel
@@ -1253,6 +1262,27 @@ pub fn config_set(
             Ok(ep.to_string())
         })
         .transpose()?;
+    let validated_stream_endpoint = payload
+        .stream_endpoint
+        .as_deref()
+        .map(|raw| {
+            let ep = raw.trim();
+            if ep.is_empty() {
+                return Err(OpError::InvalidArgument(
+                    "stream_endpoint must not be blank (omit the flag to leave \
+                     unchanged; unset derives from plan_endpoint)"
+                        .to_string(),
+                ));
+            }
+            if !control_url_is_acceptable(ep) {
+                return Err(OpError::InvalidArgument(format!(
+                    "stream_endpoint {ep:?} is not an acceptable control URL \
+                     (https required; http only to loopback)"
+                )));
+            }
+            Ok(ep.to_string())
+        })
+        .transpose()?;
     if !store.exists(&env_id)? {
         return Err(OpError::NotFound(format!(
             "environment `{env_id}` not found"
@@ -1274,6 +1304,12 @@ pub fn config_set(
     }
     if validated_plan_endpoint.is_some() {
         fields.push("plan_endpoint");
+    }
+    if payload.push_enabled.is_some() {
+        fields.push("push_enabled");
+    }
+    if validated_stream_endpoint.is_some() {
+        fields.push("stream_endpoint");
     }
 
     let ctx = AuditCtx {
@@ -1306,6 +1342,12 @@ pub fn config_set(
             }
             if let Some(ep) = validated_plan_endpoint {
                 cfg.plan_endpoint = Some(ep);
+            }
+            if let Some(pe) = payload.push_enabled {
+                cfg.push_enabled = Some(pe);
+            }
+            if let Some(ep) = validated_stream_endpoint {
+                cfg.stream_endpoint = Some(ep);
             }
             locked.save_update_channel(&cfg)?;
             Ok(cfg)
@@ -1351,12 +1393,16 @@ fn config_view(cfg: &UpdateChannelConfig) -> Value {
         "on_update": cfg.on_update.map(|a| a.as_str()),
         "poll_interval_secs": cfg.poll_interval_secs,
         "plan_endpoint": cfg.plan_endpoint,
+        "push_enabled": cfg.push_enabled,
+        "stream_endpoint": cfg.stream_endpoint,
         "resolved": {
             "enabled": cfg.resolved_enabled(),
             "action": cfg.resolved_action().as_str(),
             "on_notify": cfg.resolved_on_notify().as_str(),
             "poll_interval_secs": cfg.resolved_poll_interval_secs(),
             "plan_endpoint": cfg.resolved_plan_endpoint(),
+            "push_enabled": cfg.resolved_push_enabled(),
+            "stream_endpoint": cfg.resolved_stream_endpoint(),
         }
     })
 }
@@ -2966,7 +3012,9 @@ fn config_set_schema() -> Value {
             "enabled": {"type": ["boolean", "null"], "description": "master switch for the update-channel notification machinery; null leaves the stored value unchanged (absent = disabled, deny-by-default)"},
             "on_notify": {"type": ["string", "null"], "enum": [null, "record-only", "record_only", "stage", "apply"], "description": "action on a verified plan; null leaves the stored value unchanged (unset resolves to `stage`). `apply` opts the environment into converging on its own; the executor lives in the runtime, and a greentic-start that predates `on_update` reads the legacy `on_notify: stage` mirror this also writes, staging instead of breaking"},
             "poll_interval_secs": {"type": ["integer", "null"], "minimum": MIN_POLL_INTERVAL_SECS, "description": "fallback poll interval in seconds; null leaves the stored value unchanged (unset resolves to 3600)"},
-            "plan_endpoint": {"type": ["string", "null"], "description": "base URL to poll for the latest signed update plan (`{url}` + `{url}.sig`); null leaves the stored value unchanged; must be https (or http to loopback)"}
+            "plan_endpoint": {"type": ["string", "null"], "description": "base URL to poll for the latest signed update plan (`{url}` + `{url}.sig`); null leaves the stored value unchanged; must be https (or http to loopback)"},
+            "push_enabled": {"type": ["boolean", "null"], "description": "whether the runtime subscribes to a pushed update stream (SSE); null leaves the stored value unchanged (unset resolves to true)"},
+            "stream_endpoint": {"type": ["string", "null"], "description": "SSE stream endpoint URL; null leaves the stored value unchanged (unset derives from plan_endpoint); must be https (or http to loopback)"}
         }
     })
 }
@@ -3053,6 +3101,8 @@ mod tests {
                 on_notify: Some("record-only".into()),
                 poll_interval_secs: Some(120),
                 plan_endpoint: Some("https://updates.example.com/plans/latest".into()),
+                push_enabled: Some(false),
+                stream_endpoint: Some("https://updates.example.com/updates/stream".into()),
             }),
         )
         .unwrap();
@@ -3064,6 +3114,11 @@ mod tests {
         assert_eq!(
             cfg.plan_endpoint.as_deref(),
             Some("https://updates.example.com/plans/latest")
+        );
+        assert_eq!(cfg.push_enabled, Some(false));
+        assert_eq!(
+            cfg.stream_endpoint.as_deref(),
+            Some("https://updates.example.com/updates/stream")
         );
         assert!(cfg.resolved_enabled());
         // Read back via config-show and verify the resolved view.
@@ -3083,6 +3138,15 @@ mod tests {
             out.result["resolved"]["plan_endpoint"].as_str(),
             Some("https://updates.example.com/plans/latest")
         );
+        assert_eq!(out.result["push_enabled"], false);
+        assert_eq!(
+            out.result["stream_endpoint"].as_str(),
+            Some("https://updates.example.com/updates/stream")
+        );
+        assert_eq!(
+            out.result["resolved"]["stream_endpoint"].as_str(),
+            Some("https://updates.example.com/updates/stream")
+        );
     }
 
     #[test]
@@ -3098,6 +3162,8 @@ mod tests {
                 on_notify: Some("apply".into()),
                 poll_interval_secs: None,
                 plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
             }),
         )
         .unwrap();
@@ -3128,6 +3194,8 @@ mod tests {
             on_notify: None,
             poll_interval_secs: None,
             plan_endpoint: None,
+            push_enabled: Some(false),
+            stream_endpoint: Some("https://example.com/stream".into()),
         });
         set(UpdateConfigSetPayload {
             environment_id: "local".into(),
@@ -3135,10 +3203,17 @@ mod tests {
             on_notify: Some("record-only".into()),
             poll_interval_secs: None,
             plan_endpoint: None,
+            push_enabled: None,
+            stream_endpoint: None,
         });
         let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
         assert_eq!(cfg.enabled, Some(true)); // preserved across the second set
         assert_eq!(cfg.on_notify, Some(OnNotifyAction::RecordOnly));
+        assert_eq!(cfg.push_enabled, Some(false)); // preserved
+        assert_eq!(
+            cfg.stream_endpoint.as_deref(),
+            Some("https://example.com/stream")
+        ); // preserved
     }
 
     #[test]
@@ -3156,6 +3231,8 @@ mod tests {
                 on_notify: Some("converge".into()),
                 poll_interval_secs: None,
                 plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
             }),
         )
         .unwrap_err();
@@ -3180,6 +3257,8 @@ mod tests {
                 on_notify: None,
                 poll_interval_secs: Some(10),
                 plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
             }),
         )
         .unwrap_err();
@@ -3199,6 +3278,8 @@ mod tests {
                 on_notify: None,
                 poll_interval_secs: None,
                 plan_endpoint: Some("http://example.com/plan".into()),
+                push_enabled: None,
+                stream_endpoint: None,
             }),
         )
         .unwrap_err();
@@ -3222,6 +3303,8 @@ mod tests {
                 on_notify: None,
                 poll_interval_secs: None,
                 plan_endpoint: Some("   ".into()),
+                push_enabled: None,
+                stream_endpoint: None,
             }),
         )
         .unwrap_err();
@@ -3241,6 +3324,8 @@ mod tests {
                 on_notify: None,
                 poll_interval_secs: None,
                 plan_endpoint: Some("".into()),
+                push_enabled: None,
+                stream_endpoint: None,
             }),
         )
         .unwrap_err();
@@ -3250,6 +3335,68 @@ mod tests {
             msg2.contains("blank"),
             "error should mention 'blank': {msg2}"
         );
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_set_rejects_unacceptable_stream_endpoint() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: Some("http://example.com/stream".into()),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_set_rejects_blank_stream_endpoint() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: Some("   ".into()),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+
+        let err2 = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: Some("".into()),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err2, OpError::InvalidArgument(_)), "got {err2:?}");
         assert!(store.load_update_channel(&env_id).unwrap().is_none());
     }
 
@@ -3266,6 +3413,8 @@ mod tests {
                 on_notify: None,
                 poll_interval_secs: None,
                 plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
             }),
         )
         .unwrap_err();
@@ -3306,6 +3455,8 @@ mod tests {
                         on_notify: None,
                         poll_interval_secs: None,
                         plan_endpoint: None,
+                        push_enabled: None,
+                        stream_endpoint: None,
                     }),
                 )
                 .unwrap();
@@ -3321,6 +3472,8 @@ mod tests {
                         on_notify: Some("record-only".into()),
                         poll_interval_secs: None,
                         plan_endpoint: None,
+                        push_enabled: None,
+                        stream_endpoint: None,
                     }),
                 )
                 .unwrap();
@@ -3359,6 +3512,8 @@ mod tests {
                 on_notify: None,
                 poll_interval_secs: None,
                 plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
             }),
         )
         .unwrap_err();
@@ -6002,6 +6157,8 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
                 on_notify: Some("apply".into()),
                 poll_interval_secs: None,
                 plan_endpoint: Some(endpoint.to_string()),
+                push_enabled: None,
+                stream_endpoint: None,
             }),
         )
         .unwrap();

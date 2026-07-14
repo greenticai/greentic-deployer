@@ -2022,6 +2022,10 @@ fn updates_step(
     let enabled = updates.resolved_enabled();
     let endpoint = updates.plan_endpoint.trim().to_string();
     let declared_action = updates.on_notify.as_deref().and_then(UpdateAction::parse);
+    let stream_endpoint = updates
+        .stream_endpoint
+        .as_deref()
+        .map(|s| s.trim().to_string());
 
     let current = store.load_update_channel(&ctx.env_id)?;
     let unchanged = current.as_ref().is_some_and(|cur| {
@@ -2031,6 +2035,12 @@ fn updates_step(
             && updates
                 .poll_interval_secs
                 .is_none_or(|want| cur.resolved_poll_interval_secs() == want)
+            && updates
+                .push_enabled
+                .is_none_or(|want| cur.push_enabled == Some(want))
+            && stream_endpoint
+                .as_deref()
+                .is_none_or(|want| cur.stream_endpoint.as_deref() == Some(want))
     });
     if unchanged {
         return Ok(ApplyStep::no_op(
@@ -2050,6 +2060,8 @@ fn updates_step(
         "on_notify": updates.on_notify,
         "poll_interval_secs": updates.poll_interval_secs,
         "plan_endpoint": endpoint,
+        "push_enabled": updates.push_enabled,
+        "stream_endpoint": stream_endpoint,
     }));
     let ikey = derive_idempotency_key(
         &ctx.env_id,
@@ -2073,6 +2085,8 @@ fn updates_step(
             on_notify: updates.on_notify.clone(),
             poll_interval_secs: updates.poll_interval_secs,
             plan_endpoint: Some(endpoint),
+            push_enabled: updates.push_enabled,
+            stream_endpoint,
         })),
     })
 }
@@ -3799,6 +3813,116 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cfg.resolved_action(), UpdateAction::Apply);
+    }
+
+    #[test]
+    fn updates_block_changing_push_enabled_replans_as_update() {
+        let (dir, store) = seeded_store();
+        let staged = write_manifest(dir.path(), &updates_manifest("stage"));
+        run_apply(&store, &staged).expect("first apply");
+
+        // Same endpoint + action, but adding push_enabled: false -> Update step.
+        let with_push = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "http://127.0.0.1:3140/v1/environments/local/plan",
+                "on_notify": "stage",
+                "poll_interval_secs": 60,
+                "push_enabled": false,
+            }
+        });
+        let path = dir.path().join("manifest-push.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&with_push).unwrap()).unwrap();
+        let outcome = run_apply(&store, &path).expect("second apply");
+        assert!(
+            step_actions(&outcome.result)
+                .contains(&("configure-updates".to_string(), "update".to_string())),
+            "a push_enabled change must produce an update step, got: {:?}",
+            step_actions(&outcome.result)
+        );
+        let cfg = store
+            .load_update_channel(&EnvId::try_from("local").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.push_enabled, Some(false));
+    }
+
+    #[test]
+    fn updates_block_changing_stream_endpoint_replans_as_update() {
+        let (dir, store) = seeded_store();
+        let staged = write_manifest(dir.path(), &updates_manifest("stage"));
+        run_apply(&store, &staged).expect("first apply");
+
+        // Same endpoint + action, but adding an explicit stream_endpoint -> Update step.
+        let with_stream = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "http://127.0.0.1:3140/v1/environments/local/plan",
+                "on_notify": "stage",
+                "poll_interval_secs": 60,
+                "stream_endpoint": "https://example.com/custom/stream",
+            }
+        });
+        let path = dir.path().join("manifest-stream.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&with_stream).unwrap()).unwrap();
+        let outcome = run_apply(&store, &path).expect("second apply");
+        assert!(
+            step_actions(&outcome.result)
+                .contains(&("configure-updates".to_string(), "update".to_string())),
+            "a stream_endpoint change must produce an update step, got: {:?}",
+            step_actions(&outcome.result)
+        );
+        let cfg = store
+            .load_update_channel(&EnvId::try_from("local").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cfg.stream_endpoint.as_deref(),
+            Some("https://example.com/custom/stream")
+        );
+    }
+
+    #[test]
+    fn updates_block_whitespace_in_stream_endpoint_is_idempotent() {
+        let (dir, store) = seeded_store();
+
+        // First apply: set an explicit stream_endpoint (trimmed value).
+        let clean = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "http://127.0.0.1:3140/v1/environments/local/plan",
+                "on_notify": "stage",
+                "poll_interval_secs": 60,
+                "stream_endpoint": "https://example.com/custom/stream",
+            }
+        });
+        let first = write_manifest(dir.path(), &clean);
+        run_apply(&store, &first).expect("first apply");
+
+        // Re-apply with leading AND trailing whitespace around the same value.
+        // The trim normalization makes the values match → no-op.
+        let with_ws = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "http://127.0.0.1:3140/v1/environments/local/plan",
+                "on_notify": "stage",
+                "poll_interval_secs": 60,
+                "stream_endpoint": "  https://example.com/custom/stream  ",
+            }
+        });
+        let path = dir.path().join("manifest-ws.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&with_ws).unwrap()).unwrap();
+        let outcome = run_apply(&store, &path).expect("re-apply with whitespace");
+        assert!(
+            step_actions(&outcome.result)
+                .contains(&("configure-updates".to_string(), "no-op".to_string())),
+            "whitespace-only difference in stream_endpoint must not trigger an update step, got: {:?}",
+            step_actions(&outcome.result)
+        );
     }
 
     #[test]
