@@ -14,7 +14,7 @@
 //! `unbundle_artifact` (path-traversal + symlink-escape guards), rather than
 //! re-implementing the unpack here.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use greentic_deploy_spec::{
@@ -285,11 +285,22 @@ fn stage_into(
         )));
     }
 
-    // Pin the embedded `.gtpack`s. Scope the scan to the canonical `packs/`
-    // subtree so a stray `.gtpack` elsewhere in the bundle (e.g. under
-    // `resolved/`) can't silently join the runtime pack set. Each pack's
-    // load-time identity is its content digest + path, re-verified by the
-    // runner host; cross-checking the embedded pack manifest's id/version
+    // Pin the embedded `.gtpack`s from the bundle's TWO canonical runtime pack
+    // roots. `gtbundle-v1` splits them: `app_packs` are staged under `packs/`,
+    // `extension_providers` under `providers/<domain>/` (see the bundle's own
+    // `bundle-manifest.json`). Scanning only `packs/` is what left every
+    // bundle-shipped provider — the webchat GUI included — invisible to the
+    // revision runtime: its packs never entered `pack-list.lock`, so
+    // `revision_boot` never handed them to route discovery and every
+    // provider-declared route 405'd.
+    //
+    // The scan stays SCOPED (it is not a whole-tree glob): a stray `.gtpack`
+    // under `resolved/`, `.cache/` or the bundle root still cannot join the
+    // runtime pack set. That scoping was deliberate security hardening and is
+    // preserved — `providers/` is a declared pack root, not a stray location.
+    //
+    // Each pack's load-time identity is its content digest + path, re-verified
+    // by the runner host; cross-checking the embedded pack manifest's id/version
     // against the bundle lock is deferred (needs a `.gtpack` reader) and is
     // belt-and-suspenders on top of the digest binding + bundle-level DSSE.
     let packs_dir = extract_dir.join("packs");
@@ -310,6 +321,12 @@ fn stage_into(
             bundle_path.display()
         )));
     }
+    collect_provider_gtpacks(&extract_dir, &mut gtpacks).map_err(|source| OpError::Io {
+        path: extract_dir.join(PROVIDERS_DIR),
+        source,
+    })?;
+
+    reject_duplicate_pack_ids(&gtpacks)?;
 
     let mut packs = Vec::with_capacity(gtpacks.len());
     for path in gtpacks {
@@ -405,14 +422,141 @@ fn collect_gtpacks(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The bundle's second runtime pack root. `gtbundle-v1` stages every
+/// `extension_providers` entry under `providers/<domain>/` (`messaging`,
+/// `state`, `oauth`, …) rather than `packs/`.
+const PROVIDERS_DIR: &str = "providers";
+
+/// `providers/deployer/` holds deployment-time IaC packs (Terraform/AWS/GCP/
+/// Azure), NOT runtime WASM components. `greentic-bundle` hides this directory
+/// outright while warming a bundle
+/// (`build/warmup.rs::temporarily_hide_deployer_packs`), which is the same
+/// judgement: these must never enter the runtime pack set. Pinning them here
+/// would hand the runner host archives it cannot load.
+const NON_RUNTIME_PROVIDER_DOMAINS: &[&str] = &["deployer"];
+
+/// Collect the runtime provider packs: every `.gtpack` under
+/// `providers/<domain>/`, skipping non-runtime domains.
+///
+/// Deliberately enumerates domain directories rather than recursing from
+/// `providers/` in one shot — the per-domain step is what makes the
+/// `deployer` exclusion possible at all.
+fn collect_provider_gtpacks(extract_dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    let providers_dir = extract_dir.join(PROVIDERS_DIR);
+    if !providers_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&providers_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let domain = entry.file_name();
+        if domain
+            .to_str()
+            .is_some_and(|d| NON_RUNTIME_PROVIDER_DOMAINS.contains(&d))
+        {
+            continue;
+        }
+        collect_gtpacks(&entry.path(), out)?;
+    }
+    Ok(())
+}
+
+/// Does this revision's `pack-list.lock` pin every runtime pack its own staged
+/// bundle actually carries?
+///
+/// A revision staged before `providers/<domain>/` was scanned has a lock that
+/// pins only the `packs/` entries, so the runtime loads none of the bundle's
+/// providers and every route they declare 404s/405s. Nothing else notices: the
+/// lock file EXISTS and its packs all resolve, so the `pack_ref` classifier
+/// (which only distinguishes Resolved / Missing / Invalid) calls the revision
+/// healthy, and `env apply` sees an unchanged bundle digest and converges.
+/// The env would stay silently broken forever.
+///
+/// So convergence asks the stronger question — not "is the lock readable?" but
+/// "is it COMPLETE?" — and a short lock re-stages on the next apply.
+///
+/// Returns `true` when we cannot tell (no lock ref, unreadable lock, no staged
+/// bundle on disk — e.g. a K8s worker that never staged locally). This check
+/// exists to force a re-stage that heals, never to fail an env it does not
+/// understand.
+pub fn pack_list_is_complete(
+    env_dir: &Path,
+    revision_id: RevisionId,
+    pack_list_lock_ref: &Path,
+) -> bool {
+    if pack_list_lock_ref.as_os_str().is_empty() {
+        return true;
+    }
+    let Ok(bytes) = std::fs::read(env_dir.join(pack_list_lock_ref)) else {
+        return true;
+    };
+    let Ok(lock) = serde_json::from_slice::<PackListLock>(&bytes) else {
+        return true;
+    };
+    let extract_dir = env_dir
+        .join("revisions")
+        .join(revision_id.to_string())
+        .join("bundle");
+    if !extract_dir.join("packs").is_dir() {
+        return true; // nothing staged locally — not ours to judge.
+    }
+
+    let mut on_disk = Vec::new();
+    if collect_gtpacks(&extract_dir.join("packs"), &mut on_disk).is_err() {
+        return true;
+    }
+    if collect_provider_gtpacks(&extract_dir, &mut on_disk).is_err() {
+        return true;
+    }
+    // Compare by pack id: the lock stores env-relative paths, and comparing those
+    // to absolute on-disk paths would be a permanent false "incomplete".
+    let locked: HashSet<&str> = lock
+        .packs
+        .iter()
+        .map(|p| p.pack_id.as_str())
+        .collect::<HashSet<_>>();
+    on_disk.iter().all(|p| {
+        p.file_stem()
+            .and_then(|s| s.to_str())
+            .is_none_or(|stem| locked.contains(stem))
+    })
+}
+
+/// `pack_id` is the file stem, so two packs with the same stem under different
+/// roots (`packs/foo.gtpack` + `providers/messaging/foo.gtpack`) would write a
+/// lock with a duplicate `pack_id`. Reject that HERE, while we can still name
+/// both paths, rather than letting a bundle stage cleanly and fail later at
+/// revision activation with no clue which files collided.
+fn reject_duplicate_pack_ids(gtpacks: &[PathBuf]) -> Result<(), OpError> {
+    let mut seen: BTreeMap<&str, &Path> = BTreeMap::new();
+    for path in gtpacks {
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue; // the `pack_id` build below reports a missing stem.
+        };
+        if let Some(previous) = seen.insert(stem, path.as_path()) {
+            return Err(OpError::InvalidArgument(format!(
+                "bundle stages two packs with the same pack id `{stem}`: `{}` and `{}`. \
+                 Pack ids come from the file stem and must be unique across `packs/` \
+                 and `providers/<domain>/`; rename or remove one.",
+                previous.display(),
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
 
     /// `collect_gtpacks` recurses into nested dirs and only matches `.gtpack`,
-    /// ignoring other files. `stage_local_bundle` hands it the `packs/` subtree,
-    /// so a `.gtpack` placed outside `packs/` is never pinned.
+    /// ignoring other files. It scans whatever root it is handed;
+    /// `stage_local_bundle` hands it `packs/` and each `providers/<domain>/`,
+    /// so a `.gtpack` outside those roots is never pinned.
     #[test]
     fn collect_gtpacks_recurses_and_filters_by_extension() {
         let dir = tempdir().unwrap();
@@ -432,6 +576,294 @@ mod tests {
 
         assert_eq!(found.len(), 1, "only the packs/ .gtpack, got {found:?}");
         assert!(found[0].ends_with("alpha/dist/alpha.gtpack"));
+    }
+
+    /// Lay out a bundle the way `gtbundle-v1` actually stages one: `app_packs`
+    /// under `packs/`, `extension_providers` under `providers/<domain>/`, and
+    /// the deployment-time IaC packs under `providers/deployer/`.
+    fn bundle_tree(root: &Path) {
+        for (dir, pack) in [
+            ("packs", "quickstart"),
+            ("providers/messaging", "messaging-webchat-gui"),
+            ("providers/messaging", "messaging-slack"),
+            ("providers/state", "state-memory"),
+            ("providers/deployer", "deployer-terraform"),
+        ] {
+            let d = root.join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(format!("{pack}.gtpack")), b"PK\x03\x04").unwrap();
+        }
+        // Stray packs outside both runtime roots stay excluded.
+        std::fs::create_dir_all(root.join("resolved")).unwrap();
+        std::fs::write(root.join("resolved/stray.gtpack"), b"PK\x03\x04").unwrap();
+        std::fs::write(root.join("root-stray.gtpack"), b"PK\x03\x04").unwrap();
+    }
+
+    fn stems(paths: &[PathBuf]) -> Vec<String> {
+        let mut s: Vec<String> = paths
+            .iter()
+            .map(|p| p.file_stem().unwrap().to_str().unwrap().to_string())
+            .collect();
+        s.sort();
+        s
+    }
+
+    /// THE REGRESSION THIS FIX EXISTS FOR: a bundle-shipped provider pack must be
+    /// pinned into `pack-list.lock`. Before this, `providers/**` was never scanned,
+    /// so `messaging-webchat-gui` never reached the runtime and every route it
+    /// declared (`/v1/web/webchat/{tenant}`, DirectLine, `/auth/config`) 405'd on
+    /// the revision path.
+    #[test]
+    fn provider_packs_are_pinned_alongside_app_packs() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        bundle_tree(root);
+
+        let mut found = Vec::new();
+        collect_gtpacks(&root.join("packs"), &mut found).unwrap();
+        collect_provider_gtpacks(root, &mut found).unwrap();
+
+        assert_eq!(
+            stems(&found),
+            vec![
+                "messaging-slack",
+                "messaging-webchat-gui",
+                "quickstart",
+                "state-memory",
+            ],
+            "app pack + every runtime provider pack, and nothing else"
+        );
+    }
+
+    /// `providers/deployer/` is IaC, not runtime WASM. Pinning it would hand the
+    /// runner host an archive it cannot load.
+    #[test]
+    fn deployer_provider_packs_are_not_pinned() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        bundle_tree(root);
+
+        let mut found = Vec::new();
+        collect_provider_gtpacks(root, &mut found).unwrap();
+
+        assert!(
+            !stems(&found).iter().any(|s| s == "deployer-terraform"),
+            "providers/deployer/ must never enter the runtime pack set, got {found:?}"
+        );
+    }
+
+    /// The scan stays scoped: widening it to `providers/` must NOT become a
+    /// whole-tree glob. Stray packs elsewhere in the bundle stay out.
+    #[test]
+    fn stray_packs_outside_the_two_runtime_roots_are_not_pinned() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        bundle_tree(root);
+
+        let mut found = Vec::new();
+        collect_gtpacks(&root.join("packs"), &mut found).unwrap();
+        collect_provider_gtpacks(root, &mut found).unwrap();
+
+        let s = stems(&found);
+        assert!(!s.iter().any(|p| p == "stray"), "resolved/ pack leaked in");
+        assert!(!s.iter().any(|p| p == "root-stray"), "root pack leaked in");
+    }
+
+    /// A bundle with no `providers/` at all (an app-only bundle) still stages.
+    #[test]
+    fn missing_providers_dir_is_not_an_error() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("packs")).unwrap();
+        std::fs::write(root.join("packs/only.gtpack"), b"PK\x03\x04").unwrap();
+
+        let mut found = Vec::new();
+        collect_provider_gtpacks(root, &mut found).unwrap();
+        assert!(found.is_empty());
+    }
+
+    /// `pack_id` is the file stem, so the same stem under both roots would write a
+    /// lock with a duplicate id. Caught at stage time, naming both paths.
+    #[test]
+    fn duplicate_pack_id_across_roots_is_rejected() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("packs")).unwrap();
+        std::fs::create_dir_all(root.join("providers/messaging")).unwrap();
+        std::fs::write(root.join("packs/dup.gtpack"), b"PK\x03\x04").unwrap();
+        std::fs::write(root.join("providers/messaging/dup.gtpack"), b"PK\x03\x04").unwrap();
+
+        let mut found = Vec::new();
+        collect_gtpacks(&root.join("packs"), &mut found).unwrap();
+        collect_provider_gtpacks(root, &mut found).unwrap();
+
+        let err =
+            reject_duplicate_pack_ids(&found).expect_err("duplicate pack id must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("dup"),
+            "error must name the colliding id: {msg}"
+        );
+        assert!(
+            msg.contains("packs/dup.gtpack") && msg.contains("providers/messaging/dup.gtpack"),
+            "error must name BOTH colliding paths: {msg}"
+        );
+    }
+
+    /// Distinct ids across the two roots are fine — the guard must not reject the
+    /// normal case it was added to protect.
+    #[test]
+    fn distinct_pack_ids_across_roots_are_accepted() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        bundle_tree(root);
+
+        let mut found = Vec::new();
+        collect_gtpacks(&root.join("packs"), &mut found).unwrap();
+        collect_provider_gtpacks(root, &mut found).unwrap();
+
+        reject_duplicate_pack_ids(&found).expect("distinct ids must be accepted");
+    }
+
+    /// THE CALL-SITE TEST. The three tests above exercise the collectors directly,
+    /// so they all stay green if the `collect_provider_gtpacks` CALL is deleted
+    /// from `stage_into` — they would prove nothing about the shipped behaviour.
+    /// This one stages a REAL `.gtbundle` carrying the real `gtbundle-v1` layout
+    /// (`packs/` + `providers/{messaging,state,deployer}/` + a stray under
+    /// `resolved/`) and asserts on the `pack-list.lock` that staging actually
+    /// WROTE. Deleting the call site fails HERE.
+    #[test]
+    fn stage_writes_provider_packs_into_the_pack_list_lock() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+        let revision_id = RevisionId::new();
+        let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/bundles/provider-packs-bundle.gtbundle");
+
+        let staged = stage_local_bundle(env_dir, revision_id, &bundle).expect("stage");
+
+        let lock_path = env_dir.join(&staged.pack_list_lock_ref);
+        let lock: PackListLock =
+            serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+
+        let mut ids: Vec<String> = lock.packs.iter().map(|p| p.pack_id.to_string()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["app", "messaging-webchat-gui", "state-memory"],
+            "the lock must pin the app pack AND every runtime provider pack — \
+             pinning only `app` is the regression that made bundle-shipped \
+             providers invisible to the revision runtime"
+        );
+
+        // Every pinned pack resolves to a real file whose digest matches the lock.
+        for pack in &lock.packs {
+            let p = env_dir.join(&pack.path);
+            assert!(p.is_file(), "pinned pack must exist: {}", p.display());
+            assert_eq!(pack.digest, sha256_file(&p).unwrap(), "digest must bind");
+        }
+
+        // The provider pack keeps its `providers/<domain>/` location — staging pins
+        // it where the bundle put it, it does not relocate it.
+        let webchat = lock
+            .packs
+            .iter()
+            .find(|p| p.pack_id.to_string() == "messaging-webchat-gui")
+            .expect("webchat pack pinned");
+        assert!(
+            webchat
+                .path
+                .to_string_lossy()
+                .contains("providers/messaging/"),
+            "expected the pack pinned under providers/messaging/, got {}",
+            webchat.path.display()
+        );
+    }
+
+    /// Stage the provider fixture and return `(revision_id, pack_list_lock_ref)`.
+    fn staged_revision(env_dir: &Path) -> (RevisionId, PathBuf) {
+        let revision_id = RevisionId::new();
+        let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/bundles/provider-packs-bundle.gtbundle");
+        let staged = stage_local_bundle(env_dir, revision_id, &bundle).expect("stage");
+        (revision_id, staged.pack_list_lock_ref)
+    }
+
+    /// A freshly-staged revision pins everything its bundle carries.
+    #[test]
+    fn freshly_staged_revision_has_a_complete_pack_list() {
+        let dir = tempdir().unwrap();
+        let (rev, lock_ref) = staged_revision(dir.path());
+        assert!(pack_list_is_complete(dir.path(), rev, &lock_ref));
+    }
+
+    /// THE MIGRATION CASE. Simulate a revision staged by the OLD deployer: the same
+    /// bundle on disk (providers and all), but a lock pinning only the `packs/`
+    /// entry. This MUST read as incomplete — that verdict is what makes `env apply`
+    /// re-stage instead of converging on a silently-broken env.
+    #[test]
+    fn revision_staged_before_the_fix_has_an_incomplete_pack_list() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+        let (rev, lock_ref) = staged_revision(env_dir);
+
+        // Rewrite the lock the way the pre-fix deployer would have written it:
+        // drop every provider pack, keep the app pack.
+        let lock_path = env_dir.join(&lock_ref);
+        let mut lock: PackListLock =
+            serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+        lock.packs.retain(|p| p.pack_id.to_string() == "app");
+        assert_eq!(lock.packs.len(), 1, "pre-fix lock pins only the app pack");
+        std::fs::write(&lock_path, serde_json::to_vec(&lock).unwrap()).unwrap();
+
+        assert!(
+            !pack_list_is_complete(env_dir, rev, &lock_ref),
+            "a lock missing the bundle's provider packs must read as INCOMPLETE, \
+             otherwise a pre-fix env converges and never heals"
+        );
+    }
+
+    /// `providers/deployer/` is not a runtime pack, so its absence from the lock
+    /// must NOT make a healthy revision look incomplete — that would re-stage the
+    /// env on every apply, forever.
+    #[test]
+    fn omitting_the_deployer_pack_does_not_make_a_lock_look_incomplete() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+        let (rev, lock_ref) = staged_revision(env_dir);
+
+        let extract = env_dir
+            .join("revisions")
+            .join(rev.to_string())
+            .join("bundle");
+        assert!(
+            extract
+                .join("providers/deployer/deployer-terraform.gtpack")
+                .is_file(),
+            "fixture must actually ship a deployer pack or this test proves nothing"
+        );
+        assert!(pack_list_is_complete(env_dir, rev, &lock_ref));
+    }
+
+    /// Unknowable cases are "complete": this check exists to trigger a heal, never
+    /// to fail an env it cannot see (e.g. a K8s worker with no local staging).
+    #[test]
+    fn unstaged_or_unreadable_revisions_are_treated_as_complete() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+
+        assert!(
+            pack_list_is_complete(env_dir, RevisionId::new(), Path::new("")),
+            "empty ref is the documented no-pinned-pack-list signal"
+        );
+        assert!(
+            pack_list_is_complete(
+                env_dir,
+                RevisionId::new(),
+                Path::new("revisions/nope/pack-list.lock")
+            ),
+            "no lock on disk"
+        );
     }
 }
 

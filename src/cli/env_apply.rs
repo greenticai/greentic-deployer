@@ -363,6 +363,10 @@ struct ApplyContext {
     /// against it, and apply stages them into the env store so reconcile
     /// (which resolves against the env dir) can find them.
     manifest_dir: PathBuf,
+    /// The env's on-disk root. Convergence needs it to look at what a revision
+    /// ACTUALLY staged, not just what `environment.json` says about it — see
+    /// `pack_list_is_complete`.
+    env_dir: Option<PathBuf>,
 }
 
 // --- entry point ----------------------------------------------------------------
@@ -1128,6 +1132,7 @@ fn resolve_and_validate(
         }
     }
 
+    let env_id_for_dir = env_id.clone();
     Ok(ApplyContext {
         env_id,
         manifest,
@@ -1142,6 +1147,7 @@ fn resolve_and_validate(
         warnings,
         updated_by,
         manifest_dir: manifest_dir.to_path_buf(),
+        env_dir: store.env_dir(&env_id_for_dir).ok(),
     })
 }
 
@@ -1671,6 +1677,10 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     dep.deployment_id,
                     &primary_digest(),
                     rb.spec.bundle_source_uri.as_deref(),
+                ) && live_pack_lists_are_complete(
+                    ctx.env_dir.as_deref(),
+                    env,
+                    dep.deployment_id,
                 );
                 let needs_deploy = !converged;
                 let live = live_revision_digest(env, dep.deployment_id);
@@ -3074,6 +3084,45 @@ pub(super) fn digest_is_real(digest: &str) -> bool {
 /// matches (`None` vs `Some` counts as a difference — a K8s worker needs
 /// the pull ref to boot). A mixed split (e.g. 60/40 blue-green) or a
 /// degenerate placeholder digest is NOT converged.
+/// Every revision this deployment currently serves must pin every runtime pack
+/// its staged bundle carries. A revision staged by a deployer that only scanned
+/// `packs/` has a SHORT lock — its bundle's providers were never pinned, so the
+/// runtime serves none of their routes — and because the bundle digest is
+/// unchanged, plain digest convergence would happily leave it that way forever.
+/// Treating a short lock as not-converged is what lets `gtc start <same-bundle>`
+/// heal an already-broken env instead of no-opping on it.
+///
+/// Unknowable (no env dir, nothing staged locally) counts as complete: this is a
+/// heal trigger, not a new way to fail an apply.
+fn live_pack_lists_are_complete(
+    env_dir: Option<&Path>,
+    env: &Environment,
+    deployment_id: DeploymentId,
+) -> bool {
+    let Some(env_dir) = env_dir else {
+        return true;
+    };
+    let Some(split) = env
+        .traffic_splits
+        .iter()
+        .find(|s| s.deployment_id == deployment_id)
+    else {
+        return true;
+    };
+    split.entries.iter().all(|entry| {
+        env.revisions
+            .iter()
+            .find(|r| r.revision_id == entry.revision_id)
+            .is_none_or(|rev| {
+                super::bundle_stage::pack_list_is_complete(
+                    env_dir,
+                    rev.revision_id,
+                    &rev.pack_list_lock_ref,
+                )
+            })
+    })
+}
+
 fn deployment_converged(
     env: &Environment,
     deployment_id: DeploymentId,
