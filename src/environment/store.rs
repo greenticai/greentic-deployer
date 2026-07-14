@@ -721,6 +721,87 @@ impl LocalFsStore {
         };
         f(&locked)
     }
+
+    /// Destroy `env_id`: atomically retire `<root>/<env_id>` to a sibling
+    /// tombstone, then remove the tombstone tree. Returns the removed
+    /// canonical env dir.
+    ///
+    /// The rename is the commit point. After it, no authority-granting
+    /// state (`trust-root.json`, dev-store secrets, pack answers) remains
+    /// at the canonical path for a later `init`/`create` to silently
+    /// adopt, and no sidecar enumeration is needed — sidecars added in the
+    /// future are covered for free. The tombstone name embeds `~`, which
+    /// the `EnvId` charset rejects, so it can never collide with a real
+    /// env and [`list`](EnvironmentStore::list) skips it by construction.
+    ///
+    /// Failure contract: a rename failure commits nothing (plain `Err`); a
+    /// tombstone-removal failure returns
+    /// [`StoreError::CommittedAfterSave`] — the env IS destroyed, the
+    /// tombstone at the error's path needs manual cleanup, and CLI callers
+    /// must `mark_committed` before mapping the error.
+    ///
+    /// Concurrency: the env flock is held across the existence re-check
+    /// and the rename, so no `transact`-based mutation interleaves. A
+    /// waiter blocked on the pre-rename `.lock` inode acquires a stale
+    /// lock after destroy; `transact`-based verbs then fail their `load()`
+    /// with `NotFound`, but the standalone
+    /// [`save`](EnvironmentStore::save) /
+    /// [`save_runtime`](EnvironmentStore::save_runtime) trait methods do
+    /// not check existence and would recreate the env dir — no CLI verb
+    /// calls them without loading first; accepted residue risk. There is
+    /// deliberately no liveness guard: a running `greentic-start` server
+    /// holds no flock, so destroying an env it is serving is the
+    /// operator's responsibility, exactly as manual removal was before
+    /// this verb existed.
+    pub fn destroy_environment(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
+        let env_dir = self.env_dir(env_id)?;
+        let environment_path = self.environment_path(env_id)?;
+        // Unlocked fast-path so a missing env doesn't leave behind the husk
+        // dir that acquiring the flock would create.
+        if !environment_path.exists() {
+            return Err(StoreError::NotFound(env_id.clone()));
+        }
+        let guard = EnvFlock::acquire(&self.lock_path(env_id)?)?;
+        // Re-check under the lock: a concurrent destroy may have won.
+        if !environment_path.exists() {
+            return Err(StoreError::NotFound(env_id.clone()));
+        }
+        // Refuse a symlinked env root: renaming would retire the link, not
+        // the tree behind it, and the caller would be told "destroyed"
+        // while every secret survives at the target.
+        let meta = std::fs::symlink_metadata(&env_dir).map_err(|source| StoreError::Io {
+            path: env_dir.clone(),
+            source,
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(StoreError::InvalidArgument(format!(
+                "environment `{env_id}` root is a symlink; refusing to destroy through it"
+            )));
+        }
+        // The id prefix is operator-facing garnish only (uniqueness comes
+        // from the ULID); cap it so the tombstone name stays under NAME_MAX
+        // even for env ids near the 255-byte filename limit. EnvId is ASCII,
+        // so a char-based cut is a byte-based cut.
+        let id_prefix: String = env_id.as_str().chars().take(128).collect();
+        let tombstone = self
+            .root
+            .join(format!("{id_prefix}.destroyed~{}", ulid::Ulid::new()));
+        std::fs::rename(&env_dir, &tombstone).map_err(|source| StoreError::Io {
+            path: env_dir.clone(),
+            source,
+        })?;
+        // Commit point passed. Release the flock explicitly before the
+        // recursive removal — its fd lives inside the tombstone now, and on
+        // Windows an open handle in the tree can block deletion.
+        drop(guard);
+        if let Err(source) = std::fs::remove_dir_all(&tombstone) {
+            return Err(StoreError::CommittedAfterSave(Box::new(StoreError::Io {
+                path: tombstone,
+                source,
+            })));
+        }
+        Ok(env_dir)
+    }
 }
 
 /// Lock-holding handle returned by [`LocalFsStore::transact`]. All mutator

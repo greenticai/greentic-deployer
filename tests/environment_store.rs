@@ -658,3 +658,73 @@ fn default_root_under_home() {
         );
     }
 }
+
+#[test]
+fn destroy_environment_removes_tree_and_returns_canonical_path() {
+    let (tmp, store) = fresh_store();
+    let id = env_id("doomed");
+    store.save(&minimal_environment(&id)).unwrap();
+    // A sidecar the store APIs never wrote proves rename-then-remove needs
+    // no enumeration of the env dir's contents.
+    std::fs::write(tmp.path().join("doomed").join("trust-root.json"), b"{}").unwrap();
+
+    let removed = store.destroy_environment(&id).unwrap();
+    assert_eq!(removed, tmp.path().join("doomed"));
+    assert!(!removed.exists());
+    assert!(!store.exists(&id).unwrap());
+    assert!(store.list().unwrap().is_empty());
+    // A clean purge leaves no tombstone sibling behind.
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(leftovers.is_empty(), "got {leftovers:?}");
+}
+
+#[test]
+fn destroy_environment_missing_env_is_not_found() {
+    let (tmp, store) = fresh_store();
+    let err = store.destroy_environment(&env_id("ghost")).unwrap_err();
+    assert!(matches!(err, StoreError::NotFound(_)), "got {err:?}");
+    // The unlocked fast-path must not leave a flock husk dir behind.
+    assert!(!tmp.path().join("ghost").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn destroy_environment_purge_failure_is_committed_after_save() {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, store) = fresh_store();
+    let id = env_id("doomed");
+    store.save(&minimal_environment(&id)).unwrap();
+    // A write-protected dir with a child makes remove_dir_all fail after the
+    // (committing) rename already happened.
+    let blocked = tmp.path().join("doomed").join("blocked");
+    std::fs::create_dir_all(&blocked).unwrap();
+    std::fs::write(blocked.join("child"), b"x").unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let err = store.destroy_environment(&id).unwrap_err();
+
+    // Restore permissions BEFORE any assertion so TempDir::drop can clean up
+    // on every exit path, including assertion failure. The tombstone itself
+    // must remain for manual cleanup.
+    let tombstone = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().contains(".destroyed~"))
+        .expect("tombstone survives the failed purge");
+    std::fs::set_permissions(
+        tombstone.path().join("blocked"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    assert!(err.is_committed_after_save(), "got {err:?}");
+    // The rename committed: the canonical path is gone...
+    assert!(!store.exists(&id).unwrap());
+    assert!(!tmp.path().join("doomed").exists());
+    // ...and the surviving tombstone is invisible to list().
+    assert!(store.list().unwrap().is_empty());
+}

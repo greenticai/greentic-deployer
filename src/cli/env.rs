@@ -1819,11 +1819,24 @@ pub fn init(
     })
 }
 
-/// `op env destroy <env_id> --confirm`. Removes the env's on-disk state.
+/// `op env destroy <env_id> --confirm`. Irreversibly removes the env's
+/// on-disk state under the store root via
+/// [`LocalFsStore::destroy_environment`] (rename to a sibling tombstone,
+/// then purge) — the supported replacement for the manual cleanup this
+/// verb's error message used to recommend.
 ///
 /// Force-free safety net: the caller must pass `confirm = true`. The
 /// `--confirm` flag is the operator-binary's responsibility; this library
 /// just enforces the gate.
+///
+/// The audit event appends AFTER the mutation closure, so it lands in a
+/// recreated `<env_id>/audit/events.jsonl` holding only the destroy event:
+/// the destroy record is durable (fail-closed on append failure via
+/// `mark_committed`) and a later `init` continues the same trail. The
+/// residue dir has no `environment.json`, so `exists()`/`list()` ignore
+/// it. Destroying `local` is allowed — `gtc setup`/`gtc start` re-create
+/// it on next launch. Dev-store secrets redirected outside the env dir via
+/// `GREENTIC_DEV_SECRETS_PATH` are not touched.
 pub fn destroy(
     store: &LocalFsStore,
     flags: &OpFlags,
@@ -1851,16 +1864,28 @@ pub fn destroy(
         target: json!({"environment_id": env_id.as_str(), "confirm": confirm}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, |_committed| {
+    audit_and_record(store, ctx, |committed| {
         if !store.exists(&env_id)? {
             return Err(OpError::NotFound(format!("environment `{env_id}`")));
         }
-        // The A2 trait does not yet expose a remove API. Destructive removal
-        // ships with the bundle-deployment retention path (B-phase); A7 wires
-        // the audit + authorize surface so the destroy intent is logged today.
-        Err(OpError::NotYetImplemented(
-            "`op env destroy` requires the retention path (B-phase); use the LocalFsStore root path returned by `op env show` for manual cleanup".to_string(),
-        ))
+        let removed_path = store
+            .destroy_environment(&env_id)
+            .inspect_err(|err| {
+                if err.is_committed_after_save() {
+                    committed.mark_committed();
+                }
+            })
+            .map_err(super::map_store_err_preserving_noun)?;
+        let outcome = OpOutcome::new(
+            NOUN,
+            "destroy",
+            json!({
+                "environment_id": env_id.as_str(),
+                "outcome": "destroyed",
+                "removed_path": removed_path.display().to_string(),
+            }),
+        );
+        Ok((outcome, super::AuditGens::NONE))
     })
 }
 
@@ -3107,12 +3132,214 @@ mod tests {
     }
 
     #[test]
-    fn destroy_with_confirm_returns_not_yet_implemented() {
+    fn destroy_with_confirm_removes_env_state() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
-        store.save(&make_env("local")).unwrap();
-        let err = destroy(&store, &OpFlags::default(), "local", true).unwrap_err();
-        assert!(matches!(err, OpError::NotYetImplemented(_)), "got {err:?}");
+        store.save(&make_env("doomed")).unwrap();
+        // Seed sidecars beyond environment.json so the test proves the whole
+        // tree goes, not just the file `exists()` checks.
+        let env_dir = dir.path().join("doomed");
+        std::fs::write(env_dir.join("trust-root.json"), b"{}").unwrap();
+        let nested = env_dir.join("env-packs").join("messaging");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("answers.json"), b"{}").unwrap();
+
+        let outcome = destroy(&store, &OpFlags::default(), "doomed", true).unwrap();
+        assert_eq!(outcome.noun, "env");
+        assert_eq!(outcome.op, "destroy");
+        assert_eq!(outcome.result["environment_id"], "doomed");
+        assert_eq!(outcome.result["outcome"], "destroyed");
+        assert_eq!(
+            outcome.result["removed_path"],
+            env_dir.display().to_string()
+        );
+
+        // Live state is gone; only the post-verb audit residue may remain.
+        assert!(!env_dir.join("environment.json").exists());
+        assert!(!env_dir.join("trust-root.json").exists());
+        assert!(!env_dir.join("env-packs").exists());
+        assert!(!store.exists(&EnvId::try_from("doomed").unwrap()).unwrap());
+        assert!(store.list().unwrap().is_empty());
+        // A clean purge leaves no tombstone sibling behind.
+        let tombstones: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".destroyed~"))
+            .collect();
+        assert!(tombstones.is_empty(), "got {tombstones:?}");
+    }
+
+    #[test]
+    fn destroy_missing_env_errors_not_found() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let err = destroy(&store, &OpFlags::default(), "ghost", true).unwrap_err();
+        assert!(matches!(err, OpError::NotFound(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn destroy_leaves_sibling_envs_untouched() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("doomed")).unwrap();
+        store.save(&make_env("survivor")).unwrap();
+        destroy(&store, &OpFlags::default(), "doomed", true).unwrap();
+        let survivor = EnvId::try_from("survivor").unwrap();
+        assert!(store.exists(&survivor).unwrap());
+        store.load(&survivor).expect("survivor still loads");
+        assert_eq!(store.list().unwrap(), vec![survivor]);
+    }
+
+    #[test]
+    fn destroy_schema_flag_short_circuits_without_touching_store() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("doomed")).unwrap();
+        let flags = OpFlags {
+            schema_only: true,
+            answers: None,
+        };
+        // No --confirm needed for a schema dump.
+        let outcome = destroy(&store, &flags, "doomed", false).unwrap();
+        assert_eq!(outcome.op, "destroy");
+        assert!(store.exists(&EnvId::try_from("doomed").unwrap()).unwrap());
+    }
+
+    #[test]
+    fn destroy_records_audit_event_in_recreated_residue_log() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        // Create via the CLI verb so a `create` audit event exists first —
+        // proving destroy takes prior history with the env.
+        create(
+            &store,
+            &OpFlags::default(),
+            Some(EnvCreatePayload {
+                environment_id: "doomed".to_string(),
+                name: "doomed".to_string(),
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+                public_base_url: None,
+            }),
+        )
+        .unwrap();
+        destroy(&store, &OpFlags::default(), "doomed", true).unwrap();
+        // The audit event appends AFTER the mutation closure, so it lands in
+        // a recreated `<env_id>/audit/` residue dir; only the destroy event
+        // survives (the create event went with the env).
+        let log = dir.path().join("doomed").join("audit").join("events.jsonl");
+        let raw = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<_> = raw.lines().collect();
+        assert_eq!(lines.len(), 1, "only the destroy event survives: {raw}");
+        let event: crate::environment::AuditEvent = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(event.env_id, "doomed");
+        assert_eq!(event.noun, "env");
+        assert_eq!(event.verb, "destroy");
+        assert!(matches!(event.result, crate::environment::AuditResult::Ok));
+    }
+
+    #[test]
+    fn destroy_then_init_yields_fresh_env_and_reseeded_trust_root() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let first = init(&store, &OpFlags::default(), EnvInitPayload::default()).unwrap();
+        assert!(first.result["trust_root"].is_object());
+        let env_dir = dir.path().join("local");
+        assert!(env_dir.join("trust-root.json").exists());
+
+        destroy(&store, &OpFlags::default(), "local", true).unwrap();
+        assert!(!env_dir.join("trust-root.json").exists());
+
+        let second = init(&store, &OpFlags::default(), EnvInitPayload::default()).unwrap();
+        assert_eq!(second.result["outcome"], "created");
+        // The seed gate is trust-root.json presence; destroy removed it, so
+        // re-init runs the seed path again. The operator key is unchanged,
+        // so this asserts the PATH was taken, not that key material differs.
+        assert!(second.result["trust_root"].is_object());
+        // Audit continuity: the residue log bridges destroy → init.
+        let raw = std::fs::read_to_string(env_dir.join("audit").join("events.jsonl")).unwrap();
+        let verbs: Vec<String> = raw
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<crate::environment::AuditEvent>(l)
+                    .unwrap()
+                    .verb
+            })
+            .collect();
+        assert_eq!(verbs, vec!["destroy".to_string(), "init".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destroy_cleanup_failure_is_committed_and_audited() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("doomed")).unwrap();
+        let env_dir = dir.path().join("doomed");
+        // A write-protected dir with a child makes remove_dir_all fail after
+        // the (committing) rename already happened.
+        let blocked = env_dir.join("blocked");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join("child"), b"x").unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = destroy(&store, &OpFlags::default(), "doomed", true).unwrap_err();
+
+        // The tombstone survives the failed purge; restore permissions so
+        // TempDir::drop can clean up.
+        let tombstone = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| e.file_name().to_string_lossy().contains(".destroyed~"))
+            .expect("tombstone must remain after failed purge");
+        std::fs::set_permissions(
+            tombstone.path().join("blocked"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        // CommittedAfterSave was unwrapped by the noun-preserving mapper to
+        // the inner Io (surfacing as `store`)...
+        assert!(matches!(err, OpError::Store(_)), "got {err:?}");
+        // ...the rename committed (the canonical path no longer holds the env)...
+        assert!(!env_dir.join("environment.json").exists());
+        assert!(!store.exists(&EnvId::try_from("doomed").unwrap()).unwrap());
+        // ...and mark_committed fired, so the fail-closed audit boundary
+        // still appended the (error-result) destroy event.
+        let raw = std::fs::read_to_string(env_dir.join("audit").join("events.jsonl")).unwrap();
+        let event: crate::environment::AuditEvent = serde_json::from_str(raw.trim_end()).unwrap();
+        assert_eq!(event.verb, "destroy");
+        assert!(matches!(
+            event.result,
+            crate::environment::AuditResult::Error { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destroy_refuses_symlinked_env_root() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        // The real env tree lives under a different root; the store path is
+        // a symlink to it.
+        let target = tempdir().unwrap();
+        let real_store = LocalFsStore::new(target.path());
+        real_store.save(&make_env("linked")).unwrap();
+        std::os::unix::fs::symlink(target.path().join("linked"), dir.path().join("linked"))
+            .unwrap();
+
+        let err = destroy(&store, &OpFlags::default(), "linked", true).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        // The link target is untouched.
+        assert!(
+            target
+                .path()
+                .join("linked")
+                .join("environment.json")
+                .exists()
+        );
     }
 
     #[test]
