@@ -3101,8 +3101,8 @@ mod tests {
                 on_notify: Some("record-only".into()),
                 poll_interval_secs: Some(120),
                 plan_endpoint: Some("https://updates.example.com/plans/latest".into()),
-                push_enabled: None,
-                stream_endpoint: None,
+                push_enabled: Some(false),
+                stream_endpoint: Some("https://updates.example.com/updates/stream".into()),
             }),
         )
         .unwrap();
@@ -3114,6 +3114,11 @@ mod tests {
         assert_eq!(
             cfg.plan_endpoint.as_deref(),
             Some("https://updates.example.com/plans/latest")
+        );
+        assert_eq!(cfg.push_enabled, Some(false));
+        assert_eq!(
+            cfg.stream_endpoint.as_deref(),
+            Some("https://updates.example.com/updates/stream")
         );
         assert!(cfg.resolved_enabled());
         // Read back via config-show and verify the resolved view.
@@ -3132,6 +3137,15 @@ mod tests {
         assert_eq!(
             out.result["resolved"]["plan_endpoint"].as_str(),
             Some("https://updates.example.com/plans/latest")
+        );
+        assert_eq!(out.result["push_enabled"], false);
+        assert_eq!(
+            out.result["stream_endpoint"].as_str(),
+            Some("https://updates.example.com/updates/stream")
+        );
+        assert_eq!(
+            out.result["resolved"]["stream_endpoint"].as_str(),
+            Some("https://updates.example.com/updates/stream")
         );
     }
 
@@ -3180,8 +3194,8 @@ mod tests {
             on_notify: None,
             poll_interval_secs: None,
             plan_endpoint: None,
-            push_enabled: None,
-            stream_endpoint: None,
+            push_enabled: Some(false),
+            stream_endpoint: Some("https://example.com/stream".into()),
         });
         set(UpdateConfigSetPayload {
             environment_id: "local".into(),
@@ -3195,6 +3209,11 @@ mod tests {
         let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
         assert_eq!(cfg.enabled, Some(true)); // preserved across the second set
         assert_eq!(cfg.on_notify, Some(OnNotifyAction::RecordOnly));
+        assert_eq!(cfg.push_enabled, Some(false)); // preserved
+        assert_eq!(
+            cfg.stream_endpoint.as_deref(),
+            Some("https://example.com/stream")
+        ); // preserved
     }
 
     #[test]
@@ -3316,6 +3335,68 @@ mod tests {
             msg2.contains("blank"),
             "error should mention 'blank': {msg2}"
         );
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_set_rejects_unacceptable_stream_endpoint() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: Some("http://example.com/stream".into()),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_set_rejects_blank_stream_endpoint() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: Some("   ".into()),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+
+        let err2 = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: Some("".into()),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err2, OpError::InvalidArgument(_)), "got {err2:?}");
         assert!(store.load_update_channel(&env_id).unwrap().is_none());
     }
 

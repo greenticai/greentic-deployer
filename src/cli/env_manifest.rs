@@ -3640,4 +3640,33 @@ mod tests {
         let roundtripped = serde_json::to_value(&m).unwrap();
         assert_eq!(json, roundtripped);
     }
+
+    #[test]
+    fn validate_shape_rejects_invalid_stream_endpoint() {
+        // Non-loopback HTTP is rejected.
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "https://example.com/plan",
+                "stream_endpoint": "http://example.com/stream"
+            }
+        }))
+        .unwrap();
+        let err = m.validate_shape().unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "{err}");
+
+        // Empty string is rejected.
+        let m2: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "https://example.com/plan",
+                "stream_endpoint": ""
+            }
+        }))
+        .unwrap();
+        let err2 = m2.validate_shape().unwrap_err();
+        assert!(matches!(err2, OpError::InvalidArgument(_)), "{err2}");
+    }
 }

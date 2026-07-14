@@ -3846,6 +3846,42 @@ mod tests {
     }
 
     #[test]
+    fn updates_block_changing_stream_endpoint_replans_as_update() {
+        let (dir, store) = seeded_store();
+        let staged = write_manifest(dir.path(), &updates_manifest("stage"));
+        run_apply(&store, &staged).expect("first apply");
+
+        // Same endpoint + action, but adding an explicit stream_endpoint -> Update step.
+        let with_stream = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "http://127.0.0.1:3140/v1/environments/local/plan",
+                "on_notify": "stage",
+                "poll_interval_secs": 60,
+                "stream_endpoint": "https://example.com/custom/stream",
+            }
+        });
+        let path = dir.path().join("manifest-stream.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&with_stream).unwrap()).unwrap();
+        let outcome = run_apply(&store, &path).expect("second apply");
+        assert!(
+            step_actions(&outcome.result)
+                .contains(&("configure-updates".to_string(), "update".to_string())),
+            "a stream_endpoint change must produce an update step, got: {:?}",
+            step_actions(&outcome.result)
+        );
+        let cfg = store
+            .load_update_channel(&EnvId::try_from("local").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cfg.stream_endpoint.as_deref(),
+            Some("https://example.com/custom/stream")
+        );
+    }
+
+    #[test]
     fn fresh_apply_then_noop_reapply() {
         let (dir, store) = seeded_store();
         let manifest_path = write_manifest(dir.path(), &full_manifest(&fixture()));
