@@ -668,9 +668,10 @@ fn destroy_environment_removes_tree_and_returns_canonical_path() {
     // no enumeration of the env dir's contents.
     std::fs::write(tmp.path().join("doomed").join("trust-root.json"), b"{}").unwrap();
 
-    let removed = store.destroy_environment(&id).unwrap();
-    assert_eq!(removed, tmp.path().join("doomed"));
-    assert!(!removed.exists());
+    let outcome = store.destroy_environment(&id).unwrap();
+    assert_eq!(outcome.removed_path, tmp.path().join("doomed"));
+    assert_eq!(outcome.reaped_tombstones, 0);
+    assert!(!outcome.removed_path.exists());
     assert!(!store.exists(&id).unwrap());
     assert!(store.list().unwrap().is_empty());
     // A clean purge leaves no tombstone sibling behind.
@@ -727,4 +728,46 @@ fn destroy_environment_purge_failure_is_committed_after_save() {
     assert!(!tmp.path().join("doomed").exists());
     // ...and the surviving tombstone is invisible to list().
     assert!(store.list().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn destroy_environment_rerun_reaps_stale_tombstone() {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, store) = fresh_store();
+    let id = env_id("doomed");
+    store.save(&minimal_environment(&id)).unwrap();
+    // Inject a permission failure so the first destroy leaves a tombstone.
+    let blocked = tmp.path().join("doomed").join("blocked");
+    std::fs::create_dir_all(&blocked).unwrap();
+    std::fs::write(blocked.join("child"), b"x").unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let err = store.destroy_environment(&id).unwrap_err();
+    assert!(err.is_committed_after_save());
+
+    // Restore permissions so the tombstone can be removed.
+    let tombstone = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().contains(".destroyed~"))
+        .expect("tombstone must remain");
+    std::fs::set_permissions(
+        tombstone.path().join("blocked"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    // Re-running destroy reaps the stale tombstone.
+    let outcome = store.destroy_environment(&id).unwrap();
+    assert_eq!(outcome.removed_path, tmp.path().join("doomed"));
+    assert_eq!(outcome.reaped_tombstones, 1);
+
+    // The tombstone is gone from the root.
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains(".destroyed~"))
+        .collect();
+    assert!(leftovers.is_empty(), "got {leftovers:?}");
 }

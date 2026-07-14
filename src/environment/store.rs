@@ -723,8 +723,9 @@ impl LocalFsStore {
     }
 
     /// Destroy `env_id`: atomically retire `<root>/<env_id>` to a sibling
-    /// tombstone, then remove the tombstone tree. Returns the removed
-    /// canonical env dir.
+    /// tombstone, then remove the tombstone tree. Returns a
+    /// [`DestroyOutcome`] with the removed canonical env dir and the count
+    /// of stale tombstones reaped.
     ///
     /// The rename is the commit point. After it, no authority-granting
     /// state (`trust-root.json`, dev-store secrets, pack answers) remains
@@ -738,29 +739,38 @@ impl LocalFsStore {
     /// tombstone-removal failure returns
     /// [`StoreError::CommittedAfterSave`] — the env IS destroyed, the
     /// tombstone at the error's path needs manual cleanup, and CLI callers
-    /// must `mark_committed` before mapping the error.
+    /// must `mark_committed` before mapping the error. Re-running
+    /// `destroy` after a failed purge reaps the leftover tombstone(s).
     ///
     /// Concurrency: the env flock is held across the existence re-check
     /// and the rename, so no `transact`-based mutation interleaves. A
-    /// waiter blocked on the pre-rename `.lock` inode acquires a stale
-    /// lock after destroy; `transact`-based verbs then fail their `load()`
-    /// with `NotFound`, but the standalone
-    /// [`save`](EnvironmentStore::save) /
-    /// [`save_runtime`](EnvironmentStore::save_runtime) trait methods do
-    /// not check existence and would recreate the env dir — no CLI verb
-    /// calls them without loading first; accepted residue risk. There is
-    /// deliberately no liveness guard: a running `greentic-start` server
-    /// holds no flock, so destroying an env it is serving is the
-    /// operator's responsibility, exactly as manual removal was before
-    /// this verb existed.
-    pub fn destroy_environment(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
+    /// waiter that acquires the renamed-away inode detects the identity
+    /// mismatch and re-acquires on the canonical path (see
+    /// [`EnvFlock`]), so post-destroy waiters coordinate on the fresh
+    /// lock like any other mutation. There is deliberately no liveness
+    /// guard: a running `greentic-start` server holds no flock, so
+    /// destroying an env it is serving is the operator's responsibility,
+    /// exactly as manual removal was before this verb existed.
+    pub fn destroy_environment(&self, env_id: &EnvId) -> Result<DestroyOutcome, StoreError> {
         let env_dir = self.env_dir(env_id)?;
         let environment_path = self.environment_path(env_id)?;
+        let prefix = tombstone_prefix(env_id);
+
         // Unlocked fast-path so a missing env doesn't leave behind the husk
         // dir that acquiring the flock would create.
         if !environment_path.exists() {
-            return Err(StoreError::NotFound(env_id.clone()));
+            let stale = self.collect_tombstones(&prefix);
+            if stale.is_empty() {
+                return Err(StoreError::NotFound(env_id.clone()));
+            }
+            // The env was already destroyed; reap leftover tombstones.
+            let reaped = self.purge_tombstones(&stale)?;
+            return Ok(DestroyOutcome {
+                removed_path: env_dir,
+                reaped_tombstones: reaped,
+            });
         }
+
         let guard = EnvFlock::acquire(&self.lock_path(env_id)?)?;
         // Re-check under the lock: a concurrent destroy may have won.
         if !environment_path.exists() {
@@ -778,14 +788,7 @@ impl LocalFsStore {
                 "environment `{env_id}` root is a symlink; refusing to destroy through it"
             )));
         }
-        // The id prefix is operator-facing garnish only (uniqueness comes
-        // from the ULID); cap it so the tombstone name stays under NAME_MAX
-        // even for env ids near the 255-byte filename limit. EnvId is ASCII,
-        // so a char-based cut is a byte-based cut.
-        let id_prefix: String = env_id.as_str().chars().take(128).collect();
-        let tombstone = self
-            .root
-            .join(format!("{id_prefix}.destroyed~{}", ulid::Ulid::new()));
+        let tombstone = self.root.join(format!("{prefix}{}", ulid::Ulid::new()));
         std::fs::rename(&env_dir, &tombstone).map_err(|source| StoreError::Io {
             path: env_dir.clone(),
             source,
@@ -794,14 +797,73 @@ impl LocalFsStore {
         // recursive removal — its fd lives inside the tombstone now, and on
         // Windows an open handle in the tree can block deletion.
         drop(guard);
+
+        // Purge the fresh tombstone, then any stale ones from prior failures.
         if let Err(source) = std::fs::remove_dir_all(&tombstone) {
             return Err(StoreError::CommittedAfterSave(Box::new(StoreError::Io {
                 path: tombstone,
                 source,
             })));
         }
-        Ok(env_dir)
+        let stale = self.collect_tombstones(&prefix);
+        let reaped = self.purge_tombstones(&stale)?;
+        Ok(DestroyOutcome {
+            removed_path: env_dir,
+            reaped_tombstones: reaped,
+        })
     }
+
+    /// List stale tombstone dirs for an env whose prefix matches `prefix`.
+    fn collect_tombstones(&self, prefix: &str) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with(prefix) {
+                    Some(e.path())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Remove each tombstone in `paths`. Returns the count removed. On the
+    /// first failure returns `CommittedAfterSave` with the failing path.
+    fn purge_tombstones(&self, paths: &[PathBuf]) -> Result<usize, StoreError> {
+        let mut count = 0;
+        for path in paths {
+            if let Err(source) = std::fs::remove_dir_all(path) {
+                return Err(StoreError::CommittedAfterSave(Box::new(StoreError::Io {
+                    path: path.clone(),
+                    source,
+                })));
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+}
+
+/// Outcome of a successful [`LocalFsStore::destroy_environment`] call.
+#[derive(Debug)]
+pub struct DestroyOutcome {
+    /// Canonical env dir that was removed (`<root>/<env_id>`).
+    pub removed_path: PathBuf,
+    /// Number of stale tombstones from prior failed purges reaped in this call.
+    pub reaped_tombstones: usize,
+}
+
+/// Tombstone filename prefix for a given env id. The `~` separator cannot
+/// appear in any valid `EnvId`, so a prefix match never collides with another
+/// env's tombstone. The id is capped at 128 chars so the full tombstone name
+/// stays under `NAME_MAX` even for env ids near the 255-byte limit.
+fn tombstone_prefix(env_id: &EnvId) -> String {
+    let id_prefix: String = env_id.as_str().chars().take(128).collect();
+    format!("{id_prefix}.destroyed~")
 }
 
 /// Lock-holding handle returned by [`LocalFsStore::transact`]. All mutator

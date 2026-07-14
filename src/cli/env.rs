@@ -1865,10 +1865,9 @@ pub fn destroy(
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |committed| {
-        if !store.exists(&env_id)? {
-            return Err(OpError::NotFound(format!("environment `{env_id}`")));
-        }
-        let removed_path = store
+        // No pre-check: destroy_environment handles NotFound internally and
+        // also reaps stale tombstones when the env is already gone.
+        let result = store
             .destroy_environment(&env_id)
             .inspect_err(|err| {
                 if err.is_committed_after_save() {
@@ -1876,15 +1875,18 @@ pub fn destroy(
                 }
             })
             .map_err(super::map_store_err_preserving_noun)?;
-        let outcome = OpOutcome::new(
-            NOUN,
-            "destroy",
-            json!({
-                "environment_id": env_id.as_str(),
-                "outcome": "destroyed",
-                "removed_path": removed_path.display().to_string(),
-            }),
-        );
+        let mut payload = json!({
+            "environment_id": env_id.as_str(),
+            "outcome": "destroyed",
+            "removed_path": result.removed_path.display().to_string(),
+        });
+        if result.reaped_tombstones > 0 {
+            payload
+                .as_object_mut()
+                .expect("payload constructed as object")
+                .insert("reaped_tombstones".into(), json!(result.reaped_tombstones));
+        }
+        let outcome = OpOutcome::new(NOUN, "destroy", payload);
         Ok((outcome, super::AuditGens::NONE))
     })
 }
@@ -3160,6 +3162,11 @@ mod tests {
         assert!(!env_dir.join("env-packs").exists());
         assert!(!store.exists(&EnvId::try_from("doomed").unwrap()).unwrap());
         assert!(store.list().unwrap().is_empty());
+        // A clean purge emits no reaped_tombstones key.
+        assert!(
+            outcome.result.get("reaped_tombstones").is_none(),
+            "clean destroy must not include reaped_tombstones"
+        );
         // A clean purge leaves no tombstone sibling behind.
         let tombstones: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -3315,6 +3322,12 @@ mod tests {
             event.result,
             crate::environment::AuditResult::Error { .. }
         ));
+
+        // Re-running destroy reaps the stale tombstone (permissions already
+        // restored above).
+        let outcome = destroy(&store, &OpFlags::default(), "doomed", true).unwrap();
+        assert_eq!(outcome.result["outcome"], "destroyed");
+        assert_eq!(outcome.result["reaped_tombstones"], 1);
     }
 
     #[cfg(unix)]
