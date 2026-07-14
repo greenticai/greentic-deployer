@@ -692,26 +692,24 @@ fn destroy_environment_missing_env_is_not_found() {
     assert!(!tmp.path().join("ghost").exists());
 }
 
+/// Make the (future) tombstone's purge fail: a write-protected dir with a
+/// child makes `remove_dir_all` fail after the (committing) rename.
 #[cfg(unix)]
-#[test]
-fn destroy_environment_purge_failure_is_committed_after_save() {
+fn poison_purge(env_dir: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
-    let (tmp, store) = fresh_store();
-    let id = env_id("doomed");
-    store.save(&minimal_environment(&id)).unwrap();
-    // A write-protected dir with a child makes remove_dir_all fail after the
-    // (committing) rename already happened.
-    let blocked = tmp.path().join("doomed").join("blocked");
+    let blocked = env_dir.join("blocked");
     std::fs::create_dir_all(&blocked).unwrap();
     std::fs::write(blocked.join("child"), b"x").unwrap();
     std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o555)).unwrap();
+}
 
-    let err = store.destroy_environment(&id).unwrap_err();
-
-    // Restore permissions BEFORE any assertion so TempDir::drop can clean up
-    // on every exit path, including assertion failure. The tombstone itself
-    // must remain for manual cleanup.
-    let tombstone = std::fs::read_dir(tmp.path())
+/// Find the surviving tombstone under `root` and restore write permissions
+/// on its poisoned dir so a reap — or TempDir::drop — can remove it. Call
+/// BEFORE any assertion so cleanup happens on every exit path.
+#[cfg(unix)]
+fn find_tombstone_and_unblock(root: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let tombstone = std::fs::read_dir(root)
         .unwrap()
         .filter_map(Result::ok)
         .find(|e| e.file_name().to_string_lossy().contains(".destroyed~"))
@@ -721,6 +719,19 @@ fn destroy_environment_purge_failure_is_committed_after_save() {
         std::fs::Permissions::from_mode(0o755),
     )
     .unwrap();
+    tombstone.path()
+}
+
+#[cfg(unix)]
+#[test]
+fn destroy_environment_purge_failure_is_committed_after_save() {
+    let (tmp, store) = fresh_store();
+    let id = env_id("doomed");
+    store.save(&minimal_environment(&id)).unwrap();
+    poison_purge(&tmp.path().join("doomed"));
+
+    let err = store.destroy_environment(&id).unwrap_err();
+    let _tombstone = find_tombstone_and_unblock(tmp.path());
 
     assert!(err.is_committed_after_save(), "got {err:?}");
     // The rename committed: the canonical path is gone...
@@ -733,30 +744,14 @@ fn destroy_environment_purge_failure_is_committed_after_save() {
 #[cfg(unix)]
 #[test]
 fn destroy_environment_rerun_reaps_stale_tombstone() {
-    use std::os::unix::fs::PermissionsExt;
     let (tmp, store) = fresh_store();
     let id = env_id("doomed");
     store.save(&minimal_environment(&id)).unwrap();
-    // Inject a permission failure so the first destroy leaves a tombstone.
-    let blocked = tmp.path().join("doomed").join("blocked");
-    std::fs::create_dir_all(&blocked).unwrap();
-    std::fs::write(blocked.join("child"), b"x").unwrap();
-    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    poison_purge(&tmp.path().join("doomed"));
 
     let err = store.destroy_environment(&id).unwrap_err();
     assert!(err.is_committed_after_save());
-
-    // Restore permissions so the tombstone can be removed.
-    let tombstone = std::fs::read_dir(tmp.path())
-        .unwrap()
-        .filter_map(Result::ok)
-        .find(|e| e.file_name().to_string_lossy().contains(".destroyed~"))
-        .expect("tombstone must remain");
-    std::fs::set_permissions(
-        tombstone.path().join("blocked"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+    find_tombstone_and_unblock(tmp.path());
 
     // Re-running destroy reaps the stale tombstone.
     let outcome = store.destroy_environment(&id).unwrap();

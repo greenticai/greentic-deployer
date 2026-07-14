@@ -1820,23 +1820,20 @@ pub fn init(
 }
 
 /// `op env destroy <env_id> --confirm`. Irreversibly removes the env's
-/// on-disk state under the store root via
-/// [`LocalFsStore::destroy_environment`] (rename to a sibling tombstone,
-/// then purge) — the supported replacement for the manual cleanup this
-/// verb's error message used to recommend.
+/// on-disk state via [`LocalFsStore::destroy_environment`] (mechanics,
+/// failure contract, and concurrency notes documented there).
 ///
 /// Force-free safety net: the caller must pass `confirm = true`. The
 /// `--confirm` flag is the operator-binary's responsibility; this library
 /// just enforces the gate.
 ///
-/// The audit event appends AFTER the mutation closure, so it lands in a
-/// recreated `<env_id>/audit/events.jsonl` holding only the destroy event:
-/// the destroy record is durable (fail-closed on append failure via
-/// `mark_committed`) and a later `init` continues the same trail. The
-/// residue dir has no `environment.json`, so `exists()`/`list()` ignore
-/// it. Destroying `local` is allowed — `gtc setup`/`gtc start` re-create
-/// it on next launch. Dev-store secrets redirected outside the env dir via
-/// `GREENTIC_DEV_SECRETS_PATH` are not touched.
+/// CLI-layer specifics: the audit event appends AFTER the mutation
+/// closure, so it lands in a recreated `<env_id>/audit/events.jsonl`
+/// holding only the destroy event (fail-closed via `mark_committed`); a
+/// later `init` continues the same trail. Destroying `local` is allowed —
+/// `gtc setup`/`gtc start` re-create it on next launch. Dev-store secrets
+/// redirected outside the env dir via `GREENTIC_DEV_SECRETS_PATH` are not
+/// touched.
 pub fn destroy(
     store: &LocalFsStore,
     flags: &OpFlags,

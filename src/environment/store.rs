@@ -799,12 +799,7 @@ impl LocalFsStore {
         drop(guard);
 
         // Purge the fresh tombstone, then any stale ones from prior failures.
-        if let Err(source) = std::fs::remove_dir_all(&tombstone) {
-            return Err(StoreError::CommittedAfterSave(Box::new(StoreError::Io {
-                path: tombstone,
-                source,
-            })));
-        }
+        self.purge_tombstones(std::slice::from_ref(&tombstone))?;
         let stale = self.collect_tombstones(&prefix);
         let reaped = self.purge_tombstones(&stale)?;
         Ok(DestroyOutcome {
@@ -820,14 +815,8 @@ impl LocalFsStore {
         };
         entries
             .filter_map(Result::ok)
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.starts_with(prefix) {
-                    Some(e.path())
-                } else {
-                    None
-                }
-            })
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .map(|e| e.path())
             .collect()
     }
 
