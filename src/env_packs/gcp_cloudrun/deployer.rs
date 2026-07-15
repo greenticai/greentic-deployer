@@ -53,6 +53,12 @@ const WARM_READY_TIMEOUT: Duration = Duration::from_secs(300);
 const WARM_READY_TIMEOUT_ENV: &str = "GREENTIC_GCP_WARM_READY_TIMEOUT_SECS";
 const WARM_READY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Bounded retries for an `etag` optimistic-concurrency conflict (plan D4: on a
+/// precondition failure the adapter re-reads and recomputes rather than
+/// replaying stale state). A concurrent warm/traffic mutation should resolve
+/// well within this budget; exceeding it is surfaced as a provider error.
+const MAX_ETAG_RETRIES: u32 = 5;
+
 fn warm_ready_timeout() -> Duration {
     std::env::var(WARM_READY_TIMEOUT_ENV)
         .ok()
@@ -175,6 +181,20 @@ impl GcpCloudRunParams {
             max_instances: self.max_instances,
             concurrency: self.concurrency,
         }
+    }
+
+    /// The least-privilege runtime service account the revision runs as: the
+    /// `service_account` answer when set, otherwise the default the bootstrap
+    /// Terraform provisions (`gtc-{env}-runtime@{project}.iam.gserviceaccount.com`).
+    /// Never empty — a revision must never fall back to the Compute Engine
+    /// default identity.
+    pub fn runtime_service_account(&self, env_id: &str) -> String {
+        self.service_account.clone().unwrap_or_else(|| {
+            format!(
+                "gtc-{env_id}-runtime@{project}.iam.gserviceaccount.com",
+                project = self.project,
+            )
+        })
     }
 }
 
@@ -351,52 +371,68 @@ impl Deployer for GcpCloudRunDeployerHandler {
             project: params.project.clone(),
             region: params.region.clone(),
         };
-        let existing = self
-            .target
-            .get_service(&service_ref)
-            .await
-            .map_err(provider)?;
+        let runtime_service_account = params.runtime_service_account(env.environment_id.as_str());
 
-        // Pin traffic to NAMED revisions in the same upsert (plan D4). First
-        // create: 100% to the named first revision (never LATEST, never a
-        // 0%-only array). Update: keep the existing distribution and add this
-        // revision at 0% if it is new — warm never moves traffic.
-        let (traffic, etag) = match &existing {
-            None => (
-                vec![TrafficTarget {
-                    revision_id,
-                    percent: 100,
-                }],
-                None,
-            ),
-            Some(status) => {
-                let mut traffic = status.traffic.clone();
-                if !traffic.iter().any(|t| t.revision_id == revision_id) {
-                    traffic.push(TrafficTarget {
+        // Read-modify-write under etag optimistic concurrency with bounded
+        // retries on a precondition conflict (plan D4): re-read, recompute
+        // traffic from the fresh state, and retry rather than replaying a stale
+        // etag. Traffic is pinned to NAMED revisions in the same upsert — first
+        // create is 100% to the named first revision (never LATEST, never a
+        // 0%-only array); an update keeps the existing distribution and adds
+        // this revision at 0% if it is new, so warm never moves traffic.
+        let mut attempt = 0;
+        loop {
+            let existing = self
+                .target
+                .get_service(&service_ref)
+                .await
+                .map_err(provider)?;
+            let (traffic, etag) = match &existing {
+                None => (
+                    vec![TrafficTarget {
                         revision_id,
-                        percent: 0,
-                    });
+                        percent: 100,
+                    }],
+                    None,
+                ),
+                Some(status) => {
+                    let mut traffic = status.traffic.clone();
+                    if !traffic.iter().any(|t| t.revision_id == revision_id) {
+                        traffic.push(TrafficTarget {
+                            revision_id,
+                            percent: 0,
+                        });
+                    }
+                    (traffic, Some(status.etag.clone()))
                 }
-                (traffic, Some(status.etag.clone()))
+            };
+            let spec = ServiceSpec {
+                deployment_id,
+                project: params.project.clone(),
+                region: params.region.clone(),
+                image: params.image_ref(),
+                revision_id,
+                runtime_service_account: runtime_service_account.clone(),
+                traffic,
+                scaling: params.scaling(),
+                access_mode: params.access_mode,
+                session_affinity: true,
+                secrets: Vec::new(),
+            };
+            match self.target.upsert_service(&spec, etag.as_deref()).await {
+                Ok(_) => break,
+                Err(CloudRunTargetError::PreconditionFailed) => {
+                    attempt += 1;
+                    if attempt > MAX_ETAG_RETRIES {
+                        return Err(DeployerError::Provider(format!(
+                            "Cloud Run service for deployment `{deployment_id}` kept losing the \
+                             etag race after {MAX_ETAG_RETRIES} retries"
+                        )));
+                    }
+                }
+                Err(e) => return Err(provider(e)),
             }
-        };
-
-        let spec = ServiceSpec {
-            deployment_id,
-            project: params.project.clone(),
-            region: params.region.clone(),
-            image: params.image_ref(),
-            revision_id,
-            traffic,
-            scaling: params.scaling(),
-            access_mode: params.access_mode,
-            session_affinity: true,
-            secrets: Vec::new(),
-        };
-        self.target
-            .upsert_service(&spec, etag.as_deref())
-            .await
-            .map_err(provider)?;
+        }
 
         let revision_ref = RevisionRef {
             deployment_id,
@@ -465,20 +501,39 @@ impl Deployer for GcpCloudRunDeployerHandler {
             region: params.region,
         };
         // When the Service exists, set traffic under its live etag (read-modify-
-        // write). When it does not (no revision warmed yet), the recorded split
-        // is authoritative and projects at the next warm — mirroring the AWS
-        // impl's "no provider mirror configured" no-op so the runtime
-        // dispatcher / spec stays the source of truth.
-        if let Some(status) = self
-            .target
-            .get_service(&service_ref)
-            .await
-            .map_err(provider)?
-        {
-            self.target
+        // write) with bounded retries on an etag conflict (plan D4). When it
+        // does not (no revision warmed yet), the recorded split is authoritative
+        // and projects at the next warm — mirroring the AWS impl's "no provider
+        // mirror configured" no-op so the spec stays the source of truth. In the
+        // real `op env up` flow the deployment is always warmed before its split
+        // is applied, so the Service exists whenever enforcement matters.
+        let mut attempt = 0;
+        loop {
+            let Some(status) = self
+                .target
+                .get_service(&service_ref)
+                .await
+                .map_err(provider)?
+            else {
+                break;
+            };
+            match self
+                .target
                 .set_traffic(&service_ref, &targets, &status.etag)
                 .await
-                .map_err(provider)?;
+            {
+                Ok(_) => break,
+                Err(CloudRunTargetError::PreconditionFailed) => {
+                    attempt += 1;
+                    if attempt > MAX_ETAG_RETRIES {
+                        return Err(DeployerError::Provider(format!(
+                            "Cloud Run traffic split for deployment `{deployment_id}` kept losing \
+                             the etag race after {MAX_ETAG_RETRIES} retries"
+                        )));
+                    }
+                }
+                Err(e) => return Err(provider(e)),
+            }
         }
         Ok(outcome)
     }
@@ -491,9 +546,13 @@ mod tests {
 
     use greentic_deploy_spec::TrafficSplitEntry;
 
+    use async_trait::async_trait;
+
     use crate::env_packs::deployer::conformance::build_fixture_env;
     use crate::env_packs::deployer::run_conformance;
-    use crate::env_packs::gcp_cloudrun::deploy_target::InMemoryCloudRun;
+    use crate::env_packs::gcp_cloudrun::deploy_target::{
+        CloudRunTarget, InMemoryCloudRun, RevisionStatus, SecretVersion, ServiceStatus,
+    };
 
     fn handler_with_fake() -> (GcpCloudRunDeployerHandler, Arc<InMemoryCloudRun>) {
         let target = Arc::new(InMemoryCloudRun::default());
@@ -501,6 +560,100 @@ mod tests {
             GcpCloudRunDeployerHandler::with_target(target.clone()),
             target,
         )
+    }
+
+    /// Target that injects a fixed number of etag conflicts before delegating to
+    /// a real in-memory backend — proves the deployer's bounded read-modify-write
+    /// retry (plan D4). Only `upsert_service` / `set_traffic` are intercepted;
+    /// every other verb passes straight through.
+    #[derive(Debug)]
+    struct ConflictInjector {
+        inner: InMemoryCloudRun,
+        upsert_conflicts: std::sync::Mutex<u32>,
+        set_traffic_conflicts: std::sync::Mutex<u32>,
+    }
+
+    impl ConflictInjector {
+        fn new(upsert_conflicts: u32, set_traffic_conflicts: u32) -> Self {
+            Self {
+                inner: InMemoryCloudRun::default(),
+                upsert_conflicts: std::sync::Mutex::new(upsert_conflicts),
+                set_traffic_conflicts: std::sync::Mutex::new(set_traffic_conflicts),
+            }
+        }
+
+        fn take_conflict(slot: &std::sync::Mutex<u32>) -> bool {
+            let mut n = slot.lock().unwrap();
+            if *n > 0 {
+                *n -= 1;
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CloudRunTarget for ConflictInjector {
+        async fn get_service(
+            &self,
+            service: &ServiceRef,
+        ) -> Result<Option<ServiceStatus>, CloudRunTargetError> {
+            self.inner.get_service(service).await
+        }
+        async fn upsert_service(
+            &self,
+            spec: &ServiceSpec,
+            etag: Option<&str>,
+        ) -> Result<ServiceStatus, CloudRunTargetError> {
+            if Self::take_conflict(&self.upsert_conflicts) {
+                return Err(CloudRunTargetError::PreconditionFailed);
+            }
+            self.inner.upsert_service(spec, etag).await
+        }
+        async fn get_revision_status(
+            &self,
+            revision: &RevisionRef,
+        ) -> Result<RevisionStatus, CloudRunTargetError> {
+            self.inner.get_revision_status(revision).await
+        }
+        async fn set_traffic(
+            &self,
+            service: &ServiceRef,
+            traffic: &[TrafficTarget],
+            etag: &str,
+        ) -> Result<ServiceStatus, CloudRunTargetError> {
+            if Self::take_conflict(&self.set_traffic_conflicts) {
+                return Err(CloudRunTargetError::PreconditionFailed);
+            }
+            self.inner.set_traffic(service, traffic, etag).await
+        }
+        async fn set_invoker_policy(
+            &self,
+            service: &ServiceRef,
+            access_mode: AccessMode,
+        ) -> Result<(), CloudRunTargetError> {
+            self.inner.set_invoker_policy(service, access_mode).await
+        }
+        async fn delete_revision(&self, revision: &RevisionRef) -> Result<(), CloudRunTargetError> {
+            self.inner.delete_revision(revision).await
+        }
+        async fn delete_service(&self, service: &ServiceRef) -> Result<(), CloudRunTargetError> {
+            self.inner.delete_service(service).await
+        }
+        async fn get_service_url(
+            &self,
+            service: &ServiceRef,
+        ) -> Result<Option<String>, CloudRunTargetError> {
+            self.inner.get_service_url(service).await
+        }
+        async fn upsert_secret(
+            &self,
+            name: &str,
+            payload: &[u8],
+        ) -> Result<SecretVersion, CloudRunTargetError> {
+            self.inner.upsert_secret(name, payload).await
+        }
     }
 
     #[tokio::test]
@@ -713,5 +866,86 @@ mod tests {
             .await
             .expect_err("unconfigured target must fail warm");
         assert!(matches!(err, DeployerError::Provider(_)));
+    }
+
+    #[tokio::test]
+    async fn warm_threads_runtime_service_account_default_then_override() {
+        // Default: derived from the env id + project (the SA the bootstrap
+        // Terraform provisions), never blank.
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+        let sa = target
+            .runtime_service_account_for(dep_a)
+            .expect("warm records the runtime SA");
+        assert!(
+            sa.starts_with("gtc-conformance-runtime@"),
+            "default runtime SA is derived from the env, got {sa}"
+        );
+
+        // Override: the `service_account` answer wins and is threaded through.
+        let (handler2, target2) = handler_with_fake();
+        let answers =
+            serde_json::json!({ "service_account": "custom-runtime@acme.iam.gserviceaccount.com" });
+        handler2
+            .warm_revision(&env, r_warm, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            target2.runtime_service_account_for(dep_a).unwrap(),
+            "custom-runtime@acme.iam.gserviceaccount.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_retries_on_etag_conflict_then_succeeds() {
+        // Two conflicts, then success — within the retry budget (plan D4).
+        let target = Arc::new(ConflictInjector::new(2, 0));
+        let handler = GcpCloudRunDeployerHandler::with_target(target.clone());
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+        handler
+            .warm_revision(&env, r_warm, None)
+            .await
+            .expect("warm re-reads and retries past etag conflicts");
+        assert!(
+            target.inner.traffic_for(dep_a).is_some(),
+            "the service is created once the retry wins the etag race"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_gives_up_after_max_etag_retries() {
+        let target = Arc::new(ConflictInjector::new(MAX_ETAG_RETRIES + 1, 0));
+        let handler = GcpCloudRunDeployerHandler::with_target(target);
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let err = handler
+            .warm_revision(&env, r_warm, None)
+            .await
+            .expect_err("unbounded etag conflicts must surface a provider error");
+        assert!(matches!(err, DeployerError::Provider(ref m) if m.contains("etag race")));
+    }
+
+    #[tokio::test]
+    async fn apply_traffic_split_retries_on_etag_conflict() {
+        let target = Arc::new(ConflictInjector::new(0, 1));
+        let handler = GcpCloudRunDeployerHandler::with_target(target.clone());
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+        handler
+            .apply_traffic_split(&env, dep_a, None)
+            .await
+            .expect("traffic apply re-reads and retries past the etag conflict");
+        assert_eq!(
+            target.inner.traffic_for(dep_a).unwrap().len(),
+            2,
+            "the 50/50 split lands after the retry"
+        );
     }
 }

@@ -257,6 +257,26 @@ bills for cached-artifact storage.
    All capabilities (`{caller_cap}` + the permissions above) must pass before
    `gtc op env up {env_id}` is honored.
 
+## Least-privilege caveat (review before applying)
+
+The custom role above is bound at **project scope**, and project IAM policies
+flow down to every resource in the project. In a **shared project** that is
+broader than one environment needs: the deployer could `actAs` unrelated service
+accounts, read unrelated secrets, and mutate other environments' Cloud Run
+Services. Before production use, tighten this to least privilege:
+
+- Grant `iam.serviceAccounts.actAs` (via `roles/iam.serviceAccountUser`) on the
+  **runtime service account resource** only — not project-wide.
+- Grant the runtime service account `roles/secretmanager.secretAccessor` on
+  **this environment's secrets** only (the deploy binds this per-secret when it
+  creates them; revisions that mount secrets cannot start without it).
+- Add IAM Conditions or resource-scoped bindings for the destructive
+  `run.services.*` / `run.revisions.*` verbs so one env cannot mutate another's.
+
+A dedicated project per environment sidesteps all of the above. Resource-scoped
+credential validation and per-secret accessor binding are wired in later steps
+of the Cloud Run deployment train.
+
 ## What this does NOT do
 
 This is the credentials bootstrap. The Cloud Run Services, revisions, and Secret
@@ -387,5 +407,8 @@ mod tests {
         assert!(readme.contains("tofu apply"));
         assert!(readme.contains("gtc op credentials rotate prod-eu"));
         assert!(readme.contains("env `prod-eu`"));
+        // The least-privilege caveat must warn about the project-scope binding.
+        assert!(readme.contains("Least-privilege caveat"));
+        assert!(readme.contains("shared project"));
     }
 }

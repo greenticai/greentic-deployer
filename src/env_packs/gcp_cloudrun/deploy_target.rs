@@ -109,6 +109,11 @@ pub struct ServiceSpec {
     pub image: String,
     /// The revision this upsert creates.
     pub revision_id: RevisionId,
+    /// The least-privilege runtime service account the revision runs as
+    /// (resolved from the `service_account` answer, or the bootstrap default).
+    /// Empty is invalid — the deployer always resolves a concrete identity so a
+    /// revision never silently runs under the Compute Engine default SA.
+    pub runtime_service_account: String,
     /// Traffic pinned to *named* revisions in the same call (plan D4) — never
     /// `LATEST`, never a single-entry 0% array.
     pub traffic: Vec<TrafficTarget>,
@@ -307,6 +312,9 @@ pub struct InMemoryCloudRun {
     revisions: Mutex<BTreeMap<(DeploymentId, RevisionId), RevisionStatus>>,
     secrets: Mutex<BTreeMap<String, (Vec<u8>, u64)>>,
     invoker_policies: Mutex<BTreeMap<DeploymentId, AccessMode>>,
+    /// Last runtime service account each Service was upserted with, so tests can
+    /// assert the deployer threads the resolved identity through the seam.
+    runtime_service_accounts: Mutex<BTreeMap<DeploymentId, String>>,
     etag_counter: Mutex<u64>,
 }
 
@@ -359,6 +367,15 @@ impl InMemoryCloudRun {
             .get(&deployment_id)
             .copied()
     }
+
+    /// Runtime service account the deployment's Service was last upserted with.
+    pub fn runtime_service_account_for(&self, deployment_id: DeploymentId) -> Option<String> {
+        self.runtime_service_accounts
+            .lock()
+            .expect("runtime-sa mutex")
+            .get(&deployment_id)
+            .cloned()
+    }
 }
 
 #[async_trait]
@@ -406,6 +423,10 @@ impl CloudRunTarget for InMemoryCloudRun {
                 active: true,
             },
         );
+        self.runtime_service_accounts
+            .lock()
+            .expect("runtime-sa mutex")
+            .insert(spec.deployment_id, spec.runtime_service_account.clone());
         Ok(status)
     }
 
@@ -482,6 +503,10 @@ impl CloudRunTarget for InMemoryCloudRun {
             .lock()
             .expect("invoker mutex")
             .remove(&service.deployment_id);
+        self.runtime_service_accounts
+            .lock()
+            .expect("runtime-sa mutex")
+            .remove(&service.deployment_id);
         Ok(())
     }
 
@@ -545,6 +570,7 @@ mod tests {
             region: "us-central1".to_string(),
             image: "ghcr.io/greenticai/greentic-start-distroless:develop".to_string(),
             revision_id,
+            runtime_service_account: "gtc-local-runtime@proj.iam.gserviceaccount.com".to_string(),
             traffic,
             scaling: ScalingSpec {
                 cpu: "1".to_string(),
