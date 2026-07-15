@@ -1,0 +1,180 @@
+# wizard.qaspec.yaml — GCP Cloud Run deployer env-pack.
+#
+# Collects the operator-facing knobs the Cloud Run deployer needs at bind time.
+# GCP credential MATERIAL is not captured here — the credential chain
+# (Application Default Credentials: gcloud auth, service-account key, or
+# workload-identity federation) is resolved by the deployer's validator client
+# and validated via `projects.testIamPermissions` over the
+# `VALIDATED_GCP_PERMISSIONS` list. The wizard's job is to capture the
+# *non-secret* identifiers the deployer needs to scope its operations: which
+# project, which region, how the service is reached, and sizing.
+#
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Trust-boundary disclosure (C6 ↔ Phase D scope split):
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# As with the AWS-ECS wizard, the credentials probe runs against whatever
+# ambient ADC identity is present in the process environment — NOT against the
+# `project` / `service_account` captured here. The captured answers are
+# PERSISTED on the binding (`answers_ref`) and consumed by the deploy path
+# (`op env up`); make sure the host's ambient GCP identity points at the same
+# project you fill in here, or validation can pass/fail for a different
+# principal than this wizard scopes.
+#
+# Versioning: this spec rides the env-pack handler's
+# `GcpCloudRunDeployerHandler::VERSION_REQ` (`>=1.0.0-dev, <2.0.0`).
+
+id: greentic.deployer.gcp-cloudrun.wizard
+title: GCP Cloud Run deployer
+version: "0.1.0"
+description: >-
+  Records the Google Cloud project + region the Cloud Run deployer will operate
+  against, plus service access mode and sizing. Cloud Run scales to zero, so an
+  idle environment costs nothing. Credential MATERIAL is never collected here;
+  the deployer resolves Application Default Credentials at deploy time.
+presentation:
+  intro: >-
+    Bind a GCP Cloud Run environment. Cloud Run deploys the public Greentic
+    runtime image directly from GHCR (no Artifact Registry needed) and scales to
+    zero when idle. Make sure your ambient gcloud/ADC identity points at the
+    project you fill in here.
+
+questions:
+  - id: project
+    type: string
+    title: GCP project id
+    description: >-
+      The Google Cloud project id that will host the Cloud Run services and
+      Secret Manager secrets (e.g. `my-greentic-prod`). Must already exist and
+      have billing enabled; the bootstrap rules pack provisions the deployer
+      service account and IAM inside it.
+    required: true
+    constraint:
+      pattern: '^[a-z][a-z0-9-]{4,28}[a-z0-9]$'
+
+  - id: region
+    type: string
+    title: Cloud Run region
+    description: >-
+      The Cloud Run region the services run in (e.g. `us-central1`,
+      `europe-west1`, `asia-northeast1`).
+    required: true
+    constraint:
+      pattern: '^[a-z]+-[a-z]+[0-9]+$'
+
+  - id: access_mode
+    type: enum
+    title: Service access mode
+    description: >-
+      `public` grants `roles/run.invoker` to `allUsers` so the returned
+      `run.app` URL, its health probe, and webhook callbacks (Telegram, …) are
+      reachable — the default for the webhook/demo flow. `authenticated` leaves
+      the service private (callers must present a Google identity token), which
+      breaks webhooks that cannot present one. A deliberate trust-boundary
+      choice; never blind-grant public.
+    required: false
+    default_value: "public"
+    choices: ["public", "authenticated"]
+
+  - id: ar_repo
+    type: string
+    title: Artifact Registry remote repo (optional)
+    description: >-
+      OPTIONAL. Leave blank to deploy the public GHCR image directly (the
+      free-when-idle default). Set to an Artifact Registry remote-repository id
+      proxying ghcr.io for the higher-availability case Google recommends — note
+      a remote repo bills for cached-artifact storage, so it is NOT
+      free-when-idle.
+    required: false
+
+  - id: runtime_image_tag
+    type: string
+    title: Runtime image tag
+    description: >-
+      Tag of the `greentic-start-distroless` runtime image to deploy (e.g.
+      `develop`). Ignored when a digest is set. Prefer pinning a digest below to
+      defeat the ≤1h Cloud Run tag cache.
+    required: false
+    default_value: "develop"
+    constraint:
+      pattern: '^[a-zA-Z0-9_.-]+$'
+
+  - id: runtime_image_digest
+    type: string
+    title: Runtime image digest (recommended)
+    description: >-
+      RECOMMENDED. Pin the runtime image by digest (e.g.
+      `sha256:<64 hex>`) so a cold start or rollback always pulls the exact
+      image, defeating tag-cache staleness. When set, overrides the tag.
+    required: false
+    constraint:
+      pattern: '^sha256:[a-f0-9]{64}$'
+
+  - id: service_account
+    type: string
+    title: Runtime service account (optional)
+    description: >-
+      Email of the least-privilege service account the Cloud Run revisions run
+      as. Leave blank to use the account the bootstrap rules pack provisions
+      (`gtc-<env>-runtime@<project>.iam.gserviceaccount.com`).
+    required: false
+
+  - id: secret_prefix
+    type: string
+    title: Secret Manager name prefix (optional)
+    description: >-
+      Prefix for the per-env Secret Manager secrets the deploy stages
+      (env-store + dev-secrets). Leave blank to default to `gtc-<env>`.
+    required: false
+
+  - id: cpu
+    type: string
+    title: CPU per instance
+    description: >-
+      vCPU allocated to each Cloud Run instance (e.g. `1`, `2`). Billed only
+      while serving a request (request-based billing).
+    required: false
+    default_value: "1"
+
+  - id: memory
+    type: string
+    title: Memory per instance
+    description: >-
+      Memory per Cloud Run instance (e.g. `512Mi`, `1Gi`).
+    required: false
+    default_value: "512Mi"
+
+  - id: max_instances
+    type: string
+    title: Max instances
+    description: >-
+      Maximum concurrent Cloud Run instances. Defaults to `1`: the dev env-store
+      is seeded per-instance and ephemeral, so a single writer avoids
+      cross-instance divergence. Raising this above 1 requires the durable
+      shared-store follow-up.
+    required: false
+    default_value: "1"
+    constraint:
+      pattern: '^[0-9]+$'
+
+  - id: concurrency
+    type: string
+    title: Requests per instance
+    description: >-
+      Maximum concurrent requests a single Cloud Run instance handles before
+      Cloud Run scales out (up to `max_instances`).
+    required: false
+    default_value: "80"
+    constraint:
+      pattern: '^[0-9]+$'
+
+  - id: min_instances
+    type: string
+    title: Min instances
+    description: >-
+      Minimum warm instances. `0` is the scale-to-zero default that makes an
+      idle env cost nothing; a non-zero value keeps instances warm and COSTS
+      MONEY while idle.
+    required: false
+    default_value: "0"
+    constraint:
+      pattern: '^[0-9]+$'

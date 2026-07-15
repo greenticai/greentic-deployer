@@ -101,6 +101,12 @@ impl EnvPackRegistry {
         registry
             .register(Box::new(super::aws::AwsEcsDeployerHandler::default()))
             .expect("aws-ecs deployer handler path is unique");
+        #[cfg(feature = "creds-gcp")]
+        registry
+            .register(Box::new(
+                super::gcp_cloudrun::GcpCloudRunDeployerHandler::default(),
+            ))
+            .expect("gcp-cloudrun deployer handler path is unique");
         registry
             .register(Box::new(super::k8s::K8sDeployerHandler::default()))
             .expect("k8s deployer handler path is unique");
@@ -208,17 +214,14 @@ mod tests {
     #[test]
     fn with_builtins_registers_baseline_handlers() {
         // Five `local` handlers (Secrets / Telemetry / Sessions / State +
-        // local-process Deployer) plus the Phase D K8s deployer. With the
-        // `creds-aws` feature on, the C3 AWS-ECS Deployer handler is also
-        // registered — neither cloud handler is part of the `local` env's
-        // default bindings but the registry resolves them so
-        // `gtc op env-packs add … --kind greentic.deployer.<cloud>`
-        // resolves.
+        // local-process Deployer) plus the Phase D K8s deployer (6 baseline).
+        // Each cloud deployer adds one when its feature is on: `creds-aws` for
+        // AWS-ECS, `creds-gcp` for GCP Cloud Run. Neither cloud handler is part
+        // of the `local` env's default bindings, but the registry resolves them
+        // so `gtc op env-packs add … --kind greentic.deployer.<cloud>` resolves.
         let registry = EnvPackRegistry::with_builtins();
-        #[cfg(feature = "creds-aws")]
-        let expected = 7;
-        #[cfg(not(feature = "creds-aws"))]
-        let expected = 6;
+        let expected =
+            6 + cfg!(feature = "creds-aws") as usize + cfg!(feature = "creds-gcp") as usize;
         assert_eq!(registry.len(), expected);
     }
 

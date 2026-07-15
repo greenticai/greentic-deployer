@@ -30,7 +30,7 @@ categories = [
 ]
 
 [features]
-default = ["bundle-upload-aws", "runtime-secrets-aws", "creds-aws", "deploy-aws-ecs", "k8s-client"]
+default = ["bundle-upload-aws", "runtime-secrets-aws", "creds-aws", "deploy-aws-ecs", "creds-gcp", "k8s-client"]
 internal-tools = []
 test-utils = []
 bundle-upload-aws = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime-api"]
@@ -53,6 +53,13 @@ deploy-aws-ecs = ["dep:aws-sdk-ecs", "dep:aws-sdk-elasticloadbalancingv2", "dep:
 # at `connect()` — both `ring` (kube) and `aws-lc-rs` (AWS SDK) are linked,
 # so rustls 0.23 cannot auto-select one and the first TLS handshake panics.
 k8s-client = ["dep:kube", "dep:k8s-openapi", "dep:rustls"]
+# GCP Cloud Run deployer env-pack credentials + adapter scaffold: the
+# `CloudRunTarget` seam, its in-memory fake, the Deployer verbs, the credentials
+# validator seam, and the Terraform bootstrap renderer. Default-on so nightly
+# `gtc-dev` binaries ship the adapter. Pure-Rust in this PR (no SDK deps); the
+# `google-cloud-*`-backed real target + validator land behind a follow-up
+# `deploy-gcp-cloudrun` feature.
+creds-gcp = []
 bundle-upload-gcp = []
 bundle-upload-azure = []
 
