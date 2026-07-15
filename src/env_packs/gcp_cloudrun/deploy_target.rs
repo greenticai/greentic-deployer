@@ -326,9 +326,11 @@ impl InMemoryCloudRun {
     }
 
     fn deterministic_url(deployment_id: DeploymentId) -> String {
+        // Reuse the canonical service-name format so the fake URL can't drift
+        // from the real Cloud Run naming scheme.
         format!(
-            "https://gtc-svc-{}-000000.run.app",
-            deployment_id.0.to_string().to_lowercase()
+            "https://{}-000000.run.app",
+            super::deployer::service_name(deployment_id)
         )
     }
 
