@@ -310,12 +310,15 @@ pub fn stage(
                         pack_config_refs,
                     )
                 }
-                None => (
-                    payload_bundle_digest,
-                    pack_list,
-                    payload_pack_list_lock_ref,
-                    Vec::new(),
-                ),
+                None => {
+                    validate_legacy_pack_list_lock_ref(&payload_pack_list_lock_ref, revision_id)?;
+                    (
+                        payload_bundle_digest,
+                        pack_list,
+                        payload_pack_list_lock_ref,
+                        Vec::new(),
+                    )
+                }
             };
 
         let store_payload = StageRevisionPayload {
@@ -809,6 +812,93 @@ fn parse_revision_id(raw: &str) -> Result<RevisionId, OpError> {
     let ulid = ulid::Ulid::from_str(raw)
         .map_err(|e| OpError::InvalidArgument(format!("revision_id: {e}")))?;
     Ok(RevisionId(ulid))
+}
+
+#[cfg(test)]
+mod legacy_pack_ref_guard_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// The exact value that pre-1.1.0 callers passed, and that left every such
+    /// environment unable to boot.
+    #[test]
+    fn rejects_the_bare_placeholder() {
+        let revision_id = RevisionId::new();
+        let err = validate_legacy_pack_list_lock_ref(&PathBuf::from("pack-list.lock"), revision_id)
+            .unwrap_err();
+        let OpError::InvalidArgument(msg) = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert!(msg.contains("not backed by any file"), "got: {msg}");
+    }
+
+    /// The legitimate "no pinned pack list" signal — the materializer already
+    /// fail-safes on it, and `env_apply` passes exactly this.
+    #[test]
+    fn accepts_an_empty_ref() {
+        validate_legacy_pack_list_lock_ref(&PathBuf::new(), RevisionId::new())
+            .expect("an empty ref is the documented legacy signal");
+    }
+
+    #[test]
+    fn accepts_a_ref_under_this_revisions_own_dir() {
+        let revision_id = RevisionId::new();
+        let rel = PathBuf::from("revisions")
+            .join(revision_id.to_string())
+            .join("pack-list.lock");
+        validate_legacy_pack_list_lock_ref(&rel, revision_id).expect("own-revision ref is valid");
+    }
+
+    /// A ref under a DIFFERENT revision's directory is someone else's lockfile.
+    #[test]
+    fn rejects_a_ref_under_another_revisions_dir() {
+        let rel = PathBuf::from("revisions")
+            .join(RevisionId::new().to_string())
+            .join("pack-list.lock");
+        assert!(
+            validate_legacy_pack_list_lock_ref(&rel, RevisionId::new()).is_err(),
+            "a ref pointing into another revision's dir must be rejected"
+        );
+    }
+}
+
+/// Guard the hole that produced the pre-1.1.0 unbootable-env bug.
+///
+/// A revision staged WITHOUT `--bundle` has no pinned pack list: nothing on
+/// that arm writes a `pack-list.lock` (the sole writer is
+/// [`super::bundle_stage::stage_local_bundle`], on the `--bundle` arm). Before
+/// 1.1.0 this path recorded the caller's `pack_list_lock_ref` verbatim and
+/// unvalidated, and callers passed the placeholder `pack-list.lock` — a ref to
+/// a file that was never created. It sat inert until `greentic-start` began
+/// dereferencing the field at boot, at which point every environment staged on
+/// this path became unbootable.
+///
+/// An EMPTY ref stays legal: it is the documented "no pinned pack list" signal
+/// that the runtime-config materializer already fail-safes on (it emits no
+/// `pack_list_refs`, and the loader only file-checks non-empty refs). What is
+/// rejected is a NON-empty ref that no file backs. `revision_id` is minted
+/// server-side by the caller of this function, so a client cannot construct a
+/// correct `revisions/<rev>/…` ref for a legacy stage anyway — but we accept
+/// one that does point at this revision's own directory rather than hard-coding
+/// "must be empty", so a future path that pins its own lock stays valid.
+fn validate_legacy_pack_list_lock_ref(
+    rel: &std::path::Path,
+    revision_id: RevisionId,
+) -> Result<(), OpError> {
+    if rel.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let expected_prefix = std::path::Path::new("revisions").join(revision_id.to_string());
+    if rel.starts_with(&expected_prefix) {
+        return Ok(());
+    }
+    Err(OpError::InvalidArgument(format!(
+        "pack_list_lock_ref `{}` is not backed by any file: a revision staged without `--bundle` \
+         has no pinned pack list, so the ref must be empty, or point under `{}`. Recording an \
+         unbacked ref here is what left pre-1.1.0 environments unable to boot.",
+        rel.display(),
+        expected_prefix.display(),
+    )))
 }
 
 #[allow(dead_code)]

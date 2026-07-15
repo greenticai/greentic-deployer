@@ -135,3 +135,112 @@ pub trait DeployerCredentials: std::fmt::Debug + Send + Sync {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// Minimal stub implementing the trait with all defaults, so the
+    /// default-method coverage is exercised without a real deployer.
+    #[derive(Debug)]
+    struct StubCredentials;
+
+    impl DeployerCredentials for StubCredentials {
+        fn required_capabilities(&self) -> Vec<Capability> {
+            vec![]
+        }
+
+        fn validate(&self, _ctx: &ValidationContext<'_>) -> RequirementsReport {
+            RequirementsReport { checks: vec![] }
+        }
+
+        fn bootstrap(
+            &self,
+            _input: &BootstrapInput<'_>,
+        ) -> Result<BootstrapOutcome, BootstrapError> {
+            Err(BootstrapError::NotApplicable(
+                "stub has no bootstrap".into(),
+            ))
+        }
+    }
+
+    /// Stub that overrides `rotate_at` to return a fixed point.
+    #[derive(Debug)]
+    struct TimedCredentials {
+        rotate_at: DateTime<Utc>,
+    }
+
+    impl DeployerCredentials for TimedCredentials {
+        fn required_capabilities(&self) -> Vec<Capability> {
+            vec![]
+        }
+
+        fn validate(&self, _ctx: &ValidationContext<'_>) -> RequirementsReport {
+            RequirementsReport { checks: vec![] }
+        }
+
+        fn bootstrap(
+            &self,
+            _input: &BootstrapInput<'_>,
+        ) -> Result<BootstrapOutcome, BootstrapError> {
+            Err(BootstrapError::NotApplicable("stub".into()))
+        }
+
+        fn rotate_at(&self, _material: &str) -> Option<DateTime<Utc>> {
+            Some(self.rotate_at)
+        }
+    }
+
+    #[test]
+    fn default_requires_credentials_material_is_true() {
+        let stub = StubCredentials;
+        assert!(stub.requires_credentials_material());
+    }
+
+    #[test]
+    fn default_rotate_at_returns_none() {
+        let stub = StubCredentials;
+        assert!(stub.rotate_at("any-material").is_none());
+    }
+
+    #[test]
+    fn default_rotation_due_fails_open_when_rotate_at_is_none() {
+        let stub = StubCredentials;
+        let now = Utc::now();
+        assert!(
+            stub.rotation_due("opaque-token", now),
+            "rotation_due must fail open (true) when rotate_at returns None"
+        );
+    }
+
+    #[test]
+    fn rotation_due_false_before_rotate_at() {
+        let rotate_at = Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+        let creds = TimedCredentials { rotate_at };
+        let now = Utc::now();
+        assert!(
+            !creds.rotation_due("material", now),
+            "rotation should not be due when rotate_at is in the future"
+        );
+    }
+
+    #[test]
+    fn rotation_due_true_at_or_after_rotate_at() {
+        let rotate_at = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let creds = TimedCredentials { rotate_at };
+        let now = Utc::now();
+        assert!(
+            creds.rotation_due("material", now),
+            "rotation should be due when rotate_at is in the past"
+        );
+    }
+
+    #[test]
+    fn default_rollback_bound_material_is_noop() {
+        let stub = StubCredentials;
+        let env_id = greentic_deploy_spec::EnvId::try_from("local").unwrap();
+        // Must not panic.
+        stub.rollback_bound_material(&env_id);
+    }
+}

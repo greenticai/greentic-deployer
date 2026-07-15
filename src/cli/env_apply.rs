@@ -70,7 +70,7 @@ use std::path::{Path, PathBuf};
 
 use greentic_deploy_spec::{
     BundleDeploymentStatus, CapabilitySlot, CustomerId, DeploymentId, EnvId, Environment,
-    MessagingEndpoint, RouteBinding,
+    MessagingEndpoint, RouteBinding, UpdateAction,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -87,7 +87,8 @@ use super::deploy::BundleDeployPayload;
 use super::env::EnvInitPayload;
 use super::env_manifest::{
     ENV_MANIFEST_SCHEMA_V1, EnvManifest, ManifestBundle, ManifestEndpoint, ManifestRevision,
-    ManifestWelcomeFlow, TrustRootDirective, compute_effective_weights_bps, manifest_schema,
+    ManifestUpdates, ManifestWelcomeFlow, TrustRootDirective, compute_effective_weights_bps,
+    manifest_schema,
 };
 use super::env_packs::EnvPackBindingPayload;
 use super::extensions::ExtensionBindingPayload;
@@ -96,6 +97,7 @@ use super::messaging::{
 };
 use super::secrets::SecretsPutPayload;
 use super::trust_root::TrustRootBootstrapPayload;
+use super::updates::UpdateConfigSetPayload;
 use super::{OpError, OpFlags, OpOutcome};
 
 const NOUN: &str = "env";
@@ -157,6 +159,7 @@ enum ApplyStepKind {
     AddEndpoint,
     LinkEndpoint,
     SetWelcomeFlow,
+    ConfigureUpdates,
 }
 
 impl ApplyStepKind {
@@ -176,6 +179,7 @@ impl ApplyStepKind {
             ApplyStepKind::AddEndpoint => "add-endpoint",
             ApplyStepKind::LinkEndpoint => "link-endpoint",
             ApplyStepKind::SetWelcomeFlow => "set-welcome-flow",
+            ApplyStepKind::ConfigureUpdates => "configure-updates",
         }
     }
 }
@@ -242,6 +246,10 @@ enum StepOp {
         revisions: Vec<SplitRevisionEntry>,
     },
     UpdateHostConfig(Box<ConfigSetPayload>),
+    /// Write `<env_dir>/update-channel.json` through `op updates config-set`,
+    /// so the manifest path and the imperative verb share one validator, one
+    /// locked read-modify-write, and one audit record.
+    ConfigureUpdates(Box<UpdateConfigSetPayload>),
     AddPackBinding(Box<EnvPackBindingPayload>),
     UpdatePackBinding(Box<EnvPackBindingPayload>),
     AddExtension(Box<ExtensionBindingPayload>),
@@ -355,6 +363,10 @@ struct ApplyContext {
     /// against it, and apply stages them into the env store so reconcile
     /// (which resolves against the env dir) can find them.
     manifest_dir: PathBuf,
+    /// The env's on-disk root. Convergence needs it to look at what a revision
+    /// ACTUALLY staged, not just what `environment.json` says about it — see
+    /// `pack_list_is_complete`.
+    env_dir: Option<PathBuf>,
 }
 
 // --- entry point ----------------------------------------------------------------
@@ -529,6 +541,40 @@ fn prompt_secret_value(path: &str, from_env: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Write each pack's inline `answers` to a temp file and point its `answers_ref`
+/// at the absolute path. `stage_answers_file` copies it into the env dir and
+/// rewrites the persisted ref to an env-relative path, so the temp dir may be
+/// dropped once `apply` returns.
+fn materialize_inline_pack_answers(
+    manifest: &mut EnvManifest,
+) -> Result<Option<tempfile::TempDir>, OpError> {
+    let needs = manifest.packs.iter().any(|p| p.answers.is_some());
+    if !needs {
+        return Ok(None);
+    }
+    let dir = tempfile::tempdir().map_err(|e| OpError::Io {
+        path: PathBuf::from("<tempdir>"),
+        source: e,
+    })?;
+    for (i, pack) in manifest.packs.iter_mut().enumerate() {
+        let Some(answers) = pack.answers.take() else {
+            continue;
+        };
+        let file = dir.path().join(format!("pack-{i}-answers.json"));
+        // `stage_answers_file` copies these bytes verbatim into
+        // `<env_dir>/env-packs/<slot>/answers.json`, a durable artifact operators
+        // read. Keep it pretty-printed, like a hand-authored `answers_ref` file.
+        let bytes = serde_json::to_vec_pretty(&answers)
+            .map_err(|e| OpError::InvalidArgument(format!("serialize inline answers: {e}")))?;
+        std::fs::write(&file, bytes).map_err(|e| OpError::Io {
+            path: file.clone(),
+            source: e,
+        })?;
+        pack.answers_ref = Some(file);
+    }
+    Ok(Some(dir))
+}
+
 /// [`apply`] with the `from_env` secret-value lookup and the TTY prompter
 /// injected. Tests pass fakes so they never mutate the process environment
 /// (`set_var` is unsafe under a multithreaded test harness) and never need
@@ -558,8 +604,9 @@ fn apply_with_lookups(
                 .to_string(),
         )
     })?;
-    let manifest: EnvManifest = super::load_answers(&manifest_path)?;
+    let mut manifest: EnvManifest = super::load_answers(&manifest_path)?;
     manifest.validate_shape()?;
+    let _inline_answers_dir = materialize_inline_pack_answers(&mut manifest)?;
     let manifest_dir = manifest_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1085,6 +1132,7 @@ fn resolve_and_validate(
         }
     }
 
+    let env_dir = store.env_dir(&env_id).ok();
     Ok(ApplyContext {
         env_id,
         manifest,
@@ -1099,6 +1147,7 @@ fn resolve_and_validate(
         warnings,
         updated_by,
         manifest_dir: manifest_dir.to_path_buf(),
+        env_dir,
     })
 }
 
@@ -1537,7 +1586,8 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
             }
             Some(dep) if is_multi => {
                 let env = ctx.env.as_ref().expect("existing deployment implies env");
-                let converged = split_converged(env, dep.deployment_id, &rb.revisions);
+                let converged = split_converged(env, dep.deployment_id, &rb.revisions)
+                    && live_pack_lists_are_complete(ctx.env_dir.as_deref(), env, dep.deployment_id);
                 let desired_binding: Option<RouteBinding> =
                     rb.spec.route_binding.clone().map(into_route_binding);
                 let binding_differs = desired_binding
@@ -1628,6 +1678,10 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     dep.deployment_id,
                     &primary_digest(),
                     rb.spec.bundle_source_uri.as_deref(),
+                ) && live_pack_lists_are_complete(
+                    ctx.env_dir.as_deref(),
+                    env,
+                    dep.deployment_id,
                 );
                 let needs_deploy = !converged;
                 let live = live_revision_digest(env, dep.deployment_id);
@@ -1941,7 +1995,100 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
         }
     }
 
+    // Update-channel subscription, last: an environment only starts polling for
+    // updates once everything else it declares has converged. A failed bundle
+    // deploy therefore leaves the env unsubscribed rather than subscribed to a
+    // channel it cannot yet serve.
+    if let Some(updates) = &ctx.manifest.updates {
+        steps.push(updates_step(store, ctx, updates)?);
+    }
+
     Ok(steps)
+}
+
+/// Update-channel diff. `op updates config-set` is a merge — a `None` field
+/// leaves the stored value alone — so a declared field is compared against
+/// what is on disk and an all-equal comparison plans as a no-op.
+///
+/// `on_notify` and `poll_interval_secs` were already validated by
+/// [`EnvManifest::validate_shape`], so the parse here cannot fail; the
+/// declared-but-unset case is what `None` means (leave the stored value).
+fn updates_step(
+    store: &LocalFsStore,
+    ctx: &ApplyContext,
+    updates: &ManifestUpdates,
+) -> Result<ApplyStep, OpError> {
+    let key = ctx.env_id.as_str().to_string();
+    let enabled = updates.resolved_enabled();
+    let endpoint = updates.plan_endpoint.trim().to_string();
+    let declared_action = updates.on_notify.as_deref().and_then(UpdateAction::parse);
+    let stream_endpoint = updates
+        .stream_endpoint
+        .as_deref()
+        .map(|s| s.trim().to_string());
+
+    let current = store.load_update_channel(&ctx.env_id)?;
+    let unchanged = current.as_ref().is_some_and(|cur| {
+        cur.enabled == Some(enabled)
+            && cur.resolved_plan_endpoint() == Some(endpoint.as_str())
+            && declared_action.is_none_or(|want| cur.resolved_action() == want)
+            && updates
+                .poll_interval_secs
+                .is_none_or(|want| cur.resolved_poll_interval_secs() == want)
+            && updates
+                .push_enabled
+                .is_none_or(|want| cur.push_enabled == Some(want))
+            && stream_endpoint
+                .as_deref()
+                .is_none_or(|want| cur.stream_endpoint.as_deref() == Some(want))
+    });
+    if unchanged {
+        return Ok(ApplyStep::no_op(
+            ApplyStepKind::ConfigureUpdates,
+            key,
+            "update-channel unchanged",
+        ));
+    }
+
+    let action_label = declared_action.map_or("stage (default)", |a| a.as_str());
+    let detail = format!(
+        "{}, on-update {action_label} → {endpoint}",
+        if enabled { "enabled" } else { "disabled" },
+    );
+    let desired_hash = hash_json(&json!({
+        "enabled": enabled,
+        "on_notify": updates.on_notify,
+        "poll_interval_secs": updates.poll_interval_secs,
+        "plan_endpoint": endpoint,
+        "push_enabled": updates.push_enabled,
+        "stream_endpoint": stream_endpoint,
+    }));
+    let ikey = derive_idempotency_key(
+        &ctx.env_id,
+        ApplyStepKind::ConfigureUpdates.label(),
+        &key,
+        &desired_hash,
+    );
+    Ok(ApplyStep {
+        kind: ApplyStepKind::ConfigureUpdates,
+        key: key.clone(),
+        action: if current.is_some() {
+            ApplyAction::Update
+        } else {
+            ApplyAction::Create
+        },
+        detail,
+        idempotency_key: Some(ikey),
+        op: StepOp::ConfigureUpdates(Box::new(UpdateConfigSetPayload {
+            environment_id: key,
+            enabled: Some(enabled),
+            on_notify: updates.on_notify.clone(),
+            poll_interval_secs: updates.poll_interval_secs,
+            plan_endpoint: Some(endpoint),
+            push_enabled: updates.push_enabled,
+            stream_endpoint,
+        })),
+    })
 }
 
 /// Trust-root diff: read-only — `load_existing_only` never generates a key,
@@ -2048,6 +2195,10 @@ fn execute(store: &LocalFsStore, ctx: &ApplyContext, steps: &[ApplyStep]) -> Res
             }
             StepOp::UpdateHostConfig(payload) => {
                 super::config::set(store, &exec_flags, Some((**payload).clone())).map(|_| ())
+            }
+            StepOp::ConfigureUpdates(payload) => {
+                super::updates::config_set(store, &exec_flags, Some((**payload).clone()))
+                    .map(|_| ())
             }
             StepOp::AddPackBinding(payload) => {
                 let payload = stage_binding_answers(store, ctx, (**payload).clone())?;
@@ -2383,6 +2534,18 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
                     primary_digest
                 ));
             }
+        }
+        // Post-condition, both shapes: a served revision must pin every runtime
+        // pack its own staged bundle carries. Digest convergence cannot see this —
+        // the digest is unchanged when the lock is short — so without this the
+        // verifier reports `failures: []` over an env that serves no provider
+        // routes at all. That green verify is exactly how this shipped.
+        if !live_pack_lists_are_complete(ctx.env_dir.as_deref(), &env, dep.deployment_id) {
+            failures.push(format!(
+                "bundle `{}`: a served revision's pack-list.lock omits packs its \
+                 staged bundle carries (provider routes will not serve)",
+                rb.spec.bundle_id
+            ));
         }
         if let Some(binding) = &rb.spec.route_binding {
             let desired = into_route_binding(binding.clone());
@@ -2942,12 +3105,54 @@ pub(super) fn digest_is_real(digest: &str) -> bool {
     digest.starts_with("sha256:") && digest.len() > "sha256:".len() && digest != "sha256:00"
 }
 
+/// Every revision this deployment currently serves must pin every runtime pack
+/// its staged bundle carries. A revision staged by a deployer that only scanned
+/// `packs/` has a SHORT lock — its bundle's providers were never pinned, so the
+/// runtime serves none of their routes — and because the bundle digest is
+/// unchanged, plain digest convergence would happily leave it that way forever.
+/// Treating a short lock as not-converged is what lets `gtc start <same-bundle>`
+/// heal an already-broken env instead of no-opping on it.
+///
+/// Unknowable (no env dir, nothing staged locally) counts as complete: this is a
+/// heal trigger, not a new way to fail an apply.
+fn live_pack_lists_are_complete(
+    env_dir: Option<&Path>,
+    env: &Environment,
+    deployment_id: DeploymentId,
+) -> bool {
+    let Some(env_dir) = env_dir else {
+        return true;
+    };
+    let Some(split) = env
+        .traffic_splits
+        .iter()
+        .find(|s| s.deployment_id == deployment_id)
+    else {
+        return true;
+    };
+    split.entries.iter().all(|entry| {
+        env.revisions
+            .iter()
+            .find(|r| r.revision_id == entry.revision_id)
+            .is_none_or(|rev| {
+                super::bundle_stage::pack_list_is_complete(
+                    env_dir,
+                    rev.revision_id,
+                    &rev.pack_list_lock_ref,
+                )
+            })
+    })
+}
+
 /// Strict convergence: the deployment's traffic split has EXACTLY ONE entry
 /// at full weight (10,000 bps), that entry's revision exists, carries a real
 /// digest, the digest matches `expected_digest`, and `bundle_source_uri`
 /// matches (`None` vs `Some` counts as a difference — a K8s worker needs
 /// the pull ref to boot). A mixed split (e.g. 60/40 blue-green) or a
 /// degenerate placeholder digest is NOT converged.
+///
+/// Says nothing about whether the converged revision's pack list is COMPLETE —
+/// that is [`live_pack_lists_are_complete`], and both must hold.
 fn deployment_converged(
     env: &Environment,
     deployment_id: DeploymentId,
@@ -3192,7 +3397,7 @@ mod tests {
         bootstrap_env_trust_root, make_binding, make_bundle_deployment, make_env, make_revision,
         make_traffic_split,
     };
-    use greentic_deploy_spec::{CapabilitySlot, RevisionLifecycle};
+    use greentic_deploy_spec::{CapabilitySlot, PackListLock, RevisionLifecycle};
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -3362,6 +3567,362 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// The manifest shape the demo uses: declaring `updates` IS the
+    /// subscription, so no `op updates config-set` is needed.
+    fn updates_manifest(on_notify: &str) -> Value {
+        json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "http://127.0.0.1:3140/v1/environments/local/plan",
+                "on_notify": on_notify,
+                "poll_interval_secs": 60,
+            }
+        })
+    }
+
+    #[test]
+    fn updates_block_subscribes_the_env_and_reapply_is_a_noop() {
+        let (dir, store) = seeded_store();
+        let path = write_manifest(dir.path(), &updates_manifest("apply"));
+
+        let outcome = run_apply(&store, &path).expect("apply succeeds");
+        assert!(
+            step_actions(&outcome.result)
+                .contains(&("configure-updates".to_string(), "create".to_string())),
+            "steps: {:?}",
+            step_actions(&outcome.result)
+        );
+
+        let cfg = store
+            .load_update_channel(&EnvId::try_from("local").unwrap())
+            .unwrap()
+            .expect("update-channel.json written");
+        assert!(cfg.resolved_enabled(), "declaring the block enables it");
+        assert_eq!(cfg.resolved_action(), UpdateAction::Apply);
+        assert_eq!(cfg.resolved_poll_interval_secs(), 60);
+        assert_eq!(
+            cfg.resolved_plan_endpoint(),
+            Some("http://127.0.0.1:3140/v1/environments/local/plan")
+        );
+        // The legacy mirror keeps an older runtime staging rather than broken.
+        assert_eq!(
+            cfg.on_notify,
+            Some(greentic_deploy_spec::OnNotifyAction::Stage)
+        );
+
+        // Converged: a second apply of the same manifest changes nothing.
+        let again = run_apply(&store, &path).expect("re-apply succeeds");
+        assert!(
+            step_actions(&again.result)
+                .contains(&("configure-updates".to_string(), "no-op".to_string())),
+            "steps: {:?}",
+            step_actions(&again.result)
+        );
+    }
+
+    /// The `.gtbundle` carrying the real two-root layout: an app pack under
+    /// `packs/` plus provider packs under `providers/<domain>/`.
+    fn provider_fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/bundles/provider-packs-bundle.gtbundle")
+    }
+
+    fn provider_manifest(bundle_path: &Path) -> Value {
+        json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "provider-packs-bundle",
+                "bundle_path": bundle_path,
+            }]
+        })
+    }
+
+    fn lock_of_live_revision(store: &LocalFsStore) -> (PathBuf, PackListLock) {
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        let rev = env.revisions.last().expect("a staged revision");
+        let path = env_dir.join(&rev.pack_list_lock_ref);
+        let lock: PackListLock = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        (path, lock)
+    }
+
+    /// THE SELF-HEAL, at the real call site.
+    ///
+    /// Apply a bundle, then rewrite its `pack-list.lock` exactly the way the
+    /// pre-fix deployer wrote it — provider packs dropped — and re-apply the SAME
+    /// manifest. The bundle digest is unchanged, so digest convergence alone
+    /// no-ops and the env stays broken forever. Completeness makes it re-stage.
+    ///
+    /// Deleting the `live_pack_lists_are_complete` clause from EITHER convergence
+    /// site fails here; the unit tests on the predicate itself do not.
+    #[test]
+    fn re_apply_re_stages_a_revision_whose_pack_list_is_incomplete() {
+        let (dir, store) = seeded_store();
+        let bundle = provider_fixture();
+        let path = write_manifest(dir.path(), &provider_manifest(&bundle));
+
+        run_apply(&store, &path).expect("first apply");
+        let (lock_path, lock) = lock_of_live_revision(&store);
+        let mut ids: Vec<String> = lock.packs.iter().map(|p| p.pack_id.to_string()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["app", "messaging-webchat-gui", "state-memory"],
+            "staging must pin the app pack AND the runtime provider packs"
+        );
+
+        // Converged, healthy: re-applying an unchanged bundle is a no-op.
+        let again = run_apply(&store, &path).expect("re-apply of a healthy env");
+        assert!(
+            step_actions(&again.result)
+                .iter()
+                .any(|(kind, action)| kind == "deploy-bundle" && action == "no-op"),
+            "a healthy env must NOT re-stage on every apply: {:?}",
+            step_actions(&again.result)
+        );
+
+        // Now damage it the way the pre-fix deployer did: keep only the app pack.
+        let mut short = lock.clone();
+        short.packs.retain(|p| p.pack_id.to_string() == "app");
+        assert_eq!(short.packs.len(), 1);
+        std::fs::write(&lock_path, serde_json::to_vec(&short).unwrap()).unwrap();
+
+        // Same manifest, same bundle, same digest — and it MUST re-stage.
+        let healed = run_apply(&store, &path).expect("re-apply of a short-locked env");
+        assert!(
+            step_actions(&healed.result)
+                .iter()
+                .any(|(kind, action)| kind == "deploy-bundle" && action != "no-op"),
+            "an incomplete pack list must re-stage, not converge: {:?}",
+            step_actions(&healed.result)
+        );
+
+        let (_, healed_lock) = lock_of_live_revision(&store);
+        let mut healed_ids: Vec<String> = healed_lock
+            .packs
+            .iter()
+            .map(|p| p.pack_id.to_string())
+            .collect();
+        healed_ids.sort();
+        assert_eq!(
+            healed_ids,
+            vec!["app", "messaging-webchat-gui", "state-memory"],
+            "the re-staged revision must pin the provider packs again"
+        );
+    }
+
+    /// The MULTI-revision (traffic-split) convergence path has its own predicate,
+    /// `split_converged`, and it is a completely separate call site. Wiring the
+    /// completeness check into the single-revision path alone leaves every
+    /// blue-green env unable to heal — the exact gap Codex caught in review.
+    #[test]
+    fn re_apply_re_stages_an_incomplete_pack_list_on_the_multi_revision_path() {
+        let (dir, store) = seeded_store();
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{
+                "bundle_id": "provider-packs-bundle",
+                "revisions": [
+                    {"name": "a", "bundle_path": provider_fixture(), "weight_bps": 10000}
+                ]
+            }]
+        });
+        let path = write_manifest(dir.path(), &manifest);
+
+        run_apply(&store, &path).expect("first apply");
+        let (lock_path, lock) = lock_of_live_revision(&store);
+        assert_eq!(lock.packs.len(), 3, "app + 2 runtime provider packs");
+
+        // Healthy: an unchanged split re-applies as a no-op.
+        let again = run_apply(&store, &path).expect("re-apply of a healthy split");
+        assert!(
+            step_actions(&again.result)
+                .iter()
+                .any(|(kind, action)| kind == "deploy-split" && action == "no-op"),
+            "a healthy split must not re-stage on every apply: {:?}",
+            step_actions(&again.result)
+        );
+
+        // Damage the lock the way the pre-fix deployer wrote it.
+        let mut short = lock.clone();
+        short.packs.retain(|p| p.pack_id.to_string() == "app");
+        std::fs::write(&lock_path, serde_json::to_vec(&short).unwrap()).unwrap();
+
+        let healed = run_apply(&store, &path).expect("re-apply of a short-locked split");
+        assert!(
+            step_actions(&healed.result)
+                .iter()
+                .any(|(kind, action)| kind == "deploy-split" && action != "no-op"),
+            "an incomplete pack list must re-stage on the SPLIT path too: {:?}",
+            step_actions(&healed.result)
+        );
+        let (_, healed_lock) = lock_of_live_revision(&store);
+        assert_eq!(healed_lock.packs.len(), 3, "provider packs pinned again");
+    }
+
+    #[test]
+    fn updates_block_is_absent_by_default_so_the_channel_stays_deny_by_default() {
+        let (dir, store) = seeded_store();
+        let path = write_manifest(
+            dir.path(),
+            &json!({"schema": "greentic.env-manifest.v1", "environment": {"id": "local"}}),
+        );
+        let outcome = run_apply(&store, &path).expect("apply succeeds");
+        assert!(
+            !step_actions(&outcome.result)
+                .iter()
+                .any(|(kind, _)| kind == "configure-updates"),
+            "a manifest with no `updates` block must not plan a channel step"
+        );
+        assert!(
+            store
+                .load_update_channel(&EnvId::try_from("local").unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn updates_block_changing_action_replans_as_update_not_create() {
+        let (dir, store) = seeded_store();
+        let staged = write_manifest(dir.path(), &updates_manifest("stage"));
+        run_apply(&store, &staged).expect("first apply");
+
+        // Same endpoint, different action → an Update step, and the stored
+        // action follows the manifest.
+        let applied = dir.path().join("manifest-apply.json");
+        std::fs::write(
+            &applied,
+            serde_json::to_vec_pretty(&updates_manifest("apply")).unwrap(),
+        )
+        .unwrap();
+        let outcome = run_apply(&store, &applied).expect("second apply");
+        assert!(
+            step_actions(&outcome.result)
+                .contains(&("configure-updates".to_string(), "update".to_string())),
+            "steps: {:?}",
+            step_actions(&outcome.result)
+        );
+        let cfg = store
+            .load_update_channel(&EnvId::try_from("local").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.resolved_action(), UpdateAction::Apply);
+    }
+
+    #[test]
+    fn updates_block_changing_push_enabled_replans_as_update() {
+        let (dir, store) = seeded_store();
+        let staged = write_manifest(dir.path(), &updates_manifest("stage"));
+        run_apply(&store, &staged).expect("first apply");
+
+        // Same endpoint + action, but adding push_enabled: false -> Update step.
+        let with_push = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "http://127.0.0.1:3140/v1/environments/local/plan",
+                "on_notify": "stage",
+                "poll_interval_secs": 60,
+                "push_enabled": false,
+            }
+        });
+        let path = dir.path().join("manifest-push.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&with_push).unwrap()).unwrap();
+        let outcome = run_apply(&store, &path).expect("second apply");
+        assert!(
+            step_actions(&outcome.result)
+                .contains(&("configure-updates".to_string(), "update".to_string())),
+            "a push_enabled change must produce an update step, got: {:?}",
+            step_actions(&outcome.result)
+        );
+        let cfg = store
+            .load_update_channel(&EnvId::try_from("local").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.push_enabled, Some(false));
+    }
+
+    #[test]
+    fn updates_block_changing_stream_endpoint_replans_as_update() {
+        let (dir, store) = seeded_store();
+        let staged = write_manifest(dir.path(), &updates_manifest("stage"));
+        run_apply(&store, &staged).expect("first apply");
+
+        // Same endpoint + action, but adding an explicit stream_endpoint -> Update step.
+        let with_stream = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "http://127.0.0.1:3140/v1/environments/local/plan",
+                "on_notify": "stage",
+                "poll_interval_secs": 60,
+                "stream_endpoint": "https://example.com/custom/stream",
+            }
+        });
+        let path = dir.path().join("manifest-stream.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&with_stream).unwrap()).unwrap();
+        let outcome = run_apply(&store, &path).expect("second apply");
+        assert!(
+            step_actions(&outcome.result)
+                .contains(&("configure-updates".to_string(), "update".to_string())),
+            "a stream_endpoint change must produce an update step, got: {:?}",
+            step_actions(&outcome.result)
+        );
+        let cfg = store
+            .load_update_channel(&EnvId::try_from("local").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cfg.stream_endpoint.as_deref(),
+            Some("https://example.com/custom/stream")
+        );
+    }
+
+    #[test]
+    fn updates_block_whitespace_in_stream_endpoint_is_idempotent() {
+        let (dir, store) = seeded_store();
+
+        // First apply: set an explicit stream_endpoint (trimmed value).
+        let clean = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "http://127.0.0.1:3140/v1/environments/local/plan",
+                "on_notify": "stage",
+                "poll_interval_secs": 60,
+                "stream_endpoint": "https://example.com/custom/stream",
+            }
+        });
+        let first = write_manifest(dir.path(), &clean);
+        run_apply(&store, &first).expect("first apply");
+
+        // Re-apply with leading AND trailing whitespace around the same value.
+        // The trim normalization makes the values match → no-op.
+        let with_ws = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "http://127.0.0.1:3140/v1/environments/local/plan",
+                "on_notify": "stage",
+                "poll_interval_secs": 60,
+                "stream_endpoint": "  https://example.com/custom/stream  ",
+            }
+        });
+        let path = dir.path().join("manifest-ws.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&with_ws).unwrap()).unwrap();
+        let outcome = run_apply(&store, &path).expect("re-apply with whitespace");
+        assert!(
+            step_actions(&outcome.result)
+                .contains(&("configure-updates".to_string(), "no-op".to_string())),
+            "whitespace-only difference in stream_endpoint must not trigger an update step, got: {:?}",
+            step_actions(&outcome.result)
+        );
     }
 
     #[test]
@@ -5577,5 +6138,62 @@ mod tests {
             "create",
             "revocation action must be create: {revocation}"
         );
+    }
+
+    #[test]
+    fn materialize_inline_pack_answers_writes_temp_file_and_clears_field() {
+        use crate::cli::env_manifest::ENV_MANIFEST_SCHEMA_V1;
+
+        let mut manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "deployer",
+                "kind": "greentic.deployer.k8s@1.0.0",
+                "pack_ref": "builtin",
+                "answers": {"runtime_image": "example.com/img:v1"}
+            }]
+        }))
+        .unwrap();
+
+        let dir = materialize_inline_pack_answers(&mut manifest)
+            .expect("materialize succeeds")
+            .expect("temp dir returned");
+
+        assert!(
+            manifest.packs[0].answers.is_none(),
+            "inline answers cleared"
+        );
+        let ref_path = manifest.packs[0]
+            .answers_ref
+            .as_ref()
+            .expect("answers_ref set");
+        assert!(ref_path.is_absolute(), "answers_ref is absolute");
+        assert!(ref_path.is_file(), "temp file exists");
+
+        let content: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(ref_path).unwrap()).unwrap();
+        assert_eq!(content["runtime_image"], "example.com/img:v1");
+
+        drop(dir);
+    }
+
+    #[test]
+    fn materialize_inline_pack_answers_noop_when_no_inline() {
+        use crate::cli::env_manifest::ENV_MANIFEST_SCHEMA_V1;
+
+        let mut manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "deployer",
+                "kind": "greentic.deployer.k8s@1.0.0",
+                "pack_ref": "builtin"
+            }]
+        }))
+        .unwrap();
+
+        let result = materialize_inline_pack_answers(&mut manifest).expect("succeeds");
+        assert!(result.is_none(), "no temp dir needed");
     }
 }

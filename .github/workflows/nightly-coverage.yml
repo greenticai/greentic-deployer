@@ -19,13 +19,24 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
 
     steps:
       - name: Free disk space
         run: |
-          df -h
-          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/lib/android \
+            /usr/local/share/boost 2>/dev/null || true
+          df -h /
 
       - uses: actions/checkout@v4
 
@@ -61,9 +72,16 @@ jobs:
       - name: Install llvm-tools-preview
         run: rustup component add llvm-tools-preview
 
+      - name: Disk before coverage
+        run: df -h /
+
       - name: Validate coverage policy
         run: |
           greentic-dev coverage
+
+      - name: Disk after coverage
+        if: always()
+        run: df -h /
 
       - name: Upload coverage report
         if: always()

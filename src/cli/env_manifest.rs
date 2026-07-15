@@ -62,6 +62,73 @@ pub struct EnvManifest {
     pub extensions: Vec<ManifestExtension>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messaging_endpoints: Vec<ManifestEndpoint>,
+    /// Cluster declaration for `env up`. Not a wizard question and not part of
+    /// the schema/template — follows the `updates` precedent: Rust struct +
+    /// `validate_shape()` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<ManifestCluster>,
+    /// Update-channel subscription. Declaring this block IS the opt-in: apply
+    /// writes `<env_dir>/update-channel.json` and the runtime starts polling on
+    /// its next boot. Absent = the channel is untouched (deny-by-default for a
+    /// fresh env; upsert-only, so it is never torn down by omission).
+    ///
+    /// Operator-authored manifests only. A manifest that arrives as the *target*
+    /// of a signed update plan may not carry this block: a plan that re-points
+    /// `plan_endpoint` would be a self-perpetuating takeover primitive, so
+    /// `op updates publish` strips it at sign time and
+    /// `updates::check_applyable_manifest` rejects it at apply time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updates: Option<ManifestUpdates>,
+    /// In-cluster Vault provisioning for `env up`. Like `cluster`/`updates`, this
+    /// is a JSON-first block the wizard never asks about — Rust struct +
+    /// `validate_shape()` only, excluded from the emitted schema/template. Absent
+    /// = `env up` runs no Vault phase (the secrets backend is whatever the packs
+    /// bind). Ignored by plain `env apply`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_bootstrap: Option<VaultBootstrapConfig>,
+}
+
+/// `updates` block of [`EnvManifest`] — a declarative mirror of
+/// `greentic.update-channel.v1`, minus the schema/env-id fields the manifest
+/// already carries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestUpdates {
+    /// Base URL the runtime polls for the latest signed plan (`{url}` for the
+    /// plan, `{url}.sig` for the DSSE envelope, `{url}/meta` for the sequence).
+    /// https, or http to loopback.
+    pub plan_endpoint: String,
+    /// Master switch. Absent = `true`: an operator who wrote this block wants
+    /// the channel on. Set `false` to declare the endpoint without subscribing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// `record-only`, `stage`, or `apply`. Absent = leave the stored value
+    /// unchanged (unset resolves to `stage`). `apply` is the opt-in that lets
+    /// the runtime converge onto a discovered plan with no operator step — the
+    /// executor lives in `greentic-start`, and a release that predates
+    /// `on_update` reads the legacy `on_notify` mirror and stages instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_notify: Option<String>,
+    /// Poll interval in seconds; rejected below the 60s floor. Absent = leave
+    /// the stored value unchanged (unset resolves to 3600).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval_secs: Option<u64>,
+    /// Whether the runtime subscribes to a pushed update stream (SSE). Absent =
+    /// leave the stored value unchanged (unset resolves to `true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_enabled: Option<bool>,
+    /// SSE stream endpoint URL. Absent = leave the stored value unchanged (unset
+    /// derives from `plan_endpoint`). Must be https (or http to loopback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_endpoint: Option<String>,
+}
+
+impl ManifestUpdates {
+    /// Resolved master switch — absent means "on", because declaring the block
+    /// is the subscription.
+    pub fn resolved_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +179,103 @@ impl ManifestEnvironment {
     }
 }
 
+/// Cluster provider for `env up`. Only `kind` today; future providers (EKS,
+/// GKE, AKS) extend this enum without a schema bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClusterProvider {
+    Kind,
+}
+
+/// Cluster declaration for `env up`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestCluster {
+    pub provider: ClusterProvider,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubeconfig_context: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub load_images: Vec<String>,
+}
+
+/// Default namespace the in-cluster dev Vault is deployed into. Matches the
+/// `k8s-vault-demo` (`vault.greentic.svc:8200`) — deliberately NOT the env
+/// namespace, which reconcile creates in a later phase.
+pub const DEFAULT_VAULT_NAMESPACE: &str = "greentic";
+/// Default dev-mode root token. Dev-mode Vault is in-memory and insecure; the
+/// token only has to match what the seed phase presents.
+pub const DEFAULT_VAULT_ROOT_TOKEN: &str = "root";
+/// Default dev-mode Vault image (matches `k8s-vault-demo/vault.yaml`).
+pub const DEFAULT_VAULT_DEV_IMAGE: &str = "hashicorp/vault:1.17";
+
+/// How `env up` obtains the Vault the env's secrets are seeded into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VaultDeployMode {
+    /// Deploy an in-memory dev-mode Vault into the cluster and bootstrap it.
+    /// Requires a cluster-admin kubeconfig (it applies a cluster-scoped
+    /// `ClusterRoleBinding`), so it is a kind/local-dev path only.
+    DevInCluster,
+    /// The env's binding already points at a reachable Vault; `env up` skips
+    /// the deploy + bootstrap and only seeds.
+    External,
+}
+
+/// In-cluster Vault provisioning declaration for `env up`. Follows the
+/// `cluster`/`updates` precedent: a JSON-first block the wizard never asks
+/// about, validated by [`EnvManifest::validate_shape`] and excluded from the
+/// emitted schema/template. Seed VALUES never appear here — `seed[]` reuses
+/// [`ManifestSecret`], so each entry names an env var (or is supplied by an
+/// interactive masked paste).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultBootstrapConfig {
+    pub deploy: VaultDeployMode,
+    /// Namespace the dev Vault runs in (default [`DEFAULT_VAULT_NAMESPACE`]).
+    /// Ignored for `external`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// Dev-mode root token used to bootstrap + seed (default
+    /// [`DEFAULT_VAULT_ROOT_TOKEN`]). Ignored for `external`, which seeds with
+    /// the ambient/binding credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_token: Option<String>,
+    /// Dev-mode Vault image (default [`DEFAULT_VAULT_DEV_IMAGE`]). Ignored for
+    /// `external`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// Secrets to seed into Vault after apply, before reconcile. Same shape and
+    /// masked-paste fallback as the dev-store `secrets[]` slot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seed: Vec<ManifestSecret>,
+}
+
+impl VaultBootstrapConfig {
+    /// Resolved Vault namespace (explicit or the dev default).
+    pub fn resolved_namespace(&self) -> &str {
+        self.namespace.as_deref().unwrap_or(DEFAULT_VAULT_NAMESPACE)
+    }
+
+    /// Resolved dev-mode root token (explicit or the dev default).
+    pub fn resolved_root_token(&self) -> &str {
+        self.root_token
+            .as_deref()
+            .unwrap_or(DEFAULT_VAULT_ROOT_TOKEN)
+    }
+
+    /// Resolved dev-mode Vault image (explicit or the dev default).
+    pub fn resolved_image(&self) -> &str {
+        self.image.as_deref().unwrap_or(DEFAULT_VAULT_DEV_IMAGE)
+    }
+
+    /// Whether `env up` should deploy + bootstrap an in-cluster dev Vault (vs.
+    /// seed an already-reachable external Vault).
+    pub fn is_dev_in_cluster(&self) -> bool {
+        matches!(self.deploy, VaultDeployMode::DevInCluster)
+    }
+}
+
 /// v1 accepts only the string `"bootstrap"`. A future
 /// `{ "additional_keys": [...] }` shape extends this enum without a schema
 /// bump.
@@ -149,6 +313,12 @@ pub struct ManifestPack {
     /// Optional answers file relative to the manifest directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answers_ref: Option<PathBuf>,
+    /// Inline answers object — mutually exclusive with `answers_ref`. When
+    /// present, `env up` materializes it to a temp file and points `answers_ref`
+    /// at the absolute path before `apply` runs, so `stage_answers_file` copies
+    /// it into the env dir as usual.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<serde_json::Value>,
 }
 
 /// One extension binding in the open-namespace `extensions[]` section.
@@ -317,6 +487,69 @@ impl EnvManifest {
             })?;
         }
 
+        // cluster: name non-empty, load_images entries non-empty.
+        if let Some(cluster) = &self.cluster {
+            if cluster.name.trim().is_empty() {
+                return Err(OpError::InvalidArgument(
+                    "cluster.name must not be empty".to_string(),
+                ));
+            }
+            for (i, img) in cluster.load_images.iter().enumerate() {
+                if img.trim().is_empty() {
+                    return Err(OpError::InvalidArgument(format!(
+                        "cluster.load_images[{i}] must not be empty"
+                    )));
+                }
+            }
+        }
+
+        // updates: same validators `op updates config-set` applies, so a manifest
+        // cannot express a channel the imperative verb would refuse.
+        if let Some(updates) = &self.updates {
+            let endpoint = updates.plan_endpoint.trim();
+            if endpoint.is_empty() {
+                return Err(OpError::InvalidArgument(
+                    "updates.plan_endpoint must not be empty".to_string(),
+                ));
+            }
+            if !super::updates::control_url_is_acceptable(endpoint) {
+                return Err(OpError::InvalidArgument(format!(
+                    "updates.plan_endpoint {endpoint:?} is not an acceptable control URL \
+                     (https required; http only to loopback)"
+                )));
+            }
+            if let Some(raw) = &updates.on_notify
+                && greentic_deploy_spec::UpdateAction::parse(raw).is_none()
+            {
+                return Err(OpError::InvalidArgument(format!(
+                    "updates.on_notify {raw:?} is not a valid action \
+                     (expected `record-only`, `stage`, or `apply`)"
+                )));
+            }
+            if let Some(secs) = updates.poll_interval_secs
+                && secs < greentic_deploy_spec::MIN_POLL_INTERVAL_SECS
+            {
+                return Err(OpError::InvalidArgument(format!(
+                    "updates.poll_interval_secs {secs} is below the {}s floor",
+                    greentic_deploy_spec::MIN_POLL_INTERVAL_SECS
+                )));
+            }
+            if let Some(ref ep) = updates.stream_endpoint {
+                let ep = ep.trim();
+                if ep.is_empty() {
+                    return Err(OpError::InvalidArgument(
+                        "updates.stream_endpoint must not be empty".to_string(),
+                    ));
+                }
+                if !super::updates::control_url_is_acceptable(ep) {
+                    return Err(OpError::InvalidArgument(format!(
+                        "updates.stream_endpoint {ep:?} is not an acceptable control URL \
+                         (https required; http only to loopback)"
+                    )));
+                }
+            }
+        }
+
         // Env-pack bindings: each slot must bind in packs, unique slots,
         // kind must parse as PackDescriptor, pack_ref non-empty.
         let mut pack_slots = BTreeSet::new();
@@ -340,6 +573,12 @@ impl EnvManifest {
             if p.pack_ref.trim().is_empty() {
                 return Err(OpError::InvalidArgument(format!(
                     "packs[] slot `{}`: pack_ref must not be empty",
+                    p.slot
+                )));
+            }
+            if p.answers.is_some() && p.answers_ref.is_some() {
+                return Err(OpError::InvalidArgument(format!(
+                    "packs[] slot `{}`: `answers` and `answers_ref` are mutually exclusive",
                     p.slot
                 )));
             }
@@ -590,6 +829,63 @@ impl EnvManifest {
                     return Err(OpError::InvalidArgument(format!(
                         "endpoint `{}`: duplicate link `{link}` in links[]",
                         ep.name
+                    )));
+                }
+            }
+        }
+
+        // vault_bootstrap: same path-shape checks as `secrets[]` on the
+        // seed[] entries (shared helper — the two secret surfaces cannot
+        // drift). Values (`from_env` resolution) are checked later, with
+        // process context, in the `env up` seed phase.
+        if let Some(vault) = &self.vault_bootstrap {
+            // A vault-backed env seeds through `vault_bootstrap.seed[]`; the
+            // dev-store `secrets[]` slot cannot reach Vault (env_apply writes
+            // it through the dev store only), so carrying both is a mistake.
+            if !self.secrets.is_empty() {
+                return Err(OpError::InvalidArgument(
+                    "manifest declares both `vault_bootstrap` and dev-store `secrets[]`; \
+                     a Vault-backed env seeds through `vault_bootstrap.seed[]` — move the \
+                     entries there (dev-store `secrets[]` cannot write to Vault)"
+                        .to_string(),
+                ));
+            }
+            if let Some(ns) = &vault.namespace
+                && ns.trim().is_empty()
+            {
+                return Err(OpError::InvalidArgument(
+                    "vault_bootstrap.namespace, when present, must not be empty".to_string(),
+                ));
+            }
+            if let Some(token) = &vault.root_token
+                && token.trim().is_empty()
+            {
+                return Err(OpError::InvalidArgument(
+                    "vault_bootstrap.root_token, when present, must not be empty".to_string(),
+                ));
+            }
+            if let Some(image) = &vault.image
+                && image.trim().is_empty()
+            {
+                return Err(OpError::InvalidArgument(
+                    "vault_bootstrap.image, when present, must not be empty".to_string(),
+                ));
+            }
+            let mut seed_paths = BTreeSet::new();
+            for s in &vault.seed {
+                let rel_path = s.path.trim_start_matches('/');
+                super::secrets::validate_dev_store_secret_path(rel_path)?;
+                if !seed_paths.insert(rel_path) {
+                    return Err(OpError::InvalidArgument(format!(
+                        "duplicate seed path `{rel_path}` in manifest vault_bootstrap.seed[]"
+                    )));
+                }
+                if let Some(from_env) = &s.from_env
+                    && from_env.trim().is_empty()
+                {
+                    return Err(OpError::InvalidArgument(format!(
+                        "vault_bootstrap.seed `{rel_path}`: from_env, when present, must name an \
+                         environment variable — omit it entirely for a pasted secret"
                     )));
                 }
             }
@@ -1497,6 +1793,13 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
             listen_addr: None,
             gui_enabled,
         },
+        cluster: None,
+        // The wizard has no update-channel question yet; `None` leaves whatever
+        // the env already has (upsert), rather than tearing a channel down.
+        updates: None,
+        // JSON-first block (like `cluster`/`updates`); the wizard never asks
+        // about in-cluster Vault provisioning.
+        vault_bootstrap: None,
         trust_root,
         secrets,
         packs: Vec::new(),
@@ -2979,5 +3282,391 @@ mod tests {
             err.to_string().contains("status") || err.to_string().contains("variant"),
             "{err}"
         );
+    }
+
+    // --- updates block ------------------------------------------------------
+
+    fn with_updates(updates: serde_json::Value) -> Result<EnvManifest, serde_json::Error> {
+        serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "updates": updates
+        }))
+    }
+
+    #[test]
+    fn updates_block_is_optional_and_absent_by_default() {
+        assert!(minimal(ENV_MANIFEST_SCHEMA_V1).updates.is_none());
+    }
+
+    #[test]
+    fn updates_block_declaring_only_an_endpoint_is_enabled() {
+        let m = with_updates(serde_json::json!({"plan_endpoint": "https://u.example.com/plan"}))
+            .expect("parses");
+        m.validate_shape().expect("valid");
+        let updates = m.updates.as_ref().unwrap();
+        assert!(
+            updates.resolved_enabled(),
+            "declaring the block is the subscription"
+        );
+        assert!(
+            updates.on_notify.is_none(),
+            "action left to the stored value"
+        );
+    }
+
+    #[test]
+    fn updates_block_can_declare_an_endpoint_without_subscribing() {
+        let m = with_updates(
+            serde_json::json!({"plan_endpoint": "https://u.example.com/plan", "enabled": false}),
+        )
+        .expect("parses");
+        m.validate_shape().expect("valid");
+        assert!(!m.updates.as_ref().unwrap().resolved_enabled());
+    }
+
+    #[test]
+    fn updates_block_accepts_every_action() {
+        for action in ["record-only", "record_only", "stage", "apply"] {
+            let m = with_updates(serde_json::json!({
+                "plan_endpoint": "https://u.example.com/plan",
+                "on_notify": action
+            }))
+            .expect("parses");
+            m.validate_shape()
+                .unwrap_or_else(|e| panic!("{action}: {e}"));
+        }
+    }
+
+    #[test]
+    fn updates_block_rejects_an_unknown_action() {
+        let m = with_updates(serde_json::json!({
+            "plan_endpoint": "https://u.example.com/plan",
+            "on_notify": "converge"
+        }))
+        .expect("parses");
+        let err = m.validate_shape().unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(ref msg) if msg.contains("updates.on_notify")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn updates_block_rejects_a_non_loopback_http_endpoint() {
+        // Same control-URL rule `op updates config-set` enforces: a manifest
+        // cannot express a channel the imperative verb would refuse.
+        let m =
+            with_updates(serde_json::json!({"plan_endpoint": "http://updates.example.com/plan"}))
+                .expect("parses");
+        let err = m.validate_shape().unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(ref msg) if msg.contains("control URL")),
+            "{err}"
+        );
+        // ...while http to loopback (the demo) is fine.
+        let ok = with_updates(
+            serde_json::json!({"plan_endpoint": "http://127.0.0.1:3140/v1/environments/local/plan"}),
+        )
+        .expect("parses");
+        ok.validate_shape().expect("loopback http is acceptable");
+    }
+
+    #[test]
+    fn updates_block_rejects_a_poll_interval_below_the_floor() {
+        let m = with_updates(serde_json::json!({
+            "plan_endpoint": "https://u.example.com/plan",
+            "poll_interval_secs": 5
+        }))
+        .expect("parses");
+        let err = m.validate_shape().unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(ref msg) if msg.contains("floor")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn updates_block_rejects_unknown_and_missing_fields_at_parse() {
+        assert!(
+            with_updates(serde_json::json!({"plan_endpoint": "https://u/p", "typo": 1})).is_err()
+        );
+        assert!(with_updates(serde_json::json!({"enabled": true})).is_err());
+    }
+
+    // --- cluster + inline answers tests ---
+
+    #[test]
+    fn manifest_round_trips_with_cluster() {
+        let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "cluster": {
+                "provider": "kind",
+                "name": "my-cluster",
+                "kubeconfig_context": "kind-my-cluster",
+                "load_images": ["example.com/img:latest"]
+            }
+        }))
+        .unwrap();
+        manifest.validate_shape().expect("valid with cluster");
+        let cluster = manifest.cluster.as_ref().expect("cluster present");
+        assert_eq!(cluster.provider, ClusterProvider::Kind);
+        assert_eq!(cluster.name, "my-cluster");
+        assert_eq!(
+            cluster.kubeconfig_context.as_deref(),
+            Some("kind-my-cluster")
+        );
+        assert_eq!(cluster.load_images, vec!["example.com/img:latest"]);
+
+        let json = serde_json::to_value(&manifest).unwrap();
+        let rt: EnvManifest = serde_json::from_value(json).unwrap();
+        rt.validate_shape().expect("round-trip valid");
+    }
+
+    #[test]
+    fn manifest_round_trips_without_cluster() {
+        let json_str = r#"{"schema":"greentic.env-manifest.v1","environment":{"id":"local"}}"#;
+        let m1: EnvManifest = serde_json::from_str(json_str).unwrap();
+        m1.validate_shape().expect("valid without cluster");
+        assert!(m1.cluster.is_none());
+
+        let serialized = serde_json::to_string(&m1).unwrap();
+        let m2: EnvManifest = serde_json::from_str(&serialized).unwrap();
+        m2.validate_shape().expect("round-trip valid");
+        assert_eq!(serialized, serde_json::to_string(&m2).unwrap());
+    }
+
+    #[test]
+    fn manifest_round_trips_with_vault_bootstrap() {
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "vault-demo", "tenant_org_id": "org-1"},
+            "vault_bootstrap": {
+                "deploy": "dev-in-cluster",
+                "namespace": "vaultns",
+                "root_token": "s.abc",
+                "image": "hashicorp/vault:1.18",
+                "seed": [
+                    {"path": "org-1/_/messaging-telegram/telegram_bot_token",
+                     "from_env": "TELEGRAM_DEMO_BOT_TOKEN"}
+                ]
+            }
+        }))
+        .unwrap();
+        m.validate_shape().expect("valid with vault_bootstrap");
+        let vault = m.vault_bootstrap.as_ref().expect("vault present");
+        assert_eq!(vault.deploy, VaultDeployMode::DevInCluster);
+        assert!(vault.is_dev_in_cluster());
+        assert_eq!(vault.resolved_namespace(), "vaultns");
+        assert_eq!(vault.resolved_root_token(), "s.abc");
+        assert_eq!(vault.resolved_image(), "hashicorp/vault:1.18");
+        assert_eq!(vault.seed.len(), 1);
+
+        let serialized = serde_json::to_string(&m).unwrap();
+        let m2: EnvManifest = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(serialized, serde_json::to_string(&m2).unwrap());
+    }
+
+    #[test]
+    fn vault_bootstrap_defaults_resolve_to_the_demo_values() {
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "vault-demo", "tenant_org_id": "org-1"},
+            "vault_bootstrap": {"deploy": "dev-in-cluster"}
+        }))
+        .unwrap();
+        m.validate_shape()
+            .expect("valid with minimal vault_bootstrap");
+        let vault = m.vault_bootstrap.as_ref().unwrap();
+        assert_eq!(vault.resolved_namespace(), DEFAULT_VAULT_NAMESPACE);
+        assert_eq!(vault.resolved_root_token(), DEFAULT_VAULT_ROOT_TOKEN);
+        assert_eq!(vault.resolved_image(), DEFAULT_VAULT_DEV_IMAGE);
+        assert!(vault.seed.is_empty());
+    }
+
+    #[test]
+    fn vault_bootstrap_external_mode_parses() {
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "vault-demo", "tenant_org_id": "org-1"},
+            "vault_bootstrap": {"deploy": "external"}
+        }))
+        .unwrap();
+        m.validate_shape().expect("valid external");
+        assert!(!m.vault_bootstrap.as_ref().unwrap().is_dev_in_cluster());
+    }
+
+    #[test]
+    fn vault_bootstrap_deny_unknown_fields() {
+        let err = serde_json::from_value::<EnvManifest>(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "vault_bootstrap": {"deploy": "dev-in-cluster", "bogus": true}
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn vault_bootstrap_and_dev_store_secrets_are_mutually_exclusive() {
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "vault-demo", "tenant_org_id": "org-1"},
+            "secrets": [{"path": "org-1/_/p/tok", "from_env": "TOK"}],
+            "vault_bootstrap": {"deploy": "dev-in-cluster"}
+        }))
+        .unwrap();
+        let err = m.validate_shape().unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(ref msg)
+                if msg.contains("vault_bootstrap") && msg.contains("secrets[]")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn vault_bootstrap_rejects_empty_namespace_and_bad_seed_path() {
+        let empty_ns: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "vault-demo"},
+            "vault_bootstrap": {"deploy": "dev-in-cluster", "namespace": "  "}
+        }))
+        .unwrap();
+        assert!(matches!(
+            empty_ns.validate_shape().unwrap_err(),
+            OpError::InvalidArgument(_)
+        ));
+
+        let bad_seed: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "vault-demo"},
+            "vault_bootstrap": {
+                "deploy": "dev-in-cluster",
+                "seed": [{"path": "too/few/segments"}]
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            bad_seed.validate_shape().unwrap_err(),
+            OpError::InvalidArgument(_)
+        ));
+    }
+
+    #[test]
+    fn cluster_deny_unknown_fields() {
+        let err = serde_json::from_value::<EnvManifest>(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "cluster": {
+                "provider": "kind",
+                "name": "c",
+                "bogus": true
+            }
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn cluster_empty_name_rejected() {
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "cluster": {"provider": "kind", "name": "  "}
+        }))
+        .unwrap();
+        let err = m.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("cluster.name"), "{err}");
+    }
+
+    #[test]
+    fn cluster_empty_load_image_rejected() {
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "cluster": {"provider": "kind", "name": "c", "load_images": ["ok", ""]}
+        }))
+        .unwrap();
+        let err = m.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("load_images"), "{err}");
+    }
+
+    #[test]
+    fn pack_both_answers_and_answers_ref_rejected() {
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "deployer",
+                "kind": "greentic.deployer.k8s@1.0.0",
+                "pack_ref": "builtin",
+                "answers_ref": "answers.json",
+                "answers": {"key": "value"}
+            }]
+        }))
+        .unwrap();
+        let err = m.validate_shape().unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn pack_inline_answers_alone_is_valid() {
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "deployer",
+                "kind": "greentic.deployer.k8s@1.0.0",
+                "pack_ref": "builtin",
+                "answers": {"runtime_image": "example.com/img:v1"}
+            }]
+        }))
+        .unwrap();
+        m.validate_shape().expect("inline answers alone is valid");
+        assert!(m.packs[0].answers.is_some());
+        assert!(m.packs[0].answers_ref.is_none());
+    }
+
+    #[test]
+    fn v1_manifest_without_new_fields_byte_identical() {
+        let json = serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "trust_root": "bootstrap"
+        });
+        let m: EnvManifest = serde_json::from_value(json.clone()).unwrap();
+        m.validate_shape().expect("v1 valid");
+        let roundtripped = serde_json::to_value(&m).unwrap();
+        assert_eq!(json, roundtripped);
+    }
+
+    #[test]
+    fn validate_shape_rejects_invalid_stream_endpoint() {
+        // Non-loopback HTTP is rejected.
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "https://example.com/plan",
+                "stream_endpoint": "http://example.com/stream"
+            }
+        }))
+        .unwrap();
+        let err = m.validate_shape().unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "{err}");
+
+        // Empty string is rejected.
+        let m2: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "updates": {
+                "plan_endpoint": "https://example.com/plan",
+                "stream_endpoint": ""
+            }
+        }))
+        .unwrap();
+        let err2 = m2.validate_shape().unwrap_err();
+        assert!(matches!(err2, OpError::InvalidArgument(_)), "{err2}");
     }
 }

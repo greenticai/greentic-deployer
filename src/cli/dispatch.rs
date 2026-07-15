@@ -301,6 +301,11 @@ pub enum EnvVerb {
     /// or reports `untouched` if the env is already complete. User-bound
     /// non-default descriptors are NEVER overwritten.
     Init(EnvInitArgs),
+    /// One-command local K8s environment bootstrap: parse → preflight →
+    /// cluster → env ensure → apply → reconcile+rollout → port-forward.
+    /// The manifest arrives via `--answers`. Re-running is safe and
+    /// idempotent.
+    Up(super::env_up::EnvUpArgs),
     /// Declarative, upsert-only environment apply. Reads a
     /// `greentic.env-manifest.v1` document via `--answers <PATH>` and
     /// reconciles the env toward it: validate → diff → plan → execute →
@@ -321,6 +326,24 @@ pub enum EnvVerb {
     },
     Doctor {
         env_id: String,
+    },
+    /// Repair an environment whose traffic splits route to revisions staged
+    /// before greentic 1.1.0. Those revisions recorded a `pack_list_lock_ref`
+    /// that no file ever backed, so they can never serve — and until 1.1.18 a
+    /// single one made the whole env refuse to boot. Repair evicts them from
+    /// their traffic splits (rebalancing any healthy survivors) and archives
+    /// them. Bundles, secrets and messaging endpoints are left untouched;
+    /// re-deploy the affected bundle to bring its deployment back.
+    ///
+    /// Dry-runs by default — pass `--apply` to actually mutate the env.
+    Repair {
+        env_id: String,
+        /// Scan and report; do not touch state. This is also the default.
+        #[arg(long, conflicts_with = "apply")]
+        check: bool,
+        /// Perform the repair.
+        #[arg(long, conflicts_with = "check")]
+        apply: bool,
     },
     /// Run per-binding tool preflight. Resolves each env-pack binding via the
     /// registry and invokes its handler's `preflight()` to check external
@@ -692,6 +715,11 @@ pub enum UpdatesVerb {
     /// writing `plan.json` + `plan.json.sig` that round-trip through the
     /// existing `verify_update_plan`. Producer side of the update path.
     PlanBuild(UpdatesPlanBuildArgs),
+    /// Sign a plan and upload it to the environment's plan server, in one step.
+    /// The online counterpart to `plan-build`: the sequence defaults to the
+    /// server's current one plus one, and the endpoint defaults to the env's
+    /// configured `plan_endpoint`. The signing key never leaves this machine.
+    Publish(UpdatesPublishArgs),
 }
 
 #[derive(Args, Debug)]
@@ -728,13 +756,105 @@ pub struct UpdatesConfigSetArgs {
     /// leave unchanged (absent = disabled, deny-by-default).
     #[arg(long)]
     pub enabled: Option<bool>,
-    /// Action on a verified notification: `record-only` or `stage`. Omit to
-    /// leave unchanged (unset resolves to `stage`).
+    /// Action on a verified plan: `record-only`, `stage`, or `apply`. Omit to
+    /// leave unchanged (unset resolves to `stage`). `apply` opts the environment
+    /// into converging on its own, with no operator step — but the executor lives
+    /// in the runtime: a `greentic-start` that predates `on_update` reads the
+    /// legacy `on_notify` mirror and stages instead.
     #[arg(long = "on-notify")]
     pub on_notify: Option<String>,
     /// Fallback poll interval in seconds (>= 60). Omit to leave unchanged.
     #[arg(long = "poll-interval-secs")]
     pub poll_interval_secs: Option<u64>,
+    /// Base URL to poll for the latest signed update plan (`{url}` + `{url}.sig`).
+    /// Must be https (or http to loopback). Omit to leave unchanged.
+    #[arg(long = "plan-endpoint")]
+    pub plan_endpoint: Option<String>,
+    /// Whether the runtime subscribes to a pushed update stream (SSE) instead
+    /// of relying solely on the fallback poll. Omit to leave unchanged (unset
+    /// resolves to `true`).
+    #[arg(long = "push-enabled")]
+    pub push_enabled: Option<bool>,
+    /// SSE stream endpoint the runtime connects to for pushed updates. Must be
+    /// https (or http to loopback). Omit to leave unchanged (unset derives from
+    /// plan-endpoint).
+    #[arg(long = "stream-endpoint")]
+    pub stream_endpoint: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesPublishArgs {
+    /// Target environment id.
+    #[arg(conflicts_with = "all_envs")]
+    pub env_id: Option<String>,
+    /// JSON file for the plan target (env-manifest.v1). Its `updates` block, if
+    /// any, is stripped before signing — a plan may not re-point the channel it
+    /// arrives on. Required unless `--binary` or `--release` is supplied.
+    #[arg(long = "target-file")]
+    pub target_file: Option<PathBuf>,
+    /// Monotonic plan sequence (anti-rollback). Default: the plan server's
+    /// current sequence plus one. Incompatible with --all-envs (sequences
+    /// are per-environment).
+    #[arg(long, conflicts_with = "all_envs")]
+    pub sequence: Option<u64>,
+    /// Binary artifact spec (repeatable); see `plan-build --binary`.
+    #[arg(long = "binary", conflicts_with = "release")]
+    pub binaries: Vec<String>,
+    /// PKCS#8 Ed25519 private key PEM for signing. Default: the global operator key.
+    #[arg(long = "signing-key")]
+    pub signing_key: Option<PathBuf>,
+    /// Minimum runtime version (semver) for `compat.min_runtime`.
+    #[arg(long = "min-runtime")]
+    pub min_runtime: Option<String>,
+    /// Plan-server endpoint to publish to. Default: the env's configured
+    /// `plan_endpoint`, so the environment's subscription decides where its
+    /// updates are published.
+    #[arg(long = "plan-endpoint", conflicts_with = "plan_server_url")]
+    pub plan_endpoint: Option<String>,
+    /// Plan-server upload credential. Prefer `$GREENTIC_PLAN_UPLOAD_TOKEN` — a
+    /// token passed on the command line lands in shell history and `ps`.
+    #[arg(long = "upload-token")]
+    pub upload_token: Option<String>,
+    /// Derive binary artifacts from a GitHub release (e.g. `1.1.12`).
+    /// Downloads each target's archive, verifies its `.sha256` sidecar,
+    /// unpacks and hashes the inner binary.
+    #[arg(long = "release", conflicts_with = "binaries")]
+    pub release: Option<String>,
+    /// GitHub `owner/repo` for --release (default: `greenticai/greentic-start`).
+    #[arg(long = "release-repo", requires = "release")]
+    pub release_repo: Option<String>,
+    /// Binary name inside the archive for --release (default: `greentic-start`).
+    #[arg(long = "release-binary-name", requires = "release")]
+    pub release_binary_name: Option<String>,
+    /// Comma-separated target triples to derive from the release. When set,
+    /// only these targets are downloaded and included in the plan. Missing
+    /// targets fail the command.
+    #[arg(long = "targets", requires = "release", value_delimiter = ',')]
+    pub targets: Vec<String>,
+    /// Expected number of target archives in the release. When set and
+    /// --targets is empty (discover-all mode), the command fails if the
+    /// release contains a different number of archives. Guards against
+    /// partial releases silently producing fewer artifacts than expected.
+    #[arg(long = "expected-target-count", requires = "release")]
+    pub expected_target_count: Option<usize>,
+    /// Path to a trust-root.json file for plan signing verification.
+    /// Bypasses the env-store trust root lookup, enabling CI runners
+    /// with no local env dir.
+    #[arg(long = "trust-root")]
+    pub trust_root: Option<PathBuf>,
+    /// Publish to ALL environments registered on the plan server.
+    /// Requires --plan-server-url.
+    #[arg(
+        long = "all-envs",
+        conflicts_with = "env_id",
+        requires = "plan_server_url"
+    )]
+    pub all_envs: bool,
+    /// Base URL of the plan server (e.g. `https://updates.example.com`).
+    /// Used with --all-envs to enumerate and publish to every registered
+    /// environment.
+    #[arg(long = "plan-server-url", conflicts_with = "plan_endpoint")]
+    pub plan_server_url: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -746,14 +866,15 @@ pub struct UpdatesPlanBuildArgs {
     pub sequence: Option<u64>,
     /// Binary artifact spec (repeatable). Comma-separated key=value:
     /// `name=greentic-start,version=1.1.9,target=x86_64-unknown-linux-gnu,digest=sha256:<hex>[,source=https://...]`.
-    /// Required unless `--target-file` is supplied.
-    #[arg(long = "binary")]
+    /// Required unless `--target-file` or `--release` is supplied.
+    #[arg(long = "binary", conflicts_with = "release")]
     pub binaries: Vec<String>,
     /// PKCS#8 Ed25519 private key PEM for signing. Default: the global operator key.
     #[arg(long = "signing-key")]
     pub signing_key: Option<PathBuf>,
     /// JSON file for the plan target (env-manifest.v1). Required unless
-    /// `--binary` is supplied. Default: minimal manifest with schema + env id.
+    /// `--binary` or `--release` is supplied. Default: minimal manifest with
+    /// schema + env id.
     #[arg(long = "target-file")]
     pub target_file: Option<PathBuf>,
     /// Minimum runtime version (semver) for `compat.min_runtime`.
@@ -762,6 +883,32 @@ pub struct UpdatesPlanBuildArgs {
     /// Output directory for `plan.json` + `plan.json.sig`. Default: current dir.
     #[arg(long = "out-dir")]
     pub out_dir: Option<PathBuf>,
+    /// Derive binary artifacts from a GitHub release (e.g. `1.1.12`).
+    /// Downloads each target's archive, verifies its `.sha256` sidecar,
+    /// unpacks and hashes the inner binary.
+    #[arg(long = "release", conflicts_with = "binaries")]
+    pub release: Option<String>,
+    /// GitHub `owner/repo` for --release (default: `greenticai/greentic-start`).
+    #[arg(long = "release-repo", requires = "release")]
+    pub release_repo: Option<String>,
+    /// Binary name inside the archive for --release (default: `greentic-start`).
+    #[arg(long = "release-binary-name", requires = "release")]
+    pub release_binary_name: Option<String>,
+    /// Comma-separated target triples to derive from the release. When set,
+    /// only these targets are downloaded and included in the plan. Missing
+    /// targets fail the command.
+    #[arg(long = "targets", requires = "release", value_delimiter = ',')]
+    pub targets: Vec<String>,
+    /// Expected number of target archives in the release. When set and
+    /// --targets is empty (discover-all mode), the command fails if the
+    /// release contains a different number of archives.
+    #[arg(long = "expected-target-count", requires = "release")]
+    pub expected_target_count: Option<usize>,
+    /// Path to a trust-root.json file for plan signing verification.
+    /// Bypasses the env-store trust root lookup, enabling CI runners
+    /// with no local env dir.
+    #[arg(long = "trust-root")]
+    pub trust_root: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1065,6 +1212,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
             "env",
             match verb {
                 EnvVerb::Init(_) => "init",
+                EnvVerb::Up(_) => "up",
                 EnvVerb::Apply(_) => "apply",
                 EnvVerb::Create(_) => "create",
                 EnvVerb::Update(_) => "update",
@@ -1072,6 +1220,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 EnvVerb::List => "list",
                 EnvVerb::Show { .. } => "show",
                 EnvVerb::Doctor { .. } => "doctor",
+                EnvVerb::Repair { .. } => "repair",
                 EnvVerb::ToolCheck { .. } => "tool-check",
                 EnvVerb::Render(_) => "render",
                 EnvVerb::Reconcile(_) => "reconcile",
@@ -1189,6 +1338,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 UpdatesVerb::ConfigSet(_) => "config-set",
                 UpdatesVerb::ConfigShow { .. } => "config-show",
                 UpdatesVerb::PlanBuild(_) => "plan-build",
+                UpdatesVerb::Publish(_) => "publish",
             },
         ),
     }
@@ -1202,6 +1352,16 @@ fn dispatch_env(
 ) -> Result<(), OpError> {
     let outcome = match verb {
         EnvVerb::Init(args) => super::env::init(store, flags, args.into_payload(flags)?)?,
+        EnvVerb::Up(args) => {
+            // `up` may block on a foreground port-forward, so the JSON envelope is printed
+            // BEFORE the forward starts — stdout must carry exactly one envelope.
+            let (outcome, forward) = super::env_up::up(store, registry, flags, args)?;
+            print_outcome(&outcome)?;
+            return match forward {
+                Some(pf) => super::env_up::run_port_forward(&pf),
+                None => Ok(()),
+            };
+        }
         EnvVerb::Apply(mut args) => {
             if let Some(path) = args.emit_answers_template.take() {
                 super::env_apply::emit_answers_template(&path)?
@@ -1222,6 +1382,12 @@ fn dispatch_env(
         EnvVerb::List => super::env::list(store, flags)?,
         EnvVerb::Show { env_id } => super::env::show(store, flags, &env_id)?,
         EnvVerb::Doctor { env_id } => super::env::doctor(store, flags, &env_id)?,
+        // `check` is the default, so only an explicit `--apply` mutates.
+        EnvVerb::Repair {
+            env_id,
+            check: _,
+            apply,
+        } => super::env::repair(store, flags, &env_id, apply)?,
         EnvVerb::ToolCheck { env_id } => super::env::tool_check(store, flags, &env_id)?,
         EnvVerb::Render(args) => super::env::render(store, registry, flags, args)?,
         EnvVerb::Reconcile(args) => super::env::reconcile(store, registry, flags, args)?,
@@ -1507,6 +1673,9 @@ fn dispatch_updates(
                         enabled: args.enabled,
                         on_notify: args.on_notify,
                         poll_interval_secs: args.poll_interval_secs,
+                        plan_endpoint: args.plan_endpoint,
+                        push_enabled: args.push_enabled,
+                        stream_endpoint: args.stream_endpoint,
                     });
             super::updates::config_set(store, flags, payload)?
         }
@@ -1516,6 +1685,7 @@ fn dispatch_updates(
             super::updates::config_show(store, flags, payload)?
         }
         UpdatesVerb::PlanBuild(args) => super::updates::plan_build(store, flags, args)?,
+        UpdatesVerb::Publish(args) => super::updates::publish(store, flags, args)?,
     };
     print_outcome(&outcome)
 }

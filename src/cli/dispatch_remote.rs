@@ -119,6 +119,7 @@ fn route_remote(
                 remote_env_set_public_url(store, &args.env_id, &args.url)
             }
             EnvVerb::Init(_) => Err(not_supported("env init")),
+            EnvVerb::Up(_) => Err(not_supported("env up")),
             // Manifest-driven whole-env document reconcile over the remote
             // store. `--emit-answers-template` is store-independent (a local
             // template write), so it runs the same as on the local path.
@@ -132,6 +133,10 @@ fn route_remote(
             EnvVerb::List => super::env::list(store, flags),
             EnvVerb::Show { env_id } => super::env::show(store, flags, &env_id),
             EnvVerb::Doctor { .. } => Err(not_supported("env doctor")),
+            // Repair reads the env DIRECTORY (it must know whether each
+            // revision's pinned pack list exists on disk), so it is inherently
+            // local-fs only.
+            EnvVerb::Repair { .. } => Err(not_supported("env repair")),
             EnvVerb::ToolCheck { .. } => Err(not_supported("env tool-check")),
             EnvVerb::Render(_) => Err(not_supported("env render")),
             EnvVerb::Reconcile(args) => remote_reconcile(store, flags, args),
@@ -286,6 +291,9 @@ fn route_remote(
             UpdatesVerb::ConfigSet(_) => Err(not_supported("updates config-set")),
             UpdatesVerb::ConfigShow { .. } => Err(not_supported("updates config-show")),
             UpdatesVerb::PlanBuild(_) => Err(not_supported("updates plan-build")),
+            // Signs with the local operator key against the local env trust
+            // root; the remote store holds neither.
+            UpdatesVerb::Publish(_) => Err(not_supported("updates publish")),
         },
     }
 }
@@ -1485,6 +1493,7 @@ fn remote_reconcile(
         bound_token,
         None,
         secrets_backend,
+        false,
     )?;
 
     Ok(OpOutcome::new(

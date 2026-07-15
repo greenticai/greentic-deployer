@@ -343,6 +343,8 @@ pub const MIN_AWS_VERSION: &str = "2.13.0";
 pub const MIN_GCLOUD_VERSION: &str = "450.0.0";
 /// Minimum supported Azure CLI version.
 pub const MIN_AZ_VERSION: &str = "2.50.0";
+/// Minimum supported kind version.
+pub const MIN_KIND_VERSION: &str = "0.20.0";
 
 /// `>=min`, unbounded above: these are external CLIs we don't own, and a newer
 /// major (terraform 2.x, kubectl 1.31, ...) is the normal upgrade path, not a
@@ -448,6 +450,18 @@ pub fn gcloud() -> ToolCheck {
         parse_first_semver_token,
         &version_req_at_least(MIN_GCLOUD_VERSION),
         "Install gcloud from https://cloud.google.com/sdk/docs/install.",
+    )
+}
+
+/// Check `kind` is installed and at or above [`MIN_KIND_VERSION`].
+pub fn kind() -> ToolCheck {
+    check_version_probe(
+        "kind",
+        "kind",
+        &["--version"],
+        parse_first_semver_token,
+        &version_req_at_least(MIN_KIND_VERSION),
+        "Install kind from https://kind.sigs.k8s.io/docs/user/quick-start/#installation.",
     )
 }
 
@@ -667,6 +681,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_first_semver_token_handles_kind_version() {
+        assert_eq!(
+            parse_first_semver_token("kind version 0.23.0"),
+            Some(Version::new(0, 23, 0))
+        );
+    }
+
+    #[test]
     fn parse_first_semver_token_handles_common_shapes() {
         // `tofu --version`: `OpenTofu v1.6.2`
         assert_eq!(
@@ -769,6 +791,7 @@ mod tests {
             aws(),
             gcloud(),
             az(),
+            kind(),
         ] {
             if let ToolCheckOutcome::Missing { install_hint } = &check.outcome {
                 assert!(
@@ -793,11 +816,97 @@ mod tests {
             MIN_AWS_VERSION,
             MIN_GCLOUD_VERSION,
             MIN_AZ_VERSION,
+            MIN_KIND_VERSION,
         ] {
             let _: Version = min.parse().unwrap_or_else(|e| {
                 panic!("MIN_*_VERSION `{min}` is not valid semver: {e}");
             });
             let _ = version_req_at_least(min);
         }
+    }
+
+    #[test]
+    fn check_binary_present_with_real_binary() {
+        // `true` is universally available on Unix, exits 0 with no output.
+        let check = check_binary_present("true-check", "true", &[], "N/A");
+        assert!(
+            check.outcome.is_ok(),
+            "expected Ok, got {:?}",
+            check.outcome
+        );
+        assert_eq!(check.name, "true-check");
+    }
+
+    #[test]
+    fn check_version_probe_with_unparseable_version() {
+        // `true` exits 0 but prints nothing parseable as semver.
+        let req: VersionReq = ">=1.0.0".parse().unwrap();
+        let check = check_version_probe(
+            "parse-fail",
+            "true",
+            &[],
+            parse_first_semver_token,
+            &req,
+            "install hint",
+        );
+        assert!(
+            matches!(check.outcome, ToolCheckOutcome::ProbeError { .. }),
+            "expected ProbeError for unparseable version, got {:?}",
+            check.outcome
+        );
+    }
+
+    #[test]
+    fn tool_check_constructors_set_fields() {
+        let missing = ToolCheck::missing("m", "desc-m", "hint-m");
+        assert_eq!(missing.name, "m");
+        assert!(!missing.outcome.is_ok());
+
+        let vm = ToolCheck::version_mismatch("v", "desc-v", "1.0.0", ">=2.0.0", "hint-v");
+        assert_eq!(vm.name, "v");
+        if let ToolCheckOutcome::VersionMismatch {
+            found, required, ..
+        } = &vm.outcome
+        {
+            assert_eq!(found, "1.0.0");
+            assert_eq!(required, ">=2.0.0");
+        } else {
+            panic!("expected VersionMismatch");
+        }
+
+        let af = ToolCheck::auth_failed("a", "desc-a", "no creds", "fix it");
+        assert_eq!(af.name, "a");
+        assert!(matches!(af.outcome, ToolCheckOutcome::AuthFailed { .. }));
+
+        let ur = ToolCheck::unreachable("u", "desc-u", "timeout", "check network");
+        assert_eq!(ur.name, "u");
+        assert!(matches!(ur.outcome, ToolCheckOutcome::Unreachable { .. }));
+
+        let pe = ToolCheck::probe_error("p", "desc-p", "unknown");
+        assert_eq!(pe.name, "p");
+        assert!(matches!(pe.outcome, ToolCheckOutcome::ProbeError { .. }));
+    }
+
+    #[test]
+    fn outcome_deserializes_from_json() {
+        let json = r#"{"status":"version_mismatch","found":"1.0.0","required":">=2.0.0","install_hint":"upgrade"}"#;
+        let outcome: ToolCheckOutcome = serde_json::from_str(json).unwrap();
+        assert!(matches!(outcome, ToolCheckOutcome::VersionMismatch { .. }));
+
+        let json = r#"{"status":"unreachable","detail":"timeout","recovery_hint":"retry"}"#;
+        let outcome: ToolCheckOutcome = serde_json::from_str(json).unwrap();
+        assert!(matches!(outcome, ToolCheckOutcome::Unreachable { .. }));
+
+        let json = r#"{"status":"probe_error","detail":"unknown failure"}"#;
+        let outcome: ToolCheckOutcome = serde_json::from_str(json).unwrap();
+        assert!(matches!(outcome, ToolCheckOutcome::ProbeError { .. }));
+    }
+
+    #[test]
+    fn version_req_at_least_accepts_matching() {
+        let req = version_req_at_least("1.5.0");
+        assert!(req.matches(&Version::new(1, 5, 0)));
+        assert!(req.matches(&Version::new(2, 0, 0)));
+        assert!(!req.matches(&Version::new(1, 4, 9)));
     }
 }
