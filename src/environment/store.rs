@@ -721,6 +721,138 @@ impl LocalFsStore {
         };
         f(&locked)
     }
+
+    /// Destroy `env_id`: atomically retire `<root>/<env_id>` to a sibling
+    /// tombstone, then remove the tombstone tree. Returns a
+    /// [`DestroyOutcome`] with the removed canonical env dir and the count
+    /// of stale tombstones reaped.
+    ///
+    /// The rename is the commit point. After it, no authority-granting
+    /// state (`trust-root.json`, dev-store secrets, pack answers) remains
+    /// at the canonical path for a later `init`/`create` to silently
+    /// adopt, and no sidecar enumeration is needed — sidecars added in the
+    /// future are covered for free. The tombstone name embeds `~`, which
+    /// the `EnvId` charset rejects, so it can never collide with a real
+    /// env and [`list`](EnvironmentStore::list) skips it by construction.
+    ///
+    /// Failure contract: a rename failure commits nothing (plain `Err`); a
+    /// tombstone-removal failure returns
+    /// [`StoreError::CommittedAfterSave`] — the env IS destroyed, the
+    /// tombstone at the error's path needs manual cleanup, and CLI callers
+    /// must `mark_committed` before mapping the error. Re-running
+    /// `destroy` after a failed purge reaps the leftover tombstone(s).
+    ///
+    /// Concurrency: the env flock is held across the existence re-check
+    /// and the rename, so no `transact`-based mutation interleaves. A
+    /// waiter that acquires the renamed-away inode detects the identity
+    /// mismatch and re-acquires on the canonical path (see
+    /// [`EnvFlock`]), so post-destroy waiters coordinate on the fresh
+    /// lock like any other mutation. There is deliberately no liveness
+    /// guard: a running `greentic-start` server holds no flock, so
+    /// destroying an env it is serving is the operator's responsibility,
+    /// exactly as manual removal was before this verb existed.
+    pub fn destroy_environment(&self, env_id: &EnvId) -> Result<DestroyOutcome, StoreError> {
+        let env_dir = self.env_dir(env_id)?;
+        let environment_path = self.environment_path(env_id)?;
+        let prefix = tombstone_prefix(env_id);
+
+        // Unlocked fast-path so a missing env doesn't leave behind the husk
+        // dir that acquiring the flock would create.
+        if !environment_path.exists() {
+            let stale = self.collect_tombstones(&prefix);
+            if stale.is_empty() {
+                return Err(StoreError::NotFound(env_id.clone()));
+            }
+            // The env was already destroyed; reap leftover tombstones.
+            let reaped = self.purge_tombstones(&stale)?;
+            return Ok(DestroyOutcome {
+                removed_path: env_dir,
+                reaped_tombstones: reaped,
+            });
+        }
+
+        let guard = EnvFlock::acquire(&self.lock_path(env_id)?)?;
+        // Re-check under the lock: a concurrent destroy may have won.
+        if !environment_path.exists() {
+            return Err(StoreError::NotFound(env_id.clone()));
+        }
+        // Refuse a symlinked env root: renaming would retire the link, not
+        // the tree behind it, and the caller would be told "destroyed"
+        // while every secret survives at the target.
+        let meta = std::fs::symlink_metadata(&env_dir).map_err(|source| StoreError::Io {
+            path: env_dir.clone(),
+            source,
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(StoreError::InvalidArgument(format!(
+                "environment `{env_id}` root is a symlink; refusing to destroy through it"
+            )));
+        }
+        let tombstone = self.root.join(format!("{prefix}{}", ulid::Ulid::new()));
+        std::fs::rename(&env_dir, &tombstone).map_err(|source| StoreError::Io {
+            path: env_dir.clone(),
+            source,
+        })?;
+        // Commit point passed. Release the flock explicitly before the
+        // recursive removal — its fd lives inside the tombstone now, and on
+        // Windows an open handle in the tree can block deletion.
+        drop(guard);
+
+        // Purge the fresh tombstone, then any stale ones from prior failures.
+        self.purge_tombstones(std::slice::from_ref(&tombstone))?;
+        let stale = self.collect_tombstones(&prefix);
+        let reaped = self.purge_tombstones(&stale)?;
+        Ok(DestroyOutcome {
+            removed_path: env_dir,
+            reaped_tombstones: reaped,
+        })
+    }
+
+    /// List stale tombstone dirs for an env whose prefix matches `prefix`.
+    fn collect_tombstones(&self, prefix: &str) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .map(|e| e.path())
+            .collect()
+    }
+
+    /// Remove each tombstone in `paths`. Returns the count removed. On the
+    /// first failure returns `CommittedAfterSave` with the failing path.
+    fn purge_tombstones(&self, paths: &[PathBuf]) -> Result<usize, StoreError> {
+        let mut count = 0;
+        for path in paths {
+            if let Err(source) = std::fs::remove_dir_all(path) {
+                return Err(StoreError::CommittedAfterSave(Box::new(StoreError::Io {
+                    path: path.clone(),
+                    source,
+                })));
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+}
+
+/// Outcome of a successful [`LocalFsStore::destroy_environment`] call.
+#[derive(Debug)]
+pub struct DestroyOutcome {
+    /// Canonical env dir that was removed (`<root>/<env_id>`).
+    pub removed_path: PathBuf,
+    /// Number of stale tombstones from prior failed purges reaped in this call.
+    pub reaped_tombstones: usize,
+}
+
+/// Tombstone filename prefix for a given env id. The `~` separator cannot
+/// appear in any valid `EnvId`, so a prefix match never collides with another
+/// env's tombstone. The id is capped at 128 chars so the full tombstone name
+/// stays under `NAME_MAX` even for env ids near the 255-byte limit.
+fn tombstone_prefix(env_id: &EnvId) -> String {
+    let id_prefix: String = env_id.as_str().chars().take(128).collect();
+    format!("{id_prefix}.destroyed~")
 }
 
 /// Lock-holding handle returned by [`LocalFsStore::transact`]. All mutator
