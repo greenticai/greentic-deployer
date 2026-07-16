@@ -406,12 +406,14 @@ fn vault_seed_put(
     value: &str,
 ) -> Result<String, OpError> {
     use crate::env_packs::k8s::manifests::SecretsBackend;
-    use greentic_secrets_lib::core::{CoreBuilder, rt};
+    use greentic_secrets_lib::core::rt;
 
     // A Vault-backed env is single-tenant at the runtime (greentic-start scopes
     // one SecretsCore to the env owner and fails closed otherwise), so seeding
-    // requires an owner and writes under it.
-    let tenant = env
+    // requires an owner. The `?` below is a fail-closed precondition; the stored
+    // location is determined by the `secret://<env>/…` URI (env-scoped), not the
+    // owner, so the owner value itself is not threaded into the write.
+    let _tenant = env
         .host_config
         .tenant_org_id
         .clone()
@@ -469,20 +471,31 @@ fn vault_seed_put(
         })
     })?;
 
-    // Construct the embedded core over the env-driven Vault backend and write the
-    // value verbatim (the broker envelope-encrypts). Driven through the secrets
-    // runtime so the async backend runs from this synchronous verb.
+    // Write the value verbatim over the env-driven Vault backend (the broker
+    // envelope-encrypts). Driven through the secrets runtime so the async backend
+    // runs from this synchronous verb.
     rt::sync_await(async {
+        use greentic_secrets_lib::core::{
+            BrokerStore, DekCache, EncryptionAlgorithm, EnvelopeService, SecretsBroker,
+        };
         let components = greentic_secrets_lib::vault::build_backend()
             .await
             .map_err(|e| OpError::Conflict(format!("vault backend init failed: {e}")))?;
-        let core = CoreBuilder::default()
-            .tenant(tenant.as_str())
-            .backend(components.backend, components.key_provider)
-            .build()
-            .await
-            .map_err(|e| OpError::Conflict(format!("vault secrets core build failed: {e}")))?;
-        core.put_text(store_uri, value)
+        // Mirror `CoreBuilder::build`'s broker construction (same DEK cache + AES-256-GCM
+        // envelope) and write raw text through the `SecretsStore` trait. The 1.3.x-research
+        // `SecretsCore` does not carry the `put_text`/`put_bytes` convenience the 1.1.x line
+        // has (secrets#97); `BrokerStore::put(_, SecretFormat::Text, _)` performs the
+        // identical `SecretUri::parse` + `broker.put_secret(ContentType::Text)`, so the
+        // seed lands byte-for-byte where the worker (and `vault_seed_get`'s `get_text`) reads.
+        let crypto = EnvelopeService::new(
+            components.key_provider,
+            DekCache::from_env(),
+            EncryptionAlgorithm::Aes256Gcm,
+        );
+        let broker = SecretsBroker::new(components.backend, crypto);
+        let store = BrokerStore::new(broker);
+        store
+            .put(store_uri, SecretFormat::Text, value.as_bytes())
             .await
             .map_err(|e| OpError::Conflict(format!("vault put failed: {e}")))?;
         Ok::<(), OpError>(())

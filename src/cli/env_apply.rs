@@ -2917,8 +2917,33 @@ fn derive_idempotency_key(
 /// must stay canonical across builds (no `preserve_order` feature).
 fn hash_json(value: &Value) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(value.to_string().as_bytes());
+    hasher.update(canonical_json(value).as_bytes());
     hex::encode(hasher.finalize())
+}
+
+/// Compact JSON with object keys sorted, so the digest is content-canonical
+/// regardless of `serde_json`'s `preserve_order` feature. That feature is
+/// enabled by feature-unification on the research dependency line (it pulls
+/// `serde_json/indexmap`), which would otherwise flip `Value::to_string` to
+/// insertion order and shift every idempotency key. Sorting here keeps the key
+/// stable across dependency lines and matches the historical (sorted) digest.
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let body: Vec<String> = keys
+                .into_iter()
+                .map(|k| format!("{}:{}", Value::String(k.clone()), canonical_json(&map[k])))
+                .collect();
+            format!("{{{}}}", body.join(","))
+        }
+        Value::Array(items) => {
+            let body: Vec<String> = items.iter().map(canonical_json).collect();
+            format!("[{}]", body.join(","))
+        }
+        leaf => leaf.to_string(),
+    }
 }
 
 /// Digest of the revision currently carrying the (highest-weight) live
