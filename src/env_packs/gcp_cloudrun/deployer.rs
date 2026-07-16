@@ -440,19 +440,6 @@ impl Deployer for GcpCloudRunDeployerHandler {
             }
         }
 
-        // Apply the invoker IAM binding for the requested access mode (plan D12).
-        // A `Public` service needs `allUsers` granted `roles/run.invoker` or the
-        // returned `run.app` URL 403s every request — the upsert alone does NOT
-        // set it (the IAM policy is a separate resource from the Service). Runs
-        // after the upsert wins the etag race (so the Service exists) and before
-        // the readiness wait, so the URL is reachable the moment the revision
-        // reports `Ready`. Idempotent: re-applying the same binding on a
-        // second-revision warm is a harmless no-op.
-        self.target
-            .set_invoker_policy(&service_ref, params.access_mode)
-            .await
-            .map_err(provider)?;
-
         let revision_ref = RevisionRef {
             deployment_id,
             revision_id,
@@ -466,6 +453,22 @@ impl Deployer for GcpCloudRunDeployerHandler {
             WARM_READY_POLL_INTERVAL,
         )
         .await?;
+
+        // Apply the invoker IAM binding for the requested access mode (plan D12)
+        // as the FINAL commit step — only after the new revision is proven ready.
+        // The invoker policy is service-WIDE (it governs every revision at once),
+        // so mutating it before readiness would change access on the currently-
+        // serving revision even when this deploy then fails or times out: a
+        // `public`→`authenticated` flip is an outage, the inverse exposes prod on
+        // a failed deploy. Deferring it past the readiness wait means a failed
+        // revision never touches live access. The Service upsert alone does NOT
+        // set the policy (it is a separate IAM resource, so a `Public` service's
+        // `run.app` URL 403s without this), and re-applying the same binding on a
+        // second-revision warm is a harmless idempotent no-op.
+        self.target
+            .set_invoker_policy(&service_ref, params.access_mode)
+            .await
+            .map_err(provider)?;
         Ok(WarmOutcome::default())
     }
 
