@@ -1482,19 +1482,17 @@ fn cloudrun_target_inputs(
 }
 
 /// Build the region-pinned Cloud Run + Secret Manager clients (with the bound
-/// credential injected, else ambient ADC) and hand back the shared `Arc` — the
-/// caller both wraps it in a handler (`with_target`) and queries the live URL
-/// through it. The GCP analogue of [`resolve_ecs_handler`], but returns the
-/// target `Arc` (not the handler) so the endpoint lookup can reuse it.
+/// credential injected, else ambient ADC) and wrap them in a handler — the GCP
+/// analogue of [`resolve_ecs_handler`]. The Service's `*.run.app` URL rides back
+/// on the warm outcome (read from the upsert response), so the caller needs no
+/// separate handle on the target.
 #[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
-async fn resolve_cloudrun_target(
+async fn resolve_cloudrun_handler(
     project: &str,
     region: &str,
     credentials: Option<crate::env_packs::gcp_cloudrun::bound_session::GcpCredentialMaterial>,
-) -> Result<
-    std::sync::Arc<dyn crate::env_packs::gcp_cloudrun::deploy_target::CloudRunTarget>,
-    OpError,
-> {
+) -> Result<crate::env_packs::gcp_cloudrun::GcpCloudRunDeployerHandler, OpError> {
+    use crate::env_packs::gcp_cloudrun::GcpCloudRunDeployerHandler;
     use crate::env_packs::gcp_cloudrun::real_target::RealCloudRunTarget;
     use std::sync::Arc;
 
@@ -1505,7 +1503,7 @@ async fn resolve_cloudrun_target(
                 "cannot initialize the GCP Cloud Run deployer client: {e}"
             ))
         })?;
-    Ok(Arc::new(target))
+    Ok(GcpCloudRunDeployerHandler::with_target(Arc::new(target)))
 }
 
 /// Connect to GCP and drive the single revision's Cloud Run verb: `warm_revision`
@@ -1523,9 +1521,7 @@ fn apply_revision_cloudrun(
     answers: Option<&Value>,
 ) -> Result<(&'static str, String, Option<String>), OpError> {
     use crate::env_packs::deployer::Deployer;
-    use crate::env_packs::gcp_cloudrun::GcpCloudRunDeployerHandler;
     use crate::env_packs::gcp_cloudrun::credentials::run_gcp_async;
-    use crate::env_packs::gcp_cloudrun::deploy_target::ServiceRef;
     use crate::env_packs::gcp_cloudrun::deployer::service_name;
 
     let revision = env
@@ -1533,29 +1529,21 @@ fn apply_revision_cloudrun(
         .iter()
         .find(|r| r.revision_id == revision_id)
         .expect("revision presence checked by the caller");
-    let deployment_id = revision.deployment_id;
-    let worker_name = service_name(deployment_id);
+    let worker_name = service_name(revision.deployment_id);
     let (identity, params, credentials) = cloudrun_target_inputs(store, env, env_id, answers)?;
 
     let endpoint_url = run_gcp_async(async move {
-        let target = resolve_cloudrun_target(&params.project, &params.region, credentials).await?;
-        let handler = GcpCloudRunDeployerHandler::with_target(target.clone());
+        let handler =
+            resolve_cloudrun_handler(&params.project, &params.region, credentials).await?;
         if present {
-            handler
+            // The Service's live `*.run.app` URL rides back on the warm outcome
+            // (read from the upsert response — no extra round-trip): the "one
+            // command → live URL" milestone.
+            let outcome = handler
                 .warm_revision(env, revision_id, answers)
                 .await
                 .map_err(|e| OpError::Conflict(e.to_string()))?;
-            // Discover the Service's live `*.run.app` URL for the outcome
-            // envelope (the "one command → live URL" milestone).
-            let service_ref = ServiceRef {
-                deployment_id,
-                project: params.project.clone(),
-                region: params.region.clone(),
-            };
-            target
-                .get_service_url(&service_ref)
-                .await
-                .map_err(|e| OpError::Conflict(e.to_string()))
+            Ok::<Option<String>, OpError>(outcome.endpoint_url)
         } else {
             handler
                 .archive_revision(env, revision_id, answers)
@@ -1796,13 +1784,12 @@ fn apply_traffic_cloudrun(
     OpError,
 > {
     use crate::env_packs::deployer::Deployer;
-    use crate::env_packs::gcp_cloudrun::GcpCloudRunDeployerHandler;
     use crate::env_packs::gcp_cloudrun::credentials::run_gcp_async;
 
     let (identity, params, credentials) = cloudrun_target_inputs(store, env, env_id, answers)?;
     let outcome = run_gcp_async(async move {
-        let target = resolve_cloudrun_target(&params.project, &params.region, credentials).await?;
-        let handler = GcpCloudRunDeployerHandler::with_target(target);
+        let handler =
+            resolve_cloudrun_handler(&params.project, &params.region, credentials).await?;
         handler
             .apply_traffic_split(env, deployment_id, answers)
             .await

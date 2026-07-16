@@ -20,8 +20,16 @@ use crate::environment::runtime_config::materialize_runtime_config;
 pub struct StageOutcome {}
 
 /// Side-effect outcome of [`Deployer::warm_revision`].
+///
+/// `endpoint_url` carries a provider-discovered public endpoint when the backend
+/// assigns one — Cloud Run returns the Service's `*.run.app` URL here (read from
+/// the upsert response, so no extra round-trip). `None` for backends with no
+/// deployer-discovered endpoint (a K8s ingress host / the AWS-ECS ALB DNS are
+/// operator-supplied, not discovered by the warm).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct WarmOutcome {}
+pub struct WarmOutcome {
+    pub endpoint_url: Option<String>,
+}
 
 /// Side-effect outcome of [`Deployer::drain_revision`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

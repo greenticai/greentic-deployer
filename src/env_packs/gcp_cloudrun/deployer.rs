@@ -387,7 +387,10 @@ impl Deployer for GcpCloudRunDeployerHandler {
         // 0%-only array); an update keeps the existing distribution and adds
         // this revision at 0% if it is new, so warm never moves traffic.
         let mut attempt = 0;
-        loop {
+        // The Service's `*.run.app` URL rides back on the upsert response (it is
+        // assigned at Service-create time and is immutable after), so take it as
+        // the loop's break value — the caller needs no extra `get_service`.
+        let endpoint_url = loop {
             let existing = self
                 .target
                 .get_service(&service_ref)
@@ -426,7 +429,7 @@ impl Deployer for GcpCloudRunDeployerHandler {
                 secrets: Vec::new(),
             };
             match self.target.upsert_service(&spec, etag.as_deref()).await {
-                Ok(_) => break,
+                Ok(status) => break status.url,
                 Err(CloudRunTargetError::PreconditionFailed) => {
                     attempt += 1;
                     if attempt > MAX_ETAG_RETRIES {
@@ -438,7 +441,7 @@ impl Deployer for GcpCloudRunDeployerHandler {
                 }
                 Err(e) => return Err(provider(e)),
             }
-        }
+        };
 
         let revision_ref = RevisionRef {
             deployment_id,
@@ -469,7 +472,7 @@ impl Deployer for GcpCloudRunDeployerHandler {
             .set_invoker_policy(&service_ref, params.access_mode)
             .await
             .map_err(provider)?;
-        Ok(WarmOutcome::default())
+        Ok(WarmOutcome { endpoint_url })
     }
 
     async fn drain_revision(
@@ -948,6 +951,24 @@ mod tests {
             target2.invoker_policy_for(dep_a),
             Some(AccessMode::Authenticated),
             "an authenticated env applies the Authenticated invoker binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_returns_the_service_endpoint_url() {
+        // The Service's `*.run.app` URL rides back on the warm outcome (read from
+        // the upsert response), so the CLI needs no extra get_service round-trip.
+        let (handler, _target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+        let outcome = handler.warm_revision(&env, r_warm, None).await.unwrap();
+        let url = outcome
+            .endpoint_url
+            .expect("warm surfaces the Service's *.run.app URL from the upsert response");
+        assert!(
+            url.contains(&service_name(dep_a)) && url.ends_with(".run.app"),
+            "endpoint URL should be the Service's run.app URL, got {url}"
         );
     }
 
