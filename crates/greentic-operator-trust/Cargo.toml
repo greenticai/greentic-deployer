@@ -20,7 +20,7 @@ test-utils = []
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "zeroize"] }
-greentic-deploy-spec = { path = "../greentic-deploy-spec", version = "0.2" }
+greentic-deploy-spec = "0.2"
 # Only the (ungated) `signing` module is used. `default-features = false`
 # would be the right spec, but distributor-client's `store_auth` module
 # references the optional `dirs_next` crate without a cfg gate, so the
