@@ -10,6 +10,16 @@
 //! converges (idempotency).
 //!
 //! Runs against the ambient kubeconfig current-context (kind in CI).
+//!
+//! NOTE — skeleton until the k8s-vault demo. This fixture is **not yet runnable
+//! end to end**: it declares no bundle, so `env up` renders no worker Deployment
+//! and phase 6b (`vault_verify_phase`) rejects an empty worker list ("no worker
+//! Deployment found to verify"). A passing run needs a warmed bundle (a real
+//! revision → worker) — e.g. the `webchat-bot` OCI bundle used by
+//! `my_demos/k8s-vault-demo` — plus a tenant-owned env whose `tenant_org_id`
+//! covers the served deployment tenant. The full manifest is completed and this
+//! test is actually executed as part of the k8s-vault demo step; until then it
+//! stands as the intended-assertions skeleton and only compiles + gated-skips.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -78,6 +88,11 @@ fn write_manifest(dir: &Path, manifest: &Value) -> PathBuf {
 }
 
 /// Build the env-manifest for a Vault-backed `env up`.
+///
+/// NOTE: intentionally declares no `bundles[]` yet, so this manifest produces no
+/// worker and `vault_verify_phase` fails if armed as-is (see the module header).
+/// Add a warmed bundle (e.g. the demo's `webchat-bot`) to make it a passing run
+/// at the demo step.
 fn vault_manifest() -> Value {
     serde_json::json!({
         "schema": "greentic.env-manifest.v1",
