@@ -50,6 +50,10 @@ pub struct VaultInfraParams<'a> {
     pub root_token: &'a str,
     /// Owning env id, stamped as [`ENV_LABEL`] for the apply ownership guard.
     pub env_id: &'a str,
+    /// The env's worker namespace (`gtc-<env>`, or a customized value). The
+    /// ingress NetworkPolicy scopes Vault's ingress to EXACTLY this namespace by
+    /// name — see [`render_vault_network_policy`].
+    pub worker_namespace: &'a str,
 }
 
 /// The cluster-scoped binding name — namespace-suffixed so two dev Vaults in
@@ -188,11 +192,27 @@ pub fn render_vault_service(p: &VaultInfraParams) -> Value {
 
 /// Open Vault's ingress to the worker pods. The deployer renders a
 /// deny-by-default posture (`gtc-default-deny` selects every pod in the
-/// namespace, including this operator-deployed Vault), and kindnet enforces
+/// namespace, including this operator-deployed Vault), and the CNI enforces
 /// NetworkPolicies — so without this the worker's `auth/kubernetes/login` + KV
 /// read to `vault.<ns>.svc:8200` is dropped at Vault's ingress and every
-/// webhook 401s. Same-namespace component selector: `env up`'s dev Vault shares
-/// the env namespace, so a worker-component selector suffices.
+/// webhook 401s.
+///
+/// The workers do NOT share Vault's namespace: Vault runs in
+/// `vault_bootstrap.namespace` (default `greentic`) while the workers run in the
+/// env namespace (`worker_namespace`, `gtc-<env>` by default) — see
+/// [`VaultInfraParams::namespace`]. A bare `podSelector` in an ingress `from`
+/// matches only pods in the policy's OWN namespace (here, Vault's), so it never
+/// matches the workers: under a policy-enforcing CNI (e.g. Cilium) this silently
+/// denied worker->Vault and every webhook 401'd; kindnet's laxer enforcement
+/// masked it.
+///
+/// The `from` scopes to the worker namespace by its EXACT name
+/// (`kubernetes.io/metadata.name`, the Kubernetes-managed immutable label), not
+/// by the env-ownership label: [`ENV_LABEL`] carries only the env id, so on a
+/// shared cluster two envs with the same id (e.g. `local`) — or a customized
+/// worker namespace — would both match, letting either's worker reach the
+/// other's dev Vault, whose root token defaults to the well-known `root`. The
+/// exact-name selector admits only this env's worker namespace.
 pub fn render_vault_network_policy(p: &VaultInfraParams) -> Value {
     json!({
         "apiVersion": "networking.k8s.io/v1",
@@ -209,6 +229,9 @@ pub fn render_vault_network_policy(p: &VaultInfraParams) -> Value {
             "policyTypes": ["Ingress"],
             "ingress": [{
                 "from": [{
+                    "namespaceSelector": {
+                        "matchLabels": { "kubernetes.io/metadata.name": p.worker_namespace },
+                    },
                     "podSelector": {
                         "matchLabels": { "app.kubernetes.io/component": WORKER_COMPONENT },
                     },
@@ -243,6 +266,7 @@ mod tests {
             image: "hashicorp/vault:1.17",
             root_token: "root",
             env_id: "vault-demo",
+            worker_namespace: "gtc-vault-demo",
         }
     }
 
@@ -276,6 +300,36 @@ mod tests {
                 obj["kind"]
             );
         }
+    }
+
+    #[test]
+    fn vault_ingress_netpol_scopes_to_the_exact_worker_namespace() {
+        // Regression: a bare podSelector `from` matches only pods in the policy's
+        // own (Vault) namespace, so it never matched the workers, which live in
+        // the env namespace. And scoping by the env-ownership label alone would
+        // admit a sibling env sharing the same env id (whose dev Vault root token
+        // is the well-known `root`). The `from` must pair a namespaceSelector on
+        // the EXACT worker-namespace name with the worker podSelector.
+        let np = render_vault_network_policy(&params());
+        let from = &np["spec"]["ingress"][0]["from"][0];
+        assert_eq!(
+            from["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "gtc-vault-demo",
+            "ingress `from` must scope to the worker namespace by its exact name"
+        );
+        // The broad env-ownership label must NOT be the namespace selector — it
+        // would admit a same-id sibling env's workers.
+        assert!(
+            from["namespaceSelector"]["matchLabels"]
+                .get(ENV_LABEL)
+                .is_none(),
+            "ingress `from` must not scope by the env-ownership label (too broad)"
+        );
+        assert_eq!(
+            from["podSelector"]["matchLabels"]["app.kubernetes.io/component"], "worker",
+            "ingress `from` must still select the worker component"
+        );
+        assert_eq!(np["spec"]["ingress"][0]["ports"][0]["port"], VAULT_PORT);
     }
 
     #[test]
