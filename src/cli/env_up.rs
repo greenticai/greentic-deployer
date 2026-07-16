@@ -437,7 +437,7 @@ fn reconcile_phase(
 
     let bound_token =
         crate::env_packs::k8s::resolve_bound_identity(store, &env, env_id, answers.as_ref())?;
-    let dev_secrets = super::env::read_dev_secrets_b64(store, &env, env_id)?;
+    let dev_secrets = super::env::read_dev_secrets_b64(store, env_id)?;
     let secrets_backend = super::env::resolve_secrets_backend(store, &env)?;
 
     let report = super::env::reconcile_k8s_cluster(
