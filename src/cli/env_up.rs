@@ -111,19 +111,26 @@ pub(crate) fn up(
     let has_cluster = manifest.cluster.is_some();
     let provision_cluster = should_provision_cluster(has_cluster, args.skip_cluster, args.dry_run);
 
-    // Fail before any mutation: the k8s deployer's reconcile/rollout needs
-    // `k8s-client`, so a build without it must not run `env_apply::apply` (a
-    // store mutation) only to fail in the featureless reconcile stub. Cloud Run
-    // is imperative and reconciles without `k8s-client`, so it is exempt. Key
-    // off the EFFECTIVE desired deployer — resolved from the manifest (or the
-    // existing env) — not the optional `cluster` block, which a clusterless k8s
-    // manifest targeting an ambient kubeconfig legitimately omits.
-    if !cfg!(feature = "k8s-client") && !manifest_targets_cloudrun(store, &env_id, &manifest)? {
-        return Err(OpError::Conflict(
+    // Fail before any mutation: `op env up` must not run `env_apply::apply` (a
+    // store mutation) only to fail later in a featureless stub. Resolve the
+    // EFFECTIVE desired deployer from the manifest (or the existing env) — not
+    // the optional `cluster` block, which a clusterless k8s manifest targeting an
+    // ambient kubeconfig legitimately omits. A k8s deployer needs `k8s-client`
+    // for reconcile; a Cloud Run deployer needs `deploy-gcp-cloudrun` for its
+    // real target (the `creds-gcp` scaffold recognizes the kind but only stubs
+    // the deploy path, so it is NOT sufficient on its own).
+    let targets_cloudrun = manifest_targets_cloudrun(store, &env_id, &manifest)?;
+    let cloudrun_deployable = targets_cloudrun && cfg!(feature = "deploy-gcp-cloudrun");
+    if !cloudrun_deployable && !cfg!(feature = "k8s-client") {
+        return Err(OpError::Conflict(if targets_cloudrun {
+            "this build was compiled without the `deploy-gcp-cloudrun` feature; \
+             `op env up` needs it to deploy a Cloud Run environment"
+                .to_string()
+        } else {
             "this build was compiled without the `k8s-client` feature; \
              `op env up` needs it for the k8s deployer"
-                .to_string(),
-        ));
+                .to_string()
+        }));
     }
 
     // ── Phase 1: preflight ───────────────────────────────────────────

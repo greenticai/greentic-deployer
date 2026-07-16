@@ -1802,6 +1802,14 @@ pub fn apply_traffic(
 /// Archived revisions are left in place (they carry no traffic and cost nothing
 /// at scale-to-zero); archival convergence stays with the granular
 /// `op env apply-revision <id>` verb.
+///
+/// Known limitations (tracked hardening, not this slice): the underlying warm is
+/// not yet content-idempotent, so a second `op env up` (or a retried one) can
+/// fail re-pinning an immutable Cloud Run revision (H2); and the env is read into
+/// one snapshot for the whole bring-up, so a concurrent `op traffic set` during a
+/// long multi-revision warm is not observed (same converge-from-snapshot model as
+/// the k8s reconcile). Both are acceptable for a bring-up and neither affects the
+/// primary fresh single-revision flow.
 pub(crate) fn cloudrun_env_up(
     store: &LocalFsStore,
     registry: &crate::env_packs::EnvPackRegistry,
@@ -1821,12 +1829,30 @@ pub(crate) fn cloudrun_env_up(
 
     let (answers, _answers_ref_wire) = load_render_answers(store, &env, &descriptor)?;
 
+    // Preflight (side-effect-free, before any warm): Cloud Run's integer
+    // `percent` cannot represent basis-point weights that are not whole multiples
+    // of 100 bps (plan D1 — the same invariant `split_to_traffic_targets` enforces
+    // at apply time). Reject a non-representable split up front so it fails BEFORE
+    // warming creates live revisions we would then be unable to route to.
+    for split in &env.traffic_splits {
+        for entry in &split.entries {
+            if entry.weight_bps % 100 != 0 {
+                return Err(OpError::Conflict(format!(
+                    "traffic split for deployment `{}` weights revision `{}` at {} bps; \
+                     Cloud Run weights must be whole multiples of 100 bps (1%)",
+                    split.deployment_id, entry.revision_id, entry.weight_bps,
+                )));
+            }
+        }
+    }
+
     // 1. Warm every present revision (bring-up only — see the archival note in
-    //    the doc comment). Each Cloud Run warm returns the Service's `*.run.app`
-    //    URL; a deployment's revisions share one Service, so the last discovered
-    //    URL is the live endpoint.
+    //    the doc comment). Each Cloud Run warm returns its Service's `*.run.app`
+    //    URL; a deployment's revisions share one Service, so endpoints are keyed
+    //    by deployment rather than collapsed to a single last-wins URL.
     let mut warmed: Vec<String> = Vec::new();
-    let mut endpoint_url: Option<String> = None;
+    let mut endpoints: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     for revision in &env.revisions {
         if !crate::env_packs::k8s::manifests::has_cluster_presence(revision.lifecycle) {
             continue;
@@ -1840,8 +1866,8 @@ pub(crate) fn cloudrun_env_up(
             answers.as_ref(),
             &descriptor,
         )?;
-        if url.is_some() {
-            endpoint_url = url;
+        if let Some(url) = url {
+            endpoints.insert(revision.deployment_id.to_string(), url);
         }
         warmed.push(service_name);
     }
@@ -1866,8 +1892,17 @@ pub(crate) fn cloudrun_env_up(
         "kind": descriptor.as_str(),
         "warmed": warmed,
         "applied_splits": env.traffic_splits.len(),
+        // One `*.run.app` URL per deployment — an env may front several Services.
+        "endpoints": endpoints
+            .iter()
+            .map(|(deployment_id, url)| json!({"deployment_id": deployment_id, "url": url}))
+            .collect::<Vec<_>>(),
     });
-    if let Some(url) = endpoint_url {
+    // Convenience single-URL field for the common one-deployment env; omitted for
+    // zero or multiple live Services (callers read `endpoints` for the general case).
+    if endpoints.len() == 1
+        && let Some(url) = endpoints.values().next()
+    {
         result["endpoint_url"] = json!(url);
     }
     Ok(Some(result))
@@ -5125,10 +5160,84 @@ mod tests {
             "no present revisions to warm"
         );
         assert_eq!(out.get("applied_splits").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(
+            out.get("endpoints")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(0),
+            "no revision warmed → no endpoints"
+        );
         assert!(
             out.get("endpoint_url").is_none(),
-            "no revision warmed → no discovered URL: {out:?}"
+            "no revision warmed → no single-deployment URL: {out:?}"
         );
+    }
+
+    /// The bring-up preflights traffic representability BEFORE warming: a
+    /// store-valid split whose weights are not whole multiples of 100 bps (plan
+    /// D1) is rejected up front, so `op env up` never creates live Cloud Run
+    /// revisions it cannot then route to. Deterministic — the preflight fires
+    /// before any GCP call (Codex adversarial-review finding).
+    #[cfg(feature = "creds-gcp")]
+    #[test]
+    fn cloudrun_env_up_rejects_non_representable_split_before_warming() {
+        use crate::cli::tests_common::{
+            make_binding, make_bundle_deployment, make_revision, make_traffic_split,
+        };
+        use greentic_deploy_spec::{RevisionLifecycle, TrafficSplitEntry};
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.gcp-cloudrun@1.0.0",
+        ));
+        let deployment = make_bundle_deployment("local", "demo-bundle");
+        let r1 = make_revision(
+            "local",
+            "demo-bundle",
+            &deployment.deployment_id,
+            1,
+            RevisionLifecycle::Ready,
+        );
+        let r2 = make_revision(
+            "local",
+            "demo-bundle",
+            &deployment.deployment_id,
+            2,
+            RevisionLifecycle::Ready,
+        );
+        // 3333 / 6667 bps sums to 10000 (spec-valid) but 3333 % 100 != 0, so Cloud
+        // Run's integer percent cannot represent it — the adapter must reject it.
+        let mut split = make_traffic_split(
+            "local",
+            "demo-bundle",
+            &deployment.deployment_id,
+            &r1.revision_id,
+            "01J000000000000000000000AA",
+        );
+        split.entries = vec![
+            TrafficSplitEntry {
+                revision_id: r1.revision_id,
+                weight_bps: 3333,
+            },
+            TrafficSplitEntry {
+                revision_id: r2.revision_id,
+                weight_bps: 6667,
+            },
+        ];
+        env.bundles.push(deployment);
+        env.revisions.push(r1);
+        env.revisions.push(r2);
+        env.traffic_splits.push(split);
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        let err = cloudrun_env_up(&store, &reg, &env_id).unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(msg.contains("100 bps"), "{msg}"),
+            other => panic!("expected Conflict(non-representable split), got {other}"),
+        }
     }
 
     /// An AWS-ECS env IS admitted past the gate, but a binding without a Fargate
