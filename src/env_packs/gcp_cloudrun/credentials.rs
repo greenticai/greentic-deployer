@@ -75,6 +75,11 @@ pub const VALIDATED_GCP_PERMISSIONS: &[&str] = &[
     "secretmanager.secrets.update",
     "secretmanager.versions.add",
     "secretmanager.versions.access",
+    // Grant the runtime SA `secretAccessor` on each staged secret (get→set RMW)
+    // and delete secrets on `op env destroy` teardown (plan D6).
+    "secretmanager.secrets.getIamPolicy",
+    "secretmanager.secrets.setIamPolicy",
+    "secretmanager.secrets.delete",
     // Artifact Registry read — only exercised when an `ar_repo` remote repo is
     // configured (plan D3); harmless to validate when it is not.
     "artifactregistry.repositories.get",

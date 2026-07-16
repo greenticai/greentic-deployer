@@ -273,9 +273,9 @@ Services. Before production use, tighten this to least privilege:
 - Add IAM Conditions or resource-scoped bindings for the destructive
   `run.services.*` / `run.revisions.*` verbs so one env cannot mutate another's.
 
-A dedicated project per environment sidesteps all of the above. Resource-scoped
-credential validation and per-secret accessor binding are wired in later steps
-of the Cloud Run deployment train.
+A dedicated project per environment sidesteps all of the above. The per-secret
+accessor binding is applied automatically at deploy time; resource-scoped
+credential validation is wired in a later step of the Cloud Run deployment train.
 
 ## What this does NOT do
 

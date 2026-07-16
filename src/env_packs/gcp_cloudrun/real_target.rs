@@ -82,6 +82,11 @@ pub const REAL_CLOUDRUN_TARGET_IAM_PERMISSIONS: &[&str] = &[
     "secretmanager.secrets.get",
     "secretmanager.secrets.create",
     "secretmanager.versions.add",
+    // Grant the runtime SA secretAccessor on each staged secret (get→set RMW),
+    // and delete secrets on `op env destroy` teardown (D6).
+    "secretmanager.secrets.getIamPolicy",
+    "secretmanager.secrets.setIamPolicy",
+    "secretmanager.secrets.delete",
 ];
 
 /// Ownership labels stamped on every managed Service (plan D1). Cloud Run
@@ -388,6 +393,44 @@ impl CloudRunTarget for RealCloudRunTarget {
             version: numeric_version_from(&version.name),
         })
     }
+
+    async fn grant_secret_accessor(
+        &self,
+        secret_name: &str,
+        service_account: &str,
+    ) -> Result<(), CloudRunTargetError> {
+        let resource = self.secret_resource(secret_name);
+        // Read-modify-write the secret's IAM policy so unrelated bindings survive;
+        // only write when the member is actually added (idempotent re-grant).
+        let policy = self
+            .secrets
+            .get_iam_policy()
+            .set_resource(resource.clone())
+            .send()
+            .await
+            .map_err(|e| classify("secret get_iam_policy", &e))?;
+        let (policy, changed) = apply_secret_accessor_binding(policy, service_account);
+        if changed {
+            self.secrets
+                .set_iam_policy()
+                .set_resource(resource)
+                .set_policy(policy)
+                .send()
+                .await
+                .map_err(|e| classify("secret set_iam_policy", &e))?;
+        }
+        Ok(())
+    }
+
+    async fn delete_secret(&self, name: &str) -> Result<(), CloudRunTargetError> {
+        let resource = self.secret_resource(name);
+        match self.secrets.delete_secret().set_name(resource).send().await {
+            Ok(_) => Ok(()),
+            // Idempotent against an already-gone secret.
+            Err(e) if is_not_found(&e) => Ok(()),
+            Err(e) => Err(classify("delete_secret", &e)),
+        }
+    }
 }
 
 // ---- Pure request builders (unit-tested; no HTTP) ----
@@ -428,7 +471,7 @@ fn service_fqn(project: &str, region: &str, deployment_id: DeploymentId) -> Stri
 }
 
 /// Build the revision template: single container, scale-to-zero, the resolved
-/// runtime SA (D7), session affinity (D11), and any secret env sources (D6).
+/// runtime SA (D7), session affinity (D11), and read-only secret volumes (D6).
 fn build_revision_template(spec: &ServiceSpec) -> run::RevisionTemplate {
     run::RevisionTemplate::new()
         .set_revision(revision_name(spec.deployment_id, spec.revision_id))
@@ -437,29 +480,67 @@ fn build_revision_template(spec: &ServiceSpec) -> run::RevisionTemplate {
         .set_max_instance_request_concurrency(clamp_i32(spec.scaling.concurrency))
         .set_scaling(build_scaling(spec))
         .set_labels(ownership_labels(spec.deployment_id))
+        .set_volumes(build_secret_volumes(spec))
         .set_containers([build_container(spec)])
 }
 
-fn build_container(spec: &ServiceSpec) -> run::Container {
-    let mut env: Vec<run::EnvVar> = Vec::with_capacity(spec.secrets.len());
-    for mount in &spec.secrets {
-        env.push(
-            run::EnvVar::new()
-                .set_name(mount.env_var.clone())
-                .set_value_source(
-                    run::EnvVarSource::new().set_secret_key_ref(
-                        run::SecretKeySelector::new()
-                            .set_secret(mount.secret_name.clone())
-                            // The immutable numeric version — never `latest` (D6).
-                            .set_version(mount.version.clone()),
-                    ),
-                ),
-        );
+/// Stable, deterministic volume name for the `index`-th secret mount.
+fn secret_volume_name(index: usize) -> String {
+    format!("seed-secret-{index}")
+}
+
+/// Split a secret mount's absolute file path into `(parent_dir, file_name)`.
+/// Cloud Run secret volumes mount at a directory; the pinned version maps to a
+/// relative file beneath it (plan D6).
+fn split_mount_path(mount_path: &str) -> (String, String) {
+    match mount_path.rsplit_once('/') {
+        Some(("", file)) => ("/".to_string(), file.to_string()),
+        Some((dir, file)) => (dir.to_string(), file.to_string()),
+        None => ("/".to_string(), mount_path.to_string()),
     }
+}
+
+/// Each [`SecretMount`](super::deploy_target::SecretMount) → one secret volume
+/// pinned to the immutable numeric version at the mount's file name (never
+/// `latest`, plan D6).
+fn build_secret_volumes(spec: &ServiceSpec) -> Vec<run::Volume> {
+    spec.secrets
+        .iter()
+        .enumerate()
+        .map(|(index, mount)| {
+            let (_dir, file_name) = split_mount_path(&mount.mount_path);
+            run::Volume::new()
+                .set_name(secret_volume_name(index))
+                .set_secret(
+                    run::SecretVolumeSource::new()
+                        .set_secret(mount.secret_name.clone())
+                        .set_items([run::VersionToPath::new()
+                            .set_version(mount.version.clone())
+                            .set_path(file_name)]),
+                )
+        })
+        .collect()
+}
+
+/// Mount each secret volume read-only at its file's parent directory.
+fn build_secret_volume_mounts(spec: &ServiceSpec) -> Vec<run::VolumeMount> {
+    spec.secrets
+        .iter()
+        .enumerate()
+        .map(|(index, mount)| {
+            let (dir, _file_name) = split_mount_path(&mount.mount_path);
+            run::VolumeMount::new()
+                .set_name(secret_volume_name(index))
+                .set_mount_path(dir)
+        })
+        .collect()
+}
+
+fn build_container(spec: &ServiceSpec) -> run::Container {
     run::Container::new()
         .set_image(spec.image.clone())
         .set_resources(build_resources(spec))
-        .set_env(env)
+        .set_volume_mounts(build_secret_volume_mounts(spec))
 }
 
 /// Scale-to-zero rendered explicitly (plan D5): `min_instance_count = 0`,
@@ -527,6 +608,32 @@ fn apply_invoker_binding(mut policy: iam::Policy, access_mode: AccessMode) -> ia
         }
     }
     policy
+}
+
+/// Add `serviceAccount:{sa}` to the secret's `roles/secretmanager.secretAccessor`
+/// binding, preserving every other binding (plan D6). Returns the updated policy
+/// and whether it changed — an already-present member is a no-op, so the caller
+/// skips the `set_iam_policy` write (idempotent re-grant).
+fn apply_secret_accessor_binding(
+    mut policy: iam::Policy,
+    service_account: &str,
+) -> (iam::Policy, bool) {
+    const ACCESSOR_ROLE: &str = "roles/secretmanager.secretAccessor";
+    let member = format!("serviceAccount:{service_account}");
+
+    if let Some(binding) = policy.bindings.iter_mut().find(|b| b.role == ACCESSOR_ROLE) {
+        if binding.members.iter().any(|m| m == &member) {
+            return (policy, false);
+        }
+        binding.members.push(member);
+    } else {
+        policy.bindings.push(
+            iam::Binding::new()
+                .set_role(ACCESSOR_ROLE)
+                .set_members([member]),
+        );
+    }
+    (policy, true)
 }
 
 fn new_automatic_secret() -> sm::Secret {
@@ -788,28 +895,40 @@ mod tests {
     }
 
     #[test]
-    fn build_container_maps_secret_mounts_to_env_sources() {
+    fn build_secret_mounts_pin_version_and_mount_readonly_volume() {
         let s = spec(
             vec![],
             vec![SecretMount {
-                env_var: "GTC_DB_PASSWORD".to_string(),
-                secret_name: "gtc-local-dev-secrets".to_string(),
+                mount_path: "/seed/environment.json".to_string(),
+                secret_name: "gtc-local-environment".to_string(),
                 version: "5".to_string(),
             }],
         );
-        let c = build_container(&s);
-        let env = c
-            .env
-            .iter()
-            .find(|e| e.name == "GTC_DB_PASSWORD")
-            .expect("env var");
-        let source = env.value_source().expect("secret source");
-        let selector = source.secret_key_ref.as_ref().expect("secret key ref");
-        assert_eq!(selector.secret, "gtc-local-dev-secrets");
+
+        // The secret is a version-pinned volume, not an env-var source (plan D6).
+        let volumes = build_secret_volumes(&s);
+        assert_eq!(volumes.len(), 1);
+        let source = volumes[0].secret().expect("secret volume source");
+        assert_eq!(source.secret, "gtc-local-environment");
+        assert_eq!(source.items.len(), 1);
         assert_eq!(
-            selector.version, "5",
+            source.items[0].version, "5",
             "pinned to the numeric version, never latest"
         );
+        assert_eq!(source.items[0].path, "environment.json");
+
+        // The container mounts that volume read-only at the file's parent dir,
+        // and carries no env-var secret sources.
+        let mounts = build_secret_volume_mounts(&s);
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(
+            mounts[0].name, volumes[0].name,
+            "mount references the volume"
+        );
+        assert_eq!(mounts[0].mount_path, "/seed");
+        let c = build_container(&s);
+        assert_eq!(c.volume_mounts.len(), 1);
+        assert!(c.env.is_empty(), "secrets are file volumes, not env vars");
     }
 
     #[test]
@@ -907,6 +1026,42 @@ mod tests {
             .find(|b| b.role == "roles/run.invoker")
             .expect("invoker binding");
         assert_eq!(invoker.members, vec!["allUsers".to_string()]);
+    }
+
+    #[test]
+    fn secret_accessor_binding_adds_member_once_and_preserves_others() {
+        // A pre-existing unrelated binding must survive the grant.
+        let seeded = iam::Policy::new().set_bindings([iam::Binding::new()
+            .set_role("roles/viewer")
+            .set_members(["user:ops@example.com".to_string()])]);
+        let (policy, changed) =
+            apply_secret_accessor_binding(seeded, "sa@proj.iam.gserviceaccount.com");
+        assert!(changed);
+        assert!(
+            policy.bindings.iter().any(|b| b.role == "roles/viewer"),
+            "unrelated bindings are preserved"
+        );
+        let accessor = policy
+            .bindings
+            .iter()
+            .find(|b| b.role == "roles/secretmanager.secretAccessor")
+            .expect("accessor binding");
+        assert_eq!(
+            accessor.members,
+            vec!["serviceAccount:sa@proj.iam.gserviceaccount.com".to_string()]
+        );
+
+        // Idempotent: re-granting the same member reports no change and no dup,
+        // so the caller skips the `set_iam_policy` write.
+        let (policy, changed) =
+            apply_secret_accessor_binding(policy, "sa@proj.iam.gserviceaccount.com");
+        assert!(!changed, "re-grant is a no-op");
+        let accessor = policy
+            .bindings
+            .iter()
+            .find(|b| b.role == "roles/secretmanager.secretAccessor")
+            .unwrap();
+        assert_eq!(accessor.members.len(), 1, "member added once");
     }
 
     #[test]

@@ -37,8 +37,8 @@ use crate::env_packs::deployer::{
 
 use super::GcpCloudRunDeployerHandler;
 use super::deploy_target::{
-    AccessMode, CloudRunTargetError, RevisionRef, ScalingSpec, ServiceRef, ServiceSpec,
-    TrafficTarget,
+    AccessMode, CloudRunTargetError, RevisionRef, ScalingSpec, SecretMount, ServiceRef,
+    ServiceSpec, TrafficTarget,
 };
 
 /// Default runtime image (plan D2/D3): the public GHCR distroless image Cloud
@@ -210,6 +210,20 @@ pub fn service_name(deployment_id: DeploymentId) -> String {
     format!("gtc-svc-{}", deployment_id.0.to_string().to_lowercase())
 }
 
+/// Container directory the env-store seed secrets are volume-mounted under
+/// (plan D6). greentic-start's `GREENTIC_SEED_DIR` boot-copy (a follow-up slice)
+/// reads this tree into the writable env store.
+const SEED_MOUNT_DIR: &str = "/seed";
+/// The `environment.json` seed file name under [`SEED_MOUNT_DIR`].
+const ENVIRONMENT_SEED_FILE: &str = "environment.json";
+
+/// The Secret Manager secret name carrying an env's `environment.json` seed
+/// (plan D6): `<secret_prefix>-environment` (default `gtc-{env}-environment`).
+/// Shared so `op env destroy` teardown deletes exactly what `warm` staged.
+pub fn environment_secret_name(secret_prefix: &str) -> String {
+    format!("{secret_prefix}-environment")
+}
+
 /// Deterministic Cloud Run revision name: `gtc-svc-{dep}-{rev}` (61 chars ≤ the
 /// 63-char limit; Cloud Run requires the service-name prefix). Plan D1.
 pub fn revision_name(deployment_id: DeploymentId, revision_id: RevisionId) -> String {
@@ -379,6 +393,35 @@ impl Deployer for GcpCloudRunDeployerHandler {
         };
         let runtime_service_account = params.runtime_service_account(env.environment_id.as_str());
 
+        // Stage the env-store seed (plan D6): upload environment.json to a
+        // version-pinned Secret Manager secret and grant the runtime SA read
+        // access, then mount that exact version read-only. The grant is
+        // load-bearing — Cloud Run rejects a revision whose SA cannot read a
+        // mounted secret version. Staged ONCE, before the etag retry loop, so a
+        // precondition retry does not add a redundant secret version. (The
+        // dev-secrets payload and the `GREENTIC_SEED_DIR` boot-copy activation
+        // land in a follow-up slice; the seed is mounted but not yet consumed.)
+        let environment_json = serde_json::to_vec(env).map_err(|e| {
+            DeployerError::Provider(format!(
+                "serializing environment.json for seed staging: {e}"
+            ))
+        })?;
+        let secret_name = environment_secret_name(&params.secret_prefix);
+        let secret_version = self
+            .target
+            .upsert_secret(&secret_name, &environment_json)
+            .await
+            .map_err(provider)?;
+        self.target
+            .grant_secret_accessor(&secret_name, &runtime_service_account)
+            .await
+            .map_err(provider)?;
+        let secret_mounts = vec![SecretMount {
+            mount_path: format!("{SEED_MOUNT_DIR}/{ENVIRONMENT_SEED_FILE}"),
+            secret_name,
+            version: secret_version.version,
+        }];
+
         // Read-modify-write under etag optimistic concurrency with bounded
         // retries on a precondition conflict (plan D4): re-read, recompute
         // traffic from the fresh state, and retry rather than replaying a stale
@@ -426,7 +469,7 @@ impl Deployer for GcpCloudRunDeployerHandler {
                 scaling: params.scaling(),
                 access_mode: params.access_mode,
                 session_affinity: true,
-                secrets: Vec::new(),
+                secrets: secret_mounts.clone(),
             };
             match self.target.upsert_service(&spec, etag.as_deref()).await {
                 Ok(status) => break status.url,
@@ -678,6 +721,18 @@ mod tests {
             payload: &[u8],
         ) -> Result<SecretVersion, CloudRunTargetError> {
             self.inner.upsert_secret(name, payload).await
+        }
+        async fn grant_secret_accessor(
+            &self,
+            secret_name: &str,
+            service_account: &str,
+        ) -> Result<(), CloudRunTargetError> {
+            self.inner
+                .grant_secret_accessor(secret_name, service_account)
+                .await
+        }
+        async fn delete_secret(&self, name: &str) -> Result<(), CloudRunTargetError> {
+            self.inner.delete_secret(name).await
         }
     }
 
@@ -987,6 +1042,61 @@ mod tests {
         assert!(
             target.inner.traffic_for(dep_a).is_some(),
             "the service is created once the retry wins the etag race"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_stages_environment_secret_and_grants_runtime_sa() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+
+        // environment.json is staged as a version-pinned Secret Manager secret (D6).
+        let params = params_from_answers(&env, None).unwrap();
+        let secret_name = environment_secret_name(&params.secret_prefix);
+        let secrets = target.secrets();
+        let (payload, version) = secrets
+            .get(&secret_name)
+            .expect("warm stages the environment.json seed secret");
+        assert_eq!(payload, &serde_json::to_vec(&env).unwrap());
+        assert_eq!(*version, 1, "first warm adds version 1");
+
+        // The runtime SA is granted secretAccessor so the mounted version is
+        // readable — Cloud Run rejects a revision whose SA cannot read it.
+        let sa = params.runtime_service_account(env.environment_id.as_str());
+        let accessors = target
+            .secret_accessors_for(&secret_name)
+            .expect("secretAccessor grant recorded");
+        assert!(
+            accessors.contains(&sa),
+            "runtime SA {sa} must be granted secretAccessor"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_stages_secret_once_across_etag_retries() {
+        // Two upsert_service conflicts before success: staging happens BEFORE the
+        // retry loop, so the seed secret gets exactly one version, not one per retry.
+        let target = Arc::new(ConflictInjector::new(2, 0));
+        let handler = GcpCloudRunDeployerHandler::with_target(target.clone());
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+
+        let params = params_from_answers(&env, None).unwrap();
+        let secret_name = environment_secret_name(&params.secret_prefix);
+        let version = target
+            .inner
+            .secrets()
+            .get(&secret_name)
+            .expect("seed secret staged")
+            .1;
+        assert_eq!(
+            version, 1,
+            "the seed secret is staged once, before the etag loop"
         );
     }
 
