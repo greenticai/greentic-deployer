@@ -93,17 +93,6 @@ pub(crate) fn up(
         ));
     }
 
-    // Fail before any mutation: without `k8s-client` the reconcile phase cannot
-    // run, and reaching it after `apply` would leave the store converged against
-    // a cluster this build can never talk to.
-    if !cfg!(feature = "k8s-client") {
-        return Err(OpError::Conflict(
-            "this build was compiled without the `k8s-client` feature; \
-             `op env up` needs it to reach a cluster"
-                .to_string(),
-        ));
-    }
-
     // ── Phase 0: parse ───────────────────────────────────────────────
     let answers_path = flags.answers.as_ref().ok_or_else(|| {
         OpError::InvalidArgument(
@@ -121,6 +110,32 @@ pub(crate) fn up(
 
     let has_cluster = manifest.cluster.is_some();
     let provision_cluster = should_provision_cluster(has_cluster, args.skip_cluster, args.dry_run);
+
+    // Fail before any mutation: `op env up` must not run `env_apply::apply` (a
+    // store mutation) only to fail later in a featureless stub. Resolve the
+    // EFFECTIVE desired deployer from the manifest (or the existing env) — not
+    // the optional `cluster` block, which a clusterless k8s manifest legitimately
+    // omits — and gate each deployer INDEPENDENTLY on the feature that can
+    // actually converge it (the other deployer's feature never substitutes; see
+    // `env_up_deployer_gate`). A build without `creds-gcp` cannot recognize the
+    // Cloud Run kind, so it treats a Cloud Run manifest as k8s; such a build
+    // cannot deploy Cloud Run regardless, and apply is idempotent.
+    let targets_cloudrun = manifest_targets_cloudrun(store, &env_id, &manifest)?;
+    if let Err(missing) = env_up_deployer_gate(
+        targets_cloudrun,
+        cfg!(feature = "deploy-gcp-cloudrun"),
+        cfg!(feature = "k8s-client"),
+    ) {
+        return Err(OpError::Conflict(match missing {
+            "deploy-gcp-cloudrun" => "this build was compiled without the \
+                 `deploy-gcp-cloudrun` feature; `op env up` needs it to deploy a \
+                 Cloud Run environment"
+                .to_string(),
+            _ => "this build was compiled without the `k8s-client` feature; \
+                 `op env up` needs it for the k8s deployer"
+                .to_string(),
+        }));
+    }
 
     // ── Phase 1: preflight ───────────────────────────────────────────
     if has_cluster && !args.skip_cluster {
@@ -243,6 +258,16 @@ pub(crate) fn up(
         return Ok((apply_outcome, None));
     }
 
+    // ── Deployer dispatch: Cloud Run bring-up ────────────────────────
+    // Cloud Run is imperative — no cluster to reconcile. When the applied env's
+    // live deployer is Cloud Run, warm its revisions + push traffic and return
+    // the discovered `*.run.app` URL (no port-forward). Any other deployer kind
+    // returns `None` and falls through to the k8s convergence phases below,
+    // unchanged.
+    if let Some(result) = super::env::cloudrun_env_up(store, registry, &env_id)? {
+        return Ok((OpOutcome::new(NOUN, "up", result), None));
+    }
+
     // ── Phase 4b: vault ──────────────────────────────────────────────
     // Deploy + bootstrap + seed an in-cluster (or external) Vault, when the
     // manifest declares one. Pinned AFTER apply (the secrets binding it needs
@@ -316,6 +341,67 @@ pub(crate) fn up(
     }
 
     Ok((OpOutcome::new(NOUN, "up", result), forward))
+}
+
+/// Whether THIS build can converge the effective `op env up` deployer, or must
+/// fail before apply. Each deployer is gated INDEPENDENTLY: a Cloud Run env needs
+/// the real `deploy-gcp-cloudrun` target (the `creds-gcp` scaffold only stubs the
+/// deploy path), and a k8s env needs `k8s-client` for reconcile. The presence of
+/// the OTHER deployer's feature never satisfies the requirement — a k8s-client
+/// build cannot deploy Cloud Run, and a Cloud Run build cannot reconcile k8s.
+/// Pure (feature flags passed in) so the full truth table is unit-testable
+/// regardless of the build's compiled features; `Err` names the missing feature.
+fn env_up_deployer_gate(
+    targets_cloudrun: bool,
+    has_deploy_gcp_cloudrun: bool,
+    has_k8s_client: bool,
+) -> Result<(), &'static str> {
+    if targets_cloudrun {
+        if !has_deploy_gcp_cloudrun {
+            return Err("deploy-gcp-cloudrun");
+        }
+    } else if !has_k8s_client {
+        return Err("k8s-client");
+    }
+    Ok(())
+}
+
+/// Whether `op env up`'s effective desired deployer is Cloud Run, resolved
+/// BEFORE any mutation: the manifest's Deployer-slot pack when it (re)binds one,
+/// else the existing env's Deployer binding. Cloud Run is the only `env up`
+/// deployer that reconciles without `k8s-client` (it is imperative); every k8s
+/// path needs it. The pre-apply feature gate keys off this rather than the
+/// optional `cluster` block, which a clusterless k8s manifest (targeting an
+/// ambient kubeconfig) legitimately omits. Total function: `false` on builds
+/// without `creds-gcp`, where `is_cloudrun_kind` is `false`.
+fn manifest_targets_cloudrun(
+    store: &LocalFsStore,
+    env_id: &greentic_deploy_spec::EnvId,
+    manifest: &EnvManifest,
+) -> Result<bool, OpError> {
+    use crate::environment::EnvironmentStore as _;
+    use greentic_deploy_spec::{CapabilitySlot, PackDescriptor};
+
+    // A manifest that (re)binds the Deployer slot names the desired kind.
+    if let Some(pack) = manifest
+        .packs
+        .iter()
+        .find(|p| p.slot == CapabilitySlot::Deployer)
+    {
+        return Ok(PackDescriptor::try_new(pack.kind.as_str())
+            .map(|d| super::env::is_cloudrun_kind(&d))
+            .unwrap_or(false));
+    }
+
+    // No deployer in the manifest → inherit the existing env's binding, when the
+    // env already exists (a fresh env with no bound deployer is not Cloud Run).
+    if store.exists(env_id)? {
+        let env = store.load(env_id)?;
+        if let Some(binding) = env.pack_for_slot(CapabilitySlot::Deployer) {
+            return Ok(super::env::is_cloudrun_kind(&binding.kind));
+        }
+    }
+    Ok(false)
 }
 
 /// Phase 5 — reconcile + rollout, gated on `k8s-client`.
@@ -1549,6 +1635,128 @@ mod tests {
             "cluster": cluster,
         }))
         .expect("valid cluster manifest")
+    }
+
+    /// Minimal `env up` manifest binding the given deployer kind, no `cluster`
+    /// block. `None` omits the deployer pack (exercises the existing-env
+    /// fallback in `manifest_targets_cloudrun`).
+    fn deployer_manifest(deployer_kind: Option<&str>) -> EnvManifest {
+        let mut m = json!({
+            "schema": crate::cli::env_manifest::ENV_MANIFEST_SCHEMA_V1,
+            "environment": { "id": "local" },
+        });
+        if let Some(kind) = deployer_kind {
+            m["packs"] = json!([{
+                "slot": "deployer",
+                "kind": kind,
+                "pack_ref": kind.split('@').next().unwrap_or(kind),
+            }]);
+        }
+        serde_json::from_value(m).expect("valid deployer manifest")
+    }
+
+    /// Full truth table of the pre-apply deployer gate. Each deployer is gated
+    /// independently — the other deployer's feature must NEVER satisfy it (the
+    /// Codex-flagged bug: a `creds-gcp,k8s-client` build without
+    /// `deploy-gcp-cloudrun` was letting k8s-client cover a Cloud Run deployer).
+    #[test]
+    fn env_up_deployer_gate_truth_table() {
+        // (targets_cloudrun, has_deploy_gcp_cloudrun, has_k8s_client)
+        // Cloud Run deployer → needs deploy-gcp-cloudrun; k8s-client never covers.
+        assert_eq!(env_up_deployer_gate(true, true, true), Ok(()));
+        assert_eq!(env_up_deployer_gate(true, true, false), Ok(()));
+        assert_eq!(
+            env_up_deployer_gate(true, false, true),
+            Err("deploy-gcp-cloudrun"),
+            "k8s-client must NOT satisfy a Cloud Run deployer"
+        );
+        assert_eq!(
+            env_up_deployer_gate(true, false, false),
+            Err("deploy-gcp-cloudrun")
+        );
+        // k8s deployer → needs k8s-client; deploy-gcp-cloudrun never covers.
+        assert_eq!(env_up_deployer_gate(false, true, true), Ok(()));
+        assert_eq!(env_up_deployer_gate(false, false, true), Ok(()));
+        assert_eq!(
+            env_up_deployer_gate(false, true, false),
+            Err("k8s-client"),
+            "deploy-gcp-cloudrun must NOT satisfy a k8s deployer"
+        );
+        assert_eq!(env_up_deployer_gate(false, false, false), Err("k8s-client"));
+    }
+
+    /// A k8s deployer named in the manifest is NOT Cloud Run, so the pre-apply
+    /// `k8s-client` gate still fires for it.
+    #[test]
+    fn manifest_targets_cloudrun_false_for_k8s_deployer_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let m = deployer_manifest(Some("greentic.deployer.k8s@1.0.0"));
+        let env_id = greentic_deploy_spec::EnvId::try_from("local").unwrap();
+        assert!(!manifest_targets_cloudrun(&store, &env_id, &m).unwrap());
+    }
+
+    #[cfg(feature = "creds-gcp")]
+    #[test]
+    fn manifest_targets_cloudrun_true_for_cloudrun_deployer_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let m = deployer_manifest(Some("greentic.deployer.gcp-cloudrun@1.0.0"));
+        let env_id = greentic_deploy_spec::EnvId::try_from("local").unwrap();
+        assert!(manifest_targets_cloudrun(&store, &env_id, &m).unwrap());
+    }
+
+    /// No deployer in the manifest and no existing env → not Cloud Run (the gate
+    /// fires; a fresh env with no bound deployer fails downstream regardless).
+    #[test]
+    fn manifest_targets_cloudrun_false_when_no_deployer_and_no_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let m = deployer_manifest(None);
+        let env_id = greentic_deploy_spec::EnvId::try_from("nonexistent").unwrap();
+        assert!(!manifest_targets_cloudrun(&store, &env_id, &m).unwrap());
+    }
+
+    /// Clusterless k8s regression (Codex finding): the manifest omits both
+    /// `cluster` and a deployer pack, and the existing env is bound to k8s → NOT
+    /// Cloud Run, so a no-`k8s-client` build still fails BEFORE apply rather than
+    /// mutating then failing in the reconcile stub. Exercises the existing-env
+    /// fallback branch.
+    #[test]
+    fn manifest_targets_cloudrun_false_for_existing_k8s_env_without_manifest_deployer() {
+        use crate::cli::tests_common::{make_binding, make_env};
+        use crate::environment::EnvironmentStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            greentic_deploy_spec::CapabilitySlot::Deployer,
+            "greentic.deployer.k8s@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let m = deployer_manifest(None);
+        let env_id = greentic_deploy_spec::EnvId::try_from("local").unwrap();
+        assert!(!manifest_targets_cloudrun(&store, &env_id, &m).unwrap());
+    }
+
+    /// Existing env bound to Cloud Run, manifest omits the deployer → inherits
+    /// the binding → Cloud Run (exempt from the k8s-client gate).
+    #[cfg(feature = "creds-gcp")]
+    #[test]
+    fn manifest_targets_cloudrun_true_for_existing_cloudrun_env_without_manifest_deployer() {
+        use crate::cli::tests_common::{make_binding, make_env};
+        use crate::environment::EnvironmentStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            greentic_deploy_spec::CapabilitySlot::Deployer,
+            "greentic.deployer.gcp-cloudrun@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let m = deployer_manifest(None);
+        let env_id = greentic_deploy_spec::EnvId::try_from("local").unwrap();
+        assert!(manifest_targets_cloudrun(&store, &env_id, &m).unwrap());
     }
 
     #[test]
