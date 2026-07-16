@@ -271,11 +271,14 @@ audits but is not yet implemented, so there is no store-side teardown verb to ca
 
 ---
 
-## 5. Secrets — the dev-store bridge
+## 5. Secrets
 
-The K8s model does **not** yet integrate a real secrets backend (AWS SM / Vault
-/ native K8s `secretKeyRef`). Instead, when an env binds the
-`greentic.secrets.dev-store@1.0.0` pack:
+Two secrets backends are supported. The env-manifest `packs[]` entry on the
+`secrets` slot selects which one:
+
+### 5a. Dev-store bridge (`greentic.secrets.dev-store@1.0.0`)
+
+When an env binds the `greentic.secrets.dev-store@1.0.0` pack:
 
 1. `op env apply` (or `op secrets put`) writes secret values into the operator's
    **local dev-store** (`<store>/<env>/.greentic/dev/.dev.secrets.env`,
@@ -298,8 +301,104 @@ defaulting to `SHA256("")` when unset on both host and pod. With the default
 (unset) the `.dev.secrets.env` file is fully portable — decryptable in-pod with
 no extra key material.
 
-This is the **Phase-E gap**: it works, but it is not a production secrets
-backend. See [§9](#9-known-gaps--production-caveats).
+The dev-store bridge works but is not a production secrets backend — secrets are
+base64'd into a K8s Secret object. For production clusters, use Vault (below).
+
+### 5b. HashiCorp Vault (`greentic.secrets.vault@0.1.0`)
+
+When an env binds the `greentic.secrets.vault@0.1.0` pack and the manifest
+declares a `vault_bootstrap` block, `op env up` provisions and bootstraps Vault
+natively — no shell scripts or manual Vault CLI steps. The worker resolves
+`secret://` refs from Vault under its pod ServiceAccount identity (Kubernetes
+auth), and **no `gtc-dev-secrets` K8s Secret is rendered** (Vault replaces the
+dev-store bridge entirely).
+
+#### The `vault_bootstrap` manifest block
+
+```json
+{
+  "vault_bootstrap": {
+    "deploy": "dev-in-cluster",
+    "namespace": "greentic",
+    "root_token": "root",
+    "image": "hashicorp/vault:1.17",
+    "seed": [
+      {
+        "path": "tenant-default/_/messaging-telegram/telegram_bot_token",
+        "from_env": "TELEGRAM_BOT_TOKEN"
+      }
+    ]
+  }
+}
+```
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `deploy` | `"dev-in-cluster"` \| `"external"` | *(required)* | How `env up` obtains the Vault (see below). |
+| `namespace` | string | `"greentic"` | Namespace the dev Vault runs in. Ignored for `external`. |
+| `root_token` | string | `"root"` | Dev-mode root token for bootstrap + seed. Ignored for `external`. |
+| `image` | string | `"hashicorp/vault:1.17"` | Dev-mode Vault container image. Ignored for `external`. |
+| `seed` | `ManifestSecret[]` | `[]` | Secrets to seed into Vault after bootstrap, before reconcile. Each entry has a `path` (the `<tenant>/<team>/<pack>/<name>` shape) and an optional `from_env` (the name of the environment variable holding the value — read at apply time). When `from_env` is absent, the value is supplied via an interactive masked paste. |
+
+#### Deploy modes
+
+**`dev-in-cluster`** — `env up` deploys an in-memory dev-mode Vault into the
+cluster (the same topology as `my_demos/k8s-vault-demo/vault.yaml`), then
+bootstraps and seeds it. The full sequence:
+
+1. **RBAC preflight.** A `SelfSubjectAccessReview` confirms the ambient
+   kubeconfig can `create` `clusterrolebindings` (the Vault SA needs
+   `system:auth-delegator` so it can `TokenReview` worker pod tokens). A denied
+   preflight fails with an actionable message naming `external` as the
+   alternative.
+2. **Apply Vault objects** into the `vault_bootstrap.namespace` (default
+   `greentic`): Namespace, ServiceAccount, the `system:auth-delegator`
+   ClusterRoleBinding, a single-replica dev-mode Deployment
+   (`-dev -dev-root-token-id=<root_token>`, with `SKIP_SETCAP=true`,
+   `HOME=/tmp`, `VAULT_DISABLE_MLOCK=true` for SCC compatibility), a
+   ClusterIP Service on `:8200`, and a NetworkPolicy opening Vault's ingress
+   to worker pods.
+3. **Wait for rollout** — blocks until the Vault Deployment's readiness probe
+   (`/v1/sys/health`) passes (up to 180 s).
+4. **Bootstrap** over a transient `kubectl port-forward` to `svc/vault:8200`:
+   enable KV v2 (`secret/`) + transit mounts, create the transit DEK key
+   (`greentic`), enable + configure Kubernetes auth (`kubernetes`), write a
+   read-only policy (`gtc-worker-ro`) scoped to
+   `secret/data/greentic/<env_id>/<tenant>/*` + `transit/decrypt/greentic`,
+   and bind the worker ServiceAccount (`gtc-worker` in the env namespace) to
+   the `gtc-worker` role. Every step is idempotent — a re-run against a
+   surviving Vault converges; a re-run against a restarted (wiped, in-memory)
+   dev Vault re-provisions from scratch.
+5. **Seed** each `vault_bootstrap.seed[]` entry into Vault via the same
+   port-forward. A resolvable value is always written (idempotent). A missing
+   value follows a decision matrix: if the secret is already present in a
+   surviving Vault, skip; otherwise fail (unless `--allow-missing-seeds`
+   downgrades it to a warning).
+6. **Kill the port-forward** — it is only needed for bootstrap + seed.
+7. **Reconcile** — the worker Deployment is rendered with ServiceAccount
+   `gtc-worker` and `VAULT_ADDR` / `VAULT_K8S_ROLE` env vars pointing at the
+   in-cluster Vault Service. The worker authenticates to Vault with Kubernetes
+   auth at boot and reads secrets through the scoped policy.
+8. **Verify** (belt-and-suspenders) — after reconcile, confirms every worker
+   Deployment in the env namespace runs as SA `gtc-worker` and carries
+   `VAULT_*` env vars.
+
+**Requires a cluster-admin kubeconfig** (the `system:auth-delegator`
+ClusterRoleBinding is cluster-scoped). This is the kind / local-dev path.
+
+**`external`** — the env's Vault binding already points at a reachable Vault
+(e.g. a centrally managed instance); `env up` skips the deploy + bootstrap
+phases and only seeds. This is the path for bound/min-RBAC production clusters
+where the operator does not have cluster-admin. The seed phase dials the
+binding's `addr` directly (no port-forward).
+
+#### `--allow-missing-seeds`
+
+By default, a seed entry whose value cannot be resolved (env var unset, empty
+paste, or `--non-interactive`) and is not already present in Vault is a **hard
+error** — a fresh dev Vault that boots without its secrets fails only at
+runtime, so `env up` fails closed. Pass `--allow-missing-seeds` to downgrade
+the error to a warning.
 
 ---
 
@@ -443,10 +542,10 @@ limitation with a workaround.
   Services on `:8080`. External exposure is BYO-Ingress ([§7](#7-reaching-the-worker)
   option A) or the ephemeral cloudflared tunnel (option B). There is no
   first-class stable-hostname mode yet.
-- **Secrets use the dev-store bridge, not a real backend.** The bot token is
-  base64'd from the operator's local dev-store into a K8s Secret. It works but
-  is not AWS SM / Vault / native `secretKeyRef`. This is the **Phase-E** gap
-  ([§5](#5-secrets--the-dev-store-bridge)).
+- **Vault is dev-mode only.** The `dev-in-cluster` path deploys an in-memory,
+  auto-unsealed Vault (`-dev`) — suitable for kind / local dev, not production.
+  For production, use `external` mode pointed at a managed Vault instance
+  ([§5b](#5b-hashicorp-vault-greenticsecretsvaul010)).
 - **No `imagePullSecrets`.** A private runtime image or private bundle registry
   is not yet supported by the rendered manifests. The demo image and bundle are
   public ghcr. Use `oci_insecure_registries` only for plain-HTTP dev registries.
@@ -476,6 +575,9 @@ limitation with a workaround.
 | `/chat` returns 405/403 over the tunnel | Loopback-trust posture: the tunneled main port serves webhooks only. | Port-forward the **admin** listener (`8081`, main+1). The boot banner prints the port. |
 | Webhook registration not visible in `kubectl logs` | greentic-start logs registration via OTLP / `system.log`, not pod stdout. | Confirm with Telegram `getWebhookInfo`, not `kubectl logs`. |
 | Secret change didn't take effect | Init container copies the dev-store once at pod start. | Re-reconcile — the `greentic.ai/dev-store-hash` annotation rolls the pods on a data change. |
+| `vault bootstrap: vault unreachable at …` | The transient `kubectl port-forward` to `svc/vault` did not become ready, or the Vault pod is not running. | Confirm the Vault Deployment is Ready in the `vault_bootstrap.namespace` (`kubectl -n greentic get deploy vault`). If the pod is stuck, check image pull errors or the readiness probe. |
+| `current credential cannot create clusterrolebindings` | The ambient kubeconfig is not cluster-admin. `dev-in-cluster` needs it for the `system:auth-delegator` ClusterRoleBinding. | Use an admin context (kind / local dev), or switch to `vault_bootstrap.deploy: "external"`. |
+| `vault seed … from_env … is unset` | A `seed[]` entry references an env var that is not exported. | Export the env var before running `env up`, or pass `--allow-missing-seeds` to downgrade to a warning. |
 
 ---
 
@@ -488,6 +590,7 @@ limitation with a workaround.
 | **reconcile** | Render the store's desired state to manifests and push them onto the live cluster (and prune stale workers). |
 | **revision** | A staged, integrity-pinned snapshot of a bundle (`pack_list`, `config_digest`, `bundle_digest`, …). The worker pulls and serves it. |
 | **route_binding** | How a bundle's traffic is selected — host(s), path prefix(es), and `tenant_selector`. |
-| **dev-store bridge** | The mechanism that gets operator secrets into the pod via a rendered Secret + init container (the Phase-E placeholder for a real backend). |
+| **dev-store bridge** | The mechanism that gets operator secrets into the pod via a rendered Secret + init container. Suitable for local dev; for production, use Vault ([§5b](#5b-hashicorp-vault-greenticsecretsvaul010)). |
+| **vault_bootstrap** | The env-manifest block that tells `env up` to deploy/bootstrap/seed a Vault for the env's secrets. `dev-in-cluster` deploys a dev Vault; `external` seeds an existing one. |
 | **loopback-trust** | The rule gating `/chat` + `/workers/invoke`: trusted only when the peer is loopback AND no tunnel fronts the listener. |
 | **admin listener** | A loopback-only listener (main port + 1) that serves the console while the main port is tunneled. |
