@@ -93,17 +93,6 @@ pub(crate) fn up(
         ));
     }
 
-    // Fail before any mutation: without `k8s-client` the reconcile phase cannot
-    // run, and reaching it after `apply` would leave the store converged against
-    // a cluster this build can never talk to.
-    if !cfg!(feature = "k8s-client") {
-        return Err(OpError::Conflict(
-            "this build was compiled without the `k8s-client` feature; \
-             `op env up` needs it to reach a cluster"
-                .to_string(),
-        ));
-    }
-
     // ── Phase 0: parse ───────────────────────────────────────────────
     let answers_path = flags.answers.as_ref().ok_or_else(|| {
         OpError::InvalidArgument(
@@ -121,6 +110,19 @@ pub(crate) fn up(
 
     let has_cluster = manifest.cluster.is_some();
     let provision_cluster = should_provision_cluster(has_cluster, args.skip_cluster, args.dry_run);
+
+    // Fail before any mutation: a manifest that declares a `cluster` targets the
+    // k8s deployer, whose reconcile/rollout needs `k8s-client`; reaching apply
+    // without it would converge the store against a cluster this build can never
+    // reach. Cloud Run manifests declare no cluster and take the imperative
+    // bring-up path below, which needs no `k8s-client`.
+    if has_cluster && !cfg!(feature = "k8s-client") {
+        return Err(OpError::Conflict(
+            "this build was compiled without the `k8s-client` feature; \
+             `op env up` needs it to reach the declared cluster"
+                .to_string(),
+        ));
+    }
 
     // ── Phase 1: preflight ───────────────────────────────────────────
     if has_cluster && !args.skip_cluster {
@@ -241,6 +243,16 @@ pub(crate) fn up(
 
     if args.dry_run {
         return Ok((apply_outcome, None));
+    }
+
+    // ── Deployer dispatch: Cloud Run bring-up ────────────────────────
+    // Cloud Run is imperative — no cluster to reconcile. When the applied env's
+    // live deployer is Cloud Run, warm its revisions + push traffic and return
+    // the discovered `*.run.app` URL (no port-forward). Any other deployer kind
+    // returns `None` and falls through to the k8s convergence phases below,
+    // unchanged.
+    if let Some(result) = super::env::cloudrun_env_up(store, registry, &env_id)? {
+        return Ok((OpOutcome::new(NOUN, "up", result), None));
     }
 
     // ── Phase 4b: vault ──────────────────────────────────────────────

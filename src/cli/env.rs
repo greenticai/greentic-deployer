@@ -1786,6 +1786,93 @@ pub fn apply_traffic(
     ))
 }
 
+/// One-command Cloud Run bring-up for `op env up`.
+///
+/// After the deployer-agnostic `env_apply::apply`, `op env up` calls this to
+/// finish a Cloud Run environment. Returns `Some(outcome)` — carrying the
+/// discovered `*.run.app` URL — when the env's live deployer is Cloud Run, or
+/// `None` for any other kind so `op env up` falls through to its k8s
+/// convergence phases. Keeping the deployer-kind decision here keeps `env_up.rs`
+/// free of Cloud-Run-specific knowledge.
+///
+/// Cloud Run is imperative (no declarative cluster reconcile), so bring-up warms
+/// every present revision via the same `apply-revision` verb, then pushes each
+/// recorded traffic split via `apply-traffic`. Ordering is warm-then-route so a
+/// split never references a revision whose Cloud Run revision does not yet exist.
+/// Archived revisions are left in place (they carry no traffic and cost nothing
+/// at scale-to-zero); archival convergence stays with the granular
+/// `op env apply-revision <id>` verb.
+pub(crate) fn cloudrun_env_up(
+    store: &LocalFsStore,
+    registry: &crate::env_packs::EnvPackRegistry,
+    env_id: &EnvId,
+) -> Result<Option<serde_json::Value>, OpError> {
+    let env = store.load(env_id)?;
+    let descriptor = resolve_live_deployer_kind(&env, None)?;
+    if !is_cloudrun_kind(&descriptor) {
+        return Ok(None);
+    }
+
+    // Parity with `apply-revision` / `apply-traffic`: confirm the kind is
+    // registered before driving it.
+    let _handler = registry
+        .resolve_for_slot(CapabilitySlot::Deployer, &descriptor)
+        .map_err(|e| OpError::Conflict(e.to_string()))?;
+
+    let (answers, _answers_ref_wire) = load_render_answers(store, &env, &descriptor)?;
+
+    // 1. Warm every present revision (bring-up only — see the archival note in
+    //    the doc comment). Each Cloud Run warm returns the Service's `*.run.app`
+    //    URL; a deployment's revisions share one Service, so the last discovered
+    //    URL is the live endpoint.
+    let mut warmed: Vec<String> = Vec::new();
+    let mut endpoint_url: Option<String> = None;
+    for revision in &env.revisions {
+        if !crate::env_packs::k8s::manifests::has_cluster_presence(revision.lifecycle) {
+            continue;
+        }
+        let (_identity, service_name, url) = apply_revision_non_k8s(
+            store,
+            &env,
+            env_id,
+            revision.revision_id,
+            true,
+            answers.as_ref(),
+            &descriptor,
+        )?;
+        if url.is_some() {
+            endpoint_url = url;
+        }
+        warmed.push(service_name);
+    }
+
+    // 2. Push each recorded traffic split to the live Cloud Run router. A fresh
+    //    single-revision env may record none — the warm already routes 100% to
+    //    its sole revision — so this is a no-op there and load-bearing only for
+    //    multi-revision splits.
+    for split in &env.traffic_splits {
+        apply_traffic_non_k8s(
+            store,
+            &env,
+            env_id,
+            split.deployment_id,
+            answers.as_ref(),
+            &descriptor,
+        )?;
+    }
+
+    let mut result = json!({
+        "environment_id": env.environment_id.as_str(),
+        "kind": descriptor.as_str(),
+        "warmed": warmed,
+        "applied_splits": env.traffic_splits.len(),
+    });
+    if let Some(url) = endpoint_url {
+        result["endpoint_url"] = json!(url);
+    }
+    Ok(Some(result))
+}
+
 /// Dispatch `apply-traffic` for a non-K8s deployer between the AWS-ECS and GCP
 /// Cloud Run live routers — the routing-side parallel of [`apply_revision_non_k8s`].
 /// The applicability gate in [`apply_traffic`] admits only these two kinds.
@@ -4977,6 +5064,71 @@ mod tests {
             OpError::Conflict(msg) => assert!(msg.contains("TrafficSplit"), "{msg}"),
             other => panic!("expected Conflict(no recorded split), got {other}"),
         }
+    }
+
+    /// `cloudrun_env_up` is `op env up`'s deployer-dispatch gate: it returns
+    /// `None` for any non-Cloud-Run deployer so `op env up` falls through to its
+    /// k8s convergence phases. A k8s-deployer env is the negative case (no GCP
+    /// call, deterministic without credentials).
+    #[test]
+    fn cloudrun_env_up_is_none_for_non_cloudrun_deployer() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.k8s@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        let out = cloudrun_env_up(&store, &reg, &env_id).unwrap();
+        assert!(
+            out.is_none(),
+            "non-cloudrun deployer must fall through: {out:?}"
+        );
+    }
+
+    /// A Cloud Run env IS dispatched into the bring-up arm. With zero present
+    /// revisions the warm loop and the (empty) traffic loop do nothing — no Cloud
+    /// Run API call — so the arm returns `Some` deterministically without
+    /// credentials, proving `op env up` routes cloudrun envs here (mirrors
+    /// `apply_traffic_admits_cloudrun_but_requires_recorded_split`).
+    #[cfg(feature = "creds-gcp")]
+    #[test]
+    fn cloudrun_env_up_dispatches_to_cloudrun_arm_for_empty_env() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.gcp-cloudrun@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        let out = cloudrun_env_up(&store, &reg, &env_id)
+            .unwrap()
+            .expect("cloudrun deployer must dispatch into the bring-up arm");
+        assert!(
+            out.get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .contains("gcp-cloudrun"),
+            "dispatched under the cloudrun kind: {out:?}"
+        );
+        assert_eq!(
+            out.get("warmed").and_then(|v| v.as_array()).map(Vec::len),
+            Some(0),
+            "no present revisions to warm"
+        );
+        assert_eq!(out.get("applied_splits").and_then(|v| v.as_u64()), Some(0));
+        assert!(
+            out.get("endpoint_url").is_none(),
+            "no revision warmed → no discovered URL: {out:?}"
+        );
     }
 
     /// An AWS-ECS env IS admitted past the gate, but a binding without a Fargate
