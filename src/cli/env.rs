@@ -1595,6 +1595,17 @@ impl crate::environment::ProviderTeardown for CloudRunProviderTeardown {
     }
 }
 
+/// Whether `warm_revision` should stage the local dev-store as Cloud Run seed
+/// material: the env has a `Secrets`-slot pack AND resolves `secret://` against
+/// the dev-store backend, never Vault. Mirrors the k8s render gate
+/// (`SecretsBackend::DevStore` + `env_uses_dev_secrets`). Staging a Vault-backed
+/// env's dev-store would ship operator-local material — including any bound
+/// deployer credentials persisted there — into the runtime seed.
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+fn cloudrun_stages_dev_secrets(env: &Environment) -> bool {
+    env.packs.iter().any(|p| p.slot == CapabilitySlot::Secrets) && secrets_backend_is_dev_store(env)
+}
+
 /// Connect to GCP and drive the single revision's Cloud Run verb: `warm_revision`
 /// when present, `archive_revision` when absent (mirrors `apply_revision_aws_ecs`).
 /// Returns `(identity, Cloud Run service name, endpoint_url)` — the Service's
@@ -1622,9 +1633,11 @@ fn apply_revision_cloudrun(
     let (identity, params, credentials) = cloudrun_target_inputs(store, env, env_id, answers)?;
 
     // Read the env's encrypted dev-store (this process owns the filesystem) so
-    // `warm_revision` can stage it under the seed secret. Only for envs with a
-    // `Secrets`-slot pack; a warm-only path (`present == false`) needs no seed.
-    let dev_secrets = if present && env.packs.iter().any(|p| p.slot == CapabilitySlot::Secrets) {
+    // `warm_revision` can stage it under the seed secret — but only when the env
+    // resolves `secret://` against the dev-store backend, never Vault, and only
+    // on the warm path (`present`). Keeps operator-local Vault material and any
+    // bound deployer credentials in the dev-store out of the runtime seed.
+    let dev_secrets = if present && cloudrun_stages_dev_secrets(env) {
         read_dev_secrets_bytes(store, env_id)?
     } else {
         None
@@ -5444,6 +5457,30 @@ mod tests {
             crate::defaults::VAULT_SECRETS_PACK,
         ));
         assert!(!secrets_backend_is_dev_store(&env));
+    }
+
+    #[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+    #[test]
+    fn cloudrun_stages_dev_secrets_only_for_the_dev_store_backend() {
+        // No Secrets pack → nothing resolves `secret://`, so no seed material.
+        assert!(!cloudrun_stages_dev_secrets(&make_env("local")));
+
+        // Dev-store Secrets binding → stage the local dev-store.
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            crate::defaults::LOCAL_SECRETS_PACK,
+        ));
+        assert!(cloudrun_stages_dev_secrets(&env));
+
+        // Vault Secrets binding → NEVER upload the local dev-store: the values
+        // (and any bound deployer credentials in it) stay operator-local.
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            crate::defaults::VAULT_SECRETS_PACK,
+        ));
+        assert!(!cloudrun_stages_dev_secrets(&env));
     }
 
     #[test]
