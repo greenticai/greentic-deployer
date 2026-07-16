@@ -201,4 +201,18 @@ mod tests {
             );
         }
     }
+
+    /// `op env destroy` recognizes a Cloud Run env for provider teardown by
+    /// matching the deployer descriptor string in the store's
+    /// feature-independent list. Guards that list against drifting from the
+    /// handler's canonical `DESCRIPTOR_PATH`.
+    #[test]
+    fn descriptor_path_is_registered_for_provider_teardown() {
+        assert!(
+            crate::environment::PROVIDER_TEARDOWN_DESCRIPTORS
+                .contains(&GcpCloudRunDeployerHandler::DESCRIPTOR_PATH),
+            "PROVIDER_TEARDOWN_DESCRIPTORS must include the Cloud Run descriptor so \
+             `op env destroy` tears down its resources"
+        );
+    }
 }

@@ -28,10 +28,10 @@
 use std::path::{Path, PathBuf};
 
 use greentic_deploy_spec::{
-    CapabilitySlot, EnvId, Environment, EnvironmentRuntime, MessagingEndpoint, MessagingEndpointId,
-    RuntimeConfig, SchemaVersion, SpecError, UpdateChannelConfig,
+    CapabilitySlot, DeploymentId, EnvId, Environment, EnvironmentRuntime, MessagingEndpoint,
+    MessagingEndpointId, RuntimeConfig, SchemaVersion, SpecError, UpdateChannelConfig,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use thiserror::Error;
 
 use super::atomic_write::{AtomicWriteError, atomic_write_json, copy_to_backup};
@@ -130,6 +130,27 @@ pub enum StoreError {
     /// [`crate::cli::map_store_err_preserving_noun`] (PR-4.0).
     #[error("not yet implemented: {0}")]
     NotYetImplemented(String),
+    /// Provider teardown (deleting the remote cloud resources an environment
+    /// owns — e.g. its Cloud Run Services — before the local state is purged)
+    /// failed. The env dir is LEFT INTACT: no rename or purge happened, so a
+    /// retried `destroy` re-attempts the teardown (teardown is idempotent).
+    /// CLI callers surface it as a conflict (the destroy could not proceed).
+    #[error("provider teardown failed: {0}")]
+    ProviderTeardown(String),
+    /// The environment is bound to a deployer that owns remote provider
+    /// resources, but this binary cannot tear them down (built without the
+    /// provider feature). Purging local state would orphan the cloud
+    /// resources AND delete the only record of what to clean up, so destroy
+    /// refuses. Recognized by descriptor-string compare, so it fires even in a
+    /// feature-reduced binary. Re-run with the provider feature enabled, or
+    /// pass `--force-local` to purge local state only (leaving the cloud
+    /// resources for manual cleanup).
+    #[error(
+        "environment `{env_id}` is bound to deployer `{descriptor}`, which owns remote resources \
+         this build cannot tear down; re-run with the provider feature enabled, or pass \
+         --force-local to purge local state only"
+    )]
+    ProviderTeardownUnavailable { env_id: EnvId, descriptor: String },
     /// A typed-verb body persisted state to disk via the lifecycle
     /// helper's internal `locked.save(...)` and *then* failed on a
     /// post-save step (env reload, materialized-runtime-config refresh,
@@ -752,6 +773,32 @@ impl LocalFsStore {
     /// destroying an env it is serving is the operator's responsibility,
     /// exactly as manual removal was before this verb existed.
     pub fn destroy_environment(&self, env_id: &EnvId) -> Result<DestroyOutcome, StoreError> {
+        self.destroy_environment_with_teardown(env_id, None, false)
+    }
+
+    /// [`destroy_environment`](Self::destroy_environment) with provider-resource
+    /// teardown: before the local state is retired, an env bound to a deployer
+    /// in [`PROVIDER_TEARDOWN_DESCRIPTORS`] has its remote resources torn down.
+    ///
+    /// - `teardown`: the feature-gated teardown implementation (e.g. Cloud Run
+    ///   service deletion). `None` on a build without the provider feature.
+    /// - `force_local`: skip provider teardown and purge local state only (the
+    ///   operator's escape hatch when the resources are gone/unreachable, or the
+    ///   env is unreadable). Leaves any live cloud resources for manual cleanup.
+    ///
+    /// Classification, teardown, and the rename all happen under the SAME env
+    /// flock, so a concurrent rebind cannot flip the deployer kind between the
+    /// check and the purge (the TOCTOU that sank the earlier CLI-level guard).
+    /// Teardown runs BEFORE the rename: on teardown failure the env dir (with the
+    /// binding answers naming the resources) is left intact and a retried destroy
+    /// re-attempts it — the env dir is itself the retry record, so no separate
+    /// cleanup tombstone is needed.
+    pub fn destroy_environment_with_teardown(
+        &self,
+        env_id: &EnvId,
+        teardown: Option<&dyn ProviderTeardown>,
+        force_local: bool,
+    ) -> Result<DestroyOutcome, StoreError> {
         let env_dir = self.env_dir(env_id)?;
         let environment_path = self.environment_path(env_id)?;
         let prefix = tombstone_prefix(env_id);
@@ -768,6 +815,7 @@ impl LocalFsStore {
             return Ok(DestroyOutcome {
                 removed_path: env_dir,
                 reaped_tombstones: reaped,
+                provider_teardown: None,
             });
         }
 
@@ -776,6 +824,10 @@ impl LocalFsStore {
         if !environment_path.exists() {
             return Err(StoreError::NotFound(env_id.clone()));
         }
+        // Tear down provider resources (or refuse) under the lock, BEFORE the
+        // rename — so a failure leaves the env fully intact for a retry, and a
+        // concurrent rebind cannot change the deployer kind after this point.
+        let provider_teardown = self.provider_teardown_locked(env_id, teardown, force_local)?;
         // Refuse a symlinked env root: renaming would retire the link, not
         // the tree behind it, and the caller would be told "destroyed"
         // while every secret survives at the target.
@@ -805,7 +857,64 @@ impl LocalFsStore {
         Ok(DestroyOutcome {
             removed_path: env_dir,
             reaped_tombstones: reaped,
+            provider_teardown,
         })
+    }
+
+    /// Classify the env's deployer binding and, if it owns remote provider
+    /// resources, run (or refuse) teardown. Called with the env flock held.
+    /// Returns the teardown summary (`Some`) for a resource-owning env, or
+    /// `None` when the deployer owns nothing remote (k8s/local/in-process AWS).
+    fn provider_teardown_locked(
+        &self,
+        env_id: &EnvId,
+        teardown: Option<&dyn ProviderTeardown>,
+        force_local: bool,
+    ) -> Result<Option<Value>, StoreError> {
+        // Classify by descriptor STRING (feature-independent). An unreadable env
+        // cannot be proven resource-free, so refuse unless the operator forces a
+        // local-only purge.
+        let env = match self.load(env_id) {
+            Ok(env) => env,
+            Err(_) if force_local => {
+                return Ok(Some(
+                    json!({ "status": "skipped", "reason": "force_local (environment unreadable)" }),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(binding) = env.pack_for_slot(CapabilitySlot::Deployer) else {
+            return Ok(None);
+        };
+        let descriptor_path = binding.kind.path();
+        if !PROVIDER_TEARDOWN_DESCRIPTORS.contains(&descriptor_path) {
+            return Ok(None);
+        }
+        if force_local {
+            return Ok(Some(json!({
+                "status": "skipped",
+                "reason": "force_local",
+                "descriptor": descriptor_path,
+            })));
+        }
+        let Some(teardown) = teardown else {
+            return Err(StoreError::ProviderTeardownUnavailable {
+                env_id: env_id.clone(),
+                descriptor: descriptor_path.to_string(),
+            });
+        };
+        let answers = self.load_pack_answers(env_id, CapabilitySlot::Deployer)?;
+        let deployment_ids: Vec<DeploymentId> =
+            env.bundles.iter().map(|b| b.deployment_id).collect();
+        let report = teardown.teardown(ProviderTeardownCtx {
+            store: self,
+            env: &env,
+            env_id,
+            descriptor_path,
+            answers: answers.as_ref(),
+            deployment_ids: &deployment_ids,
+        })?;
+        Ok(Some(report))
     }
 
     /// List stale tombstone dirs for an env whose prefix matches `prefix`.
@@ -837,6 +946,51 @@ impl LocalFsStore {
     }
 }
 
+/// Deployer descriptor paths whose environments own remote provider resources
+/// (e.g. Cloud Run Services) that MUST be torn down before the local state is
+/// purged. Compared as plain strings — deliberately NOT gated on any provider
+/// Cargo feature — so a binary built without the provider still recognizes the
+/// binding and refuses-not-purges (see [`StoreError::ProviderTeardownUnavailable`])
+/// rather than silently orphaning cloud resources. A feature-gated equality test
+/// in each provider module guards against the string drifting from the handler's
+/// `DESCRIPTOR_PATH`.
+pub const PROVIDER_TEARDOWN_DESCRIPTORS: &[&str] = &["greentic.deployer.gcp-cloudrun"];
+
+/// Inputs to [`ProviderTeardown::teardown`], assembled by the store from the
+/// env's persisted state while the destroy flock is held. Borrows the env the
+/// store already loaded for classification (no double-load) plus a store handle
+/// so the implementation can resolve bound credentials (a lock-free read on a
+/// sidecar lock, never the env flock).
+pub struct ProviderTeardownCtx<'a> {
+    /// The store performing the destroy; the impl reads bound credentials through it.
+    pub store: &'a LocalFsStore,
+    /// The env being destroyed (already loaded + validated under the flock).
+    pub env: &'a Environment,
+    /// The env's id.
+    pub env_id: &'a EnvId,
+    /// The deployer binding's descriptor path (one of [`PROVIDER_TEARDOWN_DESCRIPTORS`]).
+    pub descriptor_path: &'a str,
+    /// The deployer-slot binding's wizard answers (project, region, credentials_ref…).
+    pub answers: Option<&'a Value>,
+    /// Every deployment the env has bound; the impl maps each to its owned
+    /// provider resource (Cloud Run: `service_name(id)`) and deletes it idempotently.
+    pub deployment_ids: &'a [DeploymentId],
+}
+
+/// Injected teardown of the remote provider resources an environment owns, run
+/// by [`LocalFsStore::destroy_environment_with_teardown`] under the destroy
+/// flock, BEFORE the env dir is retired. The store depends only on this trait
+/// (not on any provider feature); a feature-reduced build passes `None` and the
+/// store refuses-not-purges a resource-owning env. Implementations MUST be
+/// idempotent (already-deleted resources are not an error) so a retried destroy
+/// — after a partial failure left the env dir intact — converges.
+pub trait ProviderTeardown {
+    /// Tear down all remote resources the env owns. Returns a JSON summary
+    /// (surfaced on [`DestroyOutcome::provider_teardown`]); any error is mapped
+    /// to [`StoreError::ProviderTeardown`] and the env is left intact for retry.
+    fn teardown(&self, ctx: ProviderTeardownCtx<'_>) -> Result<Value, StoreError>;
+}
+
 /// Outcome of a successful [`LocalFsStore::destroy_environment`] call.
 #[derive(Debug)]
 pub struct DestroyOutcome {
@@ -844,6 +998,10 @@ pub struct DestroyOutcome {
     pub removed_path: PathBuf,
     /// Number of stale tombstones from prior failed purges reaped in this call.
     pub reaped_tombstones: usize,
+    /// Provider-teardown summary when the env owned remote resources that were
+    /// torn down (or skipped via `--force-local`) before the local purge;
+    /// `None` for envs whose deployer owns no remote resources.
+    pub provider_teardown: Option<Value>,
 }
 
 /// Tombstone filename prefix for a given env id. The `~` separator cannot

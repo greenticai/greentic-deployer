@@ -1506,6 +1506,71 @@ async fn resolve_cloudrun_handler(
     Ok(GcpCloudRunDeployerHandler::with_target(Arc::new(target)))
 }
 
+/// Store-injected teardown of a Cloud Run env's owned Services, run under the
+/// destroy flock before the local state is purged (plan item 5b). Deletes the
+/// Service for each of the env's deployments — idempotent, an already-gone
+/// Service is not an error — so a retried `destroy` after a partial failure
+/// converges. Version-pinned Secret Manager teardown lands with secret *staging*
+/// in a later slice (the deploy path stages no secrets yet).
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+struct CloudRunProviderTeardown;
+
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+impl crate::environment::ProviderTeardown for CloudRunProviderTeardown {
+    fn teardown(
+        &self,
+        ctx: crate::environment::ProviderTeardownCtx<'_>,
+    ) -> Result<Value, crate::environment::StoreError> {
+        use crate::env_packs::gcp_cloudrun::credentials::run_gcp_async;
+        use crate::env_packs::gcp_cloudrun::deploy_target::{CloudRunTarget, ServiceRef};
+        use crate::env_packs::gcp_cloudrun::deployer::service_name;
+        use crate::env_packs::gcp_cloudrun::real_target::RealCloudRunTarget;
+        use crate::environment::StoreError;
+
+        // Resolve project/region + bound credentials from the same answers the
+        // deploy path uses (fails closed on an unreadable bound credential). Any
+        // error becomes `ProviderTeardown`, leaving the env intact for retry.
+        let (_identity, params, credentials) =
+            cloudrun_target_inputs(ctx.store, ctx.env, ctx.env_id, ctx.answers)
+                .map_err(|e| StoreError::ProviderTeardown(e.to_string()))?;
+        let deployment_ids = ctx.deployment_ids.to_vec();
+        let project = params.project.clone();
+        let region = params.region.clone();
+
+        let deleted = run_gcp_async(async move {
+            let target = RealCloudRunTarget::resolve(&params.project, &params.region, credentials)
+                .await
+                .map_err(|e| {
+                    StoreError::ProviderTeardown(format!(
+                        "cannot initialize the GCP Cloud Run deployer client: {e}"
+                    ))
+                })?;
+            let mut deleted = Vec::with_capacity(deployment_ids.len());
+            for deployment_id in deployment_ids {
+                let service = ServiceRef {
+                    deployment_id,
+                    project: params.project.clone(),
+                    region: params.region.clone(),
+                };
+                target.delete_service(&service).await.map_err(|e| {
+                    StoreError::ProviderTeardown(format!(
+                        "deleting Cloud Run service for deployment `{deployment_id}`: {e}"
+                    ))
+                })?;
+                deleted.push(service_name(deployment_id));
+            }
+            Ok::<Vec<String>, StoreError>(deleted)
+        })?;
+
+        Ok(json!({
+            "provider": "gcp-cloudrun",
+            "project": project,
+            "region": region,
+            "deleted_services": deleted,
+        }))
+    }
+}
+
 /// Connect to GCP and drive the single revision's Cloud Run verb: `warm_revision`
 /// when present, `archive_revision` when absent (mirrors `apply_revision_aws_ecs`).
 /// Returns `(identity, Cloud Run service name, endpoint_url)` — the Service's
@@ -2310,12 +2375,13 @@ pub fn destroy(
     flags: &OpFlags,
     env_id: &str,
     confirm: bool,
+    force_local: bool,
 ) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(
             NOUN,
             "destroy",
-            json!({ "input_schema": "env_id positional + confirm flag" }),
+            json!({ "input_schema": "env_id positional + confirm flag + optional --force-local" }),
         ));
     }
     if !confirm {
@@ -2332,11 +2398,25 @@ pub fn destroy(
         target: json!({"environment_id": env_id.as_str(), "confirm": confirm}),
         idempotency_key: None,
     };
+    // Provider-resource teardown callback. The store recognizes a
+    // resource-owning deployer (e.g. Cloud Run) by descriptor string even in a
+    // feature-reduced binary and refuses-not-purges when it cannot tear the
+    // resources down; the teardown implementation is only wired when the provider
+    // feature is compiled in. `--force-local` skips teardown and purges local
+    // state only.
+    #[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+    let cloudrun_teardown = CloudRunProviderTeardown;
+    #[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+    let teardown: Option<&dyn crate::environment::ProviderTeardown> = Some(&cloudrun_teardown);
+    #[cfg(not(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun")))]
+    let teardown: Option<&dyn crate::environment::ProviderTeardown> = None;
+
     audit_and_record(store, ctx, |committed| {
-        // No pre-check: destroy_environment handles NotFound internally and
-        // also reaps stale tombstones when the env is already gone.
+        // No pre-check: destroy_environment_with_teardown handles NotFound
+        // internally, reaps stale tombstones when the env is already gone, and
+        // classifies + tears down provider resources under the same destroy flock.
         let result = store
-            .destroy_environment(&env_id)
+            .destroy_environment_with_teardown(&env_id, teardown, force_local)
             .inspect_err(|err| {
                 if err.is_committed_after_save() {
                     committed.mark_committed();
@@ -2348,11 +2428,14 @@ pub fn destroy(
             "outcome": "destroyed",
             "removed_path": result.removed_path.display().to_string(),
         });
+        let payload_obj = payload
+            .as_object_mut()
+            .expect("payload constructed as object");
         if result.reaped_tombstones > 0 {
-            payload
-                .as_object_mut()
-                .expect("payload constructed as object")
-                .insert("reaped_tombstones".into(), json!(result.reaped_tombstones));
+            payload_obj.insert("reaped_tombstones".into(), json!(result.reaped_tombstones));
+        }
+        if let Some(teardown_report) = result.provider_teardown {
+            payload_obj.insert("provider_teardown".into(), teardown_report);
         }
         let outcome = OpOutcome::new(NOUN, "destroy", payload);
         Ok((outcome, super::AuditGens::NONE))
@@ -3597,7 +3680,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
-        let err = destroy(&store, &OpFlags::default(), "local", false).unwrap_err();
+        let err = destroy(&store, &OpFlags::default(), "local", false, false).unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
     }
 
@@ -3614,7 +3697,7 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("answers.json"), b"{}").unwrap();
 
-        let outcome = destroy(&store, &OpFlags::default(), "doomed", true).unwrap();
+        let outcome = destroy(&store, &OpFlags::default(), "doomed", true, false).unwrap();
         assert_eq!(outcome.noun, "env");
         assert_eq!(outcome.op, "destroy");
         assert_eq!(outcome.result["environment_id"], "doomed");
@@ -3648,7 +3731,7 @@ mod tests {
     fn destroy_missing_env_errors_not_found() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
-        let err = destroy(&store, &OpFlags::default(), "ghost", true).unwrap_err();
+        let err = destroy(&store, &OpFlags::default(), "ghost", true, false).unwrap_err();
         assert!(matches!(err, OpError::NotFound(_)), "got {err:?}");
     }
 
@@ -3658,7 +3741,7 @@ mod tests {
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("doomed")).unwrap();
         store.save(&make_env("survivor")).unwrap();
-        destroy(&store, &OpFlags::default(), "doomed", true).unwrap();
+        destroy(&store, &OpFlags::default(), "doomed", true, false).unwrap();
         let survivor = EnvId::try_from("survivor").unwrap();
         assert!(store.exists(&survivor).unwrap());
         store.load(&survivor).expect("survivor still loads");
@@ -3686,7 +3769,7 @@ mod tests {
             answers: None,
         };
         // No --confirm needed for a schema dump.
-        let outcome = destroy(&store, &flags, "doomed", false).unwrap();
+        let outcome = destroy(&store, &flags, "doomed", false, false).unwrap();
         assert_eq!(outcome.op, "destroy");
         assert!(store.exists(&EnvId::try_from("doomed").unwrap()).unwrap());
     }
@@ -3710,7 +3793,7 @@ mod tests {
             }),
         )
         .unwrap();
-        destroy(&store, &OpFlags::default(), "doomed", true).unwrap();
+        destroy(&store, &OpFlags::default(), "doomed", true, false).unwrap();
         // The audit event appends AFTER the mutation closure, so it lands in
         // a recreated `<env_id>/audit/` residue dir; only the destroy event
         // survives (the create event went with the env).
@@ -3734,7 +3817,7 @@ mod tests {
         let env_dir = dir.path().join("local");
         assert!(env_dir.join("trust-root.json").exists());
 
-        destroy(&store, &OpFlags::default(), "local", true).unwrap();
+        destroy(&store, &OpFlags::default(), "local", true, false).unwrap();
         assert!(!env_dir.join("trust-root.json").exists());
 
         let second = init(&store, &OpFlags::default(), EnvInitPayload::default()).unwrap();
@@ -3771,7 +3854,7 @@ mod tests {
         std::fs::write(blocked.join("child"), b"x").unwrap();
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let err = destroy(&store, &OpFlags::default(), "doomed", true).unwrap_err();
+        let err = destroy(&store, &OpFlags::default(), "doomed", true, false).unwrap_err();
 
         // The tombstone survives the failed purge; restore permissions so
         // TempDir::drop can clean up.
@@ -3804,7 +3887,7 @@ mod tests {
 
         // Re-running destroy reaps the stale tombstone (permissions already
         // restored above).
-        let outcome = destroy(&store, &OpFlags::default(), "doomed", true).unwrap();
+        let outcome = destroy(&store, &OpFlags::default(), "doomed", true, false).unwrap();
         assert_eq!(outcome.result["outcome"], "destroyed");
         assert_eq!(outcome.result["reaped_tombstones"], 1);
     }
@@ -3822,7 +3905,7 @@ mod tests {
         std::os::unix::fs::symlink(target.path().join("linked"), dir.path().join("linked"))
             .unwrap();
 
-        let err = destroy(&store, &OpFlags::default(), "linked", true).unwrap_err();
+        let err = destroy(&store, &OpFlags::default(), "linked", true, false).unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
         // The link target is untouched.
         assert!(

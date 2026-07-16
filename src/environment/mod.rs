@@ -52,7 +52,10 @@ pub use mutations::{
 pub use reads::EnvironmentReads;
 pub use runtime_config::materialize_runtime_config;
 pub use snapshot::{SnapshotId, restore_environment, snapshot_environment};
-pub use store::{DestroyOutcome, EnvironmentStore, LocalFsStore, Locked, StoreError};
+pub use store::{
+    DestroyOutcome, EnvironmentStore, LocalFsStore, Locked, PROVIDER_TEARDOWN_DESCRIPTORS,
+    ProviderTeardown, ProviderTeardownCtx, StoreError,
+};
 pub use trust_root::{
     TRUST_ROOT_FILE, TRUST_ROOT_SCHEMA_V1, TrustRootDocument, TrustRootError, add_trusted_key,
     load as load_trust_root, remove_trusted_key, trust_root_path,
