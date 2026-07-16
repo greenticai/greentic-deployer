@@ -756,12 +756,22 @@ fn webhook_ref_to_store_uri(ref_uri: &str) -> Option<String> {
 ///   ([`messaging::build_webhook_secret_ref`]) are minted. A caller can stamp a
 ///   BYO `webhook_secret_ref` on an endpoint and provision its value out of
 ///   band; minting over that here would swap in an unrelated token, so a
-///   non-generated ref is left untouched.
-/// - **Idempotence:** a ref already present in Vault is skipped, so a
-///   (sequential) re-run never rotates a live webhook secret. Two *concurrent*
-///   first-time runs could both observe absence and mint different values, but
-///   that window is strictly before any webhook is registered (`env up` does
-///   not register webhooks), so no live secret is ever rotated.
+///   non-generated ref is left untouched. The generated shape embeds the env's
+///   *current* tenant, so a ref minted under a prior `tenant_org_id` also reads
+///   as non-generated and is left untouched — changing an env's tenant after
+///   endpoints exist strands their refs (the same pre-existing hazard that hits
+///   every tenant-scoped endpoint secret, not just webhooks).
+/// - **Idempotence:** the presence check and the write are not atomic (the store
+///   exposes no compare-and-set here), so this protects the common case, not
+///   concurrency. A *sequential* re-run finds the ref present and skips it, never
+///   rotating a live webhook secret. Two *concurrent* first-time runs can each
+///   observe absence and write different values (last-writer-wins). That is
+///   benign while no webhook is registered — `env up` never calls `setWebhook` —
+///   but a public-URL env whose worker registers one on reconcile could have a
+///   losing concurrent write strand the registered secret until the next
+///   `env up` re-provisions it. The failure mode is fail-closed (mismatched
+///   inbound webhooks are rejected, never spoofable); fully atomic provisioning
+///   would need a CAS-capable backend op (tracked separately).
 #[cfg(feature = "k8s-client")]
 fn provision_endpoint_webhook_secrets(
     binding: &crate::env_packs::k8s::manifests::VaultBackend,
