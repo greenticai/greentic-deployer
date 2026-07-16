@@ -166,11 +166,7 @@ impl RealCloudRunTarget {
     }
 
     fn service_resource(&self, deployment_id: DeploymentId) -> String {
-        format!(
-            "{}/services/{}",
-            self.services_parent(),
-            service_name(deployment_id)
-        )
+        service_fqn(&self.project, &self.region, deployment_id)
     }
 
     fn revision_resource(&self, deployment_id: DeploymentId, revision_id: RevisionId) -> String {
@@ -412,20 +408,22 @@ fn build_service_message(spec: &ServiceSpec, etag: Option<&str>) -> run::Service
         .set_ingress(run::IngressTraffic::All)
         .set_labels(ownership_labels(spec.deployment_id));
     if let Some(etag) = etag {
-        service.name = service_resource_name(spec);
+        service.name = service_fqn(&spec.project, &spec.region, spec.deployment_id);
         service.etag = etag.to_string();
     }
     service
 }
 
-/// The fully-qualified Cloud Run Service resource name for a spec. `update_service`
-/// locates the resource through this; `build_service_message` sets it on updates.
-fn service_resource_name(spec: &ServiceSpec) -> String {
+/// The fully-qualified Cloud Run Service resource name
+/// (`projects/{project}/locations/{region}/services/gtc-svc-{ulid}`). The single
+/// place the format lives: `RealCloudRunTarget::service_resource` builds it from
+/// the target's pinned project/region, and `build_service_message` from the
+/// spec's (they are equal for this single-binding target) to identify the
+/// resource on `update_service`.
+fn service_fqn(project: &str, region: &str, deployment_id: DeploymentId) -> String {
     format!(
-        "projects/{}/locations/{}/services/{}",
-        spec.project,
-        spec.region,
-        service_name(spec.deployment_id),
+        "projects/{project}/locations/{region}/services/{}",
+        service_name(deployment_id)
     )
 }
 
