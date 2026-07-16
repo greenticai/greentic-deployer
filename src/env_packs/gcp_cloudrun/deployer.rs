@@ -30,6 +30,7 @@ use async_trait::async_trait;
 use greentic_deploy_spec::{DeploymentId, Environment, Revision, RevisionId, TrafficSplitEntry};
 use serde_json::Value;
 
+use crate::cli::secrets::DEV_STORE_RELATIVE;
 use crate::env_packs::deployer::{
     ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome, TrafficSplitOutcome,
     WarmOutcome, enforce_split_invariants, require_revision,
@@ -217,11 +218,6 @@ pub fn service_name(deployment_id: DeploymentId) -> String {
 const SEED_MOUNT_DIR: &str = "/seed";
 /// The `environment.json` seed file name under [`SEED_MOUNT_DIR`].
 const ENVIRONMENT_SEED_FILE: &str = "environment.json";
-/// The dev-store seed file's path relative to [`SEED_MOUNT_DIR`], mirroring the
-/// on-disk store layout greentic-start's `seed_copy` reproduces. Projected as a
-/// subdirectory item path on the one `/seed` secret volume (Cloud Run forbids a
-/// nested `/seed/.greentic/dev` mount).
-const DEV_SECRETS_SEED_REL: &str = ".greentic/dev/.dev.secrets.env";
 /// Writable env-store root for the runtime container, exported as `HOME`. Cloud
 /// Run's root filesystem is read-only except `/tmp` (in-memory, world-writable)
 /// on the gen1 execution environment, so `LocalFsStore` (`$HOME/.greentic/
@@ -483,7 +479,10 @@ impl Deployer for GcpCloudRunDeployerHandler {
                 .map_err(provider)?;
             secret_items.push(SecretMountItem {
                 version: dev_version.version,
-                rel_path: DEV_SECRETS_SEED_REL.to_string(),
+                // The seed tree mirrors the on-disk store, so the dev-store's
+                // store-relative path is also its path under `/seed`, projected
+                // as a subdirectory item (Cloud Run forbids a nested mount).
+                rel_path: DEV_STORE_RELATIVE.to_string(),
             });
         }
         // Grant the runtime SA read on the secret (covers every version) —
@@ -1276,7 +1275,7 @@ mod tests {
         assert_eq!(mounts[0].items.len(), 2);
         assert_eq!(mounts[0].items[0].rel_path, ENVIRONMENT_SEED_FILE);
         assert_eq!(mounts[0].items[0].version, "1");
-        assert_eq!(mounts[0].items[1].rel_path, DEV_SECRETS_SEED_REL);
+        assert_eq!(mounts[0].items[1].rel_path, DEV_STORE_RELATIVE);
         assert_eq!(mounts[0].items[1].version, "2");
 
         // The runtime SA can read the mounted versions.

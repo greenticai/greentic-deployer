@@ -497,21 +497,16 @@ fn build_secret_volumes(spec: &ServiceSpec) -> Vec<run::Volume> {
         .iter()
         .enumerate()
         .map(|(index, mount)| {
-            let items = mount
-                .items
-                .iter()
-                .map(|it| {
-                    run::VersionToPath::new()
-                        .set_version(it.version.clone())
-                        .set_path(it.rel_path.clone())
-                })
-                .collect::<Vec<_>>();
             run::Volume::new()
                 .set_name(secret_volume_name(index))
                 .set_secret(
                     run::SecretVolumeSource::new()
                         .set_secret(mount.secret_name.clone())
-                        .set_items(items),
+                        .set_items(mount.items.iter().map(|it| {
+                            run::VersionToPath::new()
+                                .set_version(it.version.clone())
+                                .set_path(it.rel_path.clone())
+                        })),
                 )
         })
         .collect()
