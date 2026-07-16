@@ -489,34 +489,29 @@ fn secret_volume_name(index: usize) -> String {
     format!("seed-secret-{index}")
 }
 
-/// Split a secret mount's absolute file path into `(parent_dir, file_name)`.
-/// Cloud Run secret volumes mount at a directory; the pinned version maps to a
-/// relative file beneath it (plan D6).
-fn split_mount_path(mount_path: &str) -> (String, String) {
-    match mount_path.rsplit_once('/') {
-        Some(("", file)) => ("/".to_string(), file.to_string()),
-        Some((dir, file)) => (dir.to_string(), file.to_string()),
-        None => ("/".to_string(), mount_path.to_string()),
-    }
-}
-
 /// Each [`SecretMount`](super::deploy_target::SecretMount) → one secret volume
-/// pinned to the immutable numeric version at the mount's file name (never
-/// `latest`, plan D6).
+/// carrying each item's immutable numeric version at its (subdirectory-capable)
+/// relative path (never `latest`, plan D6).
 fn build_secret_volumes(spec: &ServiceSpec) -> Vec<run::Volume> {
     spec.secrets
         .iter()
         .enumerate()
         .map(|(index, mount)| {
-            let (_dir, file_name) = split_mount_path(&mount.mount_path);
+            let items = mount
+                .items
+                .iter()
+                .map(|it| {
+                    run::VersionToPath::new()
+                        .set_version(it.version.clone())
+                        .set_path(it.rel_path.clone())
+                })
+                .collect::<Vec<_>>();
             run::Volume::new()
                 .set_name(secret_volume_name(index))
                 .set_secret(
                     run::SecretVolumeSource::new()
                         .set_secret(mount.secret_name.clone())
-                        .set_items([run::VersionToPath::new()
-                            .set_version(mount.version.clone())
-                            .set_path(file_name)]),
+                        .set_items(items),
                 )
         })
         .collect()
@@ -528,10 +523,9 @@ fn build_secret_volume_mounts(spec: &ServiceSpec) -> Vec<run::VolumeMount> {
         .iter()
         .enumerate()
         .map(|(index, mount)| {
-            let (dir, _file_name) = split_mount_path(&mount.mount_path);
             run::VolumeMount::new()
                 .set_name(secret_volume_name(index))
-                .set_mount_path(dir)
+                .set_mount_path(mount.mount_dir.clone())
         })
         .collect()
 }
@@ -791,7 +785,9 @@ fn bytes_from(payload: &[u8]) -> bytes::Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::env_packs::gcp_cloudrun::deploy_target::{ScalingSpec, SecretMount};
+    use crate::env_packs::gcp_cloudrun::deploy_target::{
+        ScalingSpec, SecretMount, SecretMountItem,
+    };
 
     fn dep(seed: u128) -> DeploymentId {
         DeploymentId(Ulid::from(seed))
@@ -910,30 +906,44 @@ mod tests {
     }
 
     #[test]
-    fn build_secret_mounts_pin_version_and_mount_readonly_volume() {
+    fn build_secret_mounts_pin_versions_under_one_seed_volume_with_subdirs() {
+        // Both seed files ride ONE secret's two versions under ONE /seed volume
+        // (Cloud Run forbids nested mounts) — env.json at the root, dev-secrets
+        // at a subdirectory item path.
         let s = spec(
             vec![],
             vec![SecretMount {
-                mount_path: "/seed/environment.json".to_string(),
+                mount_dir: "/seed".to_string(),
                 secret_name: "gtc-local-environment".to_string(),
-                version: "5".to_string(),
+                items: vec![
+                    SecretMountItem {
+                        version: "5".to_string(),
+                        rel_path: "environment.json".to_string(),
+                    },
+                    SecretMountItem {
+                        version: "6".to_string(),
+                        rel_path: ".greentic/dev/.dev.secrets.env".to_string(),
+                    },
+                ],
             }],
         );
 
-        // The secret is a version-pinned volume, not an env-var source (plan D6).
+        // One version-pinned volume carries both files; never the latest alias.
         let volumes = build_secret_volumes(&s);
-        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes.len(), 1, "one secret → one volume, never nested");
         let source = volumes[0].secret().expect("secret volume source");
         assert_eq!(source.secret, "gtc-local-environment");
-        assert_eq!(source.items.len(), 1);
-        assert_eq!(
-            source.items[0].version, "5",
-            "pinned to the numeric version, never latest"
-        );
+        assert_eq!(source.items.len(), 2);
+        assert_eq!(source.items[0].version, "5");
         assert_eq!(source.items[0].path, "environment.json");
+        assert_eq!(source.items[1].version, "6");
+        assert_eq!(
+            source.items[1].path, ".greentic/dev/.dev.secrets.env",
+            "dev-secrets projects into a subdirectory of the same mount"
+        );
 
-        // The container mounts that volume read-only at the file's parent dir,
-        // and carries no env-var secret sources.
+        // A single VolumeMount at the shared /seed dir — no /seed/.greentic/dev
+        // nested mount (which Cloud Run would reject).
         let mounts = build_secret_volume_mounts(&s);
         assert_eq!(mounts.len(), 1);
         assert_eq!(
@@ -943,7 +953,6 @@ mod tests {
         assert_eq!(mounts[0].mount_path, "/seed");
         let c = build_container(&s);
         assert_eq!(c.volume_mounts.len(), 1);
-        assert!(c.env.is_empty(), "secrets are file volumes, not env vars");
     }
 
     #[test]

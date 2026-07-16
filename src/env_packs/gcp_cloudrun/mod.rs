@@ -56,6 +56,12 @@ pub struct GcpCloudRunDeployerHandler {
     /// (fails verbs honestly); the real `google-cloud-*`-backed target is wired
     /// in a follow-up PR behind the `deploy-gcp-cloudrun` feature.
     pub(crate) target: std::sync::Arc<dyn deploy_target::CloudRunTarget>,
+    /// The env's raw encrypted dev-store bytes (`.dev.secrets.env`), read by the
+    /// CLI which owns the filesystem, staged by `warm_revision` as a second
+    /// version of the seed secret (plan D6). `None` for envs with no
+    /// `Secrets`-slot pack (and for the registry/default handler, which never
+    /// runs a live deploy).
+    pub(crate) dev_secrets: Option<Vec<u8>>,
 }
 
 impl Default for GcpCloudRunDeployerHandler {
@@ -63,6 +69,7 @@ impl Default for GcpCloudRunDeployerHandler {
         Self {
             creds: GcpDeployerCredentials::default(),
             target: std::sync::Arc::new(deploy_target::UnconfiguredCloudRunTarget),
+            dev_secrets: None,
         }
     }
 }
@@ -83,16 +90,30 @@ impl GcpCloudRunDeployerHandler {
         Self {
             creds: GcpDeployerCredentials::with_client(client),
             target: std::sync::Arc::new(deploy_target::UnconfiguredCloudRunTarget),
+            dev_secrets: None,
         }
     }
 
     /// Construct with a pluggable deploy-target seam. Tests pass the in-memory
     /// fake; the orchestration wiring passes a connected `google-cloud-*`-backed
-    /// target.
+    /// target. Stages no dev-store material (see
+    /// [`with_target_and_dev_secrets`](Self::with_target_and_dev_secrets)).
     pub fn with_target(target: std::sync::Arc<dyn deploy_target::CloudRunTarget>) -> Self {
+        Self::with_target_and_dev_secrets(target, None)
+    }
+
+    /// Construct with a deploy-target seam plus the env's raw dev-store bytes, so
+    /// `warm_revision` stages them alongside `environment.json` under the one
+    /// `/seed` secret (plan D6). The CLI reads the dev-store file (it owns the
+    /// filesystem) and passes it here; `None` stages only `environment.json`.
+    pub fn with_target_and_dev_secrets(
+        target: std::sync::Arc<dyn deploy_target::CloudRunTarget>,
+        dev_secrets: Option<Vec<u8>>,
+    ) -> Self {
         Self {
             creds: GcpDeployerCredentials::default(),
             target,
+            dev_secrets,
         }
     }
 }

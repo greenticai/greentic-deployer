@@ -969,14 +969,25 @@ pub(crate) fn read_dev_secrets_b64(
     env_id: &EnvId,
 ) -> Result<Option<String>, OpError> {
     use base64::Engine as _;
+    Ok(read_dev_secrets_bytes(store, env_id)?
+        .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)))
+}
+
+/// Read the env's local dev-store as raw bytes (the encrypted `.dev.secrets.env`
+/// file). `Ok(None)` when no dev-store file exists yet; a present-but-unreadable
+/// store is surfaced rather than silently shipping nothing. The Cloud Run deploy
+/// stages these bytes verbatim as a Secret Manager version, so it needs the raw
+/// file, not the k8s path's base64-in-a-K8s-Secret.
+pub(crate) fn read_dev_secrets_bytes(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+) -> Result<Option<Vec<u8>>, OpError> {
     let env_dir = store
         .env_dir(env_id)
         .map_err(|e| OpError::Conflict(format!("resolving env dir: {e}")))?;
     let path = super::secrets::resolve_dev_store_path(&env_dir, None);
     match std::fs::read(&path) {
-        Ok(bytes) => Ok(Some(
-            base64::engine::general_purpose::STANDARD.encode(bytes),
-        )),
+        Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(OpError::Conflict(format!(
             "reading dev-store at {}: {e}",
@@ -1491,6 +1502,7 @@ async fn resolve_cloudrun_handler(
     project: &str,
     region: &str,
     credentials: Option<crate::env_packs::gcp_cloudrun::bound_session::GcpCredentialMaterial>,
+    dev_secrets: Option<Vec<u8>>,
 ) -> Result<crate::env_packs::gcp_cloudrun::GcpCloudRunDeployerHandler, OpError> {
     use crate::env_packs::gcp_cloudrun::GcpCloudRunDeployerHandler;
     use crate::env_packs::gcp_cloudrun::real_target::RealCloudRunTarget;
@@ -1503,7 +1515,10 @@ async fn resolve_cloudrun_handler(
                 "cannot initialize the GCP Cloud Run deployer client: {e}"
             ))
         })?;
-    Ok(GcpCloudRunDeployerHandler::with_target(Arc::new(target)))
+    Ok(GcpCloudRunDeployerHandler::with_target_and_dev_secrets(
+        Arc::new(target),
+        dev_secrets,
+    ))
 }
 
 /// Store-injected teardown of a Cloud Run env's owned Services, run under the
@@ -1606,9 +1621,19 @@ fn apply_revision_cloudrun(
     let worker_name = service_name(revision.deployment_id);
     let (identity, params, credentials) = cloudrun_target_inputs(store, env, env_id, answers)?;
 
+    // Read the env's encrypted dev-store (this process owns the filesystem) so
+    // `warm_revision` can stage it under the seed secret. Only for envs with a
+    // `Secrets`-slot pack; a warm-only path (`present == false`) needs no seed.
+    let dev_secrets = if present && env.packs.iter().any(|p| p.slot == CapabilitySlot::Secrets) {
+        read_dev_secrets_bytes(store, env_id)?
+    } else {
+        None
+    };
+
     let endpoint_url = run_gcp_async(async move {
         let handler =
-            resolve_cloudrun_handler(&params.project, &params.region, credentials).await?;
+            resolve_cloudrun_handler(&params.project, &params.region, credentials, dev_secrets)
+                .await?;
         if present {
             // The Service's live `*.run.app` URL rides back on the warm outcome
             // (read from the upsert response — no extra round-trip): the "one
@@ -1862,8 +1887,9 @@ fn apply_traffic_cloudrun(
 
     let (identity, params, credentials) = cloudrun_target_inputs(store, env, env_id, answers)?;
     let outcome = run_gcp_async(async move {
+        // Traffic reweight never warms a revision, so it stages no seed secret.
         let handler =
-            resolve_cloudrun_handler(&params.project, &params.region, credentials).await?;
+            resolve_cloudrun_handler(&params.project, &params.region, credentials, None).await?;
         handler
             .apply_traffic_split(env, deployment_id, answers)
             .await
