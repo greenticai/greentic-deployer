@@ -1527,18 +1527,16 @@ pub fn apply_traffic(
     // with no routing condition it REPLACES the listener's default action
     // (whole-listener ownership), assuming the `alb_listener_arn` is dedicated to
     // this deployment — see the `op env apply-traffic` help WARNING.
-    // Dispatch to the resolved kind's live router. Without `creds-gcp` the gate
-    // above already rejected the cloudrun kind, so the aws-ecs path is the only
-    // reachable one and `apply_traffic_cloudrun` is not referenced.
-    #[cfg(feature = "creds-gcp")]
-    let (identity, outcome) = if is_cloudrun_kind(&descriptor) {
-        apply_traffic_cloudrun(store, &env, &env_id, deployment_id, answers.as_ref())?
-    } else {
-        apply_traffic_aws_ecs(store, &env, &env_id, deployment_id, answers.as_ref())?
-    };
-    #[cfg(not(feature = "creds-gcp"))]
-    let (identity, outcome) =
-        apply_traffic_aws_ecs(store, &env, &env_id, deployment_id, answers.as_ref())?;
+    // Dispatch to the resolved kind's live router (AWS-ECS ALB listener or Cloud
+    // Run traffic weights); the gate above admitted only those two kinds.
+    let (identity, outcome) = apply_traffic_non_k8s(
+        store,
+        &env,
+        &env_id,
+        deployment_id,
+        answers.as_ref(),
+        &descriptor,
+    )?;
 
     Ok(OpOutcome::new(
         NOUN,
@@ -1562,6 +1560,40 @@ pub fn apply_traffic(
                 .collect::<Vec<_>>(),
         }),
     ))
+}
+
+/// Dispatch `apply-traffic` for a non-K8s deployer between the AWS-ECS and GCP
+/// Cloud Run live routers — the routing-side parallel of [`apply_revision_non_k8s`].
+/// The applicability gate in [`apply_traffic`] admits only these two kinds.
+///
+/// `apply_traffic_aws_ecs` is a total function (its `#[cfg(not(deploy-aws-ecs))]`
+/// body is the "compiled without the cloud feature" stub), so AWS-ECS is the
+/// fallthrough and only the `creds-gcp`-gated Cloud Run arm needs special-casing
+/// — no build-matrix split is required here.
+fn apply_traffic_non_k8s(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    deployment_id: greentic_deploy_spec::DeploymentId,
+    answers: Option<&Value>,
+    descriptor: &greentic_deploy_spec::PackDescriptor,
+) -> Result<
+    (
+        &'static str,
+        crate::env_packs::deployer::TrafficSplitOutcome,
+    ),
+    OpError,
+> {
+    #[cfg(feature = "creds-gcp")]
+    {
+        if is_cloudrun_kind(descriptor) {
+            return apply_traffic_cloudrun(store, env, env_id, deployment_id, answers);
+        }
+    }
+    // `descriptor` selects the kind only when the cloudrun arm is compiled in.
+    #[cfg(not(feature = "creds-gcp"))]
+    let _ = descriptor;
+    apply_traffic_aws_ecs(store, env, env_id, deployment_id, answers)
 }
 
 /// Connect to AWS and push one deployment's recorded traffic split to its ALB
