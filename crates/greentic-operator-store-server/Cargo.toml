@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 greentic-deploy-spec = "=1.3.0-research.1"
-greentic-operator-trust = { path = "../greentic-operator-trust", version = "0.2" }
+greentic-operator-trust = { path = "../greentic-operator-trust", version = "=1.3.0-research.0" }
 axum = { version = "0.8", features = ["macros"] }
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 fs4 = "0.13"
@@ -45,7 +45,7 @@ features = [
 
 [dev-dependencies]
 # Re-declared to turn on `test_support` (shared keypair fixtures) for tests.
-greentic-operator-trust = { path = "../greentic-operator-trust", version = "0.2", features = ["test-utils"] }
+greentic-operator-trust = { path = "../greentic-operator-trust", version = "=1.3.0-research.0", features = ["test-utils"] }
 http-body-util = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
