@@ -172,6 +172,19 @@ pub trait GcpValidatorClient: std::fmt::Debug + Send + Sync {
 #[derive(Default)]
 pub struct GcpDeployerCredentials {
     client: Mutex<Option<Arc<dyn GcpValidatorClient>>>,
+    /// Target project the `projects.testIamPermissions` probe runs against, from
+    /// the binding's `project` answer. `None` → fall back to the ADC-resolved
+    /// project (the un-connected default / test path). Set by the CLI's
+    /// `connected_cloudrun_credentials` so `requirements` probes the project the
+    /// deployer actually targets, not just whatever the ambient chain resolves —
+    /// a WIF/external-account credential often resolves no project at all.
+    project: Option<String>,
+    /// Runtime service account the `iam.serviceAccounts.actAs` probe targets, from
+    /// the binding's resolved `runtime_service_account`. `None` → the default
+    /// `gtc-{env}-runtime@{project}` formula. Set by the CLI so the probe matches
+    /// the SA a live `op env up` attaches to the revision (a `service_account`
+    /// answer override honored).
+    service_account: Option<String>,
 }
 
 impl std::fmt::Debug for GcpDeployerCredentials {
@@ -194,7 +207,23 @@ impl GcpDeployerCredentials {
     pub fn with_client(client: Arc<dyn GcpValidatorClient>) -> Self {
         Self {
             client: Mutex::new(Some(client)),
+            ..Default::default()
         }
+    }
+
+    /// Target the binding's `project` for the IAM probes instead of the
+    /// ADC-resolved project. Set by the connected CLI path; see [`Self::project`].
+    pub fn with_project(mut self, project: impl Into<String>) -> Self {
+        self.project = Some(project.into());
+        self
+    }
+
+    /// Target the binding's resolved runtime service account for the `actAs`
+    /// probe instead of the default `gtc-{env}-runtime@{project}` formula. Set by
+    /// the connected CLI path; see [`Self::service_account`].
+    pub fn with_service_account(mut self, service_account: impl Into<String>) -> Self {
+        self.service_account = Some(service_account.into());
+        self
     }
 
     /// Return the injected client, or build the real ADC-backed one.
@@ -295,10 +324,14 @@ impl DeployerCredentials for GcpDeployerCredentials {
             Err(e) => return all_failed(&caps, &format!("ADC caller identity failed: {e}")),
         };
 
-        let Some(project) = identity.project.clone() else {
+        // Prefer the binding's target `project` (set by the connected CLI path)
+        // over whatever the credential chain resolves: a WIF/external-account
+        // credential often resolves no project, and even a keyed SA's home
+        // project may differ from the project Cloud Run deploys into.
+        let Some(project) = self.project.clone().or_else(|| identity.project.clone()) else {
             return self.identity_pass_permissions_failed(
-                "ADC resolved no quota/target project to run projects.testIamPermissions against; \
-                 set a quota project or bind a service account scoped to the target project",
+                "no target project to run projects.testIamPermissions against; set the binding's \
+                 `project` answer, or bind a service account scoped to the target project",
             );
         };
 
@@ -321,11 +354,14 @@ impl DeployerCredentials for GcpDeployerCredentials {
         let project_granted: HashSet<&str> = project_granted.iter().map(String::as_str).collect();
 
         // `actAs` is validated against the runtime SA the revision impersonates,
-        // scoped to that SA resource — not the project. The validator sees only
-        // the *default* runtime SA (a `service_account` answer override is out of
-        // scope here); the failure reason spells out the SA it checked.
-        let sa_email =
-            super::deployer::default_runtime_service_account(ctx.env_id.as_str(), &project);
+        // scoped to that SA resource — not the project. Prefer the binding's
+        // resolved runtime SA (set by the connected CLI path, honoring a
+        // `service_account` answer override) so the probe matches the SA a live
+        // `op env up` attaches; fall back to the default `gtc-{env}-runtime`
+        // formula for the un-connected path. The failure reason spells out the SA.
+        let sa_email = self.service_account.clone().unwrap_or_else(|| {
+            super::deployer::default_runtime_service_account(ctx.env_id.as_str(), &project)
+        });
         let act_as_probe: Result<bool, String> = match run_gcp_async(
             client.test_sa_permissions(&service_account_resource(&sa_email), &[ACT_AS_PERMISSION]),
         ) {
@@ -472,6 +508,29 @@ impl RealGcpClient {
         })
     }
 
+    /// Build from the env's bound deployer material (a service-account key or WIF
+    /// config) so `requirements` authenticates + probes IAM AS THE BOUND DEPLOYER
+    /// identity — the identity a live `op env up` deploys as — not the ambient ADC
+    /// principal. Email/project are read straight off the material (both absent
+    /// for a WIF external-account, whose target project the caller supplies via
+    /// the binding's `project` answer, threaded into [`GcpDeployerCredentials`]).
+    fn from_bound(
+        material: &super::bound_session::GcpCredentialMaterial,
+    ) -> Result<Self, GcpClientError> {
+        let credentials = material
+            .build_credentials()
+            .map_err(GcpClientError::NoCredentialChain)?;
+        Ok(Self {
+            credentials,
+            http: reqwest::Client::new(),
+            email: material
+                .client_email
+                .clone()
+                .unwrap_or_else(|| ADC_PRINCIPAL_UNKNOWN.to_string()),
+            project: material.project_id.clone(),
+        })
+    }
+
     /// Fetch the ADC auth headers (mints/refreshes the token), returning the
     /// `http::HeaderMap` forwardable straight onto the reqwest request.
     async fn auth_headers(&self) -> Result<http::HeaderMap, GcpClientError> {
@@ -554,6 +613,21 @@ impl GcpValidatorClient for RealGcpClient {
         self.post_test_iam(&sa_test_iam_url(sa_resource), permissions)
             .await
     }
+}
+
+/// Build the validator client the connected `op credentials requirements` path
+/// injects: authenticate + probe IAM AS THE BOUND deployer credential. The
+/// crate-visible entry point that lets `cli::credentials` build a real client
+/// without exposing [`RealGcpClient`]. Mirrors the AWS/K8s connected-requirements
+/// pattern so the probes reflect the deployer's real identity, not the ambient
+/// one. (No ambient branch: `requirements` on a material-requiring deployer is
+/// rejected upstream when no credential is bound, so this is only ever reached
+/// with resolved bound material.)
+#[cfg(feature = "deploy-gcp-cloudrun")]
+pub(crate) fn build_validator_client(
+    material: &super::bound_session::GcpCredentialMaterial,
+) -> Result<Arc<dyn GcpValidatorClient>, GcpClientError> {
+    Ok(Arc::new(RealGcpClient::from_bound(material)?))
 }
 
 // ---- Pure REST helpers (unit-tested; no HTTP) ----
@@ -838,6 +912,66 @@ mod tests {
         let report = creds.validate(&ctx());
         assert!(!report.passed());
         assert_eq!(report.missing().len(), 1);
+    }
+
+    /// 5d: the connected CLI path threads the binding's target `project` in. It
+    /// overrides the ADC-resolved project for the project-scoped probe AND flows
+    /// into the default runtime-SA formula the `actAs` probe derives.
+    #[test]
+    fn validate_targets_the_configured_project_over_the_adc_project() {
+        let client = Arc::new(MockGcpClient::new(Ok(identity()), Ok(all_granted())));
+        let creds =
+            GcpDeployerCredentials::with_client(client.clone()).with_project("override-proj");
+        assert!(creds.validate(&ctx()).passed());
+        // Project-scoped probe hits the override, not the ADC identity's "proj".
+        let calls = client.test_calls.lock().unwrap();
+        assert_eq!(calls[0].0, "override-proj");
+        // The default runtime SA is derived from the overridden project.
+        let sa_calls = client.sa_calls.lock().unwrap();
+        assert_eq!(
+            sa_calls[0].0,
+            "projects/-/serviceAccounts/gtc-local-runtime@override-proj.iam.gserviceaccount.com",
+        );
+    }
+
+    /// 5d: the connected CLI path threads the binding's resolved runtime SA in
+    /// (honoring a `service_account` answer override), so the `actAs` probe hits
+    /// exactly the SA a live `op env up` attaches — not the default formula. The
+    /// project-scoped probe is unaffected (still the ADC-resolved project).
+    #[test]
+    fn validate_probes_the_configured_service_account() {
+        let client = Arc::new(MockGcpClient::new(Ok(identity()), Ok(all_granted())));
+        let creds = GcpDeployerCredentials::with_client(client.clone())
+            .with_service_account("custom-runtime@other.iam.gserviceaccount.com");
+        assert!(creds.validate(&ctx()).passed());
+        let sa_calls = client.sa_calls.lock().unwrap();
+        assert_eq!(
+            sa_calls[0].0,
+            "projects/-/serviceAccounts/custom-runtime@other.iam.gserviceaccount.com",
+        );
+        assert_eq!(client.test_calls.lock().unwrap()[0].0, "proj");
+    }
+
+    /// 5d: a WIF/external-account credential resolves no project, but the binding
+    /// supplies one — so a configured `project` lets `validate` run the probes
+    /// instead of short-circuiting to "no target project" as it would on the
+    /// un-connected ADC path.
+    #[test]
+    fn validate_uses_configured_project_when_the_credential_resolves_none() {
+        let identity_no_project = GcpCallerIdentity {
+            // A WIF external-account resolves no legible principal/project; the
+            // email is display-only here, so any placeholder does.
+            email: "wif-federated-subject".to_string(),
+            project: None,
+        };
+        let client = Arc::new(MockGcpClient::new(
+            Ok(identity_no_project),
+            Ok(all_granted()),
+        ));
+        let creds = GcpDeployerCredentials::with_client(client.clone()).with_project("proj");
+        let report = creds.validate(&ctx());
+        assert!(report.passed(), "configured project must drive the probe");
+        assert_eq!(client.test_calls.lock().unwrap()[0].0, "proj");
     }
 
     #[test]
