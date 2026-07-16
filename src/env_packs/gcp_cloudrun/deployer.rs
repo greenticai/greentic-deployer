@@ -440,6 +440,19 @@ impl Deployer for GcpCloudRunDeployerHandler {
             }
         }
 
+        // Apply the invoker IAM binding for the requested access mode (plan D12).
+        // A `Public` service needs `allUsers` granted `roles/run.invoker` or the
+        // returned `run.app` URL 403s every request — the upsert alone does NOT
+        // set it (the IAM policy is a separate resource from the Service). Runs
+        // after the upsert wins the etag race (so the Service exists) and before
+        // the readiness wait, so the URL is reachable the moment the revision
+        // reports `Ready`. Idempotent: re-applying the same binding on a
+        // second-revision warm is a harmless no-op.
+        self.target
+            .set_invoker_policy(&service_ref, params.access_mode)
+            .await
+            .map_err(provider)?;
+
         let revision_ref = RevisionRef {
             deployment_id,
             revision_id,
@@ -902,6 +915,36 @@ mod tests {
         assert_eq!(
             target2.runtime_service_account_for(dep_a).unwrap(),
             "custom-runtime@acme.iam.gserviceaccount.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_applies_invoker_policy_for_the_requested_access_mode() {
+        // F5 (plan D12): a warm must apply the invoker IAM binding, not just the
+        // Service upsert — the IAM policy is a separate resource, so without this
+        // a Public service's `run.app` URL 403s every request. Default is Public.
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+        assert_eq!(
+            target.invoker_policy_for(dep_a),
+            Some(AccessMode::Public),
+            "warm applies the default Public invoker binding"
+        );
+
+        // An `authenticated` answer leaves the service private.
+        let (handler2, target2) = handler_with_fake();
+        let answers = serde_json::json!({ "access_mode": "authenticated" });
+        handler2
+            .warm_revision(&env, r_warm, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            target2.invoker_policy_for(dep_a),
+            Some(AccessMode::Authenticated),
+            "an authenticated env applies the Authenticated invoker binding"
         );
     }
 
