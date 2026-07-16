@@ -873,6 +873,7 @@ fn vault_phase(
             image: vault_cfg.resolved_image(),
             root_token: vault_cfg.resolved_root_token(),
             env_id: env_id.as_str(),
+            worker_namespace: &worker_ns,
         };
         let objects = render_vault_manifests(&params);
         let deploy_ref = ObjectRef::from_manifest(&render_vault_deployment(&params))
