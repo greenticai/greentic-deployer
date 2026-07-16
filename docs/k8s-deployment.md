@@ -336,7 +336,7 @@ dev-store bridge entirely).
 |-------|------|---------|-------|
 | `deploy` | `"dev-in-cluster"` \| `"external"` | *(required)* | How `env up` obtains the Vault (see below). |
 | `namespace` | string | `"greentic"` | Namespace the dev Vault runs in. Ignored for `external`. |
-| `root_token` | string | `"root"` | Dev-mode root token for bootstrap + seed. Ignored for `external`. |
+| `root_token` | string | `"root"` | Token used for bootstrap + seed. For `external`, must be a token with write access to the target Vault. |
 | `image` | string | `"hashicorp/vault:1.17"` | Dev-mode Vault container image. Ignored for `external`. |
 | `seed` | `ManifestSecret[]` | `[]` | Secrets to seed into Vault after bootstrap, before reconcile. Each entry has a `path` (the `<tenant>/<team>/<pack>/<name>` shape) and an optional `from_env` (the name of the environment variable holding the value — read at apply time). When `from_env` is absent, the value is supplied via an interactive masked paste. |
 

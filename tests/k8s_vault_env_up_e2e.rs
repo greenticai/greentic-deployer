@@ -81,7 +81,7 @@ fn write_manifest(dir: &Path, manifest: &Value) -> PathBuf {
 fn vault_manifest() -> Value {
     serde_json::json!({
         "schema": "greentic.env-manifest.v1",
-        "environment": { "id": "local" },
+        "environment": { "id": "local", "tenant_org_id": "e2e-org" },
         "cluster": {
             "provider": "kind",
             "name": KIND_CLUSTER,
