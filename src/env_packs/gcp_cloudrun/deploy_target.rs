@@ -85,10 +85,16 @@ pub struct TrafficTarget {
     pub percent: u32,
 }
 
-/// A Secret Manager version mount for the container.
+/// A Secret Manager version mounted as a read-only file in the container (plan
+/// D6). Cloud Run mounts the immutable numeric `version` at `mount_path`;
+/// greentic-start's `GREENTIC_SEED_DIR` boot-copy (a follow-up slice) reads it
+/// into the writable env store. Env-var secret sources were rejected: the dev
+/// store needs a writable file, and env-var payloads hit the 32 KB limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretMount {
-    pub env_var: String,
+    /// Absolute container path the secret version is mounted at
+    /// (e.g. `/seed/environment.json`).
+    pub mount_path: String,
     pub secret_name: String,
     /// The immutable numeric version (never the `latest` alias — plan D6).
     pub version: String,
@@ -237,6 +243,20 @@ pub trait CloudRunTarget: std::fmt::Debug + Send + Sync {
         name: &str,
         payload: &[u8],
     ) -> Result<SecretVersion, CloudRunTargetError>;
+
+    /// Grant `roles/secretmanager.secretAccessor` on `secret_name` to
+    /// `service_account` (plan D6). Load-bearing: Cloud Run rejects a revision
+    /// whose runtime SA cannot read a mounted secret version, so the deploy must
+    /// grant access before mounting. Idempotent (a re-grant is a no-op).
+    async fn grant_secret_accessor(
+        &self,
+        secret_name: &str,
+        service_account: &str,
+    ) -> Result<(), CloudRunTargetError>;
+
+    /// Delete a Secret Manager secret and all its versions. Idempotent against
+    /// an absent secret. Used by the `op env destroy` teardown.
+    async fn delete_secret(&self, name: &str) -> Result<(), CloudRunTargetError>;
 }
 
 /// Default target: every verb fails with [`CloudRunTargetError::Unconfigured`]
@@ -299,6 +319,16 @@ impl CloudRunTarget for UnconfiguredCloudRunTarget {
     ) -> Result<SecretVersion, CloudRunTargetError> {
         Err(CloudRunTargetError::Unconfigured)
     }
+    async fn grant_secret_accessor(
+        &self,
+        _secret_name: &str,
+        _service_account: &str,
+    ) -> Result<(), CloudRunTargetError> {
+        Err(CloudRunTargetError::Unconfigured)
+    }
+    async fn delete_secret(&self, _name: &str) -> Result<(), CloudRunTargetError> {
+        Err(CloudRunTargetError::Unconfigured)
+    }
 }
 
 /// In-memory fake modelling Cloud Run's single-resource + etag semantics.
@@ -311,6 +341,9 @@ pub struct InMemoryCloudRun {
     services: Mutex<BTreeMap<DeploymentId, ServiceStatus>>,
     revisions: Mutex<BTreeMap<(DeploymentId, RevisionId), RevisionStatus>>,
     secrets: Mutex<BTreeMap<String, (Vec<u8>, u64)>>,
+    /// Service accounts granted `secretAccessor` on each secret, so tests can
+    /// assert the deployer grants the runtime SA before mounting.
+    secret_accessors: Mutex<BTreeMap<String, Vec<String>>>,
     invoker_policies: Mutex<BTreeMap<DeploymentId, AccessMode>>,
     /// Last runtime service account each Service was upserted with, so tests can
     /// assert the deployer threads the resolved identity through the seam.
@@ -349,6 +382,15 @@ impl InMemoryCloudRun {
     /// Snapshot of every staged secret: name → (payload, version count).
     pub fn secrets(&self) -> BTreeMap<String, (Vec<u8>, u64)> {
         self.secrets.lock().expect("secrets mutex").clone()
+    }
+
+    /// Service accounts granted `secretAccessor` on `secret_name`, if any.
+    pub fn secret_accessors_for(&self, secret_name: &str) -> Option<Vec<String>> {
+        self.secret_accessors
+            .lock()
+            .expect("secret-accessors mutex")
+            .get(secret_name)
+            .cloned()
     }
 
     /// Last-applied traffic for a deployment's Service, if it exists.
@@ -539,6 +581,31 @@ impl CloudRunTarget for InMemoryCloudRun {
             version: entry.1.to_string(),
         })
     }
+
+    async fn grant_secret_accessor(
+        &self,
+        secret_name: &str,
+        service_account: &str,
+    ) -> Result<(), CloudRunTargetError> {
+        let mut grants = self
+            .secret_accessors
+            .lock()
+            .expect("secret-accessors mutex");
+        let members = grants.entry(secret_name.to_string()).or_default();
+        if !members.iter().any(|m| m == service_account) {
+            members.push(service_account.to_string());
+        }
+        Ok(())
+    }
+
+    async fn delete_secret(&self, name: &str) -> Result<(), CloudRunTargetError> {
+        self.secrets.lock().expect("secrets mutex").remove(name);
+        self.secret_accessors
+            .lock()
+            .expect("secret-accessors mutex")
+            .remove(name);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -723,6 +790,32 @@ mod tests {
         assert_eq!(v1.version, "1");
         assert_eq!(v2.version, "2", "each upsert adds a new immutable version");
         assert_eq!(t.secrets()["gtc-local-environment"].0, b"two");
+    }
+
+    #[tokio::test]
+    async fn grant_secret_accessor_is_idempotent_and_delete_removes_secret() {
+        let t = InMemoryCloudRun::default();
+        t.upsert_secret("gtc-local-environment", b"cfg")
+            .await
+            .unwrap();
+        let sa = "gtc-local-runtime@proj.iam.gserviceaccount.com";
+        t.grant_secret_accessor("gtc-local-environment", sa)
+            .await
+            .unwrap();
+        t.grant_secret_accessor("gtc-local-environment", sa)
+            .await
+            .unwrap();
+        assert_eq!(
+            t.secret_accessors_for("gtc-local-environment"),
+            Some(vec![sa.to_string()]),
+            "re-grant adds the member once"
+        );
+
+        t.delete_secret("gtc-local-environment").await.unwrap();
+        assert!(!t.secrets().contains_key("gtc-local-environment"));
+        assert_eq!(t.secret_accessors_for("gtc-local-environment"), None);
+        // Idempotent against an already-gone secret.
+        t.delete_secret("gtc-local-environment").await.unwrap();
     }
 
     #[tokio::test]

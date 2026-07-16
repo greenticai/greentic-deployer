@@ -1523,7 +1523,7 @@ impl crate::environment::ProviderTeardown for CloudRunProviderTeardown {
     ) -> Result<Value, crate::environment::StoreError> {
         use crate::env_packs::gcp_cloudrun::credentials::run_gcp_async;
         use crate::env_packs::gcp_cloudrun::deploy_target::{CloudRunTarget, ServiceRef};
-        use crate::env_packs::gcp_cloudrun::deployer::service_name;
+        use crate::env_packs::gcp_cloudrun::deployer::{environment_secret_name, service_name};
         use crate::env_packs::gcp_cloudrun::real_target::RealCloudRunTarget;
         use crate::environment::StoreError;
 
@@ -1536,8 +1536,11 @@ impl crate::environment::ProviderTeardown for CloudRunProviderTeardown {
         let deployment_ids = ctx.deployment_ids.to_vec();
         let project = params.project.clone();
         let region = params.region.clone();
+        // The env-level seed secrets warm staged (plan D6) are per-env, not
+        // per-deployment — delete them once, after the Services.
+        let secret_name = environment_secret_name(&params.secret_prefix);
 
-        let deleted = run_gcp_async(async move {
+        let (deleted_services, deleted_secrets) = run_gcp_async(async move {
             let target = RealCloudRunTarget::resolve(&params.project, &params.region, credentials)
                 .await
                 .map_err(|e| {
@@ -1559,14 +1562,20 @@ impl crate::environment::ProviderTeardown for CloudRunProviderTeardown {
                 })?;
                 deleted.push(service_name(deployment_id));
             }
-            Ok::<Vec<String>, StoreError>(deleted)
+            target.delete_secret(&secret_name).await.map_err(|e| {
+                StoreError::ProviderTeardown(format!(
+                    "deleting Secret Manager secret `{secret_name}`: {e}"
+                ))
+            })?;
+            Ok::<(Vec<String>, Vec<String>), StoreError>((deleted, vec![secret_name]))
         })?;
 
         Ok(json!({
             "provider": "gcp-cloudrun",
             "project": project,
             "region": region,
-            "deleted_services": deleted,
+            "deleted_services": deleted_services,
+            "deleted_secrets": deleted_secrets,
         }))
     }
 }
