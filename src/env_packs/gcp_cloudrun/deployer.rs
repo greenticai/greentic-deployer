@@ -30,6 +30,7 @@ use async_trait::async_trait;
 use greentic_deploy_spec::{DeploymentId, Environment, Revision, RevisionId, TrafficSplitEntry};
 use serde_json::Value;
 
+use crate::cli::secrets::DEV_STORE_RELATIVE;
 use crate::env_packs::deployer::{
     ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome, TrafficSplitOutcome,
     WarmOutcome, enforce_split_invariants, require_revision,
@@ -37,8 +38,8 @@ use crate::env_packs::deployer::{
 
 use super::GcpCloudRunDeployerHandler;
 use super::deploy_target::{
-    AccessMode, CloudRunTargetError, RevisionRef, ScalingSpec, SecretMount, ServiceRef,
-    ServiceSpec, TrafficTarget,
+    AccessMode, CloudRunTargetError, RevisionRef, ScalingSpec, SecretMount, SecretMountItem,
+    ServiceRef, ServiceSpec, TrafficTarget,
 };
 
 /// Default runtime image (plan D2/D3): the public GHCR distroless image Cloud
@@ -447,27 +448,54 @@ impl Deployer for GcpCloudRunDeployerHandler {
         // mounted secret version. Staged ONCE, before the etag retry loop, so a
         // precondition retry does not add a redundant secret version. The
         // revision's boot env (`runtime_boot_env`) sets `GREENTIC_SEED_DIR`, so
-        // greentic-start copies this mount into its writable store at boot; the
-        // encrypted dev-secrets payload lands in a follow-up slice.
+        // greentic-start copies this mount into its writable store at boot. When
+        // the env carries dev-store material, the CLI injected the raw bytes and
+        // they are staged as a SECOND version of the same secret below.
         let environment_json = serde_json::to_vec(env).map_err(|e| {
             DeployerError::Provider(format!(
                 "serializing environment.json for seed staging: {e}"
             ))
         })?;
         let secret_name = environment_secret_name(&params.secret_prefix);
-        let secret_version = self
+        let env_version = self
             .target
             .upsert_secret(&secret_name, &environment_json)
             .await
             .map_err(provider)?;
+        let mut secret_items = vec![SecretMountItem {
+            version: env_version.version,
+            rel_path: ENVIRONMENT_SEED_FILE.to_string(),
+        }];
+        // Stage the operator's encrypted dev-store (`.dev.secrets.env`) as a
+        // second version of the SAME secret, projected at a subdirectory item
+        // path under the one `/seed` volume — Cloud Run forbids nested mounts, so
+        // the two seed files cannot be two volumes. Absent for envs with no
+        // `Secrets`-slot pack (the CLI passes `None`).
+        if let Some(dev_bytes) = &self.dev_secrets {
+            let dev_version = self
+                .target
+                .upsert_secret(&secret_name, dev_bytes)
+                .await
+                .map_err(provider)?;
+            secret_items.push(SecretMountItem {
+                version: dev_version.version,
+                // The seed tree mirrors the on-disk store, so the dev-store's
+                // store-relative path is also its path under `/seed`, projected
+                // as a subdirectory item (Cloud Run forbids a nested mount).
+                rel_path: DEV_STORE_RELATIVE.to_string(),
+            });
+        }
+        // Grant the runtime SA read on the secret (covers every version) —
+        // load-bearing: Cloud Run rejects a revision whose SA cannot read a
+        // mounted version. Idempotent, so a re-warm is a no-op.
         self.target
             .grant_secret_accessor(&secret_name, &runtime_service_account)
             .await
             .map_err(provider)?;
         let secret_mounts = vec![SecretMount {
-            mount_path: format!("{SEED_MOUNT_DIR}/{ENVIRONMENT_SEED_FILE}"),
+            mount_dir: SEED_MOUNT_DIR.to_string(),
             secret_name,
-            version: secret_version.version,
+            items: secret_items,
         }];
         // Revision-scoped, deterministic — built once and reused across etag
         // retries so a re-upsert never renders a different container.
@@ -1184,6 +1212,79 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "GREENTIC_SEED_DIR" && v == SEED_MOUNT_DIR),
             "the seed boot-copy is activated"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_without_dev_secrets_mounts_only_environment_json() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+
+        handler
+            .warm_revision(&env, revision.revision_id, None)
+            .await
+            .unwrap();
+
+        let mounts = target
+            .service_secrets_for(revision.deployment_id)
+            .expect("warm upserts the Service with a seed mount");
+        assert_eq!(mounts.len(), 1, "one /seed volume");
+        assert_eq!(mounts[0].mount_dir, SEED_MOUNT_DIR);
+        assert_eq!(mounts[0].items.len(), 1, "no dev-store → env.json only");
+        assert_eq!(mounts[0].items[0].rel_path, ENVIRONMENT_SEED_FILE);
+    }
+
+    #[tokio::test]
+    async fn warm_stages_dev_store_as_second_version_under_one_seed_volume() {
+        let target = Arc::new(InMemoryCloudRun::default());
+        let handler = GcpCloudRunDeployerHandler::with_target_and_dev_secrets(
+            target.clone(),
+            Some(b"ENC-DEV-STORE".to_vec()),
+        );
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+
+        handler
+            .warm_revision(&env, revision.revision_id, None)
+            .await
+            .unwrap();
+
+        // Both seed files ride ONE secret's two versions under ONE /seed volume
+        // (Cloud Run forbids nested mounts): env.json at the root, dev-store at
+        // its on-disk subdirectory path.
+        let params = params_from_answers(&env, None).unwrap();
+        let secret_name = environment_secret_name(&params.secret_prefix);
+        let (_, version_count) = target
+            .secrets()
+            .get(&secret_name)
+            .cloned()
+            .expect("seed secret staged");
+        assert_eq!(version_count, 2, "env.json v1 + dev-store v2 on one secret");
+
+        let mounts = target
+            .service_secrets_for(revision.deployment_id)
+            .expect("warm upserts the Service with a seed mount");
+        assert_eq!(
+            mounts.len(),
+            1,
+            "one secret → one /seed volume, never nested"
+        );
+        assert_eq!(mounts[0].mount_dir, SEED_MOUNT_DIR);
+        assert_eq!(mounts[0].secret_name, secret_name);
+        assert_eq!(mounts[0].items.len(), 2);
+        assert_eq!(mounts[0].items[0].rel_path, ENVIRONMENT_SEED_FILE);
+        assert_eq!(mounts[0].items[0].version, "1");
+        assert_eq!(mounts[0].items[1].rel_path, DEV_STORE_RELATIVE);
+        assert_eq!(mounts[0].items[1].version, "2");
+
+        // The runtime SA can read the mounted versions.
+        let sa = params.runtime_service_account(env.environment_id.as_str());
+        assert!(
+            target
+                .secret_accessors_for(&secret_name)
+                .expect("grant recorded")
+                .contains(&sa)
         );
     }
 

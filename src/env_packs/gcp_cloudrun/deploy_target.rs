@@ -85,19 +85,32 @@ pub struct TrafficTarget {
     pub percent: u32,
 }
 
-/// A Secret Manager version mounted as a read-only file in the container (plan
-/// D6). Cloud Run mounts the immutable numeric `version` at `mount_path`;
-/// greentic-start's `GREENTIC_SEED_DIR` boot-copy (a follow-up slice) reads it
-/// into the writable env store. Env-var secret sources were rejected: the dev
-/// store needs a writable file, and env-var payloads hit the 32 KB limit.
+/// A single Secret Manager secret projected as a read-only volume at `mount_dir`
+/// (plan D6). Each item maps an immutable numeric `version` to a file at a
+/// subdirectory-capable `rel_path` under `mount_dir`; greentic-start's
+/// `GREENTIC_SEED_DIR` boot-copy reads the tree into the writable env store.
+/// One secret → one volume: Cloud Run **forbids nested volume mounts**, so both
+/// seed files (`environment.json` and `.greentic/dev/.dev.secrets.env`) ride
+/// distinct versions of the SAME secret under one `/seed` mount rather than two
+/// nested mounts. Env-var secret sources were rejected: the dev store needs a
+/// writable file, and env-var payloads hit the 32 KB limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretMount {
-    /// Absolute container path the secret version is mounted at
-    /// (e.g. `/seed/environment.json`).
-    pub mount_path: String,
+    /// Absolute container directory the secret volume mounts at (e.g. `/seed`).
+    pub mount_dir: String,
     pub secret_name: String,
+    /// Version→relative-path items projected into `mount_dir`.
+    pub items: Vec<SecretMountItem>,
+}
+
+/// One `(version, rel_path)` file within a [`SecretMount`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretMountItem {
     /// The immutable numeric version (never the `latest` alias — plan D6).
     pub version: String,
+    /// Path relative to [`SecretMount::mount_dir`]; may contain subdirectories
+    /// (Cloud Run projects `a/b/c` by creating the intermediate directories).
+    pub rel_path: String,
 }
 
 /// Desired state of a Cloud Run Service + the one revision being created.
@@ -359,6 +372,9 @@ pub struct InMemoryCloudRun {
     /// Boot env vars each Service was upserted with, so tests can assert the
     /// deployer projects the seed-activation + identity vars onto the container.
     service_env: Mutex<BTreeMap<DeploymentId, Vec<(String, String)>>>,
+    /// Secret mounts each Service was upserted with, so tests can assert the
+    /// deployer projects both seed files under one `/seed` volume.
+    service_secrets: Mutex<BTreeMap<DeploymentId, Vec<SecretMount>>>,
     etag_counter: Mutex<u64>,
 }
 
@@ -440,6 +456,15 @@ impl InMemoryCloudRun {
             .get(&deployment_id)
             .cloned()
     }
+
+    /// Secret mounts the last upsert projected onto `deployment_id`'s container.
+    pub fn service_secrets_for(&self, deployment_id: DeploymentId) -> Option<Vec<SecretMount>> {
+        self.service_secrets
+            .lock()
+            .expect("service-secrets mutex")
+            .get(&deployment_id)
+            .cloned()
+    }
 }
 
 #[async_trait]
@@ -495,6 +520,10 @@ impl CloudRunTarget for InMemoryCloudRun {
             .lock()
             .expect("service-env mutex")
             .insert(spec.deployment_id, spec.env.clone());
+        self.service_secrets
+            .lock()
+            .expect("service-secrets mutex")
+            .insert(spec.deployment_id, spec.secrets.clone());
         Ok(status)
     }
 
