@@ -128,6 +128,14 @@ pub struct ServiceSpec {
     /// Cloud Run `sessionAffinity` (plan D11).
     pub session_affinity: bool,
     pub secrets: Vec<SecretMount>,
+    /// Literal boot environment variables projected onto the container (plan D6
+    /// activation). `GREENTIC_SEED_DIR` triggers greentic-start's seed boot-copy
+    /// of the mounted `environment.json` into the writable env store rooted at
+    /// `HOME`; `GREENTIC_ENV` selects the env dir the seed lands in;
+    /// `GREENTIC_GATEWAY_LISTEN_ADDR` makes the gateway reachable on Cloud Run;
+    /// and the revision-identity vars tell the runtime which revision to serve.
+    /// Order-preserving so the rendered Service is deterministic.
+    pub env: Vec<(String, String)>,
 }
 
 /// Live state of a Cloud Run Service returned by [`CloudRunTarget::get_service`].
@@ -348,6 +356,9 @@ pub struct InMemoryCloudRun {
     /// Last runtime service account each Service was upserted with, so tests can
     /// assert the deployer threads the resolved identity through the seam.
     runtime_service_accounts: Mutex<BTreeMap<DeploymentId, String>>,
+    /// Boot env vars each Service was upserted with, so tests can assert the
+    /// deployer projects the seed-activation + identity vars onto the container.
+    service_env: Mutex<BTreeMap<DeploymentId, Vec<(String, String)>>>,
     etag_counter: Mutex<u64>,
 }
 
@@ -420,6 +431,15 @@ impl InMemoryCloudRun {
             .get(&deployment_id)
             .cloned()
     }
+
+    /// Boot env vars the last upsert projected onto `deployment_id`'s container.
+    pub fn service_env_for(&self, deployment_id: DeploymentId) -> Option<Vec<(String, String)>> {
+        self.service_env
+            .lock()
+            .expect("service-env mutex")
+            .get(&deployment_id)
+            .cloned()
+    }
 }
 
 #[async_trait]
@@ -471,6 +491,10 @@ impl CloudRunTarget for InMemoryCloudRun {
             .lock()
             .expect("runtime-sa mutex")
             .insert(spec.deployment_id, spec.runtime_service_account.clone());
+        self.service_env
+            .lock()
+            .expect("service-env mutex")
+            .insert(spec.deployment_id, spec.env.clone());
         Ok(status)
     }
 
@@ -651,6 +675,7 @@ mod tests {
             access_mode: AccessMode::Public,
             session_affinity: true,
             secrets: Vec::new(),
+            env: Vec::new(),
         }
     }
 

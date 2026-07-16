@@ -211,17 +211,64 @@ pub fn service_name(deployment_id: DeploymentId) -> String {
 }
 
 /// Container directory the env-store seed secrets are volume-mounted under
-/// (plan D6). greentic-start's `GREENTIC_SEED_DIR` boot-copy (a follow-up slice)
-/// reads this tree into the writable env store.
+/// (plan D6). Exported to the runtime as `GREENTIC_SEED_DIR` (see
+/// [`runtime_boot_env`]) so greentic-start's boot-copy reads this tree into the
+/// writable env store.
 const SEED_MOUNT_DIR: &str = "/seed";
 /// The `environment.json` seed file name under [`SEED_MOUNT_DIR`].
 const ENVIRONMENT_SEED_FILE: &str = "environment.json";
+/// Writable env-store root for the runtime container, exported as `HOME`. Cloud
+/// Run's root filesystem is read-only except `/tmp` (in-memory, world-writable)
+/// on the gen1 execution environment, so `LocalFsStore` (`$HOME/.greentic/
+/// environments`) must root there to be creatable under the distroless nonroot
+/// uid. The seed is re-copied on every cold start, matching this ephemeral root.
+const RUNTIME_HOME: &str = "/tmp";
 
 /// The Secret Manager secret name carrying an env's `environment.json` seed
 /// (plan D6): `<secret_prefix>-environment` (default `gtc-{env}-environment`).
 /// Shared so `op env destroy` teardown deletes exactly what `warm` staged.
 pub fn environment_secret_name(secret_prefix: &str) -> String {
     format!("{secret_prefix}-environment")
+}
+
+/// Literal boot env vars projected onto every Cloud Run revision (plan D6
+/// activation + runtime identity). `GREENTIC_SEED_DIR` triggers greentic-start's
+/// boot-copy of the mounted `environment.json` into the writable store rooted at
+/// `HOME`; `GREENTIC_ENV` selects the env dir the seed lands in (greentic-start's
+/// `resolve_env` reads it, and it must agree with where the store opens);
+/// `GREENTIC_GATEWAY_LISTEN_ADDR=0.0.0.0` makes the gateway reachable (greentic-
+/// start otherwise binds loopback and Cloud Run's health check never passes);
+/// and the revision-identity vars mirror the k8s pack-pull contract so the
+/// runtime knows which revision to serve. The bundle *source* URI is read from
+/// the seeded `environment.json`, not an env var, so none is set here.
+fn runtime_boot_env(env: &Environment, revision: &Revision) -> Vec<(String, String)> {
+    let env_id = env.environment_id.as_str();
+    vec![
+        ("GREENTIC_ENV".to_string(), env_id.to_string()),
+        ("GREENTIC_ENV_ID".to_string(), env_id.to_string()),
+        ("GREENTIC_SEED_DIR".to_string(), SEED_MOUNT_DIR.to_string()),
+        ("HOME".to_string(), RUNTIME_HOME.to_string()),
+        (
+            "GREENTIC_GATEWAY_LISTEN_ADDR".to_string(),
+            "0.0.0.0".to_string(),
+        ),
+        (
+            "GREENTIC_REVISION_ID".to_string(),
+            revision.revision_id.0.to_string(),
+        ),
+        (
+            "GREENTIC_DEPLOYMENT_ID".to_string(),
+            revision.deployment_id.0.to_string(),
+        ),
+        (
+            "GREENTIC_BUNDLE_ID".to_string(),
+            revision.bundle_id.as_str().to_string(),
+        ),
+        (
+            "GREENTIC_BUNDLE_DIGEST".to_string(),
+            revision.bundle_digest.clone(),
+        ),
+    ]
 }
 
 /// Deterministic Cloud Run revision name: `gtc-svc-{dep}-{rev}` (61 chars ≤ the
@@ -398,9 +445,10 @@ impl Deployer for GcpCloudRunDeployerHandler {
         // access, then mount that exact version read-only. The grant is
         // load-bearing — Cloud Run rejects a revision whose SA cannot read a
         // mounted secret version. Staged ONCE, before the etag retry loop, so a
-        // precondition retry does not add a redundant secret version. (The
-        // dev-secrets payload and the `GREENTIC_SEED_DIR` boot-copy activation
-        // land in a follow-up slice; the seed is mounted but not yet consumed.)
+        // precondition retry does not add a redundant secret version. The
+        // revision's boot env (`runtime_boot_env`) sets `GREENTIC_SEED_DIR`, so
+        // greentic-start copies this mount into its writable store at boot; the
+        // encrypted dev-secrets payload lands in a follow-up slice.
         let environment_json = serde_json::to_vec(env).map_err(|e| {
             DeployerError::Provider(format!(
                 "serializing environment.json for seed staging: {e}"
@@ -421,6 +469,9 @@ impl Deployer for GcpCloudRunDeployerHandler {
             secret_name,
             version: secret_version.version,
         }];
+        // Revision-scoped, deterministic — built once and reused across etag
+        // retries so a re-upsert never renders a different container.
+        let boot_env = runtime_boot_env(env, revision);
 
         // Read-modify-write under etag optimistic concurrency with bounded
         // retries on a precondition conflict (plan D4): re-read, recompute
@@ -470,6 +521,7 @@ impl Deployer for GcpCloudRunDeployerHandler {
                 access_mode: params.access_mode,
                 session_affinity: true,
                 secrets: secret_mounts.clone(),
+                env: boot_env.clone(),
             };
             match self.target.upsert_service(&spec, etag.as_deref()).await {
                 Ok(status) => break status.url,
@@ -1072,6 +1124,66 @@ mod tests {
         assert!(
             accessors.contains(&sa),
             "runtime SA {sa} must be granted secretAccessor"
+        );
+    }
+
+    #[test]
+    fn runtime_boot_env_activates_seed_and_carries_revision_identity() {
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+        let vars = runtime_boot_env(&env, revision);
+        let get = |k: &str| {
+            vars.iter()
+                .find(|(name, _)| name == k)
+                .map(|(_, v)| v.as_str())
+        };
+
+        // Seed activation + writable store root: the exact contract greentic-
+        // start's boot-copy and `resolve_env` read.
+        assert_eq!(get("GREENTIC_SEED_DIR"), Some(SEED_MOUNT_DIR));
+        assert_eq!(get("HOME"), Some(RUNTIME_HOME));
+        assert_eq!(get("GREENTIC_ENV"), Some(env.environment_id.as_str()));
+        // Reachable on Cloud Run — greentic-start binds loopback by default.
+        assert_eq!(get("GREENTIC_GATEWAY_LISTEN_ADDR"), Some("0.0.0.0"));
+        // Revision identity (k8s pack-pull parity).
+        assert_eq!(get("GREENTIC_ENV_ID"), Some(env.environment_id.as_str()));
+        assert_eq!(
+            get("GREENTIC_REVISION_ID"),
+            Some(revision.revision_id.0.to_string().as_str())
+        );
+        assert_eq!(
+            get("GREENTIC_DEPLOYMENT_ID"),
+            Some(revision.deployment_id.0.to_string().as_str())
+        );
+        assert_eq!(get("GREENTIC_BUNDLE_ID"), Some(revision.bundle_id.as_str()));
+        assert_eq!(
+            get("GREENTIC_BUNDLE_DIGEST"),
+            Some(revision.bundle_digest.as_str())
+        );
+        // No bundle-source var — the source URI rides in the seeded environment.json.
+        assert!(get("GREENTIC_BUNDLE_SOURCE_URI").is_none());
+    }
+
+    #[tokio::test]
+    async fn warm_threads_boot_env_onto_the_service() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+        let r_warm = revision.revision_id;
+
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+
+        // warm builds boot env once and projects it onto the upserted Service,
+        // so the running container actually boots from the staged seed.
+        let recorded = target
+            .service_env_for(revision.deployment_id)
+            .expect("warm upserts the Service with boot env");
+        assert_eq!(recorded, runtime_boot_env(&env, revision));
+        assert!(
+            recorded
+                .iter()
+                .any(|(k, v)| k == "GREENTIC_SEED_DIR" && v == SEED_MOUNT_DIR),
+            "the seed boot-copy is activated"
         );
     }
 
