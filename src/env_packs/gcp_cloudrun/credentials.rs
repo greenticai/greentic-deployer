@@ -57,6 +57,9 @@ pub const VALIDATED_GCP_PERMISSIONS: &[&str] = &[
     "run.services.create",
     "run.services.update",
     "run.services.delete",
+    // Invoker IAM (D12) is a read-modify-write, so BOTH get + set are needed;
+    // set_invoker_policy calls get_iam_policy before set_iam_policy.
+    "run.services.getIamPolicy",
     "run.services.setIamPolicy",
     // Cloud Run revision lifecycle.
     "run.revisions.get",

@@ -70,6 +70,8 @@ pub const REAL_CLOUDRUN_TARGET_IAM_PERMISSIONS: &[&str] = &[
     "run.services.create",
     "run.services.update",
     "run.services.delete",
+    // set_invoker_policy is a read-modify-write: get_iam_policy THEN set_iam_policy.
+    "run.services.getIamPolicy",
     "run.services.setIamPolicy",
     // Revision readiness poll + archive.
     "run.revisions.get",
@@ -395,8 +397,12 @@ impl CloudRunTarget for RealCloudRunTarget {
 // ---- Pure request builders (unit-tested; no HTTP) ----
 
 /// Build the desired Cloud Run [`run::Service`] from a seam [`ServiceSpec`].
-/// `etag` (present on an update) is stamped on the message — `update_service`
-/// carries the precondition on the Service, not a separate builder call.
+///
+/// On an **update** (`etag` present) the message carries the resource `name` and
+/// the precondition `etag` — `update_service` identifies the resource through
+/// `Service.name` and has no separate name/precondition setter. On a **create**
+/// (`etag` is `None`) both are left empty: the resource is formed from the
+/// request's parent + service_id, and a create-with-name would be rejected.
 fn build_service_message(spec: &ServiceSpec, etag: Option<&str>) -> run::Service {
     let mut service = run::Service::new()
         .set_template(build_revision_template(spec))
@@ -406,9 +412,21 @@ fn build_service_message(spec: &ServiceSpec, etag: Option<&str>) -> run::Service
         .set_ingress(run::IngressTraffic::All)
         .set_labels(ownership_labels(spec.deployment_id));
     if let Some(etag) = etag {
+        service.name = service_resource_name(spec);
         service.etag = etag.to_string();
     }
     service
+}
+
+/// The fully-qualified Cloud Run Service resource name for a spec. `update_service`
+/// locates the resource through this; `build_service_message` sets it on updates.
+fn service_resource_name(spec: &ServiceSpec) -> String {
+    format!(
+        "projects/{}/locations/{}/services/{}",
+        spec.project,
+        spec.region,
+        service_name(spec.deployment_id),
+    )
 }
 
 /// Build the revision template: single container, scale-to-zero, the resolved
@@ -746,10 +764,29 @@ mod tests {
     }
 
     #[test]
-    fn build_service_stamps_etag_on_update() {
+    fn build_service_stamps_etag_and_name_on_update_but_not_create() {
         let s = spec(vec![], vec![]);
-        let msg = build_service_message(&s, Some("etag-7"));
-        assert_eq!(msg.etag, "etag-7", "update carries the precondition etag");
+
+        // Create: no name (formed from parent + service_id) and no etag.
+        let create = build_service_message(&s, None);
+        assert_eq!(create.name, "", "create must not carry a resource name");
+        assert_eq!(create.etag, "");
+
+        // Update: name identifies the resource (update_service has no set_name),
+        // etag is the precondition.
+        let update = build_service_message(&s, Some("etag-7"));
+        assert_eq!(
+            update.etag, "etag-7",
+            "update carries the precondition etag"
+        );
+        assert_eq!(
+            update.name,
+            format!(
+                "projects/greentic-local/locations/us-central1/services/{}",
+                service_name(dep(1))
+            ),
+            "update must identify the resource by name, or Cloud Run rejects it",
+        );
     }
 
     #[test]
