@@ -387,7 +387,10 @@ impl Deployer for GcpCloudRunDeployerHandler {
         // 0%-only array); an update keeps the existing distribution and adds
         // this revision at 0% if it is new, so warm never moves traffic.
         let mut attempt = 0;
-        loop {
+        // The Service's `*.run.app` URL rides back on the upsert response (it is
+        // assigned at Service-create time and is immutable after), so take it as
+        // the loop's break value — the caller needs no extra `get_service`.
+        let endpoint_url = loop {
             let existing = self
                 .target
                 .get_service(&service_ref)
@@ -426,7 +429,7 @@ impl Deployer for GcpCloudRunDeployerHandler {
                 secrets: Vec::new(),
             };
             match self.target.upsert_service(&spec, etag.as_deref()).await {
-                Ok(_) => break,
+                Ok(status) => break status.url,
                 Err(CloudRunTargetError::PreconditionFailed) => {
                     attempt += 1;
                     if attempt > MAX_ETAG_RETRIES {
@@ -438,7 +441,7 @@ impl Deployer for GcpCloudRunDeployerHandler {
                 }
                 Err(e) => return Err(provider(e)),
             }
-        }
+        };
 
         let revision_ref = RevisionRef {
             deployment_id,
@@ -453,7 +456,23 @@ impl Deployer for GcpCloudRunDeployerHandler {
             WARM_READY_POLL_INTERVAL,
         )
         .await?;
-        Ok(WarmOutcome::default())
+
+        // Apply the invoker IAM binding for the requested access mode (plan D12)
+        // as the FINAL commit step — only after the new revision is proven ready.
+        // The invoker policy is service-WIDE (it governs every revision at once),
+        // so mutating it before readiness would change access on the currently-
+        // serving revision even when this deploy then fails or times out: a
+        // `public`→`authenticated` flip is an outage, the inverse exposes prod on
+        // a failed deploy. Deferring it past the readiness wait means a failed
+        // revision never touches live access. The Service upsert alone does NOT
+        // set the policy (it is a separate IAM resource, so a `Public` service's
+        // `run.app` URL 403s without this), and re-applying the same binding on a
+        // second-revision warm is a harmless idempotent no-op.
+        self.target
+            .set_invoker_policy(&service_ref, params.access_mode)
+            .await
+            .map_err(provider)?;
+        Ok(WarmOutcome { endpoint_url })
     }
 
     async fn drain_revision(
@@ -902,6 +921,54 @@ mod tests {
         assert_eq!(
             target2.runtime_service_account_for(dep_a).unwrap(),
             "custom-runtime@acme.iam.gserviceaccount.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_applies_invoker_policy_for_the_requested_access_mode() {
+        // F5 (plan D12): a warm must apply the invoker IAM binding, not just the
+        // Service upsert — the IAM policy is a separate resource, so without this
+        // a Public service's `run.app` URL 403s every request. Default is Public.
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+        assert_eq!(
+            target.invoker_policy_for(dep_a),
+            Some(AccessMode::Public),
+            "warm applies the default Public invoker binding"
+        );
+
+        // An `authenticated` answer leaves the service private.
+        let (handler2, target2) = handler_with_fake();
+        let answers = serde_json::json!({ "access_mode": "authenticated" });
+        handler2
+            .warm_revision(&env, r_warm, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            target2.invoker_policy_for(dep_a),
+            Some(AccessMode::Authenticated),
+            "an authenticated env applies the Authenticated invoker binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_returns_the_service_endpoint_url() {
+        // The Service's `*.run.app` URL rides back on the warm outcome (read from
+        // the upsert response), so the CLI needs no extra get_service round-trip.
+        let (handler, _target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+        let outcome = handler.warm_revision(&env, r_warm, None).await.unwrap();
+        let url = outcome
+            .endpoint_url
+            .expect("warm surfaces the Service's *.run.app URL from the upsert response");
+        assert!(
+            url.contains(&service_name(dep_a)) && url.ends_with(".run.app"),
+            "endpoint URL should be the Service's run.app URL, got {url}"
         );
     }
 

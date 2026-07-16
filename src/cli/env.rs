@@ -1082,7 +1082,7 @@ pub fn apply_revision(
     // (K8s worker Deployment / ECS service / Cloud Run service) for the outcome.
     // The applicability gate above guarantees the `else` arm is AWS-ECS or Cloud
     // Run; `apply_revision_non_k8s` dispatches between them.
-    let (identity, worker_name): (&'static str, String) = if is_k8s {
+    let (identity, worker_name, endpoint_url): (&'static str, String, Option<String>) = if is_k8s {
         let worker_name = crate::env_packs::k8s::manifests::worker_name(revision);
         let bound_token =
             crate::env_packs::k8s::resolve_bound_identity(store, &env, &env_id, answers.as_ref())?;
@@ -1103,7 +1103,7 @@ pub fn apply_revision(
             bound_token,
             secrets_backend,
         )?;
-        (identity, worker_name)
+        (identity, worker_name, None)
     } else {
         apply_revision_non_k8s(
             store,
@@ -1116,22 +1116,26 @@ pub fn apply_revision(
         )?
     };
 
-    Ok(OpOutcome::new(
-        NOUN,
-        "apply-revision",
-        json!({
-            "environment_id": env.environment_id.as_str(),
-            "kind": descriptor.as_str(),
-            "revision_id": revision_id.to_string(),
-            "lifecycle": lifecycle,
-            // Which Deployer verb the recorded lifecycle drove.
-            "action": action,
-            "worker_name": worker_name,
-            "answers_ref": answers_ref_wire,
-            // Identity the cluster was mutated as — see `reconcile`.
-            "identity": identity,
-        }),
-    ))
+    let mut result = json!({
+        "environment_id": env.environment_id.as_str(),
+        "kind": descriptor.as_str(),
+        "revision_id": revision_id.to_string(),
+        "lifecycle": lifecycle,
+        // Which Deployer verb the recorded lifecycle drove.
+        "action": action,
+        "worker_name": worker_name,
+        "answers_ref": answers_ref_wire,
+        // Identity the cluster was mutated as — see `reconcile`.
+        "identity": identity,
+    });
+    // Cloud Run discovers a live `*.run.app` URL for the Service and returns it
+    // here (the "one command → live URL" milestone). The K8s / AWS-ECS paths
+    // have no deployer-discovered endpoint (operator-supplied ingress / ALB), so
+    // surface the field only when present — their outcomes stay byte-identical.
+    if let Some(url) = endpoint_url {
+        result["endpoint_url"] = json!(url);
+    }
+    Ok(OpOutcome::new(NOUN, "apply-revision", result))
 }
 
 /// Connect to the cluster and dispatch the single revision's Deployer verb:
@@ -1236,8 +1240,9 @@ fn unsupported_apply_kind(descriptor: &greentic_deploy_spec::PackDescriptor) -> 
 
 /// Dispatch `apply-revision` for a non-K8s deployer. Today the AWS-ECS and GCP
 /// Cloud Run env-packs have live deploy paths; every other registered kind is
-/// rejected. Returns `(identity, worker_name)` — the analogue of the K8s
-/// `(bound|ambient, worker Deployment name)`.
+/// rejected. Returns `(identity, worker_name, endpoint_url)` — the analogue of
+/// the K8s `(bound|ambient, worker Deployment name)`, plus the live endpoint URL
+/// when the backend discovers one (Cloud Run's `*.run.app`; `None` for AWS-ECS).
 #[cfg(any(feature = "creds-aws", feature = "creds-gcp"))]
 #[allow(clippy::too_many_arguments)]
 fn apply_revision_non_k8s(
@@ -1248,7 +1253,7 @@ fn apply_revision_non_k8s(
     present: bool,
     answers: Option<&Value>,
     descriptor: &greentic_deploy_spec::PackDescriptor,
-) -> Result<(&'static str, String), OpError> {
+) -> Result<(&'static str, String, Option<String>), OpError> {
     #[cfg(feature = "creds-aws")]
     {
         if is_aws_ecs_kind(descriptor) {
@@ -1274,7 +1279,7 @@ fn apply_revision_non_k8s(
     _present: bool,
     _answers: Option<&Value>,
     descriptor: &greentic_deploy_spec::PackDescriptor,
-) -> Result<(&'static str, String), OpError> {
+) -> Result<(&'static str, String, Option<String>), OpError> {
     Err(unsupported_apply_kind(descriptor))
 }
 
@@ -1379,8 +1384,9 @@ async fn resolve_ecs_handler(
 
 /// Connect to AWS and drive the single revision's ECS verb: `warm_revision`
 /// when present, `archive_revision` when absent (mirrors
-/// `apply_revision_k8s_cluster`). Returns `(identity, ECS service name)`.
-/// Requires the `deploy-aws-ecs` feature.
+/// `apply_revision_k8s_cluster`). Returns `(identity, ECS service name, None)` —
+/// AWS-ECS has no deployer-discovered endpoint (the ALB DNS is operator infra),
+/// so the endpoint slot is always `None`. Requires the `deploy-aws-ecs` feature.
 #[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
 fn apply_revision_aws_ecs(
     store: &LocalFsStore,
@@ -1389,7 +1395,7 @@ fn apply_revision_aws_ecs(
     revision_id: RevisionId,
     present: bool,
     answers: Option<&Value>,
-) -> Result<(&'static str, String), OpError> {
+) -> Result<(&'static str, String, Option<String>), OpError> {
     use crate::env_packs::aws::credentials::run_aws_async;
     use crate::env_packs::aws::real_target::service_name;
     use crate::env_packs::deployer::Deployer;
@@ -1418,7 +1424,7 @@ fn apply_revision_aws_ecs(
         }
         Ok::<(), OpError>(())
     })?;
-    Ok((identity, worker_name))
+    Ok((identity, worker_name, None))
 }
 
 #[cfg(all(feature = "creds-aws", not(feature = "deploy-aws-ecs")))]
@@ -1429,7 +1435,7 @@ fn apply_revision_aws_ecs(
     _revision_id: RevisionId,
     _present: bool,
     _answers: Option<&Value>,
-) -> Result<(&'static str, String), OpError> {
+) -> Result<(&'static str, String, Option<String>), OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `deploy-aws-ecs` feature; \
          `op env apply-revision` for an aws-ecs env needs it to talk to AWS"
@@ -1437,15 +1443,122 @@ fn apply_revision_aws_ecs(
     ))
 }
 
-/// Dispatch `apply-revision` for the GCP Cloud Run deployer.
+/// Resolve the bound deployer credential (or the ambient ADC chain) and parse
+/// the Cloud Run construction inputs from the binding answers. Returns
+/// `(identity_label, params, credentials)` — the GCP analogue of
+/// [`aws_ecs_target_inputs`], shared by `apply-revision` and `apply-traffic` so
+/// both honor the same credential resolution.
 ///
-/// The dispatch/routing is wired in this train slice (the applicability gate now
-/// admits the cloudrun kind and routes it here); the live Cloud Run connection
-/// is delivered with the real target in a later slice. Until then this
-/// recognizes the kind and returns an honest `Conflict` rather than silently
-/// succeeding or driving an unconfigured target — the Cloud Run analogue of the
+/// Fails closed (before any GCP call) when a `credentials_ref` is bound but
+/// unreadable (via `resolve_bound_credentials`); a `None` credential means "no
+/// ref bound", so the target falls back to the ambient ADC chain — the same
+/// bound-or-ambient model the AWS path uses.
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+fn cloudrun_target_inputs(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    answers: Option<&Value>,
+) -> Result<
+    (
+        &'static str,
+        crate::env_packs::gcp_cloudrun::deployer::GcpCloudRunParams,
+        Option<crate::env_packs::gcp_cloudrun::bound_session::GcpCredentialMaterial>,
+    ),
+    OpError,
+> {
+    use crate::env_packs::gcp_cloudrun::bound_session::resolve_bound_credentials;
+    use crate::env_packs::gcp_cloudrun::deployer::GcpCloudRunParams;
+
+    let credentials = resolve_bound_credentials(store, env, env_id)?;
+    let identity = if credentials.is_some() {
+        "bound"
+    } else {
+        "ambient"
+    };
+    let params = GcpCloudRunParams::from_answers(env, answers)
+        .map_err(|e| OpError::Conflict(format!("invalid gcp-cloudrun binding answers: {e}")))?;
+    Ok((identity, params, credentials))
+}
+
+/// Build the region-pinned Cloud Run + Secret Manager clients (with the bound
+/// credential injected, else ambient ADC) and wrap them in a handler — the GCP
+/// analogue of [`resolve_ecs_handler`]. The Service's `*.run.app` URL rides back
+/// on the warm outcome (read from the upsert response), so the caller needs no
+/// separate handle on the target.
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+async fn resolve_cloudrun_handler(
+    project: &str,
+    region: &str,
+    credentials: Option<crate::env_packs::gcp_cloudrun::bound_session::GcpCredentialMaterial>,
+) -> Result<crate::env_packs::gcp_cloudrun::GcpCloudRunDeployerHandler, OpError> {
+    use crate::env_packs::gcp_cloudrun::GcpCloudRunDeployerHandler;
+    use crate::env_packs::gcp_cloudrun::real_target::RealCloudRunTarget;
+    use std::sync::Arc;
+
+    let target = RealCloudRunTarget::resolve(project, region, credentials)
+        .await
+        .map_err(|e| {
+            OpError::Conflict(format!(
+                "cannot initialize the GCP Cloud Run deployer client: {e}"
+            ))
+        })?;
+    Ok(GcpCloudRunDeployerHandler::with_target(Arc::new(target)))
+}
+
+/// Connect to GCP and drive the single revision's Cloud Run verb: `warm_revision`
+/// when present, `archive_revision` when absent (mirrors `apply_revision_aws_ecs`).
+/// Returns `(identity, Cloud Run service name, endpoint_url)` — the Service's
+/// live `*.run.app` URL is discovered after a successful warm (`None` on
+/// archive). Requires the `deploy-gcp-cloudrun` feature.
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+fn apply_revision_cloudrun(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    revision_id: RevisionId,
+    present: bool,
+    answers: Option<&Value>,
+) -> Result<(&'static str, String, Option<String>), OpError> {
+    use crate::env_packs::deployer::Deployer;
+    use crate::env_packs::gcp_cloudrun::credentials::run_gcp_async;
+    use crate::env_packs::gcp_cloudrun::deployer::service_name;
+
+    let revision = env
+        .revisions
+        .iter()
+        .find(|r| r.revision_id == revision_id)
+        .expect("revision presence checked by the caller");
+    let worker_name = service_name(revision.deployment_id);
+    let (identity, params, credentials) = cloudrun_target_inputs(store, env, env_id, answers)?;
+
+    let endpoint_url = run_gcp_async(async move {
+        let handler =
+            resolve_cloudrun_handler(&params.project, &params.region, credentials).await?;
+        if present {
+            // The Service's live `*.run.app` URL rides back on the warm outcome
+            // (read from the upsert response — no extra round-trip): the "one
+            // command → live URL" milestone.
+            let outcome = handler
+                .warm_revision(env, revision_id, answers)
+                .await
+                .map_err(|e| OpError::Conflict(e.to_string()))?;
+            Ok::<Option<String>, OpError>(outcome.endpoint_url)
+        } else {
+            handler
+                .archive_revision(env, revision_id, answers)
+                .await
+                .map_err(|e| OpError::Conflict(e.to_string()))?;
+            Ok::<Option<String>, OpError>(None)
+        }
+    })?;
+    Ok((identity, worker_name, endpoint_url))
+}
+
+/// `deploy-gcp-cloudrun`-less builds recognize the cloudrun kind (the dispatch
+/// arm is `creds-gcp`-gated) but cannot talk to Cloud Run — the analogue of the
 /// AWS `#[cfg(not(deploy-aws-ecs))]` "compiled without the cloud feature" stub.
-#[cfg(feature = "creds-gcp")]
+#[cfg(all(feature = "creds-gcp", not(feature = "deploy-gcp-cloudrun")))]
 fn apply_revision_cloudrun(
     _store: &LocalFsStore,
     _env: &Environment,
@@ -1453,11 +1566,10 @@ fn apply_revision_cloudrun(
     _revision_id: RevisionId,
     _present: bool,
     _answers: Option<&Value>,
-) -> Result<(&'static str, String), OpError> {
+) -> Result<(&'static str, String, Option<String>), OpError> {
     Err(OpError::Conflict(
-        "the GCP Cloud Run deployer kind is recognized, but this build has no live \
-         Cloud Run apply path yet — the real target lands in a later release. \
-         `op env apply-revision` for a cloudrun env is not available until then"
+        "this build was compiled without the `deploy-gcp-cloudrun` feature; \
+         `op env apply-revision` for a cloudrun env needs it to talk to Cloud Run"
             .to_string(),
     ))
 }
@@ -1653,11 +1765,42 @@ fn apply_traffic_aws_ecs(
 }
 
 /// Push one deployment's recorded traffic split to its live Cloud Run Service
-/// (native `traffic[]` weights). The dispatch is wired in this train slice; the
-/// live Cloud Run connection lands with the real target in a later slice, so
-/// today this recognizes the kind and returns an honest `Conflict` rather than
-/// silently succeeding — the Cloud Run analogue of `apply_revision_cloudrun`.
-#[cfg(feature = "creds-gcp")]
+/// (native `traffic[]` weights) via `apply_traffic_split`. A no-op live when the
+/// Service does not yet exist (the recorded split's invariants are still
+/// enforced first). Returns the identity used + the enforced split. Requires the
+/// `deploy-gcp-cloudrun` feature.
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+fn apply_traffic_cloudrun(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    deployment_id: greentic_deploy_spec::DeploymentId,
+    answers: Option<&Value>,
+) -> Result<
+    (
+        &'static str,
+        crate::env_packs::deployer::TrafficSplitOutcome,
+    ),
+    OpError,
+> {
+    use crate::env_packs::deployer::Deployer;
+    use crate::env_packs::gcp_cloudrun::credentials::run_gcp_async;
+
+    let (identity, params, credentials) = cloudrun_target_inputs(store, env, env_id, answers)?;
+    let outcome = run_gcp_async(async move {
+        let handler =
+            resolve_cloudrun_handler(&params.project, &params.region, credentials).await?;
+        handler
+            .apply_traffic_split(env, deployment_id, answers)
+            .await
+            .map_err(|e| OpError::Conflict(e.to_string()))
+    })?;
+    Ok((identity, outcome))
+}
+
+/// `deploy-gcp-cloudrun`-less builds recognize the cloudrun kind but cannot talk
+/// to Cloud Run — the analogue of the AWS `#[cfg(not(deploy-aws-ecs))]` stub.
+#[cfg(all(feature = "creds-gcp", not(feature = "deploy-gcp-cloudrun")))]
 fn apply_traffic_cloudrun(
     _store: &LocalFsStore,
     _env: &Environment,
@@ -1672,9 +1815,8 @@ fn apply_traffic_cloudrun(
     OpError,
 > {
     Err(OpError::Conflict(
-        "the GCP Cloud Run deployer kind is recognized, but this build has no live \
-         Cloud Run traffic path yet — the real target lands in a later release. \
-         `op env apply-traffic` for a cloudrun env is not available until then"
+        "this build was compiled without the `deploy-gcp-cloudrun` feature; \
+         `op env apply-traffic` for a cloudrun env needs it to talk to Cloud Run"
             .to_string(),
     ))
 }
@@ -4542,14 +4684,17 @@ mod tests {
         }
     }
 
-    /// With a staged revision the cloudrun dispatch is reached; the live Cloud
-    /// Run apply path is not built in this slice, so it fails closed with an
-    /// honest conflict (never a silent success against an unconfigured target).
+    /// The GCP Cloud Run deployer kind IS admitted past the applicability gate
+    /// (this live-wiring slice): with a bogus revision id the verb falls through
+    /// to the per-revision lookup and returns `NotFound`, where PR-2 rejected the
+    /// whole kind with a stub `Conflict`. Proves the gate no longer hard-rejects
+    /// cloudrun — no GCP call is reached (the revision lookup fails first), so the
+    /// test is deterministic without credentials (mirrors
+    /// `apply_revision_admits_aws_ecs_kind`).
     #[cfg(feature = "creds-gcp")]
     #[test]
-    fn apply_revision_cloudrun_live_path_unavailable() {
-        use crate::cli::tests_common::{make_binding, make_bundle_deployment, make_revision};
-        use greentic_deploy_spec::RevisionLifecycle;
+    fn apply_revision_admits_cloudrun_kind() {
+        use crate::cli::tests_common::make_binding;
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let reg = builtins();
@@ -4558,28 +4703,17 @@ mod tests {
             CapabilitySlot::Deployer,
             "greentic.deployer.gcp-cloudrun@1.0.0",
         ));
-        let deployment = make_bundle_deployment("local", "cr-bundle");
-        let revision = make_revision(
-            "local",
-            "cr-bundle",
-            &deployment.deployment_id,
-            1,
-            RevisionLifecycle::Ready,
-        );
-        let revision_id = revision.revision_id;
-        env.bundles.push(deployment);
-        env.revisions.push(revision);
         store.save(&env).unwrap();
         let err = apply_revision(
             &store,
             &reg,
             &OpFlags::default(),
-            apply_revision_args("local", &revision_id.to_string(), None),
+            apply_revision_args("local", "00000000000000000000000000", None),
         )
         .unwrap_err();
         match err {
-            OpError::Conflict(msg) => assert!(msg.contains("Cloud Run apply path"), "{msg}"),
-            other => panic!("expected Conflict(live path unavailable), got {other}"),
+            OpError::NotFound(msg) => assert!(msg.contains("revision"), "{msg}"),
+            other => panic!("expected NotFound(revision), got {other}"),
         }
     }
 
@@ -4681,13 +4815,16 @@ mod tests {
         }
     }
 
-    /// A cloudrun env is admitted past the apply-traffic gate (Cloud Run has a
-    /// native traffic-weight router, like the ALB listener) and reaches the
-    /// dispatch; the live path is not built in this slice, so it fails closed
-    /// with an honest conflict rather than a silent success.
+    /// A cloudrun env IS admitted past the apply-traffic gate (Cloud Run has a
+    /// native traffic-weight router, like the ALB listener) and reaches the live
+    /// dispatch (this live-wiring slice). With no recorded split for the target
+    /// deployment the pure `enforce_split_invariants` precondition fires first —
+    /// before any Cloud Run API call — so the test is deterministic without
+    /// credentials (mirrors `apply_traffic_admits_aws_ecs_but_requires_launch_config`,
+    /// where the AWS launch-config check fires first).
     #[cfg(feature = "creds-gcp")]
     #[test]
-    fn apply_traffic_admits_cloudrun_but_live_path_unavailable() {
+    fn apply_traffic_admits_cloudrun_but_requires_recorded_split() {
         use crate::cli::tests_common::make_binding;
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
@@ -4706,8 +4843,8 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            OpError::Conflict(msg) => assert!(msg.contains("Cloud Run traffic path"), "{msg}"),
-            other => panic!("expected Conflict(live path unavailable), got {other}"),
+            OpError::Conflict(msg) => assert!(msg.contains("TrafficSplit"), "{msg}"),
+            other => panic!("expected Conflict(no recorded split), got {other}"),
         }
     }
 
