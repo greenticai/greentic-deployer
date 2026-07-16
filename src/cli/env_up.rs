@@ -312,6 +312,7 @@ pub(crate) fn up(
             "seeded": vault.seeds.seeded,
             "skipped_present": vault.seeds.skipped_present,
             "warned_missing": vault.seeds.warned_missing,
+            "webhook_secrets_provisioned": vault.seeds.webhook_secrets_provisioned,
         });
     }
 
@@ -413,6 +414,10 @@ struct SeedSummary {
     seeded: usize,
     skipped_present: usize,
     warned_missing: usize,
+    /// Generated per-endpoint webhook secrets minted into Vault this run (the
+    /// custodial dev-store path mints them; a Vault backend leaves them unset —
+    /// see [`provision_endpoint_webhook_secrets`]).
+    webhook_secrets_provisioned: usize,
 }
 
 /// The vault phase result, for the outcome + verify.
@@ -724,6 +729,87 @@ fn seed_secrets(
     Ok(summary)
 }
 
+/// Phase 4b.3 — provision each messaging endpoint's GENERATED webhook secret
+/// into Vault.
+///
+/// `messaging::provision_webhook_secret` mints the value only for the custodial
+/// dev-store backend; on a Vault backend it stamps the `webhook_secret_ref` but
+/// writes no value, and it runs at endpoint-create time — before this Vault
+/// exists. The worker reads that ref from Vault to authenticate every inbound
+/// webhook (the `x-telegram-bot-api-secret-token` header), so without this it
+/// finds the secret absent and 401s every request.
+///
+/// Runs after [`seed_secrets`], while Vault is reachable. Two guards:
+///
+/// - **Ownership:** only refs matching the deterministic generated shape
+///   ([`messaging::build_webhook_secret_ref`]) are minted. A caller can stamp a
+///   BYO `webhook_secret_ref` on an endpoint and provision its value out of
+///   band; minting over that here would swap in an unrelated token, so a
+///   non-generated ref is left untouched. The generated shape embeds the env's
+///   *current* tenant, so a ref minted under a prior `tenant_org_id` also reads
+///   as non-generated and is left untouched — changing an env's tenant after
+///   endpoints exist strands their refs (the same pre-existing hazard that hits
+///   every tenant-scoped endpoint secret, not just webhooks).
+/// - **Idempotence:** the presence check and the write are not atomic (the store
+///   exposes no compare-and-set here), so this protects the common case, not
+///   concurrency. A *sequential* re-run finds the ref present and skips it, never
+///   rotating a live webhook secret. Two *concurrent* first-time runs can each
+///   observe absence and write different values (last-writer-wins). That is
+///   benign while no webhook is registered — `env up` never calls `setWebhook` —
+///   but a public-URL env whose worker registers one on reconcile could have a
+///   losing concurrent write strand the registered secret until the next
+///   `env up` re-provisions it. The failure mode is fail-closed (mismatched
+///   inbound webhooks are rejected, never spoofable); fully atomic provisioning
+///   would need a CAS-capable backend op (tracked separately).
+#[cfg(feature = "k8s-client")]
+fn provision_endpoint_webhook_secrets(
+    binding: &crate::env_packs::k8s::manifests::VaultBackend,
+    addr: &str,
+    token: &str,
+    tenant: &str,
+    env_id: &greentic_deploy_spec::EnvId,
+    endpoints: &[greentic_deploy_spec::MessagingEndpoint],
+) -> Result<usize, OpError> {
+    use greentic_secrets_lib::vault::VaultAuth;
+    let mut provisioned = 0;
+    for ep in endpoints {
+        let Some(ref_uri) = ep.webhook_secret_ref.as_ref() else {
+            continue;
+        };
+        // Ownership guard: only provision refs env up itself would have
+        // generated. A caller-supplied ref (different value provenance) is left
+        // for its owner rather than clobbered with a fresh mint.
+        let generated_ref =
+            super::messaging::build_webhook_secret_ref(env_id, &ep.endpoint_id, tenant)?;
+        if ref_uri != &generated_ref {
+            continue;
+        }
+        // The worker resolves this ref to a runtime store URI via the one
+        // authoritative converter; write to the same place by deriving the URI
+        // through it (`SecretRef::to_store_uri`) rather than a local scheme swap.
+        let store_uri = super::secrets::secret_ref_to_store_uri(ref_uri)?;
+        let cfg = || {
+            super::secrets::vault_backend_config_from_binding(
+                binding,
+                addr.to_string(),
+                VaultAuth::Token(token.to_string()),
+            )
+        };
+        if super::secrets::vault_get_with_config(cfg(), tenant, &store_uri)?.is_some() {
+            // Already provisioned — never rotate a live webhook secret.
+            continue;
+        }
+        let value = super::messaging::generate_webhook_secret()?;
+        super::secrets::vault_put_with_config(cfg(), tenant, &store_uri, &value)?;
+        eprintln!(
+            "[env up] vault: provisioned generated webhook secret for endpoint `{}`",
+            ep.provider_id
+        );
+        provisioned += 1;
+    }
+    Ok(provisioned)
+}
+
 /// Phase 4b — deploy (dev-in-cluster), bootstrap, and seed the env's Vault.
 /// Runs after apply (the secrets binding is in the store) and before reconcile
 /// (workers boot there and must find their secrets present).
@@ -843,7 +929,7 @@ fn vault_phase(
                 "fresh"
             }
         );
-        let seeds = seed_secrets(
+        let mut seeds = seed_secrets(
             &binding,
             &addr,
             root_token,
@@ -854,6 +940,14 @@ fn vault_phase(
             allow_missing_seeds,
             non_interactive,
         )?;
+        seeds.webhook_secrets_provisioned = provision_endpoint_webhook_secrets(
+            &binding,
+            &addr,
+            root_token,
+            &tenant,
+            env_id,
+            &env.messaging_endpoints,
+        )?;
         drop(pf); // kill the port-forward
         (outcome.was_already_configured, seeds)
     } else {
@@ -861,7 +955,7 @@ fn vault_phase(
             "[env up] vault: external mode — skipping deploy + bootstrap, seeding against `{}`",
             binding.addr
         );
-        let seeds = seed_secrets(
+        let mut seeds = seed_secrets(
             &binding,
             &binding.addr,
             root_token,
@@ -871,6 +965,14 @@ fn vault_phase(
             true, // a surviving external Vault: existence-checked seed semantics
             allow_missing_seeds,
             non_interactive,
+        )?;
+        seeds.webhook_secrets_provisioned = provision_endpoint_webhook_secrets(
+            &binding,
+            &binding.addr,
+            root_token,
+            &tenant,
+            env_id,
+            &env.messaging_endpoints,
         )?;
         (true, seeds)
     };
