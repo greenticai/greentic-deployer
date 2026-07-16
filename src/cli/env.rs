@@ -2116,50 +2116,6 @@ pub fn init(
     })
 }
 
-/// Provider-teardown seam for `op env destroy`.
-///
-/// Destroy is otherwise purely local: [`LocalFsStore::destroy_environment`]
-/// renames and purges the env dir — including the binding answers that record
-/// which cloud resources exist. A cloud deployer whose live resources this build
-/// cannot tear down must therefore refuse destroy rather than orphan those
-/// resources *and* delete the only record of them. Today that is GCP Cloud Run:
-/// its provider teardown (inventory → delete Cloud Run Services + Secret Manager
-/// secrets → wait → tombstone, before local removal) is delivered with the real
-/// target in a later train slice, so until then this fails closed for a cloudrun
-/// env. This is the dispatch seam that slice fills in.
-///
-/// K8s / AWS-ECS / local destroy stay purely local (unchanged) — their teardown
-/// is out of destroy's scope today. Best-effort: a missing or unreadable env
-/// never blocks destroy of a corrupt env (that would make it undeletable).
-#[cfg(feature = "creds-gcp")]
-fn provider_teardown_before_destroy(store: &LocalFsStore, env_id: &EnvId) -> Result<(), OpError> {
-    let Ok(true) = store.exists(env_id) else {
-        return Ok(());
-    };
-    let Ok(env) = store.load(env_id) else {
-        return Ok(());
-    };
-    let Some(binding) = env.pack_for_slot(CapabilitySlot::Deployer) else {
-        return Ok(());
-    };
-    if is_cloudrun_kind(&binding.kind) {
-        return Err(OpError::Conflict(
-            "cannot destroy a GCP Cloud Run environment in this build: provider \
-             teardown (deleting Cloud Run Services and Secret Manager secrets before \
-             local removal) is not implemented yet, and destroying now would orphan \
-             those cloud resources and delete the record of them. The teardown lands \
-             with the Cloud Run deploy path in a later release."
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "creds-gcp"))]
-fn provider_teardown_before_destroy(_store: &LocalFsStore, _env_id: &EnvId) -> Result<(), OpError> {
-    Ok(())
-}
-
 /// `op env destroy <env_id> --confirm`. Irreversibly removes the env's
 /// on-disk state via [`LocalFsStore::destroy_environment`] (mechanics,
 /// failure contract, and concurrency notes documented there).
@@ -2195,9 +2151,6 @@ pub fn destroy(
     }
     let env_id =
         EnvId::try_from(env_id).map_err(|e| OpError::InvalidArgument(format!("env_id: {e}")))?;
-    // Provider-teardown seam (see fn docs): fail closed for a cloud env whose
-    // live resources this build cannot tear down, before any audit/mutation.
-    provider_teardown_before_destroy(store, &env_id)?;
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -3536,35 +3489,6 @@ mod tests {
         assert!(store.exists(&survivor).unwrap());
         store.load(&survivor).expect("survivor still loads");
         assert_eq!(store.list().unwrap(), vec![survivor]);
-    }
-
-    /// The provider-teardown seam fails closed for a Cloud Run env: destroy is
-    /// otherwise purely local and would orphan the Cloud Run Services + Secret
-    /// Manager secrets AND delete the record of them. The env is left intact
-    /// until the teardown lands (a later train slice fills this seam).
-    #[cfg(feature = "creds-gcp")]
-    #[test]
-    fn destroy_refuses_cloudrun_env_until_teardown() {
-        use crate::cli::tests_common::make_binding;
-        let dir = tempdir().unwrap();
-        let store = LocalFsStore::new(dir.path());
-        let mut env = make_env("cr-env");
-        env.packs.push(make_binding(
-            CapabilitySlot::Deployer,
-            "greentic.deployer.gcp-cloudrun@1.0.0",
-        ));
-        store.save(&env).unwrap();
-        let err = destroy(&store, &OpFlags::default(), "cr-env", true).unwrap_err();
-        match err {
-            OpError::Conflict(msg) => assert!(msg.contains("teardown"), "{msg}"),
-            other => panic!("expected Conflict(teardown), got {other}"),
-        }
-        // Fail-closed: the env must still exist (nothing was destroyed).
-        let env_id = EnvId::try_from("cr-env").unwrap();
-        assert!(
-            store.exists(&env_id).unwrap(),
-            "a cloudrun env must not be destroyed before provider teardown exists"
-        );
     }
 
     /// `is_cloudrun_kind` recognizes only the Cloud Run descriptor path.
