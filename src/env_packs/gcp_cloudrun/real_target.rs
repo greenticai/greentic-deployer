@@ -540,7 +540,21 @@ fn build_container(spec: &ServiceSpec) -> run::Container {
     run::Container::new()
         .set_image(spec.image.clone())
         .set_resources(build_resources(spec))
+        .set_env(build_env_vars(spec))
         .set_volume_mounts(build_secret_volume_mounts(spec))
+}
+
+/// Project the spec's literal boot env vars onto the container (plan D6
+/// activation), preserving order so the rendered Service is deterministic.
+fn build_env_vars(spec: &ServiceSpec) -> Vec<run::EnvVar> {
+    spec.env
+        .iter()
+        .map(|(name, value)| {
+            run::EnvVar::new()
+                .set_name(name.clone())
+                .set_value(value.clone())
+        })
+        .collect()
 }
 
 /// Scale-to-zero rendered explicitly (plan D5): `min_instance_count = 0`,
@@ -806,6 +820,7 @@ mod tests {
             access_mode: AccessMode::Public,
             session_affinity: true,
             secrets,
+            env: Vec::new(),
         }
     }
 
@@ -929,6 +944,35 @@ mod tests {
         let c = build_container(&s);
         assert_eq!(c.volume_mounts.len(), 1);
         assert!(c.env.is_empty(), "secrets are file volumes, not env vars");
+    }
+
+    #[test]
+    fn build_container_projects_boot_env_as_literal_values_in_order() {
+        let mut s = spec(vec![], vec![]);
+        s.env = vec![
+            ("GREENTIC_SEED_DIR".to_string(), "/seed".to_string()),
+            ("HOME".to_string(), "/tmp".to_string()),
+            (
+                "GREENTIC_GATEWAY_LISTEN_ADDR".to_string(),
+                "0.0.0.0".to_string(),
+            ),
+        ];
+
+        let c = build_container(&s);
+        let rendered: Vec<(&str, Option<&str>)> = c
+            .env
+            .iter()
+            .map(|e| (e.name.as_str(), e.value().map(String::as_str)))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                ("GREENTIC_SEED_DIR", Some("/seed")),
+                ("HOME", Some("/tmp")),
+                ("GREENTIC_GATEWAY_LISTEN_ADDR", Some("0.0.0.0")),
+            ],
+            "boot env is projected as ordered literal values (never value sources)"
+        );
     }
 
     #[test]
