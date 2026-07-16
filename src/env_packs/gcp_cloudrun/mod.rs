@@ -26,9 +26,17 @@
 //! support.
 
 pub mod bootstrap;
+// Only the `deploy-gcp-cloudrun` live-deploy path consumes the bound credential
+// material (`RealCloudRunTarget::resolve` injects it into the Cloud Run / Secret
+// Manager clients), so gate it the same way `real_target` is — otherwise a
+// `creds-gcp`-only build has it dead.
+#[cfg(feature = "deploy-gcp-cloudrun")]
+pub mod bound_session;
 pub mod credentials;
 pub mod deploy_target;
 pub mod deployer;
+#[cfg(feature = "deploy-gcp-cloudrun")]
+pub mod real_target;
 
 use greentic_deploy_spec::CapabilitySlot;
 use semver::VersionReq;

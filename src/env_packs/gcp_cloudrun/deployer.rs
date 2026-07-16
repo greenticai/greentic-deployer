@@ -189,13 +189,19 @@ impl GcpCloudRunParams {
     /// Never empty — a revision must never fall back to the Compute Engine
     /// default identity.
     pub fn runtime_service_account(&self, env_id: &str) -> String {
-        self.service_account.clone().unwrap_or_else(|| {
-            format!(
-                "gtc-{env_id}-runtime@{project}.iam.gserviceaccount.com",
-                project = self.project,
-            )
-        })
+        self.service_account
+            .clone()
+            .unwrap_or_else(|| default_runtime_service_account(env_id, &self.project))
     }
+}
+
+/// The bootstrap-provisioned default runtime service-account email for an env in
+/// a project. The single source of the formula: both the deployer (threading the
+/// identity onto the revision) and the credentials validator (probing
+/// `iam.serviceAccounts.actAs` against this resource, when no `service_account`
+/// override is set) must agree on it, or the preflight validates the wrong SA.
+pub(crate) fn default_runtime_service_account(env_id: &str, project: &str) -> String {
+    format!("gtc-{env_id}-runtime@{project}.iam.gserviceaccount.com")
 }
 
 /// Deterministic Cloud Run Service name for a deployment: `gtc-svc-{ulid}`
