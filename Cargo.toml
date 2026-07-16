@@ -1,7 +1,6 @@
 [workspace]
 members = [
     ".",
-    "crates/greentic-deploy-spec",
     "crates/greentic-environment-store-postgres",
     "crates/greentic-operator-store-server",
     "crates/greentic-operator-trust",
@@ -82,7 +81,7 @@ fs4 = "0.13"
 greentic-bundle = ">=1.1.0-0, <1.2.0-0"
 greentic-config = ">=1.1.0-0, <1.2.0-0"
 greentic-config-types = ">=1.1.0-0, <1.2.0-0"
-greentic-deploy-spec = { path = "crates/greentic-deploy-spec", version = "0.2" }
+greentic-deploy-spec = "0.2"
 greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.2" }
 serde_json = "1"
 semver = "1"
@@ -304,7 +303,7 @@ axum = "0.8"
 # (the K8s deployer requires credential material and there is no CLI setter).
 # Resolves to the same path crate the lib uses, so the `Environment` types
 # unify across the test/lib boundary.
-greentic-deploy-spec = { path = "crates/greentic-deploy-spec" }
+greentic-deploy-spec = "0.2"
 # Re-declared (same registry version the lib already pins) so the live-cluster
 # E2E can derive the canonical store-key the bound-credential resolver reads,
 # and seed a ServiceAccount token via env var. Already in the lockfile via the
