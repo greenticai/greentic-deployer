@@ -765,7 +765,11 @@ mod tests {
     #[test]
     fn aws_request_forwards_extra_env() {
         use std::collections::BTreeMap;
-        let mut req = AwsRequest::new(DeployerCapability::Plan, "acme", PathBuf::from("pack-dir"));
+        let mut req = AwsRequest::new(
+            DeployerCapability::Plan,
+            "acme",
+            Some(PathBuf::from("pack-dir")),
+        );
         req.extra_env = BTreeMap::from([("AWS_ACCESS_KEY_ID".to_string(), "AKIA".to_string())]);
         let dr = req.into_deployer_request();
         assert_eq!(
