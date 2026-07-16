@@ -950,7 +950,7 @@ pub(crate) fn generate_webhook_secret() -> Result<String, OpError> {
 /// endpoint id is folded to lowercase in the pack segment because
 /// `MessagingEndpointId` is a ULID (uppercase) and the runtime canonicalizes
 /// pack segments.
-fn build_webhook_secret_ref(
+pub(crate) fn build_webhook_secret_ref(
     env_id: &EnvId,
     endpoint_id: &MessagingEndpointId,
     tenant: &str,

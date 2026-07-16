@@ -750,15 +750,25 @@ fn webhook_ref_to_store_uri(ref_uri: &str) -> Option<String> {
 /// webhook (the `x-telegram-bot-api-secret-token` header), so without this it
 /// finds the secret absent and 401s every request.
 ///
-/// Runs after [`seed_secrets`], while Vault is reachable. Idempotent: a secret
-/// already present is left untouched — re-running `env up` must never rotate a
-/// live webhook secret out from under an already-registered webhook.
+/// Runs after [`seed_secrets`], while Vault is reachable. Two guards:
+///
+/// - **Ownership:** only refs matching the deterministic generated shape
+///   ([`messaging::build_webhook_secret_ref`]) are minted. A caller can stamp a
+///   BYO `webhook_secret_ref` on an endpoint and provision its value out of
+///   band; minting over that here would swap in an unrelated token, so a
+///   non-generated ref is left untouched.
+/// - **Idempotence:** a ref already present in Vault is skipped, so a
+///   (sequential) re-run never rotates a live webhook secret. Two *concurrent*
+///   first-time runs could both observe absence and mint different values, but
+///   that window is strictly before any webhook is registered (`env up` does
+///   not register webhooks), so no live secret is ever rotated.
 #[cfg(feature = "k8s-client")]
 fn provision_endpoint_webhook_secrets(
     binding: &crate::env_packs::k8s::manifests::VaultBackend,
     addr: &str,
     token: &str,
     tenant: &str,
+    env_id: &greentic_deploy_spec::EnvId,
     endpoints: &[greentic_deploy_spec::MessagingEndpoint],
 ) -> Result<usize, OpError> {
     use greentic_secrets_lib::vault::VaultAuth;
@@ -767,6 +777,14 @@ fn provision_endpoint_webhook_secrets(
         let Some(ref_uri) = ep.webhook_secret_ref.as_ref() else {
             continue;
         };
+        // Ownership guard: only provision refs env up itself would have
+        // generated. A caller-supplied ref (different value provenance) is left
+        // for its owner rather than clobbered with a fresh mint.
+        let generated_ref =
+            super::messaging::build_webhook_secret_ref(env_id, &ep.endpoint_id, tenant)?;
+        if ref_uri != &generated_ref {
+            continue;
+        }
         let store_uri = webhook_ref_to_store_uri(ref_uri.as_str()).ok_or_else(|| {
             OpError::Conflict(format!(
                 "endpoint `{}` has a webhook_secret_ref that is not a `secret://` URI: {}",
@@ -930,6 +948,7 @@ fn vault_phase(
             &addr,
             root_token,
             &tenant,
+            env_id,
             &env.messaging_endpoints,
         )?;
         drop(pf); // kill the port-forward
@@ -955,6 +974,7 @@ fn vault_phase(
             &binding.addr,
             root_token,
             &tenant,
+            env_id,
             &env.messaging_endpoints,
         )?;
         (true, seeds)
