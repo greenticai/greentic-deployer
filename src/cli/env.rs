@@ -973,11 +973,50 @@ pub(crate) fn read_dev_secrets_b64(
         .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)))
 }
 
+/// Store URIs in the env dev-store that are control-plane material and must
+/// NEVER be staged into a runtime seed — currently the bound deployer credential
+/// (`credentials_ref`). A dev-store-backed env persists that credential in the
+/// same `.dev.secrets.env` the seed is built from (`put_credential_material`
+/// writes it at exactly this URI), so a workload holding the shared dev master
+/// key could otherwise decrypt the credential that deployed it.
+///
+/// Fail-open on a non-store-alignable `credentials_ref` is safe, not a leak: the
+/// credential can only be present in the dev-store if its ref *is*
+/// store-alignable (that is what lets `put_credential_material` write it), so an
+/// un-alignable ref provably points somewhere else (e.g. Vault) and there is
+/// nothing in this file to strip.
+fn staging_excluded_uris(env: &Environment) -> Vec<String> {
+    env.credentials_ref
+        .as_ref()
+        .and_then(|cred| super::secrets::secret_ref_to_store_uri(cred).ok())
+        .into_iter()
+        .collect()
+}
+
 /// Read the env's local dev-store as raw bytes (the encrypted `.dev.secrets.env`
-/// file). `Ok(None)` when no dev-store file exists yet; a present-but-unreadable
-/// store is surfaced rather than silently shipping nothing. The Cloud Run deploy
-/// stages these bytes verbatim as a Secret Manager version, so it needs the raw
-/// file, not the k8s path's base64-in-a-K8s-Secret.
+/// file) for staging into a runtime seed. `Ok(None)` when no dev-store file
+/// exists yet; a present-but-unreadable store is surfaced rather than silently
+/// shipping nothing. The Cloud Run deploy stages these bytes verbatim as a
+/// Secret Manager version, so it needs the raw file, not the k8s path's
+/// base64-in-a-K8s-Secret.
+///
+/// Any control-plane material (`staging_excluded_uris`) is hard-excluded from
+/// the returned bytes via a filtered copy, so the staged seed cannot resolve the
+/// bound deployer credential even with the shared dev master key. The operator's
+/// on-disk store is never modified.
+///
+/// **Concurrency.** The exclusion is derived from a fresh env load and the
+/// dev-store is snapshotted inside a single `store.transact` critical section,
+/// under the same per-env flock the credential writer holds. A bootstrap /
+/// rotation persists the dev-store credential and then `credentials_ref` under
+/// that flock (see `credentials::bootstrap`), so serializing here guarantees the
+/// exclusion is consistent with the bytes read: if the snapshot contains the
+/// credential, the reloaded env already names it and it is stripped. Reloading
+/// the authoritative env — rather than trusting the caller's possibly-stale
+/// snapshot — is what closes the stale-state window, so this takes `env_id`, not
+/// an `&Environment`. MUST NOT be called from within an open `transact` for the
+/// same env (the flock is not re-entrant); all current callers pass an unlocked
+/// env.
 pub(crate) fn read_dev_secrets_bytes(
     store: &LocalFsStore,
     env_id: &EnvId,
@@ -985,15 +1024,44 @@ pub(crate) fn read_dev_secrets_bytes(
     let env_dir = store
         .env_dir(env_id)
         .map_err(|e| OpError::Conflict(format!("resolving env dir: {e}")))?;
-    let path = super::secrets::resolve_dev_store_path(&env_dir, None);
-    match std::fs::read(&path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(OpError::Conflict(format!(
-            "reading dev-store at {}: {e}",
-            path.display()
-        ))),
-    }
+    let src = super::secrets::resolve_dev_store_path(&env_dir, None);
+
+    store.transact(env_id, |locked| -> Result<Option<Vec<u8>>, OpError> {
+        let env = locked
+            .load()
+            .map_err(|e| OpError::Conflict(format!("reloading env for staging: {e}")))?;
+        let exclude = staging_excluded_uris(&env);
+
+        // A dev-store file may not exist yet — guarded no-op (a missing file
+        // stages nothing; the worker's staging init is then a no-op).
+        if !src.exists() {
+            return Ok(None);
+        }
+
+        // Always stage through a filtered copy — even with nothing to exclude —
+        // so the read takes the DevStore advisory lock and never observes a
+        // torn write, and so the deployer credential (H3) is hard-excluded: the
+        // workload still receives every runtime secret, but no residual
+        // ciphertext for the credential survives in the staged bytes. The
+        // operator's on-disk store is never modified.
+        let staged_dir = tempfile::tempdir()
+            .map_err(|e| OpError::Conflict(format!("staging dev-store copy: {e}")))?;
+        let staged = staged_dir.path().join(".dev.secrets.env");
+        let exclude_refs: Vec<&str> = exclude.iter().map(String::as_str).collect();
+        greentic_secrets_lib::DevStore::copy_excluding(&src, &staged, &exclude_refs).map_err(
+            |e| {
+                OpError::Conflict(format!(
+                    "staging dev-store (excluding control-plane material): {e}"
+                ))
+            },
+        )?;
+        std::fs::read(&staged).map(Some).map_err(|e| {
+            OpError::Conflict(format!(
+                "reading staged dev-store at {}: {e}",
+                staged.display()
+            ))
+        })
+    })
 }
 
 /// `op env apply-revision <env_id> <revision_id> [--kind <descriptor>]` — bring
@@ -6064,5 +6132,138 @@ mod tests {
                  not left at its original 7,000"
             );
         }
+    }
+
+    #[test]
+    fn staging_excluded_uris_targets_the_bound_deployer_credential() {
+        use greentic_deploy_spec::SecretRef;
+
+        let mut env = make_env("cred");
+        assert!(
+            staging_excluded_uris(&env).is_empty(),
+            "an env with no credentials_ref excludes nothing"
+        );
+
+        let cred_ref = SecretRef::try_new("secret://cred/default/_/gcp-deployer/sa_key").unwrap();
+        env.credentials_ref = Some(cred_ref.clone());
+        let expected = crate::cli::secrets::secret_ref_to_store_uri(&cred_ref).unwrap();
+        assert_eq!(
+            staging_excluded_uris(&env),
+            vec![expected],
+            "the bound deployer credential's store URI must be excluded from staging"
+        );
+    }
+
+    #[test]
+    fn read_dev_secrets_bytes_strips_the_deployer_credential_from_the_seed() {
+        use greentic_deploy_spec::SecretRef;
+        use greentic_secrets_lib::{DevStore, SecretsStore};
+
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("cred");
+        let cred_ref = SecretRef::try_new("secret://cred/default/_/gcp-deployer/sa_key").unwrap();
+        env.credentials_ref = Some(cred_ref.clone());
+        store.save(&env).unwrap();
+        let env_id = env.environment_id.clone();
+        let env_dir = store.env_dir(&env_id).unwrap();
+
+        // Write the deployer credential (at the URI the exclusion computes) plus a
+        // runtime secret into the env dev-store, exactly as the real flows do.
+        // `put_credential_material` succeeding also proves the ref is
+        // store-alignable (it computes the same store URI internally).
+        crate::cli::secrets::put_credential_material(&env_dir, &cred_ref, "DEPLOYER-SA-KEY")
+            .unwrap();
+        let dev_path = crate::cli::secrets::resolve_dev_store_path(&env_dir, None);
+        let runtime_uri = "secrets://cred/acme/_/kv/runtime-token";
+        crate::cli::secrets::dev_store_put(&dev_path, runtime_uri, "runtime-value").unwrap();
+
+        let cred_store_uri = crate::cli::secrets::secret_ref_to_store_uri(&cred_ref).unwrap();
+        assert_eq!(
+            crate::cli::tests_common::dev_store_read(&dev_path, &cred_store_uri),
+            b"DEPLOYER-SA-KEY",
+            "sanity: the source store holds the credential before staging"
+        );
+
+        let staged = read_dev_secrets_bytes(&store, &env_id)
+            .unwrap()
+            .expect("a dev-store-backed env stages some bytes");
+
+        // Load the staged bytes as the workload would: the runtime secret
+        // resolves, but the deployer credential is gone.
+        let staged_dir = tempdir().unwrap();
+        let staged_path = staged_dir.path().join(".dev.secrets.env");
+        std::fs::write(&staged_path, &staged).unwrap();
+        let read_uri = |uri: &str| -> Result<Vec<u8>, ()> {
+            let dev = DevStore::with_path(staged_path.clone()).unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async { dev.get(uri).await.map_err(|_| ()) })
+        };
+        assert_eq!(read_uri(runtime_uri).unwrap(), b"runtime-value");
+        assert!(
+            read_uri(&cred_store_uri).is_err(),
+            "the staged seed must not resolve the deployer credential"
+        );
+
+        // The operator's real store is untouched — the credential still resolves.
+        assert_eq!(
+            crate::cli::tests_common::dev_store_read(&dev_path, &cred_store_uri),
+            b"DEPLOYER-SA-KEY",
+            "the operator's real dev-store must not be modified by staging"
+        );
+    }
+
+    // Regression for the stale-environment-state race: staging must derive the
+    // exclusion from a *fresh* env load, not the state a caller loaded earlier.
+    // Deterministic stand-in for "reconcile loads an uncredentialed env, a
+    // concurrent bootstrap binds the credential, staging still excludes it":
+    // persist the env uncredentialed, then land the credential + `credentials_ref`
+    // (bootstrap's dev-store-then-ref order), then stage. If the helper trusted a
+    // stale snapshot it would ship the credential; reloading strips it.
+    #[test]
+    fn read_dev_secrets_bytes_reloads_env_so_a_late_bound_credential_is_still_stripped() {
+        use greentic_deploy_spec::SecretRef;
+        use greentic_secrets_lib::{DevStore, SecretsStore};
+
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+
+        // The env is persisted with NO bound credential — the world a reconcile
+        // would have loaded before the bind landed.
+        let env = make_env("cred");
+        assert!(env.credentials_ref.is_none());
+        store.save(&env).unwrap();
+        let env_id = env.environment_id.clone();
+        let env_dir = store.env_dir(&env_id).unwrap();
+
+        // The bind lands afterwards: credential material into the dev-store,
+        // then `credentials_ref` persisted (bootstrap's on-flock order).
+        let cred_ref = SecretRef::try_new("secret://cred/default/_/gcp-deployer/sa_key").unwrap();
+        crate::cli::secrets::put_credential_material(&env_dir, &cred_ref, "LATE-SA-KEY").unwrap();
+        let mut bound = store.load(&env_id).unwrap();
+        bound.credentials_ref = Some(cred_ref.clone());
+        store.save(&bound).unwrap();
+
+        let staged = read_dev_secrets_bytes(&store, &env_id)
+            .unwrap()
+            .expect("a dev-store-backed env stages some bytes");
+
+        let staged_dir = tempdir().unwrap();
+        let staged_path = staged_dir.path().join(".dev.secrets.env");
+        std::fs::write(&staged_path, &staged).unwrap();
+        let cred_store_uri = crate::cli::secrets::secret_ref_to_store_uri(&cred_ref).unwrap();
+        let dev = DevStore::with_path(staged_path).unwrap();
+        let resolved = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { dev.get(&cred_store_uri).await });
+        assert!(
+            resolved.is_err(),
+            "staging must reload the env and strip a credential bound after the caller's load"
+        );
     }
 }
