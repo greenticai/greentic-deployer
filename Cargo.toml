@@ -9,7 +9,7 @@ resolver = "2"
 
 [package]
 name = "greentic-deployer"
-version = "1.1.6"
+version = "1.3.0-research.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic deployer runtime for plan construction and deployment-pack dispatch"
@@ -78,10 +78,10 @@ anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
 fs4 = "0.13"
-greentic-bundle = ">=1.1.0-0, <1.2.0-0"
-greentic-config = ">=1.1.0-0, <1.2.0-0"
-greentic-config-types = ">=1.1.0-0, <1.2.0-0"
-greentic-deploy-spec = "0.2"
+greentic-bundle = "=1.3.0-research.0"
+greentic-config = "=1.3.0-research.1"
+greentic-config-types = "=1.3.0-research.1"
+greentic-deploy-spec = "=1.3.0-research.1"
 greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.2" }
 serde_json = "1"
 semver = "1"
@@ -109,7 +109,7 @@ libc = "0.2"
 # is a runtime dep now (it was dev-only for the C6 env-pack YAML round-trip
 # tests; the env-pack trait still carries raw YAML). Already in the runtime
 # graph via greentic-bundle -> greentic-qa-lib, so this adds no new crates.
-qa-spec = ">=1.1.0-0, <1.2.0-0"
+qa-spec = "=1.3.0-research.1"
 
 [dependencies.clap]
 version = "4.5"
@@ -127,20 +127,20 @@ features = [
 ]
 
 [dependencies.greentic-types]
-version = ">=1.1.0-0, <1.2.0-0"
+version = "=1.3.0-research.1"
 
 [dependencies.greentic-distributor-client]
-version = ">=1.1.0-0, <1.2.0-0"
+version = "=1.3.0-research.1"
 
 [dependencies.greentic-secrets-lib]
-version = ">=1.1.0-0, <1.2.0-0"
+version = "=1.3.0-research.1"
 features = [
     "providers-dev",
     "providers-vault",
 ]
 
 [dependencies.greentic-update]
-version = "0.1"
+version = ">=1.3.0-research.0, <1.4.0-0"
 features = [
     "enroll",
     "mtls",
@@ -303,9 +303,9 @@ axum = "0.8"
 # (the K8s deployer requires credential material and there is no CLI setter).
 # Resolves to the same path crate the lib uses, so the `Environment` types
 # unify across the test/lib boundary.
-greentic-deploy-spec = "0.2"
+greentic-deploy-spec = "=1.3.0-research.1"
 # Re-declared (same registry version the lib already pins) so the live-cluster
 # E2E can derive the canonical store-key the bound-credential resolver reads,
 # and seed a ServiceAccount token via env var. Already in the lockfile via the
 # normal dep, so no resolution change.
-greentic-secrets-lib = ">=1.1.0-0, <1.2.0-0"
+greentic-secrets-lib = "=1.3.0-research.1"
