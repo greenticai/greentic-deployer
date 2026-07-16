@@ -154,18 +154,20 @@ pub fn requirements(
     let payload = resolve_payload::<CredentialsRequirementsPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
 
-    // For a K8s-bound env, connect a live validator client so the SSAR
-    // probes run against the cluster the deployer actually targets. Other
-    // deployers (and `--no-default-features` builds) get `None` and fall
-    // back to the handler's own credentials probe inside the runner.
-    let connected = connected_k8s_credentials(store, &env_id)?;
-    let (doc, report) = validate_requirements(
-        store,
-        registry,
-        &env_id,
-        connected.as_ref().map(|c| c as &dyn DeployerCredentials),
-    )
-    .map_err(map_validate_err)?;
+    // Connect a live validator for the bound deployer so `requirements` probes
+    // as the deployer's real identity: K8s against the cluster (SSAR), Cloud Run
+    // against IAM (`testIamPermissions` as the bound service account). Each
+    // returns `None` for a non-matching deployer (and for builds lacking the
+    // client feature); both `None` → the runner falls back to the handler's own
+    // fail-closed probe. Boxed to a common trait object, mirroring the `--bind`
+    // path's K8s-then-AWS dispatch.
+    let connected: Option<Box<dyn DeployerCredentials>> =
+        match connected_k8s_credentials(store, &env_id)? {
+            Some(c) => Some(Box::new(c)),
+            None => connected_cloudrun_credentials(store, &env_id)?,
+        };
+    let (doc, report) = validate_requirements(store, registry, &env_id, connected.as_deref())
+        .map_err(map_validate_err)?;
 
     Ok(OpOutcome::new(
         NOUN,
@@ -583,6 +585,83 @@ fn connected_k8s_credentials(
     Ok(None)
 }
 
+/// Connect a live GCP validator client for a Cloud-Run-bound env so
+/// `op credentials requirements` runs its `projects.testIamPermissions` /
+/// `serviceAccounts.testIamPermissions` probes AS THE BOUND DEPLOYER credential,
+/// against the project + runtime service account the binding actually targets.
+///
+/// The GCP analogue of [`connected_k8s_credentials`]. Returns `Ok(None)` for any
+/// non-Cloud-Run deployer (the runner falls back to the handler's own
+/// fail-closed probe) and — via the `#[cfg(not)]` twin — for builds without the
+/// `deploy-gcp-cloudrun` real target. Fails closed (`Conflict`) when the binding
+/// answers are unreadable or the bound credential material is present but
+/// invalid — the same posture as `op env reconcile`.
+///
+/// When no `credentials_ref` is bound this returns `Ok(None)` rather than an
+/// ambient-ADC client: the GCP deployer requires credential material, so the
+/// runner rejects such an env with `NoCredentialsRef` before `validate` runs —
+/// building an ambient client here would be discarded work that could mask that
+/// error with an ADC-resolution failure.
+#[cfg(feature = "deploy-gcp-cloudrun")]
+fn connected_cloudrun_credentials(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+) -> Result<Option<Box<dyn DeployerCredentials>>, OpError> {
+    use crate::cli::env::load_render_answers;
+    use crate::env_packs::gcp_cloudrun::GcpCloudRunDeployerHandler;
+    use crate::env_packs::gcp_cloudrun::bound_session::resolve_bound_credentials;
+    use crate::env_packs::gcp_cloudrun::credentials::{
+        GcpDeployerCredentials, build_validator_client,
+    };
+    use crate::env_packs::gcp_cloudrun::deployer::GcpCloudRunParams;
+
+    // Not loadable / no deployer bound / non-Cloud-Run ⇒ `None`; the runner
+    // surfaces the proper NotFound / no-deployer error.
+    let Ok(env) = store.load(env_id) else {
+        return Ok(None);
+    };
+    let Some(binding) = env.pack_for_slot(greentic_deploy_spec::CapabilitySlot::Deployer) else {
+        return Ok(None);
+    };
+    if binding.kind.path() != GcpCloudRunDeployerHandler::DESCRIPTOR_PATH {
+        return Ok(None);
+    }
+
+    // Resolve the target project + runtime SA the same way reconcile / warm do:
+    // the binding answers over the env-derived sandbox defaults. Fail closed if
+    // the recorded answers are broken (mirrors render / reconcile).
+    let (answers, _wire) = load_render_answers(store, &env, &binding.kind)?;
+    let params = GcpCloudRunParams::from_answers(&env, answers.as_ref())
+        .map_err(|e| OpError::Conflict(format!("invalid GCP Cloud Run answers: {e}")))?;
+    let runtime_sa = params.runtime_service_account(env_id.as_str());
+
+    // Authenticate AS THE BOUND deployer credential. No bound material ⇒ nothing
+    // to probe as (see the doc comment) → `None`; a bound ref with unreadable /
+    // invalid material fails closed.
+    let Some(material) = resolve_bound_credentials(store, &env, env_id)? else {
+        return Ok(None);
+    };
+    let client = build_validator_client(&material)
+        .map_err(|e| OpError::Conflict(format!("GCP validator client could not be built: {e}")))?;
+
+    Ok(Some(Box::new(
+        GcpDeployerCredentials::with_client(client)
+            .with_project(params.project)
+            .with_service_account(runtime_sa),
+    )))
+}
+
+/// Builds without the `deploy-gcp-cloudrun` real target cannot connect a GCP
+/// validator; the runner falls back to the handler's (fail-closed) default
+/// credentials.
+#[cfg(not(feature = "deploy-gcp-cloudrun"))]
+fn connected_cloudrun_credentials(
+    _store: &LocalFsStore,
+    _env_id: &EnvId,
+) -> Result<Option<Box<dyn DeployerCredentials>>, OpError> {
+    Ok(None)
+}
+
 /// Build admin-connected K8s credentials for the `--bind` bootstrap path:
 /// a bootstrap connector that authenticates AS THE ADMIN (the
 /// `admin_profile` kubeconfig context, no bound SA token) and applies the
@@ -962,6 +1041,51 @@ mod tests {
         assert!(
             got.is_none(),
             "non-K8s deployer must not connect a validator client"
+        );
+    }
+
+    /// The GCP live-validator wiring only fires for a Cloud-Run-bound deployer:
+    /// any other deployer yields `None` (before touching any GCP client) and the
+    /// runner falls back to the handler's own probe.
+    #[cfg(feature = "deploy-gcp-cloudrun")]
+    #[test]
+    fn connected_cloudrun_credentials_is_none_for_non_cloudrun_deployer() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.local-process@0.1.0",
+        ));
+        store.save(&env).unwrap();
+        let got = connected_cloudrun_credentials(&store, &EnvId::try_from("local").unwrap())
+            .expect("non-Cloud-Run detection never errors");
+        assert!(
+            got.is_none(),
+            "non-Cloud-Run deployer must not connect a GCP validator client"
+        );
+    }
+
+    /// A Cloud-Run-bound env with no `credentials_ref` yields `None` (not an
+    /// ambient-ADC client): the runner rejects it with `NoCredentialsRef` before
+    /// `validate` runs, so there is nothing to authenticate as here.
+    #[cfg(feature = "deploy-gcp-cloudrun")]
+    #[test]
+    fn connected_cloudrun_credentials_is_none_without_a_bound_credential() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.gcp-cloudrun@1.0.0",
+        ));
+        // No credentials_ref set.
+        store.save(&env).unwrap();
+        let got = connected_cloudrun_credentials(&store, &EnvId::try_from("local").unwrap())
+            .expect("a missing bound credential is not an error here");
+        assert!(
+            got.is_none(),
+            "no bound credential ⇒ no connected client (runner rejects upstream)"
         );
     }
 
