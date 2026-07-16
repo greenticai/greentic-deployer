@@ -1227,12 +1227,12 @@ fn is_aws_ecs_kind(_descriptor: &greentic_deploy_spec::PackDescriptor) -> bool {
 /// cannot be served, so the applicability gate rejects it. Mirrors
 /// [`is_aws_ecs_kind`].
 #[cfg(feature = "creds-gcp")]
-fn is_cloudrun_kind(descriptor: &greentic_deploy_spec::PackDescriptor) -> bool {
+pub(crate) fn is_cloudrun_kind(descriptor: &greentic_deploy_spec::PackDescriptor) -> bool {
     descriptor.path() == crate::env_packs::gcp_cloudrun::GcpCloudRunDeployerHandler::DESCRIPTOR_PATH
 }
 
 #[cfg(not(feature = "creds-gcp"))]
-fn is_cloudrun_kind(_descriptor: &greentic_deploy_spec::PackDescriptor) -> bool {
+pub(crate) fn is_cloudrun_kind(_descriptor: &greentic_deploy_spec::PackDescriptor) -> bool {
     false
 }
 
