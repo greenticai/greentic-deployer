@@ -312,6 +312,7 @@ pub(crate) fn up(
             "seeded": vault.seeds.seeded,
             "skipped_present": vault.seeds.skipped_present,
             "warned_missing": vault.seeds.warned_missing,
+            "webhook_secrets_provisioned": vault.seeds.webhook_secrets_provisioned,
         });
     }
 
@@ -413,6 +414,10 @@ struct SeedSummary {
     seeded: usize,
     skipped_present: usize,
     warned_missing: usize,
+    /// Generated per-endpoint webhook secrets minted into Vault this run (the
+    /// custodial dev-store path mints them; a Vault backend leaves them unset —
+    /// see [`provision_endpoint_webhook_secrets`]).
+    webhook_secrets_provisioned: usize,
 }
 
 /// The vault phase result, for the outcome + verify.
@@ -724,6 +729,73 @@ fn seed_secrets(
     Ok(summary)
 }
 
+/// Convert an endpoint's `secret://<env>/<path>` webhook-secret ref into the
+/// `secrets://<env>/<path>` store URI the Vault backend reads/writes under (the
+/// same shape [`seed_secrets`] builds). Returns `None` for a ref that is not a
+/// `secret://` URI.
+#[cfg(feature = "k8s-client")]
+fn webhook_ref_to_store_uri(ref_uri: &str) -> Option<String> {
+    ref_uri
+        .strip_prefix("secret://")
+        .map(|rest| format!("secrets://{rest}"))
+}
+
+/// Phase 4b.3 — provision each messaging endpoint's GENERATED webhook secret
+/// into Vault.
+///
+/// `messaging::provision_webhook_secret` mints the value only for the custodial
+/// dev-store backend; on a Vault backend it stamps the `webhook_secret_ref` but
+/// writes no value, and it runs at endpoint-create time — before this Vault
+/// exists. The worker reads that ref from Vault to authenticate every inbound
+/// webhook (the `x-telegram-bot-api-secret-token` header), so without this it
+/// finds the secret absent and 401s every request.
+///
+/// Runs after [`seed_secrets`], while Vault is reachable. Idempotent: a secret
+/// already present is left untouched — re-running `env up` must never rotate a
+/// live webhook secret out from under an already-registered webhook.
+#[cfg(feature = "k8s-client")]
+fn provision_endpoint_webhook_secrets(
+    binding: &crate::env_packs::k8s::manifests::VaultBackend,
+    addr: &str,
+    token: &str,
+    tenant: &str,
+    endpoints: &[greentic_deploy_spec::MessagingEndpoint],
+) -> Result<usize, OpError> {
+    use greentic_secrets_lib::vault::VaultAuth;
+    let mut provisioned = 0;
+    for ep in endpoints {
+        let Some(ref_uri) = ep.webhook_secret_ref.as_ref() else {
+            continue;
+        };
+        let store_uri = webhook_ref_to_store_uri(ref_uri.as_str()).ok_or_else(|| {
+            OpError::Conflict(format!(
+                "endpoint `{}` has a webhook_secret_ref that is not a `secret://` URI: {}",
+                ep.provider_id,
+                ref_uri.as_str()
+            ))
+        })?;
+        let cfg = || {
+            super::secrets::vault_backend_config_from_binding(
+                binding,
+                addr.to_string(),
+                VaultAuth::Token(token.to_string()),
+            )
+        };
+        if super::secrets::vault_get_with_config(cfg(), tenant, &store_uri)?.is_some() {
+            // Already provisioned — never rotate a live webhook secret.
+            continue;
+        }
+        let value = super::messaging::generate_webhook_secret()?;
+        super::secrets::vault_put_with_config(cfg(), tenant, &store_uri, &value)?;
+        eprintln!(
+            "[env up] vault: provisioned generated webhook secret for endpoint `{}`",
+            ep.provider_id
+        );
+        provisioned += 1;
+    }
+    Ok(provisioned)
+}
+
 /// Phase 4b — deploy (dev-in-cluster), bootstrap, and seed the env's Vault.
 /// Runs after apply (the secrets binding is in the store) and before reconcile
 /// (workers boot there and must find their secrets present).
@@ -842,7 +914,7 @@ fn vault_phase(
                 "fresh"
             }
         );
-        let seeds = seed_secrets(
+        let mut seeds = seed_secrets(
             &binding,
             &addr,
             root_token,
@@ -853,6 +925,13 @@ fn vault_phase(
             allow_missing_seeds,
             non_interactive,
         )?;
+        seeds.webhook_secrets_provisioned = provision_endpoint_webhook_secrets(
+            &binding,
+            &addr,
+            root_token,
+            &tenant,
+            &env.messaging_endpoints,
+        )?;
         drop(pf); // kill the port-forward
         (outcome.was_already_configured, seeds)
     } else {
@@ -860,7 +939,7 @@ fn vault_phase(
             "[env up] vault: external mode — skipping deploy + bootstrap, seeding against `{}`",
             binding.addr
         );
-        let seeds = seed_secrets(
+        let mut seeds = seed_secrets(
             &binding,
             &binding.addr,
             root_token,
@@ -870,6 +949,13 @@ fn vault_phase(
             true, // a surviving external Vault: existence-checked seed semantics
             allow_missing_seeds,
             non_interactive,
+        )?;
+        seeds.webhook_secrets_provisioned = provision_endpoint_webhook_secrets(
+            &binding,
+            &binding.addr,
+            root_token,
+            &tenant,
+            &env.messaging_endpoints,
         )?;
         (true, seeds)
     };
@@ -1363,6 +1449,23 @@ mod tests {
         // Vault without the key): fail closed unless the escape hatch is set.
         assert_eq!(decide_missing_seed(false, false), MissingSeedAction::Fail);
         assert_eq!(decide_missing_seed(false, true), MissingSeedAction::Warn);
+    }
+
+    #[cfg(feature = "k8s-client")]
+    #[test]
+    fn webhook_ref_to_store_uri_maps_secret_scheme_to_the_store_uri() {
+        // The endpoint ref is `secret://…`; the Vault backend reads/writes under
+        // the `secrets://…` store URI (same shape `seed_secrets` builds).
+        assert_eq!(
+            webhook_ref_to_store_uri(
+                "secret://vault-demo/tenant-default/_/messaging-01k/webhook_secret"
+            ),
+            Some("secrets://vault-demo/tenant-default/_/messaging-01k/webhook_secret".to_string()),
+        );
+        // A ref that is not a `secret://` URI is rejected (the provisioner turns
+        // this into a hard Conflict rather than writing to the wrong place).
+        assert_eq!(webhook_ref_to_store_uri("secrets://vault-demo/x"), None);
+        assert_eq!(webhook_ref_to_store_uri("https://example/x"), None);
     }
 
     #[cfg(feature = "k8s-client")]
