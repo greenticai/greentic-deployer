@@ -188,12 +188,26 @@ pub fn render_vault_service(p: &VaultInfraParams) -> Value {
 
 /// Open Vault's ingress to the worker pods. The deployer renders a
 /// deny-by-default posture (`gtc-default-deny` selects every pod in the
-/// namespace, including this operator-deployed Vault), and kindnet enforces
+/// namespace, including this operator-deployed Vault), and the CNI enforces
 /// NetworkPolicies — so without this the worker's `auth/kubernetes/login` + KV
 /// read to `vault.<ns>.svc:8200` is dropped at Vault's ingress and every
-/// webhook 401s. Same-namespace component selector: `env up`'s dev Vault shares
-/// the env namespace, so a worker-component selector suffices.
+/// webhook 401s.
+///
+/// The workers do NOT share Vault's namespace: Vault runs in
+/// `vault_bootstrap.namespace` (default `greentic`) while the workers run in the
+/// env namespace (`gtc-<env>`) — see [`VaultInfraParams::namespace`]. A bare
+/// `podSelector` in an ingress `from` matches only pods in the policy's OWN
+/// namespace (here, Vault's), so it never matches the workers: under a
+/// policy-enforcing CNI (e.g. Cilium) this silently denied worker->Vault and
+/// every webhook 401'd; kindnet's laxer enforcement masked it. The `from`
+/// therefore pairs the worker component selector with a `namespaceSelector` on
+/// the env-ownership label ([`ENV_LABEL`]), which every env-owned namespace
+/// (both the env namespace and this Vault namespace) carries.
 pub fn render_vault_network_policy(p: &VaultInfraParams) -> Value {
+    // `json!` keys must be literals, so build the env-namespace selector the same
+    // way `vault_labels` stamps the ownership label.
+    let mut env_ns_labels = json!({});
+    env_ns_labels[ENV_LABEL] = json!(p.env_id);
     json!({
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
@@ -209,6 +223,7 @@ pub fn render_vault_network_policy(p: &VaultInfraParams) -> Value {
             "policyTypes": ["Ingress"],
             "ingress": [{
                 "from": [{
+                    "namespaceSelector": { "matchLabels": env_ns_labels },
                     "podSelector": {
                         "matchLabels": { "app.kubernetes.io/component": WORKER_COMPONENT },
                     },
@@ -276,6 +291,25 @@ mod tests {
                 obj["kind"]
             );
         }
+    }
+
+    #[test]
+    fn vault_ingress_netpol_allows_workers_from_the_env_namespace() {
+        // Regression: a bare podSelector `from` matches only pods in the
+        // policy's own (Vault) namespace, so it never matched the workers, which
+        // live in the env namespace. The `from` must pair a namespaceSelector on
+        // the env-ownership label with the worker podSelector.
+        let np = render_vault_network_policy(&params());
+        let from = &np["spec"]["ingress"][0]["from"][0];
+        assert_eq!(
+            from["namespaceSelector"]["matchLabels"][ENV_LABEL], "vault-demo",
+            "ingress `from` must scope to the env namespace via the ownership label"
+        );
+        assert_eq!(
+            from["podSelector"]["matchLabels"]["app.kubernetes.io/component"], "worker",
+            "ingress `from` must still select the worker component"
+        );
+        assert_eq!(np["spec"]["ingress"][0]["ports"][0]["port"], VAULT_PORT);
     }
 
     #[test]
