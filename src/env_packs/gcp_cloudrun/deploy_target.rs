@@ -179,14 +179,37 @@ struct RevisionTemplate {
 
 impl RevisionTemplate {
     fn of(spec: &ServiceSpec) -> Self {
+        // Destructured exhaustively, with no `..` rest pattern, ON PURPOSE: a new
+        // `ServiceSpec` field must not silently default to "not part of the
+        // revision". Adding one breaks this line until someone classifies it,
+        // and a field that IS revision-scoped almost certainly also belongs in
+        // `deployer::revision_intent` — which nothing else would tell them, and
+        // whose omission silently reduces the intent check back to an existence
+        // check.
+        let ServiceSpec {
+            image,
+            runtime_service_account,
+            scaling,
+            session_affinity,
+            revision_intent,
+            secrets,
+            env,
+            // Service-level or non-Service: mutable without a new revision.
+            deployment_id: _,
+            revision_id: _,
+            project: _,
+            region: _,
+            traffic: _,
+            access_mode: _,
+        } = spec;
         Self {
-            image: spec.image.clone(),
-            runtime_service_account: spec.runtime_service_account.clone(),
-            scaling: spec.scaling.clone(),
-            session_affinity: spec.session_affinity,
-            revision_intent: spec.revision_intent.clone(),
-            secrets: spec.secrets.clone(),
-            env: spec.env.clone(),
+            image: image.clone(),
+            runtime_service_account: runtime_service_account.clone(),
+            scaling: scaling.clone(),
+            session_affinity: *session_affinity,
+            revision_intent: revision_intent.clone(),
+            secrets: secrets.clone(),
+            env: env.clone(),
         }
     }
 }

@@ -1016,24 +1016,15 @@ mod tests {
                     // Same intent, but its own staged versions — so the rendered
                     // template differs (our re-upsert would 409) while the stamp
                     // still says this is our warm.
-                    Rival::SameIntent => Some(ServiceSpec {
-                        secrets: spec
-                            .secrets
-                            .iter()
-                            .map(|mount| SecretMount {
-                                items: mount
-                                    .items
-                                    .iter()
-                                    .map(|item| SecretMountItem {
-                                        version: format!("{}00", item.version),
-                                        ..item.clone()
-                                    })
-                                    .collect(),
-                                ..mount.clone()
-                            })
-                            .collect(),
-                        ..spec.clone()
-                    }),
+                    Rival::SameIntent => {
+                        let mut rival = spec.clone();
+                        for mount in &mut rival.secrets {
+                            for item in &mut mount.items {
+                                item.version = format!("{}00", item.version);
+                            }
+                        }
+                        Some(rival)
+                    }
                     Rival::DifferentIntent => Some(ServiceSpec {
                         image: format!("{}-rival", spec.image),
                         revision_intent: format!("{}-rival", spec.revision_intent),
