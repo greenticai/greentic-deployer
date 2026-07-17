@@ -973,18 +973,7 @@ pub(crate) fn read_dev_secrets_b64(
         .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)))
 }
 
-/// Store-relative paths at which a deployer env-pack's `bootstrap` persists the
-/// bound deployer credential it minted. Kept as the *same* constants the minting
-/// handlers build their bound ref from, so the two provably cannot drift.
-///
-/// Only env-packs that actually mint bind material appear here: the GCP Cloud Run
-/// bootstrap is render-only (`bound_credentials_ref: None`) and never writes a
-/// credential, so it has no path to exclude.
-const KNOWN_DEPLOYER_CREDENTIAL_PATHS: &[&str] = &[
-    crate::env_packs::k8s::bootstrap::DEPLOYER_TOKEN_STORE_PATH,
-    #[cfg(feature = "creds-aws")]
-    crate::env_packs::aws::credentials::DEPLOYER_SESSION_STORE_PATH,
-];
+use crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS;
 
 /// Store URIs in the env dev-store that are control-plane material and must
 /// NEVER be staged into a runtime seed — the bound deployer credential. A
@@ -996,7 +985,7 @@ const KNOWN_DEPLOYER_CREDENTIAL_PATHS: &[&str] = &[
 /// The denylist is the union of two sources, and needs both:
 ///
 /// * **`credentials_ref`** — covers a credential bound at a custom URI.
-/// * **`KNOWN_DEPLOYER_CREDENTIAL_PATHS`, unconditionally** — covers the
+/// * **`BOUND_CREDENTIAL_STORE_PATHS`, unconditionally** — covers the
 ///   *orphan*: `credentials::bootstrap` writes the material (W1) *before*
 ///   persisting `credentials_ref` (W2), deliberately, so that a failed save
 ///   leaves bootstrap re-runnable rather than pointing the env at a credential
@@ -1005,7 +994,17 @@ const KNOWN_DEPLOYER_CREDENTIAL_PATHS: &[&str] = &[
 ///   and the next seed would copy it into the workload. Excluding the well-known
 ///   paths regardless of `credentials_ref` closes that window without needing to
 ///   record what was written: the minting handlers derive their ref from these
-///   very constants, so the landing URI is deterministic per env.
+///   very constants, so the landing URI is deterministic per env. The list is
+///   deliberately *unconditional* — not gated on the provider SDK features this
+///   binary compiled — because a dev-store outlives the binary that wrote it.
+///
+/// Residual (accepted): a *custom* deployer env-pack registered through
+/// `EnvPackRegistry::register` could mint at a path in neither source, and an
+/// orphan of that credential (crash between W1 and W2, before anything names it)
+/// would escape both. Closing that needs a durable pending-ref record. No such
+/// handler exists — the registry's production set is closed over the built-ins,
+/// and a new one has to be compiled in, at which point its path belongs in
+/// `BOUND_CREDENTIAL_STORE_PATHS` (whose drift guard enforces exactly that).
 ///
 /// Fail-open on a non-store-alignable `credentials_ref` is safe, not a leak: the
 /// credential can only be present in the dev-store if its ref *is*
@@ -1015,7 +1014,7 @@ const KNOWN_DEPLOYER_CREDENTIAL_PATHS: &[&str] = &[
 fn staging_excluded_uris(env: &Environment) -> Vec<String> {
     use greentic_deploy_spec::SecretRef;
 
-    let mut uris: Vec<String> = KNOWN_DEPLOYER_CREDENTIAL_PATHS
+    let mut uris: Vec<String> = BOUND_CREDENTIAL_STORE_PATHS
         .iter()
         .filter_map(|path| {
             SecretRef::try_new(format!("secret://{}/{path}", env.environment_id.as_str())).ok()
@@ -6211,10 +6210,10 @@ mod tests {
 
         let excluded = staging_excluded_uris(&env);
         assert!(
-            !KNOWN_DEPLOYER_CREDENTIAL_PATHS.is_empty(),
+            !BOUND_CREDENTIAL_STORE_PATHS.is_empty(),
             "sanity: at least the always-compiled k8s path is present"
         );
-        for path in KNOWN_DEPLOYER_CREDENTIAL_PATHS {
+        for path in BOUND_CREDENTIAL_STORE_PATHS {
             assert!(
                 excluded.contains(&known_credential_store_uri("cred", path)),
                 "an env with NO credentials_ref must still exclude `{path}` — a crashed \
@@ -6238,7 +6237,7 @@ mod tests {
             excluded.contains(&crate::cli::secrets::secret_ref_to_store_uri(&cred_ref).unwrap()),
             "the custom bound credential must still be excluded"
         );
-        for path in KNOWN_DEPLOYER_CREDENTIAL_PATHS {
+        for path in BOUND_CREDENTIAL_STORE_PATHS {
             assert!(
                 excluded.contains(&known_credential_store_uri("cred", path)),
                 "the well-known `{path}` must be excluded alongside the bound ref"
@@ -6251,7 +6250,7 @@ mod tests {
     fn staging_excluded_uris_does_not_duplicate_a_credential_bound_at_a_known_path() {
         use greentic_deploy_spec::SecretRef;
 
-        let path = KNOWN_DEPLOYER_CREDENTIAL_PATHS[0];
+        let path = BOUND_CREDENTIAL_STORE_PATHS[0];
         let mut env = make_env("cred");
         env.credentials_ref = Some(SecretRef::try_new(format!("secret://cred/{path}")).unwrap());
 
@@ -6281,7 +6280,7 @@ mod tests {
         let env_dir = store.env_dir(&env_id).unwrap();
 
         // W1 landed; W2 never did — the env names no credential.
-        let orphan_path = KNOWN_DEPLOYER_CREDENTIAL_PATHS[0];
+        let orphan_path = BOUND_CREDENTIAL_STORE_PATHS[0];
         let orphan_ref = SecretRef::try_new(format!("secret://cred/{orphan_path}")).unwrap();
         crate::cli::secrets::put_credential_material(&env_dir, &orphan_ref, "ORPHANED-TOKEN")
             .unwrap();

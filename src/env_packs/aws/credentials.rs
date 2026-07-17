@@ -204,7 +204,8 @@ const STS_SESSION_DURATION_SECONDS: i32 = 3600;
 /// K8s deployer token's `default/_/<kind>/<artifact>` shape. The bound
 /// `secret://<env>/<this>` ref is what the runtime client resolves to sign
 /// ECS/ELB calls (the resolver lands in a follow-up slice).
-pub(crate) const DEPLOYER_SESSION_STORE_PATH: &str = "default/_/aws-deployer/deployer_session";
+pub(crate) const DEPLOYER_SESSION_STORE_PATH: &str =
+    crate::credentials::store_paths::AWS_DEPLOYER_SESSION;
 
 /// A short-lived AWS session minted by assuming the scoped deployer role.
 ///

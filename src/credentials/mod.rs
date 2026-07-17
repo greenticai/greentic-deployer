@@ -28,6 +28,7 @@
 pub mod bootstrap;
 pub mod rotate;
 pub mod rules_export;
+pub mod store_paths;
 pub mod validate;
 
 pub use bootstrap::{
