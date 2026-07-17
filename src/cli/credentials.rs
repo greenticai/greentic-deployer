@@ -833,6 +833,11 @@ fn map_bootstrap_err(e: RunBootstrapError) -> OpError {
         RunBootstrapError::AlreadyBootstrapped(env_id) => OpError::Conflict(format!(
             "env `{env_id}` already has credentials_ref; use `rotate` instead of `bootstrap`"
         )),
+        // Fail-closed: the handler minted material we could not guarantee we
+        // could strip from a runtime seed, so bootstrap refused to write it.
+        // A misconfigured env-pack, not a user error — surface it as a conflict
+        // with the remediation the error itself carries.
+        e @ RunBootstrapError::UndeclaredCredentialPath { .. } => OpError::Conflict(e.to_string()),
         RunBootstrapError::HandlerNotRegistered { kind } => {
             OpError::Conflict(handler_not_registered_msg(&kind))
         }
@@ -1546,11 +1551,15 @@ mod tests {
         secret_ref: String,
         token: String,
         expiry: chrono::DateTime<chrono::Utc>,
+        /// What the handler declares as its landing path. `run_bootstrap`
+        /// refuses to write material unless this names a path the runtime-seed
+        /// denylist covers, so tests can drive both sides of that gate.
+        declared_path: Option<&'static str>,
     }
 
     impl crate::credentials::DeployerCredentials for MintingCreds {
         fn bound_credential_store_path(&self) -> Option<&'static str> {
-            None
+            self.declared_path
         }
 
         fn required_capabilities(&self) -> Vec<crate::credentials::Capability> {
@@ -1638,6 +1647,70 @@ mod tests {
         );
     }
 
+    /// Bootstrap writes bound material (W1) before it records `credentials_ref`
+    /// (W2), so a crash in between orphans a credential nothing names. The
+    /// runtime-seed denylist covers that by stripping the known landing paths
+    /// unconditionally — which only works for paths it knows. So a handler that
+    /// mints without declaring a covered landing path must be refused BEFORE the
+    /// write: no material on disk, no orphan, no leak.
+    ///
+    /// This is the check that also covers handlers registered through the public
+    /// plug-in hook, which no in-tree constant or compile-time obligation can
+    /// reach.
+    #[test]
+    fn run_bootstrap_refuses_to_write_material_at_an_undeclared_landing_path() {
+        let expiry = chrono::DateTime::from_timestamp(2_000_000_000, 0).unwrap();
+        // Two ways to get this wrong: declare nothing, or declare a path the
+        // seed denylist does not cover. Both must fail closed.
+        for declared in [None, Some("default/_/rogue-deployer/token")] {
+            let dir = tempdir().unwrap();
+            let (store, registry, env_id) = bind_fixture(dir.path());
+            let admin = crate::credentials::ZeroizedAdmin::new("admin-ctx", String::new());
+            let bind = MintingCreds {
+                secret_ref: "secret://local/default/_/k8s-deployer/deployer_token".to_string(),
+                declared_path: declared,
+                token: "MINTED".to_string(),
+                expiry,
+            };
+
+            let sink_calls = std::sync::Mutex::new(0usize);
+            let sink = |_root: &std::path::Path,
+                        _secret_ref: &SecretRef,
+                        _value: &str|
+             -> Result<(), String> {
+                *sink_calls.lock().unwrap() += 1;
+                Ok(())
+            };
+
+            let err = crate::credentials::run_bootstrap(
+                &store,
+                &registry,
+                &env_id,
+                &admin,
+                Some(&bind),
+                &sink,
+            )
+            .expect_err("a minting handler with an uncovered landing path must be refused");
+            assert!(
+                matches!(
+                    err,
+                    crate::credentials::RunBootstrapError::UndeclaredCredentialPath { .. }
+                ),
+                "declared={declared:?} got {err:?}"
+            );
+            assert_eq!(
+                *sink_calls.lock().unwrap(),
+                0,
+                "declared={declared:?}: the refusal must land BEFORE any material \
+                 is written — a sink call means a credential is already on disk"
+            );
+            assert!(
+                store.load(&env_id).unwrap().credentials_ref.is_none(),
+                "declared={declared:?}: no credentials_ref may be persisted"
+            );
+        }
+    }
+
     #[test]
     fn run_bootstrap_writes_material_then_persists_ref_and_expiry() {
         let dir = tempdir().unwrap();
@@ -1646,6 +1719,7 @@ mod tests {
         let expiry = chrono::DateTime::from_timestamp(2_000_000_000, 0).unwrap();
         let bind = MintingCreds {
             secret_ref: "secret://local/default/_/k8s-deployer/deployer_token".to_string(),
+            declared_path: Some(crate::credentials::store_paths::K8S_DEPLOYER_TOKEN),
             token: "MINTED".to_string(),
             expiry,
         };
@@ -1689,6 +1763,7 @@ mod tests {
         let admin = crate::credentials::ZeroizedAdmin::new("admin-ctx", String::new());
         let bind = MintingCreds {
             secret_ref: "secret://local/default/_/k8s-deployer/deployer_token".to_string(),
+            declared_path: Some(crate::credentials::store_paths::K8S_DEPLOYER_TOKEN),
             token: "MINTED".to_string(),
             expiry: chrono::DateTime::from_timestamp(2_000_000_000, 0).unwrap(),
         };

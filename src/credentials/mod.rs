@@ -109,12 +109,18 @@ pub trait DeployerCredentials: std::fmt::Debug + Send + Sync {
     /// [`store_paths`] so it stays compiled in regardless of provider SDK
     /// features (a dev-store outlives the binary that wrote it).
     ///
-    /// **Deliberately has no default.** A default of `None` would make a handler
-    /// that *forgot* to declare indistinguishable from one that genuinely mints
-    /// nothing, so a new minting env-pack could inherit it, reopen the orphan
-    /// leak, and still pass the conformance test. Requiring every implementation
-    /// to answer turns that omission into a compile error.
-    fn bound_credential_store_path(&self) -> Option<&'static str>;
+    /// Defaults to `None` — "mints nothing" — which keeps this trait
+    /// source-compatible for external implementors. The default is safe rather
+    /// than merely convenient because it is not the last line of defence:
+    /// [`run_bootstrap`] refuses to write bound material whose landing path is
+    /// not declared here *and* listed in
+    /// [`store_paths::BOUND_CREDENTIAL_STORE_PATHS`]. A handler that mints but
+    /// inherits the default therefore fails closed at bootstrap — before any
+    /// material is written — instead of silently orphaning a credential the seed
+    /// denylist cannot see.
+    fn bound_credential_store_path(&self) -> Option<&'static str> {
+        None
+    }
 
     /// Best-effort compensating cleanup for a bootstrap that wrote durable
     /// credential material to a REMOTE backend (e.g. the K8s `--bind` path

@@ -56,6 +56,7 @@ use crate::env_packs::{EnvPackRegistry, RegistryError};
 use crate::environment::{LocalFsStore, StoreError};
 
 use super::rules_export::{RulesExportError, RulesPack, write_rules_pack};
+use super::store_paths;
 
 /// One-shot admin credential material. `Drop` zeroizes the in-process
 /// buffer; see the module docstring for the limits of that guarantee.
@@ -217,6 +218,19 @@ pub enum RunBootstrapError {
     #[error("env `{0}` already has credentials_ref; use `rotate` instead of `bootstrap`")]
     AlreadyBootstrapped(EnvId),
     #[error(
+        "deployer env-pack `{deployer_kind}` minted bound credential material but its landing \
+         path is not covered by the runtime-seed denylist (declared: {declared:?}); refusing to \
+         write it. Bootstrap writes material before recording `credentials_ref`, so a crash in \
+         between would orphan a credential no seed exclusion can strip, leaking it into every \
+         workload this env deploys. Declare the path via \
+         `DeployerCredentials::bound_credential_store_path` and add it to \
+         `credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS`."
+    )]
+    UndeclaredCredentialPath {
+        deployer_kind: String,
+        declared: Option<String>,
+    },
+    #[error(
         "deployer env-pack `{kind}` has no native credentials handler registered (Phase D plug-in)"
     )]
     HandlerNotRegistered { kind: String },
@@ -291,6 +305,8 @@ pub fn run_bootstrap(
         let rules_pack_ref = write_rules_pack(&env_root, &deployer.kind, &outcome.rules_pack)?;
         // Snapshot the deployer kind before the &env borrow ends below.
         let deployer_kind = deployer.kind.clone();
+        // Kept for diagnostics: `deployer_kind` moves into the `Credentials` doc below.
+        let deployer_kind_label = deployer_kind.as_str().to_string();
 
         // When the handler bound credentials directly (e.g. Phase D AWS
         // mints a session token), the env is immediately credentialed.
@@ -346,6 +362,24 @@ pub fn run_bootstrap(
             outcome.bound_credentials_ref.as_ref(),
             outcome.bound_secret_material.as_ref(),
         ) {
+            // Fail closed BEFORE the write: material may only land where the
+            // runtime-seed denylist can strip it. This write is W1 and the
+            // `credentials_ref` save below is W2 — a crash between them orphans
+            // a credential nothing names, so the denylist covers the landing
+            // paths unconditionally. That only works if the path is one it
+            // knows. Checking here, at the single choke point every handler's
+            // material flows through, holds for handlers we never compiled —
+            // which a compile-time trait obligation could not do.
+            let declared = creds.bound_credential_store_path();
+            match declared {
+                Some(path) if store_paths::BOUND_CREDENTIAL_STORE_PATHS.contains(&path) => {}
+                _ => {
+                    return Err(RunBootstrapError::UndeclaredCredentialPath {
+                        deployer_kind: deployer_kind_label,
+                        declared: declared.map(str::to_string),
+                    });
+                }
+            }
             secret_sink(&env_root, bound_ref, material.as_str())
                 .map_err(RunBootstrapError::SecretWrite)?;
         }

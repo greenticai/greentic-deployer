@@ -781,8 +781,28 @@ pub(super) fn validate_dev_store_secret_path(rel_path: &str) -> Result<(), OpErr
 
 /// Whether `rel_path` (`<tenant>/<team>/<pack>/<name>`) is the deployer's own
 /// bound-credential namespace.
+///
+/// Compared by **canonical, versionless identity**: a store URI's last segment
+/// may carry an `@version` suffix, and the dev-store's exclusion filter drops
+/// every version of an excluded key. A raw string compare would therefore miss
+/// `…/deployer_token@1` and let it through — accepted, written, then silently
+/// stripped from the seed anyway (and, worse, landing on the live credential's
+/// key). Normalize before comparing, exactly as the exporter does.
 pub(super) fn is_reserved_credential_rel_path(rel_path: &str) -> bool {
-    crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS.contains(&rel_path)
+    let versionless = versionless_rel_path(rel_path);
+    crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS.contains(&versionless.as_str())
+}
+
+/// `<tenant>/<team>/<pack>/<name>@<version>` → `<tenant>/<team>/<pack>/<name>`.
+/// Only the final segment may carry a version (`SecretUri` parses `@` there).
+fn versionless_rel_path(rel_path: &str) -> String {
+    match rel_path.rsplit_once('/') {
+        Some((head, last)) => match last.split_once('@') {
+            Some((name, _version)) => format!("{head}/{name}"),
+            None => rel_path.to_string(),
+        },
+        None => rel_path.to_string(),
+    }
 }
 
 /// Refuse to write RUNTIME material onto the deployer's reserved credential
@@ -1618,6 +1638,30 @@ mod tests {
         // reservation is exact, not a prefix ban.
         validate_dev_store_secret_path("default/_/k8s-deployer/some_runtime_value")
             .expect("only the exact reserved paths are refused");
+    }
+
+    /// A store URI's last segment may carry an `@version`, and the dev-store's
+    /// exclusion filter matches by versionless identity — so a version-qualified
+    /// ref names the SAME key. Comparing raw strings would let
+    /// `…/deployer_token@1` through: accepted, written over the live credential's
+    /// key, then stripped from the seed anyway.
+    #[test]
+    fn the_reservation_matches_version_qualified_refs() {
+        for path in crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS {
+            for qualified in [format!("{path}@1"), format!("{path}@v2")] {
+                assert!(
+                    is_reserved_credential_rel_path(&qualified),
+                    "`{qualified}` names the same key as the reserved `{path}` and \
+                     must be refused"
+                );
+                let err = reject_reserved_credential_rel_path(&qualified).unwrap_err();
+                assert!(matches!(&err, OpError::InvalidArgument(msg) if msg.contains("reserved")));
+            }
+        }
+        // Version stripping must not over-match: a different name is writable.
+        assert!(!is_reserved_credential_rel_path(
+            "default/_/k8s-deployer/other@1"
+        ));
     }
 
     #[test]
