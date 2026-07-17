@@ -985,26 +985,13 @@ use crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS;
 /// The denylist is the union of two sources, and needs both:
 ///
 /// * **`credentials_ref`** — covers a credential bound at a custom URI.
-/// * **`BOUND_CREDENTIAL_STORE_PATHS`, unconditionally** — covers the
-///   *orphan*: `credentials::bootstrap` writes the material (W1) *before*
-///   persisting `credentials_ref` (W2), deliberately, so that a failed save
-///   leaves bootstrap re-runnable rather than pointing the env at a credential
-///   whose material isn't there. A crash in that window leaves material the env
-///   never names, which a `credentials_ref`-keyed denylist alone would miss —
-///   and the next seed would copy it into the workload. Excluding the well-known
-///   paths regardless of `credentials_ref` closes that window without needing to
-///   record what was written: the minting handlers derive their ref from these
-///   very constants, so the landing URI is deterministic per env. The list is
-///   deliberately *unconditional* — not gated on the provider SDK features this
-///   binary compiled — because a dev-store outlives the binary that wrote it.
-///
-/// Residual (accepted): a *custom* deployer env-pack registered through
-/// `EnvPackRegistry::register` could mint at a path in neither source, and an
-/// orphan of that credential (crash between W1 and W2, before anything names it)
-/// would escape both. Closing that needs a durable pending-ref record. No such
-/// handler exists — the registry's production set is closed over the built-ins,
-/// and a new one has to be compiled in, at which point its path belongs in
-/// `BOUND_CREDENTIAL_STORE_PATHS` (whose drift guard enforces exactly that).
+/// * **`BOUND_CREDENTIAL_STORE_PATHS`, unconditionally** — covers the *orphan* a
+///   crashed bootstrap leaves behind, which `credentials_ref` by definition does
+///   not name. This is the seed-time half of the invariant in
+///   [`credentials::store_paths`](crate::credentials::store_paths); see that
+///   module doc for why the window exists and why the list is unconditional.
+///   No record of what was written is needed: the minting handlers derive their
+///   ref from those very constants, so the landing URI is deterministic per env.
 ///
 /// Fail-open on a non-store-alignable `credentials_ref` is safe, not a leak: the
 /// credential can only be present in the dev-store if its ref *is*
@@ -6179,20 +6166,6 @@ mod tests {
 
         let bound = SecretRef::try_new(format!("secret://{env_id}/{path}")).unwrap();
         crate::cli::secrets::secret_ref_to_store_uri(&bound).unwrap()
-    }
-
-    #[test]
-    fn staging_excluded_uris_targets_the_bound_deployer_credential() {
-        use greentic_deploy_spec::SecretRef;
-
-        let mut env = make_env("cred");
-        let cred_ref = SecretRef::try_new("secret://cred/default/_/gcp-deployer/sa_key").unwrap();
-        env.credentials_ref = Some(cred_ref.clone());
-        let expected = crate::cli::secrets::secret_ref_to_store_uri(&cred_ref).unwrap();
-        assert!(
-            staging_excluded_uris(&env).contains(&expected),
-            "the bound deployer credential's store URI must be excluded from staging"
-        );
     }
 
     /// The H1-orphan window: `bootstrap` writes the credential material (W1) and

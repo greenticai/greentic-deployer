@@ -1388,10 +1388,6 @@ mod tests {
         struct NoMaterialCreds;
 
         impl DeployerCredentials for NoMaterialCreds {
-            fn bound_credential_store_path(&self) -> Option<&'static str> {
-                None
-            }
-
             fn requires_credentials_material(&self) -> bool {
                 false
             }
@@ -1519,10 +1515,6 @@ mod tests {
     struct BindPlaceholderCreds;
 
     impl crate::credentials::DeployerCredentials for BindPlaceholderCreds {
-        fn bound_credential_store_path(&self) -> Option<&'static str> {
-            None
-        }
-
         fn required_capabilities(&self) -> Vec<crate::credentials::Capability> {
             Vec::new()
         }

@@ -96,28 +96,22 @@ pub trait DeployerCredentials: std::fmt::Debug + Send + Sync {
     /// local paths — e.g. GCP Cloud Run, which returns
     /// `bound_credentials_ref: None`).
     ///
-    /// Declaring it is load-bearing, not informational: `bootstrap` writes the
-    /// material *before* it persists `credentials_ref`, so a crash in between
-    /// orphans a credential nothing names. The runtime-seed denylist therefore
-    /// strips these paths unconditionally, and
-    /// [`store_paths::BOUND_CREDENTIAL_STORE_PATHS`] must list every one of
-    /// them — a conformance test walks the registry and fails if an
-    /// implementation declares a path that is missing from that list.
+    /// Declaring it is load-bearing, not informational — it is what lets the
+    /// runtime-seed denylist cover this handler's material. See the
+    /// [`store_paths`] module doc for the invariant and why it exists.
     ///
     /// Implementations MUST return the same constant their `bootstrap` builds
-    /// its `bound_credentials_ref` from, and it MUST live in
-    /// [`store_paths`] so it stays compiled in regardless of provider SDK
-    /// features (a dev-store outlives the binary that wrote it).
+    /// its `bound_credentials_ref` from, and it MUST live in [`store_paths`] so
+    /// it stays compiled in regardless of provider SDK features. A conformance
+    /// test walks the registry and fails on a declared path missing from
+    /// [`store_paths::BOUND_CREDENTIAL_STORE_PATHS`].
     ///
-    /// Defaults to `None` — "mints nothing" — which keeps this trait
-    /// source-compatible for external implementors. The default is safe rather
+    /// Defaults to `None` — "mints nothing" — keeping this trait
+    /// source-compatible for external implementors. That default is safe rather
     /// than merely convenient because it is not the last line of defence:
-    /// [`run_bootstrap`] refuses to write bound material whose landing path is
-    /// not declared here *and* listed in
-    /// [`store_paths::BOUND_CREDENTIAL_STORE_PATHS`]. A handler that mints but
-    /// inherits the default therefore fails closed at bootstrap — before any
-    /// material is written — instead of silently orphaning a credential the seed
-    /// denylist cannot see.
+    /// [`run_bootstrap`] refuses to write material whose landing path is not
+    /// declared here *and* covered, so a handler that mints but inherits the
+    /// default fails closed instead of orphaning a credential.
     fn bound_credential_store_path(&self) -> Option<&'static str> {
         None
     }
@@ -180,10 +174,6 @@ mod tests {
     struct StubCredentials;
 
     impl DeployerCredentials for StubCredentials {
-        fn bound_credential_store_path(&self) -> Option<&'static str> {
-            None
-        }
-
         fn required_capabilities(&self) -> Vec<Capability> {
             vec![]
         }
@@ -209,10 +199,6 @@ mod tests {
     }
 
     impl DeployerCredentials for TimedCredentials {
-        fn bound_credential_store_path(&self) -> Option<&'static str> {
-            None
-        }
-
         fn required_capabilities(&self) -> Vec<Capability> {
             vec![]
         }

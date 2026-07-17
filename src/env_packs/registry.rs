@@ -191,7 +191,6 @@ impl EnvPackRegistry {
         Ok(self.resolve(kind)?.wizard_qaspec_yaml())
     }
 
-    /// Number of registered handlers.
     /// Every registered handler, in `descriptor_path` order.
     ///
     /// Lets cross-cutting invariants be checked against the *whole* registry
@@ -203,6 +202,7 @@ impl EnvPackRegistry {
         self.handlers.values().map(|handler| handler.as_ref())
     }
 
+    /// Number of registered handlers.
     pub fn len(&self) -> usize {
         self.handlers.len()
     }

@@ -1023,10 +1023,9 @@ pub(crate) fn provision_webhook_secret(
 /// pattern (sidecar flock, dedicated OS thread, own current-thread runtime).
 ///
 /// `secret_ref` can be caller-supplied (an endpoint may carry its own webhook
-/// ref, reused verbatim across rotations), so the reserved control-plane
-/// namespace is enforced here: without it, an endpoint added with a ref pointing
-/// at the deployer's own credential path would, on rotation, overwrite the env's
-/// bound deployer credential with a webhook secret.
+/// ref, reused verbatim across rotations), so a ref aimed at the deployer's own
+/// credential path would otherwise overwrite the env's bound deployer credential
+/// with a webhook secret on rotation. `dev_store_put` refuses that.
 fn write_webhook_secret_to_devstore(
     store: &LocalFsStore,
     env_id: &EnvId,
@@ -1039,9 +1038,6 @@ fn write_webhook_secret_to_devstore(
         std::env::var_os(super::secrets::DEV_SECRETS_PATH_ENV).map(PathBuf::from),
     );
     let store_uri = super::secrets::secret_ref_to_store_uri(secret_ref)?;
-    if let Some(rel) = super::secrets::store_uri_rel_path(&store_uri) {
-        super::secrets::reject_reserved_credential_rel_path(&rel)?;
-    }
     super::secrets::dev_store_put(&dev_path, &store_uri, value)
 }
 

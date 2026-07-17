@@ -2,13 +2,35 @@
 //! [`bootstrap`](super::DeployerCredentials::bootstrap) lands the bound
 //! credential material it minted.
 //!
-//! These live here — beside the credentials contract, in an always-compiled
-//! module — rather than inside each env-pack, for two reasons:
+//! **This module owns the W1/W2 orphan invariant. Other sites link here rather
+//! than restate it.**
+//!
+//! ## The invariant
+//!
+//! `credentials::bootstrap` writes the minted material (**W1**) *before* it
+//! persists `credentials_ref` (**W2**). That order is deliberate — a failed save
+//! must leave bootstrap re-runnable rather than point the env at a credential
+//! whose material isn't there — but it means a crash between the two orphans
+//! material that nothing names. A denylist keyed on `credentials_ref` therefore
+//! cannot see it, and the next runtime seed would copy the deployer's own
+//! credential into the workload, where the shared dev master key decrypts it.
+//!
+//! So: **bound credential material may only ever land somewhere the runtime-seed
+//! denylist can strip it.** Two mechanisms hold that up, and neither subsumes the
+//! other:
+//!
+//! * **Write-time** — [`landing_is_covered`], enforced by `run_bootstrap` before
+//!   anything is written or persisted. Catches a handler that mints at a path
+//!   nothing here covers.
+//! * **Seed-time** — `cli::env::staging_excluded_uris` strips
+//!   [`BOUND_CREDENTIAL_STORE_PATHS`] unconditionally. Catches the orphan itself,
+//!   which by definition appears *after* the write-time check already passed.
+//!
+//! ## Why the paths live here
 //!
 //! 1. **Single source of truth.** The minting handlers build their
-//!    `bound_credentials_ref` from these constants and the runtime-seed denylist
-//!    (`cli::env::staging_excluded_uris`) excludes them, so the writer and the
-//!    denylist provably cannot drift.
+//!    `bound_credentials_ref` from these constants and the denylist excludes
+//!    them, so the writer and the denylist provably cannot drift.
 //! 2. **Feature independence.** A dev-store outlives the binary that wrote it.
 //!    An AWS-capable build can land material at [`AWS_DEPLOYER_SESSION`] and
 //!    crash; a later build compiled *without* `creds-aws` must still strip that
@@ -27,17 +49,13 @@ pub(crate) const AWS_DEPLOYER_SESSION: &str = "default/_/aws-deployer/deployer_s
 /// Every store-relative path at which a built-in deployer bootstrap has ever
 /// landed bound credential material, `secret://<env>/<path>`-relative.
 ///
-/// **Control-plane namespace.** These paths are reserved for the deployer's own
-/// credentials; runtime material must not be written to them. Everything listed
-/// is stripped from every staged runtime seed unconditionally — see
-/// `cli::env::staging_excluded_uris` for why `credentials_ref` alone is not
-/// enough (the bootstrap W1/W2 orphan window).
+/// **Control-plane namespace.** Reserved for the deployer's own credentials;
+/// runtime material must not be written here, and everything listed is stripped
+/// from every staged runtime seed unconditionally (module doc).
 ///
-/// **Adding a deployer env-pack that mints bind material?** Its landing path
-/// MUST be added here, or a crashed bootstrap can orphan a credential that the
-/// seed denylist will miss. Only env-packs whose `bootstrap` returns
-/// `bound_credentials_ref: Some(_)` need an entry: the GCP Cloud Run bootstrap
-/// is render-only and writes no material, so it has none.
+/// **Adding a deployer env-pack that mints bind material?** Its landing path MUST
+/// be added here, or its bootstrap fails closed. Only env-packs whose `bootstrap`
+/// returns `bound_credentials_ref: Some(_)` need an entry.
 pub(crate) const BOUND_CREDENTIAL_STORE_PATHS: &[&str] =
     &[K8S_DEPLOYER_TOKEN, AWS_DEPLOYER_SESSION];
 
@@ -63,27 +81,11 @@ pub(crate) fn is_reserved_rel_path(rel_path: &str) -> bool {
     BOUND_CREDENTIAL_STORE_PATHS.contains(&versionless_rel_path(rel_path).as_str())
 }
 
-/// Where `bound_ref` will actually land, as `(env, versionless rel path)`,
-/// resolved through the same canonicalization the writer uses
-/// (`SecretRef::to_store_uri`, which re-canonicalizes the team). `None` when the
-/// ref is not a store-aligned URI at all.
-pub(crate) fn landing_site(
-    bound_ref: &greentic_deploy_spec::SecretRef,
-) -> Option<(String, String)> {
-    let uri = bound_ref.to_store_uri().ok()?.to_string();
-    split_store_uri(&uri).map(|(env, rel)| (env.to_string(), rel))
-}
-
-/// Whether bound credential material may be written at `bound_ref`.
-///
-/// The single invariant behind the whole runtime-seed denylist: **material may
-/// only ever land somewhere the denylist can strip it.** `bootstrap` writes
-/// material before it records `credentials_ref`, so a crash in between orphans a
-/// credential nothing names; the denylist covers that by stripping the known
-/// landing paths unconditionally, which only works if the path is one it knows.
+/// Check that bound credential material may be written at `bound_ref` — the
+/// write-time half of the module's invariant.
 ///
 /// Checked against the ACTUAL destination rather than the handler's claim about
-/// it — a handler that declares a covered path while returning a rogue or
+/// it: a handler that declares a covered path while returning a rogue or
 /// cross-environment ref must not pass. All three conditions are load-bearing:
 ///
 /// * the ref parses (a ref no exclusion can match is itself a refusal reason),
@@ -92,23 +94,30 @@ pub(crate) fn landing_site(
 /// * its versionless path equals the declaration AND is covered by
 ///   [`BOUND_CREDENTIAL_STORE_PATHS`].
 ///
-/// Returns the resolved landing site alongside the verdict so callers can report
-/// what would have happened.
+/// `Err` carries the resolved landing site (`<env>:<rel>`, `None` if the ref did
+/// not parse) so the caller can report what would have happened.
 pub(crate) fn landing_is_covered(
     bound_ref: &greentic_deploy_spec::SecretRef,
     env_id: &greentic_deploy_spec::EnvId,
     declared: Option<&str>,
-) -> (bool, Option<String>) {
-    let landing = landing_site(bound_ref);
-    let ok = match (&landing, declared) {
-        (Some((ref_env, rel)), Some(path)) => {
-            ref_env == env_id.as_str()
+) -> Result<(), Option<String>> {
+    // Resolved through the same canonicalization the writer uses
+    // (`to_store_uri` re-canonicalizes the team), so this compares what will
+    // really be on disk.
+    let landing = bound_ref
+        .to_store_uri()
+        .ok()
+        .and_then(|uri| split_store_uri(&uri.to_string()).map(|(env, rel)| (env.to_string(), rel)));
+    match (&landing, declared) {
+        (Some((ref_env, rel)), Some(path))
+            if ref_env == env_id.as_str()
                 && rel == path
-                && BOUND_CREDENTIAL_STORE_PATHS.contains(&path)
+                && BOUND_CREDENTIAL_STORE_PATHS.contains(&path) =>
+        {
+            Ok(())
         }
-        _ => false,
-    };
-    (ok, landing.map(|(env, rel)| format!("{env}:{rel}")))
+        _ => Err(landing.map(|(env, rel)| format!("{env}:{rel}"))),
+    }
 }
 
 /// Split a canonical store URI `secret(s)://<env>/<rel>` into its env and its

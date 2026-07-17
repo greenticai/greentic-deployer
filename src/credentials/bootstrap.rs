@@ -220,10 +220,8 @@ pub enum RunBootstrapError {
     #[error(
         "deployer env-pack `{deployer_kind}` minted bound credential material but its landing \
          path is not covered by the runtime-seed denylist (declared: {declared:?}, actual \
-         landing: {landing:?}); refusing to \
-         write it. Bootstrap writes material before recording `credentials_ref`, so a crash in \
-         between would orphan a credential no seed exclusion can strip, leaking it into every \
-         workload this env deploys. Declare the path via \
+         landing: {landing:?}); refusing to write it, because a crashed bootstrap could then \
+         orphan a credential no seed exclusion can strip. Declare the path via \
          `DeployerCredentials::bound_credential_store_path` and add it to \
          `credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS`."
     )]
@@ -311,8 +309,25 @@ pub fn run_bootstrap(
         let rules_pack_ref = write_rules_pack(&env_root, &deployer.kind, &outcome.rules_pack)?;
         // Snapshot the deployer kind before the &env borrow ends below.
         let deployer_kind = deployer.kind.clone();
-        // Kept for diagnostics: `deployer_kind` moves into the `Credentials` doc below.
-        let deployer_kind_label = deployer_kind.as_str().to_string();
+
+        // Fail closed BEFORE anything is written or persisted — the write-time
+        // half of the `store_paths` invariant (see that module doc).
+        //
+        // Gated on the REF, not on the material: a handler returning
+        // `Some(rogue_ref)` with no material writes nothing now, but persisting
+        // that ref makes it the env's credential location — and `run_rotate`
+        // later writes real material at exactly that persisted ref. Gating only
+        // the material-carrying case would leave that path open.
+        if let Some(bound_ref) = outcome.bound_credentials_ref.as_ref() {
+            let declared = creds.bound_credential_store_path();
+            if let Err(landing) = store_paths::landing_is_covered(bound_ref, env_id, declared) {
+                return Err(RunBootstrapError::UndeclaredCredentialPath {
+                    deployer_kind: deployer_kind.as_str().to_string(),
+                    declared: declared.map(str::to_string),
+                    landing,
+                });
+            }
+        }
 
         // When the handler bound credentials directly (e.g. Phase D AWS
         // mints a session token), the env is immediately credentialed.
@@ -358,27 +373,6 @@ pub fn run_bootstrap(
                 rotate_at: None,
             }),
         };
-
-        // Fail closed BEFORE anything is written or persisted: bound credential
-        // material may only ever land where the runtime-seed denylist can strip
-        // it. See `store_paths::landing_is_covered` for the full invariant.
-        //
-        // Gated on the REF, not on the material: a handler returning
-        // `Some(rogue_ref)` with no material writes nothing now, but persisting
-        // that ref makes it the env's credential location — and `run_rotate`
-        // later writes real material at exactly that persisted ref. Gating only
-        // the material-carrying case would leave that path open.
-        if let Some(bound_ref) = outcome.bound_credentials_ref.as_ref() {
-            let declared = creds.bound_credential_store_path();
-            let (ok, landing) = store_paths::landing_is_covered(bound_ref, env_id, declared);
-            if !ok {
-                return Err(RunBootstrapError::UndeclaredCredentialPath {
-                    deployer_kind: deployer_kind_label,
-                    declared: declared.map(str::to_string),
-                    landing,
-                });
-            }
-        }
 
         // Persist bound secret material (when the handler minted it) to the
         // secret backend BEFORE recording credentials_ref: the env must
