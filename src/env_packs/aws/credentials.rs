@@ -579,6 +579,10 @@ impl AwsDeployerCredentials {
 }
 
 impl DeployerCredentials for AwsDeployerCredentials {
+    fn bound_credential_store_path(&self) -> Option<&'static str> {
+        Some(DEPLOYER_SESSION_STORE_PATH)
+    }
+
     fn requires_credentials_material(&self) -> bool {
         true
     }

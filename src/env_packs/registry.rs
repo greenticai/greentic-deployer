@@ -192,6 +192,17 @@ impl EnvPackRegistry {
     }
 
     /// Number of registered handlers.
+    /// Every registered handler, in `descriptor_path` order.
+    ///
+    /// Lets cross-cutting invariants be checked against the *whole* registry
+    /// rather than a hard-coded list of built-ins — e.g. the conformance guard
+    /// in [`credentials::store_paths`](crate::credentials::store_paths) that
+    /// requires every deployer declaring a bound-credential landing path to have
+    /// that path in the runtime-seed denylist.
+    pub fn handlers(&self) -> impl Iterator<Item = &dyn EnvPackHandler> {
+        self.handlers.values().map(|handler| handler.as_ref())
+    }
+
     pub fn len(&self) -> usize {
         self.handlers.len()
     }

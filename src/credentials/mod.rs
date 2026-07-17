@@ -90,6 +90,33 @@ pub trait DeployerCredentials: std::fmt::Debug + Send + Sync {
     /// pointing at nothing.
     fn bootstrap(&self, input: &BootstrapInput<'_>) -> Result<BootstrapOutcome, BootstrapError>;
 
+    /// The store-relative path at which this deployer's
+    /// [`bootstrap`](Self::bootstrap) lands the bound credential material it
+    /// mints, or `None` for a bootstrap that mints none (the render-only /
+    /// local paths — e.g. GCP Cloud Run, which returns
+    /// `bound_credentials_ref: None`).
+    ///
+    /// Declaring it is load-bearing, not informational: `bootstrap` writes the
+    /// material *before* it persists `credentials_ref`, so a crash in between
+    /// orphans a credential nothing names. The runtime-seed denylist therefore
+    /// strips these paths unconditionally, and
+    /// [`store_paths::BOUND_CREDENTIAL_STORE_PATHS`] must list every one of
+    /// them — a conformance test walks the registry and fails if an
+    /// implementation declares a path that is missing from that list.
+    ///
+    /// Implementations MUST return the same constant their `bootstrap` builds
+    /// its `bound_credentials_ref` from, and it MUST live in
+    /// [`store_paths`] so it stays compiled in regardless of provider SDK
+    /// features (a dev-store outlives the binary that wrote it).
+    ///
+    /// Default is `None`, which is the safe answer for a handler that mints
+    /// nothing; a handler that *does* mint and forgets to override this is
+    /// caught by the conformance test only if its path is also absent from the
+    /// list, so new minting handlers must add both.
+    fn bound_credential_store_path(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Best-effort compensating cleanup for a bootstrap that wrote durable
     /// credential material to a REMOTE backend (e.g. the K8s `--bind` path
     /// writes the minted bearer into an in-cluster Secret) but then failed a

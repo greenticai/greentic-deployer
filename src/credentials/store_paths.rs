@@ -45,21 +45,46 @@ pub(crate) const BOUND_CREDENTIAL_STORE_PATHS: &[&str] =
 mod tests {
     use super::*;
 
-    /// Drift guard: the constants the minting handlers build their bound ref
-    /// from must be the ones the denylist strips. Renaming one without the
-    /// other would silently reopen the orphan leak.
+    /// Conformance guard: walk the *registry* — not a hard-coded pair — and
+    /// require that every deployer env-pack which declares a credential landing
+    /// path has that path in the denylist. A new minting handler that forgets to
+    /// register its path fails here rather than silently leaking an orphaned
+    /// credential into a workload seed.
+    ///
+    /// Registry-driven on purpose: asserting on the two built-in constants would
+    /// be tautological (they are aliases of the entries below) and would pass
+    /// for a third handler that never registered its path at all.
     #[test]
-    fn every_minting_handler_path_is_in_the_denylist() {
+    fn every_declared_handler_landing_path_is_in_the_denylist() {
+        use crate::env_packs::registry::EnvPackRegistry;
+        use greentic_deploy_spec::CapabilitySlot;
+
+        let registry = EnvPackRegistry::with_builtins();
+        let mut declared = 0;
+        for handler in registry.handlers() {
+            if handler.slot() != CapabilitySlot::Deployer {
+                continue;
+            }
+            let Some(creds) = handler.deployer_credentials() else {
+                continue;
+            };
+            let Some(path) = creds.bound_credential_store_path() else {
+                continue; // render-only / local — mints nothing to orphan
+            };
+            declared += 1;
+            assert!(
+                BOUND_CREDENTIAL_STORE_PATHS.contains(&path),
+                "deployer env-pack `{}` lands bound credential material at `{path}`, \
+                 but that path is not in BOUND_CREDENTIAL_STORE_PATHS — a crashed \
+                 bootstrap would orphan a credential the runtime-seed denylist misses. \
+                 Add it to credentials::store_paths.",
+                handler.descriptor_path()
+            );
+        }
         assert!(
-            BOUND_CREDENTIAL_STORE_PATHS
-                .contains(&crate::env_packs::k8s::bootstrap::DEPLOYER_TOKEN_STORE_PATH),
-            "the k8s bootstrap's landing path must be excluded from staged seeds"
-        );
-        #[cfg(feature = "creds-aws")]
-        assert!(
-            BOUND_CREDENTIAL_STORE_PATHS
-                .contains(&crate::env_packs::aws::credentials::DEPLOYER_SESSION_STORE_PATH),
-            "the aws bootstrap's landing path must be excluded from staged seeds"
+            declared > 0,
+            "sanity: at least the k8s deployer must declare a landing path — a zero \
+             count would make this guard vacuous"
         );
     }
 

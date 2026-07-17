@@ -775,6 +775,23 @@ pub(super) fn validate_dev_store_secret_path(rel_path: &str) -> Result<(), OpErr
              a-z, 0-9 and single `_` separators (no leading/trailing `_`)"
         )));
     }
+    // The deployer's own credential namespace. `staging_excluded_uris` strips
+    // these from every runtime seed unconditionally (a crashed bootstrap can
+    // orphan material there that nothing names), so runtime material written
+    // here would be accepted, stored, and audited as present — then silently
+    // vanish from the workload. Reserve the paths at the write surface instead,
+    // so the collision cannot be created rather than being papered over.
+    //
+    // Only the runtime-secret surfaces route through this validator; the
+    // credentials bootstrap's own sink (`put_credential_material`) writes via
+    // `dev_store_put` directly and is unaffected — it is the legitimate writer.
+    if crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS.contains(&rel_path) {
+        return Err(OpError::InvalidArgument(format!(
+            "`{rel_path}` is reserved for the deployer's own bound credential and \
+             cannot hold runtime material: it is stripped from every staged runtime \
+             seed, so a workload could never read it back — choose another path"
+        )));
+    }
     Ok(())
 }
 
@@ -1525,6 +1542,54 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    /// The deployer's credential namespace is reserved: the runtime-seed
+    /// denylist strips those paths unconditionally, so runtime material written
+    /// there would be stored and audited as present, then silently vanish from
+    /// the workload. Reject at the write surface so the collision cannot exist.
+    #[test]
+    fn put_rejects_the_reserved_deployer_credential_paths() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&env_with_secrets()).unwrap();
+        for path in crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS {
+            let err = put(
+                &store,
+                &OpFlags::default(),
+                Some(SecretsPutPayload {
+                    environment_id: "local".to_string(),
+                    path: (*path).to_string(),
+                    value: "v".to_string(),
+                    idempotency_key: None,
+                }),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, OpError::InvalidArgument(msg) if msg.contains("reserved")),
+                "runtime material must not be writable at the reserved deployer \
+                 credential path `{path}`; got {err:?}"
+            );
+        }
+    }
+
+    /// The reservation lives in the validator shared by `op secrets put`, `op
+    /// updates enroll` and `env apply`'s manifest validation, so no write
+    /// surface can drift from it. The credentials bootstrap's own sink writes
+    /// through `dev_store_put` and is deliberately unaffected.
+    #[test]
+    fn the_shared_validator_reserves_deployer_credential_paths() {
+        for path in crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS {
+            let err = validate_dev_store_secret_path(path).unwrap_err();
+            assert!(
+                matches!(&err, OpError::InvalidArgument(msg) if msg.contains("reserved")),
+                "`{path}` must be reserved in the shared validator; got {err:?}"
+            );
+        }
+        // A neighbouring path in the same category is still writable — the
+        // reservation is exact, not a prefix ban.
+        validate_dev_store_secret_path("default/_/k8s-deployer/some_runtime_value")
+            .expect("only the exact reserved paths are refused");
     }
 
     #[test]
