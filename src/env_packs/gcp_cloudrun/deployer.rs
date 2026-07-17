@@ -241,6 +241,83 @@ pub fn environment_secret_name(secret_prefix: &str) -> String {
     format!("{secret_prefix}-environment")
 }
 
+/// The value stamped as a staged secret's owner: a GCP-label-safe rendering of
+/// `env_id` that is *injective* — distinct env ids never collide.
+///
+/// Both halves are load-bearing. GCP label values admit only `[a-z0-9_-]{0,63}`
+/// while [`EnvId`](greentic_types::EnvId) also admits uppercase and `.`, so the
+/// raw id cannot be stamped. Folding it into the charset alone is not enough:
+/// `a.b` and `a-b` would render identically, two different environments would
+/// read as one owner, and the ownership check would wave through exactly the
+/// cross-environment write it exists to stop. The hash of the ORIGINAL id keeps
+/// the stamp injective; the readable prefix is what an operator sees in the
+/// console and in [`secret_conflict`]'s message.
+pub(crate) fn env_owner_stamp(env_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = hex::encode(&Sha256::digest(env_id.as_bytes())[..4]);
+    // `EnvId` is ASCII-only, so chars are bytes and 54 + '-' + 8 <= 63.
+    let readable: String = env_id
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(54)
+        .collect();
+    format!("{readable}-{digest}")
+}
+
+/// What a live staged secret is, relative to the environment about to write it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SecretOwnership {
+    /// No such secret — this warm creates it and stamps itself the owner.
+    Absent,
+    /// Stamped with our own [`env_owner_stamp`].
+    Ours,
+    /// Exists carrying no stamp: staged before ownership stamping. Adopted as
+    /// ours without re-stamping — the deployer never asks for
+    /// `secretmanager.secrets.update`, and these envs predate the fix on a lane
+    /// Cloud Run has never shipped to stable users from.
+    Legacy,
+    /// Stamped by a DIFFERENT environment. Writing here would add our seed to
+    /// their secret, grant our runtime SA read over every version of theirs
+    /// (their dev-store included), and put their secret on our teardown's
+    /// delete list.
+    Conflict { owner: String },
+}
+
+/// Read `name`'s owner stamp and classify it for `env_id`.
+pub(crate) async fn secret_ownership(
+    target: &dyn super::deploy_target::CloudRunTarget,
+    name: &str,
+    env_id: &str,
+) -> Result<SecretOwnership, DeployerError> {
+    match target.get_secret_owner(name).await {
+        Ok(Some(owner)) if owner == env_owner_stamp(env_id) => Ok(SecretOwnership::Ours),
+        Ok(Some(owner)) => Ok(SecretOwnership::Conflict { owner }),
+        Ok(None) => Ok(SecretOwnership::Legacy),
+        Err(CloudRunTargetError::NotFound(_)) => Ok(SecretOwnership::Absent),
+        Err(e) => Err(provider(e)),
+    }
+}
+
+/// The refusal for a secret another environment owns. Names both stamps: the
+/// live one identifies who to talk to, ours confirms which environment was
+/// refused.
+pub(crate) fn secret_conflict(name: &str, owner: &str, env_id: &str) -> DeployerError {
+    DeployerError::Provider(format!(
+        "Secret Manager secret `{name}` belongs to environment `{owner}`, but this is environment \
+         `{ours}`. Two environments cannot share one secret — each would grant its own runtime \
+         service account read over the other's staged seed. Give this environment a distinct \
+         `secret_prefix` answer.",
+        ours = env_owner_stamp(env_id),
+    ))
+}
+
 /// Literal boot env vars projected onto every Cloud Run revision (plan D6
 /// activation + runtime identity). `GREENTIC_SEED_DIR` triggers greentic-start's
 /// boot-copy of the mounted `environment.json` into the writable store rooted at
@@ -785,9 +862,32 @@ impl GcpCloudRunDeployerHandler {
                 "serializing environment.json for seed staging: {e}"
             ))
         })?;
+        // Refuse before the first write if the secret is another environment's
+        // (H1): `secret_prefix` is a free-text answer, so two envs in one project
+        // can resolve to one secret name while keeping DIFFERENT runtime service
+        // accounts (`gtc-{env}-runtime@`) — staging on would hand our SA read
+        // over their dev-store. Probed only here, on the create path: the
+        // revision-exists path never stages, so it has nothing to protect.
+        let owner = env_owner_stamp(env.environment_id.as_str());
+        match secret_ownership(
+            self.target.as_ref(),
+            secret_name,
+            env.environment_id.as_str(),
+        )
+        .await?
+        {
+            SecretOwnership::Conflict { owner: live } => {
+                return Err(secret_conflict(
+                    secret_name,
+                    &live,
+                    env.environment_id.as_str(),
+                ));
+            }
+            SecretOwnership::Absent | SecretOwnership::Ours | SecretOwnership::Legacy => {}
+        }
         let env_version = self
             .target
-            .upsert_secret(secret_name, &environment_json)
+            .upsert_secret(secret_name, &owner, &environment_json)
             .await
             .map_err(provider)?;
         let mut secret_items = vec![SecretMountItem {
@@ -802,7 +902,7 @@ impl GcpCloudRunDeployerHandler {
         if let Some(dev_bytes) = &self.dev_secrets {
             let dev_version = self
                 .target
-                .upsert_secret(secret_name, dev_bytes)
+                .upsert_secret(secret_name, &owner, dev_bytes)
                 .await
                 .map_err(provider)?;
             secret_items.push(SecretMountItem {
@@ -1074,12 +1174,19 @@ mod tests {
         ) -> Result<Option<String>, CloudRunTargetError> {
             self.inner.get_service_url(service).await
         }
+        async fn get_secret_owner(
+            &self,
+            name: &str,
+        ) -> Result<Option<String>, CloudRunTargetError> {
+            self.inner.get_secret_owner(name).await
+        }
         async fn upsert_secret(
             &self,
             name: &str,
+            owner: &str,
             payload: &[u8],
         ) -> Result<SecretVersion, CloudRunTargetError> {
-            self.inner.upsert_secret(name, payload).await
+            self.inner.upsert_secret(name, owner, payload).await
         }
         async fn grant_secret_accessor(
             &self,
@@ -1419,7 +1526,11 @@ mod tests {
         let secret_name = environment_secret_name(&params.secret_prefix);
 
         handler.warm_revision(&env, r_warm, None).await.unwrap();
-        assert_eq!(target.secrets()[&secret_name].1, 1, "first warm stages v1");
+        assert_eq!(
+            target.secrets()[&secret_name].versions,
+            1,
+            "first warm stages v1"
+        );
 
         handler
             .warm_revision(&env, r_warm, None)
@@ -1427,7 +1538,7 @@ mod tests {
             .expect("re-warming a live revision must succeed (trait idempotency contract)");
 
         assert_eq!(
-            target.secrets()[&secret_name].1,
+            target.secrets()[&secret_name].versions,
             1,
             "the second warm must stage NO new secret version — a fresh version could \
              never reach this immutable revision, so it would be pure orphan"
@@ -1471,6 +1582,100 @@ mod tests {
         );
     }
 
+    /// H1. `secret_prefix` is a free-text answer, so two environments in one
+    /// project can resolve to the same secret name. Their runtime service
+    /// accounts do NOT collide (`gtc-{env}-runtime@`), so staging on would grant
+    /// this env's SA `secretAccessor` over every version of the other's secret —
+    /// including the dev-store, which holds that env's whole credential set.
+    #[tokio::test]
+    async fn warm_refuses_a_secret_another_environment_owns() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let params = params_from_answers(&env, None).unwrap();
+        let secret_name = environment_secret_name(&params.secret_prefix);
+        // Another env got to this name first, exactly as a copied
+        // `secret_prefix` answer would produce.
+        target.seed_secret(&secret_name, Some(&env_owner_stamp("other-env")));
+
+        let err = handler
+            .warm_revision(&env, env.revisions[0].revision_id, None)
+            .await
+            .expect_err("staging into another environment's secret must be refused");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("belongs to environment") && msg.contains("secret_prefix"),
+            "the refusal must name the owner and the answer to change, got: {msg}"
+        );
+        assert_eq!(
+            target.secrets()[&secret_name].versions,
+            1,
+            "refuse BEFORE writing — a version added here is our seed sitting in \
+             their secret, readable by them, and no error can take it back"
+        );
+        assert!(
+            target.secret_accessors_for(&secret_name).is_none(),
+            "and before granting — the grant is the actual credential leak"
+        );
+    }
+
+    /// H1. The owner stamp must be injective. `EnvId` admits `.` and uppercase,
+    /// which GCP label values do not, so the stamp folds the id into GCP's
+    /// charset — and a fold alone would map `a.b` and `a-b` onto one owner,
+    /// letting each pass the other's ownership check. The hash is what keeps
+    /// them apart.
+    #[test]
+    fn owner_stamps_separate_env_ids_that_fold_to_the_same_label() {
+        for (left, right) in [("a.b", "a-b"), ("Prod", "prod"), ("x_y", "x.y")] {
+            assert_ne!(
+                env_owner_stamp(left),
+                env_owner_stamp(right),
+                "`{left}` and `{right}` are different environments and must not share an owner"
+            );
+        }
+        let stamp = env_owner_stamp("My.Env");
+        assert!(
+            stamp
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+                && stamp.len() <= 63,
+            "the stamp must be a valid GCP label value, got `{stamp}`"
+        );
+        assert_eq!(
+            env_owner_stamp("prod"),
+            env_owner_stamp("prod"),
+            "the same env must stamp the same value on every warm, or it locks itself out"
+        );
+    }
+
+    /// H1. A secret staged before ownership stamping carries no label. The
+    /// deployer adopts it rather than failing closed — refusing would brick
+    /// every env deployed before this fix.
+    ///
+    /// That it is adopted *without being re-stamped* is not asserted here: the
+    /// fake stamps at create only, so no deployer-level assertion could fail. It
+    /// is pinned as a seam contract in
+    /// `deploy_target::upsert_secret_stamps_the_owner_at_create_only`.
+    #[tokio::test]
+    async fn warm_adopts_a_legacy_unstamped_secret() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let params = params_from_answers(&env, None).unwrap();
+        let secret_name = environment_secret_name(&params.secret_prefix);
+        target.seed_secret(&secret_name, None);
+
+        handler
+            .warm_revision(&env, env.revisions[0].revision_id, None)
+            .await
+            .expect("an unstamped secret is legacy, not foreign");
+
+        assert_eq!(
+            target.secrets()[&secret_name].versions,
+            2,
+            "the legacy secret takes our new version rather than the warm failing"
+        );
+    }
+
     /// H2. Existence is not convergence. `answers_ref` is env-level and
     /// editable, so the same revision can be re-warmed under a configuration the
     /// live revision does not have. Cloud Run cannot update an immutable
@@ -1485,7 +1690,7 @@ mod tests {
         let dep_a = env.bundles[0].deployment_id;
 
         handler.warm_revision(&env, r_warm, None).await.unwrap();
-        let staged_before = target.secrets().values().map(|(_, v)| *v).sum::<u64>();
+        let staged_before = target.secrets().values().map(|s| s.versions).sum::<u64>();
 
         // The operator edits the binding's answers and re-runs `op env up`.
         let answers = serde_json::json!({ "runtime_image_tag": "v2-rolled-forward" });
@@ -1500,7 +1705,7 @@ mod tests {
             "the error must name the conflict and the way out, got: {msg}"
         );
         assert_eq!(
-            target.secrets().values().map(|(_, v)| *v).sum::<u64>(),
+            target.secrets().values().map(|s| s.versions).sum::<u64>(),
             staged_before,
             "the refusal must come BEFORE staging — a rejected warm leaves no orphans"
         );
@@ -1569,11 +1774,16 @@ mod tests {
         let params = params_from_answers(&env, None).unwrap();
         let secret_name = environment_secret_name(&params.secret_prefix);
         let secrets = target.secrets();
-        let (payload, version) = secrets
+        let staged = secrets
             .get(&secret_name)
             .expect("warm stages the environment.json seed secret");
-        assert_eq!(payload, &serde_json::to_vec(&env).unwrap());
-        assert_eq!(*version, 1, "first warm adds version 1");
+        assert_eq!(staged.payload, serde_json::to_vec(&env).unwrap());
+        assert_eq!(staged.versions, 1, "first warm adds version 1");
+        assert_eq!(
+            staged.owner.as_deref(),
+            Some(env_owner_stamp(env.environment_id.as_str()).as_str()),
+            "the creating env stamps itself the secret's owner"
+        );
 
         // The runtime SA is granted secretAccessor so the mounted version is
         // readable — Cloud Run rejects a revision whose SA cannot read it.
@@ -1687,11 +1897,11 @@ mod tests {
         // its on-disk subdirectory path.
         let params = params_from_answers(&env, None).unwrap();
         let secret_name = environment_secret_name(&params.secret_prefix);
-        let (_, version_count) = target
+        let version_count = target
             .secrets()
             .get(&secret_name)
-            .cloned()
-            .expect("seed secret staged");
+            .expect("seed secret staged")
+            .versions;
         assert_eq!(version_count, 2, "env.json v1 + dev-store v2 on one secret");
 
         let mounts = target
@@ -1738,7 +1948,7 @@ mod tests {
             .secrets()
             .get(&secret_name)
             .expect("seed secret staged")
-            .1;
+            .versions;
         assert_eq!(
             version, 1,
             "the seed secret is staged once, before the etag loop"

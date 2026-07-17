@@ -244,6 +244,19 @@ pub struct SecretVersion {
     pub version: String,
 }
 
+/// One staged secret as [`InMemoryCloudRun`] holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSecret {
+    /// Payload of the most recent version (the fake keeps only the latest).
+    pub payload: Vec<u8>,
+    /// How many versions have been added — what a warm's staging spends.
+    pub versions: u64,
+    /// The owner stamp `upsert_secret` created the secret with, or `None` for a
+    /// secret created before ownership stamping. See
+    /// [`CloudRunTarget::get_secret_owner`].
+    pub owner: Option<String>,
+}
+
 /// Errors the Cloud Run target can surface. All flow into
 /// [`DeployerError::Provider`](crate::env_packs::deployer::DeployerError::Provider)
 /// at the [`Deployer`](super::deployer) boundary.
@@ -324,12 +337,26 @@ pub trait CloudRunTarget: std::fmt::Debug + Send + Sync {
         service: &ServiceRef,
     ) -> Result<Option<String>, CloudRunTargetError>;
 
+    /// The environment stamped as `name`'s owner when it was created, or `None`
+    /// for a secret carrying no stamp (created before ownership stamping, or by
+    /// something other than this deployer). Returns
+    /// [`NotFound`](CloudRunTargetError::NotFound) when the secret does not
+    /// exist. The deployer — not the target — decides what a given owner means;
+    /// see `deployer::secret_ownership`.
+    async fn get_secret_owner(&self, name: &str) -> Result<Option<String>, CloudRunTargetError>;
+
     /// Create-or-update a Secret Manager secret and add a new version,
     /// returning the immutable numeric version resource (plan D6). Never the
     /// `latest` alias.
+    ///
+    /// `owner` is stamped onto the secret **at create only**: an existing secret
+    /// is adopted as-is, never re-stamped. Re-stamping would open a read→update
+    /// race against a concurrent warm, and it would buy nothing — the ownership
+    /// check upstream has already established this secret is safe to write to.
     async fn upsert_secret(
         &self,
         name: &str,
+        owner: &str,
         payload: &[u8],
     ) -> Result<SecretVersion, CloudRunTargetError>;
 
@@ -401,9 +428,13 @@ impl CloudRunTarget for UnconfiguredCloudRunTarget {
     ) -> Result<Option<String>, CloudRunTargetError> {
         Err(CloudRunTargetError::Unconfigured)
     }
+    async fn get_secret_owner(&self, _name: &str) -> Result<Option<String>, CloudRunTargetError> {
+        Err(CloudRunTargetError::Unconfigured)
+    }
     async fn upsert_secret(
         &self,
         _name: &str,
+        _owner: &str,
         _payload: &[u8],
     ) -> Result<SecretVersion, CloudRunTargetError> {
         Err(CloudRunTargetError::Unconfigured)
@@ -437,7 +468,7 @@ pub struct InMemoryCloudRun {
     /// Each live revision plus the template it was rendered from, so a
     /// re-upsert can be checked against Cloud Run's immutability rule.
     revisions: Mutex<BTreeMap<(DeploymentId, RevisionId), (RevisionStatus, RevisionTemplate)>>,
-    secrets: Mutex<BTreeMap<String, (Vec<u8>, u64)>>,
+    secrets: Mutex<BTreeMap<String, StoredSecret>>,
     /// Service accounts granted `secretAccessor` on each secret, so tests can
     /// assert the deployer grants the runtime SA before mounting.
     secret_accessors: Mutex<BTreeMap<String, Vec<String>>>,
@@ -487,9 +518,23 @@ impl InMemoryCloudRun {
             .collect()
     }
 
-    /// Snapshot of every staged secret: name → (payload, version count).
-    pub fn secrets(&self) -> BTreeMap<String, (Vec<u8>, u64)> {
+    /// Snapshot of every staged secret, keyed by name.
+    pub fn secrets(&self) -> BTreeMap<String, StoredSecret> {
         self.secrets.lock().expect("secrets mutex").clone()
+    }
+
+    /// Pre-create `name` as `owner` — `Some(env)` for a secret another
+    /// environment staged, `None` for one created before ownership stamping.
+    /// Lets a test drive the deployer's ownership check without a GCP project.
+    pub fn seed_secret(&self, name: &str, owner: Option<&str>) {
+        self.secrets.lock().expect("secrets mutex").insert(
+            name.to_string(),
+            StoredSecret {
+                payload: b"pre-existing".to_vec(),
+                versions: 1,
+                owner: owner.map(str::to_string),
+            },
+        );
     }
 
     /// Service accounts granted `secretAccessor` on `secret_name`, if any.
@@ -729,19 +774,43 @@ impl CloudRunTarget for InMemoryCloudRun {
             .and_then(|s| s.url.clone()))
     }
 
+    async fn get_secret_owner(&self, name: &str) -> Result<Option<String>, CloudRunTargetError> {
+        self.secrets
+            .lock()
+            .expect("secrets mutex")
+            .get(name)
+            .map(|secret| secret.owner.clone())
+            .ok_or_else(|| CloudRunTargetError::NotFound(format!("secret `{name}`")))
+    }
+
+    /// Deliberately does NOT reject a write to a secret owned by another
+    /// environment: real Secret Manager has no such rule — it accepts a version
+    /// from anyone holding `secretmanager.versions.add`. Ownership is this
+    /// deployer's policy, not the server's, so enforcing it here would model a
+    /// constraint that does not exist and move the tested behaviour out of the
+    /// deployer, where the refusal actually lives. The fake's honest job is the
+    /// stamp round-trip: `owner` is recorded at create and read back by
+    /// [`get_secret_owner`](CloudRunTarget::get_secret_owner).
     async fn upsert_secret(
         &self,
         name: &str,
+        owner: &str,
         payload: &[u8],
     ) -> Result<SecretVersion, CloudRunTargetError> {
         let mut secrets = self.secrets.lock().expect("secrets mutex");
         let entry = secrets
             .entry(name.to_string())
-            .or_insert_with(|| (Vec::new(), 0));
-        entry.0 = payload.to_vec();
-        entry.1 += 1;
+            .or_insert_with(|| StoredSecret {
+                payload: Vec::new(),
+                versions: 0,
+                // Stamped at create only — an existing secret keeps the owner it was
+                // created with, exactly as the real target never rewrites labels.
+                owner: Some(owner.to_string()),
+            });
+        entry.payload = payload.to_vec();
+        entry.versions += 1;
         Ok(SecretVersion {
-            version: entry.1.to_string(),
+            version: entry.versions.to_string(),
         })
     }
 
@@ -831,7 +900,7 @@ mod tests {
             Err(CloudRunTargetError::Unconfigured)
         ));
         assert!(matches!(
-            t.upsert_secret("s", b"x").await,
+            t.upsert_secret("s", "owner", b"x").await,
             Err(CloudRunTargetError::Unconfigured)
         ));
     }
@@ -945,22 +1014,50 @@ mod tests {
     async fn upsert_secret_returns_incrementing_versions() {
         let t = InMemoryCloudRun::default();
         let v1 = t
-            .upsert_secret("gtc-local-environment", b"one")
+            .upsert_secret("gtc-local-environment", "local-1234abcd", b"one")
             .await
             .unwrap();
         let v2 = t
-            .upsert_secret("gtc-local-environment", b"two")
+            .upsert_secret("gtc-local-environment", "local-1234abcd", b"two")
             .await
             .unwrap();
         assert_eq!(v1.version, "1");
         assert_eq!(v2.version, "2", "each upsert adds a new immutable version");
-        assert_eq!(t.secrets()["gtc-local-environment"].0, b"two");
+        assert_eq!(t.secrets()["gtc-local-environment"].payload, b"two");
+    }
+
+    /// The seam contract both impls owe: `owner` is stamped when the secret is
+    /// created and never afterwards, so adopting a secret never seizes it.
+    ///
+    /// This pins the contract; it cannot police the real target, whose adopt
+    /// path is a network branch with no pure builder to assert against. The
+    /// deployer's own reason to honour it is the read→update race a re-stamp
+    /// would open, not IAM: `secretmanager.secrets.update` is already in
+    /// `credentials::VALIDATED_GCP_PERMISSIONS`, so a re-stamp would be
+    /// permitted, just wrong.
+    #[tokio::test]
+    async fn upsert_secret_stamps_the_owner_at_create_only() {
+        let t = InMemoryCloudRun::default();
+        t.upsert_secret("s", "first-owner", b"one").await.unwrap();
+        t.upsert_secret("s", "second-owner", b"two").await.unwrap();
+        assert_eq!(
+            t.secrets()["s"].owner.as_deref(),
+            Some("first-owner"),
+            "a later writer must not rewrite the creating env's stamp"
+        );
+
+        // A legacy secret (created before stamping) stays unstamped on adopt —
+        // `None` must keep reading as legacy, not flip to the adopter's stamp.
+        t.seed_secret("legacy", None);
+        t.upsert_secret("legacy", "adopter", b"x").await.unwrap();
+        assert_eq!(t.secrets()["legacy"].owner, None);
+        assert_eq!(t.get_secret_owner("legacy").await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn grant_secret_accessor_is_idempotent_and_delete_removes_secret() {
         let t = InMemoryCloudRun::default();
-        t.upsert_secret("gtc-local-environment", b"cfg")
+        t.upsert_secret("gtc-local-environment", "local-1234abcd", b"cfg")
             .await
             .unwrap();
         let sa = "gtc-local-runtime@proj.iam.gserviceaccount.com";

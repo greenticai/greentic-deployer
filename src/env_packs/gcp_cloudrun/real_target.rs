@@ -100,6 +100,12 @@ const DEPLOYMENT_LABEL_KEY: &str = "greentic-deployment";
 /// configuration. Revision labels are part of the immutable revision, so the
 /// stamp cannot drift from what it describes.
 const INTENT_LABEL_KEY: &str = "greentic-intent";
+/// Names the environment that created a staged Secret Manager secret, so a
+/// second environment resolving to the same `secret_prefix` cannot stage into
+/// it, grant its own runtime SA read over it, or delete it (plan D6). Stamped
+/// at create only; the value is whatever `deployer::env_owner_stamp` produced
+/// — the target carries it opaquely and never interprets it.
+const ENV_LABEL_KEY: &str = "greentic-env";
 
 /// Production [`CloudRunTarget`]: Cloud Run Services + Revisions + Secret Manager,
 /// pinned to one `(project, region)` at construction (the env-pack binding is
@@ -358,14 +364,33 @@ impl CloudRunTarget for RealCloudRunTarget {
         }
     }
 
+    async fn get_secret_owner(&self, name: &str) -> Result<Option<String>, CloudRunTargetError> {
+        match self
+            .secrets
+            .get_secret()
+            .set_name(self.secret_resource(name))
+            .send()
+            .await
+        {
+            Ok(secret) => Ok(secret_owner_from(&secret)),
+            Err(e) if is_not_found(&e) => {
+                Err(CloudRunTargetError::NotFound(format!("secret `{name}`")))
+            }
+            Err(e) => Err(classify("get_secret", &e)),
+        }
+    }
+
     async fn upsert_secret(
         &self,
         name: &str,
+        owner: &str,
         payload: &[u8],
     ) -> Result<SecretVersion, CloudRunTargetError> {
         let secret_resource = self.secret_resource(name);
-        // Create-or-get: a missing secret is created with automatic replication;
-        // an existing one is left as-is (its versions are what we add to).
+        // Create-or-get: a missing secret is created with automatic replication
+        // and stamped with `owner`; an existing one is left as-is (its versions
+        // are what we add to, and its labels are not ours to rewrite — the
+        // caller's ownership check already cleared this write).
         if let Err(e) = self
             .secrets
             .get_secret()
@@ -378,7 +403,7 @@ impl CloudRunTarget for RealCloudRunTarget {
                     .create_secret()
                     .set_parent(format!("projects/{}", self.project))
                     .set_secret_id(name)
-                    .set_secret(new_automatic_secret())
+                    .set_secret(new_automatic_secret(owner))
                     .send()
                     .await
                     .map_err(|e| classify("create_secret", &e))?;
@@ -407,10 +432,15 @@ impl CloudRunTarget for RealCloudRunTarget {
         let resource = self.secret_resource(secret_name);
         // Read-modify-write the secret's IAM policy so unrelated bindings survive;
         // only write when the member is actually added (idempotent re-grant).
+        // Request policy version 3 (as the Service invoker path already does):
+        // at the default version 1 the server returns CONDITIONAL bindings with
+        // their conditions stripped, so writing that policy back would silently
+        // delete a condition someone else attached to this secret.
         let policy = self
             .secrets
             .get_iam_policy()
             .set_resource(resource.clone())
+            .set_options(iam::GetPolicyOptions::new().set_requested_policy_version(3))
             .send()
             .await
             .map_err(|e| classify("secret get_iam_policy", &e))?;
@@ -644,9 +674,23 @@ fn apply_secret_accessor_binding(
     (policy, true)
 }
 
-fn new_automatic_secret() -> sm::Secret {
+/// A new automatically-replicated secret stamped as `owner`'s (plan D6). The
+/// stamp is what a later warm — or another environment's teardown — reads back
+/// via [`secret_owner_from`] to decide whether the secret is theirs to touch.
+fn new_automatic_secret(owner: &str) -> sm::Secret {
     sm::Secret::new()
         .set_replication(sm::Replication::new().set_automatic(sm::replication::Automatic::new()))
+        .set_labels([
+            (MANAGED_LABEL_KEY.to_string(), "true".to_string()),
+            (ENV_LABEL_KEY.to_string(), owner.to_string()),
+        ])
+}
+
+/// Recover the owner stamp from a live secret. `None` means the secret carries
+/// no [`ENV_LABEL_KEY`] — created before ownership stamping, or by something
+/// else entirely.
+fn secret_owner_from(secret: &sm::Secret) -> Option<String> {
+    secret.labels.get(ENV_LABEL_KEY).cloned()
 }
 
 /// [`ownership_labels`] plus the revision's intent stamp. Only the revision
@@ -1189,6 +1233,36 @@ mod tests {
                 .set_state(run::condition::State::ConditionSucceeded),
         );
         assert!(service_ready(&svc), "terminal Ready=Succeeded → ready");
+    }
+
+    /// H1. The ownership check is only as good as the stamp actually reaching
+    /// GCP: the in-memory fake carries `owner` as a field, so it cannot catch a
+    /// real target that forgets the label, and every deployer test would still
+    /// pass while every live secret came back unowned — silently degrading the
+    /// check to "adopt anything". Assert the write→read round-trip here, against
+    /// the real message builders.
+    #[test]
+    fn secret_owner_survives_the_create_to_get_round_trip() {
+        let created = new_automatic_secret("prod-a1b2c3d4");
+        assert_eq!(
+            created.labels.get(ENV_LABEL_KEY).map(String::as_str),
+            Some("prod-a1b2c3d4"),
+            "create_secret must stamp the owner, or nothing owns anything"
+        );
+        assert_eq!(
+            created.labels.get(MANAGED_LABEL_KEY).map(String::as_str),
+            Some("true"),
+        );
+        assert_eq!(
+            secret_owner_from(&created),
+            Some("prod-a1b2c3d4".to_string()),
+            "and the read path must recover exactly what the write path stamped"
+        );
+        assert_eq!(
+            secret_owner_from(&sm::Secret::new()),
+            None,
+            "an unlabeled secret reads as legacy, not as owned-by-empty-string"
+        );
     }
 
     #[test]
