@@ -140,6 +140,12 @@ pub struct ServiceSpec {
     pub access_mode: AccessMode,
     /// Cloud Run `sessionAffinity` (plan D11).
     pub session_affinity: bool,
+    /// Fingerprint of the caller's intent for this revision, stamped onto the
+    /// revision so a later warm can tell "the same warm, retried" from "a
+    /// different configuration under a name already taken" — computed by
+    /// `deployer::revision_intent`. The target owns how it is stored (the real
+    /// one uses a revision label); the seam only carries the value.
+    pub revision_intent: String,
     pub secrets: Vec<SecretMount>,
     /// Literal boot environment variables projected onto the container (plan D6
     /// activation). `GREENTIC_SEED_DIR` triggers greentic-start's seed boot-copy
@@ -166,6 +172,7 @@ struct RevisionTemplate {
     runtime_service_account: String,
     scaling: ScalingSpec,
     session_affinity: bool,
+    revision_intent: String,
     secrets: Vec<SecretMount>,
     env: Vec<(String, String)>,
 }
@@ -177,6 +184,7 @@ impl RevisionTemplate {
             runtime_service_account: spec.runtime_service_account.clone(),
             scaling: spec.scaling.clone(),
             session_affinity: spec.session_affinity,
+            revision_intent: spec.revision_intent.clone(),
             secrets: spec.secrets.clone(),
             env: spec.env.clone(),
         }
@@ -196,10 +204,15 @@ pub struct ServiceStatus {
 }
 
 /// Readiness of a single revision, polled during the warm wait.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevisionStatus {
     pub ready: bool,
     pub active: bool,
+    /// The [`ServiceSpec::revision_intent`] this revision was stamped with, or
+    /// `None` for a revision carrying no stamp (created before stamping, or by
+    /// something other than this deployer). `None` is not "matches anything" —
+    /// it is unverifiable, which the deployer treats as a conflict.
+    pub intent: Option<String>,
 }
 
 /// Return of [`CloudRunTarget::upsert_secret`]: the immutable numeric version.
@@ -447,7 +460,7 @@ impl InMemoryCloudRun {
             .lock()
             .expect("revisions mutex")
             .iter()
-            .map(|(key, (status, _template))| (*key, *status))
+            .map(|(key, (status, _template))| (*key, status.clone()))
             .collect()
     }
 
@@ -472,6 +485,15 @@ impl InMemoryCloudRun {
             .expect("services mutex")
             .get(&deployment_id)
             .map(|s| s.traffic.clone())
+    }
+
+    /// Forget the invoker policy, modelling a warm that died after its upsert
+    /// but before the invoker grant — the state a resumed warm must repair.
+    pub fn forget_invoker_policy(&self, deployment_id: DeploymentId) {
+        self.invoker_policies
+            .lock()
+            .expect("invoker mutex")
+            .remove(&deployment_id);
     }
 
     /// Last-applied invoker access mode for a deployment, if `set_invoker_policy`
@@ -571,6 +593,7 @@ impl CloudRunTarget for InMemoryCloudRun {
                 RevisionStatus {
                     ready: true,
                     active: true,
+                    intent: Some(spec.revision_intent.clone()),
                 },
                 template,
             ),
@@ -599,7 +622,7 @@ impl CloudRunTarget for InMemoryCloudRun {
             .lock()
             .expect("revisions mutex")
             .get(&(revision.deployment_id, revision.revision_id))
-            .map(|(status, _template)| *status)
+            .map(|(status, _template)| status.clone())
             .ok_or_else(|| {
                 CloudRunTargetError::NotFound(format!(
                     "revision {} not found",
@@ -767,6 +790,7 @@ mod tests {
             },
             access_mode: AccessMode::Public,
             session_affinity: true,
+            revision_intent: "test-intent".to_string(),
             secrets: Vec::new(),
             env: Vec::new(),
         }

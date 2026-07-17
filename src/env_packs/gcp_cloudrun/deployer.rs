@@ -11,7 +11,8 @@
 //!   traffic when the Service already exists, or creates the Service with 100%
 //!   pinned to the *named* first revision when it does not (plan D4). Cloud Run
 //!   revisions are immutable, so an existing one is converged onto rather than
-//!   re-rendered — see [`revision_exists`].
+//!   re-rendered — but only when its stamped intent matches this warm's, else
+//!   the name is taken by a configuration we cannot reconcile (`live_revision`).
 //! - **`apply_traffic_split`** enforces the shared `sum == 10000 bps`
 //!   invariant, then rejects any weight that is not a whole multiple of 100 bps
 //!   (Cloud Run's `percent` is an integer 0..=100 and cannot represent basis
@@ -56,6 +57,11 @@ const DEFAULT_RUNTIME_IMAGE_TAG: &str = "develop";
 const WARM_READY_TIMEOUT: Duration = Duration::from_secs(300);
 const WARM_READY_TIMEOUT_ENV: &str = "GREENTIC_GCP_WARM_READY_TIMEOUT_SECS";
 const WARM_READY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Cloud Run `sessionAffinity` (plan D11). A constant rather than a literal at
+/// the render site: [`revision_intent`] fingerprints it, and a stamp that
+/// disagreed with what was stamped would reject every warm as a conflict.
+const SESSION_AFFINITY: bool = true;
 
 /// Bounded retries for an `etag` optimistic-concurrency conflict (plan D4: on a
 /// precondition failure the adapter re-reads and recomputes rather than
@@ -389,29 +395,112 @@ fn find_revision(env: &Environment, revision_id: RevisionId) -> Option<&Revision
     env.revisions.iter().find(|r| r.revision_id == revision_id)
 }
 
-/// Whether the Cloud Run revision already exists.
+/// Fingerprint of everything the caller pins onto this revision, stamped at
+/// create and compared on every later warm (see [`live_revision`]).
 ///
-/// This is the only signal that distinguishes the two distinct 409s the seam
+/// Covers each field that lands in the immutable revision — image, runtime
+/// identity, scaling, session affinity, the seed secret's NAME, and the boot
+/// env. Two exclusions are deliberate:
+///
+/// * **Secret versions.** They are an artifact of staging, not intent: every
+///   warm mints new ones, so folding them in would make a plain retry look like
+///   a config change — the very thing this exists to rule out. The fingerprint
+///   must also be computable BEFORE staging, which is what lets the probe skip
+///   staging entirely on a retry.
+/// * **`access_mode`.** The invoker policy is a separate IAM resource, not part
+///   of the revision, and the converge tail reapplies it on every warm. Folding
+///   it in would demand a new revision to flip public/authenticated.
+///
+/// Fields are length-prefixed so no value can forge a boundary by embedding the
+/// separator. Truncated to 32 hex chars: a valid GCP label value (lowercase
+/// alnum, ≤63), and 128 bits is far past what an accident could collide.
+fn revision_intent(
+    image: &str,
+    runtime_service_account: &str,
+    scaling: &ScalingSpec,
+    session_affinity: bool,
+    secret_name: &str,
+    boot_env: &[(String, String)],
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut field = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    field(image.as_bytes());
+    field(runtime_service_account.as_bytes());
+    field(scaling.cpu.as_bytes());
+    field(scaling.memory.as_bytes());
+    field(&scaling.min_instances.to_le_bytes());
+    field(&scaling.max_instances.to_le_bytes());
+    field(&scaling.concurrency.to_le_bytes());
+    field(&[u8::from(session_affinity)]);
+    field(secret_name.as_bytes());
+    for (key, value) in boot_env {
+        field(key.as_bytes());
+        field(value.as_bytes());
+    }
+    hex::encode(&hasher.finalize()[..16])
+}
+
+/// What the provider holds for the revision this warm intends to create.
+#[derive(Debug, PartialEq, Eq)]
+enum LiveRevision {
+    /// Nothing by that name — create it.
+    Absent,
+    /// A revision stamped with this warm's own intent: the same warm, retried.
+    /// Converge on it.
+    SameIntent,
+    /// The name is taken by a revision this warm did not ask for — a different
+    /// intent, or no stamp to verify. Cloud Run revisions are immutable, so
+    /// this cannot be reconciled: it needs a new revision, not a retry.
+    Conflict { live: Option<String> },
+}
+
+/// Classify the live revision against `intent`.
+///
+/// Existence alone is NOT convergence. The revision name is a pure function of
+/// (deployment, revision), while the image, runtime identity, scaling, and
+/// secret name all come from the env-pack binding's `answers_ref` — which the
+/// operator can edit between warms. So a live revision may be running something
+/// the current answers no longer describe, and reporting that as a converged
+/// warm would tell the operator their new image is live when the old one is
+/// still serving. The stamp is what tells the two apart.
+///
+/// This is also the only signal separating the two distinct 409s the seam
 /// collapses into [`CloudRunTargetError::PreconditionFailed`] (see
-/// `real_target::classify`):
-///
-/// * a **stale-etag race** — transient, and retrying with a fresh read wins;
-/// * a **revision-name/config conflict** — Cloud Run revisions are immutable,
-///   so re-rendering a live revision name with any different template is
-///   rejected permanently. Retrying can only fail identically.
-///
-/// Absent this probe the deployer must guess, and guessing "etag race" is what
-/// makes a re-warm burn `MAX_ETAG_RETRIES` futile upserts and then report a
-/// race that never happened.
-async fn revision_exists(
+/// `real_target::classify`): a **stale-etag race**, transient and worth a
+/// retry, from a **revision-name conflict**, which is permanent. Guessing
+/// "etag race" is what makes a re-warm burn `MAX_ETAG_RETRIES` futile upserts
+/// and then report a race that never happened.
+async fn live_revision(
     target: &dyn super::deploy_target::CloudRunTarget,
     revision: &RevisionRef,
-) -> Result<bool, DeployerError> {
+    intent: &str,
+) -> Result<LiveRevision, DeployerError> {
     match target.get_revision_status(revision).await {
-        Ok(_) => Ok(true),
-        Err(CloudRunTargetError::NotFound(_)) => Ok(false),
+        Ok(status) if status.intent.as_deref() == Some(intent) => Ok(LiveRevision::SameIntent),
+        Ok(status) => Ok(LiveRevision::Conflict {
+            live: status.intent,
+        }),
+        Err(CloudRunTargetError::NotFound(_)) => Ok(LiveRevision::Absent),
         Err(e) => Err(provider(e)),
     }
+}
+
+/// Reject a revision name already taken by a different configuration.
+fn revision_conflict(revision_id: RevisionId, intent: &str, live: Option<String>) -> DeployerError {
+    let held = match live {
+        Some(live) => format!("holds a different configuration (`{live}`)"),
+        None => "carries no configuration stamp, so it cannot be verified".to_string(),
+    };
+    DeployerError::Provider(format!(
+        "Cloud Run revision `{name}` already exists and {held}; this warm intends `{intent}`. \
+         Cloud Run revisions are immutable, so the live one cannot be updated in place — stage a \
+         NEW revision to roll out the changed configuration.",
+        name = revision_id,
+    ))
 }
 
 async fn wait_for_revision_ready(
@@ -474,32 +563,61 @@ impl Deployer for GcpCloudRunDeployerHandler {
             region: params.region.clone(),
         };
 
+        // What this warm intends, computed BEFORE staging — staging mints secret
+        // versions, and a retry must not have to mint any to know what it wants.
+        let runtime_service_account = params.runtime_service_account(env.environment_id.as_str());
+        let secret_name = environment_secret_name(&params.secret_prefix);
+        let boot_env = runtime_boot_env(env, revision);
+        let intent = revision_intent(
+            &params.image_ref(),
+            &runtime_service_account,
+            &params.scaling(),
+            SESSION_AFFINITY,
+            &secret_name,
+            &boot_env,
+        );
+
         // Create the revision only if it is not already there, then converge the
         // rest unconditionally (below). A warm is retried routinely — the CLI
         // re-runs `op env up`, or a previous attempt died after the upsert
-        // committed but before the readiness wait or the invoker grant — and
-        // the trait requires the second call to succeed.
+        // committed but before the readiness wait or the invoker grant — and the
+        // trait requires the second call, against the SAME input, to succeed.
         //
-        // Re-creating is not an option: Cloud Run revisions are IMMUTABLE, and
-        // this revision's template is not reproducible. Staging mints a fresh
-        // Secret Manager version every time, so a re-render of the same
-        // revision name necessarily differs from the live one and is rejected
-        // 409 (see `revision_exists`). Probing BEFORE staging is what keeps a
-        // retry from minting those orphan versions in the first place.
+        // Recreating is impossible: Cloud Run revisions are immutable, and a
+        // re-render could not reproduce the live template anyway (staging mints
+        // fresh secret versions). Probing before staging is what keeps a retry
+        // from minting versions that could never reach the live revision.
         //
-        // So an existing revision is left exactly as it is, including its
-        // pinned secret versions. That is not a policy choice — an immutable
-        // revision cannot pick up restaged material. Rolling out new material
-        // means a NEW revision, which the caller expresses with a new
-        // `revision_id`.
-        let endpoint_url = if revision_exists(self.target.as_ref(), &revision_ref).await? {
-            self.target
+        // A live revision therefore keeps its pinned secret versions. That is
+        // not a policy choice — an immutable revision cannot pick up restaged
+        // material. New material means a NEW revision, and the same goes for
+        // changed answers: see `live_revision` for why existence alone is not
+        // convergence.
+        let endpoint_url = match live_revision(self.target.as_ref(), &revision_ref, &intent).await?
+        {
+            LiveRevision::SameIntent => self
+                .target
                 .get_service_url(&service_ref)
                 .await
-                .map_err(provider)?
-        } else {
-            self.create_revision(env, revision, &params, &service_ref, &revision_ref)
+                .map_err(provider)?,
+            LiveRevision::Conflict { live } => {
+                return Err(revision_conflict(revision_id, &intent, live));
+            }
+            LiveRevision::Absent => {
+                self.create_revision(
+                    env,
+                    &params,
+                    &service_ref,
+                    &revision_ref,
+                    CreateRevisionSpec {
+                        runtime_service_account: &runtime_service_account,
+                        secret_name: &secret_name,
+                        boot_env: &boot_env,
+                        intent: &intent,
+                    },
+                )
                 .await?
+            }
         };
 
         // Converge the non-revision state on BOTH paths: neither step is part
@@ -620,6 +738,17 @@ impl Deployer for GcpCloudRunDeployerHandler {
     }
 }
 
+/// The parts of the revision [`Deployer::warm_revision`] resolved before
+/// staging, so [`GcpCloudRunDeployerHandler::create_revision`] renders exactly
+/// what [`revision_intent`] fingerprinted rather than deriving them a second
+/// time and risking drift between the stamp and the stamped.
+struct CreateRevisionSpec<'a> {
+    runtime_service_account: &'a str,
+    secret_name: &'a str,
+    boot_env: &'a [(String, String)],
+    intent: &'a str,
+}
+
 impl GcpCloudRunDeployerHandler {
     /// Stage the seed secrets and create the revision, returning the Service's
     /// `*.run.app` URL. Only called once the revision is known absent — see
@@ -627,14 +756,19 @@ impl GcpCloudRunDeployerHandler {
     async fn create_revision(
         &self,
         env: &Environment,
-        revision: &Revision,
         params: &GcpCloudRunParams,
         service_ref: &ServiceRef,
         revision_ref: &RevisionRef,
+        spec: CreateRevisionSpec<'_>,
     ) -> Result<Option<String>, DeployerError> {
-        let deployment_id = revision.deployment_id;
-        let revision_id = revision.revision_id;
-        let runtime_service_account = params.runtime_service_account(env.environment_id.as_str());
+        let CreateRevisionSpec {
+            runtime_service_account,
+            secret_name,
+            boot_env,
+            intent,
+        } = spec;
+        let deployment_id = revision_ref.deployment_id;
+        let revision_id = revision_ref.revision_id;
 
         // Stage the env-store seed (plan D6): upload environment.json to a
         // version-pinned Secret Manager secret and grant the runtime SA read
@@ -651,10 +785,9 @@ impl GcpCloudRunDeployerHandler {
                 "serializing environment.json for seed staging: {e}"
             ))
         })?;
-        let secret_name = environment_secret_name(&params.secret_prefix);
         let env_version = self
             .target
-            .upsert_secret(&secret_name, &environment_json)
+            .upsert_secret(secret_name, &environment_json)
             .await
             .map_err(provider)?;
         let mut secret_items = vec![SecretMountItem {
@@ -669,7 +802,7 @@ impl GcpCloudRunDeployerHandler {
         if let Some(dev_bytes) = &self.dev_secrets {
             let dev_version = self
                 .target
-                .upsert_secret(&secret_name, dev_bytes)
+                .upsert_secret(secret_name, dev_bytes)
                 .await
                 .map_err(provider)?;
             secret_items.push(SecretMountItem {
@@ -684,17 +817,14 @@ impl GcpCloudRunDeployerHandler {
         // load-bearing: Cloud Run rejects a revision whose SA cannot read a
         // mounted version. Idempotent, so a re-warm is a no-op.
         self.target
-            .grant_secret_accessor(&secret_name, &runtime_service_account)
+            .grant_secret_accessor(secret_name, runtime_service_account)
             .await
             .map_err(provider)?;
         let secret_mounts = vec![SecretMount {
             mount_dir: SEED_MOUNT_DIR.to_string(),
-            secret_name,
+            secret_name: secret_name.to_string(),
             items: secret_items,
         }];
-        // Revision-scoped, deterministic — built once and reused across etag
-        // retries so a re-upsert never renders a different container.
-        let boot_env = runtime_boot_env(env, revision);
 
         // Read-modify-write under etag optimistic concurrency with bounded
         // retries on a precondition conflict (plan D4): re-read, recompute
@@ -738,24 +868,35 @@ impl GcpCloudRunDeployerHandler {
                 region: params.region.clone(),
                 image: params.image_ref(),
                 revision_id,
-                runtime_service_account: runtime_service_account.clone(),
+                runtime_service_account: runtime_service_account.to_string(),
                 traffic,
                 scaling: params.scaling(),
                 access_mode: params.access_mode,
-                session_affinity: true,
+                session_affinity: SESSION_AFFINITY,
+                revision_intent: intent.to_string(),
                 secrets: secret_mounts.clone(),
-                env: boot_env.clone(),
+                env: boot_env.to_vec(),
             };
             match self.target.upsert_service(&spec, etag.as_deref()).await {
-                Ok(status) => break Ok(status.url),
+                Ok(status) => break status.url,
                 Err(CloudRunTargetError::PreconditionFailed) => {
-                    // Both 409s land here (see `revision_exists`). If the
-                    // revision now exists, a concurrent warm created it between
-                    // our probe and this upsert: the conflict is permanent, so
-                    // converge on what is there instead of retrying into the
-                    // identical rejection and then blaming an etag race.
-                    if revision_exists(self.target.as_ref(), revision_ref).await? {
-                        break self.target.get_service_url(service_ref).await;
+                    // Both 409s land here (see `live_revision`). A rival warm
+                    // that took the name between our probe and this upsert makes
+                    // the conflict permanent, so re-classify rather than retry
+                    // into the identical rejection and then blame an etag race.
+                    match live_revision(self.target.as_ref(), revision_ref, intent).await? {
+                        LiveRevision::SameIntent => {
+                            break self
+                                .target
+                                .get_service_url(service_ref)
+                                .await
+                                .map_err(provider)?;
+                        }
+                        LiveRevision::Conflict { live } => {
+                            return Err(revision_conflict(revision_id, intent, live));
+                        }
+                        // Still absent, so it really was the etag: retry.
+                        LiveRevision::Absent => {}
                     }
                     attempt += 1;
                     if attempt > MAX_ETAG_RETRIES {
@@ -768,7 +909,7 @@ impl GcpCloudRunDeployerHandler {
                 Err(e) => return Err(provider(e)),
             }
         };
-        endpoint_url.map_err(provider)
+        Ok(endpoint_url)
     }
 }
 
@@ -804,14 +945,25 @@ mod tests {
         inner: InMemoryCloudRun,
         upsert_conflicts: std::sync::Mutex<u32>,
         set_traffic_conflicts: std::sync::Mutex<u32>,
-        /// When set, an injected upsert conflict first lets a *rival* warm land
-        /// the revision (from a different template, as a concurrent warm's own
-        /// freshly-staged secret versions would make it). This is the create
-        /// race: the same `PreconditionFailed` as a stale etag, but permanent.
-        rival_create: bool,
+        /// How a rival warm takes the revision name before our upsert lands.
+        rival: Rival,
         /// Upserts attempted, so a test can prove the deployer did not burn its
         /// retry budget on a conflict that could never resolve.
         upsert_attempts: std::sync::Mutex<u32>,
+    }
+
+    /// What an injected upsert conflict means — indistinguishable to the caller,
+    /// since Cloud Run reports all three as the same `PreconditionFailed`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Rival {
+        /// Nobody else; a plain stale etag. Retrying is right.
+        None,
+        /// Our own warm, running concurrently: same intent, its own freshly
+        /// staged secret versions. Converging on it is right.
+        SameIntent,
+        /// A different configuration under the name we wanted. Neither
+        /// retryable nor convergeable.
+        DifferentIntent,
     }
 
     impl ConflictInjector {
@@ -820,15 +972,15 @@ mod tests {
                 inner: InMemoryCloudRun::default(),
                 upsert_conflicts: std::sync::Mutex::new(upsert_conflicts),
                 set_traffic_conflicts: std::sync::Mutex::new(set_traffic_conflicts),
-                rival_create: false,
+                rival: Rival::None,
                 upsert_attempts: std::sync::Mutex::new(0),
             }
         }
 
         /// A rival warm wins the create race on our first upsert.
-        fn losing_create_race() -> Self {
+        fn losing_create_race(rival: Rival) -> Self {
             Self {
-                rival_create: true,
+                rival,
                 ..Self::new(1, 0)
             }
         }
@@ -859,11 +1011,36 @@ mod tests {
         ) -> Result<ServiceStatus, CloudRunTargetError> {
             *self.upsert_attempts.lock().unwrap() += 1;
             if Self::take_conflict(&self.upsert_conflicts) {
-                if self.rival_create {
-                    let rival = ServiceSpec {
-                        image: format!("{}-rival", spec.image),
+                let rival = match self.rival {
+                    Rival::None => None,
+                    // Same intent, but its own staged versions — so the rendered
+                    // template differs (our re-upsert would 409) while the stamp
+                    // still says this is our warm.
+                    Rival::SameIntent => Some(ServiceSpec {
+                        secrets: spec
+                            .secrets
+                            .iter()
+                            .map(|mount| SecretMount {
+                                items: mount
+                                    .items
+                                    .iter()
+                                    .map(|item| SecretMountItem {
+                                        version: format!("{}00", item.version),
+                                        ..item.clone()
+                                    })
+                                    .collect(),
+                                ..mount.clone()
+                            })
+                            .collect(),
                         ..spec.clone()
-                    };
+                    }),
+                    Rival::DifferentIntent => Some(ServiceSpec {
+                        image: format!("{}-rival", spec.image),
+                        revision_intent: format!("{}-rival", spec.revision_intent),
+                        ..spec.clone()
+                    }),
+                };
+                if let Some(rival) = rival {
                     self.inner.upsert_service(&rival, etag).await?;
                 }
                 return Err(CloudRunTargetError::PreconditionFailed);
@@ -1279,39 +1456,17 @@ mod tests {
     async fn warm_resumes_a_revision_left_without_its_invoker_policy() {
         let (handler, target) = handler_with_fake();
         let env = build_fixture_env();
-        let revision = &env.revisions[0];
-        let r_warm = revision.revision_id;
+        let r_warm = env.revisions[0].revision_id;
         let dep_a = env.bundles[0].deployment_id;
 
-        // Exactly the state a warm that died after its upsert leaves behind.
-        let params = params_from_answers(&env, None).unwrap();
-        target
-            .upsert_service(
-                &ServiceSpec {
-                    deployment_id: dep_a,
-                    project: params.project.clone(),
-                    region: params.region.clone(),
-                    image: params.image_ref(),
-                    revision_id: r_warm,
-                    runtime_service_account: params
-                        .runtime_service_account(env.environment_id.as_str()),
-                    traffic: vec![TrafficTarget {
-                        revision_id: r_warm,
-                        percent: 100,
-                    }],
-                    scaling: params.scaling(),
-                    access_mode: params.access_mode,
-                    session_affinity: true,
-                    secrets: Vec::new(),
-                    env: Vec::new(),
-                },
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(target.invoker_policy_for(dep_a), None, "precondition");
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+        // Exactly what a warm that died after its upsert leaves behind.
+        target.forget_invoker_policy(dep_a);
 
-        let outcome = handler.warm_revision(&env, r_warm, None).await.unwrap();
+        let outcome = handler
+            .warm_revision(&env, r_warm, None)
+            .await
+            .expect("a half-finished warm is resumable");
 
         assert_eq!(
             target.invoker_policy_for(dep_a),
@@ -1325,14 +1480,52 @@ mod tests {
         );
     }
 
-    /// H2. A rival warm landing the revision between our probe and our upsert
-    /// yields the SAME `PreconditionFailed` as a stale etag — but retrying it is
-    /// futile, because the revision is immutable and our template will never
-    /// match. The deployer must converge on what is there instead of burning the
-    /// retry budget and then blaming a race that did not happen.
+    /// H2. Existence is not convergence. `answers_ref` is env-level and
+    /// editable, so the same revision can be re-warmed under a configuration the
+    /// live revision does not have. Cloud Run cannot update an immutable
+    /// revision in place, so the only honest answer is to refuse — reporting
+    /// success would tell the operator their new image is live while the old one
+    /// keeps serving.
     #[tokio::test]
-    async fn warm_converges_when_a_rival_wins_the_create_race() {
-        let target = Arc::new(ConflictInjector::losing_create_race());
+    async fn warm_refuses_a_live_revision_whose_configuration_changed() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+        let staged_before = target.secrets().values().map(|(_, v)| *v).sum::<u64>();
+
+        // The operator edits the binding's answers and re-runs `op env up`.
+        let answers = serde_json::json!({ "runtime_image_tag": "v2-rolled-forward" });
+        let err = handler
+            .warm_revision(&env, r_warm, Some(&answers))
+            .await
+            .expect_err("a changed configuration cannot converge onto an immutable revision");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already exists") && msg.contains("NEW revision"),
+            "the error must name the conflict and the way out, got: {msg}"
+        );
+        assert_eq!(
+            target.secrets().values().map(|(_, v)| *v).sum::<u64>(),
+            staged_before,
+            "the refusal must come BEFORE staging — a rejected warm leaves no orphans"
+        );
+        assert_eq!(
+            target.service_secrets_for(dep_a).unwrap()[0].items[0].version,
+            "1",
+            "the live revision is untouched"
+        );
+    }
+
+    /// H2. Our own warm, running concurrently, takes the name between our probe
+    /// and our upsert: same intent, its own staged versions. Converging is
+    /// right, and retrying is not — the template can never match.
+    #[tokio::test]
+    async fn warm_converges_when_a_rival_warm_wins_the_create_race() {
+        let target = Arc::new(ConflictInjector::losing_create_race(Rival::SameIntent));
         let handler = GcpCloudRunDeployerHandler::with_target(target.clone());
         let env = build_fixture_env();
         let r_warm = env.revisions[0].revision_id;
@@ -1340,7 +1533,7 @@ mod tests {
         let outcome = handler
             .warm_revision(&env, r_warm, None)
             .await
-            .expect("a revision the rival already created is a converged warm, not a failure");
+            .expect("a revision our own concurrent warm created is converged, not failed");
 
         assert!(outcome.endpoint_url.is_some(), "endpoint still reported");
         assert_eq!(
@@ -1348,6 +1541,28 @@ mod tests {
             1,
             "the conflict is permanent, so it must cost exactly one upsert — retrying \
              could only reproduce it {MAX_ETAG_RETRIES} more times"
+        );
+    }
+
+    /// H2. Same race, but the name was taken by a DIFFERENT configuration. The
+    /// stamp is what separates this from the case above; without it both look
+    /// like "the revision exists" and this one would be served as a success.
+    #[tokio::test]
+    async fn warm_refuses_when_a_rival_takes_the_name_with_another_configuration() {
+        let target = Arc::new(ConflictInjector::losing_create_race(Rival::DifferentIntent));
+        let handler = GcpCloudRunDeployerHandler::with_target(target.clone());
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+
+        let err = handler
+            .warm_revision(&env, r_warm, None)
+            .await
+            .expect_err("a rival's different configuration must not be reported as our warm");
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(
+            *target.upsert_attempts.lock().unwrap(),
+            1,
+            "a permanent conflict costs exactly one upsert"
         );
     }
 

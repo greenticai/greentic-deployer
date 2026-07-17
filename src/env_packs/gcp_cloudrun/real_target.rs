@@ -95,6 +95,11 @@ pub const REAL_CLOUDRUN_TARGET_IAM_PERMISSIONS: &[&str] = &[
 /// labels — the deployment ULID (lowercased base32) is a valid value.
 const MANAGED_LABEL_KEY: &str = "greentic-managed";
 const DEPLOYMENT_LABEL_KEY: &str = "greentic-deployment";
+/// Carries [`ServiceSpec::revision_intent`] on the revision it describes, so a
+/// later warm can tell its own retry from a name already taken by a different
+/// configuration. Revision labels are part of the immutable revision, so the
+/// stamp cannot drift from what it describes.
+const INTENT_LABEL_KEY: &str = "greentic-intent";
 
 /// Production [`CloudRunTarget`]: Cloud Run Services + Revisions + Secret Manager,
 /// pinned to one `(project, region)` at construction (the env-pack binding is
@@ -479,7 +484,7 @@ fn build_revision_template(spec: &ServiceSpec) -> run::RevisionTemplate {
         .set_session_affinity(spec.session_affinity)
         .set_max_instance_request_concurrency(clamp_i32(spec.scaling.concurrency))
         .set_scaling(build_scaling(spec))
-        .set_labels(ownership_labels(spec.deployment_id))
+        .set_labels(revision_labels(spec))
         .set_volumes(build_secret_volumes(spec))
         .set_containers([build_container(spec)])
 }
@@ -644,6 +649,15 @@ fn new_automatic_secret() -> sm::Secret {
         .set_replication(sm::Replication::new().set_automatic(sm::replication::Automatic::new()))
 }
 
+/// [`ownership_labels`] plus the revision's intent stamp. Only the revision
+/// carries the stamp: it describes one immutable revision, while the Service's
+/// labels outlive every revision under it.
+fn revision_labels(spec: &ServiceSpec) -> BTreeMap<String, String> {
+    let mut labels = ownership_labels(spec.deployment_id);
+    labels.insert(INTENT_LABEL_KEY.to_string(), spec.revision_intent.clone());
+    labels
+}
+
 fn ownership_labels(deployment_id: DeploymentId) -> BTreeMap<String, String> {
     BTreeMap::from([
         (MANAGED_LABEL_KEY.to_string(), "true".to_string()),
@@ -689,6 +703,9 @@ fn revision_status_from(rev: &run::Revision) -> RevisionStatus {
         // A revision that reports Ready is serving; nothing downstream reads
         // `active` independently, so mirror readiness.
         active: ready,
+        // Absent for a revision this deployer did not stamp, which the caller
+        // treats as unverifiable rather than as a match.
+        intent: rev.labels.get(INTENT_LABEL_KEY).cloned(),
     }
 }
 
@@ -810,6 +827,7 @@ mod tests {
             },
             access_mode: AccessMode::Public,
             session_affinity: true,
+            revision_intent: "test-intent".to_string(),
             secrets,
             env: Vec::new(),
         }
@@ -827,6 +845,31 @@ mod tests {
         let msg = build_service_message(&s, None);
         assert_eq!(msg.ingress, run::IngressTraffic::All);
         assert_eq!(msg.etag, "", "create carries no etag");
+
+        // The H2 intent stamp must survive the write→read round-trip through the
+        // real message shapes. Both halves are load-bearing and neither is
+        // observable through the in-memory fake, which carries the intent as a
+        // field: a template that stops stamping, or a status parse that stops
+        // reading, silently makes EVERY warm unverifiable — and unverifiable is
+        // a conflict, so every retry would be refused in production while the
+        // fake-backed tests stayed green.
+        let stamped = build_revision_template(&s);
+        assert_eq!(
+            stamped.labels.get(INTENT_LABEL_KEY).map(String::as_str),
+            Some(s.revision_intent.as_str()),
+            "the revision carries its intent stamp"
+        );
+        let read_back = revision_status_from(&run::Revision::new().set_labels(stamped.labels));
+        assert_eq!(
+            read_back.intent.as_deref(),
+            Some(s.revision_intent.as_str()),
+            "and a live revision reports the stamp it was created with"
+        );
+        assert_eq!(
+            revision_status_from(&run::Revision::new()).intent,
+            None,
+            "an unstamped revision reports no intent rather than a spurious match"
+        );
 
         let template = msg.template.expect("template set");
         assert_eq!(
