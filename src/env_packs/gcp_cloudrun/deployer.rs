@@ -5,10 +5,13 @@
 //! [`deployer`](crate::env_packs::aws::deployer) structure but against Cloud
 //! Run's single-resource + `etag` model:
 //!
-//! - **`warm`** reads the live Service (for its `etag`), then upserts the new
-//!   revision at 0% traffic when the Service already exists, or creates the
-//!   Service with 100% pinned to the *named* first revision when it does not
-//!   (plan D4), and waits for the revision to report `Ready`.
+//! - **`warm`** creates the revision only if it does not already exist, then
+//!   waits for it to report `Ready` and applies the invoker policy. Creating
+//!   reads the live Service (for its `etag`) and upserts the new revision at 0%
+//!   traffic when the Service already exists, or creates the Service with 100%
+//!   pinned to the *named* first revision when it does not (plan D4). Cloud Run
+//!   revisions are immutable, so an existing one is converged onto rather than
+//!   re-rendered — see [`revision_exists`].
 //! - **`apply_traffic_split`** enforces the shared `sum == 10000 bps`
 //!   invariant, then rejects any weight that is not a whole multiple of 100 bps
 //!   (Cloud Run's `percent` is an integer 0..=100 and cannot represent basis
@@ -386,6 +389,31 @@ fn find_revision(env: &Environment, revision_id: RevisionId) -> Option<&Revision
     env.revisions.iter().find(|r| r.revision_id == revision_id)
 }
 
+/// Whether the Cloud Run revision already exists.
+///
+/// This is the only signal that distinguishes the two distinct 409s the seam
+/// collapses into [`CloudRunTargetError::PreconditionFailed`] (see
+/// `real_target::classify`):
+///
+/// * a **stale-etag race** — transient, and retrying with a fresh read wins;
+/// * a **revision-name/config conflict** — Cloud Run revisions are immutable,
+///   so re-rendering a live revision name with any different template is
+///   rejected permanently. Retrying can only fail identically.
+///
+/// Absent this probe the deployer must guess, and guessing "etag race" is what
+/// makes a re-warm burn `MAX_ETAG_RETRIES` futile upserts and then report a
+/// race that never happened.
+async fn revision_exists(
+    target: &dyn super::deploy_target::CloudRunTarget,
+    revision: &RevisionRef,
+) -> Result<bool, DeployerError> {
+    match target.get_revision_status(revision).await {
+        Ok(_) => Ok(true),
+        Err(CloudRunTargetError::NotFound(_)) => Ok(false),
+        Err(e) => Err(provider(e)),
+    }
+}
+
 async fn wait_for_revision_ready(
     target: &dyn super::deploy_target::CloudRunTarget,
     revision: &RevisionRef,
@@ -439,139 +467,44 @@ impl Deployer for GcpCloudRunDeployerHandler {
             project: params.project.clone(),
             region: params.region.clone(),
         };
-        let runtime_service_account = params.runtime_service_account(env.environment_id.as_str());
-
-        // Stage the env-store seed (plan D6): upload environment.json to a
-        // version-pinned Secret Manager secret and grant the runtime SA read
-        // access, then mount that exact version read-only. The grant is
-        // load-bearing — Cloud Run rejects a revision whose SA cannot read a
-        // mounted secret version. Staged ONCE, before the etag retry loop, so a
-        // precondition retry does not add a redundant secret version. The
-        // revision's boot env (`runtime_boot_env`) sets `GREENTIC_SEED_DIR`, so
-        // greentic-start copies this mount into its writable store at boot. When
-        // the env carries dev-store material, the CLI injected the raw bytes and
-        // they are staged as a SECOND version of the same secret below.
-        let environment_json = serde_json::to_vec(env).map_err(|e| {
-            DeployerError::Provider(format!(
-                "serializing environment.json for seed staging: {e}"
-            ))
-        })?;
-        let secret_name = environment_secret_name(&params.secret_prefix);
-        let env_version = self
-            .target
-            .upsert_secret(&secret_name, &environment_json)
-            .await
-            .map_err(provider)?;
-        let mut secret_items = vec![SecretMountItem {
-            version: env_version.version,
-            rel_path: ENVIRONMENT_SEED_FILE.to_string(),
-        }];
-        // Stage the operator's encrypted dev-store (`.dev.secrets.env`) as a
-        // second version of the SAME secret, projected at a subdirectory item
-        // path under the one `/seed` volume — Cloud Run forbids nested mounts, so
-        // the two seed files cannot be two volumes. Absent for envs with no
-        // `Secrets`-slot pack (the CLI passes `None`).
-        if let Some(dev_bytes) = &self.dev_secrets {
-            let dev_version = self
-                .target
-                .upsert_secret(&secret_name, dev_bytes)
-                .await
-                .map_err(provider)?;
-            secret_items.push(SecretMountItem {
-                version: dev_version.version,
-                // The seed tree mirrors the on-disk store, so the dev-store's
-                // store-relative path is also its path under `/seed`, projected
-                // as a subdirectory item (Cloud Run forbids a nested mount).
-                rel_path: DEV_STORE_RELATIVE.to_string(),
-            });
-        }
-        // Grant the runtime SA read on the secret (covers every version) —
-        // load-bearing: Cloud Run rejects a revision whose SA cannot read a
-        // mounted version. Idempotent, so a re-warm is a no-op.
-        self.target
-            .grant_secret_accessor(&secret_name, &runtime_service_account)
-            .await
-            .map_err(provider)?;
-        let secret_mounts = vec![SecretMount {
-            mount_dir: SEED_MOUNT_DIR.to_string(),
-            secret_name,
-            items: secret_items,
-        }];
-        // Revision-scoped, deterministic — built once and reused across etag
-        // retries so a re-upsert never renders a different container.
-        let boot_env = runtime_boot_env(env, revision);
-
-        // Read-modify-write under etag optimistic concurrency with bounded
-        // retries on a precondition conflict (plan D4): re-read, recompute
-        // traffic from the fresh state, and retry rather than replaying a stale
-        // etag. Traffic is pinned to NAMED revisions in the same upsert — first
-        // create is 100% to the named first revision (never LATEST, never a
-        // 0%-only array); an update keeps the existing distribution and adds
-        // this revision at 0% if it is new, so warm never moves traffic.
-        let mut attempt = 0;
-        // The Service's `*.run.app` URL rides back on the upsert response (it is
-        // assigned at Service-create time and is immutable after), so take it as
-        // the loop's break value — the caller needs no extra `get_service`.
-        let endpoint_url = loop {
-            let existing = self
-                .target
-                .get_service(&service_ref)
-                .await
-                .map_err(provider)?;
-            let (traffic, etag) = match &existing {
-                None => (
-                    vec![TrafficTarget {
-                        revision_id,
-                        percent: 100,
-                    }],
-                    None,
-                ),
-                Some(status) => {
-                    let mut traffic = status.traffic.clone();
-                    if !traffic.iter().any(|t| t.revision_id == revision_id) {
-                        traffic.push(TrafficTarget {
-                            revision_id,
-                            percent: 0,
-                        });
-                    }
-                    (traffic, Some(status.etag.clone()))
-                }
-            };
-            let spec = ServiceSpec {
-                deployment_id,
-                project: params.project.clone(),
-                region: params.region.clone(),
-                image: params.image_ref(),
-                revision_id,
-                runtime_service_account: runtime_service_account.clone(),
-                traffic,
-                scaling: params.scaling(),
-                access_mode: params.access_mode,
-                session_affinity: true,
-                secrets: secret_mounts.clone(),
-                env: boot_env.clone(),
-            };
-            match self.target.upsert_service(&spec, etag.as_deref()).await {
-                Ok(status) => break status.url,
-                Err(CloudRunTargetError::PreconditionFailed) => {
-                    attempt += 1;
-                    if attempt > MAX_ETAG_RETRIES {
-                        return Err(DeployerError::Provider(format!(
-                            "Cloud Run service for deployment `{deployment_id}` kept losing the \
-                             etag race after {MAX_ETAG_RETRIES} retries"
-                        )));
-                    }
-                }
-                Err(e) => return Err(provider(e)),
-            }
-        };
-
         let revision_ref = RevisionRef {
             deployment_id,
             revision_id,
-            project: params.project,
-            region: params.region,
+            project: params.project.clone(),
+            region: params.region.clone(),
         };
+
+        // Create the revision only if it is not already there, then converge the
+        // rest unconditionally (below). A warm is retried routinely — the CLI
+        // re-runs `op env up`, or a previous attempt died after the upsert
+        // committed but before the readiness wait or the invoker grant — and
+        // the trait requires the second call to succeed.
+        //
+        // Re-creating is not an option: Cloud Run revisions are IMMUTABLE, and
+        // this revision's template is not reproducible. Staging mints a fresh
+        // Secret Manager version every time, so a re-render of the same
+        // revision name necessarily differs from the live one and is rejected
+        // 409 (see `revision_exists`). Probing BEFORE staging is what keeps a
+        // retry from minting those orphan versions in the first place.
+        //
+        // So an existing revision is left exactly as it is, including its
+        // pinned secret versions. That is not a policy choice — an immutable
+        // revision cannot pick up restaged material. Rolling out new material
+        // means a NEW revision, which the caller expresses with a new
+        // `revision_id`.
+        let endpoint_url = if revision_exists(self.target.as_ref(), &revision_ref).await? {
+            self.target
+                .get_service_url(&service_ref)
+                .await
+                .map_err(provider)?
+        } else {
+            self.create_revision(env, revision, &params, &service_ref, &revision_ref)
+                .await?
+        };
+
+        // Converge the non-revision state on BOTH paths: neither step is part
+        // of the immutable revision, and a resumed warm is precisely the case
+        // where the first attempt died before reaching them.
         wait_for_revision_ready(
             self.target.as_ref(),
             &revision_ref,
@@ -687,6 +620,158 @@ impl Deployer for GcpCloudRunDeployerHandler {
     }
 }
 
+impl GcpCloudRunDeployerHandler {
+    /// Stage the seed secrets and create the revision, returning the Service's
+    /// `*.run.app` URL. Only called once the revision is known absent — see
+    /// [`Deployer::warm_revision`].
+    async fn create_revision(
+        &self,
+        env: &Environment,
+        revision: &Revision,
+        params: &GcpCloudRunParams,
+        service_ref: &ServiceRef,
+        revision_ref: &RevisionRef,
+    ) -> Result<Option<String>, DeployerError> {
+        let deployment_id = revision.deployment_id;
+        let revision_id = revision.revision_id;
+        let runtime_service_account = params.runtime_service_account(env.environment_id.as_str());
+
+        // Stage the env-store seed (plan D6): upload environment.json to a
+        // version-pinned Secret Manager secret and grant the runtime SA read
+        // access, then mount that exact version read-only. The grant is
+        // load-bearing — Cloud Run rejects a revision whose SA cannot read a
+        // mounted secret version. Staged ONCE, before the etag retry loop, so a
+        // precondition retry does not add a redundant secret version. The
+        // revision's boot env (`runtime_boot_env`) sets `GREENTIC_SEED_DIR`, so
+        // greentic-start copies this mount into its writable store at boot. When
+        // the env carries dev-store material, the CLI injected the raw bytes and
+        // they are staged as a SECOND version of the same secret below.
+        let environment_json = serde_json::to_vec(env).map_err(|e| {
+            DeployerError::Provider(format!(
+                "serializing environment.json for seed staging: {e}"
+            ))
+        })?;
+        let secret_name = environment_secret_name(&params.secret_prefix);
+        let env_version = self
+            .target
+            .upsert_secret(&secret_name, &environment_json)
+            .await
+            .map_err(provider)?;
+        let mut secret_items = vec![SecretMountItem {
+            version: env_version.version,
+            rel_path: ENVIRONMENT_SEED_FILE.to_string(),
+        }];
+        // Stage the operator's encrypted dev-store (`.dev.secrets.env`) as a
+        // second version of the SAME secret, projected at a subdirectory item
+        // path under the one `/seed` volume — Cloud Run forbids nested mounts, so
+        // the two seed files cannot be two volumes. Absent for envs with no
+        // `Secrets`-slot pack (the CLI passes `None`).
+        if let Some(dev_bytes) = &self.dev_secrets {
+            let dev_version = self
+                .target
+                .upsert_secret(&secret_name, dev_bytes)
+                .await
+                .map_err(provider)?;
+            secret_items.push(SecretMountItem {
+                version: dev_version.version,
+                // The seed tree mirrors the on-disk store, so the dev-store's
+                // store-relative path is also its path under `/seed`, projected
+                // as a subdirectory item (Cloud Run forbids a nested mount).
+                rel_path: DEV_STORE_RELATIVE.to_string(),
+            });
+        }
+        // Grant the runtime SA read on the secret (covers every version) —
+        // load-bearing: Cloud Run rejects a revision whose SA cannot read a
+        // mounted version. Idempotent, so a re-warm is a no-op.
+        self.target
+            .grant_secret_accessor(&secret_name, &runtime_service_account)
+            .await
+            .map_err(provider)?;
+        let secret_mounts = vec![SecretMount {
+            mount_dir: SEED_MOUNT_DIR.to_string(),
+            secret_name,
+            items: secret_items,
+        }];
+        // Revision-scoped, deterministic — built once and reused across etag
+        // retries so a re-upsert never renders a different container.
+        let boot_env = runtime_boot_env(env, revision);
+
+        // Read-modify-write under etag optimistic concurrency with bounded
+        // retries on a precondition conflict (plan D4): re-read, recompute
+        // traffic from the fresh state, and retry rather than replaying a stale
+        // etag. Traffic is pinned to NAMED revisions in the same upsert — first
+        // create is 100% to the named first revision (never LATEST, never a
+        // 0%-only array); an update keeps the existing distribution and adds
+        // this revision at 0% if it is new, so warm never moves traffic.
+        let mut attempt = 0;
+        // The Service's `*.run.app` URL rides back on the upsert response (it is
+        // assigned at Service-create time and is immutable after), so take it as
+        // the loop's break value — the caller needs no extra `get_service`.
+        let endpoint_url = loop {
+            let existing = self
+                .target
+                .get_service(service_ref)
+                .await
+                .map_err(provider)?;
+            let (traffic, etag) = match &existing {
+                None => (
+                    vec![TrafficTarget {
+                        revision_id,
+                        percent: 100,
+                    }],
+                    None,
+                ),
+                Some(status) => {
+                    let mut traffic = status.traffic.clone();
+                    if !traffic.iter().any(|t| t.revision_id == revision_id) {
+                        traffic.push(TrafficTarget {
+                            revision_id,
+                            percent: 0,
+                        });
+                    }
+                    (traffic, Some(status.etag.clone()))
+                }
+            };
+            let spec = ServiceSpec {
+                deployment_id,
+                project: params.project.clone(),
+                region: params.region.clone(),
+                image: params.image_ref(),
+                revision_id,
+                runtime_service_account: runtime_service_account.clone(),
+                traffic,
+                scaling: params.scaling(),
+                access_mode: params.access_mode,
+                session_affinity: true,
+                secrets: secret_mounts.clone(),
+                env: boot_env.clone(),
+            };
+            match self.target.upsert_service(&spec, etag.as_deref()).await {
+                Ok(status) => break Ok(status.url),
+                Err(CloudRunTargetError::PreconditionFailed) => {
+                    // Both 409s land here (see `revision_exists`). If the
+                    // revision now exists, a concurrent warm created it between
+                    // our probe and this upsert: the conflict is permanent, so
+                    // converge on what is there instead of retrying into the
+                    // identical rejection and then blaming an etag race.
+                    if revision_exists(self.target.as_ref(), revision_ref).await? {
+                        break self.target.get_service_url(service_ref).await;
+                    }
+                    attempt += 1;
+                    if attempt > MAX_ETAG_RETRIES {
+                        return Err(DeployerError::Provider(format!(
+                            "Cloud Run service for deployment `{deployment_id}` kept losing the \
+                             etag race after {MAX_ETAG_RETRIES} retries"
+                        )));
+                    }
+                }
+                Err(e) => return Err(provider(e)),
+            }
+        };
+        endpoint_url.map_err(provider)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,6 +804,14 @@ mod tests {
         inner: InMemoryCloudRun,
         upsert_conflicts: std::sync::Mutex<u32>,
         set_traffic_conflicts: std::sync::Mutex<u32>,
+        /// When set, an injected upsert conflict first lets a *rival* warm land
+        /// the revision (from a different template, as a concurrent warm's own
+        /// freshly-staged secret versions would make it). This is the create
+        /// race: the same `PreconditionFailed` as a stale etag, but permanent.
+        rival_create: bool,
+        /// Upserts attempted, so a test can prove the deployer did not burn its
+        /// retry budget on a conflict that could never resolve.
+        upsert_attempts: std::sync::Mutex<u32>,
     }
 
     impl ConflictInjector {
@@ -727,6 +820,16 @@ mod tests {
                 inner: InMemoryCloudRun::default(),
                 upsert_conflicts: std::sync::Mutex::new(upsert_conflicts),
                 set_traffic_conflicts: std::sync::Mutex::new(set_traffic_conflicts),
+                rival_create: false,
+                upsert_attempts: std::sync::Mutex::new(0),
+            }
+        }
+
+        /// A rival warm wins the create race on our first upsert.
+        fn losing_create_race() -> Self {
+            Self {
+                rival_create: true,
+                ..Self::new(1, 0)
             }
         }
 
@@ -754,7 +857,15 @@ mod tests {
             spec: &ServiceSpec,
             etag: Option<&str>,
         ) -> Result<ServiceStatus, CloudRunTargetError> {
+            *self.upsert_attempts.lock().unwrap() += 1;
             if Self::take_conflict(&self.upsert_conflicts) {
+                if self.rival_create {
+                    let rival = ServiceSpec {
+                        image: format!("{}-rival", spec.image),
+                        ..spec.clone()
+                    };
+                    self.inner.upsert_service(&rival, etag).await?;
+                }
                 return Err(CloudRunTargetError::PreconditionFailed);
             }
             self.inner.upsert_service(spec, etag).await
@@ -1122,6 +1233,121 @@ mod tests {
         assert!(
             target.inner.traffic_for(dep_a).is_some(),
             "the service is created once the retry wins the etag race"
+        );
+    }
+
+    /// H2. A warm is retried routinely (`op env up` re-run, or a first attempt
+    /// that died past the upsert). Restaging would mint a fresh Secret Manager
+    /// version, which renders a different template for an IMMUTABLE revision —
+    /// rejected 409, and the versions are orphaned for good measure. So the
+    /// second warm must not stage at all.
+    #[tokio::test]
+    async fn warm_twice_reuses_the_existing_revision_without_restaging() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+        let params = params_from_answers(&env, None).unwrap();
+        let secret_name = environment_secret_name(&params.secret_prefix);
+
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+        assert_eq!(target.secrets()[&secret_name].1, 1, "first warm stages v1");
+
+        handler
+            .warm_revision(&env, r_warm, None)
+            .await
+            .expect("re-warming a live revision must succeed (trait idempotency contract)");
+
+        assert_eq!(
+            target.secrets()[&secret_name].1,
+            1,
+            "the second warm must stage NO new secret version — a fresh version could \
+             never reach this immutable revision, so it would be pure orphan"
+        );
+        let mounts = target.service_secrets_for(dep_a).expect("service exists");
+        assert_eq!(
+            mounts[0].items[0].version, "1",
+            "the live revision keeps its originally pinned version"
+        );
+    }
+
+    /// H2. The resume path must converge the steps that are NOT part of the
+    /// immutable revision, not just return early: an attempt that died between
+    /// the upsert and the invoker grant leaves a revision that exists but is
+    /// unreachable, and the retry is what has to finish the job.
+    #[tokio::test]
+    async fn warm_resumes_a_revision_left_without_its_invoker_policy() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+        let r_warm = revision.revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+
+        // Exactly the state a warm that died after its upsert leaves behind.
+        let params = params_from_answers(&env, None).unwrap();
+        target
+            .upsert_service(
+                &ServiceSpec {
+                    deployment_id: dep_a,
+                    project: params.project.clone(),
+                    region: params.region.clone(),
+                    image: params.image_ref(),
+                    revision_id: r_warm,
+                    runtime_service_account: params
+                        .runtime_service_account(env.environment_id.as_str()),
+                    traffic: vec![TrafficTarget {
+                        revision_id: r_warm,
+                        percent: 100,
+                    }],
+                    scaling: params.scaling(),
+                    access_mode: params.access_mode,
+                    session_affinity: true,
+                    secrets: Vec::new(),
+                    env: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(target.invoker_policy_for(dep_a), None, "precondition");
+
+        let outcome = handler.warm_revision(&env, r_warm, None).await.unwrap();
+
+        assert_eq!(
+            target.invoker_policy_for(dep_a),
+            Some(AccessMode::Public),
+            "the resumed warm must still apply the invoker policy — without it the \
+             revision is live but every request 403s"
+        );
+        assert!(
+            outcome.endpoint_url.is_some(),
+            "the resumed warm reports the endpoint the caller needs"
+        );
+    }
+
+    /// H2. A rival warm landing the revision between our probe and our upsert
+    /// yields the SAME `PreconditionFailed` as a stale etag — but retrying it is
+    /// futile, because the revision is immutable and our template will never
+    /// match. The deployer must converge on what is there instead of burning the
+    /// retry budget and then blaming a race that did not happen.
+    #[tokio::test]
+    async fn warm_converges_when_a_rival_wins_the_create_race() {
+        let target = Arc::new(ConflictInjector::losing_create_race());
+        let handler = GcpCloudRunDeployerHandler::with_target(target.clone());
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+
+        let outcome = handler
+            .warm_revision(&env, r_warm, None)
+            .await
+            .expect("a revision the rival already created is a converged warm, not a failure");
+
+        assert!(outcome.endpoint_url.is_some(), "endpoint still reported");
+        assert_eq!(
+            *target.upsert_attempts.lock().unwrap(),
+            1,
+            "the conflict is permanent, so it must cost exactly one upsert — retrying \
+             could only reproduce it {MAX_ETAG_RETRIES} more times"
         );
     }
 

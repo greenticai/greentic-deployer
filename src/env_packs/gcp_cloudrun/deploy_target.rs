@@ -151,6 +151,38 @@ pub struct ServiceSpec {
     pub env: Vec<(String, String)>,
 }
 
+/// The subset of [`ServiceSpec`] Cloud Run renders into the **immutable**
+/// revision (`Service.template`).
+///
+/// Everything else on the spec is Service-level and freely mutable: `traffic`
+/// is an array on the Service, and `access_mode` is not on the Service at all
+/// (it is a separate IAM policy). Two upserts naming the same revision must
+/// agree on every field here — Cloud Run rejects the second otherwise, with
+/// *"Revision named 'X' with different configuration already exists"* (HTTP
+/// 409). Used by [`InMemoryCloudRun`] to model that rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RevisionTemplate {
+    image: String,
+    runtime_service_account: String,
+    scaling: ScalingSpec,
+    session_affinity: bool,
+    secrets: Vec<SecretMount>,
+    env: Vec<(String, String)>,
+}
+
+impl RevisionTemplate {
+    fn of(spec: &ServiceSpec) -> Self {
+        Self {
+            image: spec.image.clone(),
+            runtime_service_account: spec.runtime_service_account.clone(),
+            scaling: spec.scaling.clone(),
+            session_affinity: spec.session_affinity,
+            secrets: spec.secrets.clone(),
+            env: spec.env.clone(),
+        }
+    }
+}
+
 /// Live state of a Cloud Run Service returned by [`CloudRunTarget::get_service`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceStatus {
@@ -357,10 +389,18 @@ impl CloudRunTarget for UnconfiguredCloudRunTarget {
 /// Mirrors `InMemoryEcs`: `Mutex`-wrapped `BTreeMap`s plus snapshot accessors
 /// for test assertions. Readiness is instant (revisions report `ready` the
 /// moment they are created) so the warm wait resolves on the first poll.
+///
+/// **Revisions are immutable here, as they are in Cloud Run** — see
+/// [`upsert_service`](InMemoryCloudRun::upsert_service). A fake that silently
+/// accepted a re-render of a live revision would make the conformance suite's
+/// idempotency check vacuous for the one way Cloud Run's warm can realistically
+/// fail to be idempotent.
 #[derive(Debug, Default)]
 pub struct InMemoryCloudRun {
     services: Mutex<BTreeMap<DeploymentId, ServiceStatus>>,
-    revisions: Mutex<BTreeMap<(DeploymentId, RevisionId), RevisionStatus>>,
+    /// Each live revision plus the template it was rendered from, so a
+    /// re-upsert can be checked against Cloud Run's immutability rule.
+    revisions: Mutex<BTreeMap<(DeploymentId, RevisionId), (RevisionStatus, RevisionTemplate)>>,
     secrets: Mutex<BTreeMap<String, (Vec<u8>, u64)>>,
     /// Service accounts granted `secretAccessor` on each secret, so tests can
     /// assert the deployer grants the runtime SA before mounting.
@@ -403,7 +443,12 @@ impl InMemoryCloudRun {
 
     /// Snapshot of every live revision.
     pub fn revisions(&self) -> BTreeMap<(DeploymentId, RevisionId), RevisionStatus> {
-        self.revisions.lock().expect("revisions mutex").clone()
+        self.revisions
+            .lock()
+            .expect("revisions mutex")
+            .iter()
+            .map(|(key, (status, _template))| (*key, *status))
+            .collect()
     }
 
     /// Snapshot of every staged secret: name → (payload, version count).
@@ -498,6 +543,21 @@ impl CloudRunTarget for InMemoryCloudRun {
             (Some(_), None) => return Err(CloudRunTargetError::PreconditionFailed),
             _ => {}
         }
+        let mut revisions = self.revisions.lock().expect("revisions mutex");
+        let template = RevisionTemplate::of(spec);
+        // Cloud Run revisions are immutable. Re-rendering a live revision name
+        // with any different template is rejected 409 ("Revision named 'X' with
+        // different configuration already exists") — which `real_target`'s
+        // `classify` maps onto `PreconditionFailed`, exactly as returned here.
+        // The collapse is faithful, and it is why the deployer cannot tell this
+        // apart from a stale-etag race by error alone: only the revision's
+        // existence distinguishes them. Re-rendering the SAME template is a
+        // no-op that succeeds, which is what makes a warm retry idempotent.
+        if let Some((_, live_template)) = revisions.get(&(spec.deployment_id, spec.revision_id))
+            && *live_template != template
+        {
+            return Err(CloudRunTargetError::PreconditionFailed);
+        }
         let status = ServiceStatus {
             ready: true,
             url: Some(Self::deterministic_url(spec.deployment_id)),
@@ -505,13 +565,17 @@ impl CloudRunTarget for InMemoryCloudRun {
             etag: self.next_etag(),
         };
         services.insert(spec.deployment_id, status.clone());
-        self.revisions.lock().expect("revisions mutex").insert(
+        revisions.insert(
             (spec.deployment_id, spec.revision_id),
-            RevisionStatus {
-                ready: true,
-                active: true,
-            },
+            (
+                RevisionStatus {
+                    ready: true,
+                    active: true,
+                },
+                template,
+            ),
         );
+        drop(revisions);
         self.runtime_service_accounts
             .lock()
             .expect("runtime-sa mutex")
@@ -535,7 +599,7 @@ impl CloudRunTarget for InMemoryCloudRun {
             .lock()
             .expect("revisions mutex")
             .get(&(revision.deployment_id, revision.revision_id))
-            .copied()
+            .map(|(status, _template)| *status)
             .ok_or_else(|| {
                 CloudRunTargetError::NotFound(format!(
                     "revision {} not found",
