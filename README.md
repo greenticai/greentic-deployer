@@ -25,6 +25,26 @@ which materialize handoff manifests/scripts from a provider pack rather than
 managing a live environment store. The guide opens with how to choose between
 the two.
 
+## Google Cloud Run deployment (env-pack model)
+
+The scale-to-zero sibling of the K8s path: **an idle environment bills no
+compute**. Same store, same `op env …` surface, no cluster to run.
+
+- **[docs/cloudrun-deployment.md](docs/cloudrun-deployment.md)** — mental model
+  (why Cloud Run is imperative, not reconciled), what lands in your project, the
+  one-file/one-command quickstart, the Secret Manager seed contract, access
+  modes (Cloud Run is private by default), **the zero-idle-cost claim and how to
+  verify it**, the config reference, known gaps, and troubleshooting.
+
+```bash
+gtc op env up --answers cloudrun.env.json --yes   # → one JSON envelope with a *.run.app URL
+gtc start cloudrun --answers cloudrun.env.json    # the same thing, sugared
+```
+
+Note the name collision: the `gcp` **adapter family** listed below is the older
+terraform-backed `iac-only` deployment-pack path and is unrelated to this
+env-pack deployer (`greentic.deployer.gcp-cloudrun@1.0.0`).
+
 ## Concepts
 
 - **Application packs** (`kind: application` or `mixed`) describe flows, components, tools, secrets, tenant bindings, and deployment hints.
