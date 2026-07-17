@@ -1938,7 +1938,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2102,7 +2102,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2706,9 +2706,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-bundle"
-version = "1.2.0-dev.29321929452"
+version = "1.2.0-dev.29406166006"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3dbc221bebfa9e3a11f201c2658159760b6e1e9b91ab75016ac647c4cb9c8fed"
+checksum = "edd79b7b815c7b546ae17e2fe49546e74ec3731e79d2df41ccaa3b2712434ab6"
 dependencies = [
  "anyhow",
  "backhand",
@@ -2740,9 +2740,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-bundle-reader"
-version = "1.2.0-dev.29321929452"
+version = "1.2.0-dev.29406166006"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a5e8f8210f7bc71620a43ff8490098b3e0f5c0dc25acab430b671e64cbe0b8c"
+checksum = "26376883a99b4b0ca96c68cc3ccdd650413943d0bd3687fe59f03618fb9a9634"
 dependencies = [
  "backhand",
  "serde",
@@ -2880,9 +2880,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-distributor-client"
-version = "1.2.0-dev.29307492104"
+version = "1.2.0-dev.29406158696"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "450f433dc4809326cff8c4c33f59cbe02306fd191e39b7b924196b04e5516d72"
+checksum = "7399aeffe89dcfab98b621850b66367d8a4cae5e5881d969be37b0a4a3416244"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3140,9 +3140,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-types"
-version = "1.2.0-dev.28924494708"
+version = "1.2.0-dev.29406150555"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1097d4d60cc94b3904caf7eb26f43f7c1c824a35cbbb7719c9c7c0472e501969"
+checksum = "dd5ecbc239bc4f7367c833c2d10b5c4366ff4c13fa2ccf3eaa83da158417cb5e"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3171,9 +3171,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-types-macros"
-version = "1.2.0-dev.28924494708"
+version = "1.2.0-dev.29406150555"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7d399561efec1a6e8465f12f382ea9d5c8a0ef8a5200002dece59d34f1c56c9"
+checksum = "410952283a32d8f75336da71db4cd757de1dc4a571fc4f1c6654b0e2c7b543ee"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3182,9 +3182,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-update"
-version = "0.1.29307732708"
+version = "0.1.29391551069"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e6ca677d27d79f452731036300b7a536935f04cff5bab9511df6073305c84d8"
+checksum = "d913d33774d8d81003cd810381557b6420e5e8ac02383dab5cb802d6fc3c5691"
 dependencies = [
  "chrono",
  "flate2",
@@ -4250,7 +4250,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5010,7 +5010,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5464,7 +5464,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5532,7 +5532,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6410,7 +6410,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7667,7 +7667,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
