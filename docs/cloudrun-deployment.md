@@ -79,10 +79,13 @@ For an environment `<env>` in project `<project>`, region `<region>`:
 | IAM: `secretAccessor` | on the seed secret, for the runtime SA | first warm | Cloud Run refuses a revision whose SA cannot read a mounted version. |
 | IAM: `run.invoker` for `allUsers` | on the Service | warm, when `access_mode: public` | See §6. |
 
-The deployer creates **nothing else**. Notably it does **not** create an
-Artifact Registry repository unless you ask for one (`ar_repo`) — by default the
-worker image and your bundle are pulled straight from public GHCR, which is what
-keeps standing storage cost at zero (§8).
+The deployer creates **nothing else**. In particular it **never** creates an
+Artifact Registry repository — not even when you set `ar_repo`. That answer only
+*points at* a repository you have already provisioned, by rewriting the image
+reference to `<region>-docker.pkg.dev/<project>/<ar_repo>/…`; set it without
+creating the repository first and you get a failed image pull, not a cache. By
+default the worker image and your bundle are pulled straight from public GHCR,
+which is what keeps standing storage cost at zero (§8).
 
 ---
 
@@ -129,9 +132,11 @@ keeps standing storage cost at zero (§8).
    It enables the two APIs, creates `gtc-<env>-deployer` and `gtc-<env>-runtime`,
    defines a custom role holding exactly the permission list the deployer
    validates, and binds it. The Artifact Registry resources are present but
-   **commented out** — uncomment them only if you set `ar_repo`. It is
-   render-only: `"bound": false` in the output means no credential was minted and
-   nothing was written to your project by this step.
+   **commented out**; if you want a pull-through cache, uncomment and apply them
+   **first**, then set `ar_repo` to the repository id they create — the answer
+   alone provisions nothing. The bootstrap is render-only: `"bound": false` in
+   the output means no credential was minted and nothing was written to your
+   project by this step.
 4. **Credentials for the deployer (ADC).** The deployer runs as the **ambient**
    Application Default Credentials chain unless the env binds a deployer
    session. Any of:
@@ -351,7 +356,7 @@ Those standing charges, in the default configuration:
 |---|---|
 | Cloud Run Service, 0 instances | **Zero.** No compute billed. |
 | Secret Manager | The seed secret's **active versions** — a few cents/month. |
-| Artifact Registry | **Zero — no repository is created by default.** Setting `ar_repo` adds storage billing; that is the trade-off for a pull-through cache. |
+| Artifact Registry | **Zero — the deployer creates no repository, ever.** If *you* provision one and point `ar_repo` at it, its cached-artifact storage bills; that is the trade-off for a pull-through cache. |
 | Cloud Logging | Whatever your log retention costs; unrelated to idleness. |
 
 To verify, after ~15 minutes of no traffic:
@@ -388,7 +393,7 @@ in the manifest or via `answers_ref`:
 | `project` | **yes** | — | GCP project id. |
 | `region` | **yes** | — | e.g. `europe-west1`. |
 | `access_mode` | no | `public` | `public` \| `authenticated`. See §6. |
-| `ar_repo` | no | *(unset)* | Artifact Registry **remote** repo to pull through instead of direct GHCR. Adds storage cost (§8). |
+| `ar_repo` | no | *(unset)* | Id of an **already-provisioned** Artifact Registry remote repo to pull the image through instead of direct GHCR. **Creates nothing** — provision it first (§3) or the pull fails. Adds storage cost (§8). |
 | `runtime_image_tag` | no | `develop` | Tag of `ghcr.io/greenticai/greentic-start-distroless`. |
 | `runtime_image_digest` | no | *(unset)* | `sha256:…`. **Prefer this over a tag** — see §10. |
 | `service_account` | no | `gtc-<env>-runtime@<project>.iam.gserviceaccount.com` | Runtime identity. |

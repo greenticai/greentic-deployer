@@ -76,10 +76,14 @@
 //!   OPTIONAL:
 //!     GTC_GCP_E2E_SERVICE_ACCOUNT    runtime SA email
 //!                                    (default: gtc-<env>-runtime@<project>…)
-//!     GTC_GCP_E2E_SECRET_PREFIX      Secret Manager name prefix
-//!                                    (default: the deployer's gtc-<env-id>)
-//!     GTC_GCP_E2E_AR_REPO            Artifact Registry remote repo (default:
-//!                                    unset = direct public GHCR, plan D3)
+//!     GTC_GCP_E2E_SECRET_PREFIX      Secret Manager name prefix. Default: a
+//!                                    per-run unique prefix — do NOT pin it to a
+//!                                    constant for two concurrent runs (see
+//!                                    `run_secret_prefix`).
+//!     GTC_GCP_E2E_AR_REPO            An ALREADY-PROVISIONED Artifact Registry
+//!                                    remote repo id to pull the image through.
+//!                                    Setting it does not create one. Default:
+//!                                    unset = direct public GHCR (plan D3).
 //!     GTC_GCP_E2E_RUNTIME_IMAGE_TAG  worker image tag (default: `develop`)
 //!     GTC_GCP_E2E_RUNTIME_IMAGE_DIGEST  pin the worker image by digest
 //!     GTC_GCP_E2E_BUNDLE_URI         `oci://…` bundle (default: the public
@@ -100,14 +104,26 @@
 //! archive its sole routed revision. That destroy is also the only live coverage
 //! of the teardown path, so it is an ASSERTION, not just hygiene.
 //!
-//! A mid-run FAILURE leaves the Service and its secrets behind. Reclaim them
-//! with the same verb the test uses — the store is a tempdir, so read the printed
-//! `store root` from the failure output and run:
-//!   greentic-deployer op --store-root <root> env destroy local --confirm
-//! Left alone, a leaked Service scales to zero and bills no compute; the staged
-//! secrets bill the (tiny) Secret Manager active-version footprint until deleted.
+//! A mid-run FAILURE leaves the Service and its secrets behind, so the run's
+//! store is **deliberately persisted** (not a self-deleting `TempDir`) and the
+//! reclaim command is printed BEFORE any resource exists. Re-run it by hand:
+//!   greentic-deployer op --store-root <printed root> env destroy local --confirm
+//! and delete the store dir afterwards. It is removed automatically only after a
+//! successful teardown. Left alone, a leaked Service scales to zero and bills no
+//! compute; the staged secrets bill the (tiny) Secret Manager active-version
+//! footprint until deleted.
+//!
 //! (No in-test Drop guard on purpose: running cloud teardown while unwinding
 //! would double-fault the panic and hide the real failure.)
+//!
+//! **A stuck provider call can hang this test.** `Command::output()` has no
+//! deadline, and while the warm-readiness poll is bounded (300 s, see
+//! `GREENTIC_GCP_WARM_READY_TIMEOUT_SECS`), the underlying create/update LRO
+//! poll is not. A degraded Cloud Run API can therefore stall a run while
+//! resources are live. This is operator-run in the foreground, so Ctrl+C is the
+//! timeout — and because the store is persisted, the printed reclaim command
+//! still works afterwards. (Bounding the LRO itself belongs in `real_target.rs`,
+//! not here: the same unbounded poll would hang a real `op env up`.)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -240,18 +256,18 @@ fn bundle_ref() -> (String, String) {
 /// SA formula, `secret_prefix`, direct-GHCR image path) stay in force —
 /// exercising the SAME defaults a real operator gets rather than a fully
 /// pinned-down fixture.
-fn cloudrun_answers() -> Value {
+fn cloudrun_answers(secret_prefix: &str) -> Value {
     let mut answers = json!({
         "project": required_var("GTC_GCP_E2E_PROJECT"),
         "region": required_var("GTC_GCP_E2E_REGION"),
         // The URL must be reachable without a token for the `/healthz` probe
         // (plan D12: Cloud Run is private by default).
         "access_mode": "public",
+        "secret_prefix": secret_prefix,
     });
     let obj = answers.as_object_mut().expect("answers object");
     for (var, key) in [
         ("GTC_GCP_E2E_SERVICE_ACCOUNT", "service_account"),
-        ("GTC_GCP_E2E_SECRET_PREFIX", "secret_prefix"),
         ("GTC_GCP_E2E_AR_REPO", "ar_repo"),
         ("GTC_GCP_E2E_RUNTIME_IMAGE_TAG", "runtime_image_tag"),
         ("GTC_GCP_E2E_RUNTIME_IMAGE_DIGEST", "runtime_image_digest"),
@@ -263,10 +279,47 @@ fn cloudrun_answers() -> Value {
     answers
 }
 
+/// A Secret Manager name prefix unique to THIS run.
+///
+/// Load-bearing for isolation, not cosmetics. The env id is fixed at `local`, so
+/// the deployer's default prefix would be `gtc-local` for every run in the
+/// project — and the H1 owner stamp is a function of the env id ALONE, so every
+/// run would also stamp an identical owner. Two runs would then share
+/// `gtc-local-environment`, each classify it as `Ours`, and the first to finish
+/// would delete the secret the other's live Service still mounts, breaking it on
+/// its next cold start. (This is the tracked `[H1-install]` gap — two installs of
+/// one env name in one project — and a concurrent E2E is exactly that case.)
+/// Distinct prefixes give distinct secrets, so the shared stamp stops mattering.
+///
+/// Services are already ULID-named and the runtime SA is deliberately shared, so
+/// the secret is the only colliding resource.
+///
+/// `GTC_GCP_E2E_SECRET_PREFIX` overrides it — pointing two runs at one prefix is
+/// then the operator's explicit choice.
+fn run_secret_prefix() -> String {
+    if let Ok(explicit) = std::env::var("GTC_GCP_E2E_SECRET_PREFIX") {
+        return explicit;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after the epoch")
+        .as_nanos();
+    unique_secret_prefix(std::process::id(), nanos)
+}
+
+/// The prefix formula, pure (pid + clock passed in) so the properties that make
+/// it safe are unit-tested without a project — see [`run_secret_prefix`] for why
+/// uniqueness is load-bearing rather than cosmetic.
+fn unique_secret_prefix(pid: u32, nanos: u128) -> String {
+    // Secret Manager names are `[a-zA-Z0-9_-]{1,255}`; the `gtc-` lead keeps it
+    // starting with a letter.
+    format!("gtc-e2e-{pid}-{nanos}")
+}
+
 /// The `greentic.env-manifest.v1` document `op env up` consumes — the same
 /// one-file shape the demo and `gtc start cloudrun` use, so this test covers the
 /// documented path rather than a test-only assembly of granular verbs.
-fn env_manifest(bundle_uri: &str, bundle_digest: &str) -> Value {
+fn env_manifest(bundle_uri: &str, bundle_digest: &str, secret_prefix: &str) -> Value {
     json!({
         "schema": "greentic.env-manifest.v1",
         "environment": {"id": ENV_ID, "name": "cloudrun-e2e"},
@@ -276,7 +329,7 @@ fn env_manifest(bundle_uri: &str, bundle_digest: &str) -> Value {
                 "slot": "deployer",
                 "kind": DESCRIPTOR,
                 "pack_ref": "builtin",
-                "answers": cloudrun_answers(),
+                "answers": cloudrun_answers(secret_prefix),
             },
             {"slot": "secrets", "kind": "greentic.secrets.dev-store@1.0.0", "pack_ref": "builtin"},
         ],
@@ -361,6 +414,39 @@ fn gate_arms_only_on_exact_1() {
     assert!(!gate_armed(Some("false")));
     assert!(!gate_armed(Some("true")));
     assert!(!gate_armed(Some("")));
+}
+
+/// CI-runnable guard on the isolation property: two runs must never resolve to
+/// one Secret Manager secret. Because the env id is fixed at `local`, the H1
+/// owner stamp is identical across runs, so a shared secret name would be
+/// classified `Ours` by BOTH and the first destroy would delete the other's live
+/// seed. The prefix is the only thing keeping them apart — pin that it actually
+/// varies, and that it stays inside Secret Manager's charset.
+#[test]
+fn run_secret_prefixes_are_unique_and_name_safe() {
+    let a = unique_secret_prefix(1234, 1_000_000_000_000_000_000);
+    let b = unique_secret_prefix(1234, 1_000_000_000_000_000_001);
+    let other_proc = unique_secret_prefix(5678, 1_000_000_000_000_000_000);
+    assert_ne!(a, b, "same pid, later clock → distinct prefix");
+    assert_ne!(a, other_proc, "same clock, other pid → distinct prefix");
+
+    for name in [&a, &b, &other_proc] {
+        // The full secret is `<prefix>-environment`; both must satisfy
+        // Secret Manager's `[a-zA-Z0-9_-]{1,255}`, leading letter.
+        assert!(
+            name.starts_with(|c: char| c.is_ascii_alphabetic()),
+            "{name} must start with a letter"
+        );
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "{name} must stay in Secret Manager's charset"
+        );
+        assert!(
+            name.len() + "-environment".len() <= 255,
+            "{name}-environment must fit Secret Manager's 255-char limit"
+        );
+    }
 }
 
 /// Also CI-runnable: pins the URL shape the live assertion depends on, so a
@@ -479,19 +565,31 @@ fn cloudrun_full_lifecycle_against_real_project() {
         return;
     }
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let store = tmp.path();
+    // The store OUTLIVES a failure on purpose. `TempDir` would delete itself as
+    // the panic unwinds — taking the environment state with it and making the
+    // reclaim command below impossible to run at exactly the moment it is needed
+    // (a failure after `env up` leaves a live Service and a staged secret). So
+    // detach it now and remove it explicitly only once teardown has succeeded.
+    let store_path = tempfile::tempdir().expect("tempdir").keep();
+    let store = store_path.as_path();
     let (bundle_uri, bundle_digest) = bundle_ref();
-    // Printed up front: a mid-run panic leaks a live Service, and this is the
-    // store root the reclaim command in the module doc needs.
-    eprintln!("[gcp-e2e] store root: {}", store.display());
+    let secret_prefix = run_secret_prefix();
+    // Printed up front, not on the failure path: a panic (or a Ctrl+C out of a
+    // stuck provider call) must leave these where the operator can see them.
+    eprintln!("[gcp-e2e] store root:    {}", store.display());
+    eprintln!("[gcp-e2e] secret prefix: {secret_prefix}");
+    eprintln!(
+        "[gcp-e2e] reclaim with: {} op --store-root {} env destroy {ENV_ID} --confirm",
+        deployer_bin().display(),
+        store.display()
+    );
 
     // 1. ONE command: create the env, bind the Cloud Run deployer, add the
     //    bundle, warm revision A, and route 100 % to it. The headline UX.
     let manifest = payload(
         store,
         "cloudrun.env.json",
-        env_manifest(&bundle_uri, &bundle_digest),
+        env_manifest(&bundle_uri, &bundle_digest, &secret_prefix),
     );
     let up = op(store, Some(&manifest), &["env", "up", "--yes"]);
     assert_eq!(
@@ -518,9 +616,7 @@ fn cloudrun_full_lifecycle_against_real_project() {
         panic!(
             "{url}/healthz never returned 200 ({last}). The Service deployed, so this points at \
              the seed/boot chain (secret volume mount, GREENTIC_SEED_DIR) rather than the deploy \
-             glue — check the Cloud Run revision logs. Reclaim with: \
-             greentic-deployer op --store-root {} env destroy {ENV_ID} --confirm",
-            store.display()
+             glue — check the Cloud Run revision logs. Reclaim with the command printed above."
         );
     }
 
@@ -639,6 +735,11 @@ fn cloudrun_full_lifecycle_against_real_project() {
         Some(0),
         "nothing skipped as another environment's: {destroyed}"
     );
+
+    // Only now is the store expendable: every provider resource is reclaimed and
+    // every teardown assertion held, so there is nothing left to recover.
+    // Anything that panicked before this point left it on disk deliberately.
+    let _ = std::fs::remove_dir_all(store);
 
     eprintln!(
         "[gcp-e2e] destroyed: {} service(s), {} secret(s)",
