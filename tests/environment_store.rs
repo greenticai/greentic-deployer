@@ -4,17 +4,23 @@
 //! live alongside the modules; this file exercises the full trait surface
 //! against a real temp-rooted [`LocalFsStore`].
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
+use chrono::{TimeZone, Utc};
 use greentic_deploy_spec::{
-    CapabilitySlot, EnvId, EnvPackBinding, Environment, EnvironmentHostConfig, EnvironmentRuntime,
-    PackDescriptor, PackId, RuntimeDiscoveryValue, SchemaVersion,
+    BundleDeployment, BundleDeploymentStatus, BundleId, CapabilitySlot, CustomerId, DeploymentId,
+    EnvId, EnvPackBinding, Environment, EnvironmentHostConfig, EnvironmentRuntime, PackDescriptor,
+    PackId, PartyId, RevenueShareEntry, RouteBinding, RuntimeDiscoveryValue, SchemaVersion,
+    TenantSelector,
 };
 use greentic_deployer::environment::{
-    EnvFlock, EnvironmentStore, LocalFsStore, StoreError, mint_deployment_id, mint_revision_id,
+    EnvFlock, EnvironmentStore, LocalFsStore, PROVIDER_TEARDOWN_DESCRIPTORS, ProviderTeardown,
+    ProviderTeardownCtx, StoreError, mint_deployment_id, mint_revision_id,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 fn env_id(s: &str) -> EnvId {
@@ -657,4 +663,366 @@ fn default_root_under_home() {
             "got {s}"
         );
     }
+}
+
+#[test]
+fn destroy_environment_removes_tree_and_returns_canonical_path() {
+    let (tmp, store) = fresh_store();
+    let id = env_id("doomed");
+    store.save(&minimal_environment(&id)).unwrap();
+    // A sidecar the store APIs never wrote proves rename-then-remove needs
+    // no enumeration of the env dir's contents.
+    std::fs::write(tmp.path().join("doomed").join("trust-root.json"), b"{}").unwrap();
+
+    let outcome = store.destroy_environment(&id).unwrap();
+    assert_eq!(outcome.removed_path, tmp.path().join("doomed"));
+    assert_eq!(outcome.reaped_tombstones, 0);
+    assert!(!outcome.removed_path.exists());
+    assert!(!store.exists(&id).unwrap());
+    assert!(store.list().unwrap().is_empty());
+    // A clean purge leaves no tombstone sibling behind.
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(leftovers.is_empty(), "got {leftovers:?}");
+}
+
+#[test]
+fn destroy_environment_missing_env_is_not_found() {
+    let (tmp, store) = fresh_store();
+    let err = store.destroy_environment(&env_id("ghost")).unwrap_err();
+    assert!(matches!(err, StoreError::NotFound(_)), "got {err:?}");
+    // The unlocked fast-path must not leave a flock husk dir behind.
+    assert!(!tmp.path().join("ghost").exists());
+}
+
+/// Make the (future) tombstone's purge fail: a write-protected dir with a
+/// child makes `remove_dir_all` fail after the (committing) rename.
+#[cfg(unix)]
+fn poison_purge(env_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let blocked = env_dir.join("blocked");
+    std::fs::create_dir_all(&blocked).unwrap();
+    std::fs::write(blocked.join("child"), b"x").unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o555)).unwrap();
+}
+
+/// Find the surviving tombstone under `root` and restore write permissions
+/// on its poisoned dir so a reap — or TempDir::drop — can remove it. Call
+/// BEFORE any assertion so cleanup happens on every exit path.
+#[cfg(unix)]
+fn find_tombstone_and_unblock(root: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let tombstone = std::fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().contains(".destroyed~"))
+        .expect("tombstone survives the failed purge");
+    std::fs::set_permissions(
+        tombstone.path().join("blocked"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    tombstone.path()
+}
+
+#[cfg(unix)]
+#[test]
+fn destroy_environment_purge_failure_is_committed_after_save() {
+    let (tmp, store) = fresh_store();
+    let id = env_id("doomed");
+    store.save(&minimal_environment(&id)).unwrap();
+    poison_purge(&tmp.path().join("doomed"));
+
+    let err = store.destroy_environment(&id).unwrap_err();
+    let _tombstone = find_tombstone_and_unblock(tmp.path());
+
+    assert!(err.is_committed_after_save(), "got {err:?}");
+    // The rename committed: the canonical path is gone...
+    assert!(!store.exists(&id).unwrap());
+    assert!(!tmp.path().join("doomed").exists());
+    // ...and the surviving tombstone is invisible to list().
+    assert!(store.list().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn destroy_environment_rerun_reaps_stale_tombstone() {
+    let (tmp, store) = fresh_store();
+    let id = env_id("doomed");
+    store.save(&minimal_environment(&id)).unwrap();
+    poison_purge(&tmp.path().join("doomed"));
+
+    let err = store.destroy_environment(&id).unwrap_err();
+    assert!(err.is_committed_after_save());
+    find_tombstone_and_unblock(tmp.path());
+
+    // Re-running destroy reaps the stale tombstone.
+    let outcome = store.destroy_environment(&id).unwrap();
+    assert_eq!(outcome.removed_path, tmp.path().join("doomed"));
+    assert_eq!(outcome.reaped_tombstones, 1);
+
+    // The tombstone is gone from the root.
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains(".destroyed~"))
+        .collect();
+    assert!(leftovers.is_empty(), "got {leftovers:?}");
+}
+
+// --- provider-resource teardown on destroy (plan item 5b) --------------------
+
+/// The Cloud Run deployer descriptor, versioned as it appears on a binding.
+/// `PackDescriptor::path()` strips the `@version`, so it matches the version-less
+/// entry in [`PROVIDER_TEARDOWN_DESCRIPTORS`].
+const CLOUDRUN_DESCRIPTOR: &str = "greentic.deployer.gcp-cloudrun@1.0.0";
+
+/// A minimal-but-valid `BundleDeployment` for the env, mirroring the crate's
+/// internal `make_bundle_deployment` fixture (empty `current_revisions` so
+/// `Environment::validate` needs no matching revisions).
+fn make_cloudrun_bundle(id: &EnvId) -> BundleDeployment {
+    BundleDeployment {
+        schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
+        deployment_id: mint_deployment_id(),
+        env_id: id.clone(),
+        bundle_id: BundleId::new("demo"),
+        customer_id: CustomerId::new("local-dev"),
+        status: BundleDeploymentStatus::Active,
+        current_revisions: Vec::new(),
+        route_binding: RouteBinding {
+            hosts: vec!["demo.local".to_string()],
+            path_prefixes: Vec::new(),
+            tenant_selector: TenantSelector {
+                tenant: "default".to_string(),
+                team: "default".to_string(),
+            },
+        },
+        revenue_share: vec![RevenueShareEntry {
+            party_id: PartyId::new("greentic"),
+            basis_points: 10_000,
+        }],
+        revenue_policy_ref: PathBuf::from("revenue.json"),
+        usage: None,
+        created_at: Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap(),
+        authorization_ref: PathBuf::from("auth.json"),
+        config_overrides: BTreeMap::new(),
+    }
+}
+
+/// A saved cloudrun-bound env with `n` deployments + seeded deployer answers.
+/// Returns the store, tempdir, env id, and the env's deployment ids in order.
+fn saved_cloudrun_env(n: usize) -> (TempDir, LocalFsStore, EnvId, Vec<DeploymentId>) {
+    let (tmp, store) = fresh_store();
+    let id = env_id("cloudy");
+    let mut env = minimal_environment(&id);
+    env.packs[0].kind = pack_descriptor(CLOUDRUN_DESCRIPTOR);
+    env.packs[0].pack_ref = PackId::new("gcp-cloudrun");
+    let bundles: Vec<BundleDeployment> = (0..n).map(|_| make_cloudrun_bundle(&id)).collect();
+    let ids: Vec<DeploymentId> = bundles.iter().map(|b| b.deployment_id).collect();
+    env.bundles = bundles;
+    store.save(&env).unwrap();
+    store
+        .save_pack_answers(
+            &id,
+            CapabilitySlot::Deployer,
+            &json!({ "project": "demo-proj", "region": "us-central1" }),
+        )
+        .unwrap();
+    (tmp, store, id, ids)
+}
+
+/// One captured teardown invocation.
+struct RecordedTeardown {
+    env_id: String,
+    descriptor: String,
+    deployment_ids: Vec<DeploymentId>,
+    answers: Option<Value>,
+}
+
+/// Records each teardown invocation for assertions.
+#[derive(Default)]
+struct RecordingTeardown {
+    calls: Mutex<Vec<RecordedTeardown>>,
+}
+
+impl ProviderTeardown for RecordingTeardown {
+    fn teardown(&self, ctx: ProviderTeardownCtx<'_>) -> Result<Value, StoreError> {
+        self.calls.lock().unwrap().push(RecordedTeardown {
+            env_id: ctx.env_id.as_str().to_string(),
+            descriptor: ctx.descriptor_path.to_string(),
+            deployment_ids: ctx.deployment_ids.to_vec(),
+            answers: ctx.answers.cloned(),
+        });
+        Ok(json!({ "deleted_services": ctx.deployment_ids.len() }))
+    }
+}
+
+/// Always fails, leaving the env intact for a retry.
+struct FailingTeardown;
+
+impl ProviderTeardown for FailingTeardown {
+    fn teardown(&self, _ctx: ProviderTeardownCtx<'_>) -> Result<Value, StoreError> {
+        Err(StoreError::ProviderTeardown(
+            "simulated GCP failure".to_string(),
+        ))
+    }
+}
+
+/// Signals when teardown starts, then blocks until released — proves the destroy
+/// flock is held across teardown.
+struct BlockingTeardown {
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl ProviderTeardown for BlockingTeardown {
+    fn teardown(&self, _ctx: ProviderTeardownCtx<'_>) -> Result<Value, StoreError> {
+        self.entered.send(()).unwrap();
+        self.release.lock().unwrap().recv().unwrap();
+        Ok(json!({ "deleted_services": 0 }))
+    }
+}
+
+#[test]
+fn provider_teardown_descriptors_lists_cloudrun() {
+    // The store recognizes the Cloud Run deployer by string, feature-independently.
+    assert!(PROVIDER_TEARDOWN_DESCRIPTORS.contains(&"greentic.deployer.gcp-cloudrun"));
+}
+
+#[test]
+fn destroy_cloudrun_env_without_teardown_capability_refuses_not_purges() {
+    let (_tmp, store, id, _ids) = saved_cloudrun_env(1);
+    // No teardown impl (feature-reduced binary) and no --force-local → refuse.
+    let err = store
+        .destroy_environment_with_teardown(&id, None, false)
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::ProviderTeardownUnavailable { .. }),
+        "got {err:?}"
+    );
+    // The env survives so the resources are not orphaned and destroy is retryable.
+    assert!(store.exists(&id).unwrap());
+}
+
+#[test]
+fn destroy_cloudrun_env_runs_provider_teardown_then_purges() {
+    let (_tmp, store, id, ids) = saved_cloudrun_env(2);
+    let teardown = RecordingTeardown::default();
+
+    let outcome = store
+        .destroy_environment_with_teardown(&id, Some(&teardown), false)
+        .unwrap();
+
+    // Teardown was invoked once with the version-less descriptor, both
+    // deployment ids (in order), and the seeded answers.
+    let calls = teardown.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "teardown called exactly once");
+    let call = &calls[0];
+    assert_eq!(call.env_id, "cloudy");
+    assert_eq!(call.descriptor, "greentic.deployer.gcp-cloudrun");
+    assert_eq!(call.deployment_ids, ids);
+    assert_eq!(
+        call.answers.as_ref().and_then(|a| a.get("project")),
+        Some(&json!("demo-proj"))
+    );
+
+    // Local state is purged and the teardown report rides back on the outcome.
+    assert!(!store.exists(&id).unwrap());
+    assert_eq!(
+        outcome.provider_teardown,
+        Some(json!({ "deleted_services": 2 }))
+    );
+}
+
+#[test]
+fn destroy_cloudrun_env_force_local_skips_teardown_and_purges() {
+    let (_tmp, store, id, _ids) = saved_cloudrun_env(1);
+    // --force-local: purge local state only, even with no teardown impl.
+    let outcome = store
+        .destroy_environment_with_teardown(&id, None, true)
+        .unwrap();
+    assert!(!store.exists(&id).unwrap());
+    let report = outcome
+        .provider_teardown
+        .expect("force-local records a skip");
+    assert_eq!(report.get("status"), Some(&json!("skipped")));
+    assert_eq!(report.get("reason"), Some(&json!("force_local")));
+}
+
+#[test]
+fn destroy_provider_teardown_failure_leaves_env_intact_for_retry() {
+    let (_tmp, store, id, _ids) = saved_cloudrun_env(1);
+    let err = store
+        .destroy_environment_with_teardown(&id, Some(&FailingTeardown), false)
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::ProviderTeardown(_)),
+        "got {err:?}"
+    );
+    // No rename happened — the env (and its resource inventory) survives.
+    assert!(store.exists(&id).unwrap());
+}
+
+#[test]
+fn destroy_non_cloudrun_env_ignores_teardown_capability() {
+    // A local-process env owns no remote resources: the teardown impl must not
+    // be consulted, and the env purges normally.
+    let (_tmp, store) = fresh_store();
+    let id = env_id("plain");
+    store.save(&minimal_environment(&id)).unwrap();
+    let teardown = RecordingTeardown::default();
+
+    let outcome = store
+        .destroy_environment_with_teardown(&id, Some(&teardown), false)
+        .unwrap();
+
+    assert!(teardown.calls.lock().unwrap().is_empty());
+    assert!(outcome.provider_teardown.is_none());
+    assert!(!store.exists(&id).unwrap());
+}
+
+#[test]
+fn destroy_holds_env_flock_across_provider_teardown() {
+    let (_tmp, store, id, _ids) = saved_cloudrun_env(1);
+    let lock_path = store.env_lock_path(&id).unwrap();
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let teardown = Arc::new(BlockingTeardown {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    });
+
+    let store = Arc::new(store);
+    let worker = {
+        let store = Arc::clone(&store);
+        let teardown = Arc::clone(&teardown);
+        let id = id.clone();
+        thread::spawn(move || {
+            store.destroy_environment_with_teardown(&id, Some(teardown.as_ref()), false)
+        })
+    };
+
+    // Wait until teardown is running — the destroy flock is now held.
+    entered_rx.recv().unwrap();
+    // A concurrent lock acquisition must fail while destroy is mid-teardown,
+    // proving classify + teardown + rename are one atomic critical section.
+    assert!(
+        EnvFlock::try_acquire(&lock_path).unwrap().is_none(),
+        "env flock must be held across provider teardown"
+    );
+
+    // Release teardown; destroy completes and purges.
+    release_tx.send(()).unwrap();
+    let outcome = worker.join().unwrap().unwrap();
+    assert!(!store.exists(&id).unwrap());
+    assert_eq!(
+        outcome.provider_teardown,
+        Some(json!({ "deleted_services": 0 }))
+    );
+    // The lock is free again after the destroy returns.
+    assert!(EnvFlock::try_acquire(&lock_path).unwrap().is_some());
 }

@@ -386,6 +386,13 @@ pub enum EnvVerb {
         env_id: String,
         #[arg(long)]
         confirm: bool,
+        /// Purge local state only, skipping provider-resource teardown. Use when
+        /// the env owns cloud resources (e.g. Cloud Run) this build cannot tear
+        /// down, or they are already gone — the resources are left for manual
+        /// cleanup. Without it, destroying such an env refuses rather than
+        /// orphaning the cloud resources.
+        #[arg(long)]
+        force_local: bool,
     },
     /// Migrate the legacy `dev` environment to `<target>` (typically `local`).
     /// Run with `--check` to scan without touching state; `--apply` performs
@@ -1393,9 +1400,11 @@ fn dispatch_env(
         EnvVerb::Reconcile(args) => super::env::reconcile(store, registry, flags, args)?,
         EnvVerb::ApplyRevision(args) => super::env::apply_revision(store, registry, flags, args)?,
         EnvVerb::ApplyTraffic(args) => super::env::apply_traffic(store, registry, flags, args)?,
-        EnvVerb::Destroy { env_id, confirm } => {
-            super::env::destroy(store, flags, &env_id, confirm)?
-        }
+        EnvVerb::Destroy {
+            env_id,
+            confirm,
+            force_local,
+        } => super::env::destroy(store, flags, &env_id, confirm, force_local)?,
         EnvVerb::MigrateDev {
             target,
             check,

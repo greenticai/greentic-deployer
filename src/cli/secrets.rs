@@ -775,6 +775,31 @@ pub(super) fn validate_dev_store_secret_path(rel_path: &str) -> Result<(), OpErr
              a-z, 0-9 and single `_` separators (no leading/trailing `_`)"
         )));
     }
+    reject_reserved_credential_rel_path(rel_path)?;
+    Ok(())
+}
+
+/// Refuse to write RUNTIME material onto the deployer's reserved credential
+/// namespace (see [`credentials::store_paths`](crate::credentials::store_paths)
+/// for what is reserved and why).
+///
+/// Two distinct harms, hence a hard reject rather than a warning:
+///
+/// * **Silent loss.** Those paths are stripped from every runtime seed, so a
+///   runtime secret written here would be stored and audited as present, then
+///   never reach the workload.
+/// * **Credential clobber.** A caller-supplied ref pointed at one of them would
+///   overwrite the env's live bound deployer credential with unrelated material,
+///   breaking every subsequent deployer verb.
+pub(super) fn reject_reserved_credential_rel_path(rel_path: &str) -> Result<(), OpError> {
+    if crate::credentials::store_paths::is_reserved_rel_path(rel_path) {
+        return Err(OpError::InvalidArgument(format!(
+            "`{rel_path}` is reserved for the deployer's own bound credential and \
+             cannot hold runtime material: writing it would overwrite the env's \
+             deployer credential, and it is stripped from every staged runtime seed \
+             so a workload could never read it back — choose another path"
+        )));
+    }
     Ok(())
 }
 
@@ -842,7 +867,26 @@ pub(super) fn secret_ref_to_store_uri(secret_ref: &SecretRef) -> Result<String, 
 
 /// downstream exhaustive matches (greentic-operator's HTTP status mapping).
 /// Error messages carry the backend's text only — never secret material.
+///
+/// Writes RUNTIME material, so it refuses the deployer's reserved credential
+/// namespace. The check lives here — at the shared writer — rather than at each
+/// caller, so a new write surface is protected by default instead of having to
+/// remember; the webhook writer needing its own check was a bug found in review,
+/// not a design. The credential sink uses
+/// [`dev_store_put_credential`] to opt out.
 pub(super) fn dev_store_put(path: &Path, uri: &str, value: &str) -> Result<(), OpError> {
+    if let Some(rel) = crate::credentials::store_paths::split_store_uri(uri).map(|(_env, rel)| rel)
+    {
+        reject_reserved_credential_rel_path(&rel)?;
+    }
+    dev_store_put_credential(path, uri, value)
+}
+
+/// [`dev_store_put`] without the reserved-namespace check — the ONLY legitimate
+/// writer of the deployer's own bound credential, driven by
+/// [`put_credential_material`] from the credentials bootstrap/rotate sink.
+/// Runtime material must never use this.
+pub(super) fn dev_store_put_credential(path: &Path, uri: &str, value: &str) -> Result<(), OpError> {
     let io_err = |message: String| OpError::Io {
         path: path.to_path_buf(),
         source: std::io::Error::other(message),
@@ -888,7 +932,7 @@ pub(super) fn put_credential_material(
         env_dir,
         std::env::var_os(DEV_SECRETS_PATH_ENV).map(PathBuf::from),
     );
-    dev_store_put(&dev_path, &store_uri, value)
+    dev_store_put_credential(&dev_path, &store_uri, value)
 }
 
 /// Whether the env's dev store already holds a non-empty value at `rel_path`
@@ -1193,7 +1237,9 @@ mod tests {
         let store_uri =
             secret_ref_to_store_uri(&secret_ref).expect("documented ref is store-aligned");
         let dev_path = resolve_dev_store_path(&store.env_dir(&env_id).unwrap(), None);
-        dev_store_put(&dev_path, &store_uri, "sa-bearer-doc").unwrap();
+        // The credential sink's writer: this path is the deployer's own reserved
+        // namespace, which the runtime writer (`dev_store_put`) refuses.
+        dev_store_put_credential(&dev_path, &store_uri, "sa-bearer-doc").unwrap();
         assert_eq!(
             resolve_credentials_token(&store, &env, &env_id).unwrap(),
             Some("sa-bearer-doc".to_string())
@@ -1525,6 +1571,78 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    /// The deployer's credential namespace is reserved: the runtime-seed
+    /// denylist strips those paths unconditionally, so runtime material written
+    /// there would be stored and audited as present, then silently vanish from
+    /// the workload. Reject at the write surface so the collision cannot exist.
+    #[test]
+    fn put_rejects_the_reserved_deployer_credential_paths() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&env_with_secrets()).unwrap();
+        for path in crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS {
+            let err = put(
+                &store,
+                &OpFlags::default(),
+                Some(SecretsPutPayload {
+                    environment_id: "local".to_string(),
+                    path: (*path).to_string(),
+                    value: "v".to_string(),
+                    idempotency_key: None,
+                }),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, OpError::InvalidArgument(msg) if msg.contains("reserved")),
+                "runtime material must not be writable at the reserved deployer \
+                 credential path `{path}`; got {err:?}"
+            );
+        }
+    }
+
+    /// The reservation lives in the validator shared by `op secrets put`, `op
+    /// updates enroll` and `env apply`'s manifest validation, so no write
+    /// surface can drift from it. The credentials bootstrap's own sink writes
+    /// through `dev_store_put` and is deliberately unaffected.
+    #[test]
+    fn the_shared_validator_reserves_deployer_credential_paths() {
+        for path in crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS {
+            let err = validate_dev_store_secret_path(path).unwrap_err();
+            assert!(
+                matches!(&err, OpError::InvalidArgument(msg) if msg.contains("reserved")),
+                "`{path}` must be reserved in the shared validator; got {err:?}"
+            );
+        }
+        // A neighbouring path in the same category is still writable — the
+        // reservation is exact, not a prefix ban.
+        validate_dev_store_secret_path("default/_/k8s-deployer/some_runtime_value")
+            .expect("only the exact reserved paths are refused");
+    }
+
+    /// A store URI's last segment may carry an `@version`, and the dev-store's
+    /// exclusion filter matches by versionless identity — so a version-qualified
+    /// ref names the SAME key. Comparing raw strings would let
+    /// `…/deployer_token@1` through: accepted, written over the live credential's
+    /// key, then stripped from the seed anyway.
+    #[test]
+    fn the_reservation_matches_version_qualified_refs() {
+        for path in crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS {
+            for qualified in [format!("{path}@1"), format!("{path}@v2")] {
+                assert!(
+                    crate::credentials::store_paths::is_reserved_rel_path(&qualified),
+                    "`{qualified}` names the same key as the reserved `{path}` and \
+                     must be refused"
+                );
+                let err = reject_reserved_credential_rel_path(&qualified).unwrap_err();
+                assert!(matches!(&err, OpError::InvalidArgument(msg) if msg.contains("reserved")));
+            }
+        }
+        // Version stripping must not over-match: a different name is writable.
+        assert!(!crate::credentials::store_paths::is_reserved_rel_path(
+            "default/_/k8s-deployer/other@1"
+        ));
     }
 
     #[test]

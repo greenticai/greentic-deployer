@@ -456,6 +456,10 @@ fn decode_token_lifetime(bearer: &str) -> Option<(DateTime<Utc>, DateTime<Utc>)>
 }
 
 impl DeployerCredentials for K8sDeployerCredentials {
+    fn bound_credential_store_path(&self) -> Option<&'static str> {
+        Some(DEPLOYER_TOKEN_STORE_PATH)
+    }
+
     fn requires_credentials_material(&self) -> bool {
         true
     }

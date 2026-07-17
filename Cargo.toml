@@ -10,7 +10,7 @@ resolver = "2"
 
 [package]
 name = "greentic-deployer"
-version = "1.1.18"
+version = "1.2.0-dev.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic deployer runtime for plan construction and deployment-pack dispatch"
@@ -30,7 +30,7 @@ categories = [
 ]
 
 [features]
-default = ["bundle-upload-aws", "runtime-secrets-aws", "creds-aws", "deploy-aws-ecs", "k8s-client"]
+default = ["bundle-upload-aws", "runtime-secrets-aws", "creds-aws", "deploy-aws-ecs", "creds-gcp", "deploy-gcp-cloudrun", "k8s-client"]
 internal-tools = []
 test-utils = []
 bundle-upload-aws = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime-api"]
@@ -53,6 +53,33 @@ deploy-aws-ecs = ["dep:aws-sdk-ecs", "dep:aws-sdk-elasticloadbalancingv2", "dep:
 # at `connect()` — both `ring` (kube) and `aws-lc-rs` (AWS SDK) are linked,
 # so rustls 0.23 cannot auto-select one and the first TLS handshake panics.
 k8s-client = ["dep:kube", "dep:k8s-openapi", "dep:rustls"]
+# GCP Cloud Run deployer env-pack credentials + adapter scaffold: the
+# `CloudRunTarget` seam, its in-memory fake, the Deployer verbs, the credentials
+# validator seam, and the Terraform bootstrap renderer. Default-on so nightly
+# `gtc-dev` binaries ship the adapter. Pure-Rust in this PR (no SDK deps); the
+# `google-cloud-*`-backed real target + validator land behind a follow-up
+# `deploy-gcp-cloudrun` feature.
+creds-gcp = []
+# GCP Cloud Run real target + real ADC-backed validator client. Adds the
+# `google-cloud-*` SDK deps (all optional, pulled only when this feature is on)
+# and compiles `real_target.rs` + `bound_session.rs` + the real
+# `GcpValidatorClient`. Default-on alongside `creds-gcp` so nightly `gtc-dev`
+# binaries ship a live Cloud Run deploy path. The seam / fake / verbs from the
+# scaffold stay SDK-free under `creds-gcp`, so `--no-default-features --features
+# creds-gcp` still builds without any google-cloud-* dep.
+deploy-gcp-cloudrun = [
+    "creds-gcp",
+    "dep:google-cloud-run-v2",
+    "dep:google-cloud-secretmanager-v1",
+    "dep:google-cloud-auth",
+    "dep:google-cloud-gax",
+    "dep:google-cloud-iam-v1",
+    "dep:google-cloud-type",
+    "dep:google-cloud-lro",
+    "dep:google-cloud-wkt",
+    "dep:bytes",
+    "dep:http",
+]
 bundle-upload-gcp = []
 bundle-upload-azure = []
 
@@ -79,9 +106,9 @@ anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
 fs4 = "0.13"
-greentic-bundle = ">=1.1.0-0, <1.2.0-0"
-greentic-config = ">=1.1.0-0, <1.2.0-0"
-greentic-config-types = ">=1.1.0-0, <1.2.0-0"
+greentic-bundle = ">=1.2.0-dev, <1.3.0-0"
+greentic-config = ">=1.2.0-dev, <1.3.0-0"
+greentic-config-types = ">=1.2.0-dev, <1.3.0-0"
 greentic-deploy-spec = { path = "crates/greentic-deploy-spec", version = ">=0.2.3, <0.3" }
 greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.2" }
 serde_json = "1"
@@ -110,7 +137,7 @@ libc = "0.2"
 # is a runtime dep now (it was dev-only for the C6 env-pack YAML round-trip
 # tests; the env-pack trait still carries raw YAML). Already in the runtime
 # graph via greentic-bundle -> greentic-qa-lib, so this adds no new crates.
-qa-spec = ">=1.1.0-0, <1.2.0-0"
+qa-spec = ">=1.2.0-dev, <1.3.0-0"
 
 [dependencies.clap]
 version = "4.5"
@@ -122,19 +149,19 @@ features = [
 # Floor pinned to the C5.1 publish that exposes `RolloutEvent` +
 # `emit_rollout_event`. Lower versions in the same range satisfy
 # `>=1.1.0-dev` but lack the rollout module.
-version = ">=1.1.0-0, <1.2.0-0"
+version = ">=1.2.0-dev, <1.3.0-0"
 features = [
     "otlp",
 ]
 
 [dependencies.greentic-types]
-version = ">=1.1.0-0, <1.2.0-0"
+version = ">=1.2.0-dev, <1.3.0-0"
 
 [dependencies.greentic-distributor-client]
-version = ">=1.1.0-0, <1.2.0-0"
+version = ">=1.2.0-dev, <1.3.0-0"
 
 [dependencies.greentic-secrets-lib]
-version = ">=1.1.0-0, <1.2.0-0"
+version = ">=1.2.0-dev, <1.3.0-0"
 features = [
     "providers-dev",
     "providers-vault",
@@ -283,6 +310,72 @@ features = [
     "v1_33",
 ]
 
+# GCP Cloud Run real target (feature `deploy-gcp-cloudrun`). The
+# google-cloud-rust generated clients are 1.x (semver-stable) with MSRV 1.88,
+# under the deployer's 1.95. All optional — pulled only when the feature is on.
+# `default-features = false` (per plan D8, matching the AWS SDK deps): the
+# process installs its own rustls CryptoProvider (see the `k8s-client` note),
+# so the crates' bundled provider is not needed.
+[dependencies.google-cloud-run-v2]
+version = "1"
+optional = true
+default-features = false
+
+[dependencies.google-cloud-secretmanager-v1]
+version = "1"
+optional = true
+default-features = false
+
+[dependencies.google-cloud-auth]
+version = "1"
+optional = true
+default-features = false
+
+# Shared runtime types (Error, options) referenced directly by the target impl.
+[dependencies.google-cloud-gax]
+version = "1"
+optional = true
+default-features = false
+
+# IAM Policy / Binding / GetPolicyOptions for the Cloud Run invoker binding (D12).
+[dependencies.google-cloud-iam-v1]
+version = "1"
+optional = true
+default-features = false
+
+# `Expr`, the CEL condition on an `iam::Binding`. Already in the tree via
+# google-cloud-iam-v1, which does not re-export it; declared so the accessor
+# grant's conditional-binding tests can construct one.
+[dependencies.google-cloud-type]
+version = "1"
+optional = true
+default-features = false
+
+# The `Poller` trait whose `until_done()` awaits Cloud Run long-running ops.
+[dependencies.google-cloud-lro]
+version = "1"
+optional = true
+default-features = false
+
+# `bytes::Bytes` for the Secret Manager payload. Already in the tree via the
+# google-cloud-* clients; gated to the real-target feature.
+[dependencies.bytes]
+version = "1"
+optional = true
+
+# Well-known-type wrappers (Duration, field masks) the request builders touch.
+[dependencies.google-cloud-wkt]
+version = "1"
+optional = true
+default-features = false
+
+# `http::Extensions` for `Credentials::headers()` + `http::HeaderMap` forwarded
+# onto the reqwest testIamPermissions request. Already in the tree via reqwest;
+# gated to the real-target feature.
+[dependencies.http]
+version = "1"
+optional = true
+
 [dependencies.tempfile]
 version = "3"
 
@@ -313,4 +406,4 @@ greentic-deploy-spec = { path = "crates/greentic-deploy-spec" }
 # E2E can derive the canonical store-key the bound-credential resolver reads,
 # and seed a ServiceAccount token via env var. Already in the lockfile via the
 # normal dep, so no resolution change.
-greentic-secrets-lib = ">=1.1.5, <1.2.0-0"
+greentic-secrets-lib = ">=1.2.0-dev, <1.3.0-0"
