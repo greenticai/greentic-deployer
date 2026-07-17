@@ -141,6 +141,14 @@ pub fn run_rotate(
         // (not at the minted ref) is what keeps live verbs from resolving the
         // stale token. `env.credentials_ref` itself is NOT rewritten (the URI
         // is stable; only the material behind it changes).
+        //
+        // NOT gated on the reserved-namespace landing invariant that `bootstrap`
+        // enforces, deliberately: custom credential locations are a supported,
+        // tested capability here (see `run_rotate_writes_to_the_active_ref_not_
+        // the_minted_ref`), and rotation cannot orphan anything — it writes at an
+        // ALREADY-persisted `credentials_ref`, which `staging_excluded_uris`
+        // therefore always names and strips. The orphan window is bootstrap-only
+        // (material written before the ref exists), which is where the gate sits.
         secret_sink(&env_root, &active_ref, material.as_str())
             .map_err(RunRotateError::SecretWrite)?;
 

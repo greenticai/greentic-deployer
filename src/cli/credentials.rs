@@ -1555,6 +1555,10 @@ mod tests {
         /// refuses to write material unless this names a path the runtime-seed
         /// denylist covers, so tests can drive both sides of that gate.
         declared_path: Option<&'static str>,
+        /// When false, returns `Some(bound_credentials_ref)` with NO material —
+        /// the shape that writes nothing now but makes the ref the env's
+        /// credential location, which `run_rotate` later writes real material at.
+        mint_material: bool,
     }
 
     impl crate::credentials::DeployerCredentials for MintingCreds {
@@ -1582,7 +1586,9 @@ mod tests {
                 },
                 bound_credentials_ref: Some(SecretRef::try_new(self.secret_ref.clone()).unwrap()),
                 bound_expiry: Some(self.expiry),
-                bound_secret_material: Some(zeroize::Zeroizing::new(self.token.clone())),
+                bound_secret_material: self
+                    .mint_material
+                    .then(|| zeroize::Zeroizing::new(self.token.clone())),
             })
         }
     }
@@ -1697,6 +1703,7 @@ mod tests {
                 secret_ref: secret_ref.to_string(),
                 declared_path: declared,
                 token: "MINTED".to_string(),
+                mint_material: true,
                 expiry,
             };
 
@@ -1738,6 +1745,50 @@ mod tests {
         }
     }
 
+    /// The gate is on the REF, not on the material. A handler returning
+    /// `Some(rogue_ref)` with no material writes nothing right now — but
+    /// persisting that ref makes it the env's credential location, and
+    /// `run_rotate` later writes real minted material at exactly that persisted
+    /// ref. Gating only the material-carrying case would leave that chain open,
+    /// so an uncovered ref must be refused even when nothing is written yet.
+    #[test]
+    fn run_bootstrap_refuses_an_uncovered_ref_even_with_no_material_to_write() {
+        let dir = tempdir().unwrap();
+        let (store, registry, env_id) = bind_fixture(dir.path());
+        let admin = crate::credentials::ZeroizedAdmin::new("admin-ctx", String::new());
+        let bind = MintingCreds {
+            secret_ref: "secret://local/default/_/rogue-deployer/token".to_string(),
+            declared_path: Some(crate::credentials::store_paths::K8S_DEPLOYER_TOKEN),
+            token: "MINTED".to_string(),
+            mint_material: false,
+            expiry: chrono::DateTime::from_timestamp(2_000_000_000, 0).unwrap(),
+        };
+        let sink =
+            |_root: &std::path::Path, _r: &SecretRef, _v: &str| -> Result<(), String> { Ok(()) };
+
+        let err = crate::credentials::run_bootstrap(
+            &store,
+            &registry,
+            &env_id,
+            &admin,
+            Some(&bind),
+            &sink,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::credentials::RunBootstrapError::UndeclaredCredentialPath { .. }
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            store.load(&env_id).unwrap().credentials_ref.is_none(),
+            "an uncovered ref must never become the env's credential location — \
+             rotate would later write real material there"
+        );
+    }
+
     #[test]
     fn run_bootstrap_writes_material_then_persists_ref_and_expiry() {
         let dir = tempdir().unwrap();
@@ -1748,6 +1799,7 @@ mod tests {
             secret_ref: "secret://local/default/_/k8s-deployer/deployer_token".to_string(),
             declared_path: Some(crate::credentials::store_paths::K8S_DEPLOYER_TOKEN),
             token: "MINTED".to_string(),
+            mint_material: true,
             expiry,
         };
 
@@ -1792,6 +1844,7 @@ mod tests {
             secret_ref: "secret://local/default/_/k8s-deployer/deployer_token".to_string(),
             declared_path: Some(crate::credentials::store_paths::K8S_DEPLOYER_TOKEN),
             token: "MINTED".to_string(),
+            mint_material: true,
             expiry: chrono::DateTime::from_timestamp(2_000_000_000, 0).unwrap(),
         };
         let sink = |_root: &std::path::Path, _r: &SecretRef, _v: &str| -> Result<(), String> {

@@ -63,6 +63,54 @@ pub(crate) fn is_reserved_rel_path(rel_path: &str) -> bool {
     BOUND_CREDENTIAL_STORE_PATHS.contains(&versionless_rel_path(rel_path).as_str())
 }
 
+/// Where `bound_ref` will actually land, as `(env, versionless rel path)`,
+/// resolved through the same canonicalization the writer uses
+/// (`SecretRef::to_store_uri`, which re-canonicalizes the team). `None` when the
+/// ref is not a store-aligned URI at all.
+pub(crate) fn landing_site(
+    bound_ref: &greentic_deploy_spec::SecretRef,
+) -> Option<(String, String)> {
+    let uri = bound_ref.to_store_uri().ok()?.to_string();
+    split_store_uri(&uri).map(|(env, rel)| (env.to_string(), rel))
+}
+
+/// Whether bound credential material may be written at `bound_ref`.
+///
+/// The single invariant behind the whole runtime-seed denylist: **material may
+/// only ever land somewhere the denylist can strip it.** `bootstrap` writes
+/// material before it records `credentials_ref`, so a crash in between orphans a
+/// credential nothing names; the denylist covers that by stripping the known
+/// landing paths unconditionally, which only works if the path is one it knows.
+///
+/// Checked against the ACTUAL destination rather than the handler's claim about
+/// it — a handler that declares a covered path while returning a rogue or
+/// cross-environment ref must not pass. All three conditions are load-bearing:
+///
+/// * the ref parses (a ref no exclusion can match is itself a refusal reason),
+/// * it is scoped to the env being written (a cross-env ref lands a key in this
+///   env's store that this env's exclusion would never name),
+/// * its versionless path equals the declaration AND is covered by
+///   [`BOUND_CREDENTIAL_STORE_PATHS`].
+///
+/// Returns the resolved landing site alongside the verdict so callers can report
+/// what would have happened.
+pub(crate) fn landing_is_covered(
+    bound_ref: &greentic_deploy_spec::SecretRef,
+    env_id: &greentic_deploy_spec::EnvId,
+    declared: Option<&str>,
+) -> (bool, Option<String>) {
+    let landing = landing_site(bound_ref);
+    let ok = match (&landing, declared) {
+        (Some((ref_env, rel)), Some(path)) => {
+            ref_env == env_id.as_str()
+                && rel == path
+                && BOUND_CREDENTIAL_STORE_PATHS.contains(&path)
+        }
+        _ => false,
+    };
+    (ok, landing.map(|(env, rel)| format!("{env}:{rel}")))
+}
+
 /// Split a canonical store URI `secret(s)://<env>/<rel>` into its env and its
 /// versionless store-relative path. `None` when the URI has no env + tail.
 pub(crate) fn split_store_uri(store_uri: &str) -> Option<(&str, String)> {

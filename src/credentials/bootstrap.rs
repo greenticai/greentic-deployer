@@ -359,6 +359,27 @@ pub fn run_bootstrap(
             }),
         };
 
+        // Fail closed BEFORE anything is written or persisted: bound credential
+        // material may only ever land where the runtime-seed denylist can strip
+        // it. See `store_paths::landing_is_covered` for the full invariant.
+        //
+        // Gated on the REF, not on the material: a handler returning
+        // `Some(rogue_ref)` with no material writes nothing now, but persisting
+        // that ref makes it the env's credential location — and `run_rotate`
+        // later writes real material at exactly that persisted ref. Gating only
+        // the material-carrying case would leave that path open.
+        if let Some(bound_ref) = outcome.bound_credentials_ref.as_ref() {
+            let declared = creds.bound_credential_store_path();
+            let (ok, landing) = store_paths::landing_is_covered(bound_ref, env_id, declared);
+            if !ok {
+                return Err(RunBootstrapError::UndeclaredCredentialPath {
+                    deployer_kind: deployer_kind_label,
+                    declared: declared.map(str::to_string),
+                    landing,
+                });
+            }
+        }
+
         // Persist bound secret material (when the handler minted it) to the
         // secret backend BEFORE recording credentials_ref: the env must
         // never point at a credential whose material isn't there. On write
@@ -368,44 +389,6 @@ pub fn run_bootstrap(
             outcome.bound_credentials_ref.as_ref(),
             outcome.bound_secret_material.as_ref(),
         ) {
-            // Fail closed BEFORE the write: material may only land where the
-            // runtime-seed denylist can strip it. This write is W1 and the
-            // `credentials_ref` save below is W2 — a crash between them orphans
-            // a credential nothing names, so the denylist covers the landing
-            // paths unconditionally. That only works if the path is one it
-            // knows. Checking here, at the single choke point every handler's
-            // material flows through, holds for handlers we never compiled —
-            // which a compile-time trait obligation could not do.
-            //
-            // The check is against the ACTUAL destination, not the handler's
-            // claim about it: the sink writes at `bound_ref`, so a handler that
-            // declared a covered path while returning a rogue (or
-            // cross-environment) ref would otherwise sail through the gate and
-            // orphan exactly the key the denylist cannot see. Declaration and
-            // destination must agree, and both must be covered.
-            let declared = creds.bound_credential_store_path();
-            let landing = bound_ref
-                .to_store_uri()
-                .ok()
-                .map(|uri| uri.to_string())
-                .and_then(|uri| {
-                    store_paths::split_store_uri(&uri).map(|(env, rel)| (env.to_string(), rel))
-                });
-            let ok = match (&landing, declared) {
-                (Some((ref_env, rel)), Some(path)) => {
-                    ref_env == env_id.as_str()
-                        && rel == path
-                        && store_paths::BOUND_CREDENTIAL_STORE_PATHS.contains(&path)
-                }
-                _ => false,
-            };
-            if !ok {
-                return Err(RunBootstrapError::UndeclaredCredentialPath {
-                    deployer_kind: deployer_kind_label,
-                    declared: declared.map(str::to_string),
-                    landing: landing.map(|(env, rel)| format!("{env}:{rel}")),
-                });
-            }
             secret_sink(&env_root, bound_ref, material.as_str())
                 .map_err(RunBootstrapError::SecretWrite)?;
         }
