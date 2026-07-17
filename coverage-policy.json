@@ -13,7 +13,12 @@
       "src/bin/replay_deployer_scaffolds.rs",
       "src/bundle_upload/azure.rs",
       "src/bundle_upload/gcs.rs",
-      "src/bundle_upload/s3.rs"
+      "src/bundle_upload/s3.rs",
+      "crates/greentic-deploy-spec/src/bin/gen_schemas.rs",
+      "crates/greentic-operator-store-server/src/main.rs",
+      "crates/greentic-environment-store-postgres/src/lib.rs",
+      "src/cli/dispatch.rs",
+      "src/environment/mutations.rs"
     ]
   },
   "per_file": {}

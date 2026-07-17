@@ -78,6 +78,10 @@ pub mod deployer;
 pub mod kube_client;
 pub mod manifests;
 pub mod render;
+#[cfg(feature = "k8s-client")]
+pub mod vault_bootstrap;
+#[cfg(feature = "k8s-client")]
+pub mod vault_infra;
 
 use std::sync::Arc;
 

@@ -156,24 +156,28 @@ global flags that matter here come **before** the noun:
 
 ---
 
-## 4. Quickstart — declarative deploy to a local kind cluster
+## 4. Quickstart — one file, one command
 
-The fastest path: **2 JSON files, 2 commands** (plus one-time cluster
-bring-up). Brings up **Webchat *and* Telegram**. This is the K8s analog of the
-local `setup --answers … && start --cloudflared on` two-liner.
+`op env up` fuses cluster bring-up, `env apply`, `env reconcile`, the rollout wait, and a
+port-forward into a single **idempotent** command. Re-running it converges. It brings up
+**Webchat *and* Telegram** — the K8s analog of the local
+`setup --answers … && start --cloudflared on` two-liner.
 
-Save the following two files into a directory of your choice (referred to below
-as `$HERE`):
-
-**`k8s.env.json`** — the env-manifest (`greentic.env-manifest.v1`):
+Save one file, `k8s.env.json` (`greentic.env-manifest.v1`):
 
 ```json
 {
   "schema": "greentic.env-manifest.v1",
+  "cluster": {
+    "provider": "kind",
+    "name": "gtc-demo",
+    "load_images": ["ghcr.io/greenticai/greentic-start-distroless:latest"]
+  },
   "environment": { "id": "local", "name": "k8s", "gui_enabled": true },
   "trust_root": "bootstrap",
   "packs": [
-    { "slot": "deployer", "kind": "greentic.deployer.k8s@1.0.0", "pack_ref": "builtin", "answers_ref": "deployer-answers.json" },
+    { "slot": "deployer", "kind": "greentic.deployer.k8s@1.0.0", "pack_ref": "builtin",
+      "answers": { "tunnel": "cloudflared" } },
     { "slot": "secrets",  "kind": "greentic.secrets.dev-store@1.0.0", "pack_ref": "builtin" }
   ],
   "bundles": [
@@ -197,45 +201,52 @@ as `$HERE`):
 }
 ```
 
-**`deployer-answers.json`** — the K8s deployer pack's answers
-(`answers_ref` above):
+Two things differ from a plain `env apply` manifest:
 
-```json
-{
-  "runtime_image": "ghcr.io/greenticai/greentic-start-distroless:develop",
-  "tunnel": "cloudflared"
-}
-```
+- **`cluster`** — kind provisioning is declared, not scripted. `load_images` pre-loads images onto
+  the node so pods never pull them over the network. **Omit the whole block** to deploy into whatever
+  cluster your current kubeconfig context points at; `env up` then skips phases that touch `kind`.
+- **inline `answers`** on the deployer pack replaces the separate `deployer-answers.json`.
+  `runtime_image` is gone — the default is already `ghcr.io/greenticai/greentic-start-distroless:latest`.
+  (Inline answers are a `packs[]` feature; `extensions[]` still use `answers_ref`.)
 
 Then:
 
 ```bash
 export STORE=/tmp/gtc-k8s-demo/.greentic/environments
-export HERE=/path/to/dir/with/the/two/json/files   # where you saved them above
 mkdir -p "$STORE"
 
-# one-time cluster
-kind create cluster --name gtc-demo
-kind export kubeconfig --name gtc-demo
-
-# 1. author the env from ONE manifest (env + trust-root + 2 packs + OCI bundle
-#    staged pullable + Telegram endpoint + bot-token secret). The bot token is
-#    passed inline so it reaches the apply process on any shell, and is never
-#    written to a file.
+# The bot token is passed inline so it reaches the process on any shell,
+# and is never written to a file.
 env TELEGRAM_DEMO_BOT_TOKEN=<your-bot-token> \
-  greentic-deployer op --store-root "$STORE" --answers "$HERE/k8s.env.json" env apply --yes
-
-# 2. push rendered objects onto the cluster
-greentic-deployer op --store-root "$STORE" env reconcile local
+  greentic-deployer op --store-root "$STORE" --answers ./k8s.env.json env up --yes
 ```
+
+or, through the CLI:
+
+```bash
+env TELEGRAM_DEMO_BOT_TOKEN=<your-bot-token> \
+  gtc start k8s --answers ./k8s.env.json --yes
+```
+
+`env up` runs, in order: **preflight** (`kind` / `docker` / `kubectl` presence + minimum versions,
+only for the tools this manifest actually needs) → **cluster** (create the kind cluster if absent,
+`docker pull` + `kind load` each `load_images` entry) → **apply** (author the env into the store) →
+**reconcile + rollout** (push rendered objects, then block until every applied Deployment is
+Available) → **access** (print the namespace and teardown hints, then hold a foreground port-forward
+on `svc/gtc-router`).
+
+Useful flags: `--dry-run` (plan only — never touches the cluster), `--skip-cluster` (the cluster
+already exists), `--no-port-forward`, `--port <N>` (default 8080).
 
 Reach it:
 
 ```bash
-# webchat — port-forward the worker; with a tunnel up the console lives on the
-# loopback admin listener (main port + 1 = 8081). The boot banner prints the port.
+# bundle routes — `env up` is already forwarding svc/gtc-router on localhost:8080
+
+# webchat console — the worker's loopback admin listener (main port + 1 = 8081).
+# Run this in a second shell; the boot banner prints the port.
 WORKER=$(kubectl -n gtc-local get deploy -l component=worker -o jsonpath='{.items[0].metadata.name}')
-kubectl -n gtc-local rollout status deploy/"$WORKER" --timeout=180s
 kubectl -n gtc-local port-forward deploy/"$WORKER" 8081:8081
 #   → http://localhost:8081/chat
 
@@ -244,22 +255,30 @@ kubectl -n gtc-local port-forward deploy/"$WORKER" 8081:8081
 #   confirm: curl -s "https://api.telegram.org/bot<token>/getWebhookInfo" | jq .
 ```
 
-Teardown: `kind delete cluster --name gtc-demo`.
+Teardown: `kind delete cluster --name gtc-demo`, then remove `$STORE`. (`op env destroy` parses and
+audits but is not yet implemented, so there is no store-side teardown verb to call.)
 
-### What collapsed into the two files
+### What collapsed into the one file
 
-| File | Replaces these `op` calls |
-|------|---------------------------|
-| `k8s.env.json` (`op env apply`) | `env create` + 2× `env-packs add` + `trust-root bootstrap` + `bundles add` + `revisions stage` + `revisions warm` + `traffic set` + `messaging endpoint add` + `endpoint link-bundle` + `secrets put` |
-| `deployer-answers.json` | the deployer pack's `runtime_image` + `tunnel` answers |
+| Was | Now |
+|-----|-----|
+| `kind create cluster` + `kind export kubeconfig` + `kind load docker-image` | the `cluster` block |
+| `deployer-answers.json` | inline `answers` on the deployer pack |
+| `op env apply` (which itself replaces `env create` + 2× `env-packs add` + `trust-root bootstrap` + `bundles add` + `revisions stage` + `revisions warm` + `traffic set` + `messaging endpoint add` + `endpoint link-bundle` + `secrets put`) | phase 4 of `op env up` |
+| `op env reconcile local` | phase 5 |
+| `kubectl rollout status` | phase 5 (fused — one cluster connection) |
+| `kubectl port-forward` | phase 6 |
 
 ---
 
-## 5. Secrets — the dev-store bridge
+## 5. Secrets
 
-The K8s model does **not** yet integrate a real secrets backend (AWS SM / Vault
-/ native K8s `secretKeyRef`). Instead, when an env binds the
-`greentic.secrets.dev-store@1.0.0` pack:
+Two secrets backends are supported. The env-manifest `packs[]` entry on the
+`secrets` slot selects which one:
+
+### 5a. Dev-store bridge (`greentic.secrets.dev-store@1.0.0`)
+
+When an env binds the `greentic.secrets.dev-store@1.0.0` pack:
 
 1. `op env apply` (or `op secrets put`) writes secret values into the operator's
    **local dev-store** (`<store>/<env>/.greentic/dev/.dev.secrets.env`,
@@ -282,8 +301,104 @@ defaulting to `SHA256("")` when unset on both host and pod. With the default
 (unset) the `.dev.secrets.env` file is fully portable — decryptable in-pod with
 no extra key material.
 
-This is the **Phase-E gap**: it works, but it is not a production secrets
-backend. See [§9](#9-known-gaps--production-caveats).
+The dev-store bridge works but is not a production secrets backend — secrets are
+base64'd into a K8s Secret object. For production clusters, use Vault (below).
+
+### 5b. HashiCorp Vault (`greentic.secrets.vault@0.1.0`)
+
+When an env binds the `greentic.secrets.vault@0.1.0` pack and the manifest
+declares a `vault_bootstrap` block, `op env up` provisions and bootstraps Vault
+natively — no shell scripts or manual Vault CLI steps. The worker resolves
+`secret://` refs from Vault under its pod ServiceAccount identity (Kubernetes
+auth), and **no `gtc-dev-secrets` K8s Secret is rendered** (Vault replaces the
+dev-store bridge entirely).
+
+#### The `vault_bootstrap` manifest block
+
+```json
+{
+  "vault_bootstrap": {
+    "deploy": "dev-in-cluster",
+    "namespace": "greentic",
+    "root_token": "root",
+    "image": "hashicorp/vault:1.17",
+    "seed": [
+      {
+        "path": "tenant-default/_/messaging-telegram/telegram_bot_token",
+        "from_env": "TELEGRAM_BOT_TOKEN"
+      }
+    ]
+  }
+}
+```
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `deploy` | `"dev-in-cluster"` \| `"external"` | *(required)* | How `env up` obtains the Vault (see below). |
+| `namespace` | string | `"greentic"` | Namespace the dev Vault runs in. Ignored for `external`. |
+| `root_token` | string | `"root"` | Token used for bootstrap + seed. For `external`, must be a token with write access to the target Vault. |
+| `image` | string | `"hashicorp/vault:1.17"` | Dev-mode Vault container image. Ignored for `external`. |
+| `seed` | `ManifestSecret[]` | `[]` | Secrets to seed into Vault after bootstrap, before reconcile. Each entry has a `path` (the `<tenant>/<team>/<pack>/<name>` shape) and an optional `from_env` (the name of the environment variable holding the value — read at apply time). When `from_env` is absent, the value is supplied via an interactive masked paste. |
+
+#### Deploy modes
+
+**`dev-in-cluster`** — `env up` deploys an in-memory dev-mode Vault into the
+cluster (the same topology as `my_demos/k8s-vault-demo/vault.yaml`), then
+bootstraps and seeds it. The full sequence:
+
+1. **RBAC preflight.** A `SelfSubjectAccessReview` confirms the ambient
+   kubeconfig can `create` `clusterrolebindings` (the Vault SA needs
+   `system:auth-delegator` so it can `TokenReview` worker pod tokens). A denied
+   preflight fails with an actionable message naming `external` as the
+   alternative.
+2. **Apply Vault objects** into the `vault_bootstrap.namespace` (default
+   `greentic`): Namespace, ServiceAccount, the `system:auth-delegator`
+   ClusterRoleBinding, a single-replica dev-mode Deployment
+   (`-dev -dev-root-token-id=<root_token>`, with `SKIP_SETCAP=true`,
+   `HOME=/tmp`, `VAULT_DISABLE_MLOCK=true` for SCC compatibility), a
+   ClusterIP Service on `:8200`, and a NetworkPolicy opening Vault's ingress
+   to worker pods.
+3. **Wait for rollout** — blocks until the Vault Deployment's readiness probe
+   (`/v1/sys/health`) passes (up to 180 s).
+4. **Bootstrap** over a transient `kubectl port-forward` to `svc/vault:8200`:
+   enable KV v2 (`secret/`) + transit mounts, create the transit DEK key
+   (`greentic`), enable + configure Kubernetes auth (`kubernetes`), write a
+   read-only policy (`gtc-worker-ro`) scoped to
+   `secret/data/greentic/<env_id>/<tenant>/*` + `transit/decrypt/greentic`,
+   and bind the worker ServiceAccount (`gtc-worker` in the env namespace) to
+   the `gtc-worker` role. Every step is idempotent — a re-run against a
+   surviving Vault converges; a re-run against a restarted (wiped, in-memory)
+   dev Vault re-provisions from scratch.
+5. **Seed** each `vault_bootstrap.seed[]` entry into Vault via the same
+   port-forward. A resolvable value is always written (idempotent). A missing
+   value follows a decision matrix: if the secret is already present in a
+   surviving Vault, skip; otherwise fail (unless `--allow-missing-seeds`
+   downgrades it to a warning).
+6. **Kill the port-forward** — it is only needed for bootstrap + seed.
+7. **Reconcile** — the worker Deployment is rendered with ServiceAccount
+   `gtc-worker` and `VAULT_ADDR` / `VAULT_K8S_ROLE` env vars pointing at the
+   in-cluster Vault Service. The worker authenticates to Vault with Kubernetes
+   auth at boot and reads secrets through the scoped policy.
+8. **Verify** (belt-and-suspenders) — after reconcile, confirms every worker
+   Deployment in the env namespace runs as SA `gtc-worker` and carries
+   `VAULT_*` env vars.
+
+**Requires a cluster-admin kubeconfig** (the `system:auth-delegator`
+ClusterRoleBinding is cluster-scoped). This is the kind / local-dev path.
+
+**`external`** — the env's Vault binding already points at a reachable Vault
+(e.g. a centrally managed instance); `env up` skips the deploy + bootstrap
+phases and only seeds. This is the path for bound/min-RBAC production clusters
+where the operator does not have cluster-admin. The seed phase dials the
+binding's `addr` directly (no port-forward).
+
+#### `--allow-missing-seeds`
+
+By default, a seed entry whose value cannot be resolved (env var unset, empty
+paste, or `--non-interactive`) and is not already present in Vault is a **hard
+error** — a fresh dev Vault that boots without its secrets fails only at
+runtime, so `env up` fails closed. Pass `--allow-missing-seeds` to downgrade
+the error to a warning.
 
 ---
 
@@ -395,9 +510,9 @@ are **rejected** (fail closed on version skew).
 
 | Key | Type | Default | Effect |
 |-----|------|---------|--------|
-| `kubeconfig_context` | string | current context | Which kubeconfig context `reconcile` targets. Client-targeting only — not a manifest knob. |
+| `kubeconfig_context` | string | current context | Which kubeconfig context `reconcile` targets. Client-targeting only — not a manifest knob. When the manifest carries a `cluster` block, `env up` derives this (`kind-<name>`) for its own reconcile; setting it to a *different* value here is an error. |
 | `namespace` | string (RFC 1123 label) | `gtc-<env-id>` | Override the namespace every object lands in. |
-| `runtime_image` | string `[a-z0-9.\-_/:@]+` | `ghcr.io/greenticai/greentic-start-distroless:develop` | Container image for router + worker pods. Pin to a digest in production. |
+| `runtime_image` | string `[a-z0-9.\-_/:@]+` | `ghcr.io/greenticai/greentic-start-distroless:latest` | Container image for router + worker pods. Pin to a digest in production. (The `develop` lane defaults to the `:develop` tag.) |
 | `router_replicas` | int (string or number) | `2` | Router replica count. Must be **≥ 2** (HA). |
 | `tunnel` | `"off"` \| `"cloudflared"` | `off` | Worker public-exposure mode. `cloudflared` → worker spawns a quick tunnel (single-revision only). |
 | `oci_insecure_registries` | string[] (`host[:port]`) | `[]` | Registry authorities the worker/router may pull bundles from over plain HTTP. Rendered as `GREENTIC_OCI_INSECURE_REGISTRIES`. Empty → HTTPS only. |
@@ -406,11 +521,12 @@ are **rejected** (fail closed on version skew).
 
 | Field | Notes |
 |-------|-------|
-| `environment.id` | Drives the namespace (`gtc-<id>`) and the store partition. Only `local` is auto-bootstrapped by `apply`; other ids need `op env create <id>` first. |
+| `cluster` | **`op env up` only** — ignored by `env apply` / `env reconcile`. `{ provider: "kind", name, kubeconfig_context?, load_images? }`. `provider` accepts only `"kind"` today. `load_images[]` are `docker pull`ed then `kind load docker-image`d onto the node. Omit the block to target the ambient kubeconfig context. |
+| `environment.id` | Drives the namespace (`gtc-<id>`) and the store partition. Only `local` is auto-bootstrapped by `apply`; other ids need `op env create <id>` first (`env up` creates it for you, and then requires `environment.tenant_org_id`). |
 | `environment.gui_enabled` | Serve the `/chat` console (loopback-trusted). |
 | `environment.public_base_url` | HTTPS URL for webhook auto-registration (option A). Omit when using a tunnel (the tunnel URL wins). |
 | `trust_root` | `"bootstrap"` to mint the env trust-root. |
-| `packs[]` | `slot` ∈ `deployer` / `secrets` / … (lowercase). For K8s: a `deployer` slot bound to `greentic.deployer.k8s@1.0.0` (+ `answers_ref`), and a `secrets` slot bound to `greentic.secrets.dev-store@1.0.0` if you need pod secrets. |
+| `packs[]` | `slot` ∈ `deployer` / `secrets` / … (lowercase). For K8s: a `deployer` slot bound to `greentic.deployer.k8s@1.0.0`, and a `secrets` slot bound to `greentic.secrets.dev-store@1.0.0` if you need pod secrets. Answers come from either `answers_ref` (a path relative to the manifest) **or** an inline `answers` object — never both. `extensions[]` support `answers_ref` only. |
 | `bundles[]` | Declare the bundle by `bundle_source_uri` (an `oci://` ref the worker pulls) + a `bundle_digest` integrity pin (`sha256:<hex>`) — **no local `bundle_path` needed on the apply host**. `route_binding` selects host/path-prefix + `tenant_selector`. Non-`local` envs require `customer_id`. |
 | `secrets[]` | `{ path, from_env }` — values come from `from_env` (read at apply) or paste; **secret values never go in the manifest**. |
 | `messaging_endpoints[]` | `{ name, provider_type, links }`. `provider_type: "messaging.telegram.bot"`; `links` references a `bundle_id`. The URI segment for the bot-token secret is fixed `messaging-telegram` (not the endpoint name). |
@@ -426,10 +542,10 @@ limitation with a workaround.
   Services on `:8080`. External exposure is BYO-Ingress ([§7](#7-reaching-the-worker)
   option A) or the ephemeral cloudflared tunnel (option B). There is no
   first-class stable-hostname mode yet.
-- **Secrets use the dev-store bridge, not a real backend.** The bot token is
-  base64'd from the operator's local dev-store into a K8s Secret. It works but
-  is not AWS SM / Vault / native `secretKeyRef`. This is the **Phase-E** gap
-  ([§5](#5-secrets--the-dev-store-bridge)).
+- **Vault is dev-mode only.** The `dev-in-cluster` path deploys an in-memory,
+  auto-unsealed Vault (`-dev`) — suitable for kind / local dev, not production.
+  For production, use `external` mode pointed at a managed Vault instance
+  ([§5b](#5b-hashicorp-vault-greenticsecretsvaul010)).
 - **No `imagePullSecrets`.** A private runtime image or private bundle registry
   is not yet supported by the rendered manifests. The demo image and bundle are
   public ghcr. Use `oci_insecure_registries` only for plain-HTTP dev registries.
@@ -459,6 +575,9 @@ limitation with a workaround.
 | `/chat` returns 405/403 over the tunnel | Loopback-trust posture: the tunneled main port serves webhooks only. | Port-forward the **admin** listener (`8081`, main+1). The boot banner prints the port. |
 | Webhook registration not visible in `kubectl logs` | greentic-start logs registration via OTLP / `system.log`, not pod stdout. | Confirm with Telegram `getWebhookInfo`, not `kubectl logs`. |
 | Secret change didn't take effect | Init container copies the dev-store once at pod start. | Re-reconcile — the `greentic.ai/dev-store-hash` annotation rolls the pods on a data change. |
+| `vault bootstrap: vault unreachable at …` | The transient `kubectl port-forward` to `svc/vault` did not become ready, or the Vault pod is not running. | Confirm the Vault Deployment is Ready in the `vault_bootstrap.namespace` (`kubectl -n greentic get deploy vault`). If the pod is stuck, check image pull errors or the readiness probe. |
+| `current credential cannot create clusterrolebindings` | The ambient kubeconfig is not cluster-admin. `dev-in-cluster` needs it for the `system:auth-delegator` ClusterRoleBinding. | Use an admin context (kind / local dev), or switch to `vault_bootstrap.deploy: "external"`. |
+| `vault seed … from_env … is unset` | A `seed[]` entry references an env var that is not exported. | Export the env var before running `env up`, or pass `--allow-missing-seeds` to downgrade to a warning. |
 
 ---
 
@@ -471,6 +590,7 @@ limitation with a workaround.
 | **reconcile** | Render the store's desired state to manifests and push them onto the live cluster (and prune stale workers). |
 | **revision** | A staged, integrity-pinned snapshot of a bundle (`pack_list`, `config_digest`, `bundle_digest`, …). The worker pulls and serves it. |
 | **route_binding** | How a bundle's traffic is selected — host(s), path prefix(es), and `tenant_selector`. |
-| **dev-store bridge** | The mechanism that gets operator secrets into the pod via a rendered Secret + init container (the Phase-E placeholder for a real backend). |
+| **dev-store bridge** | The mechanism that gets operator secrets into the pod via a rendered Secret + init container. Suitable for local dev; for production, use Vault ([§5b](#5b-hashicorp-vault-greenticsecretsvaul010)). |
+| **vault_bootstrap** | The env-manifest block that tells `env up` to deploy/bootstrap/seed a Vault for the env's secrets. `dev-in-cluster` deploys a dev Vault; `external` seeds an existing one. |
 | **loopback-trust** | The rule gating `/chat` + `/workers/invoke`: trusted only when the peer is loopback AND no tunnel fronts the listener. |
 | **admin listener** | A loopback-only listener (main port + 1) that serves the console while the main port is tunneled. |

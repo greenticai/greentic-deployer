@@ -100,6 +100,7 @@ mod tests {
     use super::*;
     use crate::cli::tests_common::make_env;
     use crate::environment::EnvironmentStore;
+    use greentic_deploy_spec::SecretRef;
     use tempfile::tempdir;
 
     #[test]
@@ -117,5 +118,64 @@ mod tests {
             resolve_bound_identity(&store, &env, &env_id, None).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn bound_ref_without_local_material_falls_through_to_cluster() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        // Set a credentials_ref so the base resolver will fail closed with
+        // Conflict (ref bound, no material in env-var or dev-store).
+        env.credentials_ref =
+            Some(SecretRef::try_new("secret://local/credentials/deployer").unwrap());
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        // With no kubeconfig, the cluster read will fail, which surfaces as
+        // an error (Conflict with the cluster-access message appended). The
+        // important thing is that code ENTERS the Conflict branch, covering
+        // the cluster-fallback path.
+        let result = resolve_bound_identity(&store, &env, &env_id, None);
+        assert!(
+            result.is_err(),
+            "expected error when ref is bound but no material exists anywhere"
+        );
+    }
+
+    #[test]
+    fn bound_ref_with_explicit_answers_exercises_namespace_resolution() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.credentials_ref =
+            Some(SecretRef::try_new("secret://local/credentials/deployer").unwrap());
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        // Pass explicit answers with a custom namespace — exercises the
+        // `K8sParams::from_answers` → `Ok(params)` branch and the
+        // `kubeconfig_context_from_answers` helper inside `read_from_cluster`.
+        let answers = serde_json::json!({ "namespace": "custom-ns" });
+        let result = resolve_bound_identity(&store, &env, &env_id, Some(&answers));
+        assert!(
+            result.is_err(),
+            "expected error (no cluster), but the answers path was exercised"
+        );
+    }
+
+    #[test]
+    fn bound_ref_with_invalid_answers_falls_back_to_env_namespace() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.credentials_ref =
+            Some(SecretRef::try_new("secret://local/credentials/deployer").unwrap());
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        // A non-object Value makes K8sParams::from_answers return Err(_),
+        // so read_from_cluster falls back to namespace_for_env — exercises
+        // the `Err(_) => namespace_for_env(env_id)` branch.
+        let bad_answers = serde_json::json!("not-an-object");
+        let result = resolve_bound_identity(&store, &env, &env_id, Some(&bad_answers));
+        assert!(result.is_err());
     }
 }

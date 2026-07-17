@@ -175,6 +175,12 @@ fn api_route_for(api_version: &str, kind: &str) -> Result<(ApiResource, Scope), 
         // steady-state reconcile renderer does not emit these.
         ("rbac.authorization.k8s.io/v1", "Role") => ("roles", Scope::Namespaced),
         ("rbac.authorization.k8s.io/v1", "RoleBinding") => ("rolebindings", Scope::Namespaced),
+        // Cluster-scoped: the in-cluster dev Vault's `system:auth-delegator`
+        // binding (rendered by `vault_infra`, applied only on the cluster-admin
+        // `env up` path — see its cluster-scoped SSAR preflight).
+        ("rbac.authorization.k8s.io/v1", "ClusterRoleBinding") => {
+            ("clusterrolebindings", Scope::Cluster)
+        }
         _ => {
             return Err(K8sClusterError::InvalidManifest(format!(
                 "unsupported object `{api_version}/{kind}` — the deployer's routing table \
@@ -372,39 +378,17 @@ impl KubeValidatorClient {
     pub fn new(client: kube::Client) -> Self {
         Self { client }
     }
-}
 
-impl std::fmt::Debug for KubeValidatorClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KubeValidatorClient")
-            .finish_non_exhaustive()
-    }
-}
-
-#[async_trait]
-impl K8sValidatorClient for KubeValidatorClient {
-    async fn who_am_i(&self) -> Result<ClusterIdentity, K8sClientError> {
-        let api: Api<SelfSubjectReview> = Api::all(self.client.clone());
-        let created = api
-            .create(&PostParams::default(), &SelfSubjectReview::default())
-            .await
-            .map_err(map_validator_error)?;
-        let user = created
-            .status
-            .and_then(|s| s.user_info)
-            .and_then(|u| u.username)
-            .ok_or_else(|| {
-                K8sClientError::ApiRejected(
-                    "SelfSubjectReview response carried no user identity".to_string(),
-                )
-            })?;
-        Ok(ClusterIdentity { user })
-    }
-
-    async fn review_access<'a>(
-        &'a self,
-        namespace: &'a str,
-        operations: &'a [K8sOperation],
+    /// Run one `SelfSubjectAccessReview` per operation at the given scope:
+    /// `Some(ns)` sets `resourceAttributes.namespace` (namespaced authz),
+    /// `None` leaves it unset (cluster-scoped authz — the only way to ask
+    /// about a cluster-scoped verb like `clusterrolebindings.create`). Shared
+    /// by the namespaced [`Self::review_access`] and the cluster-scoped
+    /// [`Self::review_cluster_access`] so both build the request identically.
+    async fn review_scoped(
+        &self,
+        namespace: Option<&str>,
+        operations: &[K8sOperation],
     ) -> Result<Vec<OperationDecision>, K8sClientError> {
         let api: Api<SelfSubjectAccessReview> = Api::all(self.client.clone());
         let mut decisions = Vec::with_capacity(operations.len());
@@ -412,7 +396,7 @@ impl K8sValidatorClient for KubeValidatorClient {
             let review = SelfSubjectAccessReview {
                 spec: SelfSubjectAccessReviewSpec {
                     resource_attributes: Some(ResourceAttributes {
-                        namespace: Some(namespace.to_string()),
+                        namespace: namespace.map(str::to_string),
                         group: Some(operation.group.to_string()),
                         resource: Some(operation.resource.to_string()),
                         verb: Some(operation.verb.to_string()),
@@ -448,6 +432,49 @@ impl K8sValidatorClient for KubeValidatorClient {
             });
         }
         Ok(decisions)
+    }
+}
+
+impl std::fmt::Debug for KubeValidatorClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KubeValidatorClient")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl K8sValidatorClient for KubeValidatorClient {
+    async fn who_am_i(&self) -> Result<ClusterIdentity, K8sClientError> {
+        let api: Api<SelfSubjectReview> = Api::all(self.client.clone());
+        let created = api
+            .create(&PostParams::default(), &SelfSubjectReview::default())
+            .await
+            .map_err(map_validator_error)?;
+        let user = created
+            .status
+            .and_then(|s| s.user_info)
+            .and_then(|u| u.username)
+            .ok_or_else(|| {
+                K8sClientError::ApiRejected(
+                    "SelfSubjectReview response carried no user identity".to_string(),
+                )
+            })?;
+        Ok(ClusterIdentity { user })
+    }
+
+    async fn review_access<'a>(
+        &'a self,
+        namespace: &'a str,
+        operations: &'a [K8sOperation],
+    ) -> Result<Vec<OperationDecision>, K8sClientError> {
+        self.review_scoped(Some(namespace), operations).await
+    }
+
+    async fn review_cluster_access<'a>(
+        &'a self,
+        operations: &'a [K8sOperation],
+    ) -> Result<Vec<OperationDecision>, K8sClientError> {
+        self.review_scoped(None, operations).await
     }
 }
 
@@ -1174,6 +1201,36 @@ mod tests {
             decisions[0].decision,
             AccessDecision::Denied("no reason supplied".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn review_cluster_access_omits_the_namespace_for_a_cluster_scoped_verb() {
+        let (client, mut handle) = mock_client();
+        let validator = KubeValidatorClient::new(client);
+        let operations = [K8sOperation {
+            group: "rbac.authorization.k8s.io",
+            resource: "clusterrolebindings",
+            verb: "create",
+        }];
+        let (result, request) = tokio::join!(
+            validator.review_cluster_access(&operations),
+            respond_json(&mut handle, 201, ssar_response(true, None)),
+        );
+        let decisions = result.unwrap();
+        assert_eq!(decisions[0].operation, operations[0]);
+        assert_eq!(decisions[0].decision, AccessDecision::Allowed);
+
+        let body = request_body_json(request).await;
+        let attrs = &body["spec"]["resourceAttributes"];
+        // A cluster-scoped review must NOT carry a namespace — otherwise the
+        // API server answers a namespaced question and a cluster-admin-less
+        // token could look "allowed" for the wrong scope.
+        assert!(
+            attrs.get("namespace").is_none() || attrs["namespace"].is_null(),
+            "cluster-scoped SSAR must omit namespace, got {attrs}"
+        );
+        assert_eq!(attrs["resource"], json!("clusterrolebindings"));
+        assert_eq!(attrs["verb"], json!("create"));
     }
 
     // ── apply_bound_token ──────────────────────────────────────────

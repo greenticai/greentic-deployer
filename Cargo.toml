@@ -133,7 +133,12 @@ version = "=1.3.0-research.1"
 version = "=1.3.0-research.1"
 
 [dependencies.greentic-secrets-lib]
-version = "=1.3.0-research.1"
+# Pinned to the merged research secrets (git-rev): carries main's Phase-E Vault
+# KV backend (`vault::{VaultBackendConfig,VaultAuth,build_backend_with}`) the
+# `op env up` / secrets vault-provisioning path needs. The crates.io
+# =1.3.0-research.1 predates the vault re-export.
+git = "https://github.com/greenticai/greentic-secrets.git"
+rev = "2e491e3c2c8b7355785193ac839c02ba9116a630"
 features = [
     "providers-dev",
     "providers-vault",
@@ -142,6 +147,7 @@ features = [
 [dependencies.greentic-update]
 version = ">=1.3.0-research.0, <1.4.0-0"
 features = [
+    "binswap",
     "enroll",
     "mtls",
 ]
@@ -283,6 +289,7 @@ features = [
 version = "3"
 
 [dev-dependencies]
+flate2 = "1"
 wat = "1"
 # kube-client mock harness (PR-5.2): drive a real `kube::Client` against
 # a `tower_test::mock` service so the K8sCluster / K8sValidatorClient
@@ -308,4 +315,4 @@ greentic-deploy-spec = "=1.3.0-research.1"
 # E2E can derive the canonical store-key the bound-credential resolver reads,
 # and seed a ServiceAccount token via env var. Already in the lockfile via the
 # normal dep, so no resolution change.
-greentic-secrets-lib = "=1.3.0-research.1"
+greentic-secrets-lib = { git = "https://github.com/greenticai/greentic-secrets.git", rev = "2e491e3c2c8b7355785193ac839c02ba9116a630" }
