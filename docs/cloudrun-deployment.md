@@ -296,7 +296,7 @@ expected answer, not a bug:
 
 ```bash
 # authenticated mode: mint a token for the call
-curl -H "Authorization: Bearer $(gcloud auth print-identity-token)" "$URL/healthz"
+curl -H "Authorization: Bearer $(gcloud auth print-identity-token)" "$URL/readyz"
 ```
 
 > **Org policy.** `constraints/iam.allowedPolicyMemberDomains` blocks `allUsers`
@@ -305,7 +305,7 @@ curl -H "Authorization: Bearer $(gcloud auth print-identity-token)" "$URL/health
 > authenticating front end in front of it.
 
 > **`public` exposes the runtime's own probe routes**, including `/status`
-> (which reports env id and active bundle/revision counts) and `/healthz`. That
+> (which reports env id and active bundle/revision counts) and `/readyz`. That
 > is a property of greentic-start's route table, not of this deployer. Do not
 > use `public` for an environment whose existence is itself sensitive.
 
@@ -316,13 +316,29 @@ curl -H "Authorization: Bearer $(gcloud auth print-identity-token)" "$URL/health
 ```bash
 URL=$(gtc op env up --answers cloudrun.env.json --yes | jq -r '.result.endpoint_url')
 
-curl -fsS "$URL/healthz"    # → ok        (liveness — a STATIC route)
+curl -fsS "$URL/readyz"     # → ok        (liveness — a STATIC route)
 curl -fsS "$URL/status"     # → greentic.status.v1 diagnostics
 ```
 
-**`/healthz` proves less than it looks like it does.** It is a static route: it
-answers `200 ok` from a runtime that pulled no bundle and loaded nothing. To
-know the deploy actually *worked*, read `/status`:
+> ### ⚠ `/healthz` does not work on Cloud Run — use `/readyz`
+>
+> **`GET <url>/healthz` returns Google's own HTML 404 and never reaches your
+> container.** Its siblings `/health`, `/livez`, `/readyz` and `/status` all
+> arrive normally, so this is not your worker being broken — something in
+> Google's frontend swallows that one path before Cloud Run routes it. You can
+> tell them apart by the response: a real answer from the worker carries a
+> `server: Google Frontend` header and a plain-text/JSON body; the `/healthz`
+> 404 is a branded Google error page with no `server` header.
+>
+> Verified live 2026-07-17 against Cloud Run in `europe-west1`. Harmless for
+> deployment itself — this deployer configures no HTTP probe, so Cloud Run's
+> default TCP check on `$PORT` decides readiness — but it will waste your
+> afternoon if you health-check the wrong path. The K8s guide's `/healthz` probe
+> is fine: it runs inside the cluster and never crosses a Google frontend.
+
+**The liveness route proves less than it looks like it does.** `/readyz` is a
+static route: it answers `200 ok` from a runtime that pulled no bundle and loaded
+nothing. To know the deploy actually *worked*, read `/status`:
 
 ```json
 {"schema":"greentic.status.v1","env_id":"local","listen_addr":"0.0.0.0:8080",
@@ -331,7 +347,7 @@ know the deploy actually *worked*, read `/status`:
 
 `bundles_active` and `revisions_active` are non-zero only once the seeded
 environment resolved, the bundle pulled from the registry, and its packs loaded.
-**`bundles_active: 0` with a healthy `/healthz` is the signature of a boot that
+**`bundles_active: 0` next to a healthy `/readyz` is the signature of a boot that
 came up but found no work** — see §11.
 
 > These fields come from **greentic-start** (`try_probe_response` in its
@@ -449,7 +465,7 @@ Environment variables read by the deployer itself:
 
 ## 11. Troubleshooting
 
-**`/healthz` is 200 but `/status` shows `bundles_active: 0`.**
+**`/readyz` is 200 but `/status` shows `bundles_active: 0`.**
 The container booted but loaded no bundle. Almost always the bundle reference:
 the `bundle_source_uri` is unreachable from Cloud Run (private registry, no
 credential on the runtime SA) or the `bundle_digest` does not match what the tag

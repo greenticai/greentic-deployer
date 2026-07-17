@@ -1,5 +1,13 @@
 //! Live-project E2E for the GCP Cloud Run deployer env-pack (plan item 7).
 //!
+//! **Provenance: first executed against a real GCP project on 2026-07-17
+//! (`europe-west1`) and PASSED** — deploy → boot from the staged seed → bundle
+//! pulled from public GHCR → 50/50 split → 100 % shift → archive → teardown, in
+//! ~95 s, leaving nothing behind. Unlike `aws_ecs_e2e` (still never run against
+//! a live account), the assertions below are confirmed, not merely plausible.
+//! That first run immediately earned its keep: the deploy was flawless and the
+//! probe 404'd, because Cloud Run swallows `/healthz` — see [`LIVENESS_PATH`].
+//!
 //! The Cloud Run deployer's decision logic — params parsing, the integer-percent
 //! traffic conversion, secret ownership, the conformance suite — is unit-tested
 //! against the in-memory `InMemoryCloudRun` fake, which opens no sockets. The
@@ -8,7 +16,7 @@
 //! readiness poll / `CreateSecret` / `AddSecretVersion` / the `secretAccessor`
 //! and invoker IAM RMWs / `DeleteService` / `DeleteSecret`) therefore has zero
 //! end-to-end coverage. This test closes that gap by driving a full lifecycle —
-//! `env up → healthz → warm B → 50/50 split → SHIFT 100 % to B → archive A →
+//! `env up → serves → warm B → 50/50 split → SHIFT 100 % to B → archive A →
 //! destroy` — through the real CLI verbs against a real GCP project.
 //!
 //! ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -18,9 +26,9 @@
 //!     secret-staging chain (environment.json + the dev-store rendered as
 //!     version-pinned Secret Manager volumes, `GREENTIC_SEED_DIR` pointing
 //!     greentic-start's boot-copy at them) is asserted only against the fake
-//!     everywhere else. Proven here in two steps, deliberately: `/healthz` 200
-//!     says the container came up, but it is a STATIC route that answers just as
-//!     happily from a runtime that loaded nothing — so `/status`
+//!     everywhere else. Proven here in two steps, deliberately: a 200 from the
+//!     liveness path says the container came up, but that is a STATIC route which
+//!     answers just as happily from a runtime that loaded nothing — so `/status`
 //!     (`greentic.status.v1`) is the real assertion, because its
 //!     `bundles_active` / `revisions_active` counts are non-zero only once the
 //!     seed parsed, the bundle OCI-pulled, and its packs loaded.
@@ -151,11 +159,30 @@ const DEFAULT_BUNDLE_URI: &str = "oci://ghcr.io/greenticai/greentic-demo-bundles
 const DEFAULT_BUNDLE_DIGEST: &str =
     "sha256:4f560749ec709e75b6063cdeccab15ed5074c2e60bc5f772c2d3b7d4bd992363";
 
-/// Bound on the `/healthz` probe: a first request against a just-deployed Service
+/// The liveness path to probe. **`/readyz`, deliberately NOT `/healthz`.**
+///
+/// Verified live 2026-07-17 against real Cloud Run: `GET /healthz` on a `*.run.app`
+/// URL returns Google's own branded HTML 404 and **never reaches the container** —
+/// no `server: Google Frontend` header, a `referrer-policy: no-referrer`, i.e. the
+/// Google frontend answers it. Its siblings `/health`, `/livez`, `/readyz`,
+/// `/status` (and any unknown path, which greentic-start 405s) all arrive
+/// normally. So `/healthz` is swallowed somewhere in Google's infrastructure
+/// before Cloud Run routes it.
+///
+/// Do NOT "fix" this back to `/healthz` because the k8s path uses it — that probe
+/// runs inside the cluster and never crosses a Google frontend. This is a Cloud
+/// Run-only hazard, and the first live run of this test is what found it: the
+/// deploy was perfect and the probe 404'd.
+///
+/// Harmless for the deployer itself, which configures no HTTP probe (Cloud Run's
+/// default TCP check on `$PORT` marks the revision Ready).
+const LIVENESS_PATH: &str = "/readyz";
+
+/// Bound on the liveness probe: a first request against a just-deployed Service
 /// races a cold start (Cloud Run reports Ready when the container binds `$PORT`,
 /// but the very first request can still land mid-start).
-const HEALTHZ_ATTEMPTS: u32 = 10;
-const HEALTHZ_BACKOFF: Duration = Duration::from_secs(3);
+const LIVENESS_ATTEMPTS: u32 = 10;
+const LIVENESS_BACKOFF: Duration = Duration::from_secs(3);
 
 fn deployer_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_greentic-deployer"))
@@ -260,8 +287,8 @@ fn cloudrun_answers(secret_prefix: &str) -> Value {
     let mut answers = json!({
         "project": required_var("GTC_GCP_E2E_PROJECT"),
         "region": required_var("GTC_GCP_E2E_REGION"),
-        // The URL must be reachable without a token for the `/healthz` probe
-        // (plan D12: Cloud Run is private by default).
+        // The URL must be reachable without a token for the liveness/status
+        // probes (plan D12: Cloud Run is private by default).
         "access_mode": "public",
         "secret_prefix": secret_prefix,
     });
@@ -344,13 +371,16 @@ fn env_manifest(bundle_uri: &str, bundle_digest: &str, secret_prefix: &str) -> V
     })
 }
 
-/// GET `<url>/healthz` until it answers 200 or the attempts run out. Returns the
-/// last status seen. greentic-start serves `/healthz` as a static route, so a 200
-/// says the runtime process is up and serving.
-fn probe_healthz(url: &str) -> Result<(), String> {
-    let endpoint = format!("{}/healthz", url.trim_end_matches('/'));
+/// GET `<url>`[`LIVENESS_PATH`] until it answers 200 or the attempts run out.
+/// Returns the last status seen. greentic-start serves it as a static route, so a
+/// 200 says the runtime process is up and serving — and nothing more (see
+/// [`probe_status`] for the assertion that actually proves the deploy worked).
+///
+/// Retried because the first request after a deploy races a cold start.
+fn probe_liveness(url: &str) -> Result<(), String> {
+    let endpoint = format!("{}{LIVENESS_PATH}", url.trim_end_matches('/'));
     let mut last = String::from("never attempted");
-    for attempt in 1..=HEALTHZ_ATTEMPTS {
+    for attempt in 1..=LIVENESS_ATTEMPTS {
         match http().get(&endpoint).send() {
             Ok(resp) if resp.status().is_success() => {
                 eprintln!(
@@ -363,17 +393,17 @@ fn probe_healthz(url: &str) -> Result<(), String> {
             Err(e) => last = format!("transport error: {e}"),
         }
         eprintln!(
-            "[gcp-e2e] {endpoint} not ready yet ({last}); attempt {attempt}/{HEALTHZ_ATTEMPTS}"
+            "[gcp-e2e] {endpoint} not ready yet ({last}); attempt {attempt}/{LIVENESS_ATTEMPTS}"
         );
-        std::thread::sleep(HEALTHZ_BACKOFF);
+        std::thread::sleep(LIVENESS_BACKOFF);
     }
     Err(last)
 }
 
 /// GET `<url>/status` → greentic-start's `greentic.status.v1` diagnostics.
 ///
-/// This — not `/healthz` — is what proves the deploy actually WORKED.
-/// `/healthz` is a static route that answers 200 from a runtime with zero
+/// This — not the liveness probe — is what proves the deploy actually WORKED.
+/// [`LIVENESS_PATH`] is a static route that answers 200 from a runtime with zero
 /// bundles loaded, so on its own it only shows the container booted. `/status`
 /// reports `bundles_active` / `revisions_active`, which are non-zero only once
 /// the seeded environment.json resolved AND the bundle OCI-pulled AND its packs
@@ -619,15 +649,16 @@ fn cloudrun_full_lifecycle_against_real_project() {
 
     // 2. The boot proof: the container came up from the staged secret volumes.
     //    Everything before this only shows GCP ACCEPTED our calls.
-    if let Err(last) = probe_healthz(&url) {
+    if let Err(last) = probe_liveness(&url) {
         panic!(
-            "{url}/healthz never returned 200 ({last}). The Service deployed, so this points at \
-             the seed/boot chain (secret volume mount, GREENTIC_SEED_DIR) rather than the deploy \
-             glue — check the Cloud Run revision logs. Reclaim with the command printed above."
+            "{url}{LIVENESS_PATH} never returned 200 ({last}). The Service deployed, so this \
+             points at the seed/boot chain (secret volume mount, GREENTIC_SEED_DIR) rather than \
+             the deploy glue — check the Cloud Run revision logs. Reclaim with the command \
+             printed above."
         );
     }
 
-    // 2b. The WORK proof — what `/healthz` structurally cannot tell us. See
+    // 2b. The WORK proof — what the liveness probe structurally cannot tell us. See
     //     `probe_status`.
     let status = probe_status(&url);
     eprintln!("[gcp-e2e] /status: {status}");
@@ -637,8 +668,8 @@ fn cloudrun_full_lifecycle_against_real_project() {
     );
     assert!(
         status["bundles_active"].as_u64().unwrap_or(0) >= 1,
-        "the worker pulled and loaded the bundle (a 200 from static /healthz alone would not \
-         prove this): {status}"
+        "the worker pulled and loaded the bundle (a 200 from the static liveness route alone \
+         would not prove this): {status}"
     );
     assert!(
         status["revisions_active"].as_u64().unwrap_or(0) >= 1,
@@ -677,7 +708,7 @@ fn cloudrun_full_lifecycle_against_real_project() {
         "50/50 split enforced as recorded: {split:?}"
     );
     // Still serving mid-split: the URL is stable across a traffic re-point.
-    probe_healthz(&url).expect("service still serves during the 50/50 split");
+    probe_liveness(&url).expect("service still serves during the 50/50 split");
 
     // 5. SHIFT 100 % → B. Replaces the split, freeing A to archive.
     let shifted = apply_split(
