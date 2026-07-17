@@ -97,6 +97,12 @@ impl LocalProcessCredentials {
 }
 
 impl DeployerCredentials for LocalProcessCredentials {
+    /// The local-process deployer needs no credential material at all (it
+    /// probes only the local environment), so it mints nothing to orphan.
+    fn bound_credential_store_path(&self) -> Option<&'static str> {
+        None
+    }
+
     fn requires_credentials_material(&self) -> bool {
         false
     }

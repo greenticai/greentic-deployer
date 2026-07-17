@@ -283,6 +283,10 @@ mod tests {
     #[derive(Debug)]
     struct FakeCreds;
     impl crate::credentials::DeployerCredentials for FakeCreds {
+        fn bound_credential_store_path(&self) -> Option<&'static str> {
+            None
+        }
+
         fn requires_credentials_material(&self) -> bool {
             false
         }

@@ -775,24 +775,52 @@ pub(super) fn validate_dev_store_secret_path(rel_path: &str) -> Result<(), OpErr
              a-z, 0-9 and single `_` separators (no leading/trailing `_`)"
         )));
     }
-    // The deployer's own credential namespace. `staging_excluded_uris` strips
-    // these from every runtime seed unconditionally (a crashed bootstrap can
-    // orphan material there that nothing names), so runtime material written
-    // here would be accepted, stored, and audited as present — then silently
-    // vanish from the workload. Reserve the paths at the write surface instead,
-    // so the collision cannot be created rather than being papered over.
-    //
-    // Only the runtime-secret surfaces route through this validator; the
-    // credentials bootstrap's own sink (`put_credential_material`) writes via
-    // `dev_store_put` directly and is unaffected — it is the legitimate writer.
-    if crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS.contains(&rel_path) {
+    reject_reserved_credential_rel_path(rel_path)?;
+    Ok(())
+}
+
+/// Whether `rel_path` (`<tenant>/<team>/<pack>/<name>`) is the deployer's own
+/// bound-credential namespace.
+pub(super) fn is_reserved_credential_rel_path(rel_path: &str) -> bool {
+    crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS.contains(&rel_path)
+}
+
+/// Refuse to write RUNTIME material onto the deployer's reserved credential
+/// namespace.
+///
+/// Two distinct harms, hence a hard reject rather than a warning:
+///
+/// * **Silent loss.** `staging_excluded_uris` strips these paths from every
+///   runtime seed unconditionally (a crashed bootstrap can orphan material there
+///   that nothing names), so a runtime secret written here would be stored and
+///   audited as present, then never reach the workload.
+/// * **Credential clobber.** A caller-supplied ref pointed at one of these paths
+///   would overwrite the env's live bound deployer credential with unrelated
+///   material, breaking every subsequent deployer verb.
+///
+/// Every writer of runtime material MUST go through this (directly, or via
+/// [`validate_dev_store_secret_path`], which calls it). The credentials
+/// bootstrap's own sink — [`put_credential_material`] — deliberately does not:
+/// it is the legitimate writer of exactly these paths.
+pub(super) fn reject_reserved_credential_rel_path(rel_path: &str) -> Result<(), OpError> {
+    if is_reserved_credential_rel_path(rel_path) {
         return Err(OpError::InvalidArgument(format!(
             "`{rel_path}` is reserved for the deployer's own bound credential and \
-             cannot hold runtime material: it is stripped from every staged runtime \
-             seed, so a workload could never read it back — choose another path"
+             cannot hold runtime material: writing it would overwrite the env's \
+             deployer credential, and it is stripped from every staged runtime seed \
+             so a workload could never read it back — choose another path"
         )));
     }
     Ok(())
+}
+
+/// The store-relative `<tenant>/<team>/<pack>/<name>` tail of a
+/// `secret(s)://<env>/<rel>` URI, for callers that hold a built URI rather than
+/// the raw path. `None` when the URI has no env + tail.
+pub(super) fn store_uri_rel_path(store_uri: &str) -> Option<&str> {
+    let (_scheme, rest) = store_uri.split_once("://")?;
+    let (_env, rel) = rest.split_once('/')?;
+    Some(rel)
 }
 
 /// A segment is writable iff the runtime reader's canonicalization maps it to

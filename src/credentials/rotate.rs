@@ -219,6 +219,10 @@ mod tests {
     }
 
     impl DeployerCredentials for MintingCreds {
+        fn bound_credential_store_path(&self) -> Option<&'static str> {
+            None
+        }
+
         fn required_capabilities(&self) -> Vec<Capability> {
             vec![]
         }

@@ -298,6 +298,14 @@ impl GcpDeployerCredentials {
 }
 
 impl DeployerCredentials for GcpDeployerCredentials {
+    /// Render-only: `bootstrap` emits a Terraform rules pack and returns
+    /// `bound_credentials_ref: None` — the admin applies it out of band and
+    /// binds the resulting service account afterwards. No material is ever
+    /// written here, so there is nothing a crashed bootstrap could orphan.
+    fn bound_credential_store_path(&self) -> Option<&'static str> {
+        None
+    }
+
     fn requires_credentials_material(&self) -> bool {
         true
     }

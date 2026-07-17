@@ -109,13 +109,12 @@ pub trait DeployerCredentials: std::fmt::Debug + Send + Sync {
     /// [`store_paths`] so it stays compiled in regardless of provider SDK
     /// features (a dev-store outlives the binary that wrote it).
     ///
-    /// Default is `None`, which is the safe answer for a handler that mints
-    /// nothing; a handler that *does* mint and forgets to override this is
-    /// caught by the conformance test only if its path is also absent from the
-    /// list, so new minting handlers must add both.
-    fn bound_credential_store_path(&self) -> Option<&'static str> {
-        None
-    }
+    /// **Deliberately has no default.** A default of `None` would make a handler
+    /// that *forgot* to declare indistinguishable from one that genuinely mints
+    /// nothing, so a new minting env-pack could inherit it, reopen the orphan
+    /// leak, and still pass the conformance test. Requiring every implementation
+    /// to answer turns that omission into a compile error.
+    fn bound_credential_store_path(&self) -> Option<&'static str>;
 
     /// Best-effort compensating cleanup for a bootstrap that wrote durable
     /// credential material to a REMOTE backend (e.g. the K8s `--bind` path
@@ -175,6 +174,10 @@ mod tests {
     struct StubCredentials;
 
     impl DeployerCredentials for StubCredentials {
+        fn bound_credential_store_path(&self) -> Option<&'static str> {
+            None
+        }
+
         fn required_capabilities(&self) -> Vec<Capability> {
             vec![]
         }
@@ -200,6 +203,10 @@ mod tests {
     }
 
     impl DeployerCredentials for TimedCredentials {
+        fn bound_credential_store_path(&self) -> Option<&'static str> {
+            None
+        }
+
         fn required_capabilities(&self) -> Vec<Capability> {
             vec![]
         }
