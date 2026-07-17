@@ -41,9 +41,84 @@ pub(crate) const AWS_DEPLOYER_SESSION: &str = "default/_/aws-deployer/deployer_s
 pub(crate) const BOUND_CREDENTIAL_STORE_PATHS: &[&str] =
     &[K8S_DEPLOYER_TOKEN, AWS_DEPLOYER_SESSION];
 
+/// `<tenant>/<team>/<pack>/<name>@<version>` → `<tenant>/<team>/<pack>/<name>`.
+///
+/// Only the final segment may carry a version (`SecretUri` parses `@` there).
+/// The dev-store's exclusion filter matches by this versionless identity, so
+/// every reservation/denylist comparison must normalize first — otherwise
+/// `…/deployer_token@1`, which names the very same key, slips through.
+pub(crate) fn versionless_rel_path(rel_path: &str) -> String {
+    match rel_path.rsplit_once('/') {
+        Some((head, last)) => match last.split_once('@') {
+            Some((name, _version)) => format!("{head}/{name}"),
+            None => rel_path.to_string(),
+        },
+        None => rel_path.to_string(),
+    }
+}
+
+/// Whether `rel_path` names the deployer's own bound-credential namespace,
+/// compared by canonical versionless identity.
+pub(crate) fn is_reserved_rel_path(rel_path: &str) -> bool {
+    BOUND_CREDENTIAL_STORE_PATHS.contains(&versionless_rel_path(rel_path).as_str())
+}
+
+/// Split a canonical store URI `secret(s)://<env>/<rel>` into its env and its
+/// versionless store-relative path. `None` when the URI has no env + tail.
+pub(crate) fn split_store_uri(store_uri: &str) -> Option<(&str, String)> {
+    let (_scheme, rest) = store_uri.split_once("://")?;
+    let (env, rel) = rest.split_once('/')?;
+    if env.is_empty() || rel.is_empty() {
+        return None;
+    }
+    Some((env, versionless_rel_path(rel)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn versionless_rel_path_normalizes_only_the_final_segment() {
+        let base = "default/_/k8s-deployer/deployer_token";
+        assert_eq!(versionless_rel_path(base), base);
+        assert_eq!(versionless_rel_path(&format!("{base}@1")), base);
+        assert_eq!(versionless_rel_path(&format!("{base}@v2")), base);
+        // Trailing `@` — an empty version still names the same key.
+        assert_eq!(versionless_rel_path(&format!("{base}@")), base);
+        // Only the FIRST `@` splits, so a version containing `@` cannot smuggle
+        // the name back in.
+        assert_eq!(versionless_rel_path(&format!("{base}@1@2")), base);
+        // An `@` in a non-final segment is not a version.
+        assert_eq!(
+            versionless_rel_path("default/_/k8s@x/token"),
+            "default/_/k8s@x/token"
+        );
+        // Degenerate inputs must not panic.
+        assert_eq!(versionless_rel_path("nolash"), "nolash");
+        assert_eq!(versionless_rel_path(""), "");
+    }
+
+    #[test]
+    fn split_store_uri_extracts_env_and_versionless_rel() {
+        assert_eq!(
+            split_store_uri("secrets://local/default/_/k8s-deployer/deployer_token@3"),
+            Some(("local", "default/_/k8s-deployer/deployer_token".to_string()))
+        );
+        assert_eq!(
+            split_store_uri("secret://prod/a/b/c/d"),
+            Some(("prod", "a/b/c/d".to_string()))
+        );
+        for bad in [
+            "",
+            "nonsense",
+            "secrets://",
+            "secrets://env",
+            "secrets:///rel",
+        ] {
+            assert!(split_store_uri(bad).is_none(), "`{bad}` must not parse");
+        }
+    }
 
     /// Conformance guard: walk the *registry* — not a hard-coded pair — and
     /// require that every deployer env-pack which declares a credential landing

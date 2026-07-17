@@ -219,7 +219,8 @@ pub enum RunBootstrapError {
     AlreadyBootstrapped(EnvId),
     #[error(
         "deployer env-pack `{deployer_kind}` minted bound credential material but its landing \
-         path is not covered by the runtime-seed denylist (declared: {declared:?}); refusing to \
+         path is not covered by the runtime-seed denylist (declared: {declared:?}, actual \
+         landing: {landing:?}); refusing to \
          write it. Bootstrap writes material before recording `credentials_ref`, so a crash in \
          between would orphan a credential no seed exclusion can strip, leaking it into every \
          workload this env deploys. Declare the path via \
@@ -229,6 +230,11 @@ pub enum RunBootstrapError {
     UndeclaredCredentialPath {
         deployer_kind: String,
         declared: Option<String>,
+        /// Where the material would actually have landed (`<env>:<rel path>`),
+        /// versionless. `None` when `bound_credentials_ref` is not a parseable
+        /// store-aligned URI at all — which is itself a refusal reason: an
+        /// unparseable ref cannot be matched by any exclusion.
+        landing: Option<String>,
     },
     #[error(
         "deployer env-pack `{kind}` has no native credentials handler registered (Phase D plug-in)"
@@ -370,15 +376,35 @@ pub fn run_bootstrap(
             // knows. Checking here, at the single choke point every handler's
             // material flows through, holds for handlers we never compiled —
             // which a compile-time trait obligation could not do.
+            //
+            // The check is against the ACTUAL destination, not the handler's
+            // claim about it: the sink writes at `bound_ref`, so a handler that
+            // declared a covered path while returning a rogue (or
+            // cross-environment) ref would otherwise sail through the gate and
+            // orphan exactly the key the denylist cannot see. Declaration and
+            // destination must agree, and both must be covered.
             let declared = creds.bound_credential_store_path();
-            match declared {
-                Some(path) if store_paths::BOUND_CREDENTIAL_STORE_PATHS.contains(&path) => {}
-                _ => {
-                    return Err(RunBootstrapError::UndeclaredCredentialPath {
-                        deployer_kind: deployer_kind_label,
-                        declared: declared.map(str::to_string),
-                    });
+            let landing = bound_ref
+                .to_store_uri()
+                .ok()
+                .map(|uri| uri.to_string())
+                .and_then(|uri| {
+                    store_paths::split_store_uri(&uri).map(|(env, rel)| (env.to_string(), rel))
+                });
+            let ok = match (&landing, declared) {
+                (Some((ref_env, rel)), Some(path)) => {
+                    ref_env == env_id.as_str()
+                        && rel == path
+                        && store_paths::BOUND_CREDENTIAL_STORE_PATHS.contains(&path)
                 }
+                _ => false,
+            };
+            if !ok {
+                return Err(RunBootstrapError::UndeclaredCredentialPath {
+                    deployer_kind: deployer_kind_label,
+                    declared: declared.map(str::to_string),
+                    landing: landing.map(|(env, rel)| format!("{env}:{rel}")),
+                });
             }
             secret_sink(&env_root, bound_ref, material.as_str())
                 .map_err(RunBootstrapError::SecretWrite)?;

@@ -789,20 +789,7 @@ pub(super) fn validate_dev_store_secret_path(rel_path: &str) -> Result<(), OpErr
 /// stripped from the seed anyway (and, worse, landing on the live credential's
 /// key). Normalize before comparing, exactly as the exporter does.
 pub(super) fn is_reserved_credential_rel_path(rel_path: &str) -> bool {
-    let versionless = versionless_rel_path(rel_path);
-    crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS.contains(&versionless.as_str())
-}
-
-/// `<tenant>/<team>/<pack>/<name>@<version>` → `<tenant>/<team>/<pack>/<name>`.
-/// Only the final segment may carry a version (`SecretUri` parses `@` there).
-fn versionless_rel_path(rel_path: &str) -> String {
-    match rel_path.rsplit_once('/') {
-        Some((head, last)) => match last.split_once('@') {
-            Some((name, _version)) => format!("{head}/{name}"),
-            None => rel_path.to_string(),
-        },
-        None => rel_path.to_string(),
-    }
+    crate::credentials::store_paths::is_reserved_rel_path(rel_path)
 }
 
 /// Refuse to write RUNTIME material onto the deployer's reserved credential
@@ -837,10 +824,8 @@ pub(super) fn reject_reserved_credential_rel_path(rel_path: &str) -> Result<(), 
 /// The store-relative `<tenant>/<team>/<pack>/<name>` tail of a
 /// `secret(s)://<env>/<rel>` URI, for callers that hold a built URI rather than
 /// the raw path. `None` when the URI has no env + tail.
-pub(super) fn store_uri_rel_path(store_uri: &str) -> Option<&str> {
-    let (_scheme, rest) = store_uri.split_once("://")?;
-    let (_env, rel) = rest.split_once('/')?;
-    Some(rel)
+pub(super) fn store_uri_rel_path(store_uri: &str) -> Option<String> {
+    crate::credentials::store_paths::split_store_uri(store_uri).map(|(_env, rel)| rel)
 }
 
 /// A segment is writable iff the runtime reader's canonicalization maps it to

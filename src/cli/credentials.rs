@@ -1660,14 +1660,41 @@ mod tests {
     #[test]
     fn run_bootstrap_refuses_to_write_material_at_an_undeclared_landing_path() {
         let expiry = chrono::DateTime::from_timestamp(2_000_000_000, 0).unwrap();
-        // Two ways to get this wrong: declare nothing, or declare a path the
-        // seed denylist does not cover. Both must fail closed.
-        for declared in [None, Some("default/_/rogue-deployer/token")] {
+        const COVERED: &str = crate::credentials::store_paths::K8S_DEPLOYER_TOKEN;
+        // Every way to get this wrong. The last two are the important ones: the
+        // gate must check where the material ACTUALLY lands (`secret_ref`, what
+        // the sink writes), not merely what the handler claims — otherwise a
+        // handler declaring a covered path while returning a rogue or
+        // cross-environment ref sails straight through and orphans exactly the
+        // key the denylist cannot see.
+        let cases: [(&str, Option<&'static str>, &str); 4] = [
+            (
+                "declares nothing",
+                None,
+                "secret://local/default/_/k8s-deployer/deployer_token",
+            ),
+            (
+                "declares an uncovered path",
+                Some("default/_/rogue-deployer/token"),
+                "secret://local/default/_/rogue-deployer/token",
+            ),
+            (
+                "declares a covered path but writes elsewhere",
+                Some(COVERED),
+                "secret://local/default/_/rogue-deployer/token",
+            ),
+            (
+                "declares a covered path but writes into another env",
+                Some(COVERED),
+                "secret://other-env/default/_/k8s-deployer/deployer_token",
+            ),
+        ];
+        for (case, declared, secret_ref) in cases {
             let dir = tempdir().unwrap();
             let (store, registry, env_id) = bind_fixture(dir.path());
             let admin = crate::credentials::ZeroizedAdmin::new("admin-ctx", String::new());
             let bind = MintingCreds {
-                secret_ref: "secret://local/default/_/k8s-deployer/deployer_token".to_string(),
+                secret_ref: secret_ref.to_string(),
                 declared_path: declared,
                 token: "MINTED".to_string(),
                 expiry,
@@ -1690,23 +1717,23 @@ mod tests {
                 Some(&bind),
                 &sink,
             )
-            .expect_err("a minting handler with an uncovered landing path must be refused");
+            .unwrap_err();
             assert!(
                 matches!(
                     err,
                     crate::credentials::RunBootstrapError::UndeclaredCredentialPath { .. }
                 ),
-                "declared={declared:?} got {err:?}"
+                "{case}: got {err:?}"
             );
             assert_eq!(
                 *sink_calls.lock().unwrap(),
                 0,
-                "declared={declared:?}: the refusal must land BEFORE any material \
-                 is written — a sink call means a credential is already on disk"
+                "{case}: the refusal must land BEFORE any material is written — \
+                 a sink call means a credential is already on disk"
             );
             assert!(
                 store.load(&env_id).unwrap().credentials_ref.is_none(),
-                "declared={declared:?}: no credentials_ref may be persisted"
+                "{case}: no credentials_ref may be persisted"
             );
         }
     }

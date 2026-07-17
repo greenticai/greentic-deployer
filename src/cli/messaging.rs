@@ -1040,7 +1040,7 @@ fn write_webhook_secret_to_devstore(
     );
     let store_uri = super::secrets::secret_ref_to_store_uri(secret_ref)?;
     if let Some(rel) = super::secrets::store_uri_rel_path(&store_uri) {
-        super::secrets::reject_reserved_credential_rel_path(rel)?;
+        super::secrets::reject_reserved_credential_rel_path(&rel)?;
     }
     super::secrets::dev_store_put(&dev_path, &store_uri, value)
 }
