@@ -334,6 +334,11 @@ environment resolved, the bundle pulled from the registry, and its packs loaded.
 **`bundles_active: 0` with a healthy `/healthz` is the signature of a boot that
 came up but found no work** — see §11.
 
+> These fields come from **greentic-start** (`try_probe_response` in its
+> `src/revision_serve.rs`), not from this deployer — the deployer creates the
+> revision and walks away, so the runtime is the only thing that can report what
+> it actually loaded. `tests/gcp_cloudrun_e2e.rs` asserts on them.
+
 Beyond the probes, the worker serves whatever your bundle's `route_binding`
 declares (`/` in the quickstart).
 

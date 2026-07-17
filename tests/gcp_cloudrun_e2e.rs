@@ -381,6 +381,13 @@ fn probe_healthz(url: &str) -> Result<(), String> {
 ///
 /// (Learned the hard way on the webchat demo: a 200 from the static page that
 /// HOSTS a feature is not evidence the feature works.)
+///
+/// **Cross-repo contract.** `schema` / `env_id` / `bundles_active` /
+/// `revisions_active` are emitted by greentic-start, NOT by this repo — see its
+/// `try_probe_response` in `src/revision_serve.rs`. Nothing compiles these field
+/// names together, so a rename there breaks this assertion at runtime only, and
+/// only when armed. This comment is the breadcrumb: if you are here because
+/// `bundles_active` went missing, the rename is in greentic-start.
 fn probe_status(url: &str) -> Value {
     let endpoint = format!("{}/status", url.trim_end_matches('/'));
     let resp = http()
@@ -620,12 +627,8 @@ fn cloudrun_full_lifecycle_against_real_project() {
         );
     }
 
-    // 2b. The WORK proof. `/healthz` is static — it answers 200 from a runtime
-    //     that loaded nothing at all, so it cannot distinguish "booted" from
-    //     "booted and working". `/status` counts what actually resolved, which is
-    //     non-zero only if the seeded environment.json parsed, the bundle pulled
-    //     from GHCR, and its packs loaded. This is the assertion that makes the
-    //     whole seed/D2/D6 chain honest.
+    // 2b. The WORK proof — what `/healthz` structurally cannot tell us. See
+    //     `probe_status`.
     let status = probe_status(&url);
     eprintln!("[gcp-e2e] /status: {status}");
     assert_eq!(
