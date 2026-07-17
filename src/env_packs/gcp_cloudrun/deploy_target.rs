@@ -140,6 +140,12 @@ pub struct ServiceSpec {
     pub access_mode: AccessMode,
     /// Cloud Run `sessionAffinity` (plan D11).
     pub session_affinity: bool,
+    /// Fingerprint of the caller's intent for this revision, stamped onto the
+    /// revision so a later warm can tell "the same warm, retried" from "a
+    /// different configuration under a name already taken" — computed by
+    /// `deployer::revision_intent`. The target owns how it is stored (the real
+    /// one uses a revision label); the seam only carries the value.
+    pub revision_intent: String,
     pub secrets: Vec<SecretMount>,
     /// Literal boot environment variables projected onto the container (plan D6
     /// activation). `GREENTIC_SEED_DIR` triggers greentic-start's seed boot-copy
@@ -149,6 +155,63 @@ pub struct ServiceSpec {
     /// and the revision-identity vars tell the runtime which revision to serve.
     /// Order-preserving so the rendered Service is deterministic.
     pub env: Vec<(String, String)>,
+}
+
+/// The subset of [`ServiceSpec`] Cloud Run renders into the **immutable**
+/// revision (`Service.template`).
+///
+/// Everything else on the spec is Service-level and freely mutable: `traffic`
+/// is an array on the Service, and `access_mode` is not on the Service at all
+/// (it is a separate IAM policy). Two upserts naming the same revision must
+/// agree on every field here — Cloud Run rejects the second otherwise, with
+/// *"Revision named 'X' with different configuration already exists"* (HTTP
+/// 409). Used by [`InMemoryCloudRun`] to model that rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RevisionTemplate {
+    image: String,
+    runtime_service_account: String,
+    scaling: ScalingSpec,
+    session_affinity: bool,
+    revision_intent: String,
+    secrets: Vec<SecretMount>,
+    env: Vec<(String, String)>,
+}
+
+impl RevisionTemplate {
+    fn of(spec: &ServiceSpec) -> Self {
+        // Destructured exhaustively, with no `..` rest pattern, ON PURPOSE: a new
+        // `ServiceSpec` field must not silently default to "not part of the
+        // revision". Adding one breaks this line until someone classifies it,
+        // and a field that IS revision-scoped almost certainly also belongs in
+        // `deployer::revision_intent` — which nothing else would tell them, and
+        // whose omission silently reduces the intent check back to an existence
+        // check.
+        let ServiceSpec {
+            image,
+            runtime_service_account,
+            scaling,
+            session_affinity,
+            revision_intent,
+            secrets,
+            env,
+            // Service-level or non-Service: mutable without a new revision.
+            deployment_id: _,
+            revision_id: _,
+            project: _,
+            region: _,
+            traffic: _,
+            access_mode: _,
+        } = spec;
+        Self {
+            image: image.clone(),
+            runtime_service_account: runtime_service_account.clone(),
+            scaling: scaling.clone(),
+            session_affinity: *session_affinity,
+            revision_intent: revision_intent.clone(),
+            secrets: secrets.clone(),
+            env: env.clone(),
+        }
+    }
 }
 
 /// Live state of a Cloud Run Service returned by [`CloudRunTarget::get_service`].
@@ -164,10 +227,15 @@ pub struct ServiceStatus {
 }
 
 /// Readiness of a single revision, polled during the warm wait.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevisionStatus {
     pub ready: bool,
     pub active: bool,
+    /// The [`ServiceSpec::revision_intent`] this revision was stamped with, or
+    /// `None` for a revision carrying no stamp (created before stamping, or by
+    /// something other than this deployer). `None` is not "matches anything" —
+    /// it is unverifiable, which the deployer treats as a conflict.
+    pub intent: Option<String>,
 }
 
 /// Return of [`CloudRunTarget::upsert_secret`]: the immutable numeric version.
@@ -357,10 +425,18 @@ impl CloudRunTarget for UnconfiguredCloudRunTarget {
 /// Mirrors `InMemoryEcs`: `Mutex`-wrapped `BTreeMap`s plus snapshot accessors
 /// for test assertions. Readiness is instant (revisions report `ready` the
 /// moment they are created) so the warm wait resolves on the first poll.
+///
+/// **Revisions are immutable here, as they are in Cloud Run** — see
+/// [`upsert_service`](InMemoryCloudRun::upsert_service). A fake that silently
+/// accepted a re-render of a live revision would make the conformance suite's
+/// idempotency check vacuous for the one way Cloud Run's warm can realistically
+/// fail to be idempotent.
 #[derive(Debug, Default)]
 pub struct InMemoryCloudRun {
     services: Mutex<BTreeMap<DeploymentId, ServiceStatus>>,
-    revisions: Mutex<BTreeMap<(DeploymentId, RevisionId), RevisionStatus>>,
+    /// Each live revision plus the template it was rendered from, so a
+    /// re-upsert can be checked against Cloud Run's immutability rule.
+    revisions: Mutex<BTreeMap<(DeploymentId, RevisionId), (RevisionStatus, RevisionTemplate)>>,
     secrets: Mutex<BTreeMap<String, (Vec<u8>, u64)>>,
     /// Service accounts granted `secretAccessor` on each secret, so tests can
     /// assert the deployer grants the runtime SA before mounting.
@@ -403,7 +479,12 @@ impl InMemoryCloudRun {
 
     /// Snapshot of every live revision.
     pub fn revisions(&self) -> BTreeMap<(DeploymentId, RevisionId), RevisionStatus> {
-        self.revisions.lock().expect("revisions mutex").clone()
+        self.revisions
+            .lock()
+            .expect("revisions mutex")
+            .iter()
+            .map(|(key, (status, _template))| (*key, status.clone()))
+            .collect()
     }
 
     /// Snapshot of every staged secret: name → (payload, version count).
@@ -427,6 +508,15 @@ impl InMemoryCloudRun {
             .expect("services mutex")
             .get(&deployment_id)
             .map(|s| s.traffic.clone())
+    }
+
+    /// Forget the invoker policy, modelling a warm that died after its upsert
+    /// but before the invoker grant — the state a resumed warm must repair.
+    pub fn forget_invoker_policy(&self, deployment_id: DeploymentId) {
+        self.invoker_policies
+            .lock()
+            .expect("invoker mutex")
+            .remove(&deployment_id);
     }
 
     /// Last-applied invoker access mode for a deployment, if `set_invoker_policy`
@@ -498,6 +588,21 @@ impl CloudRunTarget for InMemoryCloudRun {
             (Some(_), None) => return Err(CloudRunTargetError::PreconditionFailed),
             _ => {}
         }
+        let mut revisions = self.revisions.lock().expect("revisions mutex");
+        let template = RevisionTemplate::of(spec);
+        // Cloud Run revisions are immutable. Re-rendering a live revision name
+        // with any different template is rejected 409 ("Revision named 'X' with
+        // different configuration already exists") — which `real_target`'s
+        // `classify` maps onto `PreconditionFailed`, exactly as returned here.
+        // The collapse is faithful, and it is why the deployer cannot tell this
+        // apart from a stale-etag race by error alone: only the revision's
+        // existence distinguishes them. Re-rendering the SAME template is a
+        // no-op that succeeds, which is what makes a warm retry idempotent.
+        if let Some((_, live_template)) = revisions.get(&(spec.deployment_id, spec.revision_id))
+            && *live_template != template
+        {
+            return Err(CloudRunTargetError::PreconditionFailed);
+        }
         let status = ServiceStatus {
             ready: true,
             url: Some(Self::deterministic_url(spec.deployment_id)),
@@ -505,13 +610,18 @@ impl CloudRunTarget for InMemoryCloudRun {
             etag: self.next_etag(),
         };
         services.insert(spec.deployment_id, status.clone());
-        self.revisions.lock().expect("revisions mutex").insert(
+        revisions.insert(
             (spec.deployment_id, spec.revision_id),
-            RevisionStatus {
-                ready: true,
-                active: true,
-            },
+            (
+                RevisionStatus {
+                    ready: true,
+                    active: true,
+                    intent: Some(spec.revision_intent.clone()),
+                },
+                template,
+            ),
         );
+        drop(revisions);
         self.runtime_service_accounts
             .lock()
             .expect("runtime-sa mutex")
@@ -535,7 +645,7 @@ impl CloudRunTarget for InMemoryCloudRun {
             .lock()
             .expect("revisions mutex")
             .get(&(revision.deployment_id, revision.revision_id))
-            .copied()
+            .map(|(status, _template)| status.clone())
             .ok_or_else(|| {
                 CloudRunTargetError::NotFound(format!(
                     "revision {} not found",
@@ -703,6 +813,7 @@ mod tests {
             },
             access_mode: AccessMode::Public,
             session_affinity: true,
+            revision_intent: "test-intent".to_string(),
             secrets: Vec::new(),
             env: Vec::new(),
         }
