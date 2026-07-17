@@ -973,12 +973,25 @@ pub(crate) fn read_dev_secrets_b64(
         .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)))
 }
 
+use crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS;
+
 /// Store URIs in the env dev-store that are control-plane material and must
-/// NEVER be staged into a runtime seed — currently the bound deployer credential
-/// (`credentials_ref`). A dev-store-backed env persists that credential in the
-/// same `.dev.secrets.env` the seed is built from (`put_credential_material`
-/// writes it at exactly this URI), so a workload holding the shared dev master
-/// key could otherwise decrypt the credential that deployed it.
+/// NEVER be staged into a runtime seed — the bound deployer credential. A
+/// dev-store-backed env persists that credential in the same `.dev.secrets.env`
+/// the seed is built from (`put_credential_material` writes it at exactly this
+/// URI), so a workload holding the shared dev master key could otherwise decrypt
+/// the credential that deployed it.
+///
+/// The denylist is the union of two sources, and needs both:
+///
+/// * **`credentials_ref`** — covers a credential bound at a custom URI.
+/// * **`BOUND_CREDENTIAL_STORE_PATHS`, unconditionally** — covers the *orphan* a
+///   crashed bootstrap leaves behind, which `credentials_ref` by definition does
+///   not name. This is the seed-time half of the invariant in
+///   [`credentials::store_paths`](crate::credentials::store_paths); see that
+///   module doc for why the window exists and why the list is unconditional.
+///   No record of what was written is needed: the minting handlers derive their
+///   ref from those very constants, so the landing URI is deterministic per env.
 ///
 /// Fail-open on a non-store-alignable `credentials_ref` is safe, not a leak: the
 /// credential can only be present in the dev-store if its ref *is*
@@ -986,11 +999,24 @@ pub(crate) fn read_dev_secrets_b64(
 /// un-alignable ref provably points somewhere else (e.g. Vault) and there is
 /// nothing in this file to strip.
 fn staging_excluded_uris(env: &Environment) -> Vec<String> {
-    env.credentials_ref
+    use greentic_deploy_spec::SecretRef;
+
+    let mut uris: Vec<String> = BOUND_CREDENTIAL_STORE_PATHS
+        .iter()
+        .filter_map(|path| {
+            SecretRef::try_new(format!("secret://{}/{path}", env.environment_id.as_str())).ok()
+        })
+        .filter_map(|bound| super::secrets::secret_ref_to_store_uri(&bound).ok())
+        .collect();
+    if let Some(cred) = env
+        .credentials_ref
         .as_ref()
         .and_then(|cred| super::secrets::secret_ref_to_store_uri(cred).ok())
-        .into_iter()
-        .collect()
+        && !uris.contains(&cred)
+    {
+        uris.push(cred);
+    }
+    uris
 }
 
 /// Read the env's local dev-store as raw bytes (the encrypted `.dev.secrets.env`
@@ -6134,23 +6160,137 @@ mod tests {
         }
     }
 
+    /// The store URI a minting env-pack's bootstrap lands its bound credential at.
+    fn known_credential_store_uri(env_id: &str, path: &str) -> String {
+        use greentic_deploy_spec::SecretRef;
+
+        let bound = SecretRef::try_new(format!("secret://{env_id}/{path}")).unwrap();
+        crate::cli::secrets::secret_ref_to_store_uri(&bound).unwrap()
+    }
+
+    /// The H1-orphan window: `bootstrap` writes the credential material (W1) and
+    /// crashes before persisting `credentials_ref` (W2). The env names nothing,
+    /// so a `credentials_ref`-keyed denylist alone yields an empty exclusion and
+    /// the next seed would ship the credential. The well-known paths must be
+    /// excluded regardless.
     #[test]
-    fn staging_excluded_uris_targets_the_bound_deployer_credential() {
+    fn staging_excluded_uris_excludes_known_deployer_paths_without_a_credentials_ref() {
+        let env = make_env("cred");
+        assert!(
+            env.credentials_ref.is_none(),
+            "sanity: this pins the crashed-bootstrap shape"
+        );
+
+        let excluded = staging_excluded_uris(&env);
+        assert!(
+            !BOUND_CREDENTIAL_STORE_PATHS.is_empty(),
+            "sanity: at least the always-compiled k8s path is present"
+        );
+        for path in BOUND_CREDENTIAL_STORE_PATHS {
+            assert!(
+                excluded.contains(&known_credential_store_uri("cred", path)),
+                "an env with NO credentials_ref must still exclude `{path}` — a crashed \
+                 bootstrap can have orphaned material there that nothing names"
+            );
+        }
+    }
+
+    /// The exclusion is a union, not a replacement: a credential bound at a
+    /// custom URI must survive alongside the unconditional well-known paths.
+    #[test]
+    fn staging_excluded_uris_unions_the_bound_credential_with_the_known_paths() {
         use greentic_deploy_spec::SecretRef;
 
         let mut env = make_env("cred");
-        assert!(
-            staging_excluded_uris(&env).is_empty(),
-            "an env with no credentials_ref excludes nothing"
-        );
-
         let cred_ref = SecretRef::try_new("secret://cred/default/_/gcp-deployer/sa_key").unwrap();
         env.credentials_ref = Some(cred_ref.clone());
-        let expected = crate::cli::secrets::secret_ref_to_store_uri(&cred_ref).unwrap();
+
+        let excluded = staging_excluded_uris(&env);
+        assert!(
+            excluded.contains(&crate::cli::secrets::secret_ref_to_store_uri(&cred_ref).unwrap()),
+            "the custom bound credential must still be excluded"
+        );
+        for path in BOUND_CREDENTIAL_STORE_PATHS {
+            assert!(
+                excluded.contains(&known_credential_store_uri("cred", path)),
+                "the well-known `{path}` must be excluded alongside the bound ref"
+            );
+        }
+    }
+
+    /// A credential bound at exactly a well-known path must not be listed twice.
+    #[test]
+    fn staging_excluded_uris_does_not_duplicate_a_credential_bound_at_a_known_path() {
+        use greentic_deploy_spec::SecretRef;
+
+        let path = BOUND_CREDENTIAL_STORE_PATHS[0];
+        let mut env = make_env("cred");
+        env.credentials_ref = Some(SecretRef::try_new(format!("secret://cred/{path}")).unwrap());
+
+        let excluded = staging_excluded_uris(&env);
+        let uri = known_credential_store_uri("cred", path);
         assert_eq!(
-            staging_excluded_uris(&env),
-            vec![expected],
-            "the bound deployer credential's store URI must be excluded from staging"
+            excluded.iter().filter(|u| **u == uri).count(),
+            1,
+            "the same store URI must appear once, not once per source"
+        );
+    }
+
+    /// End-to-end proof of the orphan fix: material sits in the dev-store at a
+    /// well-known deployer path while `credentials_ref` is `None` (bootstrap
+    /// crashed between W1 and W2). The staged seed must not resolve it.
+    #[test]
+    fn read_dev_secrets_bytes_strips_an_orphaned_credential_the_env_never_named() {
+        use greentic_deploy_spec::SecretRef;
+        use greentic_secrets_lib::{DevStore, SecretsStore};
+
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = make_env("cred");
+        assert!(env.credentials_ref.is_none());
+        store.save(&env).unwrap();
+        let env_id = env.environment_id.clone();
+        let env_dir = store.env_dir(&env_id).unwrap();
+
+        // W1 landed; W2 never did — the env names no credential.
+        let orphan_path = BOUND_CREDENTIAL_STORE_PATHS[0];
+        let orphan_ref = SecretRef::try_new(format!("secret://cred/{orphan_path}")).unwrap();
+        crate::cli::secrets::put_credential_material(&env_dir, &orphan_ref, "ORPHANED-TOKEN")
+            .unwrap();
+        let dev_path = crate::cli::secrets::resolve_dev_store_path(&env_dir, None);
+        let runtime_uri = "secrets://cred/acme/_/kv/runtime-token";
+        crate::cli::secrets::dev_store_put(&dev_path, runtime_uri, "runtime-value").unwrap();
+
+        let orphan_uri = crate::cli::secrets::secret_ref_to_store_uri(&orphan_ref).unwrap();
+        assert_eq!(
+            crate::cli::tests_common::dev_store_read(&dev_path, &orphan_uri),
+            b"ORPHANED-TOKEN",
+            "sanity: the source store holds the orphan before staging"
+        );
+
+        let staged = read_dev_secrets_bytes(&store, &env_id)
+            .unwrap()
+            .expect("a dev-store-backed env stages some bytes");
+
+        let staged_dir = tempdir().unwrap();
+        let staged_path = staged_dir.path().join(".dev.secrets.env");
+        std::fs::write(&staged_path, &staged).unwrap();
+        let read_uri = |uri: &str| -> Result<Vec<u8>, ()> {
+            let dev = DevStore::with_path(staged_path.clone()).unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async { dev.get(uri).await.map_err(|_| ()) })
+        };
+        assert_eq!(
+            read_uri(runtime_uri).unwrap(),
+            b"runtime-value",
+            "runtime material must still reach the workload"
+        );
+        assert!(
+            read_uri(&orphan_uri).is_err(),
+            "the staged seed must not resolve a credential orphaned by a crashed bootstrap"
         );
     }
 

@@ -43,7 +43,8 @@ pub(crate) const K8S_RBAC_MANIFEST_FILENAME: &str = "k8s-min-rbac.yaml";
 /// `SecretRef::to_store_uri` — a non-aligned ref (e.g. `…/k8s/deployer-token`)
 /// has no store location and fails to resolve. The bootstrap README advertises
 /// `secret://<env>/{this}` so the documented binding matches what resolves.
-pub(crate) const DEPLOYER_TOKEN_STORE_PATH: &str = "default/_/k8s-deployer/deployer_token";
+pub(crate) const DEPLOYER_TOKEN_STORE_PATH: &str =
+    crate::credentials::store_paths::K8S_DEPLOYER_TOKEN;
 
 /// Name of the in-cluster `core/v1 Secret` the `--bind` path writes the
 /// minted ServiceAccount bearer into, in the deployer namespace. This is the

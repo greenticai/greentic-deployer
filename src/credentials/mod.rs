@@ -28,6 +28,7 @@
 pub mod bootstrap;
 pub mod rotate;
 pub mod rules_export;
+pub mod store_paths;
 pub mod validate;
 
 pub use bootstrap::{
@@ -88,6 +89,32 @@ pub trait DeployerCredentials: std::fmt::Debug + Send + Sync {
     /// actually consumed) and would leave a sentinel `credentials_ref`
     /// pointing at nothing.
     fn bootstrap(&self, input: &BootstrapInput<'_>) -> Result<BootstrapOutcome, BootstrapError>;
+
+    /// The store-relative path at which this deployer's
+    /// [`bootstrap`](Self::bootstrap) lands the bound credential material it
+    /// mints, or `None` for a bootstrap that mints none (the render-only /
+    /// local paths — e.g. GCP Cloud Run, which returns
+    /// `bound_credentials_ref: None`).
+    ///
+    /// Declaring it is load-bearing, not informational — it is what lets the
+    /// runtime-seed denylist cover this handler's material. See the
+    /// [`store_paths`] module doc for the invariant and why it exists.
+    ///
+    /// Implementations MUST return the same constant their `bootstrap` builds
+    /// its `bound_credentials_ref` from, and it MUST live in [`store_paths`] so
+    /// it stays compiled in regardless of provider SDK features. A conformance
+    /// test walks the registry and fails on a declared path missing from
+    /// [`store_paths::BOUND_CREDENTIAL_STORE_PATHS`].
+    ///
+    /// Defaults to `None` — "mints nothing" — keeping this trait
+    /// source-compatible for external implementors. That default is safe rather
+    /// than merely convenient because it is not the last line of defence:
+    /// [`run_bootstrap`] refuses to write material whose landing path is not
+    /// declared here *and* covered, so a handler that mints but inherits the
+    /// default fails closed instead of orphaning a credential.
+    fn bound_credential_store_path(&self) -> Option<&'static str> {
+        None
+    }
 
     /// Best-effort compensating cleanup for a bootstrap that wrote durable
     /// credential material to a REMOTE backend (e.g. the K8s `--bind` path
