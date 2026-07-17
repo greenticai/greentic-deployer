@@ -2830,6 +2830,7 @@ dependencies = [
  "google-cloud-lro",
  "google-cloud-run-v2",
  "google-cloud-secretmanager-v1",
+ "google-cloud-type",
  "google-cloud-wkt",
  "greentic-bundle",
  "greentic-config",

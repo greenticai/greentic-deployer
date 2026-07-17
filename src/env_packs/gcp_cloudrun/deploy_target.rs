@@ -238,10 +238,21 @@ pub struct RevisionStatus {
     pub intent: Option<String>,
 }
 
-/// Return of [`CloudRunTarget::upsert_secret`]: the immutable numeric version.
+/// Return of [`CloudRunTarget::add_secret_version`]: the immutable numeric
+/// version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretVersion {
     pub version: String,
+}
+
+/// Return of [`CloudRunTarget::ensure_secret`] — a fact, not a judgement: the
+/// deployer decides what a given owner means (`deployer::classify_owner`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnsuredSecret {
+    /// This call created the secret, carrying our stamp.
+    Created,
+    /// It was already there, stamped by this owner (`None` = no stamp at all).
+    Existed { owner: Option<String> },
 }
 
 /// One staged secret as [`InMemoryCloudRun`] holds it.
@@ -251,7 +262,7 @@ pub struct StoredSecret {
     pub payload: Vec<u8>,
     /// How many versions have been added — what a warm's staging spends.
     pub versions: u64,
-    /// The owner stamp `upsert_secret` created the secret with, or `None` for a
+    /// The owner stamp `ensure_secret` created the secret with, or `None` for a
     /// secret created before ownership stamping. See
     /// [`CloudRunTarget::get_secret_owner`].
     pub owner: Option<String>,
@@ -345,18 +356,29 @@ pub trait CloudRunTarget: std::fmt::Debug + Send + Sync {
     /// see `deployer::secret_ownership`.
     async fn get_secret_owner(&self, name: &str) -> Result<Option<String>, CloudRunTargetError>;
 
-    /// Create-or-update a Secret Manager secret and add a new version,
-    /// returning the immutable numeric version resource (plan D6). Never the
-    /// `latest` alias.
+    /// Create `name` stamped as `owner`, or report the stamp of the secret
+    /// already there. Adds no version and never rewrites an existing secret's
+    /// labels — an adopted secret keeps the owner it was created with.
     ///
-    /// `owner` is stamped onto the secret **at create only**: an existing secret
-    /// is adopted as-is, never re-stamped. Re-stamping would open a read→update
-    /// race against a concurrent warm, and it would buy nothing — the ownership
-    /// check upstream has already established this secret is safe to write to.
-    async fn upsert_secret(
+    /// Create-or-report is ONE operation on purpose. Probing ownership and then
+    /// writing cannot be made safe from two processes: both read `Absent`, one
+    /// creates, and the other's write lands in the winner's secret. Losing the
+    /// create race must therefore surface as [`Existed`](EnsuredSecret::Existed)
+    /// carrying the winner's stamp, not as a silent adoption.
+    async fn ensure_secret(
         &self,
         name: &str,
         owner: &str,
+    ) -> Result<EnsuredSecret, CloudRunTargetError>;
+
+    /// Add a new immutable version to an existing secret, returning its numeric
+    /// version (plan D6). Never the `latest` alias. The caller must have cleared
+    /// ownership through [`ensure_secret`](CloudRunTarget::ensure_secret) first:
+    /// this writes the env's seed, so a version added to another environment's
+    /// secret is readable by them and cannot be taken back.
+    async fn add_secret_version(
+        &self,
+        name: &str,
         payload: &[u8],
     ) -> Result<SecretVersion, CloudRunTargetError>;
 
@@ -431,10 +453,16 @@ impl CloudRunTarget for UnconfiguredCloudRunTarget {
     async fn get_secret_owner(&self, _name: &str) -> Result<Option<String>, CloudRunTargetError> {
         Err(CloudRunTargetError::Unconfigured)
     }
-    async fn upsert_secret(
+    async fn ensure_secret(
         &self,
         _name: &str,
         _owner: &str,
+    ) -> Result<EnsuredSecret, CloudRunTargetError> {
+        Err(CloudRunTargetError::Unconfigured)
+    }
+    async fn add_secret_version(
+        &self,
+        _name: &str,
         _payload: &[u8],
     ) -> Result<SecretVersion, CloudRunTargetError> {
         Err(CloudRunTargetError::Unconfigured)
@@ -783,30 +811,49 @@ impl CloudRunTarget for InMemoryCloudRun {
             .ok_or_else(|| CloudRunTargetError::NotFound(format!("secret `{name}`")))
     }
 
-    /// Deliberately does NOT reject a write to a secret owned by another
-    /// environment: real Secret Manager has no such rule — it accepts a version
-    /// from anyone holding `secretmanager.versions.add`. Ownership is this
-    /// deployer's policy, not the server's, so enforcing it here would model a
-    /// constraint that does not exist and move the tested behaviour out of the
-    /// deployer, where the refusal actually lives. The fake's honest job is the
-    /// stamp round-trip: `owner` is recorded at create and read back by
-    /// [`get_secret_owner`](CloudRunTarget::get_secret_owner).
-    async fn upsert_secret(
+    async fn ensure_secret(
         &self,
         name: &str,
         owner: &str,
+    ) -> Result<EnsuredSecret, CloudRunTargetError> {
+        let mut secrets = self.secrets.lock().expect("secrets mutex");
+        match secrets.get(name) {
+            // Stamped at create only — an adopted secret keeps the owner it was
+            // created with, exactly as the real target never rewrites labels.
+            Some(live) => Ok(EnsuredSecret::Existed {
+                owner: live.owner.clone(),
+            }),
+            None => {
+                secrets.insert(
+                    name.to_string(),
+                    StoredSecret {
+                        payload: Vec::new(),
+                        versions: 0,
+                        owner: Some(owner.to_string()),
+                    },
+                );
+                Ok(EnsuredSecret::Created)
+            }
+        }
+    }
+
+    /// Deliberately does NOT re-check ownership: real Secret Manager has no such
+    /// rule — it accepts a version from anyone holding
+    /// `secretmanager.versions.add`. Ownership is this deployer's policy, not
+    /// the server's, so enforcing it here would model a constraint that does not
+    /// exist and move the tested behaviour out of the deployer, where the
+    /// refusal actually lives. What the fake owes is the honest failure mode: a
+    /// version added to a foreign secret SUCCEEDS, which is precisely why the
+    /// deployer must refuse before calling this.
+    async fn add_secret_version(
+        &self,
+        name: &str,
         payload: &[u8],
     ) -> Result<SecretVersion, CloudRunTargetError> {
         let mut secrets = self.secrets.lock().expect("secrets mutex");
         let entry = secrets
-            .entry(name.to_string())
-            .or_insert_with(|| StoredSecret {
-                payload: Vec::new(),
-                versions: 0,
-                // Stamped at create only — an existing secret keeps the owner it was
-                // created with, exactly as the real target never rewrites labels.
-                owner: Some(owner.to_string()),
-            });
+            .get_mut(name)
+            .ok_or_else(|| CloudRunTargetError::NotFound(format!("secret `{name}`")))?;
         entry.payload = payload.to_vec();
         entry.versions += 1;
         Ok(SecretVersion {
@@ -900,7 +947,7 @@ mod tests {
             Err(CloudRunTargetError::Unconfigured)
         ));
         assert!(matches!(
-            t.upsert_secret("s", "owner", b"x").await,
+            t.ensure_secret("s", "owner").await,
             Err(CloudRunTargetError::Unconfigured)
         ));
     }
@@ -1011,14 +1058,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_secret_returns_incrementing_versions() {
+    async fn add_secret_version_returns_incrementing_versions() {
         let t = InMemoryCloudRun::default();
+        t.ensure_secret("gtc-local-environment", "local-1234abcd")
+            .await
+            .unwrap();
         let v1 = t
-            .upsert_secret("gtc-local-environment", "local-1234abcd", b"one")
+            .add_secret_version("gtc-local-environment", b"one")
             .await
             .unwrap();
         let v2 = t
-            .upsert_secret("gtc-local-environment", "local-1234abcd", b"two")
+            .add_secret_version("gtc-local-environment", b"two")
             .await
             .unwrap();
         assert_eq!(v1.version, "1");
@@ -1036,10 +1086,16 @@ mod tests {
     /// `credentials::VALIDATED_GCP_PERMISSIONS`, so a re-stamp would be
     /// permitted, just wrong.
     #[tokio::test]
-    async fn upsert_secret_stamps_the_owner_at_create_only() {
+    async fn ensure_secret_stamps_the_owner_at_create_only() {
         let t = InMemoryCloudRun::default();
-        t.upsert_secret("s", "first-owner", b"one").await.unwrap();
-        t.upsert_secret("s", "second-owner", b"two").await.unwrap();
+        t.ensure_secret("s", "first-owner").await.unwrap();
+        assert_eq!(
+            t.ensure_secret("s", "second-owner").await.unwrap(),
+            EnsuredSecret::Existed {
+                owner: Some("first-owner".to_string())
+            },
+            "the loser of a create race is told who won, not silently adopted in"
+        );
         assert_eq!(
             t.secrets()["s"].owner.as_deref(),
             Some("first-owner"),
@@ -1049,7 +1105,11 @@ mod tests {
         // A legacy secret (created before stamping) stays unstamped on adopt —
         // `None` must keep reading as legacy, not flip to the adopter's stamp.
         t.seed_secret("legacy", None);
-        t.upsert_secret("legacy", "adopter", b"x").await.unwrap();
+        assert_eq!(
+            t.ensure_secret("legacy", "adopter").await.unwrap(),
+            EnsuredSecret::Existed { owner: None },
+        );
+        t.add_secret_version("legacy", b"x").await.unwrap();
         assert_eq!(t.secrets()["legacy"].owner, None);
         assert_eq!(t.get_secret_owner("legacy").await.unwrap(), None);
     }
@@ -1057,7 +1117,10 @@ mod tests {
     #[tokio::test]
     async fn grant_secret_accessor_is_idempotent_and_delete_removes_secret() {
         let t = InMemoryCloudRun::default();
-        t.upsert_secret("gtc-local-environment", "local-1234abcd", b"cfg")
+        t.ensure_secret("gtc-local-environment", "local-1234abcd")
+            .await
+            .unwrap();
+        t.add_secret_version("gtc-local-environment", b"cfg")
             .await
             .unwrap();
         let sa = "gtc-local-runtime@proj.iam.gserviceaccount.com";

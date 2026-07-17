@@ -74,6 +74,7 @@ deploy-gcp-cloudrun = [
     "dep:google-cloud-auth",
     "dep:google-cloud-gax",
     "dep:google-cloud-iam-v1",
+    "dep:google-cloud-type",
     "dep:google-cloud-lro",
     "dep:google-cloud-wkt",
     "dep:bytes",
@@ -338,6 +339,14 @@ default-features = false
 
 # IAM Policy / Binding / GetPolicyOptions for the Cloud Run invoker binding (D12).
 [dependencies.google-cloud-iam-v1]
+version = "1"
+optional = true
+default-features = false
+
+# `Expr`, the CEL condition on an `iam::Binding`. Already in the tree via
+# google-cloud-iam-v1, which does not re-export it; declared so the accessor
+# grant's conditional-binding tests can construct one.
+[dependencies.google-cloud-type]
 version = "1"
 optional = true
 default-features = false

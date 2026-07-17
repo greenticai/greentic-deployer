@@ -42,8 +42,8 @@ use crate::env_packs::deployer::{
 
 use super::GcpCloudRunDeployerHandler;
 use super::deploy_target::{
-    AccessMode, CloudRunTargetError, RevisionRef, ScalingSpec, SecretMount, SecretMountItem,
-    ServiceRef, ServiceSpec, TrafficTarget,
+    AccessMode, CloudRunTargetError, EnsuredSecret, RevisionRef, ScalingSpec, SecretMount,
+    SecretMountItem, ServiceRef, ServiceSpec, TrafficTarget,
 };
 
 /// Default runtime image (plan D2/D3): the public GHCR distroless image Cloud
@@ -242,20 +242,28 @@ pub fn environment_secret_name(secret_prefix: &str) -> String {
 }
 
 /// The value stamped as a staged secret's owner: a GCP-label-safe rendering of
-/// `env_id` that is *injective* — distinct env ids never collide.
+/// `env_id`.
 ///
-/// Both halves are load-bearing. GCP label values admit only `[a-z0-9_-]{0,63}`
-/// while [`EnvId`](greentic_types::EnvId) also admits uppercase and `.`, so the
-/// raw id cannot be stamped. Folding it into the charset alone is not enough:
-/// `a.b` and `a-b` would render identically, two different environments would
-/// read as one owner, and the ownership check would wave through exactly the
-/// cross-environment write it exists to stop. The hash of the ORIGINAL id keeps
-/// the stamp injective; the readable prefix is what an operator sees in the
-/// console and in [`secret_conflict`]'s message.
+/// GCP label values admit only `[a-z0-9_-]{0,63}` while
+/// [`EnvId`](greentic_types::EnvId) also admits uppercase and `.`, so the raw id
+/// cannot be stamped. **The digest is the identity; the readable prefix is
+/// decoration** for the console and [`secret_conflict`]'s message. Folding the
+/// id into the charset is lossy — `a.b` and `a-b` render identically — so a
+/// stamp built from the fold alone would read two environments as one owner and
+/// wave through exactly the cross-environment write the check exists to stop.
+/// The digest is taken over the ORIGINAL id, which is what keeps them apart.
+///
+/// 26 bytes of SHA-256 (208 bits, 52 hex chars — the most that fits beside a
+/// 10-char prefix inside the 63-char limit). Collision-resistant, not injective:
+/// two ids CAN in principle share a stamp, and one that did would be classified
+/// [`SecretOwnership::Ours`]. At 208 bits that is infeasible to hit by accident
+/// or to construct. Do not shorten it — an earlier 32-bit digest here had
+/// findable collisions between two valid env ids, which is a full bypass of the
+/// ownership boundary.
 pub(crate) fn env_owner_stamp(env_id: &str) -> String {
     use sha2::{Digest, Sha256};
-    let digest = hex::encode(&Sha256::digest(env_id.as_bytes())[..4]);
-    // `EnvId` is ASCII-only, so chars are bytes and 54 + '-' + 8 <= 63.
+    let digest = hex::encode(&Sha256::digest(env_id.as_bytes())[..26]);
+    // `EnvId` is ASCII-only, so chars are bytes and 10 + '-' + 52 == 63.
     let readable: String = env_id
         .to_ascii_lowercase()
         .chars()
@@ -266,7 +274,7 @@ pub(crate) fn env_owner_stamp(env_id: &str) -> String {
                 '-'
             }
         })
-        .take(54)
+        .take(10)
         .collect();
     format!("{readable}-{digest}")
 }
@@ -290,16 +298,29 @@ pub(crate) enum SecretOwnership {
     Conflict { owner: String },
 }
 
-/// Read `name`'s owner stamp and classify it for `env_id`.
+/// Classify a live secret's owner stamp against `env_id`'s. The whole ownership
+/// decision, kept as one pure function: both the warm (via
+/// [`CloudRunTarget::ensure_secret`]) and the teardown (via
+/// [`secret_ownership`]) route through it, so the two cannot drift into
+/// disagreeing about who owns what.
+pub(crate) fn classify_owner(live: Option<String>, env_id: &str) -> SecretOwnership {
+    match live {
+        Some(live) if live == env_owner_stamp(env_id) => SecretOwnership::Ours,
+        Some(live) => SecretOwnership::Conflict { owner: live },
+        None => SecretOwnership::Legacy,
+    }
+}
+
+/// Read `name`'s owner stamp and classify it for `env_id`, WITHOUT creating it.
+/// The teardown's probe — the warm uses [`CloudRunTarget::ensure_secret`], which
+/// cannot be split into probe-then-create without reopening the create race.
 pub(crate) async fn secret_ownership(
     target: &dyn super::deploy_target::CloudRunTarget,
     name: &str,
     env_id: &str,
 ) -> Result<SecretOwnership, DeployerError> {
     match target.get_secret_owner(name).await {
-        Ok(Some(owner)) if owner == env_owner_stamp(env_id) => Ok(SecretOwnership::Ours),
-        Ok(Some(owner)) => Ok(SecretOwnership::Conflict { owner }),
-        Ok(None) => Ok(SecretOwnership::Legacy),
+        Ok(live) => Ok(classify_owner(live, env_id)),
         Err(CloudRunTargetError::NotFound(_)) => Ok(SecretOwnership::Absent),
         Err(e) => Err(provider(e)),
     }
@@ -862,32 +883,31 @@ impl GcpCloudRunDeployerHandler {
                 "serializing environment.json for seed staging: {e}"
             ))
         })?;
-        // Refuse before the first write if the secret is another environment's
-        // (H1): `secret_prefix` is a free-text answer, so two envs in one project
-        // can resolve to one secret name while keeping DIFFERENT runtime service
-        // accounts (`gtc-{env}-runtime@`) — staging on would hand our SA read
-        // over their dev-store. Probed only here, on the create path: the
-        // revision-exists path never stages, so it has nothing to protect.
-        let owner = env_owner_stamp(env.environment_id.as_str());
-        match secret_ownership(
-            self.target.as_ref(),
-            secret_name,
-            env.environment_id.as_str(),
-        )
-        .await?
-        {
-            SecretOwnership::Conflict { owner: live } => {
-                return Err(secret_conflict(
-                    secret_name,
-                    &live,
-                    env.environment_id.as_str(),
-                ));
-            }
-            SecretOwnership::Absent | SecretOwnership::Ours | SecretOwnership::Legacy => {}
+        // Claim the secret before the first write, and refuse if it is another
+        // environment's (H1): `secret_prefix` is a free-text answer, so two envs
+        // in one project can resolve to one secret name while keeping DIFFERENT
+        // runtime service accounts (`gtc-{env}-runtime@`) — staging on would hand
+        // our SA read over their dev-store. Claim-then-write rather than
+        // probe-then-write: two warms racing would both probe `Absent`, and the
+        // loser's seed would land in the winner's secret. Only on the create
+        // path — the revision-exists path never stages, so it has nothing to
+        // protect.
+        let env_id = env.environment_id.as_str();
+        let ensured = self
+            .target
+            .ensure_secret(secret_name, &env_owner_stamp(env_id))
+            .await
+            .map_err(provider)?;
+        let ownership = match ensured {
+            EnsuredSecret::Created => SecretOwnership::Ours,
+            EnsuredSecret::Existed { owner } => classify_owner(owner, env_id),
+        };
+        if let SecretOwnership::Conflict { owner: live } = ownership {
+            return Err(secret_conflict(secret_name, &live, env_id));
         }
         let env_version = self
             .target
-            .upsert_secret(secret_name, &owner, &environment_json)
+            .add_secret_version(secret_name, &environment_json)
             .await
             .map_err(provider)?;
         let mut secret_items = vec![SecretMountItem {
@@ -902,7 +922,7 @@ impl GcpCloudRunDeployerHandler {
         if let Some(dev_bytes) = &self.dev_secrets {
             let dev_version = self
                 .target
-                .upsert_secret(secret_name, &owner, dev_bytes)
+                .add_secret_version(secret_name, dev_bytes)
                 .await
                 .map_err(provider)?;
             secret_items.push(SecretMountItem {
@@ -1180,13 +1200,19 @@ mod tests {
         ) -> Result<Option<String>, CloudRunTargetError> {
             self.inner.get_secret_owner(name).await
         }
-        async fn upsert_secret(
+        async fn ensure_secret(
             &self,
             name: &str,
             owner: &str,
+        ) -> Result<EnsuredSecret, CloudRunTargetError> {
+            self.inner.ensure_secret(name, owner).await
+        }
+        async fn add_secret_version(
+            &self,
+            name: &str,
             payload: &[u8],
         ) -> Result<SecretVersion, CloudRunTargetError> {
-            self.inner.upsert_secret(name, owner, payload).await
+            self.inner.add_secret_version(name, payload).await
         }
         async fn grant_secret_accessor(
             &self,
@@ -1619,32 +1645,87 @@ mod tests {
         );
     }
 
-    /// H1. The owner stamp must be injective. `EnvId` admits `.` and uppercase,
-    /// which GCP label values do not, so the stamp folds the id into GCP's
-    /// charset — and a fold alone would map `a.b` and `a-b` onto one owner,
-    /// letting each pass the other's ownership check. The hash is what keeps
-    /// them apart.
+    /// H1. `EnvId` admits `.` and uppercase, which GCP label values do not, so
+    /// the stamp folds the id into GCP's charset — and a fold alone maps `a.b`
+    /// and `a-b` onto one owner, letting each pass the other's ownership check.
+    /// The digest over the ORIGINAL id is what keeps them apart.
     #[test]
     fn owner_stamps_separate_env_ids_that_fold_to_the_same_label() {
-        for (left, right) in [("a.b", "a-b"), ("Prod", "prod"), ("x_y", "x.y")] {
+        for (left, right) in [
+            ("a.b", "a-b"),
+            ("Prod", "prod"),
+            ("x_y", "x.y"),
+            // Both fold to 10 `a`s, so ONLY the digest separates them — and both
+            // exceed the readable prefix, proving it is not carrying the identity.
+            ("aaaaaaaaaaaa1", "aaaaaaaaaaaa2"),
+            // Found against a 4-byte digest, where these two collided outright.
+            // Same fold, same 32-bit prefix: a full bypass of the boundary.
+            (
+                "AAAAAaaaAaAaAAAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "AAaAAAaAAaAaAaaAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        ] {
             assert_ne!(
                 env_owner_stamp(left),
                 env_owner_stamp(right),
                 "`{left}` and `{right}` are different environments and must not share an owner"
             );
         }
-        let stamp = env_owner_stamp("My.Env");
+        // A GCP label value: `[a-z0-9_-]` and at most 63 chars, for the longest
+        // readable prefix the stamp can carry.
+        let stamp = env_owner_stamp("My.Env.Is.Really.Quite.Long");
         assert!(
             stamp
                 .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
-                && stamp.len() <= 63,
-            "the stamp must be a valid GCP label value, got `{stamp}`"
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'),
+            "not a valid GCP label value: `{stamp}`"
+        );
+        assert_eq!(
+            stamp.len(),
+            63,
+            "the stamp must use, and not exceed, the limit"
         );
         assert_eq!(
             env_owner_stamp("prod"),
             env_owner_stamp("prod"),
             "the same env must stamp the same value on every warm, or it locks itself out"
+        );
+    }
+
+    /// H1. Two warms racing to create the same secret name. Both find it absent,
+    /// so neither can refuse on a prior probe — only claiming it atomically
+    /// separates them. The loser must not stage: its seed would land in the
+    /// winner's secret, readable by them and impossible to take back.
+    #[tokio::test]
+    async fn warm_refuses_when_another_environment_wins_the_create_race() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let params = params_from_answers(&env, None).unwrap();
+        let secret_name = environment_secret_name(&params.secret_prefix);
+
+        // The rival's create landed first — what our warm's ensure_secret meets.
+        target
+            .ensure_secret(&secret_name, &env_owner_stamp("rival-env"))
+            .await
+            .unwrap();
+
+        let err = handler
+            .warm_revision(&env, env.revisions[0].revision_id, None)
+            .await
+            .expect_err("losing the create race must refuse, not adopt");
+        assert!(
+            err.to_string().contains("belongs to environment"),
+            "got: {err}"
+        );
+        assert_eq!(
+            target.secrets()[&secret_name].versions,
+            0,
+            "the race loser must add NO version to the winner's secret"
+        );
+        assert_eq!(
+            target.secrets()[&secret_name].owner,
+            Some(env_owner_stamp("rival-env")),
+            "and must not restamp it as its own"
         );
     }
 
@@ -1655,7 +1736,7 @@ mod tests {
     /// That it is adopted *without being re-stamped* is not asserted here: the
     /// fake stamps at create only, so no deployer-level assertion could fail. It
     /// is pinned as a seam contract in
-    /// `deploy_target::upsert_secret_stamps_the_owner_at_create_only`.
+    /// `deploy_target::ensure_secret_stamps_the_owner_at_create_only`.
     #[tokio::test]
     async fn warm_adopts_a_legacy_unstamped_secret() {
         let (handler, target) = handler_with_fake();
