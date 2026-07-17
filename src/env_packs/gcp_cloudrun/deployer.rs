@@ -898,11 +898,11 @@ impl GcpCloudRunDeployerHandler {
             .ensure_secret(secret_name, &env_owner_stamp(env_id))
             .await
             .map_err(provider)?;
-        let ownership = match ensured {
-            EnsuredSecret::Created => SecretOwnership::Ours,
-            EnsuredSecret::Existed { owner } => classify_owner(owner, env_id),
-        };
-        if let SecretOwnership::Conflict { owner: live } = ownership {
+        // A secret we just created is ours by construction; only one we found
+        // has an owner to answer for.
+        if let EnsuredSecret::Existed { owner } = ensured
+            && let SecretOwnership::Conflict { owner: live } = classify_owner(owner, env_id)
+        {
             return Err(secret_conflict(secret_name, &live, env_id));
         }
         let env_version = self
@@ -1613,15 +1613,21 @@ mod tests {
     /// accounts do NOT collide (`gtc-{env}-runtime@`), so staging on would grant
     /// this env's SA `secretAccessor` over every version of the other's secret —
     /// including the dev-store, which holds that env's whole credential set.
+    ///
+    /// Seeded through the real seam op rather than [`InMemoryCloudRun::seed_secret`],
+    /// so this covers the create race too: whether the rival was there all along
+    /// or won the race by a millisecond, it reaches the deployer as the same
+    /// `Existed { owner }` and must be refused the same way.
     #[tokio::test]
     async fn warm_refuses_a_secret_another_environment_owns() {
         let (handler, target) = handler_with_fake();
         let env = build_fixture_env();
         let params = params_from_answers(&env, None).unwrap();
         let secret_name = environment_secret_name(&params.secret_prefix);
-        // Another env got to this name first, exactly as a copied
-        // `secret_prefix` answer would produce.
-        target.seed_secret(&secret_name, Some(&env_owner_stamp("other-env")));
+        let rival = env_owner_stamp("other-env");
+        // The rival's create landed first — a copied `secret_prefix` answer, or
+        // a concurrent warm that beat us to the name.
+        target.ensure_secret(&secret_name, &rival).await.unwrap();
 
         let err = handler
             .warm_revision(&env, env.revisions[0].revision_id, None)
@@ -1635,13 +1641,18 @@ mod tests {
         );
         assert_eq!(
             target.secrets()[&secret_name].versions,
-            1,
+            0,
             "refuse BEFORE writing — a version added here is our seed sitting in \
              their secret, readable by them, and no error can take it back"
         );
         assert!(
             target.secret_accessors_for(&secret_name).is_none(),
             "and before granting — the grant is the actual credential leak"
+        );
+        assert_eq!(
+            target.secrets()[&secret_name].owner,
+            Some(rival),
+            "and must not restamp the rival's secret as its own"
         );
     }
 
@@ -1689,43 +1700,6 @@ mod tests {
             env_owner_stamp("prod"),
             env_owner_stamp("prod"),
             "the same env must stamp the same value on every warm, or it locks itself out"
-        );
-    }
-
-    /// H1. Two warms racing to create the same secret name. Both find it absent,
-    /// so neither can refuse on a prior probe — only claiming it atomically
-    /// separates them. The loser must not stage: its seed would land in the
-    /// winner's secret, readable by them and impossible to take back.
-    #[tokio::test]
-    async fn warm_refuses_when_another_environment_wins_the_create_race() {
-        let (handler, target) = handler_with_fake();
-        let env = build_fixture_env();
-        let params = params_from_answers(&env, None).unwrap();
-        let secret_name = environment_secret_name(&params.secret_prefix);
-
-        // The rival's create landed first — what our warm's ensure_secret meets.
-        target
-            .ensure_secret(&secret_name, &env_owner_stamp("rival-env"))
-            .await
-            .unwrap();
-
-        let err = handler
-            .warm_revision(&env, env.revisions[0].revision_id, None)
-            .await
-            .expect_err("losing the create race must refuse, not adopt");
-        assert!(
-            err.to_string().contains("belongs to environment"),
-            "got: {err}"
-        );
-        assert_eq!(
-            target.secrets()[&secret_name].versions,
-            0,
-            "the race loser must add NO version to the winner's secret"
-        );
-        assert_eq!(
-            target.secrets()[&secret_name].owner,
-            Some(env_owner_stamp("rival-env")),
-            "and must not restamp it as its own"
         );
     }
 

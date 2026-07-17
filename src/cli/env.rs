@@ -1682,27 +1682,26 @@ impl crate::environment::ProviderTeardown for CloudRunProviderTeardown {
             let ownership = secret_ownership(&target, &secret_name, &env_id)
                 .await
                 .map_err(|e| StoreError::ProviderTeardown(e.to_string()))?;
-            if let SecretOwnership::Conflict { owner } = ownership {
-                return Ok((
-                    deleted,
+            // Deleted or skipped, never both.
+            let (deleted_secrets, skipped_secrets) = match ownership {
+                SecretOwnership::Conflict { owner } => (
                     vec![],
                     vec![json!({
                         "secret": secret_name,
                         "owned_by": owner,
                         "reason": "belongs to another environment; left intact",
                     })],
-                ));
-            }
-            target.delete_secret(&secret_name).await.map_err(|e| {
-                StoreError::ProviderTeardown(format!(
-                    "deleting Secret Manager secret `{secret_name}`: {e}"
-                ))
-            })?;
-            Ok::<(Vec<String>, Vec<String>, Vec<Value>), StoreError>((
-                deleted,
-                vec![secret_name],
-                vec![],
-            ))
+                ),
+                SecretOwnership::Absent | SecretOwnership::Ours | SecretOwnership::Legacy => {
+                    target.delete_secret(&secret_name).await.map_err(|e| {
+                        StoreError::ProviderTeardown(format!(
+                            "deleting Secret Manager secret `{secret_name}`: {e}"
+                        ))
+                    })?;
+                    (vec![secret_name], vec![])
+                }
+            };
+            Ok::<_, StoreError>((deleted, deleted_secrets, skipped_secrets))
         })?;
 
         Ok(json!({
