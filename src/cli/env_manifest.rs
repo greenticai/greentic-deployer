@@ -43,6 +43,12 @@ pub struct EnvManifest {
     pub environment: ManifestEnvironment,
     /// `"bootstrap"` seeds the env trust root with the local operator key
     /// (idempotent). Absent = skip the step.
+    ///
+    /// Operator-authored manifests only. A manifest that arrives as the *target*
+    /// of a signed update plan may not carry this block: a plan that re-points
+    /// the trust root gains permanent signing authority, so
+    /// `op updates publish` strips it at sign time and
+    /// `updates::check_applyable_manifest` rejects it at apply time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_root: Option<TrustRootDirective>,
     /// Dev-store secret entries — always-put (`op secrets get` is
