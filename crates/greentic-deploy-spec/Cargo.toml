@@ -1,6 +1,6 @@
 [package]
 name = "greentic-deploy-spec"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic deployment object-model schemas (Environment, Revision, TrafficSplit, BundleDeployment, Credentials, PackConfig, RuntimeConfig)"
