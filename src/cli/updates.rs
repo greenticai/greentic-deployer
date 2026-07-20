@@ -1510,6 +1510,18 @@ fn check_applyable_manifest(
                 .to_string(),
         ));
     }
+    // Same invariant for the trust root: a plan that seeds or rotates the
+    // env's signing-key trust anchor would gain permanent signing authority.
+    // Stripped at sign time by `strip_non_applyable_blocks`; refused here as
+    // the fail-closed backstop.
+    if manifest.trust_root.is_some() {
+        return Err(OpError::InvalidArgument(
+            "update plan target declares a `trust_root` block: a plan may not \
+             re-point the trust root it is verified against. Configure the \
+             trust root with `op env apply`."
+                .to_string(),
+        ));
+    }
     // secrets[] / messaging_endpoints[] both write dev-store secret material;
     // allow them only when a failed apply's rollback (the P0b snapshot) would
     // undo those writes — i.e. the effective sink is the snapshotted dev-store.
@@ -2248,7 +2260,8 @@ pub fn plan_build(
             "key_id": signed.key_id,
             "plan_path": plan_path.display().to_string(),
             "sig_path": sig_path.display().to_string(),
-            "stripped_updates_block": signed.stripped_updates_block,
+            "stripped_updates_block": signed.stripped.updates,
+            "stripped_trust_root": signed.stripped.trust_root,
         }),
     ))
 }
@@ -2277,20 +2290,39 @@ struct SignedPlan {
     envelope_bytes: Vec<u8>,
     plan_sha256: String,
     key_id: String,
-    /// The target manifest declared an `updates` block and it was removed before
-    /// signing — reported so the operator learns their channel policy did not
-    /// ship inside the plan.
-    stripped_updates_block: bool,
+    /// Which non-applyable blocks were stripped from the target before signing.
+    stripped: StrippedBlocks,
 }
 
-/// Remove an `updates` block from a plan target, returning whether one was
-/// there. The update channel is operator-local state: a plan that could
-/// re-point `plan_endpoint` would control every plan that follows it. Stripped
-/// here at sign time; [`check_applyable_manifest`] refuses it at apply time.
-fn strip_updates_block(target: &mut serde_json::Value) -> bool {
-    target
-        .as_object_mut()
-        .is_some_and(|obj| obj.remove("updates").is_some())
+/// Remove blocks that [`check_applyable_manifest`] would reject from a plan
+/// target, returning which ones were present. Stripped here at sign time;
+/// `check_applyable_manifest` refuses them at apply time as the fail-closed
+/// backstop for plans built any other way.
+///
+/// Currently strips:
+/// - `updates` — the update channel is operator-local state; a plan that
+///   re-points `plan_endpoint` controls every plan that follows it.
+/// - `trust_root` — seeds or rotates the env's signing-key trust anchor; a
+///   plan that re-points it gains permanent signing authority.
+fn strip_non_applyable_blocks(target: &mut serde_json::Value) -> StrippedBlocks {
+    let obj = target.as_object_mut();
+    let updates = obj.as_ref().is_some_and(|o| o.contains_key("updates"));
+    let trust_root = obj.as_ref().is_some_and(|o| o.contains_key("trust_root"));
+    if let Some(o) = obj {
+        o.remove("updates");
+        o.remove("trust_root");
+    }
+    StrippedBlocks {
+        updates,
+        trust_root,
+    }
+}
+
+/// Which non-applyable blocks were stripped from a plan target at sign time.
+#[derive(Debug, Clone, Copy)]
+struct StrippedBlocks {
+    updates: bool,
+    trust_root: bool,
 }
 
 /// Reject, before signing, a plan target the consumer is guaranteed to refuse.
@@ -2419,7 +2451,7 @@ fn build_and_sign_plan(
             "environment": { "id": env_id.as_str() },
         }),
     };
-    let stripped_updates_block = strip_updates_block(&mut target);
+    let stripped = strip_non_applyable_blocks(&mut target);
     // Validate the document we are about to sign — i.e. after the strip.
     validate_plan_target(&target, env_id)?;
 
@@ -2461,7 +2493,7 @@ fn build_and_sign_plan(
         envelope_bytes: built.envelope_bytes,
         plan_sha256: built.plan_sha256,
         key_id: built.key_id,
-        stripped_updates_block,
+        stripped,
     })
 }
 
@@ -2651,7 +2683,8 @@ pub fn publish(
             "key_id": signed.key_id,
             "plan_endpoint": plan_endpoint,
             "status": "published",
-            "stripped_updates_block": signed.stripped_updates_block,
+            "stripped_updates_block": signed.stripped.updates,
+            "stripped_trust_root": signed.stripped.trust_root,
         }),
     ))
 }
@@ -5509,6 +5542,24 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
     }
 
     #[test]
+    fn guard_rejects_a_plan_target_that_repoints_the_trust_root() {
+        // A signed plan whose target re-points the trust root would gain
+        // permanent signing authority. Refused before anything is applied.
+        let env = make_env("local");
+        let td = tempdir().unwrap();
+        let m = parse_manifest(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "trust_root": "bootstrap"
+        }));
+        let err = check_applyable_manifest(&env, td.path(), &m, false).unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(msg) if msg.contains("re-point the trust root")),
+            "unexpected error"
+        );
+    }
+
+    #[test]
     fn guard_accepts_a_plan_target_without_an_updates_block() {
         // The shape `op updates publish` produces: the block is stripped at sign
         // time, so an ordinary content plan applies.
@@ -6223,6 +6274,7 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         args.target_file = Some(target_file);
         let outcome = plan_build(&store, &OpFlags::default(), args).unwrap();
         assert_eq!(outcome.result["stripped_updates_block"], json!(true));
+        assert_eq!(outcome.result["stripped_trust_root"], json!(false));
 
         let plan_bytes = std::fs::read(out_dir.path().join("plan.json")).unwrap();
         let sig_bytes = std::fs::read(out_dir.path().join("plan.json.sig")).unwrap();
@@ -6235,6 +6287,51 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             "the signed target still carries an `updates` block"
         );
         // The rest of the manifest is untouched.
+        assert_eq!(
+            verified.plan.target["bundles"][0]["bundle_id"].as_str(),
+            Some("app")
+        );
+    }
+
+    #[test]
+    fn plan_build_strips_a_trust_root_block_from_the_signed_target() {
+        let dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (key_path, tk) = write_ephemeral_key(dir.path());
+        env_trusting(&store, &tk);
+
+        let target_file = dir.path().join("target.json");
+        std::fs::write(
+            &target_file,
+            r#"{"schema":"greentic.env-manifest.v1","environment":{"id":"local"},
+                "trust_root":"bootstrap",
+                "bundles":[{"bundle_id":"app","bundle_path":"/tmp/app.gtbundle","bundle_digest":"sha256:aa"}]}"#,
+        )
+        .unwrap();
+
+        let mut args = plan_build_args(
+            "local",
+            2,
+            vec![],
+            Some(key_path),
+            out_dir.path().to_path_buf(),
+        );
+        args.target_file = Some(target_file);
+        let outcome = plan_build(&store, &OpFlags::default(), args).unwrap();
+        assert_eq!(outcome.result["stripped_trust_root"], json!(true));
+        assert_eq!(outcome.result["stripped_updates_block"], json!(false));
+
+        let plan_bytes = std::fs::read(out_dir.path().join("plan.json")).unwrap();
+        let sig_bytes = std::fs::read(out_dir.path().join("plan.json.sig")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        let trust = store_trust_root::load(&env_dir).unwrap();
+        let verified =
+            greentic_update::plan::verify_update_plan(&plan_bytes, &sig_bytes, &trust).unwrap();
+        assert!(
+            verified.plan.target.get("trust_root").is_none(),
+            "the signed target still carries a `trust_root` block"
+        );
         assert_eq!(
             verified.plan.target["bundles"][0]["bundle_id"].as_str(),
             Some("app")
@@ -6360,18 +6457,63 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
     }
 
     #[test]
-    fn strip_updates_block_reports_whether_one_was_present() {
+    fn strip_non_applyable_blocks_reports_whether_each_was_present() {
         let mut with = json!({"schema": "x", "updates": {"plan_endpoint": "https://u/p"}});
-        assert!(strip_updates_block(&mut with));
+        let s = strip_non_applyable_blocks(&mut with);
+        assert!(s.updates);
+        assert!(!s.trust_root);
         assert!(with.get("updates").is_none());
         assert_eq!(with["schema"], json!("x"));
 
         let mut without = json!({"schema": "x"});
-        assert!(!strip_updates_block(&mut without));
+        let s = strip_non_applyable_blocks(&mut without);
+        assert!(!s.updates);
+        assert!(!s.trust_root);
 
         // A non-object target (never produced here, but the helper must not panic).
         let mut scalar = json!("not-an-object");
-        assert!(!strip_updates_block(&mut scalar));
+        let s = strip_non_applyable_blocks(&mut scalar);
+        assert!(!s.updates);
+        assert!(!s.trust_root);
+    }
+
+    #[test]
+    fn strip_non_applyable_blocks_removes_trust_root() {
+        let mut target = json!({"schema": "x", "trust_root": "bootstrap"});
+        let s = strip_non_applyable_blocks(&mut target);
+        assert!(s.trust_root);
+        assert!(!s.updates);
+        assert!(target.get("trust_root").is_none());
+        assert_eq!(target["schema"], json!("x"));
+    }
+
+    #[test]
+    fn strip_non_applyable_blocks_removes_both_updates_and_trust_root() {
+        let mut target = json!({
+            "schema": "x",
+            "updates": {"plan_endpoint": "https://u/p"},
+            "trust_root": "bootstrap"
+        });
+        let s = strip_non_applyable_blocks(&mut target);
+        assert!(s.updates);
+        assert!(s.trust_root);
+        assert!(target.get("updates").is_none());
+        assert!(target.get("trust_root").is_none());
+        assert_eq!(target["schema"], json!("x"));
+    }
+
+    #[test]
+    fn strip_non_applyable_blocks_leaves_clean_manifest_unchanged() {
+        let mut target = json!({
+            "schema": "x",
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "app"}]
+        });
+        let original = target.clone();
+        let s = strip_non_applyable_blocks(&mut target);
+        assert!(!s.updates);
+        assert!(!s.trust_root);
+        assert_eq!(target, original);
     }
 
     #[test]
