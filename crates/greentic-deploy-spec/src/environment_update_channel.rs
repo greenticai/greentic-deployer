@@ -138,6 +138,23 @@ impl From<OnNotifyAction> for UpdateAction {
     }
 }
 
+/// Fleet-wide default trust root for update-plan signature verification.
+///
+/// An operator that does not pin a custom trust DID gets this one — the Greentic
+/// public signing identity. The URL confers no trust on its own: every plan is
+/// still verified against the client's pinned root, so a compromised channel
+/// cannot inject unsigned updates.
+pub const DEFAULT_TRUST_DID: &str = "did:web:trust.greentic.cloud";
+
+/// Fleet-wide default plan endpoint — the broadcast update channel.
+///
+/// `_` is the fleet-wide default namespace, mirroring the established `_` team
+/// placeholder convention used elsewhere in the environment model. This is a
+/// BROADCAST channel: every environment that subscribes to it receives the same
+/// signed plan. A client reaching it still verifies signatures against its own
+/// pinned trust root — the URL confers no trust.
+pub const DEFAULT_PLAN_ENDPOINT: &str = "https://updates.greentic.cloud/v1/environments/_/plan";
+
 /// Default poll interval when [`UpdateChannelConfig::poll_interval_secs`] is
 /// unset and polling is enabled — 1 hour. The primary discovery path is the
 /// signed webhook; polling is the fallback, so a slow default is fine.
@@ -707,5 +724,59 @@ mod tests {
         ] {
             assert_eq!(UpdateAction::parse(action.as_str()), Some(action));
         }
+    }
+
+    // ── default channel constants ──────────────────────────────────────
+
+    #[test]
+    fn default_trust_did_has_did_web_prefix() {
+        assert!(
+            DEFAULT_TRUST_DID.starts_with("did:web:"),
+            "DEFAULT_TRUST_DID must carry the did:web: method prefix"
+        );
+    }
+
+    #[test]
+    fn default_plan_endpoint_is_a_valid_url() {
+        let url: http::Uri = DEFAULT_PLAN_ENDPOINT
+            .parse()
+            .expect("DEFAULT_PLAN_ENDPOINT must be a valid URI");
+        assert_eq!(url.scheme_str(), Some("https"));
+    }
+
+    #[test]
+    fn default_plan_endpoint_ends_in_plan_so_stream_derivation_works() {
+        // The stream endpoint is derived by replacing a trailing `/plan` with
+        // `/updates/stream`. If this invariant breaks, push-enabled channels
+        // that rely on the default endpoint silently lose their stream.
+        assert!(
+            DEFAULT_PLAN_ENDPOINT.ends_with("/plan"),
+            "DEFAULT_PLAN_ENDPOINT must end in /plan for stream derivation"
+        );
+
+        // Actually derive the stream URL and verify the result.
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.plan_endpoint = Some(DEFAULT_PLAN_ENDPOINT.to_owned());
+        assert_eq!(
+            cfg.resolved_stream_endpoint().as_deref(),
+            Some("https://updates.greentic.cloud/v1/environments/_/updates/stream"),
+        );
+    }
+
+    #[test]
+    fn enabled_config_with_no_endpoint_resolves_plan_to_none() {
+        // Load-bearing invariant: `resolved_plan_endpoint()` must NOT fall back
+        // to the default constant at read time. A read-time fallback would make
+        // every existing enabled-but-endpointless config silently start polling
+        // Greentic on upgrade — a behavior change for stable-release users. The
+        // default is resolved and persisted at apply time by the deployer.
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+        assert!(
+            cfg.resolved_plan_endpoint().is_none(),
+            "an enabled config with no plan_endpoint must resolve to None, \
+             not a built-in default — the deployer persists the default at \
+             apply time, not at read time"
+        );
     }
 }
