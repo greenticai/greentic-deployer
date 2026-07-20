@@ -2305,16 +2305,15 @@ struct SignedPlan {
 /// - `trust_root` — seeds or rotates the env's signing-key trust anchor; a
 ///   plan that re-points it gains permanent signing authority.
 fn strip_non_applyable_blocks(target: &mut serde_json::Value) -> StrippedBlocks {
-    let obj = target.as_object_mut();
-    let updates = obj.as_ref().is_some_and(|o| o.contains_key("updates"));
-    let trust_root = obj.as_ref().is_some_and(|o| o.contains_key("trust_root"));
-    if let Some(o) = obj {
-        o.remove("updates");
-        o.remove("trust_root");
-    }
+    let Some(obj) = target.as_object_mut() else {
+        return StrippedBlocks {
+            updates: false,
+            trust_root: false,
+        };
+    };
     StrippedBlocks {
-        updates,
-        trust_root,
+        updates: obj.remove("updates").is_some(),
+        trust_root: obj.remove("trust_root").is_some(),
     }
 }
 
