@@ -495,8 +495,18 @@ curl -s "https://api.telegram.org/bot$TOKEN/getWebhookInfo"
 #   "url": "https://<name>-….run.app/webhook/telegram"   ← set by the runtime
 ```
 
-Precedence for the public URL is: tunnel → captured (Cloud Run) → env-store →
-`PUBLIC_BASE_URL`.
+Precedence for the public URL, highest first:
+
+1. a cloudflared **tunnel** URL, if one is running;
+2. the environment's stored `host_config.public_base_url`;
+3. the `PUBLIC_BASE_URL` env var;
+4. the **Cloud Run capture** — armed *only* when none of the above resolved, and
+   deferred until the first request arrives.
+
+So the capture is the last resort, not an override: configure the URL explicitly
+and it wins, exactly as before. It exists because on Cloud Run the URL is not
+knowable until Google assigns it, which is after the container is already
+configured.
 
 > Requires a runtime image carrying the capture (greentic-start ≥ the
 > 2026-07-20 develop build). On an older image the webhook URL simply stays
