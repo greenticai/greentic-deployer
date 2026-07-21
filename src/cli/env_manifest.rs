@@ -103,6 +103,13 @@ pub struct ManifestUpdates {
     /// Base URL the runtime polls for the latest signed plan (`{url}` for the
     /// plan, `{url}.sig` for the DSSE envelope, `{url}/meta` for the sequence).
     /// https, or http to loopback.
+    ///
+    /// Omitted → [`greentic_deploy_spec::DEFAULT_PLAN_ENDPOINT`] (the fleet
+    /// broadcast channel). The default is applied at parse time via
+    /// `#[serde(default)]`, so `"updates": {}` is valid and subscribes to the
+    /// fleet channel. The field stays `String` (not `Option`) to preserve
+    /// semver — every existing struct literal keeps compiling.
+    #[serde(default = "default_plan_endpoint")]
     pub plan_endpoint: String,
     /// Master switch. Absent = `true`: an operator who wrote this block wants
     /// the channel on. Set `false` to declare the endpoint without subscribing.
@@ -127,6 +134,13 @@ pub struct ManifestUpdates {
     /// derives from `plan_endpoint`). Must be https (or http to loopback).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_endpoint: Option<String>,
+}
+
+/// Serde default for [`ManifestUpdates::plan_endpoint`] — returns the fleet
+/// broadcast channel constant.  A free function because `#[serde(default)]`
+/// on a non-`Option` field requires a path to a `fn() -> T`.
+fn default_plan_endpoint() -> String {
+    greentic_deploy_spec::DEFAULT_PLAN_ENDPOINT.to_owned()
 }
 
 impl ManifestUpdates {
@@ -3393,11 +3407,67 @@ mod tests {
     }
 
     #[test]
-    fn updates_block_rejects_unknown_and_missing_fields_at_parse() {
+    fn updates_block_rejects_unknown_fields_at_parse() {
         assert!(
             with_updates(serde_json::json!({"plan_endpoint": "https://u/p", "typo": 1})).is_err()
         );
-        assert!(with_updates(serde_json::json!({"enabled": true})).is_err());
+    }
+
+    // --- default plan endpoint tests ----------------------------------------
+
+    #[test]
+    fn empty_updates_block_parses_with_default_plan_endpoint() {
+        // `"updates": {}` is the zero-config subscription: the operator opts in
+        // to the fleet channel by declaring the block, without specifying a URL.
+        let m = with_updates(serde_json::json!({})).expect("parses");
+        m.validate_shape().expect("valid");
+        let updates = m.updates.as_ref().unwrap();
+        assert_eq!(
+            updates.plan_endpoint,
+            greentic_deploy_spec::DEFAULT_PLAN_ENDPOINT,
+            "an omitted plan_endpoint must deserialize to the fleet default"
+        );
+        assert!(
+            updates.resolved_enabled(),
+            "declaring the block is the subscription"
+        );
+    }
+
+    #[test]
+    fn explicit_plan_endpoint_is_not_overwritten_by_default() {
+        let custom = "https://custom.example.com/plan";
+        let m = with_updates(serde_json::json!({"plan_endpoint": custom})).expect("parses");
+        m.validate_shape().expect("valid");
+        assert_eq!(
+            m.updates.as_ref().unwrap().plan_endpoint,
+            custom,
+            "an explicit plan_endpoint must be preserved, not overwritten"
+        );
+    }
+
+    #[test]
+    fn absent_updates_block_means_no_channel() {
+        // Deny-by-default: a manifest with NO `updates` block produces a
+        // disabled channel that polls nothing. The block's *presence* is the
+        // opt-in; its *absence* keeps the operator out of the channel.
+        let m = minimal(ENV_MANIFEST_SCHEMA_V1);
+        assert!(
+            m.updates.is_none(),
+            "a manifest without an `updates` block must not create one"
+        );
+    }
+
+    #[test]
+    fn default_plan_endpoint_passes_validate_shape() {
+        // End-to-end: the serde default value must survive the same validators
+        // that `op updates config-set` applies. Both the plan URL and the
+        // derived stream URL must be acceptable control URLs.
+        let m = with_updates(serde_json::json!({})).expect("parses");
+        m.validate_shape().expect(
+            "the default plan_endpoint must pass validate_shape — \
+             if this breaks, DEFAULT_PLAN_ENDPOINT is no longer an \
+             acceptable control URL",
+        );
     }
 
     // --- cluster + inline answers tests ---
