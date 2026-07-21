@@ -2560,7 +2560,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "1.1.21"
+version = "1.1.22"
 dependencies = [
  "anyhow",
  "async-trait",
