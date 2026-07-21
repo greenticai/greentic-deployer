@@ -255,6 +255,7 @@ fn route_remote(
                 remote_trust_root_bootstrap(store, flags, env_id)
             }
             TrustRootVerb::Add(args) => remote_trust_root_add(store, flags, args),
+            TrustRootVerb::AddDid(args) => remote_trust_root_add_did(store, flags, args),
             TrustRootVerb::Remove(args) => remote_trust_root_remove(store, flags, args),
             TrustRootVerb::List { env_id } => remote_trust_root_list(store, &env_id),
         },
@@ -1747,6 +1748,32 @@ fn remote_trust_root_add(
     ))
 }
 
+/// `--store-url` counterpart of `trust_root::add_did` — deliberately refused,
+/// not merely unimplemented. Decomposing the verb into N ordinary
+/// `add_trusted_key` calls would appear to work: `AddTrustedKeyPayload` is
+/// `{key_id, public_key_pem}` with no DID field, so the server would durably
+/// record N unrelated `trust-root add` events and the DID — the verb's ONLY
+/// provenance, which is why resolved keys carry none on disk — would survive
+/// nowhere but this process's stdout. Implementing it needs a batch endpoint
+/// carrying the DID and one action-level idempotency key, written
+/// transactionally with the trust root.
+///
+/// Note it does NOT use the shared `not_supported()` helper: that message says
+/// "read/local-only verb", which is false here and would read as an oversight.
+fn remote_trust_root_add_did(
+    _store: &dyn EnvironmentMutations,
+    _flags: &OpFlags,
+    _args: super::dispatch::TrustRootAddDidArgs,
+) -> Result<OpOutcome, OpError> {
+    Err(OpError::NotYetImplemented(
+        "trust-root add-did needs a local store: the remote backend has no add-did endpoint, \
+         so the DID would not be recorded in the durable audit log. Resolve the document and \
+         add each key with `trust-root add --key-id <id> --public-key-pem <pem>`, or run \
+         against a local store."
+            .to_string(),
+    ))
+}
+
 fn remote_trust_root_remove(
     store: &dyn EnvironmentMutations,
     flags: &OpFlags,
@@ -2596,6 +2623,33 @@ mod tests {
     use std::net::{SocketAddr, TcpListener};
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    /// Refusing is the point. Decomposing `add-did` into N ordinary
+    /// `add_trusted_key` calls would appear to work while the server durably
+    /// audited them as unrelated `add` events — leaving the DID, which is the
+    /// verb's ONLY provenance, in nothing but this process's stdout.
+    #[test]
+    fn remote_add_did_is_refused_rather_than_silently_dropping_the_did() {
+        let store =
+            HttpEnvironmentStore::new("https://store.example".parse().unwrap(), AuthMethod::None)
+                .unwrap();
+        let err = remote_trust_root_add_did(
+            &store,
+            &OpFlags::default(),
+            super::super::dispatch::TrustRootAddDidArgs {
+                env_id: Some("local".to_string()),
+                did: Some("did:web:trust.greentic.cloud".to_string()),
+            },
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(matches!(err, OpError::NotYetImplemented(_)), "got {msg}");
+        assert!(
+            msg.contains("audit"),
+            "the refusal must explain WHY, or an operator reads it as an oversight: {msg}"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // resolve_remote_target: URL/token origin pairing (anti-credential-leak)

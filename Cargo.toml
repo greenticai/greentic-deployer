@@ -10,7 +10,7 @@ resolver = "2"
 
 [package]
 name = "greentic-deployer"
-version = "1.1.22"
+version = "1.1.23"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic deployer runtime for plan construction and deployment-pack dispatch"
@@ -90,6 +90,9 @@ greentic-config-types = ">=1.1.0-0, <1.2.0-0"
 # same release means bumping this floor in the same PR.
 greentic-deploy-spec = { path = "crates/greentic-deploy-spec", version = ">=0.2.4, <0.3" }
 greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.2" }
+# did:web resolution for `trust-root add-did`. Default features only: `cli` and
+# `testing` would drag clap/tokio/rand in for no runtime benefit.
+greentic-trust = "0.2"
 serde_json = "1"
 semver = "1"
 thiserror = "2"
