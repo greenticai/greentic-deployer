@@ -353,12 +353,40 @@ pub(crate) fn add_resolved_did_keys(
         // make the HTTP backend replay the first key's response for all of them.
         idempotency_key: Some(mint_idempotency_key().as_str().to_string()),
     };
-    audit_and_record(store, ctx, |_committed| {
+    audit_and_record(store, ctx, |committed| {
         let mut trusted_key_count = 0;
+        // Each key is its own store transaction, so a failure partway through
+        // leaves the earlier ones trusted. Two things follow, and neither is
+        // optional:
+        //
+        //  - `mark_committed` after the FIRST success. Without it
+        //    `audit_and_record` classifies the whole verb as non-committing and
+        //    demotes an audit-append failure to a `warn!` — silently changing
+        //    which keys an env trusts with no durable record. Every other verb
+        //    in this file writes once, so this is the first closure here that
+        //    can persist state and still return `Err`.
+        //  - Name the keys that DID land in the error. The audit event records
+        //    the full resolved set as its target, so without this the operator
+        //    reads "add-did failed" over a list of N keys while some subset of
+        //    them is now trusted.
+        let mut persisted: Vec<&str> = Vec::new();
         for (key_id, pem) in keys {
             let outcome = store
                 .add_trusted_key(env_id, key_id.clone(), pem.clone(), mint_idempotency_key())
-                .map_err(map_store_err_preserving_noun)?;
+                .map_err(|source| {
+                    let err = map_store_err_preserving_noun(source);
+                    if persisted.is_empty() {
+                        return err;
+                    }
+                    OpError::Conflict(format!(
+                        "trust-root add-did `{did}` partially applied: {err}. \
+                         Already trusted and NOT rolled back: {}. \
+                         Re-running is safe — adding a key already present is a no-op.",
+                        persisted.join(", ")
+                    ))
+                })?;
+            committed.mark_committed();
+            persisted.push(key_id);
             trusted_key_count = outcome.trusted_key_count;
         }
         Ok((
@@ -951,6 +979,70 @@ mod tests {
 
         assert!(matches!(err, OpError::Fetch(_)), "got {err}");
         assert!(trusted_key_ids(&store).is_empty());
+    }
+
+    /// Each key is its own store transaction, so a mid-import failure really
+    /// does leave the earlier keys trusted. The error has to say which ones, or
+    /// the operator reads "add-did failed" over the audit event's full N-key
+    /// target while some subset is live.
+    #[test]
+    fn add_did_partial_failure_names_the_keys_it_already_trusted() {
+        let dir = tempdir().unwrap();
+        let store = seeded_env(&dir);
+        let (good_pem, good_id) = keypair(51);
+        let keys = vec![
+            (good_id.clone(), good_pem),
+            (
+                "ffffffffffffffffffffffffffffffff".to_string(),
+                "not a pem".to_string(),
+            ),
+        ];
+
+        let err = add_resolved_did_keys(&store, &parse_env_id("local").unwrap(), TEST_DID, &keys)
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&good_id),
+            "a partially applied import must name the keys that landed; got: {msg}"
+        );
+        assert!(
+            trusted_key_ids(&store).contains(&good_id),
+            "the first key really is trusted — that is why the error must say so"
+        );
+    }
+
+    /// `audit_and_record` demotes an audit-append failure to a `warn!` for a
+    /// non-committing op. A partial import IS committing, so it must instead
+    /// fail closed with `OpError::Audit`: silently changing which keys an env
+    /// trusts, with no durable record, is the worst outcome available here.
+    /// Every other verb in this file writes once and cannot reach this state.
+    #[test]
+    fn add_did_partial_failure_fails_closed_when_the_audit_write_also_fails() {
+        let dir = tempdir().unwrap();
+        let store = seeded_env(&dir);
+        // Block the audit log: `append` does `create_dir_all(<env>/audit)`,
+        // which fails when that path is an ordinary file.
+        let env_dir = store.env_dir(&parse_env_id("local").unwrap()).unwrap();
+        std::fs::write(env_dir.join("audit"), b"not a directory").unwrap();
+
+        let (good_pem, good_id) = keypair(52);
+        let keys = vec![
+            (good_id, good_pem),
+            (
+                "ffffffffffffffffffffffffffffffff".to_string(),
+                "not a pem".to_string(),
+            ),
+        ];
+
+        let err = add_resolved_did_keys(&store, &parse_env_id("local").unwrap(), TEST_DID, &keys)
+            .unwrap_err();
+
+        assert!(
+            matches!(err, OpError::Audit(_)),
+            "a committed mutation with no durable audit record must surface as \
+             OpError::Audit, not the underlying store error: {err}"
+        );
     }
 
     #[test]

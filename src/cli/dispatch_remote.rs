@@ -1748,49 +1748,33 @@ fn remote_trust_root_add(
     ))
 }
 
-/// `--store-url` counterpart of `trust_root::add_did`.
+/// `--store-url` counterpart of `trust_root::add_did` — deliberately refused.
 ///
-/// did:web resolution is a client-side concern, so the remote backend needs no
-/// did:web support at all — it keeps receiving ordinary `add_trusted_key`
-/// calls and audits them server-side, exactly as it does for `add`.
+/// Resolution itself is a client-side concern, so decomposing the verb into N
+/// ordinary `add_trusted_key` calls would "work". It is refused because the
+/// audit trail it produces contradicts the verb's own provenance model: a
+/// did-resolved key is stored indistinguishably from a hand-added one precisely
+/// because the `add-did` audit event carries the DID. `AddTrustedKeyPayload` is
+/// `{key_id, public_key_pem}` — there is no DID field — so the server would
+/// durably record N unrelated `trust-root add` events and the DID would exist
+/// only in this process's stdout. An operator later asking "which of these keys
+/// came from the DID we just rotated?" would have no way to answer.
+///
+/// Wiring this properly means a batch endpoint carrying the DID, the full key
+/// set, and one action-level idempotency key, persisted transactionally with
+/// the trust-root update — a `greentic-deploy-spec` wire type plus a
+/// `greentic-operator-store-server` route, which is its own change.
 fn remote_trust_root_add_did(
-    store: &dyn EnvironmentMutations,
-    flags: &OpFlags,
-    args: super::dispatch::TrustRootAddDidArgs,
+    _store: &dyn EnvironmentMutations,
+    _flags: &OpFlags,
+    _args: super::dispatch::TrustRootAddDidArgs,
 ) -> Result<OpOutcome, OpError> {
-    let payload = match (args.env_id, args.did) {
-        (Some(environment_id), Some(did)) => Some(super::trust_root::TrustRootAddDidPayload {
-            environment_id,
-            did,
-        }),
-        _ => None,
-    };
-    let payload = resolve_payload::<super::trust_root::TrustRootAddDidPayload>(flags, payload)?;
-    let env_id = parse_env_id(&payload.environment_id)?;
-    let resolver = greentic_trust::HttpResolver::new(std::time::Duration::from_secs(60), 1)
-        .map_err(|e| OpError::Fetch(format!("build did:web resolver: {e}")))?;
-    let keys = super::trust_root::resolve_did_keys(&payload.did, &resolver)?;
-    let mut trusted_key_count = 0;
-    for (key_id, pem) in &keys {
-        let outcome = store
-            .add_trusted_key(
-                &env_id,
-                key_id.clone(),
-                pem.clone(),
-                super::mint_idempotency_key(),
-            )
-            .map_err(map_store_err_preserving_noun)?;
-        trusted_key_count = outcome.trusted_key_count;
-    }
-    Ok(OpOutcome::new(
-        "trust-root",
-        "add-did",
-        serde_json::json!({
-            "environment_id": env_id.as_str(),
-            "did": payload.did,
-            "key_ids": keys.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
-            "trusted_key_count": trusted_key_count,
-        }),
+    Err(OpError::NotYetImplemented(
+        "trust-root add-did needs a local store: the remote backend has no add-did endpoint, \
+         so the DID would not be recorded in the durable audit log. Resolve the document and \
+         add each key with `trust-root add --key-id <id> --public-key-pem <pem>`, or run \
+         against a local store."
+            .to_string(),
     ))
 }
 
@@ -2643,6 +2627,33 @@ mod tests {
     use std::net::{SocketAddr, TcpListener};
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    /// Refusing is the point. Decomposing `add-did` into N ordinary
+    /// `add_trusted_key` calls would appear to work while the server durably
+    /// audited them as unrelated `add` events — leaving the DID, which is the
+    /// verb's ONLY provenance, in nothing but this process's stdout.
+    #[test]
+    fn remote_add_did_is_refused_rather_than_silently_dropping_the_did() {
+        let store =
+            HttpEnvironmentStore::new("https://store.example".parse().unwrap(), AuthMethod::None)
+                .unwrap();
+        let err = remote_trust_root_add_did(
+            &store,
+            &OpFlags::default(),
+            super::super::dispatch::TrustRootAddDidArgs {
+                env_id: Some("local".to_string()),
+                did: Some("did:web:trust.greentic.cloud".to_string()),
+            },
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(matches!(err, OpError::NotYetImplemented(_)), "got {msg}");
+        assert!(
+            msg.contains("audit"),
+            "the refusal must explain WHY, or an operator reads it as an oversight: {msg}"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // resolve_remote_target: URL/token origin pairing (anti-credential-leak)
