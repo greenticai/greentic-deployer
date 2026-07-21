@@ -19,6 +19,9 @@ readme = "README.md"
 repository = "https://github.com/greenticai/greentic-deployer"
 homepage = "https://github.com/greenticai/greentic-deployer"
 documentation = "https://docs.greentic.ai/deployer"
+# The demo's rendered web page is a deployment artifact, not source a consumer
+# of this crate needs; keep it in git but out of the published .crate.
+exclude = ["examples/cloudrun-demo/site/"]
 keywords = [
     "greentic",
     "deployer",

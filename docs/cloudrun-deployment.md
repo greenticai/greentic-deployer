@@ -91,6 +91,56 @@ which is what keeps standing storage cost at zero (§8).
 
 ## 3. Prerequisites
 
+### 3.0 A build that can actually deploy Cloud Run
+
+**Check this first.** The Cloud Run deployer is the `deploy-gcp-cloudrun` cargo
+feature. It is a *default* feature, but it has to be compiled into the binary you
+run — and a build without it does not say so:
+
+| What you'd check | On a build that **cannot** deploy Cloud Run |
+|---|---|
+| `op env --help` | still lists `up` — it is the generic verb |
+| `op env up --dry-run` | green plan, `kind → …gcp-cloudrun` |
+| `op env apply --yes` | **exit 0**, `changed: 6`, `verify.failures: []` |
+| `op env doctor` | `unknown_kinds: ["greentic.deployer.gcp-cloudrun@1.0.0"]` |
+
+Three of the four happily plan and *bind* a deployer kind the binary cannot
+execute. Only `doctor` resolves the binding against the handler registry, so it
+is the only one that tells the truth. Probe it on a throwaway store — this makes
+no cloud calls:
+
+```bash
+S=$(mktemp -d)
+greentic-deployer op --store-root "$S" --answers cloudrun.env.json env apply --yes >/dev/null
+greentic-deployer op --store-root "$S" env doctor local | python3 -m json.tool | grep -A1 unknown_kinds
+rm -rf "$S"
+#   "unknown_kinds": [],                                        ← good
+#   "unknown_kinds": ["greentic.deployer.gcp-cloudrun@1.0.0"]   ← no Cloud Run in this build
+```
+
+Do not settle for "does the report *mention* cloudrun?" — a binary too old to
+have `op env up` at all produces no report, and an absent NO is not a YES. Demand
+a parseable report whose `bound_slots` includes `deployer` **and** whose
+`unknown_kinds` excludes cloudrun.
+
+> **Commands below say `greentic-deployer` on purpose.** `gtc op …` is a
+> *different* binary: it delegates to `greentic-operator`, a separate crate on
+> its own release cadence. The operator inherits this crate's default features,
+> so Cloud Run rides along automatically once a release carries it — but a stable
+> `gtc` can lag by an entire capability. If the probe above fails on `gtc`, run
+> `greentic-deployer` directly. On the develop lane it installs under a sibling
+> `-dev` name (binary bifurcation):
+> ```bash
+> cargo binstall greentic-deployer-dev
+> ```
+
+> **A stale `-dev` binary looks identical to a fresh one.** `--version` prints
+> `greentic-deployer 1.2.0-dev.0` for every nightly — the build identity lives
+> only in the crates.io version, not in the binary. If behaviour surprises you,
+> re-run the binstall before debugging anything else.
+
+### 3.1 The rest
+
 1. **A GCP project with billing enabled.** Cloud Run has a free tier, but the
    project must still have billing attached.
 2. **APIs enabled**: `run.googleapis.com`, `secretmanager.googleapis.com`.
@@ -100,7 +150,7 @@ which is what keeps standing storage cost at zero (§8).
 
    ```bash
    # 1. Bind the deployer (this is just the store half of the quickstart manifest).
-   gtc op env apply --answers cloudrun.env.json --yes
+   greentic-deployer op env apply --answers cloudrun.env.json --yes
 
    # 2. Render the bootstrap pack. `admin_profile` identifies the admin who will
    #    run terraform; the material is required by the CLI but unused by the GCP
@@ -110,7 +160,7 @@ which is what keeps standing storage cost at zero (§8).
      "admin_profile": "you@example.com",
      "admin_material_inline": "unused-by-gcp-render" }
    JSON
-   gtc op credentials bootstrap --answers bootstrap.json
+   greentic-deployer op credentials bootstrap --answers bootstrap.json
    ```
 
    The pack lands in the env's store dir:
@@ -197,9 +247,16 @@ One env-manifest describes the whole environment:
 ```
 
 ```bash
-gtc op env up --answers cloudrun.env.json --yes
-# or the sugar:  gtc start cloudrun --answers cloudrun.env.json
+greentic-deployer op --answers cloudrun.env.json env up --yes
 ```
+
+Note the flag position: `--answers` is a **global** flag, so it goes *before*
+`env up`, not after. Add `--store-root ./state` to keep the environment local and
+disposable instead of in `~/.greentic/environments`.
+
+> There is **no `gtc start cloudrun`** sugar. `gtc start` reserves exactly one
+> first token, `k8s`; anything else is treated as a bundle reference
+> (`gtc start cloudrun` → *bundle ref already given as `cloudrun`*).
 
 One JSON envelope comes back on stdout, carrying the URL Cloud Run assigned:
 
@@ -221,7 +278,7 @@ Preview without touching Google Cloud — this stops after the store plan and
 never reaches the Cloud Run dispatch, so it needs no credentials:
 
 ```bash
-gtc op env up --answers cloudrun.env.json --dry-run
+greentic-deployer op env up --answers cloudrun.env.json --dry-run
 ```
 
 **Bundles must be remote.** Cloud Run pulls your bundle from a registry at boot,
@@ -264,6 +321,50 @@ Load-bearing details:
   which is **in-memory**. The seed is re-copied on every cold start.
 - The deployer's own credential is **excluded** from the seed — a workload never
   receives the identity that deployed it.
+
+### Seeding a provider secret from the manifest
+
+A pack that needs a credential — a Telegram bot token, an API key — reads it from
+the dev-store, which means the value has to be in the store *before* the seed is
+staged. The manifest can do that in the same `env up`, without the value ever
+entering a file: a top-level `secrets` array names the **environment variable**,
+never the secret.
+
+```jsonc
+{
+  "schema": "greentic.env-manifest.v1",
+  "environment": { "id": "local" },
+  "packs": [ /* … */ ],
+  "secrets": [
+    { "path": "default/_/messaging-telegram/telegram_bot_token",
+      "from_env": "TELEGRAM_BOT_TOKEN" }
+  ],
+  "bundles": [ /* … */ ]
+}
+```
+
+```bash
+export TELEGRAM_BOT_TOKEN=…
+greentic-deployer op --store-root ./state --answers cloudrun.env.json env up --yes
+```
+
+`env up` resolves the variable at apply time, writes it to the per-environment
+dev-store, and stages it into the Cloud Run seed — one command, no separate
+`op secrets put`, no temp file holding a credential.
+
+- `path` is `<tenant>/<team>/<pack>/<name>`. `_` is the default team; a literal
+  `default` team is rejected.
+- **If the variable is unset on a mutating run, `env up` refuses** — it is a
+  missing input, not an empty value. On a TTY it prompts instead, masked. This is
+  why the block is opt-in rather than always present.
+- The runtime reads it back as
+  `secrets://<env>/<tenant>/<team>/<pack>/<name>`.
+
+The authoritative field list is the schema itself:
+
+```bash
+greentic-deployer op env apply --schema
+```
 
 ### Secret ownership
 
@@ -314,7 +415,7 @@ curl -H "Authorization: Bearer $(gcloud auth print-identity-token)" "$URL/readyz
 ## 7. Reaching the worker
 
 ```bash
-URL=$(gtc op env up --answers cloudrun.env.json --yes | jq -r '.result.endpoint_url')
+URL=$(greentic-deployer op env up --answers cloudrun.env.json --yes | jq -r '.result.endpoint_url')
 
 curl -fsS "$URL/readyz"     # → ok        (liveness — a STATIC route)
 curl -fsS "$URL/status"     # → greentic.status.v1 diagnostics
@@ -357,6 +458,51 @@ came up but found no work** — see §11.
 
 Beyond the probes, the worker serves whatever your bundle's `route_binding`
 declares (`/` in the quickstart).
+
+### Chat surfaces, if your bundle carries them
+
+Both of the following are **greentic-start** behaviours, not deployer ones — but
+they are what most Cloud Run bundles are actually for, and both have a
+Cloud-Run-specific failure mode.
+
+**Browser webchat.** A bundle carrying `messaging-webchat-gui` serves a public
+SPA at `GET <url>/v1/web/webchat/default/`, backed by DirectLine under
+`/v1/messaging/webchat/default/…`. It works from **pack presence alone** — no
+messaging endpoint has to be registered.
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' "$URL/v1/web/webchat/default/"   # → 200
+```
+
+A **405** here means the runtime image predates the SPA-serving code. Pin
+`runtime_image_digest` (§9) rather than riding the `:develop` tag, which Cloud
+Run caches for ~1h. A chat that loads but never *answers* is a different fault:
+webchat-gui packs older than `0.5.10` did not declare the
+`render_plan`/`encode`/`send_payload` egress ops, so the reply was silently
+rejected by the runner's declared-ops allowlist.
+
+**Webhook self-registration.** On Cloud Run the runtime derives its own public
+URL from the first inbound request's `Host` header — pinned to this service's own
+`<name>-*.run.app` address so a forged `Host` cannot hijack it — and calls each
+messaging provider's `setup_webhook` for you. There is no manual `setWebhook`
+step and no `PUBLIC_BASE_URL` to set: the URL is not knowable until Cloud Run
+assigns it, and the deployer's warm issues no public GET, so **the first real
+public request is what triggers registration** (your own `curl "$URL/status"`
+will do it).
+
+```bash
+curl -s "https://api.telegram.org/bot$TOKEN/getWebhookInfo"
+#   "url": "https://<name>-….run.app/webhook/telegram"   ← set by the runtime
+```
+
+Precedence for the public URL is: tunnel → captured (Cloud Run) → env-store →
+`PUBLIC_BASE_URL`.
+
+> Requires a runtime image carrying the capture (greentic-start ≥ the
+> 2026-07-20 develop build). On an older image the webhook URL simply stays
+> empty; register it by hand until you re-pin the digest. Note that
+> `op env destroy` **cannot** clear a provider-side webhook — it lives on the
+> provider's servers, not in GCP.
 
 ---
 
@@ -477,6 +623,11 @@ gcloud logging read \
   --project <project> --limit 50 --freshness=1h
 ```
 
+**The deploy reported success but nothing exists in the project.**
+The binary has no Cloud Run deployer compiled in. `env up --dry-run` and
+`env apply --yes` both return green on such a build — only `op env doctor`
+reports it. Run the capability probe in §3.0.
+
 **The URL returns 403.**
 `access_mode: authenticated` (by design — §6), or a `public` deploy whose
 `allUsers` binding was refused by org policy. The deploy would have surfaced the
@@ -511,7 +662,7 @@ secret by hand.
 
 **Reclaiming everything.**
 ```bash
-gtc op env destroy <env> --confirm
+greentic-deployer op env destroy <env> --confirm
 ```
 Deletes each Service the env created and the seed secret it owns, then removes
 local state. Verify:
@@ -537,6 +688,12 @@ gcloud secrets list --project <project>
 
 ## See also
 
+- [`examples/cloudrun-demo/`](../examples/cloudrun-demo/) — a runnable,
+  live-verified walkthrough of everything above: a narrated script, and the same
+  path as commands you type yourself (fish and bash).
+- [Cloud Run internals](cloudrun-internals.md) — how the deployer is *built*:
+  module map, the target seam, credential resolution, and the deploy-time
+  invariants. Read this before changing it.
 - [Kubernetes Deployment Guide](k8s-deployment.md) — the declarative,
   cluster-based sibling of this path.
 - [Env-Pack Authoring Guide](env-packs.md) — how the `deployer` slot is bound.
