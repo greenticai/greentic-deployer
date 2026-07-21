@@ -10,7 +10,7 @@ resolver = "2"
 
 [package]
 name = "greentic-deployer"
-version = "1.1.20"
+version = "1.1.21"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic deployer runtime for plan construction and deployment-pack dispatch"
@@ -148,7 +148,10 @@ features = [
 # on `<0.2` here froze this crate on the 2026-07-07 dev build with nothing
 # failing loudly: every subsequent main-lane fix (staging, plan, binswap) landed
 # on 1.1.x and was invisible to us. Same lane as the rest of our 1.1 pins.
-version = ">=1.1.0, <1.2.0-0"
+#
+# Floor raised to 1.1.1: first publish carrying `plan::BROADCAST_ENV_ID` +
+# `plan::plan_targets_env`, which the broadcast-channel gates below match on.
+version = ">=1.1.1, <1.2.0-0"
 features = [
     "binswap",
     "enroll",

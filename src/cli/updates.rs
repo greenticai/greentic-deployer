@@ -23,6 +23,7 @@ use greentic_deploy_spec::{
 };
 use greentic_distributor_client::{CachePolicy, DistClient, DistOptions, ResolvePolicy};
 use greentic_secrets_lib::core::rt;
+use greentic_update::plan::{BROADCAST_ENV_ID, plan_targets_env};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -31,7 +32,7 @@ use crate::environment::{
     trust_root as store_trust_root,
 };
 
-use super::env_manifest::{ENV_MANIFEST_SCHEMA_V1, EnvManifest};
+use super::env_manifest::{ENV_MANIFEST_SCHEMA_V1, EnvManifest, ManifestEnvironment};
 use super::secrets::{get_env_secret, put_env_secret, require_secrets_pack};
 use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
 
@@ -444,30 +445,15 @@ fn get_impl(
     let verified = greentic_update::plan::verify_update_plan(&plan_bytes, &envelope_bytes, &trust)
         .map_err(|e| OpError::Conflict(format!("update plan failed verification: {e}")))?;
 
-    // 3. The plan must target THIS environment. Two identities must agree — the
-    //    plan header (`plan.env_id`) AND the signed desired-state manifest it
+    // 3. The plan must be addressed to THIS environment — an exact `env_id`
+    //    match, or the fleet broadcast channel (`_`). Two identities must agree —
+    //    the plan header (`plan.env_id`) AND the signed desired-state manifest it
     //    carries (`target.environment.id`). Both are under the DSSE signature, so
     //    a divergence means a buggy/compromised signer produced a plan whose
     //    header names this env while its manifest reconciles another; fail closed
     //    on either mismatch before touching the staging tree.
-    if verified.plan.env_id != env_id.as_str() {
-        return Err(OpError::InvalidArgument(format!(
-            "plan targets env `{}`, not `{env_id}`",
-            verified.plan.env_id
-        )));
-    }
-    let manifest: EnvManifest =
-        serde_json::from_value(verified.plan.target.clone()).map_err(|e| {
-            OpError::InvalidArgument(format!(
-                "plan target is not a valid {ENV_MANIFEST_SCHEMA_V1}: {e}"
-            ))
-        })?;
-    if manifest.environment.id != env_id.as_str() {
-        return Err(OpError::InvalidArgument(format!(
-            "plan target manifest names env `{}`, not `{env_id}`",
-            manifest.environment.id
-        )));
-    }
+    check_plan_addresses_env(&verified.plan.env_id, &env_id, "plan")?;
+    deserialize_plan_manifest(&verified.plan.target, &verified.plan.env_id)?;
 
     // 4. Admit to staging under a single lock hold — or RESUME an
     //    already-admitted identical plan. The downgrade guard (monotonic
@@ -830,6 +816,12 @@ fn apply_updates_impl(
     // artifacts at the already-verified staged blobs so the apply runs from
     // local disk instead of re-fetching them from the network.
     let target = materialize_bundles(&verified.plan.target, &staged_blobs);
+    // Resolve the broadcast address to this environment's identity. `env_apply`
+    // reconciles the environment the manifest NAMES, and it does not create
+    // one — so a `_` target would send it looking for an environment called `_`
+    // and fail the whole apply ("environment `_` not found"). `_` was only ever
+    // an address; the environment being converged is this one.
+    let target = localize_broadcast_target(target, &env_id);
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -1474,26 +1466,14 @@ fn reverify_staged(
             verified.plan.plan_id
         )));
     }
-    // Target-env identity: the plan header AND the signed desired-state manifest
-    // must both name this env (both are under the DSSE signature).
-    if verified.plan.env_id != env_id.as_str() {
-        return Err(OpError::InvalidArgument(format!(
-            "staged plan targets env `{}`, not `{env_id}`",
-            verified.plan.env_id
-        )));
-    }
-    let manifest: EnvManifest =
-        serde_json::from_value(verified.plan.target.clone()).map_err(|e| {
-            OpError::InvalidArgument(format!(
-                "plan target is not a valid {ENV_MANIFEST_SCHEMA_V1}: {e}"
-            ))
-        })?;
-    if manifest.environment.id != env_id.as_str() {
-        return Err(OpError::InvalidArgument(format!(
-            "plan target manifest names env `{}`, not `{env_id}`",
-            manifest.environment.id
-        )));
-    }
+    // Target-env addressing: the plan header AND the signed desired-state
+    // manifest must agree, and the plan must be addressed to this env or to the
+    // broadcast channel (both are under the DSSE signature). Re-checked here and
+    // not just at `get` time because the staging tree is on-disk state a plan can
+    // outlive: nothing stops a `_`-addressed plan being staged, the env being
+    // renamed, and this running against a different identity.
+    check_plan_addresses_env(&verified.plan.env_id, env_id, "staged plan")?;
+    let manifest = deserialize_plan_manifest(&verified.plan.target, &verified.plan.env_id)?;
     // Fail closed on manifest content this increment cannot apply *safely*. The
     // dev-store-secret guard needs the env's `Secrets` binding, the env dir (to
     // check the dev-store files aren't symlinked off the tree), and whether the
@@ -1503,6 +1483,162 @@ fn reverify_staged(
         std::env::var_os(super::secrets::DEV_SECRETS_PATH_ENV).is_some();
     check_applyable_manifest(&env, &env_dir, &manifest, dev_secrets_path_override)?;
     Ok(verified)
+}
+
+/// Reject a plan not addressed to this environment. `what` names the subject in
+/// the error (`"plan"` / `"staged plan"`).
+///
+/// Addressing is [`plan_targets_env`]: an exact match, or the fleet broadcast
+/// channel. It is the *third* of three independent gates, which is why widening
+/// it grants no new authority — a plan still has to arrive from the
+/// `plan_endpoint` the operator configured, and still has to verify against this
+/// env's own trust root, before it gets here.
+fn check_plan_addresses_env(plan_env: &str, env_id: &EnvId, what: &str) -> Result<(), OpError> {
+    if !plan_targets_env(plan_env, env_id.as_str()) {
+        return Err(OpError::InvalidArgument(format!(
+            "{what} targets env `{plan_env}`, not `{env_id}`"
+        )));
+    }
+    Ok(())
+}
+
+/// Require the signed target manifest to name the same environment as the plan
+/// header.
+///
+/// Compared against the **plan header**, not the local env id. Checking each
+/// against the local id separately used to imply this agreement for free; once
+/// `_` is accepted that implication breaks, and a plan header of `_` paired with
+/// a manifest naming a real env (or vice versa) would slip through two
+/// independently-passing checks. A broadcast plan must be `_` on both sides.
+fn check_manifest_matches_plan_env(manifest: &EnvManifest, plan_env: &str) -> Result<(), OpError> {
+    if manifest.environment.id != plan_env {
+        return Err(OpError::InvalidArgument(format!(
+            "plan target manifest names env `{}`, but the plan header targets `{plan_env}`",
+            manifest.environment.id
+        )));
+    }
+    Ok(())
+}
+
+/// Deserialize the plan's target as an [`EnvManifest`] and verify that the
+/// manifest's `environment.id` matches the plan header, in one call. Used by
+/// both [`get_impl`] and [`reverify_staged`] — the two consumer-side sites
+/// that need the same deser + agreement check before further admission gates.
+fn deserialize_plan_manifest(
+    target: &serde_json::Value,
+    plan_env: &str,
+) -> Result<EnvManifest, OpError> {
+    let manifest: EnvManifest = serde_json::from_value(target.clone()).map_err(|e| {
+        OpError::InvalidArgument(format!(
+            "plan target is not a valid {ENV_MANIFEST_SCHEMA_V1}: {e}"
+        ))
+    })?;
+    check_manifest_matches_plan_env(&manifest, plan_env)?;
+    Ok(manifest)
+}
+
+/// Reject a broadcast (`_`-addressed) plan that declares anything beyond its own
+/// environment id.
+///
+/// A broadcast plan converges **every subscribed environment at once**, so the
+/// only thing it may safely carry is the plan's `binaries[]` — a self-update,
+/// which is uniform by nature and already digest-pinned under the DSSE
+/// signature. Every field of the target manifest is per-environment
+/// configuration: one `listen_addr` would rebind the whole fleet to the same
+/// port, one `packs[]` entry would rebind every env's capability slot, one
+/// `bundles[]` entry would push identical content everywhere. So a broadcast
+/// target must be **environment-id-only**.
+///
+/// Returns the first offending field. The manifest is destructured exhaustively
+/// on purpose: a new `EnvManifest` or `ManifestEnvironment` field fails to
+/// compile here until someone decides whether a broadcast plan may carry it.
+/// A `..` rest-pattern would let the next field silently default into the
+/// allowlist — which is exactly the fleet-wide mutation this guard exists to
+/// stop.
+fn broadcast_target_violation(manifest: &EnvManifest) -> Option<&'static str> {
+    let EnvManifest {
+        schema: _,
+        environment,
+        // `trust_root` / `updates` are refused for EVERY plan, broadcast or not,
+        // by the checks above; not re-reported here so the operator sees the
+        // specific takeover error rather than a generic scope one.
+        trust_root: _,
+        updates: _,
+        secrets,
+        packs,
+        bundles,
+        extensions,
+        messaging_endpoints,
+        cluster,
+        vault_bootstrap,
+    } = manifest;
+    let ManifestEnvironment {
+        id: _,
+        public_base_url,
+        name,
+        region,
+        tenant_org_id,
+        listen_addr,
+        gui_enabled,
+    } = environment;
+
+    // Host config first — these are the fleet-rebinding ones.
+    if listen_addr.is_some() {
+        return Some("environment.listen_addr");
+    }
+    if public_base_url.is_some() {
+        return Some("environment.public_base_url");
+    }
+    if name.is_some() {
+        return Some("environment.name");
+    }
+    if region.is_some() {
+        return Some("environment.region");
+    }
+    if tenant_org_id.is_some() {
+        return Some("environment.tenant_org_id");
+    }
+    if gui_enabled.is_some() {
+        return Some("environment.gui_enabled");
+    }
+    if !secrets.is_empty() {
+        return Some("secrets");
+    }
+    if !packs.is_empty() {
+        return Some("packs");
+    }
+    if !bundles.is_empty() {
+        return Some("bundles");
+    }
+    if !extensions.is_empty() {
+        return Some("extensions");
+    }
+    if !messaging_endpoints.is_empty() {
+        return Some("messaging_endpoints");
+    }
+    if cluster.is_some() {
+        return Some("cluster");
+    }
+    if vault_bootstrap.is_some() {
+        return Some("vault_bootstrap");
+    }
+    None
+}
+
+/// [`broadcast_target_violation`] as a fail-closed gate.
+fn check_broadcast_target_is_id_only(manifest: &EnvManifest) -> Result<(), OpError> {
+    if manifest.environment.id != BROADCAST_ENV_ID {
+        return Ok(());
+    }
+    if let Some(field) = broadcast_target_violation(manifest) {
+        return Err(OpError::InvalidArgument(format!(
+            "broadcast update plan (env `{BROADCAST_ENV_ID}`) declares `{field}`: a plan on the \
+             fleet channel is applied by EVERY subscribed environment, so its target manifest must \
+             carry nothing but `environment.id`. Publish per-environment content to that \
+             environment's own channel instead."
+        )));
+    }
+    Ok(())
 }
 
 /// Reject a target manifest whose apply/rollback this increment cannot yet
@@ -1559,6 +1695,12 @@ fn check_applyable_manifest(
                 .to_string(),
         ));
     }
+    // A broadcast plan converges every subscribed environment, so its target may
+    // carry nothing but the environment id. Checked after the takeover guards
+    // above (so those report their specific error) and before the per-env
+    // guards below (which reason about THIS env's runtime state — meaningless
+    // for a plan addressed to all of them).
+    check_broadcast_target_is_id_only(manifest)?;
     // secrets[] / messaging_endpoints[] both write dev-store secret material;
     // allow them only when a failed apply's rollback (the P0b snapshot) would
     // undo those writes — i.e. the effective sink is the snapshotted dev-store.
@@ -1725,6 +1867,31 @@ fn materialize_entry(entry: &mut Value, staged_blobs: &BTreeMap<String, PathBuf>
             );
         }
     }
+}
+
+/// Rewrite a broadcast target's `environment.id` from `_` to the environment
+/// actually being converged. A non-broadcast target is returned untouched.
+///
+/// `_` addresses a plan; it never names an environment. `env_apply` reconciles
+/// the environment its manifest names and refuses to create one, so handing it
+/// a `_` target fails the entire apply with "environment `_` not found" — after
+/// the plan has staged, verified and passed every gate. Same principle as
+/// `StageState.env_id` recording the local environment rather than `_`.
+///
+/// Safe only because [`check_broadcast_target_is_id_only`] has already run (in
+/// `reverify_staged` → `check_applyable_manifest`): a broadcast target is
+/// guaranteed to carry nothing but `environment.id`, so swapping that id yields
+/// a manifest with no per-environment content at all. If that guard is ever
+/// relaxed, this rewrite stops being a rename and starts silently retargeting
+/// whatever else the manifest declares.
+fn localize_broadcast_target(mut target: Value, env_id: &EnvId) -> Value {
+    let Some(env) = target.get_mut("environment").and_then(Value::as_object_mut) else {
+        return target;
+    };
+    if env.get("id").and_then(Value::as_str) == Some(BROADCAST_ENV_ID) {
+        env.insert("id".to_string(), Value::String(env_id.as_str().to_string()));
+    }
+    target
 }
 
 /// Write the plan's signed target manifest to a temp file and drive the
@@ -2383,12 +2550,21 @@ fn validate_plan_target(target: &serde_json::Value, env_id: &EnvId) -> Result<()
         ))
     })?;
     manifest.validate_shape()?;
+    // The producer signs the header and the target together, so here the two
+    // must be identical — this is not the consumer's `plan_targets_env` wildcard
+    // (an operator publishing to `_` passes `_` as `env_id`).
     if manifest.environment.id != env_id.as_str() {
         return Err(OpError::InvalidArgument(format!(
             "plan target declares environment `{}`, but the plan is for `{env_id}`",
             manifest.environment.id
         )));
     }
+    // Refuse to SIGN a broadcast plan the fleet would reject at apply time. The
+    // consumer backstop in `check_applyable_manifest` is per-environment and
+    // fires once per subscriber per poll; catching it here means the operator
+    // learns at publish time instead of never (nothing reports fleet-wide
+    // rejection back to the publisher).
+    check_broadcast_target_is_id_only(&manifest)?;
     Ok(())
 }
 
@@ -4487,6 +4663,329 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert!(matches!(err, OpError::InvalidArgument(_)));
     }
 
+    // ---- fleet broadcast channel (`_`) ----
+
+    /// Write a signed plan/envelope pair to disk and return the two paths, so a
+    /// test can drive `get_impl` through the local-file source.
+    fn plan_pair_on_disk(dir: &std::path::Path, plan_b: &[u8], sig_b: &[u8]) -> (PathBuf, PathBuf) {
+        let plan_file = dir.join("plan.json");
+        let sig_file = dir.join("plan.json.sig");
+        std::fs::write(&plan_file, plan_b).unwrap();
+        std::fs::write(&sig_file, sig_b).unwrap();
+        (plan_file, sig_file)
+    }
+
+    #[test]
+    fn get_admits_a_broadcast_plan_into_a_differently_named_env() {
+        // The whole point of the fleet channel: a plan addressed to `_` is
+        // applied by an env called something else entirely.
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+        assert_ne!(
+            env_id.as_str(),
+            BROADCAST_ENV_ID,
+            "fixture env must not be `_`"
+        );
+
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        let (plan_b, sig_b) = signed_plan_target(
+            BROADCAST_ENV_ID,
+            "plan-broadcast",
+            1,
+            json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": {"id": BROADCAST_ENV_ID},
+            }),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let (plan_file, sig_file) = plan_pair_on_disk(dir.path(), &plan_b, &sig_b);
+
+        let out = get_impl(
+            &store,
+            &OpFlags::default(),
+            Some(UpdatesGetPayload {
+                environment_id: env_id.to_string(),
+                plan_url: None,
+                plan_file: Some(plan_file),
+                plan_sig_file: Some(sig_file),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap();
+        assert_eq!(out.result["stage"], "staged");
+        assert_eq!(out.result["plan_id"], "plan-broadcast");
+    }
+
+    #[test]
+    fn get_still_rejects_a_plan_for_another_named_env() {
+        // Widening to `_` must not widen to "any env id" — the exact-match arm
+        // is untouched.
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+
+        let (plan_b, sig_b) = signed_plan_target(
+            "some-other-env",
+            "plan-foreign",
+            1,
+            json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": {"id": "some-other-env"},
+            }),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let (plan_file, sig_file) = plan_pair_on_disk(dir.path(), &plan_b, &sig_b);
+
+        let err = get_impl(
+            &store,
+            &OpFlags::default(),
+            Some(UpdatesGetPayload {
+                environment_id: env_id.to_string(),
+                plan_url: None,
+                plan_file: Some(plan_file),
+                plan_sig_file: Some(sig_file),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("some-other-env")));
+    }
+
+    #[test]
+    fn get_rejects_a_broadcast_header_whose_manifest_names_a_real_env() {
+        // The dangerous half-match: before `_` was accepted, checking the header
+        // and the manifest against the LOCAL id each implied they agreed with
+        // each other. That implication is gone, so the manifest is now compared
+        // to the header. A `_` header carrying a manifest for a named env would
+        // otherwise pass the header gate (broadcast) while reconciling another
+        // environment's desired state on every subscriber.
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+
+        let (plan_b, sig_b) = signed_plan_target(
+            BROADCAST_ENV_ID,
+            "plan-half-match",
+            1,
+            json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": {"id": "victim-env"},
+            }),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let (plan_file, sig_file) = plan_pair_on_disk(dir.path(), &plan_b, &sig_b);
+
+        let err = get_impl(
+            &store,
+            &OpFlags::default(),
+            Some(UpdatesGetPayload {
+                environment_id: env_id.to_string(),
+                plan_url: None,
+                plan_file: Some(plan_file),
+                plan_sig_file: Some(sig_file),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("victim-env")));
+    }
+
+    #[test]
+    fn get_rejects_a_named_header_whose_manifest_is_broadcast() {
+        // The mirror image: a header naming this env, carrying a `_` manifest.
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+
+        let (plan_b, sig_b) = signed_plan_target(
+            env_id.as_str(),
+            "plan-mirror",
+            1,
+            json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": {"id": BROADCAST_ENV_ID},
+            }),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let (plan_file, sig_file) = plan_pair_on_disk(dir.path(), &plan_b, &sig_b);
+
+        let err = get_impl(
+            &store,
+            &OpFlags::default(),
+            Some(UpdatesGetPayload {
+                environment_id: env_id.to_string(),
+                plan_url: None,
+                plan_file: Some(plan_file),
+                plan_sig_file: Some(sig_file),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    // ---- broadcast plans are environment-id-only ----
+
+    #[test]
+    fn broadcast_target_rejects_every_non_id_field() {
+        // Table-driven so the guard cannot be half-implemented: each entry is a
+        // field that, on the fleet channel, would be applied identically to
+        // EVERY subscribed environment.
+        let cases: &[(&str, Value)] = &[
+            (
+                "environment.listen_addr",
+                json!({"listen_addr": "0.0.0.0:9999"}),
+            ),
+            (
+                "environment.public_base_url",
+                json!({"public_base_url": "https://evil.example"}),
+            ),
+            ("environment.name", json!({"name": "renamed"})),
+            ("environment.region", json!({"region": "eu-west-1"})),
+            (
+                "environment.tenant_org_id",
+                json!({"tenant_org_id": "org-x"}),
+            ),
+            ("environment.gui_enabled", json!({"gui_enabled": true})),
+        ];
+        for (field, extra) in cases {
+            let mut env_obj = json!({"id": BROADCAST_ENV_ID});
+            for (k, v) in extra.as_object().unwrap() {
+                env_obj[k] = v.clone();
+            }
+            let m = parse_manifest(json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": env_obj,
+            }));
+            let err = check_broadcast_target_is_id_only(&m).expect_err(&format!(
+                "`{field}` must be refused on the broadcast channel"
+            ));
+            assert!(
+                matches!(&err, OpError::InvalidArgument(msg) if msg.contains(field)),
+                "error for `{field}` should name the field, got: {err:?}"
+            );
+        }
+
+        // Top-level collections / blocks.
+        let top_level: &[(&str, Value)] = &[
+            (
+                "secrets",
+                json!({"secrets": [{"path": "acme/_/tls/foo", "from_env": "FOO"}]}),
+            ),
+            (
+                "bundles",
+                json!({"bundles": [{"bundle_id": "b1", "bundle_path": "/x.gtbundle"}]}),
+            ),
+            (
+                "messaging_endpoints",
+                json!({"messaging_endpoints": [
+                    {"name": "tg", "provider_type": "telegram"}
+                ]}),
+            ),
+            (
+                "packs",
+                json!({"packs": [
+                    {"slot": "secrets", "kind": "greentic/secrets-dev", "pack_ref": "r"}
+                ]}),
+            ),
+            (
+                "extensions",
+                json!({"extensions": [
+                    {"kind": "greentic/ext", "pack_ref": "r"}
+                ]}),
+            ),
+            (
+                "cluster",
+                json!({"cluster": {"provider": "kind", "name": "c1"}}),
+            ),
+            (
+                "vault_bootstrap",
+                json!({"vault_bootstrap": {"deploy": "dev-in-cluster"}}),
+            ),
+        ];
+        for (field, extra) in top_level {
+            let mut doc = json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": {"id": BROADCAST_ENV_ID},
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                doc[k] = v.clone();
+            }
+            let m = parse_manifest(doc);
+            let err = check_broadcast_target_is_id_only(&m).expect_err(&format!(
+                "`{field}` must be refused on the broadcast channel"
+            ));
+            assert!(
+                matches!(&err, OpError::InvalidArgument(msg) if msg.contains(field)),
+                "error for `{field}` should name the field, got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn broadcast_target_accepts_an_id_only_manifest() {
+        let m = parse_manifest(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": BROADCAST_ENV_ID},
+        }));
+        check_broadcast_target_is_id_only(&m).unwrap();
+    }
+
+    #[test]
+    fn the_id_only_rule_applies_only_to_broadcast_plans() {
+        // A per-environment plan may still carry host config — the restriction
+        // is a property of the CHANNEL, not of update plans in general.
+        let m = parse_manifest(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local", "listen_addr": "127.0.0.1:8080"},
+        }));
+        check_broadcast_target_is_id_only(&m).unwrap();
+    }
+
+    #[test]
+    fn publish_refuses_to_sign_a_broadcast_plan_carrying_host_config() {
+        // Producer-side: the operator learns at publish time. Nothing reports
+        // fleet-wide apply rejection back to the publisher, so without this the
+        // failure would be invisible.
+        let target = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": BROADCAST_ENV_ID, "listen_addr": "0.0.0.0:9999"},
+        });
+        let broadcast_id = EnvId::try_from(BROADCAST_ENV_ID).unwrap();
+        let err = validate_plan_target(&target, &broadcast_id).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("environment.listen_addr")),
+            "got: {err:?}"
+        );
+
+        // The id-only form signs fine.
+        let ok = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": BROADCAST_ENV_ID},
+        });
+        validate_plan_target(&ok, &broadcast_id).unwrap();
+    }
+
     #[test]
     fn get_rejects_plaintext_remote_plan_url() {
         // A remote plaintext plan_url would fetch without presenting the enrolled
@@ -4988,6 +5487,91 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         )
         .unwrap_err();
         assert!(matches!(err, OpError::NotFound(_)));
+    }
+
+    #[test]
+    fn apply_converges_a_broadcast_plan_end_to_end() {
+        // The APPLY half of broadcast support, which `get`-only tests miss
+        // entirely. `reverify_staged` re-runs the identity checks against the
+        // staged bytes before converging, so a broadcast plan can stage cleanly
+        // and then fail at the last step — a half-working feature that looks
+        // fine until an operator actually publishes to the fleet channel.
+        //
+        // Verified by mutation: feeding `deserialize_plan_manifest` the local
+        // env id instead of the plan header inside `reverify_staged` was caught
+        // by NOTHING in the 1906-test suite before this test existed.
+        use greentic_update::staging::UpdateStage;
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+        assert_ne!(
+            env_id.as_str(),
+            BROADCAST_ENV_ID,
+            "fixture env must not be `_`"
+        );
+
+        // A `_`-addressed, id-only plan staged into the `local` env's tree.
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        let (p, sig) = signed_plan_target(
+            BROADCAST_ENV_ID,
+            "plan-bcast-apply",
+            1,
+            json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": {"id": BROADCAST_ENV_ID},
+            }),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let v = verify_with(&p, &sig, &tk7);
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        let staged = root.begin(&v, &p, &sig).unwrap();
+        advance_to_staged(&staged).unwrap();
+
+        let out = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-bcast-apply".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap();
+
+        assert_eq!(out.result["stage"], "applied");
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-bcast-apply"),
+            UpdateStage::Applied
+        );
+    }
+
+    #[test]
+    fn localize_broadcast_target_rewrites_only_the_broadcast_id() {
+        // Broadcast -> local rename.
+        let out = localize_broadcast_target(
+            json!({"schema": "greentic.env-manifest.v1", "environment": {"id": BROADCAST_ENV_ID}}),
+            &EnvId::try_from("prod").unwrap(),
+        );
+        assert_eq!(out["environment"]["id"], "prod");
+
+        // A named target is untouched — this must never retarget a plan that
+        // was addressed to a specific environment.
+        let out = localize_broadcast_target(
+            json!({"schema": "greentic.env-manifest.v1", "environment": {"id": "staging"}}),
+            &EnvId::try_from("prod").unwrap(),
+        );
+        assert_eq!(out["environment"]["id"], "staging");
+
+        // Malformed shapes pass through rather than panicking; the manifest
+        // deser gate upstream is what rejects them.
+        let out =
+            localize_broadcast_target(json!({"schema": "x"}), &EnvId::try_from("prod").unwrap());
+        assert_eq!(out, json!({"schema": "x"}));
     }
 
     #[test]
@@ -5682,6 +6266,44 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         let err =
             check_applyable_manifest(&env, td.path(), &secrets_manifest(), false).unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("non-dev-store backend")));
+    }
+
+    #[test]
+    fn guard_rejects_a_broadcast_target_carrying_host_config() {
+        // The APPLY-PATH backstop, distinct from the producer gate and from the
+        // direct unit tests: `check_applyable_manifest` must refuse this on its
+        // own. `op updates publish` already refuses to SIGN it, so a plan that
+        // reaches here was built some other way — a bespoke or compromised
+        // signer — which is precisely when a backstop has to hold.
+        //
+        // Without this test, deleting the `check_broadcast_target_is_id_only`
+        // call from `check_applyable_manifest` left the whole suite green
+        // (verified by mutation): every other broadcast test either calls the
+        // guard directly or goes through the producer path.
+        let env = make_env("local");
+        let td = tempdir().unwrap();
+        let m = parse_manifest(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": BROADCAST_ENV_ID, "listen_addr": "0.0.0.0:9999"},
+        }));
+        let err = check_applyable_manifest(&env, td.path(), &m, false).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(msg) if msg.contains("environment.listen_addr")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn guard_accepts_an_id_only_broadcast_target() {
+        // The paired positive: the backstop must not reject legitimate
+        // broadcast plans, or the fleet channel is dead on arrival.
+        let env = make_env("local");
+        let td = tempdir().unwrap();
+        let m = parse_manifest(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": BROADCAST_ENV_ID},
+        }));
+        check_applyable_manifest(&env, td.path(), &m, false).unwrap();
     }
 
     #[test]
