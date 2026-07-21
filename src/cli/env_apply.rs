@@ -2031,7 +2031,7 @@ fn updates_steps(
     ctx: &ApplyContext,
     updates: &ManifestUpdates,
 ) -> Result<Vec<ApplyStep>, OpError> {
-    let resolved = match updates.trust_did.as_deref().map(str::trim) {
+    let resolved = match updates.resolved_trust_did().map(str::trim) {
         Some(did) => {
             let resolver = super::trust_root::default_resolver()?;
             let keys = super::trust_root::resolve_did_keys(did, &resolver)?;
@@ -2099,14 +2099,13 @@ fn plan_trust_did(
             format!("{did} already trusted"),
         ));
     }
-    let detail = format!(
-        "trust {} from {did}",
-        missing
-            .iter()
-            .map(|id| short_key_id(id))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    // FULL key ids, not `short_key_id`. Everywhere else the short form names a
+    // key the operator already holds; here it names a key a network document
+    // just told us to trust, and the plan is the only place a human sees it
+    // before it gains signing authority. Eight hex chars is 32 bits — cheap to
+    // collide deliberately, so a truncated line cannot distinguish the key the
+    // operator expects from one a hijacked document substituted for it.
+    let detail = format!("trust {} from {did}", missing.join(", "));
     Ok(ApplyStep {
         kind: ApplyStepKind::TrustDid,
         key,
@@ -6376,12 +6375,12 @@ mod tests {
 
         assert_eq!(step.action, ApplyAction::Create);
         assert!(
-            step.detail.contains("34b69025"),
-            "the untrusted key must be named: {}",
+            step.detail.contains("34b690258f1ae48d4a4be0bdbffb7fa3"),
+            "the untrusted key must be named IN FULL: {}",
             step.detail
         );
         assert!(
-            !step.detail.contains(short_key_id(&trusted_id)),
+            !step.detail.contains(&trusted_id),
             "an already-trusted key must not be listed as new: {}",
             step.detail
         );
@@ -6399,6 +6398,38 @@ mod tests {
             }
             other => panic!("expected TrustRootAddDid, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn trust_did_distinguishes_keys_that_share_a_short_prefix() {
+        // The plan is the only place a human sees a network-sourced key before
+        // it gains signing authority. `short_key_id` is 8 hex chars = 32 bits,
+        // cheap to collide on purpose, so two distinct keys must never render
+        // as the same line.
+        let (_dir, store) = seeded_store();
+        let (_trusted_id, pem) = seeded_key(&store);
+        let ctx = updates_ctx(Some(make_env("local")), json!({}));
+        let a = "34b690258f1ae48d4a4be0bdbffb7fa3";
+        let b = "34b69025ffffffffffffffffffffffff";
+        assert_eq!(
+            short_key_id(a),
+            short_key_id(b),
+            "premise: prefixes collide"
+        );
+
+        let step = plan_trust_did(
+            &store,
+            &ctx,
+            "did:web:trust.greentic.cloud",
+            vec![(a.to_string(), pem.clone()), (b.to_string(), pem)],
+        )
+        .expect("plans");
+
+        assert!(
+            step.detail.contains(a) && step.detail.contains(b),
+            "both keys must be distinguishable in the plan: {}",
+            step.detail
+        );
     }
 
     #[test]
@@ -6499,7 +6530,7 @@ mod tests {
         let ctx = updates_ctx(Some(make_env("local")), json!({"trust_did": null}));
         let updates = ctx.manifest.updates.clone().unwrap();
         assert!(
-            updates.trust_did.is_none(),
+            updates.resolved_trust_did().is_none(),
             "explicit null must parse as opt-out, not fall back to the default"
         );
 
