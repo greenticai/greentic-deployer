@@ -816,6 +816,12 @@ fn apply_updates_impl(
     // artifacts at the already-verified staged blobs so the apply runs from
     // local disk instead of re-fetching them from the network.
     let target = materialize_bundles(&verified.plan.target, &staged_blobs);
+    // Resolve the broadcast address to this environment's identity. `env_apply`
+    // reconciles the environment the manifest NAMES, and it does not create
+    // one — so a `_` target would send it looking for an environment called `_`
+    // and fail the whole apply ("environment `_` not found"). `_` was only ever
+    // an address; the environment being converged is this one.
+    let target = localize_broadcast_target(target, &env_id);
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -1861,6 +1867,31 @@ fn materialize_entry(entry: &mut Value, staged_blobs: &BTreeMap<String, PathBuf>
             );
         }
     }
+}
+
+/// Rewrite a broadcast target's `environment.id` from `_` to the environment
+/// actually being converged. A non-broadcast target is returned untouched.
+///
+/// `_` addresses a plan; it never names an environment. `env_apply` reconciles
+/// the environment its manifest names and refuses to create one, so handing it
+/// a `_` target fails the entire apply with "environment `_` not found" — after
+/// the plan has staged, verified and passed every gate. Same principle as
+/// `StageState.env_id` recording the local environment rather than `_`.
+///
+/// Safe only because [`check_broadcast_target_is_id_only`] has already run (in
+/// `reverify_staged` → `check_applyable_manifest`): a broadcast target is
+/// guaranteed to carry nothing but `environment.id`, so swapping that id yields
+/// a manifest with no per-environment content at all. If that guard is ever
+/// relaxed, this rewrite stops being a rename and starts silently retargeting
+/// whatever else the manifest declares.
+fn localize_broadcast_target(mut target: Value, env_id: &EnvId) -> Value {
+    let Some(env) = target.get_mut("environment").and_then(Value::as_object_mut) else {
+        return target;
+    };
+    if env.get("id").and_then(Value::as_str) == Some(BROADCAST_ENV_ID) {
+        env.insert("id".to_string(), Value::String(env_id.as_str().to_string()));
+    }
+    target
 }
 
 /// Write the plan's signed target manifest to a temp file and drive the
@@ -5456,6 +5487,91 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         )
         .unwrap_err();
         assert!(matches!(err, OpError::NotFound(_)));
+    }
+
+    #[test]
+    fn apply_converges_a_broadcast_plan_end_to_end() {
+        // The APPLY half of broadcast support, which `get`-only tests miss
+        // entirely. `reverify_staged` re-runs the identity checks against the
+        // staged bytes before converging, so a broadcast plan can stage cleanly
+        // and then fail at the last step — a half-working feature that looks
+        // fine until an operator actually publishes to the fleet channel.
+        //
+        // Verified by mutation: feeding `deserialize_plan_manifest` the local
+        // env id instead of the plan header inside `reverify_staged` was caught
+        // by NOTHING in the 1906-test suite before this test existed.
+        use greentic_update::staging::UpdateStage;
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+        assert_ne!(
+            env_id.as_str(),
+            BROADCAST_ENV_ID,
+            "fixture env must not be `_`"
+        );
+
+        // A `_`-addressed, id-only plan staged into the `local` env's tree.
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        let (p, sig) = signed_plan_target(
+            BROADCAST_ENV_ID,
+            "plan-bcast-apply",
+            1,
+            json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": {"id": BROADCAST_ENV_ID},
+            }),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let v = verify_with(&p, &sig, &tk7);
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        let staged = root.begin(&v, &p, &sig).unwrap();
+        advance_to_staged(&staged).unwrap();
+
+        let out = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-bcast-apply".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap();
+
+        assert_eq!(out.result["stage"], "applied");
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-bcast-apply"),
+            UpdateStage::Applied
+        );
+    }
+
+    #[test]
+    fn localize_broadcast_target_rewrites_only_the_broadcast_id() {
+        // Broadcast -> local rename.
+        let out = localize_broadcast_target(
+            json!({"schema": "greentic.env-manifest.v1", "environment": {"id": BROADCAST_ENV_ID}}),
+            &EnvId::try_from("prod").unwrap(),
+        );
+        assert_eq!(out["environment"]["id"], "prod");
+
+        // A named target is untouched — this must never retarget a plan that
+        // was addressed to a specific environment.
+        let out = localize_broadcast_target(
+            json!({"schema": "greentic.env-manifest.v1", "environment": {"id": "staging"}}),
+            &EnvId::try_from("prod").unwrap(),
+        );
+        assert_eq!(out["environment"]["id"], "staging");
+
+        // Malformed shapes pass through rather than panicking; the manifest
+        // deser gate upstream is what rejects them.
+        let out =
+            localize_broadcast_target(json!({"schema": "x"}), &EnvId::try_from("prod").unwrap());
+        assert_eq!(out, json!({"schema": "x"}));
     }
 
     #[test]
