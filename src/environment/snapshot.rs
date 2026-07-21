@@ -2,7 +2,7 @@
 //!
 //! A snapshot captures the **full per-env file set** — `environment.json`,
 //! `runtime.json`, `runtime-config.json`, per-slot `env-packs/<slot>/answers.json`,
-//! `messaging/**`, and `trust-root.json` — into `<env_dir>/snapshots/<id>/`.
+//! and `messaging/**` — into `<env_dir>/snapshots/<id>/`.
 //! Restore replays the captured bytes **exactly**, then re-derives the
 //! projected files (`runtime-config.json`, `messaging/`) so the running
 //! system picks up the restored state.
@@ -10,8 +10,14 @@
 //! Both operations run under the env's flock via [`LocalFsStore::transact`].
 //!
 //! **Meaningful-absence:** if a file was absent at snapshot time (e.g.
-//! `trust-root.json` or `runtime-config.json`), restore deletes it from the
-//! live env if it exists — a snapshot records *exactly* what was there.
+//! `runtime-config.json`), restore deletes it from the live env if it
+//! exists — a snapshot records *exactly* what was there.
+//!
+//! **`trust-root.json` is deliberately excluded.** The F6 gate (#487)
+//! guarantees no apply step writes the trust root, so snapshotting it
+//! provides no rollback value. Worse, capturing it would let a rollback
+//! silently resurrect a signing key that `op trust-root remove` revoked
+//! between the snapshot and the restore.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -24,7 +30,6 @@ use crate::cli::secrets::{DEV_SECRETS_PATH_ENV, DEV_STORE_RELATIVE, DEV_STORE_ST
 
 use super::atomic_write::{atomic_write_bytes, atomic_write_json};
 use super::store::{LocalFsStore, StoreError};
-use super::trust_root::TRUST_ROOT_FILE;
 
 // ---------------------------------------------------------------------------
 // SnapshotId
@@ -104,12 +109,12 @@ fn snapshot_locked(store: &LocalFsStore, env_id: &EnvId) -> Result<SnapshotId, S
     let mut manifest_files: BTreeMap<String, bool> = BTreeMap::new();
 
     // --- Tracked top-level files ---
-    let top_level = &[
-        "environment.json",
-        "runtime.json",
-        "runtime-config.json",
-        TRUST_ROOT_FILE,
-    ];
+    //
+    // `trust-root.json` is deliberately NOT in this list. The F6 gate (#487)
+    // guarantees no apply step writes the trust root, so snapshotting it
+    // provides no rollback value. Capturing it would let a rollback silently
+    // resurrect a signing key that was revoked between snapshot and restore.
+    let top_level = &["environment.json", "runtime.json", "runtime-config.json"];
     for rel in top_level {
         capture_file(&env_dir, rel, &snap_dir, &mut manifest_files)?;
     }
@@ -441,7 +446,7 @@ mod tests {
         let env_dir = tmp.path().join(env_id.as_str());
 
         // Write additional files: runtime.json stub, answers for deployer slot,
-        // trust-root, and a messaging endpoint.
+        // and a messaging endpoint.
         let runtime_content = br#"{"schema":"greentic.environment-runtime.v1","environment_id":"snapshot-test","discovered":{}}"#;
         fs::write(env_dir.join("runtime.json"), runtime_content).unwrap();
 
@@ -449,9 +454,6 @@ mod tests {
         fs::create_dir_all(&answers_dir).unwrap();
         let answers_content = br#"{"cloud":"aws","region":"us-east-1"}"#;
         fs::write(answers_dir.join("answers.json"), answers_content).unwrap();
-
-        let trust_root_content = br#"{"schema":"greentic.trust-root.v1","keys":[]}"#;
-        fs::write(env_dir.join(TRUST_ROOT_FILE), trust_root_content).unwrap();
 
         // Add a messaging endpoint and project it.
         env.messaging_endpoints
@@ -464,11 +466,10 @@ mod tests {
         // Snapshot
         let snap_id = snapshot_environment(&store, &env_id).unwrap();
 
-        // Mutate/corrupt: overwrite environment.json, delete trust-root, add
-        // a stray messaging file, overwrite answers.
+        // Mutate/corrupt: overwrite environment.json, add a stray messaging
+        // file, overwrite answers.
         let corrupted = b"CORRUPTED";
         fs::write(env_dir.join("environment.json"), corrupted).unwrap();
-        fs::remove_file(env_dir.join(TRUST_ROOT_FILE)).unwrap();
         fs::write(env_dir.join("messaging").join("stray.json"), b"stray").unwrap();
         fs::write(answers_dir.join("answers.json"), b"{}").unwrap();
 
@@ -494,12 +495,6 @@ mod tests {
             runtime_content
         );
 
-        // trust-root.json restored
-        assert_eq!(
-            fs::read(env_dir.join(TRUST_ROOT_FILE)).unwrap(),
-            trust_root_content
-        );
-
         // answers.json byte-exact
         assert_eq!(
             fs::read(answers_dir.join("answers.json")).unwrap(),
@@ -513,31 +508,90 @@ mod tests {
         );
     }
 
+    /// Security property: `trust-root.json` is deliberately excluded from
+    /// the snapshot set. The F6 gate (#487) guarantees no apply step writes
+    /// it, so snapshotting it provides no rollback value. Capturing it would
+    /// let rollback silently resurrect a signing key revoked between
+    /// snapshot and restore.
     #[test]
-    fn meaningful_absence_trust_root() {
+    fn trust_root_excluded_from_snapshot() {
         let tmp = TempDir::new().unwrap();
         let (store, env_id, _env) = seed_env(&tmp);
         let env_dir = tmp.path().join(env_id.as_str());
 
-        // No trust-root.json exists.
-        assert!(!env_dir.join(TRUST_ROOT_FILE).exists());
-
-        // Snapshot (captures absence).
-        let snap_id = snapshot_environment(&store, &env_id).unwrap();
-
-        // Create a trust-root after the snapshot.
+        // Seed a trust-root file so it is present on disk at snapshot time.
+        let trust_root_file = "trust-root.json";
         fs::write(
-            env_dir.join(TRUST_ROOT_FILE),
+            env_dir.join(trust_root_file),
             br#"{"schema":"greentic.trust-root.v1","keys":[]}"#,
         )
         .unwrap();
-        assert!(env_dir.join(TRUST_ROOT_FILE).exists());
 
-        // Restore — trust-root should be gone again.
-        restore_environment(&store, &env_id, &snap_id).unwrap();
+        let snap_id = snapshot_environment(&store, &env_id).unwrap();
+
+        // The snapshot manifest must NOT contain trust-root.json.
+        let snap_dir = env_dir.join(SNAPSHOTS_DIR).join(snap_id.as_str());
+        let manifest: SnapshotManifest =
+            serde_json::from_slice(&fs::read(snap_dir.join(MANIFEST_FILE)).unwrap()).unwrap();
         assert!(
-            !env_dir.join(TRUST_ROOT_FILE).exists(),
-            "trust-root.json should be absent after restoring a snapshot that lacked it"
+            !manifest.files.contains_key(trust_root_file),
+            "trust-root.json must not appear in the snapshot manifest — \
+             the F6 gate (#487) makes it unreachable from apply, and \
+             capturing it would let rollback resurrect a revoked key"
+        );
+        assert!(
+            !snap_dir.join(trust_root_file).exists(),
+            "trust-root.json must not be copied into the snapshot directory"
+        );
+    }
+
+    /// End-to-end hazard regression: a revoked signing key must stay
+    /// revoked after a snapshot restore, not be silently re-authorized.
+    ///
+    /// Sequence (the attack this test codifies):
+    ///   1. Snapshot taken — trust-root contains key K.
+    ///   2. Operator revokes K (`op trust-root remove`).
+    ///   3. Apply fails, triggering rollback.
+    ///   4. Restore must NOT resurrect K.
+    #[test]
+    fn rollback_does_not_resurrect_revoked_trust_key() {
+        use super::super::trust_root;
+
+        let tmp = TempDir::new().unwrap();
+        let (store, env_id, _env) = seed_env(&tmp);
+        let env_dir = tmp.path().join(env_id.as_str());
+
+        // Step 1: seed a trusted key K.
+        let (pem, key_id) = greentic_operator_trust::test_support::keypair(99);
+        trust_root::add_trusted_key(
+            &env_dir,
+            greentic_distributor_client::signing::TrustedKey {
+                key_id: key_id.clone(),
+                public_key_pem: pem,
+            },
+        )
+        .unwrap();
+        assert_eq!(trust_root::load(&env_dir).unwrap().keys.len(), 1);
+
+        // Snapshot (while K is present).
+        let snap_id = snapshot_environment(&store, &env_id).unwrap();
+
+        // Step 2: operator revokes K.
+        trust_root::remove_trusted_key(&env_dir, &key_id).unwrap();
+        assert!(
+            trust_root::load(&env_dir).unwrap().is_empty(),
+            "K must be gone after revocation"
+        );
+
+        // Step 3+4: a failed apply triggers rollback.
+        restore_environment(&store, &env_id, &snap_id).unwrap();
+
+        // K must still be gone — rollback must not resurrect it.
+        let after_restore = trust_root::load(&env_dir).unwrap();
+        assert!(
+            !after_restore.keys.iter().any(|k| k.key_id == key_id),
+            "revoked key {key_id} was resurrected by rollback — \
+             trust-root.json must not be in the snapshot set"
         );
     }
 
