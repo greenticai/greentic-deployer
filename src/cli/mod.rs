@@ -110,7 +110,10 @@ pub enum OpError {
     /// A remote `bundle_source_uri` could not be fetched (registry unreachable,
     /// auth/transport failure, or the artifact is missing). The fetched bytes
     /// are gated against the manifest `bundle_digest` separately by the caller.
-    #[error("bundle fetch failed: {0}")]
+    // Not "bundle fetch failed": did:web trust-root resolution reports through
+    // this variant too, and during an apply that also deploys bundles a
+    // bundle-shaped prefix sends the reader after the wrong subsystem.
+    #[error("fetch failed: {0}")]
     Fetch(String),
     #[error("unauthorized: {policy} — {reason}")]
     Unauthorized { policy: String, reason: String },

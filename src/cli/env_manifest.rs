@@ -111,6 +111,22 @@ pub struct ManifestUpdates {
     /// semver — every existing struct literal keeps compiling.
     #[serde(default = "default_plan_endpoint")]
     pub plan_endpoint: String,
+    /// `did:web` document whose assertion keys this environment trusts to sign
+    /// update plans. Apply resolves it and adds every key the document
+    /// authorizes to the env trust root, add-only — see [`super::trust_root`].
+    ///
+    /// Omitted → [`greentic_deploy_spec::DEFAULT_TRUST_DID`], which is the whole
+    /// point of the field: `"updates": {}` anchors the environment with neither
+    /// a public key nor a DID typed by hand. Deny-by-default survives because
+    /// declaring the block at all is the opt-in — a bare install resolves
+    /// nothing and trusts nothing.
+    ///
+    /// Explicit `null` opts out, for an operator running their own signer.
+    /// Unlike every other optional field here this one is deliberately NOT
+    /// `skip_serializing_if`: `null` must survive a serialize→parse round trip,
+    /// and omitting it on the way out would silently re-arm the default.
+    #[serde(default = "default_trust_did")]
+    pub trust_did: Option<String>,
     /// Master switch. Absent = `true`: an operator who wrote this block wants
     /// the channel on. Set `false` to declare the endpoint without subscribing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -141,6 +157,15 @@ pub struct ManifestUpdates {
 /// on a non-`Option` field requires a path to a `fn() -> T`.
 fn default_plan_endpoint() -> String {
     greentic_deploy_spec::DEFAULT_PLAN_ENDPOINT.to_owned()
+}
+
+/// Serde default for [`ManifestUpdates::trust_did`] — the fleet trust root.
+///
+/// Returns `Some`, so an ABSENT field anchors on the default while an explicit
+/// `null` parses to `None` and skips the step. A `-> String` signature could not
+/// express that difference, which is why this one field is `Option`.
+fn default_trust_did() -> Option<String> {
+    Some(greentic_deploy_spec::DEFAULT_TRUST_DID.to_owned())
 }
 
 impl ManifestUpdates {
@@ -552,6 +577,17 @@ impl EnvManifest {
                 return Err(OpError::InvalidArgument(format!(
                     "updates.poll_interval_secs {secs} is below the {}s floor",
                     greentic_deploy_spec::MIN_POLL_INTERVAL_SECS
+                )));
+            }
+            // Shape-check the DID here rather than leaving it to the resolver:
+            // apply would otherwise reach the network — and possibly mutate
+            // earlier steps — before discovering a typo in a string that never
+            // had a chance of parsing.
+            if let Some(did) = &updates.trust_did
+                && let Err(e) = greentic_trust::DidWeb::parse(did.trim())
+            {
+                return Err(OpError::InvalidArgument(format!(
+                    "updates.trust_did {did:?} is not a usable did:web: {e}"
                 )));
             }
             if let Some(ref ep) = updates.stream_endpoint {
@@ -3317,6 +3353,67 @@ mod tests {
     #[test]
     fn updates_block_is_optional_and_absent_by_default() {
         assert!(minimal(ENV_MANIFEST_SCHEMA_V1).updates.is_none());
+    }
+
+    // --- trust_did: the built-in default trust anchor -----------------------
+
+    #[test]
+    fn an_updates_block_with_no_trust_did_anchors_on_the_fleet_default() {
+        let m = with_updates(serde_json::json!({})).expect("parses");
+        m.validate_shape().expect("valid");
+        assert_eq!(
+            m.updates.unwrap().trust_did.as_deref(),
+            Some(greentic_deploy_spec::DEFAULT_TRUST_DID),
+            "`updates: {{}}` must anchor the env with no DID typed by hand"
+        );
+    }
+
+    #[test]
+    fn an_explicit_null_trust_did_opts_out() {
+        let m = with_updates(serde_json::json!({"trust_did": null})).expect("parses");
+        m.validate_shape().expect("valid");
+        assert!(
+            m.updates.unwrap().trust_did.is_none(),
+            "explicit null must mean opt-out, not fall through to the default"
+        );
+    }
+
+    #[test]
+    fn an_explicit_trust_did_is_preserved() {
+        let m = with_updates(serde_json::json!({"trust_did": "did:web:trust.example.com"}))
+            .expect("parses");
+        m.validate_shape().expect("valid");
+        assert_eq!(
+            m.updates.unwrap().trust_did.as_deref(),
+            Some("did:web:trust.example.com")
+        );
+    }
+
+    #[test]
+    fn an_opted_out_trust_did_survives_a_serialize_parse_round_trip() {
+        // `skip_serializing_if = "Option::is_none"` on this field would drop the
+        // null on the way out, and re-parsing would silently re-arm the fleet
+        // default — turning an operator's deliberate opt-out back on.
+        let m = with_updates(serde_json::json!({"trust_did": null})).expect("parses");
+        let round_tripped: EnvManifest =
+            serde_json::from_str(&serde_json::to_string(&m).expect("serializes"))
+                .expect("re-parses");
+        assert!(
+            round_tripped.updates.unwrap().trust_did.is_none(),
+            "a serialize/parse round trip must not re-arm the default"
+        );
+    }
+
+    #[test]
+    fn a_trust_did_that_is_not_a_did_web_is_rejected_before_any_network_call() {
+        for bad in ["", "   ", "did:key:z6Mk", "https://trust.example.com"] {
+            let m = with_updates(serde_json::json!({"trust_did": bad})).expect("parses");
+            let err = m.validate_shape().unwrap_err();
+            assert!(
+                matches!(err, OpError::InvalidArgument(_)),
+                "{bad:?} should be rejected at validate_shape, got {err}"
+            );
+        }
     }
 
     #[test]
