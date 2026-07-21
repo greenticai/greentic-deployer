@@ -453,13 +453,7 @@ fn get_impl(
     //    header names this env while its manifest reconciles another; fail closed
     //    on either mismatch before touching the staging tree.
     check_plan_addresses_env(&verified.plan.env_id, &env_id, "plan")?;
-    let manifest: EnvManifest =
-        serde_json::from_value(verified.plan.target.clone()).map_err(|e| {
-            OpError::InvalidArgument(format!(
-                "plan target is not a valid {ENV_MANIFEST_SCHEMA_V1}: {e}"
-            ))
-        })?;
-    check_manifest_matches_plan_env(&manifest, &verified.plan.env_id)?;
+    deserialize_plan_manifest(&verified.plan.target, &verified.plan.env_id)?;
 
     // 4. Admit to staging under a single lock hold — or RESUME an
     //    already-admitted identical plan. The downgrade guard (monotonic
@@ -1473,13 +1467,7 @@ fn reverify_staged(
     // outlive: nothing stops a `_`-addressed plan being staged, the env being
     // renamed, and this running against a different identity.
     check_plan_addresses_env(&verified.plan.env_id, env_id, "staged plan")?;
-    let manifest: EnvManifest =
-        serde_json::from_value(verified.plan.target.clone()).map_err(|e| {
-            OpError::InvalidArgument(format!(
-                "plan target is not a valid {ENV_MANIFEST_SCHEMA_V1}: {e}"
-            ))
-        })?;
-    check_manifest_matches_plan_env(&manifest, &verified.plan.env_id)?;
+    let manifest = deserialize_plan_manifest(&verified.plan.target, &verified.plan.env_id)?;
     // Fail closed on manifest content this increment cannot apply *safely*. The
     // dev-store-secret guard needs the env's `Secrets` binding, the env dir (to
     // check the dev-store files aren't symlinked off the tree), and whether the
@@ -1524,6 +1512,23 @@ fn check_manifest_matches_plan_env(manifest: &EnvManifest, plan_env: &str) -> Re
         )));
     }
     Ok(())
+}
+
+/// Deserialize the plan's target as an [`EnvManifest`] and verify that the
+/// manifest's `environment.id` matches the plan header, in one call. Used by
+/// both [`get_impl`] and [`reverify_staged`] — the two consumer-side sites
+/// that need the same deser + agreement check before further admission gates.
+fn deserialize_plan_manifest(
+    target: &serde_json::Value,
+    plan_env: &str,
+) -> Result<EnvManifest, OpError> {
+    let manifest: EnvManifest = serde_json::from_value(target.clone()).map_err(|e| {
+        OpError::InvalidArgument(format!(
+            "plan target is not a valid {ENV_MANIFEST_SCHEMA_V1}: {e}"
+        ))
+    })?;
+    check_manifest_matches_plan_env(&manifest, plan_env)?;
+    Ok(manifest)
 }
 
 /// Reject a broadcast (`_`-addressed) plan that declares anything beyond its own
