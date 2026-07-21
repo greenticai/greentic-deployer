@@ -18,7 +18,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use greentic_deploy_spec::{
-    EnvId, Environment, MIN_POLL_INTERVAL_SECS, UpdateAction, UpdateChannelConfig,
+    DEFAULT_PLAN_ENDPOINT, EnvId, Environment, MIN_POLL_INTERVAL_SECS, UpdateAction,
+    UpdateChannelConfig,
 };
 use greentic_distributor_client::{CachePolicy, DistClient, DistOptions, ResolvePolicy};
 use greentic_secrets_lib::core::rt;
@@ -1289,6 +1290,13 @@ pub fn config_set(
         )));
     }
 
+    // Enabling without an explicit endpoint triggers the fleet-default write:
+    // the operator is subscribing to the channel and hasn't said where to poll,
+    // so we persist `DEFAULT_PLAN_ENDPOINT` (write-time, not read-time — see the
+    // deploy-spec test `enabled_config_with_no_endpoint_resolves_plan_to_none`).
+    let enabling_without_endpoint =
+        payload.enabled == Some(true) && validated_plan_endpoint.is_none();
+
     let mut fields = Vec::new();
     if payload.enabled.is_some() {
         fields.push("enabled");
@@ -1302,7 +1310,7 @@ pub fn config_set(
     if payload.poll_interval_secs.is_some() {
         fields.push("poll_interval_secs");
     }
-    if validated_plan_endpoint.is_some() {
+    if validated_plan_endpoint.is_some() || enabling_without_endpoint {
         fields.push("plan_endpoint");
     }
     if payload.push_enabled.is_some() {
@@ -1325,34 +1333,54 @@ pub fn config_set(
         // disjoint concurrent `config-set`s can't drop each other's fields, and
         // a corrupt/spoofed env directory (which `exists` alone would admit) is
         // rejected fail-closed before anything is written.
-        let cfg = store.transact(&env_id, |locked| -> Result<UpdateChannelConfig, OpError> {
-            // Validated Environment load under the lock (schema + env-id binding).
-            locked.load()?;
-            let mut cfg = locked
-                .load_update_channel()?
-                .unwrap_or_else(|| UpdateChannelConfig::disabled(env_id.clone()));
-            if let Some(enabled) = payload.enabled {
-                cfg.enabled = Some(enabled);
-            }
-            if let Some(action) = parsed_action {
-                cfg.set_action(action);
-            }
-            if let Some(secs) = payload.poll_interval_secs {
-                cfg.poll_interval_secs = Some(secs);
-            }
-            if let Some(ep) = validated_plan_endpoint {
-                cfg.plan_endpoint = Some(ep);
-            }
-            if let Some(pe) = payload.push_enabled {
-                cfg.push_enabled = Some(pe);
-            }
-            if let Some(ep) = validated_stream_endpoint {
-                cfg.stream_endpoint = Some(ep);
-            }
-            locked.save_update_channel(&cfg)?;
-            Ok(cfg)
-        })?;
-        let outcome = OpOutcome::new(NOUN, "config-set", config_view(&cfg));
+        let (cfg, defaulted_endpoint) = store.transact(
+            &env_id,
+            |locked| -> Result<(UpdateChannelConfig, bool), OpError> {
+                // Validated Environment load under the lock (schema + env-id binding).
+                locked.load()?;
+                let mut cfg = locked
+                    .load_update_channel()?
+                    .unwrap_or_else(|| UpdateChannelConfig::disabled(env_id.clone()));
+                if let Some(enabled) = payload.enabled {
+                    cfg.enabled = Some(enabled);
+                }
+                if let Some(action) = parsed_action {
+                    cfg.set_action(action);
+                }
+                if let Some(secs) = payload.poll_interval_secs {
+                    cfg.poll_interval_secs = Some(secs);
+                }
+                let mut defaulted = false;
+                if let Some(ep) = validated_plan_endpoint {
+                    cfg.plan_endpoint = Some(ep);
+                } else if enabling_without_endpoint && cfg.plan_endpoint.is_none() {
+                    // No endpoint supplied, none stored, and the operator is
+                    // enabling — persist the fleet default so the runtime has
+                    // somewhere to poll. Write-time, not read-time.
+                    cfg.plan_endpoint = Some(DEFAULT_PLAN_ENDPOINT.to_owned());
+                    defaulted = true;
+                }
+                if let Some(pe) = payload.push_enabled {
+                    cfg.push_enabled = Some(pe);
+                }
+                if let Some(ep) = validated_stream_endpoint {
+                    cfg.stream_endpoint = Some(ep);
+                }
+                locked.save_update_channel(&cfg)?;
+                Ok((cfg, defaulted))
+            },
+        )?;
+        let mut view = config_view(&cfg);
+        if defaulted_endpoint {
+            // Make the defaulting visible: silently pointing a runtime at a
+            // Greentic-operated URL is exactly the kind of thing that must
+            // surface in the operator's output.
+            view["defaulted_plan_endpoint"] = json!(DEFAULT_PLAN_ENDPOINT);
+            view["note"] = json!(format!(
+                "no plan_endpoint supplied; using fleet default: {DEFAULT_PLAN_ENDPOINT}"
+            ));
+        }
+        let outcome = OpOutcome::new(NOUN, "config-set", view);
         Ok((outcome, super::AuditGens::NONE))
     })
 }
@@ -3430,6 +3458,131 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err2, OpError::InvalidArgument(_)), "got {err2:?}");
         assert!(store.load_update_channel(&env_id).unwrap().is_none());
+    }
+
+    // --- default plan endpoint (config-set) ---------------------------------
+
+    #[test]
+    fn config_set_enabling_without_endpoint_persists_default() {
+        // An operator enables the channel but supplies no --plan-endpoint and
+        // none is stored: the fleet default is persisted at write time so the
+        // runtime has somewhere to poll.
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        let out = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: Some(true),
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+            }),
+        )
+        .unwrap();
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert_eq!(
+            cfg.plan_endpoint.as_deref(),
+            Some(DEFAULT_PLAN_ENDPOINT),
+            "enabling without an endpoint must persist the fleet default"
+        );
+        assert!(cfg.resolved_enabled());
+        // The outcome must surface the defaulting visibly — silently pointing a
+        // runtime at a Greentic-operated URL is the kind of thing that must
+        // appear in the operator's output.
+        assert_eq!(
+            out.result["defaulted_plan_endpoint"].as_str(),
+            Some(DEFAULT_PLAN_ENDPOINT),
+            "outcome must carry `defaulted_plan_endpoint` so the operator sees it"
+        );
+        assert!(
+            out.result["note"]
+                .as_str()
+                .unwrap_or("")
+                .contains(DEFAULT_PLAN_ENDPOINT),
+            "outcome note must mention the default URL"
+        );
+    }
+
+    #[test]
+    fn config_set_enabling_with_stored_endpoint_leaves_it_alone() {
+        // An operator has already set a custom endpoint, then enables the
+        // channel without re-supplying --plan-endpoint: the stored endpoint
+        // must not be overwritten by the fleet default.
+        let dir = tempdir().unwrap();
+        let (store, _) = store_with_env(dir.path(), "local");
+        let custom = "https://custom.example.com/plans/latest";
+        // First: store a custom endpoint.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: Some(false),
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some(custom.into()),
+                push_enabled: None,
+                stream_endpoint: None,
+            }),
+        )
+        .unwrap();
+        // Second: enable with no --plan-endpoint.
+        let out = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: Some(true),
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            out.result["plan_endpoint"].as_str(),
+            Some(custom),
+            "stored custom endpoint must not be overwritten by the default"
+        );
+        assert!(
+            out.result.get("defaulted_plan_endpoint").is_none()
+                || out.result["defaulted_plan_endpoint"].is_null(),
+            "no defaulting note when the endpoint was already stored"
+        );
+    }
+
+    #[test]
+    fn config_set_disabling_without_endpoint_does_not_default() {
+        // Disabling the channel with no endpoint must not inject the fleet
+        // default — deny-by-default means a disabled channel has no source.
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: Some(false),
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+            }),
+        )
+        .unwrap();
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert!(
+            cfg.plan_endpoint.is_none(),
+            "disabling must not inject a plan_endpoint"
+        );
+        assert!(!cfg.resolved_enabled());
     }
 
     #[test]
