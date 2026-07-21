@@ -225,10 +225,9 @@ pub fn add(
 /// Resolve `did` and derive the `(key_id, public_key_pem)` pair for every key
 /// the document authorizes, in document order.
 ///
-/// Shared by the local verb below and the `--store-url` path in
-/// `dispatch_remote`: resolution is a client-side concern either way, so the
-/// remote backend needs no did:web support — it keeps receiving ordinary
-/// `add_trusted_key` calls.
+/// Split out from [`add_did`] so tests can drive resolution on its own — the
+/// canonical key-id derivation and the malformed-DID rejection are asserted
+/// here, with no store in the picture.
 ///
 /// An empty assertion set is impossible to reach here: `TrustDocument::parse`
 /// already rejects it with `NoAssertionKeys`. That is load-bearing — a document
@@ -325,8 +324,9 @@ pub fn add_did(
 }
 
 /// Persist an already-resolved key set under one audit record. Split from
-/// [`add_did`] so tests can drive it with a fake [`RootResolver`] and so the
-/// remote dispatch path can reuse the audit shape.
+/// [`add_did`] so tests can drive it with a fake [`RootResolver`], and so the
+/// partial-failure tests can feed it a synthetic key set the resolver would
+/// never produce.
 pub(crate) fn add_resolved_did_keys(
     store: &LocalFsStore,
     env_id: &EnvId,

@@ -1748,22 +1748,18 @@ fn remote_trust_root_add(
     ))
 }
 
-/// `--store-url` counterpart of `trust_root::add_did` — deliberately refused.
+/// `--store-url` counterpart of `trust_root::add_did` — deliberately refused,
+/// not merely unimplemented. Decomposing the verb into N ordinary
+/// `add_trusted_key` calls would appear to work: `AddTrustedKeyPayload` is
+/// `{key_id, public_key_pem}` with no DID field, so the server would durably
+/// record N unrelated `trust-root add` events and the DID — the verb's ONLY
+/// provenance, which is why resolved keys carry none on disk — would survive
+/// nowhere but this process's stdout. Implementing it needs a batch endpoint
+/// carrying the DID and one action-level idempotency key, written
+/// transactionally with the trust root.
 ///
-/// Resolution itself is a client-side concern, so decomposing the verb into N
-/// ordinary `add_trusted_key` calls would "work". It is refused because the
-/// audit trail it produces contradicts the verb's own provenance model: a
-/// did-resolved key is stored indistinguishably from a hand-added one precisely
-/// because the `add-did` audit event carries the DID. `AddTrustedKeyPayload` is
-/// `{key_id, public_key_pem}` — there is no DID field — so the server would
-/// durably record N unrelated `trust-root add` events and the DID would exist
-/// only in this process's stdout. An operator later asking "which of these keys
-/// came from the DID we just rotated?" would have no way to answer.
-///
-/// Wiring this properly means a batch endpoint carrying the DID, the full key
-/// set, and one action-level idempotency key, persisted transactionally with
-/// the trust-root update — a `greentic-deploy-spec` wire type plus a
-/// `greentic-operator-store-server` route, which is its own change.
+/// Note it does NOT use the shared `not_supported()` helper: that message says
+/// "read/local-only verb", which is false here and would read as an oversight.
 fn remote_trust_root_add_did(
     _store: &dyn EnvironmentMutations,
     _flags: &OpFlags,
