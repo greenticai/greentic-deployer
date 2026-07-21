@@ -111,6 +111,29 @@ pub struct ManifestUpdates {
     /// semver — every existing struct literal keeps compiling.
     #[serde(default = "default_plan_endpoint")]
     pub plan_endpoint: String,
+    /// `did:web` document whose assertion keys this environment trusts to sign
+    /// update plans. Apply resolves it and adds every key the document
+    /// authorizes to the env trust root, add-only — see [`super::trust_root`].
+    ///
+    /// Three states, which is why this is a double `Option` and not a plain one
+    /// (see [`Self::resolved_trust_did`] for the decision itself):
+    ///
+    /// - **absent** (`None`) — implicit. Anchors on
+    ///   [`greentic_deploy_spec::DEFAULT_TRUST_DID`] *only* for an enabled
+    ///   subscription to the fleet channel. That is the point of the field:
+    ///   `"updates": {}` anchors the environment with neither a public key nor a
+    ///   DID typed by hand. Deny-by-default survives because declaring the block
+    ///   at all is the opt-in — a bare install resolves nothing.
+    /// - **`null`** (`Some(None)`) — explicit opt-out, for an operator running
+    ///   their own signer.
+    /// - **a string** (`Some(Some(did))`) — that DID, whatever the endpoint is.
+    ///
+    /// `skip_serializing_if` skips only the absent case, so an explicit `null`
+    /// survives a serialize→parse round trip instead of decaying back to
+    /// implicit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_explicit_null")]
+    pub trust_did: Option<Option<String>>,
     /// Master switch. Absent = `true`: an operator who wrote this block wants
     /// the channel on. Set `false` to declare the endpoint without subscribing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,11 +166,50 @@ fn default_plan_endpoint() -> String {
     greentic_deploy_spec::DEFAULT_PLAN_ENDPOINT.to_owned()
 }
 
+/// Deserialize a present-but-`null` field as `Some(None)` rather than `None`.
+///
+/// Serde collapses both "absent" and "`null`" to `None` for an `Option`, and for
+/// [`ManifestUpdates::trust_did`] those two must mean different things — one is
+/// "decide for me", the other is "do not touch my trust root". Pairing this with
+/// `#[serde(default)]` recovers the distinction: absent never reaches the
+/// deserializer, so it stays `None`, while a literal `null` arrives here and
+/// becomes `Some(None)`.
+fn deserialize_explicit_null<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer).map(Some)
+}
+
 impl ManifestUpdates {
     /// Resolved master switch — absent means "on", because declaring the block
     /// is the subscription.
     pub fn resolved_enabled(&self) -> bool {
         self.enabled.unwrap_or(true)
+    }
+
+    /// The trust anchor apply should establish, or `None` to leave the env
+    /// trust root alone.
+    ///
+    /// The implicit fleet anchor rides with the fleet channel and nothing else.
+    /// Trust roots are undifferentiated — any key in one may sign any plan the
+    /// environment accepts — so defaulting unconditionally would hand the
+    /// Greentic signer authority over a tenant's own channel the first time they
+    /// re-applied a manifest written before this field existed. Their manifest
+    /// omits `trust_did` because it predates it, not because they chose the
+    /// fleet root.
+    ///
+    /// So the implicit case requires BOTH an enabled subscription and the
+    /// default plan endpoint. An operator pointing at their own endpoint who
+    /// does want the fleet keys names the DID explicitly.
+    pub fn resolved_trust_did(&self) -> Option<&str> {
+        match &self.trust_did {
+            // Explicit wins outright, `null` included.
+            Some(explicit) => explicit.as_deref(),
+            None => (self.resolved_enabled()
+                && self.plan_endpoint.trim() == greentic_deploy_spec::DEFAULT_PLAN_ENDPOINT)
+                .then_some(greentic_deploy_spec::DEFAULT_TRUST_DID),
+        }
     }
 }
 
@@ -552,6 +614,17 @@ impl EnvManifest {
                 return Err(OpError::InvalidArgument(format!(
                     "updates.poll_interval_secs {secs} is below the {}s floor",
                     greentic_deploy_spec::MIN_POLL_INTERVAL_SECS
+                )));
+            }
+            // Shape-check the DID here rather than leaving it to the resolver:
+            // apply would otherwise reach the network — and possibly mutate
+            // earlier steps — before discovering a typo in a string that never
+            // had a chance of parsing.
+            if let Some(did) = updates.resolved_trust_did()
+                && let Err(e) = greentic_trust::DidWeb::parse(did.trim())
+            {
+                return Err(OpError::InvalidArgument(format!(
+                    "updates.trust_did {did:?} is not a usable did:web: {e}"
                 )));
             }
             if let Some(ref ep) = updates.stream_endpoint {
@@ -3317,6 +3390,116 @@ mod tests {
     #[test]
     fn updates_block_is_optional_and_absent_by_default() {
         assert!(minimal(ENV_MANIFEST_SCHEMA_V1).updates.is_none());
+    }
+
+    // --- trust_did: the built-in default trust anchor -----------------------
+
+    fn resolved_did(updates: serde_json::Value) -> Option<String> {
+        let m = with_updates(updates).expect("parses");
+        m.validate_shape().expect("valid");
+        m.updates
+            .as_ref()
+            .unwrap()
+            .resolved_trust_did()
+            .map(str::to_owned)
+    }
+
+    #[test]
+    fn an_updates_block_with_no_trust_did_anchors_on_the_fleet_default() {
+        assert_eq!(
+            resolved_did(serde_json::json!({})).as_deref(),
+            Some(greentic_deploy_spec::DEFAULT_TRUST_DID),
+            "`updates: {{}}` must anchor the env with no DID typed by hand"
+        );
+    }
+
+    #[test]
+    fn an_explicit_null_trust_did_opts_out() {
+        assert_eq!(
+            resolved_did(serde_json::json!({"trust_did": null})),
+            None,
+            "explicit null must mean opt-out, not fall through to the default"
+        );
+    }
+
+    #[test]
+    fn an_explicit_trust_did_is_preserved() {
+        assert_eq!(
+            resolved_did(serde_json::json!({"trust_did": "did:web:trust.example.com"})).as_deref(),
+            Some("did:web:trust.example.com")
+        );
+    }
+
+    #[test]
+    fn a_custom_plan_endpoint_never_picks_up_the_fleet_anchor_implicitly() {
+        // The security case for the conditional default. Every manifest written
+        // before this field existed omits it — including a tenant's, pointed at
+        // their own signer. Trust roots are undifferentiated, so defaulting
+        // unconditionally would hand the Greentic key authority over that
+        // tenant's channel on the next otherwise-unchanged apply.
+        assert_eq!(
+            resolved_did(serde_json::json!({
+                "plan_endpoint": "https://updates.tenant.example.com/plan"
+            })),
+            None,
+            "a tenant-owned endpoint must not implicitly trust the fleet signer"
+        );
+    }
+
+    #[test]
+    fn a_custom_plan_endpoint_still_honours_an_explicit_trust_did() {
+        assert_eq!(
+            resolved_did(serde_json::json!({
+                "plan_endpoint": "https://updates.tenant.example.com/plan",
+                "trust_did": greentic_deploy_spec::DEFAULT_TRUST_DID
+            }))
+            .as_deref(),
+            Some(greentic_deploy_spec::DEFAULT_TRUST_DID),
+            "naming the DID explicitly must work whatever the endpoint is"
+        );
+    }
+
+    #[test]
+    fn a_declared_but_disabled_channel_trusts_nothing_implicitly() {
+        assert_eq!(
+            resolved_did(serde_json::json!({"enabled": false})),
+            None,
+            "declaring an endpoint without subscribing must not grant signing authority"
+        );
+    }
+
+    #[test]
+    fn the_three_trust_did_states_survive_a_serialize_parse_round_trip() {
+        // Absent and `null` both deserialize to `None` under plain serde, which
+        // would collapse "decide for me" into "never" (or, with the outer
+        // `skip_serializing_if`, the reverse). Both directions must hold.
+        for (label, block, want) in [
+            ("absent", serde_json::json!({}), Some(())),
+            ("null", serde_json::json!({"trust_did": null}), None),
+        ] {
+            let m = with_updates(block).expect("parses");
+            let round_tripped: EnvManifest =
+                serde_json::from_str(&serde_json::to_string(&m).expect("serializes"))
+                    .expect("re-parses");
+            let got = round_tripped
+                .updates
+                .unwrap()
+                .resolved_trust_did()
+                .map(|_| ());
+            assert_eq!(got, want, "{label} must survive a round trip");
+        }
+    }
+
+    #[test]
+    fn a_trust_did_that_is_not_a_did_web_is_rejected_before_any_network_call() {
+        for bad in ["", "   ", "did:key:z6Mk", "https://trust.example.com"] {
+            let m = with_updates(serde_json::json!({"trust_did": bad})).expect("parses");
+            let err = m.validate_shape().unwrap_err();
+            assert!(
+                matches!(err, OpError::InvalidArgument(_)),
+                "{bad:?} should be rejected at validate_shape, got {err}"
+            );
+        }
     }
 
     #[test]

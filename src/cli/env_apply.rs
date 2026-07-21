@@ -159,6 +159,7 @@ enum ApplyStepKind {
     AddEndpoint,
     LinkEndpoint,
     SetWelcomeFlow,
+    TrustDid,
     ConfigureUpdates,
 }
 
@@ -179,6 +180,7 @@ impl ApplyStepKind {
             ApplyStepKind::AddEndpoint => "add-endpoint",
             ApplyStepKind::LinkEndpoint => "link-endpoint",
             ApplyStepKind::SetWelcomeFlow => "set-welcome-flow",
+            ApplyStepKind::TrustDid => "trust-did",
             ApplyStepKind::ConfigureUpdates => "configure-updates",
         }
     }
@@ -218,6 +220,15 @@ enum StepOp {
         url: String,
     },
     TrustRootBootstrap,
+    /// Trust the keys of an already-resolved `did:web` document. The keys are
+    /// carried, not re-fetched: resolution happens at plan time so `--dry-run`
+    /// can name the exact key ids, and re-resolving at execute time would let
+    /// the document change between the plan the operator approved and the keys
+    /// actually trusted.
+    TrustRootAddDid {
+        did: String,
+        keys: Vec<(String, String)>,
+    },
     /// The resolved VALUE deliberately does not live in the step (steps
     /// derive `Debug` and serialize into the plan/report) — execute looks it
     /// up in [`ApplyContext::secret_values`] by this path.
@@ -2000,10 +2011,112 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
     // deploy therefore leaves the env unsubscribed rather than subscribed to a
     // channel it cannot yet serve.
     if let Some(updates) = &ctx.manifest.updates {
-        steps.push(updates_step(store, ctx, updates)?);
+        steps.extend(updates_steps(store, ctx, updates)?);
     }
 
     Ok(steps)
+}
+
+/// The `updates` block's steps, in the order they must execute.
+///
+/// Resolution happens HERE, at plan time, which is a deliberate departure from
+/// [`trust_root_step`]'s disk-only rule. Two reasons: a `--dry-run` that cannot
+/// name the key ids it would trust is not a reviewable plan for a trust-anchor
+/// change, and a document that fails to resolve should abort before any step
+/// mutates the store rather than after. The cost is that `--dry-run` needs the
+/// network once the block declares a DID. The resolver is built only once a DID
+/// is actually declared, so an opt-out plans with no network at all.
+fn updates_steps(
+    store: &LocalFsStore,
+    ctx: &ApplyContext,
+    updates: &ManifestUpdates,
+) -> Result<Vec<ApplyStep>, OpError> {
+    let resolved = match updates.resolved_trust_did().map(str::trim) {
+        Some(did) => {
+            let resolver = super::trust_root::default_resolver()?;
+            let keys = super::trust_root::resolve_did_keys(did, &resolver)?;
+            Some((did.to_string(), keys))
+        }
+        None => None,
+    };
+    plan_updates_steps(store, ctx, updates, resolved)
+}
+
+/// The ordering half of [`updates_steps`], taking a trust-anchor that is already
+/// resolved (`None` = the operator opted out with an explicit `null`).
+///
+/// Trust comes BEFORE subscription, and that is a correctness property rather
+/// than tidiness: an environment that starts polling a channel whose signing key
+/// it does not yet trust rejects every plan it fetches. Split out so a test can
+/// assert the order without a network round trip.
+fn plan_updates_steps(
+    store: &LocalFsStore,
+    ctx: &ApplyContext,
+    updates: &ManifestUpdates,
+    resolved: Option<(String, Vec<(String, String)>)>,
+) -> Result<Vec<ApplyStep>, OpError> {
+    let mut steps = Vec::new();
+    if let Some((did, keys)) = resolved {
+        steps.push(plan_trust_did(store, ctx, &did, keys)?);
+    }
+    steps.push(updates_step(store, ctx, updates)?);
+    Ok(steps)
+}
+
+/// The diff half of [`updates_steps`], taking keys that are already resolved.
+/// Split so tests can exercise the already-trusted / partially-trusted /
+/// nothing-trusted cases without a network or a fake resolver.
+fn plan_trust_did(
+    store: &LocalFsStore,
+    ctx: &ApplyContext,
+    did: &str,
+    keys: Vec<(String, String)>,
+) -> Result<ApplyStep, OpError> {
+    let key = ctx.env_id.as_str().to_string();
+    // A fresh env has no trust root on disk yet, so nothing is trusted and every
+    // resolved key is new.
+    let already: Vec<String> = match &ctx.env {
+        Some(_) => {
+            let env_dir = store.env_dir(&ctx.env_id)?;
+            store_trust_root::load(&env_dir)?
+                .keys
+                .into_iter()
+                .map(|k| k.key_id)
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    let missing: Vec<&str> = keys
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .filter(|id| !already.iter().any(|a| a.eq_ignore_ascii_case(id)))
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(ApplyStep::no_op(
+            ApplyStepKind::TrustDid,
+            key,
+            format!("{did} already trusted"),
+        ));
+    }
+    // FULL key ids, not `short_key_id`. Everywhere else the short form names a
+    // key the operator already holds; here it names a key a network document
+    // just told us to trust, and the plan is the only place a human sees it
+    // before it gains signing authority. Eight hex chars is 32 bits — cheap to
+    // collide deliberately, so a truncated line cannot distinguish the key the
+    // operator expects from one a hijacked document substituted for it.
+    let detail = format!("trust {} from {did}", missing.join(", "));
+    Ok(ApplyStep {
+        kind: ApplyStepKind::TrustDid,
+        key,
+        action: ApplyAction::Create,
+        detail,
+        idempotency_key: None,
+        op: StepOp::TrustRootAddDid {
+            did: did.to_string(),
+            keys,
+        },
+    })
 }
 
 /// Update-channel diff. `op updates config-set` is a merge — a `None` field
@@ -2213,6 +2326,9 @@ fn execute(store: &LocalFsStore, ctx: &ApplyContext, steps: &[ApplyStep]) -> Res
             }
             StepOp::UpdateExtension(payload) => {
                 super::extensions::update(store, &exec_flags, Some((**payload).clone())).map(|_| ())
+            }
+            StepOp::TrustRootAddDid { did, keys } => {
+                super::trust_root::add_resolved_did_keys(store, &ctx.env_id, did, keys).map(|_| ())
             }
             StepOp::TrustRootBootstrap => super::trust_root::bootstrap(
                 store,
@@ -6195,5 +6311,236 @@ mod tests {
 
         let result = materialize_inline_pack_answers(&mut manifest).expect("succeeds");
         assert!(result.is_none(), "no temp dir needed");
+    }
+
+    // --- trust-did: the built-in default trust anchor -------------------------
+    //
+    // These drive `plan_updates_steps` / `plan_trust_did` with keys that are
+    // already resolved, so none of them touch the network. Resolution itself is
+    // covered by `trust_root`'s `add_did` tests.
+
+    fn updates_ctx(env: Option<Environment>, updates: Value) -> ApplyContext {
+        let manifest: EnvManifest = serde_json::from_value(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "updates": updates,
+        }))
+        .expect("manifest fixture parses");
+        ApplyContext {
+            env_id: EnvId::try_from("local").unwrap(),
+            manifest,
+            secret_values: BTreeMap::new(),
+            prompted_paths: BTreeSet::new(),
+            store_satisfied_paths: BTreeSet::new(),
+            bundles: Vec::new(),
+            endpoints: Vec::new(),
+            env,
+            canonical_public_base_url: None,
+            missing: Vec::new(),
+            warnings: Vec::new(),
+            updated_by: "test".to_string(),
+            manifest_dir: PathBuf::from("."),
+            env_dir: None,
+        }
+    }
+
+    /// The `(key_id, pem)` pair already sitting in a `seeded_store`'s trust root.
+    fn seeded_key(store: &LocalFsStore) -> (String, String) {
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        let k = store_trust_root::load(&env_dir)
+            .unwrap()
+            .keys
+            .into_iter()
+            .next()
+            .expect("seeded_store bootstraps one operator key");
+        (k.key_id, k.public_key_pem)
+    }
+
+    #[test]
+    fn trust_did_plans_a_create_naming_every_key_not_yet_trusted() {
+        let (_dir, store) = seeded_store();
+        let (trusted_id, pem) = seeded_key(&store);
+        let ctx = updates_ctx(Some(make_env("local")), json!({}));
+
+        let step = plan_trust_did(
+            &store,
+            &ctx,
+            "did:web:trust.greentic.cloud",
+            vec![
+                (trusted_id.clone(), pem.clone()),
+                ("34b690258f1ae48d4a4be0bdbffb7fa3".to_string(), pem),
+            ],
+        )
+        .expect("plans");
+
+        assert_eq!(step.action, ApplyAction::Create);
+        assert!(
+            step.detail.contains("34b690258f1ae48d4a4be0bdbffb7fa3"),
+            "the untrusted key must be named IN FULL: {}",
+            step.detail
+        );
+        assert!(
+            !step.detail.contains(&trusted_id),
+            "an already-trusted key must not be listed as new: {}",
+            step.detail
+        );
+        // The resolved set is carried whole — execute must not re-fetch, and it
+        // must not narrow to only the missing keys either (adding a key already
+        // present is a no-op, and narrowing would hide the full set from audit).
+        match &step.op {
+            StepOp::TrustRootAddDid { did, keys } => {
+                assert_eq!(did, "did:web:trust.greentic.cloud");
+                assert_eq!(
+                    keys.len(),
+                    2,
+                    "the whole resolved set travels with the step"
+                );
+            }
+            other => panic!("expected TrustRootAddDid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trust_did_distinguishes_keys_that_share_a_short_prefix() {
+        // The plan is the only place a human sees a network-sourced key before
+        // it gains signing authority. `short_key_id` is 8 hex chars = 32 bits,
+        // cheap to collide on purpose, so two distinct keys must never render
+        // as the same line.
+        let (_dir, store) = seeded_store();
+        let (_trusted_id, pem) = seeded_key(&store);
+        let ctx = updates_ctx(Some(make_env("local")), json!({}));
+        let a = "34b690258f1ae48d4a4be0bdbffb7fa3";
+        let b = "34b69025ffffffffffffffffffffffff";
+        assert_eq!(
+            short_key_id(a),
+            short_key_id(b),
+            "premise: prefixes collide"
+        );
+
+        let step = plan_trust_did(
+            &store,
+            &ctx,
+            "did:web:trust.greentic.cloud",
+            vec![(a.to_string(), pem.clone()), (b.to_string(), pem)],
+        )
+        .expect("plans");
+
+        assert!(
+            step.detail.contains(a) && step.detail.contains(b),
+            "both keys must be distinguishable in the plan: {}",
+            step.detail
+        );
+    }
+
+    #[test]
+    fn trust_did_is_a_no_op_once_every_resolved_key_is_trusted() {
+        let (_dir, store) = seeded_store();
+        let (trusted_id, pem) = seeded_key(&store);
+        let ctx = updates_ctx(Some(make_env("local")), json!({}));
+
+        let step = plan_trust_did(
+            &store,
+            &ctx,
+            "did:web:trust.greentic.cloud",
+            vec![(trusted_id, pem)],
+        )
+        .expect("plans");
+
+        assert_eq!(
+            step.action,
+            ApplyAction::NoOp,
+            "a converged trust anchor must not re-plan every apply: {}",
+            step.detail
+        );
+    }
+
+    #[test]
+    fn trust_did_matches_trusted_key_ids_case_insensitively() {
+        let (_dir, store) = seeded_store();
+        let (trusted_id, pem) = seeded_key(&store);
+        let ctx = updates_ctx(Some(make_env("local")), json!({}));
+
+        let step = plan_trust_did(
+            &store,
+            &ctx,
+            "did:web:trust.greentic.cloud",
+            vec![(trusted_id.to_uppercase(), pem)],
+        )
+        .expect("plans");
+
+        assert_eq!(
+            step.action,
+            ApplyAction::NoOp,
+            "key ids are hex; case must not make a trusted key look missing"
+        );
+    }
+
+    #[test]
+    fn trust_did_plans_a_create_for_an_environment_that_does_not_exist_yet() {
+        let (_dir, store) = seeded_store();
+        // `env: None` is the fresh-env path: no trust root exists on disk, so
+        // reading one must not be attempted and every key counts as new.
+        let ctx = updates_ctx(None, json!({}));
+
+        let step = plan_trust_did(
+            &store,
+            &ctx,
+            "did:web:trust.greentic.cloud",
+            vec![(
+                "34b690258f1ae48d4a4be0bdbffb7fa3".to_string(),
+                "-----BEGIN PUBLIC KEY-----\nx\n-----END PUBLIC KEY-----\n".to_string(),
+            )],
+        )
+        .expect("plans");
+
+        assert_eq!(step.action, ApplyAction::Create);
+    }
+
+    #[test]
+    fn trust_did_is_planned_before_the_channel_subscription() {
+        let (_dir, store) = seeded_store();
+        let ctx = updates_ctx(Some(make_env("local")), json!({}));
+        let updates = ctx.manifest.updates.clone().unwrap();
+
+        let steps = plan_updates_steps(
+            &store,
+            &ctx,
+            &updates,
+            Some((
+                "did:web:trust.greentic.cloud".to_string(),
+                vec![(
+                    "34b690258f1ae48d4a4be0bdbffb7fa3".to_string(),
+                    "-----BEGIN PUBLIC KEY-----\nx\n-----END PUBLIC KEY-----\n".to_string(),
+                )],
+            )),
+        )
+        .expect("plans");
+
+        let kinds: Vec<_> = steps.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![ApplyStepKind::TrustDid, ApplyStepKind::ConfigureUpdates],
+            "an env must trust the signing key before it starts polling the channel"
+        );
+    }
+
+    #[test]
+    fn opting_out_of_the_trust_did_leaves_the_trust_root_alone() {
+        let (_dir, store) = seeded_store();
+        let ctx = updates_ctx(Some(make_env("local")), json!({"trust_did": null}));
+        let updates = ctx.manifest.updates.clone().unwrap();
+        assert!(
+            updates.resolved_trust_did().is_none(),
+            "explicit null must parse as opt-out, not fall back to the default"
+        );
+
+        let steps = plan_updates_steps(&store, &ctx, &updates, None).expect("plans");
+
+        let kinds: Vec<_> = steps.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![ApplyStepKind::ConfigureUpdates],
+            "opting out must plan no trust-root change at all"
+        );
     }
 }

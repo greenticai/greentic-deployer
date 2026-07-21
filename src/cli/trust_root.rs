@@ -222,6 +222,13 @@ pub fn add(
     })
 }
 
+/// The resolver both entry points use — [`add_did`] and the `env apply`
+/// trust-did step. Shared so the two paths cannot drift on TTL or capacity.
+pub(crate) fn default_resolver() -> Result<HttpResolver, OpError> {
+    HttpResolver::new(DID_CACHE_TTL, DID_CACHE_CAPACITY)
+        .map_err(|e| OpError::Fetch(format!("build did:web resolver: {e}")))
+}
+
 /// Resolve `did` and derive the `(key_id, public_key_pem)` pair for every key
 /// the document authorizes, in document order.
 ///
@@ -284,8 +291,8 @@ fn block_on_resolve(
     })
 }
 
-/// `op env trust-root add-did` — resolve a `did:web` document and trust every
-/// key it authorizes.
+/// `op trust-root add-did` — resolve a `did:web` document and trust every key
+/// it authorizes.
 ///
 /// **Add-only, and deliberately so.** This verb never removes a key, because
 /// the document arrives over the network: a reconciling verb would hand whoever
@@ -313,8 +320,7 @@ pub fn add_did(
     }
     let payload = resolve_payload::<TrustRootAddDidPayload>(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
-    let resolver = HttpResolver::new(DID_CACHE_TTL, DID_CACHE_CAPACITY)
-        .map_err(|e| OpError::Fetch(format!("build did:web resolver: {e}")))?;
+    let resolver = default_resolver()?;
     // Resolve BEFORE `audit_and_record`, unlike `bootstrap`: a GET has no local
     // side effect to withhold from an unauthorized caller, and holding the env
     // flock across a network round trip would block every concurrent verb for
