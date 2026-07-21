@@ -35,11 +35,19 @@ compute**. Same store, same `op env …` surface, no cluster to run.
   one-file/one-command quickstart, the Secret Manager seed contract, access
   modes (Cloud Run is private by default), **the zero-idle-cost claim and how to
   verify it**, the config reference, known gaps, and troubleshooting.
+- **[docs/cloudrun-internals.md](docs/cloudrun-internals.md)** — how the deployer
+  is built: module map, the `CloudRunTarget` seam, credential resolution, and the
+  deploy-time invariants. Read before changing it.
+- **[examples/cloudrun-demo/](examples/cloudrun-demo/)** — a runnable,
+  live-verified walkthrough, as a narrated script and as commands you type.
 
 ```bash
-gtc op env up --answers cloudrun.env.json --yes   # → one JSON envelope with a *.run.app URL
-gtc start cloudrun --answers cloudrun.env.json    # the same thing, sugared
+greentic-deployer op --answers cloudrun.env.json env up --yes   # → JSON envelope with a *.run.app URL
 ```
+
+`--answers` is a **global** flag: it goes before `env up`, not after. Verify the
+binary actually has the Cloud Run deployer compiled in first — a build without it
+still prints a perfectly green plan (guide §3.0).
 
 Note the name collision: the `gcp` **adapter family** listed below is the older
 terraform-backed `iac-only` deployment-pack path and is unrelated to this
@@ -356,7 +364,7 @@ Deployment packs own:
 
 The deployer library does not own target-specific prompts or provider execution logic.
 
-See [docs/deployment-packs.md](/projects/ai/greentic-ng/greentic-deployer/docs/deployment-packs.md) for the runtime contract and authoring model.
+See [docs/deployment-packs.md](docs/deployment-packs.md) for the runtime contract and authoring model.
 
 ## Embedding
 
