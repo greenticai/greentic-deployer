@@ -1310,6 +1310,15 @@ pub fn config_set(
     if payload.poll_interval_secs.is_some() {
         fields.push("poll_interval_secs");
     }
+    // Deliberately over-reports: `enabling_without_endpoint` only says a default
+    // *may* be written — whether it actually is depends on `cfg.plan_endpoint`,
+    // which is read under the lock below, after this audit target is already
+    // sealed. Re-enabling a channel that already has a stored endpoint therefore
+    // lists `plan_endpoint` without changing it. That direction is the safe one:
+    // the alternative leaves a real write — one that points a runtime at a
+    // Greentic-operated URL — with no audit record at all. Do not "tighten" this
+    // to `validated_plan_endpoint.is_some()` without first giving the closure a
+    // way to amend `AuditCtx::target`.
     if validated_plan_endpoint.is_some() || enabling_without_endpoint {
         fields.push("plan_endpoint");
     }
