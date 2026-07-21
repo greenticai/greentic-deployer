@@ -5,9 +5,14 @@
 //! trust root without writing JSON by hand.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use greentic_deploy_spec::EnvId;
 use greentic_distributor_client::signing::TrustedKey;
+use greentic_trust::{
+    DidWeb, HttpResolver, RootResolver, TrustDocument, greentic_key_id, spki_pem,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -23,6 +28,12 @@ use super::{
 
 const NOUN: &str = "trust-root";
 
+/// The resolver is built fresh per invocation and used exactly once, so the
+/// cache never serves a hit — these exist only because `HttpResolver::new`
+/// requires them. Kept small rather than tuned.
+const DID_CACHE_TTL: Duration = Duration::from_secs(60);
+const DID_CACHE_CAPACITY: u64 = 1;
+
 /// Payload for `op env trust-root add`. Either inline `public_key_pem` OR a
 /// `public_key_file` path; one is required.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +44,14 @@ pub struct TrustRootAddPayload {
     pub public_key_pem: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key_file: Option<PathBuf>,
+}
+
+/// Payload for `op env trust-root add-did`. The DID is the whole input: the
+/// key ids and PEMs are derived from the document it resolves to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustRootAddDidPayload {
+    pub environment_id: String,
+    pub did: String,
 }
 
 /// Payload for `op env trust-root remove`.
@@ -203,6 +222,161 @@ pub fn add(
     })
 }
 
+/// Resolve `did` and derive the `(key_id, public_key_pem)` pair for every key
+/// the document authorizes, in document order.
+///
+/// Shared by the local verb below and the `--store-url` path in
+/// `dispatch_remote`: resolution is a client-side concern either way, so the
+/// remote backend needs no did:web support — it keeps receiving ordinary
+/// `add_trusted_key` calls.
+///
+/// An empty assertion set is impossible to reach here: `TrustDocument::parse`
+/// already rejects it with `NoAssertionKeys`. That is load-bearing — a document
+/// resolving to zero keys must be an error, never a success that reports
+/// "added 0" and leaves the operator believing they are anchored.
+pub(crate) fn resolve_did_keys(
+    did: &str,
+    resolver: &dyn RootResolver,
+) -> Result<Vec<(String, String)>, OpError> {
+    let did = DidWeb::parse(did)
+        .map_err(|e| OpError::InvalidArgument(format!("trust-root add-did: {e}")))?;
+    let document = block_on_resolve(resolver, &did)?;
+    document
+        .assertion_keys()
+        .iter()
+        .map(|key| {
+            let pem = spki_pem(key).map_err(|e| {
+                OpError::Fetch(format!(
+                    "did:web `{}`: encoding a resolved key: {e}",
+                    did.as_str()
+                ))
+            })?;
+            Ok((greentic_key_id(key), pem))
+        })
+        .collect()
+}
+
+/// Drive the async resolve on a dedicated thread with its own runtime.
+///
+/// `main.rs` already drives every `op` verb under `block_on`, so building a
+/// second runtime inline would panic with "Cannot start a runtime from within a
+/// runtime". Same reason and same shape as `bundle_fetch::fetch_oci_to_cache`.
+fn block_on_resolve(
+    resolver: &dyn RootResolver,
+    did: &DidWeb,
+) -> Result<Arc<TrustDocument>, OpError> {
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(|| -> Result<Arc<TrustDocument>, OpError> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|source| {
+                    OpError::Fetch(format!("build did:web resolve runtime: {source}"))
+                })?;
+            rt.block_on(resolver.resolve(did))
+                .map_err(|source| OpError::Fetch(format!("resolve `{}`: {source}", did.as_str())))
+        });
+        match handle.join() {
+            Ok(result) => result,
+            Err(_) => Err(OpError::Fetch(
+                "did:web resolve thread panicked".to_string(),
+            )),
+        }
+    })
+}
+
+/// `op env trust-root add-did` — resolve a `did:web` document and trust every
+/// key it authorizes.
+///
+/// **Add-only, and deliberately so.** This verb never removes a key, because
+/// the document arrives over the network: a reconciling verb would hand whoever
+/// controls — or can spoof — that document the power to strip the local
+/// operator bootstrap key. Best case the operator is locked out of their own
+/// env; worst case the attacker's key is the only one left standing. Revocation
+/// stays a deliberate local [`remove`].
+///
+/// The keys land in `trust-root.json` indistinguishable from hand-added ones.
+/// That is a decision, not an oversight: `TrustedKey` has all-public fields and
+/// 17 crates depend on `greentic-distributor-client`, so adding a `source` field
+/// is a fleet-wide breaking change — and the write path in
+/// `greentic-operator-trust` reconstructs the value anyway, so it would be
+/// dropped. The audit record below carries the DID, which is the provenance.
+///
+/// Idempotent: `add_trusted_key` is a no-op for a key id already present, so a
+/// re-run against an unchanged document leaves `trusted_key_count` unmoved.
+pub fn add_did(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<TrustRootAddDidPayload>,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(NOUN, "add-did", add_did_schema()));
+    }
+    let payload = resolve_payload::<TrustRootAddDidPayload>(flags, payload)?;
+    let env_id = parse_env_id(&payload.environment_id)?;
+    let resolver = HttpResolver::new(DID_CACHE_TTL, DID_CACHE_CAPACITY)
+        .map_err(|e| OpError::Fetch(format!("build did:web resolver: {e}")))?;
+    // Resolve BEFORE `audit_and_record`, unlike `bootstrap`: a GET has no local
+    // side effect to withhold from an unauthorized caller, and holding the env
+    // flock across a network round trip would block every concurrent verb for
+    // the resolver's full timeout.
+    let keys = resolve_did_keys(&payload.did, &resolver)?;
+    add_resolved_did_keys(store, &env_id, &payload.did, &keys)
+}
+
+/// Persist an already-resolved key set under one audit record. Split from
+/// [`add_did`] so tests can drive it with a fake [`RootResolver`] and so the
+/// remote dispatch path can reuse the audit shape.
+pub(crate) fn add_resolved_did_keys(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    did: &str,
+    keys: &[(String, String)],
+) -> Result<OpOutcome, OpError> {
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "add-did",
+        // Carries the DID *and* the full PEMs. The DID because it is the only
+        // provenance that exists (see the type-level note above); the PEMs for
+        // the same reason `add` records them — a key removed later can be
+        // reconstructed from the audit log alone.
+        target: json!({
+            "did": did,
+            "keys": keys
+                .iter()
+                .map(|(key_id, pem)| json!({"key_id": key_id, "public_key_pem": pem}))
+                .collect::<Vec<_>>(),
+        }),
+        // One record per operator action, matching `bootstrap`. The per-key
+        // idempotency keys below are separate: reusing one across N adds would
+        // make the HTTP backend replay the first key's response for all of them.
+        idempotency_key: Some(mint_idempotency_key().as_str().to_string()),
+    };
+    audit_and_record(store, ctx, |_committed| {
+        let mut trusted_key_count = 0;
+        for (key_id, pem) in keys {
+            let outcome = store
+                .add_trusted_key(env_id, key_id.clone(), pem.clone(), mint_idempotency_key())
+                .map_err(map_store_err_preserving_noun)?;
+            trusted_key_count = outcome.trusted_key_count;
+        }
+        Ok((
+            OpOutcome::new(
+                NOUN,
+                "add-did",
+                json!({
+                    "environment_id": env_id.as_str(),
+                    "did": did,
+                    "key_ids": keys.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+                    "trusted_key_count": trusted_key_count,
+                }),
+            ),
+            super::AuditGens::NONE,
+        ))
+    })
+}
+
 /// `op env trust-root remove` — silently no-ops if the key isn't present.
 pub fn remove(
     store: &LocalFsStore,
@@ -315,6 +489,23 @@ fn add_schema() -> Value {
             "key_id": {"type": "string", "description": "Canonical key id (hex SHA-256[..16] of the raw public key)."},
             "public_key_pem": {"type": ["string", "null"], "description": "Inline SPKI PEM."},
             "public_key_file": {"type": ["string", "null"], "description": "Path to a SPKI PEM file."}
+        }
+    })
+}
+
+fn add_did_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "TrustRootAddDidPayload",
+        "type": "object",
+        "required": ["environment_id", "did"],
+        "additionalProperties": false,
+        "properties": {
+            "environment_id": {"type": "string"},
+            "did": {
+                "type": "string",
+                "description": "did:web identifier, e.g. `did:web:trust.greentic.cloud`. Every key its document authorizes is added; none are removed."
+            }
         }
     })
 }
@@ -558,5 +749,230 @@ mod tests {
         assert_eq!(out.op, "add");
         assert_eq!(out.noun, NOUN);
         assert!(out.result["properties"]["key_id"].is_object());
+    }
+
+    // -- add-did ----------------------------------------------------------
+    //
+    // Driven through a fake `RootResolver` rather than a mock HTTP server:
+    // `RootResolver` is a public trait, so this exercises the real document
+    // parse and key derivation without a listener, a dev-dep, or the
+    // `testing`-gated `allow_http` escape hatch.
+
+    use ed25519_dalek::{SigningKey, VerifyingKey};
+    use greentic_trust::TrustError;
+
+    fn root_key(seed: u8) -> VerifyingKey {
+        SigningKey::from_bytes(&[seed; 32]).verifying_key()
+    }
+
+    /// A resolver that serves one prepared document, or a fetch failure.
+    struct FakeResolver(Result<Vec<VerifyingKey>, ()>);
+
+    #[async_trait::async_trait]
+    impl RootResolver for FakeResolver {
+        async fn resolve(&self, did: &DidWeb) -> Result<Arc<TrustDocument>, TrustError> {
+            // `HttpStatus` rather than `Fetch`: constructing a `Fetch` means
+            // fabricating a `reqwest::Error`, and two reqwest majors coexist in
+            // this dependency graph. Any resolve error maps to the same
+            // `OpError::Fetch`, so the variant is immaterial to what is asserted.
+            let roots = self
+                .0
+                .as_ref()
+                .map_err(|()| TrustError::HttpStatus { code: 503 })?;
+            let doc = greentic_trust::ceremony::build_document(did, roots, &[])?;
+            let bytes = serde_json::to_vec(&doc).expect("ceremony document serializes");
+            Ok(Arc::new(TrustDocument::parse(did, &bytes)?))
+        }
+    }
+
+    const TEST_DID: &str = "did:web:trust.greentic.cloud";
+
+    fn seeded_env(dir: &tempfile::TempDir) -> LocalFsStore {
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        store
+    }
+
+    fn trusted_key_ids(store: &LocalFsStore) -> Vec<String> {
+        let listed = list(store, &OpFlags::default(), "local").unwrap();
+        listed.result["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k["key_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Resolve + persist, bypassing only the `HttpResolver` construction that
+    /// `add_did` would do. Everything downstream is the production path.
+    fn add_did_via(
+        store: &LocalFsStore,
+        resolver: &dyn RootResolver,
+    ) -> Result<OpOutcome, OpError> {
+        let env_id = parse_env_id("local")?;
+        let keys = resolve_did_keys(TEST_DID, resolver)?;
+        add_resolved_did_keys(store, &env_id, TEST_DID, &keys)
+    }
+
+    #[test]
+    fn add_did_trusts_every_key_the_document_authorizes() {
+        let dir = tempdir().unwrap();
+        let store = seeded_env(&dir);
+        let resolver = FakeResolver(Ok(vec![root_key(7), root_key(8)]));
+
+        let out = add_did_via(&store, &resolver).unwrap();
+
+        assert_eq!(out.noun, NOUN);
+        assert_eq!(out.op, "add-did");
+        assert_eq!(out.result["did"].as_str().unwrap(), TEST_DID);
+        assert_eq!(out.result["trusted_key_count"].as_u64().unwrap(), 2);
+        assert_eq!(
+            out.result["key_ids"].as_array().unwrap().len(),
+            2,
+            "a two-key document must trust both keys, not just the first"
+        );
+        assert_eq!(trusted_key_ids(&store).len(), 2);
+    }
+
+    #[test]
+    fn add_did_reports_the_canonical_key_id_for_each_resolved_key() {
+        let resolver = FakeResolver(Ok(vec![root_key(7)]));
+        let keys = resolve_did_keys(TEST_DID, &resolver).unwrap();
+
+        assert_eq!(keys.len(), 1);
+        let (key_id, pem) = &keys[0];
+        assert_eq!(
+            *key_id,
+            greentic_key_id(&root_key(7)),
+            "the id written to trust-root.json must be the canonical derivation — \
+             the verifier matches keyid by exact string equality, so a divergence \
+             never fails loudly, it just stops every signature matching"
+        );
+        assert!(pem.starts_with("-----BEGIN PUBLIC KEY-----"));
+    }
+
+    #[test]
+    fn add_did_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let store = seeded_env(&dir);
+        let resolver = FakeResolver(Ok(vec![root_key(7), root_key(8)]));
+
+        add_did_via(&store, &resolver).unwrap();
+        let second = add_did_via(&store, &resolver).unwrap();
+
+        assert_eq!(
+            second.result["trusted_key_count"].as_u64().unwrap(),
+            2,
+            "re-running against an unchanged document must not duplicate keys"
+        );
+        assert_eq!(trusted_key_ids(&store).len(), 2);
+    }
+
+    /// The load-bearing security property: the document arrives over the
+    /// network, so it must never be able to take a key away. A reconciling
+    /// implementation would strip the operator's own bootstrap key here.
+    #[test]
+    fn add_did_never_removes_a_key_the_document_does_not_authorize() {
+        let dir = tempdir().unwrap();
+        let store = seeded_env(&dir);
+        // The operator's own key, added by hand and NOT in the DID document.
+        let (pem, hand_added) = keypair(41);
+        add(
+            &store,
+            &OpFlags::default(),
+            Some(TrustRootAddPayload {
+                environment_id: "local".into(),
+                key_id: hand_added.clone(),
+                public_key_pem: Some(pem),
+                public_key_file: None,
+            }),
+        )
+        .unwrap();
+
+        add_did_via(&store, &FakeResolver(Ok(vec![root_key(7)]))).unwrap();
+
+        let ids = trusted_key_ids(&store);
+        assert!(
+            ids.contains(&hand_added),
+            "add-did stripped a hand-added key: a hijacked did:web document \
+             must never be able to revoke the local operator key"
+        );
+        assert_eq!(ids.len(), 2, "the did key is added alongside, not instead");
+    }
+
+    #[test]
+    fn add_did_rejects_a_malformed_did() {
+        let resolver = FakeResolver(Ok(vec![root_key(7)]));
+        let err = resolve_did_keys("https://trust.greentic.cloud", &resolver).unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(_)),
+            "a non-did input is an argument error, not a fetch failure: {err}"
+        );
+    }
+
+    #[test]
+    fn add_did_adds_nothing_when_resolution_fails() {
+        let dir = tempdir().unwrap();
+        let store = seeded_env(&dir);
+
+        let err = add_did_via(&store, &FakeResolver(Err(()))).unwrap_err();
+
+        assert!(matches!(err, OpError::Fetch(_)), "got {err}");
+        assert!(
+            trusted_key_ids(&store).is_empty(),
+            "a failed resolve must leave the trust root untouched"
+        );
+    }
+
+    /// A document authorizing no keys must be an error, never a success that
+    /// reports "added 0" and leaves the operator believing they are anchored.
+    /// Enforced upstream by `TrustDocument::parse`; asserted here so a future
+    /// change that starts hand-rolling the parse cannot silently lose it.
+    #[test]
+    fn add_did_refuses_a_document_with_no_assertion_keys() {
+        struct EmptyDoc;
+        #[async_trait::async_trait]
+        impl RootResolver for EmptyDoc {
+            async fn resolve(&self, did: &DidWeb) -> Result<Arc<TrustDocument>, TrustError> {
+                let bytes = serde_json::to_vec(&json!({
+                    "@context": ["https://www.w3.org/ns/did/v1"],
+                    "id": did.as_str(),
+                    "verificationMethod": [],
+                    "assertionMethod": [],
+                }))
+                .unwrap();
+                Ok(Arc::new(TrustDocument::parse(did, &bytes)?))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let store = seeded_env(&dir);
+        let err = add_did_via(&store, &EmptyDoc).unwrap_err();
+
+        assert!(matches!(err, OpError::Fetch(_)), "got {err}");
+        assert!(trusted_key_ids(&store).is_empty());
+    }
+
+    #[test]
+    fn add_did_schema_only_returns_payload_schema_without_touching_disk() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let out = add_did(
+            &store,
+            &OpFlags {
+                schema_only: true,
+                ..OpFlags::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.op, "add-did");
+        assert_eq!(out.noun, NOUN);
+        assert!(out.result["properties"]["did"].is_object());
+        assert!(
+            out.result["properties"]["key_id"].is_null(),
+            "add-did derives key ids; accepting one would let a caller pin a key \
+             the document does not authorize"
+        );
     }
 }

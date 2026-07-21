@@ -255,6 +255,7 @@ fn route_remote(
                 remote_trust_root_bootstrap(store, flags, env_id)
             }
             TrustRootVerb::Add(args) => remote_trust_root_add(store, flags, args),
+            TrustRootVerb::AddDid(args) => remote_trust_root_add_did(store, flags, args),
             TrustRootVerb::Remove(args) => remote_trust_root_remove(store, flags, args),
             TrustRootVerb::List { env_id } => remote_trust_root_list(store, &env_id),
         },
@@ -1744,6 +1745,52 @@ fn remote_trust_root_add(
         "trust-root",
         "add",
         super::trust_root::trust_root_add_outcome_to_wire(&env_id, &outcome),
+    ))
+}
+
+/// `--store-url` counterpart of `trust_root::add_did`.
+///
+/// did:web resolution is a client-side concern, so the remote backend needs no
+/// did:web support at all — it keeps receiving ordinary `add_trusted_key`
+/// calls and audits them server-side, exactly as it does for `add`.
+fn remote_trust_root_add_did(
+    store: &dyn EnvironmentMutations,
+    flags: &OpFlags,
+    args: super::dispatch::TrustRootAddDidArgs,
+) -> Result<OpOutcome, OpError> {
+    let payload = match (args.env_id, args.did) {
+        (Some(environment_id), Some(did)) => Some(super::trust_root::TrustRootAddDidPayload {
+            environment_id,
+            did,
+        }),
+        _ => None,
+    };
+    let payload = resolve_payload::<super::trust_root::TrustRootAddDidPayload>(flags, payload)?;
+    let env_id = parse_env_id(&payload.environment_id)?;
+    let resolver = greentic_trust::HttpResolver::new(std::time::Duration::from_secs(60), 1)
+        .map_err(|e| OpError::Fetch(format!("build did:web resolver: {e}")))?;
+    let keys = super::trust_root::resolve_did_keys(&payload.did, &resolver)?;
+    let mut trusted_key_count = 0;
+    for (key_id, pem) in &keys {
+        let outcome = store
+            .add_trusted_key(
+                &env_id,
+                key_id.clone(),
+                pem.clone(),
+                super::mint_idempotency_key(),
+            )
+            .map_err(map_store_err_preserving_noun)?;
+        trusted_key_count = outcome.trusted_key_count;
+    }
+    Ok(OpOutcome::new(
+        "trust-root",
+        "add-did",
+        serde_json::json!({
+            "environment_id": env_id.as_str(),
+            "did": payload.did,
+            "key_ids": keys.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            "trusted_key_count": trusted_key_count,
+        }),
     ))
 }
 
