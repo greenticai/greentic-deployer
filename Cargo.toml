@@ -10,7 +10,7 @@ resolver = "2"
 
 [package]
 name = "greentic-deployer"
-version = "1.1.25"
+version = "1.1.26"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic deployer runtime for plan construction and deployment-pack dispatch"
@@ -158,9 +158,10 @@ features = [
 # failing loudly: every subsequent main-lane fix (staging, plan, binswap) landed
 # on 1.1.x and was invisible to us. Same lane as the rest of our 1.1 pins.
 #
-# Floor raised to 1.1.1: first publish carrying `plan::BROADCAST_ENV_ID` +
-# `plan::plan_targets_env`, which the broadcast-channel gates below match on.
-version = ">=1.1.1, <1.2.0-0"
+# Floor raised to 1.1.2: adds the per-channel downgrade guard (`StageState.channel`
+# + channel-scoped admission facts). The resume re-gate below (`current_admission_facts`)
+# reads `StageState.channel`, which only exists at >= 1.1.2.
+version = ">=1.1.2, <1.2.0-0"
 features = [
     "binswap",
     "enroll",
