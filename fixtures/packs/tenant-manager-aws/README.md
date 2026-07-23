@@ -23,6 +23,12 @@ aws secretsmanager create-secret --name tm-develop-db-url \
   --region ap-southeast-1
 ```
 
+> **Shared-ALB listener priority:** `listener_rule_priority` defaults to `100`. The
+> shared estate ALB already carries designer-admin/designer rules, so a real apply can
+> collide on priority 100. Before applying, list the existing rules
+> (`aws elbv2 describe-rules --listener-arn <shared-listener> --region ap-southeast-1`)
+> and set an unused `listener_rule_priority` in `examples/develop.answers.json`.
+
 Deploy (credential-gated; run with real AWS creds for the shared estate):
 ```bash
 greentic-deployer aws generate --tenant develop --provider-pack dist/tenant-manager-aws.gtpack --answers examples/develop.answers.json
