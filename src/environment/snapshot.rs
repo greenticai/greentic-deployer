@@ -13,11 +13,14 @@
 //! `runtime-config.json`), restore deletes it from the live env if it
 //! exists — a snapshot records *exactly* what was there.
 //!
-//! **`trust-root.json` is deliberately excluded.** The F6 gate (#487)
-//! guarantees no apply step writes the trust root, so snapshotting it
-//! provides no rollback value. Worse, capturing it would let a rollback
-//! silently resurrect a signing key that `op trust-root remove` revoked
-//! between the snapshot and the restore.
+//! **`trust-root.json` is deliberately excluded.** The trust-did step
+//! (PR #497) DOES write the trust root during a default apply, but the
+//! write is add-only and idempotent — re-running `add_resolved_did_keys`
+//! for the same DID key is a no-op. Because the write only adds, not
+//! replaces, there is nothing to roll back. More importantly, capturing
+//! `trust-root.json` would let a rollback silently resurrect a signing key
+//! that `op trust-root remove` revoked between the snapshot and the
+//! restore.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -110,10 +113,12 @@ fn snapshot_locked(store: &LocalFsStore, env_id: &EnvId) -> Result<SnapshotId, S
 
     // --- Tracked top-level files ---
     //
-    // `trust-root.json` is deliberately NOT in this list. The F6 gate (#487)
-    // guarantees no apply step writes the trust root, so snapshotting it
-    // provides no rollback value. Capturing it would let a rollback silently
-    // resurrect a signing key that was revoked between snapshot and restore.
+    // `trust-root.json` is deliberately NOT in this list. The trust-did step
+    // (PR #497) does write the trust root during a default apply, but the
+    // write is add-only and idempotent — re-running `add_resolved_did_keys`
+    // for the same DID key is a no-op, so there is nothing to roll back.
+    // Capturing it would let a rollback silently resurrect a signing key
+    // that `op trust-root remove` revoked between snapshot and restore.
     let top_level = &["environment.json", "runtime.json", "runtime-config.json"];
     for rel in top_level {
         capture_file(&env_dir, rel, &snap_dir, &mut manifest_files)?;
@@ -729,6 +734,82 @@ mod tests {
         let a = SnapshotId::new();
         let b = SnapshotId::new();
         assert_ne!(a, b);
+    }
+
+    /// The trust-did step (PR #497) writes `trust-root.json` during a
+    /// default apply, but the write is add-only and idempotent. A rollback
+    /// must NOT undo it: the DID key is a public fleet anchor and reverting
+    /// it would break plan verification. This test proves the property
+    /// end-to-end: snapshot → add DID key → restore → both the pre-existing
+    /// operator key AND the DID key survive.
+    #[test]
+    fn trust_did_key_survives_updates_apply_rollback() {
+        use super::super::trust_root;
+
+        let tmp = TempDir::new().unwrap();
+        let (store, env_id, _env) = seed_env(&tmp);
+        let env_dir = tmp.path().join(env_id.as_str());
+
+        // Seed an operator key (the pre-existing fleet key).
+        let (op_pem, op_key_id) = greentic_operator_trust::test_support::keypair(10);
+        trust_root::add_trusted_key(
+            &env_dir,
+            greentic_distributor_client::signing::TrustedKey {
+                key_id: op_key_id.clone(),
+                public_key_pem: op_pem,
+            },
+        )
+        .unwrap();
+        assert_eq!(trust_root::load(&env_dir).unwrap().keys.len(), 1);
+
+        // Snapshot while only the operator key is present.
+        let snap_id = snapshot_environment(&store, &env_id).unwrap();
+
+        // Simulate the trust-did step of an apply: add a DID-resolved key.
+        let (did_pem, did_key_id) = greentic_operator_trust::test_support::keypair(20);
+        trust_root::add_trusted_key(
+            &env_dir,
+            greentic_distributor_client::signing::TrustedKey {
+                key_id: did_key_id.clone(),
+                public_key_pem: did_pem,
+            },
+        )
+        .unwrap();
+        assert_eq!(trust_root::load(&env_dir).unwrap().keys.len(), 2);
+
+        // A later apply step fails → rollback via restore.
+        restore_environment(&store, &env_id, &snap_id).unwrap();
+
+        // Both keys must still be present: restore does not touch
+        // trust-root.json, so the DID key added between snapshot and restore
+        // survives.
+        let after = trust_root::load(&env_dir).unwrap();
+        assert!(
+            after.keys.iter().any(|k| k.key_id == op_key_id),
+            "operator key must survive rollback"
+        );
+        assert!(
+            after.keys.iter().any(|k| k.key_id == did_key_id),
+            "DID key added after snapshot must survive rollback — \
+             trust-root.json is excluded from the snapshot set"
+        );
+
+        // Re-adding the same DID key is a no-op (idempotent).
+        let before_count = after.keys.len();
+        let (did_pem2, _) = greentic_operator_trust::test_support::keypair(20);
+        trust_root::add_trusted_key(
+            &env_dir,
+            greentic_distributor_client::signing::TrustedKey {
+                key_id: did_key_id.clone(),
+                public_key_pem: did_pem2,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            trust_root::load(&env_dir).unwrap().keys.len(),
+            before_count,
+            "re-adding the same DID key must be a no-op"
+        );
     }
 
     #[test]
