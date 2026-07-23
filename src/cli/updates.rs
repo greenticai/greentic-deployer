@@ -2154,19 +2154,31 @@ fn load_plan_source(
         &payload.plan_sig_file,
     ) {
         (Some(url), None, None) => {
-            // The plan is fetched over the enrolled mTLS identity, which is only
-            // presented over TLS — reject plaintext `http://` (except loopback,
-            // for a local dev server) so a remote endpoint can't be reached
-            // without the client cert.
             if !control_url_is_acceptable(url) {
                 return Err(OpError::InvalidArgument(
                     "plan_url must be an https:// URL; plaintext http:// is accepted only for a \
-                     loopback dev server. The enrolled mTLS client identity is presented only over \
-                     TLS, so a plaintext fetch would bypass it."
+                     loopback dev server."
                         .to_string(),
                 ));
             }
-            fetch_plan_over_mtls(store, env, env_id, url)
+            // Opportunistic mTLS: use the enrolled identity when available,
+            // fall back to an anonymous GET otherwise. Reads are public; the
+            // DSSE signature (verified after fetch) is the authenticity gate,
+            // not the client cert.
+            let identity = match env.pack_for_slot(greentic_deploy_spec::CapabilitySlot::Secrets) {
+                Some(secrets) => {
+                    let kind_path = secrets.kind.path();
+                    match require_tenant(env, env_id) {
+                        Ok(tenant) => load_identity(store, env, env_id, kind_path, &tenant)?,
+                        Err(_) => None,
+                    }
+                }
+                None => None,
+            };
+            match identity {
+                Some(_) => fetch_plan_over_mtls(store, env, env_id, url),
+                None => fetch_plan_anonymous(url),
+            }
         }
         (None, Some(plan), Some(sig)) => {
             let plan_bytes = std::fs::read(plan).map_err(|source| OpError::Io {
@@ -2230,6 +2242,28 @@ fn fetch_plan_over_mtls(
             client_key_pem: key_pem,
         })
         .map_err(|e| OpError::Conflict(format!("stored mTLS identity is unusable: {e}")))?;
+        let plan_bytes = mtls_get(&client, plan_url).await?;
+        let sig_bytes = mtls_get(&client, &sig_url).await?;
+        Ok::<(Vec<u8>, Vec<u8>), OpError>((plan_bytes, sig_bytes))
+    })
+}
+
+/// Fetch the plan document + `.sig` sidecar over a plain (server-auth-only)
+/// HTTP client. Used when the environment has no enrolled mTLS identity.
+/// The DSSE signature verified after fetch is the authenticity gate.
+fn fetch_plan_anonymous(plan_url: &str) -> Result<(Vec<u8>, Vec<u8>), OpError> {
+    let sig_url = {
+        let mut u = url::Url::parse(plan_url)
+            .map_err(|e| OpError::InvalidArgument(format!("plan_url: {e}")))?;
+        let sig_path = format!("{}.sig", u.path());
+        u.set_path(&sig_path);
+        u.to_string()
+    };
+    rt::sync_await(async {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| OpError::Fetch(format!("building HTTP client: {e}")))?;
         let plan_bytes = mtls_get(&client, plan_url).await?;
         let sig_bytes = mtls_get(&client, &sig_url).await?;
         Ok::<(Vec<u8>, Vec<u8>), OpError>((plan_bytes, sig_bytes))
@@ -4374,6 +4408,170 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
 
         let err = load_identity(&store, &env, &env_id, DEV_STORE_KIND_PATH, "acme").unwrap_err();
         assert!(matches!(err, OpError::Conflict(m) if m.contains("corrupt")));
+    }
+
+    // ---- anonymous plan-url fetch (Defect 3) ----
+
+    /// Tiny mock HTTP server that serves pre-canned responses for N sequential
+    /// connections (one response per connection). Mirrors the pattern in
+    /// `dispatch_remote::tests`.
+    struct PlanMockServer {
+        addr: std::net::SocketAddr,
+        _handle: std::thread::JoinHandle<()>,
+    }
+
+    fn start_plan_mock(responses: Vec<(u16, Vec<u8>)>) -> PlanMockServer {
+        use std::io::{BufRead, BufReader, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for (status, body) in responses {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                // Consume request headers.
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let status_text = match status {
+                    200 => "OK",
+                    404 => "Not Found",
+                    _ => "Error",
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} {status_text}\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                let w = reader.get_mut();
+                w.write_all(resp.as_bytes()).unwrap();
+                w.write_all(&body).unwrap();
+                w.flush().unwrap();
+            }
+        });
+        PlanMockServer {
+            addr,
+            _handle: handle,
+        }
+    }
+
+    #[test]
+    fn plan_url_anonymous_fetch_succeeds_when_unenrolled() {
+        // An env with no secrets pack / no enrollment must still fetch a plan
+        // over a plain HTTP GET (the DSSE signature is the authenticity gate).
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        // Env WITHOUT a secrets pack or tenant — not enrolled.
+        let env = make_env("local");
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        let loaded_env = store.load(&env_id).unwrap();
+
+        let plan_body = b"plan-document-bytes";
+        let sig_body = b"sig-envelope-bytes";
+        // The mock serves two connections: first the plan, then the .sig sidecar.
+        let mock = start_plan_mock(vec![(200, plan_body.to_vec()), (200, sig_body.to_vec())]);
+
+        let plan_url = format!(
+            "http://127.0.0.1:{}/v1/environments/local/plan",
+            mock.addr.port()
+        );
+        let payload = UpdatesGetPayload {
+            environment_id: "local".into(),
+            plan_url: Some(plan_url),
+            plan_file: None,
+            plan_sig_file: None,
+        };
+        let (got_plan, got_sig) = load_plan_source(&store, &loaded_env, &env_id, &payload).unwrap();
+        assert_eq!(got_plan, plan_body);
+        assert_eq!(got_sig, sig_body);
+    }
+
+    #[test]
+    fn plan_url_uses_mtls_when_enrolled() {
+        // An env WITH a secrets pack + tenant + enrolled identity must
+        // still prefer the mTLS path. We can't spin up a real mTLS server
+        // in a unit test, so we just verify the code path picks the mTLS
+        // branch by confirming that `fetch_plan_over_mtls` is reached (it
+        // will fail trying to build the mTLS client from test PEMs, which
+        // is fine — the point is it doesn't fall through to anonymous).
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = dev_store_env_with_tenant();
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        let loaded_env = store.load(&env_id).unwrap();
+
+        // Persist a synthetic identity so load_identity returns Some.
+        let identity = StoredIdentity {
+            client_key_pem: "KEY".into(),
+            client_cert_pem: "CERT".into(),
+            ca_pem: "CA".into(),
+            ca_url: "https://ca.example".into(),
+        };
+        put_env_secret(
+            &store,
+            &loaded_env,
+            &env_id,
+            DEV_STORE_KIND_PATH,
+            &tls_rel_path("acme", IDENTITY_NAME),
+            &serde_json::to_string(&identity).unwrap(),
+        )
+        .unwrap();
+
+        let payload = UpdatesGetPayload {
+            environment_id: "local".into(),
+            plan_url: Some("http://127.0.0.1:1/v1/plan".into()),
+            plan_file: None,
+            plan_sig_file: None,
+        };
+        // The mTLS path will fail because the test PEMs aren't real TLS
+        // material — the error proves the code entered that branch.
+        let err = load_plan_source(&store, &loaded_env, &env_id, &payload).unwrap_err();
+        assert!(
+            matches!(&err, OpError::Conflict(m) if m.contains("mTLS")),
+            "expected mTLS path error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn plan_url_hard_fails_on_corrupt_identity() {
+        // A corrupt identity blob must produce a hard error, never silently
+        // degrade to anonymous fetch.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = dev_store_env_with_tenant();
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        let loaded_env = store.load(&env_id).unwrap();
+
+        put_env_secret(
+            &store,
+            &loaded_env,
+            &env_id,
+            DEV_STORE_KIND_PATH,
+            &tls_rel_path("acme", IDENTITY_NAME),
+            "not-json",
+        )
+        .unwrap();
+
+        let payload = UpdatesGetPayload {
+            environment_id: "local".into(),
+            plan_url: Some("http://127.0.0.1:1/v1/plan".into()),
+            plan_file: None,
+            plan_sig_file: None,
+        };
+        let err = load_plan_source(&store, &loaded_env, &env_id, &payload).unwrap_err();
+        assert!(
+            matches!(&err, OpError::Conflict(m) if m.contains("corrupt")),
+            "expected corrupt-identity error, got: {err:?}"
+        );
     }
 
     // ---- `get` ----
