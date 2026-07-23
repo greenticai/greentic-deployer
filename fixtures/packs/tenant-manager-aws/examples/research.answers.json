@@ -1,0 +1,20 @@
+{
+  "aws_region": "ap-southeast-1",
+  "environment": "research",
+  "name_prefix": "greentic-tm",
+  "image_uri": "REPLACE_WITH_ECR_DIGEST_PINNED_IMAGE",
+  "domain_name": "id.research.greentic.cloud",
+  "acm_certificate_arn": "REPLACE_WITH_SHARED_STAR_GREENTIC_CLOUD_ACM_ARN",
+  "vpc_id": "REPLACE_WITH_SHARED_VPC_ID",
+  "subnet_ids": ["REPLACE_WITH_SHARED_SUBNET_A", "REPLACE_WITH_SHARED_SUBNET_B"],
+  "master_key_secret_arn": "REPLACE_WITH_SECRETSMANAGER_ARN_RESEARCH_MASTER_KEY",
+  "platform_secret_hash_arn": "REPLACE_WITH_SECRETSMANAGER_ARN_RESEARCH_PLATFORM_HASH",
+  "database_url_secret_arn": "REPLACE_WITH_SECRETSMANAGER_ARN_RESEARCH_SUPABASE_URL",
+  "existing_https_listener_arn": "REPLACE_WITH_SHARED_ALB_HTTPS_LISTENER_ARN",
+  "existing_alb_security_group_id": "REPLACE_WITH_SHARED_ALB_SG_ID",
+  "listener_rule_priority": 90,
+  "desired_count": 1,
+  "min_capacity": 1,
+  "max_capacity": 2,
+  "create_dns_record": true
+}
