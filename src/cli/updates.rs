@@ -594,7 +594,10 @@ fn admit_or_resume(
                 // Stranded mid-flight: re-gate against the CURRENT applied set
                 // before resuming, so a newer applied plan invalidates it.
                 UpdateStage::Downloading | UpdateStage::Inbox => {
-                    admit_plan(verified, &current_admission_facts(root)?)?;
+                    admit_plan(
+                        verified,
+                        &current_admission_facts(root, &verified.plan.env_id)?,
+                    )?;
                     Ok(existing)
                 }
                 // Already admitted AND promoted — its gates ran at begin.
@@ -616,8 +619,15 @@ fn admit_or_resume(
 
 /// Snapshot the applied-plan set for a resume-time re-gate (best-effort — not
 /// under the staging lock; the atomic gate is `begin_checked`).
+///
+/// `channel` is the resuming plan's target env (`_` for broadcast, the env name
+/// for per-env). The downgrade watermark is scoped to it — matching the
+/// authoritative `begin_checked` gate (greentic-update >= 1.1.2) — so a plan
+/// resuming after its env migrated channels is not wedged by the other channel's
+/// higher applied sequence. `StageState.channel` is backfilled by `list()`.
 fn current_admission_facts(
     root: &greentic_update::staging::UpdatesRoot,
+    channel: &str,
 ) -> Result<greentic_update::staging::AdmissionFacts, OpError> {
     let applied: Vec<_> = root
         .list()
@@ -626,7 +636,13 @@ fn current_admission_facts(
         .filter(|s| s.stage == greentic_update::staging::UpdateStage::Applied)
         .collect();
     Ok(greentic_update::staging::AdmissionFacts {
-        latest_applied_sequence: applied.iter().map(|s| s.sequence).max(),
+        // Per-channel downgrade watermark (see the doc note above).
+        latest_applied_sequence: applied
+            .iter()
+            .filter(|s| s.channel.as_deref() == Some(channel))
+            .map(|s| s.sequence)
+            .max(),
+        // `requires` is environment-wide — keep every applied id across channels.
         applied_plan_ids: applied.into_iter().map(|s| s.plan_id).collect(),
     })
 }
@@ -5635,6 +5651,48 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         // Resuming it must RE-GATE and reject the now-downgrade — not promote it.
         let err = admit_or_resume(&root, &vs, &ps, &ss).unwrap_err();
         assert!(matches!(err, OpError::Conflict(m) if m.contains("rejected")));
+    }
+
+    #[test]
+    fn admit_or_resume_regate_is_channel_scoped() {
+        use greentic_update::staging::UpdateStage;
+        let updates_dir = tempdir().unwrap();
+        let (priv9, tk9) = key_pair(9);
+        let build_trust = TrustRoot::new(vec![tk9.clone()]);
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+
+        // A high-sequence BROADCAST plan (channel `_`) is already Applied.
+        let (pb, sb) = signed_plan(
+            "_",
+            "bcast",
+            100,
+            json!([]),
+            json!({}),
+            &priv9,
+            &tk9.key_id,
+            &build_trust,
+        );
+        let vb = verify_with(&pb, &sb, &tk9);
+        let applied = root.begin(&vb, &pb, &sb).unwrap();
+        applied.transition(UpdateStage::Inbox).unwrap();
+        applied.transition(UpdateStage::Staged).unwrap();
+        applied.transition(UpdateStage::Applying).unwrap();
+        applied.transition(UpdateStage::Applied).unwrap();
+
+        // A lower-sequence PER-ENV plan (channel `local`) stranded at `downloading`.
+        let (ps, ss, vs) = signed_local("perenv", 5, &priv9, &tk9);
+        root.begin(&vs, &ps, &ss).unwrap();
+        assert_eq!(
+            root.load("perenv").unwrap().unwrap().stage().unwrap(),
+            UpdateStage::Downloading
+        );
+
+        // Resuming it must be ADMITTED, not rejected: the broadcast watermark is
+        // on a different channel, so seq 5 on the per-env channel is not a
+        // downgrade. Before per-channel scoping, the unscoped max (100) wedged it.
+        let resumed = admit_or_resume(&root, &vs, &ps, &ss).unwrap();
+        assert_eq!(resumed.stage().unwrap(), UpdateStage::Downloading);
     }
 
     #[test]
