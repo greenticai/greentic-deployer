@@ -2262,6 +2262,15 @@ fn fetch_plan_anonymous(plan_url: &str) -> Result<(Vec<u8>, Vec<u8>), OpError> {
     rt::sync_await(async {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            // The plan endpoint is a direct, operator-configured URL already
+            // validated by `control_url_is_acceptable`. Refuse to follow
+            // redirects — as a hard error, not a silently-returned 3xx body — so
+            // an accepted https endpoint cannot redirect the plan/sig fetch to a
+            // plaintext http target and defeat that scheme check (the fleet
+            // did:web resolver takes the same stance).
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                attempt.error("refusing to follow a plan-fetch redirect")
+            }))
             .build()
             .map_err(|e| OpError::Fetch(format!("building HTTP client: {e}")))?;
         let plan_bytes = mtls_get(&client, plan_url).await?;
@@ -4459,6 +4468,82 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             addr,
             _handle: handle,
         }
+    }
+
+    /// Mock that answers `count` sequential connections with a `302` redirect to
+    /// `location`. Used to prove the anonymous fetch does NOT follow redirects.
+    fn start_redirect_mock(location: String, count: usize) -> PlanMockServer {
+        use std::io::{BufRead, BufReader, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..count {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\n\
+                     Location: {location}\r\n\
+                     Content-Length: 0\r\n\
+                     Connection: close\r\n\r\n"
+                );
+                let w = reader.get_mut();
+                w.write_all(resp.as_bytes()).unwrap();
+                w.flush().unwrap();
+            }
+        });
+        PlanMockServer {
+            addr,
+            _handle: handle,
+        }
+    }
+
+    #[test]
+    fn plan_url_anonymous_refuses_redirects() {
+        // A plan server that 302-redirects the plan/sig fetch must NOT be
+        // followed: an accepted https endpoint could otherwise redirect to
+        // plaintext http, defeating the `control_url_is_acceptable` scheme
+        // check. With redirects refused, the 302 surfaces as a fetch error
+        // instead of transparently fetching the redirected target.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = make_env("local");
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        let loaded_env = store.load(&env_id).unwrap();
+
+        // Where a followed redirect WOULD land (serves plan then sig).
+        let target = start_plan_mock(vec![
+            (200, b"redir-plan".to_vec()),
+            (200, b"redir-sig".to_vec()),
+        ]);
+        let location = format!("http://127.0.0.1:{}/plan", target.addr.port());
+        // Redirector answers both the plan and the sig request with a 302.
+        let redirector = start_redirect_mock(location, 2);
+
+        let plan_url = format!(
+            "http://127.0.0.1:{}/v1/environments/local/plan",
+            redirector.addr.port()
+        );
+        let payload = UpdatesGetPayload {
+            environment_id: "local".into(),
+            plan_url: Some(plan_url),
+            plan_file: None,
+            plan_sig_file: None,
+        };
+        let err = load_plan_source(&store, &loaded_env, &env_id, &payload).unwrap_err();
+        assert!(
+            matches!(&err, OpError::Fetch(_)),
+            "a redirected plan fetch must fail (redirects refused), got: {err:?}"
+        );
     }
 
     #[test]
