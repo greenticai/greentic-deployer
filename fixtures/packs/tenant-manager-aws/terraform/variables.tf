@@ -60,3 +60,18 @@ variable "max_capacity" {
   type    = number
   default = 1
 }
+
+variable "existing_https_listener_arn" {
+  type    = string
+  default = ""
+}
+
+variable "existing_alb_security_group_id" {
+  type    = string
+  default = ""
+}
+
+variable "listener_rule_priority" {
+  type    = number
+  default = 100
+}

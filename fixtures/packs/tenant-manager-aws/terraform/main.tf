@@ -3,13 +3,16 @@ locals {
 }
 
 module "route" {
-  source              = "./modules/route"
-  name                = local.name
-  vpc_id              = var.vpc_id
-  subnet_ids          = var.subnet_ids
-  domain_name         = var.domain_name
-  acm_certificate_arn = var.acm_certificate_arn
-  create_dns_record   = var.create_dns_record
+  source                         = "./modules/route"
+  name                           = local.name
+  vpc_id                         = var.vpc_id
+  subnet_ids                     = var.subnet_ids
+  domain_name                    = var.domain_name
+  acm_certificate_arn            = var.acm_certificate_arn
+  create_dns_record              = var.create_dns_record
+  existing_https_listener_arn    = var.existing_https_listener_arn
+  existing_alb_security_group_id = var.existing_alb_security_group_id
+  listener_rule_priority         = var.listener_rule_priority
 }
 
 module "rds" {
