@@ -38,6 +38,9 @@ module "service" {
   platform_secret_hash_arn = var.platform_secret_hash_arn
   target_group_arn         = module.route.target_group_arn
   alb_security_group_id    = module.route.alb_security_group_id
+  desired_count            = var.desired_count
+  min_capacity             = var.min_capacity
+  max_capacity             = var.max_capacity
 }
 
 # Only needed when RDS is provisioned (both SGs then exist).

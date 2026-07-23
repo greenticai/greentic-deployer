@@ -9,3 +9,7 @@ subnet_ids               = ["subnet-00000000000000000", "subnet-1111111111111111
 master_key_secret_arn    = "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:tm-master-key"
 platform_secret_hash_arn = "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:tm-platform-hash"
 database_url_secret_arn  = "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:tm-develop-db-url"
+
+desired_count = 0
+min_capacity  = 0
+max_capacity  = 1
