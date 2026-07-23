@@ -13,11 +13,17 @@ module "route" {
 }
 
 module "rds" {
+  count             = var.database_url_secret_arn == "" ? 1 : 0
   source            = "./modules/rds"
   name              = local.name
   vpc_id            = var.vpc_id
   subnet_ids        = var.subnet_ids
   db_instance_class = var.db_instance_class
+}
+
+locals {
+  # External secret when provided; otherwise the RDS-provisioned secret.
+  effective_database_url_secret_arn = var.database_url_secret_arn != "" ? var.database_url_secret_arn : module.rds[0].database_url_secret_arn
 }
 
 module "service" {
@@ -27,20 +33,20 @@ module "service" {
   vpc_id                   = var.vpc_id
   subnet_ids               = var.subnet_ids
   image_uri                = var.image_uri
-  database_url_secret_arn  = module.rds.database_url_secret_arn
+  database_url_secret_arn  = local.effective_database_url_secret_arn
   master_key_secret_arn    = var.master_key_secret_arn
   platform_secret_hash_arn = var.platform_secret_hash_arn
   target_group_arn         = module.route.target_group_arn
   alb_security_group_id    = module.route.alb_security_group_id
 }
 
-# DB ingress from the service SG, declared at the root so neither module depends
-# on the other's security group (avoids a module dependency cycle).
+# Only needed when RDS is provisioned (both SGs then exist).
 resource "aws_security_group_rule" "db_from_service" {
+  count                    = var.database_url_secret_arn == "" ? 1 : 0
   type                     = "ingress"
   from_port                = 5432
   to_port                  = 5432
   protocol                 = "tcp"
-  security_group_id        = module.rds.db_security_group_id
+  security_group_id        = module.rds[0].db_security_group_id
   source_security_group_id = module.service.service_security_group_id
 }

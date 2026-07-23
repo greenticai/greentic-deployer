@@ -38,3 +38,9 @@ variable "create_dns_record" {
   type    = bool
   default = true
 }
+
+variable "database_url_secret_arn" {
+  type        = string
+  default     = ""
+  description = "ARN of a Secrets Manager secret holding the full libpq TENANT_DATABASE_URL (incl. ?sslmode=require). When set, an external Postgres (e.g. Supabase) is used and the RDS module is NOT created."
+}
