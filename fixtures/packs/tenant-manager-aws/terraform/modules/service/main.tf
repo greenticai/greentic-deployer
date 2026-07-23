@@ -121,8 +121,14 @@ resource "aws_ecs_service" "this" {
   name            = var.name
   cluster         = aws_ecs_cluster.this.id
   task_definition = aws_ecs_task_definition.this.arn
-  desired_count   = 1
+  desired_count   = var.desired_count
   launch_type     = "FARGATE"
+
+  lifecycle {
+    # Manual/scheduled scale-ups (aws ecs update-service --desired-count 1) must
+    # not be reverted to 0 on the next terraform apply.
+    ignore_changes = [desired_count]
+  }
 
   network_configuration {
     subnets          = var.subnet_ids
@@ -135,4 +141,12 @@ resource "aws_ecs_service" "this" {
     container_name   = "tenant-manager"
     container_port   = 8080
   }
+}
+
+resource "aws_appautoscaling_target" "this" {
+  service_namespace  = "ecs"
+  resource_id        = "service/${aws_ecs_cluster.this.name}/${aws_ecs_service.this.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  min_capacity       = var.min_capacity
+  max_capacity       = var.max_capacity
 }

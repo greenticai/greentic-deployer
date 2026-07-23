@@ -38,3 +38,40 @@ variable "create_dns_record" {
   type    = bool
   default = true
 }
+
+variable "database_url_secret_arn" {
+  type        = string
+  default     = ""
+  description = "ARN of a Secrets Manager secret holding the full libpq TENANT_DATABASE_URL (incl. ?sslmode=require). When set, an external Postgres (e.g. Supabase) is used and the RDS module is NOT created."
+}
+
+variable "desired_count" {
+  type        = number
+  default     = 1
+  description = "Initial ECS desired task count (0 = scale-to-zero for develop)."
+}
+
+variable "min_capacity" {
+  type    = number
+  default = 1
+}
+
+variable "max_capacity" {
+  type    = number
+  default = 1
+}
+
+variable "existing_https_listener_arn" {
+  type    = string
+  default = ""
+}
+
+variable "existing_alb_security_group_id" {
+  type    = string
+  default = ""
+}
+
+variable "listener_rule_priority" {
+  type    = number
+  default = 100
+}
