@@ -17,6 +17,7 @@ use crate::traffic_split::TrafficSplit;
 use crate::version::SchemaVersion;
 use greentic_types::EnvId;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -299,6 +300,17 @@ impl ExtensionBinding {
     }
 }
 
+/// Deterministic total order for picking the "newest" deployment: newest
+/// `created_at` first, ties broken by largest `deployment_id` (ULIDs are
+/// monotonic). Used by every rung of
+/// [`Environment::resolve_default_bundle`] so the comparator cannot drift
+/// between the explicit-config and fallback paths.
+fn newest_deployment_order(a: &&BundleDeployment, b: &&BundleDeployment) -> Ordering {
+    a.created_at
+        .cmp(&b.created_at)
+        .then_with(|| a.deployment_id.cmp(&b.deployment_id))
+}
+
 /// `greentic.environment.v1` compose-view (`§5.1`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Environment {
@@ -363,7 +375,10 @@ impl Environment {
     /// 1. [`EnvironmentHostConfig::default_bundle`] — only if that bundle has
     ///    an Active deployment whose `route_binding.tenant_selector.tenant`
     ///    matches `tenant`. If the configured bundle is missing, not Active,
-    ///    or bound to a different tenant, falls through.
+    ///    or bound to a different tenant, falls through. When multiple
+    ///    deployments share the configured `(tenant, bundle_id)`, the newest
+    ///    `created_at` / largest `deployment_id` wins (same total order as
+    ///    step 3).
     /// 2. If exactly one Active deployment matches the tenant, that one.
     /// 3. The Active tenant-matched deployment with the newest `created_at`;
     ///    ties broken by the larger `deployment_id` (ULIDs are monotonic, so
@@ -379,14 +394,18 @@ impl Environment {
                 && b.route_binding.tenant_selector.tenant == tenant
         };
 
-        // (a) Explicit config hit.
-        if let Some(configured) = &self.host_config.default_bundle
-            && let Some(hit) = self
+        // (a) Explicit config hit — collect all Active tenant-matched
+        //     deployments whose bundle_id equals the configured one, then
+        //     pick the newest via the shared total order.
+        if let Some(configured) = &self.host_config.default_bundle {
+            let hit = self
                 .bundles
                 .iter()
-                .find(|b| is_active_tenant(b) && b.bundle_id == *configured)
-        {
-            return Some((hit, DefaultBundleReason::ExplicitConfig));
+                .filter(|b| is_active_tenant(b) && b.bundle_id == *configured)
+                .max_by(newest_deployment_order);
+            if let Some(bd) = hit {
+                return Some((bd, DefaultBundleReason::ExplicitConfig));
+            }
         }
         // Configured bundle is absent / not Active / wrong tenant — fall through.
 
@@ -402,12 +421,7 @@ impl Environment {
             1 => Some((matches[0], DefaultBundleReason::LoneActive)),
             _ => {
                 // (c) Newest created_at, then largest deployment_id.
-                matches.sort_by(|a, b| {
-                    a.created_at
-                        .cmp(&b.created_at)
-                        .then_with(|| a.deployment_id.cmp(&b.deployment_id))
-                        .reverse()
-                });
+                matches.sort_by(|a, b| newest_deployment_order(a, b).reverse());
                 Some((matches[0], DefaultBundleReason::NewestActive))
             }
         }
@@ -914,6 +928,59 @@ mod default_bundle_tests {
         let (bd, reason) = env.resolve_default_bundle(TENANT).unwrap();
         assert_eq!(bd.bundle_id.as_str(), "chat-bundle");
         assert_eq!(reason, DefaultBundleReason::ExplicitConfig);
+    }
+
+    #[test]
+    fn explicit_config_picks_newest_among_duplicates() {
+        // Two Active deployments share the same (tenant, bundle_id).
+        // The explicit path must pick the newest created_at / largest
+        // deployment_id — the same total order the fallback rungs use.
+        // Insert the *newer* deployment first so a naive `.find()` would
+        // return it by accident; the test proves the choice is
+        // order-independent by also checking the reversed insertion order.
+        let newer_did = did(200);
+        let older_did = did(100);
+
+        let mut env = base_env(Some(BundleId::new("dup-bundle")));
+        // Newer first in vec — a `.find()` regression would still pass
+        // if we only checked this order, so we verify both.
+        env.bundles.push(deployment(
+            "dup-bundle",
+            TENANT,
+            BundleDeploymentStatus::Active,
+            ts(5000),
+            newer_did,
+        ));
+        env.bundles.push(deployment(
+            "dup-bundle",
+            TENANT,
+            BundleDeploymentStatus::Active,
+            ts(3000),
+            older_did,
+        ));
+        let (bd, reason) = env.resolve_default_bundle(TENANT).unwrap();
+        assert_eq!(reason, DefaultBundleReason::ExplicitConfig);
+        assert_eq!(bd.deployment_id, newer_did);
+
+        // Reverse insertion order — must still pick the newer one.
+        let mut env2 = base_env(Some(BundleId::new("dup-bundle")));
+        env2.bundles.push(deployment(
+            "dup-bundle",
+            TENANT,
+            BundleDeploymentStatus::Active,
+            ts(3000),
+            older_did,
+        ));
+        env2.bundles.push(deployment(
+            "dup-bundle",
+            TENANT,
+            BundleDeploymentStatus::Active,
+            ts(5000),
+            newer_did,
+        ));
+        let (bd2, reason2) = env2.resolve_default_bundle(TENANT).unwrap();
+        assert_eq!(reason2, DefaultBundleReason::ExplicitConfig);
+        assert_eq!(bd2.deployment_id, newer_did);
     }
 
     // -- explicit config falls through --
