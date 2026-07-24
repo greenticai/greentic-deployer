@@ -74,6 +74,16 @@ required-features = [
     "internal-tools",
 ]
 
+[package.metadata.binstall]
+pkg-url = "{repo}/releases/download/v{version}/{name}-v{version}-{target}.{archive-format}"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
