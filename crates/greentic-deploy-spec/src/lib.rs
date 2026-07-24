@@ -60,8 +60,8 @@ pub use engine::{
     UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 pub use environment::{
-    DEFAULT_LISTEN_ADDR, EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding,
-    GUI_DEFAULT_ENV_ID, validate_public_base_url,
+    DEFAULT_LISTEN_ADDR, DefaultBundleReason, EnvPackBinding, Environment, EnvironmentHostConfig,
+    ExtensionBinding, GUI_DEFAULT_ENV_ID, validate_public_base_url,
 };
 pub use environment_runtime::{EnvironmentRuntime, RuntimeDiscoveryValue};
 pub use environment_update_channel::{
