@@ -23,6 +23,18 @@ const MAX_SIDECAR_BYTES: u64 = 1024;
 /// Download timeout mirroring the consumer (300s, from greentic-start).
 const BINARY_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Total download attempts per asset before giving up (1 initial + 3 retries).
+///
+/// A coordinated publish derives ~168 assets (6 archives + 6 sidecars across 14
+/// packages), so it is exposed to any intermittent failure on GitHub's release
+/// CDN: a single 5xx anywhere in that sweep aborts the whole publish. Observed
+/// in production as repeated `504 Gateway Timeout` on `.sha256` sidecars whose
+/// URLs returned 200 seconds later by hand.
+const FETCH_MAX_ATTEMPTS: u32 = 4;
+
+/// Base delay for the exponential backoff between download attempts.
+const FETCH_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Windows target triples that produce `.exe` inner binaries.
 fn is_windows_target(target: &str) -> bool {
     target.contains("-windows-")
@@ -93,39 +105,113 @@ fn github_client() -> Result<reqwest::blocking::Client, OpError> {
         .map_err(|e| OpError::Fetch(format!("building GitHub client: {e}")))
 }
 
-/// Download bytes from `url` with a size cap, failing if the response exceeds
-/// `cap` bytes.
+/// Is this HTTP status worth retrying?
+///
+/// Server errors and rate limiting are the transient shapes GitHub's release
+/// CDN produces under a bulk sweep. `401`/`403`/`404` are deliberately absent:
+/// they are deterministic answers about the token or the asset, and retrying
+/// them only delays an honest failure by the whole backoff budget.
+fn status_is_transient(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+/// Is this transport error worth retrying? Timeouts, connect failures and
+/// truncated bodies are all "try again"; a malformed URL is not.
+fn transport_error_is_transient(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_body() || err.is_decode()
+}
+
+/// Backoff before attempt `attempt` (1-based): 0.5s, 1s, 2s, ...
+fn backoff_for_attempt(attempt: u32) -> std::time::Duration {
+    FETCH_BACKOFF_BASE * 2u32.pow(attempt.saturating_sub(1))
+}
+
+/// A failed download attempt, tagged with whether retrying could help.
+enum AttemptError {
+    Transient(OpError),
+    Permanent(OpError),
+}
+
+impl AttemptError {
+    fn into_inner(self) -> OpError {
+        match self {
+            AttemptError::Transient(e) | AttemptError::Permanent(e) => e,
+        }
+    }
+}
+
+/// Download bytes from `url` with a size cap, retrying transient failures with
+/// exponential backoff. Permanent failures (auth, missing asset, oversized
+/// body) return immediately.
 fn download_capped(
     client: &reqwest::blocking::Client,
     url: &str,
     cap: u64,
 ) -> Result<Vec<u8>, OpError> {
-    let resp = client
-        .get(url)
-        .send()
-        .map_err(|e| OpError::Fetch(format!("GET {url}: {e}")))?;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match download_capped_once(client, url, cap) {
+            Ok(bytes) => return Ok(bytes),
+            Err(AttemptError::Transient(e)) if attempt < FETCH_MAX_ATTEMPTS => {
+                let delay = backoff_for_attempt(attempt);
+                eprintln!(
+                    "warning: transient fetch failure (attempt {attempt}/{FETCH_MAX_ATTEMPTS}), \
+                     retrying in {:?}: {e}",
+                    delay
+                );
+                std::thread::sleep(delay);
+            }
+            Err(other) => return Err(other.into_inner()),
+        }
+    }
+}
+
+/// One download attempt. Classifies its failure so the caller can decide
+/// whether to retry.
+fn download_capped_once(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    cap: u64,
+) -> Result<Vec<u8>, AttemptError> {
+    let resp = client.get(url).send().map_err(|e| {
+        let err = OpError::Fetch(format!("GET {url}: {e}"));
+        if transport_error_is_transient(&e) {
+            AttemptError::Transient(err)
+        } else {
+            AttemptError::Permanent(err)
+        }
+    })?;
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(OpError::Unauthorized {
+        return Err(AttemptError::Permanent(OpError::Unauthorized {
             policy: "github-release".to_string(),
             reason: format!("GitHub API returned {status} for {url}"),
-        });
+        }));
     }
     if status == reqwest::StatusCode::NOT_FOUND {
-        return Err(OpError::NotFound(format!("asset not found: {url}")));
+        return Err(AttemptError::Permanent(OpError::NotFound(format!(
+            "asset not found: {url}"
+        ))));
+    }
+    if status_is_transient(status) {
+        return Err(AttemptError::Transient(OpError::Fetch(format!(
+            "GET {url}: HTTP status {status}"
+        ))));
     }
     let resp = resp
         .error_for_status()
-        .map_err(|e| OpError::Fetch(format!("GET {url}: {e}")))?;
+        .map_err(|e| AttemptError::Permanent(OpError::Fetch(format!("GET {url}: {e}"))))?;
 
     let mut buf = Vec::new();
+    // A truncated body is a transport hiccup, not a bad asset — retry it.
     resp.take(cap + 1)
         .read_to_end(&mut buf)
-        .map_err(|e| OpError::Fetch(format!("reading {url}: {e}")))?;
+        .map_err(|e| AttemptError::Transient(OpError::Fetch(format!("reading {url}: {e}"))))?;
     if buf.len() as u64 > cap {
-        return Err(OpError::InvalidArgument(format!(
+        return Err(AttemptError::Permanent(OpError::InvalidArgument(format!(
             "asset {url} exceeds {cap} byte cap"
-        )));
+        ))));
     }
     Ok(buf)
 }
@@ -540,6 +626,57 @@ mod tests {
             })
             .collect();
         serde_json::to_vec(&serde_json::json!({ "assets": asset_list })).unwrap()
+    }
+
+    // --- fetch retry classification ------------------------------------------
+
+    #[test]
+    fn server_errors_and_rate_limit_are_transient() {
+        for code in [500u16, 502, 503, 504, 429] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            assert!(
+                status_is_transient(status),
+                "{code} should be retried — it is how the release CDN fails under a bulk sweep"
+            );
+        }
+    }
+
+    #[test]
+    fn deterministic_statuses_are_not_retried() {
+        // Retrying these only delays an honest failure by the whole backoff
+        // budget: they are answers about the token or the asset, not weather.
+        for code in [400u16, 401, 403, 404, 410, 422] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            assert!(!status_is_transient(status), "{code} must not be retried");
+        }
+    }
+
+    #[test]
+    fn success_status_is_not_transient() {
+        assert!(!status_is_transient(reqwest::StatusCode::OK));
+        assert!(!status_is_transient(reqwest::StatusCode::PARTIAL_CONTENT));
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_from_the_base() {
+        assert_eq!(backoff_for_attempt(1), FETCH_BACKOFF_BASE);
+        assert_eq!(backoff_for_attempt(2), FETCH_BACKOFF_BASE * 2);
+        assert_eq!(backoff_for_attempt(3), FETCH_BACKOFF_BASE * 4);
+    }
+
+    #[test]
+    fn total_backoff_stays_within_a_sane_budget() {
+        // 4 attempts => sleeps before attempts 2, 3, 4 only.
+        let total: std::time::Duration = (1..FETCH_MAX_ATTEMPTS).map(backoff_for_attempt).sum();
+        assert_eq!(total, std::time::Duration::from_millis(3500));
+    }
+
+    #[test]
+    fn attempt_error_preserves_the_underlying_error() {
+        let transient = AttemptError::Transient(OpError::Fetch("boom".to_string()));
+        assert!(matches!(transient.into_inner(), OpError::Fetch(m) if m == "boom"));
+        let permanent = AttemptError::Permanent(OpError::NotFound("gone".to_string()));
+        assert!(matches!(permanent.into_inner(), OpError::NotFound(m) if m == "gone"));
     }
 
     // --- parse_sidecar_digest ------------------------------------------------
