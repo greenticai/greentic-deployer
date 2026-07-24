@@ -1997,14 +1997,7 @@ mod tests {
         let result = store.create_environment(
             &env_id(),
             "test".to_string(),
-            EnvironmentHostConfig {
-                env_id: env_id(),
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-            },
+            EnvironmentHostConfig::new(env_id()),
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap().name, "test");
@@ -2020,14 +2013,7 @@ mod tests {
         let result = store.create_environment(
             &env_id(),
             "test".to_string(),
-            EnvironmentHostConfig {
-                env_id: env_id(),
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-            },
+            EnvironmentHostConfig::new(env_id()),
         );
         assert!(matches!(result, Err(StoreError::Conflict(_))));
     }
@@ -3213,14 +3199,7 @@ mod tests {
         let result = store.create_environment(
             &env_id(),
             "test-envelope".to_string(),
-            EnvironmentHostConfig {
-                env_id: env_id(),
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-            },
+            EnvironmentHostConfig::new(env_id()),
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap().name, "test-envelope");
@@ -3281,14 +3260,7 @@ mod tests {
         let _ = store.create_environment(
             &env_id(),
             "test".to_string(),
-            EnvironmentHostConfig {
-                env_id: env_id(),
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-            },
+            EnvironmentHostConfig::new(env_id()),
         );
     }
 

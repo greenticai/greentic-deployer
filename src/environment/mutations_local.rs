@@ -1235,13 +1235,11 @@ impl LocalFsStore {
                         schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
                         environment_id: locked.env_id().clone(),
                         name: env_id.as_str().to_string(),
-                        host_config: EnvironmentHostConfig {
-                            env_id: locked.env_id().clone(),
-                            region: None,
-                            tenant_org_id: None,
-                            listen_addr: Some(greentic_deploy_spec::DEFAULT_LISTEN_ADDR),
-                            public_base_url: payload.public_base_url.clone(),
-                            gui_enabled: None,
+                        host_config: {
+                            let mut hc = EnvironmentHostConfig::new(locked.env_id().clone())
+                                .with_listen_addr(greentic_deploy_spec::DEFAULT_LISTEN_ADDR);
+                            hc.public_base_url = payload.public_base_url.clone();
+                            hc
                         },
                         packs,
                         credentials_ref: None,
@@ -1650,14 +1648,7 @@ mod warm_revision_tests {
             schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
             environment_id: env_id(),
             name: ENV_ID.to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id: env_id(),
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-            },
+            host_config: EnvironmentHostConfig::new(env_id()),
             packs: Vec::new(),
             credentials_ref: None,
             bundles: vec![BundleDeployment {
@@ -2001,14 +1992,7 @@ mod bootstrap_typed_verb_tests {
             ),
             environment_id: eid.clone(),
             name: LOCAL_ENV_ID.to_string(),
-            host_config: greentic_deploy_spec::EnvironmentHostConfig {
-                env_id: eid,
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-            },
+            host_config: greentic_deploy_spec::EnvironmentHostConfig::new(eid),
             packs: Vec::new(),
             credentials_ref: None,
             bundles: Vec::new(),

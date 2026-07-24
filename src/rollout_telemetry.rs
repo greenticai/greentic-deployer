@@ -198,13 +198,10 @@ mod tests {
             schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
             environment_id: EnvId::try_from("prod-eu").unwrap(),
             name: "prod-eu".into(),
-            host_config: EnvironmentHostConfig {
-                env_id: EnvId::try_from("prod-eu").unwrap(),
-                region: None,
-                tenant_org_id: owner.map(str::to_string),
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
+            host_config: {
+                let mut hc = EnvironmentHostConfig::new(EnvId::try_from("prod-eu").unwrap());
+                hc.tenant_org_id = owner.map(str::to_string);
+                hc
             },
             packs: Vec::new(),
             credentials_ref: None,

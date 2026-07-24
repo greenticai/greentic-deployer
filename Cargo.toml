@@ -92,13 +92,21 @@ fs4 = "0.13"
 greentic-bundle = ">=1.1.0-0, <1.2.0-0"
 greentic-config = ">=1.1.0-0, <1.2.0-0"
 greentic-config-types = ">=1.1.0-0, <1.2.0-0"
-# Floor is 0.2.4, NOT 0.2.3: `cli/updates.rs` uses
-# `greentic_deploy_spec::DEFAULT_PLAN_ENDPOINT`, which 0.2.3 does not define. The
-# path dep masks this locally — it always resolves to the in-tree copy — so the
-# workspace builds green while every crates.io consumer that resolves 0.2.3 fails
-# to compile this crate. Publishing a member crate and using its new API in the
-# same release means bumping this floor in the same PR.
-greentic-deploy-spec = { path = "crates/greentic-deploy-spec", version = ">=0.2.4, <0.3" }
+# API floor is 0.2.4 (pin currently at 0.2.5): `cli/updates.rs` uses
+# `greentic_deploy_spec::DEFAULT_PLAN_ENDPOINT`, which 0.2.3 does not define.
+# The path dep masks this locally — it always resolves to the in-tree copy — so
+# the workspace builds green while every crates.io consumer that resolves 0.2.3
+# fails to compile this crate. Publishing a member crate and using its new API
+# in the same release means bumping this floor in the same PR.
+#
+# Exact pin, NOT a range: the `path` is stripped on publish so only `version`
+# reaches crates.io. A `<0.3` upper bound admits dev-lane `0.2.<RUN_ID>` builds
+# (e.g. 0.2.29986812583) which pull incompatible transitive deps. Consumers
+# without a direct deploy-spec dep — like greentic-setup — resolve it
+# transitively through this version, so it must exclude dev-lane publishes.
+# The pin must move with every deploy-spec version bump; that coupling is
+# deliberate.
+greentic-deploy-spec = { path = "crates/greentic-deploy-spec", version = "=0.2.5" }
 greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.2" }
 # did:web resolution for `trust-root add-did`. Default features only: `cli` and
 # `testing` would drag clap/tokio/rand in for no runtime benefit.

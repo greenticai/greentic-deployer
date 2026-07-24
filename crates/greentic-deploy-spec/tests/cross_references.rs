@@ -27,14 +27,7 @@ fn env_with(
         schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
         environment_id: env_id.clone(),
         name: "local".into(),
-        host_config: EnvironmentHostConfig {
-            env_id,
-            region: None,
-            tenant_org_id: None,
-            listen_addr: None,
-            public_base_url: None,
-            gui_enabled: None,
-        },
+        host_config: EnvironmentHostConfig::new(env_id),
         packs: vec![EnvPackBinding {
             slot: CapabilitySlot::Deployer,
             kind: PackDescriptor::try_new("greentic.deployer.local-process@1.0.0").unwrap(),
