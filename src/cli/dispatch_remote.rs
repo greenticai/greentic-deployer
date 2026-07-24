@@ -395,19 +395,14 @@ fn remote_env_create(
     let parsed_public_base_url =
         super::env::parse_optional_public_base_url(&payload.public_base_url)?;
     let env = store
-        .create_environment(
-            &env_id,
-            payload.name,
-            EnvironmentHostConfig {
-                env_id: env_id.clone(),
-                region: payload.region,
-                tenant_org_id: payload.tenant_org_id,
-                listen_addr: parsed_listen_addr,
-                public_base_url: parsed_public_base_url,
-                gui_enabled: None,
-                default_bundle: None,
-            },
-        )
+        .create_environment(&env_id, payload.name, {
+            let mut hc = EnvironmentHostConfig::new(env_id.clone());
+            hc.region = payload.region;
+            hc.tenant_org_id = payload.tenant_org_id;
+            hc.listen_addr = parsed_listen_addr;
+            hc.public_base_url = parsed_public_base_url;
+            hc
+        })
         .map_err(map_store_err_preserving_noun)?;
     Ok(OpOutcome::new(
         "env",
@@ -2873,15 +2868,7 @@ mod tests {
         let _ = store.create_environment(
             &EnvId::try_from("local").unwrap(),
             "test".to_string(),
-            EnvironmentHostConfig {
-                env_id: EnvId::try_from("local").unwrap(),
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-                default_bundle: None,
-            },
+            EnvironmentHostConfig::new(EnvId::try_from("local").unwrap()),
         );
         assert!(
             saw_bearer.load(std::sync::atomic::Ordering::SeqCst),

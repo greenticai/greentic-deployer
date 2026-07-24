@@ -325,15 +325,7 @@ pub(crate) fn build_fixture_env() -> Environment {
         schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
         environment_id: env_id.clone(),
         name: env_id.as_str().to_string(),
-        host_config: EnvironmentHostConfig {
-            env_id: env_id.clone(),
-            region: None,
-            tenant_org_id: None,
-            listen_addr: None,
-            public_base_url: None,
-            gui_enabled: None,
-            default_bundle: None,
-        },
+        host_config: EnvironmentHostConfig::new(env_id.clone()),
         packs: Vec::new(),
         credentials_ref: None,
         bundles: vec![

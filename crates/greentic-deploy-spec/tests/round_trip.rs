@@ -22,15 +22,7 @@ fn sample_environment() -> Environment {
         schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
         environment_id: env_id(),
         name: "local".into(),
-        host_config: EnvironmentHostConfig {
-            env_id: env_id(),
-            region: Some("local".into()),
-            tenant_org_id: None,
-            listen_addr: None,
-            public_base_url: None,
-            gui_enabled: None,
-            default_bundle: None,
-        },
+        host_config: EnvironmentHostConfig::new(env_id()).with_region("local".into()),
         packs: vec![EnvPackBinding {
             slot: CapabilitySlot::Deployer,
             kind: PackDescriptor::try_new("greentic.deployer.local-process@1.0.0").unwrap(),

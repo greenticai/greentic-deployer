@@ -55,15 +55,7 @@ fn minimal_environment(id: &EnvId) -> Environment {
         schema: SchemaVersion::from(SchemaVersion::ENVIRONMENT_V1),
         environment_id: id.clone(),
         name: id.as_str().to_string(),
-        host_config: EnvironmentHostConfig {
-            env_id: id.clone(),
-            region: None,
-            tenant_org_id: None,
-            listen_addr: None,
-            public_base_url: None,
-            gui_enabled: None,
-            default_bundle: None,
-        },
+        host_config: EnvironmentHostConfig::new(id.clone()),
         packs: vec![EnvPackBinding {
             slot: CapabilitySlot::Deployer,
             kind: pack_descriptor("greentic.deployer.local-process@1.0.0"),

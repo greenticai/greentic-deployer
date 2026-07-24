@@ -32,6 +32,7 @@ pub const DEFAULT_LISTEN_ADDR: SocketAddr =
 /// (`§5.1`). Identity-only — connectivity, region, and deployment ctx; nothing
 /// secret, nothing tenant-scoped.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EnvironmentHostConfig {
     pub env_id: EnvId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,6 +69,11 @@ pub struct EnvironmentHostConfig {
     /// → resolved by [`Environment::resolve_default_bundle`] using a
     /// deterministic fallback ladder (lone Active match, then newest
     /// `created_at` / largest `deployment_id`).
+    ///
+    /// **Note:** not yet settable through [`UpdateEnvironmentPayload`] /
+    /// [`apply_environment_update`](crate::engine::apply_environment_update);
+    /// only the first-deploy stamp in `greentic-setup` writes it. For
+    /// existing environments the resolution ladder is the sole path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_bundle: Option<BundleId>,
 }
@@ -78,6 +84,57 @@ pub struct EnvironmentHostConfig {
 pub const GUI_DEFAULT_ENV_ID: &str = "local";
 
 impl EnvironmentHostConfig {
+    /// Construct a new config with only the required `env_id`; every optional
+    /// field starts as `None`. Chain [`with_region`](Self::with_region),
+    /// [`with_listen_addr`](Self::with_listen_addr), etc. to set them.
+    pub fn new(env_id: EnvId) -> Self {
+        Self {
+            env_id,
+            region: None,
+            tenant_org_id: None,
+            listen_addr: None,
+            public_base_url: None,
+            gui_enabled: None,
+            default_bundle: None,
+        }
+    }
+
+    /// Set the cloud region tag (e.g. `"eu-west-1"`).
+    pub fn with_region(mut self, region: String) -> Self {
+        self.region = Some(region);
+        self
+    }
+
+    /// Set the tenant organization this env belongs to.
+    pub fn with_tenant_org_id(mut self, tenant_org_id: String) -> Self {
+        self.tenant_org_id = Some(tenant_org_id);
+        self
+    }
+
+    /// Set the bind address for the runtime's local HTTP listener.
+    pub fn with_listen_addr(mut self, listen_addr: SocketAddr) -> Self {
+        self.listen_addr = Some(listen_addr);
+        self
+    }
+
+    /// Set the persistent public base URL (origin only, no path).
+    pub fn with_public_base_url(mut self, public_base_url: String) -> Self {
+        self.public_base_url = Some(public_base_url);
+        self
+    }
+
+    /// Explicitly enable or disable the built-in webchat GUI.
+    pub fn with_gui_enabled(mut self, gui_enabled: bool) -> Self {
+        self.gui_enabled = Some(gui_enabled);
+        self
+    }
+
+    /// Pin a default bundle for bare-URL webchat resolution.
+    pub fn with_default_bundle(mut self, default_bundle: BundleId) -> Self {
+        self.default_bundle = Some(default_bundle);
+        self
+    }
+
     /// Resolves the bind address using `self.listen_addr` falling back to
     /// [`DEFAULT_LISTEN_ADDR`]. Runtime-level env-var precedence (if any) is
     /// the caller's responsibility — this helper is the persisted-state

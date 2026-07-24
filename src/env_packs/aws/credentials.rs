@@ -816,15 +816,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn default_host_config(env_id: &EnvId) -> EnvironmentHostConfig {
-        EnvironmentHostConfig {
-            env_id: env_id.clone(),
-            region: None,
-            tenant_org_id: None,
-            listen_addr: None,
-            public_base_url: None,
-            gui_enabled: None,
-            default_bundle: None,
-        }
+        EnvironmentHostConfig::new(env_id.clone())
     }
 
     fn ctx<'a>(

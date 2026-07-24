@@ -239,15 +239,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn default_host_config(env_id: &EnvId) -> EnvironmentHostConfig {
-        EnvironmentHostConfig {
-            env_id: env_id.clone(),
-            region: None,
-            tenant_org_id: None,
-            listen_addr: None,
-            public_base_url: None,
-            gui_enabled: None,
-            default_bundle: None,
-        }
+        EnvironmentHostConfig::new(env_id.clone())
     }
 
     fn ctx<'a>(
@@ -414,15 +406,7 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let bound_addr = listener.local_addr().unwrap();
         let env_id = EnvId::try_from("local").unwrap();
-        let hc = EnvironmentHostConfig {
-            env_id: env_id.clone(),
-            region: None,
-            tenant_org_id: None,
-            listen_addr: Some(bound_addr),
-            public_base_url: None,
-            gui_enabled: None,
-            default_bundle: None,
-        };
+        let hc = EnvironmentHostConfig::new(env_id.clone()).with_listen_addr(bound_addr);
         // With the port occupied and listen_addr pointing at it, probe
         // must report Fail.
         let status = probe_port_available(DEFAULT_PORT_RANGE, &hc);
