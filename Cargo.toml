@@ -289,7 +289,7 @@ features = [
 ]
 
 [dependencies.kube]
-version = "3.1"
+version = "4.2"
 optional = true
 
 # Only used to install a process-default rustls CryptoProvider before the
