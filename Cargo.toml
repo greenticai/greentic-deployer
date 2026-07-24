@@ -122,7 +122,7 @@ rpassword = "7"
 rustix = { version = "1", features = ["process"], default-features = false }
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "zeroize"] }
 zeroize = "1"
-rand = "0.9"
+rand = "0.10"
 libc = "0.2"
 # Env-manifest authoring form (PR-5, `plans/operator-surface-unification.md`):
 # `manifest_form_spec()` / `answers_to_manifest()` are typed lib API, so this
