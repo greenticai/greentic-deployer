@@ -332,6 +332,7 @@ pub(crate) fn build_fixture_env() -> Environment {
             listen_addr: None,
             public_base_url: None,
             gui_enabled: None,
+            default_bundle: None,
         },
         packs: Vec::new(),
         credentials_ref: None,

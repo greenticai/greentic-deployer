@@ -5,10 +5,10 @@
 //! — the in-memory `Environment` is the union of those, owned by A2's
 //! `EnvironmentStore`.
 
-use crate::bundle_deployment::BundleDeployment;
+use crate::bundle_deployment::{BundleDeployment, BundleDeploymentStatus};
 use crate::capability_slot::{CapabilitySlot, PackDescriptor};
 use crate::error::SpecError;
-use crate::ids::PackId;
+use crate::ids::{BundleId, PackId};
 use crate::messaging_endpoint::MessagingEndpoint;
 use crate::refs::{ExtensionRef, SecretRef};
 use crate::retention::{HealthStatus, RetentionPolicy, RevocationConfig};
@@ -63,6 +63,13 @@ pub struct EnvironmentHostConfig {
     /// env-id default either way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gui_enabled: Option<bool>,
+    /// The bundle that the bare webchat URL `/v1/web/webchat/{tenant}/`
+    /// resolves to when an environment holds several bundles. `None` = unset
+    /// → resolved by [`Environment::resolve_default_bundle`] using a
+    /// deterministic fallback ladder (lone Active match, then newest
+    /// `created_at` / largest `deployment_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_bundle: Option<BundleId>,
 }
 
 /// Env id whose runtime serves the built-in webchat GUI by default. Other
@@ -153,6 +160,23 @@ pub fn validate_public_base_url(value: &str) -> Result<String, crate::error::Spe
         return Err(invalid("must be an origin without a path"));
     }
     Ok(trimmed.trim_end_matches('/').to_string())
+}
+
+/// Why [`Environment::resolve_default_bundle`] picked a particular deployment.
+/// Callers (e.g. `greentic-start`) log the reason when the choice was implicit
+/// so operators can tell whether a bundle was served by explicit config or by
+/// fallback heuristics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DefaultBundleReason {
+    /// [`EnvironmentHostConfig::default_bundle`] named this bundle and it has
+    /// an Active, tenant-matched deployment.
+    ExplicitConfig,
+    /// Exactly one Active deployment matched the tenant — unambiguous.
+    LoneActive,
+    /// Multiple Active deployments matched; the one with the newest
+    /// `created_at` (ties broken by largest `deployment_id`) was chosen.
+    NewestActive,
 }
 
 /// Binding from a [`CapabilitySlot`] to a concrete pack (`§5.1`).
@@ -272,6 +296,64 @@ impl Environment {
         self.extensions
             .iter()
             .find(|b| b.kind.path() == r.path() && b.instance_id.as_deref() == r.instance_id())
+    }
+
+    /// Resolve the default bundle deployment for a tenant. Returns the chosen
+    /// deployment and the reason it was selected, or `None` when no Active
+    /// tenant-matched deployment exists.
+    ///
+    /// Resolution ladder (in order):
+    /// 1. [`EnvironmentHostConfig::default_bundle`] — only if that bundle has
+    ///    an Active deployment whose `route_binding.tenant_selector.tenant`
+    ///    matches `tenant`. If the configured bundle is missing, not Active,
+    ///    or bound to a different tenant, falls through.
+    /// 2. If exactly one Active deployment matches the tenant, that one.
+    /// 3. The Active tenant-matched deployment with the newest `created_at`;
+    ///    ties broken by the larger `deployment_id` (ULIDs are monotonic, so
+    ///    this is a deterministic total order).
+    /// 4. `None` if no Active deployment matches.
+    pub fn resolve_default_bundle(
+        &self,
+        tenant: &str,
+    ) -> Option<(&BundleDeployment, DefaultBundleReason)> {
+        // Predicate shared by all ladder steps.
+        let is_active_tenant = |b: &&BundleDeployment| {
+            b.status == BundleDeploymentStatus::Active
+                && b.route_binding.tenant_selector.tenant == tenant
+        };
+
+        // (a) Explicit config hit.
+        if let Some(configured) = &self.host_config.default_bundle
+            && let Some(hit) = self
+                .bundles
+                .iter()
+                .find(|b| is_active_tenant(b) && b.bundle_id == *configured)
+        {
+            return Some((hit, DefaultBundleReason::ExplicitConfig));
+        }
+        // Configured bundle is absent / not Active / wrong tenant — fall through.
+
+        // Collect all Active tenant-matched deployments.
+        let mut matches: Vec<&BundleDeployment> = self
+            .bundles
+            .iter()
+            .filter(|b| is_active_tenant(b))
+            .collect();
+
+        match matches.len() {
+            0 => None,
+            1 => Some((matches[0], DefaultBundleReason::LoneActive)),
+            _ => {
+                // (c) Newest created_at, then largest deployment_id.
+                matches.sort_by(|a, b| {
+                    a.created_at
+                        .cmp(&b.created_at)
+                        .then_with(|| a.deployment_id.cmp(&b.deployment_id))
+                        .reverse()
+                });
+                Some((matches[0], DefaultBundleReason::NewestActive))
+            }
+        }
     }
 
     /// Validates spec-level invariants:
@@ -648,6 +730,7 @@ mod gui_enabled_tests {
             listen_addr: None,
             public_base_url: None,
             gui_enabled,
+            default_bundle: None,
         }
     }
 
@@ -668,5 +751,324 @@ mod gui_enabled_tests {
         assert!(!host_config("local", Some(false)).resolved_gui_enabled());
         // ... and on for a non-local env (explicit opt-in).
         assert!(host_config("staging", Some(true)).resolved_gui_enabled());
+    }
+}
+
+#[cfg(test)]
+mod default_bundle_tests {
+    use super::*;
+    use crate::bundle_deployment::{
+        BundleDeployment, BundleDeploymentStatus, RevenueShareEntry, RouteBinding, TenantSelector,
+    };
+    use crate::ids::{BundleId, CustomerId, DeploymentId, PartyId};
+    use crate::version::SchemaVersion;
+    use chrono::{DateTime, TimeZone, Utc};
+    use greentic_types::EnvId;
+    use std::path::PathBuf;
+
+    const TENANT: &str = "acme";
+
+    fn env_id() -> EnvId {
+        EnvId::try_from("local").unwrap()
+    }
+
+    fn base_env(default_bundle: Option<BundleId>) -> Environment {
+        Environment {
+            schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
+            environment_id: env_id(),
+            name: "local".into(),
+            host_config: EnvironmentHostConfig {
+                env_id: env_id(),
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+                public_base_url: None,
+                gui_enabled: None,
+                default_bundle,
+            },
+            packs: Vec::new(),
+            credentials_ref: None,
+            bundles: Vec::new(),
+            revisions: Vec::new(),
+            traffic_splits: Vec::new(),
+            messaging_endpoints: Vec::new(),
+            extensions: Vec::new(),
+            revocation: Default::default(),
+            retention: Default::default(),
+            health: Default::default(),
+        }
+    }
+
+    fn deployment(
+        bundle_id: &str,
+        tenant: &str,
+        status: BundleDeploymentStatus,
+        created_at: DateTime<Utc>,
+        deployment_id: DeploymentId,
+    ) -> BundleDeployment {
+        BundleDeployment {
+            schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
+            deployment_id,
+            env_id: env_id(),
+            bundle_id: BundleId::new(bundle_id),
+            customer_id: CustomerId::new("local-dev"),
+            status,
+            current_revisions: Vec::new(),
+            route_binding: RouteBinding {
+                hosts: Vec::new(),
+                path_prefixes: Vec::new(),
+                tenant_selector: TenantSelector {
+                    tenant: tenant.to_string(),
+                    team: "default".to_string(),
+                },
+            },
+            revenue_share: vec![RevenueShareEntry {
+                party_id: PartyId::new("operator"),
+                basis_points: 10_000,
+            }],
+            revenue_policy_ref: PathBuf::from("revenue-policy.json"),
+            usage: None,
+            created_at,
+            authorization_ref: PathBuf::from("authorization.json"),
+            config_overrides: Default::default(),
+        }
+    }
+
+    fn ts(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(secs, 0).unwrap()
+    }
+
+    fn did(val: u128) -> DeploymentId {
+        DeploymentId(ulid::Ulid(val))
+    }
+
+    // -- explicit config hit --
+
+    #[test]
+    fn explicit_config_hits_active_tenant_matched_bundle() {
+        let mut env = base_env(Some(BundleId::new("chat-bundle")));
+        env.bundles.push(deployment(
+            "chat-bundle",
+            TENANT,
+            BundleDeploymentStatus::Active,
+            ts(1000),
+            did(1),
+        ));
+        let (bd, reason) = env.resolve_default_bundle(TENANT).unwrap();
+        assert_eq!(bd.bundle_id.as_str(), "chat-bundle");
+        assert_eq!(reason, DefaultBundleReason::ExplicitConfig);
+    }
+
+    // -- explicit config falls through --
+
+    #[test]
+    fn explicit_config_falls_through_when_bundle_absent() {
+        let env = base_env(Some(BundleId::new("missing")));
+        assert!(env.resolve_default_bundle(TENANT).is_none());
+    }
+
+    #[test]
+    fn explicit_config_falls_through_when_not_active() {
+        let mut env = base_env(Some(BundleId::new("paused-bundle")));
+        env.bundles.push(deployment(
+            "paused-bundle",
+            TENANT,
+            BundleDeploymentStatus::Paused,
+            ts(1000),
+            did(1),
+        ));
+        assert!(env.resolve_default_bundle(TENANT).is_none());
+    }
+
+    #[test]
+    fn explicit_config_falls_through_when_wrong_tenant() {
+        let mut env = base_env(Some(BundleId::new("other-tenant-bundle")));
+        env.bundles.push(deployment(
+            "other-tenant-bundle",
+            "other-corp",
+            BundleDeploymentStatus::Active,
+            ts(1000),
+            did(1),
+        ));
+        assert!(env.resolve_default_bundle(TENANT).is_none());
+    }
+
+    #[test]
+    fn explicit_config_wrong_tenant_falls_through_to_lone_active() {
+        let mut env = base_env(Some(BundleId::new("wrong-tenant")));
+        env.bundles.push(deployment(
+            "wrong-tenant",
+            "other-corp",
+            BundleDeploymentStatus::Active,
+            ts(1000),
+            did(1),
+        ));
+        env.bundles.push(deployment(
+            "correct-bundle",
+            TENANT,
+            BundleDeploymentStatus::Active,
+            ts(2000),
+            did(2),
+        ));
+        let (bd, reason) = env.resolve_default_bundle(TENANT).unwrap();
+        assert_eq!(bd.bundle_id.as_str(), "correct-bundle");
+        assert_eq!(reason, DefaultBundleReason::LoneActive);
+    }
+
+    // -- lone active --
+
+    #[test]
+    fn lone_active_deployment_wins() {
+        let mut env = base_env(None);
+        env.bundles.push(deployment(
+            "solo",
+            TENANT,
+            BundleDeploymentStatus::Active,
+            ts(1000),
+            did(1),
+        ));
+        let (bd, reason) = env.resolve_default_bundle(TENANT).unwrap();
+        assert_eq!(bd.bundle_id.as_str(), "solo");
+        assert_eq!(reason, DefaultBundleReason::LoneActive);
+    }
+
+    // -- newest created_at --
+
+    #[test]
+    fn newest_created_at_wins_among_multiple() {
+        let mut env = base_env(None);
+        env.bundles.push(deployment(
+            "old",
+            TENANT,
+            BundleDeploymentStatus::Active,
+            ts(1000),
+            did(1),
+        ));
+        env.bundles.push(deployment(
+            "new",
+            TENANT,
+            BundleDeploymentStatus::Active,
+            ts(2000),
+            did(2),
+        ));
+        let (bd, reason) = env.resolve_default_bundle(TENANT).unwrap();
+        assert_eq!(bd.bundle_id.as_str(), "new");
+        assert_eq!(reason, DefaultBundleReason::NewestActive);
+    }
+
+    // -- ULID tiebreak --
+
+    #[test]
+    fn ulid_tiebreak_is_deterministic() {
+        let same_time = ts(5000);
+        let mut env = base_env(None);
+        env.bundles.push(deployment(
+            "smaller-id",
+            TENANT,
+            BundleDeploymentStatus::Active,
+            same_time,
+            did(10),
+        ));
+        env.bundles.push(deployment(
+            "larger-id",
+            TENANT,
+            BundleDeploymentStatus::Active,
+            same_time,
+            did(20),
+        ));
+        let (bd, reason) = env.resolve_default_bundle(TENANT).unwrap();
+        assert_eq!(bd.bundle_id.as_str(), "larger-id");
+        assert_eq!(reason, DefaultBundleReason::NewestActive);
+
+        // Reversing insertion order must yield the same result.
+        let mut env2 = base_env(None);
+        env2.bundles.push(deployment(
+            "larger-id",
+            TENANT,
+            BundleDeploymentStatus::Active,
+            same_time,
+            did(20),
+        ));
+        env2.bundles.push(deployment(
+            "smaller-id",
+            TENANT,
+            BundleDeploymentStatus::Active,
+            same_time,
+            did(10),
+        ));
+        let (bd2, _) = env2.resolve_default_bundle(TENANT).unwrap();
+        assert_eq!(bd2.bundle_id.as_str(), "larger-id");
+    }
+
+    // -- empty / no match --
+
+    #[test]
+    fn empty_bundles_returns_none() {
+        let env = base_env(None);
+        assert!(env.resolve_default_bundle(TENANT).is_none());
+    }
+
+    #[test]
+    fn no_active_tenant_match_returns_none() {
+        let mut env = base_env(None);
+        // Wrong tenant.
+        env.bundles.push(deployment(
+            "other",
+            "other-corp",
+            BundleDeploymentStatus::Active,
+            ts(1000),
+            did(1),
+        ));
+        // Right tenant, but paused.
+        env.bundles.push(deployment(
+            "paused",
+            TENANT,
+            BundleDeploymentStatus::Paused,
+            ts(2000),
+            did(2),
+        ));
+        assert!(env.resolve_default_bundle(TENANT).is_none());
+    }
+
+    // -- serde round-trip --
+
+    #[test]
+    fn absent_default_bundle_deserializes_to_none_and_none_is_not_serialized() {
+        let hc = EnvironmentHostConfig {
+            env_id: env_id(),
+            region: None,
+            tenant_org_id: None,
+            listen_addr: None,
+            public_base_url: None,
+            gui_enabled: None,
+            default_bundle: None,
+        };
+        let json = serde_json::to_string(&hc).unwrap();
+        assert!(
+            !json.contains("default_bundle"),
+            "None field must not appear in serialized JSON"
+        );
+        let back: EnvironmentHostConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.default_bundle, None);
+    }
+
+    #[test]
+    fn present_default_bundle_round_trips() {
+        let hc = EnvironmentHostConfig {
+            env_id: env_id(),
+            region: None,
+            tenant_org_id: None,
+            listen_addr: None,
+            public_base_url: None,
+            gui_enabled: None,
+            default_bundle: Some(BundleId::new("my-bundle")),
+        };
+        let json = serde_json::to_string(&hc).unwrap();
+        assert!(json.contains("\"default_bundle\":\"my-bundle\""));
+        let back: EnvironmentHostConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.default_bundle.as_ref().map(|b| b.as_str()),
+            Some("my-bundle")
+        );
     }
 }

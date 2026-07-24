@@ -246,6 +246,7 @@ mod tests {
             listen_addr: None,
             public_base_url: None,
             gui_enabled: None,
+            default_bundle: None,
         }
     }
 
@@ -420,6 +421,7 @@ mod tests {
             listen_addr: Some(bound_addr),
             public_base_url: None,
             gui_enabled: None,
+            default_bundle: None,
         };
         // With the port occupied and listen_addr pointing at it, probe
         // must report Fail.

@@ -405,6 +405,7 @@ fn remote_env_create(
                 listen_addr: parsed_listen_addr,
                 public_base_url: parsed_public_base_url,
                 gui_enabled: None,
+                default_bundle: None,
             },
         )
         .map_err(map_store_err_preserving_noun)?;
@@ -2879,6 +2880,7 @@ mod tests {
                 listen_addr: None,
                 public_base_url: None,
                 gui_enabled: None,
+                default_bundle: None,
             },
         );
         assert!(

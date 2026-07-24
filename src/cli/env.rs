@@ -132,6 +132,7 @@ pub fn create(
                     listen_addr: parsed_listen_addr,
                     public_base_url: parsed_public_base_url,
                     gui_enabled: None,
+                    default_bundle: None,
                 },
             )
             .map_err(map_store_err_preserving_noun)?;

@@ -2004,6 +2004,7 @@ mod tests {
                 listen_addr: None,
                 public_base_url: None,
                 gui_enabled: None,
+                default_bundle: None,
             },
         );
         assert!(result.is_ok());
@@ -2027,6 +2028,7 @@ mod tests {
                 listen_addr: None,
                 public_base_url: None,
                 gui_enabled: None,
+                default_bundle: None,
             },
         );
         assert!(matches!(result, Err(StoreError::Conflict(_))));
@@ -3220,6 +3222,7 @@ mod tests {
                 listen_addr: None,
                 public_base_url: None,
                 gui_enabled: None,
+                default_bundle: None,
             },
         );
         assert!(result.is_ok());
@@ -3288,6 +3291,7 @@ mod tests {
                 listen_addr: None,
                 public_base_url: None,
                 gui_enabled: None,
+                default_bundle: None,
             },
         );
     }
