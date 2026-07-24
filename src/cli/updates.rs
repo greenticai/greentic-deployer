@@ -2441,8 +2441,83 @@ fn resolve_release_artifacts(
         tag: format!("v{version}"),
         targets: targets.to_vec(),
         expected_target_count,
+        archive_prefix: None,
+        checksums_asset: None,
     };
     super::release_artifacts::derive_binary_artifacts(&spec)
+}
+
+/// A single entry in the `--release-specs-file` JSON array.
+#[derive(Debug, serde::Deserialize)]
+struct ReleaseSpecEntry {
+    name: String,
+    version: String,
+    repo: String,
+    tag: Option<String>,
+    archive_prefix: Option<String>,
+    checksums_asset: Option<String>,
+    targets: Option<Vec<String>>,
+    expected_target_count: Option<usize>,
+}
+
+/// Resolve `--release-specs-file` into pre-derived `BinaryArtifact`s from
+/// multiple GitHub releases. Fail-closed: rejects an empty file, an
+/// unparseable entry, a malformed `repo`, or any entry that yields zero
+/// artifacts (a silently-empty entry would look like "this package is
+/// unchanged" to clients, which is the exact silent-correctness hazard this
+/// feature exists to prevent).
+fn resolve_multi_release_artifacts(
+    path: &Path,
+) -> Result<Vec<greentic_update::plan::BinaryArtifact>, OpError> {
+    let contents = std::fs::read_to_string(path).map_err(|source| OpError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let entries: Vec<ReleaseSpecEntry> = serde_json::from_str(&contents).map_err(|e| {
+        OpError::InvalidArgument(format!("release-specs-file {}: {e}", path.display()))
+    })?;
+    if entries.is_empty() {
+        return Err(OpError::InvalidArgument(format!(
+            "release-specs-file {} is an empty array",
+            path.display()
+        )));
+    }
+
+    let mut all_artifacts = Vec::new();
+    for entry in &entries {
+        let (owner, repo) = parse_owner_repo(&entry.repo);
+        if owner.is_empty() || repo.is_empty() {
+            return Err(OpError::InvalidArgument(format!(
+                "release-specs-file: entry `{}` has malformed repo `{}`",
+                entry.name, entry.repo
+            )));
+        }
+        let tag = entry
+            .tag
+            .clone()
+            .unwrap_or_else(|| format!("v{}", entry.version));
+        let spec = super::release_artifacts::ReleaseSpec {
+            owner,
+            repo,
+            binary_name: entry.name.clone(),
+            version: entry.version.clone(),
+            tag,
+            targets: entry.targets.clone().unwrap_or_default(),
+            expected_target_count: entry.expected_target_count,
+            archive_prefix: entry.archive_prefix.clone(),
+            checksums_asset: entry.checksums_asset.clone(),
+        };
+        let artifacts = super::release_artifacts::derive_binary_artifacts(&spec)?;
+        if artifacts.is_empty() {
+            return Err(OpError::InvalidArgument(format!(
+                "release-specs-file: entry `{}` (tag {}) yielded zero artifacts",
+                entry.name, spec.tag,
+            )));
+        }
+        all_artifacts.extend(artifacts);
+    }
+
+    Ok(all_artifacts)
 }
 
 /// `op updates plan-build` — build and DSSE-sign an [`UpdatePlan`] carrying a
@@ -2473,13 +2548,17 @@ pub fn plan_build(
         .sequence
         .ok_or_else(|| OpError::InvalidArgument("--sequence is required".to_string()))?;
 
-    let derived_binaries = resolve_release_artifacts(
-        args.release.as_deref(),
-        args.release_repo.as_deref(),
-        args.release_binary_name.as_deref(),
-        &args.targets,
-        args.expected_target_count,
-    )?;
+    let derived_binaries = if let Some(ref specs_file) = args.release_specs_file {
+        resolve_multi_release_artifacts(specs_file)?
+    } else {
+        resolve_release_artifacts(
+            args.release.as_deref(),
+            args.release_repo.as_deref(),
+            args.release_binary_name.as_deref(),
+            &args.targets,
+            args.expected_target_count,
+        )?
+    };
 
     let signed = build_and_sign_plan(
         store,
@@ -2839,13 +2918,17 @@ pub fn publish(
         return Ok(OpOutcome::new(NOUN, "publish", publish_schema()));
     }
 
-    let derived_binaries = resolve_release_artifacts(
-        args.release.as_deref(),
-        args.release_repo.as_deref(),
-        args.release_binary_name.as_deref(),
-        &args.targets,
-        args.expected_target_count,
-    )?;
+    let derived_binaries = if let Some(ref specs_file) = args.release_specs_file {
+        resolve_multi_release_artifacts(specs_file)?
+    } else {
+        resolve_release_artifacts(
+            args.release.as_deref(),
+            args.release_repo.as_deref(),
+            args.release_binary_name.as_deref(),
+            &args.targets,
+            args.expected_target_count,
+        )?
+    };
 
     let token = args
         .upload_token
@@ -7010,6 +7093,7 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             release_binary_name: None,
             targets: vec![],
             expected_target_count: None,
+            release_specs_file: None,
             trust_root: None,
         }
     }
@@ -7255,6 +7339,7 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             release_binary_name: None,
             targets: vec![],
             expected_target_count: None,
+            release_specs_file: None,
             trust_root: None,
             all_envs: false,
             plan_server_url: None,
@@ -7851,5 +7936,49 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         let (owner2, repo2) = parse_owner_repo("greentic-start");
         assert_eq!(owner2, "greenticai");
         assert_eq!(repo2, "greentic-start");
+    }
+
+    // --- resolve_multi_release_artifacts tests --------------------------------
+
+    #[test]
+    fn multi_release_specs_empty_file_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let specs_path = dir.path().join("specs.json");
+        std::fs::write(&specs_path, "[]").unwrap();
+        let err = resolve_multi_release_artifacts(&specs_path).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("empty array")),
+            "expected empty-array error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn multi_release_specs_malformed_json_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let specs_path = dir.path().join("specs.json");
+        std::fs::write(&specs_path, "not json").unwrap();
+        let err = resolve_multi_release_artifacts(&specs_path).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("release-specs-file")),
+            "expected parse error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn multi_release_specs_malformed_repo_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let specs_path = dir.path().join("specs.json");
+        // repo with no slash resolves to ("greenticai", repo) via parse_owner_repo,
+        // but an empty string for repo is the malformed case.
+        std::fs::write(
+            &specs_path,
+            r#"[{"name":"x","version":"1.0.0","repo":"/bad"}]"#,
+        )
+        .unwrap();
+        let err = resolve_multi_release_artifacts(&specs_path).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("malformed repo")),
+            "expected malformed-repo error, got: {err:?}"
+        );
     }
 }

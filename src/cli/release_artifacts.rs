@@ -42,6 +42,14 @@ pub struct ReleaseSpec {
     /// archive count must equal this value. Guards against partial releases
     /// silently producing fewer artifacts than expected.
     pub expected_target_count: Option<usize>,
+    /// Override the default `{binary_name}-v{version}-` archive-name prefix.
+    /// Used by repos whose release assets do not follow the standard naming
+    /// (e.g. `gtc` ships archives as `gtc-{target}.tgz`, so prefix = `"gtc-"`).
+    pub archive_prefix: Option<String>,
+    /// Name of a consolidated checksums asset (sha256sum-format) attached to
+    /// the GitHub release. When set, per-archive `.sha256` sidecars are not
+    /// required; digests are looked up in this single file instead.
+    pub checksums_asset: Option<String>,
 }
 
 /// A single asset from the GitHub Releases API.
@@ -154,6 +162,59 @@ pub(crate) fn parse_sidecar_digest(sidecar: &str) -> Result<String, OpError> {
     Ok(hex_digest)
 }
 
+/// Parse a consolidated checksums file (sha256sum batch output). Format:
+/// `<hex>  <filename>\n` per line. Returns a map from filename to lowercase
+/// hex digest. Rejects empty files and lines with malformed digests.
+pub(crate) fn parse_consolidated_checksums(text: &str) -> Result<HashMap<String, String>, OpError> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(OpError::InvalidArgument(
+            "consolidated checksums file is empty".to_string(),
+        ));
+    }
+    let mut map = HashMap::new();
+    for (i, line) in trimmed.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, |c: char| c.is_ascii_whitespace());
+        let hex_digest = parts
+            .next()
+            .ok_or_else(|| {
+                OpError::InvalidArgument(format!("checksums line {}: no digest field", i + 1))
+            })?
+            .to_ascii_lowercase();
+        if hex_digest.len() != 64 || !hex_digest.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(OpError::InvalidArgument(format!(
+                "checksums line {}: digest is not 64 hex chars: `{hex_digest}`",
+                i + 1
+            )));
+        }
+        let filename = parts
+            .next()
+            .map(|s| s.trim_start())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                OpError::InvalidArgument(format!(
+                    "checksums line {}: missing filename after digest",
+                    i + 1
+                ))
+            })?
+            .to_string();
+        map.insert(filename, hex_digest);
+    }
+    if map.is_empty() {
+        return Err(OpError::InvalidArgument(
+            "consolidated checksums file contains no valid entries".to_string(),
+        ));
+    }
+    Ok(map)
+}
+
+/// Maximum consolidated checksums file size (64 KiB; typically ~1 KiB).
+const MAX_CHECKSUMS_BYTES: u64 = 64 * 1024;
+
 /// Derive `BinaryArtifact`s from a GitHub release.
 ///
 /// Fail-closed: any missing asset, unparseable sidecar, digest mismatch, or
@@ -163,11 +224,17 @@ pub(crate) fn parse_sidecar_digest(sidecar: &str) -> Result<String, OpError> {
 /// the discovered archive count must match the expected count.
 pub fn derive_binary_artifacts(spec: &ReleaseSpec) -> Result<Vec<BinaryArtifact>, OpError> {
     let client = github_client()?;
-    let fetcher = |url: &str| -> Result<Vec<u8>, OpError> {
+    let checksums_asset_name = spec.checksums_asset.clone();
+    let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
         let cap = if url.contains("/releases/tags/") {
             MAX_SIDECAR_BYTES * 1024
         } else if url.ends_with(".sha256") {
             MAX_SIDECAR_BYTES
+        } else if checksums_asset_name
+            .as_ref()
+            .is_some_and(|name| url.ends_with(name))
+        {
+            MAX_CHECKSUMS_BYTES
         } else {
             MAX_BINARY_ARCHIVE_BYTES
         };
@@ -200,7 +267,10 @@ where
         .map(|a| (a.name.as_str(), a))
         .collect();
 
-    let prefix = format!("{}-v{}-", spec.binary_name, spec.version);
+    let prefix = match &spec.archive_prefix {
+        Some(p) => p.clone(),
+        None => format!("{}-v{}-", spec.binary_name, spec.version),
+    };
     let archive_assets: Vec<(&GitHubAsset, String)> = release
         .assets
         .iter()
@@ -282,22 +352,54 @@ where
         }
     }
 
+    // When a consolidated checksums asset is configured, fetch and parse it
+    // once up front instead of fetching per-archive .sha256 sidecars.
+    let consolidated_digests: Option<HashMap<String, String>> =
+        if let Some(checksums_name) = &spec.checksums_asset {
+            let checksums_asset = assets_by_name.get(checksums_name.as_str()).ok_or_else(|| {
+                OpError::NotFound(format!(
+                    "release {} is missing checksums asset `{checksums_name}`",
+                    spec.tag
+                ))
+            })?;
+            let checksums_bytes = fetcher(&checksums_asset.browser_download_url)?;
+            let checksums_text = String::from_utf8(checksums_bytes).map_err(|e| {
+                OpError::InvalidArgument(format!(
+                    "checksums asset `{checksums_name}` is not UTF-8: {e}"
+                ))
+            })?;
+            Some(parse_consolidated_checksums(&checksums_text)?)
+        } else {
+            None
+        };
+
     let tmp_dir = tempfile::tempdir().map_err(|e| OpError::Fetch(format!("tempdir: {e}")))?;
     let mut artifacts = Vec::with_capacity(filtered.len());
 
     for (archive_asset, target) in &filtered {
-        let sidecar_name = format!("{}.sha256", archive_asset.name);
-        let sidecar_asset = assets_by_name.get(sidecar_name.as_str()).ok_or_else(|| {
-            OpError::NotFound(format!(
-                "release {} is missing sidecar `{sidecar_name}`",
-                spec.tag
-            ))
-        })?;
-        let sidecar_bytes = fetcher(&sidecar_asset.browser_download_url)?;
-        let sidecar_text = String::from_utf8(sidecar_bytes).map_err(|e| {
-            OpError::InvalidArgument(format!("sidecar `{sidecar_name}` is not UTF-8: {e}"))
-        })?;
-        let expected_archive_digest = parse_sidecar_digest(&sidecar_text)?;
+        let expected_archive_digest = if let Some(ref digests) = consolidated_digests {
+            // Consolidated checksums path: look up by archive filename.
+            digests.get(&archive_asset.name).cloned().ok_or_else(|| {
+                OpError::NotFound(format!(
+                    "consolidated checksums for release {} has no entry for `{}`",
+                    spec.tag, archive_asset.name
+                ))
+            })?
+        } else {
+            // Per-archive sidecar path (existing behavior).
+            let sidecar_name = format!("{}.sha256", archive_asset.name);
+            let sidecar_asset = assets_by_name.get(sidecar_name.as_str()).ok_or_else(|| {
+                OpError::NotFound(format!(
+                    "release {} is missing sidecar `{sidecar_name}`",
+                    spec.tag
+                ))
+            })?;
+            let sidecar_bytes = fetcher(&sidecar_asset.browser_download_url)?;
+            let sidecar_text = String::from_utf8(sidecar_bytes).map_err(|e| {
+                OpError::InvalidArgument(format!("sidecar `{sidecar_name}` is not UTF-8: {e}"))
+            })?;
+            parse_sidecar_digest(&sidecar_text)?
+        };
 
         let archive_bytes = fetcher(&archive_asset.browser_download_url)?;
 
@@ -546,6 +648,8 @@ mod tests {
             tag: "v1.0.0".to_string(),
             targets: vec![],
             expected_target_count: None,
+            archive_prefix: None,
+            checksums_asset: None,
         };
 
         let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
@@ -603,6 +707,8 @@ mod tests {
             tag: "v1.0.0".to_string(),
             targets: vec![],
             expected_target_count: None,
+            archive_prefix: None,
+            checksums_asset: None,
         };
 
         let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
@@ -652,6 +758,8 @@ mod tests {
             tag: "v1.0.0".to_string(),
             targets: vec![],
             expected_target_count: None,
+            archive_prefix: None,
+            checksums_asset: None,
         };
 
         let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
@@ -686,6 +794,8 @@ mod tests {
             tag: "v1.0.0".to_string(),
             targets: vec!["aarch64-apple-darwin".to_string()],
             expected_target_count: None,
+            archive_prefix: None,
+            checksums_asset: None,
         };
 
         let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
@@ -736,6 +846,8 @@ mod tests {
             tag: "v1.0.0".to_string(),
             targets: vec!["x86_64-unknown-linux-gnu".to_string()],
             expected_target_count: None,
+            archive_prefix: None,
+            checksums_asset: None,
         };
 
         let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
@@ -793,6 +905,8 @@ mod tests {
             tag: "v1.0.0".to_string(),
             targets: vec![],
             expected_target_count: None,
+            archive_prefix: None,
+            checksums_asset: None,
         };
 
         let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
@@ -843,6 +957,8 @@ mod tests {
             tag: "v1.0.0".to_string(),
             targets: vec![],
             expected_target_count: None,
+            archive_prefix: None,
+            checksums_asset: None,
         };
 
         let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
@@ -881,6 +997,8 @@ mod tests {
             tag: "v1.0.0".to_string(),
             targets: vec![],
             expected_target_count: None,
+            archive_prefix: None,
+            checksums_asset: None,
         };
 
         let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
@@ -926,6 +1044,8 @@ mod tests {
             tag: "v1.0.0".to_string(),
             targets: vec![],
             expected_target_count: Some(2),
+            archive_prefix: None,
+            checksums_asset: None,
         };
 
         let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
@@ -971,6 +1091,8 @@ mod tests {
             tag: "v1.0.0".to_string(),
             targets: vec![],
             expected_target_count: Some(1),
+            archive_prefix: None,
+            checksums_asset: None,
         };
 
         let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
@@ -1021,6 +1143,8 @@ mod tests {
             tag: "v1.0.0".to_string(),
             targets: vec![],
             expected_target_count: None,
+            archive_prefix: None,
+            checksums_asset: None,
         };
 
         let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
@@ -1050,5 +1174,181 @@ mod tests {
             matches!(&err, OpError::InvalidArgument(m) if m.contains("duplicate archives")),
             "expected duplicate target rejection, got: {err:?}"
         );
+    }
+
+    // --- parse_consolidated_checksums -----------------------------------------
+
+    #[test]
+    fn consolidated_checksums_happy_path() {
+        let text = "\
+            aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  gtc-x86_64-unknown-linux-gnu.tgz\n\
+            bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  gtc-aarch64-apple-darwin.tgz\n";
+        let map = parse_consolidated_checksums(text).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get("gtc-x86_64-unknown-linux-gnu.tgz").unwrap(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            map.get("gtc-aarch64-apple-darwin.tgz").unwrap(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+    }
+
+    #[test]
+    fn consolidated_checksums_malformed_digest() {
+        let text = "tooshort  file.tgz\n";
+        let err = parse_consolidated_checksums(text).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("64 hex")),
+            "expected malformed digest error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn consolidated_checksums_missing_filename() {
+        let text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        let err = parse_consolidated_checksums(text).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("missing filename")),
+            "expected missing filename error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn consolidated_checksums_empty() {
+        let err = parse_consolidated_checksums("").unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    // --- derive_binary_artifacts with archive_prefix override -----------------
+
+    #[test]
+    fn derive_with_archive_prefix_override() {
+        let binary_content = b"gtc-binary-content";
+        let inner_digest = format!("sha256:{}", sha256_hex(binary_content));
+
+        // gtc uses prefix "gtc-" (no version in the archive name).
+        let tgz = build_tgz("gtc-x86_64-unknown-linux-gnu", "gtc", binary_content);
+        let sidecar = make_sidecar(&tgz, "gtc-x86_64-unknown-linux-gnu.tgz");
+
+        let release = release_json(&[
+            (
+                "gtc-x86_64-unknown-linux-gnu.tgz",
+                "https://example.com/gtc-x86_64-unknown-linux-gnu.tgz",
+            ),
+            (
+                "gtc-x86_64-unknown-linux-gnu.tgz.sha256",
+                "https://example.com/gtc-x86_64-unknown-linux-gnu.tgz.sha256",
+            ),
+        ]);
+
+        let spec = ReleaseSpec {
+            owner: "greenticai".to_string(),
+            repo: "greentic".to_string(),
+            binary_name: "gtc".to_string(),
+            version: "1.1.10".to_string(),
+            tag: "v1.1.10".to_string(),
+            targets: vec![],
+            expected_target_count: None,
+            archive_prefix: Some("gtc-".to_string()),
+            checksums_asset: None,
+        };
+
+        let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
+            if url.contains("/releases/tags/") {
+                Ok(release.clone())
+            } else if url.ends_with(".sha256") {
+                Ok(sidecar.as_bytes().to_vec())
+            } else if url.ends_with(".tgz") {
+                Ok(tgz.clone())
+            } else {
+                Err(OpError::NotFound(format!("unexpected URL: {url}")))
+            }
+        };
+
+        let artifacts = derive_binary_artifacts_with_fetcher(&spec, &fetcher).unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name, "gtc");
+        assert_eq!(artifacts[0].version, "1.1.10");
+        assert_eq!(artifacts[0].target, "x86_64-unknown-linux-gnu");
+        assert_eq!(artifacts[0].digest, inner_digest);
+    }
+
+    // --- derive_binary_artifacts with checksums_asset -------------------------
+
+    #[test]
+    fn derive_with_checksums_asset() {
+        // Simulates gtc-shaped release: archives named "gtc-{target}.tgz" plus
+        // one consolidated "gtc-1.1.10-checksums.txt" instead of per-archive
+        // .sha256 sidecars.
+        let linux_content = b"gtc-linux-bin";
+        let mac_content = b"gtc-mac-bin";
+
+        let tgz_linux = build_tgz("gtc-x86_64-unknown-linux-gnu", "gtc", linux_content);
+        let tgz_mac = build_tgz("gtc-aarch64-apple-darwin", "gtc", mac_content);
+
+        let checksums_text = format!(
+            "{}  gtc-x86_64-unknown-linux-gnu.tgz\n{}  gtc-aarch64-apple-darwin.tgz\n",
+            sha256_hex(&tgz_linux),
+            sha256_hex(&tgz_mac),
+        );
+
+        let release = release_json(&[
+            (
+                "gtc-x86_64-unknown-linux-gnu.tgz",
+                "https://example.com/gtc-x86_64-unknown-linux-gnu.tgz",
+            ),
+            (
+                "gtc-aarch64-apple-darwin.tgz",
+                "https://example.com/gtc-aarch64-apple-darwin.tgz",
+            ),
+            (
+                "gtc-1.1.10-checksums.txt",
+                "https://example.com/gtc-1.1.10-checksums.txt",
+            ),
+        ]);
+
+        let spec = ReleaseSpec {
+            owner: "greenticai".to_string(),
+            repo: "greentic".to_string(),
+            binary_name: "gtc".to_string(),
+            version: "1.1.10".to_string(),
+            tag: "v1.1.10".to_string(),
+            targets: vec![],
+            expected_target_count: None,
+            archive_prefix: Some("gtc-".to_string()),
+            checksums_asset: Some("gtc-1.1.10-checksums.txt".to_string()),
+        };
+
+        let fetcher = move |url: &str| -> Result<Vec<u8>, OpError> {
+            if url.contains("/releases/tags/") {
+                Ok(release.clone())
+            } else if url.ends_with("checksums.txt") {
+                Ok(checksums_text.as_bytes().to_vec())
+            } else if url.contains("linux") {
+                Ok(tgz_linux.clone())
+            } else if url.contains("darwin") {
+                Ok(tgz_mac.clone())
+            } else {
+                Err(OpError::NotFound(format!("unexpected URL: {url}")))
+            }
+        };
+
+        let artifacts = derive_binary_artifacts_with_fetcher(&spec, &fetcher).unwrap();
+        assert_eq!(artifacts.len(), 2);
+        let linux = artifacts
+            .iter()
+            .find(|a| a.target == "x86_64-unknown-linux-gnu")
+            .unwrap();
+        let mac = artifacts
+            .iter()
+            .find(|a| a.target == "aarch64-apple-darwin")
+            .unwrap();
+        assert_eq!(
+            linux.digest,
+            format!("sha256:{}", sha256_hex(linux_content))
+        );
+        assert_eq!(mac.digest, format!("sha256:{}", sha256_hex(mac_content)));
     }
 }

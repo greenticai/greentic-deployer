@@ -850,6 +850,24 @@ pub struct UpdatesPublishArgs {
     /// partial releases silently producing fewer artifacts than expected.
     #[arg(long = "expected-target-count", requires = "release")]
     pub expected_target_count: Option<usize>,
+    /// JSON file containing an array of release specs. Each entry describes
+    /// one GitHub release to derive binary artifacts from:
+    /// `[{"name":"greentic-start","version":"1.1.28","repo":"greenticai/greentic-start",
+    ///    "tag":"v1.1.28","archive_prefix":null,"checksums_asset":null,
+    ///    "targets":null,"expected_target_count":null}, ...]`.
+    /// Mutually exclusive with the single-release flags.
+    #[arg(
+        long = "release-specs-file",
+        conflicts_with_all = [
+            "release",
+            "binaries",
+            "release_repo",
+            "release_binary_name",
+            "targets",
+            "expected_target_count",
+        ]
+    )]
+    pub release_specs_file: Option<PathBuf>,
     /// Path to a trust-root.json file for plan signing verification.
     /// Bypasses the env-store trust root lookup, enabling CI runners
     /// with no local env dir.
@@ -917,6 +935,24 @@ pub struct UpdatesPlanBuildArgs {
     /// release contains a different number of archives.
     #[arg(long = "expected-target-count", requires = "release")]
     pub expected_target_count: Option<usize>,
+    /// JSON file containing an array of release specs. Each entry describes
+    /// one GitHub release to derive binary artifacts from:
+    /// `[{"name":"greentic-start","version":"1.1.28","repo":"greenticai/greentic-start",
+    ///    "tag":"v1.1.28","archive_prefix":null,"checksums_asset":null,
+    ///    "targets":null,"expected_target_count":null}, ...]`.
+    /// Mutually exclusive with the single-release flags.
+    #[arg(
+        long = "release-specs-file",
+        conflicts_with_all = [
+            "release",
+            "binaries",
+            "release_repo",
+            "release_binary_name",
+            "targets",
+            "expected_target_count",
+        ]
+    )]
+    pub release_specs_file: Option<PathBuf>,
     /// Path to a trust-root.json file for plan signing verification.
     /// Bypasses the env-store trust root lookup, enabling CI runners
     /// with no local env dir.
