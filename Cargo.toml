@@ -92,6 +92,13 @@ fs4 = "0.13"
 greentic-bundle = ">=1.1.0-0, <1.2.0-0"
 greentic-config = ">=1.1.0-0, <1.2.0-0"
 greentic-config-types = ">=1.1.0-0, <1.2.0-0"
+# API floor is 0.2.4 (pin currently at 0.2.5): `cli/updates.rs` uses
+# `greentic_deploy_spec::DEFAULT_PLAN_ENDPOINT`, which 0.2.3 does not define.
+# The path dep masks this locally — it always resolves to the in-tree copy — so
+# the workspace builds green while every crates.io consumer that resolves 0.2.3
+# fails to compile this crate. Publishing a member crate and using its new API
+# in the same release means bumping this floor in the same PR.
+#
 # Exact pin, NOT a range: the `path` is stripped on publish so only `version`
 # reaches crates.io. A `<0.3` upper bound admits dev-lane `0.2.<RUN_ID>` builds
 # (e.g. 0.2.29986812583) which pull incompatible transitive deps. Consumers
