@@ -186,6 +186,7 @@ pub fn update(
                     listen_addr: FieldUpdate::Keep,
                     public_base_url: FieldUpdate::from_option(parsed_public_base_url),
                     gui_enabled: FieldUpdate::Keep,
+                    default_bundle: FieldUpdate::Keep,
                 },
             )
             .map_err(map_store_err_preserving_noun)?;
@@ -2638,6 +2639,7 @@ mod tests {
                     listen_addr: FieldUpdate::Clear,
                     public_base_url: FieldUpdate::Clear,
                     gui_enabled: FieldUpdate::Keep,
+                    default_bundle: FieldUpdate::Keep,
                 },
             )
             .unwrap();
@@ -2683,6 +2685,7 @@ mod tests {
                     listen_addr: FieldUpdate::Clear, // clear
                     public_base_url: FieldUpdate::Set("https://new.example.com".to_string()),
                     gui_enabled: FieldUpdate::Keep,
+                    default_bundle: FieldUpdate::Keep,
                 },
             )
             .unwrap();
@@ -2731,6 +2734,7 @@ mod tests {
                     listen_addr: FieldUpdate::Clear,
                     public_base_url: FieldUpdate::Clear,
                     gui_enabled: FieldUpdate::Keep,
+                    default_bundle: FieldUpdate::Keep,
                 },
             )
             .unwrap();

@@ -71,10 +71,9 @@ pub struct EnvironmentHostConfig {
     /// deterministic fallback ladder (lone Active match, then newest
     /// `created_at` / largest `deployment_id`).
     ///
-    /// **Note:** not yet settable through [`UpdateEnvironmentPayload`] /
-    /// [`apply_environment_update`](crate::engine::apply_environment_update);
-    /// only the first-deploy stamp in `greentic-setup` writes it. For
-    /// existing environments the resolution ladder is the sole path.
+    /// Settable via [`UpdateEnvironmentPayload`] /
+    /// [`apply_environment_update`](crate::engine::apply_environment_update),
+    /// `op config set`, or the environment manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_bundle: Option<BundleId>,
 }

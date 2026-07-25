@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::environment::{EnvPackBinding, Environment, EnvironmentHostConfig, ExtensionBinding};
+use crate::ids::BundleId;
 use crate::retention::{HealthStatus, RetentionPolicy, RevocationConfig};
 use crate::version::SchemaVersion;
 use greentic_types::EnvId;
@@ -229,8 +230,8 @@ pub struct CreateEnvironmentPayload {
 ///
 /// Required fields (`name`) stay `Option<T>` — `None` = keep, `Some(v)` =
 /// set. Optional fields (`region`, `tenant_org_id`, `listen_addr`,
-/// `public_base_url`) use [`FieldUpdate<T>`] so callers can distinguish
-/// Keep / Set / Clear.
+/// `public_base_url`, `default_bundle`) use [`FieldUpdate<T>`] so callers
+/// can distinguish Keep / Set / Clear.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpdateEnvironmentPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,6 +249,11 @@ pub struct UpdateEnvironmentPayload {
     /// [`EnvironmentHostConfig::resolved_gui_enabled`]).
     #[serde(default, skip_serializing_if = "FieldUpdate::is_keep")]
     pub gui_enabled: FieldUpdate<bool>,
+    /// Default bundle for bare-URL webchat resolution. `Keep` leaves the
+    /// existing value; `Set(id)` pins a specific bundle; `Clear` reverts to
+    /// the resolution ladder (see [`Environment::resolve_default_bundle`]).
+    #[serde(default, skip_serializing_if = "FieldUpdate::is_keep")]
+    pub default_bundle: FieldUpdate<BundleId>,
 }
 
 /// Optional seed payload for `EnvironmentMutations::migrate_merge_bindings`.
@@ -418,6 +424,9 @@ pub fn apply_environment_update(env: &mut Environment, patch: UpdateEnvironmentP
         .public_base_url
         .apply_to(&mut env.host_config.public_base_url);
     patch.gui_enabled.apply_to(&mut env.host_config.gui_enabled);
+    patch
+        .default_bundle
+        .apply_to(&mut env.host_config.default_bundle);
 }
 
 /// Resolve the migrate-bindings target: an existing env passes through; a
@@ -563,6 +572,8 @@ mod tests {
         assert!(payload.tenant_org_id.is_keep());
         assert!(payload.listen_addr.is_keep());
         assert!(payload.public_base_url.is_keep());
+        assert!(payload.gui_enabled.is_keep());
+        assert!(payload.default_bundle.is_keep());
     }
 
     #[test]
@@ -600,6 +611,7 @@ mod tests {
             listen_addr: FieldUpdate::Keep,
             public_base_url: FieldUpdate::Keep,
             gui_enabled: FieldUpdate::Keep,
+            default_bundle: FieldUpdate::Keep,
         };
         assert_eq!(
             serde_json::to_value(&payload).unwrap(),
@@ -722,6 +734,7 @@ mod tests {
                 listen_addr: FieldUpdate::Keep,
                 public_base_url: FieldUpdate::Keep,
                 gui_enabled: FieldUpdate::Keep,
+                default_bundle: FieldUpdate::Keep,
             },
         );
         assert_eq!(env.name, "renamed");
@@ -792,5 +805,114 @@ mod tests {
         );
         assert_eq!(env.packs.len(), 2);
         assert_eq!(env.extensions.len(), 2);
+    }
+
+    // --- default_bundle on UpdateEnvironmentPayload ---
+
+    #[test]
+    fn apply_environment_update_sets_default_bundle() {
+        let mut env = minimal_env();
+        assert_eq!(env.host_config.default_bundle, None);
+        apply_environment_update(
+            &mut env,
+            UpdateEnvironmentPayload {
+                default_bundle: FieldUpdate::Set(BundleId::from("acct")),
+                ..Default::default()
+            },
+        );
+        assert_eq!(env.host_config.default_bundle, Some(BundleId::from("acct")));
+    }
+
+    #[test]
+    fn apply_environment_update_clears_default_bundle() {
+        let mut env = minimal_env();
+        env.host_config.default_bundle = Some(BundleId::from("acct"));
+        apply_environment_update(
+            &mut env,
+            UpdateEnvironmentPayload {
+                default_bundle: FieldUpdate::Clear,
+                ..Default::default()
+            },
+        );
+        assert_eq!(env.host_config.default_bundle, None);
+    }
+
+    #[test]
+    fn apply_environment_update_keep_leaves_existing_default_bundle() {
+        let mut env = minimal_env();
+        env.host_config.default_bundle = Some(BundleId::from("acct"));
+        apply_environment_update(
+            &mut env,
+            UpdateEnvironmentPayload {
+                default_bundle: FieldUpdate::Keep,
+                ..Default::default()
+            },
+        );
+        assert_eq!(env.host_config.default_bundle, Some(BundleId::from("acct")));
+    }
+
+    #[test]
+    fn apply_environment_update_set_default_bundle_is_idempotent() {
+        let mut env = minimal_env();
+        env.host_config.default_bundle = Some(BundleId::from("acct"));
+        apply_environment_update(
+            &mut env,
+            UpdateEnvironmentPayload {
+                default_bundle: FieldUpdate::Set(BundleId::from("acct")),
+                ..Default::default()
+            },
+        );
+        assert_eq!(env.host_config.default_bundle, Some(BundleId::from("acct")));
+    }
+
+    // --- default_bundle serde round-trips ---
+
+    #[test]
+    fn default_bundle_serde_set_round_trips() {
+        let payload: UpdateEnvironmentPayload = serde_json::from_value(json!({
+            "default_bundle": {"value": "acct"},
+        }))
+        .unwrap();
+        assert_eq!(
+            payload.default_bundle,
+            FieldUpdate::Set(BundleId::from("acct"))
+        );
+    }
+
+    #[test]
+    fn default_bundle_serde_clear_round_trips() {
+        let payload: UpdateEnvironmentPayload = serde_json::from_value(json!({
+            "default_bundle": {"clear": true},
+        }))
+        .unwrap();
+        assert_eq!(payload.default_bundle, FieldUpdate::Clear);
+    }
+
+    #[test]
+    fn default_bundle_serde_absent_is_keep() {
+        let payload: UpdateEnvironmentPayload = serde_json::from_value(json!({})).unwrap();
+        assert!(payload.default_bundle.is_keep());
+    }
+
+    #[test]
+    fn default_bundle_absent_key_round_trips_unchanged() {
+        // A payload omitting default_bundle must round-trip unchanged
+        // (wire back-compat with older clients).
+        let original = json!({"name": "test"});
+        let payload: UpdateEnvironmentPayload = serde_json::from_value(original.clone()).unwrap();
+        let reserialized = serde_json::to_value(&payload).unwrap();
+        assert_eq!(reserialized, original);
+    }
+
+    #[test]
+    fn default_bundle_serde_rejects_contradictory_value_and_clear() {
+        let err = serde_json::from_value::<UpdateEnvironmentPayload>(json!({
+            "default_bundle": {"value": "acct", "clear": true},
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot carry both"),
+            "expected contradictory-field rejection: {err}"
+        );
     }
 }

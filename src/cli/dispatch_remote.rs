@@ -430,6 +430,7 @@ fn remote_env_update(
                 listen_addr: FieldUpdate::Keep,
                 public_base_url: FieldUpdate::from_option(parsed_public_base_url),
                 gui_enabled: FieldUpdate::Keep,
+                default_bundle: FieldUpdate::Keep,
             },
         )
         .map_err(map_store_err_preserving_noun)?;
@@ -2082,7 +2083,10 @@ fn resolve_host_config_update(
         || public_base_url
             .as_deref()
             .is_some_and(|u| hc.public_base_url.as_deref() != Some(u))
-        || m.gui_enabled.is_some_and(|g| hc.gui_enabled != Some(g));
+        || m.gui_enabled.is_some_and(|g| hc.gui_enabled != Some(g))
+        || m.default_bundle
+            .as_ref()
+            .is_some_and(|db| hc.default_bundle.as_ref().map(|b| b.as_str()) != Some(db.as_str()));
     let payload = UpdateEnvironmentPayload {
         name: m.name.clone(),
         region: FieldUpdate::from_option(m.region.clone()),
@@ -2096,6 +2100,11 @@ fn resolve_host_config_update(
             None => FieldUpdate::Keep,
         },
         gui_enabled: FieldUpdate::from_option(m.gui_enabled),
+        default_bundle: FieldUpdate::from_option(
+            m.default_bundle
+                .as_deref()
+                .map(greentic_deploy_spec::BundleId::from),
+        ),
     };
     Ok((payload, differs))
 }

@@ -246,6 +246,10 @@ pub struct ManifestEnvironment {
     /// via `op config set`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gui_enabled: Option<bool>,
+    /// Default bundle for bare-URL webchat resolution. Absent = leave
+    /// untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_bundle: Option<String>,
 }
 
 impl ManifestEnvironment {
@@ -258,6 +262,7 @@ impl ManifestEnvironment {
             || self.tenant_org_id.is_some()
             || self.listen_addr.is_some()
             || self.gui_enabled.is_some()
+            || self.default_bundle.is_some()
     }
 }
 
@@ -1158,7 +1163,8 @@ pub fn manifest_schema() -> Value {
                     "region": {"type": ["string", "null"], "description": "cloud region tag; absent = leave untouched"},
                     "tenant_org_id": {"type": ["string", "null"], "description": "tenant organization id; absent = leave untouched"},
                     "listen_addr": {"type": ["string", "null"], "description": "bind address (SocketAddr); absent = leave untouched"},
-                    "gui_enabled": {"type": ["boolean", "null"], "description": "serve the built-in webchat GUI; absent/null = leave the stored value unchanged (upsert) — the env-id default (on for local, off elsewhere) applies only when the stored value is unset"}
+                    "gui_enabled": {"type": ["boolean", "null"], "description": "serve the built-in webchat GUI; absent/null = leave the stored value unchanged (upsert) — the env-id default (on for local, off elsewhere) applies only when the stored value is unset"},
+                    "default_bundle": {"type": ["string", "null"], "description": "default bundle for bare-URL webchat resolution; absent = leave untouched"}
                 }
             },
             "trust_root": {"enum": ["bootstrap", null], "description": "`bootstrap` seeds the operator key (idempotent)"},
@@ -1885,6 +1891,7 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
             tenant_org_id: None,
             listen_addr: None,
             gui_enabled,
+            default_bundle: None,
         },
         cluster: None,
         // The wizard has no update-channel question yet; `None` leaves whatever
@@ -2573,6 +2580,7 @@ mod tests {
             ("environment.tenant_org_id", ""),
             ("environment.listen_addr", ""),
             ("environment.gui_enabled", "webchat_gui"),
+            ("environment.default_bundle", ""),
             ("trust_root", "trust_root_bootstrap"),
             ("secrets[].path", "secrets.path"),
             ("secrets[].from_env", "secrets.from_env"),
