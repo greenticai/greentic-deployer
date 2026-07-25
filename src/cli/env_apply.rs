@@ -1274,12 +1274,16 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
         let gui_enabled_differs = me
             .gui_enabled
             .is_some_and(|g| env.host_config.gui_enabled != Some(g));
+        let default_bundle_differs = me.default_bundle.as_ref().is_some_and(|db| {
+            env.host_config.default_bundle.as_ref().map(|b| b.as_str()) != Some(db.as_str())
+        });
 
         if name_differs
             || region_differs
             || tenant_org_differs
             || listen_addr_differs
             || gui_enabled_differs
+            || default_bundle_differs
         {
             let mut fields = Vec::new();
             if name_differs {
@@ -1297,12 +1301,16 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
             if gui_enabled_differs {
                 fields.push("gui_enabled");
             }
+            if default_bundle_differs {
+                fields.push("default_bundle");
+            }
             let desired_hash = hash_json(&json!({
                 "name": me.name,
                 "region": me.region,
                 "tenant_org_id": me.tenant_org_id,
                 "listen_addr": me.listen_addr,
                 "gui_enabled": me.gui_enabled,
+                "default_bundle": me.default_bundle,
             }));
             let ikey = derive_idempotency_key(
                 &ctx.env_id,
@@ -1324,6 +1332,7 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     listen_addr: me.listen_addr.clone(),
                     public_base_url: None, // public_base_url is handled by SetPublicUrl
                     gui_enabled: me.gui_enabled,
+                    default_bundle: me.default_bundle.clone(),
                 })),
             });
         } else if me.declares_host_config() {
@@ -1354,6 +1363,7 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     listen_addr: me.listen_addr.clone(),
                     public_base_url: None,
                     gui_enabled: me.gui_enabled,
+                    default_bundle: me.default_bundle.clone(),
                 })),
             });
         }
@@ -2307,7 +2317,8 @@ fn execute(store: &LocalFsStore, ctx: &ApplyContext, steps: &[ApplyStep]) -> Res
                 super::env::set_public_url(store, &exec_flags, ctx.env_id.as_str(), url).map(|_| ())
             }
             StepOp::UpdateHostConfig(payload) => {
-                super::config::set(store, &exec_flags, Some((**payload).clone())).map(|_| ())
+                super::config::set_unchecked(store, &exec_flags, Some((**payload).clone()))
+                    .map(|_| ())
             }
             StepOp::ConfigureUpdates(payload) => {
                 super::updates::config_set(store, &exec_flags, Some((**payload).clone()))
@@ -6124,6 +6135,92 @@ mod tests {
         let loaded: EnvManifest = serde_json::from_value(manifest).unwrap();
         let err = loaded.validate_shape().unwrap_err();
         assert!(err.to_string().contains("listen_addr"), "got: {err}");
+    }
+
+    #[test]
+    fn default_bundle_reconcile_then_idempotent() {
+        let (dir, store) = seeded_store();
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {
+                "id": "local",
+                "default_bundle": "acct"
+            }
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let outcome = run_apply(&store, &manifest_path).expect("default_bundle apply");
+        let actions = step_actions(&outcome.result);
+        assert!(
+            actions.contains(&("update-host-config".to_string(), "update".to_string()))
+                || actions.contains(&("update-host-config".to_string(), "create".to_string())),
+            "must plan update-host-config for default_bundle: {actions:?}"
+        );
+
+        let env = load_local(&store);
+        assert_eq!(
+            env.host_config.default_bundle,
+            Some(greentic_deploy_spec::BundleId::from("acct"))
+        );
+
+        // Idempotent re-apply.
+        let second = run_apply(&store, &manifest_path).expect("re-apply");
+        assert_eq!(second.result["changed"], 0, "{}", second.result);
+    }
+
+    #[test]
+    fn manifest_omitting_default_bundle_leaves_existing_value() {
+        let (dir, store) = seeded_store();
+        // Pre-set default_bundle on the env.
+        let env_id = greentic_deploy_spec::EnvId::try_from("local").unwrap();
+        let mut env = store.load(&env_id).unwrap();
+        env.host_config.default_bundle = Some(greentic_deploy_spec::BundleId::from("acct"));
+        store.save(&env).unwrap();
+
+        // Manifest that does NOT declare default_bundle — must not clear it.
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"}
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let _outcome = run_apply(&store, &manifest_path).expect("apply without default_bundle");
+
+        let env = load_local(&store);
+        assert_eq!(
+            env.host_config.default_bundle,
+            Some(greentic_deploy_spec::BundleId::from("acct")),
+            "omitting default_bundle must leave the existing value intact"
+        );
+    }
+
+    #[test]
+    fn manifest_setting_name_without_default_bundle_preserves_existing_default_bundle() {
+        let (dir, store) = seeded_store();
+        // Pre-set default_bundle on the env.
+        let env_id = greentic_deploy_spec::EnvId::try_from("local").unwrap();
+        let mut env = store.load(&env_id).unwrap();
+        env.host_config.default_bundle = Some(greentic_deploy_spec::BundleId::from("acct"));
+        store.save(&env).unwrap();
+
+        // Manifest declares `name` (triggers UpdateHostConfig) but omits default_bundle.
+        let manifest = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local", "name": "renamed"}
+        });
+        let manifest_path = write_manifest(dir.path(), &manifest);
+        let outcome = run_apply(&store, &manifest_path).expect("apply with name only");
+        let actions = step_actions(&outcome.result);
+        assert!(
+            actions.contains(&("update-host-config".to_string(), "update".to_string())),
+            "must emit UpdateHostConfig for name change: {actions:?}"
+        );
+
+        let env = load_local(&store);
+        assert_eq!(env.name, "renamed");
+        assert_eq!(
+            env.host_config.default_bundle,
+            Some(greentic_deploy_spec::BundleId::from("acct")),
+            "omitting default_bundle in a manifest that updates other host-config fields must preserve the existing value"
+        );
     }
 
     // --- G5+G6 ordering ---

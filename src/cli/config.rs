@@ -7,7 +7,7 @@
 //! `plans/next-gen-deployment.md` §P1b.
 
 use chrono::Utc;
-use greentic_deploy_spec::{CapabilitySlot, EnvId};
+use greentic_deploy_spec::{BundleDeploymentStatus, BundleId, CapabilitySlot, EnvId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -103,15 +103,45 @@ pub struct ConfigSetPayload {
     /// only when this is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gui_enabled: Option<bool>,
+    /// Default bundle for bare-URL webchat resolution. `None` leaves the
+    /// existing value unchanged. Must name a bundle with an Active deployment
+    /// in this environment — rejected before the store is touched otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_bundle: Option<String>,
 }
 
 /// `op config set`. Mutates `host_config` fields (region, tenant_org_id,
-/// listen_addr, gui_enabled) and the env's display `name`. To change anything
-/// inside an env-pack's answers, use `op env-packs update`.
+/// listen_addr, gui_enabled, default_bundle) and the env's display `name`.
+/// To change anything inside an env-pack's answers, use `op env-packs update`.
+///
+/// `default_bundle` is validated to name an Active deployment in this env.
+/// The manifest-apply path (`env_apply`) uses [`set_unchecked`] to bypass
+/// that check — manifests write host-config (step 2) BEFORE deploying bundles
+/// (step 4), so a first-apply would always fail the check.
 pub fn set(
     store: &LocalFsStore,
     flags: &OpFlags,
     payload: Option<ConfigSetPayload>,
+) -> Result<OpOutcome, OpError> {
+    set_impl(store, flags, payload, false)
+}
+
+/// Like [`set`] but skips the `default_bundle` Active-deployment check.
+/// Used by the manifest-apply path where host-config is written before bundles
+/// are deployed.
+pub(crate) fn set_unchecked(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<ConfigSetPayload>,
+) -> Result<OpOutcome, OpError> {
+    set_impl(store, flags, payload, true)
+}
+
+fn set_impl(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<ConfigSetPayload>,
+    skip_bundle_check: bool,
 ) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(NOUN, "set", set_schema()));
@@ -135,6 +165,25 @@ pub fn set(
         .transpose()?;
     let parsed_public_base_url =
         super::env::parse_optional_public_base_url(&payload.public_base_url)?;
+    let parsed_default_bundle = payload
+        .default_bundle
+        .as_deref()
+        .map(|raw| {
+            let bundle_id = BundleId::from(raw);
+            if !skip_bundle_check {
+                let env = store.load(&env_id).map_err(map_store_err_preserving_noun)?;
+                let has_active = env.bundles.iter().any(|b| {
+                    b.bundle_id == bundle_id && b.status == BundleDeploymentStatus::Active
+                });
+                if !has_active {
+                    return Err(OpError::InvalidArgument(format!(
+                        "default_bundle {raw:?} has no Active deployment in this environment"
+                    )));
+                }
+            }
+            Ok(bundle_id)
+        })
+        .transpose()?;
     let mut fields = Vec::new();
     if payload.name.is_some() {
         fields.push("name");
@@ -154,6 +203,9 @@ pub fn set(
     if payload.gui_enabled.is_some() {
         fields.push("gui_enabled");
     }
+    if parsed_default_bundle.is_some() {
+        fields.push("default_bundle");
+    }
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -172,6 +224,7 @@ pub fn set(
                     listen_addr: FieldUpdate::from_option(parsed_listen_addr),
                     public_base_url: FieldUpdate::from_option(parsed_public_base_url),
                     gui_enabled: FieldUpdate::from_option(payload.gui_enabled),
+                    default_bundle: FieldUpdate::from_option(parsed_default_bundle),
                 },
             )
             .map_err(map_store_err_preserving_noun)?;
@@ -246,7 +299,8 @@ fn set_schema() -> Value {
                 "description": "Bind address for the runtime's local HTTP listener (e.g. 127.0.0.1:8080, 0.0.0.0:9090, [::1]:8443). Parsed as SocketAddr; malformed values are rejected."
             },
             "public_base_url": {"type": ["string", "null"], "description": "origin-only URL (https://host[:port])"},
-            "gui_enabled": {"type": ["boolean", "null"], "description": "serve the built-in webchat GUI; null leaves the stored value unchanged (the env-id default — on for local — applies only when unset)"}
+            "gui_enabled": {"type": ["boolean", "null"], "description": "serve the built-in webchat GUI; null leaves the stored value unchanged (the env-id default — on for local — applies only when unset)"},
+            "default_bundle": {"type": ["string", "null"], "description": "bundle id for bare-URL webchat resolution; must name a bundle with an Active deployment in this environment"}
         }
     })
 }
@@ -321,6 +375,7 @@ mod tests {
                 listen_addr: None,
                 public_base_url: None,
                 gui_enabled: None,
+                default_bundle: None,
             }),
         )
         .unwrap();
@@ -349,6 +404,7 @@ mod tests {
                 listen_addr: Some("127.0.0.1:8080".to_string()),
                 public_base_url: None,
                 gui_enabled: None,
+                default_bundle: None,
             }),
         )
         .unwrap();
@@ -374,6 +430,7 @@ mod tests {
                 listen_addr: Some("0.0.0.0:9090".to_string()),
                 public_base_url: None,
                 gui_enabled: None,
+                default_bundle: None,
             }),
         )
         .unwrap();
@@ -398,6 +455,7 @@ mod tests {
                 listen_addr: Some("not-a-socket-addr".to_string()),
                 public_base_url: None,
                 gui_enabled: None,
+                default_bundle: None,
             }),
         )
         .expect_err("malformed listen_addr must be rejected");
@@ -429,6 +487,7 @@ mod tests {
                 listen_addr: Some(hostile.to_string()),
                 public_base_url: None,
                 gui_enabled: None,
+                default_bundle: None,
             }),
         )
         .expect_err("hostile listen_addr must still be rejected");
@@ -466,6 +525,7 @@ mod tests {
             "listen_addr",
             "public_base_url",
             "gui_enabled",
+            "default_bundle",
         ]
         .into_iter()
         .collect();
@@ -478,6 +538,95 @@ mod tests {
             Some(&json!(false)),
             "set_schema must keep additionalProperties: false; otherwise the \
              completeness check above is moot",
+        );
+    }
+
+    #[test]
+    fn set_default_bundle_with_active_deployment() {
+        use crate::cli::tests_common::make_bundle_deployment;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.bundles.push(make_bundle_deployment("local", "acct"));
+        store.save(&env).unwrap();
+        set(
+            &store,
+            &OpFlags::default(),
+            Some(ConfigSetPayload {
+                environment_id: "local".to_string(),
+                name: None,
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+                public_base_url: None,
+                gui_enabled: None,
+                default_bundle: Some("acct".to_string()),
+            }),
+        )
+        .unwrap();
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert_eq!(env.host_config.default_bundle, Some(BundleId::from("acct")));
+    }
+
+    #[test]
+    fn set_rejects_default_bundle_with_no_active_deployment() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("local")).unwrap();
+        let err = set(
+            &store,
+            &OpFlags::default(),
+            Some(ConfigSetPayload {
+                environment_id: "local".to_string(),
+                name: None,
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+                public_base_url: None,
+                gui_enabled: None,
+                default_bundle: Some("nonexistent".to_string()),
+            }),
+        )
+        .expect_err("must reject bundle with no Active deployment");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("default_bundle") && msg.contains("no Active deployment"),
+            "error must name the field and reason, got: {msg}"
+        );
+        // Env state must remain untouched.
+        let env = store.load(&EnvId::try_from("local").unwrap()).unwrap();
+        assert_eq!(env.host_config.default_bundle, None);
+    }
+
+    #[test]
+    fn set_rejects_default_bundle_with_paused_deployment() {
+        use crate::cli::tests_common::make_bundle_deployment;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        let mut dep = make_bundle_deployment("local", "acct");
+        dep.status = BundleDeploymentStatus::Paused;
+        env.bundles.push(dep);
+        store.save(&env).unwrap();
+        let err = set(
+            &store,
+            &OpFlags::default(),
+            Some(ConfigSetPayload {
+                environment_id: "local".to_string(),
+                name: None,
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+                public_base_url: None,
+                gui_enabled: None,
+                default_bundle: Some("acct".to_string()),
+            }),
+        )
+        .expect_err("must reject bundle with only Paused deployment");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("default_bundle") && msg.contains("no Active deployment"),
+            "error must name the field and reason, got: {msg}"
         );
     }
 

@@ -181,6 +181,7 @@ async fn remote_env_lifecycle_end_to_end() {
                     listen_addr: FieldUpdate::Keep,
                     public_base_url: FieldUpdate::Keep,
                     gui_enabled: FieldUpdate::Keep,
+                    default_bundle: FieldUpdate::Keep,
                 },
             )
             .expect("update environment");
@@ -831,6 +832,7 @@ async fn backup_restore_end_to_end() {
                     listen_addr: FieldUpdate::Keep,
                     public_base_url: FieldUpdate::Keep,
                     gui_enabled: FieldUpdate::Keep,
+                    default_bundle: FieldUpdate::Keep,
                 },
             )
             .expect("update environment");
@@ -1151,6 +1153,7 @@ async fn remote_reconcile_authorization_end_to_end() {
                     listen_addr: FieldUpdate::Keep,
                     public_base_url: FieldUpdate::Keep,
                     gui_enabled: FieldUpdate::Keep,
+                    default_bundle: FieldUpdate::Keep,
                 },
             )
             .expect("advance the env out-of-band");

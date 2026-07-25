@@ -1596,6 +1596,7 @@ fn broadcast_target_violation(manifest: &EnvManifest) -> Option<&'static str> {
         tenant_org_id,
         listen_addr,
         gui_enabled,
+        default_bundle,
     } = environment;
 
     // Host config first — these are the fleet-rebinding ones.
@@ -1616,6 +1617,9 @@ fn broadcast_target_violation(manifest: &EnvManifest) -> Option<&'static str> {
     }
     if gui_enabled.is_some() {
         return Some("environment.gui_enabled");
+    }
+    if default_bundle.is_some() {
+        return Some("environment.default_bundle");
     }
     if !secrets.is_empty() {
         return Some("secrets");
@@ -5249,6 +5253,10 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
                 json!({"tenant_org_id": "org-x"}),
             ),
             ("environment.gui_enabled", json!({"gui_enabled": true})),
+            (
+                "environment.default_bundle",
+                json!({"default_bundle": "acct"}),
+            ),
         ];
         for (field, extra) in cases {
             let mut env_obj = json!({"id": BROADCAST_ENV_ID});
