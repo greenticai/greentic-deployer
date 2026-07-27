@@ -14,7 +14,6 @@
 //! it with the consuming revision's scope, so the SPA is served under the real
 //! bundle's URL and talks to that bundle's DirectLine endpoint.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use super::OpError;
@@ -36,7 +35,7 @@ pub const WEBCHAT_UI_PACK_FILE: &str = "messaging-webchat-ui.gtpack";
 pub struct WebchatFacts {
     /// Declares a `greentic.static-routes.v1` route under `/v1/web/webchat`.
     pub serves_ui: bool,
-    /// Declares `messaging.provider_ingress.v1` — a messaging backend.
+    /// Declares `greentic.provider-extension.v1` with a webchat `provider_type`.
     pub serves_provider: bool,
 }
 
@@ -64,20 +63,14 @@ impl WebchatFacts {
 /// already digest-pins whatever it finds, and a pack this cannot parse is a
 /// pack whose webchat intentions are unknown — the conservative answer is "adds
 /// neither", which at worst skips the injection.
+///
+/// Delegates to the canonical reader so both TAR and ZIP archives are handled.
 fn pack_webchat_facts(pack_path: &Path) -> WebchatFacts {
-    let Ok(file) = std::fs::File::open(pack_path) else {
+    let Ok(bytes) =
+        crate::pack_introspect::read_entry_from_gtpack(pack_path, Path::new("manifest.cbor"))
+    else {
         return WebchatFacts::default();
     };
-    let Ok(mut archive) = zip::ZipArchive::new(file) else {
-        return WebchatFacts::default();
-    };
-    let Ok(mut entry) = archive.by_name("manifest.cbor") else {
-        return WebchatFacts::default();
-    };
-    let mut bytes = Vec::new();
-    if entry.read_to_end(&mut bytes).is_err() {
-        return WebchatFacts::default();
-    }
     let Ok(value) = ciborium::from_reader::<ciborium::Value, _>(bytes.as_slice()) else {
         return WebchatFacts::default();
     };
@@ -96,7 +89,9 @@ fn facts_from_manifest(value: &ciborium::Value) -> WebchatFacts {
     for (key, ext) in entries {
         let Some(name) = key.as_text() else { continue };
         match name {
-            "messaging.provider_ingress.v1" => facts.serves_provider = true,
+            "greentic.provider-extension.v1" => {
+                facts.serves_provider |= declares_webchat_provider(ext);
+            }
             "greentic.static-routes.v1" => {
                 facts.serves_ui |= declares_webchat_route(ext);
             }
@@ -104,6 +99,28 @@ fn facts_from_manifest(value: &ciborium::Value) -> WebchatFacts {
         }
     }
     facts
+}
+
+/// Whether a `greentic.provider-extension.v1` extension declares a webchat
+/// provider. `messaging.provider_ingress.v1` is shared by every messaging
+/// provider (Telegram, Teams, webchat, ...), so checking it alone would inject
+/// the SPA into non-webchat bundles. The `provider_type` inside
+/// `greentic.provider-extension.v1` is the typed identity.
+fn declares_webchat_provider(ext: &ciborium::Value) -> bool {
+    let Some(inline) = lookup(ext, "inline") else {
+        return false;
+    };
+    let Some(providers) = lookup(inline, "providers") else {
+        return false;
+    };
+    let Some(providers) = providers.as_array() else {
+        return false;
+    };
+    providers.iter().any(|provider| {
+        lookup(provider, "provider_type")
+            .and_then(ciborium::Value::as_text)
+            .is_some_and(|pt| pt.starts_with("messaging.webchat"))
+    })
 }
 
 /// Whether a `greentic.static-routes.v1` extension declares a route under the
@@ -191,6 +208,22 @@ mod tests {
         )
     }
 
+    fn provider_ext(provider_type: &str) -> (Value, Value) {
+        (
+            text("greentic.provider-extension.v1"),
+            Value::Map(vec![(
+                text("inline"),
+                Value::Map(vec![(
+                    text("providers"),
+                    Value::Array(vec![Value::Map(vec![(
+                        text("provider_type"),
+                        text(provider_type),
+                    )])]),
+                )]),
+            )]),
+        )
+    }
+
     fn manifest(exts: Vec<(Value, Value)>) -> Value {
         Value::Map(vec![(text("extensions"), Value::Map(exts))])
     }
@@ -213,13 +246,35 @@ mod tests {
     }
 
     #[test]
-    fn a_pack_declaring_provider_ingress_serves_a_provider() {
+    fn a_webchat_provider_extension_serves_a_provider() {
+        let facts = facts_from_manifest(&manifest(vec![provider_ext("messaging.webchat")]));
+        assert!(facts.serves_provider);
+        assert!(!facts.serves_ui);
+    }
+
+    /// `messaging.provider_ingress.v1` is shared across all messaging
+    /// providers; without a webchat `provider_type` it must not trigger
+    /// injection.
+    #[test]
+    fn a_generic_provider_ingress_does_not_count_as_webchat() {
         let facts = facts_from_manifest(&manifest(vec![(
             text("messaging.provider_ingress.v1"),
             Value::Map(vec![]),
         )]));
-        assert!(facts.serves_provider);
-        assert!(!facts.serves_ui);
+        assert!(!facts.serves_provider);
+    }
+
+    /// A Telegram-only bundle declares `messaging.provider_ingress.v1` and
+    /// `greentic.provider-extension.v1` with `provider_type:
+    /// "messaging.telegram.bot"` — it must NOT get a webchat SPA.
+    #[test]
+    fn a_telegram_provider_does_not_trigger_injection() {
+        let facts = facts_from_manifest(&manifest(vec![
+            provider_ext("messaging.telegram.bot"),
+            (text("messaging.provider_ingress.v1"), Value::Map(vec![])),
+        ]));
+        assert!(!facts.serves_provider);
+        assert!(!facts.needs_ui());
     }
 
     #[test]
@@ -240,7 +295,7 @@ mod tests {
     fn a_pack_serving_both_needs_no_injection() {
         let facts = facts_from_manifest(&manifest(vec![
             static_routes_ext("/v1/web/webchat/{tenant}"),
-            (text("messaging.provider_ingress.v1"), Value::Map(vec![])),
+            provider_ext("messaging.webchat"),
         ]));
         assert!(facts.serves_ui && facts.serves_provider);
         assert!(!facts.needs_ui());
@@ -249,10 +304,7 @@ mod tests {
     /// The case this whole feature exists for: the plain webchat pack.
     #[test]
     fn a_provider_without_a_ui_needs_the_injection() {
-        let facts = facts_from_manifest(&manifest(vec![(
-            text("messaging.provider_ingress.v1"),
-            Value::Map(vec![]),
-        )]));
+        let facts = facts_from_manifest(&manifest(vec![provider_ext("messaging.webchat")]));
         assert!(facts.needs_ui());
     }
 
